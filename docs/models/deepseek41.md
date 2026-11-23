@@ -24,10 +24,12 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   the main card fills the rest of its memory with copies, down to what a short prompt needs. The start line
   `expert homes of 384 per layer: ...` gives the split.
 - **RAM:** the checkpoint blocks (`--prompt-cache` + 1 per slot, about 3 MB each) are allocated page-locked at start, with a
-  spare VRAM buffer of the same size, before the RAM tier is sized. The prompt path's and the images' host buffers are allocated at
+  spare VRAM buffer of the same size, before the RAM tier is sized. The prompt path's host buffers are allocated at
   start, before the RAM tier: the pinned ring of file
   reads (only when experts may stay in the file, at most 240 experts), the staging of a short read, the second card's prompt
-  rows, a chunk's Engram reads, and each slot's largest image. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
+  rows, and a chunk's Engram reads. A picture's decoded pixels and patch rows are ordinary memory that grows while a request's pictures are read and
+  is freed after them (the largest picture takes a few hundred MiB); with `--vision dynamic` nothing is held for pictures at rest, so the RAM tier,
+  the homes and the copies are planned exactly as with `--vision off`. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
   the RAM to free.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
@@ -43,6 +45,10 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   or the start is refused with one line (what fits, the free VRAM, the reserve); `auto` takes what fits. `--vram-reserve-mib` or
   `POST /v1/vram` sets what stays free and plans the size again once, from the free memory then. The caches, prompts and images
   take the tier's copies first (homes stay) and halve their chunks to fit above the reserve.
+  `--vision dynamic` has no card memory at rest: a request's pictures borrow the encoder's weights and work buffers from the tier's copies
+  beside the homes (all the copies when those do not hold them), and the tier takes them back and refills them when the pictures are read.
+  The homes keep 1.5 GiB free beside them when the pack carries a projector, with vision on or off, so the plan is the same either way. Before this the images' buffers (6 GiB of pinned host memory for the slots' largest pictures) took the RAM the tier needed, and on two cards
+  with a 1M context that moved 18 experts a layer onto the main card as homes in place of its 60 copies (5.77 against 19.24 GiB of tier). Two cards, drafted, conv / struct / prose tok/s with `--vision dynamic`: before 99 / 249 / 101 and 97 / 246 / 100, after 99 / 252 / 104 and 99 / 255 / 104; with vision off 97 / 256 / 101.
 - **Cache precision:** `--kv fp8` (default) stores the caches as the model's reference rounds them, 920 bytes per position;
   `--kv fp16` keeps the unrounded values, 3,200 bytes per position (a 1M context about 3.2 GiB). [precision](../precision/deepseek41.md#where-each-stage-rounds)
 - **Refused flags:** `--rope-*`, `--yarn-*` (YaRN is part of the model).
@@ -95,14 +101,29 @@ Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`
 
 ## Parallel slots
 
-Slots share one decode stream: a batch window runs each busy slot's window in turn. Each slot drafts as a single stream does, from
-the drafter's window rows of its own conversation. The slots share one drafter, so `--parallel` adds no drafter memory. A request
-alone in its slot gives the same greedy tokens as with `--parallel 1` (tiers pinned).
+Slots share one decode stream through the shared batch driver ([batching](../design/batching.md)), as on every model: a round
+runs the busy slots' windows as one batch of up to 8 rows. Each slot drafts as a single stream does, from the drafter's window
+rows of its own conversation. The slots share one drafter, so `--parallel` adds no drafter memory. A request alone in its slot
+gives the same greedy tokens as with `--parallel 1` (tiers pinned), and a batch's rows give bitwise their solo windows' picks and
+logits (`--diag-batch-check`, frozen tier).
+
+With experts in RAM a batch's rows reach a wider union of experts than one slot's window, and the 8-row cap trims each slot's
+drafts (about 2 rows a slot at four slots, against 6-row windows alone), so on two cards batching is slower than running each
+slot's window in turn, as main did. Aggregate tok/s, two cards (400 W + 180 W), drafted, tiers unfrozen, 256 tokens a slot, ABBA:
+
+| Slots | Main, in turn (A1 / A2) | Batched (B1 / B2) | Change |
+| --- | --- | --- | --- |
+| 1 | 89.3 / 87.0 | 87.0 / 92.8 | none: one slot runs its solo window, the same code |
+| 2 | 85.0 / 82.7 | 85.4 / 80.4 | -1.1% |
+| 4 | 71.5 / 70.0 | 63.8 / 62.1 | -11.0% |
+| 8 | 76.9 / 77.2 | 54.6 / 51.1 | -31.4% |
 
 ## Lossy flags
 
-None. Output depends on which experts are resident, so a different RAM tier size can change the text
-([precision](../precision/deepseek41.md#experts-and-placement)).
+Off by default. `--route-prior` and `--route-tail-skip` change output, and each is named in one start warning. What they do on
+every MoE model: [quality](../precision/quality.md#lossy-routing-flags); what they cost and gain here:
+[precision](../precision/deepseek41.md#lossy-routing-flags). Without them, output still depends on which experts are resident, so a
+different RAM tier size can change the text ([precision](../precision/deepseek41.md#experts-and-placement)).
 
 ## Limits
 

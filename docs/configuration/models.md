@@ -41,8 +41,9 @@ directory, stop the start too.
 
 ## Requests and turns
 
-A request's `model` is the alias or the file's name on every API. Any other name is a 404. `/v1/models` shows `loaded`, `loading`,
-`unloaded` or `failed`.
+A request's `model` is the alias or the file's name on every API. Any other name is a 404, and so is no name at all while several
+models are configured. With one model configured, a request may leave `model` out or send it as null and that model answers.
+`/v1/models` shows `loaded`, `loading`, `unloaded` or `failed`.
 
 Clients wait through a swap; they do not get a 503 for it. A streamed response sends keep-alive comments every 10 s while it waits.
 

@@ -269,6 +269,10 @@ bool read_ahead_enabled();
 /// hint the pages still arrive - one fault at a time, where they are touched.  The range is asked for in 128 KiB
 /// windows, which keeps the reads in flight bounded.  Only a mapped view is reached this way.
 void advise_willneed(const void* p, uint64_t bytes);
+/// The same for several mapped ranges at once. The entries of one prefetch ask are read side by side, while a
+/// separate ask per range serializes them; batching the ranges keeps the storage queue full. A hint, never an
+/// error, and only a mapped view is reached this way.
+void advise_willneed(const void* const* addrs, const uint64_t* sizes, size_t n);
 /// The same for [offset, offset + bytes) of an open descriptor.  Linux asks its page cache.  Windows asks nothing:
 /// the cache manager takes no range hint for a handle, and a read through a descriptor is a cached read unless the
 /// caller opted out of that cache - which already reads ahead around a sequential reader.  Bytes reached only

@@ -113,6 +113,17 @@ void synthetic() {
     // the same piece twice: the memo returns the same ids
     CHECK(t.encode("abcabc abcabc", false, {}, ids, err));
     CHECK(t.encode("abcabc abcabc", false, {}, ids, err));
+    // ignore_merges: a piece that is an entry is that token (abc, which the merges build as a, bc); others still merge
+    Tokenizer whole;
+    whole.set_pretokenize(kQwen35);
+    whole.set_ignore_merges(true);
+    CHECK(whole.load(vocab, merges, types, err));
+    CHECK(whole.encode("abc", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{257}));
+    CHECK(whole.encode("abcx", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'a', 258, 'x'}));
+    CHECK(whole.encode("x<|ctl|>y", true, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'x', 261, 'y'}));
     std::string bad;
     CHECK(!t.load("{\"a\":1", "", "[]", bad));
 }

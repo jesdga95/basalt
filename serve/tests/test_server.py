@@ -900,6 +900,24 @@ class ClientShapes(unittest.TestCase):
         status, _ = self.post("/v1/nothing?beta=true", body)
         self.assertEqual(status, 404)
 
+    def test_a_base_url_that_ends_in_v1(self):
+        # an Anthropic client adds /v1/messages to its base URL itself: given ".../v1" it posts /v1/v1/messages
+        body = {"model": "basalt", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+        status, b = self.post("/v1/v1/messages?beta=true", body)
+        self.assertEqual((status, b.get("type")), (200, "message"), b)
+        status, b = self.post("/v1/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, b)
+        self.assertGreater(b["input_tokens"], 0)
+        req = urllib.request.Request(self.base + "/v1/v1/messages", data=json.dumps({**body, "stream": True}).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            events = r.read().decode()
+        self.assertIn("event: message_start", events)
+        self.assertIn("event: message_stop", events)
+        for path in ("/v1/v1/chat/completions", "/v1/v1/responses"):   # only the two Anthropic paths are aliased
+            status, _ = self.post(path, body)
+            self.assertEqual(status, 404, path)
+
     def test_anthropic_mid_conversation_system(self):
         status, b = self.post("/v1/messages?beta=true", {
             "model": "basalt", "max_tokens": 50,
@@ -1765,6 +1783,147 @@ class LoadProgress(unittest.TestCase):
         bars.say("[server] warning: x")
         self.assertIn("\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
 
+    def test_the_one_bar_says_where_the_engine_places(self):
+        from serve.engine.progress import LoadBars, load_into
+        self.assertEqual(load_into("basalt load: into cuda0"), "cuda0")
+        self.assertEqual(load_into("basalt load: into ram"), "ram")
+        self.assertIsNone(load_into("basalt load: into disk"))
+        self.assertIsNone(load_into("basalt load: weights 1 2"))
+        out = Tty()
+        bars = LoadBars(out, gpus=[2, 3])                               # CUDA ordinals 0, 1 are nvidia-smi 2, 3
+        bars.set_total(4 << 30)
+        bars.set_stages(["cuda0", "cuda1", "ram"])
+        bars.set_into("cuda0")                                          # each card's share in turn, first
+        bars.update("weights", 1 << 30, 4 << 30)
+        self.assertEqual(bars.lines(), ["[server] loading model weights: cuda2 [" + "=" * 6 + ">" + " " * 17 + "]   1.0/4.0 GiB"])
+        bars.set_into("cuda1")
+        bars.update("weights", 2 << 30, 4 << 30)
+        self.assertEqual(bars.lines(), ["[server] loading model weights: cuda3 [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"])
+        bars.set_into("ram")                                            # then RAM, on the same bar, which stays put
+        self.assertEqual(bars.lines(), ["[server] loading model weights: ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"])
+        self.assertTrue(out.getvalue().splitlines()[-1].endswith("ram   [" + "=" * 12 + ">" + " " * 11 + "]   2.0/4.0 GiB"))
+        log = io.StringIO()                                             # off a terminal: a change prints nothing,
+        bars = LoadBars(log)                                            # a sample of the whole load is no stage's
+        bars.set_total(4 << 30)
+        bars.set_into("cuda0")
+        bars.update("weights", 3 << 30, 4 << 30)
+        bars.set_into("ram")
+        self.assertEqual(log.getvalue(), "")
+        self.assertEqual(bars.lines(), ["[server] loading model weights [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB"])
+
+    def test_four_cards_then_ram_on_one_bar_that_never_shifts(self):
+        from serve.engine.progress import LoadBars, load_stages
+        stages = load_stages("basalt load: stages cuda0 cuda1 cuda2 cuda3 ram")
+        self.assertEqual(stages, ["cuda0", "cuda1", "cuda2", "cuda3", "ram"])
+        self.assertIsNone(load_stages("basalt load: stages disk"))
+        bars = LoadBars(Tty(), gpus=[3, 10, 1, 0])                      # nvidia-smi numbers: cuda10 is the widest
+        bars.set_total(10 << 30)
+        bars.set_stages(stages)
+        seen = []
+        for i, target in enumerate(stages):
+            bars.set_into(target)
+            bars.update("weights", (2 * i + 1) << 30, 10 << 30)
+            seen.append(bars.lines()[0])
+        heads = [line.split(" [")[0] for line in seen]
+        self.assertEqual(heads, ["[server] loading model weights: cuda3 ", "[server] loading model weights: cuda10",
+                                 "[server] loading model weights: cuda1 ", "[server] loading model weights: cuda0 ",
+                                 "[server] loading model weights: ram   "])
+        self.assertEqual(len({line.index("[", 9) for line in seen}), 1)   # the bar starts in one column throughout
+        self.assertTrue(seen[-1].endswith("]   9.0/10.0 GiB"))
+
+    G = 1 << 30
+
+    def _start(self, out, gpus, shares, overlap=False):
+        """A start as the engine reads it out: the total, each destination's share at 0, then the cards in turn and
+        RAM, each share line beside the weights line of its stage. `overlap`: RAM reads land during the card sweep.
+        Returns the weights rows drawn per stage."""
+        from serve.engine.progress import LoadBars
+        bars = LoadBars(out, gpus=gpus)
+        total = sum(b for _, b in shares)
+        bars.set_total(total)
+        bars.update("weights", 0, total)
+        for t, b in shares:
+            bars.set_share(t, 0, b)
+        bars.set_stages([t for t, _ in shares])
+        have = {t: 0 for t, _ in shares}
+        seen = {}
+        for t, b in shares:
+            bars.set_into(t)
+            for k in (1, 2):
+                if overlap and t != "ram" and k == 1:          # a RAM read lands beside the card read
+                    have["ram"] += self.G // 4
+                    bars.set_share("ram", have["ram"], dict(shares)["ram"])
+                have[t] = max(have[t], b * k // 2)
+                bars.set_share(t, have[t], b)
+                bars.update("weights", sum(have.values()), total)
+                seen.setdefault(t, []).append(bars.lines()[0])
+        bars.update("weights", total, total)
+        bars.finish()
+        return seen
+
+    def test_one_card_the_label_carries_the_stages_own_part_and_the_result_splits_the_total(self):
+        out = Tty()
+        seen = self._start(out, [0], [("cuda0", int(12.5 * self.G)), ("ram", int(64.3 * self.G))])
+        self.assertTrue(seen["cuda0"][0].startswith("[server] loading model weights: cuda0  6.2/12.5 ["), seen)
+        self.assertTrue(seen["cuda0"][1].startswith("[server] loading model weights: cuda0 12.5/12.5 ["), seen)
+        self.assertTrue(seen["ram"][1].startswith("[server] loading model weights: ram   64.3/64.3 ["), seen)
+        rows = [r for rs in seen.values() for r in rs]
+        self.assertEqual(len({r.index(" [") for r in rows}), 1, rows)   # the bar starts in one column throughout
+        loaded = [x.split("\x1b[2K")[-1] for x in out.getvalue().splitlines() if "[server] loaded" in x]
+        self.assertEqual(len(loaded), 1)
+        self.assertRegex(loaded[0], r"^\[server\] loaded   76\.8GiB \d+\.\ds  cuda0=12\.5GiB ram=64\.3GiB$")
+
+    def test_two_cards_the_result_names_each_card_as_nvidia_smi_numbers_it(self):
+        out = Tty()
+        self._start(out, [2, 3], [("cuda0", 23 * self.G), ("cuda1", 9 * self.G), ("ram", 40 * self.G)], overlap=True)
+        loaded, = [x.split("\x1b[2K")[-1] for x in out.getvalue().splitlines() if "[server] loaded" in x]
+        self.assertTrue(loaded.endswith("  cuda2=23.0GiB cuda3=9.0GiB ram=40.0GiB"), loaded)
+        self.assertNotIn("placed", out.getvalue())                       # a terminal keeps its one bar
+
+    def test_four_cards_and_ram_keep_one_bar_column_and_a_zero_card_prints_zero(self):
+        out = Tty()
+        shares = [("cuda0", 30 * self.G), ("cuda1", 14 * self.G), ("cuda2", 0), ("cuda3", 7 * self.G), ("ram", 101 * self.G)]
+        seen = self._start(out, [3, 10, 1, 0], shares)
+        rows = [r for rs in seen.values() for r in rs]
+        self.assertEqual(len({r.index(" [") for r in rows}), 1, rows)
+        self.assertTrue(seen["cuda1"][0].startswith("[server] loading model weights: cuda10    7.0/14.0 ["), seen)
+        loaded, = [x.split("\x1b[2K")[-1] for x in out.getvalue().splitlines() if "[server] loaded" in x]
+        self.assertTrue(loaded.endswith("  cuda3=30.0GiB cuda10=14.0GiB cuda1=0.0GiB cuda0=7.0GiB ram=101.0GiB"), loaded)
+
+    def test_off_a_terminal_each_stage_prints_once_with_its_own_total(self):
+        out = io.StringIO()
+        self._start(out, [0, 1], [("cuda0", int(23.25 * self.G)), ("cuda1", 0), ("ram", int(55.6 * self.G))], overlap=True)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 3, lines)                            # no sample of the whole load reads as a stage
+        self.assertRegex(lines[0], r"^\[server\] placed   cuda0 23\.2GiB \d+\.\ds$")
+        self.assertRegex(lines[1], r"^\[server\] placed   ram 55\.6GiB \d+\.\ds$")
+        self.assertRegex(lines[2], r"^\[server\] loaded   78\.8GiB \d+\.\ds  cuda0=23\.2GiB cuda1=0\.0GiB ram=55\.6GiB$")
+        self.assertNotIn("\x1b", out.getvalue())
+
+    def test_the_result_parts_add_up_to_the_total_as_printed(self):
+        from serve.engine.progress import LoadBars
+        for parts in ([1.25, 1.25, 1.25], [12.45, 64.45], [0.04, 0.04, 0.04, 9.88], [3.0, 0.0, 5.0]):
+            bars = LoadBars(io.StringIO())
+            sizes = [int(p * self.G) for p in parts]
+            for i, b in enumerate(sizes):
+                bars.set_share(f"cuda{i}", 0, b)
+            split = bars.split(sum(sizes))
+            got = [float(x.split("=")[1][:-3]) for x in split.split()]
+            self.assertEqual(len(got), len(parts), split)
+            self.assertAlmostEqual(sum(got), float(f"{sum(sizes) / 2**30:.1f}"), places=6, msg=split)
+            for g, p in zip(got, parts):
+                self.assertLessEqual(abs(g - p), 0.1 + 1e-9, split)
+        self.assertEqual(LoadBars(io.StringIO()).split(10), "")            # an engine that announced no split
+
+    def test_parse_share(self):
+        from serve.engine.progress import load_progress, load_share
+        self.assertEqual(load_share("basalt load: share cuda0 0 13421772800"), ("cuda0", 0, 13421772800))
+        self.assertEqual(load_share("basalt load: share ram 5 9"), ("ram", 5, 9))
+        self.assertIsNone(load_share("basalt load: share disk 5 9"))
+        self.assertIsNone(load_share("basalt load: share cuda0 x 9"))
+        self.assertIsNone(load_share("basalt load: share cuda0 9"))
+        self.assertIsNone(load_progress("basalt load: share cuda0 0 9"))
+
     def test_a_total_that_grows_or_shrinks_moves_the_bar(self):
         from serve.engine.progress import LoadBars
         bars = LoadBars(io.StringIO())
@@ -1848,8 +2007,9 @@ class LoadProgress(unittest.TestCase):
         out = io.StringIO()
         self._ple_ram_start(out, True)
         lines = out.getvalue().splitlines()
-        self.assertEqual(len(lines), 2, lines)
-        self.assertTrue(lines[0].startswith("[server] auto ") and lines[1].startswith("[server] loaded   40.0GiB"))
+        self.assertEqual(len(lines), 3, lines)
+        self.assertTrue(lines[0].startswith("[server] placed   n-gram table 18.0GiB "), lines)
+        self.assertTrue(lines[1].startswith("[server] auto ") and lines[2].startswith("[server] loaded   40.0GiB"))
         self.assertNotIn("\x1b", out.getvalue())
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
@@ -2340,7 +2500,11 @@ class WebApp(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
         self.assertIn(b"\"web/app.js\"", body)   # relative (works behind a path-prefixed proxy)
+        for icon in (b'"web/favicon.svg"', b'"web/favicon-32.png"', b'"web/apple-touch-icon.png"'):
+            self.assertIn(icon, body)
         for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/mark.svg", "image/svg+xml"),
+                           ("/web/favicon.svg", "image/svg+xml"), ("/web/favicon-32.png", "image/png"),
+                           ("/web/apple-touch-icon.png", "image/png"),
                            ("/fonts/geist-latin-wght.woff2", "font/woff2"),
                            ("/fonts/geist-mono-latin-wght.woff2", "font/woff2")):
             with self.subTest(path=path):
@@ -2349,7 +2513,7 @@ class WebApp(unittest.TestCase):
                 self.assertIn(want, ctype)
 
     def test_only_the_app_files_are_served(self):
-        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
+        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/web/missing.png", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 404)
@@ -2812,6 +2976,19 @@ class CachingThinkingEngine(ThinkingEngine):
                          "finish": "stop", "reused": min(reused, len(ids)), "hits": 9, "lookups": 10}
 
 
+class TimedThinkingEngine(CachingThinkingEngine):
+    """CachingThinkingEngine with the engine's read times: the first pass reads the prompt (READ ms), a later pass
+    only the few tokens that continue the reply (CONTINUE ms)."""
+    READ, CONTINUE = 1000.0, 5.0
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+        first = not self.prompts
+        try:
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            self.last = dict(self.last, prompt_ms=self.READ if first else self.CONTINUE)
+
+
 class ThinkingBudget(unittest.TestCase):
     """reasoning_budget_tokens: at the budget the thinking is wrapped up and the model answers."""
 
@@ -2867,6 +3044,19 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["prompt_tokens_details"]["cached_tokens"], CachingThinkingEngine.FIRST)
         self.assertEqual(b["timings"]["cache_n"], CachingThinkingEngine.FIRST)
         self.assertEqual(b["timings"]["prompt_n"] + b["timings"]["cache_n"], b["usage"]["prompt_tokens"])
+
+    def test_prompt_time_of_a_wrapped_up_request_comes_from_its_first_pass(self):
+        """The prompt is read in the first pass; a later pass's read time, beside the whole prompt, gave a rate
+        hundreds of times too high."""
+        self.engine = TimedThinkingEngine(self.tok)
+        self.svc.engine = self.engine
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)
+        t = b["timings"]
+        self.assertEqual(t["prompt_ms"], TimedThinkingEngine.READ)
+        self.assertAlmostEqual(t["prompt_per_second"], t["prompt_n"] / (TimedThinkingEngine.READ / 1000), places=1)
+        self.assertEqual(self.svc.history[-1]["prompt_ms"], TimedThinkingEngine.READ)
 
     def test_the_budget_wraps_up_the_thinking(self):
         from serve.service import REASONING_CLOSE
@@ -3060,6 +3250,74 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
                          self.engine.THOUGHT[:200] + REASONING_CLOSE.split("</think>")[0])
         self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+
+    def _pt_engine(self):
+        """A text-prompt engine as the real one answers at PT: the cap it was sent, cut to the context room."""
+        from serve.prompt import PromptText
+        self.engine.takes_text = True
+        original = self.engine.generate
+
+        def pt(ids, max_new, sampling, cancel, embeddings=None, session=None):
+            if isinstance(ids, PromptText):
+                yield None
+                n = len(ids.ids())
+                max_new = min(max_new, self.engine.max_context - n - 16)
+                ids.set_counted(n, max_new)
+                yield None
+                ids = ids.ids()
+            yield from original(ids, max_new, sampling, cancel, embeddings)
+
+        self.engine.generate = pt
+
+    def test_thinking_budget_caps_the_thinking_not_the_reply_on_the_text_path(self):
+        # issue #512: the engine answers PT with the pass's cap (the budget); that must not become the total cap
+        self.engine.max_context = 16384
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40           # far longer than any budget below
+        self._pt_engine()
+        for field in ({"thinking_budget_tokens": 800}, {"reasoning_budget": 800},
+                      {"thinking": {"type": "enabled", "budget_tokens": 800}}):
+            with self.subTest(field=field):
+                code, b = self.openai(max_tokens=3000, **field)
+                self.assertEqual(code, 200, b)
+                msg = b["choices"][0]["message"]
+                self.assertTrue(790 <= len(msg["reasoning_content"]) <= 802, len(msg["reasoning_content"]))   # stopped at the budget
+                self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+                self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+                self.assertGreater(b["usage"]["completion_tokens"], 800)
+                self.assertLessEqual(b["usage"]["completion_tokens"], 3000)
+        code, b = self.openai(max_tokens=16384, thinking_budget_tokens=4096)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertGreater(b["usage"]["completion_tokens"], 4096)
+
+    def test_thinking_budget_over_max_tokens_is_still_capped_by_max_tokens(self):
+        self.engine.max_context = 16384
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40
+        self._pt_engine()
+        code, b = self.openai(max_tokens=1000, thinking_budget_tokens=5000)
+        self.assertEqual(code, 200, b)
+        self.assertLessEqual(b["usage"]["completion_tokens"], 1000)
+
+    def test_thinking_budget_on_the_anthropic_route_keeps_max_tokens(self):
+        self.engine.max_context = 16384
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40
+        self._pt_engine()
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                code, b = self.post("/v1/messages", {"model": self.svc.model, "max_tokens": 3000, "stream": stream,
+                                                     "thinking": {"type": "enabled", "budget_tokens": 800},
+                                                     "messages": [{"role": "user", "content": "2+2?"}]})
+                self.assertEqual(code, 200, b)
+                if stream:
+                    events = [json.loads(l[6:]) for l in b.splitlines() if l.startswith("data: {")]
+                    text = "".join(e["delta"].get("text", "") for e in events if e["type"] == "content_block_delta")
+                    self.assertIn(ThinkingEngine.ANSWER, text)
+                    out = [e for e in events if e["type"] == "message_delta"][-1]
+                    self.assertEqual(out["delta"]["stop_reason"], "end_turn")
+                    self.assertGreater(out["usage"]["output_tokens"], 800)
+                else:
+                    self.assertEqual(b["stop_reason"], "end_turn")
+                    self.assertGreater(b["usage"]["output_tokens"], 800)
 
     def test_answer_room_reserves_a_quarter_of_an_8192_token_cap(self):
         from serve.service import REASONING_CLOSE

@@ -10,7 +10,8 @@ projector and the DFly2 drafter:
 
 - Routed experts: NVFP4, rounded once from BF16 (83.6 GB).
 - Attention, latent, shared-expert, dense-FFN, Engram and indexer projections and the token embedding: Q8_0 of the BF16 values.
-- Output head: BF16, as stored. Norms, hyper-connections, router and biases: F32, as stored.
+- Output head: BF16 in the file; the engine rounds it to Q8_0 as it loads. Norms, hyper-connections, router and biases: F32,
+  as stored.
 - Engram table: E4M3 codes, one byte per value, rounded once from BF16 (63.4 GB). It stays in the file and is read by row.
 - Vision projector (BF16, 1.0 GB) and the drafter (BF16 in the file, 1.7 GB), whole.
 
@@ -41,8 +42,15 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   experts by the shipped routing profile `data/profiles/hy4flash-42x512.prof`, so the first request after a start finds the
   most routed ones resident. The early layers route more widely and get more of the main card's copies (layers 0 to 3 about
   1.4 times the mean, the quietest 0.73), the same total.
-- **Cards:** the main card holds the dense weights, the caches and the drafter (0.87 GiB). Up to three more cards
+- **Copies give way by use:** an expert that earns a main card slot takes the one whose expert was looked up least lately (every
+  lookup counts, up to 15; the counts halve every 256 tokens and start again with each prompt), the one used longest ago among
+  equals. An expert that recurs every few tokens keeps its copy through runs of experts that come once, and the experts of an
+  earlier topic do not hold the card through the next one. DeepSeek's slots give way by age alone.
+- **Cards:** the main card holds the dense weights (6.76 GiB with the Q8_0 head), the caches and the drafter (0.87 GiB). Up to three more cards
   (`--gpu 0,1,2,3`) each hold the experts of one block of layers; later cards idle.
+- **Waits:** while a decode layer's expert sum waits for the CPU's and the second card's rows, the main card's memory is idle
+  once its own experts are done. It then reads the next layer's attention gate and output products (the head after the last
+  layer) into its L2, up to 56 MB, and stops when the rows are in; those products then read L2 instead of memory.
 - **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
 - **Context:** `--max-context` from 1,024 up to 1,048,576, default 8,192. The 12 sparse layers keep a row of every position;
   the window layers' rings do not grow.
@@ -80,22 +88,26 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 
 On when the pack has the DFly2 drafter. One block pass drafts up to 5 tokens and states each one's chance of acceptance, and the
 draft policy picks the window by expected tokens per millisecond, as for DeepSeek
-(`include/basalt/spec/draft_policy.hpp`). `--spec N` caps the window (default 6: the last accepted token plus the whole block);
-`--spec 0` turns it off.
+(`include/basalt/spec/draft_policy.hpp`). The heads run one draft at a time, each draft's chance before its pass over the
+vocabulary's rows, and stop at the first draft no window could hold. `--spec N` caps the window (default 6: the last accepted
+token plus the whole block); `--spec 0` turns it off.
 
 The drafter is five dense MLA layers that read target layers 25, 29, 33, 37 and 41: each attends the positions that target layer's
 indexer selected, in that layer's cache, so its cost does not grow with the context. It keeps no cache of its own, and
 the target checks every draft: output is plain decoding's ([precision](../precision/hy4-flash.md#drafting)). Its projections
-are rounded to Q8_0 as they load. It works with either `--kv`. The start line:
+are rounded as they load, the attention's gate and output and the MLP to Q4_0 and the rest to Q8_0. Its drafts pick from the
+target's own Q8_0 head through a 2-bit copy of every row (116 MB): the rows near the copy's best are scored exactly, as the
+target scores them. It works with either `--kv`. The start line:
 
 ```
-basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.87 GiB on the GPU (Q8_0 projections)
+basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.66 GiB on the GPU (Q8_0 and Q4_0 projections)
 ```
 
 ## Parallel slots
 
-Not measured. `--parallel N` starts N sessions, each with its own caches, rings and drafter scratch, over the one expert tier;
-their windows run one after another, with no shared pass through the weights.
+`--parallel N` starts N sessions, each with its own caches, rings and drafter context, over the one expert tier and one forward
+scratch. The busy slots decode together, one pass of up to 8 rows ([batched decoding](../design/batching.md)); a request alone in
+its slot gives the tokens it gives with `--parallel 1`. Speed with several slots is not measured.
 
 ## Images
 
@@ -120,8 +132,10 @@ positions are masked.
 
 ## Lossy flags
 
-None. Output depends on which experts are resident, so a different tier size can change the text
-([precision](../precision/hy4-flash.md#experts-and-placement)).
+Off by default. `--route-prior` and `--route-tail-skip` change output, and each is named in one start warning. What they do on
+every MoE model: [quality](../precision/quality.md#lossy-routing-flags); what they cost and gain here:
+[precision](../precision/hy4-flash.md#lossy-routing-flags). Without them, output still depends on which experts are resident, so a
+different tier size can change the text ([precision](../precision/hy4-flash.md#experts-and-placement)).
 
 ## Limits
 

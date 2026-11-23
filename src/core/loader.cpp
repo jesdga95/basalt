@@ -3,6 +3,7 @@
 
 #include "basalt/core/load_progress.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -69,6 +71,14 @@ void convert(Conv conv, const uint8_t* src, uint64_t n, uint8_t* out) {
             }
             break;
         }
+        case Conv::Bf16ToQ4_0: {
+            uint16_t h[32];
+            for (uint64_t b = 0; b < n / 64; ++b) {
+                std::memcpy(h, src + b * 64, 64);
+                quantize_bf16_q4_0(h, 32, out + b * 18);
+            }
+            break;
+        }
     }
 }
 
@@ -78,7 +88,8 @@ uint64_t conv_unit(Conv c) {   // the bytes of one source element (of a block, f
         case Conv::ToF16: return 4;
         case Conv::WidenF16:
         case Conv::Bf16ToF32: return 2;
-        case Conv::Bf16ToQ8_0: return 64;
+        case Conv::Bf16ToQ8_0:
+        case Conv::Bf16ToQ4_0: return 64;
         default: return 1;
     }
 }
@@ -92,6 +103,7 @@ uint64_t conv_out_bytes(Conv conv, uint64_t in) {
         case Conv::WidenF16:
         case Conv::Bf16ToF32: return in * 2;
         case Conv::Bf16ToQ8_0: return in / 64 * 34;
+        case Conv::Bf16ToQ4_0: return in / 64 * 18;
         default: return in;
     }
 }
@@ -110,6 +122,30 @@ void quantize_bf16_q8_0(const uint16_t* bf16, uint64_t n, uint8_t* blocks) {
         const uint16_t dh = basalt::kernels::f16_from_f32(d);
         std::memcpy(o, &dh, 2);
         for (int i = 0; i < 32; ++i) o[2 + i] = (uint8_t) (int8_t) std::round(x[i] * id);
+    }
+}
+
+void quantize_bf16_q4_0(const uint16_t* bf16, uint64_t n, uint8_t* blocks) {
+    for (uint64_t b = 0; b < n / 32; ++b) {
+        float x[32], amax = 0.0f, m = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const uint32_t u = (uint32_t) bf16[b * 32 + (uint64_t) i] << 16;
+            std::memcpy(&x[i], &u, 4);
+            if (amax < std::fabs(x[i])) {
+                amax = std::fabs(x[i]);
+                m = x[i];
+            }
+        }
+        const float d = m / -8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        uint8_t* o = blocks + b * 18;
+        const uint16_t dh = basalt::kernels::f16_from_f32(d);
+        std::memcpy(o, &dh, 2);
+        for (int i = 0; i < 16; ++i) {
+            const int lo = std::min(15, (int) (int8_t) (x[i] * id + 8.5f));
+            const int hi = std::min(15, (int) (int8_t) (x[16 + i] * id + 8.5f));
+            o[2 + i] = (uint8_t) (lo | (hi << 4));
+        }
     }
 }
 
@@ -201,6 +237,23 @@ uint64_t LoadPlan::counted() const {
     uint64_t n = 0;
     for (const LoadItem& it : items_) n += it.count;
     return n;
+}
+
+std::vector<std::pair<std::string, uint64_t>> LoadPlan::counted_by_target(int main_card) const {
+    std::map<int, uint64_t> cards;   // by rank: the main card first, then the others by ordinal
+    uint64_t ram = 0;
+    bool any_ram = false;
+    for (const LoadItem& it : items_) {
+        if (it.dev != nullptr) cards[it.device == main_card ? -1 : it.device] += it.count;
+        else if (it.host != nullptr) {
+            ram += it.count;
+            any_ram = true;
+        }
+    }
+    std::vector<std::pair<std::string, uint64_t>> out;
+    for (const auto& [rank, bytes] : cards) out.emplace_back(LoadProgress::cuda(rank < 0 ? main_card : rank), bytes);
+    if (any_ram) out.emplace_back("ram", ram);
+    return out;
 }
 
 namespace {
@@ -377,6 +430,7 @@ bool Loader::prepare(const std::vector<int>& devices, std::string& err) {
     return true;
 }
 Loader::~Loader() = default;
+void Loader::release_staging() { impl_->free_staging(); }
 bool Loader::unbuffered() const { return impl_->all_direct && impl_->buffered_bytes.load() == 0; }
 
 namespace {
@@ -446,19 +500,38 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
     for (size_t i = 0; i < handles.size(); ++i)
         if (!m.open(plan.files()[i], handles[i], err)) return false;
 
-    // two rounds: the file reads, then the copies from memory, whose sources those reads fill
-    std::vector<Task> rounds[2];
-    uint64_t piece = 0, out_piece = 0;
+    // two rounds: the file reads, then the copies from memory, whose sources those reads fill.  The file reads that land
+    // on a card come first, each sweep in plan order: the cards get their share before RAM fills, whatever order the
+    // model queued its items in, and a RAM tier's pages are taken only after the cards' bytes are read.
+    std::vector<Task> rounds[2], host_reads;
+    uint64_t piece = 0, out_piece = 0, device_bytes = 0;
+    size_t last_card_item = 0;   // the plan's last card read: RAM reads queued before it may run beside the card reads
+    for (size_t i = 0; i < items.size(); ++i)
+        if (items[i].from == nullptr && items[i].dev != nullptr) last_card_item = i;
+    size_t early_ram = 0;        // the tasks of those RAM reads, the first of host_reads
     for (size_t i = 0; i < items.size(); ++i) {
         // a converted range is read in smaller pieces: its staging holds the raw bytes and what they become
         const uint64_t step = items[i].conv == Conv::Copy ? kChunk : kChunk / 4;
-        std::vector<Task>& tasks = rounds[items[i].from != nullptr ? 1 : 0];
+        const bool from_file = items[i].from == nullptr;
+        if (from_file && items[i].dev != nullptr) device_bytes += items[i].bytes;
+        std::vector<Task>& tasks = !from_file ? rounds[1] : items[i].dev != nullptr ? rounds[0] : host_reads;
         for (uint64_t off = 0; off < items[i].bytes; off += step) {
             tasks.push_back(Task{(uint32_t) i, off, std::min<uint64_t>(step, items[i].bytes - off)});
+            if (&tasks == &host_reads && i < last_card_item) early_ram = host_reads.size();
             piece = std::max(piece, tasks.back().len);
             if (items[i].conv != Conv::Copy) out_piece = std::max(out_piece, conv_out_bytes(items[i].conv, tasks.back().len));
         }
     }
+    // one card after the other, in the engine's card order (the main card, the current device, then the others by
+    // ordinal), so each card's share is complete before the next begins: the drive is slower than any card's link
+    int main_card = 0;
+    if (cudaGetDevice(&main_card) != cudaSuccess) main_card = 0;
+    const auto card_rank = [&](int d) { return d == main_card ? -1 : d; };
+    std::stable_sort(rounds[0].begin(), rounds[0].end(), [&](const Task& a, const Task& b) {
+        return card_rank(items[a.item].device) < card_rank(items[b.item].device);
+    });
+    const size_t device_tasks = rounds[0].size();
+    rounds[0].insert(rounds[0].end(), host_reads.begin(), host_reads.end());
     const int n_workers = (int) std::min<size_t>((size_t) m.threads, std::max(rounds[0].size(), rounds[1].size()));
     if (!m.staging(n_workers, round_up(piece), out_piece > 0 ? round_up(out_piece) + kAlign : 0, any_dev, err)) return false;
 
@@ -474,6 +547,77 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
             }
     }
 
+    // the last device read queued: the bar reads RAM, and the log says when the cards had their share
+    const auto run_t0 = std::chrono::steady_clock::now();
+    std::atomic<size_t> device_left{device_tasks};
+    auto device_done = [&]() {
+        if (device_tasks == rounds[0].size()) return;   // no RAM reads follow
+        LoadProgress::into("ram");
+        basalt::log::info("basalt loader", "the cards' share is read (%.2f GiB in %.1f s); RAM next",
+                          (double) device_bytes / 1073741824.0,
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - run_t0).count());
+    };
+    // the bar's label in the device sweep: the first card in that order whose share is not yet placed
+    std::mutex card_mu;
+    std::vector<std::pair<int, size_t>> card_left;   // (card, its tasks not yet placed), in the sweep's order
+    for (size_t ti = 0; ti < device_tasks; ++ti) {
+        const int d = items[rounds[0][ti].item].device;
+        if (card_left.empty() || card_left.back().first != d) card_left.emplace_back(d, 0);
+        ++card_left.back().second;
+    }
+    auto card_label = [&]() {   // under card_mu
+        for (const auto& [d, left] : card_left)
+            if (left > 0) return LoadProgress::into(LoadProgress::cuda(d));
+    };
+    auto card_placed = [&](int d) {
+        std::lock_guard<std::mutex> lk(card_mu);
+        for (auto& [c, left] : card_left)
+            if (c == d && --left == 0) card_label();
+    };
+    // each item's destination among the start's shares (place_start announces them): what it counts, it counts there
+    std::vector<int> share_of(items.size(), -1);
+    {
+        const auto shares = plan.counted_by_target(main_card);
+        for (size_t i = 0; i < items.size(); ++i) {
+            const std::string target = items[i].dev != nullptr ? LoadProgress::cuda(items[i].device) : "ram";
+            for (size_t s = 0; s < shares.size(); ++s)
+                if (shares[s].first == target) share_of[i] = (int) s;
+        }
+    }
+    {
+        std::vector<std::string> stages;
+        for (const auto& [d, left] : card_left) stages.push_back(LoadProgress::cuda(d));
+        if (device_tasks < rounds[0].size()) stages.push_back("ram");
+        LoadProgress::stages(stages);
+    }
+    if (device_tasks > 0) {
+        std::lock_guard<std::mutex> lk(card_mu);
+        card_label();
+    }
+    if (device_tasks == 0 && !rounds[0].empty()) LoadProgress::into("ram");
+    // Round 0's workers: most read the cards' share first, in the sweep's order, and RAM once it is all taken.  When
+    // the plan queued RAM reads among its card reads (a tier whose experts go to RAM and to a card layer by layer), a few
+    // workers (kRamFirst, of a pool at least twice that) read those from the start: RAM reads land in fresh pages and
+    // run below the drive's speed on their own, so beside the card reads the drive stays busy and the pass takes no
+    // longer than the plan's order would, while the cards' share still completes sooner than in that order.  RAM reads
+    // queued after every card read (a RAM copy planned after the cards) wait for the cards.
+    constexpr int kRamFirst = 3;
+    const size_t early_end = device_tasks + early_ram;
+    std::atomic<size_t> ram_next{device_tasks};
+    auto take_ram = [&](bool early_only) -> size_t {   // the next RAM task, or none (rounds[0].size())
+        size_t i = ram_next.load();
+        for (;;) {
+            if (i >= rounds[0].size() || (early_only && i >= early_end)) return rounds[0].size();
+            if (ram_next.compare_exchange_weak(i, i + 1)) return i;
+        }
+    };
+    auto take = [&](int wi, const std::vector<Task>& tasks, std::atomic<size_t>& next) -> size_t {
+        if (&tasks != &rounds[0] || device_tasks == 0) return next.fetch_add(1);
+        if (n_workers >= 2 * kRamFirst && wi >= n_workers - kRamFirst && next.load() < device_tasks)
+            if (const size_t i = take_ram(true); i < tasks.size()) return i;
+        if (const size_t i = next.fetch_add(1); i < device_tasks) return i;
+        return take_ram(false);
+    };
     std::atomic<bool> failed{false};
     std::mutex fail_mu;
     std::string fail_msg;
@@ -511,7 +655,7 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
         };
 
         for (;;) {
-            const size_t ti = next.fetch_add(1);
+            const size_t ti = take(wi, tasks, next);
             if (ti >= tasks.size() || failed.load()) break;
             const Task& t = tasks[ti];
             const LoadItem& it = items[t.item];
@@ -564,7 +708,12 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
                 pending[s] = true;
                 pending_dev[s] = it.device;
             }
-            LoadProgress::placed(scaled(it.count, t.off + t.len, it.bytes) - scaled(it.count, t.off, it.bytes));
+            LoadProgress::placed(scaled(it.count, t.off + t.len, it.bytes) - scaled(it.count, t.off, it.bytes),
+                                 share_of[t.item]);
+            if (&tasks == &rounds[0] && ti < device_tasks) {
+                card_placed(it.device);
+                if (device_left.fetch_sub(1) == 1) device_done();
+            }
         }
 
         // every copy this worker issued is complete before the plan is
@@ -599,7 +748,12 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
 
 bool place_start(Loader& loader, const LoadPlan& plan, std::string& err) {
     LoadProgress::announce_total(plan.counted());
-    return loader.run(plan, err);
+    int main_card = 0;
+    if (cudaGetDevice(&main_card) != cudaSuccess) main_card = 0;
+    LoadProgress::shares(plan.counted_by_target(main_card));
+    const bool ok = loader.run(plan, err);
+    loader.release_staging();
+    return ok;
 }
 
 }  // namespace basalt::core

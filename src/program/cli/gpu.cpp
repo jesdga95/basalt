@@ -11,7 +11,7 @@
 namespace basalt::program::cli {
 
 std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers, bool prompt_split,
-                               const std::function<bool(double, double)>& layer_stage) {
+                               const std::function<bool(double, double)>& layer_stage, const std::string& one_card) {
     namespace bp = basalt::program;
     bp::GpuSpec spec;
     std::string gerr;
@@ -27,12 +27,13 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     }
     bool known = false;
     const std::vector<bp::GpuCard> visible = bp::visible_gpus(known);
-    const bp::GpuChoice choice = bp::choose_gpus(spec, visible, known);
+    bp::GpuChoice choice = bp::choose_gpus(spec, visible, known);
+    if (!one_card.empty()) bp::keep_main_card(spec, visible, one_card, choice);
     if (o.gpu_plan) {
         std::string lossy;
         for (const auto& f : o.lossy) lossy += (lossy.empty() ? "" : ",") + f.flag;
         std::printf("%s\n", bp::gpu_plan_json(visible, choice, o.arch, o.quality_flags, o.quality_window, o.plan_spec, o.max_context,
-                                             o.model_name, lossy).c_str());
+                                             o.model_name, lossy, o.community_kv).c_str());
         return choice.error.empty() ? 0 : 2;
     }
     if (!choice.error.empty()) { basalt::log::error("basalt", "%s", choice.error.c_str()); return 2; }

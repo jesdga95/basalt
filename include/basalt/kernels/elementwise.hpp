@@ -86,6 +86,8 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
 /// nodes that follow.  Captured once per layer between `pre[l]` and the parts copy; it is what lets one graph
 /// hold the whole token (a handoff needs no driver call).
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
+/// Wait for sequence equality or a set abort word. A null abort word disables the abort check.
+void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, const uint32_t* d_abort, void* stream);
 /// Holds the stream until *word (mapped host memory the host writes) equals `value`, then fences so what the host wrote
 /// before the word is visible to the work queued after it.
 void wait_word(const uint32_t* word, uint32_t value, void* stream);

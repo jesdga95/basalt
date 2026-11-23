@@ -63,7 +63,8 @@ machine; frames decode on the GPU with NVDEC ([video](../running.md#video)).
 ## Lossy flags
 
 Off by default. `--relaxed-drafting`, `--route-prior` and `--route-tail-skip` each change output, and each is named in one start
-warning. What they do and what they cost: [precision](../precision/qwen38-flash-next.md#relaxed-drafting).
+warning. What they do and what they cost: [precision](../precision/qwen38-flash-next.md#relaxed-drafting); the two routing flags
+work the same on every MoE model ([quality](../precision/quality.md#lossy-routing-flags)).
 
 ## Limits
 

@@ -4,6 +4,7 @@
 
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/vision/mmproj.hpp"
@@ -90,6 +91,8 @@ public:
         float* h_rows = nullptr;
     };
     SharedTier& shared_tier() const { return shared_tier_; }
+    /// What the sessions' batch windows share (model/batch_driver.hpp).
+    model::BatchShared& batch_shared() const { return batch_; }
     /// The drafter the sessions share, while one holds it.
     std::weak_ptr<DsparkDrafter>& shared_drafter() const { return shared_drafter_; }
     /// The sessions that will hold a context each.
@@ -137,6 +140,7 @@ private:
     mutable PromptHost prompt_host_;   // before the tier: the tier goes first
     mutable SharedTier shared_tier_;
     mutable std::weak_ptr<DsparkDrafter> shared_drafter_;
+    mutable model::BatchShared batch_;
     mutable VisionBlas vision_blas_;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();

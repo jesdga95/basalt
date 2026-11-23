@@ -245,7 +245,7 @@ struct Options {
     bool quality = false, no_windows = false, print_command = false;
     bool community = false, hardware = false;
     std::string submitter;
-    std::string community_file;          // --community-file: the table the row is added to
+    std::string community_dir;           // --community-dir: the community folder the run file is written under
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
@@ -274,20 +274,20 @@ void usage(const std::string& engine) {
         "community row\n"
         "  --community        the fixed preset \"community-1\" for the public benchmark table: the three decode\n"
         "                     fixtures, a 16384-token prefill and a 65536-token prefill, once each, with int8 KV cache\n"
-        "                     where the model takes it, else fp8 where it takes that, else its own KV format (the row records the model and the\n"
+        "                     where the model takes it, else the KV format the model's adapter names for community rows, else its own default (the row records the model and the\n"
         "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
-        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it; a row of the same\n"
-        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system) is replaced in place and keeps its notes. prefill_16k_tps and\n"
+        "                     every number is cold. Prints the table, writes the row to its own file, runs/MODEL/ID.json, and prints it; the ID is a hash of the\n"
+        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system), so a run of the same setup overwrites its file and keeps its notes. prefill_16k_tps and\n"
         "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
         "                     PCIe link (maximum generation and width) and the pinned host-to-device copy speed, measured before the engine starts; decode_tps = tokens / decode time\n"
         "                     summed over conv, struct and prose (token-weighted); the per-fixture decode speeds, acceptance and draft length and the engine\n"
         "                     arguments are recorded too. Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
-        "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
+        "                     --model, --submitter, --community-dir, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
         "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
-        "  --community-file PATH  the benchmarks.json the row is added to (default: docs/community/benchmarks.json of the\n"
-        "                     checkout this build came from); when it cannot be written the row is printed instead\n"
+        "  --community-dir DIR  the community folder the run file is written under, DIR/runs/MODEL/ID.json (default: docs/community\n"
+        "                     of the checkout this build came from); when it cannot be written the row is printed instead\n"
         "\n"
         "  --hardware         measure and print this machine's CPU, RAM read speed and, per GPU, PCIe link and\n"
         "                     host-to-device copy speed (the figures --community records), then exit; no model, no engine\n"
@@ -378,7 +378,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--gpu") o.gpu = next("--gpu");
         else if (a == "--hardware") o.hardware = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
-        else if (a == "--community-file") o.community_file = next("--community-file");
+        else if (a == "--community-dir") o.community_dir = next("--community-dir");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
@@ -437,7 +437,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         // an engine flag is refused first (in main, which asks the engine whether it is lossy): a run with one needs no submitter
         if (o.passthrough.empty() && o.sets.empty() && !community_submitter_error(o, err).empty()) return false;
     }
-    if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
+    if (!o.community_dir.empty() && !o.community) { err = "--community-dir needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
     if (o.format != "md" && o.format != "json") { err = "-o takes md or json"; return false; }
     if (o.quality_chunks < 1 || o.quality_t < 1) { err = "--quality and --quality-t need values >= 1"; return false; }
@@ -679,6 +679,19 @@ std::string hardware_text(const Hardware& h, const std::vector<std::pair<std::st
     return t;
 }
 
+// What the engine said about a plan that did not come off.  The plan's JSON answer is empty then, so the log the
+// probe left behind is the only thing naming the cause; without it the caller has the pack's metadata to blame.
+std::string plan_complaint(const std::string& log_path) {
+    std::ifstream lg(log_path);
+    std::string line, last, err;
+    while (std::getline(lg, line)) {
+        if (line.empty()) continue;
+        last = line;
+        if (line.find("error:") != std::string::npos) err = line;
+    }
+    return err.empty() ? last : err;
+}
+
 // ---------------------------------------------------------------------------------------------- main
 
 }  // namespace
@@ -736,6 +749,28 @@ int main(int argc, char** argv) {
         basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
     }
+    for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
+    if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
+    if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
+    else merge_args(args, o.passthrough);
+    // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
+    std::string gpu_value;
+    if (!o.model.empty()) {
+        std::string gerr;
+        std::vector<basalt::program::GpuCard> used;
+        // a community run uses every visible card; CUDA_VISIBLE_DEVICES picks them
+        const std::string want = o.community ? "auto" : has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
+        if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
+            basalt::log::error("basalt-bench", "%s", gerr.c_str());
+            return 2;
+        }
+        set_arg(args, "--gpu", gpu_value);
+    }
+    // the plan probes ask about these cards and not about GPU 0: on a box whose first visible card is not the main
+    // card's architecture - a Blackwell card with an older expert-tier peer, where enumeration may name the older
+    // one first - a probe at --gpu 0 plans an engine that could never start, and an answer with no plan in it has
+    // no model name in it either.  A probe is not a measurement, so a row made this way is the same row.
+    const std::string probe_gpu = gpu_value.empty() ? std::string("0") : gpu_value;
     if (o.community && (!o.passthrough.empty() || !o.sets.empty())) {
         // any engine flag is refused; the engine's plan for them says which are lossy, so the refusal can name those
         std::vector<std::string> extra = o.passthrough;
@@ -743,7 +778,7 @@ int main(int argc, char** argv) {
             extra.push_back(kv.first);
             extra.push_back(kv.second);
         }
-        std::vector<std::string> plan_args = {"--model", fs::absolute(o.model).string(), "--gpu", "0"};
+        std::vector<std::string> plan_args = {"--model", fs::absolute(o.model).string(), "--gpu", probe_gpu};
         merge_args(plan_args, extra);
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
@@ -760,20 +795,24 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    std::string community_model, community_arch;
+    std::string community_model, community_arch, community_plan_err;
     std::string community_kv;   // the cache format a community run passes; empty when the model takes neither
     if (o.fixtures.empty() || o.community) {   // the model's own fixtures, when it has them; the community row's model name
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
         const std::string abs_model = fs::absolute(o.model).string();
-        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0"}, plan_log, answer);
+        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu}, plan_log, answer);
         if (o.community) {
             community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
             community_arch = basalt::program::plan_field(answer, "arch");
+            const std::string adapter_kv = basalt::program::plan_field(answer, "community_kv");
+            if (asked != 0) community_plan_err = plan_complaint(plan_log);   // read it before the probes below reuse the log
             // the cache format users run, when the engine accepts one of the flags for this model
             std::string unused;
-            if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0", "--kv", "int8"}, plan_log, unused) == 0) community_kv = "int8";
-            else if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0", "--kv", "fp8"}, plan_log, unused) == 0) community_kv = "fp8";
+            if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", "int8"}, plan_log, unused) == 0) community_kv = "int8";
+            // else the format the model's adapter names for community rows; a model that names none runs its default
+            else if (!adapter_kv.empty() &&
+                     engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", adapter_kv}, plan_log, unused) == 0) community_kv = adapter_kv;
         }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
@@ -783,7 +822,7 @@ int main(int argc, char** argv) {
     if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id()) + ".log";
-        const int asked = engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", "0", "--ppl-base", o.kld_base}, plan_log, answer);
+        const int asked = engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", probe_gpu, "--ppl-base", o.kld_base}, plan_log, answer);
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
         if (asked != 0) {
@@ -794,23 +833,6 @@ int main(int argc, char** argv) {
         const int window = std::atoi(basalt::program::plan_field(answer, "quality_window").c_str());
         if (window > 0) o.quality_t = std::min(o.quality_t, window);
     }
-    for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
-    if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
-    if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
-    else merge_args(args, o.passthrough);
-    // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
-    if (!o.model.empty()) {
-        std::string gpu_value, gerr;
-        std::vector<basalt::program::GpuCard> used;
-        // a community run uses every visible card; CUDA_VISIBLE_DEVICES picks them
-        const std::string want = o.community ? "auto" : has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
-        if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
-            basalt::log::error("basalt-bench", "%s", gerr.c_str());
-            return 2;
-        }
-        set_arg(args, "--gpu", gpu_value);
-    }
-
     // fixtures, read before anything is started
     std::vector<std::vector<int64_t>> decode_ids(3);
     std::vector<std::vector<int64_t>> prefill_parts;
@@ -852,8 +874,10 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (o.community && community_model.empty()) {
-        basalt::log::error("basalt-bench", "--community: the engine reports no community model name for %s (architecture '%s'); "
-                           "no row was written", o.model.c_str(), community_arch.c_str());
+        const std::string why = fmt("--community: the engine reports no community model name for %s (architecture '%s'); "
+                                    "no row was written", o.model.c_str(), community_arch.c_str()) +
+                                (community_plan_err.empty() ? std::string() : "\n  the engine's plan said: " + community_plan_err);
+        basalt::log::error("basalt-bench", "%s", why.c_str());
         return 1;
     }
 
@@ -941,7 +965,8 @@ int main(int argc, char** argv) {
         Engine eng;
         basalt::log::info("basalt-bench", "starting %s (log: %s)", engine_bin.c_str(), log_path.c_str());
         if (!eng.start(engine_bin, perf_args, log_path, err)) {
-            basalt::log::error("basalt-bench", "%s", err.c_str());
+            cleanup.on = false;   // the line above names this log: keep the directory it sits in
+            basalt::log::error("basalt-bench", "%s (engine log: %s)", err.c_str(), log_path.c_str());
             return 1;
         }
         {   // fixtures of another tokenizer would fail at the first request with ids past the vocabulary
@@ -1467,26 +1492,25 @@ int main(int argc, char** argv) {
     }
     std::fputs(rep.c_str(), stdout);
     if (!community_row.empty()) {
-        const std::string path = o.community_file.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community/benchmarks.json"
-                                                          : o.community_file;
+        const std::string dir = o.community_dir.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community" : o.community_dir;
         std::string why;
         basalt::program::CommunityEdit edit;
-        const bool added = basalt::program::community_add_row_file(path, crow, why, &edit);
+        const bool added = basalt::program::community_write_run(dir, crow, why, &edit);
         std::printf("\nCOMMUNITY ROW:\n%s\n", (added ? edit.row_text : community_row).c_str());
         std::fflush(stdout);
         if (added && edit.replaced) {
-            basalt::log::info("basalt-bench", "runs[%zu] of %s has this run's setup (submitter, model, quant, GPUs, CPU, RAM, system): it was updated in "
-                              "place, not added", edit.index, path.c_str());
+            basalt::log::info("basalt-bench", "%s already held a run of this setup (submitter, model, quant, GPUs, CPU, RAM, system): it was overwritten",
+                              edit.path.c_str());
             if (!edit.notes.empty())
                 basalt::log::info("basalt-bench", "its notes were kept: \"%s\". Check they still apply to this run", edit.notes.c_str());
-            basalt::log::info("basalt-bench", "review the row, commit it and open a pull request (docs/community.md)");
+            basalt::log::info("basalt-bench", "review the file, commit it and open a pull request (docs/community.md)");
         } else if (added) {
-            basalt::log::info("basalt-bench", "the row was added to %s; review it, commit it and open a pull request (docs/community.md)",
-                              path.c_str());
+            basalt::log::info("basalt-bench", "the run was written to %s; review it, commit it and open a pull request (docs/community.md)",
+                              edit.path.c_str());
         } else {
-            basalt::log::warn("basalt-bench", "the row was not added to %s (%s); paste it at the end of the runs list of docs/community/benchmarks.json, "
-                              "run python3 tools/check_benchmarks.py --fix on it and open a pull request (docs/community.md)",
-                              path.c_str(), why.c_str());
+            basalt::log::warn("basalt-bench", "the run was not written under %s (%s); save the row above as docs/community/runs/MODEL/ID.json "
+                              "(MODEL: the model name in lower case, ID: see docs/community.md), run python3 tools/check_benchmarks.py --fix on "
+                              "docs/community and open a pull request (docs/community.md)", dir.c_str(), why.c_str());
         }
     }
     return do_quality && !quality.ran ? 1 : 0;

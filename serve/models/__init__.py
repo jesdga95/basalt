@@ -18,6 +18,8 @@ class Dialect:
     video_marker = ""                       # what the template writes for a video, replaced by video_text
     in_engine_vision = False                # the image encoder always lives in the engine (only --vision dynamic)
     effort_turn = ""                        # a trailing turn that states the reasoning effort ("{}" for its text)
+    thinks_in_blocks = False                # its thinking is a block of its reply: the grammar is told when it is off
+    minimal_effort = False                  # the template has a `minimal` level (else minimal is thinking off)
     # what the model's template does with a conversation, as llama.cpp's /props `chat_template_caps` names it
     caps = {"supports_tool_calls": False, "supports_parallel_tool_calls": False, "supports_reasoning_effort": False,
             "supports_system_role": False, "supports_preserve_reasoning": False}
@@ -70,6 +72,9 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch in ("hy4flash", "hy_v4_flash"):
         from serve.models.hy4flash import Hy4Flash
         return Hy4Flash()
+    if arch == "inkling2":
+        from serve.models.inkling2 import Inkling2
+        return Inkling2()
     if arch in ("qwen4exp", "qwen35", None):
         from serve.models.qwen import Qwen
         return Qwen()

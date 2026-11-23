@@ -21,6 +21,8 @@ They hold no CUDA libraries and no Python environment. Needs:
 
 - An NVIDIA driver of the R580 branch or newer. The archives are built with CUDA 13.0.2, whose Linux minimum is 580.95.05; NVIDIA
   publishes no Windows minimum since 13.0, so use a current driver there.
+  On Linux an older 615 build made every reply loop endlessly and 615.71.09 fixed it (#514): if output loops or looks garbled,
+  update the driver before anything else.
 - The CUDA 13 runtime libraries (cudart, cuBLAS) on the library path (`PATH` on Windows).
 - Python 3.10+ with the requirements in a `.venv` at the archive's top directory, which `bin/basalt serve` uses when it is there:
 
@@ -97,7 +99,7 @@ ctest --test-dir build -L cpu -j 8 --output-on-failure
 
 The executables land in `bin/` whatever the generator is (a Visual Studio generator would otherwise put them in `bin/Release`, away from `data/`).
 
-`-DBASALT_MODELS=qwen4exp`, `deepseek41` or `qwen35` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
+`-DBASALT_MODELS=qwen4exp`, `deepseek41`, `qwen35` or `hy4flash` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
 
 If tests fail to create fixtures, point `TEMP` and `TMP` into the build tree. CUDA 13.2+ headers need `/Zc:preprocessor`; the CMakeLists
 passes it to nvcc's host compiler.

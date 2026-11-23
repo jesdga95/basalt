@@ -1,0 +1,36 @@
+{
+  "submitter": "DaHoodie",
+  "date": "2026-11-17",
+  "commit": "899e820af7",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 4500 Blackwell",
+      "vram_gib": 32,
+      "power_w": 200,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 28.2
+    }
+  ],
+  "ram_gib": 499,
+  "cpu": "AMD Ryzen Threadripper PRO 5975WX, 31 cores",
+  "ram_gbps": 114.2,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 5530.6,
+  "prefill_64k_tps": 5931.5,
+  "decode_tps": 306.3,
+  "decode_conv_tps": 207.3,
+  "decode_struct_tps": 371.7,
+  "decode_prose_tps": 187.4,
+  "accept_conv_pct": 70.8,
+  "accept_struct_pct": 98.6,
+  "accept_prose_pct": 70.8,
+  "draft_len_conv": 2.5,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.7,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "One of 32 cores is offline (logical CPUs 4 and 36), so the bench counted 31. CPU name hand-corrected; the bench left a stray s from 32-Cores."
+}

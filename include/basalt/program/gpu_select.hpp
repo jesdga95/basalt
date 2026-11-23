@@ -55,6 +55,10 @@ struct GpuChoice {
 /// management library and no CUDA_VISIBLE_DEVICES): numbers are then taken as given and `auto` is an error.
 GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known = true);
 
+/// A run whose flags keep it on its main card (`why` says which): `auto` keeps only the main card it picked, with a
+/// note naming the cards left idle; a list of several is an error; unset drops the warning about unused cards.
+void keep_main_card(const GpuSpec& spec, const std::vector<GpuCard>& visible, const std::string& why, GpuChoice& c);
+
 /// What a chosen card does.
 enum class GpuRole { Main, ExpertTier, PromptSplit, LayerStage, Idle };
 const char* gpu_role_name(GpuRole r);
@@ -102,7 +106,8 @@ std::string gpu_identity(size_t n);
 /// would run (0: no model given); `lossy` the flags given that change the model's output, comma separated.
 std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c, const std::string& arch = {},
                           const std::string& quality_flags = {}, int quality_window = 1, int spec = 0, int64_t max_context = 0,
-                          const std::string& model_name = {}, const std::string& lossy = {});
+                          const std::string& model_name = {}, const std::string& lossy = {},
+                          const std::string& community_kv = {});
 
 /// For a launcher (basalt-bench, basalt-probe): resolves `text` ("" = unset), prints its lines under `label`, narrows
 /// the environment the engine inherits, and returns the engine's `gpu` value in `engine_value` and the chosen cards in

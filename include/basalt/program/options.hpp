@@ -8,6 +8,7 @@
 
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/model/rope_flags.hpp"
+#include "basalt/model/route_flags.hpp"
 #include "basalt/platform/memory.hpp"
 
 namespace basalt::program {
@@ -52,10 +53,12 @@ struct CommonOptions {
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
     /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
     basalt::model::RopeFlags rope;
+    /// --route-tail-skip, --route-prior: taken by the mixture-of-experts models (basalt/model/route_flags.hpp)
+    basalt::model::RouteFlags route;
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
-    /// --diag-split-at N: diagnostic, a dense model split across two cards at layer N whether or not it fits one (0: off)
+    /// --diag-split-at N: diagnostic, a model split across two cards at layer N whatever the start would pick (0: off)
     int diag_rows = 0;
     int diag_split_at = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
@@ -88,6 +91,8 @@ struct CommonOptions {
     std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out
     std::string model_name;            ///< the adapter's community-row name, for --gpu-plan
     std::string quality_flags;         ///< the flags the quality gate starts this model with, for --gpu-plan
+    std::string community_quant;       ///< the adapter's quant label for community rows when the pack name has none
+    std::string community_kv;          ///< the adapter's KV format for community rows, for --gpu-plan
     int quality_window = 1;            ///< the widest window the gate scores on this model (0: as the request asks)
     int plan_spec = 0;                 ///< the verify window this start would run, for --gpu-plan (0: plain decode)
     /// Speculative decoding with a verify window of this many tokens (the last accepted token and spec-1 drafts);
@@ -108,6 +113,7 @@ struct CommonOptions {
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
     bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
     std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
+    bool diag_batch_check = false;         ///< --diag-batch-check: the batch conformance check over --batch N sessions (model/batch_check.hpp)
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
     std::vector<int64_t> image_at;
     bool image_pad_given = false;

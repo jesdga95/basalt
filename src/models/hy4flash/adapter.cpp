@@ -4,7 +4,9 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/log.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/model/route_flags.hpp"
 #include "basalt/program/options.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/meta.hpp"
@@ -12,6 +14,8 @@
 
 namespace basalt::models::hy4flash {
 namespace {
+
+constexpr float kRoutePriorBare = 0.01f;   // --route-prior alone: on the biased score (a sigmoid plus its bias)
 
 class Adapter final : public model::ModelAdapter {
 public:
@@ -53,7 +57,8 @@ public:
     const char* model_name() const override { return "Hy4-flash"; }
 
     // --kv (the sparse layers' latent rows, fp16 by default or fp8) and, DFLY HOOK, --spec and its companions as DeepSeek's
-    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
+    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
+        if (model::parse_route_flag(a, args, o.route, code)) return true;
         if (a == "--diag-rows") {
             o.diag_rows = std::atoi(args.next("--diag-rows"));
             return true;
@@ -71,7 +76,15 @@ public:
             return 2;
         }
         dfly_finish_flags(o);
-        return std::nullopt;
+        int top_k = 0;
+        if (o.route.tail_skip != 0 || o.route.prior != 0.0f) {   // the routed experts per token, from the pack
+            core::ModelFile file;
+            std::string err;
+            const core::Json* geo = !o.model.empty() && file.open(o.model, err) && file.load_meta(err) ? file.meta().get("geometry") : nullptr;
+            const core::Json* used = geo ? geo->get("expert_used_count") : nullptr;
+            top_k = used ? (int) used->num() : 0;
+        }
+        return model::finish_route_flags(o, top_k, kRoutePriorBare, "basalt hy4flash");
     }
 
     // The pack's own special tokens, by name: their suffix differs between the packs (the test pack's GGUF carries a hash, the

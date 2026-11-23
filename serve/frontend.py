@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+from jinja2 import nodes
+from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from serve.api.documents import expand_documents, has_document
@@ -24,6 +26,21 @@ from serve.api.documents import expand_documents, has_document
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the messages; a ValueError so the client gets a 400 with its message."""
+
+
+class _Generation(Extension):
+    """transformers' `{% generation %}` block (it marks the assistant's tokens for training masks): its body renders as
+    it is."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.CallBlock(self.call_method("_body"), [], [], body).set_lineno(lineno)
+
+    def _body(self, caller):
+        return caller()
 
 
 class ChatTemplate:
@@ -40,7 +57,8 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                            extensions=["jinja2.ext.loopcontrols", _Generation])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = source
@@ -66,8 +84,9 @@ IMAGE_PARTS = ("image_url", "input_image", "image")
 VIDEO_PARTS = ("video_url", "input_video", "video")
 VIDEO_OPTIONS = ("fps", "max_frames")         # a video part's own sampling, as vLLM takes them
 
-# client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
+# client spellings of a thinking level -> minimal, low, medium, high, max or none; a dialect says what its template takes
+# for each (minimal is thinking off for a template with no such level: Service.thinking_kwargs)
+EFFORT = {"none": None, "off": None, "minimal": "minimal", "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
 
@@ -476,13 +495,16 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     _order_chat_tool_results(messages)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
-    # Thinking, strongest first: off from any field (enable_thinking false, an effort of none, reasoning_budget 0),
-    # then chat_template_kwargs.reasoning_effort, "reasoning_effort" or Responses-style "reasoning": {"effort": ...},
-    # and last the level a reasoning_budget implies (-1: the highest, N: as Anthropic's budget_tokens)
+    # Thinking, strongest first: off from any field (enable_thinking false, an effort of none, reasoning_budget 0,
+    # a "reasoning": {"enabled": false}), then chat_template_kwargs.reasoning_effort, "reasoning_effort" or
+    # Responses-style "reasoning": {"effort": ...}, and last the level a reasoning_budget implies
+    # (-1: the highest, N: as Anthropic's budget_tokens)
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
     template_kw = req.get("chat_template_kwargs") or {}
     kwargs = {**llama_budget(req.get("reasoning_budget")),
               **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
+    if reasoning.get("enabled") is False:                 # the generic off switch; true is the route's default
+        kwargs["enable_thinking"] = False
     if "reasoning_effort" in template_kw:
         kwargs.update(effort_kwargs(template_kw["reasoning_effort"]))
     if "enable_thinking" in template_kw and not template_kw["enable_thinking"]:
@@ -585,6 +607,8 @@ class Event:
 
 
 THINK_END = "</think>"
+# How far back the quote of an escaped mention ("`\n</think>\n\n`") can sit from the tag.
+THINK_QUOTE_WINDOW = 4
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 
@@ -596,9 +620,36 @@ FUNC_START = "<function="
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
+def _full_close_end(text: str, at: int) -> int:
+    """For the `</parameter>` at `at`: the index just past the `</function>` and `</tool_call>` that follow it
+    (whitespace between), or -1 when the three are not all there."""
+    s = text[at + len(PARAM_END):].lstrip()
+    if not s.startswith(FUNC_END):
+        return -1
+    s = s[len(FUNC_END):].lstrip()
+    return len(text) - len(s) + len(CALL_END) if s.startswith(CALL_END) else -1
+
+
+def _closes_again(rest: str, final: bool) -> bool | None:
+    """The output after a whole `</parameter></function></tool_call>`: True when it reaches another whole close
+    before any `<tool_call>` opens. The first close was then text inside the value: a string that holds the three
+    tags on their own lines, whose real end comes later. False for a real end (output that ends, prose that never
+    closes, a next call that opens first); None while the output so far cannot tell."""
+    if not rest.strip():
+        return False if final else None
+    opener = rest.find(CALL_START)
+    at = rest.find(PARAM_END)
+    while at >= 0 and (opener < 0 or at < opener):
+        if _full_close_end(rest, at) >= 0:
+            return True
+        at = rest.find(PARAM_END, at + 1)
+    return False if final or opener >= 0 else None
+
+
 def param_end(text: str, final: bool = False, name: str | None = None) -> int:
-    """Find a structural parameter close, keeping quoted calls and a reopened parameter inside its value.
-    -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural close."""
+    """Find a structural parameter close, keeping quoted calls, a reopened parameter and a quoted whole call close
+    inside its value. -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural
+    close."""
     at = text.find(PARAM_END)
     fallback = -1
     while at >= 0:
@@ -611,7 +662,14 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             elif name is None or after[len(PARAM_START):gt].strip() != name:
                 candidate = at
         elif after.startswith(FUNC_END):
-            candidate = at
+            end = _full_close_end(text, at)
+            if end >= 0:
+                again = _closes_again(text[end:], final)
+                candidate = -2 if again is None else (-1 if again else at)
+            else:
+                tail = after[len(FUNC_END):].lstrip()
+                # the </tool_call> may still be arriving: what follows it decides
+                candidate = -2 if not final and (not tail or CALL_END.startswith(tail)) else at
         elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
             candidate = at if final else -2
         if candidate != -1:
@@ -827,7 +885,10 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
+        # the body stops before its </tool_call>: put it back, so a quoted whole close inside a value is told from
+        # the real one the same way as in the output
+        end = param_end(rest + "\n" + CALL_END, final=True, name=pname.strip())
+        end = end if end < len(rest) else -1
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
@@ -849,19 +910,137 @@ def hold_back(text: str, tags: tuple[str, ...]) -> int:
     return best
 
 
-class OutputParser:
-    """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
+class JsonPrefix:
+    """A JSON value read as it streams. `safe` is the length of the longest prefix read so far that text appended after
+    it closes into valid JSON without inventing a key or a value, and `closer` is that text: a point inside a string
+    (not inside an escape), after a whole value, or right after an opening bracket. A dangling key, colon or comma and a
+    number or literal not yet ended are not such points, so a value cut off there loses them (vLLM #53739). The value's
+    own end is the last point: what follows it is not the value's."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
-        self.state = "reasoning" if thinking else "content"
-        self.buf = ""
-        self.lead = False
-        self.rtail = ""              # last reasoning character sent
-        self.schemas = {t.get("name"): t for t in tools or []}
-        # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
-        self.stream_tools = stream_tools
-        self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
-        self._reset_scan()
+    _PLAIN = re.compile(r'[^"\\]*')
+    _WORD = re.compile(r"[0-9A-Za-z.+-]*")
+
+    def __init__(self):
+        self.stack: list[str] = []      # the open containers, "{" or "["
+        self.state = "value"            # value, first_key, first_value, key, colon, after, string, escape, unicode, end, bad
+        self.key = False                # the string read is a key
+        self.word = ""                  # a number or literal read so far
+        self.hex = 0                    # digits of a \u escape read
+        self.pos = 0                    # characters read
+        self.safe = 0
+        self.closer = ""
+
+    def _mark(self, at: int, open_string: bool = False) -> None:
+        self.safe = at
+        self.closer = ('"' if open_string else "") + "".join("}" if c == "{" else "]" for c in reversed(self.stack))
+
+    def _after_value(self, at: int) -> None:
+        self.state = "after" if self.stack else "end"
+        self._mark(at)
+
+    def feed(self, text: str) -> None:
+        base, i, n = self.pos, 0, len(text)
+        self.pos += n
+        while i < n and self.state not in ("end", "bad"):
+            c, st = text[i], self.state
+            if st == "string":
+                j = self._PLAIN.match(text, i).end()
+                if j > i:
+                    i = j
+                    if not self.key:
+                        self._mark(base + i, True)
+                elif c == '"':
+                    i += 1
+                    if self.key:
+                        self.state = "colon"
+                    else:
+                        self._after_value(base + i)
+                else:
+                    self.state, i = "escape", i + 1
+                continue
+            if st == "escape":
+                i += 1
+                if c == "u":
+                    self.state, self.hex = "unicode", 0
+                    continue
+                if c not in '"\\/bfnrt':
+                    self.state = "bad"
+                    continue
+                self.state = "string"
+                if not self.key:
+                    self._mark(base + i, True)
+                continue
+            if st == "unicode":
+                if c not in "0123456789abcdefABCDEF":
+                    self.state = "bad"
+                    continue
+                i += 1
+                self.hex += 1
+                if self.hex == 4:
+                    self.state = "string"
+                    if not self.key:
+                        self._mark(base + i, True)
+                continue
+            if st == "word":
+                j = self._WORD.match(text, i).end()
+                self.word += text[i:j]
+                i = j
+                if i < n:               # the word ended: a whole number or literal is a value
+                    try:
+                        json.loads(self.word)
+                        self._after_value(base + i)
+                    except ValueError:
+                        self.state = "bad"
+                continue
+            if c in " \t\r\n":
+                i += 1
+                continue
+            if st in ("value", "first_value"):
+                if st == "first_value" and c == "]":
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                elif c in "{[":
+                    self.stack.append(c)
+                    self.state = "first_key" if c == "{" else "first_value"
+                    self._mark(base + i + 1)
+                elif c == '"':
+                    self.state, self.key = "string", False
+                    self._mark(base + i + 1, True)
+                elif c in "-0123456789tfn":
+                    self.state, self.word = "word", ""
+                    continue
+                else:
+                    self.state = "bad"
+                i += 1
+            elif st in ("first_key", "key"):
+                if st == "first_key" and c == "}":
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                elif c == '"':
+                    self.state, self.key = "string", True
+                else:
+                    self.state = "bad"
+                i += 1
+            elif st == "colon":
+                self.state = "value" if c == ":" else "bad"
+                i += 1
+            else:                       # after a value
+                top = self.stack[-1]
+                if c == ",":
+                    self.state = "key" if top == "{" else "value"
+                elif c == ("}" if top == "{" else "]"):
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                else:
+                    self.state = "bad"
+                i += 1
+
+
+class CodeTracker:
+    """What the answer text that has gone out leaves open: a code fence, the current line, the backticks of the current
+    paragraph. A tag opening inside code is a quoted example, text."""
+
+    fence, line, ticks = "", "", 0
 
     def _track(self, text: str) -> str:
         """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, and the
@@ -887,6 +1066,21 @@ class OutputParser:
     def _in_code(self) -> bool:
         """The text so far leaves the next character inside a code fence or inline code."""
         return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+
+
+class OutputParser(CodeTracker):
+    """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+        self.state = "reasoning" if thinking else "content"
+        self.buf = ""
+        self.lead = False
+        self.rtail = ""              # the last reasoning characters sent (the mention check's context)
+        self.schemas = {t.get("name"): t for t in tools or []}
+        # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
+        self.stream_tools = stream_tools
+        self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
+        self._reset_scan()
 
     def _reset_scan(self):
         self.sp = 0                  # consumed part of self.buf (the call body)
@@ -1001,21 +1195,34 @@ class OutputParser:
         return out
 
     def _reasoning(self, text: str) -> Event:
-        """A reasoning event for text going out; remembers its last character for the quote check."""
-        self.rtail = text[-1:] or self.rtail
+        """A reasoning event for text going out; remembers its last characters for the mention check."""
+        self.rtail = (self.rtail + text)[-THINK_QUOTE_WINDOW:] if text else self.rtail
         return Event("reasoning", text)
 
     def _quoted_think_end(self, i: int) -> bool | None:
-        """Whether the `</think>` at self.buf[i] is the model quoting the tag while it thinks: written right after a
-        quote or backtick and followed by anything but a line break. None while the character after it has not
-        arrived."""
-        before = self.buf[i - 1] if i else self.rtail
+        """Whether the `</think>` at self.buf[i] is the model mentioning the tag while it thinks: inside a pair of
+        quotes, right after a quote that opens a quotation, or after a typed `\\n` with a quote just before it, where
+        the model writes about the tag and the real end is elsewhere. A quote that closes a sentence precedes the
+        real end. None while the character after it has not arrived."""
+        context = self.buf[:i] if i >= 2 else self.rtail + self.buf[:i]
+        before = context[-1:]
         if before not in ('"', "'", "`"):
+            # a real end is followed by a line break, never by a typed escape
+            if context[-2:] == "\\n" and any(c in ('"', "'", "`")
+                                             for c in context[-THINK_QUOTE_WINDOW:]):
+                after = self.buf[i + len(THINK_END):]
+                if not after:
+                    return None
+                return after[0] not in "\r\n"
             return False
         after = self.buf[i + len(THINK_END):]
         if not after:
             return None
-        return after[0] not in "\r\n"
+        if after[0] == before:                    # the tag inside a pair of quotes
+            return True
+        # only a quote that opens a quotation quotes the tag; one that closes a sentence precedes the real end
+        opens = context[-2:-1] in ("", " ", "\t", "\n", "(", "[", "{", ":")
+        return opens and after[0] not in "\r\n"
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         return hold_back(text, tags)
@@ -1081,8 +1288,9 @@ class OutputParser:
                 i = call_end(self.buf, final=final)
                 if self.stream_tools:
                     if i >= 0:
-                        whole, self.buf = self.buf, self.buf[:i]     # scan only the body
-                        out += self._scan(final=final)
+                        # scan only the call, closed: its </tool_call> tells a quoted close inside a value
+                        whole, self.buf = self.buf, self.buf[:i + len(CALL_END)]
+                        out += self._scan(final=True)
                         out += self._close_scan()
                         self.buf = whole
                     else:

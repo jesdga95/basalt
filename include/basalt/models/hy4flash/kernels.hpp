@@ -26,8 +26,9 @@ struct MlaArgs {
 };
 
 /// A product per head over Q8_0 rows, for n_tok tokens: y[t][h][r] = w[h * rows + r] . x[t][h] for h < heads, r < rows, over `k`
-/// values (k % 32 == 0); x of token t and head h starts at x + t * x_tok_stride + h * x_head_stride. `w` is the tensor's bytes
-/// (34 bytes per 32 values, rows of k / 32 blocks), 16-byte aligned.
+/// values (the model's two: 512, v_b over the latent, and 192, k_b over the query's nope part); x of token t and head h starts
+/// at x + t * x_tok_stride + h * x_head_stride. `w` is the tensor's bytes (34 bytes per 32 values, rows of k / 32 blocks),
+/// 16-byte aligned.
 void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok_stride, int heads, int rows, int k, int n_tok,
                      float* y, void* stream);
 
@@ -129,8 +130,8 @@ void add_vectors(const float* a, const float* b, float* out, int n, void* stream
 /// them: meta[t] = max(0, pos + 1 - window), meta[arows + t] = pos + 1 - first, meta[2 arows + t] = 0, meta[3 arows + t] = pos.
 void swa_meta(const int32_t* pos0, int R, int window, int arows, int32_t* meta, void* stream);
 /// A sublayer's end in one launch: f = a + b (the MoE's routed and shared outputs; b null: f = a, the attention's output), its
-/// rms_norm_rows by `w`, then hc_post of f into the four streams of `x` by `coef` (n_tokens rows of E, E a multiple of 4):
-/// add_vectors, rms_norm_rows and hc_post bit for bit.
+/// rms_norm_rows by `w`, then hc_post of f into the four streams of `x` by `coef` (n_tokens rows of E = 3072, the model's width):
+/// add_vectors, rms_norm_rows and hc_post bit for bit, whatever n_tokens.
 void add_norm_hc_post(const float* a, const float* b, const float* w, float eps, const float* x, const float* coef, int coef_stride,
                       int n_tokens, int E, float* out, void* stream);
 
@@ -146,6 +147,20 @@ void put_words(const void* src, void* dst, int n_words, void* stream);
 /// out[t][i] = sum_k w[t * K + k] * rows[t * K + k][i] for k < K, in that order (rows: device array of T * K row pointers, each
 /// device or mapped host memory).
 void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream);
+
+/// Holds the stream until *word (mapped host memory the host writes) equals `value`, fences, then stores `value` in mark[0]
+/// (device memory), which an l2_read_ahead on another stream stops at.
+void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream);
+/// Byte ranges of device memory (16-byte aligned, 16-byte multiples) in the order the kernels after a wait read them; empty
+/// ones last.
+constexpr int kL2Ranges = 4;
+struct L2Ranges {
+    const void* p[kL2Ranges] = {};
+    uint64_t n[kL2Ranges] = {};
+};
+/// Requests the ranges into L2, in order, until mark[0] equals `value` (mark: 2 words of device memory; mark[1] is scratch
+/// the kernel never writes in practice). Reads only: nothing queued after it waits for it.
+void l2_read_ahead(const L2Ranges& r, uint32_t* mark, uint32_t value, void* stream);
 
 /// h[r][k] = silu(min(gu[r][k], limit)) * clamp(gu[r][n_ff + k], -limit, limit) for rows of 2 * n_ff values (the gate rows' products
 /// then the up rows').
@@ -174,9 +189,7 @@ void fill_streams(const float* e, int n, int n_tok, float* x, void* stream);
 
 struct EngramArgs {
     int n_embd = 3072;
-    float eps = 1.1920929e-07f;      ///< of the value's norm
-    float gate_eps = 0.0078125f;    ///< of the gate's two norms (the stream and the key): bf16's machine epsilon, which the reference's
-                                    ///< unset RMSNorm eps resolves to in bf16
+    float eps = 1.1920929e-07f;   ///< of the gate's two norms (the stream and the key) and the value's: FP32's machine epsilon
 };
 
 /// The Engram step on the four streams x[t][4][n] of n_tok rows, in place. kv: the fused projection [t][5][n] (four keys, one value)

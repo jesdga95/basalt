@@ -28,6 +28,19 @@ struct MgModel {
     int tp_exchanges_per_layer = 2;     ///< all-reduces a layer needs when each layer is split across the cards
     double tokens = 3.0;                ///< rows in a decode window
     double exchange_mib_per_token = 1;  ///< what one all-reduce of a tensor-parallel layer moves for a row
+    double window_gb = 11.9;            ///< what a window moves on its GPUs, in GB at the rate the kernels reach
+    double miss_ms = 18.1;              ///< a window's time when no GPU holds any expert it reads, beyond the GPUs' part
+    double hit_exponent = 1.0 / 6.0;    ///< the hottest share x of the experts serves x^hit_exponent of the reads
+    bool tier_built = true;             ///< the model has the expert tier; without it the main card runs alone
+    // Two cards, a model that prices each cut (split_handoffs set): the second card runs layers [c, layers) and the cut
+    // is searched over every c. The head and the drafter stay on the first card (kDrafterBytes there, no relay).
+    std::vector<int> split_handoffs;    ///< [c]: the window's hand-offs between the cards with the cut at c
+    double handoff_ms = 0.7;            ///< one hand-off
+    std::vector<double> layer_share;    ///< [layer] its share of a window's GPU time (empty: even)
+    std::vector<uint64_t> layer_bytes;  ///< [layer] its experts' bytes (empty: pairs x blob_bytes, even)
+    std::vector<uint64_t> layer_caches; ///< [layer] its caches' bytes, part of main_overhead, on its card (empty: none apart)
+    bool split_spills = true;           ///< a split card may keep experts off the card; false: only cuts where both hold theirs
+    bool split_unlike = false;          ///< the priced split may run on unlike cards too (its cut weighs their bandwidths)
 };
 
 /// The mechanism's figure for a card set.
@@ -39,8 +52,9 @@ struct MgPrice {
 
 struct MgPlan {
     std::vector<MgPrice> prices;        ///< expert tier, layer split, tensor parallel
-    Mechanism pick = Mechanism::ExpertTier;
+    Mechanism pick = Mechanism::ExpertTier;   ///< with a model that has no tier, ExpertTier means the main card alone
     bool equal = false;                 ///< the cards match in bandwidth and VRAM
+    int cut = 0;                        ///< a priced cut (MgModel::split_handoffs): the second card's first layer
     std::string line;                   ///< the start line
 };
 

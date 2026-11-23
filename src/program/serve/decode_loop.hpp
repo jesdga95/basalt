@@ -69,6 +69,7 @@ Flow Request::decode_loop(B& b) {
             b.upload_history(T);
         }
         b.mark_before_run();
+        runtime_.stats_lookups_begin();
         typename B::TierStep tier(b);
         tier.before_window(T, e0, from_sfx);
         const Clock::time_point tw0 = Clock::now();
@@ -177,6 +178,7 @@ Flow Request::decode_loop(B& b) {
             std::fflush(stdout);
         };
         b.count_round();
+        const int64_t sent0 = produced_n;
         const Clock::time_point tw2 = Clock::now();
         bool drafted = true;
         if constexpr (kSpec) {
@@ -186,6 +188,9 @@ Flow Request::decode_loop(B& b) {
         if (!after_ran) after_launch();
         b.window_timing(T, a, from_sfx, round0, tw0, tw1, tw2);
         tier.finish();
+        runtime_.stats_window(slot_b, T - 1 - e0, a - e0, (int) (produced_n - sent0));
+        runtime_.stats_lookups_end();
+        runtime_.stats_tick();
         b.mark_after_window();
         if (!commit_ok) {
             std::printf("ERR %s\n", cerr.c_str());

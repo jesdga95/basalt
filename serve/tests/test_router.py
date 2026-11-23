@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import threading
 import time
 import unittest
@@ -20,6 +21,7 @@ from serve.service import Service
 from serve.util.text import ByteTokenizer
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
+APP_JS = (TEMPLATE.parent / "web" / "app.js").read_text(encoding="utf-8")
 MSGS = [{"role": "user", "content": "hi"}]
 ROUTES = {"/v1/chat/completions": {"messages": MSGS, "max_tokens": 64},
           "/v1/messages": {"messages": MSGS, "max_tokens": 64},
@@ -42,6 +44,7 @@ class SwapEngine(ProcessEngine):
         self.hold_start = False
         self.release = threading.Event()
         self.release.set()
+        self.quit = threading.Event()                   # QUIT at a stop: a held reply ends before its first token
         self.generating = 0
 
     def alive(self):
@@ -68,6 +71,8 @@ class SwapEngine(ProcessEngine):
         self.generating += 1
         try:
             while not self.release.wait(0.02):
+                if self.quit.is_set():
+                    return
                 yield None
             yield from self.reply.generate(*args, **kwargs)
         finally:
@@ -466,8 +471,49 @@ class Turns(Base):
         self.router.stop()
         tb.join(10)
         self.assertEqual(later["B"][0], 503)
+        self.assertIn("the server is stopping", later["B"][1])
+        self.assertNotIn("restarts it", later["B"][1])
         self.engines["A"].release.set()
         t.join(10)
+
+    def test_a_stop_ends_the_running_request_with_the_stopping_error(self):
+        out, t = self.run_with_a_running_request()
+        self.router.stop()
+        self.engines["A"].quit.set()
+        t.join(10)
+        status, body = out["first"]
+        self.assertEqual(status, 503)
+        self.assertIn("the server is stopping", body)
+        self.assertNotIn("restarts it", body)
+
+    def test_a_stop_ends_a_running_stream_with_the_stopping_error(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.engines["A"].release.clear()
+        out = {}
+        body = {**ROUTES["/v1/chat/completions"], "model": "A", "stream": True}
+        t = threading.Thread(target=lambda: out.update(r=self.post("/v1/chat/completions", body)), daemon=True)
+        t.start()
+        self.wait_until(lambda: self.engines["A"].generating == 1)
+        self.router.stop()
+        self.engines["A"].quit.set()
+        t.join(10)
+        text = out["r"][1]
+        self.assertIn("the server is stopping", text)
+        self.assertNotIn('"finish_reason": "length"', text)
+
+    def test_a_reply_that_reaches_its_cap_during_a_stop_keeps_length(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.engines["A"].release.clear()
+        out = {}
+        body = {**ROUTES["/v1/chat/completions"], "model": "A", "max_tokens": 5}
+        t = threading.Thread(target=lambda: out.update(r=self.post("/v1/chat/completions", body)), daemon=True)
+        t.start()
+        self.wait_until(lambda: self.engines["A"].generating == 1)
+        self.svcs["A"].stop()                           # the stop has begun; the engine still answers up to the cap
+        self.engines["A"].release.set()
+        t.join(10)
+        self.assertEqual(out["r"][0], 200)
+        self.assertIn('"finish_reason": "length"', out["r"][1])
 
 
 class FailedLoad(Base):
@@ -564,6 +610,26 @@ class Preload(Base):
         self.wait_until(lambda: self.get("/v1/models")[1]["data"][0]["status"]["value"] == "failed")
         self.assertIsNone(self.svcs["A"].boot_error)
         self.assertEqual(self.chat("B")[0], 200)
+
+
+class Page(Base):
+    def status(self, name):
+        """The status value /metrics gives `name`, the one the page reads."""
+        return {m["id"]: m for m in self.get("/metrics")[1]["models"]}[name]["status"]["value"]
+
+    def test_the_page_posts_routes_and_reads_values_the_server_has(self):
+        picker, unload = (APP_JS.split(f"function {f}")[1].split("\n}\n")[0] for f in ("drawModels", "unloadView"))
+        self.assertEqual(set(re.findall(r'control\("([^"]+)"', APP_JS)), {"v1/load", "v1/unload"})
+        self.engines["B"].fail = "boom"
+        self.assertEqual(self.post("/v1/load", {"model": "B"})[0], 503)
+        seen = {self.status("A"), self.status("B")}             # unloaded, failed
+        for path, after in (("/v1/load", "loaded"), ("/v1/unload", "unloaded")):
+            status, body = self.post(path, {"model": "A"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(self.status("A"), after, path)
+            seen.add(after)
+        posts = set(re.findall(r'\bv === "(\w+)"', picker)) | set(re.findall(r'status\.value === "(\w+)"', unload))
+        self.assertEqual(posts, seen)                           # the values a row loads at and the button unloads at
 
 
 class ThirdModel(Base):

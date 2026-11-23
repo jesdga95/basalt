@@ -11,6 +11,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/expert_map.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/ram_load.hpp"
@@ -19,6 +20,7 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/route_lossy.hpp"
 #include "basalt/prefill/peer_share.hpp"
 #include "basalt/platform/mapped_file.hpp"
 #include "basalt/core/file_reads.hpp"
@@ -69,6 +71,11 @@ struct ExpertTierSpec {
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
     int claims_per_row = 0;
+    /// Tokens after which the lookup counts that pick the main card's victims halve; 0: the slot used longest ago gives way,
+    /// the way the first model ran them. With N, the slot whose expert was looked up least lately gives way (every lookup
+    /// counts, hits too, and the counts halve every N tokens), the one used longest ago among equals: an expert that recurs
+    /// over hundreds of tokens keeps its slot through a run of experts that come once.
+    int victim_half_life = 0;
     /// The main card's copies per layer in these proportions (one weight per layer; core::policy::layer_slots spreads the
     /// same total), for a model whose layers miss at different rates. Empty: every layer the same, the way the first model
     /// ran them. Main card homes are always the same in every layer.
@@ -86,6 +93,10 @@ struct ExpertTierSpec {
     int ring_pieces = 0;
     uint64_t share_stride = 0;   ///< bytes between experts in a second card's prompt staging (the largest layer's)
     int share_max_tokens = 0;    ///< most tokens of a prompt chunk
+    /// --route-tail-skip R and --route-prior LAMBDA (basalt/model/route_flags.hpp; 0 = off): the tier keeps the device
+    /// table of the experts the GPUs hold that the model's decode windows route with (ExpertTier::publish_held).
+    int route_tail_skip = 0;
+    float route_prior = 0.0f;
 };
 
 class ExpertTier {
@@ -103,6 +114,7 @@ public:
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
         bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
         bool reading[kMaxK] = {};          ///<  is a RAM place a file read is filling (await_reads)
+        bool dropped[kMaxK] = {};          ///< id -1: --route-tail-skip dropped the entry; nothing computes it
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -135,20 +147,22 @@ public:
     /// borrows slots inside that total and gives the same number back.
     ///
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
-    /// allocated); `grow` opens the planned slots beside the base arena again, empty, once they are free.
+    /// allocated); `grow` opens the planned slots beside the base arena again once they are free, with the experts a
+    /// shrink or lend took off the card (most recently used first) and then the profile's ranked ones.
     void shrink();
     void grow();
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
-    /// copies go back whole, and reclaim() opens the same number again, empty (an error if the card cannot hold them
-    /// any more). Homes stay.
+    /// copies go back whole, and reclaim() opens the same number again (an error if the card cannot hold them any
+    /// more): empty, or with `restore` holding the experts the lend took off the card, the most recently used first,
+    /// copied before it returns. Homes stay.
     void lend_all();
-    bool reclaim(std::string& err);
+    bool reclaim(std::string& err, bool restore = false);
     /// Whether lend() can give up part of the base arena (ExpertTierSpec::lend_segment, copies, a segmented arena).
     bool partial_lend() const { return !live_.empty(); }
     /// Leaves `bytes` device bytes free above the floor by giving up the fewest slots: the ones beside the base arena,
     /// then each layer's last base slots in proportion to its share (the arena's tail holds every layer's last ones).
     /// First the most recently used experts of each layer move into the slots it keeps. False, with nothing given up,
-    /// when all of them would not free that much (or without partial_lend). reclaim() maps them again, empty.
+    /// when all of them would not free that much (or without partial_lend). reclaim() maps them again (refilled with restore).
     bool lend(uint64_t bytes);
     /// An explicit new --vram-reserve-mib (`mib` < 0: the start's): the one time the size is planned again after the
     /// start. The slots that fit above the new reserve are opened; the response reports them.
@@ -162,8 +176,12 @@ public:
     /// land layer by layer: each before its layer's next lookup (`pump`), so what a lookup finds depends only on the
     /// routing history, as if every copy had landed at the window's start.
     void begin_token(int n_tokens = 1);
+    /// A prompt starts, which may change the topic: the use counts that pick the main card's victims start again (with
+    /// ExpertTierSpec::victim_half_life; the slots keep their experts).
+    void forget_use();
     /// Looks up `ids[0..k)` of `layer` and stamps them as used; `layer`'s queued copies land first. The file experts
-    /// among them start reading into the RAM tier (`reading`).
+    /// among them start reading into the RAM tier (`reading`). An id of -1 (route_tail_skip dropped it) is `dropped`: no
+    /// source, no stamp, and fetch, promote and the CPU's share pass it by.
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
     /// The reads the last lookup started have landed.
     bool await_reads(std::string& err);
@@ -228,6 +246,29 @@ public:
 
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return live_base() + (int64_t) n_layers_ * ext_per_layer_; }
+    /// The experts the GPUs hold now: the main card's (the caller's device) and each second card's slots and the VRAM their
+    /// slots take; and the slots' sum, what the engine reports as its expert slots.
+    struct CardSlots { int device = 0; int64_t slots = 0; uint64_t bytes = 0; };
+    std::vector<CardSlots> slots_by_card() const;
+    int64_t gpu_slots() const;
+    /// The bytes of the pinned RAM tier's places, every layer's.
+    uint64_t ram_bytes() const;
+
+    /// The lossy routing flags (ExpertTierSpec::route_*) this tier applies: 0 when off, or when every expert is held by a
+    /// GPU (attach switches them off then, as nothing would be skipped and a bonus for every expert changes a biased choice).
+    int route_tail_skip() const { return route_tail_skip_; }
+    float route_prior() const { return route_prior_; }
+    bool route_lossy() const { return route_tail_skip_ > 0 || route_prior_ > 0.0f; }
+    /// A decode window starts: the device table of the experts the GPUs hold now (a main card or second card slot) goes
+    /// out on `stream` for the window's routers, the layers that changed since the last window. Copies that land during
+    /// the window count from the next one. Only with route_lossy().
+    void publish_held(cudaStream_t stream);
+    /// `layer`'s held table as the routing kernels read it (empty without route_lossy()).
+    kernels::ResidentTabs held_tabs(int layer) const;
+    /// The tail skip's counters (basalt/kernels/route_lossy.hpp), device; null without route_lossy().
+    unsigned long long* route_counts() const { return route_counts_; }
+    /// n_embd zeros on the main card: the output row of a dropped entry.
+    const float* zero_row() const { return zero_row_; }
 
     void report(const char* tag) const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
@@ -238,6 +279,9 @@ public:
     int64_t file_lookups() const { return file_hits_; }
     /// The experts only the file holds.
     program::ExpertSpill spill() const;
+    /// The server's expert map: the sample's pairs of all, each one's home and its lookups since the last call (the first
+    /// call starts counting them).
+    void expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed);
     /// What `PROBE rates` measures: this tier's pool, RAM blobs, formats and second card.
     void probe_env(program::ProbeEnv& env);
 
@@ -284,6 +328,14 @@ private:
     bool load_rank(std::string& err);
     /// `n` copies in each layer, or with `base_shares` each layer's base arena share (base_n).
     void seed_copies(int64_t n, bool base_shares = false);
+    /// [layer] the experts a shrink, lend or lend_all took off the card that no restore has put back, the most recently used
+    /// first; `recall` adds the owners of slots [lo, lo + n) of `layer` (call before they are cleared).
+    std::vector<std::vector<int32_t>> recall_;
+    void recall(int layer, int64_t lo, int64_t n);
+    bool recalled() const;
+    /// Fills each layer's empty slots with its recall_ experts, then with `ranked_too` the profile's order, and waits for
+    /// the copies (a placement the next lookup sees whatever the timing).
+    void restore(bool ranked_too);
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
     /// and starts reading them there; `reading[i]` marks those of `ids`.
@@ -296,7 +348,9 @@ private:
     /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
     int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false,
                   bool later = false);
-    /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
+    /// The free slot of the layer's main card share that gives way first (the least recently used; with victim_half_life the
+    /// least looked up, skipping experts this very lookup uses), or -1; `best` gets its last use (the current tick when
+    /// every slot is in use by this lookup).
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
     /// Moves (layer, e) into the second card when the expert it replaces there was last used core::policy::kPeerMoveAge
     /// lookups before the main card's oldest.
@@ -333,6 +387,7 @@ private:
     int64_t planned_per_layer_ = 0;         ///< the base slots a reclaim opens again when they fit (the largest lent)
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
+    std::vector<uint16_t> looks_;           ///< [layer * n_expert + e] lookups, halved every victim_half_life tokens (empty when 0)
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
     std::vector<uint8_t> busy_;             ///< [slot] a promotion is copying into it
     std::vector<Pending> pending_;          ///< issued copies not landed yet
@@ -381,6 +436,18 @@ private:
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share
     kernels::cpu::ExpertJobMulti cpu_jobs_[kMaxK];   ///< the CPU share started and not yet joined
 
+    int route_tail_skip_ = 0;
+    float route_prior_ = 0.0f;
+    bool open_route(std::string& err);
+    bool held(int layer, int e) const;
+    int32_t* held_dev_ = nullptr;            ///< [layer * n_expert + e] 0 when a GPU holds it, else -1 (device)
+    int32_t* held_pin_ = nullptr;            ///< its staging (pinned host)
+    std::vector<int32_t> held_pub_;          ///< what was published last
+    cudaEvent_t held_ev_ = nullptr;          ///< behind the last publish's copies
+    unsigned long long* route_counts_ = nullptr;
+    float* zero_row_ = nullptr;
+
+    core::ExpertMapTally map_;              ///< the expert map's sample, counted from the first expert_map()
     int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0, peer_hits_ = 0, file_hits_ = 0;
 };
 
