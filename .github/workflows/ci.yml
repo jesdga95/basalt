@@ -155,7 +155,8 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           cuda-version: ${{ env.CUDA_VERSION }}
-          cache-key: ubuntu-24.04
+          # its own cache under another prefix: a one-model build holds a subset of the objects, and a full build restores by the ubuntu-24.04- prefix
+          cache-key: single-${{ matrix.model }}-ubuntu-24.04
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
