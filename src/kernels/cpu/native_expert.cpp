@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace basalt::kernels::cpu {
 namespace {
@@ -67,6 +68,49 @@ void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const voi
                     ff[t0 + t][r] = (g / (1.f + std::exp(-g))) * u;
                 }
         }
+    }
+}
+
+// MXFP8 (type 46) rows: each token's activation is converted once, a weight block decoded once for every token of the
+// call (the vec_dot of the table is single-token), and each token's dot is that vec_dot's bits.  `out[t][r]`, r in [r0, r1).
+constexpr int kMx8Tok = 8;
+struct Mx8Act {
+    float* p[kMx8Tok];
+    Mx8Act(const void* const* act, int m, int n) {
+        thread_local std::vector<float> buf;   // one set per pool worker, grown to the widest row it has met
+        const size_t per = (size_t) (n / 128) * GGML_MXFP8_PREP_BLOCK;
+        if (buf.size() < (size_t) m * per) buf.resize((size_t) kMx8Tok * per);
+        for (int t = 0; t < m; ++t) {
+            p[t] = buf.data() + (size_t) t * per;
+            ggml_mxfp8_q8_0_prep(n, act[t], p[t]);
+        }
+    }
+};
+
+void mx8_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0,
+                 int r1) {
+    const SwiGlu glu = glu_of(f);
+    const int n = (int) f.n_embd;
+    thread_local std::vector<float> ub((size_t) kMx8Tok * (size_t) kNativeMaxFF);
+    for (int t0 = 0; t0 < nt; t0 += kMx8Tok) {
+        const int m = nt - t0 < kMx8Tok ? nt - t0 : kMx8Tok;
+        Mx8Act a(act + t0, m, n);
+        float* up[kMx8Tok];
+        for (int t = 0; t < m; ++t) up[t] = ub.data() + (size_t) t * kNativeMaxFF;
+        ggml_mxfp8_q8_0_rows(n, blob, f.gu_row, a.p, m, ff + t0, r0, r1);
+        ggml_mxfp8_q8_0_rows(n, blob + f.up_off, f.up_row, a.p, m, up, r0, r1);
+        for (int t = 0; t < m; ++t)
+            for (int r = r0; r < r1; ++r) ff[t0 + t][r] = swiglu(glu, ff[t0 + t][r], up[t][r]);
+    }
+}
+
+void mx8_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0,
+                   int r1) {
+    const int n = (int) f.n_ff;
+    for (int t0 = 0; t0 < nt; t0 += kMx8Tok) {
+        const int m = nt - t0 < kMx8Tok ? nt - t0 : kMx8Tok;
+        Mx8Act a(hq + t0, m, n);
+        ggml_mxfp8_q8_0_rows(n, blob + f.down_off, f.d_row, a.p, m, out + t0, r0, r1);
     }
 }
 
@@ -188,6 +232,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             return;
         }
     }
+    if (f.gu_type == GGML_TYPE_MXFP8 && f.up_type == GGML_TYPE_MXFP8 && f.n_ff <= kNativeMaxFF) {
+        mx8_gu_rows(f, blob, act, nt, ff, r0, r1);
+        return;
+    }
     const int n = (int) f.n_embd;
     float sg = 1.f, su = 1.f;
     if (f.tail) {
@@ -223,6 +271,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // the ggml dot is single-token.
     if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {   // the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    if (f.d_type == GGML_TYPE_MXFP8) {
+        mx8_down_rows(f, blob, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;

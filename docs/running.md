@@ -119,7 +119,8 @@ With `--vram-elastic`, `POST /v1/vram` with `{"reserve_mib": N}` resizes the exp
 A resize needs a gap between requests. Idle, it applies at once and answers `200` with the new figures. While a request runs it is
 queued and answered `202 {"status": "pending"}`: it applies when the running requests have finished, and requests that arrive meanwhile
 wait for it, so steady traffic cannot hold it off. A later POST replaces a queued one (`"replaced": true`). A malformed body is a
-`400`. `GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
+`400`. While the model sleeps, the reserve is kept and applied at the wake (`200 {"status": "asleep"}`), as when it is not loaded.
+`GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
 the queued one).
 
 ## Memory floors

@@ -3,6 +3,7 @@
 #include "models/qwen4exp/adapter.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "basalt/model/batch_check.hpp"
 #include "basalt/vision/ffmpeg_api.hpp"
 #include "../../../program/tokenizer/unicode_flags.hpp"
 #include "../../../program/cli/tokens.hpp"
@@ -72,26 +73,6 @@ bool QfnRuntime::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::ve
     return true;
 }
 
-bool QfnRuntime::windows_in_flight() { return piped && pipe_inflight(); }
-bool QfnRuntime::next_batch_window() { return piped ? pump(true) : batch_step(); }
-// a request reads its prompt through every stage: the groups in flight finish first
-bool QfnRuntime::drain_windows() { return !piped || pipe_drain(); }
-
-void QfnRuntime::script_command(const std::string& line) {
-    char* e1 = nullptr;
-    const long b = std::strtol(line.c_str() + 8, &e1, 10);
-    char* e2 = nullptr;
-    const unsigned long long seed = std::strtoull(e1, &e2, 10);
-    std::vector<int64_t> sids;
-    std::string se;
-    if (b < 0 || b >= (long) bs.size() || e2 == e1 || !cli::parse_i64_list(e2, sids, se)) {
-        std::printf("ERR BSCRIPT: bad slot or list\n");
-        std::fflush(stdout);
-        return;
-    }
-    bscript[(size_t) b].first.assign(sids.begin(), sids.end());
-    bscript[(size_t) b].second = seed;
-}
 
 void QfnRuntime::probe_command(const std::string& line, std::string& perr) {
 if (line.rfind("PROBE set ", 0) == 0) {   // PROBE set workers=K share=F: live values for the next requests
@@ -258,10 +239,33 @@ void QfnRuntime::at_exit() {
     save_profile("exit");   // QUIT, or the server closed stdin
 }
 
+// --diag-batch-check: the shared batch check over the slots' sessions (model/batch_check.hpp) in place of serving
+int QfnRuntime::batch_check() {
+    if (const int code = init_before_input()) return code;
+    if (const int code = init_after_input()) return code;
+    if (slot_ss.size() < 2) {
+        basalt::log::error("basalt batch", "the batch check needs --batch 2 or more slots");
+        return 1;
+    }
+    std::vector<basalt::model::ModelSession*> ss;
+    for (const auto& s : slot_ss) ss.push_back(s.get());
+    const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
+    basalt::model::BatchCheck bc;
+    basalt::model::Result r = basalt::model::check_batch(ss.data(), (int) ss.size(), prompt, (int) std::max<int64_t>(o.max_new, 4), n_vocab, bc);
+    if (std::string ce; r.ok() && !commit_settle(ce)) r = {basalt::model::Status::Error, ce};
+    std::printf("%s", bc.report.c_str());
+    if (!r.ok()) {
+        basalt::log::error("basalt batch", "%s", r.message.c_str());
+        return 1;
+    }
+    std::printf("batch check: %d windows compared, %d differ: %s\n", bc.compared, bc.differ, bc.differ ? "FAILED" : "PASSED");
+    return bc.differ ? 1 : 0;
+}
+
 int run(Context& context) {
     QfnRuntime runtime(context);
     runtime.pre_ = {"qwen35", basalt::program::tokenizer::pretok_qwen35};
-    return runtime.execute();
+    return context.o.diag_batch_check ? runtime.batch_check() : runtime.execute();
 }
 
 }  // namespace basalt::models::qwen4exp::serve
