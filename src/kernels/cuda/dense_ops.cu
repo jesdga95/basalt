@@ -226,6 +226,90 @@ __global__ void __launch_bounds__(32 * RT_W) bf16_rows_dot_tiles_kernel(const fl
 // y[t][n] = sum_k x[t][k] w[n][k] in fp32: a block of 128 threads per 32 rows x 64 outputs, K in steps of 16 through shared
 // memory (both tiles k-major), each thread 4 rows x 4 outputs. Every output sums its products in k order, so a row's result
 // does not depend on the rows beside it.
+// Bitwise-identical 3-stage cp.async f32_rows_dot: loads row-major K=32 stages directly via 16B cp.async.cg (1 barrier/stage),
+// reads strided rows (stride 36 floats == 4 banks mod 32 -> conflict-free LDS.128), and accumulates fmaf in exact k=0..K-1 order.
+template <int BT, int BN, int BK, int ST, int THR_T, int THR_N, int MIN_BLK>
+__global__ void __launch_bounds__(THR_T * THR_N, MIN_BLK)
+f32_rows_dot_cpasync_kernel(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
+                            int64_t T, int64_t N, int64_t K) {
+    constexpr int LD = BK + 4;
+    constexpr int RT = BT / THR_T, RN = BN / THR_N;
+    constexpr int NTHR = THR_T * THR_N;
+    __shared__ __align__(16) float xs[ST][BT][LD];
+    __shared__ __align__(16) float ws[ST][BN][LD];
+
+    const int tid = threadIdx.x;
+    const int tr = tid / THR_N, tc = tid % THR_N;
+    const int64_t t0 = (int64_t) blockIdx.x * BT, n0 = (int64_t) blockIdx.y * BN;
+    const int n_stages = (int) (K / BK);
+
+    const auto issue_stage = [&](int s, int stg) {
+        const int64_t k0 = (int64_t) stg * BK;
+#pragma unroll
+        for (int q = tid; q < BT * (BK / 4); q += NTHR) {
+            const int r = q / (BK / 4), k4 = (q % (BK / 4)) * 4;
+            rt_cp16(&xs[s][r][k4], x + min(t0 + r, T - 1) * K + k0 + k4);
+        }
+#pragma unroll
+        for (int q = tid; q < BN * (BK / 4); q += NTHR) {
+            const int r = q / (BK / 4), k4 = (q % (BK / 4)) * 4;
+            rt_cp16(&ws[s][r][k4], w + min(n0 + r, N - 1) * K + k0 + k4);
+        }
+    };
+
+    const int preload = min(ST - 1, n_stages);
+    for (int stg = 0; stg < preload; ++stg) {
+        issue_stage(stg, stg);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+
+    float acc[RT][RN] = {};
+    for (int stg = 0; stg < n_stages; ++stg) {
+        const int cur = stg % ST;
+        const int rem_after = min(ST - 2, (n_stages - 1) - stg);
+        if (rem_after == 2) asm volatile("cp.async.wait_group 2;" ::: "memory");
+        else if (rem_after == 1) asm volatile("cp.async.wait_group 1;" ::: "memory");
+        else asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+
+        if (stg + (ST - 1) < n_stages) {
+            const int nxt = (stg + ST - 1) % ST;
+            issue_stage(nxt, stg + ST - 1);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+
+#pragma unroll
+        for (int k4 = 0; k4 < BK; k4 += 4) {
+            float4 av[RT], bv[RN];
+#pragma unroll
+            for (int i = 0; i < RT; ++i) av[i] = *reinterpret_cast<const float4*>(&xs[cur][tr + i * THR_T][k4]);
+#pragma unroll
+            for (int j = 0; j < RN; ++j) bv[j] = *reinterpret_cast<const float4*>(&ws[cur][tc + j * THR_N][k4]);
+#pragma unroll
+            for (int i = 0; i < RT; ++i)
+#pragma unroll
+                for (int j = 0; j < RN; ++j) {
+                    acc[i][j] = fmaf(av[i].x, bv[j].x, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].y, bv[j].y, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].z, bv[j].z, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].w, bv[j].w, acc[i][j]);
+                }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        const int64_t t = t0 + tr + i * THR_T;
+        if (t < T) {
+#pragma unroll
+            for (int j = 0; j < RN; ++j) {
+                const int64_t n = n0 + tc + j * THR_N;
+                if (n < N) y[t * N + n] = acc[i][j];
+            }
+        }
+    }
+}
+
 constexpr int FD_T = 32, FD_N = 64, FD_K = 16;
 __global__ void __launch_bounds__(128) f32_rows_dot_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                                            float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
@@ -727,8 +811,21 @@ void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64
 void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
     if (T <= 0) return;
     if (K % FD_K != 0) { basalt::log::error("basalt", "f32_rows_dot: K %lld", (long long) K); std::exit(1); }
-    f32_rows_dot_kernel<<<dim3((unsigned) ((T + FD_T - 1) / FD_T), (unsigned) ((N + FD_N - 1) / FD_N)), 128, 0,
-                          (cudaStream_t) stream>>>(x, w, y, T, N, K);
+    if (K % 32 == 0 && (((uintptr_t) x | (uintptr_t) w) & 15) == 0) {
+        if (T < 1024) {
+            f32_rows_dot_cpasync_kernel<16, 32, 32, 3, 8, 8, 6>
+                <<<dim3((unsigned) ((T + 15) / 16), (unsigned) ((N + 31) / 32)), 64, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        } else if (T < 3072) {
+            f32_rows_dot_cpasync_kernel<32, 64, 32, 3, 8, 16, 3>
+                <<<dim3((unsigned) ((T + 31) / 32), (unsigned) ((N + 63) / 64)), 128, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        } else {
+            f32_rows_dot_cpasync_kernel<48, 64, 16, 4, 8, 16, 3>
+                <<<dim3((unsigned) ((T + 47) / 48), (unsigned) ((N + 63) / 64)), 128, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        }
+    } else {
+        f32_rows_dot_kernel<<<dim3((unsigned) ((T + FD_T - 1) / FD_T), (unsigned) ((N + FD_N - 1) / FD_N)), 128, 0,
+                              (cudaStream_t) stream>>>(x, w, y, T, N, K);
+    }
     check("f32_rows_dot");
 }
 
