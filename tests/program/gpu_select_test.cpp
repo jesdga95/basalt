@@ -186,6 +186,13 @@ int main() {
         CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "split"), "Qwen3.8-Flash-Next", flash), "");
         CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "peer"), "Qwen3.8-Flash-Next", flash),
                   "gpu-mode peer: Qwen3.8-Flash-Next takes at most 4 cards (the main card and 3 peers); gpu names 5");
+        // an sm_89 peer, which only a -DPEER_ADA=ON build lists: a model whose peer kernels that build does not compile refuses it
+        const std::vector<GpuCard> ada = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
+        GpuChoice two;
+        two.cards = {0, 1};
+        two.mode = GpuMode::Peer;
+        CHECK_STR(check_gpu_modes(two, "Hy4-flash", hy4, ada), "gpu-mode peer: GPU 1 (RTX 4060 Ti) is sm_89; Hy4-flash runs peer on sm_120 cards");
+        CHECK_STR(check_gpu_modes(two, "Qwen3.8-Flash-Next", GpuModes{4, 8, 0, true}, ada), "");
     }
     // The same cards with the slower one first.
     {
