@@ -288,6 +288,8 @@ bool Runtime::batch_round() {
             wins[i].round0 = t0;
             if (!slot_window_accept(act[i], wins[i])) return false;
             kept.push_back(wins[i].kept);
+            // a full batch gives each slot one row next round: drafts could not be verified, so do not draft them
+            if (n_act >= cap) wins[i].want = 0;
             if (wins[i].want > 0) {
                 const BSlot& sl = bs[(size_t) act[i]];
                 ds.push_back(&slot_session(act[i]));
