@@ -68,6 +68,48 @@ __global__ void put_words_kernel(const PutWords s, int* dst, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = s.w[i];
 }
 
+__global__ void wait_word_mark_kernel(const volatile uint32_t* word, uint32_t value, volatile uint32_t* mark) {
+    while (*word != value) __nanosleep(100);
+    __threadfence_system();
+    *mark = value;
+}
+
+constexpr int kReadAheadBlocks = 32;              // blocks that request the ranges
+constexpr uint64_t kReadAheadStep = 128 << 10;    // bytes a block requests before it looks at the mark again
+
+// Block b requests steps b, b + blocks, ... of the ranges laid end to end, a step's pieces as bulk L2 prefetches; it then
+// reads the step's last 16 bytes (they land once the step is in L2), so each block keeps one step in flight.
+__device__ void l2_read_ahead_block(const L2Ranges& r, uint32_t* mark, uint32_t value, int b, int blocks) {
+    uint64_t total = 0;
+    for (int i = 0; i < kL2Ranges; ++i) total += r.n[i];
+    uint32_t acc = 0;
+    for (uint64_t o0 = (uint64_t) b * kReadAheadStep; o0 < total && *(volatile uint32_t*) mark != value;
+         o0 += (uint64_t) blocks * kReadAheadStep) {
+        const uint64_t o1 = min(o0 + kReadAheadStep, total);
+        const char* last = nullptr;
+        for (uint64_t o = o0; o < o1;) {
+            int i = 0;
+            uint64_t ro = o;
+            while (i < kL2Ranges - 1 && ro >= r.n[i]) {
+                ro -= r.n[i];
+                ++i;
+            }
+            const uint64_t take = min(min(o1 - o, r.n[i] - ro), (uint64_t) 32768);
+            const char* src = (const char*) r.p[i] + ro;
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"((unsigned) take) : "memory");
+            last = src + take - 16;
+            o += take;
+        }
+        const uint4 w = __ldcg((const uint4*) last);
+        acc ^= w.x ^ w.y ^ w.z ^ w.w;
+    }
+    if (acc == 0x9e3779b9u && value == 0x9e3779b9u) mark[1] = acc;   // keeps the reads (never in practice)
+}
+
+__global__ void __launch_bounds__(32) l2_read_ahead_kernel(const L2Ranges r, uint32_t* mark, uint32_t value) {
+    if (threadIdx.x == 0) l2_read_ahead_block(r, mark, value, (int) blockIdx.x, (int) gridDim.x);
+}
+
 template <bool TAILS>
 __global__ void swiglu_split_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int n_ff, float limit,
                                     ExpertTails t) {
@@ -130,7 +172,7 @@ __global__ void engram_kernel(const float* __restrict__ kv, const float* __restr
     ssx = block_sum<kEngramThreads>(ssx, red);
     ssk = block_sum<kEngramThreads>(ssk, red);
     ssv = block_sum<kEngramThreads>(ssv, red);
-    const float rx = rsqrtf(ssx / (float) n + a.gate_eps), rk = rsqrtf(ssk / (float) n + a.gate_eps), rv = rsqrtf(ssv / (float) n + a.eps);
+    const float rx = rsqrtf(ssx / (float) n + a.eps), rk = rsqrtf(ssk / (float) n + a.eps), rv = rsqrtf(ssv / (float) n + a.eps);
     float dot = 0.f;
     for (int j = threadIdx.x; j < n; j += kEngramThreads)
         dot = fmaf((xi[j] * rx) * ((key[j] + kb[j]) * rk), gate_w[(size_t) i * n + j], dot);
@@ -161,38 +203,39 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
     if (i < n) out[i] = a[i] + b[i];
 }
 
-// one row a block of 512: f = a + b, its RMS over the row exactly as rms_norm_rows takes it (same threads, same sums), then
-// hc_post's four streams from f * inv * w, each value computed as the three kernels compute it, so the result is theirs bit
-// for bit
-__global__ void add_norm_hc_post_kernel(const float* __restrict__ a, const float* __restrict__ b, const float* __restrict__ w,
-                                        float eps, const float* __restrict__ x, const float* __restrict__ coef, int coef_stride,
-                                        int E, float* __restrict__ out) {
-    __shared__ float red[32];
+// row blockIdx.x by blocks of 512, blockIdx.y the slice of the row's float4 groups this block writes: every block takes
+// f = a + b and its RMS over the whole row exactly as rms_norm_rows takes it (same threads, same sums, so every block has the
+// same bits), then hc_post's four streams of its slice from f * inv * w, each value computed as the three kernels compute it,
+// so the result is theirs bit for bit
+template <int E>
+__global__ void __launch_bounds__(512) add_norm_hc_post_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                                               const float* __restrict__ w, float eps, const float* __restrict__ x,
+                                                               const float* __restrict__ coef, int coef_stride, float* __restrict__ out) {
+    static_assert(E % 512 == 0, "each of the 512 threads takes whole values");
+    constexpr int kPer = E / 512, n4 = E / 4;
+    __shared__ float red[16];
     const int t = blockIdx.x;
     const float* ar = a + (size_t) t * E;
     const float* br = b ? b + (size_t) t * E : nullptr;
-    float ss = 0.0f;
-    for (int c = threadIdx.x; c < E; c += blockDim.x) {
-        const float f = br ? ar[c] + br[c] : ar[c];
-        ss = fmaf(f, f, ss);
-    }
-    {   // block_sum of rms_norm_rows
-        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    float f[kPer];   // all of a thread's values in flight at once, summed in rms_norm_rows' order below
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-        __syncthreads();
-        if (lane == 0) red[warp] = ss;
-        __syncthreads();
-        float s = 0.0f;
-        for (int i = 0; i < nw; ++i) s += red[i];
-        ss = s;
-    }
+    for (int j = 0; j < kPer; ++j) f[j] = br ? ar[threadIdx.x + 512 * j] + br[threadIdx.x + 512 * j] : ar[threadIdx.x + 512 * j];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) ss = fmaf(f[j], f[j], ss);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);   // block_sum of rms_norm_rows
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) ss += red[i];
     const float inv = rsqrtf(ss / (float) E + eps);
     const float* cf = coef + (size_t) t * coef_stride;
     const float* xr = x + (size_t) t * 4 * E;
     float* orow = out + (size_t) t * 4 * E;
-    const int n4 = E >> 2;
-    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+    const int chunk = (n4 + (int) gridDim.y - 1) / (int) gridDim.y, i1 = min(n4, ((int) blockIdx.y + 1) * chunk);
+    for (int i = (int) blockIdx.y * chunk + threadIdx.x; i < i1; i += 512) {
         const int c = 4 * i;
         float4 f4 = make_float4(ar[c], ar[c + 1], ar[c + 2], ar[c + 3]);
         if (br) f4 = make_float4(f4.x + br[c], f4.y + br[c + 1], f4.z + br[c + 2], f4.w + br[c + 3]);
@@ -217,7 +260,11 @@ __global__ void add_norm_hc_post_kernel(const float* __restrict__ a, const float
 
 void add_norm_hc_post(const float* a, const float* b, const float* w, float eps, const float* x, const float* coef, int coef_stride,
                       int n_tokens, int E, float* out, void* stream) {
-    add_norm_hc_post_kernel<<<n_tokens, 512, 0, (cudaStream_t) stream>>>(a, b, w, eps, x, coef, coef_stride, E, out);
+    if (E != 3072) throw std::invalid_argument("add_norm_hc_post: the model's width is 3072");
+    // a decode window's few rows spread over 4 blocks each (one round of loads a thread, on 4x the SMs); a prompt chunk's rows
+    // fill the card already, so a block takes a whole row and the norm is read once a row
+    const unsigned slices = n_tokens <= 8 ? 4 : 1;
+    add_norm_hc_post_kernel<3072><<<dim3((unsigned) n_tokens, slices), 512, 0, (cudaStream_t) stream>>>(a, b, w, eps, x, coef, coef_stride, out);
 }
 
 // a sliding-window layer's row spans from the window's first position, read on the card (so a captured graph replays them for any
@@ -251,6 +298,15 @@ void put_words(const void* src, void* dst, int n_words, void* stream) {
     PutWords s;
     std::memcpy(s.w, src, (size_t) n_words * 4);
     put_words_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(s, (int*) dst, n_words);
+}
+
+void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream) {
+    wait_word_mark_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(word, value, mark);
+}
+
+void l2_read_ahead(const L2Ranges& r, uint32_t* mark, uint32_t value, void* stream) {
+    if (r.n[0] == 0) return;
+    l2_read_ahead_kernel<<<kReadAheadBlocks, 32, 0, (cudaStream_t) stream>>>(r, mark, value);
 }
 
 void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream, const ExpertTails* tails) {

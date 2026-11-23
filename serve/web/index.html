@@ -4,7 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Basalt</title>
-<link rel="icon" type="image/svg+xml" href="web/mark.svg">
+<link rel="icon" href="web/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="web/favicon-32.png" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="web/apple-touch-icon.png" sizes="180x180">
 <link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="web/app.css">
@@ -12,12 +14,13 @@
 </head>
 <body>
 
-<header class="bar">
+<header class="top">
   <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Basalt</span></div>
   <div class="crumb">
-    <span class="crumb-sep" id="crumb-sep" hidden>/</span>
+    <span class="crumb-sep" aria-hidden="true">/</span>
     <span class="model" id="model"></span>
     <div class="ms" id="models" hidden></div>
+    <button type="button" class="unload" id="unload" hidden>Unload</button>
   </div>
   <span class="grow"></span>
   <span class="sp">
@@ -34,53 +37,50 @@
   <button>Connect</button>
 </form>
 
-<main class="lay">
-  <aside class="a-side sb" aria-label="Hardware">
-    <div class="sb-h">GPUs<span>Charts · Last 60 s</span></div>
-    <div class="sb-gpus" id="gpus"></div>
-    <div class="sb-sys">
-      <div class="sb-h">System<span id="cpu-name"></span></div>
-      <div class="sb-body" id="sys"></div>
+<main>
+  <!-- decode, prefill and where the experts are; with no model, the screen saver -->
+  <section class="hero" aria-label="Speed and where the experts live">
+    <div class="col dec">
+      <div class="hd"><div class="k" id="dec-k">Decode</div><div class="v big" id="dec-v">-</div><div class="sub" id="dec-sub"></div></div>
+      <div class="ch big" id="dec-chart"></div>
     </div>
-    <div class="sb-exp">
-      <div class="sb-h"><b id="exp-h">Experts</b><span id="exp-note">Last request</span></div>
-      <div class="sb-body" id="experts"></div>
+    <div class="col pc">
+      <div class="hd"><div class="k" id="pre-k">Prefill</div><div class="v mid" id="pre-v">-</div><div class="sub" id="pre-sub"></div></div>
+      <div class="ch big" id="pre-chart"></div>
     </div>
-  </aside>
-
-  <section class="a-hero card" aria-label="Speed">
-    <div class="hd"><b>Speed</b><span>Last 60 s</span></div>
-    <div class="trio">
-      <div class="dec">
-        <div class="k" id="dec-k">Decode</div>
-        <div class="v big" id="dec-v">-</div>
-        <div class="ch" id="chips" hidden></div>
-        <div class="cw" id="dec-chart"></div>
-      </div>
-      <div class="pre">
-        <div class="k" id="pre-k">Prefill</div>
-        <div class="v mid" id="pre-v">-</div>
-        <div class="pcw" id="pre-chart"></div>
-        <div class="pst">
-          <div><span>Last prompt</span><span id="pre-last">-</span></div>
-          <div><span>Prefix cache hit</span><b id="pre-hit">-</b></div>
-        </div>
-      </div>
+    <div class="none" id="none" hidden></div>
+    <div class="col exp">
+      <div class="k" id="exp-h">Experts</div>
+      <div class="leg" id="exp-leg"></div>
+      <div class="map" id="exp-map"></div>
+      <div class="key" id="exp-key"></div>
     </div>
-    <div class="hfoot"><div id="foot-dec"></div><div id="foot-pre"></div></div>
   </section>
 
-  <section class="a-main card" aria-label="Slots and requests">
-    <div class="tabs" role="tablist" id="tabs"></div>
-    <div class="pane" id="pane" role="tabpanel"></div>
-    <div class="tot" id="totals"></div>
-  </section>
-
-  <section class="a-logs card" aria-label="Logs">
-    <div class="hd lh"><b>Logs</b><span id="log-count"></span></div>
-    <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
+  <!-- everything else: a panel of fixed height under the hero; tables and the log scroll inside it -->
+  <section class="panel" aria-label="Details">
+    <nav class="tabs" aria-label="Details">
+      <div id="tabs" role="tablist"></div>
+      <span class="grow"></span>
+      <div class="tog" id="lfilter" role="group" aria-label="Log level" hidden>
+        <button type="button" data-f="all" aria-pressed="true">All</button><span aria-hidden="true">·</span><button type="button" data-f="warn" aria-pressed="false">Warnings</button>
+      </div>
+      <button type="button" class="jump" id="jump" hidden>Jump to latest</button>
+    </nav>
+    <div class="body">
+      <section class="pane" id="p-req" role="tabpanel" hidden></section>
+      <section class="pane" id="p-slots" role="tabpanel" hidden></section>
+      <section class="pane" id="p-hw" role="tabpanel" hidden></section>
+      <section class="pane logs" id="p-logs" role="tabpanel" hidden><div id="log" role="log" aria-live="off" tabindex="0"></div></section>
+    </div>
   </section>
 </main>
+
+<!-- always on screen: the newest log line (opens Logs) and the session totals -->
+<footer class="tail">
+  <button type="button" class="ticker" id="ticker" title="Open the logs (L)"><span id="ticker-t"></span></button>
+  <span class="tot" id="totals"></span>
+</footer>
 
 </body>
 </html>

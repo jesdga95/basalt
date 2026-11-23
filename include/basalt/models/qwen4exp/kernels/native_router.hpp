@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-#include "basalt/models/qwen4exp/kernels/resident_tabs.hpp"
+#include "basalt/kernels/route_lossy.hpp"
 
 namespace basalt::kernels {
 

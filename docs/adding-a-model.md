@@ -27,7 +27,10 @@ The router then needs one config entry. Nothing in the server names a model.
   sizing depends on (weights, then what is sized from the memory left: caches, tiers, prompt-split stages), and queues every
   range of the file it reads in one `LoadPlan` (`basalt/core/loader.hpp`), with copies of bytes the plan itself places (a second
   home, a stage's image) as memory sources; nothing is placed yet. The start announces the plan's bytes as the one total, places
-  them in one unbuffered pass on a thread pool, then calls the model's `attach`: what needs the bytes landed (packed forms,
+  them in one unbuffered pass on a thread pool (the ranges bound for a card first, the main card then the others, each streamed
+  through small pinned staging; then the ranges bound for RAM; the one bar names the stage and its own part: `loading model
+  weights: cuda0 3.1/12.5`, ..., `ram`; each destination's share is summed from the plan and the result line splits the
+  total by it: `loaded 76.8GiB 30.1s  cuda0=12.5GiB ram=64.3GiB`), then calls the model's `attach`: what needs the bytes landed (packed forms,
   checks, timing a prompt split's cards) and the sessions, when nothing was sized after them. A model makes its sessions in
   `plan` instead when a cache or tier sizes itself from the memory they leave. `core/ram_load` allocates and pins the RAM tier:
   `plan` allocates it, the pass gives it its pages as it reads into it, and it is pinned once its reads have landed (in
@@ -35,6 +38,8 @@ The router then needs one config entry. Nothing in the server names a model.
   its bytes arrive; a tier sized before that pin leaves the VRAM the pin maps on its card free (`pin_mapping_bytes`);
   a prompt split's stages take the shared `core::PromptStage` and its start lines (`basalt/core/prompt_stage.hpp`).
 - Conversations: `save_cells` and `restore_cells` give the RAM and disk tiers what they need.
+- `--parallel` slots in one pass through the weights: derive the session from `model::BatchSession`, write its hooks and run
+  the batch check, see [batched decoding](design/batching.md#adding-batching-to-a-model).
 - A model with its own fast path derives from `serve::Runtime` and `serve::Request`; see `src/models/qwen4exp/`.
 - A dense model of GDN and gated attention layers (the Qwen3.5 family) needs only its pack read into `dense::Geometry` and
   `dense::Weights` (`include/basalt/dense/model.hpp`): the shared dense stack runs the layers, the drafters (MTP layer or DFlash

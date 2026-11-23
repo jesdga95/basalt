@@ -302,6 +302,12 @@ int main() {
             run(200);   // the kept slots keep working
             CHECK(bytes_right());
             CHECK(tier.slots() == kept);
+            // A retry can borrow another segment while preserving the newest experts in the smaller arena.
+            CHECK(cudaMemGetInfo(&free_b, &total_b) == cudaSuccess);
+            CHECK(tier.lend((uint64_t) free_b - tier.free_floor() + spec.lend_segment));
+            CHECK(tier.slots() > 0 && tier.slots() < kept);
+            for (int l = 0; l < kLayers; ++l) CHECK(tier.locate(l, last[l][3]).dev != nullptr);
+            CHECK(bytes_right());
             CHECK(tier.reclaim(err));
             CHECK(tier.slots() == full);
             run(400);
@@ -323,6 +329,27 @@ int main() {
             cudaMemGetInfo(&free_b, &total_b);
             CHECK(tier.lend((uint64_t) free_b - tier.free_floor() + arena / 2));
             CHECK(tier.slots() > 0 && tier.slots() < full);
+            CHECK(bytes_right());
+            // a reclaim that restores: the slots come back holding the experts the lend took off, with the pack's bytes
+            CHECK(tier.reclaim(err, /*restore=*/true));
+            CHECK(tier.slots() == full);
+            for (int l = 0; l < kLayers; ++l) CHECK(held(l) == before[l]);
+            CHECK(bytes_right());
+            // and after lend_all (a sleep, a picture's encoder): every expert the arena held is back in it
+            run(100);
+            std::vector<uint8_t> had((size_t) kLayers * kExperts);
+            for (int l = 0; l < kLayers; ++l)
+                for (int e = 0; e < kExperts; ++e) had[(size_t) l * kExperts + e] = tier.locate(l, e).dev != nullptr;
+            tier.lend_all();
+            CHECK(tier.slots() == 0);
+            CHECK(tier.reclaim(err, /*restore=*/true));
+            CHECK(tier.slots() == full);
+            bool same = true;
+            for (int l = 0; l < kLayers; ++l)
+                for (int e = 0; e < kExperts; ++e) same = same && had[(size_t) l * kExperts + e] == (tier.locate(l, e).dev != nullptr);
+            CHECK(same);
+            CHECK(bytes_right());
+            run(200);   // and the restored tier keeps working
             CHECK(bytes_right());
         }
         cudaFreeHost(h_rows);

@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <vector>
@@ -28,7 +29,7 @@ namespace basalt::models::deepseek41 {
 namespace {
 
 constexpr uint64_t kModuleRoom = 7ull << 27;    // kernel modules still to load when the tier opens
-constexpr uint64_t kVisionRoom = 3ull << 29;    // the image encoder, when the pack carries one
+constexpr uint64_t kVisionRoom = 3ull << 29;    // what the homes leave beside them when the pack carries a projector, whether or not vision is on: it sets the homes-or-copies plan, so the plan is the same in both; the encoder borrows the copies per picture and holds no memory of its own at rest
 // One layer's GPU plan for the grouped expert kernel, uploaded with a single copy.
 struct ExpertPlan {
     unsigned long long ptr[8];
@@ -40,6 +41,8 @@ struct ExpertPlan {
 
 // Experts one lookup holds: a window of up to 8 rows, 6 each.
 constexpr int kLookupK = 48;
+/// A mapped id not written yet (-1 is an entry --route-tail-skip dropped).
+constexpr int32_t kIdPending = INT32_MIN;
 
 // Joins a started CPU share on every way out of a layer's experts.
 struct CpuJoin {
@@ -625,7 +628,7 @@ public:
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
-        for (int k = 0; k < 64; ++k) h_ids_[k] = -1;
+        for (int k = 0; k < 64; ++k) h_ids_[k] = kIdPending;
         *h_join_ = 0;
         DsModel::SharedTier& shared = m_.shared_tier();
         if (shared.tier) {   // another session opened it: the sessions run one at a time over the same rows
@@ -737,11 +740,12 @@ public:
                     uniq[nu++] = e;
                     use[u] = core::ExpertTier::Use{};
                 }
+                uidx[t * K + k] = u;
+                if (e == -1) continue;   // --route-tail-skip dropped it: no rows (a token may drop several)
                 core::ExpertTier::Use& us = use[u];
                 us.tok[us.nt] = t;
                 us.row[us.nt] = t * K + k;
                 ++us.nt;
-                uidx[t * K + k] = u;
             }
         core::ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
@@ -757,7 +761,7 @@ public:
         // the experts still being read from the file follow it
         bool cpu = false, reading = false, on_peer = false;
         for (int i = 0; i < nu; ++i) {
-            cpu = cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            cpu = cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i] && !lk.dropped[i]);
             reading = reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
@@ -808,7 +812,7 @@ public:
         // launch and the next layer's are off the path from the last rows to the sum
         WindowRowPtrs rp{};
         for (int r = 0; r < T * K; ++r)
-            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
+            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : lk.dropped[uidx[r]] ? tier_->zero_row() : d_rows_ + (size_t) r * n;
         if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;
@@ -828,7 +832,7 @@ public:
         if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
-        for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
+        for (int r = 0; r < T * K; ++r) h_ids_[r] = kIdPending;
         ids_read_ = false;
         return true;
     }
@@ -845,7 +849,7 @@ public:
         const volatile int32_t* ids = h_ids_;
         for (int s = 0; s < kSpins; ++s) {
             bool all = true;
-            for (int k = 0; k < n_ids; ++k) all = all && ids[k] >= 0;
+            for (int k = 0; k < n_ids; ++k) all = all && ids[k] != kIdPending;
             if (all) {
                 std::atomic_thread_fence(std::memory_order_acquire);
                 return;
@@ -893,7 +897,7 @@ public:
         // the experts still being read from the file follow it
         bool cpu = false, reading = false, on_peer = false;
         for (int k = 0; k < K; ++k) {
-            cpu = cpu || (!lk.dev[k] && !lk.peer[k] && !lk.reading[k]);
+            cpu = cpu || (!lk.dev[k] && !lk.peer[k] && !lk.reading[k] && !lk.dropped[k]);
             reading = reading || lk.reading[k];
             on_peer = on_peer || lk.peer[k];
         }
@@ -966,7 +970,7 @@ public:
         // launch and the next layer's are off the path from the last rows to the sum
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
-            rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
+            rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : lk.dropped[k] ? tier_->zero_row() : d_rows_ + (size_t) k * g_.n_embd;
         if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;
@@ -986,7 +990,7 @@ public:
         if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);
-        for (int k = 0; k < K; ++k) h_ids_[k] = -1;
+        for (int k = 0; k < K; ++k) h_ids_[k] = kIdPending;
         ids_read_ = false;
         return true;
     }

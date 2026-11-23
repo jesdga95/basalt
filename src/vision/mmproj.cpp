@@ -145,7 +145,7 @@ bool Mmproj::open(const core::FileRange& range, std::string& err, const char* pr
         if (t == 8) {
             const std::string s = c.str();
             if (key == "general.architecture") arch = s;
-            else if (key == "clip.projector_type") proj_type = s;
+            else if (key == "clip.projector_type" || key == "clip.vision.projector_type") proj_type = s;
             continue;
         }
         kv[key] = read_value(c, t);

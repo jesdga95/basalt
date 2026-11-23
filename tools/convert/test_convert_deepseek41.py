@@ -298,3 +298,36 @@ class FromBaseTest(DeepSeek41Test):
         short.write_bytes(full.read_bytes()[:-len(self.raw["per_layer_token_embd.weight"])])
         with self.assertRaises(SystemExit):
             convert.convert(self.args(gguf=[str(short)]))
+
+
+class DefaultNameTest(unittest.TestCase):
+    """DeepSeek41.default_name: the pack name is general.name plus the quant tag of the file name (dash or dot
+    separated, shard suffix stripped); a file name not starting with the base carries no quant."""
+
+    def setUp(self):
+        self.arch = convert.A.for_architecture("deepseek41")
+
+    def test_shard_name(self):
+        kv = {"general.name": "DeepSeek-V4.1-Flash-1017"}
+        self.assertEqual(self.arch.default_name("DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf", kv),
+                         "DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL")
+
+    def test_single_file_name(self):
+        kv = {"general.name": "DeepSeek-V4.1-Flash-1017"}
+        self.assertEqual(self.arch.default_name("DeepSeek-V4.1-Flash-1017-UD-IQ1_M.gguf", kv),
+                         "DeepSeek-V4.1-Flash-1017 UD-IQ1_M")
+
+    def test_dot_separated_tag(self):
+        kv = {"general.name": "DeepSeek-V4.1-Flash"}
+        self.assertEqual(self.arch.default_name("DeepSeek-V4.1-Flash.Q8_0.gguf", kv), "DeepSeek-V4.1-Flash Q8_0")
+
+    def test_no_general_name_falls_back_to_the_base(self):
+        self.assertEqual(self.arch.default_name("DeepSeek-V4.1-Flash.gguf", {}), "DeepSeek-V4.1-Flash")
+
+    def test_file_name_not_starting_with_the_base_has_no_quant(self):
+        kv = {"general.name": "DeepSeek-V4.1-Flash"}
+        self.assertEqual(self.arch.default_name("some-fork-Q8_0.gguf", kv), "DeepSeek-V4.1-Flash")
+
+    def test_base_only_counts_at_a_boundary(self):
+        kv = {"general.name": "DeepSeek-V4.1-Flash"}
+        self.assertEqual(self.arch.default_name("DeepSeek-V4.1-Flashy-Q8_0.gguf", kv), "DeepSeek-V4.1-Flash")

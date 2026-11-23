@@ -1,6 +1,6 @@
 // src/models/hy4flash/dfly.hpp - the DFly2 drafter of Hy4-flash: its pack section and weights, what the target leaves for it
 // (a tap of each window's last-layer hidden states and index selections), the block pass over the target's own KV, and the
-// flags. The forward and every assumption in it are in docs/models/hy4-flash/dfly2.md.
+// flags. The forward and its assumptions are below; the inference reference is vLLM's hy_v4 DFly drafter.
 //
 // A block is the anchor token (the last pick, whose position the target has not run) and `n` mask tokens. The anchor's
 // embedding is fused with the target's last-layer hidden state at the row before it (Gated Fusion); five dense MLA layers
@@ -9,6 +9,31 @@
 // with the embedding of the token drafted before it, and the target's output head gives the draft. The drafter keeps no
 // cache and no indexer: a rejected block leaves nothing behind. Drafts are greedy; the target's own pick decides every row,
 // so a draft only changes the speed.
+//
+// The forward. A block is the anchor `a` at position `pos` and n (1..5) mask tokens, rows at pos .. pos + n; `s` = pos - 1 is
+// the source row, the target row whose output chose `a`; e() is the target's token embedding.
+//   1. Gated Fusion, row 0 only: x0 = e(a) + gate * eh_proj(enorm(e(a)) :: hnorm(h_s)), h_s the target's last-layer hidden
+//      state at row s after the output norm. Rows 1..n: e(mask).
+//   2. Five dense layers, one residual stream (no hyper-connections), pre-norm: y = input_ln(x);
+//      x += post_proj_norm(o_proj(attention(y))); x += mlp(post_attention_ln(x)), a plain SwiGLU (no clamp). z = final_norm(x).
+//   3. Attention of layer i: the target's absorbed MLA with the drafter's own weights. q = q_b(q_a_ln(q_a(y))), heads of 192
+//      nope + 64 rope; latent kv_a_ln(kv_a(y)[:512]), rope part kv_a(y)[512:]; interleaved-pair rope at the target sparse layers'
+//      base, position pos + r; kv_b rows per head are 192 key rows then 256 value rows, used absorbed; scale 1/sqrt(256);
+//      the sink adds exp(sink) to the softmax denominator; the output is gated by sigmoid(linear_gate(y)), then o_proj.
+//      KV Share: the keys and values are target layer kv_layers[i]'s cache rows (FP8 rows decoded exactly under --kv fp8).
+//      Index Share: the rows are the cells target layer idx_layers[i] selected for row s (every position before pos while its
+//      indexer keeps them all), the same for every block row; block row r also attends the block's rows 0..r, whose K/V come
+//      from the drafter's own kv_a and live in scratch (rounded to FP8 rows first under --kv fp8). Nothing is written into
+//      the target's cache.
+//   4. Hidden-Correction, in order, draft j = 0..n-1 from row j + 1 and the token before it (a, then draft j - 1):
+//      c = hidden_norm(z[j+1]) :: embed_norm(e(prev)), h' = z[j+1] + down(silu(gate(c)) * up(c)).
+//   5. Head: the target's output head over h', argmax, screened by a 2-bit copy of the head's rows: the rows near the copy's
+//      best are scored exactly as the target scores them (kernels/q80_screen.hpp). Row 0's output is not used; its K/V feed
+//      the later rows.
+// Assumptions the reference leaves open: the confidence is sigmoid(confidence_head(h')) (vLLM does not load the head; it only
+// steers the draft policy's window choice); rope positions are text positions, so after a picture the block turns by the
+// text's rotary position; the draft layers read sparse target layers (checked at load); a pack with a context local window
+// (dfly_context_local_window) is refused.
 #pragma once
 
 #include "basalt/core/loader.hpp"
@@ -64,9 +89,10 @@ struct DflySpec {
     std::string name;
     std::vector<uint64_t> shape;
     bool f32 = false;   ///< a vector widened to FP32
-    bool q8 = false;    ///< a projection of the block pass, rounded to Q8_0 as it loads
+    bool q8 = false;    ///< a projection, rounded to Q8_0 as it loads
+    bool q4 = false;    ///< a projection rounded to Q4_0 as it loads: the attention's gate and output and the MLP
     uint64_t elems() const;
-    uint64_t bytes() const { return q8 ? elems() / 32 * 34 : elems() * (f32 ? 4 : 2); }   ///< on the card
+    uint64_t bytes() const { return q4 ? elems() / 32 * 18 : q8 ? elems() / 32 * 34 : elems() * (f32 ? 4 : 2); }   ///< on the card
 };
 /// Every tensor of a drafter of these dims.
 std::vector<DflySpec> dfly_specs(const DflyDims& d);
@@ -74,26 +100,32 @@ std::vector<DflySpec> dfly_specs(const DflyDims& d);
 bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDims& d, std::string& err);
 
 struct DflyLayer {
-    const void *q_a, *q_b, *kv_a, *gate, *o, *mlp_gate, *mlp_up, *mlp_down;   // Q8_0
+    const void *q_a, *q_b, *kv_a;                        // Q8_0
+    const void *gate, *o, *mlp_gate, *mlp_up, *mlp_down;  // Q4_0
     const uint16_t* kv_b;                                                    // BF16: the per-head kernels read it
     const float *in_ln, *q_a_ln, *kv_a_ln, *post_proj_ln, *post_attn_ln, *sink;
 };
 
-/// The drafter's weights on the main card: the block pass's projections in Q8_0 (rounded as they load, so the expert tier is
-/// sized after the smaller drafter), kv_b in BF16 as stored, FP32 vectors.
+/// The drafter's weights on the main card: its projections rounded as they load (so the expert tier is sized after the
+/// smaller drafter), the attention's gate and output and the MLP to Q4_0 and the rest to Q8_0, kv_b in BF16 as stored, FP32
+/// vectors, and the 2-bit copy of the target's head that screens the drafts.
 class DflyWeights {
 public:
     ~DflyWeights();
-    /// Device memory for every tensor of `dims` on the current device; `slot` then says where each goes.
+    /// Device memory for every tensor of `dims` and the head's copy on the current device; `slot` then says where each goes.
     bool allocate(const DflyDims& dims, std::string& err);
     void* slot(const std::string& name) const;   ///< null for an unknown name
     uint64_t bytes() const { return bytes_; }
+    /// Packs the head's copy from head_q8 (once its bytes are on the card).
+    bool pack_screen(void* stream, std::string& err);
 
     DflyDims dims;
     std::vector<DflyLayer> layer;
     const void *eh_proj = nullptr, *hc_gate = nullptr, *hc_up = nullptr, *hc_down = nullptr;   // Q8_0
     const float *enorm = nullptr, *hnorm = nullptr, *fuse_gate = nullptr, *hc_hidden_norm = nullptr, *hc_embed_norm = nullptr,
                 *final_norm = nullptr, *conf_w = nullptr, *conf_b = nullptr;
+    const void* head_q8 = nullptr;   ///< the target's Q8_0 head (the model's tensor): the drafts read it as the target does
+    void* head_screen = nullptr;     ///< its 2-bit copy (kernels/q80_screen.hpp)
 
 private:
     std::map<std::string, void*> slots_;
@@ -148,7 +180,6 @@ public:
     struct Env {
         const DflyWeights* w = nullptr;
         int device = 0;
-        const uint16_t* head = nullptr;                          ///< the target's output matrix, BF16 [vocab][E]
         std::function<bool(int32_t, float*)> embed;              ///< a token's embedding row (E floats, host)
         int sel_cap = 2056;                                      ///< cells of a selection
         bool fp8 = false;                                        ///< the target's caches hold --kv fp8 rows (kFp8RowBytes)
@@ -162,9 +193,14 @@ public:
     /// rotary position of cell `pos` (< 0: `pos`); after a picture the text runs behind the cells (vision.hpp).
     bool begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
                std::string& err, int64_t rope_pos = -1);
-    /// Runs the heads over the block begin() made, in order, each with the token before it: the `n` drafts and each one's
-    /// estimated chance of acceptance.
-    bool finish(int32_t* ids, float* conf, void* stream, std::string& err);
+    /// Runs the heads over the block begin() made, in order, each with the token before it: the `made` drafts (the
+    /// block's n, or fewer with `need`) and each one's estimated chance of acceptance. `on_row(j, token)`, when set, is
+    /// called in head step j >= 1 once the step is queued on the card, with window row j's token (draft j - 1): host work
+    /// there runs while the card computes the step. `need(conf, j)`, when set, is asked with draft j's chance before its
+    /// head runs: false ends the block before draft j.
+    bool finish(int32_t* ids, float* conf, int& made, void* stream, std::string& err,
+                const std::function<void(int, int32_t)>& on_row = nullptr,
+                const std::function<bool(const float*, int)>& need = nullptr);
     /// The block's outputs after the final norm, `rows` rows of E floats, to the host (for the tests against a reference).
     void copy_block(float* host, int rows, void* stream) const;
 
@@ -184,7 +220,7 @@ public:
     /// `dump` (--diag-dump's directory, may be empty): each block's inputs (the source row's hidden state, the cache rows it attends)
     /// are written there for the first few blocks, to compare with a reference.
     /// `fp8`: the target's sparse caches hold --kv fp8 rows.
-    bool init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
+    bool init(const DflyWeights* w, int sel_cap, int64_t ctx, std::function<bool(int32_t, float*)> embed,
               const std::string& dump, bool fp8, std::string& err);
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
@@ -201,7 +237,9 @@ public:
     /// as DflyRunner::begin.
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint8_t*>& cache, void* stream,
                               int64_t rope_pos = -1);
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream);
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream, const model::ModelSession::DraftNeed& need);
+    /// Called in the heads with each draft row's token as it is known (DflyRunner::finish's on_row).
+    void on_row(std::function<void(int, int32_t)> f) { on_row_ = std::move(f); }
 
 private:
     std::unique_ptr<DflyTap> tap_;
@@ -210,17 +248,19 @@ private:
     int row0_ = -1, pending_ = 0, dumped_ = 0, dump_n_ = 0;
     int64_t dump_pos_ = -1;
     int32_t dump_anchor_ = 0;
-    const uint16_t* head_ = nullptr;
     std::function<bool(int32_t, float*)> embed_;
+    std::function<void(int, int32_t)> on_row_;
     std::string dump_;
     int64_t ctx_ = 0;
     bool fp8_ = false;
 };
 
-/// The drafts of a block in order, `step(j, previous)` giving draft j after the token before it (the anchor first). The
-/// loop DflyRunner::finish runs, apart from the device, so a test can run it over fake logits.
-bool dfly_draft_loop(int n, int32_t anchor, const std::function<bool(int j, int32_t previous, int32_t& token, float& conf)>& step,
-                     int32_t* ids, float* conf);
+/// The drafts of a block in order, `step(j, previous)` giving draft j after the token before it (the anchor first), or
+/// ending the block before it (`go` false): `made` drafts. The loop DflyRunner::finish runs, apart from the device, so a
+/// test can run it over fake logits. False when a step fails.
+bool dfly_draft_loop(int n, int32_t anchor,
+                     const std::function<bool(int j, int32_t previous, int32_t& token, float& conf, bool& go)>& step,
+                     int32_t* ids, float* conf, int& made);
 
 /// The flags a Hy4-flash start takes for speculative decoding, as DeepSeek's: --spec N, --spec-oracle FILE, --diag-teacher,
 /// --draft-log FILE. False when `a` is none of them.

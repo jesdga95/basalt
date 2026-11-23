@@ -174,7 +174,7 @@ void free_state(SessionState& st) {
 
 namespace {
 
-class Session final : public model::ModelSession {
+class Session final : public model::BatchSession {
 public:
     explicit Session(Model& m) : m_(m), g_(m.g) {}
     ~Session() override {
@@ -289,7 +289,7 @@ public:
         return {};
     }
 
-    Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (block_) {
             n = std::min(n_draft_, max_n);
             if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
@@ -339,67 +339,92 @@ public:
 
     int batch_rows() const override { return kBatch; }
 
-    // Several sessions' windows as one batch: each is settled and its draw prepared as decode_window does, the rows run
-    // together on the first session's stream (every session's own stream is idle by then), each session draws from its own
-    // logits.
-    Result decode_batch(model::ModelSession* const* peers, const model::DecodeRequest* reqs, int n) override {
-        if (n == 1) return peers[0]->decode_window(reqs[0]);
-        std::vector<Session*> ss((size_t) n);
-        std::vector<int32_t> tokens, pos3;
-        std::vector<BatchSeg> segs((size_t) n);
-        int rows = 0;
-        for (int i = 0; i < n; ++i) {
-            ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
-            const model::DecodeRequest& r = reqs[i];
-            if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a batch of sessions of another model");
-            if (r.n_tokens < 1 || r.n_tokens > kWindow) return fail(m_.o.arch + ": a decode window of " + std::to_string(r.n_tokens) + " rows");
-            if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the window passes the context");
-            rows += r.n_tokens;
+protected:
+    // ---- several sessions' windows as one batch, on model/batch_driver.hpp: each session is settled (its commit on its side
+    // stream, all of them side by side) and its draw prepared as decode_window does, the rows run together on the first
+    // session's stream, each session draws from its own logits
+
+    const char* batch_name() const override { return m_.o.arch.c_str(); }
+    int64_t batch_context() const override { return m_.o.max_context; }
+    model::BatchShared& batch_shared() override { return m_.batch; }
+    cudaStream_t batch_stream() const override { return st_.stream; }
+    // a layer split's forward runs its two cards' graphs itself (forward_batch)
+    bool batch_captured() const override { return !m_.split; }
+
+    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        if (r.n_tokens < 1 || r.n_tokens > kWindow) {
+            err = "a decode window of " + std::to_string(r.n_tokens) + " rows";
+            return false;
         }
-        if (rows > kBatch) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
-        for (int i = 0; i < n; ++i)
-            if (Result s = ss[(size_t) i]->settle(reqs[i].pos, true); !s.ok()) return s;   // the commits run side by side
-        for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit();
-        for (int i = 0; i < n; ++i)
-            if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess ||
-                (ss[(size_t) i]->st_.peer && cudaStreamSynchronize(ss[(size_t) i]->st_.peer->stream) != cudaSuccess))
-                return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
-        std::string err;
-        const cudaStream_t s = ss[0]->st_.stream;
-        for (int i = 0; i < n; ++i) {
-            Session& se = *ss[(size_t) i];
-            const model::DecodeRequest& r = reqs[i];
-            const int T = r.n_tokens;
-            if (!se.prepare_draw(r, err)) return fail(err);
-            tokens.insert(tokens.end(), r.tokens, r.tokens + T);
-            for (int t = 0; t < T; ++t) {
-                const int32_t p = (int32_t) (r.pos + t + se.st_.rope_delta);
-                pos3.insert(pos3.end(), {p, p, p});
-            }
-            if (se.drafter_) cudaMemcpyAsync(se.st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-            segs[(size_t) i] = {&se.st_, T, r.pos};
+        if (Result s = settle(r.pos, true); !s.ok()) {
+            err = s.message;
+            return false;
         }
-        if (!forward_batch(m_, segs.data(), n, tokens.data(), pos3.data(), err)) return fail(err);
-        for (int i = 0; i < n; ++i) {
-            Session& se = *ss[(size_t) i];
-            const model::DecodeRequest& r = reqs[i];
-            const int T = r.n_tokens;
-            se.draw(T, s);
-            se.pend_pos_ = r.pos;
-            se.pend_T_ = T;
-            if (r.logits) cudaMemcpyAsync(r.logits, se.st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
-            cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+        join_commit();
+        if (st_.peer && cudaStreamSynchronize(st_.peer->stream) != cudaSuccess) {
+            err = cudaGetErrorString(cudaGetLastError());
+            return false;
         }
-        if (cudaStreamSynchronize(s) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
-        for (int i = 0; i < n; ++i) {
-            Session& se = *ss[(size_t) i];
-            const model::DecodeRequest& r = reqs[i];
-            if (r.row_tokens) std::copy(se.h_picks_, se.h_picks_ + r.n_tokens, r.row_tokens);
-            if (r.next_token) *r.next_token = se.h_picks_[r.n_tokens - 1];
-        }
-        return {};
+        return prepare_draw(r, err);
     }
 
+    static BatchSeg seg_of(const model::BatchView& v, int i) {
+        Session& se = *static_cast<Session*>(v.ss[i]);
+        return {&se.st_, v.w.segs[(size_t) i].rows, v.w.segs[(size_t) i].pos0};
+    }
+
+    // every row's token and rope position (its session's offset), the drafter's window tokens; the composition is the key
+    void batch_pack(const model::BatchView& v, std::vector<BatchSeg>& segs, std::vector<int32_t>& pos3) const {
+        segs.resize((size_t) v.n);
+        pos3.clear();
+        for (int i = 0; i < v.n; ++i) {
+            segs[(size_t) i] = seg_of(v, i);
+            const SessionState& st = *segs[(size_t) i].st;
+            for (int t = 0; t < segs[(size_t) i].T; ++t) {
+                const int32_t p = (int32_t) (segs[(size_t) i].pos + t + st.rope_delta);
+                pos3.insert(pos3.end(), {p, p, p});
+            }
+        }
+    }
+
+    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key&, std::string&) override {
+        for (int i = 0; i < v.n; ++i) {
+            Session& se = *static_cast<Session*>(v.ss[i]);
+            if (se.drafter_)
+                cudaMemcpyAsync(se.st_.win_tok, v.reqs[i].tokens, (size_t) v.reqs[i].n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice, v.stream);
+        }
+        if (m_.split) return true;   // forward_batch stages both cards
+        std::vector<BatchSeg> segs;
+        std::vector<int32_t> pos3;
+        batch_pack(v, segs, pos3);
+        stage_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data());
+        return true;
+    }
+
+    bool batch_forward(const model::BatchView& v, std::string& err) override {
+        std::vector<BatchSeg> segs;
+        std::vector<int32_t> pos3;
+        batch_pack(v, segs, pos3);
+        if (m_.split) return forward_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data(), err);
+        batch_body(m_, segs.data(), v.n);
+        return true;
+    }
+
+    void batch_take(const model::BatchView& v, int i) override {
+        const model::DecodeRequest& r = v.reqs[i];
+        pend_pos_ = r.pos;
+        pend_T_ = r.n_tokens;
+        if (r.logits) cudaMemcpyAsync(r.logits, st_.logits + (size_t) (r.n_tokens - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, v.stream);
+    }
+
+    const int32_t* batch_draw(const model::BatchView& v, int i, std::string&) override {
+        const int T = v.reqs[i].n_tokens;
+        draw(T, v.stream);
+        cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, v.stream);
+        return h_picks_ + (T - v.head[i]);   // the driver reads the window's last head[i] rows
+    }
+
+public:
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;

@@ -50,10 +50,19 @@ std::string cpu_label(const std::string& raw_name, int physical_cores) {
     };
     for (const char* m : {"(R)", "(TM)", "(r)", "(tm)", " with Radeon Graphics", " Processor"}) erase_all(m);
     if (const size_t at = n.find(" @ "); at != std::string::npos) n.erase(at);   // the clock
+    const auto word_ends = [&n](size_t i) { return i == n.size() || !std::isalnum((unsigned char) n[i]); };
     for (size_t p = 0; (p = n.find("-Core", p)) != std::string::npos;) {   // "16-Core"
-        size_t b = p;
+        size_t b = p, e = p + 5;
         while (b > 0 && std::isdigit((unsigned char) n[b - 1])) --b;
-        n.erase(b, p + 5 - b);
+        if (b < p) {   // a count tag is erased only when it ends the word, a plural "16-Cores" too
+            if (e < n.size() && n[e] == 's' && word_ends(e + 1)) {
+                ++e;
+            } else if (!word_ends(e)) {
+                p = e;
+                continue;
+            }
+        }
+        n.erase(b, e - b);
         p = b;
     }
     if (n.size() >= 4 && n.compare(n.size() - 4, 4, " CPU") == 0) n.erase(n.size() - 4);
@@ -72,10 +81,27 @@ std::string cpu_label(const std::string& raw_name, int physical_cores) {
 }
 
 std::string pack_quant_label(const std::string& name) {
-    std::string q = name.substr(name.rfind(' ') == std::string::npos ? 0 : name.rfind(' ') + 1);
-    for (const char* pre : {"NVIDIA-", "UD-"})
-        if (q.rfind(pre, 0) == 0) q.erase(0, std::strlen(pre));
-    return q.empty() ? "unknown" : q;
+    size_t b = 0, e = name.size();
+    while (b < e && std::isspace((unsigned char) name[b])) ++b;
+    while (e > b && std::isspace((unsigned char) name[e - 1])) --e;
+    const std::string t = name.substr(b, e - b);
+    const size_t sp = t.rfind(' ');
+    if (sp == std::string::npos) return "unknown";   // a name without a space carries no quant label
+    std::string q = t.substr(sp + 1);
+    const auto strip = [&q](const char* pre) {   // the prefix in any case, the rest of the label as it is written
+        const size_t n = std::strlen(pre);
+        if (q.size() < n) return;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower((unsigned char) q[i]) != std::tolower((unsigned char) pre[i])) return;
+        q.erase(0, n);
+    };
+    for (size_t before = 0; q.size() != before;) {   // repeatedly, in any order, until neither prefix matches
+        before = q.size();
+        for (const char* pre : {"NVIDIA-", "UD-"}) strip(pre);
+    }
+    // a quant label carries a digit (NVFP4, Q4_K_M, IQ1_M, BF16); a last word without one ("Mini") is part of the model's name
+    const bool digit = std::any_of(q.begin(), q.end(), [](char c) { return std::isdigit((unsigned char) c) != 0; });
+    return digit ? q : "unknown";
 }
 
 std::string community_row_text(const CommunityRow& r) {

@@ -1,6 +1,7 @@
 // src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -22,6 +23,31 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
     return detect_cpu_topology(skip_first, affinity).worker_cores;
+}
+
+int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, double cpu_quota, PoolAffinity affinity) {
+    int n = worker_cores;
+    if (hybrid && affinity != PoolAffinity::All) {
+        // The P-cores but the host's.  The auto affinity adds half the E-cores: they run the expert kernels slower, but a
+        // layer's CPU share is split into many small tasks, so each one still shortens it.
+        n = std::max(1, p_cores - 1);
+        if (affinity == PoolAffinity::Auto) n += e_cores / 2;
+    }
+    // A CPU quota throttles the whole group once spent: the workers and the host thread together must fit it.
+    if (cpu_quota > 0) {
+        const int fit = std::max(1, (int) cpu_quota - 1);
+        if (fit < n) n = fit;
+    }
+    return std::max(1, n);
+}
+
+int start_pool_workers(int given, bool affinity_given, PoolAffinity affinity) {
+    if (given > 0) return given;
+    const CpuTopology topo = detect_cpu_topology(true);
+    const PoolAffinity pick = !affinity_given || affinity == PoolAffinity::Auto ? PoolAffinity::Auto
+                              : affinity == PoolAffinity::PCores               ? PoolAffinity::PCores
+                                                                               : PoolAffinity::All;
+    return auto_pool_workers((int) topo.worker_cores.size(), topo.p_cores, topo.e_cores, topo.is_hybrid, cgroup_cpu_quota(), pick);
 }
 
 namespace {

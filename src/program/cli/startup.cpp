@@ -107,6 +107,8 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     if (adapter != nullptr) {
         o.arch = adapter->arch();
         o.model_name = adapter->model_name();
+        o.community_kv = adapter->community_kv();
+        o.community_quant = adapter->community_quant();
         o.quality_flags = adapter->quality_flags();
         o.quality_window = adapter->quality_window();
     }
@@ -120,6 +122,7 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
             return 2;
         }
         basalt::program::grammar::set_tool_form(adapter->tool_form());
+        basalt::program::grammar::set_reply_form(adapter->reply_form());
     }
     // Batched serving reads a prompt on its own thread while verify windows run.  A lazy kernel load on that thread
     // synchronizes the context and can wait on a window kernel that waits on the load, so batched serving loads every

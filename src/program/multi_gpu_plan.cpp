@@ -11,9 +11,6 @@ namespace {
 // Window model, fitted to cold decode windows of one pack on one card, on two unlike cards and on the layer split:
 //   ms = gpu bytes / bandwidth  +  host tail of the experts no card holds
 // The experts are ranked by use, and the share of reads the hottest `c` of all pairs serve is taken as c^kHitExponent.
-constexpr double kGpuGB = 11.9;          // bytes a window moves on its GPUs at the rate the kernels reach, per window
-constexpr double kMissMs = 18.1;         // host tail per unit of read mass no card holds
-constexpr double kHitExponent = 1.0 / 6.0;
 constexpr double kDenseShare = 0.35;     // the part of the GPU bytes that is dense weights (the rest are experts)
 constexpr double kSplitHandoffMs = 0.7;  // a layer split's hand-off and the commits of its stages, per window
 constexpr double kHeadMs = 1.45;         // the head on the last card, at 448 GB/s
@@ -26,10 +23,10 @@ constexpr double kWinMargin = 0.95;      // a mechanism beyond the expert tier m
 
 double bandwidth(const GpuCard& c) { return c.mem_gbps > 0 ? c.mem_gbps : 448.0; }
 
-double read_share(double slots, double pairs) {
+double read_share(double slots, double pairs, double exponent) {
     if (pairs <= 0) return 1.0;
     const double x = std::min(1.0, std::max(0.0, slots / pairs));
-    return std::pow(x, kHitExponent);
+    return std::pow(x, exponent);
 }
 
 double room_slots(const GpuCard& c, uint64_t overhead, uint64_t blob) {
@@ -71,9 +68,13 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
         total_slots += slots[i];
         total_bw += bw[i];
     }
+    const double kGpuGB = m.window_gb, kMissMs = m.miss_ms;
+    auto read_share = [&](double slots, double pairs) { return ::basalt::program::read_share(slots, pairs, m.hit_exponent); };
     const double gpu_main = kGpuGB / bw[0] * 1000.0;
     // expert tier: the main card runs every layer; every card's experts count
-    MgPrice tier{Mechanism::ExpertTier, true, gpu_main + kMissMs * (1.0 - read_share(total_slots, pairs))};
+    MgPrice tier{Mechanism::ExpertTier, m.tier_built, gpu_main + kMissMs * (1.0 - read_share(total_slots, pairs))};
+    // without a tier the main card runs alone: its own experts count
+    const double alone = gpu_main + kMissMs * (1.0 - read_share(slots[0], pairs));
     // layer split: each later card runs k layers (k equal on all of them, or by bandwidth) and holds those layers' experts;
     // the main card runs the rest. The cheapest cut is the one the engine's split search finds.
     auto split_ms = [&](const std::vector<double>& f) {
@@ -86,6 +87,7 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     };
     std::vector<double> f(n, 0.0);
     double split_best = 1e30;
+    bool split_fits = true;
     for (size_t i = 0; i < n; ++i) f[i] = bw[i] / total_bw;
     split_best = split_ms(f);
     for (int k = 1; k * (int) (n - 1) < m.layers; ++k) {
@@ -94,7 +96,55 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
         f[0] = rest;
         split_best = std::min(split_best, split_ms(f));
     }
-    MgPrice split{Mechanism::LayerSplit, true, split_best};
+    if (n == 2 && !m.split_handoffs.empty()) {
+        // every cut: the second card runs layers [c, layers) with their experts; the head and the drafter stay on the first
+        const int L = m.layers;
+        auto share = [&](int l) { return (size_t) l < m.layer_share.size() ? m.layer_share[(size_t) l] : 1.0 / L; };
+        auto bytes = [&](int l) {
+            return (size_t) l < m.layer_bytes.size() ? (double) m.layer_bytes[(size_t) l] : pairs / L * (double) m.blob_bytes;
+        };
+        auto caches = [&](int l) { return (size_t) l < m.layer_caches.size() ? (double) m.layer_caches[(size_t) l] : 0.0; };
+        double caches_all = 0;
+        for (int l = 0; l < L; ++l) caches_all += caches(l);
+        const double even_bytes = std::max(0.0, layer_bytes - caches_all);   // what follows the layers evenly
+        split_best = 1e30;
+        double unfit_best = 1e30, best_fill = 1e30;
+        for (int c = 1; c < L; ++c) {
+            double fl[2] = {0, 0}, fw[2] = {0, 0}, eb[2] = {0, 0}, cb[2] = {0, 0};
+            for (int l = 0; l < L; ++l) {
+                const int i = l < c ? 0 : 1;
+                fl[i] += 1.0 / L;
+                fw[i] += share(l);
+                eb[i] += bytes(l);
+                cb[i] += caches(l);
+            }
+            double ms = 0, fill = 0;   // fill: the fuller card's share of its VRAM taken (the room left for context)
+            bool fits = true;
+            for (int i = 0; i < 2; ++i) {
+                const double over = (double) m.peer_overhead + even_bytes * fl[i] + cb[i] + (i == 0 ? (double) kDrafterBytes : 0.0);
+                const double card_pairs = pairs * fl[i];
+                const double room = cards[(size_t) i].vram > over ? (double) cards[(size_t) i].vram - over : 0.0;
+                const double held = eb[i] > 0 ? std::min(1.0, room / eb[i]) * card_pairs : card_pairs;
+                fits = fits && room >= eb[i];
+                fill = std::max(fill, (over + eb[i]) / std::max(1.0, (double) cards[(size_t) i].vram));
+                ms += fw[i] * kGpuGB / bw[i] * 1000.0 + fw[i] * kMissMs * (1.0 - read_share(held, card_pairs));
+            }
+            const int h = (size_t) c < m.split_handoffs.size() ? m.split_handoffs[(size_t) c] : 1;
+            ms += h * m.handoff_ms;
+            if (!fits && !m.split_spills) {
+                unfit_best = std::min(unfit_best, ms);
+            } else if (ms < split_best - 1e-6 || (ms < split_best + 1e-6 && fill < best_fill)) {   // a tie: the evener cut
+                split_best = ms;
+                best_fill = fill;
+                plan.cut = c;
+            }
+        }
+        if (split_best >= 1e30) {   // no cut fits: priced at the cheapest, not run
+            split_best = unfit_best;
+            split_fits = false;
+        }
+    }
+    MgPrice split{Mechanism::LayerSplit, split_fits, split_best};
     // tensor parallel: the dense part of every layer is split across the cards (bandwidth adds up) and every layer pays its
     // exchanges between the cards; the experts stay as in the expert tier
     const double dense_saving = kDenseShare * kGpuGB * (1.0 / bw[0] - 1.0 / total_bw) * 1000.0;
@@ -103,13 +153,21 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     MgPrice tp{Mechanism::TensorParallel, false, tier.ms - dense_saving + exchange};
     plan.prices = {tier, split, tp};
     plan.pick = Mechanism::ExpertTier;
-    double best = tier.ms;
-    if (plan.equal)
-        for (const MgPrice& p : plan.prices)
-            if (p.runs && p.mechanism != Mechanism::ExpertTier && p.ms < best * kWinMargin) { plan.pick = p.mechanism; best = p.ms; }
-    char buf[256];
-    std::snprintf(buf, sizeof buf, "multi-gpu: %zu cards %s; ms per window: expert tier %.1f, layer split %.1f, tensor parallel %.1f%s; picked %s",
-                  n, plan.equal ? "alike" : "unlike", tier.ms, split.ms, tp.ms, tp.runs ? "" : " (not built)", mechanism_name(plan.pick));
+    double best = tier.runs ? tier.ms : alone;
+    for (const MgPrice& p : plan.prices)
+        if ((plan.equal || (m.split_unlike && p.mechanism == Mechanism::LayerSplit)) && p.runs && p.mechanism != Mechanism::ExpertTier &&
+            p.ms < best * kWinMargin) {
+            plan.pick = p.mechanism;
+            best = p.ms;
+        }
+    if (plan.pick != Mechanism::LayerSplit) plan.cut = 0;
+    char buf[320], head[64] = "", cut[32] = "";
+    if (!tier.runs) std::snprintf(head, sizeof head, "main card alone %.1f, ", alone);
+    if (plan.cut > 0) std::snprintf(cut, sizeof cut, " at layer %d", plan.cut);
+    std::snprintf(buf, sizeof buf, "multi-gpu: %zu cards %s; ms per window: %sexpert tier %.1f%s, layer split %.1f%s, tensor parallel %.1f%s; picked %s%s",
+                  n, plan.equal ? "alike" : "unlike", head, tier.ms, tier.runs ? "" : " (not built)", split.ms,
+                  split.runs ? "" : " (no cut fits)", tp.ms,
+                  tp.runs ? "" : " (not built)", !tier.runs && plan.pick == Mechanism::ExpertTier ? "main card alone" : mechanism_name(plan.pick), cut);
     plan.line = buf;
     return plan;
 }

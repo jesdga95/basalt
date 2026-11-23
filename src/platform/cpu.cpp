@@ -159,6 +159,29 @@ CpuInfo cpu_info() {
     return info;
 }
 
+std::vector<std::vector<int>> cpu_l3_groups() {
+    std::vector<std::vector<int>> groups;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, nullptr, &len);
+    if (len == 0) return groups;
+    std::vector<char> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationCache, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len))
+        return groups;
+    for (DWORD off = 0; off < len;) {
+        const auto* info = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) (buf.data() + off);
+        if (info->Relationship == RelationCache && info->Cache.Level == 3 &&
+            (info->Cache.Type == CacheUnified || info->Cache.Type == CacheData)) {
+            const GROUP_AFFINITY& a = info->Cache.GroupMask;
+            std::vector<int> g;
+            for (int i = 0; i < 64; ++i)
+                if (a.Mask & ((KAFFINITY) 1 << i)) g.push_back((int) a.Group * 64 + i);
+            if (!g.empty()) groups.push_back(std::move(g));
+        }
+        off += info->Size;
+    }
+    return groups;
+}
+
 #else
 // --------------------------------------------------------------------------------------------- Linux
 
@@ -371,6 +394,30 @@ CpuInfo cpu_info() {
     info.physical_cores = (int) cores.size();
     if (info.physical_cores == 0) info.physical_cores = (int) detect_cpu_topology(false).worker_cores.size();
     return info;
+}
+
+std::vector<std::vector<int>> cpu_l3_groups() {
+    std::vector<std::vector<int>> groups;
+    std::set<std::vector<int>> seen;
+    std::vector<char> online, mark;
+    if (!read_cpu_list("/sys/devices/system/cpu/online", online)) return groups;
+    for (size_t c = 0; c < online.size(); ++c) {
+        if (!online[c]) continue;
+        // the cache whose level is 3 among the CPU's index<N> entries
+        for (int idx = 0; idx < 8; ++idx) {
+            const std::string dir = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cache/index" + std::to_string(idx);
+            std::ifstream lv(dir + "/level");
+            int level = 0;
+            if (!(lv >> level)) break;
+            if (level != 3 || !read_cpu_list((dir + "/shared_cpu_list").c_str(), mark)) continue;
+            std::vector<int> g;
+            for (size_t k = 0; k < mark.size(); ++k)
+                if (mark[k]) g.push_back((int) k);
+            if (seen.insert(g).second) groups.push_back(std::move(g));
+            break;
+        }
+    }
+    return groups;
 }
 
 #endif

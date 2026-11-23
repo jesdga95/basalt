@@ -46,7 +46,7 @@ public:
     void release();
 
     const Hparams& hp() const { return hp_; }
-    /// The `projector` the file was opened as (qwen3vl_merger, hy_v4_flash).
+    /// The `projector` the file was opened as (the name its model asked for).
     const std::string& projector() const { return projector_; }
     /// A tensor by name; null when absent.
     const TensorRef* find(const std::string& name) const;

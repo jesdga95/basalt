@@ -1,7 +1,7 @@
 // src/models/hy4flash/dfly_parity.cpp - GPU parity of the DFly2 drafter against a double-precision CPU reference written
-// from the equations of docs/models/hy4-flash/dfly2.md: the four kernels, the tap, and the whole block pass with the
-// sequential heads on small random weights (E = 256, two layers, two heads, a 300-token vocabulary) over random "target"
-// caches and selections. Synthetic: no model, no checkpoint.
+// from the equations in dfly.hpp: the four kernels, the tap, and the whole block pass with the sequential heads on small
+// random weights (the real width E = 3072, the head screen's, with two layers, eight heads and a 300-token vocabulary) over
+// random "target" caches and selections. Synthetic: no model, no checkpoint.
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
@@ -56,6 +56,7 @@ struct Mat {
     std::vector<float> v;   // the rounded values
     uint64_t rows = 0, cols = 0;
     std::vector<uint8_t> q8;   // a projection the drafter keeps in Q8_0: its blocks (the reference's product is then MMVQ's)
+    std::vector<uint8_t> q4;   // one it keeps in Q4_0
 };
 Mat rand_mat(uint64_t rows, uint64_t cols, float sd) {
     Mat m;
@@ -94,8 +95,8 @@ double max_rel(const std::vector<float>& got, const std::vector<double>& want) {
 // ---- the kernels ---------------------------------------------------------------------------------------------------------
 
 void test_kernels() {
+    for (int H : {3, 32})
     for (int rows : {1, 3, 6, 8}) {
-        const int H = 3;
         const Mat kvb = rand_mat((uint64_t) H * kDflyKvbHead, kDflyRank, 0.05f);
         std::vector<float> q((size_t) rows * H * 256), olat((size_t) rows * H * kDflyRank);
         for (float& x : q) x = gauss(1.f);
@@ -123,9 +124,38 @@ void test_kernels() {
                 }
             }
         const double ea = max_rel(download(dqa, wa.size()), wa), eo = max_rel(download(dout, wo.size()), wo);
-        std::printf("kernels rows %d: absorb_k %.2e expand_v %.2e\n", rows, ea, eo);
+        std::printf("kernels heads %d rows %d: absorb_k %.2e expand_v %.2e\n", H, rows, ea, eo);
         CHECK(ea < 1e-5 && eo < 1e-5);
         cudaFree(dkvb); cudaFree(dq); cudaFree(dol); cudaFree(dqa); cudaFree(dout);
+    }
+    {   // absorb_k at the drafter's geometry: microseconds a call and the key rows' bytes over that time
+        const int H = 32;
+        const Mat kvb = rand_mat((uint64_t) H * kDflyKvbHead, kDflyRank, 0.05f);
+        std::vector<float> q((size_t) 8 * H * 256, 0.5f);
+        uint16_t* dkvb = upload(kvb.bits);
+        float *dq = upload(q), *dqa = nullptr;
+        cudaMalloc(&dqa, (size_t) 8 * H * kDflyRank * 4);
+        cudaStream_t bs = nullptr;
+        cudaStreamCreate(&bs);
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        for (int rows : {1, 2, 4, 8}) {
+            constexpr int kCalls = 200;
+            dfly_absorb_k(dkvb, dq, H * 256, 256, rows, H, dqa, nullptr);
+            cudaEventRecord(e0, bs);
+            for (int i = 0; i < kCalls; ++i) dfly_absorb_k(dkvb, dq, H * 256, 256, rows, H, dqa, bs);
+            cudaEventRecord(e1, bs);
+            cudaEventSynchronize(e1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double us = 1e3 * ms / kCalls, bytes = (double) H * kDflyNope * kDflyRank * 2;
+            std::printf("absorb_k heads %d rows %d: %.1f us a call, %.0f GB/s of key rows\n", H, rows, us, bytes / us / 1e3);
+        }
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaStreamDestroy(bs);
+        cudaFree(dkvb); cudaFree(dq); cudaFree(dqa);
     }
     // gather (by cells, and by position) and the gated add
     std::vector<uint16_t> cache(50 * kDflyRowWidth);
@@ -249,6 +279,7 @@ struct Ref {
 
     std::vector<double> mv(const Mat& w, const std::vector<double>& x) const {
         if (!w.q8.empty()) return mvq(w, x);
+        if (!w.q4.empty()) return mvq4(w, x);
         std::vector<double> y(w.rows);
         for (uint64_t r = 0; r < w.rows; ++r) {
             double s = 0;
@@ -285,6 +316,39 @@ struct Ref {
         }
         return y;
     }
+    // a Q4_0 product as MMVQ makes it: x in q8_1 blocks as above, per block d4 (d8 sum(nibble q) - 8 s), s the block's sum
+    // of x kept as fp16 (q8_1's second half)
+    std::vector<double> mvq4(const Mat& w, const std::vector<double>& x) const {
+        const uint64_t nb = w.cols / 32;
+        std::vector<int> qx(w.cols);
+        std::vector<double> dx(nb), sx(nb);
+        for (uint64_t b = 0; b < nb; ++b) {
+            float amax = 0.f;
+            double sum = 0;
+            for (int i = 0; i < 32; ++i) {
+                amax = std::max(amax, std::fabs((float) x[b * 32 + i]));
+                sum += x[b * 32 + i];
+            }
+            const float d = amax / 127.f;
+            for (int i = 0; i < 32; ++i) qx[b * 32 + i] = amax == 0.f ? 0 : (int) std::round((float) x[b * 32 + i] / d);
+            dx[b] = basalt::kernels::f32_from_f16(basalt::kernels::f16_from_f32(d));
+            sx[b] = basalt::kernels::f32_from_f16(basalt::kernels::f16_from_f32((float) sum));
+        }
+        std::vector<double> y(w.rows);
+        for (uint64_t r = 0; r < w.rows; ++r) {
+            double s = 0;
+            for (uint64_t b = 0; b < nb; ++b) {
+                const uint8_t* blk = w.q4.data() + (r * nb + b) * 18;
+                uint16_t dh;
+                std::memcpy(&dh, blk, 2);
+                int dot = 0;
+                for (int i = 0; i < 16; ++i) dot += (blk[2 + i] & 15) * qx[b * 32 + i] + (blk[2 + i] >> 4) * qx[b * 32 + 16 + i];
+                s += (double) basalt::kernels::f32_from_f16(dh) * (dx[b] * dot - 8.0 * sx[b]);
+            }
+            y[r] = s;
+        }
+        return y;
+    }
     std::vector<double> rms(const std::vector<double>& x, const std::vector<float>& w) const {
         double ss = 0;
         for (double v : x) ss += v * v;
@@ -305,7 +369,7 @@ struct Ref {
 
 void test_block() {
     DflyDims d;
-    d.layers = 2; d.E = 256; d.q_lora = 128; d.heads = 8; d.ffn = 192; d.hc_ffn = 96; d.vocab = 300; d.mask_id = 299;
+    d.layers = 2; d.E = 3072; d.q_lora = 128; d.heads = 8; d.ffn = 192; d.hc_ffn = 96; d.vocab = 300; d.mask_id = 299;
     d.topk = 64; d.rms_eps = 1e-5f; d.rope_base = 1e7f;
     d.kv_layers = {4, 6};
     d.idx_layers = {4, 6};
@@ -330,6 +394,10 @@ void test_block() {
                 mat.q8.resize(s.bytes());
                 basalt::core::quantize_bf16_q8_0(mat.bits.data(), mat.bits.size(), mat.q8.data());
                 cudaMemcpy(w.slot(s.name), mat.q8.data(), mat.q8.size(), cudaMemcpyHostToDevice);
+            } else if (s.q4) {   // core::Conv::Bf16ToQ4_0
+                mat.q4.resize(s.bytes());
+                basalt::core::quantize_bf16_q4_0(mat.bits.data(), mat.bits.size(), mat.q4.data());
+                cudaMemcpy(w.slot(s.name), mat.q4.data(), mat.q4.size(), cudaMemcpyHostToDevice);
             } else {
                 cudaMemcpy(w.slot(s.name), mat.bits.data(), mat.bits.size() * 2, cudaMemcpyHostToDevice);
             }
@@ -337,10 +405,14 @@ void test_block() {
         }
     }
     Mat head = rand_mat((uint64_t) d.vocab, (uint64_t) E, 2.0f / std::sqrt((float) E));
+    head.q8.resize((size_t) d.vocab * E / 32 * 34);   // the drafts' head, as the loader rounds it (core::Conv::Bf16ToQ8_0)
+    basalt::core::quantize_bf16_q8_0(head.bits.data(), head.bits.size(), head.q8.data());
+    void* dhead_q8 = upload(head.q8);
+    w.head_q8 = dhead_q8;
+    CHECK(w.pack_screen(nullptr, err));
     std::vector<float> embed((size_t) d.vocab * E);
     for (float& x : embed) x = gauss(1.f);
     Ref r2{d, std::move(rm), std::move(rf), embed, head};
-    uint16_t* dhead = upload(head.bits);
 
     // the target: caches, the tap's row, selections (a list for layer 0, every position for layer 1)
     std::vector<std::vector<uint16_t>> cache(2, std::vector<uint16_t>((size_t) ctx_rows * kDflyRowWidth));
@@ -363,7 +435,6 @@ void test_block() {
 
     DflyRunner::Env env;
     env.w = &w;
-    env.head = dhead;
     env.sel_cap = sel_cap;
     env.embed = [&](int32_t t, float* o) { std::memcpy(o, embed.data() + (size_t) t * E, (size_t) E * 4); return t >= 0 && t < d.vocab; };
     auto run = DflyRunner::create(env, err);
@@ -380,7 +451,23 @@ void test_block() {
         CHECK(began);
         int32_t ids[5];
         float conf[5];
-        CHECK(run->finish(ids, conf, st, err));
+        int made = 0;
+        CHECK(run->finish(ids, conf, made, st, err) && made == n);
+        // the same block, ended before draft n - 1 by `need` (asked with each draft's chance before its head): the drafts
+        // before it and every chance asked are the same bits
+        if (n > 1) {
+            CHECK(run->begin(anchor, pos, n, *tap, 0, caches.data(), st, err));
+            int32_t ids2[5];
+            float conf2[5];
+            int asked = 0, made2 = 0;
+            const auto need = [&](const float* c, int j) {
+                CHECK(c == conf2 && j == asked);
+                ++asked;
+                return j < n - 1;
+            };
+            CHECK(run->finish(ids2, conf2, made2, st, err, nullptr, need) && made2 == n - 1 && asked == n);
+            CHECK(std::equal(ids, ids + n - 1, ids2) && std::memcmp(conf, conf2, sizeof(float) * (size_t) n) == 0);
+        }
 
         // the reference: the same equations in double
         const int R = n + 1;

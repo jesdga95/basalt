@@ -59,6 +59,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `host` | server | address | `127.0.0.1` | Listen address. `0.0.0.0` serves the network; never without `api-key`. |
 | `port` | server | integer | `8080` | TCP port. |
 | `api-key` | command line | string | none | Require this key on `/v1/*` (`Authorization: Bearer` or `x-api-key`). Command line only. |
+| `api-key-file` | command line | path | none | Read that key from the first line of this file, which keeps it out of the process list. Not with `api-key`. Command line only. |
 | `allowed-host` | server | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. |
 | `cors-origin` | server | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
 | `fit-max-tokens` | entry | switch | off | Clamp `max_tokens` to the remaining context instead of a 400. |
@@ -90,7 +91,7 @@ Command line `--name`; the Where column says which config block takes it.
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
-| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16`; Qwen3.8-27B: `fp16`, `int8` | Flash-Next `fp16`, DeepSeek `fp8`, Qwen3.8-27B `fp16` | KV storage. Qwen3.8-27B: `int8` takes about half of `fp16`'s memory per position ([guide](../models/qwen38-27b.md#memory)). Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). A model refuses the other's values. |
+| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16`; Qwen3.8-27B: `fp16`, `int8`; Inkling 2 Mini: `fp16`, `fp8` | Flash-Next `fp16`, DeepSeek `fp8`, Qwen3.8-27B `fp16`, Inkling 2 Mini `fp16` | KV storage. Qwen3.8-27B: `int8` takes about half of `fp16`'s memory per position ([guide](../models/qwen38-27b.md#memory)). Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). Inkling 2 Mini: `fp8` halves the full-attention caches (E4M3, unit scale; [guide](../models/inkling2.md#memory)). A model refuses the other's values. |
 | `kv-resident` | engine | cells (Flash-Next: min 20,480) or `0` | 0 | Flash-Next and Qwen3.8-27B. Keep N cells of KV in VRAM and the rest in pinned RAM. Flash-Next: with `parallel` and `kv` `int8`, every slot streams its own K/V this way. Qwen3.8-27B: each attention layer keeps its first N positions on the card and every decoded token reads the rest over the bus, so decode slows with each one ([guide](../models/qwen38-27b.md#memory)); output is unchanged. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next and Qwen3.8-27B. Extend past the trained length (Qwen3.8-27B: `--max-context` up to 262,144 x `rope-scale`). Fixed for the run, and it changes every position's rotation, short prompts too ([precision](../precision/qwen38-27b.md#context-past-262144)). |
 | `rope-scale` | engine | number | model's, else 1 | Flash-Next and Qwen3.8-27B. Factor for `linear` and `yarn`. |
@@ -104,13 +105,13 @@ Command line `--name`; the Where column says which config block takes it.
 | `vram-reserve-mib` | engine | MiB, at least 256 (128 on Linux) | 700 (lowered to 300 on a card with too few slots) | VRAM kept free on the main card for graphs, scratch and the head. Raised to the floor the kernels need (`--parallel 4` on Linux: at least 320). |
 | `resident-experts` | engine | switch | on with a profile | Flash-Next only. Keep experts the GPU does not hold in page-locked RAM. Falls back to a file mapping when RAM is short. |
 | `resident-budget-gib` | engine | GiB | auto | At most N GiB of experts in RAM, hottest first. |
-| `mmap-experts` | engine | switch | off | Flash-Next only. Use a file mapping instead of the RAM copy. |
+| `mmap-experts` | engine | switch | off | Flash-Next only. Use a file mapping instead of the RAM copy. The first rounds after a restart run slower while pages fault in, so drop them from benchmarks. |
 | `shared-expert-arena` | engine | file path | off | Flash-Next only. One shared file for the resident arena across processes (put it on `/dev/shm`). |
 | `expert-profile` | engine | file | `data/profiles/<arch>-<layers>x<experts>.prof` | Which experts start in VRAM. |
 | `expert-profile-save` | engine | file | off | Flash-Next only. Save the learned placement on exit and periodically; a start places from it. Needs the adaptive tier. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | Flash-Next only. Save period. |
 | `resident-cpu-experts` | engine | switch | off (implied by `resident-experts`) | Flash-Next only. With `mmap-experts`: keep RAM-resident experts in ordinary RAM. |
-| `vram-elastic` | engine | switch | off | Flash-Next only. Hold the expert cache in segments so `POST /v1/vram` can lend VRAM between requests. |
+| `vram-elastic` | engine | switch | off | Flash-Next only. Hold the expert cache in segments so `POST /v1/vram` can lend VRAM between requests ([queued while a request runs](../running.md#lending-vram-post-v1vram)). |
 | `vram-segment-mib` | engine | MiB, at least 64 | 512 | Flash-Next only. Segment size for `vram-elastic`. |
 | `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. A count is honoured exactly or the start is refused with a one-line message (what fits, the free VRAM, the reserve); it is never trimmed. |
 | `ram-reserve-mib` | engine | MiB | 2048 | RAM left free for the rest of the system. The expert tiers take what is above it after the engine's own host buffers, and the serving RAM guard holds it. `0` keeps nothing and turns the guard off. [memory floors](../running.md#memory-floors) |
@@ -135,7 +136,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `spec` | engine | integer | 8 (MTP), 6 (DSpark), 16 (Qwen3.8-27B), else 0 | Verify windows of at most N tokens (Qwen3.8-27B: up to 16). `0` or `1` turns it off. |
+| `spec` | engine | integer | 8 (MTP), 6 (DSpark), 16 (Qwen3.8-27B), 8 (Inkling 2 Mini's DSpark), else 0 | Verify windows of at most N tokens (Qwen3.8-27B: up to 16). `0` or `1` turns it off. |
 | `draft-experts` | engine | 32, 64, 96, 128, or 0 | 32 | DeepSeek only. Experts each drafter stage keeps (`0` = all 128). |
 | `suffix-draft` | engine | tokens | 3 (`0` = the drafter only) | Flash-Next and Qwen3.8-27B. Prompt lookup: fill a window from an earlier repeat of at least N tokens. Its index takes host RAM by `max-context`: 64 MiB per slot at 262,144 tokens. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Flash-Next only. Caps the MTP's own windows. |
@@ -148,7 +149,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. With `kv-resident`, each slot keeps only those cells in VRAM. |
+| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. Flash-Next needs `kv` `int8` for N above 1 (another format stops the start, naming it). With `kv-resident`, each slot keeps only those cells in VRAM. |
 | `slot-full-context` | entry | switch | off | Give every slot the whole `max-context`, at N times the KV. |
 
 ## Conversation cache

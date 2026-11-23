@@ -2,7 +2,8 @@
 
 Sent only for a request with tools or a JSON response format, and only when the server option is on or the request
 sets strict: true on the schema or on a tool function. A JSON format with tools offered (tool_choice auto) holds the
-answer to tool calls or the JSON value; a forced call keeps the tools grammar alone."""
+answer to tool calls or the JSON value; a forced call keeps the tools grammar alone. For a model that thinks in blocks
+of its reply, a request whose thinking is off also says "think": false (Service.run): it answers at once."""
 from __future__ import annotations
 
 import json

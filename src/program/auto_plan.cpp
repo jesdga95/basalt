@@ -1,6 +1,8 @@
 // src/program/auto_plan.cpp - see auto_plan.hpp.
 #include "basalt/program/auto_plan.hpp"
 
+#include "basalt/kernels/cpu/pool.hpp"
+
 #include <algorithm>
 #include <cstdio>
 
@@ -19,19 +21,10 @@ const char* auto_affinity_name(AutoAffinity a) {
 }
 
 int auto_pool_workers(const AutoInputs& in, AutoAffinity affinity) {
-    int n = in.worker_cores;
-    if (in.hybrid && affinity != AutoAffinity::All) {
-        // The P-cores but the host's. The auto affinity adds half the E-cores: they run the expert kernels slower,
-        // but a layer's CPU share is split into many small tasks, so each one still shortens it.
-        n = (std::max)(1, in.p_cores - 1);
-        if (affinity == AutoAffinity::Auto) n += in.e_cores / 2;
-    }
-    // A CPU quota throttles the whole group once spent: the workers and the host thread together must fit it.
-    if (in.cpu_quota > 0) {
-        const int fit = (std::max)(1, (int) in.cpu_quota - 1);
-        if (fit < n) n = fit;
-    }
-    return (std::max)(1, n);
+    return basalt::kernels::cpu::auto_pool_workers(in.worker_cores, in.p_cores, in.e_cores, in.hybrid, in.cpu_quota,
+                                                   affinity == AutoAffinity::All ? basalt::kernels::cpu::PoolAffinity::All
+                                                   : affinity == AutoAffinity::PCores ? basalt::kernels::cpu::PoolAffinity::PCores
+                                                                                      : basalt::kernels::cpu::PoolAffinity::Auto);
 }
 
 AutoPlan choose_auto(const AutoInputs& in) {

@@ -134,6 +134,8 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     s.diag_tier_ram = diag_tier_ram_;
     s.diag_tier_vram = diag_tier_vram_;
     s.diag_tier_frozen = tiers_.diag_tier_frozen;
+    s.route_tail_skip = tiers_.route.tail_skip;
+    s.route_prior = tiers_.route.prior;
     s.vram_reserve_mib = tiers_.vram_reserve_mib;
     s.peer_reserve_mib = tiers_.peer_reserve_mib;
     s.expert_cache = tiers_.expert_cache;

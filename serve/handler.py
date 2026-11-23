@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -39,6 +40,15 @@ CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unlo
 # What this server offers beyond the OpenAI, Anthropic and llama.cpp APIs, listed under /props "basalt"
 CAPABILITIES = ["answer_now", "logprobs", "documents"]
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
+# The longest a connection may stay silent before its handler thread gives it up. Without one, a client whose
+# connection died without a close (a laptop sleeping, a link dropping mid-body) left the thread blocked in
+# rfile.read() for the life of the server: the request never reached the engine and the thread was lost. It is a
+# per-read deadline, not a total one - a slow client that keeps sending bytes is never cut off. A header read that
+# expires is ended by handle_one_request itself; a body that stops arriving is the 408 in _body.
+HTTP_BODY_S = 60.0
+# Anthropic clients add /v1/messages to their base URL themselves, so a base URL that already ends in /v1 makes them
+# post /v1/v1/messages. These two paths mean the same as the real ones; nothing else is aliased.
+V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
 
 
 class BadBody(Exception):
@@ -47,6 +57,12 @@ class BadBody(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+def request_path(target: str) -> str:
+    """The route of a request target: no query, no trailing slash, and a doubled /v1 of the two Anthropic paths undone."""
+    path = target.split("?")[0].rstrip("/")
+    return V1_V1_ALIASES.get(path, path)
 
 
 def _size_text(n: int) -> str:
@@ -59,6 +75,8 @@ def make_handler(target: Service | Router):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        timeout = HTTP_BODY_S                               # StreamRequestHandler.setup puts it on the connection:
+        # every header, body read and write carries the deadline, so no half-open client holds a thread forever
 
         watch_done = None                                   # stops this request's disconnect watcher
         cancel = None                                       # set when the client left
@@ -67,9 +85,11 @@ def make_handler(target: Service | Router):
         live = None                                         # this request's entry in router.live (answer now)
 
         # a request's session identity, the headers a load balancer names its flows by (tinyllb's order), then the
-        # request body's own field; the slot the engine runs a conversation in follows it.  Deliberately not here:
-        # x-client-request-id, which identifies one request and would give every turn a session of its own.
-        SESSION_HEADERS = ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity")
+        # request body's own field; the slot the engine runs a conversation in follows it.  The grok build CLI names
+        # its conversations with x-grok-conv-id / x-grok-session-id on every request, to any base URL.  Deliberately
+        # not here: x-client-request-id, which identifies one request and would give every turn a session of its own.
+        SESSION_HEADERS = ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity",
+                           "x-grok-conv-id", "x-grok-session-id")
 
         def _session_id(self, req) -> str | None:
             """The conversation this request belongs to, or None when it names no session (admission is prompt-only)."""
@@ -115,12 +135,29 @@ def make_handler(target: Service | Router):
             te = self.headers.get("Transfer-Encoding", "") or ""
             return te.split(",")[-1].strip().lower() == "chunked"
 
+        def _read(self, n: int) -> bytes:
+            """rfile.read with the stalled client named: the handler's timeout (HTTP_BODY_S) turns a connection that
+            stopped arriving into a 408 and gives the thread back, instead of holding it for the life of the server."""
+            try:
+                return self.rfile.read(n)
+            except (TimeoutError, OSError) as e:
+                self.close_connection = True
+                raise BadBody(408, "the request body stopped arriving") from e
+
+        def _readline(self, n: int) -> bytes:
+            """rfile.readline under the same deadline."""
+            try:
+                return self.rfile.readline(n)
+            except (TimeoutError, OSError) as e:
+                self.close_connection = True
+                raise BadBody(408, "the request body stopped arriving") from e
+
         def _read_chunked(self, limit: int, keep: bool = True) -> bytes:
             """Decode a chunked body: at most `limit` bytes (413 beyond it; the size is checked before a chunk is
             read, so a huge announced chunk is never allocated), 400 for a malformed one. keep=False drops it."""
             parts, total = [], 0
             while True:
-                line = self.rfile.readline(1025)
+                line = self._readline(1025)
                 if not line.endswith(b"\n"):
                     raise BadBody(400, "malformed chunked request body")
                 try:
@@ -131,7 +168,7 @@ def make_handler(target: Service | Router):
                     raise BadBody(400, "malformed chunk size in the request body")
                 if size == 0:
                     for _ in range(64):                       # the trailers, up to the blank line
-                        if self.rfile.readline(8193).strip() == b"":
+                        if self._readline(8193).strip() == b"":
                             break
                     return b"".join(parts)
                 total += size
@@ -140,13 +177,13 @@ def make_handler(target: Service | Router):
                     raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
                 left = size
                 while left > 0:
-                    piece = self.rfile.read(min(left, 1 << 20))
+                    piece = self._read(min(left, 1 << 20))
                     if not piece:
                         raise BadBody(400, "the chunked request body ended early")
                     left -= len(piece)
                     if keep:
                         parts.append(piece)
-                if self.rfile.read(2) != b"\r\n":
+                if self._read(2) != b"\r\n":
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
@@ -163,7 +200,7 @@ def make_handler(target: Service | Router):
             if length > limit:
                 self.close_connection = True
                 raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
-            return self.rfile.read(length)
+            return self._read(length)
 
         def _foreign_page(self) -> bool:
             """Without an API key, refuse a /v1 POST from another site's page: its Origin must be allowed (no Origin
@@ -266,7 +303,7 @@ def make_handler(target: Service | Router):
 
         def _stream_error(self, obj) -> None:
             """An error after the stream's headers went out (a request that waited for a swap), in the API's own form."""
-            path = self.path.split("?")[0].rstrip("/")
+            path = request_path(self.path)
             err = obj.get("error") if isinstance(obj.get("error"), dict) else {"message": str(obj)}
             if path == "/v1/messages":
                 data = b"event: error\ndata: " + json.dumps({"type": "error", "error": err}, ensure_ascii=False).encode() + b"\n\n"
@@ -288,6 +325,10 @@ def make_handler(target: Service | Router):
             self.end_headers()
             self.wfile.write(body)
 
+        def _died(self, e) -> str:
+            """An engine error's message; the restart hint applies while the server runs."""
+            return str(e) if router.stopping else f"{e}; the next request restarts it"
+
         def _authorized(self) -> bool:
             if not svc.api_key:
                 return True
@@ -299,7 +340,7 @@ def make_handler(target: Service | Router):
             return False
 
         def do_GET(self):
-            path = self.path.split("?")[0].rstrip("/")
+            path = request_path(self.path)
             if path.startswith("/fonts/"):
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
@@ -317,7 +358,7 @@ def make_handler(target: Service | Router):
             if path.startswith("/web/"):
                 name = path[len("/web/"):]
                 types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                         ".svg": "image/svg+xml"}
+                         ".svg": "image/svg+xml", ".png": "image/png"}
                 f = ROOT / "serve" / "web" / name
                 ext = os.path.splitext(name)[1]
                 if "/" in name or "\\" in name or ext not in types or not f.is_file():
@@ -393,7 +434,7 @@ def make_handler(target: Service | Router):
         def do_POST(self):
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
+            path = request_path(self.path)   # clients post /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path in ("/unload", "/load") and not self._control_body():
@@ -477,7 +518,8 @@ def make_handler(target: Service | Router):
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
                     try:
-                        self._json(200, router.vram(r))
+                        out = router.vram(r)
+                        self._json(202 if out.get("status") == "pending" else 200, out)
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
@@ -525,7 +567,7 @@ def make_handler(target: Service | Router):
             except (GpuBusy, EngineStarting) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._json(503, {"error": {"type": "server_error", "message": self._died(e)}})
             except EngineStuck as e:                         # the engine could not be ended
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except ClientGone:                               # it left while queued
@@ -698,7 +740,7 @@ def make_handler(target: Service | Router):
                 cancel.set()                                 # client left: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                err = {"error": {"type": "server_error", "message": self._died(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # engine ERR after the stream started: no 400 now
                 err = {"error": {"type": "server_error", "message": str(e)}}
@@ -719,20 +761,23 @@ def make_handler(target: Service | Router):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
-                                            session=self._session_id(req), live=self.live):
-                    if kind == "ping":
-                        yield None
-                    elif kind == "event":
-                        yield from asm.feed(x)
-                    elif kind == "logprobs":
-                        asm.logprob(*x)
-                    elif kind == "done":
-                        done = x
+                with closing(self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                          session=self._session_id(req), live=self.live)) as inference:
+                    for kind, x in inference:
+                        if kind == "ping":
+                            yield None
+                        elif kind == "event":
+                            yield from asm.feed(x)
+                        elif kind == "logprobs":
+                            asm.logprob(*x)
+                        elif kind == "done":
+                            done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done)
+
+            generation = events()
             try:
-                items = primed(events(), ids)
+                items = primed(generation, ids)
             except EngineError:
                 raise
             except ValueError as e:                          # too long for the context: found when the engine counted
@@ -742,7 +787,7 @@ def make_handler(target: Service | Router):
                 try:
                     result = responses_api.collect(items)
                 except EngineDied as e:
-                    return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
+                    return self._json(503, responses_error_body(self._died(e), "server_error",
                                                                 code="server_error"))
                 except EngineError as e:                     # the engine failed
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
@@ -750,7 +795,6 @@ def make_handler(target: Service | Router):
                     err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
                     return self._json(err.status, err.body())
                 return self._json(200, result)
-            self._sse()
             last = time.monotonic()
 
             def send(e):
@@ -758,6 +802,7 @@ def make_handler(target: Service | Router):
                                  json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
 
             try:
+                self._sse()
                 for e in items:
                     if e is None:
                         # clients' idle timers count events, not SSE comments: send in_progress every 15 s
@@ -772,11 +817,16 @@ def make_handler(target: Service | Router):
                     self.wfile.flush()
             except OSError:
                 cancel.set()                                 # client left: stop the engine
-                items.close()
             except EngineDied as e:                          # mid-stream: response.failed
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+                self._responses_failed(asm, self._died(e), "server_error", send)
             except ValueError as e:                          # engine ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+            finally:
+                try:
+                    items.close()
+                finally:
+                    # A primed replay may never have started if writing the headers failed.
+                    generation.close()
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -906,7 +956,7 @@ def make_handler(target: Service | Router):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: an Anthropic error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                err = {"type": "error", "error": {"type": "api_error", "message": self._died(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # engine ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}

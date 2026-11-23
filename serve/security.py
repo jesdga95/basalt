@@ -32,6 +32,19 @@ def api_key_of(value) -> str:
     return key.strip()
 
 
+def api_key_from_file(path: str) -> str:
+    """The key in the first line of `path`. A file that cannot be read, or whose first line holds no key, raises
+    ValueError: it never means "no key"."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            line = f.readline()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f"--api-key-file {path}: {e}") from None
+    if not line.strip():
+        raise ValueError(f"--api-key-file {path}: no key in its first line")
+    return line
+
+
 def key_matches(given: str, key: str) -> bool:
     """`given` is a header's value as http.server read it, each byte one character. A key with characters outside
     ASCII arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms.
