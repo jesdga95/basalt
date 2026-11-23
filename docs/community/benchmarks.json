@@ -4069,7 +4069,7 @@
       "kv": "fp16",
       "prefill_16k_tps": 12714.1,
       "prefill_64k_tps": 10494.6,
-      "decode_tps": 537.1,
+      "decode_tps": 536.1,
       "decode_conv_tps": 357.9,
       "decode_struct_tps": 633.0,
       "decode_prose_tps": 294.5,
