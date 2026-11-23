@@ -5,7 +5,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 ## Summary
 
 - **Against the reference:** the default pack (`NVFP4-MX8`, the release's MXFP8 experts native) scores mean KLD 0.00297 and top-1 97.83% over 100 chunks, and 0.00303 and 97.72% with its RAM experts on the CPU; the `NVFP4-DQ8` pack 0.00305 and 97.76% ([below](#against-the-reference)).
-- **INT8 KV:** on the DQ8 pack, the original 100-chunk result scored mean KLD 0.00344 with 97.79% top-1; its row is 144 bytes versus 256 for FP16.
+- **INT8 KV:** on the DQ8 pack, the final rebased 100-chunk run scored mean KLD 0.00343 with 97.47% top-1; its row is 144 bytes versus 256 for FP16.
 - **At 256k context:** FP8 saves 4.25 GiB and INT8 saves 3.74 GiB of total VRAM versus FP16 with the same expert placement ([measurements](#earlier-vram-use-at-256k-context)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
@@ -77,7 +77,9 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 
 | Run | Mean KLD | Top-1 | PPL |
 | --- | ---: | ---: | ---: |
-| DQ8 pack, 100 chunks, `--kv fp16` | 0.00305 | 97.76% | 7.0695 (base 7.0633 over the scored rows) |
+| DQ8 pack, 100 chunks, `--kv fp16` (final rebased build, 475 W) | 0.00304 | 97.81% | 7.0737 (base 7.0644 on these rows) |
+| DQ8 pack, 100 chunks, `--kv fp8` (final rebased build, 475 W) | 0.00452 | 97.04% | 7.0766 (base 7.0644 on these rows) |
+| DQ8 pack, 100 chunks, `--kv int8` (final rebased build, 475 W) | 0.00343 | 97.47% | 7.0788 (base 7.0644 on these rows) |
 | DQ8 pack, 100 chunks, `--kv fp8` (pre-rebase result) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | DQ8 pack, 100 chunks, `--kv int8` (pre-rebase result) | 0.00344 | 97.79% | 7.0762 (base 7.0644) |
 | DQ8 pack, 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
@@ -91,11 +93,11 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | 100 chunks, `--kv fp8` (#552's build) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | 100 chunks, `--kv fp16` (#552's build), the same set of runs as the two rows above | 0.00310 | 97.78% | 7.0695 (base 7.0644) |
 
-RTX 5090 at 475 W, the whole model on the card, unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 quality/KLD values above predate this rebase; KLD was not rerun because the reference corpus is unavailable.
+The final rebased quality rows above use the DQ8 pack `/mnt/storage/Projects/basalt/models/Inkling-2-Mini-NVFP4-q8.basalt` and the BF16-derived reference `/mnt/storage/kld/inkling2-q6cr-eval/inkling2-bf16-base.kld`, with the same 100 wikitext-2 chunks (25,500 scored rows), T=3, and RTX 5090 power limit 475 W. The scored-row base PPL was 7.0644 for each run. Earlier quality rows and 256K VRAM readings were measured at 400 W unless noted. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512).
 
 ## Rebased decode: INT8 vs FP8
 
-One cold process per measurement, same standard `conv` prompt, fixed seed 20261122, `--max-context 32768`, `--spec 5`, and `--expert-cache 3072`; each run generated 1,200 tokens. ABBA order was INT8, FP8, FP8, INT8. Throughput is end-to-end generation throughput; acceptance varied between runs, so this is not an isolated KV-kernel comparison.
+RTX 5090 at 475 W. One cold process per measurement, same standard `conv` prompt, fixed seed 20261122, `--max-context 32768`, `--spec 5`, and `--expert-cache 3072`; each run generated 1,200 tokens. ABBA order was INT8, FP8, FP8, INT8. Throughput is end-to-end generation throughput; acceptance varied between runs, so this is not an isolated KV-kernel comparison.
 
 | Run | KV format | tok/s | Accept % | Draft len |
 | --- | --- | ---: | ---: | ---: |
@@ -108,9 +110,32 @@ One cold process per measurement, same standard `conv` prompt, fixed seed 202611
 
 FP8 was 1.6% faster in this short-context decode ABBA.
 
+## Pinned-placement decode windows
+
+Three `basalt-bench -t conv -r 3` repetitions per format, same q8 pack, seed 20261122, 32K context, speculative depth 5, and 3,070 expert slots on the RTX 5090 at 475 W. Every run reported 99.9998% VRAM expert hits. These are end-to-end verify-window measurements; draft acceptance differed across formats, so they do not isolate KV kernel cost.
+
+| KV format | Mean tok/s | Mean ms/window | Mean passes/s | Mean acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 402.9 | 5.53 | 181.0 | 70.2% |
+| FP8 | 386.4 | 5.40 | 185.4 | 64.6% |
+| INT8 | 387.9 | 5.26 | 190.3 | 67.6% |
+
+A kernel-only timing from `inkling2_kernels_parity`, one row and 2,998 keys on the same RTX 5090 at 475 W: FP16 12.5 µs, FP8 10.1 µs, INT8 11.7 µs. CUDA 13.3 `nvcc --time` phase durations for the changed translation units are listed below.
+
 ## 16K prefill memory check
 
-The standard prefill fixture requested with `-p 16384` contains 15,810 tokens. Each run used `--max-context 32768`, `--max-new 1`, and `--spec 0`. The FP16 illegal access reproduced on the PR before the fix; current main and the fixed PR both pass FP16.
+RTX 5090 at 475 W. The standard prefill fixture requested with `-p 16384` contains 15,810 tokens. Each run used `--max-context 32768`, `--max-new 1`, and `--spec 0`. The FP16 illegal access reproduced on the PR before the fix; current main and the fixed PR both pass FP16. These are single-run historical tok/s figures, so the apparent 3.3% FP8 drop remains unresolved without repeated pinned-placement `basalt-bench` window latency and passes/s.
+
+CUDA 13.3 `nvcc --time` phase durations for the changed translation units (cicc / ptxas, ms; sm_120):
+
+| File | cicc | ptxas |
+| --- | ---: | ---: |
+| `attn.cu` | 2282.8 | 1294.7 |
+| `attn_prompt.cu` | 569.8 | 179.1 |
+| `glue.cu` | 777.2 | 281.3 |
+| `ops.cu` | 604.4 | 294.2 |
+| `prompt_ops.cu` | 396.4 | 154.0 |
+| `kv_int8_parity.cu` | 316.8 | 20.8 |
 
 | Revision | KV format | Prefill tok/s | Result |
 | --- | --- | ---: | --- |
@@ -123,9 +148,9 @@ The standard prefill fixture requested with `-p 16384` contains 15,810 tokens. E
 
 The regression was specific to the PR branch's FP16 staging allocation: it used the 144-byte INT8 row size instead of FP16's 256-byte row size. Sizing staging for the widest format fixes it.
 
-## Fully resident context
+## Fully resident 512K capacity
 
-Both KV formats reached the model's full native 512K context (`--max-context 524288`) with the same q8 model and `--expert-cache 3072`; `--kv-resident` was left at its default, so KV remained fully resident. Each generated the 1,200-token fixture without an allocation error.
+These runs allocated the full native 512K cache (`--max-context 524288`) on the RTX 5090 at 475 W, with the same q8 model and `--expert-cache 3072`; `--kv-resident` stayed at its default, so the cache remained fully resident. The 12-token `conv.ids` prompt started generation near position 12, and each run generated 1,200 tokens (ending near position 1,212). They demonstrate resident capacity, not decoding at position 524,288.
 
 | KV format | Decode tok/s | Accept % | Draft len | Result |
 | --- | ---: | ---: | ---: | --- |
@@ -134,7 +159,7 @@ Both KV formats reached the model's full native 512K context (`--max-context 524
 
 ## Earlier VRAM use at 256k context
 
-Measured after `READY 262144`, before a prompt, on an RTX 5090. The full context capacity was allocated at startup; expert placement used `--expert-cache 3072` (3,070 GPU slots and 2 in RAM). Idle `nvidia-smi` use was 1,895 MiB.
+Measured after `READY 262144`, before a prompt, on an RTX 5090 at 400 W. The full context capacity was allocated at startup; expert placement used `--expert-cache 3072` (3,070 GPU slots and 2 in RAM). Idle `nvidia-smi` use was 1,895 MiB.
 
 | KV format | Total VRAM used | Above idle | Saved vs FP16 |
 | --- | ---: | ---: | ---: |
