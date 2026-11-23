@@ -764,15 +764,11 @@ public:
         // only once no copy is left: the reserve is the copies' target, not a floor the caches stop at)
         const int64_t before = m_.card_copies();
         const auto make_room = [&] {   // false: a demote failed (the model is wedged then)
-            while (m_.promoted() > 0 && m_.room() < grow + keep_free) {
-                uint64_t freed = 0;
-                if (!feed_heat() || !m_.demote(grow + keep_free - m_.room(), freed)) {
-                    err = "the caches cannot grow: the expert copies could not go back to RAM";
-                    return false;
-                }
-                if (freed == 0) break;
-            }
-            return true;
+            if (give_back(grow + keep_free, [&] { return m_.room(); }, [&] { return m_.promoted(); },
+                          [&](uint64_t b, uint64_t& freed) { return feed_heat() && m_.demote(b, freed); }))
+                return true;
+            err = "the caches cannot grow: the expert copies could not go back to RAM";
+            return false;
         };
         const auto log_grow = [&](bool ok) {
             if (m_.card_copies() != before || m_.wedged())

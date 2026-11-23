@@ -61,4 +61,17 @@ struct CopyLayout {
 };
 CopyLayout copy_layout(const std::vector<uint64_t>& strides, uint64_t gran);
 
+/// Sends copies back until `room()` counts `free` bytes: `demote(bytes, freed)` gives back at least `bytes`, the lowest
+/// ranked copies first, and sets what it freed. Stops when `copies()` is 0 or a step frees nothing; false when a step
+/// failed.
+template <class Room, class Copies, class Demote>
+bool give_back(uint64_t free, Room room, Copies copies, Demote demote) {
+    while (copies() > 0 && room() < free) {
+        uint64_t freed = 0;
+        if (!demote(free - room(), freed)) return false;
+        if (freed == 0) break;
+    }
+    return true;
+}
+
 }  // namespace basalt::models::inkling2

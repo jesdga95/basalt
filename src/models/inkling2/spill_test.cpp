@@ -1,6 +1,6 @@
 // src/models/inkling2/spill_test.cpp - the spill plan: nothing leaves when nothing is needed, the coldest experts leave
-// first, slots are a permutation with the kept experts first, and the bytes it frees cover what was asked net of the shared
-// staging and the rounding.
+// first, slots are a permutation with the kept experts first, the bytes it frees cover what was asked net of the shared
+// staging and the rounding, and copies go back until a keep is free.
 #include "models/inkling2/spill.hpp"
 
 #include <cstdio>
@@ -85,6 +85,47 @@ int main() {
         }
         // copies 0 and 1 share granule 2: dropping copy 1 alone frees granules 3..4, not granule 2
         expect(c.pages(1) == 3 && c.pages(2) == 5, "a shared granule stays while a copy uses it");
+    }
+    {   // give_back: a fake room and copies ranked hottest first; a demote drops the coldest until enough granules are free
+        const uint64_t G = 2u << 20, copy = 3u << 20;   // copies straddle granules, so a drop may free one or two
+        struct Card {
+            CopyLayout lay;
+            int64_t n = 0;
+            uint64_t mapped = 0, room = 0;
+            int calls = 0;
+        };
+        const auto fill = [&](Card& c, int64_t n, uint64_t room) {
+            c.lay = copy_layout(std::vector<uint64_t>((size_t) n, copy), G);
+            c.n = n;
+            c.mapped = c.lay.pages(n);
+            c.room = room;
+            c.calls = 0;
+        };
+        const auto run = [](Card& c, uint64_t free, bool fail = false) {
+            return give_back(free, [&] { return c.room; }, [&] { return c.n; }, [&](uint64_t bytes, uint64_t& freed) {
+                ++c.calls;
+                if (fail) return false;
+                c.n = c.lay.keep_for(c.n, c.mapped, bytes);
+                freed = (c.mapped - c.lay.pages(c.n)) * G;
+                c.mapped -= freed / G;
+                c.room += freed;
+                return true;
+            });
+        };
+        const uint64_t keep = 512ull << 20;
+        Card c;
+        fill(c, 300, 7ull << 20);   // a refused map: the card read again holds 7 MiB, not the counted room
+        expect(run(c, keep) && c.room >= keep, "shortage: copies go back until the keep is free");
+        expect(c.n < 300 && c.n > 0, "shortage: only as many copies as the keep needs");
+        expect(c.room - G * 2 < keep, "shortage: the fewest copies go (one more drop frees at most two granules)");
+        const int64_t after = c.n;
+        expect(run(c, keep) && c.n == after, "a second pass with the keep free changes nothing");
+        fill(c, 300, keep + G);
+        expect(run(c, keep) && c.n == 300 && c.calls == 0, "no shortage: no demote, the set stays");
+        fill(c, 4, 0);
+        expect(run(c, keep) && c.n == 0 && c.room < keep, "every copy back and still short: stops with none left");
+        fill(c, 4, 0);
+        expect(!run(c, keep, true) && c.calls == 1, "a failed demote stops and says so");
     }
     if (failures) return 1;
     std::printf("spill plan: ok\n");

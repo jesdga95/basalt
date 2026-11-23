@@ -886,7 +886,11 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         moved += stride;
     }
     if (join_placement()) trim_copies();   // a step that stopped part-way leaves no granule behind
-    if (map_short_) sync_room();
+    if (map_short_) {   // the count follows the card, and copies go back until it keeps `keep_free` free again
+        sync_room();
+        give_back(keep_free, [&] { return room(); }, [&] { return promoted(); },
+                  [&](uint64_t bytes, uint64_t& freed) { return demote(bytes, freed); });
+    }
     return moved;
 }
 

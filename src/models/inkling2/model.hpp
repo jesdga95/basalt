@@ -109,7 +109,8 @@ public:
     /// made (not --expert-cache), static or elastic.
     bool copies() const { return has_spill_ && flags_.expert_cache <= 0; }
     /// Copies RAM experts to the card, the highest ranked first (copy_heat.hpp), while `keep_free` bytes stay free; their
-    /// blob table entries point at the copies. Bytes copied.
+    /// blob table entries point at the copies. A map the card refuses reads the card again, and copies go back, the lowest
+    /// ranked first, until `keep_free` is free. Bytes copied.
     uint64_t promote(uint64_t keep_free);
     /// One warning when the last promote found less free memory than counted: placement then follows a fresh reading of
     /// the card, not the requests alone.
