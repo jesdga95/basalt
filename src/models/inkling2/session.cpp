@@ -652,7 +652,9 @@ public:
         if (!m_.copies()) return {};
         if (cudaStreamSynchronize(stream_) != cudaSuccess || !feed_heat()) return wedged();
         if (low && !recall_loan(-1)) return wedged();
-        if (!m_.lend(low)) return {model::Status::Error, "inkling2: the expert copies could not go back to RAM"};
+        if (!m_.lend(low))
+            return {model::Status::Error, low ? "inkling2: the expert copies could not go back to RAM"
+                                              : "inkling2: the expert copies could not come back to the card"};
         expert_slots = expert_pairs() - m_.spill().spilled + m_.promoted();
         return {};
     }
