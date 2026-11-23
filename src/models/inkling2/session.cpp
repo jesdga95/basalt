@@ -207,6 +207,9 @@ public:
     ~Session() override {
         if (stream_) cudaStreamSynchronize(stream_);
         if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
+        if (sh_ && sh_->cpu)   // the streams' merges have run: the abort's drain stops watching them before they go
+            for (const Lane& k : lane_)
+                if (k.stream) sh_->cpu->forget_stream(k.stream);
         if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {

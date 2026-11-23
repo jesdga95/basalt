@@ -31,6 +31,9 @@ public:
     void finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream);
     /// Before a window that calls start: the doorbell's thread spins from here instead of napping.
     void wake();
+    /// After `stream`'s last finish has run and before it is destroyed: the abort's drain stops watching it. Waits for a
+    /// drain in progress.
+    void forget_stream(cudaStream_t stream);
 
 private:
     struct Impl;

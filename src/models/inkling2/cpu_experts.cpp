@@ -76,25 +76,13 @@ struct CpuExperts::Impl {
     std::mutex nap_mu;
     std::condition_variable nap_cv;
     int device = 0;
-    std::mutex streams_mu;
-    std::vector<cudaStream_t> merge_streams;       // the streams whose windows wait on `done`
-
-    void note_stream(cudaStream_t s) {
-        std::lock_guard<std::mutex> lk(streams_mu);
-        if (std::find(merge_streams.begin(), merge_streams.end(), s) == merge_streams.end()) merge_streams.push_back(s);
-    }
+    MergeStreams merges;                           // the streams whose windows wait on `done`
 
     // Abort permanently, then give the queued GPU visits a bounded drain. If completion cannot be confirmed, skip
-    // CUDA teardown on the error path.
+    // CUDA teardown on the error path. Runs under g_live_mu, which is taken before the merge list's lock.
     void abort_and_drain() {
         std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
-        const cudaError_t selected = cudaSetDevice(device);
-        std::vector<cudaStream_t> watch{stream};
-        {
-            std::lock_guard<std::mutex> lk(streams_mu);
-            watch.insert(watch.end(), merge_streams.begin(), merge_streams.end());
-        }
-        drain_cpu_expert_streams(selected, watch, cudaStreamQuery);
+        merges.drain(cudaSetDevice(device), stream, cudaStreamQuery);
     }
 
     ~Impl() {
@@ -263,10 +251,12 @@ void CpuExperts::start(int l, int rows, const float* input, const int32_t* ids, 
 
 void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream) {
     Impl& p = *impl_;
-    p.note_stream(stream);
+    p.merges.note(stream);
     must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
+
+void CpuExperts::forget_stream(cudaStream_t stream) { impl_->merges.forget(stream); }
 
 void CpuExperts::wake() {
     Impl& p = *impl_;
