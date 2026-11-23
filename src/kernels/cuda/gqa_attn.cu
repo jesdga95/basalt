@@ -166,12 +166,15 @@ __global__ void __launch_bounds__(128, NTL == 2 ? 3 : 1)
     constexpr int LD = HD + 8;          // padded rows (halves): ldmatrix without bank conflicts
     constexpr int NT = HD / 32;         // P V: a warp's 8-dim tiles
     constexpr int R = 16 * NTL;         // the block's rows
-    constexpr int SL = CHUNK + 4;       // a score row (floats, 16-byte aligned); its fp16 probabilities overwrite its front
+    constexpr int PL = CHUNK + 8;       // a probability row (halves): 16-byte aligned rows, ldmatrix without bank conflicts
     __shared__ __align__(16) __half qs[R][LD];
     __shared__ __align__(16) __half ks[CHUNK][LD];
     __shared__ __align__(16) __half vs[CHUNK][LD];
-    __shared__ __align__(16) float ss[R][SL];
-    __half(*ps)[2 * SL] = reinterpret_cast<__half(*)[2 * SL]>(ss);   // a row's warp reads its scores before it writes them
+    __shared__ float ss[R][CHUNK + 1];
+    // the chunk's fp16 probabilities, rows of PL, written over its K tile once every warp's S = Q K^T is done (the next
+    // chunk's K is staged after the chunk's last barrier)
+    __half* const ps = &ks[0][0];
+    static_assert(R * PL <= CHUNK * LD, "decode attention: the probabilities fit the K tile");
     __shared__ float rm[R], rl[R], ra[R];
     __shared__ int64_t rlo[R], rhi[R];
     pdl_launch_dependents();
@@ -381,12 +384,12 @@ __global__ void __launch_bounds__(128, NTL == 2 ? 3 : 1)
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
             const float mold = rm[i], mnew = fmaxf(mold, mx);
-            __syncwarp();   // every lane has read its score and rm[i]: the row's probabilities overwrite the scores
+            __syncwarp();   // every lane has read rm[i] before lane 0 writes it
             float l = 0.0f;
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
                 const float p = pv[u] == -INFINITY ? 0.0f : exp2f(pv[u] - mnew);
-                ps[i][lane + 32 * u] = __float2half_rn(p);
+                ps[i * PL + lane + 32 * u] = __float2half_rn(p);
                 l += p;
             }
             l = warp_sum(l);
@@ -419,7 +422,7 @@ __global__ void __launch_bounds__(128, NTL == 2 ? 3 : 1)
                 unsigned a[NTL][4];
 #pragma unroll
                 for (int j = 0; j < NTL; ++j)
-                    if (on[j]) ldsm_x4(a[j][0], a[j][1], a[j][2], a[j][3], &ps[16 * j + (lane & 15)][kk + (lane >> 4) * 8]);
+                    if (on[j]) ldsm_x4(a[j][0], a[j][1], a[j][2], a[j][3], &ps[(16 * j + (lane & 15)) * PL + kk + (lane >> 4) * 8]);
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {
                     unsigned b0, b1;
