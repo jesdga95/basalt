@@ -22,8 +22,11 @@ struct GpuTrace {
 
 /// Reads `prompt` through the session (one prefill call over all but its last token, as the CLI does, so a long prompt
 /// takes the model's own chunks and any prompt stage), then `steps` greedy single-token decode steps, keeping every
-/// step's logits. Error: the session failed.
-Result record_gpu_trace(ModelSession& s, const std::vector<int32_t>& prompt, int steps, int64_t n_vocab, GpuTrace& out);
+/// step's logits. With `forced` (the reference's picks) each step feeds the reference's token instead of its own, so every
+/// step is compared on the same context: a greedy split does not turn the later steps' KLD into two texts' distance.
+/// Error: the session failed.
+Result record_gpu_trace(ModelSession& s, const std::vector<int32_t>& prompt, int steps, int64_t n_vocab, GpuTrace& out,
+                        const std::vector<int32_t>* forced = nullptr);
 
 bool write_gpu_trace(const std::string& path, const GpuTrace& t, std::string& err);
 bool read_gpu_trace(const std::string& path, GpuTrace& t, std::string& err);
@@ -33,6 +36,7 @@ struct GpuCompare {
     int bitwise = 0;                 ///< steps whose logits are the same bits
     int first_diff = -1;             ///< the first step whose logits differ (-1: none)
     int first_token_diff = -1;       ///< the first step whose pick differs (-1: greedy identical)
+    double max_kld = 0;              ///< the largest step KL(reference || run), nats
     double max_abs = 0;              ///< the largest logit difference
     double kld = 0;                  ///< the mean KL(reference || run) over the steps, nats
     double top1 = 0;                 ///< the share of steps whose argmax is the reference's

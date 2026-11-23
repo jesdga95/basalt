@@ -220,10 +220,10 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
 This works like `batch_check` (see [batching](batching.md)), in two runs since a mode and its reference are two loads. `basalt
 --tokens-file P --max-new N --diag-gpu-check --diag-gpu-trace T` reads the prompt in one prefill call (a long one takes the model's chunks
 and any prompt stage), then N greedy steps, and writes each step's logits and pick to T. The same command on the reference with
-`--diag-gpu-ref T` compares them: bitwise steps, greedy identity, KLD, top-1 (`model/gpu_check.hpp`; exit 0 only when bitwise).
-`tools/gpu_identity.py` compares greedy tokens through the serving engine (`--ref-engine`: another build), Flash-Next's only check.
-`--diag-gpu-same` with `gpu-mode split` and `--diag-gpu-cut L` puts both Flash-Next stages on CUDA0, its split's reference; it stalls
-in the first prompt window (0 layers served) while the real split runs: step 6 fixes it.
+`--diag-gpu-ref T` feeds T's picks (no step on two texts) and compares: bitwise steps, greedy identity, KLD (mean, worst), top-1
+(`model/gpu_check.hpp`; exit 0 only when bitwise). `tools/gpu_identity.py` compares greedy tokens through the serving engine (`--ref-engine`:
+another build), Flash-Next's only check. `--diag-gpu-same` with `gpu-mode split` and `--diag-gpu-cut L` puts both Flash-Next stages on CUDA0
+(the split's reference); it stalls in the first prompt window (0 layers served) while the real split runs: step 6 fixes it.
 
 | Mode, part | Reference | Bar |
 | --- | --- | --- |

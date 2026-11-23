@@ -21,7 +21,8 @@ int argmax(const float* p, int64_t n) {
 
 }  // namespace
 
-Result record_gpu_trace(ModelSession& s, const std::vector<int32_t>& prompt, int steps, int64_t n_vocab, GpuTrace& out) {
+Result record_gpu_trace(ModelSession& s, const std::vector<int32_t>& prompt, int steps, int64_t n_vocab, GpuTrace& out,
+                        const std::vector<int32_t>* forced) {
     if (prompt.size() < 2) return {Status::Error, "the GPU check needs a prompt of two tokens or more (--tokens-file)"};
     if (Result r = s.prepare(); !r.ok()) return r;
     out = GpuTrace{};
@@ -34,6 +35,7 @@ Result record_gpu_trace(ModelSession& s, const std::vector<int32_t>& prompt, int
     s.end_prompt();
     int32_t tok = prompt.back();
     int64_t pos = (int64_t) prompt.size() - 1;
+    if (forced) steps = std::min(steps, (int) forced->size());
     out.logits.assign((size_t) steps * (size_t) n_vocab, 0.f);
     for (int i = 0; i < steps; ++i) {
         int32_t next = -1;
@@ -45,7 +47,7 @@ Result record_gpu_trace(ModelSession& s, const std::vector<int32_t>& prompt, int
         d.logits = out.logits.data() + (size_t) i * (size_t) n_vocab;
         if (Result r = s.decode_window(d); !r.ok()) return r;
         out.tokens.push_back(next);
-        tok = next;
+        tok = forced ? (*forced)[(size_t) i] : next;
         ++pos;
     }
     return {};
@@ -118,6 +120,7 @@ GpuCompare compare_gpu_traces(const GpuTrace& ref, const GpuTrace& run) {
             kl += std::exp(lpa) * (lpa - ((double) b[v] - mb - lb));
         }
         c.kld += kl;
+        c.max_kld = std::max(c.max_kld, kl);
         if (argmax(a, V) == argmax(b, V)) ++agree;
     }
     if (c.steps > 0) {
@@ -130,8 +133,8 @@ GpuCompare compare_gpu_traces(const GpuTrace& ref, const GpuTrace& run) {
 std::string gpu_compare_line(const GpuCompare& c) {
     char b[320];
     const std::string greedy = c.first_token_diff < 0 ? "identical" : "differs from step " + std::to_string(c.first_token_diff);
-    std::snprintf(b, sizeof b, "gpu check: %d steps, %d bitwise equal, greedy %s, max |dlogit| %.3g, KLD %.3g, top-1 %.2f%%: %s", c.steps,
-                  c.bitwise, greedy.c_str(), c.max_abs, c.kld, 100.0 * c.top1, c.same() ? "BITWISE" : "DIFFERS");
+    std::snprintf(b, sizeof b, "gpu check: %d steps, %d bitwise equal, greedy %s, max |dlogit| %.3g, KLD %.3g (max step %.3g), top-1 %.2f%%: %s", c.steps,
+                  c.bitwise, greedy.c_str(), c.max_abs, c.kld, c.max_kld, 100.0 * c.top1, c.same() ? "BITWISE" : "DIFFERS");
     return b;
 }
 

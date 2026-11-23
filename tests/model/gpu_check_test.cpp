@@ -1,5 +1,5 @@
 // tests/model/gpu_check_test.cpp - the GPU check's trace file and its comparison (no GPU): equal runs are bitwise, one flipped
-// bit is not, and a different argmax shows in the picks and top-1.
+// bit is not, and a different argmax shows in the picks, the top-1 and the worst step KLD.
 #include "basalt/model/gpu_check.hpp"
 
 #include <cmath>
@@ -47,7 +47,7 @@ int main() {
     b = a;
     b.logits[1 * 64 + 0] += 50.f;
     c = compare_gpu_traces(a, b);
-    CHECK(c.kld > 1.0 && c.top1 < 1.0);
+    CHECK(c.kld > 1.0 && c.top1 < 1.0 && c.max_kld > c.kld);   // one step of five holds all of it
     // the file round-trips
     const std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/gpu_check_test.trace";
     std::string err;

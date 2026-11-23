@@ -433,18 +433,19 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         if (o.diag_gpu_same) return fatal_start_error("--diag-gpu-same: this model does not run a layer split with both stages on one GPU");
         if (o.diag_gpu_check) {   // the prompt and its greedy steps recorded, and compared with a reference run's trace
             const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
+            std::string err;
+            basalt::model::GpuTrace ref;   // a comparing run feeds the reference's picks, so each step sees the reference's context
+            if (!o.diag_gpu_ref.empty() && !basalt::model::read_gpu_trace(o.diag_gpu_ref, ref, err)) return fatal_start_error(err);
             basalt::model::GpuTrace trace;
             const basalt::model::Result r = basalt::model::record_gpu_trace(*started.sessions.front(), prompt, (int) std::max<int64_t>(o.max_new, 1),
-                                                                            started.model->desc().n_vocab, trace);
+                                                                            started.model->desc().n_vocab, trace,
+                                                                            o.diag_gpu_ref.empty() ? nullptr : &ref.tokens);
             if (!r.ok()) return fatal_start_error(r.message);
-            std::string err;
             if (!o.diag_gpu_trace.empty() && !basalt::model::write_gpu_trace(o.diag_gpu_trace, trace, err)) return fatal_start_error(err);
             if (o.diag_gpu_ref.empty()) {
                 std::printf("gpu check: %d steps recorded\n", trace.steps());
                 return 0;
             }
-            basalt::model::GpuTrace ref;
-            if (!basalt::model::read_gpu_trace(o.diag_gpu_ref, ref, err)) return fatal_start_error(err);
             const basalt::model::GpuCompare c = basalt::model::compare_gpu_traces(ref, trace);
             std::printf("%s\n", basalt::model::gpu_compare_line(c).c_str());
             return c.same() ? 0 : 1;
