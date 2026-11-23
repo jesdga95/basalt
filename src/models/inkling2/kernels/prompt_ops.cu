@@ -382,37 +382,30 @@ void ctrl_up_blend_prompt(const float* dest, const float* msg, const float* hid,
 namespace {
 
 // Matches block_q8_1_mmq (MMQ_Q8_1_DS_LAYOUT_D4): 4 float scales + 128 int8 codes = 144 bytes per 128 values.
-struct Q81MmqBlock {
-    float d4[4];
-    int8_t qs[128];
-};
-static_assert(sizeof(Q81MmqBlock) == 144, "Q81MmqBlock layout must match block_q8_1_mmq");
-
-__device__ __forceinline__ void emit_q8_1_sub32(float4 v, int col, int row, int rows, Q81MmqBlock* __restrict__ xq) {
+// Writes 4 floats of a 32-value block (8 consecutive lanes -> 32 values) into prefill::q8 planes:
+// int8 codes [rows][cols] and coalesced fp32 scales [cols / 32][sc_ld] (sc_ld = (rows + 63) & ~63).
+__device__ __forceinline__ void emit_q8_planes_sub32(float4 v, int col, int r, int cols, int64_t sc_ld,
+                                                     int8_t* __restrict__ codes, float* __restrict__ scales) {
     float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-    const float d_inv = amax > 0.f ? (127.f / amax) : 0.f;
-    char4 q;
-    q.x = (signed char) rintf(v.x * d_inv);
-    q.y = (signed char) rintf(v.y * d_inv);
-    q.z = (signed char) rintf(v.z * d_inv);
-    q.w = (signed char) rintf(v.w * d_inv);
-    const int k_block = col >> 7;
-    const int iqs = col & 127;
-    Q81MmqBlock& blk = xq[(int64_t) k_block * rows + row];
-    reinterpret_cast<char4*>(blk.qs)[iqs >> 2] = q;
-    if ((iqs & 31) == 0) blk.d4[iqs >> 5] = amax > 0.f ? (amax * (1.f / 127.f)) : 0.f;
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax * (1.0f / 127.0f);
+    const float id = amax > 0.0f ? (127.0f / amax) : 0.0f;
+    const uint32_t q0 = (uint32_t) (uint8_t) (int8_t) __float2int_rn(v.x * id);
+    const uint32_t q1 = (uint32_t) (uint8_t) (int8_t) __float2int_rn(v.y * id);
+    const uint32_t q2 = (uint32_t) (uint8_t) (int8_t) __float2int_rn(v.z * id);
+    const uint32_t q3 = (uint32_t) (uint8_t) (int8_t) __float2int_rn(v.w * id);
+    *reinterpret_cast<uint32_t*>(codes + (size_t) r * cols + col) = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+    if ((threadIdx.x & 7) == 0) scales[(int64_t) (col >> 5) * sc_ld + r] = d;
 }
 
-constexpr int kNormQ8Threads = 192;
-constexpr int kNormQ8Vecs = kWidth / (4 * kNormQ8Threads);   // 3 float4s per thread
-static_assert(kWidth == 4 * kNormQ8Threads * kNormQ8Vecs, "kWidth splits into float4s over kNormQ8Threads");
+constexpr int kNormQ8Threads = 288;   // 288 * 8 floats = kWidth (2304); 2 float4s per thread, 8 threads per 32-block
+constexpr int kNormQ8Vecs = (kWidth / 4) / kNormQ8Threads;
+static_assert(kNormQ8Threads * 4 * kNormQ8Vecs == kWidth, "kWidth splits across kNormQ8Threads float4s");
 
 __global__ void __launch_bounds__(kNormQ8Threads)
-    rms_norm_q8_1_prompt_kernel(const float* __restrict__ x, const float* __restrict__ w, int rows, float eps,
-                                Q81MmqBlock* __restrict__ xq) {
+    rms_norm_q8_planes_prompt_kernel(const float* __restrict__ x, const float* __restrict__ w, int rows, float eps,
+                                     int64_t sc_ld, int8_t* __restrict__ codes, float* __restrict__ scales) {
     __shared__ float red[kNormQ8Threads / 32];
     const int r = (int) blockIdx.x, tid = (int) threadIdx.x;
     const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) r * kWidth);
@@ -442,7 +435,7 @@ __global__ void __launch_bounds__(kNormQ8Threads)
         const float4 wv = w4[c4];
         const float4 nv = make_float4(xv[j].x * inv * wv.x, xv[j].y * inv * wv.y,
                                       xv[j].z * inv * wv.z, xv[j].w * inv * wv.w);
-        emit_q8_1_sub32(nv, c4 * 4, r, rows, xq);
+        emit_q8_planes_sub32(nv, c4 * 4, r, kWidth, sc_ld, codes, scales);
     }
 }
 
@@ -450,8 +443,8 @@ constexpr int kGateQ8Threads = 256;
 static_assert((kHeads * kHeadDim) % (4 * kGateQ8Threads) == 0, "kHeads * kHeadDim splits into float4 blocks");
 
 __global__ void __launch_bounds__(kGateQ8Threads)
-    attn_gate_q8_1_prompt_kernel(const float* __restrict__ attn, const float* __restrict__ yq, int64_t yq_ld, int rows,
-                                 Q81MmqBlock* __restrict__ xq) {
+    attn_gate_q8_planes_prompt_kernel(const float* __restrict__ attn, const float* __restrict__ yq, int64_t yq_ld,
+                                      int rows, int64_t sc_ld, int8_t* __restrict__ codes, float* __restrict__ scales) {
     const int r = (int) blockIdx.x;
     const int c4 = (int) blockIdx.y * kGateQ8Threads + (int) threadIdx.x;
     const int col = c4 * 4;
@@ -459,24 +452,30 @@ __global__ void __launch_bounds__(kGateQ8Threads)
     const float4 g = *reinterpret_cast<const float4*>(yq + (size_t) r * yq_ld + kOffGate + col);
     const float4 v = make_float4(a.x / (1.f + expf(-g.x)), a.y / (1.f + expf(-g.y)),
                                  a.z / (1.f + expf(-g.z)), a.w / (1.f + expf(-g.w)));
-    emit_q8_1_sub32(v, col, r, rows, xq);
+    emit_q8_planes_sub32(v, col, r, kHeads * kHeadDim, sc_ld, codes, scales);
 }
 
 }  // namespace
 
-void rms_norm_q8_1_prompt(const float* x, const float* w, int rows, float eps, void* xq, void* stream) {
+void rms_norm_q8_planes_prompt(const float* x, const float* w, int rows, float eps, void* act, void* stream) {
     if (rows <= 0) return;
-    rms_norm_q8_1_prompt_kernel<<<(unsigned) rows, kNormQ8Threads, 0, (cudaStream_t) stream>>>(
-        x, w, rows, eps, static_cast<Q81MmqBlock*>(xq));
-    check("rms_norm_q8_1_prompt");
+    const int64_t sc_ld = ((int64_t) rows + 63) & ~int64_t(63);
+    const size_t sc_off = ((size_t) rows * kWidth + 15) & ~size_t(15);
+    rms_norm_q8_planes_prompt_kernel<<<(unsigned) rows, kNormQ8Threads, 0, (cudaStream_t) stream>>>(
+        x, w, rows, eps, sc_ld, static_cast<int8_t*>(act),
+        reinterpret_cast<float*>(static_cast<uint8_t*>(act) + sc_off));
+    check("rms_norm_q8_planes_prompt");
 }
 
-void attn_gate_q8_1_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* xq, void* stream) {
+void attn_gate_q8_planes_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* act, void* stream) {
     if (rows <= 0) return;
+    const int64_t sc_ld = ((int64_t) rows + 63) & ~int64_t(63);
+    const size_t sc_off = ((size_t) rows * (kHeads * kHeadDim) + 15) & ~size_t(15);
     const dim3 grid((unsigned) rows, (unsigned) ((kHeads * kHeadDim) / (4 * kGateQ8Threads)));
-    attn_gate_q8_1_prompt_kernel<<<grid, kGateQ8Threads, 0, (cudaStream_t) stream>>>(
-        attn, yq, yq_ld, rows, static_cast<Q81MmqBlock*>(xq));
-    check("attn_gate_q8_1_prompt");
+    attn_gate_q8_planes_prompt_kernel<<<grid, kGateQ8Threads, 0, (cudaStream_t) stream>>>(
+        attn, yq, yq_ld, rows, sc_ld, static_cast<int8_t*>(act),
+        reinterpret_cast<float*>(static_cast<uint8_t*>(act) + sc_off));
+    check("attn_gate_q8_planes_prompt");
 }
 
 namespace {

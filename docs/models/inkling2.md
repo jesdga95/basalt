@@ -9,7 +9,7 @@ One file, `Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB), built from the official r
 drafter:
 
 - Routed experts, layers 0 to 19: the release's NVFP4 codes and scales, bit for bit (14.7 GiB for all 24 layers).
-- Routed experts, layers 20 to 23: the release's MXFP8 values as Q8_0.
+- Routed experts, layers 20 to 23: the release's MXFP8 codes and UE8M0 scales, bit for bit (`GGML_TYPE_MXFP8 = 46`; older Q8_0 packs still load).
 - Attention, gate, short-convolution and output projections: Q8_0 of the BF16 values.
 - Output head: BF16 in the file; the engine rounds it to Q8_0 as it loads. Token embedding BF16. Norms, router, biases and the
   loop's small tensors F32; loop controllers BF16.
