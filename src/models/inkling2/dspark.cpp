@@ -340,7 +340,7 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
 }
 
 bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
-                      std::string& err) {
+                      int64_t backed, std::string& err) {
     if (!w) return true;
     const DsparkGeometry& d = w->geo;
     const size_t E = kE, V = (size_t) w->n_vocab, ff = (size_t) d.n_ff, R = kDsBlock;
@@ -367,9 +367,21 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
         Cache& c = cache_[(size_t) l];
         c.ring = d.swa[(size_t) l];
         c.cap = c.ring ? ring_cells(d) : full_cells(context);
+        if (!c.ring && backed > 0) {   // the range reserved, the first positions' cells backed
+            for (int j = 0; j < 2; ++j) {
+                auto a = std::make_unique<core::ElasticArray>();
+                if (ok && (!a->open((uint64_t) c.cap * kKV * 2, err) ||
+                           !a->ensure((uint64_t) std::min(c.cap, full_cells(backed)) * kKV * 2, 0, err)))
+                    ok = false;
+                (j ? c.v : c.k) = (uint16_t*) a->data();
+                full_.push_back(std::move(a));
+            }
+            continue;
+        }
         c.k = (uint16_t*) dev((size_t) c.cap * kKV * 2, ok);
         c.v = (uint16_t*) dev((size_t) c.cap * kKV * 2, ok);
     }
+    count_backed();
     x_ = f(R * E);
     h_ = f(R * E);
     q_ = f(R * kQ);
@@ -627,7 +639,7 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
     pending_ = 0;
     n = std::min(n, kDsDrafts);
     // the Markov head's context is the row before the anchor's: kept for the last kFrRing positions run
-    if (n < 1 || pos < 1 || pos - 1 >= hi_ || pos - 1 < std::max(lo_, hi_ - kFrRing) || pos + kDsBlock > full_cells(context_))
+    if (n < 1 || pos < 1 || pos - 1 >= hi_ || pos - 1 < std::max(lo_, hi_ - kFrRing) || pos + kDsBlock > backed_cells_)
         return {};
     const DsparkGeometry& d = w_->geo;
     meta_h_[0] = anchor;
@@ -728,7 +740,36 @@ size_t DsparkHook::cells_bytes(int64_t positions) const {
     return n;
 }
 
+void DsparkHook::count_backed() {
+    backed_cells_ = full_cells(context_);
+    for (const auto& a : full_) backed_cells_ = std::min<int64_t>(backed_cells_, (int64_t) (a->backed() / (kKV * 2)));
+}
+
+uint64_t DsparkHook::grow_bytes(int64_t positions) const {
+    uint64_t n = 0;
+    for (const auto& a : full_) n += a->to_back((uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2);
+    return n;
+}
+
+bool DsparkHook::ensure(int64_t positions, std::string& err) {
+    if (full_.empty() || full_cells(positions) <= backed_cells_) return true;
+    const uint64_t bytes = (uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2;
+    for (const auto& a : full_)
+        if (!a->ensure(bytes, 0, err)) {
+            err = "the drafter's caches cannot grow to " + std::to_string(positions) + " positions: " + err;
+            return false;
+        }
+    count_backed();
+    return true;
+}
+
+void DsparkHook::trim(int64_t positions) {
+    for (const auto& a : full_) a->trim((uint64_t) full_cells(positions) * kKV * 2);
+    count_backed();
+}
+
 bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const {
+    if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
     for (const Cache& c : cache_) {
         if (c.ring) continue;
@@ -752,16 +793,18 @@ bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t posit
 }
 
 bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream) {
+    if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
+    const size_t run = (size_t) positions * kKV * sizeof(uint16_t);
     for (const Cache& c : cache_) {
         if (c.ring) continue;
         if (at >= kv.size()) return false;
         const core::ConversationKv& k = kv[at];
         if (k.format != 3 || k.cells != positions || k.heads != kKvHeads || k.head_dim != kHeadDim ||
-            k.k.size() != (size_t) positions * kKV * 2 || positions > c.cap)
+            k.k.size() != run || k.v.size() != run || positions > c.cap)
             return false;
         const auto up = [&](uint16_t* dev, const core::ConversationBuffer& from) {
-            return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t off) {
+            return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t off) {
                 return cudaMemcpy((uint8_t*) dev + off, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
             });
         };

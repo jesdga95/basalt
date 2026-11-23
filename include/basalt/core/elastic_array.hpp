@@ -35,6 +35,7 @@ private:
     };
     uint8_t* base_ = nullptr;
     uint64_t reserved_ = 0, backed_ = 0, gran_ = 0;
+    bool unusable_ = false;   // a new extent's clear could not be confirmed: the range's backing is not known
     bool plain_ = false;   // one cudaMalloc, no virtual memory
     std::vector<Extent> extents_;
 };

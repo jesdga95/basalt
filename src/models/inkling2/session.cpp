@@ -299,7 +299,6 @@ public:
                     (j ? c.v : c.k) = a->data();
                     elastic_.push_back(std::move(a));
                 }
-                backed_ = core::kElasticKvBase;
             } else {
                 c.k = alloc(bytes, ok);
                 c.v = alloc(bytes, ok);
@@ -363,8 +362,15 @@ public:
         }
         if (ok) cudaMemsetAsync(ex_tally_, 0, (size_t) expert_pairs() * 4, stream_);
         if (ok) cudaMemsetAsync(rec_n_, 0, (size_t) g_.visits.size() * 4, stream_);
-        cudaStreamSynchronize(stream_);
-        return dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), sh_->tap, m_.flags().diag_dump, err);   // DSPARK HOOK
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "the session stream failed during initialization";
+            return false;
+        }
+        if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
+                          elastic_.empty() ? 0 : core::kElasticKvBase, err))
+            return false;
+        count_backed();
+        return true;
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
@@ -585,9 +591,16 @@ public:
     size_t elem() const { return m_.cache_fp8() ? 1 : 2; }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * kHeadDim * elem(); }
 
-    // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
-    // and when the card has no room the RAM experts' card copies go back to RAM first, the least routed first. False when
-    // even without any copy there is no room.
+    // The positions every full-attention cache backs: the visits' and the drafter's full layers'.
+    void count_backed() {
+        backed_ = m_.context();
+        for (const auto& a : elastic_) backed_ = std::min(backed_, (int64_t) (a->backed() / cell_bytes()));
+        if (dspark_.on() && !elastic_.empty()) backed_ = std::min(backed_, std::max<int64_t>(0, dspark_.backed_cells() - kDsBlock));
+    }
+
+    // The elastic KV: before a run reaches `positions`, the full visits' caches and the drafter's full layers back them (in
+    // steps of kElasticKvStep cells), and when the card has no room the RAM experts' card copies go back to RAM first, the
+    // least routed first. False when even without any copy there is no room.
     static constexpr int64_t kElasticKvStep = 8192;
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
     static constexpr uint64_t kGraphRoom = 256ull << 20;     // copies that go back when a window's graph finds no memory
@@ -608,8 +621,7 @@ public:
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
-        uint64_t grow = 0;   // what every array newly backs, its rounding included
-        for (const auto& a : elastic_) grow += a->to_back(bytes);
+        const uint64_t grow = grow_bytes(target);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
         // the copies go back until the grow leaves the reserve free (the caches take the reserve itself only once no copy
         // is left: the reserve is the copies' target, not a floor the caches stop at)
@@ -636,22 +648,32 @@ public:
                 err = "the caches cannot grow to " + std::to_string(target) + " positions: " + err;
                 return false;
             }
-        backed_ = target;
-        return true;
+        if (!dspark_.ensure(target, err)) return false;   // DSPARK HOOK
+        count_backed();
+        if (positions <= backed_) return true;
+        err = "the caches do not back the requested positions";
+        return false;
+    }
+    // The device bytes the caches map to back `positions` positions (ensure_positions), the allocation rounding included.
+    uint64_t grow_bytes(int64_t positions) const {
+        uint64_t n = dspark_.grow_bytes(positions);   // DSPARK HOOK
+        for (const auto& a : elastic_) n += a->to_back(cell_bytes() * (uint64_t) positions);
+        return n;
     }
     // A conversation starts over (a prompt at position 0): the caches give back the cells past what it needs (never below
     // the base), and the RAM experts come back to the card while it has room.
     void restart_positions(int64_t positions) {
         if (elastic_.empty()) return;
-        const int64_t keep = std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
+        const int64_t keep = std::min(m_.context(),
+            std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep));
         if (keep < backed_) {
-            cudaStreamSynchronize(stream_);
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
-            backed_ = std::min<int64_t>(backed_, (int64_t) (elastic_[0]->backed() / cell_bytes()));
+            dspark_.trim(keep);
+            count_backed();
         }
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             cudaStreamSynchronize(stream_);
-            m_.promote(m_.held_free(kElasticKeep) + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
+            m_.promote(m_.held_free(kElasticKeep) + grow_bytes(keep));
         }
     }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem(); }
@@ -705,7 +727,7 @@ public:
 
     // A full-attention visit's cache is cell-major ([cell][head][dim]): its first `positions` cells are one run.
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
-        if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
+        if (positions < 0 || positions > backed_) return {model::Status::Error, "inkling2: positions past the backed caches"};
         cudaStreamSynchronize(stream_);
         kv.clear();
         const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
