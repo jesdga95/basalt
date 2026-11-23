@@ -38,7 +38,7 @@ Formats measured for layers 20 to 23 over 20 chunks: native MXFP8 0.00265 KLD (1
 
 | Stage | Format | Arithmetic |
 | --- | --- | --- |
-| Routed experts | NVFP4, MXFP8 (or Q8_0 on older packs) | decode: q8_1 activations, fp32 sums (MXFP8 decoded to fp32 per block, matching CPU AVX2/AVX-512); experts in RAM on the CPU: Q8_0 activations, fp32 sums, the card's softcapped SwiGLU; prompt chunks: NVFP4 layers on FP4 block-scaled tensor cores (two FP4 terms per activation row, fp16 SwiGLU/down intermediates), MXFP8 layers on block-scaled MXFP8 tensor cores (E4M3 activations + UE8M0 scales, fp32 accumulation, fp16 SwiGLU intermediate); older Q8_0 layers via MMQ |
+| Routed experts | NVFP4, MXFP8 (or Q8_0 on older packs) | decode: q8_1 activations, fp32 sums (MXFP8 decoded to fp32 per block, matching CPU AVX2/AVX-512); experts in RAM on the CPU: Q8_0 activations, fp32 sums (MXFP8 codes decoded to fp32 by F16C, a weight block once for all the tokens of a window, every token's dot the same bits as the table-lookup scalar row on AVX2 and AVX-512), the card's softcapped SwiGLU; prompt chunks: NVFP4 layers on FP4 block-scaled tensor cores (two FP4 terms per activation row, fp16 SwiGLU/down intermediates), MXFP8 layers on block-scaled MXFP8 tensor cores (E4M3 activations + UE8M0 scales, fp32 accumulation, fp16 SwiGLU intermediate); older Q8_0 layers via MMQ |
 | Q8_0 projections (`w.proj`, `w.out`), head | Q8_0 (loaded into `q8_planes` for `w.proj`/`w.out`) | q8_1 activations via `native_q8_planes_mmvq` (decode, bitwise `native_q8_0_mmvq`); block-32 Q8_0 2-CTA TMA int8 tensor cores (`prefill::q8`, prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |

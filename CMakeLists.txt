@@ -1714,7 +1714,10 @@ foreach(_isa avx2 avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
   target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
-  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa})
+  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa}
+                             ggml_vec_dot_mxfp8_q8_0_scalar=ggml_vec_dot_mxfp8_q8_0_scalar_${_isa}
+                             ggml_mxfp8_q8_0_prep=ggml_mxfp8_q8_0_prep_${_isa}
+                             ggml_mxfp8_q8_0_rows=ggml_mxfp8_q8_0_rows_${_isa})
   set_target_properties(ggml_dots_${_isa} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
 endforeach()
 # part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
@@ -2033,6 +2036,12 @@ if(BUILD_TESTING)
   target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
   set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+
+  # the MXFP8 CPU dot on each instruction set, bit for bit against the scalar row (the AVX-512 rows run where the host has them)
+  add_executable(mxfp8_cpu_rows_test tests/kernels/cpu/mxfp8_cpu_rows_test.cpp)
+  target_link_libraries(mxfp8_cpu_rows_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME mxfp8_cpu_rows_test COMMAND mxfp8_cpu_rows_test)
+  set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
 
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
 
