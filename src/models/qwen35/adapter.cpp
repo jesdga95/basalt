@@ -632,8 +632,14 @@ public:
     program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
     int max_expert_cards() const override { return 0; }
     bool second_card_reads_prompts() const override { return true; }
+    // neither the prompt split nor the layer split reads NVFP4 cells; the load refuses a second card too, for a caller
+    // that skips the card choice
+    std::string one_card_reason(const program::CommonOptions& o) const override {
+        return o.kv == "nvfp4" ? "--kv nvfp4 runs on one card" : "";
+    }
     // the load's own plan (plan_pack) on the flags and both cards' free memory before it
     bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const override {
+        if (o.kv == "nvfp4") return false;   // one card (one_card_reason)
         if (o.diag_split_at > 0) return true;
         core::ModelFile file;   // the pack's tensor table, read in place (as the load reads it)
         std::string err;
