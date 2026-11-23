@@ -86,7 +86,7 @@ class Client(unittest.TestCase):
 
     def test_review_footer_names_the_model(self):
         body = cr.review("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "", "",
-                         chat_fn=lambda cfg, m, max_tokens=0, effort=None: '{"findings": []}', cfg={"model": "gpt-6-luna"})
+                         chat_fn=lambda cfg, m, max_tokens=0, effort=None: '{"summary": "Adds a check.", "verdict": "merge", "findings": []}', cfg={"model": "gpt-6-luna"})
         self.assertIn("made automatically by an LLM (gpt-6-luna, medium effort)", body)
 
     def test_bad_answers_are_needs_human(self):
@@ -160,7 +160,7 @@ class CodeReview(unittest.TestCase):
         self.assertTrue(any("x.ids" in s for s in skipped))
 
     def test_findings_are_ranked_with_file_and_line(self):
-        reply = json.dumps({"findings": [
+        reply = json.dumps({"summary": "Changes pointer handling.", "verdict": "merge_with_changes", "findings": [
             {"file": "src/a.cpp", "line": 11, "severity": "low", "title": "t1", "detail": "see https://x.example"},
             {"file": "src/a.cpp", "line": 11, "severity": "high", "title": "null deref", "detail": "p may be null"}]})
         body = cr.review(DIFF, "rules", "focus on pointers", chat_fn=lambda c, m, max_tokens, effort=None: reply, cfg={})
@@ -168,14 +168,35 @@ class CodeReview(unittest.TestCase):
         self.assertIn("`src/a.cpp:11`", body)
         self.assertNotIn("://", body)
 
+    def test_summary_and_bold_verdict_lead_the_comment(self):
+        reply = json.dumps({"summary": "It makes the CPU pool skip idle cores. Nothing else changes.", "verdict": "merge_with_changes",
+                            "findings": [{"file": "src/a.cpp", "line": 11, "severity": "medium", "title": "t", "detail": "d"}]})
+        body = cr.review(DIFF, "rules", "", chat_fn=lambda c, m, max_tokens, effort=None: reply, cfg={})
+        self.assertIn("**Verdict: Merge with changes**", body)
+        self.assertLess(body.index("**Verdict"), body.index("It makes the CPU pool"))
+        self.assertLess(body.index("It makes the CPU pool"), body.index("Findings, most important first"))
+
+    def test_worst_part_verdict_wins_and_a_failed_part_needs_review(self):
+        big = "".join(f"diff --git a/src/f{i}.cpp b/src/f{i}.cpp\n--- a/src/f{i}.cpp\n+++ b/src/f{i}.cpp\n@@ -1,1 +1,1 @@\n" + "+x = 1;\n" * 1500
+                      for i in range(6))
+        replies = iter(['{"summary": "A.", "verdict": "merge", "findings": []}', '{"summary": "B.", "verdict": "needs_review", "findings": []}'] * 10)
+        with mock.patch.object(cr, "CHUNK_TOKENS", 7000):
+            body = cr.review(big, "", "", chat_fn=lambda c, m, max_tokens, effort=None: next(replies), cfg={})
+        self.assertIn("**Verdict: Needs further review**", body)
+        fails = iter(['{"summary": "A.", "verdict": "merge", "findings": []}', "oops"] * 10)
+        with mock.patch.object(cr, "CHUNK_TOKENS", 7000):
+            body = cr.review(big, "", "", chat_fn=lambda c, m, max_tokens, effort=None: next(fails), cfg={})
+        self.assertIn("**Verdict: Needs further review**", body)
+
     def test_no_findings_is_one_line_and_focus_is_passed(self):
         sent = []
-        body = cr.review(DIFF, "rules", "check locks", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m) or '{"findings": []}', cfg={})
+        body = cr.review(DIFF, "rules", "check locks", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m) or '{"summary": "Adds a check.", "verdict": "merge", "findings": []}', cfg={})
         self.assertIn("No findings.", body)
         self.assertIn("check locks", sent[0][1]["content"])
 
     def test_off_schema_reply_is_reported_not_trusted(self):
-        for bad in ('{"findings": [{"file": "other.c", "line": 1, "severity": "high", "title": "t", "detail": "d"}]}', "oops", '{"x": 1}'):
+        for bad in ('{"summary": "s", "verdict": "merge", "findings": [{"file": "other.c", "line": 1, "severity": "high", "title": "t", "detail": "d"}]}',
+                    "oops", '{"x": 1}', '{"findings": []}', '{"summary": "s", "verdict": "ship it", "findings": []}'):
             body = cr.review(DIFF, "rules", "", chat_fn=lambda c, m, max_tokens, effort=None, b=bad: b, cfg={})
             self.assertIn("could not run", body)
 
@@ -194,7 +215,7 @@ class CodeReview(unittest.TestCase):
                "diff --git a/src/big.cpp b/src/big.cpp\n--- a/src/big.cpp\n+++ b/src/big.cpp\n@@ -1,1 +1,1 @@\n-a\n+b\n"
         full = {"src/a.cpp": "int helper();  // defined in a.cpp\n", "src/big.cpp": "x" * int(cr.FULL_FILE_TOKENS * cr.CHARS_PER_TOKEN + 10)}
         sent = []
-        body = cr.review(diff, "", "", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m[1]["content"]) or '{"findings": []}',
+        body = cr.review(diff, "", "", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m[1]["content"]) or '{"summary": "Adds a check.", "verdict": "merge", "findings": []}',
                          cfg={"model": "m"}, full=full)
         self.assertIn("=== src/a.cpp (whole file after the change) ===", sent[0])
         self.assertIn("int helper();", sent[0])
@@ -205,7 +226,7 @@ class CodeReview(unittest.TestCase):
         diff = "".join(f"diff --git a/src/f{i}.cpp b/src/f{i}.cpp\n--- a/src/f{i}.cpp\n+++ b/src/f{i}.cpp\n@@ -1,1 +1,1 @@\n"
                        + "+x = 1;\n" * 300 for i in range(12))
         sent = []
-        cr.review(diff, "", "", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m[1]["content"]) or '{"findings": []}',
+        cr.review(diff, "", "", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m[1]["content"]) or '{"summary": "Adds a check.", "verdict": "merge", "findings": []}',
                   cfg={"model": "m"}, context="# inkling2: doorbell\n\nParity 20/20, ABBA +9.5%")
         self.assertEqual(len(sent), 1)
         self.assertIn("ABBA +9.5%", sent[0])
@@ -239,7 +260,7 @@ class Command(unittest.TestCase):
     def test_effort_reaches_the_call_and_the_footer(self):
         calls = []
         body = cr.review("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "", "",
-                         chat_fn=lambda c, m, max_tokens, effort=None: calls.append((max_tokens, effort)) or '{"findings": []}',
+                         chat_fn=lambda c, m, max_tokens, effort=None: calls.append((max_tokens, effort)) or '{"summary": "Adds a check.", "verdict": "merge", "findings": []}',
                          cfg={"model": "gpt-6.2-sol"}, effort="high")
         self.assertEqual(calls, [(64000, "high")])
         self.assertIn("(gpt-6.2-sol, high effort)", body)
