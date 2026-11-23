@@ -1,4 +1,5 @@
-// src/models/inkling2/kernels/kv_int8_parity.cu - the Inkling2 INT8 KV row writer against a CPU reference.
+// src/models/inkling2/kernels/kv_int8_parity.cu - the Inkling2 INT8 KV row writer against a CPU reference; with --bench
+// also the decode window's attention (prepare and read) over each cache format at the model's depths.
 #include "prep.cuh"
 
 #include <cuda_runtime.h>
@@ -32,6 +33,90 @@ static bool check_cuda(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return true;
     std::fprintf(stderr, "kv_int8_parity: %s: %s\n", what, cudaGetErrorString(e));
     return false;
+}
+
+// A decode window of `rows` rows (positions depth - rows ..) over one visit's cache in each format: a sliding-window ring
+// (the fused kernel) and a full cache at each depth (prepare + split attention). us a call, and the K and V bytes one row
+// reads over that time (the cache's own bytes: every row of a window reads them, from L2 after the first).
+static bool bench_attention() {
+    struct Fmt { const char* name; bool fp8, int8; };
+    const Fmt fmts[] = {{"fp16", false, false}, {"e4m3", true, false}, {"int8", false, true}};
+    const int64_t depths[] = {0, 8192, 65536, 131072, 262144};   // 0: the sliding-window ring
+    const int widths[] = {1, 3, 8};
+    float *y = nullptr, *taps = nullptr, *qs = nullptr, *rs = nullptr, *kr = nullptr, *vr = nullptr, *table = nullptr;
+    float *q = nullptr, *r = nullptr, *sink = nullptr;
+    int32_t* pos = nullptr;
+    uint8_t* q8 = nullptr;
+    void* scr = nullptr;
+    const auto alloc = [](auto** p, size_t n, const char* what) {
+        return check_cuda(cudaMalloc((void**) p, n), what) && check_cuda(cudaMemset(*p, 0, n), what);
+    };
+    bool ok = alloc(&y, (size_t) ink::kDecodeRows * ink::kProj * 4, "y") && alloc(&taps, 1024 * ink::kConv * 4, "taps") &&
+              alloc(&qs, ink::kHeads * ink::kHeadDim * 4, "q scales") && alloc(&rs, ink::kHeads * ink::kRel * 4, "r scales") &&
+              alloc(&kr, (size_t) ink::kConvRing * 1024 * 4, "k ring") && alloc(&vr, (size_t) ink::kConvRing * 1024 * 4, "v ring") &&
+              alloc(&table, (size_t) ink::kRel * ink::kExtent * 4, "table") &&
+              alloc(&q, (size_t) ink::kDecodeRows * ink::kHeads * ink::kHeadDim * 4, "q") &&
+              alloc(&r, (size_t) ink::kDecodeRows * ink::kHeads * ink::kRel * 4, "r") && alloc(&sink, (size_t) ink::kDecodeRows * ink::kHeads * 4, "sink") &&
+              alloc(&pos, ink::kDecodeRows * 4, "pos") && alloc(&q8, (size_t) ink::kDecodeRows * ink::kHeads * ink::kHeadDim / 32 * 36, "q8") &&
+              alloc(&scr, ink::attention_decode_scratch(ink::kDecodeRows, 1 << 20), "scratch");
+    cudaEvent_t t0{}, t1{};
+    ok = ok && check_cuda(cudaEventCreate(&t0), "event") && check_cuda(cudaEventCreate(&t1), "event");
+    for (const Fmt& f : fmts)
+        for (const int64_t depth : depths) {
+            const bool window = depth == 0;
+            const int64_t cap = window ? ink::kExtent + ink::kDecodeRows : depth;
+            const size_t row_bytes = (size_t) ink::kv_cache_row_bytes(f.fp8, f.int8), cache = (size_t) cap * ink::kKvHeads * row_bytes;
+            uint8_t *kc = nullptr, *vc = nullptr;
+            if (!ok || !check_cuda(cudaMalloc(&kc, cache), "k cache") || !check_cuda(cudaMalloc(&vc, cache), "v cache")) {
+                ok = false;
+                break;
+            }
+            cudaMemset(kc, 0x11, cache);
+            cudaMemset(vc, 0x11, cache);
+            for (const int rows : widths) {
+                const int64_t p0 = (window ? 8192 : depth) - rows;
+                std::vector<int32_t> hp(rows);
+                for (int i = 0; i < rows; ++i) hp[i] = (int32_t) (p0 + i);
+                cudaMemcpy(pos, hp.data(), rows * 4, cudaMemcpyHostToDevice);
+                ink::AttnPrep pa;
+                pa.yq = y; pa.yk = y + ink::kProjQ; pa.yv = y + ink::kProjQ + ink::kProjKV; pa.ldq = pa.ldk = pa.ldv = ink::kProj;
+                pa.pos = pos; pa.full = !window; pa.k_conv = taps; pa.v_conv = taps; pa.q_scale = qs; pa.r_scale = rs;
+                pa.k_ring = kr; pa.v_ring = vr; pa.k_cache = kc; pa.v_cache = vc; pa.cap = cap; pa.fp8 = f.fp8; pa.int8 = f.int8;
+                pa.q = q; pa.r = r; pa.sink = sink;
+                ink::AttnArgs aa;
+                aa.q = q; aa.r = r; aa.sink = sink; aa.rel_table = table; aa.pos = pos; aa.k_cache = kc; aa.v_cache = vc; aa.cap = cap;
+                aa.fp8 = f.fp8; aa.int8 = f.int8; aa.window = window ? ink::kExtent : 0; aa.gate = y + ink::kOffGate; aa.gate_ld = ink::kProj;
+                aa.q8 = q8;
+                const int64_t keys = window ? ink::kExtent : depth;
+                constexpr int reps = 50;
+                ink::attention_window(pa, aa, rows, keys, scr, nullptr);
+                cudaEventRecord(t0);
+                for (int i = 0; i < reps; ++i) ink::attention_window(pa, aa, rows, keys, scr, nullptr);
+                cudaEventRecord(t1);
+                float ms = 0.f;
+                ok = check_cuda(cudaEventSynchronize(t1), "bench") && check_cuda(cudaEventElapsedTime(&ms, t0, t1), "bench");
+                const double us = (double) ms * 1000. / reps, kv = 2. * (double) keys * ink::kKvHeads * (double) row_bytes;
+                std::printf("kv bench: %s %-7s %d rows: %8.1f us a window's attention, %6.0f GB/s of one row's K and V\n",
+                            window ? "window ring" : "full cache ", f.name, rows, us, kv / us / 1000.);
+                if (window) continue;
+                ink::attention_decode(aa, rows, keys, scr, nullptr, nullptr);
+                cudaEventRecord(t0);
+                for (int i = 0; i < reps; ++i) ink::attention_decode(aa, rows, keys, scr, nullptr, nullptr);
+                cudaEventRecord(t1);
+                ok = ok && check_cuda(cudaEventSynchronize(t1), "bench") && check_cuda(cudaEventElapsedTime(&ms, t0, t1), "bench");
+                const double us2 = (double) ms * 1000. / reps;
+                std::printf("kv bench: depth %-6lld %-7s %d rows: %8.1f us the read alone,    %6.0f GB/s of one row's K and V\n",
+                            (long long) depth, f.name, rows, us2, kv / us2 / 1000.);
+            }
+            cudaFree(kc);
+            cudaFree(vc);
+        }
+    if (t0) cudaEventDestroy(t0);
+    if (t1) cudaEventDestroy(t1);
+    for (void* p : {(void*) y, (void*) taps, (void*) qs, (void*) rs, (void*) kr, (void*) vr, (void*) table, (void*) q, (void*) r,
+                    (void*) sink, (void*) pos, (void*) q8, scr})
+        if (p) cudaFree(p);
+    return ok;
 }
 
 int main(int argc, char** argv) {
@@ -129,6 +214,7 @@ int main(int argc, char** argv) {
         if (stop) cudaEventDestroy(stop);
         if (bi) cudaFree(bi);
         if (bo) cudaFree(bo);
+        ok = ok && bench_attention();
     }
     cudaFree(di);
     cudaFree(dout);
