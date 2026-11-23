@@ -62,7 +62,8 @@ the text model.
   is where the copies stop, not a floor: a cache grow with no copy left to send back, or another program, can take it.
   The 256 MiB is judged from the card's total use (anything that allocates counts as loaded). The copies lie back to back
   in one address range, the least routed last, so the ones a grow sends back free whole pages. A window whose graph finds
-  no device memory sends 256 MiB of copies back and runs direct; a batched window's graph has no such retry. If copies
+  no device memory runs direct, and windows of its shape keep running without a graph (no copy moves); a batched window's
+  graph has no such fallback. If copies
   cannot be sent back (a CUDA failure), the grow, the sleep or the resize fails with an error and the copies that did go
   stay in RAM. Nothing changes when everything fits.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.

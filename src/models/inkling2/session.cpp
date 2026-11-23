@@ -603,7 +603,6 @@ public:
     // least routed first. False when even without any copy there is no room.
     static constexpr int64_t kElasticKvStep = 8192;
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
-    static constexpr uint64_t kGraphRoom = 256ull << 20;     // copies that go back when a window's graph finds no memory
 
     // The decode read-ahead's saved expert addresses (rec_blobs_, written by the window before) are dropped once copies
     // have gone back to RAM since: their memory may be unmapped. The epoch counts as seen once the drop is queued.
@@ -1155,7 +1154,7 @@ private:
         const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
         if (it != graphs_.end()) return it->second.launch(stream_, err);
-        if (direct_.insert(key).second) {
+        if (direct_.insert(key).second || graphless_.count(key)) {
             body(rows, head, full_keys);
             return true;
         }
@@ -1172,21 +1171,14 @@ private:
         }
         if (!g.end(stream_, err)) {
             // the graph's own device memory can be what the card is short of when the experts' copies fill it to its spare:
-            // some copies go back to RAM first, then the window runs direct at the placement that leaves (its CPU layers
-            // again), and a later window of the shape captures again. Any other failure fails the window.
-            if (g.status() != cudaErrorMemoryAllocation || m_.promoted() == 0) return false;
+            // the window runs direct and its shape keeps running without a graph. No copy moves: which shape meets the
+            // shortage first depends on the windows' widths, and the placement must not. Any other failure fails the window.
+            if (g.status() != cudaErrorMemoryAllocation) return false;
             (void) cudaGetLastError();
-            uint64_t freed = 0;
-            if (!m_.demote(kGraphRoom, stream_, freed) || freed == 0) {
-                err = "a window's graph found no device memory and no expert copies could go back to RAM";
-                return false;
-            }
-            basalt::log::warn("basalt inkling2", "a window's graph found no device memory; %.0f MiB of expert copies go back to RAM (%lld "
-                              "stay on the card)", (double) freed / (double) (1ull << 20), (long long) m_.promoted());
             err.clear();
-            if (!drop_stale_read_ahead(err)) return false;
-            cpu_ = cpu_layers();
-            direct_.insert(Shape{cpu_, key.second});
+            if (graphless_.empty())
+                basalt::log::warn("basalt inkling2", "a window's graph found no device memory: windows of its shape run without one");
+            graphless_.insert(key);
             body(rows, head, full_keys);
             return true;
         }
@@ -1448,6 +1440,7 @@ private:
     using Shape = std::pair<uint64_t, uint64_t>;
     std::map<Shape, core::CapturedGraph> graphs_;      // by window shape
     std::set<Shape> direct_;                           // the shapes whose first window has run
+    std::set<Shape> graphless_;                        // the shapes whose graph found no device memory: always direct
     uint64_t cpu_ = 0;                                 // the window in flight's layers with experts on the CPU
     bool admitted_ = false;                            // holds admission to the CPU experts' windows (admit)
     bool fork_open_ = false;                           // a start whose finish has not queued its join
