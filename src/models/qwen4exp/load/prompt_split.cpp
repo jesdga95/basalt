@@ -2,6 +2,9 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
+#include "basalt/artifact/dequant.hpp"
+#include "basalt/core/model_file.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
 
 namespace basalt::models::qwen4exp::generate {
@@ -72,6 +75,34 @@ int split_plan(Context& context) {
     return resident_load(context);
 }
 
+namespace {
+// The stage's copies of the matrices the main card holds only as 8-bit copies (hc8_names), widened in its page-locked image
+// exactly as hc8_dequant_bf16_kernel widens them: each value the int8 code times its group's fp16 scale (exact in fp32),
+// rounded once to bf16, nearest even.
+bool hc8_widen_into(PromptStage& st, const uint8_t* w_at, const std::set<std::string>& hc8_names, std::string& e) {
+    constexpr uint32_t kGroup = 32;   // values per fp16 scale (hc_fused.cu G8)
+    for (const std::string& n : hc8_names) {
+        const basalt::core::WeightRef* r = st.wt.find(n);
+        if (r == nullptr || r->data == nullptr) continue;   // not one of its layers
+        const basalt::core::Hc8Copy* c = basalt::core::hc8_find(n, (int) r->ne1, (int) r->ne0);
+        const uint8_t* at = (const uint8_t*) r->data;
+        if (c == nullptr || at < w_at || at + (size_t) c->rows * c->cols * 2 > w_at + st.image_bytes) {
+            e = "prompt split: no 8-bit copy of " + n + " in the stage's image";
+            return false;
+        }
+        uint16_t* out = (uint16_t*) (st.image + (at - w_at));
+        const int8_t* q = c->q();
+        const uint16_t* s = c->s();
+        for (uint32_t row = 0; row < c->rows; ++row)
+            for (uint32_t k = 0; k < c->cols; ++k) {
+                const float sc = basalt::fp16_to_fp32(s[(size_t) row * c->srow + k / kGroup]);
+                out[(size_t) row * c->cols + k] = basalt::kernels::bf16_from_f32((float) q[(size_t) row * c->cols + k] * sc);
+            }
+    }
+    return true;
+}
+}  // namespace
+
 int prompt_split(Context& context) {
     auto& o = *context.o;
     auto& pack_files = *context.pack_files;
@@ -79,6 +110,7 @@ int prompt_split(Context& context) {
     auto& err = *context.err;
     auto& g = *context.g;
     auto& skip_base = *context.skip_base;
+    auto& hc8_names = *context.hc8_names;
     auto& add_foreign = context.add_foreign;
     auto& src = *context.src;
     auto& peer = *context.peer;
@@ -247,6 +279,11 @@ int prompt_split(Context& context) {
         }
         if (ok) {
             images[j].to_host(w_at, st.image_bytes, st.image);
+            // the main card holds the hyper-connection down and up matrices only as their 8-bit copies and reads the
+            // prompt with them widened to bf16 (Gemm::bf16_w): the stage's image takes those widened values in place of
+            // the file's bf16, so that its layers read the prompt as the main card would (bitwise)
+            if (!hc8_names.empty())
+                context.after->push_back([&st, w_at, &hc8_names](std::string& e) { return hc8_widen_into(st, w_at, hc8_names, e); });
             continue;
         }
         (void) cudaGetLastError();
