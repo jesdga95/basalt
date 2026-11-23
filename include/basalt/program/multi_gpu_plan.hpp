@@ -55,6 +55,7 @@ struct MgPlan {
     Mechanism pick = Mechanism::ExpertTier;   ///< with a model that has no tier, ExpertTier means the main card alone
     bool equal = false;                 ///< the cards match in bandwidth and VRAM
     int cut = 0;                        ///< a priced cut (MgModel::split_handoffs): the second card's first layer
+    int best_cut = 0;                   ///< the cheapest priced cut that fits whether or not the split was picked (0: none fits)
     std::string line;                   ///< the start line
 };
 
