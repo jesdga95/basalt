@@ -499,7 +499,7 @@ int QfnRuntime::init_prompt() {
         return 1;
     }
     if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
-    if (peer.valid() && !o.no_peer_prefill) {
+    if (peer.valid()) {
         if (!sp.set_peer(&peer, false, err)) {   // the routed-only chunks' rows, up to kPeerSlowRows
             basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
             err.clear();
