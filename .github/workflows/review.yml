@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
+      actions: write        # approve the pull request's CI runs that wait for a maintainer
       contents: read
       issues: write
       pull-requests: write
@@ -53,6 +54,23 @@ jobs:
           echo "go=true" >> "${GITHUB_OUTPUT}"
           printf '%s' "${BODY}" | sed '1s|^[[:space:]]*/review||' > "${RUNNER_TEMP}/focus.txt"
           gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" -f content=eyes >/dev/null
+
+      # A fork pull request's CI waits for a maintainer's approval ("Approve and run workflows"); /review is that
+      # approval. Only runs of this pull request's head commit that are waiting (action_required) are approved.
+      - name: Approve the pull request's waiting CI runs
+        if: steps.cmd.outputs.go == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          sha="$(gh pr view "${PR}" --repo "${GITHUB_REPOSITORY}" --json headRefOid --jq .headRefOid)"
+          ids="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&status=action_required&per_page=100" --jq '.workflow_runs[].id')"
+          for id in ${ids}; do
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/approve" >/dev/null && echo "approved run ${id}"
+          done
+          [ -n "${ids}" ] || echo "no CI run is waiting for approval"
 
       - name: Fetch the diff as data
         if: steps.cmd.outputs.go == 'true'
