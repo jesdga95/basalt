@@ -369,6 +369,45 @@ int main(int argc, char** argv) {
                     "codes off the rule on the double reference, %zu codes past the format's bound; v rows off the rule: %zu\n",
                     eq.abs, eq.rel, k_scale_off, T * NKV * HD / 16, k_code_off, T * NKV * HD, k_far, v_diff);
         if (eq.abs > 1e-3 || k_far || v_diff) ++fails;
+        // a row's turned queries, codes and scales are its own: every window [s, s + w) of the rows, written into a fresh
+        // cache from cell s (not the full launch's cells), gives each row the full launch's bits, alone, first or last
+        {
+            const basalt::kernels::KvInt8 w4 = alloc4(cellv);
+            float* d_qw = dev<float>((size_t) T * NH * HD);
+            const size_t qrow = (size_t) NH * HD, crow = (size_t) NKV * HD;
+            std::vector<float> qw((size_t) T * NH * HD);
+            std::vector<uint8_t> kw(cellv / 2), vw(cellv / 2), ksw(cellv / 16), vsw(cellv / 16);
+            bool rows_same = true;
+            int windows = 0;
+            for (int s = 0; s < T; ++s)
+                for (int w = 1; s + w <= T; ++w) {
+                    if (s == 0 && w == T) continue;   // the full launch itself
+                    ck(cudaMemset(w4.k, 0xab, cellv / 2), "memset");   // a cell the launch left unwritten cannot match
+                    ck(cudaMemset(w4.v, 0xab, cellv / 2), "memset");
+                    ck(cudaMemset(w4.ks, 0xab, cellv / 16), "memset");
+                    ck(cudaMemset(w4.vs, 0xab, cellv / 16), "memset");
+                    basalt::kernels::attn_qk_prepare(d_qf + (size_t) s * NH * 2 * HD, d_k + (size_t) s * crow, d_v + (size_t) s * crow,
+                                                     d_qn, d_kn, 1e-6f, rope, d_pos + (size_t) s * 3, w, NH, NKV, d_qw, nullptr,
+                                                     nullptr, s, nullptr, 256, true, 0, nullptr, w4);
+                    ck(cudaMemcpy(qw.data(), d_qw, (size_t) w * qrow * 4, cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(kw.data(), w4.k, kw.size(), cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(vw.data(), w4.v, vw.size(), cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(ksw.data(), w4.ks, ksw.size(), cudaMemcpyDeviceToHost), "copy");
+                    ck(cudaMemcpy(vsw.data(), w4.vs, vsw.size(), cudaMemcpyDeviceToHost), "copy");
+                    const size_t at = (size_t) s * crow, full = ((size_t) cell0 + s) * crow, n = (size_t) w * crow;
+                    rows_same = rows_same && std::memcmp(qw.data(), &qo[(size_t) s * qrow], (size_t) w * qrow * 4) == 0 &&
+                                std::memcmp(&kw[at / 2], &kc4[full / 2], n / 2) == 0 &&
+                                std::memcmp(&vw[at / 2], &vc4[full / 2], n / 2) == 0 &&
+                                std::memcmp(&ksw[at / 16], &ks4[full / 16], n / 16) == 0 &&
+                                std::memcmp(&vsw[at / 16], &vs4[full / 16], n / 16) == 0;
+                    ++windows;
+                }
+            std::printf("attn_qk_prepare (nvfp4 cache): each row's q, codes and scales bitwise the full launch's in %d windows "
+                        "of 1-%d rows at other cells: %s\n", windows, T - 1, rows_same ? "yes" : "NO");
+            if (!rows_same) ++fails;
+            free4(w4);
+            cudaFree(d_qw);
+        }
         // the BF16 form on the same values
         std::vector<uint16_t> qb(qf.size()), kb(k.size()), vb(v.size());
         for (size_t i = 0; i < qf.size(); ++i) qb[i] = bf16_from_f32(qf[i]);
