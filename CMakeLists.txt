@@ -564,6 +564,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_commit.cu
                         src/kernels/cuda/gdn_prompt.cu
                         src/kernels/cuda/ssd.cu
+                        src/kernels/cuda/window_handoff.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
