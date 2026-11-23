@@ -177,7 +177,7 @@ def render_prometheus(entries: list[tuple[dict, dict]]) -> str:
         model = str(engine.get("model") or "default")
         ml = [("model_name", model)]
 
-        # ---- vLLM-compatible gauges and counters ----
+        # ---- requests and tokens: gauges and counters ----
         running = int(slots.get("active") or 0)
         waiting = int(live.get("queued") or 0)
         b.add("basalt_requests_running", "gauge", "Number of requests currently running.", ml, running)
@@ -201,7 +201,7 @@ def render_prometheus(entries: list[tuple[dict, dict]]) -> str:
         b.add("basalt_draft_tokens_accepted_total", "counter",
               "Total number of speculative draft tokens accepted.", ml, int(p.get("drafts_accepted") or 0))
 
-        # ---- vLLM-compatible latency histograms ----
+        # ---- latency histograms ----
         b.add_histogram("basalt_time_to_first_token_seconds", "Histogram of time to first token in seconds.", ml, p["ttft"])
         b.add_histogram("basalt_request_duration_seconds", "Histogram of end to end request latency in seconds.", ml, p["e2e"])
         b.add_histogram("basalt_time_per_output_token_seconds", "Histogram of time per output token in seconds.", ml, p["tpot"])
@@ -225,7 +225,7 @@ def render_prometheus(entries: list[tuple[dict, dict]]) -> str:
             b.add("basalt_experts_spilled", "gauge", "Number of routed experts spilled to disk.",
                   ml, int(engine["spill"]))
         if engine.get("expert_total") is not None:
-            b.add("basalt_experts_total", "gauge", "Total number of routed experts.",
+            b.add("basalt_experts", "gauge", "Total number of routed experts.",
                   ml, int(engine["expert_total"]))
 
         # ---- Host / GPU hardware metrics (emitted once per scrape) ----
