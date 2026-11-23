@@ -198,16 +198,15 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
   `peer_room` is its free memory less its prompt buffers and splits, `peer_spec` deals `Experts` (the ranked pairs the main card
   lacks, hottest first; stages over layers 2..n), `peer_place` fills each tier, `peer_main` the main card's part; one path for
   one peer or several; `peer_drop_stages` when the stages' buffers do not fit. Gate: no loss (64K 9,823 vs 9,835 tok/s). Greedy
-  identical to step 3. Step 6: a stage read unlike the main card (the file's bf16 hyper-connection matrices where the main card
-  widens its 8-bit copies; cuBLAS splitting the N=4 and N=1 products by the card's SMs), so each cut gave other bits (cuts 37-39
-  another token 29). Its image now holds the widened copies and other cards run the main card's cuBLAS algorithms (cublasLt):
-  the state after a 50K prompt is bitwise at cuts 34-42, one session and `--batch 4` (v0.5.6's own stage was the odd one); 64K
-  9,823 vs 9,859 tok/s against step 5 (-0.4%, both pairs), pp16384 and decode even.
+  identical to step 3. Step 6: a stage read unlike the main card (the file's bf16 hyper-connection matrices where the main card widens
+  its 8-bit copies; cuBLAS splitting N=4 and N=1 products by the card's SMs), so cuts 37-39 gave another token 29. Its image now
+  holds the widened copies and other cards run the main card's cuBLAS algorithms (cublasLt): bitwise after a 50K prompt at cuts
+  34-42, one session and `--batch 4`; 64K 9,810 vs 9,869 tok/s against step 5 (-0.6%; step 6 alone 9,815), pp16384 and decode even.
 - **Flash-Next, split (built, step 6):** `LayerSplit` (`load/split.hpp`) is its `SplitHooks`: `split_spec` states each layer's
   dense weights and session (`pool_bytes_by_layer`, `plan_bytes_by_layer`, `hc8_plan_bytes`, `session_bytes`) and each card's
   room, `split_place` takes `split_at` and the stages' devices, `split_part` each card's experts. The cut follows the shares
   (free VRAM: K=32; `gpu-share 3,1`: 36; `1,1`: 23); as fast as step 5 (pp16384 4,541 vs 4,502, conv 180 vs 180; v0.5.6 cannot
-  split unlike cards). Not yet bitwise against `--diag-gpu-same`: see Conformance.
+  split unlike cards). Bitwise against `--diag-gpu-same` at cuts 30 and 40, tokens and logits.
 - **DeepSeek, Hy4 (built, step 4):** `ExpertTier` derives `PeerHooks` once for both: `peer_card` opens a card's plain slots and
   prompt share, `peer_room` is what they leave, `peer_spec` deals `Blocks` (one 256-rounded slot per layer, the reserve
   `--peer-reserve-mib`), `peer_place` sets the blocks and the prompt-share prices, `peer_main` the main card's part. The models
@@ -234,9 +233,10 @@ and any prompt stage), then N greedy steps, and writes each step's logits and pi
 `--diag-gpu-ref T` feeds T's picks (no step on two texts) and compares: bitwise steps, greedy identity, KLD (mean, worst), top-1
 (`model/gpu_check.hpp`; exit 0 only when bitwise). `tools/gpu_identity.py` compares greedy tokens through the serving engine (`--ref-engine`:
 another build), Flash-Next's only check; `--logits` adds its rows' logits bitwise. `--diag-gpu-same` with `gpu-mode split` and `--diag-gpu-cut L`
-puts both Flash-Next stages on CUDA0 (the split's reference; they launch in turn) and `--diag-gpu-experts` has a GPU compute every expert row.
-Open: the split differs from its first row, as its later stage's decode kernels pick paths by the card's SMs (`qsa_qproj_half_supported`,
-`launch_q6_k_staged`, `hc_fused` `L.nb`, `qsa_mid`); they must plan by the main card, as the 27B's do (`wgemm::plan_device`).
+puts both Flash-Next stages on CUDA0 (the split's reference). What differed was expert placement, not kernels: a decode's
+missed experts ran on the CPU pool in one run and on a card in the other. `--diag-fixed-experts` fixes it: a prompt's experts all
+run on the GPU and a window's verifiers see none in VRAM, so the CPU pool computes every window row. A split plans by the main
+card (`core::plan_sms`, set in `qfn_run.cpp`): MMQ's stream-k block count and `dense_tc`'s one-tile path; peers keep their own.
 
 | Mode, part | Reference | Bar |
 | --- | --- | --- |
@@ -289,7 +289,7 @@ Everything happens on the unpushed box branch `mgpu`, one agent at a time. Every
 | 3 | Conformance: `model/gpu_check.hpp`, `--diag-gpu-check`, `tools/gpu_identity.py` | the check passes on the 27B prompt stage (bitwise) before any migration |
 | 4 | DeepSeek and Hy4 peer on the hooks (done) | greedy identical to v0.5.6 on two cards; two-card decode ABBA x1 no loss (DeepSeek is judged on two cards) |
 | 5 | Flash-Next peer on the hooks; the FP4 streamed share measured or deleted (done) | no speed loss vs v0.5.6 with Jay's config (see below); greedy identical; prompt stages bitwise |
-| 6 | Flash-Next split on the hooks (done; bitwise vs `split_same` open, see Conformance) | bitwise vs `split_same`; it runs on 5090 + 5060 Ti, numbers reported |
+| 6 | Flash-Next split on the hooks (done) | bitwise vs `split_same`; it runs on 5090 + 5060 Ti, numbers reported |
 | 7 | Qwen3.8-27B peer and split on the hooks; `second_card_runs_layers` gone | both modes bitwise vs single card; 64K prefill in peer mode no loss vs v0.5.6 on two cards |
 | 8 | Inkling split on the hooks (from `inksplit`) | bitwise vs single card at a context it fits |
 | 9 | Inkling peer: spilled experts on the peer through the `CpuExperts` shape | prefill gains and decode doesn't lose vs single card at 524,288 fp8; KLD and top-1 same or better; peer rows bitwise |
