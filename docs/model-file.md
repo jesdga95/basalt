@@ -216,7 +216,7 @@ python3 tools/convert/convert.py --verify Hy4-flash-Q4_K_M-test.basalt --gguf Hy
 
 ## Inkling 2 Mini pack
 
-The pack (`Inkling-2-Mini-NVFP4-DQ8.basalt`, 19.7 GB) comes from Thinking Machines Lab's official release alone
+The packs (`Inkling-2-Mini-NVFP4-DQ8.basalt`, 19.7 GB, and `Inkling-2-Mini-NVFP4-MX8.basalt`, 19.6 GB) come from Thinking Machines Lab's official release alone
 ([thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), Apache-2.0): both safetensors files
 (`model` and the DSpark drafter `mtp`), `config.json`, `hf_quant_config.json`, the tokenizer files and the chat template. No other
 input. [checkpoint_inkling2.py](../tools/convert/checkpoint_inkling2.py) is what `convert.py --checkpoint` runs on a checkpoint of
@@ -224,7 +224,7 @@ model type `inkling2_loop`; `--drafter` and `--head` do not apply (the drafter i
 
 ```sh
 hf download thinkingmachines/Inkling-2-Mini --local-dir Inkling-2-Mini
-python3 tools/convert/convert.py --checkpoint Inkling-2-Mini --out Inkling-2-Mini-NVFP4-DQ8.basalt --name "Inkling 2 Mini"
+python3 tools/convert/convert.py --checkpoint Inkling-2-Mini --out Inkling-2-Mini-NVFP4-MX8.basalt --name "Inkling 2 Mini"
 ```
 
 - `experts` and `experts.layout`: the routed experts of each of the 24 layers, 128 to a layer, one blob per expert in the order
@@ -233,10 +233,11 @@ python3 tools/convert/convert.py --checkpoint Inkling-2-Mini --out Inkling-2-Min
   - Layers 0 to 19 (the release's NVFP4): NVFP4 (type 40) blobs of 4,478,992 bytes. The E2M1 codes and the E4M3 scale of every 16
     values move bit for bit, the nibbles regrouped into 64-value blocks; the blob ends in an FP32 tail `{s_gate, s_up, s_down, 0}`
     with `s = amax / outer_scale_denominator` of the expert's matrices (gate and up share one `s`, from `w13`).
-  - Layers 20 to 23 (the release's MXFP8): Q8_0 blobs of 8,460,288 bytes, no tail. Each value is its E4M3 code times
-    2^(UE8M0 - 127) in ggml's reference Q8_0 rounding; one Q8_0 block is one MXFP8 block, so the 36 blocks of a down row and the 72
-    of a gate or up row are the release's own. Rounding error 0.54% RMS of the release's values
-    ([precision](precision/inkling2.md)).
+  - Layers 20 to 23 (the release's MXFP8), MX8 pack: MXFP8 (type 46) blobs of 8,211,456 bytes, no tail: 128-value blocks of four
+    UE8M0 scales then 128 E4M3 codes (132 bytes), the release's own bits.
+  - The same layers in the DQ8 pack: Q8_0 blobs of 8,460,288 bytes, no tail. Each value is its E4M3 code times
+    2^(UE8M0 - 127) in ggml's reference Q8_0 rounding; one Q8_0 block is one MXFP8 block. Rounding error 0.54% RMS of the
+    release's values ([precision](precision/inkling2.md)). `convert.py` writes the MX8 form; both load.
   - The engine reads a row of an expert 256 values at a time, so it allocates each layer's experts with `mmq::read_past_bytes`
     extra zeroed bytes after the last blob; the file holds none.
 - `gguf`: every other text tensor in llama.cpp-style names. The attention projections (q, k, v, relative-bias, gate, sink,
