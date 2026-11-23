@@ -196,7 +196,6 @@ void usage() {
                  "                       server without a layer split, a round after one that found twice as many\n"
                  "                       misses swaps four times as many, and the RAM copy keeps 4 N free places\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
-                 "  --no-peer-prefill    the peer computes none of the prompt rows: the prompt stays on the primary\n"
                  "  --pool-workers N     CPU expert pool worker count.  Auto when not set: every physical core\n"
                  "                       except the one the host loop spins on (on a hybrid CPU, with --pool-affinity\n"
                  "                       auto: P-cores minus 1 plus half the E-cores; p-cores: P-cores minus 1),\n"
