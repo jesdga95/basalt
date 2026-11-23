@@ -5,6 +5,7 @@
 #pragma once
 
 #include "basalt/model/adapter.hpp"
+#include "basalt/model/split_hooks.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/pack.hpp"
 #include "models/inkling2/spill.hpp"
@@ -52,7 +53,7 @@ struct LayerWeights {
     const uint16_t* ctrl_gf[kStreams] = {};     ///< BF16 [2 n_embd][gate_rank]: the gain rows, then the forget rows
 };
 
-class InklingModel final : public model::LoadedModel {
+class InklingModel final : public model::LoadedModel, private model::SplitHooks {
 public:
     InklingModel();
     ~InklingModel() override;
@@ -142,8 +143,11 @@ private:
                          uint16_t* dst = nullptr);
     /// Every layer's experts, the ones `spill_` sends to RAM there; their bytes on the card into `experts`.
     model::Result load_experts(core::LoadPlan& reads, int file, uint64_t& experts);
-    /// Two cards: prices what they do together and sets the layer split's cut (0: the first card runs alone).
+    /// Two cards (gpu-mode split): the layer split's cut by the shares (SplitHooks: split_spec and split_place below).
     model::Result plan_cards(const model::LoadRequest& req);
+    model::SplitSpec split_spec(const model::GpuCards& c) const override;
+    bool split_place(const model::SplitCut& cut, const std::vector<int>& devices, std::string& err) override;
+    std::string split_part(size_t card) const override;
 
     Pack pack_;
     model::ModelDesc desc_;
@@ -156,6 +160,7 @@ private:
     const float* output_norm_ = nullptr;
     const float* output_query_ = nullptr;
     float* msg_queries_[2] = {};
+    const model::LoadRequest* req_ = nullptr;   ///< what split_spec reads while plan_cards runs
     int cut_ = 0, second_ = -1;              ///< the layer split's cut (0: none) and the second card's device
     std::vector<uint64_t> split_need_;       ///< the split's bytes on each card, as the cut counted them
     model::LoadRequest flags_;

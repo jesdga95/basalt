@@ -595,6 +595,16 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
 }
 
 model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
+    req_ = &req;
+    std::string err;
+    const bool ok = split_open(req.gpus, err);
+    req_ = nullptr;
+    if (!ok) return {model::Status::Error, err};
+    return {};
+}
+
+model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
+    const model::LoadRequest& req = *req_;
     const Geometry& g = pack_.geo;
     // the bytes the share divides: per layer its experts (a split card holds every expert of its layers), its dense rows and
     // every slot's caches of its visits at the context; per card what it holds whatever its layers (the head is on the main
@@ -617,27 +627,31 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
     s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
                kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
-    for (const model::GpuCards::Card& c : req.gpus.cards) {
-        cudaSetDevice(c.device);
+    for (const model::GpuCards::Card& card : c.cards) {
+        cudaSetDevice(card.device);
         size_t free_b = 0, total_b = 0;
         s.room.push_back(cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b : 0);
     }
     cudaSetDevice(device_);
-    const model::SplitCut cut = model::split_cut(req.gpus, s);
-    if (!cut.error.empty()) return {model::Status::Error, cut.error};
+    return s;
+}
+
+bool InklingModel::split_place(const model::SplitCut& cut, const std::vector<int>& devices, std::string&) {
+    const Geometry& g = pack_.geo;
     cut_ = cut.first[1];
-    second_ = req.gpus.cards[1].device;
+    second_ = devices[1];
     split_need_ = cut.need;
     basalt::log::info("basalt inkling2", "layer split: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window", cut_ - 1,
                       device_, cut_, g.n_layers - 1, second_, split_handoffs(g, cut_));
-    return {};
+    return true;
+}
+
+std::string InklingModel::split_part(size_t card) const {
+    return "with their experts and caches (" + model::gib(split_need_[card]) + ")" + (card == 0 ? ", head" : "");
 }
 
 std::string InklingModel::gpu_report(int card) const {
-    if (cut_ <= 0 || card < 0 || card > 1) return {};
-    const int n = pack_.geo.n_layers;
-    return "layers " + std::to_string(card == 0 ? 0 : cut_) + "-" + std::to_string(card == 0 ? cut_ - 1 : n - 1) +
-           " with their experts and caches (" + model::gib(split_need_[(size_t) card]) + ")" + (card == 0 ? ", head" : "");
+    return cut_ > 0 && card >= 0 ? split_report((size_t) card) : std::string();
 }
 
 model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
