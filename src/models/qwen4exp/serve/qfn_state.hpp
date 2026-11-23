@@ -162,16 +162,13 @@ public:
     bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override;
     std::vector<CardFacts> card_facts() override;
     void at_exit() override;
-    bool windows_in_flight() override;
     bool next_batch_window() override;
-    bool drain_windows() override;
     void script_command(const std::string& line) override;
     void probe_command(const std::string& line, std::string& e) override;
     void sleep_command(bool down, std::string& e) override;
     void between_requests(const std::string& line) override;
     Flow run_request() override;
     bool slot0_solo() const override { return slot0_is_solo; }
-    bool pipelined() const override { return piped; }
     int64_t slot_context(int slot) const override { return slot_cap[(size_t) slot]; }
 
 private:
@@ -369,20 +366,6 @@ private:
     bool ov_active{};
     std::function<bool ()> ov_post{};   // what the overlapped read's thread does right after its last chunk
     bool ov_post_done{};
-    int n_pipe{};
-    bool piped{};
-    int GS{};
-    struct PGroup {
-        bool inflight = false;
-        int stage = 0;                  ///< the stage it runs on or waits for
-        int32_t tok[basalt::kernels::kVerifyMaxT] = {};
-        int64_t pos[basalt::kernels::kVerifyMaxT] = {};
-        int64_t since = 0;              ///< tick it started waiting (fairness)
-    };
-    std::vector<PGroup> pg{};
-    std::vector<int> stage_group{};
-    int64_t pipe_tick{};
-    int64_t rr{};
 
     int64_t part_slots(const PfPart& p, int64_t c);
     uint64_t part_bytes(const PfPart& p, int32_t first);
@@ -437,11 +420,6 @@ private:
     void solo_draft_back(bool keep) override;
     bool slot_digest(int b, int64_t upto, uint64_t* part);
     bool batch_step();
-    basalt::core::Verifier& stage_verifier(int k);
-    bool pipe_inflight();
-    bool group_active(int gi);
-    bool pump(bool may_start);
-    bool pipe_drain();
     size_t spill_to_disk(bool at_exit, size_t limit) override;
     int64_t disk_min_tokens() const override { return 8192; }
     bool probe_adapt(const std::string& cmd, std::string& e);

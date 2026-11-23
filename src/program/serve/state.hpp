@@ -103,9 +103,7 @@ public:
     basalt::model::ModelAdapter::PreTokenizer pre_{};
     static constexpr int kPenaltyWindowCap = 4096;
     // ---- what a model answers: one call per batch window at most, the rest per command or per request
-    virtual bool windows_in_flight() = 0;
     virtual bool next_batch_window() = 0;
-    virtual bool drain_windows() = 0;
     virtual void script_command(const std::string& line) = 0;
     virtual void probe_command(const std::string& line, std::string& e) = 0;
     virtual bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) = 0;
@@ -129,7 +127,6 @@ public:
     /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
     /// starts. The disk tier keeps a GiB above that floor either way.
     void start_guard();
-    virtual bool pipelined() const { return false; }   // batch groups pipelined through layer split stages
     virtual int64_t slot_context(int slot) const = 0;
     virtual bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) = 0;
     virtual bool slots_share_cells() const { return true; }   // one slot's positional state can be copied to another

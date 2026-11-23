@@ -172,7 +172,7 @@ bool Verifier::warm_graphs(std::string& err) {
         if (!capture(T, err)) return false;
     if (slots_.empty()) return true;
     for (int R = 1; R <= max_t_; ++R)
-        if (!capture_batch(R, 0, err) || !capture_commit_batch(R, err)) return false;
+        if (!capture_batch(R, err) || !capture_commit_batch(R, err)) return false;
     return true;
 }
 

@@ -132,13 +132,11 @@ public:
         std::printf("INFO logit_bias=%lld context=%lld spec=%d mtp_max=0 lookup=0%s engine=" BASALT_VERSION "\n",
                     (long long) n_vocab, (long long) o.max_context, o.spec, slots.c_str());
     }
-    bool windows_in_flight() override { return false; }
     bool next_batch_window() override;
     void slot_window_begin(int b, SlotWin& w, int limit);
     bool slot_window_finish(int b, SlotWin& w);
     bool slot_window_accept(int b, SlotWin& w);
     bool slot_window_end(int b, SlotWin& w);
-    bool drain_windows() override { return true; }
     void script_command(const std::string&) override {
         std::printf("ERR BSCRIPT: this model's slots take no scripts\n");
         std::fflush(stdout);
