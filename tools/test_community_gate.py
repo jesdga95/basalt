@@ -203,12 +203,12 @@ class Mode(unittest.TestCase):
                 self.assertEqual(p["mode"], "shadow")
                 self.assertIn("would be merged", p["comment"])
 
-    def test_comment_names_the_mode(self):
+    def test_shadow_comment_names_the_mode_and_live_does_not(self):
         p = apply_.plan(self.MERGE, "test")
         self.assertIn("shadow", p["comment"])
         self.assertIn("'test'", p["comment"])
         p = apply_.plan({"outcome": "reject", "comment": "needs changes"}, "live")
-        self.assertIn("Mode: live", p["comment"])
+        self.assertNotIn("Mode:", p["comment"])   # live comments carry no mode note
         self.assertEqual(p["labels"], ["community: rejected"])
 
     def test_needs_human_labels_and_requests_review(self):
