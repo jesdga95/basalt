@@ -90,11 +90,11 @@ dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions
     return o;
 }
 
-// Where the layers go with a second card: all on the main card when the model, its cells and scratch fit there (the second card
-// then reads long prompts), else split across the two (dense::plan_split), from the pack's bytes per layer and both cards'
-// free memory (CUDA device 0 and `peer`).  `forced`: a cut taken as given.
+// Where the layers go with a second card: in peer mode all on the main card when the model, its cells and scratch fit there (the
+// second card then reads long prompts); in split mode (`split`) across the two (dense::plan_split), from the pack's bytes per layer
+// and both cards' free memory (CUDA device 0 and `peer`).  `forced`: a cut taken as given.
 dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd, int peer,
-                           double main_gbps, double peer_gbps, int reserve_mib, int forced) {
+                           double main_gbps, double peer_gbps, int reserve_mib, int forced, bool split) {
     std::vector<uint64_t> layer((size_t) g.n_layers, 0);
     uint64_t main_weights = 0;
     for (const TensorInfo& t : gg.tensors()) {
@@ -120,6 +120,7 @@ dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const d
     const dense::SplitCard pc{peer_free > kMargin ? peer_free - kMargin : 0, peer_gbps};
     dense::SplitInputs in = dense::split_inputs(g, o, bd, layer, main_weights, mc, pc);
     in.forced = forced;
+    in.split = split;
     return dense::plan_split(in);
 }
 
@@ -321,14 +322,24 @@ private:
         return true;
     }
 
-    // Where the layers go with a second card (plan_pack); --diag-split-at takes its cut as given.
+    // Where the layers go with a second card (plan_pack); --diag-split-at takes its cut as given.  Peer mode keeps every layer
+    // on the main card and is refused when they do not fit there.
     bool plan_cards(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd,
                     const model::LoadRequest& req, std::string& err) {
         const int peer = req.peer_devices.front();
+        const bool split = req.gpu_mode == program::GpuMode::Split;
+        if (req.diag_split_at > 0 && !split) {
+            err = "--diag-split-at needs gpu-mode split";
+            return false;
+        }
         const dense::SplitPlan p = plan_pack(gg, g, o, bd, peer, req.card_gbps.size() > 0 ? req.card_gbps[0] : 0,
-                                             req.card_gbps.size() > 1 ? req.card_gbps[1] : 0, req.vram_reserve_mib, req.diag_split_at);
+                                             req.card_gbps.size() > 1 ? req.card_gbps[1] : 0, req.vram_reserve_mib, req.diag_split_at, split);
         if (!p.error.empty()) {
             err = "qwen35: " + p.error + "; lower --max-context or --parallel";
+            return false;
+        }
+        if (!split && p.cut > 0) {
+            err = "gpu-mode peer: Qwen3.8-27B and its cells do not fit GPU 0; use gpu-mode split or lower --max-context or --parallel";
             return false;
         }
         split_at_ = p.cut;
@@ -630,30 +641,8 @@ public:
     PreTokenizer pretokenizer() const override { return {"qwen35", program::tokenizer::pretok_qwen35}; }
     model::TokenNames token_names() const override { return program::qwen_token_names(); }
     program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
-    int max_expert_cards() const override { return 0; }
+    program::GpuModes gpu_modes() const override { return {2, 2, 0}; }   // peer: one prompt stage; split: the layer stage
     bool second_card_reads_prompts() const override { return true; }
-    // neither the prompt split nor the layer split reads NVFP4 cells; the load refuses a second card too, for a caller
-    // that skips the card choice
-    std::string one_card_reason(const program::CommonOptions& o) const override {
-        return o.kv == "nvfp4" ? "--kv nvfp4 runs on one card" : "";
-    }
-    // the load's own plan (plan_pack) on the flags and both cards' free memory before it
-    bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const override {
-        if (o.kv == "nvfp4") return false;   // one card (one_card_reason)
-        if (o.diag_split_at > 0) return true;
-        core::ModelFile file;   // the pack's tensor table, read in place (as the load reads it)
-        std::string err;
-        if (!file.open(o.model, err) || !file.load_meta(err) || !file.register_gguf_view(err)) return false;
-        const GgufFile gg(o.model);
-        const dense::Geometry g = geometry(gg, err);
-        if (!err.empty()) return false;
-        const bool draft = o.spec >= 2 && o.spec_oracle.empty();
-        const dense::Options opt = run_options(gg, o.max_context, std::max(o.batch, 1), o.spec, draft, o.vision, o.kv, o.kv_resident);
-        dense::BlockDrafter bd;
-        if (opt.drafter == dense::Drafter::Block && !block_meta(gg, bd, g.n_embd, err)) return false;
-        const dense::SplitPlan p = plan_pack(gg, g, opt, bd, 1, main_gbps, peer_gbps, o.vram_reserve_given ? o.vram_reserve_mib : 0, 0);
-        return p.error.empty() && p.cut > 0;
-    }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;

@@ -59,24 +59,12 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     }
     const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
     const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);
-    // ---- two or more cards: what they do together is priced and the cheapest mechanism the engine has runs (one card:
-    // nothing to choose, and no other card is touched)
-    if (chosen_cards.size() >= 2) {
-        basalt::program::MgModel mm;
-        mm.layers = 48;
-        mm.blob_bytes = 2760000;
-        mm.exchange_mib_per_token = 2560.0 * 4.0 / 10240.0;
-        mm.pairs = (int64_t) mm.layers * 512;
-        mm.blob_bytes = srcs.experts.bytes > 0 ? srcs.experts.bytes / (uint64_t) mm.pairs : mm.blob_bytes;
-        mm.main_overhead = srcs.dense.bytes + (7ull << 29);
-        mm.peer_overhead = 5ull << 28;
-        const basalt::program::MgPlan mp = basalt::program::plan_multi_gpu(chosen_cards, mm);
-        basalt::log::info("basalt", "%s", mp.line.c_str());
-        if (mp.pick == basalt::program::Mechanism::LayerSplit && o.peer_device >= 1) {
-            o.layer_split = "auto";
-            o.peer_devices.clear();
-            o.peer_device = -1;
-        }
+    // ---- two or more cards: what they do together is the user's gpu-mode (one card: nothing to choose, and no other card is
+    // touched). Peer keeps the expert tier the cards were given; split runs the layer split over them instead.
+    if (chosen_cards.size() >= 2 && o.card_mode == basalt::program::GpuMode::Split) {
+        if (o.layer_split.empty()) o.layer_split = "auto";
+        o.peer_devices.clear();
+        o.peer_device = -1;
     }
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps

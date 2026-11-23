@@ -10,6 +10,7 @@
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/program/gpu_select.hpp"
 
 namespace basalt::program {
 
@@ -84,8 +85,10 @@ struct CommonOptions {
     /// --ram-reserve-mib: the RAM left free for the rest of the system (platform::ram_reserve); 0 turns the guard off.
     int64_t ram_reserve_mib = (int64_t) (basalt::platform::kDefaultRamReserveBytes >> 20);
     std::vector<int64_t> eos_ids;
-    /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
-    std::string gpu;
+    /// --gpu, --gpu-mode, --gpu-share: the cards this run uses, what they do together and their shares (gpu_select.hpp);
+    /// empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
+    std::string gpu, gpu_mode, gpu_share;
+    GpuMode card_mode = GpuMode::One;   ///< the mode the run's cards were chosen for, set with them
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
     std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out

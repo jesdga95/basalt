@@ -53,7 +53,7 @@ public:
     }
 
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
-    int max_expert_cards() const override { return kMaxSecondCards; }
+    program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }   // peer: experts by layer block
     const char* model_name() const override { return "Hy4-flash"; }
 
     // --kv (the sparse layers' latent rows, fp16 by default or fp8) and, DFLY HOOK, --spec and its companions as DeepSeek's
