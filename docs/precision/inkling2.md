@@ -43,7 +43,7 @@ Formats measured for layers 20 to 23 over 20 chunks: native MXFP8 0.00265 KLD, Q
 | Q8_0 projections (`w.proj`, `w.out`), head | Q8_0 (loaded into `q8_planes` for `w.proj`/`w.out`) | q8_1 activations via `native_q8_planes_mmvq` (decode, bitwise `native_q8_0_mmvq`); block-32 Q8_0 2-CTA TMA int8 tensor cores (`prefill::q8`, prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
-| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), or fp8 (E4M3, unit scale) | decode: fp32 scores and softmax; prompt: values dequantized to fp16 tiles, fp32 accumulation |
+| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), or fp8 (E4M3, unit scale) | decode: fp32 scores and softmax (a full int8 cache at 32,768 keys and more: fp16 tensor-core tiles, [below](#attention-caches)); prompt: values dequantized to fp16 tiles, fp32 accumulation |
 | Short-convolution state | fp32 | fp32 |
 
 A decode row's arithmetic does not depend on how many rows share its window. Prompt chunks round differently from decoded rows.
@@ -58,7 +58,12 @@ as fast as through MMQ.
 - **`--kv fp8`:** E4M3 codes with a unit scale. Keys are L2-clipped and values RMS-normed by construction, so they fit E4M3's
   range without a scale. A row uses 128 bytes.
 - **`--kv int8`:** signed INT8 codes, with an FP16 scale for each 64-channel group. A row uses 144 bytes, about 44% less than
-  FP16's 256 bytes and 12.5% more than FP8.
+  FP16's 256 bytes and 12.5% more than FP8. Decode rows of a full-attention cache at 32,768 keys and more read it on the
+  tensor cores: the key codes are staged to fp16 exactly and each 64-channel group's fp32 QK partial takes its scale after
+  the accumulation; queries and the dequantized values round to fp16; the probabilities are scaled by 2^15 before they
+  round to fp16 for the value product, and the fp32 numerator drops that scale before the split merge, while the softmax
+  denominator sums the unscaled fp32 probabilities. A row's arithmetic is the same alone and in a verify window at the same
+  key count, but not bit-identical to the scalar reader, which shallower rows and the sliding-window layers keep.
 
 ## Against the reference
 
