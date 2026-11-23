@@ -22,6 +22,7 @@ CHUNK_TOKENS = 150000        # one request's diff: a normal pull request goes wh
 TOTAL_TOKENS = 400000        # all requests of one review
 FILE_TOKENS = 100000         # one file; a larger one is cut at a hunk
 CONTEXT_TOKENS = 8000        # the pull request's title and description
+RULES_CHARS = 30000          # AGENTS.md + CONTRIBUTING.md, whole
 FULL_FILE_TOKENS = 60000     # a changed file's whole text after the change; a larger one is left out (named)
 FULL_TOTAL_TOKENS = 250000   # all whole files of one review
 FULL_FILE_BYTES = 2_000_000  # fetched at most
@@ -184,7 +185,7 @@ def review(diff, rules, focus, chat_fn=None, cfg=None, effort="medium", context=
     chat_fn = chat_fn or llm.chat
     chunks, skipped = build_chunks(diff)
     files = {p for p, _ in split_files(diff)}
-    system = SYSTEM.format(rules=rules[:9000])
+    system = SYSTEM.format(rules=rules[:RULES_CHARS])
     findings, failed, errors, summaries, verdicts = [], 0, [], [], []
     full, full_budget, full_left = full or {}, FULL_TOTAL_TOKENS, []
     reviewed = [p for p in sorted(files) if not any(n.startswith(p + " ") for n in skipped)]
