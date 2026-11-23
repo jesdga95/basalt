@@ -505,6 +505,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
               **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
     if reasoning.get("enabled") is False:                 # the generic off switch; true is the route's default
         kwargs["enable_thinking"] = False
+    if req.get("enable_thinking") is False:               # the top-level switch (vLLM, DashScope); true is the default
+        kwargs["enable_thinking"] = False
     if "reasoning_effort" in template_kw:
         kwargs.update(effort_kwargs(template_kw["reasoning_effort"]))
     if "enable_thinking" in template_kw and not template_kw["enable_thinking"]:
