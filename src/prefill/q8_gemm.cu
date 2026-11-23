@@ -1,10 +1,8 @@
 // src/prefill/q8_gemm.cu - see include/basalt/prefill/q8_gemm.hpp.
-// 2-CTA/SM warp-specialized Blackwell TMA + int8 tensor-core GEMM for block-32 Q8_0 matrices in planes:
-// one producer warp streams 128B-swizzled TMA int8 tiles (64 tokens x 128 K, 64 weight rows x 128 K) alongside
-// coalesced 16B cp.async scale transfers (2 per lane for activations, 1 per lane for weights) on a dedicated
-// mbarrier; four consumer warps (2 x 2, each 32 tokens x 32 rows) double-buffer ldmatrix fragments across the four
-// K=32 sub-blocks, execute mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32, and accumulate scaled int32 block dots
-// in deterministic K order. 35 KiB shared memory per CTA lets two CTAs occupy each sm_120 SM concurrently.
+// Blackwell TMA + int8 tensor-core GEMM for block-32 Q8_0 matrices in planes:
+// - Large shapes (>= 12 waves at 128x128): 16-warp unified 128x128 double-buffered TMA kernel (70 KiB SMEM, 128 regs, 0 spills).
+// - Smaller / narrower shapes: 2-CTA/SM warp-specialized 64x64 TMA kernel (35 KiB SMEM, ldmatrix.x4 A & B, 0 spills).
+// - Quantizer: vectorized 128-element warp quantizer (4 blocks of 32 floats per warp via float4/char4).
 #include "basalt/prefill/q8_gemm.hpp"
 
 #include <cuda.h>
@@ -20,17 +18,13 @@
 namespace basalt::prefill::q8 {
 namespace {
 
-constexpr int BT = 64, BR = 64, BK = 128, ST = 2;
-constexpr int WT = 2, WR = 2;
-constexpr int NCONS = WT * WR * 32, NT = NCONS + 32;
-constexpr int WTOK = BT / WT, WROW = BR / WR;
-constexpr int MT = WTOK / 16, MR = WROW / 8;
-constexpr int ACT_B = ST * BT * BK;                       // 16 KiB
-constexpr int W_B = ST * BR * BK;                         // 16 KiB
-constexpr int ASC_B = ST * 4 * BT * (int) sizeof(float);  // 2 KiB: [ST][4][BT] float
-constexpr int WSC_B = ST * 4 * BR * (int) sizeof(__half); // 1 KiB: [ST][4][BR] half
-constexpr int SMEM = ACT_B + W_B + ASC_B + WSC_B + 3 * ST * 8;
+constexpr int BK = 128, ST = 2;
 constexpr int MAX_SEG = 3;
+
+template <int BT, int BR>
+constexpr int smem_bytes() {
+    return ST * BT * BK + ST * BR * BK + ST * 4 * BT * (int) sizeof(float) + ST * 4 * BR * (int) sizeof(__half) + 3 * ST * 8;
+}
 
 void ck(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -63,21 +57,20 @@ struct Args {
 };
 
 __device__ __forceinline__ unsigned su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
+__device__ __forceinline__ void ldsm2(unsigned& r0, unsigned& r1, unsigned a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
+}
 __device__ __forceinline__ void ldsm4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
-}
-__device__ __forceinline__ void ldsm2(unsigned& r0, unsigned& r1, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                 : "=r"(r0), "=r"(r1) : "r"(a));
 }
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1, unsigned a2,
                                        unsigned a3, unsigned b0, unsigned b1) {
     int z = 0;
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-                 : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
+        : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
 }
 __device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
@@ -104,7 +97,12 @@ __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* m, int k, int r,
 }
 __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
 
-__global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Args p) {
+__global__ __launch_bounds__(160, 2)
+void gemm_64x64_ws_kernel(const __grid_constant__ Args p) {
+    constexpr int BT = 64, BR = 64, WT = 2, WR = 2;
+    constexpr int WTOK = 32, WROW = 32, MT = 2, MR = 4;
+    constexpr int ACT_B = ST * BT * BK, W_B = ST * BR * BK;
+
     extern __shared__ __align__(1024) unsigned char raw[];
     unsigned char* act = raw;
     unsigned char* wt = raw + ACT_B;
@@ -131,9 +129,7 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
     const int rt = grp * G + rem % rg;
     const int tt = rem / rg;
     int si = 0;
-    for (int i = 1; i < p.nseg; ++i) {
-        if (rt >= p.seg[i].tile0) si = i;
-    }
+    for (int i = 1; i < p.nseg; ++i) if (rt >= p.seg[i].tile0) si = i;
     const Seg& seg = p.seg[si];
     const int row0 = (rt - seg.tile0) * BR;
     const int tok0 = tt * BT;
@@ -156,15 +152,13 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
             __half* wd = wsc + st * 4 * BR;
             if (kt < full_kt) {
                 cp16(ad + ks_a0 * BT + off_a0, p.a_scale + (int64_t) (kb + ks_a0) * p.a_sc_ld + tok0 + off_a0);
-                cp16(ad + (ks_a0 + 2) * BT + off_a0,
-                     p.a_scale + (int64_t) (kb + ks_a0 + 2) * p.a_sc_ld + tok0 + off_a0);
+                cp16(ad + (ks_a0 + 2) * BT + off_a0, p.a_scale + (int64_t) (kb + ks_a0 + 2) * p.a_sc_ld + tok0 + off_a0);
                 cp16(wd + ks_w * BR + off_w, seg.w_scale + (int64_t) (kb + ks_w) * seg.w_sc_ld + row0 + off_w);
             } else {
                 if (kb + ks_a0 < p.k_blocks)
                     cp16(ad + ks_a0 * BT + off_a0, p.a_scale + (int64_t) (kb + ks_a0) * p.a_sc_ld + tok0 + off_a0);
                 if (kb + ks_a0 + 2 < p.k_blocks)
-                    cp16(ad + (ks_a0 + 2) * BT + off_a0,
-                         p.a_scale + (int64_t) (kb + ks_a0 + 2) * p.a_sc_ld + tok0 + off_a0);
+                    cp16(ad + (ks_a0 + 2) * BT + off_a0, p.a_scale + (int64_t) (kb + ks_a0 + 2) * p.a_sc_ld + tok0 + off_a0);
                 if (kb + ks_w < p.k_blocks)
                     cp16(wd + ks_w * BR + off_w, seg.w_scale + (int64_t) (kb + ks_w) * seg.w_sc_ld + row0 + off_w);
             }
@@ -174,19 +168,15 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
     }
 
     const int tid = (int) threadIdx.x - 32;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    const int wtk = warp / WR;
-    const int wrw = warp % WR;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int wtk = warp / WR, wrw = warp % WR;
     const int am = lane >> 3;
     const int a_row = (lane & 7) + ((am & 1) << 3);
     const int a_col = (am >> 1) * 16;
     const int b_row = lane & 7;
     const int b_col = ((lane >> 3) & 1) * 16;
-    const int g = lane >> 2;
-    const int c2 = 2 * (lane & 3);
-    const int t_off = wtk * WTOK + g;
-    const int r_off = wrw * WROW + c2;
+    const int g = lane >> 2, c2 = 2 * (lane & 3);
+    const int t_off = wtk * WTOK + g, r_off = wrw * WROW + c2;
 
     float acc[MT][MR][4] = {};
 
@@ -210,9 +200,7 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
 #pragma unroll
         for (int ks = 0; ks < NKS; ++ks) {
             const int sl = ks & 1;
-            if constexpr (NKS > 1) {
-                if (ks + 1 < NKS) ld(ks + 1, af[sl ^ 1], bf[sl ^ 1]);
-            }
+            if constexpr (NKS > 1) { if (ks + 1 < NKS) ld(ks + 1, af[sl ^ 1], bf[sl ^ 1]); }
             float2 db[MR];
             const __half* wr = w_sc + ks * BR + r_off;
 #pragma unroll
@@ -244,9 +232,7 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
         if (kt + 1 < full_kt) stage.template operator()<4>(1, ph);
     }
     if (full_kt < p.k_tiles) {
-        const int st = full_kt & 1;
-        const unsigned ph = (unsigned) ((full_kt / 2) & 1);
-        stage.template operator()<2>(st, ph);
+        stage.template operator()<2>(full_kt & 1, (unsigned) ((full_kt / 2) & 1));
     }
 
 #pragma unroll
@@ -275,20 +261,187 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
     }
 }
 
-__global__ void quantize_q8_planes_kernel(const float* __restrict__ x, int64_t rows, int64_t cols, int64_t ld,
-                                          int64_t sc_ld, int8_t* __restrict__ codes, float* __restrict__ scales) {
+__global__ __launch_bounds__(512, 1)
+void gemm_128x128_u16_kernel(const __grid_constant__ Args p) {
+    constexpr int BT = 128, BR = 128, WR = 4;
+    constexpr int WTOK = 32, WROW = 32, MT = 2, MR = 4;
+    constexpr int ACT_B = ST * BT * BK, W_B = ST * BR * BK;
+
+    extern __shared__ __align__(1024) unsigned char raw[];
+    unsigned char* act = raw;
+    unsigned char* wt = raw + ACT_B;
+    float* asc = reinterpret_cast<float*>(wt + W_B);
+    __half* wsc = reinterpret_cast<__half*>(asc + ST * 4 * BT);
+    unsigned long long* full = reinterpret_cast<unsigned long long*>(wsc + ST * 4 * BR);
+    unsigned long long* full_sc = full + ST;
+
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < ST; ++s) {
+            mb_init(full + s, 1);
+            mb_init(full_sc + s, 64);
+        }
+    }
+    __syncthreads();
+
+    constexpr int G = 8;
+    const int gsz = G * p.tok_tiles;
+    const int grp = (int) blockIdx.x / gsz;
+    const int rem = (int) blockIdx.x - grp * gsz;
+    const int rg = (grp + 1) * G <= p.total_tiles ? G : (p.total_tiles - grp * G);
+    const int rt = grp * G + rem % rg;
+    const int tt = rem / rg;
+    int si = 0;
+    for (int i = 1; i < p.nseg; ++i) if (rt >= p.seg[i].tile0) si = i;
+    const Seg& seg = p.seg[si];
+    const int row0 = (rt - seg.tile0) * BR;
+    const int tok0 = tt * BT;
+    const int full_kt = p.k_blocks >> 2;
+
+    const auto issue_stage = [&](int kt) {
+        const int st = kt & 1;
+        if (threadIdx.x == 0) {
+            mb_expect(full + st, (BT + BR) * BK);
+            tma2d(act + st * BT * BK, &p.tm[0], kt * BK, tok0, full + st);
+            tma2d(wt + st * BR * BK, &p.tm[1 + si], kt * BK, row0, full + st);
+        }
+        if (threadIdx.x < 64) {
+            const int tid = (int) threadIdx.x;
+            const int kb = kt * 4;
+            float* ad = asc + st * 4 * BT;
+            __half* wd = wsc + st * 4 * BR;
+            const int ks_a0 = tid >> 5, off_a = (tid & 31) * 4;
+            const int ks_w  = tid >> 4, off_w = (tid & 15) * 8;
+            if (kb + ks_a0 < p.k_blocks)
+                cp16(ad + ks_a0 * BT + off_a, p.a_scale + (int64_t) (kb + ks_a0) * p.a_sc_ld + tok0 + off_a);
+            if (kb + ks_a0 + 2 < p.k_blocks)
+                cp16(ad + (ks_a0 + 2) * BT + off_a, p.a_scale + (int64_t) (kb + ks_a0 + 2) * p.a_sc_ld + tok0 + off_a);
+            if (kb + ks_w < p.k_blocks)
+                cp16(wd + ks_w * BR + off_w, seg.w_scale + (int64_t) (kb + ks_w) * seg.w_sc_ld + row0 + off_w);
+            cp_mb_arrive(full_sc + st);
+        }
+    };
+
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int wtk = warp / WR, wrw = warp % WR;
+    const int am = lane >> 3;
+    const int a_row = (lane & 7) + ((am & 1) << 3);
+    const int a_col = (am >> 1) * 16;
+    const int g = lane >> 2, c2 = 2 * (lane & 3);
+    const int t_off = wtk * WTOK + g, r_off = wrw * WROW + c2;
+
+    float acc[MT][MR][4] = {};
+    if (p.k_tiles > 0) issue_stage(0);
+
+    const auto run_kt = [&]<int NKS>(int kt) {
+        if (kt + 1 < p.k_tiles) issue_stage(kt + 1);
+        const int st = kt & 1;
+        const unsigned ph = (unsigned) ((kt >> 1) & 1);
+        mb_wait(full + st, ph);
+        mb_wait(full_sc + st, ph);
+        const unsigned char* as = act + st * BT * BK;
+        const unsigned char* ws = wt + st * BR * BK;
+        const float* a_sc = asc + st * 4 * BT;
+        const __half* w_sc = wsc + st * 4 * BR;
+        unsigned af[2][MT][4], bf[2][MR][2];
+        auto ld = [&](int ks, unsigned (&a)[MT][4], unsigned (&b)[MR][2]) {
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                ldsm4(a[mt][0], a[mt][1], a[mt][2], a[mt][3], su(as + sw(wtk * WTOK + mt * 16 + a_row, ks * 32 + a_col)));
+#pragma unroll
+            for (int m2 = 0; m2 < MR; m2 += 2)
+                ldsm4(b[m2][0], b[m2 + 1][0], b[m2][1], b[m2 + 1][1], su(ws + sw(wrw * WROW + m2 * 8 + a_row, ks * 32 + a_col)));
+        };
+        ld(0, af[0], bf[0]);
+#pragma unroll
+        for (int ks = 0; ks < NKS; ++ks) {
+            const int sl = ks & 1;
+            if constexpr (NKS > 1) { if (ks + 1 < NKS) ld(ks + 1, af[sl ^ 1], bf[sl ^ 1]); }
+            float2 db[MR];
+            const __half* wr = w_sc + ks * BR + r_off;
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) db[mr] = __half22float2(*reinterpret_cast<const __half2*>(wr + mr * 8));
+            const float* ar = a_sc + ks * BT + t_off;
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const float da0 = ar[mt * 16], da1 = ar[mt * 16 + 8];
+#pragma unroll
+                for (int mr = 0; mr < MR; ++mr) {
+                    int c0, c1, c2i, c3;
+                    mma_s8(c0, c1, c2i, c3, af[sl][mt][0], af[sl][mt][1], af[sl][mt][2], af[sl][mt][3],
+                           bf[sl][mr][0], bf[sl][mr][1]);
+                    acc[mt][mr][0] = fmaf((float) c0, da0 * db[mr].x, acc[mt][mr][0]);
+                    acc[mt][mr][1] = fmaf((float) c1, da0 * db[mr].y, acc[mt][mr][1]);
+                    acc[mt][mr][2] = fmaf((float) c2i, da1 * db[mr].x, acc[mt][mr][2]);
+                    acc[mt][mr][3] = fmaf((float) c3, da1 * db[mr].y, acc[mt][mr][3]);
+                }
+            }
+        }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+    };
+
+    for (int kt = 0; kt < full_kt; ++kt) run_kt.template operator()<4>(kt);
+    if (full_kt < p.k_tiles) run_kt.template operator()<2>(full_kt);
+
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int tk = tok0 + t_off + mt * 16 + h * 8;
+            if (tk >= p.ntok) continue;
+            float* orow = seg.dst + (int64_t) tk * seg.ld;
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int r = row0 + r_off + mr * 8;
+                if (r < seg.rows) {
+                    float2* dst = reinterpret_cast<float2*>(orow + r);
+                    if (p.epi == (int) Epilogue::Add) {
+                        float2 v = *dst;
+                        v.x += acc[mt][mr][2 * h];
+                        v.y += acc[mt][mr][2 * h + 1];
+                        *dst = v;
+                    } else {
+                        *dst = make_float2(acc[mt][mr][2 * h], acc[mt][mr][2 * h + 1]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+__global__ void quantize_q8_planes_vec4_kernel(const float* __restrict__ x, int64_t rows, int64_t cols, int64_t ld,
+                                               int64_t sc_ld, int8_t* __restrict__ codes, float* __restrict__ scales) {
+    const int64_t nb = cols >> 5;
+    const int64_t b0 = (((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 4;
+    const int lane = (int) (threadIdx.x & 31);
+    const int sub = lane >> 3, idx = (lane & 7) * 4;
+    const int64_t b = b0 + sub;
+    if (b >= rows * nb) return;
+    const int64_t r = b / nb, k = b - r * nb;
+    const float4 v = *reinterpret_cast<const float4*>(x + r * ld + (k << 5) + idx);
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d = amax * (1.0f / 127.0f), id = amax > 0.0f ? (127.0f / amax) : 0.0f;
+    char4 q{(signed char) __float2int_rn(v.x * id), (signed char) __float2int_rn(v.y * id),
+            (signed char) __float2int_rn(v.z * id), (signed char) __float2int_rn(v.w * id)};
+    *reinterpret_cast<char4*>(codes + r * cols + (k << 5) + idx) = q;
+    if ((lane & 7) == 0) scales[k * sc_ld + r] = d;
+}
+
+__global__ void quantize_q8_planes_scalar_kernel(const float* __restrict__ x, int64_t rows, int64_t cols, int64_t ld,
+                                                 int64_t sc_ld, int8_t* __restrict__ codes, float* __restrict__ scales) {
     const int64_t nb = cols >> 5;
     const int64_t b = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (b >= rows * nb) return;
     const int lane = (int) (threadIdx.x & 31);
-    const int64_t r = b / nb;
-    const int64_t k = b - r * nb;
+    const int64_t r = b / nb, k = b - r * nb;
     const float v = x[r * ld + (k << 5) + lane];
     float amax = fabsf(v);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-    const float d = amax * (1.0f / 127.0f);
-    const float id = amax > 0.0f ? (127.0f / amax) : 0.0f;
+    const float d = amax * (1.0f / 127.0f), id = amax > 0.0f ? (127.0f / amax) : 0.0f;
     codes[r * cols + (k << 5) + lane] = (int8_t) __float2int_rn(v * id);
     if (lane == 0) scales[k * sc_ld + r] = d;
 }
@@ -358,10 +511,10 @@ void transpose_scales(const uint16_t* row_major, int64_t rows, int64_t cols, uin
         std::exit(1);
     }
     const int64_t nb = cols >> 5;
-    const int64_t ld = scale_plane_ld(rows);
-    const dim3 block(32, 8);
-    const dim3 grid((unsigned) ((ld + block.x - 1) / block.x), (unsigned) ((nb + block.y - 1) / block.y));
-    transpose_scales_kernel<<<grid, block, 0, (cudaStream_t) stream>>>(row_major, rows, nb, ld, col_major);
+    const int64_t dst_ld = scale_plane_ld(rows);
+    const dim3 blk(32, 8);
+    const dim3 grd((unsigned) ((dst_ld + 31) / 32), (unsigned) ((nb + 7) / 8));
+    transpose_scales_kernel<<<grd, blk, 0, (cudaStream_t) stream>>>(row_major, rows, nb, dst_ld, col_major);
     ck("transpose_scales");
 }
 
@@ -372,9 +525,15 @@ void quantize(const float* x, int64_t rows, int64_t cols, int64_t ld, void* act,
         std::exit(1);
     }
     const int64_t nblocks = rows * (cols >> 5);
-    const unsigned grid = (unsigned) ((nblocks + 7) / 8);
-    quantize_q8_planes_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(
-        x, rows, cols, ld, act_scale_ld(rows), static_cast<int8_t*>(act), act_scales(act, rows, cols));
+    if (((uintptr_t) x & 15) == 0 && (ld & 3) == 0 && (((uintptr_t) act) & 3) == 0) {
+        const unsigned grid = (unsigned) (((nblocks + 3) / 4 + 7) / 8);
+        quantize_q8_planes_vec4_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(
+            x, rows, cols, ld, act_scale_ld(rows), static_cast<int8_t*>(act), act_scales(act, rows, cols));
+    } else {
+        const unsigned grid = (unsigned) ((nblocks + 7) / 8);
+        quantize_q8_planes_scalar_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(
+            x, rows, cols, ld, act_scale_ld(rows), static_cast<int8_t*>(act), act_scales(act, rows, cols));
+    }
     ck("quantize");
 }
 
@@ -389,12 +548,11 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev >= 0 && dev < 64 && !configured[dev].load(std::memory_order_acquire)) {
-        cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(gemm_64x64_ws_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<64, 64>());
+        cudaFuncSetAttribute(gemm_128x128_u16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<128, 128>());
         configured[dev].store(true, std::memory_order_release);
     }
-    Args p{};
-    tmap(&p.tm[0], act, rows, w_cols, BT);
-    int tiles = 0;
+    int tiles_128 = 0;
     for (int i = 0; i < nseg; ++i) {
         const Segment& s = seg[i];
         if (s.rows <= 0 || s.rows % 2 != 0 || !s.w_scales_t || ((uintptr_t) s.w & 15) != 0 ||
@@ -404,21 +562,38 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
                                (long long) w_cols, (long long) s.ld_dst);
             std::exit(1);
         }
-        tmap(&p.tm[1 + i], s.w, s.rows, w_cols, BR);
+        tiles_128 += (int) ((s.rows + 127) / 128);
+    }
+    const int tok_128 = (int) ((rows + 127) / 128);
+    const bool use_128 = (rows >= 1024 && tiles_128 >= 32 && tok_128 * tiles_128 >= 800);
+    const int bt = use_128 ? 128 : 64;
+    const int br = use_128 ? 128 : 64;
+
+    Args p{};
+    tmap(&p.tm[0], act, rows, w_cols, bt);
+    int tiles = 0;
+    for (int i = 0; i < nseg; ++i) {
+        const Segment& s = seg[i];
+        tmap(&p.tm[1 + i], s.w, s.rows, w_cols, br);
         p.seg[i] = {reinterpret_cast<const __half*>(s.w_scales_t), s.dst, s.ld_dst, (int) s.rows,
                     (int) scale_plane_ld(s.rows), tiles};
-        tiles += (int) ((s.rows + BR - 1) / BR);
+        tiles += (int) ((s.rows + br - 1) / br);
     }
     p.a_scale = reinterpret_cast<const float*>(static_cast<const uint8_t*>(act) + scale_off(rows, w_cols));
     p.nseg = nseg;
     p.ntok = (int) rows;
-    p.tok_tiles = (int) ((rows + BT - 1) / BT);
+    p.tok_tiles = (int) ((rows + bt - 1) / bt);
     p.total_tiles = tiles;
     p.k_tiles = (int) ((w_cols + BK - 1) / BK);
     p.k_blocks = (int) (w_cols >> 5);
     p.a_sc_ld = (int) act_scale_ld(rows);
     p.epi = (int) epi;
-    gemm_kernel<<<(unsigned) (tiles * p.tok_tiles), NT, SMEM, (cudaStream_t) stream>>>(p);
+    const unsigned grid = (unsigned) (p.tok_tiles * p.total_tiles);
+    if (use_128) {
+        gemm_128x128_u16_kernel<<<grid, 512, smem_bytes<128, 128>(), (cudaStream_t) stream>>>(p);
+    } else {
+        gemm_64x64_ws_kernel<<<grid, 160, smem_bytes<64, 64>(), (cudaStream_t) stream>>>(p);
+    }
     ck("gemm");
 }
 
