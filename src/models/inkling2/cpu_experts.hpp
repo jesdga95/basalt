@@ -16,8 +16,9 @@ class InklingModel;
 /// RAM; a host thread spinning on the doorbell has the pool compute those pairs while the card computes the rest, then sets
 /// the completion ticket, which the card's merge matches before taking the pool's rows. A visit without a RAM pair neither
 /// rings nor waits. Sessions share one hand-off per model and queue visits in order; a cached graph takes the next ticket
-/// when it runs. The abort hook releases stalled waits and gives the queued visits a bounded time to drain. The card's
-/// blob table and the host's RAM blob table agree on placement and change only between windows.
+/// when it runs. A call with such windows holds admission (enter, leave): the abort hook closes it, releases stalled waits
+/// and gives the calls in flight a bounded time to finish; a window it interrupted is discarded. The card's blob table and
+/// the host's RAM blob table agree on placement and change only between windows.
 class CpuExperts {
 public:
     ~CpuExperts();
@@ -31,12 +32,13 @@ public:
     void finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream);
     /// Before a window that calls start: the doorbell's thread spins from here instead of napping.
     void wake();
-    /// Before `stream`'s first finish, outside a capture: the abort's drain watches it until forget_stream.
-    void watch_stream(cudaStream_t stream);
-    /// After `stream`'s last finish and its synchronize, before it is destroyed: the abort's drain stops watching it.
-    /// `synced` is the synchronize's status; a failure leaves every later drain unconfirmed. Waits for a drain in
-    /// progress.
-    void forget_stream(cudaStream_t stream, cudaError_t synced);
+    /// Before a call's first window that calls start: false once the abort hook ran (the call submits nothing).
+    bool enter();
+    /// After the call's window streams are synchronized (`synced`: that status): false once the abort hook ran, and the
+    /// call's results are discarded.
+    bool leave(cudaError_t synced);
+    /// Whether the abort hook ran: a call in flight starts no further window.
+    bool stopped();
 
 private:
     struct Impl;

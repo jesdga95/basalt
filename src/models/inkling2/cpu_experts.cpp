@@ -33,6 +33,8 @@ static_assert(kDecodeRows <= cpu::MAXT, "a RAM expert takes every row of a windo
 namespace {
 // The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
 constexpr std::chrono::milliseconds kSpin{20}, kNap{1};
+// How long a path that ends the engine waits for the calls in flight to finish after it aborts the bell.
+constexpr int kDrainMs = 5000;
 
 // A CUDA call that must not fail: a visit that cannot be queued is an error, as a kernel that cannot launch is.
 void must(cudaError_t e, const char* what) {
@@ -75,14 +77,15 @@ struct CpuExperts::Impl {
     std::atomic<uint32_t> wakes{0};
     std::mutex nap_mu;
     std::condition_variable nap_cv;
-    int device = 0;
-    MergeStreams merges;                           // the streams whose windows wait on `done`
+    WindowGate gate;                               // the calls whose windows may wait on `done`
 
-    // Abort permanently, then give the queued GPU visits a bounded drain. If completion cannot be confirmed, skip
-    // CUDA teardown on the error path. Runs under g_live_mu, which is taken before the merge list's lock.
+    // No window starts after this; abort the bell permanently, then give the calls in flight a bounded time to finish.
+    // If that cannot be confirmed, skip CUDA teardown on the error path. Runs under g_live_mu, which is taken before
+    // the gate's lock.
     void abort_and_drain() {
+        gate.close();
         std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
-        merges.drain(cudaSetDevice(device), stream, cudaStreamQuery);
+        gate.drain(kDrainMs);
     }
 
     ~Impl() {
@@ -229,7 +232,6 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
     const cpu::PoolAffinity affinity = fl.pool_affinity_given ? fl.pool_affinity : cpu::PoolAffinity::All;
     p.pool = std::make_unique<cpu::ExpertPool>(cpu::start_pool_workers(fl.pool_workers, fl.pool_affinity_given, affinity), affinity);
     *p.bell = CpuBell{};
-    cudaGetDevice(&p.device);
     p.server = std::thread([&p] { p.serve(); });
     {   // published once everything it touches is live
         std::lock_guard<std::mutex> lk(g_live_mu);
@@ -255,9 +257,13 @@ void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
 
-void CpuExperts::watch_stream(cudaStream_t stream) { impl_->merges.note(stream); }
-
-void CpuExperts::forget_stream(cudaStream_t stream, cudaError_t synced) { impl_->merges.forget(stream, synced); }
+bool CpuExperts::enter() { return impl_->gate.enter(); }
+bool CpuExperts::leave(cudaError_t synced) {
+    // the bell's abort word too: a merge the abort released was let go through that word
+    const bool released = std::atomic_ref<uint32_t>(impl_->bell->abort).load(std::memory_order_acquire) != 0;
+    return impl_->gate.leave(synced) && !released;
+}
+bool CpuExperts::stopped() { return impl_->gate.closed(); }
 
 void CpuExperts::wake() {
     Impl& p = *impl_;

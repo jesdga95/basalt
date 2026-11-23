@@ -5,87 +5,67 @@
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <chrono>
-#include <cstddef>
+#include <condition_variable>
 #include <cstdio>
 #include <mutex>
-#include <thread>
-#include <vector>
 
 namespace basalt::models::inkling2 {
 
-// The streams whose windows wait on the CPU experts' completion, watched by the drain after an abort. An owner notes
-// its stream before its first window, and forgets it after synchronizing it and before destroying it. The drain holds
-// the list across its queries, so a forgotten stream is never queried and a watched one is not destroyed while it is.
-// A forgotten stream whose synchronize failed may still hold work: every later drain reports completion unconfirmed.
-class MergeStreams {
+// Admission to the windows that wait on the CPU experts. A call holds it from before its first such window until its
+// window streams are synchronized. The abort closes it before releasing the bell, so no window starts after the release
+// and a window it interrupted is discarded by its caller, then waits for the calls in flight: once none holds it, every
+// window that could wait on the bell has finished.
+class WindowGate {
 public:
-    void note(cudaStream_t s) {
+    // False once closed.
+    bool enter() {
         std::lock_guard<std::mutex> lk(mu_);
-        if (std::find(streams_.begin(), streams_.end(), s) == streams_.end()) streams_.push_back(s);
+        if (closed_) return false;
+        ++held_;
+        return true;
     }
-    // `synced`: the stream's synchronize status. Waits for a drain in progress.
-    void forget(cudaStream_t s, cudaError_t synced) {
+    // `synced`: the call's window streams' synchronize status. False once closed: the call's results are discarded.
+    bool leave(cudaError_t synced) {
         std::lock_guard<std::mutex> lk(mu_);
-        const auto gone = std::remove(streams_.begin(), streams_.end(), s);
-        if (gone != streams_.end() && retired_ == cudaSuccess) retired_ = synced;
-        streams_.erase(gone, streams_.end());
+        --held_;
+        if (synced != cudaSuccess && failed_ == cudaSuccess) failed_ = synced;
+        cv_.notify_all();
+        return !closed_;
     }
-    // Report whether queued GPU visits drained after the bell was aborted: `own` (stream 0), then the noted streams.
-    template <class Query>
-    void drain(cudaError_t selected, cudaStream_t own, Query query) {
-        constexpr int kDrainMs = 5000;
+    bool closed() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return closed_;
+    }
+    void close() {
+        std::lock_guard<std::mutex> lk(mu_);
+        closed_ = true;
+    }
+    // After close and the bell's release: report whether the calls in flight finished with their streams synchronized
+    // within `bound_ms`.
+    void drain(int bound_ms) {
         const auto start = std::chrono::steady_clock::now();
-        const auto elapsed_ms = [&] {
-            return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-        };
-        cudaError_t last_bad = selected;
-        char where[32] = "device";
-        if (selected == cudaSuccess) {
-            std::lock_guard<std::mutex> lk(mu_);
-            if (retired_ != cudaSuccess) {
-                last_bad = retired_;
-                std::snprintf(where, sizeof where, "a retired stream");
-            }
-            // A stream in a capture is not queried, which would break its owner's capture: it is polled until the
-            // capture ends, then what was queued on it before the capture is waited on as any other work.
-            const auto poll = [&](cudaStream_t s) {
-                cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-                if (const cudaError_t e = cudaStreamIsCapturing(s, &capture); e != cudaSuccess) return e;
-                return capture == cudaStreamCaptureStatusNone ? query(s) : cudaErrorStreamCaptureUnsupported;
-            };
-            const auto waiting = [](cudaError_t e) {
-                return e == cudaErrorNotReady || e == cudaErrorStreamCaptureUnsupported;
-            };
-            for (std::size_t i = 0; i <= streams_.size(); ++i) {
-                const cudaStream_t s = i ? streams_[i - 1] : own;
-                cudaError_t status = poll(s);
-                while (waiting(status) && elapsed_ms() < kDrainMs) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    status = poll(s);
-                }
-                if (status != cudaSuccess) {
-                    last_bad = status;
-                    std::snprintf(where, sizeof where, "stream %d", (int) i);
-                }
-            }
+        std::unique_lock<std::mutex> lk(mu_);
+        const bool idle = cv_.wait_for(lk, std::chrono::milliseconds(bound_ms), [&] { return held_ == 0; });
+        const long long ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (idle && failed_ == cudaSuccess) {
+            basalt::log::info("basalt inkling2", "the CPU experts' doorbell was aborted: the GPU finished in %lld ms", ms);
+            return;
         }
-        (void) cudaGetLastError();
-        if (last_bad != cudaSuccess) {
-            basalt::core::gpu_left_running().store(true);
-            basalt::log::error("basalt inkling2", "the CPU experts' doorbell was aborted: GPU completion unconfirmed after %lld ms (%s, %s)",
-                               elapsed_ms(), cudaGetErrorString(last_bad), where);
-        } else {
-            basalt::log::info("basalt inkling2", "the CPU experts' doorbell was aborted: the GPU finished in %lld ms", elapsed_ms());
-        }
+        char why[96];
+        if (!idle) std::snprintf(why, sizeof why, "%d calls still in flight", held_);
+        else std::snprintf(why, sizeof why, "%s on a window's synchronize", cudaGetErrorString(failed_));
+        basalt::core::gpu_left_running().store(true);
+        basalt::log::error("basalt inkling2", "the CPU experts' doorbell was aborted: GPU completion unconfirmed after %lld ms (%s)", ms, why);
     }
 
 private:
     std::mutex mu_;
-    std::vector<cudaStream_t> streams_;
-    cudaError_t retired_ = cudaSuccess;   // the first failed synchronize of a forgotten stream
+    std::condition_variable cv_;
+    bool closed_ = false;
+    int held_ = 0;
+    cudaError_t failed_ = cudaSuccess;   // the first failed synchronize of a call that left
 };
 
 }  // namespace basalt::models::inkling2

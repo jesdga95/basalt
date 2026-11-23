@@ -205,12 +205,9 @@ class Session final : public model::BatchSession, private Scratch {
 public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        const cudaError_t synced = stream_ ? cudaStreamSynchronize(stream_) : cudaSuccess;
-        const cudaError_t synced1 = lane_[1].stream ? cudaStreamSynchronize(lane_[1].stream) : cudaSuccess;
-        if (sh_ && sh_->cpu) {   // the abort's drain stops watching the streams before they go
-            if (lane_[0].stream) sh_->cpu->forget_stream(lane_[0].stream, synced);
-            if (lane_[1].stream) sh_->cpu->forget_stream(lane_[1].stream, synced1);
-        }
+        release();   // a batch that ended on an error still holds admission
+        if (stream_) cudaStreamSynchronize(stream_);
+        if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
         if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {
@@ -357,9 +354,6 @@ public:
         lane_[0] = Lane{m_.device(), &sh_->x, stream_, ra_st_, pf_st_, ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_, hand0_, ex_tally_,
                         rec_blobs_, rec_n_};
         lane_[1].x = &sh_->x1;
-        if (sh_->cpu)   // the window streams the CPU experts' merges wait on, for the abort's drain
-            for (const Lane& k : lane_)
-                if (k.stream) sh_->cpu->watch_stream(k.stream);
         for (const VisitCache& c : vc_) {
             if (slot_card_[(size_t) (&c - vc_.data())] != 0) continue;
             cudaMemsetAsync(c.k_ring, 0, (size_t) kConvRing * kKvHeads * kHeadDim * 4, stream_);
@@ -378,6 +372,8 @@ public:
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
         std::string err;
         if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
+        if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
+        const Admitted held{*this};
         hist_.resize((size_t) r.pos);
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             const int n = std::min(kMaxRows, r.n_tokens - t0);
@@ -397,6 +393,7 @@ public:
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the window failed"};
+        if (!release()) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
         return {};
     }
 
@@ -413,6 +410,7 @@ protected:
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
+        if (!admit(err)) return false;   // held until the first draw (or the take with no draw after it)
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
@@ -434,11 +432,17 @@ protected:
         dspark_.note(r.pos, r.n_tokens);   // DSPARK HOOK
         lookups_ += (int64_t) r.n_tokens * g_.n_used * (int64_t) g_.visits.size();
         head_rows_ = h;
+        if (i == v.n - 1 && std::all_of(v.head, v.head + v.n, [](int x) { return x == 0; }))
+            static_cast<Session*>(v.ss[0])->release();   // no draw follows, nothing is published
         if (h == 0) return;
         cudaMemcpyAsync(logits_, blog_ + (size_t) (sg.row0 + sg.rows - h) * V, (size_t) h * V * 4, cudaMemcpyDeviceToDevice, v.stream);
         if (r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (h - 1) * V, (size_t) V * 4, cudaMemcpyDeviceToHost, v.stream);
     }
     const int32_t* batch_draw(const model::BatchView& v, int i, std::string& err) override {
+        if (!static_cast<Session*>(v.ss[0])->release()) {   // the window finished before any abort, or is discarded
+            err = "the CPU experts were stopped";
+            return nullptr;
+        }
         return draw(v.reqs[i], 0, v.head[i], err, v.stream);
     }
 
@@ -450,6 +454,8 @@ public:
         hist_.resize((size_t) r.pos);
         if (sh_->prompt && r.n_tokens > 16) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
         std::string err;
+        if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
+        const Admitted held{*this};
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             if (r.stop && r.stop()) break;
             const int n = std::min(kMaxRows, r.n_tokens - t0);
@@ -461,6 +467,7 @@ public:
             }
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the prompt failed"};
+        if (!release()) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
         return {};
     }
 
@@ -482,12 +489,15 @@ public:
         hist_.resize((size_t) pos);
         if (sh_->prompt && n_rows > 16) return sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_);
         std::string err;
+        if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
+        const Admitted held{*this};
         for (int at = 0; at < n_rows; at += kMaxRows) {
             const int n = std::min(kMaxRows, n_rows - at);
             if (!forward(nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, 0, err)) return {model::Status::Error, "inkling2: " + err};
             for (int i = 0; i < n; ++i) hist_.push_back(g_.image_token);
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the image rows failed"};
+        if (!release()) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
         return {};
     }
 
@@ -1028,6 +1038,10 @@ private:
     // The forward of `rows` rows at positions pos0.. (tokens, or host embedding rows when `emb` is set, which must stay
     // as they are until the window's sync); then the head over the last `head` rows (0: none).
     bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
+        if (sh_->cpu && sh_->cpu->stopped()) {
+            err = "the CPU experts were stopped";
+            return false;
+        }
         cpu_ = cpu_layers();
         if (cpu_) sh_->cpu->wake();
         if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err) || !check(err)) return false;
@@ -1223,6 +1237,32 @@ private:
         softcap(lg, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
     }
 
+    // Admission to the CPU experts' windows (CpuExperts::enter): held from before a call's first window until its window
+    // streams are synchronized, so an abort waits for the calls in flight and their results are discarded.
+    bool admit(std::string& err) {
+        if (!sh_->cpu) return true;
+        release();
+        if (!sh_->cpu->enter()) {
+            err = "the CPU experts were stopped";
+            return false;
+        }
+        admitted_ = true;
+        return true;
+    }
+    // Synchronizes the window streams and gives admission up. False: they failed, or the abort came first.
+    bool release() {
+        if (!admitted_) return true;
+        admitted_ = false;
+        cudaError_t e = cudaStreamSynchronize(stream_);
+        if (e == cudaSuccess && lane_[1].stream) e = cudaStreamSynchronize(lane_[1].stream);
+        return sh_->cpu->leave(e) && e == cudaSuccess;
+    }
+    // Gives admission up on every return of a call that took it.
+    struct Admitted {
+        Session& s;
+        ~Admitted() { s.release(); }
+    };
+
     bool check(std::string& err) {
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
@@ -1312,6 +1352,7 @@ private:
     std::map<Shape, core::CapturedGraph> graphs_;      // by window shape
     std::set<Shape> direct_;                           // the shapes whose first window has run
     uint64_t cpu_ = 0;                                 // the window in flight's layers with experts on the CPU
+    bool admitted_ = false;                            // holds admission to the CPU experts' windows (admit)
     const model::BatchView* view_ = nullptr;           // the batch window in flight, while batch_forward runs it
     float* logits_ = nullptr;                // the last window's head rows (row_logprobs, copy_logits, resample_row)
     uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups
