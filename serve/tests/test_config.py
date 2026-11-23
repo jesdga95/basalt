@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.config import (  # noqa: E402
     CONFIG_VERSION,
+    ENGINE_SERVER_OPTIONS,
     ENGINE_VALUE_FORMS,
     ENTRY_OPTIONS,
     MODEL_OPTIONS,
@@ -65,6 +66,8 @@ def v2(cfg: dict) -> dict:
         name = key.replace("_", "-").removeprefix("--")
         if name in ENTRY_OPTIONS or name in MODEL_OPTIONS:
             entry[key] = value
+        elif name in ENGINE_SERVER_OPTIONS:
+            shared[key] = value
         else:
             server[key] = value
     return {"version": CONFIG_VERSION, "models": [entry], "server": server, "engine": shared}
@@ -157,6 +160,102 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(bfile, "--max-context"), "4096")
         self.assertNotIn("--resident-experts", bfile)
         self.assertNotIn("--route-tail-skip", bfile)
+    def test_the_slot_knobs_of_the_engine_section(self):
+        """Both slot knobs of the engine section are settings of the whole server: they reach the server's own
+        options, never the engine's argv (the engine knows neither flag), and no model entry may set one.
+        Left out, both are today: no pin, and the built-in header order."""
+        def settings(engine):
+            return model_settings(build_parser(), ["--config", conf({"engine": engine,
+                                                                    "models": [{"model": "a.basalt"}]})])[0]
+        a = settings({"conversation-cache-slot-pin": True,
+                      "conversation-cache-slot-identity": "X-Session-Id, x-opencode-session-id,x-session-id"})
+        self.assertTrue(a[0].conversation_cache_slot_pin)
+        self.assertEqual(a[0].conversation_cache_slot_identity, ("x-session-id", "x-opencode-session-id"))
+        self.assertIn("--conversation-cache-slot-pin", a[2])      # true gives the engine its own word
+        self.assertNotIn("--conversation-cache-slot-pin", a[3])
+        for words in (a[2], a[3]):
+            for word in ("--conversation-cache-slot-identity", "x-opencode-session-id", "x-session-id"):
+                self.assertNotIn(word, words)                     # the identity stays the server's own
+        a = settings({})
+        self.assertFalse(a[0].conversation_cache_slot_pin)
+        self.assertEqual(a[0].conversation_cache_slot_identity, ())
+        for words in (a[2], a[3]):
+            self.assertNotIn("--conversation-cache-slot-pin", words)   # false or absent: no word
+        for key in ("conversation-cache-slot-identity", "conversation-cache-slot-pin"):
+            with self.assertRaisesRegex(ValueError, "the whole server reads it once"):
+                model_settings(build_parser(), ["--config", conf({"models": [{"model": "a.basalt", key: True}]})])
+
+    def test_a_configured_pin_reaches_the_engine_and_its_argv(self):
+        """The pin set in the config file reaches the engine both ways the server builds one:
+        as the engine's own argv word, so a binary without the flag fails the named check_engine_flags start, and
+        as the server scheduler's setting, which no argv word of its own sets."""
+        from serve.engine.process import ProcessEngine
+        a, _, file_words, cli_words = model_settings(build_parser(), ["--config", conf(
+            {"engine": {"conversation-cache-slot-pin": True}, "models": [{"model": "a.basalt"}]})])[0]
+        self.assertTrue(a.conversation_cache_slot_pin)
+        self.assertIn("--conversation-cache-slot-pin", file_words)
+        self.assertNotIn("--conversation-cache-slot-pin", cli_words)
+        self.assertFalse(ProcessEngine("missing-executable", file_words, lazy=True).slot_pin)
+        self.assertTrue(ProcessEngine("missing-executable", file_words, lazy=True,
+                                      slot_pin=a.conversation_cache_slot_pin).slot_pin)
+
+    def test_the_cli_pin_gives_the_engine_its_word_too(self):
+        """`serve --model ... --conversation-cache-slot-pin` activates the pin on BOTH surfaces, exactly as the
+        config file's setting does: the server's own no-drift setting AND the engine's own argv word. The word is
+        consumed by the server's parser, so it has to be re-emitted for the engine; without the flag no word goes
+        out at all, and the default engine command stays byte-identical."""
+        a, _, file_words, cli_words = parse(["--conversation-cache-slot-pin"], {"engine": {}})
+        self.assertTrue(a.conversation_cache_slot_pin)
+        self.assertIn("--conversation-cache-slot-pin", cli_words)      # the engine's words, as the server assembles them
+        self.assertNotIn("--conversation-cache-slot-pin", file_words)  # it came from the command line, not the file
+        a, _, file_words, cli_words = parse([], {"engine": {}})
+        self.assertFalse(a.conversation_cache_slot_pin)
+        for words in (file_words, cli_words):
+            self.assertNotIn("--conversation-cache-slot-pin", words)   # absent: no word, as ever
+
+    def test_the_cli_pin_turns_on_both_surfaces_at_once(self):
+        """The half-activation this pins: with the flag on the command line the server scheduler's setting and the
+        word the engine process starts with are both on - one resolved value, no asymmetry between them."""
+        from serve.engine.process import ProcessEngine
+        a, _, file_words, cli_words = parse(["--conversation-cache-slot-pin"], {"engine": {}})
+        args = file_words + cli_words                                    # the engine argv the server builds (vision.py)
+        self.assertTrue(a.conversation_cache_slot_pin)                   # the server's no-drift layer
+        self.assertIn("--conversation-cache-slot-pin", args)             # the engine's own word
+        self.assertTrue(ProcessEngine("missing-executable", args, lazy=True,
+                                      slot_pin=a.conversation_cache_slot_pin).slot_pin)
+        a, _, file_words, cli_words = parse([], {"engine": {}})
+        args = file_words + cli_words
+        self.assertFalse(a.conversation_cache_slot_pin)
+        self.assertNotIn("--conversation-cache-slot-pin", args)
+        self.assertFalse(ProcessEngine("missing-executable", args, lazy=True,
+                                       slot_pin=a.conversation_cache_slot_pin).slot_pin)
+
+    def test_a_pre_rebuild_engine_refuses_the_pin_instead_of_skipping_it(self):
+        """A pre-rebuild engine refuses the pin: an engine binary without the flag fails the start naming the flag -
+        the pin word is never one of the per-model skipped ones, the way every other top-level word is."""
+        with self.assertRaisesRegex(ValueError, r"--conversation-cache-slot-pin is not an engine flag"):
+            model_settings(build_parser(), ["--config", conf(
+                {"engine": {"conversation-cache-slot-pin": True}, "models": [{"model": "a.basalt"}]})],
+                refused=lambda path, group: True)
+
+    def test_the_disk_fifo_setting_gives_the_engine_its_word(self):
+        """`conversation-cache-disk-fifo` is the disk tier's own engine flag, like the disk budget next to it: true
+        gives the engine its word, false or absent gives none (the budget then still evicts least recently used).
+        A model entry may set it, and for an engine binary without the flag the start is refused by name - the
+        same check that refuses a typo'd flag, not the pin's never-skipped rule."""
+        def words(engine, entry=None):
+            models = [dict({"model": "a.basalt"}, **(entry or {}))]
+            return model_settings(build_parser(), ["--config", conf({"engine": engine, "models": models})])[0]
+        for setting, word in ((True, True), (False, False), (None, False)):
+            _, _, file_words, cli_words = words({} if setting is None else {"conversation-cache-disk-fifo": setting})
+            self.assertEqual("--conversation-cache-disk-fifo" in file_words, word)
+            self.assertNotIn("--conversation-cache-disk-fifo", cli_words)
+        _, _, file_words, _ = words({"conversation-cache-disk-fifo": True})
+        self.assertIn("disk-fifo", start_items(file_words, []))   # the console names it as short as the disk budget
+        _, _, own, _ = words({}, {"conversation-cache-disk-fifo": True})   # a model may set it as it sets the budget
+        self.assertIn("--conversation-cache-disk-fifo", own)
+        with self.assertRaisesRegex(ValueError, r"--conversation-cache-disk-fifo is not an engine flag"):
+            check_engine_flags(file_words, {"--model"}, "--config c.json")
 
     def test_the_ram_reserve(self):
         p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})

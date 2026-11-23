@@ -26,6 +26,11 @@ MODEL_OPTIONS = frozenset({
     "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
+# the engine section's settings the WHOLE SERVER reads: no model picks its own, and they are never engine words
+ENGINE_SERVER_OPTIONS = frozenset({"conversation-cache-slot-identity", "conversation-cache-slot-pin"})
+# of those, the ones the server ALSO hands to the engine as its own flag: true gives the
+# word, false or absent gives none, and an engine binary without the flag fails the named check_engine_flags start
+SERVER_READ_ENGINE_WORDS = frozenset({"conversation-cache-slot-pin"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
 
@@ -214,6 +219,10 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> ConfigFile:
             raise ValueError(f"engine.{key}: set it in a model entry")
         if name in MODEL_OPTIONS:
             shared_model[name] = option_words("engine", key, value, known[name], here)
+        elif name in ENGINE_SERVER_OPTIONS:
+            shared_model[name] = option_words("engine", key, value, known[name], here)
+            if name in SERVER_READ_ENGINE_WORDS:
+                shared_engine[name] = engine_words(key, value)
         elif name in known:
             raise ValueError(f'engine.{key}: a server option, set it under "server"')
         else:
@@ -229,6 +238,8 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> ConfigFile:
             name = config_name(key)
             if name in ENTRY_OPTIONS or name in MODEL_OPTIONS:
                 entry_model[name] = option_words(where, key, value, known[name], here)
+            elif name in ENGINE_SERVER_OPTIONS:
+                raise ValueError(f"{where}.{key}: the whole server reads it once, set it under \"engine\"")
             elif name in known:
                 raise ValueError(f'{where}.{key}: a server option, set it under "server"')
             else:
@@ -258,6 +269,8 @@ def model_settings(ap: argparse.ArgumentParser, cli: list[str], refused=None) ->
         kept, skipped = [], []
         for group in engine_groups(entry.shared_words):
             if refused is not None and refused(entry.path, group):
+                if group[0][2:] in SERVER_READ_ENGINE_WORDS:
+                    raise ValueError(f"{entry.path}: {group[0]} is not an engine flag")   # ruled: the pin never skips
                 skipped.append(group[0])
             else:
                 kept += group
@@ -275,6 +288,12 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
     cli_words = split_engine_extras(extras)
     file_argv, file_words = [*server_argv, *model_argv], list(words)
     a = ap.parse_known_args(file_argv + cli)[0]
+    if a.conversation_cache_slot_pin and "--conversation-cache-slot-pin" not in file_words + cli_words:
+        # the server reads this one flag itself, so the command line never leaves it in `extras` for the engine to
+        # carry: re-emit the word from the resolved value, the way an engine-only word like the disk tier's fifo
+        # reaches the engine from the command line. One resolved value, both surfaces - the config file's setting
+        # already put the word in `file_words`, so a command line that repeats it adds no second word.
+        cli_words += engine_words("conversation-cache-slot-pin", True)
     a.skipped = []
     a.sampling_launch = {k: getattr(a, k) for k in SAMPLING_KEYS if getattr(a, k) is not None}
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
@@ -333,6 +352,7 @@ def engine_groups(words: list[str]) -> list[list[str]]:
 
 # flag -> the console's name; a -mib or -gib flag's unit follows its value
 ENGINE_NAMES = {"max-context": "ctx", "pool-workers": "pool", "conversation-cache-disk-mib": "disk-cache",
+                "conversation-cache-disk-fifo": "disk-fifo",
                 "conversation-cache-mib": "ram-cache", "vram-reserve-mib": "reserve"}
 UNIT_SUFFIXES = {"-mib": "MiB", "-gib": "GiB"}
 
@@ -565,6 +585,16 @@ def video_tokens(text: str) -> int:
     return n
 
 
+def slot_identity(text: str) -> tuple[str, ...]:
+    """argparse type: conversation-cache-slot-identity, the request-header names the session key is read from,
+    in the order they are named (comma-separated; header names are case-insensitive, so they are kept lower).
+    Every header of the server's own order stays in play: the list says what to read FIRST."""
+    names = tuple(dict.fromkeys(n for n in (x.strip().lower() for x in str(text).split(",")) if n))
+    if not names:
+        raise argparse.ArgumentTypeError(f"expected header names to read first, like x-session-id, not {text!r}")
+    return names
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
@@ -695,4 +725,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="price per million new (cache-write) input tokens (default: same as --cost-in)")
     ap.add_argument("--cost-cache-hit", type=cost_rate, default=None, metavar="USD",
                     help="price per million reused (cache-hit) input tokens (default: same as --cost-in)")
+    ap.add_argument("--conversation-cache-slot-pin", action="store_true",
+                    help="keep a session to the slot it owns: when that slot is busy its request waits there "
+                         "instead of taking another one")
+    ap.add_argument("--conversation-cache-slot-identity", type=slot_identity, default=(), metavar="NAME[,...]",
+                    help="the request headers the session is read from, ahead of the server's own order and in this "
+                         "order (comma-separated; every header of that order stays in play: this chooses what to read "
+                         "first, it filters nothing)")
     return ap
