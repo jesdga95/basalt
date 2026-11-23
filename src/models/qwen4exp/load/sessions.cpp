@@ -261,7 +261,9 @@ int sessions(Context& context) {
     bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
+        // one slot of a KV format batch windows cannot read is no slot: requests run one at a time, as without --batch
+        const char* off = !o.serve ? "it needs --serve" : o.batch < 1 ? "it needs 1 or more slots"
+                        : o.batch == 1 && !cli::kv_batch_refusal(o.kv, 2).empty() ? "one slot runs batch windows only with --kv int8"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
             basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
@@ -324,8 +326,8 @@ int sessions(Context& context) {
                          (int) bslot_ss[k].size(), dev, (double) total / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
-        if (fit < 2) {
-            basalt::log::warn("basalt generate", "--batch is off: not two slot sessions fit (a smaller "
+        if (fit < 1) {
+            basalt::log::warn("basalt generate", "--batch is off: no slot session fits (a smaller "
                                  "--max-context, or KV streaming, --kv-resident, makes them smaller)");
             bslot_ss.clear();
             slot_cap.clear();
