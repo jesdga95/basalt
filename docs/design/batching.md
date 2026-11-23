@@ -17,15 +17,18 @@ own conversation differs:
 
 ## The interface
 
-The interface exists today (`include/basalt/model/adapter.hpp`); the dense stack (Qwen3.8-27B) implements it and the shared
-serve engine (`src/program/serve/session_engine.cpp`) drives it. Every model batches through it: one batching path, no
-model-specific runtime or mode.
+The interface is `include/basalt/model/adapter.hpp`; the shared serve rounds (`src/program/serve/batch_round.cpp`) drive it,
+from the shared engine (`session_engine.cpp`) and from a model's own serving runtime alike. Every model batches through it:
+one batching path, no model-specific batching mode.
 
 - **Sessions are slots.** A model makes one `ModelSession` per slot (`LoadRequest::sessions`). A session owns its
   conversation's state: caches, rings, recurrent state, the drafter's context, its sampler and its last logits.
 - **`int batch_rows()`** is the rows one batched pass holds in all, 0 for a model that does not batch.
 - **`decode_batch(sessions, reqs, n)`** runs the windows `reqs[i]` of the distinct sessions `sessions[i]` as one pass. Each
   session ends exactly as after its own `decode_window(reqs[i])`: its picks, its last logits, its drafter's context.
+- **`decode_kept(sessions, kept, n)`**, after the accept and before any drafts: the rows each window keeps. A model that
+  settles a window's state at once (a verifier that rolls the rejected rows back) commits here; by default the next
+  window's position says it.
 - **`draft_batch(peers, anchors, pos, n, count)`** starts the drafts of several sessions in one pass where the drafter can
   (the default runs them in turn).
 
@@ -46,10 +49,14 @@ row counts. A model captures one graph per composition and keeps the most recent
 
 The shared engine schedules; a model only states its cap. Each round, every busy slot drafts its next window. With no more
 slots than rows one pass serves every slot (`batch_shares`): each takes one row, then each further row goes to the slot whose
-next draft is likeliest kept (the joint of its drafts' calibrated chances), and rows no draft wants go round the slots. With more
-slots than rows each may take the cap and the windows are packed first fit into passes of at most `cap` rows
+next draft is likeliest kept (the joint of its drafts' calibrated chances), and rows no draft wants go round the slots. A
+drafter that sets its own windows' length (`own_window`: a stop rule in its chain) states no chances to weigh: each window
+takes the rows it would take alone, shared max-min fairly when they do not fit (`batch_fair_shares`: the windows wanting
+least served in full, the others splitting what is left), and the policy only weighs a lookup proposal against its drafts.
+With more slots than rows each may take the cap and the windows are packed first fit into passes of at most `cap` rows
 (`batch_groups`). A lone window runs as `decode_window`, the solo path. The engine keeps one draft policy for solo windows and
-one for batch windows, whose rounds cost differently.
+one for batch windows, whose rounds cost differently. A runtime may hold a slot out of a round (`slot_ready`, Flash-Next's
+elastic KV beside a prompt read); it keeps its place.
 
 ## Shared code and what a model provides
 
@@ -57,8 +64,9 @@ Shared code never names a model (`tools/check_model_layering.sh`).
 
 | Piece | Where |
 | --- | --- |
-| The session interface: `batch_rows`, `decode_batch`, `draft_batch` | `model/adapter.hpp` |
-| Slot admission, rounds, row shares by the drafts' chances, groups, per-slot accept and output | `src/program/serve/session_engine.cpp`, `batch_plan.hpp` |
+| The session interface: `batch_rows`, `decode_batch`, `decode_kept`, `draft_batch`, `own_window` | `model/adapter.hpp` |
+| Rounds, row shares by the drafts' chances, groups, per-slot accept and output, for every runtime | `src/program/serve/batch_round.cpp`, `batch_plan.hpp` |
+| Slot admission and the slots' conversations | `src/program/serve/request_finish.cpp`, `request_restore.cpp` |
 | The driver: `decode_batch` for any model (checks, segments, head rows, graph per composition, stream order, one sync, picks) | `model/batch_driver.hpp` (`BatchSession`) |
 | A batch window's segments (rows, per-row positions and tokens) and the graph cache keyed by composition | `model/batch_window.hpp` |
 | The device form of the segment table and a row's segment lookup, for any model's kernels | `kernels/window_segs.hpp` |
@@ -89,15 +97,15 @@ times the slots plus the shared scratch once, so more slots cost only their cach
    composition. A model whose host steers its forward between launches (Hy4 places its experts between per-layer graphs)
    returns false from `batch_captured`: the driver runs its forward directly every window and the model replays its own
    graphs of the stretches between. A session whose state the batch path does not cover yet returns false from
-   `batch_ready`, and the batch's windows run in turn.
+   `batch_ready`, and the batch's windows run in turn. `batch_end` (optional) runs once on every exit after `batch_stage`,
+   with the status of the stream's sync after every draw (none on an earlier exit); false withholds the window's results.
 4. Run the checks: `basalt --model FILE --batch 4 --tokens-file PROMPT --diag-batch-check` (every row of every composition
    bitwise its solo window), then `tools/batch_identity.py ENGINE --model FILE --slots 1,2,4,8` (every slot's tokens, alone
    and together, equal to a one-slot engine's).
 
 ## Models on the driver
 
-The goal is no separate batching paths: every model batches through the shared driver and the shared engine, for
-consistency. Qwen3.8-27B, Inkling 2 Mini, Hy4-flash and DeepSeek-V4.1-Flash are on it; Qwen3.8-Flash-Next moves last.
+Every model batches through the shared driver and the shared rounds: no separate batching path.
 
 - **Qwen3.8-27B** (the dense stack, `src/dense`) is on the driver. A window holds up to 16 rows (`kBatch`); its kernels read
   their own segment tables (the attention's `GqaSeg` per segment, GDN's `BatchTable` through `dec_gdn_rec_seg_split`), which
@@ -108,11 +116,8 @@ consistency. Qwen3.8-27B, Inkling 2 Mini, Hy4-flash and DeepSeek-V4.1-Flash are 
   or MTP rows into its session (`batch_body`); `batch_take` its bookkeeping, `batch_draw` its sampler. The window scratch is the
   model's, shared by every session. A layer split runs its two cards' graphs itself (`batch_captured` false: `forward_batch`
   keeps each card's in its model's `BatchShared`). The block drafter's batched pass (`draft_batch`) stays the model's.
-- **Qwen3.8-Flash-Next** (`src/models/qwen4exp`) has its own runtime (`serve::Runtime`) and verifier: `Verifier::stage_batch`
-  takes per-row slot ids and lengths over its elastic KV arena. It is the most tuned path in the engine and already batches
-  slots x drafts in one pass. It moves onto the shared driver last, behind a hard gate: no speed loss at any slot count,
-  plain or drafted, ABBA against main, or it does not land. Until then new models copy the shared interface, not its
-  runtime.
+- **Qwen3.8-Flash-Next** (`src/models/qwen4exp`) keeps its own serving runtime (prompt split, elastic KV arena, peer
+  expert tier, conversation cache); its slots batch through the shared rounds and driver (the retrofit below).
 
 ## Retrofits
 
@@ -134,7 +139,8 @@ How each model below went onto the driver: its state, the kernels that read it, 
 - **On the driver:** `batch_stage` stages every row's token and position, `batch_forward` runs the visits with each
   segment's caches, then the head over every row into the shared batch logits, and commits each session's drafter context
   from its rows of the shared tap; `batch_take` copies a segment's head rows into its session's logits; `batch_draw` samples
-  with the session's own sampler into its pinned picks.
+  with the session's own sampler into its pinned picks. With experts on the CPU, `batch_stage` takes the CPU experts'
+  admission and `batch_end` gives it up at the driver's sync, withholding a window the CPU experts' abort interrupted.
 - **Shared:** the forward's row buffers and expert scratch, the prompt path (its chunk buffers) and the drafter's tap.
 
 ### Hy4-flash (second)
@@ -180,6 +186,40 @@ How each model below went onto the driver: its state, the kernels that read it, 
 | 2 | 85.0 / 82.7 | 85.4 / 80.4 | -1.1% |
 | 4 | 71.5 / 70.0 | 63.8 / 62.1 | -11.0% |
 | 8 | 76.9 / 77.2 | 54.6 / 51.1 | -31.4% |
+
+### Qwen3.8-Flash-Next
+
+- **State:** per slot a session state carved like the solo session's (on one card slot 0 is the solo session): the GDN
+  recurrences and convolution histories, the QSA layers' INT8 K/V (elastic: cells backed out of the expert cache's tail on
+  demand) with the indexer's tails and pooled rows, and the PLE history. The drafter's K/V is the drafter's store of the
+  slot.
+- **Kernels:** the verifier's batch window (`Verifier::run_slot_segs`) already ran segments of several slots over their own
+  states, one graph per row count; a segment's rows are its slot's window.
+- **On the driver:** a slot is a `QfnSlotSession` (`serve/slot_session.cpp`), `batch_captured` false (the host serves each
+  layer's CPU experts). `batch_forward` runs the window on the verifier, which draws every row with its slot's sampling, and
+  `batch_draw` hands back the picks. A window's kept rows are committed at `decode_kept`, beside the drafts when drafts
+  follow. `draft_batch` runs the draft chain of each slot that goes on, stopped by its own length rule (`own_window`, so the
+  windows take max-min fair shares); when the window holds as many rows as slots, the slots likeliest to use drafts make
+  them and the others only advance their draft K/V. Between rounds the runtime backs each slot's next cells (a slot whose
+  cells wait for a prompt read beside it sits the round out, `slot_ready`) and steps the adaptive tier. The runtime's own
+  serving (prompt split, peer tier, conversation cache, the solo loop) is unchanged.
+- **Cap:** 8 rows, the verifier's window (`kVerifyMaxT`). `--batch 1` with `--kv int8` is one slot (the batch identity
+  tool's reference).
+- **Checks:** `--diag-batch-check` runs in the serving engine, where the slots exist; a slot reads the check's prompt
+  through its own windows.
+- **Row invariance:** a window's CPU experts take a kernel by the window's row count, so a row's bits can depend on the
+  other rows when its experts are in RAM. Solo windows against the same windows batched agree bitwise (the batch check);
+  a slot decoding beside others can part from its tokens alone after a few dozen tokens on one card, token for token as it
+  did before the move (plain decode, tiers pinned, both builds' tokens equal at every slot count).
+- **Gate:** no slot count slower than Flash-Next's own rounds were. Two cards (400 W RTX 5090 + 180 W RTX 5060 Ti), int8
+  KV, expert cache pinned at 8600, tiers adapting, 256 tokens a slot (the bench fixtures in turn), aggregate tok/s, ABBA:
+
+| Slots | Drafted: own rounds (A1 / A2) | On the driver (B1 / B2) | Plain: own rounds (A1 / A2) | On the driver (B1 / B2) |
+| --- | --- | --- | --- | --- |
+| 1 | 195.6 (cold) / 235.9 | 233.2 / 225.1 | 127.7 / 129.2 | 129.2 / 130.2 |
+| 2 | 206.4 / 200.0 | 207.4 / 205.4 | 161.1 / 161.9 | 162.6 / 163.2 |
+| 4 | 266.8 / 261.2 | 264.9 / 263.8 | 227.0 / 236.6 | 229.5 / 236.6 |
+| 8 | 307.9 / 309.3 | 307.7 / 309.7 | 313.9 / 311.3 | 311.8 / 308.7 |
 
 ## The MoE caveat
 

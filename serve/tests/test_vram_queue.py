@@ -1,4 +1,5 @@
-"""POST /v1/vram while requests decode: queued (202), applied at the first gap, the newest one wins, new requests wait."""
+"""POST /v1/vram while requests decode: queued (202), applied at the first gap, the newest one wins, new requests wait.
+While the model sleeps (its process suspended) the engine is not told: the reserve applies at the wake."""
 import http.client
 import json
 import threading
@@ -82,3 +83,16 @@ class VramQueue(Slots):
         # no run of the second request had started when the engine was told to resize
         self.assertLess(self.runs_at_apply, len(self.engine.requests))
         self.assertEqual(self.seen, [2048])
+
+    def test_asleep_waits_for_the_wake(self):
+        self.engine.asleep, self.engine.restore_s = True, 0.0
+
+        def wake(timeout=120.0, vram_check=None):
+            self.engine.asleep = False
+        self.engine.wake = wake
+        status, body = self.vram({"reserve_mib": 3000})
+        self.assertEqual((status, body["status"], body["reserve_mib"]), (200, "asleep", 3000))
+        self.assertEqual(self.seen, [])                  # a suspended engine is never sent a command
+        self.assertIsNone(self.get("/v1/status")["vram"]["pending"])
+        self.chat("slow")                                # the request wakes it
+        self.assertEqual(self.seen, [3000])

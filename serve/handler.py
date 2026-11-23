@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
 import socket
@@ -374,7 +375,27 @@ def make_handler(target: Service | Router):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+                    qs = parse_qs(urlsplit(self.path).query)
+                    name = qs.get("model", [None])[0]
+                    fmt = qs.get("format", [None])[0]
+                    from serve.prometheus import CONTENT_TYPE as PROM_CT, render_prometheus, wants_prometheus
+                    if wants_prometheus(self.headers.get("Accept"), fmt):
+                        if name is not None:
+                            svcs = [router.service_for(name)]
+                            if svcs[0] is None:
+                                self._json(404, {"error": {"message": "model not found"}})
+                                return
+                        else:
+                            svcs = list(router.services) if hasattr(router, "services") else [router.shown()]
+                        entries = [(router.metrics(s), s.prom_snapshot()) for s in svcs]
+                        body = render_prometheus(entries).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", PROM_CT)
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                     shown = router.shown() if name is None else router.service_for(name)
                     if shown is None:
                         self._json(404, {"error": {"message": "model not found"}})
@@ -502,6 +523,52 @@ def make_handler(target: Service | Router):
                         result = "loaded"
                     self._json(200, {"status": result, **target.v1_status()})
                     return
+                if path == "/api/pricing":
+                    if not self._own_page("pricing can be changed"):
+                        return
+                    shown = router.shown()
+                    changed = []
+                    for field, attr in (("cost_input_per_million", "cost_input_per_million"),
+                                        ("cost_output_per_million", "cost_output_per_million"),
+                                        ("cost_cache_write_per_million", "cost_cache_write_per_million"),
+                                        ("cost_cache_hit_per_million", "cost_cache_hit_per_million")):
+                        if field in req:
+                            v = req[field]
+                            if v is not None:
+                                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                                    raise ValueError(f"{field}: a number or null")
+                                if not math.isfinite(v):
+                                    raise ValueError(f"{field}: a finite number or null")
+                                if v < 0:
+                                    raise ValueError(f"{field}: a non-negative number or null")
+                            setattr(shown, attr, float(v) if v is not None else None)
+                            changed.append(field)
+                    if shown.totals_path:
+                        with shown.status_lock:
+                            shown._save_totals()
+                    from serve.totals import totals_with_cost
+                    with shown.status_lock:
+                        totals = {"since": int(shown.started_at), "requests": shown.requests_done, **shown.totals}
+                        totals_with_cost(totals, shown.cost_input_per_million, shown.cost_output_per_million,
+                                         shown.cost_cache_write_per_million, shown.cost_cache_hit_per_million)
+                    self._json(200, {"status": "ok", "changed": changed, "totals": totals})
+                    return
+                if path == "/api/totals-reset":
+                    if not self._own_page("totals can be reset"):
+                        return
+                    shown = router.shown()
+                    if not shown.totals_path:
+                        self._json(400, {"error": {"message": "no totals file configured"}})
+                        return
+                    from serve.totals import totals_reset_file
+                    prev = totals_reset_file(shown.totals_path)
+                    with shown.status_lock:
+                        shown.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}
+                        shown.requests_done = 0
+                        shown.started_at = time.time()
+                        shown._save_totals()
+                    self._json(200, {"status": "reset", "previous": str(prev) if prev else None})
+                    return
                 if path == "/v1/answer_now":
                     rid = req.get("request_id")
                     if rid is not None and not isinstance(rid, str):
@@ -532,6 +599,7 @@ def make_handler(target: Service | Router):
                     return
                 self.svc.request_ctx.path = path
                 self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
+                self.svc.request_ctx.arrived = time.time()   # arrival timestamp for end-to-end / TTFT histograms
                 with document_sources(self._image_access()):   # a document by URL or path follows the image rules
                     if path == "/v1/responses":
                         self._responses(req)
@@ -691,7 +759,8 @@ def make_handler(target: Service | Router):
             self.end_headers()
 
         def _unknown_model(self, path, name):
-            """404 for a missing or unserved model, in the shape of the API called."""
+            """404 for a name that serves nothing, or no name where several models are configured, in the shape of the
+            API called. A request naming no model reaches here only through `Router.service_for`."""
             anthropic = path.startswith("/v1/messages")
             if name is None:
                 text = "model: required" if anthropic else "model is required"

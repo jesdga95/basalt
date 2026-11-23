@@ -1,6 +1,7 @@
 // src/kernels/cuda/elementwise.cu - the glue kernels.  See the header for why each exists.
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/doorbell.cuh"
 
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -193,6 +194,16 @@ __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volati
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) {
     if (d_flag == nullptr || d_seq == nullptr) return;
     doorbell_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, d_seq);
+    check_launch("doorbell_wait");
+}
+
+__global__ void doorbell_abort_wait_kernel(const uint32_t* flag, const uint32_t* seq, const uint32_t* abort) {
+    doorbell_spin(flag, *seq, abort, 1);
+}
+
+void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, const uint32_t* d_abort, void* stream) {
+    if (d_flag == nullptr || d_seq == nullptr) return;
+    doorbell_abort_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, d_seq, d_abort);
     check_launch("doorbell_wait");
 }
 

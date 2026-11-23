@@ -1,0 +1,43 @@
+{
+  "submitter": "cobra91",
+  "date": "2026-11-16",
+  "commit": "07fa0192e7",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 28.9
+    },
+    {
+      "name": "RTX 4060 Ti",
+      "vram_gib": 16,
+      "power_w": 165,
+      "pcie": "4.0 x2",
+      "h2d_gbps": 3.2
+    }
+  ],
+  "ram_gib": 31,
+  "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+  "ram_gbps": 57.1,
+  "os": "Windows",
+  "quant": "IQ1_S",
+  "kv": "int8",
+  "prefill_16k_tps": 1559.9,
+  "prefill_64k_tps": 2239.6,
+  "decode_tps": 262.3,
+  "decode_conv_tps": 162.0,
+  "decode_struct_tps": 346.4,
+  "decode_prose_tps": 142.2,
+  "accept_conv_pct": 72.6,
+  "accept_struct_pct": 94.8,
+  "accept_prose_pct": 63.8,
+  "draft_len_conv": 2.8,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 1.9,
+  "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+  "notes": "RTX 5080 main + RTX 4060 Ti (sm_89) peer-tier via PR #343 (PEER_ADA=ON); zero SSD spill on Windows 11."
+}

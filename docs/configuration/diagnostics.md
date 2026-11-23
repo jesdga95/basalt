@@ -10,7 +10,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--tokens`, `--tokens-file` | CLI | required | The prompt as token ids. |
 | `--max-new` | CLI | 16 | Tokens to generate. |
 | `--greedy` | CLI | on | Argmax decoding. |
-| `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0. |
+| `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0; the same seed gives the same text on every model, and `--temperature 0` stays greedy. |
 | `--stop-eos` | CLI | off | Stop at an end-of-turn token. |
 | `--eos-ids` | engine | the pack's | The end-of-turn tokens. |
 | `--gpu-plan` | engine | | Print the `--gpu` choice as JSON and exit. |
@@ -75,7 +75,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--power-label W` | read from the GPU | The power limit to print. |
 | `--logs DIR`, `--no-windows`, `--print-command` | | Logs, window stats, command printing. |
 | `--hardware` | | Measure CPU, RAM and each GPU's link, then exit. |
-| `--community`, `--submitter NAME`, `--community-file PATH` | bench | | The community preset and its row, which names the model ([community runs](../community.md)). |
+| `--community`, `--submitter NAME`, `--community-dir DIR` | bench | | The community preset and its row, which names the model ([community runs](../community.md)). |
 
 `basalt-device` (in the build folder): `--list-devices`, `--link-rates`, `--selftest`.
 
@@ -84,6 +84,5 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 `--exp NAME=VALUE[,...]` sets experiment switches. They carry no stability promise and go away with their experiment.
 
 - `concur9_logit_hash=1`: print a hash of each accepted row's head logits on stderr.
-- `concur5_digest=1`: batch slots print a state digest per window.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.

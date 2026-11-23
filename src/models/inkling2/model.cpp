@@ -77,16 +77,16 @@ uint64_t expert_stride(int type, uint64_t blob) {
 
 namespace {
 // The cached keys and values of one visit of layer `layer` for `context` positions (a sliding-window layer: its ring).
-uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8) {
-    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * (fp8 ? 1 : 2);
+uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8, bool int8) {
+    const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);
     return per_pos * (g.swa[(size_t) layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
 }
 }  // namespace
 
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, int cut, int card) {
+uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut, int card) {
     uint64_t caches = 0;
     for (const Visit& v : g.visits)
-        if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8);
+        if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
     return caches + kSessionFixed + (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
 }
 
@@ -339,6 +339,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     }
     ldev_ = device_;
     cudaSetDevice(device_);
+    fp8_ = req.kv == "fp8";
+    int8_ = req.kv == "int8";
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
     if (req.spec >= 2)
         if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
@@ -369,7 +371,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = kCardSpare - vision_modules;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
+            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
@@ -379,7 +381,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 cudaSetDevice(card_device(c));
                 size_t fb = 0, tb = 0;
                 cudaMemGetInfo(&fb, &tb);
-                const uint64_t need = (session_bytes(g, want, fp8_, cut_, c) +
+                const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) +
                                        (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
                                       (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
                 if (need > fb) {
@@ -447,7 +449,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
             return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
                                               std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
-                                              " positions fit" + (fp8_ ? "" : " (--kv fp8 halves a position's bytes)")};
+                                              " positions fit" + (fp8_ || int8_ ? "" : " (--kv fp8 halves a position's bytes)")};
         }
         ctx_ = want;
         }
@@ -638,7 +640,7 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
         const ExpertLayer& el = pack_.experts[(size_t) l];
         mm.layer_bytes.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes));
         experts += mm.layer_bytes.back();
-        mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8") * n_sess);
+        mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8", req.kv == "int8") * n_sess);
         mm.layer_share.push_back((double) visits[(size_t) l] / (double) g.visits.size());
         dense += (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34) +
                  prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
@@ -648,7 +650,7 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
     for (int c = 0; c <= g.n_layers; ++c) mm.split_handoffs.push_back(split_handoffs(g, c));
     mm.blob_bytes = experts / (uint64_t) mm.pairs;
     mm.peer_overhead = kCardSpare + shared_bytes(g, false);
-    mm.main_overhead = kCardSpare + shared_bytes(g, req.spec >= 2) + dense + session_bytes(g, want, req.kv == "fp8") * n_sess +
+    mm.main_overhead = kCardSpare + shared_bytes(g, req.spec >= 2) + dense + session_bytes(g, want, req.kv == "fp8", req.kv == "int8") * n_sess +
                        (1000ull << 20);   // the drafter, as multi_gpu_plan counts it on the first card
     const program::MgPlan mp = program::plan_multi_gpu(cards, mm);
     basalt::log::info("basalt inkling2", "%s", mp.line.c_str());

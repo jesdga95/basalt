@@ -104,10 +104,19 @@ function stateWord(live, name) {
 }
 // the conversation cache, only when something is cached and a model is up
 const cached = (conv, live) => !["unloaded", "asleep", "loading"].includes(live.state) && conv && num(conv.parked) && conv.parked > 0;
+const usd = v => !num(v) || v === 0 ? "$0" : v < 0.01 ? `$${v.toFixed(4)}` : v < 1 ? `$${v.toFixed(3)}` : v < 100 ? `$${v.toFixed(2)}` : `$${fmt(v, 2)}`;
 function drawTotals(t) {
-  const n = t && num(t.requests) && t.requests > 0 ? t : null;
-  html($("#totals"), n ? `<b>${fmt(n.requests)}</b> requests served · <b>${fmt(n.written)}</b> tokens written` : "");
-  $("#totals").title = n ? `Since the server started: ${fmt(n.prompt)} prompt tokens (${fmt(n.reused)} reused), ${dur(n.prompt_ms)} reading, ${dur(n.decode_ms)} generating` : "";
+  const n = t && num(t.requests) ? t : null;
+  const cost = n && num(n.cost_usd) && n.cost_usd > 0 ? `<b>${usd(n.cost_usd)}</b> · ` : "";
+  html($("#totals"), n ? `${cost}<b>${fmt(n.requests)}</b> requests · <b>${big(n.prompt)}</b> prompt · <b>${big(n.written)}</b> output` : "");
+  const tip = n ? `Since ${new Date((n.since || 0) * 1000).toLocaleDateString()}: ${fmt(n.prompt)} prompt tokens (${fmt(n.reused)} reused), ${dur(n.prompt_ms)} reading, ${dur(n.decode_ms)} generating` : "";
+  const ci = n ? (n.cost_input_per_million || 0) : 0;
+  const pricing = n && (ci || n.cost_output_per_million) ? `\nPricing: $${ci}/M in · $${n.cost_output_per_million}/M out` +
+    ((n.cost_cache_write_per_million != null && n.cost_cache_write_per_million !== ci) || (n.cost_cache_hit_per_million != null && n.cost_cache_hit_per_million !== ci) ?
+      ` · $${n.cost_cache_write_per_million ?? ci}/M write · $${n.cost_cache_hit_per_million ?? ci}/M hit` : "") : "";
+  $("#totals").title = (tip + pricing) || "Pricing and totals";
+  lastTotals = t;
+  $("#totals").onclick = () => openPricing();
 }
 
 /* ---- the heat scale: 0..400 tok/s and up; only the colour of the live decode number uses it ---- */
@@ -899,6 +908,105 @@ async function pollLog() {
 $("#auth").onsubmit = e => {
   e.preventDefault(); apiKey = $("#key").value.trim(); sessionStorage.setItem("basalt.key", apiKey);
 };
+
+/* ---- pricing dialog ---- */
+/* ---- support: the footer heart opens a quiet dialog of links; it never opens by itself ---- */
+function openSupport() {
+  let d = $("#support-dlg");
+  if (!d) {
+    d = document.createElement("dialog"); d.id = "support-dlg"; d.className = "price";
+    const out = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    const link = (href, name, note) => `<a class="support-link" href="${href}" target="_blank" rel="noopener noreferrer"><b>${name}</b><span>${note}</span>${out}</a>`;
+    d.innerHTML = `<form method="dialog">
+<div class="price-head"><h3>Support Basalt</h3><p>Basalt is free and MIT licensed. Sponsorship pays for the tokens behind its development and for time on more hardware to test on.</p></div>
+<div class="support-links">${link("https://github.com/sponsors/jesdga95", "GitHub Sponsors", "monthly or one-time")}${link("https://ko-fi.com/jesdga", "Ko-fi", "one-time")}${link("https://paypal.me/jesdga", "PayPal", "one-time")}</div>
+<p class="support-alt">No money needed to help: a <a href="https://github.com/jesdga95/basalt/blob/main/docs/community.md" target="_blank" rel="noopener noreferrer">community benchmark run</a> from your hardware helps too.</p>
+<div class="price-foot"><span class="grow"></span><button type="submit" class="price-ghost">Close</button></div></form>`;
+    document.body.append(d);
+    d.onclick = e => { if (e.target === d) d.close(); };
+  }
+  d.showModal();
+}
+$("#support").onclick = openSupport;
+
+let lastTotals = null;
+const priceVal = id => { const v = $(id).value.trim(); return v === "" ? null : Math.max(0, parseFloat(v) || 0); };
+// the dialog's live figure: the same formula as serve/totals.py, from the counts and the rates as typed
+function pricePreview() {
+  const t = lastTotals || {}, inp = priceVal("#p-in") ?? 0, out = priceVal("#p-out") ?? 0;
+  const cw = priceVal("#p-cw") ?? inp, ch = priceVal("#p-ch") ?? inp;
+  const given = t.prompt || 0, held = Math.min(t.reused || 0, given);
+  const cost = ((given - held) * cw + held * ch + (t.written || 0) * out) / 1e6;
+  $("#p-cost").textContent = usd(cost);
+  for (const id of ["#p-cw", "#p-ch"]) $(id).placeholder = String(inp);
+}
+function openPricing() {
+  let d = $("#pricing-dlg");
+  if (!d) {
+    d = document.createElement("dialog"); d.id = "pricing-dlg"; d.className = "price";
+    const field = (id, label, ph = "") => `<label class="price-f"><span>${label}</span><span class="price-in"><i>$</i>`
+      + `<input id="${id}" type="number" inputmode="decimal" step="any" min="0" placeholder="${ph}" autocomplete="off"></span></label>`;
+    d.innerHTML = `<form method="dialog" id="p-form">
+<div class="price-head"><h3>Pricing and totals</h3><p>What this server's tokens would cost at API prices, in US dollars per million tokens.</p></div>
+<div class="price-sum"><div class="cost" id="p-cost">$0</div><div class="meta" id="p-meta"></div></div><div class="price-since" id="p-since"></div>
+<div class="price-grid">${field("p-in", "Input", "0")}${field("p-out", "Output", "0")}${field("p-cw", "Cache write")}${field("p-ch", "Cache hit")}
+<div class="price-note">Leave a cache price empty to charge it like input.</div></div>
+<div class="price-foot"><button type="button" class="price-reset" id="p-reset">Reset totals</button><span class="price-msg" id="p-msg"></span>
+<span class="grow"></span><button type="button" class="price-ghost" id="p-close">Cancel</button><button type="submit" class="price-save">Save</button></div></form>`;
+    document.body.append(d);
+    $("#p-form").onsubmit = e => { e.preventDefault(); savePricing(); };
+    $("#p-close").onclick = () => d.close();
+    $("#p-reset").onclick = resetTotals;
+    d.addEventListener("input", pricePreview);
+    d.onclick = e => { if (e.target === d) d.close(); };
+  }
+  const t = lastTotals || {}, ci = t.cost_input_per_million || 0;
+  $("#p-in").value = ci || "";
+  $("#p-out").value = t.cost_output_per_million || "";
+  $("#p-cw").value = t.cost_cache_write_per_million != null && t.cost_cache_write_per_million !== ci ? t.cost_cache_write_per_million : "";
+  $("#p-ch").value = t.cost_cache_hit_per_million != null && t.cost_cache_hit_per_million !== ci ? t.cost_cache_hit_per_million : "";
+  html($("#p-meta"), priceMeta(t));
+  $("#p-since").textContent = t.since ? `Counting since ${new Date(t.since * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}` : "";
+  const reset = $("#p-reset"); reset.textContent = "Reset totals"; reset.classList.remove("armed");
+  priceMsg("");
+  pricePreview();
+  d.showModal();
+  $("#p-in").focus();
+}
+// the summary card's right side, two lines: requests, then tokens in and out, short (2.4M, 1.28B)
+const short = v => v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(v);
+const priceMeta = t => `<b>${short(t.requests || 0)}</b> requests<br><b>${short(t.prompt || 0)}</b> in · <b>${short(t.written || 0)}</b> out`;
+function priceMsg(text, kind = "") { const m = $("#p-msg"); m.textContent = text; m.className = "price-msg" + (kind ? " " + kind : ""); }
+const authHeaders = () => ({ "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) });
+async function savePricing() {
+  const body = { cost_input_per_million: priceVal("#p-in") ?? 0, cost_output_per_million: priceVal("#p-out") ?? 0,
+                 cost_cache_write_per_million: priceVal("#p-cw"), cost_cache_hit_per_million: priceVal("#p-ch") };
+  try {
+    const r = await fetch("api/pricing", { method: "POST", headers: authHeaders(), body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) return priceMsg(d.error?.message || `Error ${r.status}`, "err");
+    $("#pricing-dlg").close();
+  } catch (e) { priceMsg(e.message, "err"); }
+}
+// two clicks: the first arms it (and says what it does), the second resets
+async function resetTotals() {
+  const b = $("#p-reset");
+  if (!b.classList.contains("armed")) {
+    b.classList.add("armed"); b.textContent = "Click again to reset";
+    priceMsg("the current totals are kept in .prev.json");
+    clearTimeout(b._t); b._t = setTimeout(() => { b.classList.remove("armed"); b.textContent = "Reset totals"; priceMsg(""); }, 4000);
+    return;
+  }
+  clearTimeout(b._t); b.classList.remove("armed"); b.textContent = "Reset totals";
+  try {
+    const r = await fetch("api/totals-reset", { method: "POST", headers: authHeaders(), body: "{}" });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) return priceMsg(d.error?.message || `Error ${r.status}`, "err");
+    priceMsg("Totals reset", "ok");
+    lastTotals = { ...(lastTotals || {}), requests: 0, prompt: 0, reused: 0, written: 0, since: Date.now() / 1000 };
+    html($("#p-meta"), priceMeta(lastTotals)); $("#p-since").textContent = "Counting since now"; pricePreview();
+  } catch (e) { priceMsg(e.message, "err"); }
+}
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});

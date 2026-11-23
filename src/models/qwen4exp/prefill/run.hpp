@@ -2,6 +2,7 @@
 
 #include "state.hpp"
 #include "layout.hpp"
+#include "stream_copy.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
@@ -75,6 +76,7 @@ struct Prefill::Run::Chunk {
     bool ple_land();
     bool ple_layer(int64_t l);
     bool start_stream();
+    bool publish_route(int64_t layer);
     bool layer(int64_t l);
     bool gdn(const core::LayerView& v);
     bool qsa(const core::LayerView& v);
@@ -130,7 +132,6 @@ struct Prefill::Run::Chunk {
     PeerPrefill* const ppc =
         m.pp && m.peer_share && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
     const bool peer_fp4 = ppc && stream_all && ppc->T_fp4 > 0;
-    struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; };
     std::vector<StreamEntry> seq;
     std::vector<size_t> seq_start;
     size_t consumed = 0;
@@ -145,6 +146,17 @@ struct Prefill::Run::Chunk {
     std::atomic<bool> a_stop{false};
     double iss_ms = 0;
     int64_t iss_streamed = 0, iss_dma = 0;
+    struct RouteSnapshot {
+        uint32_t* counts = nullptr;   // pinned host copy, one immutable row per layer
+        cudaStream_t stream = nullptr;
+        std::vector<cudaEvent_t> ready;
+        std::atomic<int64_t> recorded{-1};
+        ~RouteSnapshot() {
+            if (recorded.load() >= 0) cudaStreamSynchronize(stream);
+            for (cudaEvent_t event : ready) if (event) cudaEventDestroy(event);
+            if (counts) cudaFreeHost(counts);
+        }
+    } route_snapshot;
     std::thread issuer;
     struct IssuerJoin {
         std::atomic<bool>* stop;

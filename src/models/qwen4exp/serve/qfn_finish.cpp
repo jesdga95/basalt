@@ -73,12 +73,13 @@ bool QfnRequest::slot_draft_keep(int slot) {
     return !runtime_.batch_spec || runtime_.mtp.copy_store(runtime_.mtp.main_store(), slot, (int64_t) runtime_.live.size(), runtime_.err);
 }
 
-void QfnRequest::slot_set_sampling(int slot) { runtime_.ver.set_slot_sampling(slot, req_sp); }
+void QfnRequest::slot_set_sampling(int slot) {
+    runtime_.ver.set_slot_sampling(slot, req_sp);
+    runtime_.slot_sampling[(size_t) slot] = req_sp;
+}
 
 void QfnRequest::slot_init(BSlot& sl) {
-    sl.script = std::move(runtime_.bscript[(size_t) runtime_.admit_slot].first);
-    sl.rng.seed(runtime_.bscript[(size_t) runtime_.admit_slot].second);
-    runtime_.bscript[(size_t) runtime_.admit_slot].first.clear();
+    runtime_.slot_ss[(size_t) runtime_.admit_slot]->reset();
     if (runtime_.batch_spec && runtime_.o.suffix_draft > 0) {
         sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
                                                                (size_t) runtime_.o.max_context + 4096);
