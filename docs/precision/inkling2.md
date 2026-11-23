@@ -68,6 +68,28 @@ as fast as through MMQ.
   row's arithmetic is the same alone and in a verify window at the same key count, but not bit-identical to the scalar
   reader, which shallower rows and the sliding-window layers keep.
 
+### Cost of the tensor-core INT8 reader
+
+The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16`, `--kv fp8` and shallower INT8 rows run the scalar reader unchanged.
+
+Two measurements against the scalar INT8 reader of the same build, with the same weights and forced tokens (and the same expert placement, except where a row says otherwise).
+
+The BF16-reference gate cannot reach the shipped path (its rows are 512 keys, below the cutoff), so it runs as a stress probe: a build with the cutoff at 1 sends every row through the tensor-core reader. The deltas are paired per scored row.
+
+| Probe (DQ8 pack, RTX 5080, 360 W, 100 chunks of 512, T=3) | Mean KLD | Top-1 | Paired dNLL | PPL |
+| --- | ---: | ---: | ---: | ---: |
+| `--kv int8`, scalar reader | 0.00343 | 97.51% | | 7.0762 |
+| tensor-core reader on every row, change | +0.00011 ± 0.00006 | -0.12 pt | +0.00036 ± 0.00046 | +0.036% |
+
+The depth the probe cannot reach is measured by scoring 1,000 forced tokens after each of 8 distinct 131,072-token prompts (a code corpus under a chat framing: the absolute NLL is high and only the paired differences carry meaning). The paired dNLL is the 95% interval over the 8,000 tokens; the scalar reader run twice scores byte-identically, so a difference is the reader and not run-to-run noise. A flip is a token whose NLL differs by more than 5 nats.
+
+| Deep comparison (DQ8 pack, RTX 5080, 360 W, 131,072 keys, 8 × 1,000 tokens) | Paired dNLL | Same top token | p90 \|dNLL\| | Flips (of 8,000) |
+| --- | ---: | ---: | ---: | ---: |
+| tensor-core reader against scalar INT8 | +0.0024 ± 0.025 | 93.92% | 0.37 | 102 |
+| `--kv fp16` against scalar INT8 (fp16 plans 2,033 experts in RAM, INT8 plans 1,614) | -0.0055 ± 0.028 | 93.08% | 0.48 | 130 |
+
+56 of the flips are at the same token in both comparisons. Flips go both ways at about equal rates, and the mean shift is inside its interval; the reader moves the deep output no more than changing the cache format does, though the fp16 row also changes the expert placement, so it is a yardstick and not a pure cache-format cost.
+
 ## Against the reference
 
 The base: the official release with its routed experts dequantized to BF16 (llama.cpp 29b52d398, `convert_hf_to_gguf
