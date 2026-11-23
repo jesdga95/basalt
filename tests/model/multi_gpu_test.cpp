@@ -1,8 +1,9 @@
 // tests/model/multi_gpu_test.cpp - the shared multi-GPU layer over fake card tables: the shares and their defaults, a split's
 // cut from the shares, the expert deal and the prompt stages of a peer, the peer hooks' driver over a fake model, each
-// refusal's text and the start line.
+// refusal's text and the start line; the split hooks' driver the same way.
 #include "basalt/model/multi_gpu.hpp"
 #include "basalt/model/peer_hooks.hpp"
+#include "basalt/model/split_hooks.hpp"
 
 #include <cstdio>
 #include <string>
@@ -69,6 +70,22 @@ struct FakePeer final : PeerHooks {
         return true;
     }
     std::string peer_main() const override { return "dense, KV"; }
+};
+
+// a model's split as the driver sees it: its bytes, and the cut and devices it was given
+struct FakeSplit final : SplitHooks {
+    SplitSpec spec;
+    SplitCut got;
+    std::vector<int> devs;
+    bool placed = false;
+    SplitSpec split_spec(const GpuCards&) const override { return spec; }
+    bool split_place(const SplitCut& cut, const std::vector<int>& devices, std::string&) override {
+        got = cut;
+        devs = devices;
+        placed = true;
+        return true;
+    }
+    std::string split_part(size_t card) const override { return card == 0 ? "8 experts" : ""; }
 };
 
 int main() {
@@ -282,6 +299,42 @@ int main() {
         none.rooms = {0, 40};
         CHECK(!none.peer_open(two(GpuMode::Peer), err) && !none.placed &&
               err == "gpu-mode peer: GPU 1 (RTX 5060 Ti) would hold nothing: no room for an expert; use gpu 0");
+    }
+
+    // ---- the split hooks' driver: the cut by the shares, --diag-gpu-same, a refusal, the parts
+    {
+        FakeSplit f;
+        f.spec.layer.assign(48, 1 * GiB);
+        f.spec.fixed = {0, 0};
+        f.spec.room = {40 * GiB, 14 * GiB};
+        GpuCards c = two(GpuMode::Split);
+        c.given = {0.75, 0.25};
+        std::string err;
+        CHECK(f.split_open(c, err) && f.placed && f.got.first == std::vector<int>({0, 36}) && f.devs == std::vector<int>({0, 1}));
+        CHECK_EQ(f.split_report(0), "layers 0-35, 8 experts");
+        CHECK_EQ(f.split_report(1), "layers 36-47");
+        // --diag-gpu-same: the cut as given, every part on the main card, no room checked (one card holds both)
+        FakeSplit same = f;
+        same.placed = false;
+        c.given.clear();
+        c.diag_cut = 20;
+        c.diag_same = true;
+        CHECK(same.split_open(c, err) && same.got.first == std::vector<int>({0, 20}) && same.devs == std::vector<int>({0, 0}));
+        c.diag_cut = 0;
+        CHECK(!same.split_open(c, err) &&
+              err == "--diag-gpu-same needs two cards and --diag-gpu-cut L, the layer the second part starts at");
+        // a part that does not fit is refused before the placement
+        FakeSplit big = f;
+        big.placed = false;
+        GpuCards d = two(GpuMode::Split);
+        d.given = {0.5, 0.5};
+        CHECK(!big.split_open(d, err) && !big.placed &&
+              err == "gpu-mode split: GPU 1 (RTX 5060 Ti) takes layers 24-47 at share 0.50 and needs 24.0 GiB, 14.0 GiB free; lower "
+                     "its gpu-share, max-context or parallel");
+        // not split mode: nothing happens
+        FakeSplit idle;
+        idle.spec = f.spec;
+        CHECK(idle.split_open(two(GpuMode::Peer), err) && !idle.placed && idle.split_report(0).empty());
     }
 
     // ---- the start lines

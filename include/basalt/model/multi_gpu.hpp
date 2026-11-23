@@ -27,6 +27,7 @@ struct GpuCards {
     std::vector<Card> cards;
     std::vector<double> given;          ///< gpu-share normalized to sum 1, one per card; empty when not given
     int diag_cut = 0;                   ///< --diag-gpu-cut: a two-card split's cut taken as given (0: from the shares)
+    bool diag_same = false;             ///< --diag-gpu-same: a split's every part on the main card (the split's bitwise reference)
     /// The devices after the main card.
     std::vector<int> peers() const;
 };
