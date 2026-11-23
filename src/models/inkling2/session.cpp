@@ -448,7 +448,10 @@ public:
         for (int i = 0; i < n; ++i) {
             Session& s = *static_cast<Session*>(sessions[i]);
             if (s.win_rows_ > 0) s.fold_rows(std::clamp(kept[i] - s.win_off_, 0, s.win_rows_));
+            for (const BatchSeg& b : batch_segs_)   // a batch's: on this session, its leader
+                if (b.s == &s) fold_rows(std::clamp(kept[i], 0, b.rows), nullptr, b.row0);
         }
+        batch_segs_.clear();
         return {};
     }
 
@@ -511,7 +514,11 @@ protected:
         hist_.insert(hist_.end(), r.tokens, r.tokens + r.n_tokens);
         dspark_.note(r.pos, r.n_tokens);   // DSPARK HOOK
         lookups_ += (int64_t) r.n_tokens * g_.n_used * (int64_t) g_.visits.size();
-        if (i == 0 && heat_tally_) fold_rows(v.w.rows, v.stream);   // a batch's rows rank the copies on its leader, kept or not
+        if (heat_tally_) {   // this session's rows of the batch, in its leader's routed ids, wait for decode_kept
+            Session& lead = *static_cast<Session*>(v.ss[0]);
+            if (i == 0) lead.batch_segs_.clear();
+            lead.batch_segs_.push_back({this, sg.row0, sg.rows});
+        }
         head_rows_ = h;
         if (h == 0) return;
         cudaMemcpyAsync(logits_, blog_ + (size_t) (sg.row0 + sg.rows - h) * V, (size_t) h * V * 4, cudaMemcpyDeviceToDevice, v.stream);
@@ -804,11 +811,11 @@ public:
 
     // ---- the copies' ranking: the lookups of the rows the windows keep (decode_kept), and of prompt rows read through the
     // decode path, a per-visit kernel each (heat_fold), summed over the sessions at each placement change.
-    void fold_rows(int rows, cudaStream_t st = nullptr) {
+    void fold_rows(int rows, cudaStream_t st = nullptr, int row0 = 0) {
         win_rows_ = 0;
         if (rows <= 0) return;
-        heat_fold(win_ids_, visit_layer_, (int) g_.visits.size(), kMaxRows, rows, g_.n_used, g_.n_expert, heat_tally_,
-                  st ? st : stream_);
+        heat_fold(win_ids_ + (size_t) row0 * g_.n_used, visit_layer_, (int) g_.visits.size(), kMaxRows, rows, g_.n_used,
+                  g_.n_expert, heat_tally_, st ? st : stream_);
         heat_rows_ += rows;
     }
     // A window no decode_kept settled: its rows before `next`, the position the session goes on from, were kept.
@@ -1722,6 +1729,11 @@ private:
     int win_off_ = 0, win_rows_ = 0;
     std::vector<uint32_t> heat_last_;
     int64_t heat_rows_ = 0;
+    struct BatchSeg {
+        Session* s;
+        int row0, rows;
+    };
+    std::vector<BatchSeg> batch_segs_;          // a batch window's sessions and their rows, as its leader, until decode_kept
     int64_t next_rebalance_ = -1;               // the position of the next rebalance between windows (-1: before a request)
     std::vector<uint32_t> loan_start_;          // the lookup counts when the loaned copies were published
     std::vector<uint64_t> loan_hits_;           // the loaned copies' hits, banked at each recall
