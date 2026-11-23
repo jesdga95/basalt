@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
 import socket
@@ -501,6 +502,52 @@ def make_handler(target: Service | Router):
                             target.fifo.release()
                         result = "loaded"
                     self._json(200, {"status": result, **target.v1_status()})
+                    return
+                if path == "/api/pricing":
+                    if not self._own_page("pricing can be changed"):
+                        return
+                    shown = router.shown()
+                    changed = []
+                    for field, attr in (("cost_input_per_million", "cost_input_per_million"),
+                                        ("cost_output_per_million", "cost_output_per_million"),
+                                        ("cost_cache_write_per_million", "cost_cache_write_per_million"),
+                                        ("cost_cache_hit_per_million", "cost_cache_hit_per_million")):
+                        if field in req:
+                            v = req[field]
+                            if v is not None:
+                                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                                    raise ValueError(f"{field}: a number or null")
+                                if not math.isfinite(v):
+                                    raise ValueError(f"{field}: a finite number or null")
+                                if v < 0:
+                                    raise ValueError(f"{field}: a non-negative number or null")
+                            setattr(shown, attr, float(v) if v is not None else None)
+                            changed.append(field)
+                    if shown.totals_path:
+                        with shown.status_lock:
+                            shown._save_totals()
+                    from serve.totals import totals_with_cost
+                    with shown.status_lock:
+                        totals = {"since": int(shown.started_at), "requests": shown.requests_done, **shown.totals}
+                        totals_with_cost(totals, shown.cost_input_per_million, shown.cost_output_per_million,
+                                         shown.cost_cache_write_per_million, shown.cost_cache_hit_per_million)
+                    self._json(200, {"status": "ok", "changed": changed, "totals": totals})
+                    return
+                if path == "/api/totals-reset":
+                    if not self._own_page("totals can be reset"):
+                        return
+                    shown = router.shown()
+                    if not shown.totals_path:
+                        self._json(400, {"error": {"message": "no totals file configured"}})
+                        return
+                    from serve.totals import totals_reset_file
+                    prev = totals_reset_file(shown.totals_path)
+                    with shown.status_lock:
+                        shown.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}
+                        shown.requests_done = 0
+                        shown.started_at = time.time()
+                        shown._save_totals()
+                    self._json(200, {"status": "reset", "previous": str(prev) if prev else None})
                     return
                 if path == "/v1/answer_now":
                     rid = req.get("request_id")
