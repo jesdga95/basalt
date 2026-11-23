@@ -794,8 +794,8 @@ public:
             // The card has less free memory than placement counted (another program, or graphs and modules past the spare
             // took it). As without the count: read the card again, send copies back for the grow and try once more. From
             // here placement depends on that reading, which the line says.
-            basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage at %lld (%s)", (long long) at,
-                              err.c_str());
+            basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage at position %lld (%s)",
+                              (long long) at, err.c_str());
             m_.sync_room();
             backing0 = backing_bytes();   // the reading includes what the first try mapped
             if (make_room()) {
@@ -951,6 +951,7 @@ public:
             const int64_t before = m_.card_copies();
             const uint64_t grow = grow_bytes(keep);
             m_.promote(m_.held_free(kElasticKeep) + grow);
+            m_.note_shortage("position 0");
             m_.log_copy_change("new conversation", before, grow);
         }
         return !m_.wedged();

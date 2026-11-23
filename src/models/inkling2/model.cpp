@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <utility>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -735,6 +736,7 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
         sync_room();
         const int64_t before = card_copies();
         const uint64_t moved = promote(held_free(kCardSpare));
+        note_shortage("start");
         if (wedged()) {
             log_copy_change("startup failed", before);
             return {model::Status::Error, "inkling2: expert copy placement failed"};
@@ -839,7 +841,6 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
     const uint64_t gran = copy_lay_.gran;
     uint64_t moved = 0;
     keep_free += late_room();
-    bool short_map = false;
     for (const size_t pair : by_score_desc(heat_, copy_candidates())) {
         const uint64_t stride = copy_stride(pair);
         const uint64_t start = copy_lay_.end.empty() ? 0 : CopyLayout::aligned(copy_lay_.end.back());
@@ -857,9 +858,7 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
             }
         }
         if (!mapped_ok) {   // the card had less free memory than counted: the copies stop here and the count follows the card
-            basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage: a copy's page could not be "
-                              "mapped after %lld copies", (long long) promoted());
-            short_map = true;
+            map_short_ = true;
             break;
         }
         uint8_t* ptr = copies_va_ + start;
@@ -872,8 +871,13 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         moved += stride;
     }
     if (join_placement()) trim_copies();   // a step that stopped part-way leaves no granule behind
-    if (short_map) sync_room();
+    if (map_short_) sync_room();
     return moved;
+}
+
+void InklingModel::note_shortage(const std::string& where) {
+    if (std::exchange(map_short_, false))
+        basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage at %s", where.c_str());
 }
 
 void InklingModel::log_copy_change(const char* event, int64_t before, uint64_t to_map, bool always, bool warning) const {
@@ -920,6 +924,7 @@ bool InklingModel::resize_reserve(uint64_t free_bytes) {
         }
     } else if (!lent_) {
         promote(want);
+        note_shortage(event);
     }
     log_copy_change(event.c_str(), before, 0, reserve_ != free_bytes);
     if (wedged()) return false;
@@ -941,6 +946,7 @@ bool InklingModel::lend(bool low) {
         lent_ = false;
         sync_room();   // the driver brought the rest back: the card as it is now
         promote(held_free(kCardSpare));
+        note_shortage("wake");
     }
     log_copy_change(low ? "sleep" : "wake", before);
     return !wedged();
@@ -1340,6 +1346,7 @@ void InklingModel::refill() {
     if (copies() && !lent_) {
         const int64_t before_total = card_copies();
         promote(held_free(kCardSpare));
+        note_shortage("image encoder refill");
         log_copy_change("image encoder refill", before_total);
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

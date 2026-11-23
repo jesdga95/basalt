@@ -64,7 +64,7 @@ the text model.
   loads later comes out of the spare and the 256 MiB). A grow or a copy that cannot map what was counted (another
   program took the memory, or graphs and modules needed more than the spare) reads the card again, sends copies back for it
   and goes on; a grow that does not fit even then refuses its request, as when the context does not fit. The log says
-  `placement changed by a memory shortage at P`. The copies lie back to back in one address
+  `placement changed by a memory shortage at` the position (or the start, wake or resize) where it happened. The copies lie back to back in one address
   range; a demote packs the survivors together so whole pages go back. A window whose graph finds no device memory runs
   direct, and windows of its shape keep running without a graph (no copy moves); a batched window's graph has no such
   fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A copy table update or a cache's

@@ -111,6 +111,9 @@ public:
     /// Copies RAM experts to the card, the highest ranked first (copy_heat.hpp), while `keep_free` bytes stay free; their
     /// blob table entries point at the copies. Bytes copied.
     uint64_t promote(uint64_t keep_free);
+    /// One warning when the last promote found less free memory than counted: placement then follows a fresh reading of
+    /// the card, not the requests alone.
+    void note_shortage(const std::string& where);
     /// Sends the lowest-ranked copies back until at least `bytes` are freed (their entries go back to 0, the CPU computes
     /// them again), packs the rest to the front and returns whole granules. `freed`: the bytes given back. False when a
     /// table or copy update could not be confirmed: the placement is then wedged.
@@ -253,6 +256,7 @@ private:
     /// load); 0 without it.
     uint64_t late_room() const;
     int64_t room_ = 0;   ///< room(): may run below 0 when the caches grow past what placement counted
+    bool map_short_ = false;   ///< a promote could not map a page it counted (note_shortage)
     uint8_t* copies_va_ = nullptr;
     CopyLayout copy_lay_;
     uint64_t copy_reserved_ = 0;
