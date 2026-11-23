@@ -9,6 +9,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/model/multi_gpu.hpp"
+#include "basalt/model/peer_hooks.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
 #include "basalt/program/gpu_select.hpp"
@@ -298,9 +299,11 @@ public:
     /// Once every queued byte has landed: the model connects what the reads filled (prompt stages, copies made from the
     /// weights, checks of what was placed) and makes its sessions if plan() did not; they are then ready to run.
     virtual Result attach(const LoadRequest& req, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+    /// The model's gpu-mode peer (model/peer_hooks.hpp); null for a model that runs no peer.
+    virtual PeerHooks* peer() const { return nullptr; }
     /// Card `card`'s part of a several-card run once loaded (0 = the main card), for the start line after the load
-    /// (model/multi_gpu.hpp gpu_parts_line); empty: nothing to say.
-    virtual std::string gpu_report(int card) const { (void) card; return {}; }
+    /// (model/multi_gpu.hpp gpu_parts_line): the peer's report when the model has one; empty: nothing to say.
+    virtual std::string gpu_report(int card) const { return peer() ? peer()->peer_report((size_t) card) : std::string(); }
 };
 
 /// A started model and its sessions.

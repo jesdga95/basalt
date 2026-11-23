@@ -1,6 +1,8 @@
 // tests/model/multi_gpu_test.cpp - the shared multi-GPU layer over fake card tables: the shares and their defaults, a split's
-// cut from the shares, the expert deal and the prompt stages of a peer, each refusal's text and the start line.
+// cut from the shares, the expert deal and the prompt stages of a peer, the peer hooks' driver over a fake model, each
+// refusal's text and the start line.
 #include "basalt/model/multi_gpu.hpp"
+#include "basalt/model/peer_hooks.hpp"
 
 #include <cstdio>
 #include <string>
@@ -47,6 +49,27 @@ static GpuCards two(GpuMode mode, uint64_t free0 = 31 * GiB, uint64_t free1 = 15
 }
 
 static bool near(double a, double b) { return a > b - 1e-9 && a < b + 1e-9; }
+
+// a model's peer as the driver sees it: each peer card's room, what it divides, and what it was dealt
+struct FakePeer final : PeerHooks {
+    std::vector<uint64_t> rooms;   // per card (the main card's unused)
+    PeerSpec spec;
+    std::vector<int> opened;       // the devices peer_card opened, in order
+    PeerPlacement got;
+    bool placed = false;
+    bool peer_card(size_t, int device, std::string&) override {
+        opened.push_back(device);
+        return true;
+    }
+    uint64_t peer_room(size_t card) const override { return rooms[card]; }
+    PeerSpec peer_spec() const override { return spec; }
+    bool peer_place(const PeerPlacement& p, std::string&) override {
+        got = p;
+        placed = true;
+        return true;
+    }
+    std::string peer_main() const override { return "dense, KV"; }
+};
 
 int main() {
     // ---- shares: gpu-share when given, else free VRAM for layers and experts, bandwidth for prompt stages
@@ -178,6 +201,87 @@ int main() {
         c.cards.push_back(c.cards[1]);
         c.given = {0.5, 0.25, 0.25};
         CHECK(stage_cuts(c, 48, 2) == std::vector<int>({0, 24, 36}));
+    }
+
+    // ---- peer hooks: the deal by layer block, one by one, the stages, the refusals and each card's part
+    {
+        // blocks: one expert a layer of 10 layers is 100 bytes; a peer with room for 3 per layer past its reserve holds 3
+        PeerSpec s;
+        s.deal = PeerDeal::Blocks;
+        s.unit.assign(10, 100);
+        s.block_most = 8;
+        s.reserve = 50;
+        std::string err;
+        GpuCards c = two(GpuMode::Peer);
+        PeerPlacement p = deal_peers(c, s, {0, 50 + 3 * 1000 + 99}, err);
+        CHECK(err.empty() && p.homes == 3 && p.first[1] == 0 && p.end[1] == 10);
+        CHECK_EQ(peer_part(p, 1, 0), "30 experts, layers 0-9");
+        // capped at the layer's experts
+        p = deal_peers(c, s, {0, 1u << 30}, err);
+        CHECK(err.empty() && p.homes == 8);
+        // two peers: the blocks follow the rooms, or each peer's gpu-share of them
+        c.cards.push_back(c.cards[1]);
+        c.cards[2].label = "GPU 2 (RTX 5060 Ti)";
+        p = deal_peers(c, s, {0, 50 + 2 * 700, 50 + 2 * 300}, err);
+        CHECK(err.empty() && p.homes == 2 && p.end[1] == 7 && p.first[2] == 7 && p.end[2] == 10);
+        CHECK_EQ(peer_part(p, 2, 0), "6 experts, layers 7-9");
+        p = deal_peers(c, s, {0, 1450, 1450}, err);
+        CHECK(err.empty() && p.homes == 2 && p.end[1] == 3 && p.first[2] == 3);
+        c.given = {0.5, 0.375, 0.125};   // the peers 3:1 of their 2900 bytes: the second keeps 725
+        p = deal_peers(c, s, {0, 1450, 1450}, err);
+        CHECK(err.empty() && p.homes == 2 && p.end[1] == 7 && p.first[2] == 7);
+        // a peer whose block cannot take one expert a layer is refused, named
+        c.given.clear();
+        p = deal_peers(c, s, {0, 50 + 2000, 40}, err);
+        CHECK_EQ(err, "gpu-mode peer: GPU 2 (RTX 5060 Ti) would hold nothing: no room for an expert; leave it out of gpu");
+        err.clear();
+        s.main_holds_all = true;
+        p = deal_peers(two(GpuMode::Peer), s, {0, 40}, err);
+        CHECK_EQ(err, "gpu-mode peer: GPU 1 (RTX 5060 Ti) would hold nothing: the main card holds every expert; use gpu 0");
+    }
+    {
+        // one by one: the experts outside the main card dealt within each peer's room less its reserve; a peer dealt none
+        // is refused
+        PeerSpec s;
+        s.deal = PeerDeal::Experts;
+        s.unit.assign(6, GiB);
+        s.reserve = GiB / 2;
+        std::string err;
+        PeerPlacement p = deal_peers(two(GpuMode::Peer), s, {0, 4 * GiB}, err);
+        CHECK(err.empty() && p.held[1] == 3 && p.owner == std::vector<int>({1, 1, 1, -1, -1, -1}));
+        CHECK_EQ(peer_part(p, 1, 0), "3 experts (3.0 GiB)");
+        s.unit.clear();
+        p = deal_peers(two(GpuMode::Peer), s, {0, 4 * GiB}, err);
+        CHECK_EQ(err, "gpu-mode peer: GPU 1 (RTX 5060 Ti) would hold nothing: the main card holds every expert; use gpu 0");
+    }
+    {
+        // the driver: every peer card opened, then the rooms, the deal and the placement; each card's part after; stages
+        FakePeer f;
+        f.rooms = {0, 50 + 3 * 1000};
+        f.spec.deal = PeerDeal::Blocks;
+        f.spec.unit.assign(10, 100);
+        f.spec.block_most = 8;
+        f.spec.reserve = 50;
+        f.spec.stage_layers = 48;
+        f.spec.stage_lo = 2;
+        std::string err;
+        CHECK(f.peer_report(1).empty());
+        CHECK(f.peer_open(two(GpuMode::Peer), err) && err.empty() && f.placed && f.opened == std::vector<int>({1}));
+        CHECK(f.got.homes == 3 && f.got.stage_first == std::vector<int>({0, 38}));
+        CHECK_EQ(f.peer_report(0), "dense, KV");
+        CHECK_EQ(f.peer_report(1), "30 experts, layers 0-9, prompt layers 38-47");
+        // one card, or another mode: nothing opens
+        FakePeer one;
+        GpuCards solo = two(GpuMode::One);
+        solo.cards.pop_back();
+        CHECK(one.peer_open(solo, err) && one.opened.empty() && !one.placed && one.peer_report(0).empty());
+        // a refusal stops the open before the placement
+        FakePeer none = f;
+        none.placed = false;
+        none.opened.clear();
+        none.rooms = {0, 40};
+        CHECK(!none.peer_open(two(GpuMode::Peer), err) && !none.placed &&
+              err == "gpu-mode peer: GPU 1 (RTX 5060 Ti) would hold nothing: no room for an expert; use gpu 0");
     }
 
     // ---- the start lines
