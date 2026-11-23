@@ -22,6 +22,7 @@ struct SplitInputs {
     uint64_t peer_fixed = 0;        ///< the second card's own: its scratch
     SplitCard main, peer;
     int forced = 0;                 ///< a cut to take as given (0: plan one)
+    bool split = false;             ///< cut the layers even when the main card holds everything (gpu-mode split)
 };
 
 struct SplitPlan {
@@ -33,7 +34,7 @@ struct SplitPlan {
 /// Cards within 10% of each other's memory bandwidth are alike.
 bool split_cards_alike(const SplitCard& a, const SplitCard& b);
 
-/// The split for `in`: none when everything fits the main card; else on unlike cards the most layers the faster card holds
+/// The split for `in`: none when everything fits the main card (unless `split`); else on unlike cards the most layers the faster card holds
 /// (the main card when its bandwidth is not lower), on alike cards the cut nearest half the layers' bytes that fits both.
 SplitPlan plan_split(const SplitInputs& in);
 
