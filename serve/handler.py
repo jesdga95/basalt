@@ -375,7 +375,27 @@ def make_handler(target: Service | Router):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+                    qs = parse_qs(urlsplit(self.path).query)
+                    name = qs.get("model", [None])[0]
+                    fmt = qs.get("format", [None])[0]
+                    from serve.prometheus import CONTENT_TYPE as PROM_CT, render_prometheus, wants_prometheus
+                    if wants_prometheus(self.headers.get("Accept"), fmt):
+                        if name is not None:
+                            svcs = [router.service_for(name)]
+                            if svcs[0] is None:
+                                self._json(404, {"error": {"message": "model not found"}})
+                                return
+                        else:
+                            svcs = list(router.services) if hasattr(router, "services") else [router.shown()]
+                        entries = [(router.metrics(s), s.prom_snapshot()) for s in svcs]
+                        body = render_prometheus(entries).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", PROM_CT)
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                     shown = router.shown() if name is None else router.service_for(name)
                     if shown is None:
                         self._json(404, {"error": {"message": "model not found"}})
