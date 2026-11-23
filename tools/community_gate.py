@@ -25,8 +25,9 @@ LEGACY_FILE = "docs/community/benchmarks.json"
 PATH_RE = re.compile(re.escape(RUNS_PREFIX) + r"[^/]+/[0-9a-f]{%d}\.json" % cb.ID_LEN)
 MAX_NEW_ROWS = 12
 PRESET = "community-1"
-# The engine arguments the community preset passes (bench_main.cpp): anything else is a lossy or off-preset run.
-ENGINE_FLAGS = {"--gpu": r"\d+(,\d+)*", "--max-context": r"\d{4,7}", "--kv": "|".join(re.escape(k) for k in cb.KV_FORMATS)}
+# The engine arguments the community preset passes (bench_main.cpp; the cards, their mode and shares are the submitter's): anything else is a lossy or off-preset run.
+ENGINE_FLAGS = {"--gpu": r"\d+(,\d+)*", "--gpu-mode": "peer|split|tensor", "--gpu-share": r"\d+(\.\d+)?(,\d+(\.\d+)?)*",
+                "--max-context": r"\d{4,7}", "--kv": "|".join(re.escape(k) for k in cb.KV_FORMATS)}
 # Band: a new row's decode_tps and prefill_16k_tps must lie in [lowest/BAND, highest*BAND] of the earlier rows of the
 # same model, GPU name and GPU count (different quants of one card spread about 4.5x in the table).
 BAND = 2.5
@@ -96,7 +97,7 @@ def check_engine_args(row, label, gate):
     while i < len(toks):
         pat = ENGINE_FLAGS.get(toks[i])
         if pat is None or i + 1 >= len(toks) or not re.fullmatch(pat, toks[i + 1]):
-            gate.fail(f"{label}: engine_args has '{toks[i]}' outside the community preset's --gpu, --max-context and --kv (a lossy or off-preset run)")
+            gate.fail(f"{label}: engine_args has '{toks[i]}' outside the community preset's --gpu, --gpu-mode, --gpu-share, --max-context and --kv (a lossy or off-preset run)")
             return
         i += 2
 
