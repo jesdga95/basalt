@@ -11,6 +11,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/batch_check.hpp"
+#include "basalt/model/gpu_check.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
@@ -428,6 +429,24 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
             if (!r.ok()) return fatal_start_error(r.message);
             std::printf("batch check: %d windows compared, %d differ: %s\n", bc.compared, bc.differ, bc.differ ? "FAILED" : "PASSED");
             return bc.differ ? 1 : 0;
+        }
+        if (o.diag_gpu_check) {   // the prompt and its greedy steps recorded, and compared with a reference run's trace
+            const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
+            basalt::model::GpuTrace trace;
+            const basalt::model::Result r = basalt::model::record_gpu_trace(*started.sessions.front(), prompt, (int) std::max<int64_t>(o.max_new, 1),
+                                                                            started.model->desc().n_vocab, trace);
+            if (!r.ok()) return fatal_start_error(r.message);
+            std::string err;
+            if (!o.diag_gpu_trace.empty() && !basalt::model::write_gpu_trace(o.diag_gpu_trace, trace, err)) return fatal_start_error(err);
+            if (o.diag_gpu_ref.empty()) {
+                std::printf("gpu check: %d steps recorded\n", trace.steps());
+                return 0;
+            }
+            basalt::model::GpuTrace ref;
+            if (!basalt::model::read_gpu_trace(o.diag_gpu_ref, ref, err)) return fatal_start_error(err);
+            const basalt::model::GpuCompare c = basalt::model::compare_gpu_traces(ref, trace);
+            std::printf("%s\n", basalt::model::gpu_compare_line(c).c_str());
+            return c.same() ? 0 : 1;
         }
         std::vector<int64_t> oracle;
         if (const auto code = cli::load_spec_oracle(o.spec_oracle, oracle)) return *code;
