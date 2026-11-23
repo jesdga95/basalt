@@ -9,19 +9,22 @@ Two workflows (community auto-merge and the `/review` comment) use one cheap Ope
 Order, enforced by the workflow and by `llm_review.decide`:
 
 1. **Gate** (`tools/community_gate.py`, no secrets). Any failure stops here: no model call, label `community: needs changes` and a comment with the reasons.
-   - only `docs/community/benchmarks.json` changed, modified, with rows only appended (the old rows byte for byte), 1 to 12 of them, in the house format and valid for `check_benchmarks.py`;
+   - only `docs/community/benchmarks.json` changed, modified, in the house format and valid for `check_benchmarks.py`, with 1 to 12 rows added or updated. Rows are matched by setup (submitter, model, quant and hardware), as the validator's "update your run instead" asks:
+     - a row whose setup is new is an added row;
+     - a row whose setup exists with other values is an update, checked like an added row; it can merge automatically only when the pull request author's login is the row's submitter (case-insensitive), otherwise it goes to a person (`community: needs review`);
+     - a removed row always goes to a person;
    - `preset` is `community-1` (the `submitter` is a display name and may differ from the PR author; the model review rejects an abusive one);
    - free text (submitter, notes, cpu, quant, GPU names, engine_args) has no link, domain, `@`, markup characters or invisible/direction characters, stays within its length cap, and never says LOSSY;
    - `engine_args` holds only `--gpu`, `--max-context` and `--kv` with valid values (the preset's own arguments; `basalt-bench --community` refuses any other flag);
    - `commit` is an ancestor of `origin/main`, so it is a build of this repository;
    - numbers: `decode_tps` and `prefill_16k_tps` within 2.5x outside the lowest and highest earlier row of the same model, GPU name and GPU count (one card's quants spread about 4.5x in the table); decode at most 2000 and prefill at most 40000 tok/s; `prefill_64k_tps / prefill_16k_tps` between 0.3 and 6 (the table spans 0.70 to 4.06). A card or model with no earlier row has nothing to compare with, so it goes to a person without a model call.
-2. **Model review** (only after a pass, `tools/llm_review.py`). It sees the added rows and the check results, temperature 0, with the rows declared untrusted data. It answers `{"verdict": "auto_merge" | "needs_human" | "reject", "reason": "..."}`; anything else, a timeout, an API error or a missing key is `needs_human`. It can only downgrade: the one merge needs a passing gate and `auto_merge`.
+2. **Model review** (only after a pass, `tools/llm_review.py`). It sees the added and updated rows and the check results, temperature 0, with the rows declared untrusted data. It answers `{"verdict": "auto_merge" | "needs_human" | "reject", "reason": "..."}`; anything else, a timeout, an API error or a missing key is `needs_human`. It can only downgrade: the one merge needs a passing gate and `auto_merge`.
 3. **Act** (`community_apply.py`, job `act`).
    - `auto_merge`: squash-merge, pinned to the reviewed head commit (`--match-head-commit`), with the App token.
    - `needs_human`: label `community: needs review` and a review request to jesdga95.
    - `reject`: label `community: rejected` and one neutral comment. The pull request is never closed.
 
-`COMMUNITY_AUTOMERGE`: only the exact value `live` merges. Unset, `shadow`, `test` or a typo is shadow: labels, review requests and comments only (a row that would merge gets `community: would auto-merge` and a comment). Every comment names the mode that ran.
+`COMMUNITY_AUTOMERGE`: only the exact value `live` merges. Unset, `shadow`, `test` or a typo is shadow: labels, review requests and comments only (a row that would merge gets `community: automatic merge` and a comment; in live it gets the same label and is merged). Every comment names the mode that ran.
 
 Security model: the review runs from base code with secrets only in the one model step; a fork pull request cannot change what runs. Jobs have minimal `permissions` (the deciding job is read-only; the acting job has no `contents: write`); the merge token is a GitHub App token minted only in a merge run; the comments use a second App token scoped to pull requests only. Model output only selects a label. Reasons shown in comments are stripped of links, mentions and markup. Actions are pinned by SHA.
 

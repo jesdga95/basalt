@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llm_review import plain  # noqa: E402
 
-LABELS = ("community: needs review", "community: rejected", "community: needs changes", "community: would auto-merge")
+LABELS = ("community: needs review", "community: rejected", "community: needs changes", "community: automatic merge")
 OWNER = "jesdga95"
 
 
@@ -27,10 +27,11 @@ def plan(outcome, mode_value):
     p = {"mode": mode, "merge": False, "labels": [], "request_review": False, "comment": ""}
     o = outcome["outcome"]
     if o == "merge":
+        p["labels"] = ["community: automatic merge"]
         if mode == "live":
             p["merge"] = True
+            p["comment"] = "Automatic review: this row passed every check and is merged automatically."
         else:
-            p["labels"] = ["community: would auto-merge"]
             p["comment"] = "Automatic review: this row passed every check and would be merged."
     elif o == "reject":
         p["labels"] = ["community: rejected"]

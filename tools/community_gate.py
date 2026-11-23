@@ -157,24 +157,53 @@ def run_gate(base_text, head_text, author, changed, known_commit):
     old, new = base["runs"], head["runs"]
     if head.get("preset") != base.get("preset"):
         g.fail("the top-level preset changed")
-    if new[:len(old)] != old:
-        g.fail("existing rows were edited, removed or reordered; only added rows are accepted")
-    added = new[len(old):]
-    if not added:
-        g.fail("no row was added")
-    if len(added) > MAX_NEW_ROWS:
-        g.fail(f"{len(added)} rows added; at most {MAX_NEW_ROWS} per pull request")
+    # Rows are matched by setup (submitter, model, quant and hardware), not by position: a row whose setup is in the
+    # base file is an update of that run (the validator asks for exactly that: "update your run instead").
+    def find(rows, r):
+        return next((x for x in rows if cb.same_setup(x, r)), None)
+    added, updated, removed = [], [], []
+    for r in new:
+        before = find(old, r)
+        if before is None:
+            added.append(r)
+        elif before != r:
+            updated.append((before, r))
+    for r in old:
+        if find(new, r) is None:
+            removed.append(r)
+    for r in removed:
+        human(g, f"the row of {r.get('submitter')} ({r.get('model')}) was removed; only a person can approve a removal")
+    changed_rows = added + [r for _, r in updated]
+    if not changed_rows and not removed:
+        g.fail("no row was added or updated")
+    if len(changed_rows) > MAX_NEW_ROWS:
+        g.fail(f"{len(changed_rows)} rows added or updated; at most {MAX_NEW_ROWS} per pull request")
     if g.status == "fail":
         return g
-    g.new_rows = added
-    for i, r in enumerate(added):
-        label = f"new row {i + 1} ({r['submitter']})"
+    g.new_rows = changed_rows
+    others = [r for r in old if find(changed_rows, r) is None]
+    for i, r in enumerate(changed_rows):
+        is_update = i >= len(added)
+        label = f"{'updated' if is_update else 'new'} row {i + 1} ({r['submitter']})"
         check_text(r, label, g)
         check_engine_args(r, label, g)
         if not known_commit(r["commit"]):
             g.fail(f"{label}: commit {r['commit']} is not a build of this repository's main branch")
-        plausible(r, old + added[:i], label, g)
+        if is_update:
+            g.notes.append(f"{label}: updates the existing run of the same submitter, model, quant and hardware")
+            if r["submitter"].lower() != author.lower():
+                human(g, f"{label}: updates the run of '{r['submitter']}', which is not the pull request author "
+                         f"'{author}'; only a person can approve changing someone else's numbers")
+        before = [b for b, x in updated if x is r]
+        plausible(r, others + before + changed_rows[:i], label, g)
     return g
+
+
+def human(gate, msg):
+    """A reason only a person can judge; a failure stays a failure."""
+    gate.reasons.append(msg)
+    if gate.status == "pass":
+        gate.status = "human"
 
 
 def git_known_commit(repo="."):

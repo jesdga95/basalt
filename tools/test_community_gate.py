@@ -44,16 +44,43 @@ class Gate(unittest.TestCase):
         self.assertEqual((g.status, g.reasons), ("pass", []))
         self.assertEqual(len(g.new_rows), 1)
 
-    def test_edited_existing_row_fails(self):
-        def edit(h):
-            h["runs"][0]["decode_tps"] = 1.0
-        g = run(mutate=edit)
-        self.assertEqual(g.status, "fail")
-        self.assertTrue(any("edited, removed or reordered" in r for r in g.reasons))
+    def owned(self):
+        """An existing row and its submitter's login."""
+        r = next(x for x in BASE["runs"] if cb.is_pos(x.get("decode_tps")))
+        return BASE["runs"].index(r), r["submitter"]
 
-    def test_removed_row_fails(self):
-        g = run(mutate=lambda h: h["runs"].pop(0))
+    def test_owner_updating_their_row_passes(self):
+        i, who = self.owned()
+        def bump(h):
+            h["runs"][i]["decode_tps"] = round(h["runs"][i]["decode_tps"] * 1.05, 1)
+            h["runs"][i]["commit"] = "0123456789"
+        g = run(added=[], author=who, mutate=bump)
+        self.assertEqual(g.status, "pass", g.reasons)
+        self.assertEqual(len(g.new_rows), 1)
+        self.assertTrue(any("updates the existing run" in n for n in g.notes))
+
+    def test_updating_someone_elses_row_needs_a_person(self):
+        i, who = self.owned()
+        def bump(h):
+            h["runs"][i]["decode_tps"] = round(h["runs"][i]["decode_tps"] * 1.05, 1)
+        g = run(added=[], author="someone-else", mutate=bump)
+        self.assertEqual(g.status, "human")
+        self.assertTrue(any("not the pull request author" in r for r in g.reasons))
+
+    def test_implausible_update_fails(self):
+        i, who = self.owned()
+        def edit(h):
+            h["runs"][i]["decode_tps"] = 1.0
+        g = run(added=[], author=who, mutate=edit)
         self.assertEqual(g.status, "fail")
+
+    def test_removed_row_needs_a_person(self):
+        g = run(added=[], mutate=lambda h: h["runs"].pop(0))
+        self.assertEqual(g.status, "human")
+        self.assertTrue(any("removed" in r for r in g.reasons))
+
+    def test_no_change_fails(self):
+        self.assertEqual(run(added=[]).status, "fail")
 
     def test_url_in_notes_fails(self):
         for note in ("see https://evil.example/x", "visit evil.com", "mail me a@b", "[x](y)", "<b>hi</b>", "//cdn"):
