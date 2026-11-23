@@ -160,6 +160,7 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
             plan.pick = p.mechanism;
             best = p.ms;
         }
+    plan.best_cut = plan.cut;
     if (plan.pick != Mechanism::LayerSplit) plan.cut = 0;
     char buf[320], head[64] = "", cut[32] = "";
     if (!tier.runs) std::snprintf(head, sizeof head, "main card alone %.1f, ", alone);
