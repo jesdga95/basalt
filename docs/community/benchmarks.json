@@ -4181,7 +4181,7 @@
       "kv": "int8",
       "prefill_16k_tps": 12715.2,
       "prefill_64k_tps": 8916.7,
-      "decode_tps": 481.5,
+      "decode_tps": 480.5,
       "decode_conv_tps": 279.6,
       "decode_struct_tps": 741.5,
       "decode_prose_tps": 201.4,
