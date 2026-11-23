@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <tuple>
+#include "basalt/core/diag.hpp"
 #include "basalt/log.hpp"
 
 
@@ -42,7 +43,7 @@ void note(cublasStatus_t s, const char* what) {
 // One handle made ahead of time per device, taken by the first Gemm that starts there.
 cublasHandle_t g_prepared[16] = {};
 
-// The main card's algorithm for a product, as its cublasLt heuristic picks it within the workspace: the one
+// Under --diag-main-card-bits, the main card's algorithm for a product, as its cublasLt heuristic picks it within the workspace: the one
 // cublasGemmEx runs there (checked bit for bit against it on an RTX 5090, and on an RTX 5060 Ti running the 5090's
 // algorithm).  Shared by every stage's Gemm, made once per product shape.
 struct MainAlgo {
@@ -131,7 +132,7 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     workspace_ = workspace;
     ws_bytes_ = ws_bytes;
     note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
-    if (dev != 0) note(cublasLtCreate((cublasLtHandle_t*) &lt_), "cublasLtCreate");
+    if (dev != 0 && basalt::core::diagnostics().main_card_bits) note(cublasLtCreate((cublasLtHandle_t*) &lt_), "cublasLtCreate");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
@@ -164,7 +165,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     }
     note(cublasSetWorkspace(h, workspace_, ws), "cublasSetWorkspace");
     ws_bytes_ = ws;
-    if (int dev = 0; cudaGetDevice(&dev) == cudaSuccess && dev != 0) note(cublasLtCreate((cublasLtHandle_t*) &lt_), "cublasLtCreate");
+    if (int dev = 0; cudaGetDevice(&dev) == cudaSuccess && dev != 0 && basalt::core::diagnostics().main_card_bits) note(cublasLtCreate((cublasLtHandle_t*) &lt_), "cublasLtCreate");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     if (scratch_elems > 0) {
         if (const cudaError_t e = cudaMalloc((void**) &scratch_, (size_t) scratch_elems * 2); e != cudaSuccess) {
@@ -187,7 +188,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 void Gemm::product(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                    float beta, const char* what) {
     const float alpha = 1.0f;
-    if (lt_ != nullptr) {   // off the main card: the main card's algorithm
+    if (lt_ != nullptr) {   // --diag-main-card-bits, off the main card: the main card's algorithm
         const MainAlgo& m = main_algo(type, T, N, K, ldy, ws_bytes_);
         if (m.ok) {
             ck(cublasLtMatmul((cublasLtHandle_t) lt_, m.op, &alpha, W, m.a, X, m.b, &beta, Y, m.c, Y, m.c, &m.algo, workspace_,

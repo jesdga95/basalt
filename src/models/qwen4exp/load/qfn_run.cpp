@@ -1,4 +1,5 @@
 // The whole start of a Flash-Next engine, in order: its stack frames hold the resources while the server runs.
+#include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/shipped_profiles.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
@@ -64,9 +65,9 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // touched). Peer: the cards after the main one hold the expert tier and read prompt stages; split: they run the later
     // layers, cut by the shares once the weights' sizes are known (layer_plan).
     const bool split_mode = o.gpus.mode == basalt::program::GpuMode::Split;
-    // split: every card divides its kernels' work as the main card (CUDA0) does, so a stage on a smaller card computes its
-    // bits. Peer cards plan by their own SM count (a peer stage is no split of the model, and the main card's plan costs speed)
-    if (split_mode) basalt::core::plan_sms_device(0);
+    // --diag-main-card-bits (the bitwise A/B against one card): a split card divides its kernels' work as the main card
+    // (CUDA0) does, so a stage on a smaller card computes its bits. Otherwise every card plans by its own SM count
+    if (split_mode && basalt::core::diagnostics().main_card_bits) basalt::core::plan_sms_device(0);
     if (o.gpus.mode == basalt::program::GpuMode::Peer) {
         o.peer_devices = o.gpus.peers();
         o.peer_device = o.peer_devices.front();
