@@ -85,10 +85,9 @@ constexpr int kHcTok = 8;
 constexpr int kHcMaxV = 3;   // float4 a thread holds per token: flat / kHcSplits / 4 <= kHcMaxV * kThreads
 constexpr int kHcTokMin = 64;  // tokens from which hc_mixes takes this kernel
 __global__ void __launch_bounds__(kThreads) hc_partial_tok_kernel(const float* __restrict__ x, const float* __restrict__ fn,
-                                                                  int flat, int n_tokens, float* __restrict__ ws) {
+                                                                  int flat, float* __restrict__ ws) {
     __shared__ float red[kSlots][kHcTok][kThreads / 32];
     const int split = blockIdx.x, t0 = blockIdx.y * kHcTok;
-    const int nt = min(kHcTok, n_tokens - t0);
     const int len = flat / kHcSplits, base = split * len, n4 = len / 4;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     float4 xv[kHcTok][kHcMaxV];
@@ -99,7 +98,7 @@ __global__ void __launch_bounds__(kThreads) hc_partial_tok_kernel(const float* _
 #pragma unroll
         for (int c = 0; c < kHcMaxV; ++c) {
             const int i = threadIdx.x + c * kThreads;
-            if (t < nt && i < n4) {
+            if (i < n4) {
                 const float4 a = reinterpret_cast<const float4*>(x + (size_t) (t0 + t) * flat + base)[i];
                 xv[t][c] = a;
                 ss[t] = fmaf(a.x, a.x, ss[t]); ss[t] = fmaf(a.y, a.y, ss[t]); ss[t] = fmaf(a.z, a.z, ss[t]); ss[t] = fmaf(a.w, a.w, ss[t]);
@@ -132,7 +131,7 @@ __global__ void __launch_bounds__(kThreads) hc_partial_tok_kernel(const float* _
         }
     }
     __syncthreads();
-    for (int k = threadIdx.x; k < kSlots * nt; k += kThreads) {
+    for (int k = threadIdx.x; k < kSlots * kHcTok; k += kThreads) {
         const int t = k / kSlots, mix = k % kSlots;
         float r = 0.f;
 #pragma unroll
@@ -258,10 +257,16 @@ void hc_mixes(const float* x, const float* hc_fn, const float* hc_scale, const f
     const int flat = kHcMult * a.n_embd;
     if (flat % (kHcSplits * 4) || a.sinkhorn_iters < 1) throw std::invalid_argument("hc_mixes: geometry");
     cudaStream_t st = (cudaStream_t) stream;
-    if (n_tokens >= kHcTokMin && flat / kHcSplits / 4 <= kHcMaxV * kThreads)
-        hc_partial_tok_kernel<<<dim3(kHcSplits, (n_tokens + kHcTok - 1) / kHcTok), kThreads, 0, st>>>(x, hc_fn, flat, n_tokens, workspace);
-    else
+    if (n_tokens >= kHcTokMin && flat / kHcSplits / 4 <= kHcMaxV * kThreads) {
+        const int full = n_tokens / kHcTok, rem = n_tokens - full * kHcTok;   // whole blocks, then the tail in the old kernel
+        hc_partial_tok_kernel<<<dim3(kHcSplits, full), kThreads, 0, st>>>(x, hc_fn, flat, workspace);
+        if (rem)
+            hc_partial_kernel<<<dim3(kHcSplits, kHcCoef, rem), kThreads, 0, st>>>(
+                x + (size_t) full * kHcTok * flat, hc_fn, flat,
+                workspace + (size_t) full * kHcTok * kHcSplits * kSlots);
+    } else {
         hc_partial_kernel<<<dim3(kHcSplits, kHcCoef, n_tokens), kThreads, 0, st>>>(x, hc_fn, flat, workspace);
+    }
     hc_coef_kernel<<<n_tokens, 32, 0, st>>>(workspace, hc_scale, hc_base, flat, a.rms_eps, a.hc_eps,
                                             a.sinkhorn_iters, coef);
     if (!stream) cudaStreamSynchronize(nullptr);

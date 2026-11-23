@@ -129,6 +129,22 @@ int main(int argc, char** argv) {
     std::printf("window/position independence: %s\n", bitwise ? "bitwise identical" : "DIFFERS");
     v.expect(bitwise, "output depends on window width or position");
 
+    // ---- the kernel it replaces, token by token: a one-token call is below the four-row path's 64-token threshold,
+    // so it runs the row-at-a-time kernel while the 68-token call runs four rows a block
+    {
+        bool same = true;
+        for (int t = 0; t < Tmax; ++t) {
+            std::vector<float> xs(x_h.begin() + (size_t) t * ND, x_h.begin() + (size_t)(t + 1) * ND);
+            Out o = run(gate, bias, xs, 1, a);
+            same = same && !std::memcmp(&o.logits[0], &all.logits[(size_t) t * NE], NE * 4);
+            same = same && !std::memcmp(&o.ids[0], &all.ids[(size_t) t * K], K * 4);
+            same = same && !std::memcmp(&o.w[0], &all.w[(size_t) t * K], K * 4);
+        }
+        std::printf("four gate rows a block vs the row-at-a-time kernel, one token at a time: %s\n",
+                    same ? "bitwise identical" : "DIFFERS");
+        v.expect(same, "the four-row path differs from the row-at-a-time kernel");
+    }
+
     // ---- tie order: experts 77 and 201 are identical; a token that selects either selects 77 first
     {
         std::vector<float> xs(x_h.begin(), x_h.begin() + ND);
