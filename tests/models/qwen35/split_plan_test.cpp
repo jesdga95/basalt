@@ -92,6 +92,13 @@ int main() {
     expect("16+16, 8K fp16", inputs(fp16_8k, 1, kMainFixed8K, r5070, r5070), 32);
     expect("two RTX 5070 Ti, 128K int8, spec 16 (#376)", inputs(int8_128k, 1, kMainFixed, r5070, r5070), 32);
     expect_error("16+16, 262K fp16 (fits neither one card nor a split)", inputs(fp16_262k, 1, kMainFixed, r5070, r5070));
+    // gpu-mode split cuts the layers even when the main card holds them all
+    {
+        SplitInputs unlike = inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060), alike = inputs(fp16_8k, 1, kMainFixed8K, r5090, r5090);
+        unlike.split = alike.split = true;
+        expect("32+16, 8K fp16, split asked (fits the main card)", unlike, 63);
+        expect("32+32, 8K fp16, split asked (fits the main card)", alike, 32);
+    }
     // the diagnostic cut
     expect("32+16, 8K, forced at 40", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 40), 40);
     expect("32+16, 8K, forced at 8", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 8), 8);

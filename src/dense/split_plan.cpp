@@ -28,7 +28,7 @@ SplitPlan plan_split(const SplitInputs& in) {
     const auto main_at = [&](int c) { return in.main_fixed + below[(size_t) c]; };
     const auto peer_at = [&](int c) { return in.peer_fixed + below[(size_t) n] - below[(size_t) c]; };
     const auto fits = [&](int c) { return main_at(c) <= in.main.free && peer_at(c) <= in.peer.free; };
-    if (in.forced == 0 && main_at(n) <= in.main.free) {
+    if (in.forced == 0 && !in.split && main_at(n) <= in.main.free) {
         p.main_bytes = main_at(n);
         return p;
     }
