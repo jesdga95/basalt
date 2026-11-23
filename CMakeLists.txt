@@ -540,6 +540,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_window.cu
                         src/kernels/cuda/gdn_commit.cu
                         src/kernels/cuda/gdn_prompt.cu
+                        src/kernels/cuda/ssd.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
@@ -1911,6 +1912,11 @@ if(BUILD_TESTING)
   target_link_libraries(relu2_expert_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
   basalt_gpu_test(NAME relu2_expert_parity COMMAND relu2_expert_parity)
   basalt_cpu_test(NAME relu2_expert_parity_cpu COMMAND relu2_expert_parity --cpu)
+  # the Mamba-2 mixer (ssd.hpp) at Nemotron-H's geometry: a prompt run and committed decode windows, bitwise, against double
+  add_executable(ssd_parity tests/kernels/ssd_parity.cpp)
+  target_include_directories(ssd_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(ssd_parity PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME ssd_parity COMMAND ssd_parity)
   add_executable(native_expert_bench tests/kernels/native_expert_bench.cpp)
   target_include_directories(native_expert_bench PRIVATE ${_gpu_include_directories})
   target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
