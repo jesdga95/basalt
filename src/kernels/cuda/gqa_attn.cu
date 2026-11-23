@@ -194,7 +194,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 if (ce >= r.cap) ce -= r.cap;
                 const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
-                if (q8.k && q8.fp4) {
+                if constexpr (F4) {
                     const KvInt8& c8 = far_kv ? fr.q8 : q8;
                     const uint8_t* kb = reinterpret_cast<const uint8_t*>(c8.k) + row * (HD / 2) + d8 / 2;
                     const uint8_t* vb = reinterpret_cast<const uint8_t*>(c8.v) + row * (HD / 2) + d8 / 2;
@@ -202,7 +202,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                                      reinterpret_cast<const uint8_t*>(c8.ks)[row * (HD / 16) + d8 / 16]);
                     vw = kv4_decode8(*reinterpret_cast<const uint32_t*>(vb),
                                      reinterpret_cast<const uint8_t*>(c8.vs)[row * (HD / 16) + d8 / 16]);
-                } else if (q8.k) {
+                } else if constexpr (I8) {
                     const KvInt8& c8 = far_kv ? fr.q8 : q8;
                     const float sk = __half2float(__ushort_as_half(c8.ks[row * (HD / 64) + d8 / 64]));
                     const float sv = __half2float(__ushort_as_half(c8.vs[row * (HD / 64) + d8 / 64]));
