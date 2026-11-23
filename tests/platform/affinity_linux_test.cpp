@@ -134,9 +134,66 @@ static bool topology_respects_current_mask() {
     return true;
 }
 
-// The fast-class count against the OS's own numbers: one capacity per PHYSICAL core (a sibling shares its core's), the
-// fast class being the cores above the midpoint between the extremes.  Reading the capacities here rather than trusting
-// the topology is the point - a class whose cores do not all sit at the maximum must still be one class.
+// A CPU list the kernel publishes ("0-15", "0-3,8-11", "5"): the processors it names that this run may run on.  Empty
+// when the file is missing, unreadable or names none of them.
+static std::vector<int> listed_cpus(const char* path, const std::vector<int>& allowed) {
+    std::vector<int> got;
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) return got;
+    char buf[1024];
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    buf[n] = 0;
+    char* s = buf;
+    while (*s) {
+        char* end = nullptr;
+        const long lo = std::strtol(s, &end, 10);
+        if (end == s) break;
+        long hi = lo;
+        s = end;
+        if (*s == '-') {
+            hi = std::strtol(s + 1, &end, 10);
+            if (end == s + 1) break;
+            s = end;
+        }
+        for (int id : allowed)
+            if (id >= lo && id <= hi && std::find(got.begin(), got.end(), id) == got.end()) got.push_back(id);
+        if (*s == ',') ++s; else break;
+    }
+    return got;
+}
+
+// How many PHYSICAL cores such a list covers, counted by (physical_package_id, core_id): a second reading of sysfs, not
+// the topology's own sibling bookkeeping.  A processor whose core ids cannot be read counts as a core of its own.
+static size_t listed_cores(const std::vector<int>& cpus) {
+    auto read = [](const std::string& path) -> long {
+        long v = -1;
+        if (std::FILE* f = std::fopen(path.c_str(), "r")) {
+            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+            std::fclose(f);
+        }
+        return v;
+    };
+    std::vector<std::pair<long, long>> seen;
+    for (int id : cpus) {
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(id) + "/topology/";
+        long pkg = read(base + "physical_package_id"), core = read(base + "core_id");
+        if (pkg < 0 || core < 0) pkg = core = -(long) id - 1;   // negative ids are never real ones, and unique per CPU
+        const std::pair<long, long> key{pkg, core};
+        if (std::find(seen.begin(), seen.end(), key) == seen.end()) seen.push_back(key);
+    }
+    return seen.size();
+}
+
+// The fast-class count against the OS's own numbers.  Where the kernel states its classes outright - the two hybrid
+// PMUs' CPU lists, each naming a processor this run may run on - those lists are what the topology is held to, and the
+// capacities are not consulted: a kernel that publishes `cpu_capacity` at all can report the SAME number for every
+// processor, which separates nothing, and reading that uniformity as one class is the mistake that left a hybrid
+// processor with one class.  With no lists the capacities are the only statement this kernel makes: one capacity per
+// PHYSICAL core (a sibling shares its core's), the fast class being the cores above the midpoint between the extremes.
+// Reading sysfs here rather than trusting the topology is the point either way - a second reading, not the same
+// bookkeeping twice.  A run masked to one class - `taskset` over one list's processors - names no processor of the other
+// class it may run on, and so keeps one class; that is checked too, by masking to the performance CPUs and back.
 static bool topology_core_classes() {
     auto read = [](const std::string& path) -> long {
         long v = -1;
@@ -148,6 +205,64 @@ static bool topology_core_classes() {
     };
     std::vector<int> allowed;
     if (!get_affinity(allowed)) return false;
+
+    const std::vector<int> core_list = listed_cpus("/sys/devices/cpu_core/cpus", allowed);
+    const std::vector<int> atom_list = listed_cpus("/sys/devices/cpu_atom/cpus", allowed);
+    if (!core_list.empty() && !atom_list.empty()) {
+        const size_t list_p = listed_cores(core_list), list_e = listed_cores(atom_list);
+        const auto topology = cpu::detect_cpu_topology(false, cpu::PoolAffinity::Auto);
+        if (!topology.is_hybrid || (size_t) topology.p_cores != list_p ||
+            (size_t) topology.e_cores + (size_t) topology.p_cores != list_p + list_e) {
+            std::fprintf(stderr,
+                         "affinity test: the kernel's hybrid CPU lists name %zu performance and %zu efficient physical "
+                         "cores this run may use, and the topology says %d fast / %d slow%s\n",
+                         list_p, list_e, topology.p_cores, topology.e_cores,
+                         topology.is_hybrid ? "" : " (and no core classes at all)");
+            return false;
+        }
+        std::printf("core classes: %d fast / %d slow, matching the kernel's hybrid CPU lists (%zu / %zu processors)\n",
+                    topology.p_cores, topology.e_cores, core_list.size(), atom_list.size());
+
+        // The same run with its mask narrowed to the performance list's processors - what `taskset` on the P-core CPUs
+        // does - may run on no efficient processor at all, so it is one class of cores: the fast count is that class's
+        // core count, there are no slow cores, and neither the default list nor a `p-cores` list reaches into the
+        // efficient CPUs it cannot run on.  The mask is restored before returning either way.
+        const auto named_p = [&](int id) {
+            return std::find(core_list.begin(), core_list.end(), id) != core_list.end();
+        };
+        if (!set_affinity(core_list) || !expect_affinity(core_list, "establish performance-only mask")) return false;
+        const auto one_class = cpu::detect_cpu_topology(false, cpu::PoolAffinity::Auto);
+        const auto p_only = cpu::detect_cpu_topology(true, cpu::PoolAffinity::PCores);
+        const bool sized = !one_class.is_hybrid && one_class.e_cores == 0 &&
+                           (size_t) one_class.p_cores == list_p && (size_t) one_class.p_threads == core_list.size() &&
+                           one_class.worker_cores.size() == list_p &&
+                           p_only.worker_cores.size() + 1 == list_p && named_p(p_only.host_core);
+        bool clean = true;
+        const auto workers_named = [&](const cpu::CpuTopology& t) {
+            for (int id : t.worker_cores) {
+                if (!named_p(id)) {
+                    std::fprintf(stderr, "affinity test: a performance-only mask gave worker CPU %d, which the kernel's "
+                                         "performance-core list does not name\n", id);
+                    return false;
+                }
+            }
+            return true;
+        };
+        clean = workers_named(one_class) && workers_named(p_only);
+        const bool restored = set_affinity(allowed) && expect_affinity(allowed, "restore the full mask");
+        if (!sized || !clean) {
+            std::fprintf(stderr,
+                         "affinity test: masked to the %zu performance-core processors (%zu physical cores), the topology "
+                         "says %d fast / %d slow with %zu worker(s), and `p-cores` with %zu\n",
+                         core_list.size(), list_p, one_class.p_cores, one_class.e_cores, one_class.worker_cores.size(),
+                         p_only.worker_cores.size());
+            return false;
+        }
+        std::printf("core classes under a performance-only mask: one class of %d cores, %zu worker(s); `p-cores` sizes %zu\n",
+                    one_class.p_cores, one_class.worker_cores.size(), p_only.worker_cores.size());
+        return restored;
+    }
+
     std::vector<std::pair<long, long>> seen;
     std::vector<long> caps;
     for (int id : allowed) {
