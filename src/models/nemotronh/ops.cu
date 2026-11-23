@@ -7,15 +7,6 @@
 namespace basalt::models::nemotronh {
 namespace {
 
-__global__ void weighted_sum_kernel(const float* const* rows, const float* w, int K, int n, float* out) {
-    const int t = blockIdx.y;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float acc = 0.0f;
-        for (int k = 0; k < K; ++k) acc = __fmaf_rn(w[t * K + k], rows[t * K + k][i], acc);
-        out[(size_t) t * n + i] = acc;
-    }
-}
-
 __global__ void relu2_scaled_kernel(float* h, int64_t rows, int n, const int32_t* bounds, int ne, const float* tails) {
     const int64_t r = blockIdx.y;
     if (r >= rows) return;
@@ -51,12 +42,6 @@ __global__ void add2_kernel(float* x, const float* a, const float* b, int64_t n)
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096); }
 
 }  // namespace
-
-void weighted_sum(const float* const* rows, const float* w, int T, int K, int n, float* out, void* stream) {
-    if (T <= 0) return;
-    const dim3 grid((unsigned) ((n + 255) / 256), (unsigned) T);
-    weighted_sum_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(rows, w, K, n, out);
-}
 
 void relu2_scaled_rows(float* h, int64_t rows, int n, const int32_t* bounds, int n_experts, const float* tails, void* stream) {
     if (rows <= 0) return;

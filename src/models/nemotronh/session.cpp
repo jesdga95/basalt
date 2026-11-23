@@ -9,14 +9,17 @@
 // the rows it drops.
 //
 // The routed experts of a window go to the tier in groups of up to five rows (five rows of 22 experts fit one lookup):
-// the card computes those its slots hold, the CPU pool the rest from the pinned RAM tier, and the router's weights sum
-// both on the card.  A prompt chunk stages every expert its rows use on the card (from a slot, the RAM tier or the pack)
+// the card computes those its slots hold and some RAM misses it fetches over the bus, the CPU pool the rest from the
+// pinned RAM tier, and the router's weights sum both on the card.  The host never waits for the CPU's share: the sum
+// waits on the card for a word the joiner thread writes once the CPU's rows landed, while the host queues the next
+// layers and the card reads their first weights into L2 (Hy4-flash's and DeepSeek's decode, window_handoff.hpp).  A prompt chunk stages every expert its rows use on the card (from a slot, the RAM tier or the pack)
 // and computes them there with llama.cpp's MMQ (q8_1 activations against the NVFP4 blobs).
 #include "models/nemotronh/model.hpp"
 #include "models/nemotronh/ops.hpp"
 
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/kernels/dense_ops.hpp"
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -24,7 +27,9 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/ssd.hpp"
 #include "basalt/kernels/window_gemm.hpp"
+#include "basalt/kernels/window_handoff.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
@@ -33,7 +38,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace basalt::models::nemotronh {
@@ -50,13 +60,22 @@ constexpr int kGroupExperts = 16; // the most experts of one group (a staging ha
 static_assert(kChunk <= kGroupRows, "an expert's rows of a chunk fit one group");
 constexpr int kTypeNvfp4 = 40;
 
-struct GroupPlan {   // a window group's grouped expert launch tables, uploaded together
-    unsigned long long ptr[core::ExpertTier::kMaxK];
-    int32_t start[core::ExpertTier::kMaxK + 1];
-    int32_t ng;
-    int32_t dst[core::ExpertTier::kMaxK];
-    int32_t tok[core::ExpertTier::kMaxK];
+constexpr int kLookupK = core::ExpertTier::kMaxK;
+// A window group's grouped expert launch: the experts' blobs, their entries' bounds, the count, each entry's routed row
+// and token.
+struct WindowPlan {
+    unsigned long long ptr[kLookupK];
+    int32_t start[kLookupK + 2];
+    int32_t ng[4];
+    int32_t dst[kLookupK];
+    int32_t tok[kLookupK];
 };
+// The hits' plan and every routed row's pointer (a card's row or the CPU's mapped row), put in one launch.
+struct WindowPut {
+    WindowPlan plan;
+    unsigned long long rows[kLookupK];
+};
+static_assert(sizeof(WindowPut) <= 4 * bk::kPutWords, "a window's plan fits put_words");
 
 class Session final : public model::ModelSession {
 public:
@@ -64,7 +83,18 @@ public:
         : m_(m), g_(m.geo()), sg_{g_.ssm_heads, g_.ssm_head_dim, g_.ssm_state, g_.ssm_groups, g_.ssm_conv} {}
 
     ~Session() override {
+        if (joiner_.joinable()) {
+            {
+                std::lock_guard<std::mutex> g(jm_);
+                jstop_ = true;
+            }
+            jcv_.notify_one();
+            joiner_.join();
+        }
         if (stream_) cudaStreamSynchronize(stream_);
+        if (ra_st_) cudaStreamSynchronize(ra_st_);
+        if (ra_ev_) cudaEventDestroy(ra_ev_);
+        if (ra_st_) cudaStreamDestroy(ra_st_);
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
         if (copy_) cudaStreamSynchronize(copy_);
@@ -145,7 +175,13 @@ public:
         exq_ = alloc((size_t) std::max<int64_t>(R, kMaxWindow) * (size_t) (L / 32) * 36, ok);   // q8_1 rows of the latent
         exscr_ = alloc(bk::native_expert_scratch_bytes((int64_t) kMoeGroup * K, g_.n_ff_exp), ok);
         exrows_ = f(R * K * L);
-        plan_d_ = (GroupPlan*) alloc(sizeof(GroupPlan), ok);
+        ex_plan_ = alloc(sizeof(WindowPut), ok);
+        ex_plan2_ = alloc(sizeof(WindowPlan), ok);
+        ra_mark_ = (uint32_t*) alloc(8, ok);
+        if (ok) cudaMemset(ra_mark_, 0, 8);
+        if (cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ra_ev_, cudaEventDisableTiming) != cudaSuccess)
+            ok = false;
         rowtab_d_ = (const float**) alloc((size_t) R * K * sizeof(float*), ok);
         {   // the prompt path's experts
             namespace mmq = basalt::prefill::mmq;
@@ -185,10 +221,18 @@ public:
             else pinned_.push_back(p);
             return p;
         };
-        plan_h_ = (GroupPlan*) pin(sizeof(GroupPlan));
+        // the router's ids of a window group reach the host through mapped memory behind a sequence word; a weighted sum
+        // waits for a word the host writes once the CPU's rows landed
+        h_wids_ = (int32_t*) pin((size_t) kLookupK * 4);
+        h_words_ = (uint32_t*) pin(64);
+        if (ok) {
+            h_words_[0] = h_words_[1] = 0;
+            if (cudaHostGetDevicePointer((void**) &d_wids_, h_wids_, 0) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &d_words_, h_words_, 0) != cudaSuccess)
+                ok = false;
+        }
         rowtab_h_ = (const float**) pin((size_t) R * K * sizeof(float*));
         h_ids_ = (int32_t*) pin((size_t) R * K * 4);
-        h_lat_ = (float*) pin((size_t) R * L * 4);
         keep_h_ = (int32_t*) pin(16);
         bounce_ = (uint8_t*) pin(m_.expert_stride());
         h_gtok_ = (int32_t*) pin((size_t) R * K * 4);
@@ -244,7 +288,12 @@ public:
         const bool want = r.row_tokens || r.next_token || r.logits;
         const int head = !want ? 0 : r.row_tokens ? r.n_tokens : 1;
         if (tier_) tier_->begin_token(r.n_tokens);
+        // CUDA loads a kernel lazily at its first launch, which can wait for the card, and the card may be holding at a word
+        // the host writes only after that launch: the first window of each row count (which picks its kernels) joins its
+        // groups itself, so every kernel it needs is loaded while nothing holds the card
+        join_now_ = !(warmed_ >> r.n_tokens & 1u);
         if (!run_rows(r.tokens, r.n_tokens, r.pos, true, head, err)) return {model::Status::Error, "nemotronh: " + err};
+        warmed_ |= 1u << r.n_tokens;
         pend_pos_ = r.pos;
         pend_T_ = r.n_tokens;
         alt_ready_ = r.n_tokens == 1;
@@ -477,6 +526,12 @@ private:
     // ---- the forward pass ------------------------------------------------------------------------------------------------
     // R rows at pos0..: a decode window (`window`, R <= 16) or a prompt chunk; the logits of the last `head` rows to logits_.
     bool run_rows(const int32_t* tokens, int R, int64_t pos0, bool window, int head, std::string& err) {
+        bool ok = run_rows_impl(tokens, R, pos0, window, head, err);
+        if (!join_moe(err)) ok = false;
+        if (!ok) cudaStreamSynchronize(stream_);
+        return ok;
+    }
+    bool run_rows_impl(const int32_t* tokens, int R, int64_t pos0, bool window, int head, std::string& err) {
         if (pos0 + R > m_.context()) {
             err = "position " + std::to_string(pos0 + R - 1) + " is past the context of " + std::to_string(m_.context());
             return false;
@@ -495,7 +550,7 @@ private:
             bool ok = true;
             if (L.kind == Kind::Mamba) ok = window ? mamba_window(L, mamba_[(size_t) mi++], R) : mamba_chunk(L, mamba_[(size_t) mi++], R);
             else if (L.kind == Kind::Attention) ok = window ? attn_window(L, ai++, R, pos0) : attn_chunk(L, ai++, R, pos0);
-            else ok = window ? moe_window(L, R, err) : moe_chunk(L, R, err);
+            else ok = window ? moe_window(l, L, R, err) : moe_chunk(L, R, err);
             if (!ok) {
                 if (err.empty()) err = "layer " + std::to_string(l) + " failed";
                 return false;
@@ -601,18 +656,21 @@ private:
         return ra;
     }
 
-    // the router, the latent and the shared expert of R normed rows (XN_, act_ packed for a window)
-    void moe_head(const Layer& L, int R, bool window) {
-        const int64_t E = g_.n_embd, FS = g_.n_ff_shared;
+    // the router and the latent of R normed rows (XN_, act_ packed for a window)
+    void route(const Layer& L, int R, bool window) {
         bk::router(XN_, L.router, L.router_bias, R, router_args(), rlog_, ids_, rw_, stream_);
+        if (window) gemm(L.lat_down, lat_, g_.n_latent, R);
+        else bf16_rows(L.lat_down, XN_, g_.n_embd, lat_, R);
+    }
+    // the shared expert of R normed rows (act_ packed for a window, else XN_)
+    void shared_expert(const Layer& L, int R, bool window) {
+        const int64_t E = g_.n_embd, FS = g_.n_ff_shared;
         if (window) {
-            gemm(L.lat_down, lat_, g_.n_latent, R);
             gemm(L.sh_up, shh_, FS, R);
             relu2(shh_, (int64_t) R * FS, stream_);
             wg::pack(shh_, FS, FS, R, act_, stream_);
             gemm(L.sh_down, sho_, E, R);
         } else {
-            bf16_rows(L.lat_down, XN_, E, lat_, R);
             prefill::fp4_dense::quantize(XN_, R, E, E, a4_, gs4_, stream_);
             prefill::fp4_dense::product(L.sh_up.w, L.sh_up.scale, FS, E, a4_, gs4_, R, shh_, FS, false, stream_);
             relu2(shh_, (int64_t) R * FS, stream_);
@@ -626,33 +684,109 @@ private:
         add2(X_, moe_, sho_, (int64_t) R * g_.n_embd, stream_);
     }
 
-    bool moe_window(const Layer& L, int R, std::string& err) {
-        const int64_t E = g_.n_embd, Ln = g_.n_latent, K = g_.n_used;
-        wg::norm_pack(X_, L.norm, g_.rms_eps, E, R, act_, XN_, stream_);
-        moe_head(L, R, true);
-        // the routing and the latent rows to the host, once for the window
-        cudaMemcpyAsync(h_ids_, ids_, (size_t) R * K * 4, cudaMemcpyDeviceToHost, stream_);
-        cudaMemcpyAsync(h_lat_, lat_, (size_t) R * Ln * 4, cudaMemcpyDeviceToHost, stream_);
-        bk::quantize_q8_1_rows(lat_, R, Ln, exq_, stream_);
-        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
-            err = "the router failed";
-            return false;
-        }
+    // A window's MoE layer: the routing, the first group's rows and ids published, the shared expert (it runs while the
+    // host and the CPU work), each group's experts, the tail.  Nothing here waits for the card.
+    bool moe_window(int l, const Layer& L, int R, std::string& err) {
+        wg::norm_pack(X_, L.norm, g_.rms_eps, g_.n_embd, R, act_, XN_, stream_);
+        route(L, R, true);
+        publish(0, std::min(kMoeGroup, R));
+        shared_expert(L, R, true);
         for (int g0 = 0; g0 < R; g0 += kMoeGroup)
-            if (!moe_group(L, g0, std::min(kMoeGroup, R - g0), err)) return false;
+            if (!moe_group(l, L, g0, std::min(kMoeGroup, R - g0), err)) return false;
         moe_tail(L, R);
         return true;
     }
 
-    // A group of G rows from window row g0 through the tier: the card's experts, the CPU's, then the weighted sum.
-    bool moe_group(const Layer& L, int g0, int G, std::string& err) {
+    // Rows g0..g0+G of the latent and their ids to the mapped staging, behind the sequence word the host waits on; the
+    // rows quantized for the card's experts.  Queued behind the group before's sum, so its CPU rows were read.
+    void publish(int g0, int G) {
+        const int K = g_.n_used, Ln = g_.n_latent;
+        bk::doorbell_publish(lat_ + (size_t) g0 * Ln, ids_ + (size_t) g0 * K, nullptr, (int64_t) G * Ln, (int64_t) G * K, d_x_, d_wids_,
+                             nullptr, d_words_, stream_);
+        ++seq_want_;
+        bk::quantize_q8_1_rows(lat_ + (size_t) g0 * Ln, G, Ln, exq_, stream_);
+    }
+
+    // The published ids have landed (the stream goes on meanwhile); a launch that failed never writes them.
+    bool await_ids(std::string& err) {
+        const volatile uint32_t* seq = h_words_;
+        for (int s = 0; s < (1 << 22); ++s) {
+            if (*seq == seq_want_) {
+                std::atomic_thread_fence(std::memory_order_acquire);
+                return true;
+            }
+            platform::cpu_relax();
+        }
+        cudaStreamSynchronize(stream_);
+        if (*seq == seq_want_) return true;
+        err = "the router's ids did not arrive";
+        seq_want_ = *seq;
+        return false;
+    }
+
+    // While a layer's weighted sum waits for the CPU's rows, the card's memory idles once its own experts are done: the
+    // weights the card reads next (this layer's latent projection back, then the next layer's input products, or the head
+    // after the last layer) are read into L2 meanwhile, up to 60% of the L2, and the requests stop once the wait is over.
+    // They change no result.
+    void read_ahead(int l, uint32_t word) {
+        if (ra_.empty()) {   // every layer's ranges, once
+            int l2 = 0;
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
+            const uint64_t budget = (uint64_t) l2 * 3 / 5;
+            ra_.resize((size_t) g_.n_layers);
+            for (int k = 0; k < g_.n_layers; ++k) {
+                bk::L2Ranges& r = ra_[(size_t) k];
+                uint64_t left = budget;
+                int n = 0;
+                const auto add = [&](const Mat& w) {
+                    const uint64_t bytes = w.type == kTypeF8 ? (uint64_t) w.rows * w.cols : w.type == kTypeBf16 ? (uint64_t) w.rows * w.cols * 2 : 0;
+                    if (n == bk::kL2Ranges || bytes == 0 || ((uintptr_t) w.w & 15) != 0) return;
+                    r.p[n] = w.w;
+                    r.n[n] = std::min<uint64_t>(bytes, left) & ~15ull;
+                    left -= r.n[n];
+                    n += r.n[n] > 0;
+                };
+                const Layer& L = m_.layer(k);
+                if (L.kind == Kind::Moe) add(L.lat_up);
+                if (k + 1 < g_.n_layers) {
+                    const Layer& N = m_.layer(k + 1);
+                    if (N.kind == Kind::Mamba) add(N.in);
+                    else if (N.kind == Kind::Attention) {
+                        add(N.q);
+                        add(N.k);
+                        add(N.v);
+                    }
+                } else {
+                    add(m_.head());
+                }
+            }
+        }
+        cudaEventRecord(ra_ev_, stream_);
+        cudaStreamWaitEvent(ra_st_, ra_ev_, 0);
+        bk::l2_read_ahead(ra_[(size_t) l], ra_mark_, word, ra_st_);
+    }
+
+    // A group of G rows from window row g0 through the tier: the CPU pool starts on the RAM experts, the card runs its slot
+    // hits and then the bus fetches, and the weighted sum is queued behind the word the joiner writes once the CPU's rows
+    // landed.  The host does not wait here: join_moe, called at the next group or the window's end, finishes the share.
+    bool moe_group(int l, const Layer& L, int g0, int G, std::string& err) {
         const int K = g_.n_used, Ln = g_.n_latent, tl = L.tier_layer;
-        int32_t uniq[core::ExpertTier::kMaxK];
-        int uidx[core::ExpertTier::kMaxK], nu = 0;
-        core::ExpertTier::Use use[core::ExpertTier::kMaxK];
+        if (g0 > 0) publish(g0, G);
+        if (!join_moe(err)) return false;
+        Pending& pd = pend_;
+        pd = Pending{};
+        pd.on = true;
+        pd.tl = tl;
+        tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
+        if (!await_ids(err)) return false;
+        int32_t uniq[kLookupK];
+        int uidx[kLookupK], nu = 0;
+        core::ExpertTier::Use* use = pd.use;
         for (int t = 0; t < G; ++t)
             for (int k = 0; k < K; ++k) {
-                const int32_t e = h_ids_[(size_t) (g0 + t) * K + k];
+                const int32_t e = h_wids_[t * K + k];
                 if (e < 0 || e >= g_.n_expert) {
                     err = "the router picked expert " + std::to_string(e);
                     return false;
@@ -669,53 +803,123 @@ private:
                 us.row[us.nt] = t * K + k;
                 ++us.nt;
             }
-        tier_->pump(tl, 2 + G);
-        core::ExpertTier::Lookup lk;
+        core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
-        bool cpu = false, reading = false;
+        const int n_fetched = tier_->fetch(tl, lk);
         for (int i = 0; i < nu; ++i) {
-            cpu = cpu || (!lk.dev[i] && !lk.reading[i]);
-            reading = reading || lk.reading[i];
+            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.reading[i]);
+            pd.reading = pd.reading || lk.reading[i];
         }
-        // the CPU's share runs on the pool while the card computes its own
-        if (cpu) tier_->start_cpu_window(tl, h_lat_ + (size_t) g0 * Ln, lk, use, h_rows_);
-        GroupPlan& p = *plan_h_;
-        int ng = 0, ne = 0;
-        for (int i = 0; i < nu; ++i) {
-            if (!lk.dev[i]) continue;
-            p.ptr[ng] = (unsigned long long) lk.dev[i];
-            p.start[ng] = ne;
-            for (int j = 0; j < use[i].nt; ++j) {
-                p.dst[ne] = use[i].row[j];
-                p.tok[ne] = g0 + use[i].tok[j];
-                ++ne;
+        if (pd.cpu || pd.reading) pd.word = ++join_seq_;   // the weighted sum waits for the host's rows
+        // a promotion only queues its copies (they go out at a later pump); experts still being read from the file are
+        // decided once they landed
+        if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
+        // the CPU's share first: it takes longest, and the pool's workers run it while the card's share launches
+        if (pd.cpu) tier_->start_cpu_window(tl, h_x_, lk, use, h_rows_);
+        const auto make_plan = [&](WindowPlan& p, bool fetched, int& ne) {
+            int ng = 0;
+            ne = 0;
+            for (int i = 0; i < nu; ++i) {
+                if (!lk.dev[i] || lk.fetched[i] != fetched) continue;
+                p.ptr[ng] = (unsigned long long) lk.dev[i];
+                p.start[ng] = ne;
+                for (int j = 0; j < use[i].nt; ++j) {
+                    p.dst[ne] = use[i].row[j];
+                    p.tok[ne] = use[i].tok[j];
+                    ++ne;
+                }
+                ++ng;
             }
-            ++ng;
-        }
-        p.start[ng] = ne;
-        p.ng = ng;
+            p.start[ng] = ne;
+            p.ng[0] = ng;
+            return ng;
+        };
+        const auto launch = [&](void* dev, int ng, int ne) {
+            WindowPlan* dp = (WindowPlan*) dev;
+            bk::native_expert_grouped(lay_, dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng, ne, exq_, exscr_, exrows_, stream_);
+        };
+        WindowPut put;
+        int ne = 0;
+        const int nhits = make_plan(put.plan, false, ne);
         for (int r = 0; r < G * K; ++r)
-            rowtab_h_[r] = lk.dev[uidx[r]] ? exrows_ + (size_t) r * Ln : d_rows_ + (size_t) r * Ln;
-        cudaMemcpyAsync(plan_d_, plan_h_, sizeof(GroupPlan), cudaMemcpyHostToDevice, stream_);
-        cudaMemcpyAsync(rowtab_d_, rowtab_h_, (size_t) G * K * sizeof(float*), cudaMemcpyHostToDevice, stream_);
-        if (ng)
-            bk::native_expert_grouped(lay_, plan_d_->ptr, plan_d_->start, &plan_d_->ng, plan_d_->dst, plan_d_->tok, ng, ne, exq_,
-                                      exscr_, exrows_, stream_);
-        if (cpu) tier_->finish_cpu();
-        if (reading) {
-            if (!tier_->await_reads(err)) return false;
-            tier_->start_cpu_window(tl, h_lat_ + (size_t) g0 * Ln, lk, use, h_rows_, true);
-            tier_->finish_cpu();
+            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]] ? exrows_ + (size_t) r * Ln : d_rows_ + (size_t) r * Ln);
+        bk::put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), stream_);
+        if (nhits) launch(ex_plan_, nhits, ne);
+        if (pd.word) read_ahead(l, pd.word);
+        if (n_fetched) {
+            WindowPlan p2;
+            const int ng = make_plan(p2, true, ne);
+            tier_->await_fetch(stream_);
+            bk::put_words(&p2, ex_plan2_, (int) (sizeof(WindowPlan) / 4), stream_);
+            launch(ex_plan2_, ng, ne);
         }
-        tier_->promote(tl, lk);
-        weighted_sum(rowtab_d_, rw_ + (size_t) g0 * K, G, K, Ln, latout_ + (size_t) g0 * Ln, stream_);
-        tier_->mark_gap(stream_);
-        // the host rows, the tables and the plan are this group's until the sum has read them
-        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
-            err = "a group of experts failed";
-            return false;
+        if (pd.word) bk::wait_word_mark(d_words_ + 1, pd.word, ra_mark_, stream_);
+        const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
+        bk::weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, Ln, latout_ + (size_t) g0 * Ln, stream_);
+        if (pd.cpu && !pd.reading) tier_->mark_gap(stream_);   // the promotions' copies start behind the sum
+        // the rows land and the word is written on the joiner thread, while this thread queues the next layers' work
+        if (join_now_) return join_moe(err);
+        if (pd.word && !pd.reading) {
+            if (!joiner_.joinable()) joiner_ = std::thread([this] { joiner_loop(); });
+            pd.handed = true;
+            {
+                std::lock_guard<std::mutex> g(jm_);
+                jwork_ = true;
+                jdone_.store(false, std::memory_order_relaxed);
+            }
+            jcv_.notify_one();
         }
         return true;
+    }
+
+    void joiner_loop() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(jm_);
+                jcv_.wait(lk, [this] { return jwork_ || jstop_; });
+                if (jstop_ && !jwork_) return;
+                jwork_ = false;
+            }
+            std::string e;
+            jok_ = join_body(e);
+            jerr_ = e;
+            jdone_.store(true, std::memory_order_release);
+        }
+    }
+
+    // The CPU's share of the last group placed: the pool's rows land, the experts read from the file run, and the word its
+    // weighted sum waits for is written.  On every way out, so the stream never waits for good.
+    bool join_moe(std::string& err) {
+        if (!pend_.on) return true;
+        if (pend_.handed) {   // handed to the joiner: its result
+            while (!jdone_.load(std::memory_order_acquire)) platform::cpu_relax();
+            pend_.on = false;
+            if (!jok_ && err.empty()) err = jerr_;
+            return jok_;
+        }
+        const bool ok = join_body(err);
+        pend_.on = false;
+        return ok;
+    }
+    bool join_body(std::string& err) {
+        Pending& pd = pend_;
+        bool ok = true;
+        if (pd.cpu) tier_->finish_cpu();
+        if (pd.reading) {
+            if (tier_->await_reads(err)) {
+                tier_->start_cpu_window(pd.tl, h_x_, pd.lk, pd.use, h_rows_, /*reading=*/true);
+                tier_->finish_cpu();
+            } else {
+                ok = false;
+            }
+            tier_->promote(pd.tl, pd.lk);
+        }
+        if (pd.word) {
+            std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
+            *(volatile uint32_t*) (h_words_ + 1) = pd.word;
+        }
+        if (pd.reading) tier_->mark_gap(stream_);
+        return ok;
     }
 
     // A prompt chunk's routed experts on the int8 tensor cores (llama.cpp's MMQ over the NVFP4 blobs, q8_1 activations):
@@ -729,7 +933,8 @@ private:
         namespace mmq = basalt::prefill::mmq;
         const int64_t E = g_.n_embd, Ln = g_.n_latent, K = g_.n_used, FF = g_.n_ff_exp;
         bk::rms_norm_rows(X_, L.norm, XN_, R, E, g_.rms_eps, stream_);
-        moe_head(L, R, false);
+        route(L, R, false);
+        shared_expert(L, R, false);
         cudaMemcpyAsync(h_ids_, ids_, (size_t) R * K * 4, cudaMemcpyDeviceToHost, stream_);
         if (cudaStreamSynchronize(stream_) != cudaSuccess) {
             err = "the router failed";
@@ -854,7 +1059,7 @@ private:
             mmq_->run(dn, stream_);
             cudaEventRecord(ev_done_[h], stream_);
         }
-        weighted_sum(rowtab_d_, rw_, R, (int) K, (int) Ln, latout_, stream_);
+        bk::weighted_sum_window(rowtab_d_, rw_, R, (int) K, (int) Ln, latout_, stream_);
         moe_tail(L, R);
         // the host tables are this layer's until the stream has read them
         if (cudaStreamSynchronize(stream_) != cudaSuccess) {
@@ -892,7 +1097,9 @@ private:
         }
         tier_ = shared.tier;
         h_rows_ = shared.h_rows;
-        if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess) {
+        h_x_ = shared.h_x;
+        if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_x_, h_x_, 0) != cudaSuccess) {
             err = "cannot map the expert rows";
             return false;
         }
@@ -966,10 +1173,32 @@ private:
     std::vector<Mamba> mamba_;
     std::vector<uint16_t*> kc_, vc_;
     bk::NativeExpertLayout lay_;
-    GroupPlan *plan_h_ = nullptr, *plan_d_ = nullptr;
+    void *ex_plan_ = nullptr, *ex_plan2_ = nullptr;   // a window group's plan and row pointers; its fetched experts' plan
     const float **rowtab_h_ = nullptr, **rowtab_d_ = nullptr;
     int32_t *h_ids_ = nullptr, *keep_h_ = nullptr;
-    float* h_lat_ = nullptr;
+    // a window group's ids (mapped), the sequence word and the joiner's word (mapped: [0], [1]); the L2 read-ahead
+    int32_t *h_wids_ = nullptr, *d_wids_ = nullptr;
+    uint32_t *h_words_ = nullptr, *d_words_ = nullptr, *ra_mark_ = nullptr;
+    uint32_t seq_want_ = 0, join_seq_ = 0;
+    std::vector<bk::L2Ranges> ra_;
+    cudaStream_t ra_st_ = nullptr;
+    cudaEvent_t ra_ev_ = nullptr;
+    // the CPU's share of the last group placed, until join_moe; the thread that finishes it
+    struct Pending {
+        bool on = false, cpu = false, reading = false, handed = false;   // handed: to the joiner thread
+        int tl = 0;
+        uint32_t word = 0;
+        core::ExpertTier::Lookup lk;
+        core::ExpertTier::Use use[kLookupK];
+    } pend_;
+    uint32_t warmed_ = 0;     // bit T: a window of T rows ran (its kernels are loaded)
+    bool join_now_ = false;   // this window's groups are joined as they are queued
+    std::thread joiner_;
+    std::mutex jm_;
+    std::condition_variable jcv_;
+    bool jwork_ = false, jstop_ = false, jok_ = true;
+    std::atomic<bool> jdone_{true};
+    std::string jerr_;
     uint8_t *stage_ = nullptr, *bounce_ = nullptr;
     // the prompt path's experts: gathered rows' tokens and the groups' bounds (pinned and on the card), an identity row
     // table, the staged blobs' tails, the q8_1 input and H, H; the MMQ context; the copy stream and its events
@@ -980,7 +1209,7 @@ private:
     cudaStream_t copy_ = nullptr;
     cudaEvent_t ev_ready_ = nullptr, ev_copied_[2] = {}, ev_done_[2] = {};
     std::shared_ptr<core::ExpertTier> tier_;
-    float *h_rows_ = nullptr, *d_rows_ = nullptr;
+    float *h_rows_ = nullptr, *d_rows_ = nullptr, *h_x_ = nullptr, *d_x_ = nullptr;   // the CPU's rows and its input (mapped)
     // the last window, until the next call says how many of its rows were kept
     int64_t pend_pos_ = 0;
     int pend_T_ = 0;
