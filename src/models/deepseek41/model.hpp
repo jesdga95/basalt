@@ -40,7 +40,7 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
 
 class DsparkDrafter;
 
-/// The second cards whose expert tiers a start uses; later cards idle.
+/// The most second cards whose expert tiers a start uses (gpu-mode peer takes no more cards than the main card and these).
 constexpr int kMaxSecondCards = 4;
 
 class DsModel final : public model::LoadedModel {

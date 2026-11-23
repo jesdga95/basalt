@@ -256,11 +256,6 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
     set_tiers(req);
     std::vector<int> peers = req.peer_devices;
-    if (peers.size() > (size_t) kMaxSecondCards) {
-        basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),
-                          kMaxSecondCards);
-        peers.resize((size_t) kMaxSecondCards);
-    }
     // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
     // peer card here rather than failing at its first launch with 'no kernel image'.
     for (int dev : peers) {
