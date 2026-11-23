@@ -4,9 +4,8 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 
 ## Summary
 
-- **Against the reference:** the default pack (`NVFP4-DQ8`) scores mean KLD 0.00305 and top-1 97.76% over 100 chunks; the
-  `NVFP4-MX8` pack, with the release's MXFP8 experts native, 0.00297 and 97.83%, and 0.00303 and 97.72% with its RAM experts
-  on the CPU ([below](#against-the-reference)).
+- **Against the reference:** the default pack (`NVFP4-MX8`, the release's MXFP8 experts native) scores mean KLD 0.00297 and top-1 97.83% over 100 chunks,
+  and 0.00303 and 97.72% with its RAM experts on the CPU; the `NVFP4-DQ8` pack 0.00305 and 97.76% ([below](#against-the-reference)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
   models' true-BF16 KLDs.
