@@ -274,6 +274,7 @@ public:
 
     // ---- the ModelSession calls ------------------------------------------------------------------------------------------
     int max_window() const override { return kMaxWindow; }
+    bool copy_drafts() const override { return true; }   // prompt lookup: any window's rows verify alike
 
     model::Result prepare() override {
         std::string e;

@@ -52,7 +52,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 |---|---|---|---|---|---| --- |
 | Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) | `Hy4-flash-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt) | `Inkling-2-Mini-NVFP4-q8`, [Hugging Face](https://huggingface.co/jesdga/Inkling-2-Mini-Basalt) | `Nemotron-3.5-Super-NVFP4`, [built](docs/model-file.md#nemotron-35-super-pack) from NVIDIA's checkpoint |
 | Context | up to 262,144 (longer with YaRN) | up to 1,048,576 | up to 262,144 | up to 1,048,576 | up to 1,048,576 | default 8,192 (tested to 16,384) |
-| Drafting | MTP, on by default | DSpark, on by default | DFlash 2, on by default | DFly2, on by default | DSpark, on by default | none yet |
+| Drafting | MTP, on by default | DSpark, on by default | DFlash 2, on by default | DFly2, on by default | DSpark, on by default | prompt lookup |
 | Images | yes | yes | yes | yes | yes | no |
 | Documents (PDF, text) | yes | yes | yes | yes | yes | yes |
 | Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) | [guide](docs/models/hy4-flash.md) | [guide](docs/models/inkling2.md) | [guide](docs/models/nemotron.md) |

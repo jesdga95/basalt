@@ -41,11 +41,17 @@ are shared, for any later model that uses them.
 
 ## Decode
 
-Each token runs its 40 MoE layers' 22 experts where they are: the card's from their slots, the rest by the CPU workers
-from RAM, while the card's experts and the dense layers run. The tier moves the experts routed most onto the card. On an
-RTX PRO 4000 (power limited to 145 W), 59 GiB of experts in RAM and about 37 to 50 experts a layer on the card: **42 ms a
-token (about 23.7 tok/s)**, with about 75 to 80 % of a token's experts on the CPU. Of the 42 ms, the CPU's experts take
-about 18 and waiting for the routers about 13.
+Each token runs its 40 MoE layers' 22 experts where they are: the card's from their slots, a few RAM misses the card
+fetches over the bus, the rest by the CPU workers from RAM. The host never waits for the CPU's share: the card's weighted
+sum waits for a word the host writes once the CPU's rows landed, the host queues the next layers meanwhile, and the card
+reads the next weights into L2 while it waits (the decode of Hy4-flash and DeepSeek). On an RTX PRO 4000 (power limited
+to 145 W) with 59 GiB of experts in RAM and 38 experts a layer on the card: **30.7 ms a token (32.6 tok/s)**. Windows of
+2, 4 and 8 rows take 43, 66 and 125 ms.
+
+**Prompt lookup** (`--suffix-draft N`, default 3, `0` off) fills a window from an earlier repeat of the last N or more
+tokens; any window's rows verify the same way, so only speed changes. Rewriting a 1,700-token Python file at temperature
+0: 31.0 tok/s without, 62.4 with (every draft kept, 14.3 tokens a window), the same text. The checkpoint's MTP head is
+not used yet.
 
 ## Long prompts
 

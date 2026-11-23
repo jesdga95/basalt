@@ -10,6 +10,9 @@
 #include "models/nemotronh/meta.hpp"
 #include "models/nemotronh/model.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+
 namespace basalt::models::nemotronh {
 namespace {
 
@@ -32,13 +35,12 @@ public:
     const char* model_name() const override { return "Nemotron-3.5-Super"; }
     int quality_window() const override { return 16; }
 
-    // --kv: the attention caches are fp16
+    // --kv: the attention caches are fp16; --suffix-draft: prompt lookup's least repeat (0: off)
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
-        if (a == "--kv") {
-            o.kv = args.next("--kv");
-            return true;
-        }
-        return false;
+        if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
+        else return false;
+        return true;
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
