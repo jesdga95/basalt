@@ -153,9 +153,7 @@ D = deleted. H = moves behind a hook. K = kept as a mechanic inside its mode.
 | Peer access for every pair | `cli/gpu.cpp:76-97` | none | K, moved to `core/card_link` |
 | `max_expert_cards`, `second_card_reads_prompts`, `second_card_runs_layers` | `model/adapter.hpp:359-367`, `generate/configure.cpp:27-31` | the 27B's layer stage when it does not fit | D, replaced by `gpu_modes()` |
 | `--gpu-plan` JSON, `select_gpus` for the launchers | `gpu_select.cpp:360-395` | none | K, gains mode and shares |
-| `basalt-bench --community` forces `auto` | `program/bench_main.cpp:762` | every card | H: takes the user's `gpu`, `gpu-mode` |
 | Server `--gpu` help, `check_gpu`, error text | `serve/config.py:578`, `serve/engine/vision.py:490-507`, `serve/server.py:131-133` | none | K, new values and texts |
-| Tests | `tests/program/multi_gpu_plan_test.cpp`, `gpu_select_test.cpp`, `tests/models/qwen35/split_plan_test.cpp`, `serve/tests/test_config.py` | | D or rewritten |
 
 ### Qwen3.8-Flash-Next (`src/models/qwen4exp`)
 
@@ -219,21 +217,25 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
 
 ## Conformance
 
-This works like `batch_check` (see [batching](batching.md)). `--diag-gpu-check` runs a token file through the mode, then runs it
-the way the mode promises to match, in one process, and compares. `tools/gpu_identity.py` does the same through the server
-(greedy tokens of each slot).
+This works like `batch_check` (see [batching](batching.md)), in two runs since a mode and its reference are two loads. `basalt
+--tokens-file P --max-new N --diag-gpu-check --diag-gpu-trace T` reads the prompt in one prefill call (a long one takes the model's chunks
+and any prompt stage), then N greedy steps, and writes each step's logits and pick to T. The same command on the reference with
+`--diag-gpu-ref T` compares them: bitwise steps, greedy identity, KLD, top-1 (`model/gpu_check.hpp`; exit 0 only when bitwise).
+`tools/gpu_identity.py` compares greedy tokens through the serving engine (`--ref-engine`: another build), Flash-Next's only check.
+`--diag-gpu-same` with `gpu-mode split` and `--diag-gpu-cut L` puts both Flash-Next stages on CUDA0, its split's reference; it stalls
+in the first prompt window (0 layers served) while the real split runs: step 6 fixes it.
 
 | Mode, part | Reference | Bar |
 | --- | --- | --- |
 | peer, prompt stages (Flash-Next, 27B) | the same chunks with every layer on the main card, same placement | bitwise: KLD 0, top-1 100%, greedy identical |
 | peer, experts (Flash-Next, DeepSeek, Hy4) | per expert: its rows on the main card | bitwise rows (kernel parity test per expert format) |
-| peer, experts, whole model | single card, same flags (its spill runs on CPU or over the bus) | decode-path KLD vs the BF16 base and top-1 the same or better; greedy identical to v0.5.6 in the same mode |
+| peer, experts, whole model | v0.5.6 in the same mode, tier frozen (`--diag-tier-frozen`); a single card is not bitwise: its spill runs on the CPU | greedy identical to v0.5.6; decode-path KLD vs the BF16 base and top-1 the same or better |
 | peer, Inkling | single card (CPU experts) | KLD and top-1 the same or better; peer rows bitwise equal to main-card rows |
 | split, every model | single card where the model fits at the check's context; otherwise the same split with both stages on one GPU (`split_same`) | bitwise: KLD 0, greedy identical |
 | tensor | single card | KLD and top-1 the same or better within the gate's noise; not bitwise (partial sums meet with one BF16 rounding) |
 
-KLD runs use `/mnt/nvme/kld/*-bf16-base.kld` through the decode path (rule 5). Bitwise checks use the single-card `.kld` written by
-the check itself, in a scratch directory, never in `/mnt/nvme/kld`.
+KLD runs use `/mnt/nvme/kld/*-bf16-base.kld` through the decode path (rule 5); traces go in a scratch directory. Step 3: the 27B stage
+and Inkling's split are bitwise vs one card; DeepSeek's experts on a card vs the CPU differ at KLD 9+ (no peer), so it is held to v0.5.6.
 
 ## Tensor (reserved)
 
@@ -262,14 +264,13 @@ upstream). It reports 1.5x decode and 1.2x prefill over the layer split on 2x RT
 6. **Per-op splits inside peer** (Flash-Next head and GDN splits). **DEFAULT, Jay to confirm:** kept as mechanics on the cards'
    bandwidth as today; moving them to the shares would change Jay's decode.
 7. **Diagnostic cut. DEFAULT, Jay to confirm:** one shared `--diag-gpu-cut L` replaces each model's `--diag-split-at`.
-8. **A peer with nothing to hold. DEFAULT, Jay to confirm:** refused with the reason (today it idles).
-9. **More cards than a mode takes. DEFAULT, Jay to confirm:** refused with the maximum (today the extra cards idle).
-10. **`all` and older cards. DEFAULT, Jay to confirm:** `all` takes every visible card in order and skips none; a card the mode
+8. **Idle cards. DEFAULT, Jay to confirm:** a peer with nothing to hold, or more cards than a mode takes, is refused with the reason or the maximum (today they idle).
+9. **`all` and older cards. DEFAULT, Jay to confirm:** `all` takes every visible card in order and skips none; a card the mode
     cannot use is refused with its reason (peer takes sm_89 only in a `-DPEER_ADA=ON` build, split and tensor never; the main
     card must be sm_120), so a machine with an older card names the cards it wants.
-11. **Community bench rows. DEFAULT, Jay to confirm:** `basalt-bench --community` takes the user's `gpu` and `gpu-mode` and
+10. **Community bench rows. DEFAULT, Jay to confirm:** `basalt-bench --community` takes the user's `gpu` and `gpu-mode` and
     records both in the row (it forces `auto` today).
-12. **Open PRs this touches. DEFAULT, Jay to confirm:** superseded, closed once the rework lands: #212, #352, #564. Rebased
+11. **Open PRs this touches. DEFAULT, Jay to confirm:** superseded, closed once the rework lands: #212, #352, #564. Rebased
     onto the hooks: #388 (dense split on 3+ cards), #442, #473, #589 (older peers), #501, #509 (Flash-Next prompt split, peer).
 
 ## Build plan
