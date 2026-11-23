@@ -268,6 +268,10 @@ if(BUILD_TESTING)
   target_include_directories(inkling2_kernels_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2_kernels_parity PRIVATE inkling2_kernels kernels ggml_quants ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2_kernels_parity COMMAND inkling2_kernels_parity)
+  add_executable(inkling2_kv_int8_parity src/models/inkling2/kernels/kv_int8_parity.cu)
+  target_include_directories(inkling2_kv_int8_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
+  target_link_libraries(inkling2_kv_int8_parity PRIVATE inkling2_kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_kv_int8_parity COMMAND inkling2_kv_int8_parity)
   add_executable(inkling2_dspark_parity src/models/inkling2/kernels/dspark_parity.cpp)
   target_include_directories(inkling2_dspark_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels ${_gpu_runtime_target})
@@ -1973,9 +1977,9 @@ if(BUILD_TESTING)
   # DEC_MOE's kernels on real GGUF experts, bitwise vs the path they replace (--bench: timings)
   add_executable(dec_moe_parity tests/models/qwen4exp/kernels/dec_moe_parity.cpp)
   target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
-  target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ${_gpu_runtime_target})
+  target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ggml_quants ${_gpu_runtime_target})
   basalt_gpu_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
-  basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic experts at the real geometry (K-quant gate/up with Q5_1 / Q8_0 down, i-quant gate/up with Q5_0 down)
+  basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic K-quant and i-quant experts at the real geometry
   endif()
   # native expert pairs on synthetic ggml-quantized weights at 2560/640: GPU and CPU experts against the float
   # reference, GPU dequantizers against to_float.

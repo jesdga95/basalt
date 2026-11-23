@@ -142,6 +142,8 @@ class Service:
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
         self.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}   # their sums
+        from serve.prometheus import PromStats
+        self.prom = PromStats()                          # latency histograms & finish/draft totals for /metrics
         self.totals_path = None                          # persistent counters file (None: this start only)
         self.cost_input_per_million = 0.0                # what a million input tokens costs (US dollars)
         self.cost_output_per_million = 0.0               # what a million output tokens costs
@@ -924,6 +926,11 @@ class Service:
                 "hardware": hardware_view(tel["now"], tel["static"], info, cards, l3), "hardware_static": tel["static"],
                 "history": tel["history"]}
 
+    def prom_snapshot(self) -> dict:
+        """Thread-safe snapshot of Prometheus counters and latency histograms."""
+        with self.status_lock:
+            return self.prom.snapshot()
+
     def _drop_stale_best(self) -> None:
         """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
         crash) starts its own.  Call with status_lock held."""
@@ -1403,6 +1410,7 @@ class Service:
         st = {} if par else self.status
         rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate
         wait_key = object()                             # this request's entry in self.waiting
+        arrived = getattr(self.request_ctx, "arrived", None) or time.time()
         with self.status_lock:
             self.status["queued"] += 1
             if not par:
@@ -1754,11 +1762,19 @@ class Service:
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}
                             ft = st.get("first_token")
                             ttft = ft - st["started"] if ft and st.get("started") else None
+                            now_done = time.time()
+                            self.prom.record(
+                                finish=finish,
+                                ttft_s=(ft - arrived) if ft else None,
+                                duration_s=now_done - arrived,
+                                decode_ms=last.get("decode_ms"), output_tokens=n,
+                                drafts_offered=last.get("drafts_offered"), drafts_accepted=last.get("drafts_accepted"),
+                            )
                             windows, window_tokens = st.get("windows") or 0, st.get("window_tokens") or 0
                             dl = window_tokens / windows if windows else None
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
-                                "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                "time": started, "duration_s": round(now_done - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
