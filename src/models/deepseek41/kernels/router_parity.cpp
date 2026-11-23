@@ -22,7 +22,9 @@ struct Ref {
     std::vector<double> w;
 };
 
-Ref reference(const float* x, const std::vector<float>& gate, const std::vector<float>& bias, float scale) {
+// held/prior: --route-prior, the held experts chosen on their biased score plus prior
+Ref reference(const float* x, const std::vector<float>& gate, const std::vector<float>& bias, float scale,
+              const std::vector<int32_t>* held = nullptr, double prior = 0) {
     Ref r;
     r.logits.resize(NE);
     r.biased.resize(NE);
@@ -32,7 +34,8 @@ Ref reference(const float* x, const std::vector<float>& gate, const std::vector<
         for (int d = 0; d < ND; ++d) acc += (double) gate[(size_t) e * ND + d] * (double) x[d];
         r.logits[e] = acc;
         s[e] = std::sqrt(std::log1p(std::exp(acc)));
-        r.biased[e] = s[e] + (double) bias[e];
+        const bool bonus = held && (*held)[(size_t) e] >= 0;
+        r.biased[e] = s[e] + (double) bias[e] + (bonus ? prior : 0.0);
     }
     std::vector<int> idx(NE);
     std::iota(idx.begin(), idx.end(), 0);
@@ -73,7 +76,7 @@ int main(int argc, char** argv) {
     bias_h[201] = bias_h[77];
     Dev<float> gate(gate_h), bias(bias_h);
 
-    const int Tmax = 11;
+    const int Tmax = 68;   // 64 tokens is where the router takes four gate rows a block; 65 leaves a tail block of one
     auto x_h = randn((size_t) Tmax * ND, 3);
     Out all = run(gate, bias, x_h, Tmax, a);
     double worst_logit = 0, worst_w = 0, rms_num = 0, rms_den = 0;
@@ -109,9 +112,9 @@ int main(int argc, char** argv) {
     v.expect(worst_w < 1e-4, "weights rel error");
     v.expect(id_mismatch == near_ties, "ids differ beyond near-ties");
 
-    // ---- window width and position independence: bitwise
+    // ---- window width and position independence: bitwise, across the width where the four-row path starts (64)
     bool bitwise = true;
-    for (int T : {1, 2, 3, 4}) {
+    for (int T : {1, 2, 3, 4, 64, 65}) {
         for (int start : {0, 3, 7}) {
             if (start + T > Tmax) continue;
             std::vector<float> xs(x_h.begin() + (size_t) start * ND, x_h.begin() + (size_t)(start + T) * ND);
@@ -126,6 +129,22 @@ int main(int argc, char** argv) {
     std::printf("window/position independence: %s\n", bitwise ? "bitwise identical" : "DIFFERS");
     v.expect(bitwise, "output depends on window width or position");
 
+    // ---- the kernel it replaces, token by token: a one-token call is below the four-row path's 64-token threshold,
+    // so it runs the row-at-a-time kernel while the 68-token call runs four rows a block
+    {
+        bool same = true;
+        for (int t = 0; t < Tmax; ++t) {
+            std::vector<float> xs(x_h.begin() + (size_t) t * ND, x_h.begin() + (size_t)(t + 1) * ND);
+            Out o = run(gate, bias, xs, 1, a);
+            same = same && !std::memcmp(&o.logits[0], &all.logits[(size_t) t * NE], NE * 4);
+            same = same && !std::memcmp(&o.ids[0], &all.ids[(size_t) t * K], K * 4);
+            same = same && !std::memcmp(&o.w[0], &all.w[(size_t) t * K], K * 4);
+        }
+        std::printf("four gate rows a block vs the row-at-a-time kernel, one token at a time: %s\n",
+                    same ? "bitwise identical" : "DIFFERS");
+        v.expect(same, "the four-row path differs from the row-at-a-time kernel");
+    }
+
     // ---- tie order: experts 77 and 201 are identical; a token that selects either selects 77 first
     {
         std::vector<float> xs(x_h.begin(), x_h.begin() + ND);
@@ -135,6 +154,42 @@ int main(int argc, char** argv) {
         Out o = run(gate, tb, xs, 1, a);
         std::printf("tie: top ids %d %d\n", o.ids[0], o.ids[1]);
         v.expect(o.ids[0] == 77 && o.ids[1] == 201, "tie did not resolve to the lower index first");
+    }
+
+    // ---- --route-prior: with no expert held, or every one, the selection is the plain router's, bit for bit; with a held
+    // table the held experts are chosen on their biased score plus prior and every weight stays the unbiased score's,
+    // normalised over the picks
+    {
+        std::vector<int32_t> none(NE, -1), every(NE, 0), some(NE, -1);
+        for (int e = 0; e < NE; e += 3) some[(size_t) e] = e;
+        Dev<int32_t> dn(none), de(every), ds(some);
+        bool same = true;
+        for (const Dev<int32_t>* t : {&dn, &de}) {
+            RouterArgs p = a;
+            p.prior = 0.25f;
+            p.held.add(t->p);
+            Out o = run(gate, bias, x_h, Tmax, p);
+            same = same && o.ids == all.ids && !std::memcmp(o.w.data(), all.w.data(), o.w.size() * 4);
+        }
+        std::printf("route-prior, nothing or everything held: %s\n", same ? "bitwise the plain router" : "DIFFERS");
+        v.expect(same, "route-prior with nothing or everything held changes the router");
+        RouterArgs q = a;
+        q.prior = 0.25f;
+        q.held.add(ds.p);
+        Out o = run(gate, bias, x_h, Tmax, q);
+        int bad = 0, moved = 0;
+        double worst = 0;
+        for (int t = 0; t < Tmax; ++t) {
+            Ref r = reference(&x_h[(size_t) t * ND], gate_h, bias_h, a.weight_scale, &some, 0.25);
+            for (int k = 0; k < K; ++k) {
+                bad += o.ids[(size_t) t * K + k] != r.ids[k];
+                moved += o.ids[(size_t) t * K + k] != all.ids[(size_t) t * K + k];
+                worst = std::max(worst, std::fabs(o.w[(size_t) t * K + k] - r.w[k]) / r.w[k]);
+            }
+        }
+        std::printf("route-prior 0.25, a third held: %d ids differ from the reference, %d changed by the bias, weights max rel %.3g\n",
+                    bad, moved, worst);
+        v.expect(bad == 0 && moved > 0 && worst < 1e-4, "route-prior against the reference");
     }
 
     // ---- frozen: the ids and weights of many tokens hash to the bits of the kernel the selection replaced, here and
@@ -163,8 +218,8 @@ int main(int argc, char** argv) {
         v.expect(h == kFrozen, "ids and weights equal the frozen kernel");
     }
 
-    // ---- microbench
-    for (int T : {1, 4}) {
+    // ---- microbench (68 crosses the width where the four-row path starts, 64)
+    for (int T : {1, 4, 68}) {
         Dev<float> dx(std::vector<float>(x_h.begin(), x_h.begin() + (size_t) T * ND)), dl((size_t) T * NE), dw((size_t) T * K);
         Dev<int32_t> di((size_t) T * K);
         const double us = bench_stream_us([&](void* st) { router(dx.p, gate.p, bias.p, T, a, dl.p, di.p, dw.p, st); });
@@ -181,7 +236,7 @@ int main(int argc, char** argv) {
             check(cudaMalloc(&g, (size_t) NE * ND * 4), "cudaMalloc");
             check(cudaMemcpy(g, gate.p, (size_t) NE * ND * 4, cudaMemcpyDeviceToDevice), "copy");
         }
-        for (int T : {1, 4}) {
+        for (int T : {1, 4, 68}) {
             Dev<float> dx(std::vector<float>(x_h.begin(), x_h.begin() + (size_t) T * ND)), dl((size_t) T * NE), dw((size_t) T * K);
             Dev<int32_t> di((size_t) T * K);
             int i = 0;

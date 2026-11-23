@@ -15,7 +15,9 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 - **Closer to BF16 than llama.cpp.** Same Q8_0 weights, against the BF16 reference: llama.cpp scores KLD 0.0325, top-1 93.98%;
   the Basalt Q8_0 pack scores KLD 0.0200, top-1 95.34%.
 - **Quantized once.** GGUF packs keep their blocks. The NVIDIA NVFP4 pack keeps NVIDIA's expert codes and scales bit for bit and
-  quantizes each dense tensor once from BF16.
+  quantizes each dense tensor once from BF16. A pack from an FP4-Local checkpoint keeps its expert codes and scales the same way
+  (the CSF scale streams decode bit for bit), quantizes each MXFP8 projection once after an exact widening to f32, and stores the
+  NVFP4 n-gram table as Q8_0.
 - **Only one rounding costs measurable quality by default:** the Q6_K dense projections, about 0.006 KLD and 0.3 to 0.6 points of
   top-1 against NVIDIA's precision. Everything else costs about 0.001 or less.
 
@@ -125,6 +127,10 @@ The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
 the prompt's.
 
+IQ2_S, IQ3_XXS and IQ3_S gate/up with Q5_1 down can use the device-planned tail. On the mixed IQ3_S-Q4 pack, enabling
+these pairs changes the decode path. With tiers pinned, the BF16 gate (100 chunks, T 3, INT8 KV) measured PPL 3.23857 to
+3.24341, mean KLD 0.0954673 to 0.0954654, and top-1 agreement 89.8314% to 89.8471%.
+
 ## 6-bit dense projections
 
 The NVFP4 pack's default `DQ6_K` stores attention q/k/v/o, GDN qkv/z/out and the shared experts' gate/up as Q6_K. The `DQ8` variant
@@ -220,10 +226,9 @@ becomes per-group `<t seconds>` text and pads, as the processor at the model's r
 
 ## Lossy routing flags
 
-Off by default, never picked automatically, and the two flags need the device-planned MoE tail. Both apply to experts held by any GPU tier.
-
-- `--route-prior LAMBDA` (bare 0.5): picks experts as if held experts had LAMBDA added to their router logit.
-- `--route-tail-skip R` (bare 9): skips an expert no GPU holds when every entry naming it ranks R or lower by weight.
+What the two flags do, on every MoE model: [quality](quality.md#lossy-routing-flags). On Flash-Next they need the device-planned
+MoE tail, and `--route-prior` adds LAMBDA to the router logit (the log probability of its softmax; bare 0.5).
+`--route-tail-skip` alone is R 9 (k = 10).
 
 Quality gate (100 chunks, 400 W + 180 W, int8 KV, both flags together) and prose decode:
 

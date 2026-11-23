@@ -161,7 +161,7 @@ class Totals(unittest.TestCase):
         self.assertEqual(t["prompt"], sum(r["prompt_tokens"] for r in rows))
         self.assertEqual(t["reused"], 3 * n)
         self.assertAlmostEqual(t["prompt_ms"], 40.0 * n)
-        self.assertAlmostEqual(t["decode_ms"], 20.0 * n)
+        self.assertAlmostEqual(t["decode_ms"], 2 * 20.0 * n)      # two passes each (the reply closes its thinking), 20 ms a pass
         self.assertGreater(t["written"], 0)
 
 

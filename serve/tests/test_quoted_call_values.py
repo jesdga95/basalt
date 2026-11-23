@@ -15,6 +15,11 @@ VALUES = {
     "unclosed opener in prose": f"A call starts with `{FUNC_START}NAME>` and its parameters follow.",
     "unclosed opener in code": f'opener = "{FUNC_START}"\n',
     "unclosed function with parameter": f"example:\n{FUNC_START}foo>\n{PARAM_START}x>\nunfinished",
+    # the three closing tags on their own lines inside a string, with no call opened before them
+    "whole close inside": (f"line 1\n{PARAM_END}\n{FUNC_END}\n{CALL_END}\n"
+                           "line 5 with \"quotes\" and <tags>\nlast line END"),
+    "whole close twice": f"a\n{PARAM_END}\n{FUNC_END}\n{CALL_END}\nb\n{PARAM_END}\n{FUNC_END}\n{CALL_END}\nc",
+    "whole close at the end": f"the parser stops at:\n{PARAM_END}\n{FUNC_END}\n{CALL_END}",
 }
 
 
@@ -49,6 +54,39 @@ class QuotedCallValues(unittest.TestCase):
         parser = OutputParser(thinking=False, tools=[SCHEMA], stream_tools=True)
         events = parser.feed(first + "\nnow the second:\n" + second) + parser.finish()
         self.assertEqual([e.call.arguments["content"] for e in events if e.kind == "tool_call"], ["one", "two"])
+
+    def test_whole_close_inside_a_value_then_a_second_call(self):
+        value = VALUES["whole close inside"]
+        text = call_text(value) + "\n" + call_text("two")
+        for stream in (False, True):
+            for size in (1, 7, len(text)):
+                with self.subTest(stream=stream, size=size):
+                    parser = OutputParser(thinking=False, tools=[SCHEMA], stream_tools=stream)
+                    events = []
+                    for i in range(0, len(text), size):
+                        events.extend(parser.feed(text[i:i + size]))
+                    events.extend(parser.finish())
+                    calls = [e.call for e in events if e.kind == "tool_call"]
+                    self.assertEqual([c.arguments["content"] for c in calls], [value, "two"])
+                    self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), "")
+                    if stream:
+                        for call in calls:
+                            pieces = "".join(e.text for e in events if e.kind == "tool_args" and e.call.id == call.id)
+                            self.assertEqual(json.loads(pieces), call.arguments)
+
+    def test_prose_after_a_call_that_never_closes_again_is_content(self):
+        text = call_text("one") + "\ndone, the file is written."
+        for stream in (False, True):
+            for size in (1, 7, len(text)):
+                with self.subTest(stream=stream, size=size):
+                    parser = OutputParser(thinking=False, tools=[SCHEMA], stream_tools=stream)
+                    events = []
+                    for i in range(0, len(text), size):
+                        events.extend(parser.feed(text[i:i + size]))
+                    events.extend(parser.finish())
+                    self.assertEqual([e.call.arguments["content"] for e in events if e.kind == "tool_call"], ["one"])
+                    self.assertEqual("".join(e.text for e in events if e.kind == "content"),
+                                     "done, the file is written.")
 
     def test_unclosed_quoted_function_preserves_following_text_and_calls(self):
         value = VALUES["unclosed function with parameter"]

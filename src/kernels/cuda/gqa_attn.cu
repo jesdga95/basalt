@@ -1,5 +1,6 @@
 // src/kernels/cuda/gqa_attn.cu - see include/basalt/kernels/gqa_attn.hpp.
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_bf16.h>
@@ -36,12 +37,12 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 // ---------------------------------------------------------------- decode
 // Row t of a window sees positions [lo_t, hi_t): hi_t = pos0 + t + 1 (causal) or `hi`, lo_t = pos0 + t - window + 1 (a
-// sliding window, else 0); position p sits in cache cell p % cap.  Cells are split in CHUNK-position chunks from chunk
+// sliding window; pos0 - window + 1 for every row of a block's shared window; else 0); position p sits in cache cell p % cap.  Cells are split in CHUNK-position chunks from chunk
 // `base`; block b of a row takes chunks b, b + gx, ... (gx from the capacity alone) and folds them in order, so a row's
 // sums depend on its own range only, never on the window's rows or where the first cell is read from.
 struct Range {
     int64_t pos0 = 0, hi = 0, window = 0, cap = 0;
-    int causal = 1, base = 0;
+    int causal = 1, base = 0, block = 0;
     const int32_t* pos_dev = nullptr;   // pos0 read from the device (a captured window)
 };
 __device__ __forceinline__ int64_t row_pos0(const Range& r) { return r.pos_dev ? (int64_t) *r.pos_dev : r.pos0; }
@@ -73,7 +74,7 @@ __device__ __forceinline__ int seg_of(const int* first, int n, int i) {
 }
 __device__ __forceinline__ int64_t row_hi(const Range& r, int t) { return r.causal ? row_pos0(r) + t + 1 : r.hi; }
 __device__ __forceinline__ int64_t row_lo(const Range& r, int t) {
-    return r.window > 0 ? max((int64_t) 0, row_pos0(r) + t - r.window + 1) : 0;
+    return r.window > 0 ? max((int64_t) 0, row_pos0(r) + (r.block ? 0 : t) - r.window + 1) : 0;
 }
 
 // Block (query head, row t), one thread per dim: the row's splits merged in order.  Splits past the row's last chunk
@@ -155,8 +156,9 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 // fp32 accumulate), an online softmax per row over its cells, O = O alpha + P V (P in fp16) on mma; the rows' partials
 // {max, sum, O} go to the merge.  Every row's arithmetic is its own (mma columns and rows never meet), the chunks follow
 // positions and the splits the capacity, so a row's bits are the same at any window width.
-template <int HD, bool I8>
+template <int HD, bool I8, bool F4 = false>
 // (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__)
+// F4 (with I8): the quantized cache is NVFP4 (KvInt8::fp4), each 8 values from 4 code bytes and their group's scale byte
 __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks,
                                                          float scale, float* part_all) {
     constexpr int LD = HD + 8;          // padded rows (halves): ldmatrix without bank conflicts
@@ -192,7 +194,15 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 if (ce >= r.cap) ce -= r.cap;
                 const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
-                if (q8.k) {
+                if constexpr (F4) {
+                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
+                    const uint8_t* kb = reinterpret_cast<const uint8_t*>(c8.k) + row * (HD / 2) + d8 / 2;
+                    const uint8_t* vb = reinterpret_cast<const uint8_t*>(c8.v) + row * (HD / 2) + d8 / 2;
+                    kw = kv4_decode8(*reinterpret_cast<const uint32_t*>(kb),
+                                     reinterpret_cast<const uint8_t*>(c8.ks)[row * (HD / 16) + d8 / 16]);
+                    vw = kv4_decode8(*reinterpret_cast<const uint32_t*>(vb),
+                                     reinterpret_cast<const uint8_t*>(c8.vs)[row * (HD / 16) + d8 / 16]);
+                } else if constexpr (I8) {
                     const KvInt8& c8 = far_kv ? fr.q8 : q8;
                     const float sk = __half2float(__ushort_as_half(c8.ks[row * (HD / 64) + d8 / 64]));
                     const float sv = __half2float(__ushort_as_half(c8.vs[row * (HD / 64) + d8 / 64]));
@@ -234,7 +244,13 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 if (ce >= r.cap) ce -= r.cap;
                 const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
-                if constexpr (I8) {
+                if constexpr (F4) {
+                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
+                    psk[j] = reinterpret_cast<const uint8_t*>(c8.ks)[row * (HD / 16) + d8 / 16];
+                    psv[j] = reinterpret_cast<const uint8_t*>(c8.vs)[row * (HD / 16) + d8 / 16];
+                    pk[j].x = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(c8.k) + row * (HD / 2) + d8 / 2);
+                    pv[j].x = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(c8.v) + row * (HD / 2) + d8 / 2);
+                } else if constexpr (I8) {
                     const KvInt8& c8 = far_kv ? fr.q8 : q8;
                     psk[j] = c8.ks[row * (HD / 64) + d8 / 64];
                     psv[j] = c8.vs[row * (HD / 64) + d8 / 64];
@@ -254,7 +270,10 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             const int idx = tid + j * 128, cell = idx / (HD / 8), d8 = (idx - cell * (HD / 8)) * 8;
             uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
             if ((pmask >> j) & 1u) {
-                if constexpr (I8) {
+                if constexpr (F4) {
+                    kw = kv4_decode8(pk[j].x, psk[j]);
+                    vw = kv4_decode8(pv[j].x, psv[j]);
+                } else if constexpr (I8) {
                     const float sk = __half2float(__ushort_as_half(psk[j]));
                     const float sv = __half2float(__ushort_as_half(psv[j]));
                     int8_t kb[8], vb[8];
@@ -414,7 +433,9 @@ void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scr
     for (int k = 0; k < segs.n; ++k)
         segs.tile0[k + 1] = segs.tile0[k] + ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
     const dim3 grid((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]);
-    if (segs.q8[0].k) launch_pdl(decode_mma_kernel<HD, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    if (segs.q8[0].k && segs.q8[0].fp4)
+        launch_pdl(decode_mma_kernel<HD, true, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    else if (segs.q8[0].k) launch_pdl(decode_mma_kernel<HD, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
     else launch_pdl(decode_mma_kernel<HD, false>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
     check("gqa decode attention");
     launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) segs.row0[segs.n]), dim3(HD), 0, s,
@@ -1026,7 +1047,52 @@ I8Plan plan_prompt_i8(int n_head, int64_t T, int64_t cells, size_t split_floats)
     return best;
 }
 
+// A thread per 16-value NVFP4 group, four threads per int8 group of 64: the decoded values (code x scale, exact in fp32)
+// rounded by the int8 cache's write rule.  K and V alike.
+__global__ void __launch_bounds__(256) kv4_to_int8_kernel(KvInt8 f4, KvInt8 o, int64_t groups) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const bool ok = i < groups;   // groups is a multiple of 4: a quad is whole or past the end
+    const int64_t at = ok ? i : 0;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        const uint2 c = *reinterpret_cast<const uint2*>((t ? f4.v : f4.k) + at * 8);
+        const float s = kv4_e4m3_value(reinterpret_cast<const uint8_t*>(t ? f4.vs : f4.ks)[at]) * 16384.0f;
+        float x[16], a = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t w = j < 8 ? c.x : c.y;
+            x[j] = kv4_e2m1_value14((w >> (4 * (j & 7))) & 15u) * s;
+            a = fmaxf(a, fabsf(x[j]));
+        }
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 2));
+        const __half h = __float2half_rn(a / 127.0f);
+        const float sc = __half2float(h);
+        uint32_t q[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint32_t w = 0;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float r = sc > 0.0f ? fmaxf(-127.0f, fminf(127.0f, rintf(x[4 * j + e] / sc))) : 0.0f;
+                w |= ((uint32_t) (int32_t) r & 0xffu) << (8 * e);
+            }
+            q[j] = w;
+        }
+        if (!ok) continue;
+        *reinterpret_cast<uint4*>((t ? o.v : o.k) + i * 16) = make_uint4(q[0], q[1], q[2], q[3]);
+        if ((i & 3) == 0) (t ? o.vs : o.ks)[i >> 2] = __half_as_ushort(h);
+    }
+}
+
 }  // namespace
+
+void kv4_to_int8(const KvInt8& f4, const KvInt8& out, int64_t cells, int n_kv, void* stream) {
+    const int64_t groups = cells * n_kv * (HD / 16);
+    if (groups <= 0) return;
+    kv4_to_int8_kernel<<<(unsigned) ((groups + 255) / 256), 256, 0, (cudaStream_t) stream>>>(f4, out, groups);
+    check("kv4_to_int8");
+}
 
 size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_dim) {
     const int64_t chunks = (max_cells + CHUNK - 1) / CHUNK + 1;
@@ -1078,7 +1144,7 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
 
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
-                     float* out, void* stream) {
+                     float* out, void* stream, bool block) {
     if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || window <= 0 ||
         (head_dim != 128 && head_dim != 256) || hi < pos0 + T) {
         basalt::log::error("basalt", "gqa_window_attn: invalid arguments");
@@ -1090,6 +1156,7 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     r.window = window;
     r.cap = cap;
     r.causal = 0;
+    r.block = block ? 1 : 0;
     const int64_t lo = std::max<int64_t>(0, pos0 - window + 1);
     r.base = (int) (lo / CHUNK);
     const int used = (int) ((hi + CHUNK - 1) / CHUNK) - r.base;
@@ -1111,7 +1178,7 @@ size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits) {
 void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
                           KvInt8 q8, float* split_scratch, size_t split_floats, KvFar far_kv) {
     if (T <= 0) return;
-    if (!q8.k || n_kv < 1 || n_head % n_kv || pos0 + T > INT32_MAX) {
+    if (!q8.k || q8.fp4 || n_kv < 1 || n_head % n_kv || pos0 + T > INT32_MAX) {
         basalt::log::error("basalt", "gqa_prompt_attn_bf16: an int8 cache and a supported head layout");
         std::exit(1);
     }
@@ -1129,8 +1196,8 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8, float* split_scratch, size_t split_floats,
                      KvFar far_kv) {
     if (T <= 0) return;
-    if (n_kv < 1 || n_head % n_kv || (!q8.k && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX) {
-        basalt::log::error("basalt", "gqa_prompt_attn: unsupported head layout or cell count");
+    if (n_kv < 1 || n_head % n_kv || (!q8.k && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX || q8.fp4) {
+        basalt::log::error("basalt", "gqa_prompt_attn: unsupported head layout or cell count (an NVFP4 cache: kv4_to_int8 first)");
         std::exit(1);
     }
     const cudaStream_t st = (cudaStream_t) stream;

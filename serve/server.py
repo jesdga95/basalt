@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable a
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
-                          sampling_items, shared_line, slot_share, start_items, with_spec)
+                          sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
@@ -36,8 +36,8 @@ from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, eng
                                  gpu_text, gpus_in_play, model_plan, vision_card, vision_env, vision_item)
 from serve.models import dialect_for  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
-from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
-                            lan_addresses, origins_of)
+from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_from_file, api_key_of,  # noqa: E402
+                            exposed_without_key, lan_addresses, origins_of)
 from serve.router import Router  # noqa: E402
 from serve.service import Service  # noqa: E402
 from serve.engine.progress import load_progress                             # noqa: E402
@@ -387,6 +387,15 @@ def main() -> int:
     if a.max_payload_mib < 1:
         fail(f"--max-payload-mib {a.max_payload_mib} must be at least 1")
     svc.max_payload = a.max_payload_mib << 20
+    if a.api_key_file:
+        if a.api_key:
+            print("[server] error: give --api-key or --api-key-file, not both", file=sys.stderr)
+            return 2
+        try:
+            a.api_key = api_key_from_file(a.api_key_file)
+        except ValueError as e:
+            print(f"[server] error: {e}", file=sys.stderr)
+            return 2
     try:
         svc.api_key = api_key_of(a.api_key)
     except ValueError as e:
@@ -404,6 +413,25 @@ def main() -> int:
         print(tagged("cors", ",".join(svc.cors_origins)), flush=True)
         if "*" in svc.cors_origins and not svc.api_key:
             print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
+    from serve.totals import totals_path_of, totals_reset_file
+    pricing_cli = getattr(a, "pricing_cli", set())
+    for s in services:
+        s.cost_input_per_million = a.cost_in
+        s.cost_output_per_million = a.cost_out
+        s.cost_cache_write_per_million = a.cost_cache_write
+        s.cost_cache_hit_per_million = a.cost_cache_hit
+    for s in services:
+        tp = totals_path_of(a.totals_file, a.config)
+        if tp and multi:
+            tp = str(Path(tp).with_suffix("")) + f".{s.model}.json"
+        if tp:
+            if a.totals_reset:
+                prev = totals_reset_file(tp)
+                if prev:
+                    print(tagged("totals", f"reset {s.model}, previous saved to {prev}"), flush=True)
+            s.totals_path = tp
+            s.load_totals(pricing_cli)
+            print(tagged("totals", f"persistent{' ' + s.model if multi else ''}, {tp}"), flush=True)
     httpd = serve(router, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 
@@ -418,8 +446,9 @@ def main() -> int:
                 if not a.mock_engine:
                     warn_tight_ram(engine.info.get("arena_mib"))
                 if getattr(engine, "batch", 0):
-                    print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
-                                 + (" (slot-full-context)" if m.slot_full_context else "") + ", others queue"), flush=True)
+                    shared = None if m.slot_full_context else getattr(m, "shared_context", None)
+                    print(tagged("slots", slots_text(engine.batch, engine.max_context, shared) + ", others queue"),
+                          flush=True)
             print(tagged("weights", f"loaded{f' {s.model}' if multi else ''}, ctx={engine.max_context} "
                                     f"images={'on' if s.vision else 'off'}"), flush=True)
             # with image input on, whether video works too: the encoder's own word (FFmpeg found or not), once

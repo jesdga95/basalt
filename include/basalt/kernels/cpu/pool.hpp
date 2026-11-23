@@ -66,6 +66,10 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 /// workers and the host thread together.  A pure function of the machine's counts, so a model sizes its pool without the
 /// program layer.
 int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, double cpu_quota, PoolAffinity affinity);
+/// The start-up worker count: `given` when positive (--pool-workers), else auto_pool_workers over this machine's topology
+/// and cgroup quota, with the auto affinity unless the operator gave p-cores or all.  It holds whatever the quant and the
+/// cards, so no model decides it.
+int start_pool_workers(int given, bool affinity_given, PoolAffinity affinity);
 
 class ExpertPool {
 public:

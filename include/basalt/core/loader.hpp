@@ -4,7 +4,8 @@
 // each say "these bytes of the file land there", with an optional elementwise conversion on the way.  The Loader moves
 // the bytes: unbuffered reads on a pool of threads, straight into host memory where the destination allows it and
 // through pinned staging with asynchronous copies on per-device streams where it is device memory, so the drive, the
-// bus and the conversion overlap.  Every byte placed adds to the one progress counter (load_progress.hpp).
+// bus and the conversion overlap.  Every byte placed adds to the one progress counter and to its destination's share
+// (load_progress.hpp).
 //
 // An item may instead copy bytes the same plan places (a second home of an expert, a stage's image of weights already on
 // a card): the loader runs those after every file read of the plan is complete, so one run is one pass over the file.
@@ -19,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::core {
@@ -31,6 +33,7 @@ enum class Conv : uint8_t {
     WidenF16,    ///< fp16 -> f32, exact
     Bf16ToF32,   ///< bf16 -> f32, exact
     Bf16ToQ8_0,  ///< bf16 -> ggml's block_q8_0 (34 bytes per 32 elements), rounded as quantize_bf16_q8_0
+    Bf16ToQ4_0,  ///< bf16 -> ggml's block_q4_0 (18 bytes per 32 elements), rounded as quantize_bf16_q4_0
 };
 
 /// The bytes a converted range of `in` file bytes takes at its destination.
@@ -39,6 +42,10 @@ uint64_t conv_out_bytes(Conv conv, uint64_t in);
 /// `n` bf16 values (a multiple of 32) -> ggml's block_q8_0, rounded as ggml's reference quantizer does: per 32 values
 /// d = amax / 127 stored as fp16, q = round(x / d).
 void quantize_bf16_q8_0(const uint16_t* bf16, uint64_t n, uint8_t* blocks);
+/// `n` bf16 values (a multiple of 32) -> ggml's block_q4_0, rounded as ggml's reference quantizer does: per 32 values
+/// d = m / -8 stored as fp16 (m the value of the largest magnitude), q = min(15, trunc(x / d + 8.5)); values 0..15 of a
+/// block in the low nibbles, 16..31 in the high ones.
+void quantize_bf16_q4_0(const uint16_t* bf16, uint64_t n, uint8_t* blocks);
 
 struct LoadItem {
     static constexpr uint64_t kOut = ~0ull;   ///< `count`: what the item adds to the bar is its destination bytes
@@ -87,6 +94,10 @@ public:
     bool empty() const { return items_.empty() && steps_.empty(); }
     /// The bytes the bar counts for the whole plan.
     uint64_t counted() const;
+    /// The bytes the bar counts per destination, in the order a start places them: each card the plan writes
+    /// (`cuda<N>`, `main_card` first, then the others by ordinal), then `ram` when it writes host memory.  A destination
+    /// the plan writes is listed even when it counts nothing; the bytes sum to counted().
+    std::vector<std::pair<std::string, uint64_t>> counted_by_target(int main_card) const;
 
 private:
     std::vector<File> files_;
@@ -121,8 +132,9 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// The one pass of a start: announces the bytes `plan` counts as the start's total, then places them with `loader`, whose
-/// staging is freed after it (a start that serves keeps its loader, not its pinned staging).
+/// The one pass of a start: announces the bytes `plan` counts as the start's total and each destination's share of it,
+/// then places them with `loader`, whose staging is freed after it (a start that serves keeps its loader, not its pinned
+/// staging).
 bool place_start(Loader& loader, const LoadPlan& plan, std::string& err);
 
 }  // namespace basalt::core

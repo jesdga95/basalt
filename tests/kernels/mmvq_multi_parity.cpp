@@ -479,6 +479,70 @@ int q80_section(cudaStream_t s) {
     return bad;
 }
 
+// ---- native_q8_0_mmvq_segments: row ranges of one matrix with their own inputs in one launch, bitwise against a
+// native_mmvq call per range, at Inkling 2's attention projection (q 6552 rows, k and v 1056 each, n_in 2304: the q range
+// ends inside a 16-row tile) and at T = 1..8 (every kernel the calls take: one-row, columns, multi, tensor cores)
+int q80_segments_section(cudaStream_t s) {
+    namespace k = basalt::kernels;
+    std::printf("\n=== Q8_0 segments ===\n");
+    constexpr int Q8_0 = 8, BYTES = 34, N_IN = 2304;
+    const int rows0[3] = {0, 6552, 7608}, nout[3] = {6552, 1056, 1056}, total = 8664;
+    const std::size_t wbytes = k::native_mmvq_weight_bytes(Q8_0, N_IN, total), row_bytes = wbytes / total;
+    const std::size_t qcol = k::native_q8_1_bytes(N_IN, 1);
+    std::mt19937 rng(777u);
+    std::vector<uint8_t> w(wbytes);
+    for (auto& v : w) v = (uint8_t) (rng() & 0xff);
+    for (std::size_t b = 0; b < wbytes / BYTES; ++b) {
+        const uint16_t h = sane_half(rng);
+        std::memcpy(&w[b * BYTES], &h, 2);
+    }
+    std::vector<float> x((std::size_t) 3 * 8 * N_IN);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : x) v = nd(rng);
+    uint8_t *dw = nullptr, *dq = nullptr;
+    float *dx = nullptr, *ya = nullptr, *yb = nullptr;
+    const std::size_t ybytes = (std::size_t) 8 * total * 4;
+    if (!ck(cudaMalloc(&dw, wbytes), "malloc") || !ck(cudaMalloc(&dq, 3 * 8 * qcol), "malloc") ||
+        !ck(cudaMalloc(&dx, x.size() * 4), "malloc") || !ck(cudaMalloc(&ya, ybytes), "malloc") ||
+        !ck(cudaMalloc(&yb, ybytes), "malloc"))
+        return 1;
+    cudaMemcpy(dw, w.data(), wbytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+    k::quantize_q8_1_rows(dx, 3 * 8, N_IN, dq, s);
+    int bad = 0;
+    for (int T = 1; T <= 8; ++T) {
+        cudaMemset(ya, 0xff, ybytes);
+        cudaMemset(yb, 0xfe, ybytes);
+        k::Q80Segments sg;
+        sg.n = 3;
+        std::size_t yoff = 0;
+        for (int i = 0; i < 3; ++i) {
+            sg.row0[i] = rows0[i];
+            sg.n_out[i] = nout[i];
+            sg.x[i] = dq + (std::size_t) i * 8 * qcol;
+            sg.y[i] = ya + yoff;
+            k::native_mmvq(Q8_0, dw + rows0[i] * row_bytes, sg.x[i], yb + yoff, N_IN, nout[i], T, s);
+            yoff += (std::size_t) T * nout[i];
+        }
+        k::native_q8_0_mmvq_segments(dw, sg, N_IN, T, s);
+        std::vector<float> a(yoff), b(yoff);
+        if (!ck(cudaStreamSynchronize(s), "segments") || !ck(cudaMemcpy(a.data(), ya, yoff * 4, cudaMemcpyDeviceToHost), "read") ||
+            !ck(cudaMemcpy(b.data(), yb, yoff * 4, cudaMemcpyDeviceToHost), "read"))
+            return bad + 1;
+        long long diff = 0, nonfinite = 0;
+        for (std::size_t i = 0; i < yoff; ++i) {
+            diff += std::memcmp(&a[i], &b[i], 4) != 0;
+            nonfinite += !std::isfinite(a[i]);
+        }
+        const bool ok = diff == 0 && nonfinite == 0;
+        bad += !ok;
+        std::printf("Q8_0 segments T=%d (6552 + 1056 + 1056 rows of %d): %lld of %zu differ from a call per range, %lld non-finite  %s\n",
+                    T, N_IN, diff, yoff, nonfinite, ok ? "ok" : "FAIL");
+    }
+    cudaFree(dw); cudaFree(dq); cudaFree(dx); cudaFree(ya); cudaFree(yb);
+    return bad;
+}
+
 // The one-column Q8_0 kernel's time per call and its weight bytes' rate, at the shapes above (warm L2 excluded by
 // cycling through enough distinct weights).
 void bench_q80(cudaStream_t s) {
@@ -536,7 +600,7 @@ int main(int argc, char** argv) {
     const int bad_off = sweep(false, s, off);
     basalt::kernels::native_mmvq_set_multi_exact(true);   // back to the default
     const int bad_mma = mma_section(s);
-    const int bad_q80 = q80_section(s);
+    const int bad_q80 = q80_section(s) + q80_segments_section(s);
     if (do_bench) { bench(s); bench_q80(s); }
 
     std::printf("\nmulti_exact on:   %lld outputs compared, %lld differ bitwise, %lld non-finite\n",
@@ -551,7 +615,7 @@ int main(int argc, char** argv) {
     }
     if (bad_q80 != 0) {
         std::printf("\nmmvq_multi_parity: FAILED. %d one-column Q8_0 case(s) differ from the two-column call or the "
-                    "float64 reference.\n", bad_q80);
+                    "float64 reference, or segmented launch(es) from a call per range.\n", bad_q80);
         return 1;
     }
     if (bad_mma != 0) {

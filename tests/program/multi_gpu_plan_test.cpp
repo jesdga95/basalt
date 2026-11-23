@@ -340,6 +340,48 @@ int main() {
         const auto [c1, h1] = prompt_one_card_chunks(235161, 16640, true, kHead);
         CHECK(c1 < kHead && h1 == 0);
     }
+    // a model without the expert tier that prices each cut of a layer split (Inkling 2 Mini's shape: 24 layers, 128
+    // experts a layer, 14.7 GiB of experts, a loop over layers 6..17 run three times: 2 hand-offs at a loop edge, 6 inside)
+    {
+        MgModel m;
+        m.layers = 24;
+        m.pairs = 24 * 128;
+        m.blob_bytes = 5140000;
+        m.window_gb = 6.4;
+        m.miss_ms = 130.0;
+        m.hit_exponent = 0.55;
+        m.tier_built = false;
+        m.handoff_ms = 0.1;
+        m.split_spills = false;
+        m.split_unlike = true;
+        m.peer_overhead = 1900ull << 20;
+        m.main_overhead = (1900ull + 1100 + 300 + 1000) << 20;
+        for (int c = 0; c <= 24; ++c) m.split_handoffs.push_back(c == 0 || c == 24 ? 0 : c <= 6 || c >= 18 ? 2 : 6);
+        for (int l = 0; l < 24; ++l) m.layer_share.push_back((l >= 6 && l < 18 ? 3.0 : 1.0) / 48.0);
+        // two 16 GB cards: the split, at a loop edge (the fewest hand-offs) where both cards hold their layers' experts
+        const MgPlan two = plan_multi_gpu({card(0, "RTX 5060 Ti", 448, 16), card(1, "RTX 5060 Ti", 448, 16)}, m);
+        CHECK(two.equal);
+        CHECK(two.pick == Mechanism::LayerSplit);
+        CHECK(two.cut == 6 || two.cut == 18);
+        CHECK(price(two, Mechanism::LayerSplit).runs);
+        CHECK(!price(two, Mechanism::ExpertTier).runs);
+        CHECK(two.line.find("main card alone") != std::string::npos && two.line.find("at layer") != std::string::npos);
+        // a 5090 and a 5060 Ti: the 5090 holds everything and runs alone
+        const MgPlan big = plan_multi_gpu({card(0, "RTX 5090", 1792, 32), card(1, "RTX 5060 Ti", 448, 16)}, m);
+        CHECK(big.pick == Mechanism::ExpertTier && big.cut == 0);
+        CHECK(big.line.find("picked main card alone") != std::string::npos);
+        // a 5090 with 16 GB free and a 5060 Ti: unlike, but the split beats the 5090 alone with experts in RAM; the cut
+        // gives the faster card what fits
+        const MgPlan mixed = plan_multi_gpu({card(0, "RTX 5090", 1792, 16), card(1, "RTX 5060 Ti", 448, 16)}, m);
+        CHECK(!mixed.equal && mixed.pick == Mechanism::LayerSplit && mixed.cut >= 12);
+        m.split_unlike = false;
+        CHECK(plan_multi_gpu({card(0, "RTX 5090", 1792, 16), card(1, "RTX 5060 Ti", 448, 16)}, m).pick == Mechanism::ExpertTier);
+        m.split_unlike = true;
+        // two 8 GB cards: no cut holds every expert, so the split is priced but does not run
+        const MgPlan small = plan_multi_gpu({card(0, "RTX 5060", 448, 8), card(1, "RTX 5060", 448, 8)}, m);
+        CHECK(!price(small, Mechanism::LayerSplit).runs);
+        CHECK(small.pick == Mechanism::ExpertTier && small.cut == 0);
+    }
     if (g_fail) { std::printf("multi_gpu_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("multi_gpu_plan_test: ok\n");
     return 0;

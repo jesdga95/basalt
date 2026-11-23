@@ -83,21 +83,22 @@ std::vector<DflySpec> dfly_specs(const DflyDims& d) {
     std::vector<DflySpec> v;
     auto add = [&](std::string n, std::vector<uint64_t> s, bool f32 = false) { v.push_back({std::move(n), std::move(s), f32, false}); };
     auto q8 = [&](std::string n, std::vector<uint64_t> s) { v.push_back({std::move(n), std::move(s), false, true}); };
+    auto q4 = [&](std::string n, std::vector<uint64_t> s) { v.push_back({std::move(n), std::move(s), false, false, true}); };
     for (int i = 0; i < d.layers; ++i) {
         const std::string p = std::to_string(i) + ".";
         add(p + "input_layernorm.weight", {E}, true);
         add(p + "post_attention_layernorm.weight", {E}, true);
-        q8(p + "mlp.gate_proj.weight", {F, E});
-        q8(p + "mlp.up_proj.weight", {F, E});
-        q8(p + "mlp.down_proj.weight", {E, F});
+        q4(p + "mlp.gate_proj.weight", {F, E});
+        q4(p + "mlp.up_proj.weight", {F, E});
+        q4(p + "mlp.down_proj.weight", {E, F});
         q8(p + "self_attn.q_a_proj.weight", {Q, E});
         add(p + "self_attn.q_a_layernorm.weight", {Q}, true);
         q8(p + "self_attn.q_b_proj.weight", {H * 256, Q});
         q8(p + "self_attn.kv_a_proj_with_mqa.weight", {576, E});
         add(p + "self_attn.kv_a_layernorm.weight", {512}, true);
         add(p + "self_attn.kv_b_proj.weight", {H * 448, 512});
-        q8(p + "self_attn.linear_gate.weight", {H * 256, E});
-        q8(p + "self_attn.o_proj.weight", {E, H * 256});
+        q4(p + "self_attn.linear_gate.weight", {H * 256, E});
+        q4(p + "self_attn.o_proj.weight", {E, H * 256});
         add(p + "self_attn.post_proj_norm.weight", {E}, true);
         add(p + "self_attn.learnable_sink_param", {H}, true);
     }
@@ -146,11 +147,14 @@ bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDim
     return true;
 }
 
-bool dfly_draft_loop(int n, int32_t anchor, const std::function<bool(int, int32_t, int32_t&, float&)>& step, int32_t* ids, float* conf) {
+bool dfly_draft_loop(int n, int32_t anchor, const std::function<bool(int, int32_t, int32_t&, float&, bool&)>& step, int32_t* ids,
+                     float* conf, int& made) {
     int32_t prev = anchor;
-    for (int j = 0; j < n; ++j) {
-        if (!step(j, prev, ids[j], conf[j])) return false;
-        prev = ids[j];
+    for (made = 0; made < n; ++made) {
+        bool go = true;
+        if (!step(made, prev, ids[made], conf[made], go)) return false;
+        if (!go) break;
+        prev = ids[made];
     }
     return true;
 }

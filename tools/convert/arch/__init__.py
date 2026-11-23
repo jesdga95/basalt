@@ -7,6 +7,13 @@ Everything else (tokenizer, dense/gguf, experts, container) is shared.
 from __future__ import annotations
 
 import re
+from pathlib import Path
+
+
+def gguf_stem(path) -> str:
+    """The file name alone, with a trailing `.gguf` (any case) and a shard suffix `-<digits>-of-<digits>` (any case) stripped."""
+    name = re.sub(r"\.gguf$", "", Path(path).name, flags=re.IGNORECASE)
+    return re.sub(r"-\d+-of-\d+$", "", name, flags=re.IGNORECASE)
 
 
 class Arch:

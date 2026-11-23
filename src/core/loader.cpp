@@ -71,6 +71,14 @@ void convert(Conv conv, const uint8_t* src, uint64_t n, uint8_t* out) {
             }
             break;
         }
+        case Conv::Bf16ToQ4_0: {
+            uint16_t h[32];
+            for (uint64_t b = 0; b < n / 64; ++b) {
+                std::memcpy(h, src + b * 64, 64);
+                quantize_bf16_q4_0(h, 32, out + b * 18);
+            }
+            break;
+        }
     }
 }
 
@@ -80,7 +88,8 @@ uint64_t conv_unit(Conv c) {   // the bytes of one source element (of a block, f
         case Conv::ToF16: return 4;
         case Conv::WidenF16:
         case Conv::Bf16ToF32: return 2;
-        case Conv::Bf16ToQ8_0: return 64;
+        case Conv::Bf16ToQ8_0:
+        case Conv::Bf16ToQ4_0: return 64;
         default: return 1;
     }
 }
@@ -94,6 +103,7 @@ uint64_t conv_out_bytes(Conv conv, uint64_t in) {
         case Conv::WidenF16:
         case Conv::Bf16ToF32: return in * 2;
         case Conv::Bf16ToQ8_0: return in / 64 * 34;
+        case Conv::Bf16ToQ4_0: return in / 64 * 18;
         default: return in;
     }
 }
@@ -112,6 +122,30 @@ void quantize_bf16_q8_0(const uint16_t* bf16, uint64_t n, uint8_t* blocks) {
         const uint16_t dh = basalt::kernels::f16_from_f32(d);
         std::memcpy(o, &dh, 2);
         for (int i = 0; i < 32; ++i) o[2 + i] = (uint8_t) (int8_t) std::round(x[i] * id);
+    }
+}
+
+void quantize_bf16_q4_0(const uint16_t* bf16, uint64_t n, uint8_t* blocks) {
+    for (uint64_t b = 0; b < n / 32; ++b) {
+        float x[32], amax = 0.0f, m = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const uint32_t u = (uint32_t) bf16[b * 32 + (uint64_t) i] << 16;
+            std::memcpy(&x[i], &u, 4);
+            if (amax < std::fabs(x[i])) {
+                amax = std::fabs(x[i]);
+                m = x[i];
+            }
+        }
+        const float d = m / -8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        uint8_t* o = blocks + b * 18;
+        const uint16_t dh = basalt::kernels::f16_from_f32(d);
+        std::memcpy(o, &dh, 2);
+        for (int i = 0; i < 16; ++i) {
+            const int lo = std::min(15, (int) (int8_t) (x[i] * id + 8.5f));
+            const int hi = std::min(15, (int) (int8_t) (x[16 + i] * id + 8.5f));
+            o[2 + i] = (uint8_t) (lo | (hi << 4));
+        }
     }
 }
 
@@ -203,6 +237,23 @@ uint64_t LoadPlan::counted() const {
     uint64_t n = 0;
     for (const LoadItem& it : items_) n += it.count;
     return n;
+}
+
+std::vector<std::pair<std::string, uint64_t>> LoadPlan::counted_by_target(int main_card) const {
+    std::map<int, uint64_t> cards;   // by rank: the main card first, then the others by ordinal
+    uint64_t ram = 0;
+    bool any_ram = false;
+    for (const LoadItem& it : items_) {
+        if (it.dev != nullptr) cards[it.device == main_card ? -1 : it.device] += it.count;
+        else if (it.host != nullptr) {
+            ram += it.count;
+            any_ram = true;
+        }
+    }
+    std::vector<std::pair<std::string, uint64_t>> out;
+    for (const auto& [rank, bytes] : cards) out.emplace_back(LoadProgress::cuda(rank < 0 ? main_card : rank), bytes);
+    if (any_ram) out.emplace_back("ram", ram);
+    return out;
 }
 
 namespace {
@@ -523,6 +574,16 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
         for (auto& [c, left] : card_left)
             if (c == d && --left == 0) card_label();
     };
+    // each item's destination among the start's shares (place_start announces them): what it counts, it counts there
+    std::vector<int> share_of(items.size(), -1);
+    {
+        const auto shares = plan.counted_by_target(main_card);
+        for (size_t i = 0; i < items.size(); ++i) {
+            const std::string target = items[i].dev != nullptr ? LoadProgress::cuda(items[i].device) : "ram";
+            for (size_t s = 0; s < shares.size(); ++s)
+                if (shares[s].first == target) share_of[i] = (int) s;
+        }
+    }
     {
         std::vector<std::string> stages;
         for (const auto& [d, left] : card_left) stages.push_back(LoadProgress::cuda(d));
@@ -647,7 +708,8 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
                 pending[s] = true;
                 pending_dev[s] = it.device;
             }
-            LoadProgress::placed(scaled(it.count, t.off + t.len, it.bytes) - scaled(it.count, t.off, it.bytes));
+            LoadProgress::placed(scaled(it.count, t.off + t.len, it.bytes) - scaled(it.count, t.off, it.bytes),
+                                 share_of[t.item]);
             if (&tasks == &rounds[0] && ti < device_tasks) {
                 card_placed(it.device);
                 if (device_left.fetch_sub(1) == 1) device_done();
@@ -686,6 +748,9 @@ bool Loader::run(const LoadPlan& plan, std::string& err) {
 
 bool place_start(Loader& loader, const LoadPlan& plan, std::string& err) {
     LoadProgress::announce_total(plan.counted());
+    int main_card = 0;
+    if (cudaGetDevice(&main_card) != cudaSuccess) main_card = 0;
+    LoadProgress::shares(plan.counted_by_target(main_card));
     const bool ok = loader.run(plan, err);
     loader.release_staging();
     return ok;

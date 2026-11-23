@@ -45,7 +45,8 @@ class BenchFlags(unittest.TestCase):
         # Every flag the help lists is one the engine parser accepts; an empty or cut-short list would make the
         # per-flag test vacuous.
         flags = engine_flags()
-        sources = [ROOT / "src/program/cli/arguments.cpp", *sorted((ROOT / "src/models").glob("*/flags.cpp")),
+        sources = [ROOT / "src/program/cli/arguments.cpp", ROOT / "src/model/rope_flags.cpp", ROOT / "src/model/route_flags.cpp",
+                   *sorted((ROOT / "src/models").glob("*/flags.cpp")),
                    *sorted((ROOT / "src/models").glob("*/adapter.cpp"))]
         parsed = {f for s in sources for f in re.findall(r'a == "(--[a-z0-9-]+)"', s.read_text())}
         self.assertTrue(parsed)
@@ -66,6 +67,12 @@ class BenchFlags(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--max-context") + 1], "999999")
         self.assertEqual(cmd[cmd.index("--kv") + 1], "int8")
         self.assertEqual(cmd.count("--max-context"), 1)
+
+    def test_a_flag_the_engine_keeps_every_value_of_is_passed_each_time(self):
+        cmd = self.command("--exp", "a=1", "--exp", "b=2", "--kv", "int8", "--kv", "f16")
+        self.assertEqual([cmd[i + 1] for i, w in enumerate(cmd) if w == "--exp"], ["a=1", "b=2"])
+        self.assertEqual(cmd.count("--kv"), 1)
+        self.assertEqual(cmd[cmd.index("--kv") + 1], "f16")
 
     def test_a_switch_does_not_take_the_next_option(self):
         cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--vram-reserve-mib", "-1")

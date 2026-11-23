@@ -2,6 +2,8 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
+#include <functional>
+
 namespace basalt::models::qwen4exp::serve {
 
 // write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).  A swap
@@ -131,8 +133,19 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
     // the target is the set of experts: one already in a slot stays there, each missing one takes the slot of
     // an expert outside the set (its own target slot first)
     std::vector<std::pair<int32_t, int32_t>> todo, later;
+    // a missing expert takes only a free slot its blob fits: with sized slots (layers of different blob sizes) a
+    // smaller layer's slot would be overrun
+    const auto fits_in = [&](const basalt::core::ExpertCache& c) {
+        return [&c, &lay, n_expert = g.n_expert](size_t sl, int32_t i) {
+            const uint64_t* off = c.slot_offsets();
+            if (off == nullptr) return true;
+            const uint64_t end = sl + 1 < (size_t) c.full_slots() ? off[sl + 1] : (uint64_t) c.full_bytes();
+            return lay.blob_bytes(i / n_expert) <= end - off[sl];
+        };
+    };
     const auto pair_up = [](const std::vector<std::pair<int32_t, int32_t>>& want, const std::vector<int32_t>& res,
-                            const std::vector<int32_t>& holder, std::vector<std::pair<int32_t, int32_t>>& out) {
+                            const std::vector<int32_t>& holder, std::vector<std::pair<int32_t, int32_t>>& out,
+                            const std::function<bool(size_t, int32_t)>& fits) {
         std::vector<uint8_t> in_set(res.size(), 0);
         for (const auto& w : want)
             if (w.first >= 0 && w.first < (int32_t) holder.size()) in_set[(size_t) w.second] = 1;
@@ -144,15 +157,15 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
             if (free_slot[(size_t) w.first]) { out.push_back(w); free_slot[(size_t) w.first] = 0; }
             else missing.push_back(w.second);
         }
-        size_t sl = 0;
         for (int32_t i : missing) {
-            while (sl < free_slot.size() && !free_slot[sl]) ++sl;
-            if (sl == free_slot.size()) break;
+            size_t sl = 0;
+            while (sl < free_slot.size() && !(free_slot[sl] && fits(sl, i))) ++sl;
+            if (sl == free_slot.size()) continue;
             out.emplace_back((int32_t) sl, i);
             free_slot[sl] = 0;
         }
     };
-    pair_up(want_main, host_res, holder, todo);
+    pair_up(want_main, host_res, holder, todo, fits_in(xcache));
     struct Mv { int32_t slot, in, out; uint64_t off; bool xchg; };
     std::vector<Mv> mv;
     int64_t moved = 0, kept = 0;
@@ -237,7 +250,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
         for (const auto& sw : want_peer)
             if (host_res[(size_t) sw.second] < 0) pwant.push_back(sw);
             else ++kept;   // the main card holds it
-        pair_up(pwant, pres, pholder, pw);
+        pair_up(pwant, pres, pholder, pw, fits_in(peer.cache()));
         if (!peer.place(pw, peer_moved, e)) { e = "PROBE adapt: " + e; return false; }
     }
     // the adaptation and the draft policy start again, as after a load

@@ -26,8 +26,10 @@
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/prefill/cpu_split.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/log.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
@@ -110,16 +112,42 @@ struct Bufs {
     }
 };
 
-class Session final : public model::ModelSession {
+// The forward scratch every session of a model shares (docs/design/batching.md, "Per-slot state and shared scratch"): the row
+// buffers of a decode window, the experts' staging and the products' workspaces. The engine runs one call at a time and each call
+// syncs its stream before it returns, so one set serves every session; only a conversation's own state is per session.
+struct Scratch {
+    Bufs dec;
+    std::vector<void*> dev, pinned;
+    float *iscore = nullptr, *ex_rows = nullptr;
+    int32_t *iidx_meta = nullptr, *pos_d = nullptr, *pos_h = nullptr, *heads_ids = nullptr, *heads_bounds = nullptr, *bounds_tab = nullptr;
+    void *attw = nullptr, *q8 = nullptr, *xq_n = nullptr, *ex_xq = nullptr, *ex_scr = nullptr, *ex_plan = nullptr, *ex_plan2 = nullptr;
+    void *xq1 = nullptr, *xq2 = nullptr;
+    struct Staged {
+        uint8_t* blobs = nullptr;
+        int32_t *tok = nullptr, *bounds = nullptr;
+    } stage[2];
+    const float** rowptr_d = nullptr;
+    const float** h_rowptr = nullptr;
+    void* h_plan = nullptr;
+    ~Scratch() {
+        dec.release();
+        for (void* p : dev) cudaFree(p);
+        for (void* p : pinned) cudaFreeHost(p);
+    }
+};
+
+class Session final : public model::BatchSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        dec_.release();
+        settle_early();
         big_.release();
         platform::free_aligned(cpu_act_);
         std::string e;
         join_moe(e);
         for (cudaGraphExec_t g : gx_)
+            if (g) cudaGraphExecDestroy(g);
+        for (cudaGraphExec_t g : gbx_)
             if (g) cudaGraphExecDestroy(g);
         if (joiner_.joinable()) {
             {
@@ -129,16 +157,21 @@ public:
             jcv_.notify_one();
             joiner_.join();
         }
+        if (ra_st_) cudaStreamSynchronize(ra_st_);
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
         if (ev_) cudaEventDestroy(ev_);
+        if (ra_ev_) cudaEventDestroy(ra_ev_);
+        if (ra_st_) cudaStreamDestroy(ra_st_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
     bool init(std::string& err) {
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ra_ev_, cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create a stream";
             return false;
         }
@@ -156,44 +189,13 @@ public:
         };
         fin_ = f(kMaxWindow * E);
         const int64_t pools = ctx / g_.idx_pool + 1;
-        iscore_ = f(pools * kIdxRows);
-        iidx_meta_ = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
-        pos_d_ = (int32_t*) alloc(16, ok);
-        if (ok && cudaMallocHost((void**) &pos_h_, 16) == cudaSuccess) pinned_.push_back(pos_h_);
-        else ok = false;
+        ra_mark_ = (uint32_t*) alloc(8, ok);
+        if (ok) cudaMemset(ra_mark_, 0, 8);
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
         max_heads_ = max_heads;
-        size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
-        for (int l = 0; l < g_.n_layers; ++l) attw = std::max(attw, mla_attend_work_bytes(g_.heads[(size_t) l], max_cells(l), kMaxWindow));
-        attw_ = alloc(attw, ok);
-        if (ok) cudaMemset(attw_, 0, attw);
         logits_ = f((int64_t) kMaxWindow * g_.n_vocab); pick_ = (int32_t*) alloc(4 * 32, ok);
+        pick_h_ = (int32_t*) pin(kMaxWindow);
         lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxWindow, (int) g_.n_vocab) + (int64_t) kMaxWindow * (bk::kLogprobStride + 1));
-        q8_ = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
-        xq_n_ = alloc(bk::native_q8_1_bytes(g_.n_embd, kMaxWindow), ok);
-        ex_xq_ = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
-        ex_scr_ = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
-        ex_rows_ = f((int64_t) kLookupK * g_.n_latent);
-        ex_plan_ = alloc(sizeof(WindowPut), ok);
-        ex_plan2_ = alloc(sizeof(WindowPlan), ok);
-        // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
-        {
-            namespace mmq = basalt::prefill::mmq;
-            stride_ = m_.expert_stride();
-            for (Stage& b : stage_) {
-                b.blobs = (uint8_t*) alloc(stride_ * kStageExperts, ok);
-                b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
-                b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
-                if (cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess) ok = false;
-            }
-            if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) ok = false;
-            xq1_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
-            xq2_ = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
-        }
-        heads_ids_ = (int32_t*) alloc((size_t) max_heads * kAttRows * 4, ok);
-        heads_bounds_ = (int32_t*) alloc((size_t) (max_heads + 1) * 4, ok);
-        rowptr_d_ = (const float**) alloc(kLookupK * sizeof(void*), ok);
-        h_rowptr_ = (const float**) pin(kLookupK * 2);
         // the router's ids reach the host through mapped memory behind a sequence word; the weighted sum waits for a word the
         // host writes once the CPU's and the second card's rows landed
         {
@@ -215,16 +217,22 @@ public:
                 if (cudaHostGetDevicePointer((void**) &stage_d_, stage_h_, 0) != cudaSuccess) ok = false;
             }
         }
-        // MMQ's row bounds {0, n} of a product of n rows, for every n of an attention step
-        bounds_tab_ = (int32_t*) alloc((size_t) 2 * (kAttRows + 1) * 4, ok);
-        if (ok) {
-            std::vector<int32_t> tab((size_t) 2 * (kAttRows + 1));
-            for (int n = 0; n <= kAttRows; ++n) tab[(size_t) 2 * n + 1] = n;
-            cudaMemcpy(bounds_tab_, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
-        }
         rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
-        if (cudaHostAlloc((void**) &h_plan_, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
-        else pinned_.push_back(h_plan_);
+        stride_ = m_.expert_stride();
+        for (Stage& b : stage_)
+            if (cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess) ok = false;
+        if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) ok = false;
+        // the forward scratch: the first session allocates it, the rest share it
+        if (ok) {
+            std::shared_ptr<void>& slot = m_.forward_scratch();
+            if (!slot) {
+                auto sc = std::make_shared<Scratch>();
+                if (!build_scratch(*sc, err)) return false;
+                slot = sc;
+            }
+            sc_ = std::static_pointer_cast<Scratch>(slot);
+            adopt(*sc_);
+        }
         cache_.assign((size_t) g_.n_layers, nullptr);
         ival_.assign((size_t) g_.n_layers, nullptr);
         igate_.assign((size_t) g_.n_layers, nullptr);
@@ -249,13 +257,85 @@ public:
             return false;
         }
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
-        if (!make_bufs(dec_, kMaxWindow, err)) return false;
-        use(dec_);
+        use(sc_->dec);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
-        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
-                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
+        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
+        dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
         return true;
+    }
+
+    // The shared forward scratch, allocated once (alloc and pin put it in `sc`, which frees it with the last session).
+    bool build_scratch(Scratch& sc, std::string& err) {
+        const int64_t ctx = m_.context();
+        namespace mmq = basalt::prefill::mmq;
+        bool ok = true;
+        alloc_to_ = &sc.dev;
+        pin_to_ = &sc.pinned;
+        auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
+        const int64_t pools = ctx / g_.idx_pool + 1;
+        sc.iscore = f(pools * kIdxRows);
+        sc.iidx_meta = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
+        sc.pos_d = (int32_t*) alloc(16, ok);
+        if (ok && cudaMallocHost((void**) &sc.pos_h, 16) == cudaSuccess) sc.pinned.push_back(sc.pos_h);
+        else ok = false;
+        size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
+        for (int l = 0; l < g_.n_layers; ++l) attw = std::max(attw, mla_attend_work_bytes(g_.heads[(size_t) l], max_cells(l), kMaxWindow));
+        sc.attw = alloc(attw, ok);
+        if (ok) cudaMemset(sc.attw, 0, attw);
+        sc.q8 = alloc(std::max<size_t>(bk::native_q8_1_bytes(16384, kMaxWindow), 1 << 16), ok);
+        sc.xq_n = alloc(bk::native_q8_1_bytes(g_.n_embd, kMaxWindow), ok);
+        sc.ex_xq = alloc(bk::native_q8_1_bytes(g_.n_latent, kMaxWindow), ok);
+        sc.ex_scr = alloc(bk::native_expert_scratch_bytes(kLookupK, g_.n_ff_exp), ok);
+        sc.ex_rows = f((int64_t) kLookupK * g_.n_latent);
+        sc.ex_plan = alloc(sizeof(WindowPut), ok);
+        sc.ex_plan2 = alloc(sizeof(WindowPlan), ok);
+        // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
+        const size_t stride = m_.expert_stride();
+        for (Scratch::Staged& b : sc.stage) {
+            b.blobs = (uint8_t*) alloc(stride * kStageExperts, ok);
+            b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
+            b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
+        }
+        sc.xq1 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
+        sc.xq2 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
+        sc.heads_ids = (int32_t*) alloc((size_t) max_heads_ * kAttRows * 4, ok);
+        sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
+        sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
+        {
+            void* q = nullptr;
+            if (ok && cudaMallocHost(&q, kLookupK * 2 * 4) == cudaSuccess) { sc.pinned.push_back(q); sc.h_rowptr = (const float**) q; }
+            else ok = false;
+        }
+        // MMQ's row bounds {0, n} of a product of n rows, for every n of an attention step
+        sc.bounds_tab = (int32_t*) alloc((size_t) 2 * (kAttRows + 1) * 4, ok);
+        if (ok) {
+            std::vector<int32_t> tab((size_t) 2 * (kAttRows + 1));
+            for (int n = 0; n <= kAttRows; ++n) tab[(size_t) 2 * n + 1] = n;
+            cudaMemcpy(sc.bounds_tab, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
+        }
+        if (cudaHostAlloc(&sc.h_plan, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
+        else sc.pinned.push_back(sc.h_plan);
+        alloc_to_ = &bufs_;
+        pin_to_ = &pinned_;
+        if (!ok) {
+            err = "out of device memory for the forward scratch";
+            return false;
+        }
+        return make_bufs(sc.dec, kMaxWindow, err);
+    }
+
+    // The session's pointers into the shared scratch.
+    void adopt(Scratch& sc) {
+        iscore_ = sc.iscore; iidx_meta_ = sc.iidx_meta; pos_d_ = sc.pos_d; pos_h_ = sc.pos_h; attw_ = sc.attw; q8_ = sc.q8;
+        xq_n_ = sc.xq_n; ex_xq_ = sc.ex_xq; ex_scr_ = sc.ex_scr; ex_rows_ = sc.ex_rows; ex_plan_ = sc.ex_plan; ex_plan2_ = sc.ex_plan2;
+        for (int i = 0; i < 2; ++i) {
+            stage_[i].blobs = sc.stage[i].blobs;
+            stage_[i].tok = sc.stage[i].tok;
+            stage_[i].bounds = sc.stage[i].bounds;
+        }
+        xq1_ = sc.xq1; xq2_ = sc.xq2; heads_ids_ = sc.heads_ids; heads_bounds_ = sc.heads_bounds; rowptr_d_ = sc.rowptr_d;
+        h_rowptr_ = sc.h_rowptr; bounds_tab_ = sc.bounds_tab; h_plan_ = (WindowPlan*) sc.h_plan;
     }
 
     // The buffers for `R` rows; false (with nothing left allocated) when the card has no room. With `count` it allocates nothing and
@@ -375,6 +455,7 @@ public:
         t_cpu_wait_ms_ = t_peer_wait_ms_ = t_gpu_wait_ms_ = 0;
         t_pre_ms_ = t_moe_ms_ = t_build_ms_ = t_issue_ms_ = t_att_ms_ = t_ffn_ms_ = 0;
         t_eng_ms_ = 0;
+        t_eng_read_ms_ = t_eng_norm_ms_ = 0;
         t_ring_ms_ = 0;
         if (tier_ && total < kRingRows) {
             int want = kMaxWindow;
@@ -435,10 +516,16 @@ public:
         if (!big_.rows) return;
         ring_join();
         cudaStreamSynchronize(stream_);
-        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), %.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), %.0f ms in the Engram's host step; host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms; expert rows on the second card %lld, on the CPU %lld", t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
+        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), "
+                          "%.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), "
+                          "%.0f ms in the Engram's host step (%.0f ms waiting for rows, %.0f ms normalizing); "
+                          "host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms; "
+                          "expert rows on the second card %lld, on the CPU %lld",
+                          t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_eng_read_ms_, t_eng_norm_ms_,
+                          t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
         basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
                           (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
-        use(dec_);
+        use(sc_->dec);
         ring_close();
         big_.release();
         if (tier_) {
@@ -476,14 +563,24 @@ public:
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
-        return dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
+        const model::Result r = dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
+        early_window(anchor, pos);   // while the card runs the block
+        return r;
     }
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override { return dfly_.draft_end(ids, conf, max_n, n, stream_); }
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        return dfly_.draft_end(ids, conf, max_n, n, stream_, need);
+    }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        // the lossy routing flags apply to decode windows only: prompts route as the model does
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        lossy_ = tier_ && tier_->route_lossy() ? tier_.get() : nullptr;
         dfly_.begin_window(r.pos);   // DFLY HOOK
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxWindow) {
             const int n = std::min(kMaxWindow, r.n_tokens - t0);
@@ -508,10 +605,90 @@ public:
         return {};
     }
 
+    // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
+    // session's scratch and stream. Each conversation keeps its latent caches, rings, pooled keys, Engram history, drafter
+    // context, logits and draws; the attention, the indexer and the Engram's lookups run per segment over its own state, the
+    // rest over every row. The host places the experts between the layers' graphs, so the forward runs directly every window
+    // (batch_captured false) and replays its own graphs by row count. The cap is the experts' group (8 rows).
+    int batch_rows() const override { return kMaxWindow; }
+
+protected:
+    const char* batch_name() const override { return "hy4flash"; }
+    int64_t batch_context() const override { return m_.context(); }
+    model::BatchShared& batch_shared() override { return m_.batch_shared(); }
+    cudaStream_t batch_stream() const override { return stream_; }
+    bool batch_captured() const override { return false; }
+    bool batch_ready() const override { return !rope_on_ && m_.diag_dump().empty(); }   // [vision] a picture's rotary table: in turn
+    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        release_prompt();
+        if (r.pos > (int64_t) hist_.size()) {
+            err = "position " + std::to_string(r.pos) + " does not follow the state's " + std::to_string(hist_.size());
+            return false;
+        }
+        return ensure_positions(r.pos + r.n_tokens, err);
+    }
+    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key&, std::string& err) override {
+        for (const int32_t t : v.w.tokens)
+            if (t < 0 || t >= g_.n_vocab) {
+                err = "token " + std::to_string(t) + " is out of the vocabulary";
+                return false;
+            }
+        return true;
+    }
+    bool batch_forward(const model::BatchView& v, std::string& err) override {
+        bsegs_.clear();
+        for (int i = 0; i < v.n; ++i) {
+            Session* s = static_cast<Session*>(v.ss[i]);
+            const model::DecodeRequest& r = v.reqs[i];
+            const model::BatchWindow::Seg& sg = v.w.segs[(size_t) i];
+            bsegs_.push_back({s, sg.row0, sg.rows, r.pos, v.head[i]});
+            s->hist_.resize((size_t) r.pos);   // a position before the end drops the rows after it
+            s->hist_.insert(s->hist_.end(), r.tokens, r.tokens + r.n_tokens);
+            s->place_rope(r.pos, r.n_tokens);   // [vision]
+            s->dfly_.begin_window(r.pos);   // DFLY HOOK
+            s->dfly_.run(0);
+        }
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        lossy_ = tier_ && tier_->route_lossy() ? tier_.get() : nullptr;
+        graphs_ = use_graphs_;
+        const bool ok = run_rows(v.w.tokens.data(), v.w.rows, v.reqs[0].pos, v.w.rows, err);
+        graphs_ = false;
+        for (const Seg& sg : bsegs_) sg.s->dfly_.run(-1);   // DFLY HOOK
+        bsegs_.clear();
+        return ok;
+    }
+    void batch_take(const model::BatchView& v, int i) override {
+        const model::DecodeRequest& r = v.reqs[i];
+        const model::BatchWindow::Seg& sg = v.w.segs[(size_t) i];
+        const Session* lead = static_cast<const Session*>(v.ss[0]);
+        const int h = v.head[i];
+        const size_t V = (size_t) g_.n_vocab;
+        turn_count(r.n_tokens);
+        last_rows_ = h;
+        if (h == 0) return;
+        const float* src = lead->logits_ + (size_t) (sg.row0 + sg.rows - h) * V;
+        // the leader's own rows first: its copy lands below every later segment's rows
+        if (src != logits_) cudaMemcpyAsync(logits_, src, (size_t) h * V * 4, cudaMemcpyDeviceToDevice, v.stream);
+        if (r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (h - 1) * V, V * 4, cudaMemcpyDeviceToHost, v.stream);
+    }
+    const int32_t* batch_draw(const model::BatchView& v, int i, std::string& err) override {
+        if (!draw(v.reqs[i], 0, v.head[i], v.stream, err)) return nullptr;
+        cudaMemcpyAsync(pick_h_, pick_, (size_t) v.head[i] * 4, cudaMemcpyDeviceToHost, v.stream);
+        return pick_h_;
+    }
+
+public:
+
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
-        if (!big_.rows) turn_report();
+        if (!big_.rows) {   // a prompt starts
+            turn_report();
+            if (tier_) tier_->forget_use();
+        }
         if (!big_.rows && elastic()) {   // a prompt starts: its positions against what the caches back and can back
             const int64_t need = std::min<int64_t>(m_.context(), r.pos + std::max(r.total_tokens, r.n_tokens));
             const int64_t keep = std::max(kv_base(), std::min<int64_t>(m_.context(), (need + kGrowPositions - 1) / kGrowPositions * kGrowPositions));
@@ -649,7 +826,26 @@ public:
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
-    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->slots()) : std::string(); }
+    std::vector<CardExperts> experts_by_card() const override {
+        std::vector<CardExperts> out;
+        if (tier_)
+            for (const core::ExpertTier::CardSlots& c : tier_->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
+    // the sparse layers' caches as backed now (the elastic KV)
+    int64_t kv_bytes() const override { return backed_ * (int64_t) cell_bytes(); }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        if (!tier_) return false;
+        tier_->expert_map(total, homes, routed);
+        return true;
+    }
+
+    std::string info_words() const override {
+        const std::string kv = m_.cache_fp8() ? "kv=fp8" : "kv=fp16";   // what a community row records
+        return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(tier_->spill())
+                     : kv + " " + program::spill_words({});   // no tier: every expert is on the card, none read from the file
+    }
 
     // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
     // return at the wake. The latent caches, the rings and the drafter's rows are conversation state and stay.
@@ -663,7 +859,7 @@ public:
             if (!tier_->reclaim(e, /*restore=*/true)) return {model::Status::Error, "hy4flash: " + e};
             tier_->grow();
         }
-        expert_slots = tier_->slots();
+        expert_slots = tier_->gpu_slots();
         return {};
     }
 
@@ -672,7 +868,7 @@ public:
         if (!tier_) return {model::Status::Error, "hy4flash: the expert tier is not open"};
         cudaStreamSynchronize(stream_);
         if (!tier_->replan(mib, e)) return {model::Status::Error, "hy4flash: " + e};
-        expert_slots = tier_->slots();
+        expert_slots = tier_->gpu_slots();
         return {};
     }
 
@@ -817,7 +1013,7 @@ private:
             ok = false;
             return nullptr;
         }
-        bufs_.push_back(p);
+        alloc_to_->push_back(p);
         return p;
     }
 
@@ -943,6 +1139,34 @@ private:
         return a;
     }
 
+    // A batch window's segments while batch_forward runs (empty: the rows are this session's, at pos0..). The attention, the
+    // indexer and the Engram run each segment over its own session's state; a row's position and history are its segment's.
+    struct Seg {
+        Session* s;
+        int row0, rows;
+        int64_t pos0;
+        int head;
+    };
+    std::vector<Seg> bsegs_;
+    template <class Fn>
+    void each_seg(int64_t pos0, int R, Fn&& fn) {
+        if (bsegs_.empty()) fn(Seg{this, 0, R, pos0, 0});
+        else
+            for (const Seg& sg : bsegs_) fn(sg);
+    }
+    // Row t's session and position.
+    const Seg& seg_of(int t) const {
+        size_t i = 0;
+        while (i + 1 < bsegs_.size() && bsegs_[i + 1].row0 <= t) ++i;
+        return bsegs_[i];
+    }
+    int64_t row_pos(int64_t pos0, int t) const {
+        if (bsegs_.empty()) return pos0 + t;
+        const Seg& sg = seg_of(t);
+        return sg.pos0 + (t - sg.row0);
+    }
+    const std::vector<int32_t>& row_hist(int t) const { return bsegs_.empty() ? hist_ : seg_of(t).s->hist_; }
+
     // Attention of layer `l` over R rows at pos0.. of the normed input xn_; the post-normed result goes to attn_. Steps of arows_ rows run
     // one after the other (each writes its rows' cache cells before it attends, so a row sees the rows before it), over the streams
     // offset to the step.
@@ -966,6 +1190,8 @@ private:
     static constexpr int kQuery = 1, kCells = 2, kOutput = 4, kAll = 7;
     static constexpr int kRaw = 8;   // with kOutput: leave the output projection un-normed in attn_raw_ (add_norm_hc_post norms it)
     static constexpr int kDevMeta = 16;   // with kCells on a sliding-window layer: the row spans from pos_d_ on the card (capturable)
+    static constexpr int kAttend = 32;    // the attention over the cells alone (a batch runs it per segment, between its graphs)
+    static constexpr int kTail = 64;      // with kOutput: the output alone, the attention over the cells already run
     bool attention_step(int l, int64_t pos0, int R, int step, std::string& err, int phases = kAll) {
         const int H = g_.heads[(size_t) l];
         const bool swa = g_.swa[(size_t) l];
@@ -978,7 +1204,7 @@ private:
             gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
             gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
         }
-        if (!(phases & (kCells | kOutput))) return true;
+        if (!(phases & (kCells | kOutput | kAttend))) return true;
         // the cells each row attends
         int32_t* meta = meta_h_ + ((size_t) l * steps_ + step) * 4 * arows_;   // firsts, counts, fill, positions
         int32_t *firsts = meta, *counts = meta + arows_, *fill = meta + 2 * arows_, *posv = meta + 3 * arows_;
@@ -988,17 +1214,17 @@ private:
         if ((phases & kCells) && (phases & kDevMeta) && swa) {
             swa_meta(pos_d_, R, g_.window, arows_, meta_d_, stream_);
         } else if (phases & kCells) {   // the cells and positions: a window replays only what comes before and after
-            for (int t = 0; t < R; ++t) posv[t] = (int32_t) (pos0 + t);
+            for (int t = 0; t < R; ++t) posv[t] = (int32_t) row_pos(pos0, t);
             if (swa) {
                 for (int t = 0; t < R; ++t) {
-                    const int64_t pos = pos0 + t, first = std::max<int64_t>(0, pos + 1 - g_.window);
+                    const int64_t pos = posv[t], first = std::max<int64_t>(0, pos + 1 - g_.window);
                     firsts[t] = (int32_t) first;
                     counts[t] = (int32_t) (pos + 1 - first);
                     fill[t] = 0;
                 }
             } else {
                 for (int t = 0; t < R; ++t) {
-                    const int64_t pos = pos0 + t;
+                    const int64_t pos = posv[t];
                     pools_of[(size_t) t] = (int) (pos / g_.idx_pool);   // complete groups before the row's own
                     firsts[t] = 0;
                     if (pools_of[(size_t) t] > keep) {
@@ -1013,24 +1239,30 @@ private:
             }
             put_i32(meta_d_, meta, (size_t) 4 * arows_);
         }
-        uint8_t* cache = cache_[(size_t) l];
         const int ring = swa ? swa_ring() : 0;
         const bool f8 = !swa && fp8();
         const float* kvn = F(l, "attn_kv_a_norm.weight");
         if (phases & kCells) {
-        if (R <= kMaxWindow) {   // a window: the k_b product, the query rows and the cache rows in one launch
+        if (R <= kMaxWindow) {   // a window: the k_b product, the query rows and the cache rows in one launch (a segment's)
             const void* kb = T(l, "attn_k_b.weight")->ptr;
-            const int32_t* pos_d = meta_d_ + 3 * arows_;
-            if (f8) mla_query(kb, q_, kvraw_, kvn, a, pos_d, R, ring, qcur_, cache, stream_);
-            else if (f32()) mla_query(kb, q_, kvraw_, kvn, a, pos_d, R, ring, qcur_, (float*) cache, stream_);
-            else mla_query(kb, q_, kvraw_, kvn, a, pos_d, R, ring, qcur_, (uint16_t*) cache, stream_);
+            each_seg(pos0, R, [&](const Seg& sg) {
+                uint8_t* cache = sg.s->cache_[(size_t) l];
+                const int32_t* pos_d = meta_d_ + 3 * arows_ + sg.row0;
+                const float *q = q_ + (size_t) sg.row0 * H * g_.qk_dim, *kv = kvraw_ + (size_t) sg.row0 * kRowWidth;
+                float* qc = qcur_ + (size_t) sg.row0 * H * kRowWidth;
+                if (f8) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, cache, stream_);
+                else if (f32()) mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (float*) cache, stream_);
+                else mla_query(kb, q, kv, kvn, a, pos_d, sg.rows, ring, qc, (uint16_t*) cache, stream_);
+            });
         } else {
+            uint8_t* cache = cache_[(size_t) l];
             heads_product(T(l, "attn_k_b.weight"), q_, g_.qk_dim, H * g_.qk_dim, H, rank, a.nope, R, qabs_);
             if (f8) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, cache, stream_);
             else if (f32()) mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (float*) cache, stream_);
             else mla_prepare(q_, qabs_, kvraw_, kvn, a, (int) pos0, R, ring, qcur_, (uint16_t*) cache, stream_);
         }
         if (diag(l) && f32() && !swa) {   // the inputs of the attention, for the reference's tensors (fp32 caches only)
+            const uint8_t* cache = cache_[(size_t) l];
             diag_sync();
             dump("q_resid-" + std::to_string(l), qan_, (int64_t) R * g_.q_lora);
             std::vector<float> rows((size_t) R * kRowWidth), lat((size_t) R * rank), pe((size_t) R * g_.rope_dim), qp((size_t) R * H * g_.rope_dim),
@@ -1053,25 +1285,35 @@ private:
         }
         if (!swa) {
             indexer(l, pos0, R, selecting, pools_of, err);
-            for (int t = 0; t < R; ++t) {   // DFLY HOOK: each row's selection, for the drafter
-                const bool sel = pools_of[(size_t) t] > keep;
-                dfly_.selection(l, t, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
-            }
+            each_seg(pos0, R, [&](const Seg& sg) {   // DFLY HOOK: each row's selection, for its conversation's drafter
+                for (int t = sg.row0; t < sg.row0 + sg.rows; ++t) {
+                    const bool sel = pools_of[(size_t) t] > keep;
+                    sg.s->dfly_.selection(l, t - sg.row0, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
+                }
+            });
         }
+        }
+        if (!(phases & (kOutput | kAttend))) return true;
+        if (!(phases & kTail)) {   // each segment over its own cache
+            const float* sinks = F(l, "attn_sinks.weight");
+            each_seg(pos0, R, [&](const Seg& sg) {
+                const uint8_t* cache = sg.s->cache_[(size_t) l];
+                RowSpans rs;
+                rs.firsts = meta_d_ + sg.row0;
+                rs.counts = meta_d_ + arows_ + sg.row0;
+                if (!swa) {
+                    rs.cells = icells_ + (size_t) sg.row0 * cells_stride_;
+                    rs.cells_stride = cells_stride_;
+                    rs.fill = meta_d_ + 2 * arows_ + sg.row0;
+                }
+                const float* qc = qcur_ + (size_t) sg.row0 * H * kRowWidth;
+                float* ol = olat_ + (size_t) sg.row0 * H * rank;
+                if (f8) mla_attend(qc, cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+                else if (f32()) mla_attend(qc, (const float*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+                else mla_attend(qc, (const uint16_t*) cache, rs, sg.rows, sinks, a, ring, max_cells(l), attw_, ol, stream_);
+            });
         }
         if (!(phases & kOutput)) return true;
-        RowSpans rs;
-        rs.firsts = meta_d_;
-        rs.counts = meta_d_ + arows_;
-        if (!swa) {
-            rs.cells = icells_;
-            rs.cells_stride = cells_stride_;
-            rs.fill = meta_d_ + 2 * arows_;
-        }
-        const float* sinks = F(l, "attn_sinks.weight");
-        if (f8) mla_attend(qcur_, (const uint8_t*) cache, rs, R, sinks, a, ring, max_cells(l), attw_, olat_, stream_);
-        else if (f32()) mla_attend(qcur_, (const float*) cache, rs, R, sinks, a, ring, max_cells(l), attw_, olat_, stream_);
-        else mla_attend(qcur_, (const uint16_t*) cache, rs, R, sinks, a, ring, max_cells(l), attw_, olat_, stream_);
         heads_product(T(l, "attn_v_b.weight"), olat_, rank, H * rank, H, g_.v_dim, rank, R, vout_);
         if (diag(l)) dump("attn_kqv-" + std::to_string(l), vout_, (int64_t) R * H * g_.v_dim);
         gemm_n(T(l, "attn_gate.weight"), gate_, H * g_.v_dim, R);   // xn_ as the query phase quantized it
@@ -1102,41 +1344,47 @@ private:
         bk::rms_norm_rows(ik_, F(l, "indexer.k_norm.weight"), ikn_, R, D, g_.rms_eps, stream_);
         gemm(T(l, "indexer_compressor_value.weight"), ikn_, ivt_, D, D, R);
         gemm(T(l, "indexer_compressor_gate.weight"), ikn_, igt_, D, D, R);
-        // into the ring of the last positions, at cell pos % kRawRing (one wrap at most)
-        const int64_t s0 = pos0 % kRawRing;
-        const int n1 = (int) std::min<int64_t>(R, kRawRing - s0);
-        for (auto [src, dst] : {std::pair<const float*, float*>{ivt_, ival_[(size_t) l]}, {igt_, igate_[(size_t) l]}}) {
-            cudaMemcpyAsync(dst + (size_t) s0 * D, src, (size_t) n1 * D * 4, cudaMemcpyDeviceToDevice, stream_);
-            if (n1 < R) cudaMemcpyAsync(dst, src + (size_t) n1 * D, (size_t) (R - n1) * D * 4, cudaMemcpyDeviceToDevice, stream_);
-        }
-        // the groups whose last position is among the rows
-        const int64_t last = pos0 + R - 1;
-        const int64_t g0 = pos0 >= 3 ? (pos0 - 3 + P - 1) / P : 0, g1 = last >= 3 ? (last - 3) / P : -1;
-        if (g1 >= g0) idx_pool(ival_[(size_t) l], igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
-                               a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), ipool_[(size_t) l], stream_);
+        // each segment's rows into its ring of the last positions, at cell pos % kRawRing (one wrap at most), and the pooled keys
+        // of the groups whose last position is among them
+        each_seg(pos0, R, [&](const Seg& sg) {
+            Session& c = *sg.s;
+            const int64_t s0 = sg.pos0 % kRawRing;
+            const int n1 = (int) std::min<int64_t>(sg.rows, kRawRing - s0);
+            const size_t at = (size_t) sg.row0 * D;
+            for (auto [src, dst] : {std::pair<const float*, float*>{ivt_ + at, c.ival_[(size_t) l]}, {igt_ + at, c.igate_[(size_t) l]}}) {
+                cudaMemcpyAsync(dst + (size_t) s0 * D, src, (size_t) n1 * D * 4, cudaMemcpyDeviceToDevice, stream_);
+                if (n1 < sg.rows) cudaMemcpyAsync(dst, src + (size_t) n1 * D, (size_t) (sg.rows - n1) * D * 4, cudaMemcpyDeviceToDevice, stream_);
+            }
+            const int64_t p0 = sg.pos0, last = p0 + sg.rows - 1;
+            const int64_t g0 = p0 >= 3 ? (p0 - 3 + P - 1) / P : 0, g1 = last >= 3 ? (last - 3) / P : -1;
+            if (g1 >= g0) idx_pool(c.ival_[(size_t) l], c.igate_[(size_t) l], F(l, "indexer_compressor_ape.weight"), F(l, "indexer_compressor_norm.weight"),
+                                   a, kRawRing, (int) (g0 * P), (int) (g1 - g0 + 1), c.ipool_[(size_t) l], stream_);
+        });
         if (!selecting) return;
         const int keep = g_.idx_top_k / P - (g_.idx_select_tail ? 1 : 0);
         gemm(T(l, "indexer.attn_q_b.weight"), qan_, iq_, g_.q_lora, a.heads * D, R);
-        idx_rope_heads(iq_, a, (int) pos0, R, stream_);
+        each_seg(pos0, R, [&](const Seg& sg) { idx_rope_heads(iq_ + (size_t) sg.row0 * a.heads * D, a, (int) sg.pos0, sg.rows, stream_); });
         f32_gemm_rows(xn_, F(l, "indexer.proj.weight"), a.heads, E, 1.0f / std::sqrt((float) (D * a.heads)), R, iw_, stream_);
-        // the rows that select, kIdxRows at a time
+        // each segment's rows that select over its own pooled keys, kIdxRows at a time
         const int stride = (int) (m_.context() / P + 1);
-        for (int t0 = 0; t0 < R; t0 += kIdxRows) {
-            const int n = std::min(kIdxRows, R - t0);
-            int32_t meta[kIdxRows * 3];
-            int max_pool = 0;
-            for (int i = 0; i < n; ++i) {
-                const int pools = pools_of[(size_t) (t0 + i)], tail0 = pools * P;
-                meta[i * 3] = pools;
-                meta[i * 3 + 1] = tail0;
-                meta[i * 3 + 2] = (int) (pos0 + t0 + i - tail0 + 1);
-                max_pool = std::max(max_pool, pools);
+        each_seg(pos0, R, [&](const Seg& sg) {
+            for (int t0 = sg.row0; t0 < sg.row0 + sg.rows; t0 += kIdxRows) {
+                const int n = std::min(kIdxRows, sg.row0 + sg.rows - t0);
+                int32_t meta[kIdxRows * 3];
+                int max_pool = 0;
+                for (int i = 0; i < n; ++i) {
+                    const int pools = pools_of[(size_t) (t0 + i)], tail0 = pools * P;
+                    meta[i * 3] = pools;
+                    meta[i * 3 + 1] = tail0;
+                    meta[i * 3 + 2] = (int) (sg.pos0 + (t0 - sg.row0) + i - tail0 + 1);
+                    max_pool = std::max(max_pool, pools);
+                }
+                if (max_pool <= keep) continue;
+                put_i32(iidx_meta_, meta, (size_t) n * 3);
+                idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, sg.s->ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
+                idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
             }
-            if (max_pool <= keep) continue;
-            put_i32(iidx_meta_, meta, (size_t) n * 3);
-            idx_scores_rows(iq_ + (size_t) t0 * a.heads * D, iw_ + (size_t) t0 * a.heads, ipool_[(size_t) l], iidx_meta_, max_pool, n, a, iscore_, stride, stream_);
-            idx_select_rows(iscore_, stride, iidx_meta_, n, keep, P, icells_ + (size_t) t0 * cells_stride_, cells_stride_, stream_);
-        }
+        });
     }
 
     // The Engram step of layer `l` on the streams of R rows, arows_ rows a step.
@@ -1155,11 +1403,27 @@ private:
     // asked for before the first layer runs, so the SSD works while the GPU does the layers in between.
     struct Prefetch {
         std::vector<float> valid;
-        std::vector<uint8_t> raw;
+        std::vector<uint8_t> raw;    // the rows read here, in order
+        std::vector<int> at;         // [row] its place in raw, or -1 for a row asked for early
         ngram::PleReader::Ticket tk;
         bool issued = false, collected = false;
     };
     std::vector<Prefetch> pf_;
+    // A decode window's rows are known before it runs: the anchor's when the drafter starts, each draft's as the heads make it.
+    // Their Engram rows are asked for then (every Engram layer's rows of a window row in one ticket), so they land during the
+    // draft instead of during layer 0; the window takes a row whose position, token and two tokens before match.
+    struct EarlyRow {
+        int64_t pos = 0;
+        int32_t tok = 0, p1 = 0, p2 = 0;
+        float valid = 1.f;
+        std::vector<uint8_t> raw;    // [Engram layer][column][row bytes]
+        ngram::PleReader::Ticket tk;
+        bool collected = false;
+    };
+    std::vector<EarlyRow> early_;
+    std::vector<int> early_of_;      // [window row] its early row, or -1
+    int64_t early_pos_ = -1;         // the window the drafter is making
+    int32_t early_tok_[kMaxWindow] = {};
 
     // A prompt chunk of kRingRows rows or more routes to every expert of every layer, so the next layer's experts do not wait for
     // its router: all of a layer's experts are copied into one of two slots of the ring while the layer before it computes.
@@ -1488,17 +1752,34 @@ private:
     void prefetch_engram(int64_t pos0, int R) {
         const EngramInfo& en = m_.pack().engram;
         const int n_cols = en.n_cols(), W = en.row_values;
+        early_of_.assign((size_t) R, -1);
+        std::vector<int> own;   // the rows not asked for early
+        for (int t = 0; t < R; ++t) {
+            const int64_t pos = pos0 + t;
+            const int32_t tok = hist_[(size_t) pos], p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+            for (size_t k = 0; k < early_.size() && early_of_[(size_t) t] < 0; ++k) {
+                const EarlyRow& er = early_[k];
+                if (er.pos == pos && er.tok == tok && er.p1 == p1 && er.p2 == p2) early_of_[(size_t) t] = (int) k;
+            }
+            if (early_of_[(size_t) t] < 0) own.push_back(t);
+        }
         pf_.assign(en.layers.size(), Prefetch());
         for (size_t e = 0; e < en.layers.size(); ++e) {
             Prefetch& p = pf_[e];
-            std::vector<uint32_t> ids((size_t) R * n_cols);
+            std::vector<uint32_t> ids(own.size() * n_cols);
             p.valid.assign((size_t) R, 1.f);
-            for (int t = 0; t < R; ++t) {
+            p.at.assign((size_t) R, -1);
+            for (int t = 0; t < R; ++t)
+                if (early_of_[(size_t) t] >= 0) p.valid[(size_t) t] = early_[(size_t) early_of_[(size_t) t]].valid;
+            for (size_t i = 0; i < own.size(); ++i) {
+                const int t = own[i];
                 const int64_t pos = pos0 + t;
                 const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
-                engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, p.valid[(size_t) t]);
+                engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + i * n_cols, p.valid[(size_t) t]);
+                p.at[(size_t) t] = (int) i;
             }
-            p.raw.resize((size_t) R * n_cols * W);
+            if (own.empty()) continue;
+            p.raw.resize(own.size() * n_cols * W);
             p.tk = m_.engram_reader().issue(ids.data(), ids.size(), p.raw.data());
             p.issued = true;
         }
@@ -1509,20 +1790,66 @@ private:
         for (Prefetch& p : pf_)
             if (p.issued && !p.collected) m_.engram_reader().collect(p.tk, ignore);
         pf_.clear();
+        settle_early();
+    }
+    // Every Engram layer's rows of window row (pos, tok) after p1 and p2, in one ticket.
+    void issue_early(int64_t pos, int32_t tok, int32_t p1, int32_t p2) {
+        const EngramInfo& en = m_.pack().engram;
+        if (en.layers.empty() || early_.size() >= (size_t) kMaxWindow) return;
+        const int n_cols = en.n_cols(), W = en.row_values, ne = (int) en.layers.size();
+        EarlyRow r;
+        r.pos = pos;
+        r.tok = tok;
+        r.p1 = p1;
+        r.p2 = p2;
+        std::vector<uint32_t> ids((size_t) ne * n_cols);
+        for (int e = 0; e < ne; ++e) engram_ids(en, e, tok, p1, p2, pos, false, ids.data() + (size_t) e * n_cols, r.valid);
+        r.raw.resize((size_t) ne * n_cols * W);
+        r.tk = m_.engram_reader().issue(ids.data(), ids.size(), r.raw.data());
+        early_.push_back(std::move(r));
+    }
+    // The drafter starts the window at `pos`: its first row, the anchor, has all it needs.
+    void early_window(int32_t anchor, int64_t pos) {
+        settle_early();
+        if (pos > (int64_t) hist_.size()) return;
+        early_pos_ = pos;
+        early_tok_[0] = anchor;
+        issue_early(pos, anchor, pos >= 1 ? hist_[(size_t) pos - 1] : -1, pos >= 2 ? hist_[(size_t) pos - 2] : -1);
+    }
+    // The heads made draft j - 1, window row j's token (DflyRunner::finish's on_row: the card runs the next head meanwhile).
+    void early_draft_row(int j, int32_t tok) {
+        if (early_pos_ < 0 || j < 1 || j >= kMaxWindow) return;
+        early_tok_[j] = tok;
+        const int64_t pos = early_pos_ + j;
+        const int32_t p2 = j >= 2 ? early_tok_[j - 2] : early_pos_ >= 1 ? hist_[(size_t) early_pos_ - 1] : -1;
+        issue_early(pos, tok, early_tok_[j - 1], p2);
+    }
+    // The early rows' reads land (their buffers are ours) and are dropped.
+    void settle_early() {
+        std::string ignore;
+        for (EarlyRow& r : early_)
+            if (!r.collected) m_.engram_reader().collect(r.tk, ignore);
+        early_.clear();
+        early_pos_ = -1;
     }
 
     bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err, int off = 0) {
-        const double te = now_ms();
-        struct Lap {
-            double& acc;
-            double t;
-            ~Lap() { acc += now_ms() - t; }
-        } lap{t_eng_ms_, te};
         const EngramInfo& en = m_.pack().engram;
         int e = -1;
         for (size_t k = 0; k < en.layers.size(); ++k)
             if (en.layers[k] == l) e = (int) k;
         if (e < 0) return true;
+        // The prompt line reports a prompt, so a decode that follows one adds nothing to it.
+        const bool time_prompt = big_.rows != 0;
+        struct Lap {
+            double* acc;
+            double start;
+            ~Lap() { if (acc) *acc += now_ms() - start; }
+        } lap{time_prompt ? &t_eng_ms_ : nullptr, time_prompt ? now_ms() : 0};
+        const auto collect = [&](ngram::PleReader::Ticket ticket) {
+            Lap wait{time_prompt ? &t_eng_read_ms_ : nullptr, time_prompt ? now_ms() : 0};
+            return m_.engram_reader().collect(ticket, err);
+        };
         const int n_cols = en.n_cols(), W = en.row_values;
         static const std::vector<float> lut = [] {
             std::vector<float> t(256);
@@ -1530,21 +1857,28 @@ private:
             return t;
         }();
         if (eng_ev_) cudaEventSynchronize(eng_ev_);   // the last Engram layer's copies out of these host rows have landed
-        Prefetch* pf = (size_t) e < pf_.size() && pf_[(size_t) e].issued ? &pf_[(size_t) e] : nullptr;
+        Prefetch* pf = (size_t) e < pf_.size() ? &pf_[(size_t) e] : nullptr;
         std::vector<uint8_t> own_raw;
         const uint8_t* raw = nullptr;
         if (pf) {
-            if (!pf->collected) {
-                if (!m_.engram_reader().collect(pf->tk, err)) return false;
+            if (pf->issued && !pf->collected) {
+                if (!collect(pf->tk)) return false;
                 pf->collected = true;
             }
-            for (int t = 0; t < R; ++t) h_evalid_[t] = pf->valid[(size_t) (off + t)];
-            raw = pf->raw.data() + (size_t) off * n_cols * W;
+            for (int t = 0; t < R; ++t) {
+                const int k = early_of_[(size_t) (off + t)];
+                if (k >= 0 && !early_[(size_t) k].collected) {
+                    if (!collect(early_[(size_t) k].tk)) return false;
+                    early_[(size_t) k].collected = true;
+                }
+                h_evalid_[t] = pf->valid[(size_t) (off + t)];
+            }
         } else {
             std::vector<uint32_t> ids((size_t) R * n_cols);
             for (int t = 0; t < R; ++t) {
-                const int64_t pos = pos0 + t;
-                const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+                const int64_t pos = row_pos(pos0 - off, off + t);
+                const std::vector<int32_t>& hist = row_hist(off + t);
+                const int32_t p1 = pos >= 1 ? hist[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist[(size_t) pos - 2] : -1;
                 float valid = 1.f;
                 engram_ids(en, e, tokens[t], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, valid);
                 h_evalid_[t] = valid;
@@ -1552,7 +1886,7 @@ private:
             own_raw.resize((size_t) R * n_cols * W);
             ngram::PleReader& rd = m_.engram_reader();
             const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), own_raw.data());
-            if (!rd.collect(tk, err)) return false;
+            if (!collect(tk)) return false;
             raw = own_raw.data();
         }
         if (lookup_host_.empty()) lookup_host_.resize((size_t) n_cols * W * en.layers.size());
@@ -1562,11 +1896,19 @@ private:
             cudaMemcpy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
             lookup_loaded_[(size_t) e] = true;
         }
+        // row t's n_cols rows: from the window's own reads or from its early ones
+        const auto rows_of = [&](int t) -> const uint8_t* {
+            if (!pf) return raw + (size_t) t * n_cols * W;
+            const int k = early_of_[(size_t) (off + t)];
+            return k >= 0 ? early_[(size_t) k].raw.data() + (size_t) e * n_cols * W : pf->raw.data() + (size_t) pf->at[(size_t) (off + t)] * n_cols * W;
+        };
+        const double norm_start = time_prompt ? now_ms() : 0;
         for (int t = 0; t < R; ++t) {
             const float valid = h_evalid_[t];
+            const uint8_t* trow = rows_of(t);
             for (int c = 0; c < n_cols; ++c) {
                 float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
-                const uint8_t* src = raw + ((size_t) t * n_cols + c) * W;
+                const uint8_t* src = trow + (size_t) c * W;
                 float ss = 0.f;
                 for (int d = 0; d < W; ++d) {
                     row[d] = lut[src[d]];
@@ -1576,6 +1918,7 @@ private:
                 for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
             }
         }
+        if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
         put_f32(erows_, h_erows_, (int64_t) R * n_cols * W);
         put_f32(evalid_, h_evalid_, R);
         if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
@@ -1688,7 +2031,16 @@ private:
         ra.k = K;
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
+        const bool lossy = lossy_ && !prompt;
+        if (lossy) {   // a decode window with the lossy routing flags: the experts the GPUs hold
+            ra.held = lossy_->held_tabs(l - g_.n_dense);
+            ra.prior = lossy_->route_prior();
+        }
         bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
+            for (int g0 = 0; g0 < R; g0 += kMaxWindow)
+                bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
+                                    lossy_->route_tail_skip(), g_.n_expert, lossy_->route_counts(), stream_);
         quant_n(R);
         gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
         if (!prompt) publish(0, std::min(kMaxWindow, R));
@@ -1706,11 +2058,14 @@ private:
     // ---- CUDA graphs of a decode window's layers: the stretches with no position in them, captured once per layer and row
     // count and replayed (the launches of a token were ~2,200 one by one, and the host's launch rate set the pace).
     std::vector<cudaGraphExec_t> gx_;   // [(R - 1) * n_layers * 3 + l * 3 + part]
+    std::vector<cudaGraphExec_t> gbx_;  // a batch window's, the same way (layer_batched)
     bool graphs_ = false;               // this run_rows replays them (a decode window, no dumps, no picture)
     template <class Fn>
-    bool replay(int l, int R, int part, Fn&& body, std::string& err) {
-        if (gx_.empty()) gx_.assign((size_t) kMaxWindow * g_.n_layers * 3, nullptr);
-        cudaGraphExec_t& ex = gx_[((size_t) (R - 1) * g_.n_layers + l) * 3 + part];
+    bool replay(int l, int R, int part, Fn&& body, std::string& err) { return replay_in(gx_, l, R, part, body, err); }
+    template <class Fn>
+    bool replay_in(std::vector<cudaGraphExec_t>& set, int l, int R, int part, Fn&& body, std::string& err) {
+        if (set.empty()) set.assign((size_t) kMaxWindow * g_.n_layers * 3, nullptr);
+        cudaGraphExec_t& ex = set[((size_t) (R - 1) * g_.n_layers + l) * 3 + part];
         if (!ex) {
             if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
                 err = "cannot begin a graph capture";
@@ -1784,6 +2139,53 @@ private:
         xa = X_;
         xb = Xn_;
         if (!replay(l, R, 2, [&] {
+                gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, g_.n_latent, g_.n_embd, R);
+                add_norm_hc_post(moe_out_, sh_, F(l, "post_ffw_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
+            }, err))
+            return false;
+        std::swap(X_, Xn_);
+        return true;
+    }
+
+    // A batch window's MoE layer: graph 0 (the attention's collapse, norm and query products: no position, no session), the
+    // cells, the cache rows and the attention per segment over each session's caches, graph 1 (the attention's output, its
+    // expansion, the FFN's collapse, the router, routed_down, the doorbell and the shared expert), the experts, graph 2. The
+    // graphs hold no session's state, so they are keyed by the row count alone. The same kernels in the same order as a solo
+    // window's layer, per row.
+    bool layer_batched(int l, int64_t pos0, int R, const bk::HcPlainArgs& hc, std::string& err) {
+        const int E = g_.n_embd;
+        const int tl = l - g_.n_dense;
+        const ExpertLayer& el = m_.pack().experts[(size_t) l];
+        const kernels::NativeExpertLayout lay = kernels::native_expert_layout(el.gu_type, el.d_type, g_.n_latent, g_.n_ff_exp);
+        if (lay.bytes != el.blob_bytes) {
+            err = "layer " + std::to_string(l) + "'s expert blob size does not match the layout";
+            return false;
+        }
+        float *xa = X_, *xb = Xn_;
+        if (!replay_in(gbx_, l, R, 0, [&] {
+                bk::hc_mixes_plain(xa, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                bk::hc_pre_rms_norm(xa, coef_, bk::kHcCoef, F(l, "attn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+                std::string e;
+                attention_step(l, pos0, R, 0, e, kQuery);
+            }, err))
+            return false;
+        if (!attention_step(l, pos0, R, 0, err, kCells | kAttend)) return false;
+        const uint32_t seq0 = seq_want_;
+        if (!replay_in(gbx_, l, R, 1, [&] {
+                std::string e;
+                attention_step(l, pos0, R, 0, e, kOutput | kTail | kRaw);
+                add_norm_hc_post(attn_raw_, nullptr, F(l, "post_attention_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
+                bk::hc_mixes_plain(xb, F(l, "hc_ffn_fn.weight"), F(l, "hc_ffn_scale.weight"), F(l, "hc_ffn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
+                bk::hc_pre_rms_norm(xb, coef_, bk::kHcCoef, F(l, "ffn_norm.weight"), R, E, g_.rms_eps, cur_, xn_, stream_);
+                moe_head(l, R, false);
+            }, err))
+            return false;
+        seq_want_ = seq0 + 1;   // the doorbell in the graph rings once a replay
+        std::swap(X_, Xn_);
+        if (!moe_group(l, tl, lay, 0, R, err)) return false;
+        xa = X_;
+        xb = Xn_;
+        if (!replay_in(gbx_, l, R, 2, [&] {
                 gemm(T(l, "ffn_routed_up.weight"), lat_out_, moe_out_, g_.n_latent, g_.n_embd, R);
                 add_norm_hc_post(moe_out_, sh_, F(l, "post_ffw_norm.weight"), g_.rms_eps, xa, coef_, bk::kHcCoef, R, E, xb, stream_);
             }, err))
@@ -2042,6 +2444,38 @@ private:
         return false;
     }
 
+    // While a layer's weighted sum waits for the CPU's and the second card's rows, the card's memory idles once its own experts
+    // are done: the next layer's two largest products, its attention gate and output (the head after the last layer), are read
+    // into L2 meanwhile, up to kReadAheadBytes, so those products read L2 instead of memory. The requests start behind the
+    // card's experts and stop once the wait is over; they change no result.
+    static constexpr uint64_t kReadAheadBytes = 56ull << 20;
+    void read_ahead(int l, uint32_t word, cudaStream_t st) {
+        if (ra_.empty()) {   // every layer's ranges, once
+            ra_.resize((size_t) g_.n_layers);
+            for (int k = 0; k < g_.n_layers; ++k) {
+                L2Ranges& r = ra_[(size_t) k];
+                uint64_t left = kReadAheadBytes;
+                int n = 0;
+                const auto add = [&](const DevTensor* t) {
+                    if (t == nullptr || n == kL2Ranges || ((uintptr_t) t->ptr & 15) != 0) return;
+                    r.p[n] = t->ptr;
+                    r.n[n] = std::min<uint64_t>(t->bytes, left) & ~15ull;
+                    left -= r.n[n];
+                    n += r.n[n] > 0;
+                };
+                if (k + 1 < g_.n_layers) {
+                    add(T(k + 1, "attn_gate.weight"));
+                    add(T(k + 1, "attn_output.weight"));
+                } else {
+                    add(m_.tensor("output.weight"));
+                }
+            }
+        }
+        cudaEventRecord(ra_ev_, st);
+        cudaStreamWaitEvent(ra_st_, ra_ev_, 0);
+        l2_read_ahead(ra_[(size_t) l], ra_mark_, word, ra_st_);
+    }
+
     // The routed experts of rows g0..g0+G of a layer, as DeepSeek's decode places them: the tier is asked once per distinct
     // expert of the group; the second card's share is raised first, then the CPU pool starts on the RAM experts, the card
     // runs its slot hits and then the bus fetches, and the weighted sum is queued behind a word the host writes once the
@@ -2072,7 +2506,7 @@ private:
         for (int t = 0; t < G; ++t)
             for (int k = 0; k < K; ++k) {
                 const int32_t e = h_ids_[t * K + k];
-                if (e < 0 || e >= g_.n_expert) {
+                if ((e < 0 && !(e == -1 && lossy_)) || e >= g_.n_expert) {   // -1: --route-tail-skip dropped it
                     err = "the router picked expert " + std::to_string(e);
                     return false;
                 }
@@ -2082,11 +2516,12 @@ private:
                     uniq[nu++] = e;
                     use[u] = core::ExpertTier::Use{};
                 }
+                uidx[t * K + k] = u;
+                if (e == -1) continue;   // --route-tail-skip dropped it: no rows (a token may drop several)
                 core::ExpertTier::Use& us = use[u];
                 us.tok[us.nt] = t;
                 us.row[us.nt] = t * K + k;
                 ++us.nt;
-                uidx[t * K + k] = u;
             }
         core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
@@ -2100,10 +2535,11 @@ private:
         }
         bool on_peer = false;
         for (int i = 0; i < nu; ++i) {
-            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i] && !lk.dropped[i]);
             pd.reading = pd.reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
+        if (pd.cpu || pd.reading || on_peer) pd.word = ++join_seq_;   // the weighted sum waits for the host's rows
         // a promotion only queues its copies (they go out at a later pump), so it is decided now and the copies start behind
         // this layer's sum; experts still being read from the file are decided once they landed
         if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
@@ -2138,9 +2574,12 @@ private:
         int ne = 0;
         const int nhits = make_plan(put.plan, false, ne);
         for (int r = 0; r < G * K; ++r)
-            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * L : d_rows_ + (size_t) r * L);
+            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]]       ? ex_rows_ + (size_t) r * L
+                                                : lk.dropped[uidx[r]] ? tier_->zero_row()
+                                                                      : d_rows_ + (size_t) r * L);
         put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
         if (nhits) launch(ex_plan_, nhits, ne);
+        if (pd.word) read_ahead(l, pd.word, st);
         if (n_fetched) {
             WindowPlan p2;
             const int ng = make_plan(p2, true, ne);
@@ -2150,10 +2589,7 @@ private:
         }
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !peer->run_fetched(err)) return false;
-        if (pd.cpu || pd.reading || on_peer) {
-            pd.word = ++join_seq_;
-            kernels::wait_word(d_words_ + 1, pd.word, st);
-        }
+        if (pd.word) wait_word_mark(d_words_ + 1, pd.word, ra_mark_, st);
         const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
         weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
         if (pd.cpu && !pd.reading) tier_->mark_gap(st);   // the promotions' copies start behind the sum
@@ -2234,6 +2670,7 @@ private:
         return ok;
     }
     bool run_rows_impl(const int32_t* tokens, int R, int64_t pos0, int head_rows, std::string& err) {
+        if (!bsegs_.empty()) return run_body(tokens, R, pos0, head_rows, err);   // a batch: each session checked and placed its rows
         if (pos0 + R > m_.context()) {
             err = "position " + std::to_string(pos0 + R - 1) + " is past the context of " + std::to_string(m_.context());
             return false;
@@ -2251,12 +2688,16 @@ private:
         hist_.resize((size_t) pos0);   // a position before the end drops the rows after it
         hist_.insert(hist_.end(), tokens, tokens + R);
         place_rope(pos0, R);   // [vision]
+        return run_body(tokens, R, pos0, head_rows, err);
+    }
+    bool run_body(const int32_t* tokens, int R, int64_t pos0, int head_rows, std::string& err) {
         if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
+        if (lossy_) lossy_->publish_held(stream_);   // ahead of the rows' first router
         struct Drain {
             Session* s;
             ~Drain() { s->drain_prefetch(); }
         } drain{this};
-        prefetch_engram(pos0, R);   // every Engram layer's rows are asked for before the first layer runs
+        if (bsegs_.empty()) prefetch_engram(pos0, R);   // every Engram layer's rows are asked for before the first layer runs
         const int E = g_.n_embd;
         bk::HcPlainArgs hc;
         hc.n_embd = E;
@@ -2284,7 +2725,7 @@ private:
             if (!engram(l, pos0, R, tokens, err)) return false;
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
             if (graphs_ && l >= g_.n_dense) {
-                if (!layer_replayed(l, pos0, R, hc, err)) return false;
+                if (!(bsegs_.empty() ? layer_replayed(l, pos0, R, hc, err) : layer_batched(l, pos0, R, hc, err))) return false;
                 continue;
             }
             bk::hc_mixes_plain(X_, F(l, "hc_attn_fn.weight"), F(l, "hc_attn_scale.weight"), F(l, "hc_attn_base.weight"), R, 8, hc, hcws_, coef_, stream_);
@@ -2316,9 +2757,12 @@ private:
                                (const float*) m_.tensor("output_hc_base.weight")->ptr, head_rows, 4, hc, hcws_, coef_, stream_);
             bk::hc_pre(x, coef_, bk::hc_plain_coef_stride(4), head_rows, E, cur_, stream_);
             bk::rms_norm_rows(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, fin_, head_rows, E, g_.rms_eps, stream_);
-            dfly_.hidden(R - head_rows, head_rows, fin_, stream_);   // DFLY HOOK
+            if (bsegs_.empty()) dfly_.hidden(R - head_rows, head_rows, fin_, stream_);   // DFLY HOOK
+            else   // a batch's head runs every row: each conversation's drafter its segment's head rows
+                for (const Seg& sg : bsegs_)
+                    sg.s->dfly_.hidden(sg.rows - sg.head, sg.head, fin_ + (size_t) (sg.row0 + sg.rows - sg.head) * E, stream_);
             const DevTensor* head = m_.tensor("output.weight");
-            bk::bf16_gemv_fp32_mmvf_multi(fin_, E, (const uint16_t*) head->ptr, logits_, g_.n_vocab, E, g_.n_vocab, head_rows, stream_);
+            gemm(head, fin_, logits_, E, g_.n_vocab, head_rows);
             if (!m_.diag_dump().empty()) {
                 dump("result_norm", fin_, (int64_t) head_rows * E);
                 dump("result_output", logits_, (int64_t) head_rows * g_.n_vocab);
@@ -2337,18 +2781,30 @@ private:
     // generation past the prompt, the expert tier holding the rest), the tier gives back its spare slots and the mapping is
     // tried again, then lends all its slots and takes back what is left once the caches have grown (as DeepSeek's caches do).
     bool grow_failed_ = false;   // the last ensure_positions found no room (a refusal: nothing was run past `backed_`)
-    // the device bytes the sparse layers' caches take to grow from `backed_` to `target` positions (a page more each array)
+    // the exact remaining device bytes the sparse layers' caches will map to reach `target` positions
+    // (ElasticArray::ensure grows each array in steps of 4 granules = 8 MiB on 2 MiB VMM pages)
     uint64_t grow_bytes(int64_t target) const {
-        int sparse = 0;
-        for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
-        return (uint64_t) ((double) (target - backed_) * cell_bytes()) + (uint64_t) sparse * 2 * (2ull << 20);
+        constexpr uint64_t kStep = 8ull << 20;
+        auto need = [&](const std::unique_ptr<core::ElasticArray>& a, uint64_t bytes) -> uint64_t {
+            if (!a || bytes <= a->backed()) return 0;
+            const uint64_t want = std::min(a->capacity(), (bytes + kStep - 1) / kStep * kStep);
+            return want > a->backed() ? want - a->backed() : 0;
+        };
+        uint64_t total = 0;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            total += need(ea_[(size_t) l], (uint64_t) target * sparse_row_bytes());
+            total += need(pea_[(size_t) l], (uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2);
+        }
+        return total;
     }
     bool ensure_positions(int64_t positions, std::string& err) {
         grow_failed_ = false;
         if (positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
         const uint64_t keep = tier_ ? tier_->free_floor() : 256ull << 20;
-        for (int attempt = 0; attempt < 3; ++attempt) {
+        bool lent = false, lent_all = false;
+        for (int attempt = 0; attempt < 4; ++attempt) {
             std::string e;
             bool ok = true;
             for (int l = 0; ok && l < g_.n_layers; ++l) {
@@ -2358,20 +2814,28 @@ private:
             }
             if (ok) {
                 backed_ = target;
-                if (attempt == 2 && !big_.rows) {   // lent here, outside a prompt (which takes its slots back at its end)
+                if (lent && !big_.rows) {   // lent here, outside a prompt (which takes its slots back at its end)
                     std::string r;
                     if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "the latent caches took expert slots at %lld positions: %s", (long long) target, r.c_str());
                 }
                 return true;
             }
-            if (!tier_ || attempt == 2) {
+            if (!tier_ || attempt == 3 || lent_all) {
+                if (lent && !big_.rows) {
+                    std::string r;
+                    tier_->reclaim(r);
+                }
                 err = "the latent caches cannot grow to " + std::to_string(target) + " positions: " + e + "; a smaller --max-context leaves more for the expert tier";
                 grow_failed_ = true;
                 return false;
             }
             cudaStreamSynchronize(stream_);
             if (attempt == 0) tier_->shrink();
-            else if (!tier_->partial_lend() || !tier_->lend(grow_bytes(target))) tier_->lend_all();
+            else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) lent = true;
+            else {
+                tier_->lend_all();
+                lent = lent_all = true;
+            }
         }
         return false;
     }
@@ -2443,6 +2907,16 @@ private:
 
     // The picks of the last `rows` rows of logits_ (row t of the window is draw counter + t0 + t).
     bool pick(const model::DecodeRequest& r, int t0, int rows, std::string& err) {
+        if (!draw(r, t0, rows, stream_, err)) return false;
+        picks_.assign((size_t) rows, 0);
+        if (cudaMemcpyAsync(picks_.data(), pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "the pick failed";
+            return false;
+        }
+        return true;
+    }
+    // The draws of those rows into pick_, queued on `st`.
+    bool draw(const model::DecodeRequest& r, int t0, int rows, cudaStream_t st, std::string& err) {
         bk::SamplerParams sp;
         if (r.sampling) sp = *r.sampling;
         else sp.greedy = true;
@@ -2457,16 +2931,11 @@ private:
                 if (cudaMalloc((void**) &d_hist_, n * 4) != cudaSuccess) { cudaGetLastError(); err = "out of device memory for the sampling history"; return false; }
                 d_hist_len_ = n;
             }
-            cudaMemcpyAsync(d_hist_, r.history, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, stream_);
+            cudaMemcpyAsync(d_hist_, r.history, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
         }
         sampling_ = sp;
-        bk::sample_tokens(logits_, rows, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, stream_);
-        picks_.assign((size_t) rows, 0);
-        if (cudaMemcpyAsync(picks_.data(), pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, stream_) != cudaSuccess || cudaStreamSynchronize(stream_) != cudaSuccess) {
-            err = "the pick failed";
-            return false;
-        }
-        return true;
+        bk::sample_tokens(logits_, rows, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);
+        return cudaGetLastError() == cudaSuccess || (err = "the draw failed", false);
     }
 
     Hy4Model& m_;
@@ -2474,6 +2943,9 @@ private:
     cudaStream_t stream_ = nullptr;
     cudaEvent_t ev_ = nullptr, eng_ev_ = nullptr;
     std::vector<void*> bufs_, pinned_;
+    std::vector<void*>* alloc_to_ = &bufs_;   // where alloc keeps what it gives: the session's, or the shared scratch's while that is built
+    std::vector<void*>* pin_to_ = &pinned_;
+    std::shared_ptr<Scratch> sc_;
     float *X_ = nullptr, *Xn_ = nullptr, *coef_ = nullptr, *hcws_ = nullptr;
     float *e_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;
@@ -2486,11 +2958,12 @@ private:
     static constexpr size_t kStageInts = (size_t) 4 << 20;   // the mapped staging of a prompt's small inputs
     int32_t *stage_h_ = nullptr, *stage_d_ = nullptr, *bounds_tab_ = nullptr;
     size_t stage_at_ = 0;
-    Bufs dec_, big_;   // a window's row buffers, and a prompt chunk's while one runs
+    Bufs big_;   // a window's row buffers, and a prompt chunk's while one runs
     float *gu_ = nullptr, *h_ = nullptr, *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
     float *xlat_ = nullptr, *lat_out_ = nullptr, *moe_out_ = nullptr, *sh_ = nullptr, *logits_ = nullptr, *lp_ = nullptr, *erows_ = nullptr, *ekv_ = nullptr, *evalid_ = nullptr;
     int32_t* pick_ = nullptr;
+    int32_t* pick_h_ = nullptr;   // pinned: a batch draw's picks, read after the batch's sync
     struct Stage {
         uint8_t* blobs = nullptr;
         int32_t *tok = nullptr, *bounds = nullptr;
@@ -2517,9 +2990,16 @@ private:
     int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
     uint32_t *h_words_ = nullptr, *d_words_ = nullptr;   // mapped: [0] the ids' sequence word, [1] the word a weighted sum waits for
     uint32_t seq_want_ = 0, join_seq_ = 0;
+    // the L2 read-ahead during a MoE layer's wait (read_ahead): its stream, the event it starts behind, the mark it stops at
+    // (device: the last word the weighted sum's wait saw) and each layer's ranges
+    cudaStream_t ra_st_ = nullptr;
+    cudaEvent_t ra_ev_ = nullptr;
+    uint32_t* ra_mark_ = nullptr;
+    std::vector<L2Ranges> ra_;
     // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
     bool use_joiner_ = true;
     bool use_graphs_ = true;
+    core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     std::thread joiner_;
     std::mutex jm_;
     std::condition_variable jcv_;
@@ -2563,6 +3043,7 @@ private:
     int last_rows_ = 0;
     // prompt timing (host wall time at the sync points): the work queued before a layer's MoE, the MoE itself, the Engram's reads
     double t_pre_ms_ = 0, t_moe_ms_ = 0, t_eng_ms_ = 0, t_build_ms_ = 0, t_issue_ms_ = 0, t_att_ms_ = 0, t_ffn_ms_ = 0;
+    double t_eng_read_ms_ = 0, t_eng_norm_ms_ = 0;
     std::atomic<double> t_ring_ms_{0};
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };

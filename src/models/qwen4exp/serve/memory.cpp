@@ -213,7 +213,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
     char line[400];
     std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld "
                   "expert_cache_mib=%lld expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld "
-                  "ram_homes_mib=%lld\n", reserve, (long long) xcache.slots(), (long long) xcache.full_slots(),
+                  "ram_homes_mib=%lld\n", reserve, (long long) gpu_slots(), (long long) xcache.full_slots(),
                   (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
                   (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) (src.homes_bytes() >> 20));
     if (reply != nullptr) *reply = line;

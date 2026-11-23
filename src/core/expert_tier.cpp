@@ -6,12 +6,12 @@
 #include "basalt/core/exact_slots.hpp"
 
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/route_report.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
-#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -61,6 +61,14 @@ ExpertTier::~ExpertTier() {
     }
     ram_allocations_.clear();
     platform::free_aligned(act_);
+    if (held_ev_) {
+        cudaEventSynchronize(held_ev_);
+        cudaEventDestroy(held_ev_);
+    }
+    cudaFree(held_dev_);
+    cudaFreeHost(held_pin_);
+    cudaFree(route_counts_);
+    cudaFree(zero_row_);
 }
 
 bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err) {
@@ -192,6 +200,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     if (!open_base(per_layer_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
+    if (s_.victim_half_life > 0) looks_.assign((size_t) n_layers_ * n_expert_, 0);
     owner_.assign((size_t) base_slots(), -1);
     busy_.assign((size_t) base_slots(), 0);
     int lo_prio = 0, hi_prio = 0;
@@ -236,21 +245,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);
     const kernels::cpu::PoolAffinity affinity = s_.pool_affinity_given ? s_.pool_affinity : kernels::cpu::PoolAffinity::All;
-    int workers = s_.pool_workers;
-    if (workers <= 0) {
-        // The start-up pick the pool's own rule makes: a hybrid CPU runs on its P-cores and half the E-cores, and the
-        // cgroup quota caps the workers and the host thread together.  It holds whatever the quant and whatever the peer
-        // cards, so no model decides it.
-        const kernels::cpu::CpuTopology topo = kernels::cpu::detect_cpu_topology(true);
-        const kernels::cpu::PoolAffinity auto_affinity = !s_.pool_affinity_given || affinity == kernels::cpu::PoolAffinity::Auto
-                                                             ? kernels::cpu::PoolAffinity::Auto
-                                                         : affinity == kernels::cpu::PoolAffinity::PCores
-                                                             ? kernels::cpu::PoolAffinity::PCores
-                                                             : kernels::cpu::PoolAffinity::All;
-        workers = kernels::cpu::auto_pool_workers((int) topo.worker_cores.size(), topo.p_cores, topo.e_cores, topo.is_hybrid,
-                                                  kernels::cpu::cgroup_cpu_quota(), auto_affinity);
-    }
-    pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, affinity);
+    pool_ = std::make_unique<kernels::cpu::ExpertPool>(
+        kernels::cpu::start_pool_workers(s_.pool_workers, s_.pool_affinity_given, affinity), affinity);
 
     if (!load_ram(reads, err)) return false;
     if (homes_.file > 0 && cover_ > 0) {
@@ -513,7 +509,72 @@ bool ExpertTier::attach(std::string& err) {
     if (!land_ram(err)) return false;
     if (homes_.main == 0) seed_copies(0, /*base_shares=*/true);
     promoted_ = 0;
-    return plan_ext(err);   // after the RAM tier is pinned: its registration takes VRAM too
+    return plan_ext(err) && open_route(err);   // after the RAM tier is pinned: its registration takes VRAM too
+}
+
+bool ExpertTier::held(int layer, int e) const {
+    return res_[(size_t) layer * n_expert_ + e] >= 0 || (!peers_.empty() && peer_for(layer)->slot_ptr(layer, e) != nullptr);
+}
+
+// The lossy routing flags' table, counters and zero row, once the slots are placed; off when every expert is held.
+bool ExpertTier::open_route(std::string& err) {
+    if (s_.route_tail_skip <= 0 && s_.route_prior <= 0.0f) return true;
+    bool all = true;
+    for (int l = 0; all && l < n_layers_; ++l)
+        for (int e = 0; all && e < n_expert_; ++e) all = held(l, e);
+    if (all) {
+        if (s_.route_tail_skip > 0) basalt::log::info(s_.area.c_str(), "route-tail-skip is off: every expert is held by a GPU");
+        if (s_.route_prior > 0.0f) basalt::log::info(s_.area.c_str(), "route-prior is off: every expert is held by a GPU");
+        return true;
+    }
+    const size_t n = (size_t) n_layers_ * n_expert_;
+    if (cudaMalloc((void**) &held_dev_, n * 4) != cudaSuccess || cudaHostAlloc((void**) &held_pin_, n * 4, cudaHostAllocPortable) != cudaSuccess ||
+        cudaMalloc((void**) &route_counts_, 8 * 8) != cudaSuccess || cudaMemset(route_counts_, 0, 8 * 8) != cudaSuccess ||
+        cudaMalloc((void**) &zero_row_, (size_t) s_.n_embd * 4) != cudaSuccess || cudaMemset(zero_row_, 0, (size_t) s_.n_embd * 4) != cudaSuccess ||
+        cudaMemset(held_dev_, 0xff, n * 4) != cudaSuccess || cudaEventCreateWithFlags(&held_ev_, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        err = s_.name + ": cannot allocate the lossy routing flags' tables";
+        return false;
+    }
+    held_pub_.assign(n, -1);
+    route_tail_skip_ = s_.route_tail_skip;
+    route_prior_ = s_.route_prior;
+    return true;
+}
+
+void ExpertTier::publish_held(cudaStream_t stream) {
+    if (held_dev_ == nullptr) return;
+    cudaEventSynchronize(held_ev_);   // the last publish's copies have read the staging
+    const size_t ne = (size_t) n_expert_;
+    for (int l = 0; l < n_layers_;) {
+        // a run of layers that changed goes out in one copy
+        const auto changed = [&](int layer) {
+            bool c = false;
+            int32_t* pin = held_pin_ + (size_t) layer * ne;
+            int32_t* pub = held_pub_.data() + (size_t) layer * ne;
+            for (int e = 0; e < n_expert_; ++e) {
+                const int32_t v = held(layer, e) ? 0 : -1;
+                c |= v != pub[e];
+                pin[e] = pub[e] = v;
+            }
+            return c;
+        };
+        if (!changed(l)) {
+            ++l;
+            continue;
+        }
+        int hi = l + 1;
+        while (hi < n_layers_ && changed(hi)) ++hi;
+        cudaMemcpyAsync(held_dev_ + (size_t) l * ne, held_pin_ + (size_t) l * ne, (size_t) (hi - l) * ne * 4, cudaMemcpyHostToDevice, stream);
+        l = hi + 1;   // layer hi was checked (and is unchanged, or past the end)
+    }
+    cudaEventRecord(held_ev_, stream);
+}
+
+kernels::ResidentTabs ExpertTier::held_tabs(int layer) const {
+    kernels::ResidentTabs t;
+    if (held_dev_ != nullptr) t.add(held_dev_ + (size_t) layer * n_expert_);
+    return t;
 }
 
 // The RAM tier's experts have landed (the pass's pinned staging is freed by then): its spans are pinned.
@@ -706,10 +767,14 @@ void ExpertTier::settle() {
 void ExpertTier::begin_token(int n_tokens) {
     if (!uses_.empty() && core::policy::use_half_life(token_, (uint64_t) n_tokens))
         for (uint16_t& u : uses_) u >>= 1;
+    if (!looks_.empty() && core::policy::crosses(token_, (uint64_t) n_tokens, (uint64_t) s_.victim_half_life))
+        for (uint16_t& u : looks_) u >>= 1;
     token_ += (uint64_t) n_tokens;
     claims_ = 0;
     claim_cap_ = s_.claims_per_row > 0 ? s_.claims_per_row * std::max(n_tokens, 1) : (int) kMaxPending;
 }
+
+void ExpertTier::forget_use() { std::fill(looks_.begin(), looks_.end(), (uint16_t) 0); }
 
 bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err) {
     land(layer);
@@ -718,15 +783,22 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
     if (reads_.is_open() && !read_misses(layer, ids, k, lk.reading, err)) return false;
     for (int i = 0; i < k; ++i) {
         const int e = ids[i];
+        lk.experts[i] = e;
+        lk.again[i] = false;
+        lk.fetched[i] = false;
+        lk.dropped[i] = e == -1 && route_tail_skip_ > 0;
+        if (lk.dropped[i]) {
+            lk.dev[i] = lk.peer[i] = lk.host[i] = nullptr;
+            continue;
+        }
         if (e < 0 || e >= n_expert_) {
             err = s_.name + ": router returned a bad expert id";
             return false;
         }
-        lk.experts[i] = e;
-        lk.again[i] = false;
-        lk.fetched[i] = false;
         const size_t idx = (size_t) layer * n_expert_ + e;
         stamp_[idx] = now;
+        map_.note(layer, e);
+        if (!looks_.empty()) core::policy::count_look(looks_[idx]);
         const int32_t s = res_[idx];
         lk.peer[i] = nullptr;
         if (s >= 0) {
@@ -750,6 +822,40 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
     return true;
 }
 
+std::vector<ExpertTier::CardSlots> ExpertTier::slots_by_card() const {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    std::vector<CardSlots> out{{dev, slots(), (uint64_t) (cache_.mapped_bytes() + ext_.mapped_bytes())}};
+    for (const auto& p : peers_)
+        if (p) out.push_back({p->device(), p->cache().slots(), (uint64_t) p->cache().mapped_bytes()});
+    return out;
+}
+
+uint64_t ExpertTier::ram_bytes() const {
+    if (ram_.empty()) return 0;
+    uint64_t n = 0;
+    for (const ExpertTierSpec::Layer& l : s_.layers) n += (uint64_t) (cover_ + 1) * l.blob_bytes;
+    return n;
+}
+
+int64_t ExpertTier::gpu_slots() const {
+    int64_t n = slots();
+    for (const auto& p : peers_)
+        if (p) n += p->cache().slots();
+    return n;
+}
+
+void ExpertTier::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+    if (!map_.is_open()) map_.open(n_layers_, n_expert_);
+    total = map_.total();
+    homes.clear();
+    for (const int32_t p : map_.pairs()) {
+        const Source s = locate(p / n_expert_, p % n_expert_);
+        homes.push_back((uint8_t) (s.dev ? ExpertHome::Vram : s.peer ? ExpertHome::Peer : s.pinned ? ExpertHome::Ram : ExpertHome::File));
+    }
+    map_.take(routed);
+}
+
 ExpertTier::Source ExpertTier::locate(int layer, int e) const {
     Source r;
     const int32_t s = res_[(size_t) layer * n_expert_ + e];
@@ -766,7 +872,7 @@ void ExpertTier::start_cpu(int layer, const float* x, const Lookup& lk, float* r
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
     int n = 0;
     for (int i = 0; i < lk.k; ++i) {
-        if (lk.dev[i] || lk.peer[i] || lk.reading[i] != reading) continue;
+        if (lk.dev[i] || lk.peer[i] || lk.dropped[i] || lk.reading[i] != reading) continue;
         cpu_jobs_[n] = kernels::cpu::ExpertJobMulti{};
         cpu_jobs_[n].blob = lk.host[i];
         cpu_jobs_[n].nt = 1;
@@ -785,7 +891,7 @@ void ExpertTier::start_cpu_window(int layer, const float* x, const Lookup& lk, c
     bool quantized[kMaxWindow] = {};
     int n = 0;
     for (int i = 0; i < lk.k; ++i) {
-        if (lk.dev[i] || lk.peer[i] || lk.reading[i] != reading) continue;
+        if (lk.dev[i] || lk.peer[i] || lk.dropped[i] || lk.reading[i] != reading) continue;
         cpu_jobs_[n] = kernels::cpu::ExpertJobMulti{};
         cpu_jobs_[n].blob = lk.host[i];
         cpu_jobs_[n].nt = use[i].nt;
@@ -808,11 +914,23 @@ void ExpertTier::finish_cpu() { pool_->finish_split_multi_native(); }
 int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
     int32_t slot = -1;
     best = ~0ull;
+    uint16_t best_looks = 0;
+    const size_t base = (size_t) layer * n_expert_;
     auto scan = [&](int64_t lo, int64_t n) {
         for (int64_t s = lo; s < lo + n; ++s) {
             if (busy_[(size_t) s]) continue;
             const int32_t o = owner_[(size_t) s];
-            const uint64_t st = o < 0 ? 0 : stamp_[(size_t) layer * n_expert_ + o];
+            const uint64_t st = o < 0 ? 0 : stamp_[base + o];
+            if (!looks_.empty()) {   // by use: an empty slot first, and an expert this very lookup uses stays
+                if (o >= 0 && st == tick_) continue;
+                const uint16_t lk = o < 0 ? 0 : looks_[base + o];
+                if (slot < 0 || core::policy::yields_before(lk, st, best_looks, best)) {
+                    best = st;
+                    best_looks = lk;
+                    slot = (int32_t) s;
+                }
+                continue;
+            }
             if (st < best) {
                 best = st;
                 slot = (int32_t) s;
@@ -822,6 +940,7 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
     if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0))
         scan(base_lo_[(size_t) layer], live_n(layer));
     if (ext_per_layer_) scan(base_slots() + (int64_t) layer * ext_per_layer_, ext_per_layer_);
+    if (slot < 0 && !looks_.empty()) best = tick_;
     return slot;
 }
 
@@ -989,9 +1108,9 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     if (s_.diag_tier_frozen || reads_.is_open()) return 0;
     int np = 0, nf = 0;
     // with an admission threshold only an expert that earned its slot goes over the bus; the others stay with the CPU
-    const auto eligible = [&](int i) { return pinned(layer, lk.experts[i]) && (s_.admit_uses == 0 || lk.again[i]); };
+    const auto eligible = [&](int i) { return !lk.dropped[i] && pinned(layer, lk.experts[i]) && (s_.admit_uses == 0 || lk.again[i]); };
     for (int i = 0; i < lk.k; ++i)
-        if (!lk.dev[i] && !lk.peer[i]) ++(eligible(i) ? np : nf);
+        if (!lk.dev[i] && !lk.peer[i] && !lk.dropped[i]) ++(eligible(i) ? np : nf);
     int left = core::policy::bus_count(np, nf);
     // A second card fetches some over its own link into a scratch slot and computes them there. Their main card slots are
     // claimed all the same, filled behind the window's work as a promotion is, so every expert's place is the one the
@@ -1027,7 +1146,7 @@ void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetc
 void ExpertTier::promote(int layer, const Lookup& lk) {
     if (s_.diag_tier_frozen) return;
     for (int i = 0; i < lk.k; ++i) {
-        if (lk.dev[i] || lk.fetched[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
+        if (lk.dev[i] || lk.fetched[i] || lk.dropped[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         // with the RAM tier caching the file, the experts the CPU keeps computing; else a repeat miss
         if (reads_.is_open() && s_.admit_uses == 0 ? !core::policy::count_use(uses_[(size_t) layer * n_expert_ + lk.experts[i]]) : !lk.again[i]) continue;
         if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
@@ -1446,6 +1565,12 @@ void ExpertTier::report(const char* tag) const {
     if (reads_.is_open())
         basalt::log::info(s_.area.c_str(), "TIER %s: %lld experts read into the RAM tier (%s)", tag, (long long) read_,
                           reads_.unbuffered() ? "unbuffered" : "through the file cache");
+    unsigned long long c[8] = {};
+    if (route_counts_ != nullptr && cudaMemcpy(c, route_counts_, sizeof c, cudaMemcpyDeviceToHost) == cudaSuccess)
+        for (const std::string& line : route_report(c, route_tail_skip_, route_prior_))
+            basalt::log::info(s_.area.c_str(), "TIER %s: %s", tag, line.c_str());
+    else
+        cudaGetLastError();
 }
 
 }  // namespace basalt::core

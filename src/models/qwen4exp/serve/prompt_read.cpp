@@ -6,7 +6,9 @@ namespace basalt::models::qwen4exp::serve {
 
 bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
     // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-    if (runtime_.o.batch <= 0 || runtime_.piped || (!runtime_.stages.empty() && !runtime_.batch_on()) || (b0 - a0 <= runtime_.kReadAlone && resumed_chunk <= 0)) {
+    // lend() decides whether the part is read beside the decoding slots; one it does not share the card with reads
+    // alone, with the CPU pool free
+    if (runtime_.o.batch <= 0 || (!runtime_.stages.empty() && !runtime_.batch_on()) || !beside_) {
         // no window runs meanwhile, so the CPU pool is free: it takes its share of the streamed experts
         const bool lend_pool = runtime_.o.batch > 0 && !runtime_.multi_gpu && !runtime_.o.no_pool;
         if (lend_pool) { runtime_.sp.set_cpu_pool(&runtime_.pool); runtime_.sp.set_cpu_share(runtime_.o.prefill_cpu_share); }
@@ -109,7 +111,7 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
             }
             if (!fatal && runtime_.batch_on()) {
                 const auto tw = Clock::now();
-                if (!runtime_.batch_step()) { fatal = true; abort_read.store(true); }
+                if (!runtime_.next_batch_window()) { fatal = true; abort_read.store(true); }
                 const double wm = std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
                 ++ov_wins; ov_win_ms += wm; ov_win_max = std::max(ov_win_max, wm);
             } else {
@@ -192,7 +194,7 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
         const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
         const auto td = Clock::now();
         do {
-            if (!runtime_.batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
+            if (!runtime_.next_batch_window()) { batch_fatal = true; e = "a batch window failed"; return false; }
         } while (runtime_.batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
         ++il_parts;
         il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
