@@ -34,7 +34,6 @@ public:
         int64_t n_layers = 0, n_expert = 0, n_embd = 0, n_ff = 0;
         uint64_t reserve = 0;           ///< what every peer leaves free past its experts (--peer-reserve-mib, 128 MiB at least)
         std::function<uint64_t(size_t card)> keep;   ///< what a card keeps free besides: its prompt buffers and splits
-        int64_t most = 0;               ///< --peer-slots: the most experts the peers hold together (0: no cap)
         bool stages = false;            ///< a long prompt's chunk is read in stages over the cards
     };
 

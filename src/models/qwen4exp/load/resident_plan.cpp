@@ -94,7 +94,6 @@ int resident_plan(Context& context) {
         in.keep = [pin_map, first_keep](size_t card) -> uint64_t {
             return ((card == 1 ? first_keep : 0) + pin_map + (1 << 20) - 1) >> 20 << 20;   // whole MiB
         };
-        in.most = o.peer_slots;
         // the prompt stages, when the split is still wanted with its stages laid out (prompt_split cuts their layers)
         in.stages = context.split_want != nullptr && *context.split_want && context.pstages != nullptr && !context.pstages->empty();
         context.peers->set_open(in);

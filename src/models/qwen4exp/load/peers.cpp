@@ -13,7 +13,6 @@ void TierPeers::set_open(const Open& in) {
     outside_.clear();
     for (const auto& pr : *in.profile)
         if (in.main->slot_of(pr.first, pr.second) < 0) outside_.push_back(pr);
-    if (in.most > 0 && (int64_t) outside_.size() > in.most) outside_.resize((size_t) in.most);
 }
 
 bool TierPeers::peer_card(size_t card, int device, std::string& err) {
