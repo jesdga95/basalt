@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -28,7 +29,8 @@ __global__ void __launch_bounds__(256) sort_count_kernel(const int32_t* __restri
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) hist[e] = 0;
     __syncthreads();
     const int lo = blockIdx.x * kSortPairs, hi = min(pairs, lo + kSortPairs);
-    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) atomicAdd(&hist[ids[i]], 1);
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x)
+        if (ids[i] >= 0) atomicAdd(&hist[ids[i]], 1);   // a pair another card computes has no expert here
     __syncthreads();
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) counts[(size_t) blockIdx.x * n_expert + e] = hist[e];
 }
@@ -37,6 +39,7 @@ __global__ void __launch_bounds__(256) sort_count_kernel(const int32_t* __restri
 __global__ void __launch_bounds__(kMaxExpert) sort_scan_kernel(int32_t* __restrict__ counts, int n_blocks, int n_expert,
                                                                int pairs, int32_t* __restrict__ bounds) {
     __shared__ int32_t total[kMaxExpert];
+    __shared__ int32_t all;
     const int e = threadIdx.x;
     int run = 0;
     if (e < n_expert)
@@ -54,13 +57,14 @@ __global__ void __launch_bounds__(kMaxExpert) sort_scan_kernel(int32_t* __restri
             total[x] = at;
             at += t;
         }
+        all = at;
     }
     __syncthreads();
     if (e < n_expert) {
         bounds[e] = total[e];
         for (int b = 0; b < n_blocks; ++b) counts[(size_t) b * n_expert + e] += total[e];
     }
-    if (e == 0) bounds[n_expert] = pairs;
+    if (e == 0) bounds[n_expert] = all;
 }
 
 // One warp a counting block: its pairs in order, 32 at a time; a pair's place is its expert's next entry plus the lanes
@@ -484,7 +488,8 @@ constexpr int kCombF16Threads = kWidth / 8;   // 288 threads: each owns 8 channe
 static_assert(kWidth % 8 == 0 && kCombF16Threads <= 1024, "kWidth splits into 8-half uint4s");
 
 __global__ void __launch_bounds__(kCombF16Threads)
-    moe_combine_f16_kernel(const uint16_t* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y) {
+    moe_combine_f16_kernel(const uint16_t* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y,
+                           const int32_t* __restrict__ ids) {
     __shared__ float sw[32];
     const int r = (int) blockIdx.x, tid = (int) threadIdx.x;
     if (tid < k) sw[tid] = w[(size_t) r * k + tid];
@@ -492,6 +497,7 @@ __global__ void __launch_bounds__(kCombF16Threads)
     const uint4* out8 = reinterpret_cast<const uint4*>(out);
     float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f), a1 = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int s = 0; s < k; ++s) {
+        if (ids && ids[(size_t) r * k + s] < 0) continue;   // another card's pair: no row here
         const float ws = sw[s];
         const uint4 u = out8[((size_t) r * k + s) * kCombF16Threads + tid];
         const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
@@ -510,11 +516,98 @@ __global__ void __launch_bounds__(kCombF16Threads)
 
 }  // namespace
 
-void moe_combine_f16(const uint16_t* out, const float* w, int rows, int k, float* y, void* stream) {
+void moe_combine_f16(const uint16_t* out, const float* w, int rows, int k, float* y, void* stream, const int32_t* ids) {
     if (rows <= 0) return;
     if (k <= 0 || k > 32) throw std::runtime_error("inkling2 moe_combine_f16: k");
-    moe_combine_f16_kernel<<<(unsigned) rows, kCombF16Threads, 0, (cudaStream_t) stream>>>(out, w, k, y);
+    moe_combine_f16_kernel<<<(unsigned) rows, kCombF16Threads, 0, (cudaStream_t) stream>>>(out, w, k, y, ids);
     check("moe_combine_f16");
+}
+
+namespace {
+__global__ void add_rows_kernel(const float4* __restrict__ x, float4* __restrict__ y, int64_t n4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 a = x[i], b = y[i];
+        y[i] = make_float4(b.x + a.x, b.y + a.y, b.z + a.z, b.w + a.w);
+    }
+}
+}  // namespace
+
+void add_rows(const float* x, float* y, int rows, void* stream) {
+    if (rows <= 0) return;
+    static_assert(kWidth % 4 == 0, "rows are whole float4s");
+    const int64_t n4 = (int64_t) rows * kWidth / 4;
+    add_rows_kernel<<<(unsigned) std::min<int64_t>((n4 + 255) / 256, 4096), 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const float4*>(x), reinterpret_cast<float4*>(y), n4);
+    check("add_rows");
+}
+
+namespace {
+constexpr int kPlanRows = 1024;   // one block scans a thousand rows a step
+
+// The rows with a choice on the second card (slot_map[expert] < 0), in row order.
+__global__ void __launch_bounds__(kPlanRows) peer_rows_plan_kernel(const int32_t* __restrict__ ids, int rows, int k,
+                                                                   const int32_t* __restrict__ slot_map,
+                                                                   int32_t* __restrict__ row_ix, int32_t* __restrict__ count) {
+    __shared__ int wsum[kPlanRows / 32];
+    __shared__ int carry;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    if (tid == 0) carry = 0;
+    __syncthreads();
+    for (int base = 0; base < rows; base += kPlanRows) {
+        const int r = base + tid;
+        int f = 0;
+        if (r < rows)
+            for (int s = 0; s < k; ++s) f |= slot_map[ids[(size_t) r * k + s]] < 0;
+        const unsigned b = __ballot_sync(0xffffffffu, f);
+        if (lane == 0) wsum[w] = __popc(b);
+        __syncthreads();
+        int off = 0, all = 0;
+        for (int i = 0; i < kPlanRows / 32; ++i) {
+            off += i < w ? wsum[i] : 0;
+            all += wsum[i];
+        }
+        if (f) row_ix[carry + off + __popc(b & ((1u << lane) - 1u))] = r;
+        __syncthreads();
+        if (tid == 0) carry += all;
+        __syncthreads();
+    }
+    if (tid == 0) *count = carry;
+}
+
+// Compact row c of the rows, choices and weights is row row_ix[c] of them.
+__global__ void peer_rows_gather_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, const float* __restrict__ w,
+                                        int k, const int32_t* __restrict__ row_ix, float* __restrict__ x_c,
+                                        int32_t* __restrict__ ids_c, float* __restrict__ w_c) {
+    const int c = blockIdx.x, r = row_ix[c];
+    for (int i = threadIdx.x; i < kWidth; i += blockDim.x) x_c[(size_t) c * kWidth + i] = x[(size_t) r * kWidth + i];
+    if (threadIdx.x < k) {
+        ids_c[(size_t) c * k + threadIdx.x] = ids[(size_t) r * k + threadIdx.x];
+        w_c[(size_t) c * k + threadIdx.x] = w[(size_t) r * k + threadIdx.x];
+    }
+}
+
+__global__ void peer_rows_add_kernel(const float* __restrict__ part, const int32_t* __restrict__ row_ix, float* __restrict__ y) {
+    const int c = blockIdx.x, r = row_ix[c];
+    for (int i = threadIdx.x; i < kWidth; i += blockDim.x) y[(size_t) r * kWidth + i] += part[(size_t) c * kWidth + i];
+}
+}  // namespace
+
+void peer_rows_plan(const int32_t* ids, int rows, int k, const int32_t* slot_map, int32_t* row_ix, int32_t* count, void* stream) {
+    peer_rows_plan_kernel<<<1, kPlanRows, 0, (cudaStream_t) stream>>>(ids, rows, k, slot_map, row_ix, count);
+    check("peer_rows_plan");
+}
+
+void peer_rows_gather(const float* x, const int32_t* ids, const float* w, int k, const int32_t* row_ix, int count, float* x_c,
+                      int32_t* ids_c, float* w_c, void* stream) {
+    if (count <= 0) return;
+    peer_rows_gather_kernel<<<(unsigned) count, 256, 0, (cudaStream_t) stream>>>(x, ids, w, k, row_ix, x_c, ids_c, w_c);
+    check("peer_rows_gather");
+}
+
+void peer_rows_add(const float* part, const int32_t* row_ix, int count, float* y, void* stream) {
+    if (count <= 0) return;
+    peer_rows_add_kernel<<<(unsigned) count, 256, 0, (cudaStream_t) stream>>>(part, row_ix, y);
+    check("peer_rows_add");
 }
 
 }  // namespace basalt::models::inkling2
