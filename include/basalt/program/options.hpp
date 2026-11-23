@@ -112,6 +112,7 @@ struct CommonOptions {
     std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
     bool diag_batch_check = false;         ///< --diag-batch-check: the batch conformance check over --batch N sessions (model/batch_check.hpp)
     bool diag_gpu_check = false;           ///< --diag-gpu-check: the several-GPUs conformance check over --tokens-file (model/gpu_check.hpp)
+    bool diag_gpu_same = false;            ///< --diag-gpu-same: gpu-mode split with both stages on one GPU (split_same), the split's bitwise reference
     std::string diag_gpu_trace;            ///< --diag-gpu-trace FILE: the check writes its logits and picks there
     std::string diag_gpu_ref;              ///< --diag-gpu-ref FILE: the check compares its run with that trace
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
