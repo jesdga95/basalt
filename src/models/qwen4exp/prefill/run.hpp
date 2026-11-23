@@ -2,6 +2,7 @@
 
 #include "state.hpp"
 #include "layout.hpp"
+#include "stream_copy.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
@@ -131,7 +132,6 @@ struct Prefill::Run::Chunk {
     PeerPrefill* const ppc =
         m.pp && m.peer_share && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
     const bool peer_fp4 = ppc && stream_all && ppc->T_fp4 > 0;
-    struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; };
     std::vector<StreamEntry> seq;
     std::vector<size_t> seq_start;
     size_t consumed = 0;

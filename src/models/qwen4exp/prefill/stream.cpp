@@ -91,8 +91,7 @@ bool Prefill::Run::Chunk::start_stream() {
     if (threaded_issue) {
         issuer = std::thread([this] {
             const core::OnDevice od(m.device);
-            int32_t layer = -1;
-            const uint32_t* counts = nullptr;
+            PinnedCopyDecision pinned_copy;
             for (size_t idx = 0; idx < seq.size(); ++idx) {
                 while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                     if (a_stop.load(std::memory_order_acquire)) return;
@@ -108,19 +107,13 @@ bool Prefill::Run::Chunk::start_stream() {
                 const StreamEntry& en = seq[idx];
                 const int sl = (int) (idx % (size_t) m.ring);
                 const auto th = Clock::now();
-                const bool can_skip_copy = route_snapshot.counts && en.job < 0 && en.pdev == nullptr;
-                if (can_skip_copy) {
-                    if (layer != en.l) { layer = en.l; counts = nullptr; }
-                    // This copy already depends on the slot's previous consumer. Wait here only when
-                    // the completed routing counts could make the copy unnecessary.
-                    if (!counts && m.stage_live[sl])
-                        cudaEventSynchronize(m.used[m.used_of[sl]]);
-                    if (!counts &&
-                        layer <= route_snapshot.recorded.load(std::memory_order_acquire) &&
-                        cudaEventQuery(route_snapshot.ready[(size_t) layer]) == cudaSuccess)
-                        counts = route_snapshot.counts + (size_t) layer * g.n_expert;
-                }
-                const bool skip = can_skip_copy && counts && counts[(size_t) en.e] == 0;
+                const bool skip = pinned_copy.skip(en, route_snapshot.counts != nullptr, m.stage_live[sl],
+                    [&] { cudaEventSynchronize(m.used[m.used_of[sl]]); },
+                    [&] { return route_snapshot.recorded.load(std::memory_order_acquire); },
+                    [&](int32_t layer) -> const uint32_t* {
+                        if (cudaEventQuery(route_snapshot.ready[(size_t) layer]) != cudaSuccess) return nullptr;
+                        return route_snapshot.counts + (size_t) layer * g.n_expert;
+                    });
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (!skip) {
