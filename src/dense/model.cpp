@@ -68,7 +68,7 @@ size_t block_scratch_floats(const Geometry& g, const BlockDrafter& bd) {
     if (!bd.present) return 0;
     const size_t W = kBatch, AQ = (size_t) bd.n_head * bd.head_dim, KV = (size_t) bd.n_kv * bd.head_dim;
     return W * (3 * AQ + 2 * KV + bd.layers[0].conv_a.rows + g.n_embd + kernels::kLogprobStride + bd.rank + 3) +
-           kernels::gqa_decode_scratch_floats(bd.window + 256, kWindow, bd.n_head, bd.head_dim) + 64 * 64;
+           kernels::gqa_decode_scratch_floats(bd.window + 256, kBatch, bd.n_head, bd.head_dim) + 64 * 64;
 }
 
 int64_t widest_input(const Geometry& g) {
@@ -128,9 +128,9 @@ void wgemm_need(const Geometry& g, size_t& partial, size_t& tickets) {
 size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context) {
     const size_t W = kBatch, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim;
     size_t f = 4 * W * H + W * g.value_width() + W * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) + 3 * W * g.n_ff;
-    if (g.attn_layers() > 0) f += kernels::gqa_decode_scratch_floats(max_context, kWindow, g.n_head);
+    if (g.attn_layers() > 0) f += kernels::gqa_decode_scratch_floats(max_context, kBatch, g.n_head);
     f += W * (2 * (size_t) g.conv_channels() + 2 * (size_t) g.gdn_v_heads) + (sizeof(BatchTable) + 3) / 4;
-    f += W * 2 * H + kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
+    f += W * 2 * H + kernels::row_logprobs_scratch_floats(kBatch, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
     f += block_scratch_floats(g, bd);
     size_t wp, wt;
     wgemm_need(g, wp, wt);
@@ -588,11 +588,11 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     b.g = a.take<float>(W * g.n_ff);
     b.u = a.take<float>(W * g.n_ff);
     b.h = a.take<float>(W * g.n_ff);
-    if (g.attn_layers() > 0) b.attn = a.take<float>(kernels::gqa_decode_scratch_floats(o.max_context, kWindow, g.n_head));
+    if (g.attn_layers() > 0) b.attn = a.take<float>(kernels::gqa_decode_scratch_floats(o.max_context, kBatch, g.n_head));
     b.tok = a.take<int32_t>(W);
     b.pos = a.take<int32_t>(W * 3);
     b.cat = a.take<float>(W * 2 * H);
-    b.lp_scratch = a.take<float>(kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab));
+    b.lp_scratch = a.take<float>(kernels::row_logprobs_scratch_floats(kBatch, g.n_vocab));
     if (o.drafter == Drafter::Block) {
         const BlockDrafter& bd = w.dflash;
         const size_t AQd = (size_t) bd.n_head * bd.head_dim, KVd = (size_t) bd.n_kv * bd.head_dim;
@@ -606,7 +606,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         b.blp = a.take<float>(W * kernels::kLogprobStride);
         b.bsel = a.take<float>(W * bd.rank);
         b.bpos = a.take<int32_t>(W * 3);
-        b.battn = a.take<float>(kernels::gqa_decode_scratch_floats(bd.window + 256, kWindow, bd.n_head, bd.head_dim));
+        b.battn = a.take<float>(kernels::gqa_decode_scratch_floats(bd.window + 256, kBatch, bd.n_head, bd.head_dim));
     }
     b.y = a.take<float>(W * g.value_width());
     b.hl = a.take<float>(W * (size_t) g.n_vocab);
