@@ -209,7 +209,8 @@ Flow Request::restore() {
             // a STOP during the wait ends the request here, before anything moves for it: the conversation it
             // would continue goes back to the cache - or, over the whole RAM budget and refused there, a named
             // line says it is gone - and the live one stays as it is (a batch slot's request ends in its prompt
-            // read, which hands the slot back)
+            // read, which hands the slot back).  An oversized conversation kept in VRAM is the park site's rule:
+            // here nothing of it can be kept, so a refusal costs the parked copy rather than the live slot's state.
             if ((runtime_.stop_req.load() || runtime_.stdin_lost.load()) && !in_slot && runtime_.admit_slot < 0) {
                 // the conversation was taken out of a batch slot: with the pin on, that slot's parked copy is
                 // replaced by this one instead of joining the queue behind it

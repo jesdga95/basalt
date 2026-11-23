@@ -349,8 +349,8 @@ public:
     size_t slot_bytes() const { return slot_bytes_; }
     size_t evictions() const { return evictions_; }
     /// --conversation-cache-slot-pin: the idle slots' parked conversations join the budgeted ones against BOTH
-    /// caps (count and bytes), and eviction takes the longest parked conversation of either kind.  Off (the
-    /// default) keeps the split of f63e3e21: the idle kind outside the byte budget, capped by its caller's count.
+    /// caps (count and bytes), and eviction takes the oldest parked conversation of either kind.  Off (the
+    /// default) keeps the kinds separate: the idle kind outside the byte budget, capped by its caller's count.
     void set_slot_pin(bool on) { slot_pin_ = on; }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.

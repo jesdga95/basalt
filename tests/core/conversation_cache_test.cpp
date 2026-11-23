@@ -334,7 +334,7 @@ int main() {
                   cache.best(a, {}, true).tokens == 0 && cache.best(b, {}, true).tokens == 3,
               "pin on: the byte cap evicts the oldest parked of either kind, not by the caller's count");
     }
-    {   // pin off, set by name: the f63e3e21 split stays reachable - byte pressure leaves the idle kind alone
+    {   // pin off, set by name: the two parked kinds stay separate - byte pressure leaves the idle kind alone
         const size_t one = image({1, 2, 3}).bytes();
         ConversationCache cache(one * 2, 8);
         cache.set_slot_pin(false);
@@ -412,7 +412,7 @@ int main() {
                   cache.best(b, {}, true).tokens == 3 && cache.bytes() <= one * 8,
               "pin on: the byte charge evicted exactly the oldest - the K/V was dropped once, above the loop");
     }
-    {   // toggled off on a live cache holding charged bytes: the f63e3e21 split returns, no rebuild needed
+    {   // toggled off on a live cache holding charged bytes: the separate kinds return, no rebuild needed
         const size_t one = image({1, 2, 3}).bytes();
         ConversationCache cache(one * 3, 8);
         cache.set_slot_pin(true);

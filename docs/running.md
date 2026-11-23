@@ -28,7 +28,19 @@ session and its parallel subagents (Claude Code's `x-claude-code-session-id`, Op
 name the parent session), and each conversation keeps the slot its K/V is in. A request that continues none of the session's own slots
 takes an unowned one first; with every slot owned, the session's own least recently used one comes before another session's.
 
-### Prompts beside decoding slots
+`conversation-cache-slot-identity` (the `engine` section; a setting of the whole server, which no model entry may set) names the
+headers to read first: the ones it lists are read first, in the order it lists them, then the order above as it stands - read
+case-insensitively and each only once. The knob orders the read and filters nothing: every header stays in play, so a request
+naming only one of them is keyed by it either way. Unset, the order is exactly the one above.
+
+`conversation-cache-slot-pin` (the `engine` section, default off; the whole server reads it once, and with it true the server
+also hands the engine its own `--conversation-cache-slot-pin` word) keeps a session to one slot: a session that owns a slot uses
+that slot when it is free, and while it is busy its request waits for the K/V sitting there - it never takes a second one, so a
+conversation cannot drift between slots. The several-slots behaviour above is then off too: one session id naming several parallel
+conversations serializes them into the slot it first took - the trade this setting opts into, no drift for one conversation, less
+room for parallel agents. With it on and a budgeted cache, a copy parked from a batch slot belongs to that slot too: the slot's next
+turn takes its own copy's place instead of adding another (the newest wins), so the parked queue holds each slot's newest conversation
+and still leaves oldest first. With the setting false or absent, everything above is unchanged.
 
 A prompt of up to 16,384 tokens is read at once, and the slots wait a few seconds. A longer one is read beside them, on its own thread,
 while the slots keep decoding. A short request that arrives meanwhile goes first at the end of the current chunk.
@@ -119,6 +131,13 @@ Off at 0. With a budget, conversations of at least 8,192 tokens are written to `
 RAM, a session, or at exit. Only the system prompt's and the last three turns' states are stored. Files are bound to the model and settings
 they were made with, and checked by hash; a bad file is deleted. The folder is capped by the budget (least recently used first), and a
 write always leaves 4 GiB of the volume free. After a restart, a prompt that starts with a stored conversation reads it back.
+
+`conversation-cache-disk-fifo` (the `engine` section or a model entry, default off; the engine's own `--conversation-cache-disk-fifo`
+word, which the server hands it only when the setting is true) makes that budget drop the conversation it wrote FIRST instead of the
+least recently used one: the copy a harness parked a while ago leaves first and one spilled a moment ago survives, since a copy written
+again a turn on is the newest again. After a restart the order among the files it finds is their write time - a filesystem second, so
+conversations written in the same second go in their file-name order. With the setting false or absent, the budget evicts least recently
+used, exactly as before.
 
 ## Sleep: `--idle-sleep`
 
