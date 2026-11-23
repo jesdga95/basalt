@@ -137,7 +137,7 @@ target_link_libraries(artifact INTERFACE platform warnings)
 # `model` is the registry and the adapter interface (shared code may use it). Each model is its own library under
 # src/models/<arch>/; `models` is the composition root that registers them. tools/check_model_layering.sh keeps
 # shared code from including src/models and models from including each other.
-add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp)
+add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
@@ -1508,7 +1508,7 @@ target_link_libraries(ppl_gate_test PRIVATE engine_session warnings)
 basalt_embed_manifest(ppl_gate_test)
 basalt_cpu_test(NAME ppl_gate_test COMMAND ppl_gate_test)
 set_tests_properties(ppl_gate_test PROPERTIES TIMEOUT 60)
-add_executable(multi_gpu_test tests/model/multi_gpu_test.cpp src/model/multi_gpu.cpp)
+add_executable(multi_gpu_test tests/model/multi_gpu_test.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp)
 target_include_directories(multi_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(multi_gpu_test PRIVATE warnings)
 basalt_cpu_test(NAME multi_gpu_test COMMAND multi_gpu_test)
