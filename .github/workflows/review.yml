@@ -1,6 +1,6 @@
 name: review
 
-# `/review [focus]` in a pull request comment by the owner: a model review of the diff, posted as one comment.
+# `/review [effort=low|medium|high] [model=M] [focus]` in a pull request comment by the owner: a model review of the diff, posted as one comment.
 # The diff is read through the API as data; nothing from the pull request is checked out or run.
 on:
   issue_comment:
@@ -71,6 +71,8 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ vars.LLM_BASE_URL || secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_REVIEW_MODELS: ${{ vars.LLM_REVIEW_MODELS }}
+          LLM_REVIEW_EFFORT: ${{ vars.LLM_REVIEW_EFFORT }}
         run: |
           set -euo pipefail
           if [ "${diff_failed:-}" = true ]; then
