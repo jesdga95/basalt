@@ -472,7 +472,7 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
   #log > div { grid-template-columns: 62px minmax(0, 1fr); }
   #log u { display: none; }
   #log { font-size: 12px; }
-  .tot { display: none; }
+  .tot, #tot-btn { display: none; }
   .key { flex-wrap: wrap; white-space: normal; }
 }
 
@@ -480,17 +480,20 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .rw .p.nm .api.hot { color: var(--accent); }
 
 /* pricing dialog */
-.pdlg { background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; padding: 24px; max-width: 360px; width: 90vw; }
-.pdlg::backdrop { background: rgba(0,0,0,.5); }
-.pdlg h3 { margin: 0 0 16px; font-size: 15px; }
+.pdlg { background: var(--surface); color: var(--fg); border: 1px solid var(--raised); border-radius: 12px; padding: 24px; max-width: 360px; width: 90vw; box-shadow: 0 16px 40px rgba(0, 0, 0, .5); }
+.pdlg::backdrop { background: rgba(0, 0, 0, .55); }
+.pdlg h3 { margin: 0 0 16px; font: 500 15px/1 var(--font-sans); }
 .pf { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.pf label { flex: 0 0 110px; font-size: 12px; color: var(--fg-3); }
-.pf input { flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--fg); padding: 6px 10px; font: 14px var(--font); }
-.pf input:focus { outline: none; border-color: var(--accent, #58a6ff); }
+.pf label { flex: 0 0 110px; font: 400 12px/1 var(--font-mono); color: var(--fg-3); }
+.pf input { flex: 1; background: var(--bg); border: 1px solid var(--raised); border-radius: 6px; color: var(--fg); padding: 6px 10px; font: 400 14px/1.5 var(--font-mono); }
+.pf input:focus { outline: none; border-color: var(--accent); }
+.pf input::placeholder { color: var(--fg-3); }
 .pa { display: flex; gap: 8px; margin-top: 16px; }
-.pb { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: 13px var(--font); cursor: pointer; }
-.pb:hover { border-color: var(--accent, #58a6ff); }
-.pb.pp { background: var(--accent, #1f6feb); border-color: var(--accent, #1f6feb); color: #fff; }
-.pb.pd { color: #f85149; border-color: #f85149; }
-.pm { margin-top: 10px; font-size: 12px; color: #f85149; min-height: 16px; }
-.pm.ok { color: #3fb950; }
+.pb { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--accent-line); background: none; color: var(--fg); font: 500 13px/1 var(--font-sans); cursor: pointer; }
+.pb:hover { filter: brightness(1.1); }
+.pb.pp { background: var(--accent); border-color: var(--accent); color: #1A0D06; }
+.pb.pd { color: var(--err); border-color: var(--err); }
+.pm { margin-top: 10px; font: 400 12px/1 var(--font-mono); color: var(--err); min-height: 16px; }
+.pm.ok { color: var(--ok); }
+.tot-open { flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 2px 6px; border-radius: 4px; font: 400 12px/1 var(--font-mono); color: var(--fg-3); cursor: pointer; }
+.tot-open:hover { color: var(--fg-2); background: var(--surface); }

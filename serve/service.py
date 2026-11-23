@@ -211,6 +211,10 @@ class Service:
             snap = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
             totals_with_cost(snap, self.cost_input_per_million, self.cost_output_per_million,
                              self.cost_cache_write_per_million, self.cost_cache_hit_per_million)
+            # Save the raw cache rates, not the resolved ones: a None rate stays null in the
+            # file so it does not override "same as input" on reload.
+            snap["cost_cache_write_per_million"] = self.cost_cache_write_per_million
+            snap["cost_cache_hit_per_million"] = self.cost_cache_hit_per_million
             totals_write_file(self.totals_path, snap)
         except OSError as e:
             if not self._totals_broken:

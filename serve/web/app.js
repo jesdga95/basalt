@@ -110,12 +110,13 @@ function drawTotals(t) {
   const cost = n && num(n.cost_usd) && n.cost_usd > 0 ? `<b>${usd(n.cost_usd)}</b> · ` : "";
   html($("#totals"), n ? `${cost}<b>${fmt(n.requests)}</b> requests · <b>${big(n.prompt)}</b> prompt · <b>${big(n.written)}</b> output` : "");
   const tip = n ? `Since ${new Date((n.since || 0) * 1000).toLocaleDateString()}: ${fmt(n.prompt)} prompt tokens (${fmt(n.reused)} reused), ${dur(n.prompt_ms)} reading, ${dur(n.decode_ms)} generating` : "";
-  const pricing = n && (n.cost_input_per_million || n.cost_output_per_million) ? `\nPricing: $${n.cost_input_per_million}/M in · $${n.cost_output_per_million}/M out` +
-    (n.cost_cache_write_per_million !== n.cost_input_per_million || n.cost_cache_hit_per_million !== n.cost_input_per_million ?
-      ` · $${n.cost_cache_write_per_million}/M write · $${n.cost_cache_hit_per_million}/M hit` : "") : "";
+  const ci = n ? (n.cost_input_per_million || 0) : 0;
+  const pricing = n && (ci || n.cost_output_per_million) ? `\nPricing: $${ci}/M in · $${n.cost_output_per_million}/M out` +
+    ((n.cost_cache_write_per_million != null && n.cost_cache_write_per_million !== ci) || (n.cost_cache_hit_per_million != null && n.cost_cache_hit_per_million !== ci) ?
+      ` · $${n.cost_cache_write_per_million ?? ci}/M write · $${n.cost_cache_hit_per_million ?? ci}/M hit` : "") : "";
   $("#totals").title = tip + pricing;
-  $("#totals").style.cursor = "pointer";
-  $("#totals").onclick = () => openPricing(n);
+  html($("#tot-btn"), `<span class="tot-open" title="Pricing and totals">Edit</span>`);
+  $("#tot-btn").onclick = () => openPricing(n);
 }
 
 /* ---- the heat scale: 0..400 tok/s and up; only the colour of the live decode number uses it ---- */
@@ -913,12 +914,12 @@ function openPricing(t) {
   let d = $("#pricing-dlg");
   if (!d) {
     d = document.createElement("dialog"); d.id = "pricing-dlg"; d.className = "pdlg";
-    d.innerHTML = `<form method="dialog"><h3>Pricing &amp; Totals</h3>
+    d.innerHTML = `<form method="dialog"><h3>Pricing and totals</h3>
 <div class="pf"><label>Input $/M</label><input id="p-in" type="number" step="0.01" min="0"></div>
 <div class="pf"><label>Output $/M</label><input id="p-out" type="number" step="0.01" min="0"></div>
-<div class="pf"><label>Cache Write $/M</label><input id="p-cw" type="number" step="0.01" min="0" placeholder="same as input"></div>
-<div class="pf"><label>Cache Hit $/M</label><input id="p-ch" type="number" step="0.01" min="0" placeholder="same as input"></div>
-<div class="pa"><button type="button" class="pb pp" id="p-save">Save</button><button type="button" class="pb pd" id="p-reset">Reset Totals</button><button type="button" class="pb" id="p-close">Close</button></div>
+<div class="pf"><label>Cache write $/M</label><input id="p-cw" type="number" step="0.01" min="0" placeholder="same as input"></div>
+<div class="pf"><label>Cache hit $/M</label><input id="p-ch" type="number" step="0.01" min="0" placeholder="same as input"></div>
+<div class="pa"><button type="button" class="pb pp" id="p-save">Save</button><button type="button" class="pb pd" id="p-reset">Reset totals</button><button type="button" class="pb" id="p-close">Close</button></div>
 <div class="pm" id="p-msg"></div></form>`;
     document.body.append(d);
     $("#p-save").onclick = savePricing;
