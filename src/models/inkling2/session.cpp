@@ -410,6 +410,7 @@ protected:
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         if (!admit(err)) return false;
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
+        if (!drop_stale_read_ahead(err)) return false;
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
@@ -537,23 +538,23 @@ public:
     // SLEEP / WAKE: the card's copies of the RAM experts go back to RAM (decode reads them there) and return at the wake; the
     // driver moves the rest. A model that kept every expert on the card has nothing to lend: ok, no slots, SLEEP goes on.
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
-        if (!m_.elastic()) return {};
+        if (!m_.copies()) return {};
         cudaStreamSynchronize(stream_);
         const int64_t before = m_.promoted();
-        m_.lend(low, stream_);
+        if (!m_.lend(low, stream_)) return {model::Status::Error, "inkling2: the expert copies could not go back to RAM"};
         basalt::log::info("basalt inkling2", low ? "sleep: %lld expert copies go back to RAM (decode reads them there)" : "wake: %lld expert copies return to the card",
                           (long long) (low ? before : m_.promoted()));
         expert_slots = expert_pairs() - m_.spill().spilled + m_.promoted();
         return {};
     }
 
-    // VRAM: the copies resize to leave `mib` free (< 0: the start's --vram-reserve-mib). A static spill or none has no
-    // copies to resize: refused unless the card already leaves that much.
+    // VRAM: the copies resize to leave `mib` free (< 0: the start's --vram-reserve-mib). A card that holds every expert has
+    // no copies to resize: refused unless it already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
         cudaStreamSynchronize(stream_);
         const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20, stream_);
-        expert_slots = m_.elastic() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
-        if (!fits) return {model::Status::Error, "inkling2: the card cannot leave " + std::to_string(mib) + " MiB free: the experts it holds are not copies"};
+        expert_slots = m_.copies() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
+        if (!fits) return {model::Status::Error, "inkling2: the card cannot leave " + std::to_string(mib) + " MiB free: the experts it holds are not copies, or the copies could not go back"};
         return {};
     }
 
@@ -589,19 +590,47 @@ public:
     // even without any copy there is no room.
     static constexpr int64_t kElasticKvStep = 8192;
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
+    static constexpr uint64_t kGraphRoom = 256ull << 20;     // copies that go back when a window's graph finds no memory
+
+    // The decode read-ahead's saved expert addresses (rec_blobs_, written by the window before) are dropped once copies
+    // have gone back to RAM since: their memory may be unmapped. The epoch counts as seen once the drop is queued.
+    bool drop_stale_read_ahead(std::string& err) {
+        const uint64_t epoch = m_.placement_epoch();
+        if (seen_epoch_ == epoch) return true;
+        if (cudaMemsetAsync(rec_n_, 0, (size_t) g_.visits.size() * 4, stream_) != cudaSuccess) {
+            err = "inkling2: the read-ahead records could not be dropped";
+            return false;
+        }
+        seen_epoch_ = epoch;
+        return true;
+    }
     bool ensure_positions(int64_t positions, std::string& err) {
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
-        const uint64_t grow = (uint64_t) elastic_.size() * (bytes - std::min<uint64_t>(bytes, elastic_[0]->backed())) + (64ull << 20);
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        uint64_t grow = 0;   // what every array newly backs, its rounding included
+        for (const auto& a : elastic_) grow += a->to_back(bytes);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
-        if (free_b < grow + keep_free) {
-            const uint64_t freed = m_.demote(grow + keep_free - free_b, stream_);
+        // the copies go back until the grow leaves the reserve free (the caches take the reserve itself only once no copy
+        // is left: the reserve is the copies' target, not a floor the caches stop at)
+        uint64_t freed = 0;
+        for (size_t free_b = 0, total_b = 0; m_.promoted() > 0;) {
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+                err = "the caches cannot grow: the card's free memory is unknown";
+                return false;
+            }
+            if (free_b >= grow + keep_free) break;
+            uint64_t f = 0;
+            if (!m_.demote(grow + keep_free - free_b, stream_, f)) {
+                err = "the caches cannot grow: the expert copies could not go back to RAM";
+                return false;
+            }
+            if (f == 0) break;
+            freed += f;
+        }
+        if (freed > 0)
             basalt::log::info("basalt inkling2", "elastic spill: the caches grow to %lld positions; %.2f GiB of expert copies go back to RAM "
                               "(%lld stay on the card)", (long long) target, (double) freed / (double) (1ull << 30), (long long) m_.promoted());
-        }
         for (auto& a : elastic_)
             if (!a->ensure(bytes, 0, err)) {
                 err = "the caches cannot grow to " + std::to_string(target) + " positions: " + err;
@@ -1100,6 +1129,7 @@ private:
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
     // window (its first runs direct, outside a capture).
     bool layers(int rows, int head, int64_t full_keys, std::string& err) {
+        if (!drop_stale_read_ahead(err)) return false;
         const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
         if (it != graphs_.end()) return it->second.launch(stream_, err);
@@ -1118,7 +1148,26 @@ private:
             cudaGetLastError();
             throw;
         }
-        if (!g.end(stream_, err)) return false;
+        if (!g.end(stream_, err)) {
+            // the graph's own device memory can be what the card is short of when the experts' copies fill it to its spare:
+            // some copies go back to RAM first, then the window runs direct at the placement that leaves (its CPU layers
+            // again), and a later window of the shape captures again. Any other failure fails the window.
+            if (g.status() != cudaErrorMemoryAllocation || m_.promoted() == 0) return false;
+            (void) cudaGetLastError();
+            uint64_t freed = 0;
+            if (!m_.demote(kGraphRoom, stream_, freed) || freed == 0) {
+                err = "a window's graph found no device memory and no expert copies could go back to RAM";
+                return false;
+            }
+            basalt::log::warn("basalt inkling2", "a window's graph found no device memory; %.0f MiB of expert copies go back to RAM (%lld "
+                              "stay on the card)", (double) freed / (double) (1ull << 20), (long long) m_.promoted());
+            err.clear();
+            if (!drop_stale_read_ahead(err)) return false;
+            cpu_ = cpu_layers();
+            direct_.insert(Shape{cpu_, key.second});
+            body(rows, head, full_keys);
+            return true;
+        }
         return graphs_.emplace(key, std::move(g)).first->second.launch(stream_, err);
     }
 
@@ -1385,6 +1434,7 @@ private:
     uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups
     unsigned long long* rec_blobs_ = nullptr;   // [visit][kAheadExperts] the experts each visit took in the last window
     int32_t* rec_n_ = nullptr;                  // [visit] how many
+    uint64_t seen_epoch_ = 0;                   // the model's placement epoch rec_blobs_ was written in
     cudaStream_t ra_st_ = nullptr;              // the side stream (the read-ahead, the guesses), its fork and join events
     cudaEvent_t ra_ev_ = nullptr, ra_join_ = nullptr, gs_ev_ = nullptr;   // gs_ev_: a guess is in
     cudaStream_t pf_st_ = nullptr;              // the guesses' prefetch stream, its fork and join events

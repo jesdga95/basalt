@@ -61,6 +61,31 @@ int main() {
     // more than the experts can give
     SpillPlan q;
     expect(!plan_spill(L, E, stride, gran, rank, p.full + 1, -1, q, err) && !err.empty(), "an impossible need fails");
+    // the copies' layout: mixed strides, copies sharing a granule, copies over several, reclaim by whole granules
+    {
+        const uint64_t G = 2u << 20;
+        const std::vector<uint64_t> st = {4479120, 4479120, 8957952, 4479120, 8957952, 4479120};
+        const CopyLayout c = copy_layout(st, G);
+        bool ok = c.at.size() == st.size() && c.at[0] == 0;
+        for (size_t k = 0; k < st.size(); ++k) {
+            ok = ok && c.at[k] % 256 == 0 && c.end[k] == c.at[k] + st[k];
+            if (k > 0) ok = ok && c.at[k] >= c.end[k - 1] && c.at[k] - c.end[k - 1] < 256;
+        }
+        expect(ok, "copy layout: back to back, 256-byte aligned, no overlap");
+        expect(c.pages(0) == 0 && c.pages(1) == 3 && c.bytes() == c.pages((int64_t) st.size()) * G, "copy layout: pages");
+        const int64_t n = (int64_t) st.size();
+        const uint64_t mapped = c.pages(n);
+        expect(c.keep_for(n, mapped, 0) == n, "reclaim nothing: every copy stays");
+        expect(c.keep_for(n, mapped, ~0ull) == 0, "reclaim more than all: every copy goes");
+        for (uint64_t want = 1; want <= mapped * G; want += G / 3) {
+            const int64_t m = c.keep_for(n, mapped, want);
+            const uint64_t freed = (mapped - c.pages(m)) * G;
+            // enough is freed, and keeping one more copy would not have freed enough
+            expect(freed >= want && (m == n || (mapped - c.pages(m + 1)) * G < want), "reclaim: the fewest copies dropped");
+        }
+        // copies 0 and 1 share granule 2: dropping copy 1 alone frees granules 3..4, not granule 2
+        expect(c.pages(1) == 3 && c.pages(2) == 5, "a shared granule stays while a copy uses it");
+    }
     if (failures) return 1;
     std::printf("spill plan: ok\n");
     return 0;

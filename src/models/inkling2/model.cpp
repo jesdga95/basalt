@@ -10,6 +10,7 @@
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/kernels/window_gemm.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/q8_gemm.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
@@ -40,6 +41,9 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 constexpr uint64_t kSharedFixed = 768 * kMiB;
 constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
+// with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
+// kept free beside the reserve until that much has loaded
+constexpr uint64_t kLateRoom = 256 * kMiB;
 // The multi-GPU price of a decode window (multi_gpu_plan.hpp): what one moves at the kernels' rate (3.57 ms a token on an
 // RTX 5090), what the experts no card holds add when the CPU computes them all, how the hottest share x of the experts
 // serves x^kHitExponent of the lookups, and one hand-off of a window's rows from card to card through page-locked RAM
@@ -98,8 +102,8 @@ InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
     for (void* p : dev_) cudaFree(p);
-    for (void* p : copy_)
-        if (p) cudaFree(p);
+    for (size_t g = 0; g < copy_maps_.size(); ++g) core::vmm::unmap(copies_va_ + g * copy_lay_.gran, copy_lay_.gran, copy_maps_[g]);
+    if (copies_va_) core::vmm::release_range(copies_va_, copy_lay_.bytes());
     for (const Range& r : ranges_) {
         if (r.handle) core::vmm::unmap(r.va, r.own, r.handle);
         core::vmm::unmap_only(r.va + r.own, r.bytes - r.own);
@@ -168,6 +172,13 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     const std::string& path = req.paths.front();
     if (!open_pack(path, pack_, err)) return {model::Status::Error, "inkling2: " + err};
     flags_ = req;
+    if (req.vram_reserve_mib > 0) {
+        const int floor = platform::gpu_memory_pages() ? 256 : 128;   // less makes the driver page GPU memory
+        if (req.vram_reserve_mib < floor)
+            return {model::Status::Error, "inkling2: --vram-reserve-mib " + std::to_string(req.vram_reserve_mib) + " is below " +
+                                              std::to_string(floor) + " MiB"};
+        spare_ = (uint64_t) req.vram_reserve_mib * kMiB;
+    }
     cudaGetDevice(&device_);
     ldev_ = device_;
     fp8_ = req.kv == "fp8";
@@ -700,43 +711,96 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
         if (model::Result r = dspark_->finish(head_, embd_dev_, embed_norm_, nullptr); !r.ok()) return r;
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
-    if (elastic_) {   // the caches back only their base yet: the RAM experts come back while the card has room
+    if (copies()) {   // the sessions' buffers are in place (an elastic spill's caches back only their base): the RAM experts
+                      // come back while the card has room beyond its spare
+        size_t was_b = 0, free_b = 0, total_b = 0;
+        cudaMemGetInfo(&was_b, &total_b);
+        used0_ = (uint64_t) (total_b - was_b);
         const uint64_t moved = promote(held_free(kCardSpare));
-        basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB); they go back "
-                          "to RAM, the least routed first, as a conversation's caches grow",
-                          (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB);
+        cudaMemGetInfo(&free_b, &total_b);
+        if (elastic_)
+            basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB), %.0f -> %.0f MiB "
+                              "free; they go back to RAM, the least routed first, as a conversation's caches grow",
+                              (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB, (double) was_b / (double) kMiB,
+                              (double) free_b / (double) kMiB);
+        else
+            basalt::log::info("basalt inkling2", "static spill: %lld of %lld RAM experts copied back to the card (%.2f GiB), %.0f -> %.0f MiB free",
+                              (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB, (double) was_b / (double) kMiB,
+                              (double) free_b / (double) kMiB);
     }
     return {};
+}
+
+bool InklingModel::copy_range() {
+    if (copies_va_) return true;
+    const uint64_t gran = core::vmm::granularity();
+    if (spill_order_.empty() || !gran) return false;
+    std::vector<uint64_t> strides;
+    for (const auto& [l, e] : spill_order_) strides.push_back(layers_[(size_t) l].expert_stride);
+    copy_lay_ = copy_layout(strides, gran);
+    copies_va_ = core::vmm::reserve(copy_lay_.bytes());
+    return copies_va_ != nullptr;
+}
+
+// The granules past the last copy go back to the driver. One that could not be unmapped (or whose handle could not be
+// released) leaves the range in an unknown state: it stays tracked for the end, and nothing is copied into the range again.
+bool InklingModel::trim_copies() {
+    const uint64_t gran = copy_lay_.gran, keep = copy_lay_.pages(n_copy_);
+    while (copy_maps_.size() > keep) {
+        if (!core::vmm::unmap(copies_va_ + (copy_maps_.size() - 1) * gran, gran, copy_maps_.back())) {
+            copies_retired_ = true;
+            basalt::log::error("basalt inkling2", "a granule of the expert copies could not be released; no more copies are made");
+            return false;
+        }
+        copy_maps_.pop_back();
+    }
+    return true;
+}
+
+uint64_t InklingModel::late_room() const {
+    if (!spare_ || !used0_) return 0;
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    const uint64_t used = (uint64_t) (total_b - free_b), copies = (uint64_t) copy_maps_.size() * copy_lay_.gran;
+    const uint64_t loaded = used > copies + used0_ ? used - copies - used0_ : 0;
+    return loaded < kLateRoom ? kLateRoom - loaded : 0;
 }
 
 uint64_t InklingModel::promote(uint64_t keep_free) {
     const int ne = geo().n_expert;
     uint64_t moved = 0;
-    for (const auto& [l, e] : spill_order_) {
+    if (copies_retired_ || !copy_range()) return 0;
+    const uint64_t gran = copy_lay_.gran;
+    keep_free += late_room();
+    for (size_t k = (size_t) n_copy_; k < spill_order_.size(); ++k) {
+        const auto [l, e] = spill_order_[k];
         const size_t i = (size_t) l * ne + e;
-        if (copy_[i]) continue;
         const LayerWeights& w = layers_[(size_t) l];
+        const uint64_t mapped = (uint64_t) copy_maps_.size() * gran, end = copy_lay_.end[k];
+        const uint64_t grow = end > mapped ? (end - mapped + gran - 1) / gran * gran : 0;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        if (free_b < keep_free + w.expert_stride) break;
-        void* p = nullptr;
-        if (cudaMalloc(&p, w.expert_stride) != cudaSuccess) {
-            cudaGetLastError();
-            break;
+        if (free_b < keep_free + grow) break;
+        bool mapped_ok = true;
+        for (uint64_t g = 0; g < grow && mapped_ok; g += gran) {
+            const unsigned long long h = core::vmm::map(copies_va_ + mapped + g, gran);
+            if (h) copy_maps_.push_back(h);
+            else mapped_ok = false;
         }
+        if (!mapped_ok) break;
+        uint8_t* p = copies_va_ + copy_lay_.at[k];
         const int keep = ne - w.n_spill;
         const uint8_t* src = w.spill_host + (uint64_t) (spill_.slot[(size_t) l][(size_t) e] - keep) * w.expert_stride;
         const unsigned long long at = (unsigned long long) p;
         if (cudaMemcpy(p, src, w.expert_stride, cudaMemcpyHostToDevice) != cudaSuccess ||
-            cudaMemcpy(w.blob_table + e, &at, 8, cudaMemcpyHostToDevice) != cudaSuccess) {
-            cudaFree(p);
+            cudaMemcpy(w.blob_table + e, &at, 8, cudaMemcpyHostToDevice) != cudaSuccess)
             break;
-        }
         copy_[i] = p;
         ++n_copy_;
         ++layer_copies_[(size_t) l];
         moved += w.expert_stride;
     }
+    trim_copies();   // a step that stopped part-way leaves no granule behind
     return moved;
 }
 
@@ -746,20 +810,26 @@ bool InklingModel::resize_reserve(uint64_t free_bytes, void* stream) {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
     const uint64_t want = held_free(kCardSpare);
-    if (free_b < want) demote(want - free_b, stream);
-    else promote(want);
+    if (free_b < want) {
+        uint64_t freed = 0;
+        if (!demote(want - free_b, stream, freed)) return false;
+    } else {
+        promote(want);
+    }
     cudaMemGetInfo(&free_b, &total_b);
     return free_b >= want;
 }
 
-void InklingModel::lend(bool low, void* stream) {
+bool InklingModel::lend(bool low, void* stream) {
     if (low) {
-        demote(~0ull, stream);
+        uint64_t freed = 0;
+        if (!demote(~0ull, stream, freed)) return false;
         lent_ = true;
     } else {
         lent_ = false;
         promote(held_free(kCardSpare));
     }
+    return true;
 }
 
 const uint8_t* InklingModel::ram_blob(int l, int e) const {
@@ -787,26 +857,38 @@ bool InklingModel::stage_from_card(int l, void* stream) const {
     return true;
 }
 
-uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
+bool InklingModel::demote(uint64_t bytes, void* stream, uint64_t& freed) {
+    freed = 0;
+    if (n_copy_ == 0) return true;
     const int ne = geo().n_expert;
-    std::vector<size_t> out;
-    uint64_t freed = 0;
-    for (auto it = spill_order_.rbegin(); it != spill_order_.rend() && freed < bytes; ++it) {
-        const size_t i = (size_t) it->first * ne + it->second;
-        if (!copy_[i]) continue;
-        cudaMemsetAsync(layers_[(size_t) it->first].blob_table + it->second, 0, 8, (cudaStream_t) stream);
-        out.push_back(i);
-        freed += layers_[(size_t) it->first].expert_stride;
+    // the last copies, the least routed, whose granules make up `bytes` (a granule another copy still uses stays); each one
+    // whose table entry is cleared is the CPU's at once, so a step that fails part-way leaves every copy either on the card
+    // with its entry or in RAM without one
+    const int64_t m = copy_lay_.keep_for(n_copy_, (uint64_t) copy_maps_.size(), bytes);
+    bool ok = true;
+    int64_t dropped = 0;
+    for (int64_t k = n_copy_ - 1; k >= m; --k) {
+        const auto [l, e] = spill_order_[(size_t) k];
+        if (cudaMemsetAsync(layers_[(size_t) l].blob_table + e, 0, 8, (cudaStream_t) stream) != cudaSuccess) {
+            ok = false;
+            break;
+        }
+        copy_[(size_t) l * ne + e] = nullptr;
+        --layer_copies_[(size_t) l];
+        ++dropped;
     }
-    if (out.empty()) return 0;
-    cudaStreamSynchronize((cudaStream_t) stream);
-    for (size_t i : out) {
-        cudaFree(copy_[i]);
-        copy_[i] = nullptr;
-        --n_copy_;
-        --layer_copies_[i / (size_t) ne];
+    n_copy_ -= dropped;
+    if (dropped > 0) ++epoch_;
+    // every reader of the copies is done before their granules go (the blob tables' readers run on this stream)
+    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) ok = false;
+    if (!ok) {
+        basalt::log::error("basalt inkling2", "expert copies could not go back to RAM (%lld went)", (long long) dropped);
+        return false;
     }
-    return freed;
+    const uint64_t mapped = (uint64_t) copy_maps_.size();
+    ok = trim_copies();
+    freed = (mapped - (uint64_t) copy_maps_.size()) * copy_lay_.gran;
+    return ok;
 }
 
 // [vision] ENC runs between requests and windows: once every stream is idle, nothing reads the experts until refill.
@@ -822,8 +904,14 @@ bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
     const uint64_t want = bytes + std::min<uint64_t>(held_free(kCardSpare), std::max<uint64_t>(free_b, kCardSpare));
     if (free_b < want && n_copy_ > 0) {
         const int64_t before = n_copy_;
-        demote(want - free_b, nullptr);
+        uint64_t freed = 0;
+        const bool ok = demote(want - free_b, nullptr, freed);
         lend_copies_ += before - n_copy_;
+        if (!ok) {
+            refill();
+            err = "the expert copies could not go back to RAM for the image encoder";
+            return false;
+        }
         cudaMemGetInfo(&free_b, &total_b);
     }
     for (size_t i = ranges_.size(); i-- > 0 && free_b < want;) {
@@ -866,13 +954,13 @@ void InklingModel::refill() {
     }
     const size_t layers = lent_ranges_.size();
     lent_ranges_.clear();
-    const int64_t copies = n_copy_;
-    if (elastic_ && !lent_) promote(held_free(kCardSpare));
+    const int64_t before = n_copy_;
+    if (copies() && !lent_) promote(held_free(kCardSpare));
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (layers > 0 || lend_copies_ > 0)
         basalt::log::info("basalt inkling2", "image encoder: borrowed %lld expert copies and %zu layers' experts (%.2f GiB) in %.0f ms, "
                           "back in %.0f ms (%lld copies)",
-                          (long long) lend_copies_, layers, (double) back / (double) kGiB, lend_ms_, ms, (long long) (n_copy_ - copies));
+                          (long long) lend_copies_, layers, (double) back / (double) kGiB, lend_ms_, ms, (long long) (n_copy_ - before));
     lend_ms_ = 0;
     lend_copies_ = 0;
 }

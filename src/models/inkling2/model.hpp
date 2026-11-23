@@ -99,23 +99,32 @@ public:
     /// only the positions in use. On with a spill the context made (not --expert-cache) and a context above the elastic
     /// KV's base (core/elastic_kv.hpp).
     bool elastic() const { return elastic_; }
+    /// Whether the RAM experts come back to the card as copies while it has room beyond its spare: any spill the context
+    /// made (not --expert-cache), static or elastic.
+    bool copies() const { return spill_.any() && flags_.expert_cache <= 0; }
     /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
     /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
     uint64_t promote(uint64_t keep_free);
     /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries go back to 0, the CPU
-    /// computes them again (on `stream`, which is waited for before the copies are freed). Bytes freed.
-    uint64_t demote(uint64_t bytes, void* stream);
+    /// computes them again (on `stream`, which is waited for before the copies are freed). `freed`: the bytes given back.
+    /// False when a CUDA step failed: every copy is then either still on the card with its entry or in RAM without one, and
+    /// the granules of the copies that went stay mapped (a granule that cannot be unmapped also stops any later promote).
+    bool demote(uint64_t bytes, void* stream, uint64_t& freed);
     int64_t promoted() const { return n_copy_; }
+    /// Counts the demotes: an address a session saved from the blob tables (the decode read-ahead's) is stale once it moves.
+    uint64_t placement_epoch() const { return epoch_; }
     /// The free VRAM the session holds the card at from now on (VRAM / POST /v1/vram; 0: its own spare only): a grow of
-    /// the caches and a promote keep at least this much free. `lend(true)` gives every card copy back for a sleep and holds them off (nothing promotes)
+    /// the caches and a promote keep at least this much free. `held_free(base)`: the free VRAM a step keeps, `base` its own
+    /// default unless --vram-reserve-mib set the card's spare. `lend(true)` gives every card copy back for a sleep and holds them off (nothing promotes)
     /// until `lend(false)`.
     uint64_t reserve() const { return reserve_; }
     bool lent() const { return lent_; }
-    uint64_t held_free(uint64_t base) const { return std::max(base, reserve_); }
+    uint64_t held_free(uint64_t base) const { return std::max(spare_ ? spare_ : base, reserve_); }
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
-    /// room. False when even no copy at all leaves that much.
+    /// room. False when even no copy at all leaves that much, or when the copies could not go back.
     bool resize_reserve(uint64_t free_bytes, void* stream);
-    void lend(bool low, void* stream);
+    /// False when the copies could not all go back (a low `lend` then does not hold them off).
+    bool lend(bool low, void* stream);
     /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
     /// issued; the caller copies them from RAM).
     bool stage_from_card(int l, void* stream) const;
@@ -177,10 +186,24 @@ private:
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none)
     bool elastic_ = false;
     uint64_t reserve_ = 0;
+    uint64_t spare_ = 0;   ///< --vram-reserve-mib: the free VRAM the copies leave (0: each step's own default)
     bool lent_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;
+    // the copies back to back in one reserved range (spill.hpp CopyLayout); its granules are mapped while a copy uses them,
+    // one handle each from the range's start
+    bool copy_range();
+    bool trim_copies();
+    /// With --vram-reserve-mib: the part of kLateRoom not loaded yet (what the engine allocated beyond the copies since
+    /// they were first placed counts as loaded); 0 without it.
+    uint64_t late_room() const;
+    uint64_t used0_ = 0;   ///< device bytes in use when the copies were first placed
+    uint8_t* copies_va_ = nullptr;
+    CopyLayout copy_lay_;
+    std::vector<unsigned long long> copy_maps_;
+    uint64_t epoch_ = 0;   ///< demotes so far
+    bool copies_retired_ = false;   ///< a granule of the range could not be unmapped: no promote copies into it again
     std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
     // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill
     struct LentRange {

@@ -84,4 +84,22 @@ bool plan_spill(int n_layers, int n_expert, const std::vector<uint64_t>& stride,
     return true;
 }
 
+CopyLayout copy_layout(const std::vector<uint64_t>& strides, uint64_t gran) {
+    CopyLayout c;
+    c.gran = gran;
+    uint64_t at = 0;
+    for (uint64_t s : strides) {
+        c.at.push_back(at);
+        c.end.push_back(at + s);
+        at += (s + 255) / 256 * 256;
+    }
+    return c;
+}
+
+int64_t CopyLayout::keep_for(int64_t n, uint64_t mapped, uint64_t bytes) const {
+    int64_t m = n;
+    while (m > 0 && (mapped - std::min(mapped, pages(m))) * gran < bytes) --m;
+    return m;
+}
+
 }  // namespace basalt::models::inkling2

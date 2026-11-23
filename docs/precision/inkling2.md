@@ -75,6 +75,11 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | MX8 pack, 20 chunks | 0.00265 | | |
 | MX8 pack, 100 chunks, experts in RAM on the CPU | 0.00303 | 97.72% | |
 
+Which RAM experts have a card copy changes their arithmetic (the card's q8_1 activations against the CPU's Q8_0), so
+placement is part of the result. With `--vram-reserve-mib 300` at `--max-context 8192` (1,049 experts planned into RAM,
+250 copied back to the card, 90.17% of decode lookups on the card), 100 chunks against the base build (no copy-back):
+PPL 7.0708 to 7.0725, paired NLL difference +0.00025 +- 0.00042, top-1 98.22% of rows the same (RTX 5080 at 360 W).
+
 RTX 5090 at 400 W, the whole model on the card, unless the row says otherwise. On the 5060 Ti the CPU computes the experts in
 RAM (a Ryzen 9 9950X, AVX-512).
 
