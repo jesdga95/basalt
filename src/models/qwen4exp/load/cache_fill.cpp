@@ -32,7 +32,6 @@ int cache_fill(Context& context) {
     // keeps its weights and the cache just sized, the peer card its free memory less its buffers and reserve, and the
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
-    // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
     // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
     // expert tier is filled, when the GDN mixer split is taken; without it the head's peer rows fit in what the tier
     // leaves free
