@@ -721,6 +721,16 @@ public:
     // ---- the console's experts: a lookup is a hit when its expert is on the card. With every expert resident that is each
     // window's rows times the experts a row takes at each of its visits; with a spill the card's running counts say which
     // experts the lookups went to, and those whose experts are in RAM are no hits
+    void reset_expert_counts() override {
+        // `hits` is a subset sum over the experts that are on the card NOW, so differencing it against a session-old
+        // baseline measures two different subsets: an expert promoted mid-session brings its whole history into the card
+        // sum and the reported ratio climbs past 100% (193% observed).  Zeroing the device tally and the map's snapshot at
+        // the start of a request makes the pair describe one request's real lookups.
+        if (ex_tally_ && stream_) cudaMemsetAsync(ex_tally_, 0, (size_t) expert_pairs() * 4, stream_);
+        lookups_ = 0;
+        map_.reset();
+    }
+
     ExpertCounts expert_counts() const override {
         if (!m_.spill().any() || !ex_tally_) return {lookups_, lookups_, 0, 0};
         std::vector<uint32_t> t;
