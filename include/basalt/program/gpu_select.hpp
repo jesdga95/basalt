@@ -73,10 +73,13 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
 /// What a model runs: the most cards each mode takes, 0 = the model does not run it.
 struct GpuModes {
     int peer = 0, split = 0, tensor = 0;
+    bool peer_ada = false;          ///< its peers' kernels are among those a -DPEER_ADA=ON build compiles for sm_89
 };
 
-/// Empty when `model` runs the choice's mode on that many cards; else the refusal naming the model and the modes it runs.
-std::string check_gpu_modes(const GpuChoice& choice, const std::string& model, const GpuModes& modes);
+/// Empty when `model` runs the choice's mode on that many cards of `visible`; else the refusal naming the model and the
+/// modes it runs, or the peer card its peer kernels are not built for.
+std::string check_gpu_modes(const GpuChoice& choice, const std::string& model, const GpuModes& modes,
+                            const std::vector<GpuCard>& visible = {});
 
 /// The visible cards: CUDA_VISIBLE_DEVICES when set (integers read as nvidia-smi numbers), else every card the NVIDIA
 /// management library lists, with what that library says about each. `known` false: neither was available.

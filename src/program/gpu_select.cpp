@@ -273,7 +273,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
     return c;
 }
 
-std::string check_gpu_modes(const GpuChoice& c, const std::string& model, const GpuModes& m) {
+std::string check_gpu_modes(const GpuChoice& c, const std::string& model, const GpuModes& m, const std::vector<GpuCard>& visible) {
     if (c.mode == GpuMode::One) return {};
     const char* name = gpu_mode_name(c.mode);
     const int most = c.mode == GpuMode::Peer ? m.peer : c.mode == GpuMode::Split ? m.split : m.tensor;
@@ -290,6 +290,12 @@ std::string check_gpu_modes(const GpuChoice& c, const std::string& model, const 
         return head + " takes at most " + std::to_string(most) + " cards" +
                (c.mode == GpuMode::Peer ? " (the main card and " + std::to_string(most - 1) + (most == 2 ? " peer)" : " peers)") : std::string()) +
                "; gpu names " + std::to_string(c.cards.size());
+    // an sm_89 peer (a -DPEER_ADA=ON build) runs only the peer kernels that build compiles for it
+    for (size_t i = 1; c.mode == GpuMode::Peer && !m.peer_ada && i < c.cards.size(); ++i) {
+        const int k = c.cards[i];
+        if (k >= 0 && (size_t) k < visible.size() && visible[(size_t) k].cc_major == 8 && visible[(size_t) k].cc_minor == 9)
+            return "gpu-mode peer: " + gpu_label(visible, k) + " is " + arch_name(visible[(size_t) k]) + "; " + model + " runs peer on sm_120 cards";
+    }
     return {};
 }
 
