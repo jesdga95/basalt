@@ -381,6 +381,7 @@ __global__ void __launch_bounds__(128, NTL == 2 ? 3 : 1)
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
             const float mold = rm[i], mnew = fmaxf(mold, mx);
+            __syncwarp();   // every lane has read its score and rm[i]: the row's probabilities overwrite the scores
             float l = 0.0f;
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
