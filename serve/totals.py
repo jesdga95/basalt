@@ -30,12 +30,16 @@ def totals_path_of(given: str, config: str | None) -> str | None:
 
 
 def totals_load_file(path: str | Path) -> dict:
-    """Read a saved totals file. A missing or broken file is a first start: returns {}."""
+    """Read a saved totals file. A missing or broken file is a first start: returns {}.
+    A file whose top-level value is not a dict (a list, string, number, etc.) is treated the same way."""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, json.JSONDecodeError, ValueError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def totals_add_saved(totals: dict, saved: dict) -> dict:

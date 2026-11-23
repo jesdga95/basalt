@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
 import socket
@@ -513,8 +514,13 @@ def make_handler(target: Service | Router):
                                         ("cost_cache_hit_per_million", "cost_cache_hit_per_million")):
                         if field in req:
                             v = req[field]
-                            if v is not None and not isinstance(v, (int, float)):
-                                raise ValueError(f"{field}: a number or null")
+                            if v is not None:
+                                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                                    raise ValueError(f"{field}: a number or null")
+                                if not math.isfinite(v):
+                                    raise ValueError(f"{field}: a finite number or null")
+                                if v < 0:
+                                    raise ValueError(f"{field}: a non-negative number or null")
                             setattr(shown, attr, float(v) if v is not None else None)
                             changed.append(field)
                     if shown.totals_path:

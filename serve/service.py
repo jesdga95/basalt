@@ -171,10 +171,10 @@ class Service:
 
     _totals_broken = False   # disk errors: print once then stop trying
 
-    def load_totals(self) -> None:
+    def load_totals(self, pricing_cli: set[str] | None = None) -> None:
         """Read saved lifetime counters and pricing on startup.  Called once from server.py after
-        totals_path and cost_* fields are set.  CLI flags win over the file: a field is restored
-        from the file only when the CLI left it at the default (0 or None)."""
+        totals_path and cost_* fields are set.  CLI flags win over the file: a pricing field is
+        restored from the file only when the CLI did not explicitly set it."""
         if not self.totals_path:
             return
         from serve.totals import totals_load_file, totals_add_saved
@@ -190,13 +190,17 @@ class Service:
                     self.requests_done = merged["requests"]
                 if "since" in merged:
                     self.started_at = merged["since"]
-            for field in ("cost_input_per_million", "cost_output_per_million",
-                          "cost_cache_write_per_million", "cost_cache_hit_per_million"):
+            cli_set = pricing_cli or set()
+            field_to_cli = {"cost_input_per_million": "cost_in",
+                            "cost_output_per_million": "cost_out",
+                            "cost_cache_write_per_million": "cost_cache_write",
+                            "cost_cache_hit_per_million": "cost_cache_hit"}
+            for field, cli_name in field_to_cli.items():
+                if cli_name in cli_set:
+                    continue
                 file_val = saved.get(field)
                 if file_val is not None and isinstance(file_val, (int, float)):
-                    current = getattr(self, field)
-                    if current is None or current == 0:
-                        setattr(self, field, float(file_val))
+                    setattr(self, field, float(file_val))
 
     def _save_totals(self) -> None:
         """Write the lifetime counters to disk after a request finishes.  Call with status_lock held."""
