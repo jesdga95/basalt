@@ -24,7 +24,7 @@ Order, enforced by the workflow and by `llm_review.decide`:
    - `needs_human`: label `community: needs review` and a review request to jesdga95.
    - `reject`: label `community: rejected` and one neutral comment. The pull request is never closed.
 
-`COMMUNITY_AUTOMERGE`: only the exact value `live` merges. Unset, `shadow`, `test` or a typo is shadow: labels, review requests and comments only (a row that would merge gets `community: automatic merge` and a comment; in live it gets the same label and is merged). Every comment names the mode that ran.
+`COMMUNITY_AUTOMERGE`: only the exact value `live` merges. Unset, `shadow`, `test` or a typo is shadow: labels, review requests and comments only (a row that would merge gets `community: automatic merge` and a comment; in live it gets the same label and is merged). A shadow comment ends with the mode and why nothing merged; a live comment has no mode note.
 
 Security model: the review runs from base code with secrets only in the one model step; a fork pull request cannot change what runs. Jobs have minimal `permissions` (the deciding job is read-only; the acting job has no `contents: write`); the merge token is a GitHub App token minted only in a merge run; the comments use a second App token scoped to pull requests only. Model output only selects a label. Reasons shown in comments are stripped of links, mentions and markup. Actions are pinned by SHA.
 
