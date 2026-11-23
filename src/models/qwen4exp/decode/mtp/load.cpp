@@ -138,9 +138,11 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // K8V4 never applies to the drafter: its own attention paths (below, and src/core/verify/) handle whole formats
     // only, whatever ring shape it takes (a window, or -1: fully resident).
     const bool kv_hybrid_was = qsa_kv_hybrid();
+    const bool kv_k4v8_was = qsa_kv_k4v8();
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
-    if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    qsa_set_kv_k4v8(false);
+    if (kv_hybrid_was || kv_k4v8_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4/k4v8: plain INT8
     // the draft K/V is elastic like the layers' (its arena grows and shrinks with the session's), except where a
     // store per batch slot copies whole pools
     const int64_t kv_elastic_was = qsa_kv_elastic();
@@ -160,6 +162,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    qsa_set_kv_k4v8(kv_k4v8_was);
     qsa_set_kv_elastic(kv_elastic_was);
     if (st_.kv_arena != nullptr) ss.kv_extra.push_back(st_.kv_arena);
     qsa_state_zero(st_, g, nullptr);

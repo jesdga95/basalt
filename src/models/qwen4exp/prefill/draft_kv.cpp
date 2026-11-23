@@ -30,7 +30,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // still reach (r0 below), which the ring holds, so no two of them share a slot..
     core::QsaState& st = mtp.kv_state_rw();
     if (n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && st.kv_mode != 2) ||
-        st.kv_hybrid || mtp.device() != m.device)
+        st.kv_hybrid || st.kv_k4v8 || mtp.device() != m.device)
         return false;
     const auto t0 = Clock::now();
     const core::ModelGeometry& g = *m.g;

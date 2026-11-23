@@ -129,12 +129,14 @@ if (w.has_offset || p.offset != nullptr) {            err = name + ": an S2 form
 // kind therefore comes from the manifest's `source_type`, through the index.
 if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);        return true;    }    s_gemv_q8k_split(xq8k, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);    return true;}}
 // namespace
-namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false; }
+namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_k4v8 = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
 void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
 void qsa_set_kv_hybrid(bool enabled) { g_kv_hybrid = enabled; }
 bool qsa_kv_hybrid() { return g_kv_hybrid; }
+void qsa_set_kv_k4v8(bool enabled) { g_kv_k4v8 = enabled; }
+bool qsa_kv_k4v8() { return g_kv_k4v8; }
 uint64_t gdn_buffers_bytes(const ModelGeometry& g) {    const int64_t C = g.ssm_conv_channels;    const int64_t V = g.ssm_value_dim;    const uint64_t parts[] = {        q8k_bytes(g.n_embd),
 // x_q8k
 (uint64_t) (g.n_embd / 32) * 34,
@@ -439,11 +441,16 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
 bool kv_elastic_state(const QsaShapes& s, const KvPlan& p) {
     return g_kv_elastic > 0 && p.mode == 0 && s.idx_block > 0 && s.page_size % s.idx_block == 0;
 }
-uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
+uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8, bool k4v8 = false) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2 +
                rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
+    }
+    if (k4v8) {   // K4V8: the Q4_0 K half plus the INT8 V half (codes + scales) - the same total as K8V4
+        const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
+        return rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim) + rows * (uint64_t) s.head_dim +
+               rows * (uint64_t) (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2 + 64;
     }
     if (g_kv_q4) return (uint64_t) pages * s.page_size * basalt::kernels::kv_q4_bytes_per_cell(s) + 64;
     return int8 ? (uint64_t) pages * s.page_size * basalt::kernels::kv_q8_bytes_per_cell(s) + 64
@@ -462,7 +469,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     const bool elastic = kv_elastic_state(s, p);   // elastic: pools, pooled keys and rope live in their own ranges
     if (!elastic)
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
+                           g_kv_int8 || g_kv_hybrid || g_kv_k4v8, g_kv_k4v8 && ring_cells <= 0) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
@@ -494,7 +501,17 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_int8 = false;
         st.kv_q4 = false;
     }
-    st.kv_rot = st.kv_q4;   // K8V4 rotates only V (below)
+    // Hybrid K4V8 mirrors K8V4: mode 0 only, the drafter's state stays INT8, and the K half is the packed one.
+    if (g_kv_k4v8 && ring_cells <= 0) {
+        if (p.mode == 1) {
+            basalt::log::error("basalt", "hybrid K4V8 KV does not support --kv-resident streaming");
+            return 0;
+        }
+        st.kv_k4v8 = true;
+        st.kv_int8 = false;
+        st.kv_q4 = false;
+    }
+    st.kv_rot = st.kv_q4;   // K8V4 rotates only V, K4V8 only K (the query follows, the output does not); neither sets this
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
@@ -507,6 +524,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
         std::vector<uint64_t> page_bytes;
         if (st.kv_hybrid) page_bytes = {code, scale, pr * q4_row};
+        else if (st.kv_k4v8) page_bytes = {pr * q4_row, code, scale};
         else if (st.kv_q4) page_bytes = {pr * q4_row, pr * q4_row};
         else if (st.kv_int8) page_bytes = {code, code, scale, scale};
         else page_bytes = {code * 2, code * 2};
@@ -555,6 +573,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         }
         if (st.kv_hybrid) {
             st.k_q = (int8_t*) a->array(0); st.k_scale = (uint16_t*) a->array(1); st.v_q4 = a->array(2);
+        } else if (st.kv_k4v8) {
+            st.k_q4 = a->array(0); st.v_q = (int8_t*) a->array(1); st.v_scale = (uint16_t*) a->array(2);
         } else if (st.kv_q4) {
             st.k_q4 = a->array(0); st.v_q4 = a->array(1);
         } else if (st.kv_int8) {
@@ -567,6 +587,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.k_scale = c.take<uint16_t>(rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
+    } else if (st.kv_k4v8) {
+        st.k_q4 = c.take<uint8_t>(rows * q4_row);
+        st.v_q = c.take<int8_t>(rows * s.head_dim);
+        st.v_scale = c.take<uint16_t>(rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
     } else if (st.kv_q4) {
         st.k_q4 = c.take<uint8_t>(rows * q4_row);
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
@@ -695,6 +719,10 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+    } else if (st.kv_k4v8) {
+        cudaMemsetAsync(st.k_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+        cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
+        cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2, cs);
     } else if (st.kv_q4) {
         cudaMemsetAsync(st.k_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
         cudaMemsetAsync(st.v_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
@@ -733,6 +761,11 @@ uint64_t qsa_prompt_layout(const ModelGeometry& g, int64_t max_cells, uint8_t* b
         st.kv_int8 = false;
         st.kv_q4 = false;
     }
+    if (g_kv_k4v8) {
+        st.kv_k4v8 = true;
+        st.kv_int8 = false;
+        st.kv_q4 = false;
+    }
     st.kv_rot = st.kv_q4;
     st.kv_mode = 0;
     st.n_slots = pages;
@@ -743,6 +776,10 @@ uint64_t qsa_prompt_layout(const ModelGeometry& g, int64_t max_cells, uint8_t* b
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.k_scale = c.take<uint16_t>(scales);
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
+    } else if (st.kv_k4v8) {
+        st.k_q4 = c.take<uint8_t>(rows * q4_row);
+        st.v_q = c.take<int8_t>(rows * s.head_dim);
+        st.v_scale = c.take<uint16_t>(scales);
     } else if (st.kv_q4) {
         st.k_q4 = c.take<uint8_t>(rows * q4_row);
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
@@ -789,7 +826,7 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
     const QsaShapes s = qsa_shapes(g);
     if (dst.kv_mode == 2 || src.kv_mode == 2 || (dst.kv_mode == 1 && !dst.host.present()) ||
         (src.kv_mode == 1 && !src.host.present()) || dst.kv_int8 != src.kv_int8 || dst.kv_q4 != src.kv_q4 ||
-        dst.kv_hybrid != src.kv_hybrid) {
+        dst.kv_hybrid != src.kv_hybrid || dst.kv_k4v8 != src.kv_k4v8) {
         err = "a QSA state copy needs two states of one format, each whole in VRAM or streamed";
         return false;
     }
@@ -807,6 +844,7 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
     struct Arr { void* d; const void* s; uint64_t page; };
     std::vector<Arr> arrs;
     if (src.kv_hybrid) arrs = {{dst.k_q, src.k_q, code}, {dst.k_scale, src.k_scale, scale}, {dst.v_q4, src.v_q4, q4}};
+    else if (src.kv_k4v8) arrs = {{dst.k_q4, src.k_q4, q4}, {dst.v_q, src.v_q, code}, {dst.v_scale, src.v_scale, scale}};
     else if (src.kv_q4)
         arrs = {{dh ? dst.host.k_q4 : dst.k_q4, sh ? src.host.k_q4 : src.k_q4, q4},
                 {dh ? dst.host.v_q4 : dst.v_q4, sh ? src.host.v_q4 : src.v_q4, q4}};
@@ -839,6 +877,7 @@ basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
     basalt::kernels::QsaAttnPools pools;
     pools.page_table = st.page_table;
     if (st.kv_hybrid) { pools.k_q = st.k_q; pools.k_scale = st.k_scale; pools.v_q4 = st.v_q4; }
+    else if (st.kv_k4v8) { pools.k_q4 = st.k_q4; pools.v_q = st.v_q; pools.v_scale = st.v_scale; }
     else if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
     else if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
     else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
@@ -1009,10 +1048,14 @@ if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n
 // EVERY ENTRY POINT FROM HERE ON IS THE CAPTURABLE ONE: the per-token counts come from `st.step` and every
 // launch is sized from a capacity in `st`/`b`, so this sequence can be captured and replayed.  The
 // host-scalar wrappers would be correct here today and silently wrong in a graph.
-if (st.kv_hybrid) {
-    // K8V4: only V is rotated (kv_q4.hpp's H); the scores pair unrotated q with unrotated INT8 K, and the
-    // output - a mix of rotated values - is rotated back after attention. Each append/gather call folds the
-    // unused half's lanes onto the used pool (a bit-identical duplicate write), so no kernel variants exist.
+if (st.kv_k4v8) {
+    // K4V8: only K is rotated (kv_q4.hpp's H); the scores pair rotated q with rotated Q4_0 K, V is stored and read
+    // unrotated so the output needs no transform. Each call folds the unused half's lanes onto the used pool, the
+    // same bit-identical duplicate write K8V4 relies on.
+    basalt::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
+    kv_append_q4_step(st.k_q4, st.k_q4, st.page_table, st.step, b.kcur, b.kcur, s, stream, nullptr);
+    kv_append_q8_step(st.v_q, st.v_q, st.v_scale, st.v_scale, st.page_table, st.step, b.vcur, b.vcur, s, stream, nullptr);
+} else if (st.kv_hybrid) {
     basalt::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
     kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, st.step, b.kcur, b.kcur, s, stream, nullptr);   // mode 0: no host mirror
     basalt::kernels::kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, st.step, b.vcur, b.vcur, s, stream, nullptr);
@@ -1023,7 +1066,7 @@ if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0
 }
 if (st.kv_q4) {
     basalt::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
-} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        try {
+} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid && !st.kv_k4v8) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid && !st.kv_k4v8) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        try {
             native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
                 (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, rope_scaling(), stream);
         } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }

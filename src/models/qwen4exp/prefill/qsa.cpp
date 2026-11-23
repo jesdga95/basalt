@@ -45,7 +45,14 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
     }
     const basalt::kernels::KvHostPools* host_w = &st.host;
-    if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
+    if (st.kv_k4v8) {   // K4V8: K rotated Q4_0, V INT8 unrotated (K and the queries rotate, the output does not)
+        basalt::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+        basalt::kernels::kv_append_q4(st.k_q4, st.k_q4, st.page_table, p0, T, m.Kc, m.Kc, s, m.cs, nullptr,
+                                      staged ? &m.stage : nullptr);
+        kv_append(m.Vc, m.Vc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
+                  st.v_q, st.v_q, st.v_scale, st.v_scale, m.cs, nullptr,   // mode 0: no host mirror
+                  staged ? &m.stage : nullptr);
+    } else if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
         basalt::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
         kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                   st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, nullptr,   // mode 0: no host mirror
@@ -68,7 +75,7 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
     split_q(m.Qf, m.q, T, m.cs);
     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
     rope(m.q, T, 24, 256, 6144, p0, basalt::kernels::rope_scaling(), m.cs);
-    if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+    if (st.kv_rot || st.kv_k4v8) basalt::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
     rope(m.q_idx, T, 4, 128, 512, p0, basalt::kernels::rope_scaling(), m.cs);
     // the indexer appends, token by token; then scores + selection for many queries at once:

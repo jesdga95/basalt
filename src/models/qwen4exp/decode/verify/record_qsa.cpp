@@ -44,10 +44,10 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     float* idx_raw = v_.idx_raw_L_ + (size_t) qi * MT * ID;
     // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the window's rows each
     // - row-wise identical arithmetic
-    const bool qb = n > 1 && !st.kv_q4;
+    const bool qb = n > 1 && !st.kv_q4 && !st.kv_k4v8;
     // the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the group's rows in
     // one launch, the same bits
-    const bool fused_pre = st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
+    const bool fused_pre = st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 && !st.kv_k4v8 &&
                            qsa_dec_fused_supported(s);
     auto kv_post_args = [&] {
         QsaDecKvPost kp;
@@ -168,6 +168,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
             fwht256_inplace_cuda(v_.kcur_, (int64_t) n * NKV, cs);
             fwht256_inplace_cuda(v_.vcur_, (int64_t) n * NKV, cs);
+        } else if (st.kv_k4v8) {   // K4V8: only K is rotated (the query follows, V and the output do not)
+            fwht256_inplace_cuda(v_.kcur_, (int64_t) n * NKV, cs);
         } else if (st.kv_hybrid) {   // K8V4: only V is rotated
             fwht256_inplace_cuda(v_.vcur_, (int64_t) n * NKV, cs);
         }
@@ -175,7 +177,12 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         copy_from_mapped(v_.tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
         for (int t = 0; t < T; ++t) {
                                     const int32_t* step_t = v_.step_ + t * kStepCount;
-            if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+            if (st.kv_k4v8) {   // K4V8: K into the rotated Q4_0 pool, V into INT8 (each call writes one plane twice)
+                kv_append_q4_step(st.k_q4, st.k_q4, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
+                                  v_.kcur_ + t * NKV * HD, s, cs, nullptr);
+                kv_append_q8_step(st.v_q, st.v_q, st.v_scale, st.v_scale, st.page_table, step_t,
+                                  v_.vcur_ + t * NKV * HD, v_.vcur_ + t * NKV * HD, s, cs, nullptr);
+            } else if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
                 kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
                                   v_.kcur_ + t * NKV * HD, v_.kcur_ + t * NKV * HD, s, cs, nullptr);
                 kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, v_.vcur_ + t * NKV * HD,
@@ -219,7 +226,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
             return false;
         }
         norm_rope(v_.qcur_, wqn, (int) (n * NH), (int) HD, v_.pos_);
-        if (st.kv_rot) fwht256_inplace_cuda(v_.qcur_, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
+        if (st.kv_rot || st.kv_k4v8) fwht256_inplace_cuda(v_.qcur_, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
         bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) wiq->data, v_.qidx_, IQ * ID,
                                   N, IQ * ID, n, cs);
         norm_rope(v_.qidx_, wiqn, (int) (n * IQ), (int) ID, pos_i);
@@ -232,7 +239,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
             return false;
         }
         norm_rope(qc, wqn, (int) NH, (int) HD, v_.pos_ + t * NH);
-        if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
+        if (st.kv_rot || st.kv_k4v8) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
     }
     for (int t = 0; t < T; ++t) {
         float* qx = v_.qidx_ + t * IQ * ID;
@@ -272,7 +279,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     stamp(l, 12);
     const QsaAttnPools pools = qsa_attn_pools(st);
     // staged chunks and the gate in the merge, the same bits
-    fused_gate = !st.kv_rot && !st.kv_hybrid &&
+    fused_gate = !st.kv_rot && !st.kv_hybrid && !st.kv_k4v8 &&
                  qsa_dec_attn_supported(pools, s);
     attn_q8 = fused_gate && !st.kv_rot && !st.kv_hybrid;
     PdlScope pa(pdl);   // the chunks after the top-k, the merge after them

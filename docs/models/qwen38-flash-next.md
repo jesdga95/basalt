@@ -17,8 +17,10 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
 
 ## Memory
 
-- **Context:** `--max-context`, default 8,192. The KV cache grows with it. `--kv fp16` (default), `int8` (half the VRAM), `q4_0`
-  and `k8v4` trade precision for VRAM ([precision](../precision/qwen38-flash-next.md#measured-costs)).
+- **Context:** `--max-context`, default 8,192. The KV cache grows with it. `--kv fp16` (default), `int8` (half the VRAM), `q4_0`,
+  `k8v4` and `k4v8` trade precision for VRAM ([precision](../precision/qwen38-flash-next.md#measured-costs)).
+  `k8v4` and `k4v8` are the same 816 B per cell with the eight bits on K or on V; `k4v8` scores the better KLD
+  ([K4V8](../precision/qwen38-flash-next.md#k4v8)).
 - **Experts:** the main card's cache holds the most routed ones, system RAM the rest, and an adaptive tier moves them as the
   conversation changes ([adaptive tier](../configuration/adaptive.md)).
 - **RAM:** before the RAM copy, the checkpoint blocks of every slot are allocated (page-locked, so a checkpoint saves and

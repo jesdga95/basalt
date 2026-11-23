@@ -212,6 +212,10 @@ struct QsaState {
     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
     bool kv_hybrid = false;
+    /// Hybrid K4V8, the mirror of K8V4: K in rotated Q4_0 (kv_q4.hpp's H), V in INT8 unrotated - 816 B per cell.
+    /// Uses k_q4 + v_q/v_scale. The queries and K rotate, the output does NOT (V is stored unrotated). Mode 0 only,
+    /// like K8V4, and the drafter's ring state stays plain INT8.
+    bool kv_k4v8 = false;
     /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
     /// back: for Q4_0
     bool kv_rot = false;
@@ -290,12 +294,16 @@ void qsa_set_kv_q4(bool enabled);
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell. Not with --kv-resident.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
+/// Hybrid K4V8 (`--kv k4v8`): K in rotated Q4_0, V in INT8 - 816 B per cell, the mirror of K8V4. Not with
+/// --kv-resident.
+void qsa_set_kv_k4v8(bool enabled);
+bool qsa_kv_k4v8();
 /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
 inline int qsa_kv_format(const QsaState& st) {
     // A hybrid K8V4 state is mode 0 only and never reaches the block movers; refuse rather than let it
     // fall through to kKvF16 - a wrong layout silently applied is worse than a hard stop (PR review).
-    if (st.kv_hybrid) {
-        basalt::log::error("basalt", "qsa_kv_format: a hybrid K8V4 state must never reach the block movers");
+    if (st.kv_hybrid || st.kv_k4v8) {
+        basalt::log::error("basalt", "qsa_kv_format: a hybrid K8V4/K4V8 state must never reach the block movers");
         std::exit(1);   // the kernels' own "unsupported geometry" convention (kv_q8.cu, qsa_decode_attn.cu)
     }
     return st.kv_q4 ? basalt::kernels::kKvQ4 : st.kv_int8 ? basalt::kernels::kKvInt8 : basalt::kernels::kKvF16;
