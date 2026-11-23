@@ -205,7 +205,6 @@ class Session final : public model::BatchSession, private Scratch {
 public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        release();   // a batch that ended on an error still holds admission
         if (stream_) cudaStreamSynchronize(stream_);
         if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
         if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
@@ -392,9 +391,7 @@ public:
             if (last && r.logits)
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
-        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the window failed"};
-        if (!release()) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
-        return {};
+        return end_call("the window failed");
     }
 
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
@@ -410,11 +407,18 @@ protected:
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
-        if (!admit(err)) return false;   // held until the first draw (or the take with no draw after it)
+        if (!admit(err)) return false;   // held until batch_end
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
-        return check(err);
+        if (check(err)) return true;
+        release();
+        return false;
+    }
+    bool batch_end(bool synced) override {
+        if (synced) return complete(cudaSuccess);
+        release();
+        return false;
     }
     bool batch_forward(const model::BatchView& v, std::string&) override {
         view_ = &v;
@@ -432,17 +436,11 @@ protected:
         dspark_.note(r.pos, r.n_tokens);   // DSPARK HOOK
         lookups_ += (int64_t) r.n_tokens * g_.n_used * (int64_t) g_.visits.size();
         head_rows_ = h;
-        if (i == v.n - 1 && std::all_of(v.head, v.head + v.n, [](int x) { return x == 0; }))
-            static_cast<Session*>(v.ss[0])->release();   // no draw follows, nothing is published
         if (h == 0) return;
         cudaMemcpyAsync(logits_, blog_ + (size_t) (sg.row0 + sg.rows - h) * V, (size_t) h * V * 4, cudaMemcpyDeviceToDevice, v.stream);
         if (r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (h - 1) * V, (size_t) V * 4, cudaMemcpyDeviceToHost, v.stream);
     }
     const int32_t* batch_draw(const model::BatchView& v, int i, std::string& err) override {
-        if (!static_cast<Session*>(v.ss[0])->release()) {   // the window finished before any abort, or is discarded
-            err = "the CPU experts were stopped";
-            return nullptr;
-        }
         return draw(v.reqs[i], 0, v.head[i], err, v.stream);
     }
 
@@ -466,9 +464,7 @@ public:
                 r.progress(t0 + n);
             }
         }
-        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the prompt failed"};
-        if (!release()) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
-        return {};
+        return end_call("the prompt failed");
     }
 
     // ---- [vision] images (vision.hpp, vision_encoder.hpp): a picture's rows stand in for its pad tokens' embeddings, taken
@@ -496,9 +492,7 @@ public:
             if (!forward(nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, 0, err)) return {model::Status::Error, "inkling2: " + err};
             for (int i = 0; i < n; ++i) hist_.push_back(g_.image_token);
         }
-        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "inkling2: the image rows failed"};
-        if (!release()) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
-        return {};
+        return end_call("the image rows failed");
     }
 
     model::Result set_logit_bias(const float* bias) override {
@@ -1237,11 +1231,10 @@ private:
         softcap(lg, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
     }
 
-    // Admission to the CPU experts' windows (CpuExperts::enter): held from before a call's first window until its window
-    // streams are synchronized, so an abort waits for the calls in flight and their results are discarded.
+    // Admission to the CPU experts' windows (CpuExperts::enter): held from before a call's first window until the sync
+    // that ends them, so an abort waits for the calls in flight, and a call it interrupted discards its results.
     bool admit(std::string& err) {
         if (!sh_->cpu) return true;
-        release();
         if (!sh_->cpu->enter()) {
             err = "the CPU experts were stopped";
             return false;
@@ -1249,13 +1242,25 @@ private:
         admitted_ = true;
         return true;
     }
-    // Synchronizes the window streams and gives admission up. False: they failed, or the abort came first.
-    bool release() {
-        if (!admitted_) return true;
+    // After the sync of the window stream that ends a call's windows (`synced`: its status): gives admission up. False:
+    // a sync failed or the abort came first, and the call's results are discarded.
+    bool complete(cudaError_t synced) {
+        if (!admitted_) return synced == cudaSuccess;
         admitted_ = false;
-        cudaError_t e = cudaStreamSynchronize(stream_);
-        if (e == cudaSuccess && lane_[1].stream) e = cudaStreamSynchronize(lane_[1].stream);
-        return sh_->cpu->leave(e) && e == cudaSuccess;
+        if (synced == cudaSuccess && lane_[1].stream) synced = cudaStreamSynchronize(lane_[1].stream);
+        return sh_->cpu->leave(synced) && synced == cudaSuccess;
+    }
+    // An exit before that sync: the window stream is synchronized first.
+    void release() {
+        if (admitted_) complete(cudaStreamSynchronize(stream_));
+    }
+    // The end of a call that took admission: its closing sync, then the abort's verdict on its results.
+    model::Result end_call(const char* failed) {
+        const cudaError_t synced = cudaStreamSynchronize(stream_);
+        const bool kept = complete(synced);
+        if (synced != cudaSuccess) return {model::Status::Error, std::string("inkling2: ") + failed};
+        if (!kept) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
+        return {};
     }
     // Gives admission up on every return of a call that took it.
     struct Admitted {

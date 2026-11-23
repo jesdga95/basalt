@@ -12,10 +12,10 @@
 
 namespace basalt::models::inkling2 {
 
-// Admission to the windows that wait on the CPU experts. A call holds it from before its first such window until its
-// window streams are synchronized. The abort closes it before releasing the bell, so no window starts after the release
-// and a window it interrupted is discarded by its caller, then waits for the calls in flight: once none holds it, every
-// window that could wait on the bell has finished.
+// Admission to the windows that wait on the CPU experts. A call holds it from before its first such window until the
+// sync that ends them. The abort closes it before releasing the bell: no call enters after that, a call already in
+// holds it until its sync, however many windows it still launches, and discards its results. The abort then waits for
+// the calls in flight: once none holds it, every window that could wait on the bell has finished.
 class WindowGate {
 public:
     // False once closed.
@@ -32,6 +32,11 @@ public:
         if (synced != cudaSuccess && failed_ == cudaSuccess) failed_ = synced;
         cv_.notify_all();
         return !closed_;
+    }
+    // A failure that leaves a window's fork without its join: completion can no longer be confirmed.
+    void fail(cudaError_t e) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (failed_ == cudaSuccess) failed_ = e;
     }
     bool closed() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -55,7 +60,7 @@ public:
         }
         char why[96];
         if (!idle) std::snprintf(why, sizeof why, "%d calls still in flight", held_);
-        else std::snprintf(why, sizeof why, "%s on a window's synchronize", cudaGetErrorString(failed_));
+        else std::snprintf(why, sizeof why, "%s in a call's windows", cudaGetErrorString(failed_));
         basalt::core::gpu_left_running().store(true);
         basalt::log::error("basalt inkling2", "the CPU experts' doorbell was aborted: GPU completion unconfirmed after %lld ms (%s)", ms, why);
     }
@@ -65,7 +70,7 @@ private:
     std::condition_variable cv_;
     bool closed_ = false;
     int held_ = 0;
-    cudaError_t failed_ = cudaSuccess;   // the first failed synchronize of a call that left
+    cudaError_t failed_ = cudaSuccess;   // the first failed sync of a call that left, or a fork left unjoined
 };
 
 }  // namespace basalt::models::inkling2

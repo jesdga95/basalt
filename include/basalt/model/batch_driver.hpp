@@ -77,6 +77,13 @@ public:
         const BatchView v{w, ss.data(), reqs, head.data(), n, st};
         GraphLru<core::CapturedGraph>::Key key;
         if (!batch_stage(v, key, err)) return {Status::Error, who + ": " + err};
+        struct End {   // every exit after the stage ends the window (batch_end): an early one here, the last after its sync
+            BatchSession& s;
+            bool open = true;
+            ~End() {
+                if (open) s.batch_end(false);
+            }
+        } end{*this};
         for (int i = 0; i < n; ++i)
             key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
         BatchShared& sh = batch_shared();
@@ -111,7 +118,10 @@ public:
             if (head[(size_t) i] > 0 && (picks[(size_t) i] = ss[(size_t) i]->batch_draw(v, i, err)) == nullptr)
                 return {Status::Error, who + ": " + err};
         }
-        if (cudaStreamSynchronize(st) != cudaSuccess) return {Status::Error, who + ": the batch window failed"};
+        const bool synced = cudaStreamSynchronize(st) == cudaSuccess;
+        end.open = false;
+        if (!batch_end(synced) || !synced)
+            return {Status::Error, who + (synced ? ": the window was stopped" : ": the batch window failed")};
         for (int i = 0; i < n; ++i) {
             const DecodeRequest& r = reqs[i];
             const int h = head[(size_t) i];
@@ -158,6 +168,10 @@ protected:
     /// On session i, queued on v.stream: its draws of its head rows with its own sampler; the host array of the picks it
     /// returns is read after the batch's sync (null with `err`: the draw failed).
     virtual const int32_t* batch_draw(const BatchView& v, int i, std::string& err) = 0;
+    /// On the leader, once on every exit after a successful batch_stage: `synced` when the batch's stream synchronized
+    /// after every take and draw (false: an earlier exit, or the sync failed). False: the window was stopped and nothing
+    /// of it is taken.
+    virtual bool batch_end(bool synced) { return synced; }
 };
 
 }  // namespace basalt::model

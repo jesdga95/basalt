@@ -79,13 +79,19 @@ struct CpuExperts::Impl {
     std::condition_variable nap_cv;
     WindowGate gate;                               // the calls whose windows may wait on `done`
 
-    // No window starts after this; abort the bell permanently, then give the calls in flight a bounded time to finish.
-    // If that cannot be confirmed, skip CUDA teardown on the error path. Runs under g_live_mu, which is taken before
-    // the gate's lock.
+    // No call is admitted after this (a call already in holds admission until its sync); abort the bell permanently,
+    // then give the calls in flight a bounded time to finish. If that cannot be confirmed, skip CUDA teardown on the
+    // error path. Runs under g_live_mu, which is taken before the gate's lock.
     void abort_and_drain() {
         gate.close();
         std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
         gate.drain(kDrainMs);
+    }
+
+    // must() for a fork's and join's calls: a failure can leave the doorbell's stream outside the window's sync.
+    void need(cudaError_t e, const char* what) {
+        if (e != cudaSuccess) gate.fail(e);
+        must(e, what);
     }
 
     ~Impl() {
@@ -245,15 +251,15 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
 
 void CpuExperts::start(int l, int rows, const float* input, const int32_t* ids, cudaStream_t stream) {
     Impl& p = *impl_;
-    must(cudaEventRecord(p.ready, stream), "fork");
-    must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
+    p.need(cudaEventRecord(p.ready, stream), "fork");
+    p.need(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
     moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, input, l, p.input_dev, p.ids_dev, p.bell_dev, p.seq, p.stream);
-    must(cudaEventRecord(p.done, p.stream), "join");
+    p.need(cudaEventRecord(p.done, p.stream), "join");
 }
 
 void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream) {
     Impl& p = *impl_;
-    must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
+    p.need(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
 

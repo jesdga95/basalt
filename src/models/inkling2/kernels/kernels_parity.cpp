@@ -1463,9 +1463,10 @@ void test_cpu_abort() {
     std::printf("%-34s %s\n", "moe_cpu_ring + merge: late done", late_ok ? "ok" : "FAIL");
     failures += !late_ok;
 
-    // The abort through the admission gate CpuExperts keeps: a call in flight behind a merge waiting for an unserved visit
-    // is waited on until it has synchronized its stream, its results are discarded, and no call enters after the close;
-    // a call still in flight at the bound, or one whose synchronize failed, leaves completion unconfirmed.
+    // The abort through the admission gate CpuExperts keeps: a drain started while a call holds admission behind a merge
+    // waiting for an unserved visit waits until the bell's release lets the call sync and leave, the call's results are
+    // discarded, and no call enters after the close; a call still in flight at the bound, one whose sync failed, or a
+    // fork left unjoined leaves completion unconfirmed.
     auto& unconfirmed = basalt::core::gpu_left_running();
     const bool previous = unconfirmed.exchange(false);
     bool gate_ok = true;
@@ -1476,19 +1477,24 @@ void test_cpu_abort() {
         gate_ok &= gate.enter();
         cudaGraphLaunch(exec, st);
         gate_ok &= wait_for_ring();
-        std::atomic<bool> left{false};
         bool kept = true;
         std::thread call([&] {
             const cudaError_t synced = cudaStreamSynchronize(st);   // the merge waits until the bell is aborted
             kept = gate.leave(synced);
-            left.store(true);
         });
-        gate.close();
-        const bool waiting = !left.load();
+        std::atomic<bool> drained{false};
+        std::thread drain([&] {
+            gate.close();
+            gate.drain(5000);
+            drained.store(true);
+        });
+        while (!gate.closed()) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const bool waited = !drained.load();   // the call cannot leave before the release below
         abort_bell();
-        gate.drain(5000);
+        drain.join();
         call.join();
-        gate_ok &= waiting && !kept && gate.closed() && !gate.enter() && !unconfirmed.exchange(false);
+        gate_ok &= waited && !kept && !gate.enter() && !unconfirmed.exchange(false);
     }
     {
         WindowGate gate;
@@ -1503,6 +1509,15 @@ void test_cpu_abort() {
         gate_ok &= gate.enter();
         gate.close();
         gate.leave(cudaErrorLaunchFailure);
+        gate.drain(20);
+        gate_ok &= unconfirmed.exchange(false);
+    }
+    {
+        WindowGate gate;
+        gate_ok &= gate.enter();
+        gate.fail(cudaErrorLaunchFailure);
+        gate.leave(cudaSuccess);
+        gate.close();
         gate.drain(20);
         gate_ok &= unconfirmed.exchange(false);
     }
