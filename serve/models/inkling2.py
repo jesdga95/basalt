@@ -33,7 +33,8 @@ _NAME = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")')   # a call objec
 
 class _Blocks:
     """The block structure of the model's text. `state` is "between" (a block may open), "reasoning", "content",
-    "name" (a tool call's name) or "call" (its JSON); text is held back while it may still be the start of a marker."""
+    "name" (a tool call's name), "call" (its JSON) or "literal_call" (the JSON of a call the request cannot make, passed
+    on as text); text is held back while it may still be the start of a marker."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
         self.state = "between"
