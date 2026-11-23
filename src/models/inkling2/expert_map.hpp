@@ -43,6 +43,10 @@ public:
         }
     }
 
+    /// Forget the snapshot this map keeps, so the next take() reports "since now" instead of wrapping negative after the
+    /// device tally was reset for a new request.  `pairs_` depends only on the pair count, so it stays.
+    void reset() { last_.clear(); }
+
 private:
     std::vector<int32_t> pairs_;
     std::vector<uint32_t> last_;

@@ -429,6 +429,8 @@ public:
         }
     }
     void decode_stats_begin() {
+        // the request begins: start the expert accounting over, then take the baseline (now all zeroes)
+        rt_.session().reset_expert_counts();
         counts0_ = rt_.session().expert_counts();
         draft_log_ = basalt::core::diagnostics().draft_log.empty() ? nullptr : rt_.draft_log();
         if (draft_log_ != nullptr) {
