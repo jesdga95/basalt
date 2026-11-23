@@ -772,13 +772,14 @@ bool InklingModel::copy_range() {
 }
 
 // The granules past the last copy go back to the driver. One that could not be unmapped (or whose handle could not be
-// released) leaves the range in an unknown state: it stays tracked for the end, and nothing is copied into the range again.
+// released) leaves the range in an unknown state: it stays tracked for the end, and the engine stops (wedge).
 bool InklingModel::trim_copies() {
     const uint64_t gran = copy_lay_.gran, keep = copy_lay_.pages(promoted());
     while (copy_maps_.size() > keep) {
         if (!core::vmm::unmap(copies_va_ + (copy_maps_.size() - 1) * gran, gran, copy_maps_.back())) {
             copies_retired_ = true;
-            basalt::log::error("basalt inkling2", "a granule of the expert copies could not be released; no more copies are made");
+            wedge();
+            basalt::log::error("basalt inkling2", "a granule of the expert copies could not be released; restart the engine");
             return false;
         }
         copy_maps_.pop_back();

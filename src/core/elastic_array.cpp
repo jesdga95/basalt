@@ -95,9 +95,9 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
         return false;
     }
     bool idle = false;
-    if (!clear_extent(base_ + backed_, n, idle)) {   // a CUDA failure: the extent stays tracked, the array is not used again
-        extents_.push_back({backed_, n, h});
-        unusable_ = true;
+    if (!clear_extent(base_ + backed_, n, idle)) {
+        if (!idle) extents_.push_back({backed_, n, h});
+        unusable_ = !idle || !vmm::unmap(base_ + backed_, n, h);
         err = "cannot initialize the array's new backing";
         return false;
     }
