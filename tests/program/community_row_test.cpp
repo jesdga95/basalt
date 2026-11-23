@@ -1,14 +1,17 @@
-// tests/program/community_row_test.cpp - adding a row to docs/community/benchmarks.json: the exact text for a populated
-// and an empty runs list, the refusal of a non-canonical tail, and string escaping. CPU only.
-//   community_row_test                         the built-in cases
-//   community_row_test --apply IN OUT CASE     writes IN with the case row added to OUT (community_row_fix_test.py
-//                                              compares it with what tools/check_benchmarks.py --fix writes)
-//   community_row_test --dup FILE              prints "I J" for each row I of FILE that has the setup of an earlier row J
-//                                              (the first such J), for community_row_fix_test.py to compare with the checker
+// tests/program/community_row_test.cpp - a community run's file: the exact row text, the id and folder, the write and its overwrite,
+// and string escaping. CPU only.
+//   community_row_test                    the built-in cases
+//   community_row_test --apply DIR CASE   writes the case row's run file under DIR and prints its path (community_row_fix_test.py
+//                                         compares the file and its path with what tools/check_benchmarks.py spells)
+//   community_row_test --ids FILE...      prints the id of each row file (the checker's row_id must agree)
+//   community_row_test --dup FILE...      prints "I J" for each row file I that has the setup of an earlier one J (the first such J),
+//                                         for community_row_fix_test.py to compare with the checker
 #include "basalt/program/community_row.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/program/host_rates.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -60,32 +63,38 @@ bool read_all(const char* path, std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && std::strcmp(argv[1], "--dup") == 0) {
-        std::string text, err;
+    if (argc >= 2 && (std::strcmp(argv[1], "--dup") == 0 || std::strcmp(argv[1], "--ids") == 0)) {
         std::vector<CommunityRow> rows;
-        if (!read_all(argv[2], text) || !community_parse_rows(text, rows, err)) {
-            std::printf("community_row: %s\n", err.c_str());
-            return 1;
+        for (int k = 2; k < argc; ++k) {
+            std::string text, err;
+            rows.emplace_back();
+            if (!read_all(argv[k], text) || !community_parse_row(text, rows.back(), err)) {
+                std::printf("community_row: %s: %s\n", argv[k], err.c_str());
+                return 1;
+            }
         }
-        for (size_t i = 0; i < rows.size(); ++i)
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (std::strcmp(argv[1], "--ids") == 0) {
+                std::printf("%s\n", community_run_id(rows[i]).c_str());
+                continue;
+            }
             for (size_t j = 0; j < i; ++j)
                 if (community_same_setup(rows[j], rows[i])) {
                     std::printf("%zu %zu\n", i, j);
                     break;
                 }
+        }
         return 0;
     }
-    if (argc == 5 && std::strcmp(argv[1], "--apply") == 0) {
+    if (argc == 4 && std::strcmp(argv[1], "--apply") == 0) {
         std::string err;
-        const CommunityRow r = std::strcmp(argv[4], "odd") == 0 ? odd_row() : plain_row();
-        std::string in, out;
-        if (!read_all(argv[2], in) || !community_add_row(in, r, out, err)) {
+        const CommunityRow r = std::strcmp(argv[3], "odd") == 0 ? odd_row() : plain_row();
+        CommunityEdit edit;
+        if (!community_write_run(argv[2], r, err, &edit)) {
             std::printf("community_row: %s\n", err.c_str());
             return 1;
         }
-        std::FILE* f = std::fopen(argv[3], "wb");
-        if (!f || std::fwrite(out.data(), 1, out.size(), f) != out.size()) return 1;
-        std::fclose(f);
+        std::printf("%s\n", edit.path.c_str());
         return 0;
     }
 
@@ -103,40 +112,82 @@ int main(int argc, char** argv) {
     }
 
     const std::string one =
-        "    {\n      \"submitter\": \"tester\",\n      \"date\": \"2026-10-24\",\n      \"commit\": \"abc1234\",\n"
-        "      \"preset\": \"community-1\",\n      \"model\": \"Qwen3.8-Flash-Next\",\n      \"gpus\": [\n        {\n          \"name\": \"RTX 5090\",\n"
-        "          \"vram_gib\": 32,\n          \"power_w\": 400,\n          \"pcie\": \"5.0 x16\",\n          \"h2d_gbps\": 55.3\n        },\n        {\n          \"name\": \"RTX 5060 Ti\",\n"
-        "          \"vram_gib\": 16,\n          \"power_w\": 180,\n          \"pcie\": \"5.0 x8\",\n          \"h2d_gbps\": 27.9\n        }\n      ],\n      \"ram_gib\": 64,\n"
-        "      \"cpu\": \"Test CPU 9, 16 cores\",\n      \"ram_gbps\": 78.2,\n"
-        "      \"os\": \"Linux\",\n      \"quant\": \"NVFP4\",\n      \"kv\": \"int8\",\n      \"prefill_16k_tps\": 1234.5,\n"
-        "      \"prefill_64k_tps\": 2345.6,\n      \"decode_tps\": 345.7,\n"
-        "      \"decode_conv_tps\": 400.1,\n      \"decode_struct_tps\": 500.3,\n      \"decode_prose_tps\": 300.2,\n"
-        "      \"accept_conv_pct\": 62.5,\n      \"accept_struct_pct\": 80.0,\n      \"draft_len_conv\": 3.2,\n      \"draft_len_struct\": 4.1,\n"
-        "      \"engine_args\": \"--gpu 0,1 --max-context 8192 --kv int8\"\n    }";
+        "{\n  \"submitter\": \"tester\",\n  \"date\": \"2026-10-24\",\n  \"commit\": \"abc1234\",\n"
+        "  \"preset\": \"community-1\",\n  \"model\": \"Qwen3.8-Flash-Next\",\n  \"gpus\": [\n    {\n      \"name\": \"RTX 5090\",\n"
+        "      \"vram_gib\": 32,\n      \"power_w\": 400,\n      \"pcie\": \"5.0 x16\",\n      \"h2d_gbps\": 55.3\n    },\n    {\n      \"name\": \"RTX 5060 Ti\",\n"
+        "      \"vram_gib\": 16,\n      \"power_w\": 180,\n      \"pcie\": \"5.0 x8\",\n      \"h2d_gbps\": 27.9\n    }\n  ],\n  \"ram_gib\": 64,\n"
+        "  \"cpu\": \"Test CPU 9, 16 cores\",\n  \"ram_gbps\": 78.2,\n"
+        "  \"os\": \"Linux\",\n  \"quant\": \"NVFP4\",\n  \"kv\": \"int8\",\n  \"prefill_16k_tps\": 1234.5,\n"
+        "  \"prefill_64k_tps\": 2345.6,\n  \"decode_tps\": 345.7,\n"
+        "  \"decode_conv_tps\": 400.1,\n  \"decode_struct_tps\": 500.3,\n  \"decode_prose_tps\": 300.2,\n"
+        "  \"accept_conv_pct\": 62.5,\n  \"accept_struct_pct\": 80.0,\n  \"draft_len_conv\": 3.2,\n  \"draft_len_struct\": 4.1,\n"
+        "  \"engine_args\": \"--gpu 0,1 --max-context 8192 --kv int8\"\n}";
     std::string out, err;
     check(community_row_text(plain_row()) == one, "the row text", community_row_text(plain_row()));
 
-    const std::string head = "{\n  \"preset\": \"basalt-bench --community\",\n  \"runs\": [\n";
-    const std::string prev = "    {\n      \"submitter\": \"a\"\n    }";
-    check(community_add_row(head + prev + "\n  ]\n}", plain_row(), out, err) && out == head + prev + ",\n" + one + "\n  ]\n}",
-          "a row is added after the last one with a comma", out);
-    check(community_add_row("{\n  \"preset\": \"p\",\n  \"runs\": []\n}", plain_row(), out, err) &&
-              out == "{\n  \"preset\": \"p\",\n  \"runs\": [\n" + one + "\n  ]\n}",
-          "an empty runs list gets its first row", out);
-
-    const std::string bad[] = {"", "{}", head + prev + "\n  ]\n}\n", head + prev + "\n  ]\n}   ", "{\"runs\": [{\"a\": 1}]}",
-                         "{\n  \"runs\": [],\n  \"x\": 1\n}", head + "    {\"submitter\": \"a\"}\n  ]\n}"};
-    int refused = 0;
-    for (const std::string& b : bad) {
-        std::string e;
-        refused += !community_add_row(b, plain_row(), out, e) && !e.empty();
+    check(sha256_hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" &&
+              sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" &&
+              sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
+                  "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1" &&
+              sha256_hex(std::string(1000, 'a')) == "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3",
+          "sha256_hex matches the published vectors");
+    {
+        const CommunityRow a = plain_row();
+        CommunityRow b = a, c = a, d = a;
+        b.submitter = "TESTER";                    // the submitter in other case: one setup, one id
+        b.kv = "fp16"; b.decode_tps = 1; b.notes = "x"; b.gpus[0].pcie = "4.0 x8";   // figures the setup does not include
+        c.gpus[1].power_w = 181;                   // another power limit: another setup
+        d.os = "WSL2";
+        const std::string id = community_run_id(a);
+        check(id.size() == 12 && id.find_first_not_of("0123456789abcdef") == std::string::npos, "the id is 12 hex digits", id);
+        check(community_run_id(b) == id, "the id ignores the submitter's case and the figures");
+        check(community_run_id(c) != id && community_run_id(d) != id, "another power limit or system is another id");
+        check(community_model_slug("Qwen3.8-Flash-Next") == "qwen3.8-flash-next" && community_model_slug("Hy4-flash") == "hy4-flash", "model slug");
     }
-    check(refused == (int) (sizeof bad / sizeof *bad), "a non-canonical tail is an error with a reason");
+
+    // writing a run: a file under runs/<slug>/<id>.json; the same setup again overwrites it and keeps its notes
+    {
+        const std::string dir = basalt::platform::temp_dir() + "/community_row_test_" + community_run_id(plain_row());
+        CommunityRow r = plain_row();
+        std::remove((dir + "/runs/qwen3.8-flash-next/" + community_run_id(r) + ".json").c_str());   // a leftover of an earlier run
+        CommunityEdit e;
+        const bool ok = community_write_run(dir, r, err, &e);
+        std::string text;
+        check(ok && !e.replaced && e.path == dir + "/runs/qwen3.8-flash-next/" + community_run_id(r) + ".json" && read_all(e.path.c_str(), text) &&
+                  text == one + "\n", "a run is written as its own file with a final newline", err + text);
+        CommunityRow back;
+        check(community_parse_row(text, back, err) && back.submitter == "tester" && back.model == "Qwen3.8-Flash-Next" && back.gpus.size() == 2 &&
+                  back.gpus[1].power_w == 180 && back.ram_gib == 64 && back.cpu == "Test CPU 9, 16 cores" && back.notes.empty() &&
+                  community_run_id(back) == community_run_id(r), "the file reads back to the same setup and id", err);
+        r.notes = "hand \"written\"\n\x08\x0c \xE2\x82\xAC\xF0\x9F\x98\x80";
+        CommunityEdit e2;
+        check(community_write_run(dir, r, err, &e2) && e2.replaced && e2.notes.empty(), "overwriting a run reports it", err);
+        CommunityRow again = plain_row();
+        again.submitter = "TESTER"; again.decode_tps = 99.9;
+        CommunityEdit e3;
+        text.clear();
+        check(community_write_run(dir, again, err, &e3) && e3.replaced && e3.notes == r.notes && e3.path == e2.path && read_all(e3.path.c_str(), text) &&
+                  text.find("\"decode_tps\": 99.9") != std::string::npos && text.find("\"submitter\": \"TESTER\"") != std::string::npos &&
+                  text == e3.row_text + "\n" && community_parse_row(text, back, err) && back.notes == r.notes,
+              "the same setup again overwrites the file with the new figures and keeps the notes", err + text);
+        std::remove(e3.path.c_str());
+    }
+    {
+        CommunityRow x;
+        const std::string bad[] = {"", "{}", "{\n  \"submitter\": \"a\"\n", "{\"submitter\": \"a\"}\n", "{\n  \"submitter\": \"a\"\n}\nextra\n",
+                                   "{\n  \"submitter\": \"\\q\"\n}\n", "{\n  \"gpus\": [\n    x\n  ]\n}\n"};
+        int refused = 0;
+        for (const std::string& b : bad) {
+            std::string e;
+            refused += !community_parse_row(b, x, e) && !e.empty();
+        }
+        check(refused == (int) (sizeof bad / sizeof *bad), "a row not in the house form is an error with a reason");
+    }
 
     check(json_quote("a\"b\\c\n\t\r\x01\x7f\xC3\xA9") == "\"a\\\"b\\\\c\\n\\t\\r\\u0001\x7f\xC3\xA9\"", "json_quote escapes like json.dumps",
           json_quote("a\"b\\c\n\t\r\x01\x7f\xC3\xA9"));
     check(json_quote("\b\f") == "\"\\b\\f\"", "json_quote spells backspace and form feed like json.dumps", json_quote("\b\f"));
-    check(community_row_text(odd_row()).find("\"notes\": \"line\\nbreak \xE2\x82\xAC \\u0001\x7f\"\n    }") != std::string::npos, "notes close the row");
+    check(community_row_text(odd_row()).find("\"notes\": \"line\\nbreak \xE2\x82\xAC \\u0001\x7f\"\n}") != std::string::npos, "notes close the row");
 
     check(cpu_label("AMD Ryzen 9 9950X 16-Core Processor", 16) == "AMD Ryzen 9 9950X, 16 cores", "cpu_label: AMD name");
     check(cpu_label("13th Gen Intel(R) Core(TM) i9-13900K", 24) == "13th Gen Intel Core i9-13900K, 24 cores", "cpu_label: marks");
@@ -174,43 +225,8 @@ int main(int argc, char** argv) {
     check(links.size() == 2 && links[0].second == 55.3 && normalize_bus_id(links[1].first) == normalize_bus_id("00000000:03:00.0"),
           "parse_link_rates keeps the good lines, bus ids compare across domain widths");
 
-    // a row of the same setup replaces the earlier one in its place and keeps its notes; another setup is appended
+    // the setup rule: a row with no figure of its own matches (an old row lacks cpu), a different system does not
     {
-        CommunityRow a = plain_row(), b = plain_row(), c = plain_row();
-        a.submitter = "first"; a.notes = "hand \"written\"\n\x08\x0c \xE2\x82\xAC\xF0\x9F\x98\x80";
-        b.submitter = "second"; b.notes.clear();
-        c.submitter = "third";
-        std::string f = "{\n  \"preset\": \"p\",\n  \"runs\": []\n}", next;
-        for (const CommunityRow* r : {&a, &b, &c})
-            if (!community_add_row(f, *r, next, err)) { check(false, "building the update fixture", err); break; }
-            else f = next;
-        CommunityRow upd = plain_row();   // the first row's setup again, other figures, its submitter in other case
-        upd.submitter = "FIRST"; upd.kv = "fp16"; upd.decode_tps = 99.9; upd.cpu.clear();
-        CommunityEdit e;
-        const bool ok = community_add_row(f, upd, out, err, &e);
-        std::vector<CommunityRow> rows;
-        const bool parsed = ok && community_parse_rows(out, rows, err);
-        check(ok && e.replaced && e.index == 0 && e.notes == a.notes && parsed && rows.size() == 3 && rows[0].submitter == "FIRST" &&
-                  rows[1].submitter == "second" && rows[2].submitter == "third" && rows[0].notes == a.notes,
-              "a row of the same setup replaces the earlier one in place, notes kept", out);
-        check(ok && out.find("\"decode_tps\": 99.9") != std::string::npos && e.row_text.find("\"notes\": ") != std::string::npos &&
-                  out.find(e.row_text) != std::string::npos, "the replaced row is the new figures and the edit reports its text");
-        CommunityRow other = plain_row();
-        other.submitter = "FIRST"; other.gpus[0].power_w = 401;
-        CommunityEdit e2;
-        check(community_add_row(f, other, out, err, &e2) && !e2.replaced && community_parse_rows(out, rows, err) && rows.size() == 4 &&
-                  rows[3].gpus[0].power_w == 401, "another power limit is another setup and is appended");
-        upd.ram_gib = 64.4;   // the file holds 64 and 400
-        upd.gpus[0].power_w = 400.4;
-        CommunityEdit e3;
-        check(community_add_row(f, upd, out, err, &e3) && e3.replaced, "figures compare as the file spells them (rounded)");
-        // CRLF files are edited the same way
-        std::string crlf;
-        for (char ch : f) { if (ch == '\n') crlf += '\r'; crlf += ch; }
-        CommunityEdit e4;
-        check(community_add_row(crlf, upd, out, err, &e4) && e4.replaced && out.find("\r\n") != std::string::npos &&
-                  out.find("\"decode_tps\": 99.9") != std::string::npos, "a CRLF file is updated in place too");
-        // a row with no setup figures of its own matches (an old row lacks cpu), a different system does not
         CommunityRow old = plain_row();
         old.submitter = "first"; old.cpu.clear();
         check(community_same_setup(old, plain_row()) == false, "same_setup: another submitter does not match");
@@ -221,6 +237,10 @@ int main(int argc, char** argv) {
     }
 
     std::string missing;
-    check(!community_add_row_file("/nonexistent-dir/benchmarks.json", plain_row(), missing) && !missing.empty(), "a missing file is an error");
+    // a folder under a plain file can be made on no system (a path from the root can be created on Windows)
+    const std::string blocker = basalt::platform::temp_dir() + "/community_row_test_blocker";
+    if (FILE* f = std::fopen(blocker.c_str(), "wb")) std::fclose(f);
+    check(!community_write_run(blocker + "/x", plain_row(), missing) && !missing.empty(), "an unwritable folder is an error");
+    std::remove(blocker.c_str());
     return failures ? 1 : 0;
 }

@@ -1,0 +1,34 @@
+{
+  "submitter": "cn_jie",
+  "date": "2026-11-21",
+  "commit": "ad274aa8dc",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090 Laptop GPU",
+      "vram_gib": 24,
+      "power_w": 150,
+      "pcie": "5.0 x16"
+    }
+  ],
+  "ram_gib": 255,
+  "cpu": "Intel Core Ultra 9 275HX, 24 cores",
+  "ram_gbps": 51.4,
+  "os": "Windows",
+  "quant": "DQ6_K",
+  "kv": "int8",
+  "prefill_16k_tps": 3295.4,
+  "prefill_64k_tps": 3774.7,
+  "decode_tps": 130.5,
+  "decode_conv_tps": 81.9,
+  "decode_struct_tps": 155.2,
+  "decode_prose_tps": 95.5,
+  "accept_conv_pct": 71.8,
+  "accept_struct_pct": 97.8,
+  "accept_prose_pct": 69.5,
+  "draft_len_conv": 2.5,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.9,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

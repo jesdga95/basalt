@@ -981,8 +981,8 @@ basalt_embed_manifest(iq_parity)
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
-# appending a community row to docs/community/benchmarks.json: formatting cases, and a byte comparison with
-# tools/check_benchmarks.py --fix (python3)
+# writing a community run file under docs/community/runs: formatting cases, and a byte comparison with
+# tools/check_benchmarks.py (python3)
 add_executable(community_row_test tests/program/community_row_test.cpp)
 target_link_libraries(community_row_test PRIVATE engine_session platform warnings)
 basalt_embed_manifest(community_row_test)

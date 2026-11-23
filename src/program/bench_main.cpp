@@ -245,7 +245,7 @@ struct Options {
     bool quality = false, no_windows = false, print_command = false;
     bool community = false, hardware = false;
     std::string submitter;
-    std::string community_file;          // --community-file: the table the row is added to
+    std::string community_dir;           // --community-dir: the community folder the run file is written under
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
@@ -277,17 +277,17 @@ void usage(const std::string& engine) {
         "                     where the model takes it, else the KV format the model's adapter names for community rows, else its own default (the row records the model and the\n"
         "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
-        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it; a row of the same\n"
-        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system) is replaced in place and keeps its notes. prefill_16k_tps and\n"
+        "                     every number is cold. Prints the table, writes the row to its own file, runs/MODEL/ID.json, and prints it; the ID is a hash of the\n"
+        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system), so a run of the same setup overwrites its file and keeps its notes. prefill_16k_tps and\n"
         "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
         "                     PCIe link (maximum generation and width) and the pinned host-to-device copy speed, measured before the engine starts; decode_tps = tokens / decode time\n"
         "                     summed over conv, struct and prose (token-weighted); the per-fixture decode speeds, acceptance and draft length and the engine\n"
         "                     arguments are recorded too. Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
-        "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
+        "                     --model, --submitter, --community-dir, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
         "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
-        "  --community-file PATH  the benchmarks.json the row is added to (default: docs/community/benchmarks.json of the\n"
-        "                     checkout this build came from); when it cannot be written the row is printed instead\n"
+        "  --community-dir DIR  the community folder the run file is written under, DIR/runs/MODEL/ID.json (default: docs/community\n"
+        "                     of the checkout this build came from); when it cannot be written the row is printed instead\n"
         "\n"
         "  --hardware         measure and print this machine's CPU, RAM read speed and, per GPU, PCIe link and\n"
         "                     host-to-device copy speed (the figures --community records), then exit; no model, no engine\n"
@@ -378,7 +378,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--gpu") o.gpu = next("--gpu");
         else if (a == "--hardware") o.hardware = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
-        else if (a == "--community-file") o.community_file = next("--community-file");
+        else if (a == "--community-dir") o.community_dir = next("--community-dir");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
@@ -437,7 +437,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         // an engine flag is refused first (in main, which asks the engine whether it is lossy): a run with one needs no submitter
         if (o.passthrough.empty() && o.sets.empty() && !community_submitter_error(o, err).empty()) return false;
     }
-    if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
+    if (!o.community_dir.empty() && !o.community) { err = "--community-dir needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
     if (o.format != "md" && o.format != "json") { err = "-o takes md or json"; return false; }
     if (o.quality_chunks < 1 || o.quality_t < 1) { err = "--quality and --quality-t need values >= 1"; return false; }
@@ -1492,26 +1492,25 @@ int main(int argc, char** argv) {
     }
     std::fputs(rep.c_str(), stdout);
     if (!community_row.empty()) {
-        const std::string path = o.community_file.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community/benchmarks.json"
-                                                          : o.community_file;
+        const std::string dir = o.community_dir.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community" : o.community_dir;
         std::string why;
         basalt::program::CommunityEdit edit;
-        const bool added = basalt::program::community_add_row_file(path, crow, why, &edit);
+        const bool added = basalt::program::community_write_run(dir, crow, why, &edit);
         std::printf("\nCOMMUNITY ROW:\n%s\n", (added ? edit.row_text : community_row).c_str());
         std::fflush(stdout);
         if (added && edit.replaced) {
-            basalt::log::info("basalt-bench", "runs[%zu] of %s has this run's setup (submitter, model, quant, GPUs, CPU, RAM, system): it was updated in "
-                              "place, not added", edit.index, path.c_str());
+            basalt::log::info("basalt-bench", "%s already held a run of this setup (submitter, model, quant, GPUs, CPU, RAM, system): it was overwritten",
+                              edit.path.c_str());
             if (!edit.notes.empty())
                 basalt::log::info("basalt-bench", "its notes were kept: \"%s\". Check they still apply to this run", edit.notes.c_str());
-            basalt::log::info("basalt-bench", "review the row, commit it and open a pull request (docs/community.md)");
+            basalt::log::info("basalt-bench", "review the file, commit it and open a pull request (docs/community.md)");
         } else if (added) {
-            basalt::log::info("basalt-bench", "the row was added to %s; review it, commit it and open a pull request (docs/community.md)",
-                              path.c_str());
+            basalt::log::info("basalt-bench", "the run was written to %s; review it, commit it and open a pull request (docs/community.md)",
+                              edit.path.c_str());
         } else {
-            basalt::log::warn("basalt-bench", "the row was not added to %s (%s); paste it at the end of the runs list of docs/community/benchmarks.json, "
-                              "run python3 tools/check_benchmarks.py --fix on it and open a pull request (docs/community.md)",
-                              path.c_str(), why.c_str());
+            basalt::log::warn("basalt-bench", "the run was not written under %s (%s); save the row above as docs/community/runs/MODEL/ID.json "
+                              "(MODEL: the model name in lower case, ID: see docs/community.md), run python3 tools/check_benchmarks.py --fix on "
+                              "docs/community and open a pull request (docs/community.md)", dir.c_str(), why.c_str());
         }
     }
     return do_quality && !quality.ran ? 1 : 0;
