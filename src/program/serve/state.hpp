@@ -238,7 +238,7 @@ public:
     /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
     const std::vector<int32_t>* idle_ids(int b) const;
     struct SlotMeet {
-        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation covers, the same ones the request would reuse from it
+        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation continues (another conversation sharing a head: 0)
         int64_t held = 0;    ///< the tokens it holds
     };
     std::vector<SlotMeet> slot_meets(const std::vector<int32_t>& prompt, bool media) const;

@@ -43,7 +43,8 @@ enum ggml_type {
     GGML_TYPE_IQ1_M = 29,
     GGML_TYPE_NVFP4 = 40,
     GGML_TYPE_Q2_0 = 42,
-    GGML_TYPE_COUNT = 43,
+    GGML_TYPE_MXFP8 = 46,
+    GGML_TYPE_COUNT = 47,
 };
 
 typedef uint16_t ggml_fp16_t;
@@ -93,8 +94,9 @@ const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu(enum ggml_type type)
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx2(enum ggml_type type);
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx512(enum ggml_type type);
 
-// NVFP4 row . Q8_0 row in plain C: the reference for the SIMD vec_dot (ggml_quants.c).
+// NVFP4 / MXFP8 row . Q8_0 row in plain C: the reference for the SIMD vec_dot (ggml_quants.c).
 void ggml_vec_dot_nvfp4_q8_0_ref(int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT x, const void* GGML_RESTRICT y);
+void ggml_vec_dot_mxfp8_q8_0_ref(int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT x, const void* GGML_RESTRICT y);
 
 #if defined(__cplusplus)
 }

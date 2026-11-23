@@ -21,6 +21,7 @@
 #include "basalt/model/flags.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -293,12 +294,13 @@ DsHead DsparkWeights::head_args() const {
     return h;
 }
 
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context, int tap_rows) {
+uint64_t dspark_tap_bytes(int tap_rows) { return 4ull * (uint64_t) std::max(tap_rows, kSlice) * kE * 4; }
+
+uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE, V = (uint64_t) pack.geo.n_vocab, ff = (uint64_t) d.n_ff, R = kDsBlock;
-    uint64_t n = 4ull * (uint64_t) tap_rows * E * 4;                              // the tap
-    n += 3 * kSlice * E * 4 + kFrRing * E * 4 + 2 * kSlice * kKV * 4 + 64;        // a commit step's rows
+    uint64_t n = 3 * kSlice * E * 4 + kFrRing * E * 4 + 2 * kSlice * kKV * 4 + 64;        // a commit step's rows
     n += bk::native_q8_1_bytes(kE, kSlice);
     for (int l = 0; l < d.n_layers; ++l)                                           // the caches, fp16 K and V
         n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
@@ -337,7 +339,7 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
     return p;
 }
 
-bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, const std::string& dump,
+bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
                       std::string& err) {
     if (!w) return true;
     const DsparkGeometry& d = w->geo;
@@ -348,10 +350,15 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     context_ = context;
     slot_.assign(g.visits.size(), -1);
     for (int k = 0; k + 1 < kDsTargets; ++k) slot_[(size_t) d.targets[(size_t) k]] = k;
-    tap_ = f(4 * (size_t) tap_rows_ * E);
+    tap_ = tap;
     mix_ = f(3 * kSlice * E);
     fr_ = f(kFrRing * E);
     pos3_ = (int32_t*) dev(kSlice * 3 * 4, ok);
+    ring_bounds_ = (int32_t*) dev(2 * 4, ok);
+    if (ok) {
+        const int32_t rb[2] = {0, (int32_t) ring_cells(d)};
+        if (cudaMemcpy(ring_bounds_, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+    }
     kb_ = f(kSlice * kKV);
     vb_ = f(kSlice * kKV);
     act_ = dev(bk::native_q8_1_bytes(kE, kSlice), ok);
@@ -420,7 +427,7 @@ int DsparkHook::slot_of_visit(int visit) const {
     return w_ && visit >= 0 && visit < (int) slot_.size() ? slot_[(size_t) visit] : -1;
 }
 
-void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream) {
+void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) {
     if (!w_ || rows <= 0) return;
     const DsparkGeometry& d = w_->geo;
     DsMixArgs ma;
@@ -431,7 +438,7 @@ void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream) {
     const bk::RopeSpec rope = rope_of(d);
     for (int r0 = 0; r0 < rows; r0 += kSlice) {
         const int n = std::min(kSlice, rows - r0);
-        dspark_mix(tap_ + (size_t) r0 * kE, (int64_t) tap_rows_ * kE, n, ma, mix_, (int64_t) kSlice * kE, pos_d + r0, fr_, kFrRing,
+        dspark_mix(tap_ + (size_t) (row0 + r0) * kE, (int64_t) tap_rows_ * kE, n, ma, mix_, (int64_t) kSlice * kE, pos_d + r0, fr_, kFrRing,
                    pos3_, stream);
         for (int l = 0; l < d.n_layers; ++l) {
             const DsparkLayer& L = w_->layer[(size_t) l];
@@ -442,6 +449,53 @@ void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream) {
             bk::attn_qk_prepare(nullptr, kb_, vb_, nullptr, L.k_ctx_norm, d.rms_eps, rope, pos3_, n, 0, kKvHeads, nullptr, c.k, c.v,
                                 0, stream, kHeadDim, false, c.cap, pos_d + r0);
         }
+    }
+}
+
+void DsparkHook::commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::mmq::Context& mmq, const PromptScratch& s,
+                               void* stream) {
+    if (!w_ || rows <= 0) return;
+    if (rows <= kSlice) {
+        commit(pos_d, rows, stream);
+        return;
+    }
+    namespace pm = basalt::prefill::mmq;
+    const DsparkGeometry& d = w_->geo;
+    DsMixArgs ma;
+    ma.alpha = w_->alpha;
+    for (int l = 0; l < d.n_layers; ++l) ma.norm[l] = w_->layer[(size_t) l].dflare_norm;
+    ma.norm[kDsMixes - 1] = w_->markov_norm;
+    ma.eps = d.rms_eps;
+    const bk::RopeSpec rope = rope_of(d);
+    dspark_mix(tap_, (int64_t) tap_rows_ * kE, rows, ma, s.mix, (int64_t) rows * kE, pos_d, fr_, kFrRing, s.pos3, stream);
+    for (int l = 0; l < d.n_layers; ++l) {
+        const DsparkLayer& L = w_->layer[(size_t) l];
+        const Cache& c = cache_[(size_t) l];
+        // A sliding-window layer only keeps its last c.cap cells; older rows of the chunk would be overwritten.
+        const int keep = c.ring ? (int) std::min<int64_t>(rows, c.cap) : rows;
+        const int r0 = rows - keep;
+        const float* mix_l = s.mix + ((size_t) l * rows + r0) * kE;
+        pm::quantize(mix_l, nullptr, s.xq, 8, kE, kE, keep, stream);
+        pm::Product p;
+        p.type = 8;
+        p.w_rows = kKV;
+        p.w_cols = kE;
+        p.expert_bytes = pm::matrix_bytes(8, kKV, kE);
+        p.n = 1;
+        p.xq = s.xq;
+        p.bounds = keep == rows ? s.bounds : ring_bounds_;
+        p.ids = s.ident;
+        p.total_rows = keep;
+        p.max_rows = keep;
+        p.ld_dst = kKV;
+        p.w = static_cast<const uint8_t*>(L.k_ctx);
+        p.dst = s.kb;
+        mmq.run(p, stream);
+        p.w = static_cast<const uint8_t*>(L.v_ctx);
+        p.dst = s.vb;
+        mmq.run(p, stream);
+        bk::attn_qk_prepare(nullptr, s.kb, s.vb, nullptr, L.k_ctx_norm, d.rms_eps, rope, s.pos3 + (size_t) r0 * 3, keep, 0,
+                            kKvHeads, nullptr, c.k, c.v, 0, stream, kHeadDim, false, c.cap, pos_d + r0);
     }
 }
 

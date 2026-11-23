@@ -65,6 +65,9 @@ INKLING2_PATTERNS = [
 ]
 PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS, "inkling2": INKLING2_PATTERNS}
 PRE_SOURCES = {"joyai-llm": "JOYAI_LLM", "hy_v4": "HY_V4", "inkling2": "GPT4O"}
+# pre-tokenizers whose checkpoint sets Hugging Face BPE's ignore_merges: a piece that is a vocabulary entry is that token
+# (llama.cpp sets ignore_merges for the same pre-types)
+IGNORE_MERGES = {"inkling2"}
 
 
 class Tokenizer:
@@ -88,6 +91,7 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._res = [regex.compile(p) for p in PRE_PATTERNS.get(pre, [QWEN35_PATTERN])]
+        self.ignore_merges = pre in IGNORE_MERGES
 
         # Literals matched directly instead of through BPE (GGUF token types):
         #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, ...) always matches, with or without parse_special;
@@ -217,7 +221,10 @@ class Tokenizer:
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
-                for tok in self._bpe(mapped):
+                whole = self.ids.get(mapped) if self.ignore_merges else None
+                if whole is not None and mapped not in self.special_tokens:
+                    got.append(whole)
+                for tok in self._bpe(mapped) if not got else ():
                     i = self.ids.get(tok)
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)

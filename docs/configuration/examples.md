@@ -24,7 +24,7 @@ The whole model sits on the card; the context takes what the weights leave ([gui
 ```json
 {
   "version": 2,
-  "models": [{ "model": "Inkling-2-Mini-NVFP4-q8.basalt", "gpu": "0", "max-context": 262144, "vision": "dynamic" }],
+  "models": [{ "model": "Inkling-2-Mini-NVFP4-DQ8.basalt", "gpu": "0", "max-context": 262144, "vision": "dynamic" }],
   "server": { "host": "127.0.0.1", "port": 8080 }
 }
 ```

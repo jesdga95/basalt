@@ -9,6 +9,7 @@
 #include "basalt/core/shipped_profiles.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/model/batch_check.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
@@ -404,6 +405,18 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         if (o.stop_eos) stop = o.eos_ids;
         if (started.model->context() != 0) o.max_context = started.model->context();
         if (o.serve) return basalt::program::serve::run_session(o, model_file, *adapter, started);
+        if (o.diag_batch_check) {   // every session's windows alone against the same windows batched, bitwise
+            std::vector<basalt::model::ModelSession*> ss;
+            for (auto& s : started.sessions) ss.push_back(s.get());
+            const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
+            basalt::model::BatchCheck bc;
+            const basalt::model::Result r = basalt::model::check_batch(ss.data(), (int) ss.size(), prompt, (int) std::max<int64_t>(o.max_new, 4),
+                                                                       started.model->desc().n_vocab, bc);
+            std::printf("%s", bc.report.c_str());
+            if (!r.ok()) return fatal_start_error(r.message);
+            std::printf("batch check: %d windows compared, %d differ: %s\n", bc.compared, bc.differ, bc.differ ? "FAILED" : "PASSED");
+            return bc.differ ? 1 : 0;
+        }
         std::vector<int64_t> oracle;
         if (const auto code = cli::load_spec_oracle(o.spec_oracle, oracle)) return *code;
         if (o.diag_teacher && oracle.empty()) return fatal_start_error("--diag-teacher needs --spec-oracle");

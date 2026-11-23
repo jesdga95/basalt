@@ -9,7 +9,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
   models' true-BF16 KLDs.
-- **The experts are the release's bits.** Layers 0 to 19 keep the release's NVFP4 codes and scales as they are.
+- **The experts are the release's bits.** Layers 0 to 19 keep the release's NVFP4 codes and scales as they are; layers 20 to 23 keep the release's MXFP8 codes and UE8M0 scales bit for bit (older Q8_0 packs continue to load).
 - **Drafting does not change output.** Greedy drafted decoding gives plain decoding's tokens.
 
 ## Weights
@@ -20,7 +20,7 @@ converter.
 | Tensors | Stored as | From the release |
 | --- | --- | --- |
 | Routed experts, layers 0 to 19 | NVFP4 (E2M1, an E4M3 scale per 16 values, an FP32 scale per matrix) | bit for bit; the FP32 scale is the release's amax over its denominator, rounded once |
-| Routed experts, layers 20 to 23 | Q8_0 | the release's MXFP8 values (E4M3, a UE8M0 scale per 32) rounded to Q8_0 by ggml's reference rounding (0.54% RMS error) |
+| Routed experts, layers 20 to 23 | MXFP8 (E4M3, a UE8M0 scale per 32 values, type 46) | bit for bit from the release (older Q8_0 packs still load) |
 | Attention, gate, short-convolution and output projections | Q8_0 | ggml's reference rounding of the BF16 values |
 | Output head | BF16 | as stored; the engine rounds it to Q8_0 as it loads |
 | Token embedding | BF16, in page-locked RAM | as stored |
@@ -32,15 +32,14 @@ converter.
 The release marks NVFP4 activation quantization as required (its own serving runs W4A4); transformers and llama.cpp run
 dequantized weights, and so does the reference.
 
-Formats measured for layers 20 to 23 over 20 chunks: Q8_0 of the MXFP8 values 0.00256 KLD, NVFP4 0.00431. Keeping attention in
-BF16 instead of Q8_0 scored 0.00218 for 1.2 GB more reads a token; it was not taken.
+Formats measured for layers 20 to 23 over 20 chunks: native MXFP8 0.00265 KLD (100 chunks: 0.00297 KLD, 97.83% top-1), Q8_0 of the MXFP8 values 0.00256 KLD, NVFP4 0.00431. Quantizing `w.proj`/`w.out` to MXFP8 raised 20-chunk KLD to 0.00421 (97.16% top-1, 4.9x weight L2 error vs Q8_0), so `w.proj`/`w.out` remain Q8_0. Keeping attention in BF16 instead of Q8_0 scored 0.00218 for 1.2 GB more reads a token; it was not taken.
 
 ## Where each stage rounds
 
 | Stage | Format | Arithmetic |
 | --- | --- | --- |
-| Routed experts | NVFP4, Q8_0 | decode: q8_1 activations, fp32 sums; prompt chunks: NVFP4 layers on the FP4 block-scaled tensor cores, each activation row as two FP4 terms under one per-row scale (its rounding and the rounding of what that leaves, about 8 bits), fp32 accumulation; Q8_0 layers MMQ (int8 mma); each matrix's FP32 scale applied after |
-| Q8_0 projections, head | Q8_0 | q8_1 activations (decode); MMQ (prompt); fp32 logits, softcap 30 |
+| Routed experts | NVFP4, MXFP8 (or Q8_0 on older packs) | decode: q8_1 activations, fp32 sums (MXFP8 decoded to fp32 per block, matching CPU AVX2/AVX-512); experts in RAM on the CPU: Q8_0 activations, fp32 sums, the card's softcapped SwiGLU; prompt chunks: NVFP4 layers on FP4 block-scaled tensor cores (two FP4 terms per activation row, fp16 SwiGLU/down intermediates), MXFP8 layers on block-scaled MXFP8 tensor cores (E4M3 activations + UE8M0 scales, fp32 accumulation, fp16 SwiGLU intermediate); older Q8_0 layers via MMQ |
+| Q8_0 projections (`w.proj`, `w.out`), head | Q8_0 (loaded into `q8_planes` for `w.proj`/`w.out`) | q8_1 activations via `native_q8_planes_mmvq` (decode, bitwise `native_q8_0_mmvq`); block-32 Q8_0 2-CTA TMA int8 tensor cores (`prefill::q8`, prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
 | Attention caches | fp16 (`--kv fp8`: E4M3, unit scale) | decode: fp32 scores and softmax; prompt: fp16 tensor cores, fp32 accumulation |
@@ -69,8 +68,12 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | --- | ---: | ---: | ---: |
 | 100 chunks, `--kv fp16` | 0.00305 | 97.76% | 7.0695 (base 7.0633 over the scored rows) |
 | 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
+| 90 chunks, RTX 5060 Ti alone, 1,047 experts in RAM on the CPU | 0.00298 | 97.70% | |
+| the same 90 chunks, the whole model on the card | 0.00304 | 97.76% | |
+| 100 chunks, layer split: 0 to 11 on the RTX 5090, 12 to 23 on an RTX 5060 Ti | 0.00304 | 97.70% | 7.0718 (base 7.0633) |
 
-RTX 5090 at 400 W, the whole model on the card.
+RTX 5090 at 400 W, the whole model on the card, unless the row says otherwise. On the 5060 Ti the CPU computes the experts in
+RAM (a Ryzen 9 9950X, AVX-512).
 
 ## Drafting
 

@@ -32,7 +32,7 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
         std::string lossy;
         for (const auto& f : o.lossy) lossy += (lossy.empty() ? "" : ",") + f.flag;
         std::printf("%s\n", bp::gpu_plan_json(visible, choice, o.arch, o.quality_flags, o.quality_window, o.plan_spec, o.max_context,
-                                             o.model_name, lossy).c_str());
+                                             o.model_name, lossy, o.community_kv).c_str());
         return choice.error.empty() ? 0 : 2;
     }
     if (!choice.error.empty()) { basalt::log::error("basalt", "%s", choice.error.c_str()); return 2; }

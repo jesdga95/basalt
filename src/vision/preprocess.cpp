@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -231,8 +233,16 @@ void patchify_padded(const Image& img, const Geometry& g, const float mean[3], c
     const Size canvas = padded_canvas(img.w, img.h, g);
     const int P = g.patch, gx = canvas.w / P, gy = canvas.h / P, m = g.merge;
     const size_t row = (size_t) 3 * P * P;
-    float m255[3], s255[3];
-    for (int c = 0; c < 3; ++c) { m255[c] = mean[c] * 255.0f; s255[c] = std[c] * 255.0f; }
+    // round to nearest even bf16, as the device's __float2bfloat16_rn (no NaN reaches here)
+    const auto bf16 = [](float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+        std::memcpy(&f, &u, 4);
+        return f;
+    };
+    float cm[3], cs[3];
+    for (int c = 0; c < 3; ++c) { cm[c] = bf16(kClipMean[c]); cs[c] = bf16(kClipStd[c]); }
     out.resize((size_t) gx * gy * row);
     size_t n = 0;
     for (int yb = 0; yb < gy; yb += m)
@@ -245,7 +255,8 @@ void patchify_padded(const Image& img, const Geometry& g, const float mean[3], c
                             for (int kx = 0; kx < P; ++kx) {
                                 const int X = (xb + dx) * P + kx, Y = (yb + dy) * P + ky;
                                 const float v = X < img.w && Y < img.h ? (float) img.rgb[((size_t) Y * img.w + X) * 3 + c] : -1.0f;
-                                d[((size_t) c * P + ky) * P + kx] = (v - m255[c]) / s255[c];
+                                const float x = bf16((v / 255.0f - kClipMean[c]) / kClipStd[c]);
+                                d[((size_t) c * P + ky) * P + kx] = bf16((x * cs[c] + cm[c] - mean[c]) / std[c]);
                             }
                 }
 }

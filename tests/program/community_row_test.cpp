@@ -141,6 +141,17 @@ int main(int argc, char** argv) {
     check(cpu_label("AMD Ryzen 9 9950X 16-Core Processor", 16) == "AMD Ryzen 9 9950X, 16 cores", "cpu_label: AMD name");
     check(cpu_label("13th Gen Intel(R) Core(TM) i9-13900K", 24) == "13th Gen Intel Core i9-13900K, 24 cores", "cpu_label: marks");
     check(cpu_label("Intel(R) Xeon(R) Gold 6130 CPU @ 2.10GHz", 1) == "Intel Xeon Gold 6130, 1 core", "cpu_label: clock and CPU");
+    check(cpu_label("AMD Ryzen Threadripper PRO 9955WX 16-Cores", 16) == "AMD Ryzen Threadripper PRO 9955WX, 16 cores",
+          "cpu_label: plural cores tag");
+    check(cpu_label("AMD Ryzen Threadripper PRO 7995WX 96-Cores Foo", 96) == "AMD Ryzen Threadripper PRO 7995WX Foo, 96 cores",
+          "cpu_label: plural cores tag before more text");
+    check(cpu_label("AMD Ryzen Threadripper PRO 7995WX 96-Cores (rev2)", 96) == "AMD Ryzen Threadripper PRO 7995WX (rev2), 96 cores",
+          "cpu_label: plural cores tag before punctuation");
+    check(cpu_label("Foo 16-Coresx", 16) == "Foo 16-Coresx, 16 cores", "cpu_label: tag kept when the word continues");
+    check(cpu_label("Foo 16-Cores2", 16) == "Foo 16-Cores2, 16 cores", "cpu_label: tag kept when a digit follows the s");
+    check(cpu_label("Intel Pentium Dual-Cores", 2) == "Intel Pentium Duals, 2 cores", "cpu_label: plural s kept without a count");
+    check(cpu_label("AMD Phenom II X6 Hexa-Core", 6) == "AMD Phenom II X6 Hexa, 6 cores" &&
+              cpu_label("Foo Hexa-Corex", 6) == "Foo Hexax, 6 cores", "cpu_label: tag without a count");
     check(pack_quant_label("Qwen3.8-Flash-Next NVIDIA-NVFP4") == "NVFP4" && pack_quant_label("DeepSeek-V4.1-Flash-1017 UD-IQ1_M") == "IQ1_M" &&
               pack_quant_label("") == "unknown", "pack_quant_label");
     check(pack_quant_label("Qwen3.8-Flash-Next") == "unknown" && pack_quant_label("Qwen3.8-Flash-Next UD-Q4_K_XL") == "Q4_K_XL" &&
@@ -154,6 +165,9 @@ int main(int argc, char** argv) {
     check(pack_quant_label("Qwen3.8-Flash-Next UD-NVIDIA-Q4_K_XL") == "Q4_K_XL" &&
               pack_quant_label("Qwen3.8-Flash-Next UD-UD-Q4") == "Q4",
           "pack_quant_label: prefixes stripped repeatedly in any order");
+    check(pack_quant_label("Inkling 2 Mini") == "unknown" && pack_quant_label("Hy4-flash NVFP4") == "NVFP4" &&
+              pack_quant_label("Foo Q8_0") == "Q8_0" && pack_quant_label("Foo BF16") == "BF16" && pack_quant_label("Foo UD-Mini") == "unknown",
+          "pack_quant_label: a last word without a digit is no quant label");
     check(cpu_label("", 8).empty() && cpu_label("X", 0) == "X", "cpu_label: empty name, unknown cores");
 
     const auto links = parse_link_rates("noise\npcie_h2d 0000:01:00.0 55.3\npcie_h2d 0000:02:00.0 bad\npcie_h2d 0000:03:00.0 27.9\n");

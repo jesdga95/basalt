@@ -10,6 +10,8 @@
 #include "models/inkling2/meta.hpp"
 #include "models/inkling2/model.hpp"
 
+#include <cstdlib>
+
 namespace basalt::models::inkling2 {
 namespace {
 
@@ -32,14 +34,29 @@ public:
         f.trigger_pattern = "<\\|message_model\\|>[^<]";
         return f;
     }
-    PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2}; }
-    int max_expert_cards() const override { return 0; }
+    // A reply is a list of blocks, each opened by <|message_model|> and ended by <|end_message|>: thinking blocks
+    // (<|content_thinking|>), then the answer (<|content_text|>, or text right after the header).
+    program::grammar::ReplyForm reply_form() const override {
+        program::grammar::ReplyForm f;
+        f.header = "<|message_model|>";
+        f.think_open = "<|content_thinking|>";
+        f.think_close = "<|end_message|>";
+        f.answer_open = "<|content_text|>";
+        return f;
+    }
+    PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
+    int max_expert_cards() const override { return 1; }   // the second card: the layer split (model.hpp card_of)
     const char* model_name() const override { return "Inkling-2-Mini"; }
+    const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
     // --kv: the attention caches as fp16 (the default) or fp8; --spec, --draft-log: the drafter's windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
+            return true;
+        }
+        if (a == "--diag-split-at") {   // diagnostic: the layer split forced, the second card from this layer on
+            o.diag_split_at = std::atoi(args.next("--diag-split-at"));
             return true;
         }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK

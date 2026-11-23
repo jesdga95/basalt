@@ -116,8 +116,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     constexpr int kRowBytes = FP8 ? kHeadDim : kHeadDim * 2;
     constexpr int kLoads = kRowBytes / 16;
-    const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
-    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+    const SegCaches& sc = a.seg.c[bk::seg_of(a.seg.at, r)];   // a batch window's row: its conversation's caches
+    const uint8_t* kbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
+    const uint8_t* vbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
     // a tile's key and value rows, the lane's key's (zero past the slice); the warp's first tile is loaded with the queries
     const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads]) {
         const int key = t0 + lane;
@@ -572,6 +573,12 @@ int launch_splits(int64_t max_keys) {
 
 }  // namespace
 
+int opt_in_device() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kOptInDevices) throw std::runtime_error("inkling2: device out of range");
+    return dev;
+}
+
 size_t attention_decode_scratch(int rows, int64_t max_keys) {
     const size_t slots = (size_t) rows * kHeads * (size_t) launch_splits(max_keys);
     return slots * (2 + kHeadDim) * sizeof(float);
@@ -583,11 +590,11 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
     const int z = launch_splits(max_keys);
     float* part_ml = static_cast<float*>(scratch);
     float* part_acc = part_ml + (size_t) rows * kHeads * z * 2;
-    static bool attr = false;
-    if (!attr) {
+    static bool attr[kOptInDevices] = {};   // the opt-in is per device: a layer split launches these on two cards
+    if (bool& set = attr[opt_in_device()]; !set) {
         cudaFuncSetAttribute(attn_split_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        attr = true;
+        set = true;
     }
     const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
     if (a.fp8) bk::launch_pdl(attn_split_kernel<true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
@@ -599,7 +606,7 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr) {
+    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;
@@ -607,10 +614,11 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
     // 1-2 rows, a block an SM: each block asks for more than half of an SM's shared memory (it uses sizeof(FusedSmem)), so
     // a cluster's blocks spread over as many SMs instead of sharing them two by two through the preparation and the tile,
     // while the products' small blocks still fit beside one; 3 rows, two blocks an SM, so the 3 x 8 x 8 blocks take one wave
-    static size_t smem = 0;
+    static size_t smem_of[kOptInDevices] = {};   // per device, as above
+    const int dev = opt_in_device();
+    size_t& smem = smem_of[dev];
     if (!smem) {
-        int dev = 0, per_sm = 0, reserved = 0;
-        cudaGetDevice(&dev);
+        int per_sm = 0, reserved = 0;
         cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
         cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
         smem = std::max(sizeof(FusedSmem<2>), (size_t) std::max(0, per_sm / 2 - reserved + 128));

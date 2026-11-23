@@ -46,6 +46,9 @@ TURN_POLL_S = 0.5                           # how soon a request waiting for its
 # per-read deadline, not a total one - a slow client that keeps sending bytes is never cut off. A header read that
 # expires is ended by handle_one_request itself; a body that stops arriving is the 408 in _body.
 HTTP_BODY_S = 60.0
+# Anthropic clients add /v1/messages to their base URL themselves, so a base URL that already ends in /v1 makes them
+# post /v1/v1/messages. These two paths mean the same as the real ones; nothing else is aliased.
+V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
 
 
 class BadBody(Exception):
@@ -54,6 +57,12 @@ class BadBody(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+def request_path(target: str) -> str:
+    """The route of a request target: no query, no trailing slash, and a doubled /v1 of the two Anthropic paths undone."""
+    path = target.split("?")[0].rstrip("/")
+    return V1_V1_ALIASES.get(path, path)
 
 
 def _size_text(n: int) -> str:
@@ -294,7 +303,7 @@ def make_handler(target: Service | Router):
 
         def _stream_error(self, obj) -> None:
             """An error after the stream's headers went out (a request that waited for a swap), in the API's own form."""
-            path = self.path.split("?")[0].rstrip("/")
+            path = request_path(self.path)
             err = obj.get("error") if isinstance(obj.get("error"), dict) else {"message": str(obj)}
             if path == "/v1/messages":
                 data = b"event: error\ndata: " + json.dumps({"type": "error", "error": err}, ensure_ascii=False).encode() + b"\n\n"
@@ -331,7 +340,7 @@ def make_handler(target: Service | Router):
             return False
 
         def do_GET(self):
-            path = self.path.split("?")[0].rstrip("/")
+            path = request_path(self.path)
             if path.startswith("/fonts/"):
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
@@ -425,7 +434,7 @@ def make_handler(target: Service | Router):
         def do_POST(self):
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
+            path = request_path(self.path)   # clients post /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path in ("/unload", "/load") and not self._control_body():

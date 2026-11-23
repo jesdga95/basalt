@@ -7,10 +7,27 @@
 
 namespace basalt::program::serve {
 
-/// The most rows the i-th of n active slots' window may take in a batch of `cap` rows: with no more slots than rows each
-/// takes its share (the first cap % n one more), so one pass serves them all; with more slots each may take the cap.
-inline int batch_share(int i, int n, int cap) {
-    return n <= cap ? cap / n + (i < cap % n ? 1 : 0) : cap;
+/// The most rows each active slot's window may take in a batch of `cap` rows. joint[i][k] is the chance slot i's drafts
+/// 0..k are all kept. With no more slots than rows, one pass serves them all: each slot takes one row, then each further
+/// row goes to the slot whose next draft is likeliest kept (the earlier slot on a tie), and rows no draft wants go round
+/// the slots in turn (a lookup proposal may still take them). With more slots than rows each may take the cap.
+inline std::vector<int> batch_shares(const std::vector<std::vector<double>>& joint, int cap) {
+    const size_t n = joint.size();
+    if (n == 0) return {};
+    if ((int) n > cap) return std::vector<int>(n, cap);
+    std::vector<int> rows(n, 1);
+    int left = cap - (int) n;
+    for (; left > 0; --left) {
+        size_t best = n;
+        for (size_t i = 0; i < n; ++i) {
+            const size_t k = (size_t) rows[i] - 1;   // the draft its next row would verify
+            if (k < joint[i].size() && joint[i][k] > 0 && (best == n || joint[i][k] > joint[best][(size_t) rows[best] - 1])) best = i;
+        }
+        if (best == n) break;
+        ++rows[best];
+    }
+    for (size_t i = 0; left > 0; i = (i + 1) % n, --left) ++rows[i];
+    return rows;
 }
 
 /// The windows of `rows` packed into groups of at most `cap` rows, first fit in slot order: each group starts at the

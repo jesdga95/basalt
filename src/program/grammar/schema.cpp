@@ -441,6 +441,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
         err = "grammar: missing kind";
         return out;
     }
+    if (const JsonValue* think = req.get("think"); think && think->is(Type::Bool)) out.think = think->b;
     std::string gbnf;
     if (kind->s == "json_object" || kind->s == "json_schema") {
         std::string schema = R"({"type":"object"})";

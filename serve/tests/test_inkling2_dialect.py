@@ -2,6 +2,7 @@
 effort and thinking switches mapped to the template's, and the reply's blocks parsed into reasoning, content and tool
 calls, whole and streamed. Text only: no engine, no pack."""
 import json
+import threading
 import unittest
 from pathlib import Path
 
@@ -100,6 +101,17 @@ class Controls(unittest.TestCase):
         for level, text in (("low", "0.2"), ("medium", "0.7"), ("high", "0.9"), ("max", "0.99")):
             self.assertEqual(self.prompt(reasoning_effort=level), EFFORT.format(text) + self.tail, level)
 
+    def test_minimal_is_the_templates(self):
+        self.assertEqual(self.prompt(reasoning_effort="minimal"), EFFORT.format("0.1") + self.tail)
+        msgs, tools, kwargs = openai_to_messages({"messages": self.msgs, "reasoning_effort": "minimal"})
+        self.assertEqual(self.svc.thinking_kwargs(kwargs), {"reasoning_effort": "minimal"})
+
+    def test_the_grammar_hears_when_thinking_is_off(self):
+        for thinking, want in ((False, {"kind": "json_object", "think": False}), (True, {"kind": "json_object"})):
+            svc = service(HEADER + TEXT + "{}" + END)
+            list(svc.run(svc.tok.encode("x"), thinking, None, 16, {"_grammar": {"kind": "json_object"}}, threading.Event()))
+            self.assertEqual(svc.engine.requests[-1][1]["_grammar"], want, thinking)
+
     def test_off_is_the_lowest_effort(self):
         self.assertEqual(self.prompt(enable_thinking=False), EFFORT.format("0") + self.tail)
 
@@ -141,6 +153,28 @@ class Parse(unittest.TestCase):
     def test_a_cut_off_call_is_not_a_call(self):
         reply = HEADER + "search" + TOOL_JSON + '{"name":"search","args":{"q":"o'
         self.assertFalse([e for e in parse(reply) if e.kind == "tool_call"])
+
+    def test_a_cut_off_call_streams_valid_json(self):
+        # what was streamed is closed: a value cut inside a string keeps its text, a dangling key, separator, literal or
+        # escape is dropped, nothing is invented (vLLM #53739)
+        head = HEADER + "f" + TOOL_JSON + '{"name":"f","args":'
+        for cut, want in (('{"s": "hel', {"s": "hel"}), ('{"s": "hello", ', {"s": "hello"}), ('{"n": 42, ', {"n": 42}),
+                          ('{"s": "a", "n": tr', {"s": "a"}), ('{"s": "a", "k', {"s": "a"}), ('{"s": "a", "k":', {"s": "a"}),
+                          ('{"s": "a\\', {"s": "a"}), ('{"s": "\\u00e', {"s": ""}), ('{"l": [1, 2', {"l": [1]}),
+                          ('{"o": {"p": [{"q": null}', {"o": {"p": [{"q": None}]}}), ('{"n": 4', {}), (' ', {}), ('', {})):
+            for chunk in (None, 1, 3):
+                events = parse(head + cut, chunk)
+                args = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(args), want, (cut, chunk))
+                self.assertFalse([e for e in events if e.kind == "tool_call"], cut)
+
+    def test_a_whole_call_streams_its_arguments_alone(self):
+        reply = HEADER + "f" + TOOL_JSON + '{"name":"f","args": {"a": [1, "x\\"y"], "b": {"c": true}} }' + END
+        for chunk in (None, 1, 2, 5):
+            events = parse(reply, chunk)
+            args = "".join(e.text for e in events if e.kind == "tool_args")
+            self.assertEqual(args.strip(), '{"a": [1, "x\\"y"], "b": {"c": true}}', chunk)
+            self.assertEqual([e.call.arguments for e in events if e.kind == "tool_call"], [{"a": [1, 'x"y'], "b": {"c": True}}])
 
     def test_the_reply_ends_the_turn(self):
         svc = service(HEADER + TEXT + "done" + END)

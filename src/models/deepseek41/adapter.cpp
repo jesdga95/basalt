@@ -75,6 +75,7 @@ public:
     int max_expert_cards() const override { return kMaxSecondCards; }
 
     const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
+    const char* community_kv() const override { return "fp8"; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         if (model::parse_route_flag(a, args, o.route, code)) {}

@@ -10,6 +10,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
+#include "basalt/program/grammar/reply_form.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
 #include <cstdint>
@@ -106,7 +107,7 @@ struct LoadRequest {
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
     std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
-    int diag_split_at = 0;            ///< diagnostic: a dense model's layers split at this one across two cards (0: off)
+    int diag_split_at = 0;            ///< diagnostic: a model's layers split at this one across two cards (0: off)
 };
 
 struct DecodeRequest {
@@ -337,6 +338,10 @@ public:
     virtual const char* quality_flags() const { return ""; }
     /// The model's name as a community benchmark row records it; empty for a model that has none.
     virtual const char* model_name() const { return ""; }
+    /// The KV cache format a community benchmark row runs this model with when it takes no int8; empty: its default.
+    virtual const char* community_kv() const { return ""; }
+    /// The quant label of a community row when the pack's name carries none (its name ends in no format word); empty: "unknown".
+    virtual const char* community_quant() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.
@@ -350,13 +355,18 @@ public:
         return false;
     }
     virtual TokenNames token_names() const = 0;
-    /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
+    /// The pre-tokenizer's name in the pack's tokenizer.json and its rule. `ignore_merges`: a piece that is itself a
+    /// vocabulary entry is that token, not merged from its bytes (Hugging Face BPE's ignore_merges; llama.cpp ties it to
+    /// the pre-tokenizer too).
     struct PreTokenizer {
         const char* name = "";
         void (*split)(const char* text, size_t size, std::vector<size_t>& ends) = nullptr;
+        bool ignore_merges = false;
     };
     virtual PreTokenizer pretokenizer() const = 0;
     virtual program::grammar::ToolForm tool_form() const = 0;
+    /// Where the model's reply holds its thinking, for the grammar guard (the default: a <think> block).
+    virtual program::grammar::ReplyForm reply_form() const { return {}; }
     /// The options object of this model: the common flags and its own.
     virtual std::unique_ptr<program::CommonOptions> make_options() const;
     /// Takes a flag outside the common set; false when this model has no such flag. `code`: an exit code for a bad value.

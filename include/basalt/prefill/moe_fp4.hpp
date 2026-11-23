@@ -33,6 +33,9 @@ void rebase(const int32_t* bounds, int n, int32_t* out, void* stream);
 /// (size them as for 2 * cols), the k-tiles alternating the two terms of the same 128 columns.
 void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
               float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream, bool two = false);
+/// Same as quantize(..., two = true) reading fp16 rows (halves intermediate H traffic between gate/up and down).
+void quantize_f16(const uint16_t* x, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
+                  float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream);
 
 /// The plan of a layer's experts all at once (n <= 1024, rows grouped by expert, bounds on the device): tile_off as
 /// plan() gives it, and blk_off[0..n] the first GEMM block (two tiles, 128 rows) of each expert and the total.
@@ -65,6 +68,7 @@ struct Product {
     const int32_t* bounds = nullptr;
     const int32_t* tile_off = nullptr;
     float* dst = nullptr;
+    uint16_t* dst_f16 = nullptr;   ///< optional fp16 output for FLAT (replaces dst)
     int64_t ld_dst = 0, max_rows = 0;
     bool swiglu = false;
     const int32_t* ids = nullptr;

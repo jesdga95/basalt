@@ -21,6 +21,8 @@ They hold no CUDA libraries and no Python environment. Needs:
 
 - An NVIDIA driver of the R580 branch or newer. The archives are built with CUDA 13.0.2, whose Linux minimum is 580.95.05; NVIDIA
   publishes no Windows minimum since 13.0, so use a current driver there.
+  On Linux an older 615 build made every reply loop endlessly and 615.71.09 fixed it (#514): if output loops or looks garbled,
+  update the driver before anything else.
 - The CUDA 13 runtime libraries (cudart, cuBLAS) on the library path (`PATH` on Windows).
 - Python 3.10+ with the requirements in a `.venv` at the archive's top directory, which `bin/basalt serve` uses when it is there:
 
