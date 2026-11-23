@@ -1,6 +1,6 @@
 // src/models/inkling2/kernels/kv_int8_parity.cu - INT8 KV writer and scalar/MMA reader parity against CPU references.
 // With --bench, also time decode window attention over every cache format at the model's depths. With --reduced, check only
-// a short list of MMA cases (for a race checker).
+// a short list of MMA cases and one replayed decode graph (for a race checker).
 #include "prep.cuh"
 #include "basalt/kernels/pdl.hpp"
 
@@ -605,6 +605,147 @@ static bool check_attention_mma(bool reduced) {
     return ok && schedules_ok;
 }
 
+// The serving decode chain of a narrow window: the preparation writes the window's rows into the cache, the MMA reader
+// (with programmatic dependent launch it copies its first tile of the proven prefix before it waits) and the merge,
+// captured in a graph and replayed with fresh inputs and the window's cells poisoned (NaN scales) before each replay.
+// The same graph captured with plain launches, which copies nothing early, is the reference: every replay's output must
+// be finite and the same bits. With `tight` the proven bound is the first row's keys, else the serving bucket's.
+static bool check_decode_graph(bool reduced) {
+    constexpr int rows = 2, cap = 131072 + ink::kDecodeRows;
+    const int replays = reduced ? 4 : 64;
+    struct Shape {
+        int depth;
+        bool tight;
+    };
+    const std::vector<Shape> shapes = reduced ? std::vector<Shape>{{32769, true}}
+                                              : std::vector<Shape>{{32769, false}, {32769, true}, {65537, false}, {65537, true},
+                                                                   {kKeys100Ki, false}, {kKeys100Ki, true}, {131072, false},
+                                                                   {131072, true}};
+    std::mt19937 rng(0x67726170);
+    std::normal_distribution<float> normal(0.f, 0.5f);
+    const auto randoms = [&](size_t n, float base) {
+        std::vector<float> v(n);
+        for (float& x : v) x = base + normal(rng);
+        return v;
+    };
+    std::vector<uint8_t> kp(kPeriod * kCacheCell), vp(kPeriod * kCacheCell);
+    std::vector<double> exact(kPeriod * ink::kKvHeads * ink::kHeadDim);
+    random_cache(rng, kp, exact);
+    random_cache(rng, vp, exact);
+    const std::vector<float> taps = randoms(1024 * ink::kConv, 0.f), qs = randoms(ink::kHeads * ink::kHeadDim, 1.f),
+                             rs = randoms(ink::kHeads * ink::kRel, 1.f), ring0 = randoms((size_t) ink::kConvRing * 1024, 0.f),
+                             table = randoms((size_t) ink::kRel * ink::kExtent, 0.f);
+    std::vector<std::vector<float>> ys(replays + 1);
+    for (auto& y : ys) y = randoms((size_t) rows * ink::kProj, 0.f);
+
+    float *dy = nullptr, *dtaps = nullptr, *dqs = nullptr, *drs = nullptr, *dkr = nullptr, *dvr = nullptr, *dtable = nullptr;
+    float *dq = nullptr, *dr = nullptr, *dsink = nullptr, *dout = nullptr;
+    int32_t* dpos = nullptr;
+    uint8_t *dk = nullptr, *dv = nullptr, *dq8 = nullptr;
+    void* scratch = nullptr;
+    cudaStream_t stream = nullptr;
+    const auto alloc = [](auto** ptr, size_t bytes) {
+        return check_cuda(cudaMalloc((void**) ptr, bytes), "graph parity allocate");
+    };
+    const auto upload = [&](float** ptr, const std::vector<float>& v) {
+        return alloc(ptr, v.size() * 4) &&
+               check_cuda(cudaMemcpy(*ptr, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "graph inputs");
+    };
+    const auto upload_cache = [&](uint8_t** ptr, const std::vector<uint8_t>& pattern) {
+        std::vector<uint8_t> host((size_t) cap * kCacheCell);
+        for (size_t i = 0; i < host.size(); i += pattern.size())
+            std::memcpy(host.data() + i, pattern.data(), std::min(pattern.size(), host.size() - i));
+        return alloc(ptr, host.size()) &&
+               check_cuda(cudaMemcpy(*ptr, host.data(), host.size(), cudaMemcpyHostToDevice), "graph cache");
+    };
+    bool ok = alloc(&dy, ys[0].size() * 4) && upload(&dtaps, taps) && upload(&dqs, qs) && upload(&drs, rs) &&
+              upload(&dkr, ring0) && upload(&dvr, ring0) && upload(&dtable, table) &&
+              alloc(&dq, (size_t) rows * kOutput * 4) && alloc(&dr, (size_t) rows * ink::kHeads * ink::kRel * 4) &&
+              alloc(&dsink, (size_t) rows * ink::kHeads * 4) && alloc(&dout, (size_t) rows * kOutput * 4) &&
+              alloc(&dq8, (size_t) rows * kOutputQ8) && alloc(&dpos, rows * 4) && upload_cache(&dk, kp) &&
+              upload_cache(&dv, vp) &&
+              alloc(&scratch, ink::attention_decode_scratch(rows, cap)) &&
+              check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "graph stream");
+    bool pass = true;
+    for (const Shape& shape : shapes) {
+        if (!ok) break;
+        const int pos0 = shape.depth - rows;   // the last row reads `depth` keys
+        int64_t bucket = 1024;                 // the serving graph's key bound (session.cpp full_keys_of)
+        while (bucket < shape.depth) bucket <<= 1;
+        const int64_t fewest = shape.tight ? pos0 + 1 : bucket / 2 + 2 - rows;
+        const int32_t pos[rows] = {pos0, pos0 + 1};
+        ok = check_cuda(cudaMemcpy(dpos, pos, sizeof(pos), cudaMemcpyHostToDevice), "graph positions");
+        ink::AttnPrep pa;
+        pa.yq = dy; pa.yk = dy + ink::kProjQ; pa.yv = dy + ink::kProjQ + ink::kProjKV; pa.ldq = pa.ldk = pa.ldv = ink::kProj;
+        pa.pos = dpos; pa.full = true; pa.k_conv = dtaps; pa.v_conv = dtaps; pa.q_scale = dqs; pa.r_scale = drs;
+        pa.k_ring = dkr; pa.v_ring = dvr; pa.k_cache = dk; pa.v_cache = dv; pa.cap = cap; pa.int8 = true;
+        pa.q = dq; pa.r = dr; pa.sink = dsink;
+        ink::AttnArgs aa;
+        aa.q = dq; aa.r = dr; aa.sink = dsink; aa.rel_table = dtable; aa.pos = dpos; aa.k_cache = dk; aa.v_cache = dv;
+        aa.cap = cap; aa.int8 = true; aa.gate = dy + ink::kOffGate; aa.gate_ld = ink::kProj; aa.q8 = dq8;
+        aa.min_full_keys = fewest;
+        const size_t cells = (size_t) pos0 * ink::kKvHeads * ink::kKvInt8RowBytes;
+        const size_t window = (size_t) rows * ink::kKvHeads * ink::kKvInt8RowBytes;
+        std::vector<float> fp32[2];
+        std::vector<uint8_t> q8[2];
+        long pdl_launches = 0;
+        for (const bool pdl : {true, false}) {
+            const auto chain = [&] {
+                // The preparation follows the poisoning copies (a plain launch); the reader and the merge may start early.
+                basalt::kernels::PdlScope scope(pdl, true);
+                ink::decode_prepare(pa, rows, stream);
+                ink::attention_decode(aa, rows, bucket, scratch, dout, stream);
+            };
+            // A shape's first window runs directly, as the session's does, before its graph is captured.
+            ok = ok && check_cuda(cudaMemcpy(dy, ys[replays].data(), ys[replays].size() * 4, cudaMemcpyHostToDevice), "graph y");
+            if (ok) chain();
+            ok = ok && check_cuda(cudaStreamSynchronize(stream), "graph direct run");
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+            const long before = basalt::kernels::pdl_count();
+            ok = ok && check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "graph capture");
+            if (ok) chain();
+            ok = ok && check_cuda(cudaStreamEndCapture(stream, &graph), "graph capture end") &&
+                 check_cuda(cudaGraphInstantiate(&exec, graph, 0), "graph instantiate");
+            if (pdl) pdl_launches = basalt::kernels::pdl_count() - before;
+            ok = ok && check_cuda(cudaMemcpy(dkr, ring0.data(), ring0.size() * 4, cudaMemcpyHostToDevice), "graph k ring") &&
+                 check_cuda(cudaMemcpy(dvr, ring0.data(), ring0.size() * 4, cudaMemcpyHostToDevice), "graph v ring");
+            fp32[pdl].resize((size_t) replays * rows * kOutput);
+            q8[pdl].resize((size_t) replays * rows * kOutputQ8);
+            for (int i = 0; i < replays && ok; ++i) {
+                ok = check_cuda(cudaMemsetAsync(dk + cells, 0xff, window, stream), "graph poison k") &&
+                     check_cuda(cudaMemsetAsync(dv + cells, 0xff, window, stream), "graph poison v") &&
+                     check_cuda(cudaMemcpyAsync(dy, ys[i].data(), ys[i].size() * 4, cudaMemcpyHostToDevice, stream), "graph y") &&
+                     check_cuda(cudaGraphLaunch(exec, stream), "graph launch") &&
+                     check_cuda(cudaMemcpyAsync(fp32[pdl].data() + (size_t) i * rows * kOutput, dout, (size_t) rows * kOutput * 4,
+                                                cudaMemcpyDeviceToHost, stream), "graph output") &&
+                     check_cuda(cudaMemcpyAsync(q8[pdl].data() + (size_t) i * rows * kOutputQ8, dq8, (size_t) rows * kOutputQ8,
+                                                cudaMemcpyDeviceToHost, stream), "graph q8") &&
+                     check_cuda(cudaStreamSynchronize(stream), "graph replay");
+            }
+            if (exec) cudaGraphExecDestroy(exec);
+            if (graph) cudaGraphDestroy(graph);
+        }
+        if (!ok) break;
+        bool finite = true;
+        for (const auto& out : fp32)
+            for (const float x : out) finite &= std::isfinite(x);
+        const bool identical = fp32[0] == fp32[1] && q8[0] == q8[1];
+        // The reader's prefix slice: whole passes of its block, at most 64 slices, for the proven bound's keys.
+        const int64_t units = (fewest + 128 * 64 - 1) / (128 * 64);
+        const int prime_span = (int) std::max<int64_t>(units, 1) * 128;
+        std::printf("kv MMA graph: depth=%d T=%d replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld finite=%d "
+                    "pdl_launches=%ld\n", shape.depth, rows, replays, prime_span, identical, (long long) bucket,
+                    (long long) fewest, finite, pdl_launches);
+        pass &= identical && finite && pdl_launches > 0;
+    }
+    if (stream) cudaStreamDestroy(stream);
+    for (void* p : {(void*) dy, (void*) dtaps, (void*) dqs, (void*) drs, (void*) dkr, (void*) dvr, (void*) dtable, (void*) dq,
+                    (void*) dr, (void*) dsink, (void*) dout, (void*) dpos, (void*) dk, (void*) dv, (void*) dq8, scratch})
+        if (p) cudaFree(p);
+    return ok && pass;
+}
+
 int main(int argc, char** argv) {
     const bool bench = argc == 2 && std::strcmp(argv[1], "--bench") == 0;
     const bool reduced = argc == 2 && std::strcmp(argv[1], "--reduced") == 0;
@@ -672,7 +813,7 @@ int main(int argc, char** argv) {
     std::printf("kv_int8_parity: rows=%d width=%d row_bytes=%zu mismatches=%d max_abs=%.7g max_rel(|x|>=1e-2)=%.7g fp16_max_abs=%.7g fp16_max_rel(|x|>=1e-2)=%.7g\n",
                 rows, ink::kHeadDim, row_bytes, mismatches, max_abs, max_rel, fp16_max_abs, fp16_max_rel);
 
-    bool ok = mismatches == 0 && check_attention_mma(reduced);
+    bool ok = mismatches == 0 && check_attention_mma(reduced) && check_decode_graph(reduced);
     if (bench) {
         constexpr int bench_rows = 4096;
         constexpr int reps = 200;
