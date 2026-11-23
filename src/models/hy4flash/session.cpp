@@ -1680,7 +1680,7 @@ private:
         return sl;
     }
     // Of tier layer `tl`'s experts with rows[e] rows each, those the second card computes: its own, and the RAM ones (highest
-    // ids first) its link and products price lower than the main card's (prefill::peer_take).
+    // ids first) its link and products price lower than the main card's (ExpertTier::peer_take).
     // In a ringed chunk of `tokens` rows the main card's link reads ahead while the layer's attention runs (kPreRouteCycles a token).
     static constexpr double kPreRouteCycles = 1.7e6;   // main card SM-cycles a row takes in a layer before its routing (measured)
     std::vector<uint8_t> away_of(int tl, const std::vector<int64_t>& rows, int tokens = 0) const {
@@ -1705,11 +1705,7 @@ private:
                 if (!src.dev) main_bytes += (double) el.blob_bytes;
             }
         }
-        const int L = g_.n_latent;
-        const prefill::ShareRates& r = tier_->share_rates(tl);
-        const double lead = r.sm_hz0 > 0 ? (double) tokens * kPreRouteCycles / r.sm_hz0 : 0;
-        const int take = prefill::peer_take(r, ram_rows, main_rows, main_bytes, peer_rows, (double) el.blob_bytes,
-                                            (double) (basalt::prefill::mmq::q8_bytes(2, L) - basalt::prefill::mmq::q8_bytes(1, L)), 4.0 * L, lead);
+        const int take = tier_->peer_take(tl, ram_rows, main_rows, main_bytes, peer_rows, tokens, kPreRouteCycles);
         for (int i = 0; i < take; ++i) away[(size_t) ram[(size_t) i]] = 1;
         return away;
     }
