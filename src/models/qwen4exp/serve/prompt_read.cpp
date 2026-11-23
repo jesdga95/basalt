@@ -111,7 +111,7 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
             }
             if (!fatal && runtime_.batch_on()) {
                 const auto tw = Clock::now();
-                if (!runtime_.batch_step()) { fatal = true; abort_read.store(true); }
+                if (!runtime_.next_batch_window()) { fatal = true; abort_read.store(true); }
                 const double wm = std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
                 ++ov_wins; ov_win_ms += wm; ov_win_max = std::max(ov_win_max, wm);
             } else {
@@ -194,7 +194,7 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
         const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
         const auto td = Clock::now();
         do {
-            if (!runtime_.batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
+            if (!runtime_.next_batch_window()) { batch_fatal = true; e = "a batch window failed"; return false; }
         } while (runtime_.batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
         ++il_parts;
         il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();

@@ -5,6 +5,7 @@
 #include "../serve/session_engine.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/shipped_profiles.hpp"
 #include "basalt/log.hpp"

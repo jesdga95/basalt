@@ -104,7 +104,7 @@ Flow QfnRequest::read_to(int64_t to) {
     // beside slots: a window between the serial steps of a short read keeps them from stopping
     auto ov_window = [&]() -> bool {
         if (!runtime_.batch_on()) return true;
-        if (!runtime_.batch_step()) { batch_fatal = true; runtime_.err = "a batch window failed"; return false; }
+        if (!runtime_.next_batch_window()) { batch_fatal = true; runtime_.err = "a batch window failed"; return false; }
         if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) return false;
         return true;
     };
