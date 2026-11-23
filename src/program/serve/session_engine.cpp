@@ -150,6 +150,17 @@ public:
         char* end = nullptr;
         const long long reserve = cmd.size() > 4 ? std::strtoll(cmd.c_str() + 4, &end, 10) : -1;
         if (cmd.size() > 4 && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+        if (reserve >= 0) {
+            const int floor = vram_floor_mib();
+            if (reserve < floor) {
+                e = "VRAM reserve is below " + std::to_string(floor) + " MiB";
+                return false;
+            }
+            if ((uint64_t) reserve > (UINT64_MAX >> 20)) {
+                e = "VRAM reserve is too large";
+                return false;
+            }
+        }
         int64_t slots = 0;
         if (const basalt::model::Result r = session().set_vram_reserve(reserve, slots); !r.ok()) {
             e = r.message;
