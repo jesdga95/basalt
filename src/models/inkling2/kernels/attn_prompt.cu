@@ -39,17 +39,14 @@ struct KvTile {
     __half k[kKeys][kLd];
     __half v[kKeys][kLd];
 };
-// A tile beyond the bias's reach needs neither the band nor the exchange, so the next such tile streams into the
-// exchange's room while the block works on the current one.
+// Keep both K/V ping-pong tiles separate from the relative-bias exchange so every tile (including sliding-window and
+// near tiles within kExtent) overlaps its cp.async transfer with tensor-core compute (~79.8 KiB <= 99 KiB sm_120 SMEM).
 struct Smem {
     KvTile t0;
+    KvTile t1;
     __half band[kBand][kBandLd];
-    union {
-        KvTile t1;
-        float gx[kWarps][16][kGLd];
-    } u;
+    float gx[kWarps][16][kGLd];
 };
-static_assert(sizeof(KvTile) <= sizeof(float) * kWarps * 16 * kGLd, "the second tile fits in the exchange");
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -97,20 +94,27 @@ __device__ __forceinline__ uint32_t e4m3x2_to_h2(uint16_t u) {
 
 // One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].  fp16 tiles are requested
 // (cp.async, the caller commits and waits), E4M3 tiles converted and stored before the return.
+__device__ __forceinline__ int64_t wrap_key(int64_t key, int64_t cap, bool pow2) {
+    if (key < cap) return key;
+    return pow2 ? (key & (cap - 1)) : (key % cap);
+}
+
 template <bool FP8>
-__device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, int kvh, int64_t k0, int64_t lo, int64_t hi, int tid) {
+__device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, int kvh, int64_t k0, int64_t lo, int64_t hi,
+                                          int tid, bool cap_pow2, bool chunk_pow2) {
     if constexpr (!FP8) {
         constexpr int kPieces = kKeys * kHeadDim / 8;   // 16-byte pieces of one tile
         for (int c = tid; c < 2 * kPieces; c += kThreads) {
             const bool isv = c >= kPieces;
             const int rem = isv ? c - kPieces : c;
-            const int j = rem / (kHeadDim / 8), col = (rem % (kHeadDim / 8)) * 8;
+            const int j = rem >> 4, col = (rem & 15) * 8;
             const int64_t key = k0 + j;
             const bool ok = key >= lo && key <= hi;
             const bool fresh = key >= a.pos0;
             const int64_t cap = fresh ? a.chunk_cap : a.cap;
+            const int64_t slot = ok ? wrap_key(key, cap, fresh ? chunk_pow2 : cap_pow2) : 0;
             const __half* base = static_cast<const __half*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache));
-            const __half* src = base + ((size_t) (ok ? key % cap : 0) * kKvHeads + kvh) * kHeadDim + col;
+            const __half* src = base + ((size_t) slot * kKvHeads + kvh) * kHeadDim + col;
             cp16(isv ? &sm.v[j][col] : &sm.k[j][col], src, ok);
         }
     } else {
@@ -118,15 +122,16 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
         for (int c = tid; c < 2 * kPieces; c += kThreads) {
             const bool isv = c >= kPieces;
             const int rem = isv ? c - kPieces : c;
-            const int j = rem / (kHeadDim / 16), col = (rem % (kHeadDim / 16)) * 16;
+            const int j = rem >> 3, col = (rem & 7) * 16;
             const int64_t key = k0 + j;
             const bool ok = key >= lo && key <= hi;
             uint4 u = make_uint4(0u, 0u, 0u, 0u);
             if (ok) {
                 const bool fresh = key >= a.pos0;
                 const int64_t cap = fresh ? a.chunk_cap : a.cap;
+                const int64_t slot = wrap_key(key, cap, fresh ? chunk_pow2 : cap_pow2);
                 const uint8_t* base = static_cast<const uint8_t*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache));
-                u = *reinterpret_cast<const uint4*>(base + ((size_t) (key % cap) * kKvHeads + kvh) * kHeadDim + col);
+                u = *reinterpret_cast<const uint4*>(base + ((size_t) slot * kKvHeads + kvh) * kHeadDim + col);
             }
             const uint32_t w[4] = {u.x, u.y, u.z, u.w};
             uint32_t h[8];
@@ -188,42 +193,61 @@ __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnProm
     for (int n = 0; n < kHeadDim / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
     float m_a = -INFINITY, m_b = -INFINITY, l_a = 0.f, l_b = 0.f;
     const float scale2 = a.scale * kLog2e;
-    float (*gx)[kGLd] = sm.u.gx[w];
+    float (*gx)[kGLd] = sm.gx[w];
+    const bool cap_pow2 = a.cap > 0 && (a.cap & (a.cap - 1)) == 0;
+    const bool chunk_pow2 = a.chunk_cap > 0 && (a.chunk_cap & (a.chunk_cap - 1)) == 0;
+    // Hoist band index decomposition out of the k0 loop (kThreads=384 = 16 rel rows * 24 threads, 4 consecutive b/thread).
+    const int bt = tid / 24, bb = (tid % 24) * 4;
+    static_assert(kThreads == kRel * 24 && kBand == 24 * 4, "band tile thread map");
 
     // a tile is far when no distance of the block's rows to its keys reaches below kExtent: no bias, no band, no exchange
     const auto far = [&](int64_t k0) { return q0 - k0 - (kKeys - 1) >= kExtent; };
-    int cur = 0;          // the room the current tile is in (1: the exchange's)
-    bool ready = false;   // the current tile was requested during the tile before
-    for (int64_t k0 = lo / kKeys * kKeys; k0 <= hi; k0 += kKeys) {
-        __syncthreads();   // every warp is done with the previous tile
-        if (!ready) {
-            cur = 0;
-            load_tile<FP8>(a, sm.t0, kvh, k0, lo, hi, tid);
+    const int64_t k_first = (lo / kKeys) * kKeys;
+    int cur = 0;
+    if constexpr (!FP8) {
+        if (k_first <= hi) {
+            load_tile<false>(a, sm.t0, kvh, k_first, lo, hi, tid, cap_pow2, chunk_pow2);
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
-        // a far tile followed by a far tile: the next one is requested into the other room before this one is used
-        const bool next = !FP8 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
-        if (next) {
-            load_tile<FP8>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
-            asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
-        } else {
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-        }
-        const KvTile& kt = cur ? sm.u.t1 : sm.t0;
-        ready = next;
-        if (next) cur ^= 1;
-        // the bias band: row b holds the table's column d = q0 - k0 - (kKeys - 1) + b, zero outside [0, kExtent)
-        if (!far(k0))
-            for (int idx = tid; idx < kBand * kRel; idx += kThreads) {
-                const int t = idx / kBand, b = idx % kBand;
-                const int64_t d = q0 - k0 - (kKeys - 1) + b;
-                sm.band[b][t] = __float2half_rn(d >= 0 && d < kExtent ? a.rel_table[(size_t) t * kExtent + d] : 0.f);
+    }
+    for (int64_t k0 = k_first; k0 <= hi; k0 += kKeys) {
+        if constexpr (!FP8) {
+            const bool has_next = k0 + kKeys <= hi;
+            if (has_next) {
+                load_tile<false>(a, cur ? sm.t0 : sm.t1, kvh, k0 + kKeys, lo, hi, tid, cap_pow2, chunk_pow2);
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
             }
+            // Overlap band table load with in-flight cp.async before waiting on the current tile.
+            if (!far(k0)) {
+                const int64_t d0 = q0 - k0 - (kKeys - 1) + bb;
+                const float* row = a.rel_table + (size_t) bt * kExtent;
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const int64_t d = d0 + u;
+                    sm.band[bb + u][bt] = __float2half_rn(d >= 0 && d < kExtent ? row[d] : 0.f);
+                }
+            }
+            if (has_next) asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+            else asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        } else {
+            load_tile<true>(a, sm.t0, kvh, k0, lo, hi, tid, cap_pow2, chunk_pow2);
+            if (!far(k0)) {
+                const int64_t d0 = q0 - k0 - (kKeys - 1) + bb;
+                const float* row = a.rel_table + (size_t) bt * kExtent;
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const int64_t d = d0 + u;
+                    sm.band[bb + u][bt] = __float2half_rn(d >= 0 && d < kExtent ? row[d] : 0.f);
+                }
+            }
+        }
         __syncthreads();
+        const KvTile& kt = (!FP8 && cur) ? sm.t1 : sm.t0;
 
-        // a warp none of whose rows sees a key of the tile skips it; one whose rows see every key needs no mask
+        // a warp none of whose rows sees a key of the tile skips compute, but still joins the bottom sync
         const int64_t p_first = pw, p_last = pw + 15;
-        if (k0 > p_last || (a.window > 0 && k0 + kKeys - 1 <= p_first - a.window)) continue;
+        const bool active = !(k0 > p_last || (a.window > 0 && k0 + kKeys - 1 <= p_first - a.window));
+        if (active) {
         const bool whole = k0 + kKeys - 1 <= p_first && (a.window <= 0 || k0 > p_last - a.window);
 
         // S = Q K^T
@@ -331,6 +355,9 @@ __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnProm
                 mma16816(o[n], pf[j][0], pf[j][1], pf[j][2], pf[j][3], b0, b1);
                 mma16816(o[n + 1], pf[j][0], pf[j][1], pf[j][2], pf[j][3], b2, b3);
             }
+        }
+        __syncthreads();
+        if constexpr (!FP8) cur ^= 1;
     }
 
     // the sink beside the keys, then the rows out
