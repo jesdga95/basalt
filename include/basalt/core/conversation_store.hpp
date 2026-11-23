@@ -90,7 +90,8 @@ public:
     /// The image of `m` cut at m.tokens: `out.live` is the state there, `out.kv` the K/V up to it, `out.checkpoints`
     /// the chain's root (its shortest checkpoint) and that state once more when it is a checkpoint.  A file that fails
     /// any check is deleted and false returned with `error`; the file stays otherwise (a later prompt may match it),
-    /// and so does one whose read stopped for want of a read buffer.
+    /// and so does one whose read stopped for want of a read buffer.  False when the entry matched has left the index
+    /// since (an eviction or a later turn of it); one that only moved in it is read where it is.
     /// With `kv`, the K/V is not copied: `out.kv` holds the layers' shapes with empty buffers and `*kv` reads their
     /// bytes later (the store outlives it; one load or K/V read runs at a time).
     bool load(const Match& m, SavedConversation& out, std::string& error,
