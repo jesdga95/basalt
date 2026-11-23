@@ -231,8 +231,10 @@ def render_prometheus(entries: list[tuple[dict, dict]]) -> str:
         # ---- Host / GPU hardware metrics (emitted once per scrape) ----
         if not hw_emitted:
             hw = m.get("hardware") or {}
+            hw_static_gpus = (m.get("hardware_static") or {}).get("gpus") or []
             for i, g in enumerate(hw.get("gpus") or []):
-                gl = [("gpu", str(i)), ("name", str(g.get("name") or f"gpu{i}"))]
+                gname = g.get("name") or (hw_static_gpus[i].get("name") if i < len(hw_static_gpus) else None) or f"gpu{i}"
+                gl = [("gpu", str(i)), ("name", str(gname))]
                 if g.get("mem_used") is not None:
                     b.add("basalt:gpu_memory_used_bytes", "gauge", "GPU memory used in bytes.", gl, int(g["mem_used"]))
                 if g.get("mem_total") is not None:
