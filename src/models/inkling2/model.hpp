@@ -165,9 +165,11 @@ public:
     bool loan_pending() const { return loan_publish_at_ >= 0; }
     int64_t loan_publish_at() const { return loan_publish_at_; }
     /// Queues what is left of the loan, waits for all of it and points the table entries at the copies (on `stream`).
-    bool publish_loan(void* stream);
+    /// `at`: the position it is published at (the log line names it).
+    bool publish_loan(void* stream, int64_t at);
     /// Waits for the uploads, sets the loaned entries back to 0 (the CPU computes them again) and frees the regions.
-    bool recall_loan(void* stream);
+    /// `event`: the log line's event.
+    bool recall_loan(void* stream, const std::string& event = "prompt loan recall");
     int64_t loaned() const { return (int64_t) loan_list_.size(); }
     /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
     /// issued; the caller copies them from RAM).
@@ -268,7 +270,7 @@ private:
     std::vector<LoanUpload> loan_plan_;   ///< the loan fixed at its start: each pair and its place, in rank order
     size_t loan_next_ = 0;                ///< the plan's uploads queued so far
     bool loan_inflight_ = false;          ///< uploads queued since the copy stream was last confirmed idle
-    bool loan_stuck_ = false;             ///< an upload could not be confirmed finished: its memory is never released
+    bool loan_stuck_ = false;             ///< an upload or a reader of the loan could not be confirmed finished: its memory is never released
     uint8_t* loan_arena_ = nullptr;
     uint64_t loan_arena_bytes_ = 0;
     uint8_t* loan_stage_ = nullptr;   ///< the shared staging's second address range

@@ -106,7 +106,7 @@ InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
     // an upload that may still run keeps everything it reads or writes (and the stream it runs on)
-    if (!drain_loan_upload()) return;
+    if (!drain_loan_upload() || loan_stuck_) return;
     if (loan_event_) cudaEventDestroy((cudaEvent_t) loan_event_);
     if (loan_stream_) cudaStreamDestroy((cudaStream_t) loan_stream_);
     for (void* p : dev_) cudaFree(p);
@@ -1052,10 +1052,10 @@ int InklingModel::rebalance(int max_swaps) {
 
 bool InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
     if (!base) {
-        const bool idle = drain_loan_upload();
-        if (!idle || !recall_loan(nullptr))
+        // freed only once no upload writes it and no reader of a loaned copy can still run
+        if (!drain_loan_upload() || !recall_loan(nullptr))
             basalt::log::error("basalt inkling2", "the prompt arena goes while expert copies are still loaned in it");
-        if (!idle) return false;
+        if (loan_stuck_) return false;
         loan_arena_ = nullptr;
         loan_arena_bytes_ = 0;
         return true;
@@ -1157,7 +1157,7 @@ bool InklingModel::submit_loan(int64_t publish_at) {
     return !loan_pending() || queue_loan(kLoanBytesPerWindow);
 }
 
-bool InklingModel::publish_loan(void* stream) {
+bool InklingModel::publish_loan(void* stream, int64_t at) {
     if (wedged()) return false;
     if (!loan_pending()) return true;
     loan_publish_at_ = -1;
@@ -1190,7 +1190,7 @@ bool InklingModel::publish_loan(void* stream) {
     }
     loan_plan_.clear();
     if (before != card_copies()) ++epoch_;
-    log_copy_change("prompt loan", before);
+    log_copy_change(("prompt loan at " + std::to_string(at)).c_str(), before);
     return true;
 }
 
@@ -1210,7 +1210,7 @@ bool InklingModel::drain_loan_upload() {
     return false;
 }
 
-bool InklingModel::recall_loan(void* stream) {
+bool InklingModel::recall_loan(void* stream, const std::string& event) {
     if (wedged() || !drain_loan_upload()) return false;
     loan_plan_.clear();
     loan_next_ = 0;
@@ -1220,7 +1220,10 @@ bool InklingModel::recall_loan(void* stream) {
     const int64_t before = card_copies();
     const int ne = geo().n_expert;
     cudaStream_t st = (cudaStream_t) stream;
-    if (!join_placement()) return false;
+    if (!join_placement()) {   // a reader of the loaned copies may still run
+        loan_stuck_ = true;
+        return false;
+    }
     // the entries go back to 0 (the CPU computes them again) before any loaned byte can be overwritten
     size_t queued = 0;
     for (auto it = loan_list_.rbegin(); it != loan_list_.rend(); ++it, ++queued) {
@@ -1230,10 +1233,11 @@ bool InklingModel::recall_loan(void* stream) {
             break;
         }
     }
-    if (cudaStreamSynchronize(st) != cudaSuccess) {
+    if (cudaStreamSynchronize(st) != cudaSuccess) {   // the cleared entries are not confirmed: a reader may still run
+        loan_stuck_ = true;
         wedge();
         basalt::log::error("basalt inkling2", "the prompt loan's copies could not be recalled");
-        log_copy_change("prompt loan recall failed", before);
+        log_copy_change((event + " failed").c_str(), before);
         return false;
     }
     for (size_t k = 0; k < queued; ++k) {
@@ -1247,10 +1251,10 @@ bool InklingModel::recall_loan(void* stream) {
     if (loaned() > 0) {
         wedge();
         basalt::log::error("basalt inkling2", "%lld prompt loan copies could not be recalled", (long long) loaned());
-        log_copy_change("prompt loan recall failed", before);
+        log_copy_change((event + " failed").c_str(), before);
         return false;
     }
-    log_copy_change("prompt loan recall", before);
+    log_copy_change(event.c_str(), before);
     return true;
 }
 

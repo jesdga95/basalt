@@ -403,7 +403,7 @@ public:
         if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
         if (heat_tally_) {   // the placement changes due at this position, before any row at or past it runs
             if (rebalances() && next_rebalance_ >= 0 && r.pos >= next_rebalance_) rebalance_copies(r.pos, false);
-            if (m_.loan_pending() && r.pos >= m_.loan_publish_at() && !publish_loan()) return wedged();
+            if (m_.loan_pending() && r.pos >= m_.loan_publish_at() && !publish_loan(r.pos)) return wedged();
             if (m_.wedged()) return wedged();
         }
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
@@ -544,7 +544,7 @@ public:
             PromptRunner::Prepare prepare;
             if (heat_tally_)
                 prepare = [&] {
-                    if (!recall_loan()) return false;
+                    if (!recall_loan(r.pos)) return false;
                     rebalance_copies(r.pos + r.n_tokens, true);
                     return !m_.wedged();
                 };
@@ -591,7 +591,7 @@ public:
         hist_.resize((size_t) pos);
         if (sh_->prompt && n_rows > 16) {
             PromptRunner::Prepare prepare;
-            if (heat_tally_) prepare = [&] { return recall_loan(); };
+            if (heat_tally_) prepare = [&] { return recall_loan(pos); };
             const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_, prepare);
             if (!res.ok()) hist_.resize((size_t) pos);
             return res;
@@ -651,7 +651,7 @@ public:
         if (m_.wedged()) return wedged();
         if (!m_.copies()) return {};
         if (cudaStreamSynchronize(stream_) != cudaSuccess || !feed_heat()) return wedged();
-        if (low && !recall_loan()) return wedged();
+        if (low && !recall_loan(-1)) return wedged();
         if (!m_.lend(low)) return {model::Status::Error, "inkling2: the expert copies could not go back to RAM"};
         expert_slots = expert_pairs() - m_.spill().spilled + m_.promoted();
         return {};
@@ -865,11 +865,11 @@ public:
         if (!rebalances() || !feed_heat()) return;
         const int64_t before = m_.card_copies();
         const int n = m_.rebalance(kRebalanceSwaps);   // paid copies only; the loan stays
-        if (n > 0 || m_.wedged()) m_.log_copy_change(("rebalance (" + std::to_string(n) + " swaps)").c_str(), before, 0, true);
+        if (n > 0 || m_.wedged()) m_.log_copy_change(("rebalance at " + std::to_string(at) + " (" + std::to_string(n) + " swaps)").c_str(), before, 0, true);
     }
-    bool publish_loan() {
+    bool publish_loan(int64_t at) {
         const size_t before = m_.loaned_pairs().size();
-        if (!m_.publish_loan(stream_)) return false;
+        if (!m_.publish_loan(stream_, at)) return false;
         const auto& pairs = m_.loaned_pairs();
         if (pairs.size() == before) return true;
         std::vector<uint32_t> counts;   // the lookup counts the loaned copies' hits start from
@@ -882,7 +882,8 @@ public:
         for (size_t i = before; i < pairs.size(); ++i) loan_start_[pairs[i]] = counts[pairs[i]];
         return true;
     }
-    bool recall_loan() {
+    // `at`: the prompt's position (-1: a sleep)
+    bool recall_loan(int64_t at) {
         if (m_.wedged()) return false;
         if (m_.loaned() > 0) {
             std::vector<uint32_t> t;
@@ -895,7 +896,7 @@ public:
             for (size_t pair : m_.loaned_pairs()) loan_hits_[pair] += t[pair] - loan_start_[pair];
             loan_start_.clear();
         }
-        return m_.recall_loan(stream_);
+        return m_.recall_loan(stream_, at < 0 ? std::string("prompt loan recall at sleep") : "prompt loan recall at " + std::to_string(at));
     }
     // How the lookups fell between the card and RAM; a loaned copy's hits count for the card while it held the copy.
     CardShare lookup_share(const std::vector<uint32_t>& t, uint64_t& loan) const {
