@@ -150,10 +150,12 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
     }
     const int64_t C = std::max<int64_t>(runtime_.sp.chunk(), 1);
     // while slots are decoding the prompt goes in chunks of a fixed small size, so a long prompt holds the
-    // slots' windows back for one short chunk at a time
-    constexpr int64_t live_chunk = 1024;
+    // slots' windows back for one short chunk at a time.  A slot that only reads its prompt
+    // (--live-read-split=1) is not held back by its own read either
+    constexpr int64_t kLiveChunk = 1024;
     for (int64_t q = a0; q < b0;) {
-        const int64_t r = std::min(b0, q + (runtime_.batch_on() ? std::min(C, live_chunk) : C));
+        const int64_t r = std::min(b0, q + (runtime_.batch_on() && !runtime_.bs[(size_t) slot_b].reading ?
+                                            std::min(C, kLiveChunk) : C));
         const auto tq = Clock::now();
         // each chunk runs as a prefill of its own here, so the next chunk's n-gram rows would wait for it: once
         // this chunk has its rows, the rows that follow it are read into the row cache beside it

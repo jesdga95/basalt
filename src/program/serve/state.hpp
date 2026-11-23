@@ -262,6 +262,7 @@ public:
     // ---- --batch: the slots of the batch windows
     struct BSlot {
         bool active = false, stop = false;
+        bool reading = false;   ///< its request is reading its prompt now, so the slot asks for no windows
         int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
         int64_t p = 0;                 ///< its position
         int64_t produced = 0, max_new = 0;
@@ -359,7 +360,8 @@ public:
     std::vector<int64_t> cur{};
     int next_line_within(std::string& out, int ms);
     bool halted();
-    bool batch_on();
+    bool batch_on() const;
+    bool slots_busy(int apart) const;   ///< an active slot other than `apart` that is not reading its prompt
     bool try_next_line(std::string& out);
 };
 
