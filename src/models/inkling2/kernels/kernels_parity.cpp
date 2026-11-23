@@ -5,6 +5,7 @@
 // and the decode window's fused kernels against the references and the kernels they replace, their q8_1 blocks against a
 // CPU rounding of their own fp32 rows. Every kernel is checked for a row's bits not depending on the rows beside it, and
 // timed. Exit 77 without a GPU.
+#include "../cpu_expert_drain.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -15,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -1461,6 +1463,38 @@ void test_cpu_abort() {
     }
     std::printf("%-34s %s\n", "moe_cpu_ring + merge: late done", late_ok ? "ok" : "FAIL");
     failures += !late_ok;
+
+    cudaStream_t retired = nullptr;
+    bool retired_ok = cudaStreamCreateWithFlags(&retired, cudaStreamNonBlocking) == cudaSuccess;
+    bool error_ok = false;
+    if (retired_ok) {
+        const std::array watch{st, retired};
+        retired_ok = cudaStreamDestroy(retired) == cudaSuccess;
+        if (retired_ok) {
+            reset();
+            abort_bell();
+            auto& unconfirmed = basalt::core::gpu_left_running();
+            const bool previous = unconfirmed.exchange(false);
+            bool saw_retired = false;
+            // Supply the stale-handle status without passing a destroyed stream back to CUDA.
+            drain_cpu_expert_streams(cudaSuccess, watch, [&](cudaStream_t s) {
+                if (s == st) return cudaStreamQuery(s);
+                saw_retired = true;
+                return cudaErrorInvalidResourceHandle;
+            });
+            const bool drained = !unconfirmed.exchange(false);
+            retired_ok = saw_retired && drained && cudaPeekAtLastError() == cudaSuccess;
+            // Exercise the failure path without faulting the device.
+            drain_cpu_expert_streams(cudaSuccess, watch, [&](cudaStream_t s) {
+                return s == st ? cudaErrorLaunchFailure : cudaErrorInvalidResourceHandle;
+            });
+            error_ok = unconfirmed.exchange(previous);
+        }
+    }
+    std::printf("%-34s %s\n", "CPU abort drain: retired stream", retired_ok ? "ok" : "FAIL");
+    std::printf("%-34s %s\n", "CPU abort drain: query error", error_ok ? "ok" : "FAIL");
+    failures += !retired_ok;
+    failures += !error_ok;
     cudaGraphExecDestroy(ordered_exec);
     cudaGraphDestroy(ordered_graph);
     cudaGraphExecDestroy(single_exec);

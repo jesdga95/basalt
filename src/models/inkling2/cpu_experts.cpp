@@ -1,6 +1,8 @@
 // src/models/inkling2/cpu_experts.cpp - see the header.
 #include "models/inkling2/cpu_experts.hpp"
 
+#include "models/inkling2/cpu_expert_drain.hpp"
+
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -31,8 +33,6 @@ static_assert(kDecodeRows <= cpu::MAXT, "a RAM expert takes every row of a windo
 namespace {
 // The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
 constexpr std::chrono::milliseconds kSpin{20}, kNap{1};
-// How long a path that ends the engine waits for the card's queued visits to run out after it aborts the bell.
-constexpr int kDrainMs = 5000;
 
 // A CUDA call that must not fail: a visit that cannot be queued is an error, as a kernel that cannot launch is.
 void must(cudaError_t e, const char* what) {
@@ -88,32 +88,13 @@ struct CpuExperts::Impl {
     // CUDA teardown on the error path.
     void abort_and_drain() {
         std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
-        const bool selected = cudaSetDevice(device) == cudaSuccess;
+        const cudaError_t selected = cudaSetDevice(device);
         std::vector<cudaStream_t> watch{stream};
         {
             std::lock_guard<std::mutex> lk(streams_mu);
             watch.insert(watch.end(), merge_streams.begin(), merge_streams.end());
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        auto ms = [&] { return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(); };
-        bool drained = selected;
-        if (selected) {
-            for (cudaStream_t s : watch) {
-                cudaError_t status = cudaStreamQuery(s);
-                while (status == cudaErrorNotReady && ms() < kDrainMs) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    status = cudaStreamQuery(s);
-                }
-                drained &= status == cudaSuccess;
-            }
-        }
-        cudaGetLastError();
-        if (!drained) {
-            basalt::core::gpu_left_running().store(true);
-            basalt::log::error("basalt inkling2", "the CPU experts' doorbell was aborted: GPU completion unconfirmed after %lld ms", ms());
-            return;
-        }
-        basalt::log::info("basalt inkling2", "the CPU experts' doorbell was aborted: the GPU finished in %lld ms", ms());
+        drain_cpu_expert_streams(selected, watch, cudaStreamQuery);
     }
 
     ~Impl() {
