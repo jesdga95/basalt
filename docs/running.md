@@ -142,6 +142,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
   repeats it and the stats page adds an SSD tier and turns its Experts heading amber.
 - The disk tier keeps its floor a GiB above the reserve.
 - `--resident-budget-gib` that would leave less than the floor is refused with the largest safe value.
+- The automatic RAM copy leaves the adaptive swaps' free places room beside the experts, so they need no setting of
+  their own. An explicit `--resident-budget-gib` within the places' own size of the RAM room gives back the coldest
+  experts for them: an evicted expert with nowhere to go is not evicted at all, and the tier moves nothing.
 
 ## Vision: `--vision`
 
