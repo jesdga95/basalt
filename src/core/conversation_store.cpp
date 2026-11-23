@@ -1929,22 +1929,27 @@ ConversationsToStore conversation_cache_to_store(ConversationCache& cache, Conve
     r.admitted = admitted();
     while (!r.admitted) {
         auto image = cache.take_oldest([&](const SavedConversation& c) {
-            return (int64_t) c.live.ids.size() >= shortest && c.bytes() <= store.budget();
+            return (int64_t) c.live.ids.size() >= shortest && c.bytes() <= store.budget() && c.stage_images.empty();
         });
         if (!image) break;
+        if (!stored(*image)) {
+            // written here, from the image: one the store does not hold once the write returns goes back to the cache
+            std::string error;
+            if (!store.write(image_source(*image), error, waiting)) {
+                const size_t tokens = image->live.ids.size();
+                bool back = true;
+                if (image->from_slot) cache.put_slot(std::move(*image), SIZE_MAX);
+                else back = cache.put(std::move(*image));
+                basalt::log::warn("basalt serve", "conversation cache: %zu tokens not moved to disk (%s); %s", tokens,
+                                  error.c_str(), back ? "they stay in RAM" : "dropped");
+                break;
+            }
+            ++r.written;
+        }
         ++r.left;
         r.bytes += image->bytes();
-        bool held = stored(*image);
-        if (!held) {   // in RAM already: no queue cap, and it is waited for
-            const size_t before = store.stats().written;
-            held = store.put(std::move(*image), std::numeric_limits<uint64_t>::max());
-            store.flush(waiting);
-            held = held && store.stats().written > before;
-            r.written += held;
-        }
         image.reset();
         r.admitted = admitted();
-        if (!held) break;
     }
     return r;
 }

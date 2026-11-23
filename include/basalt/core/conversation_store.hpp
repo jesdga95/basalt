@@ -180,8 +180,10 @@ struct ConversationsToStore {
 
 /// Conversations parked in `cache` leave for `store`, the longest parked first, until `admitted()` holds or none is
 /// left to go.  One that `stored` says the store holds already only leaves the cache; the others are written first
-/// and waited for (`waiting`, as for flush): an image's RAM is free once it is written.  One shorter than `shortest`
-/// tokens or larger than the store's budget stays parked, and once the store did not write one, no more are given up.
+/// (write(), with `waiting` as its progress): an image's RAM is free once it is written.  One shorter than `shortest`
+/// tokens, larger than the store's budget or with a layer split's stage images (the store takes none) stays parked;
+/// one the store does not hold after its write goes back to the cache as its most recent entry, and no more are given
+/// up after it.
 ConversationsToStore conversation_cache_to_store(ConversationCache& cache, ConversationStore& store, int64_t shortest,
                                                  const std::function<bool(const SavedConversation&)>& stored,
                                                  const std::function<bool()>& admitted,

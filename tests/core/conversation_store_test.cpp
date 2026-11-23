@@ -656,8 +656,8 @@ void interrupted_write(const std::string& dir, uint64_t id) {
 }
 
 // Conversations parked in RAM leave for the store until a condition holds: the longest parked first, one the store
-// holds without a write, the others written and read back; a short one and one over the budget stay, and after a
-// write that failed no more are given up.
+// holds without a write, the others written and read back; a short one and one over the budget stay, and one whose
+// write failed goes back to the cache, an idle slot's as one, with no more given up after it.
 void ram_tier_to_store(const std::string& dir, uint64_t id) {
     std::string err;
     const auto ids_of = [](size_t n, int salt) {
@@ -684,7 +684,7 @@ void ram_tier_to_store(const std::string& dir, uint64_t id) {
     int asked = 0, waited = 0;
     auto moved = conversation_cache_to_store(cache, st, 4096, stored, [&] { return ++asked > 2; }, [&] { ++waited; });
     // b left without a write, c was written, then the condition held: d and e stay, and the short one before them
-    CHECK(moved.admitted && moved.left == 2 && moved.written == 1 && waited < 60 &&
+    CHECK(moved.admitted && moved.left == 2 && moved.written == 1 && waited > 0 &&
           moved.bytes == SavedConversation(b).bytes() + SavedConversation(c).bytes());
     CHECK(asked == 3 && cache.size() == 3 && parked(s_ids) && !parked(b_ids) && !parked(c_ids) && parked(d_ids));
     CHECK(st.stats().written == 2 && st.queued_bytes() == 0 && cache.take_spilled().empty());
@@ -693,27 +693,47 @@ void ram_tier_to_store(const std::string& dir, uint64_t id) {
     SavedConversation got;
     CHECK(m.tokens == (int64_t) c_ids.size() && st.load(m, got, err));
     CHECK(same_state(got.live, c.live) && same_kv(got.kv, c.kv));
-    // the write of d fails (a directory where its temporary file goes): it is lost, and e is not given up after it
-    std::string d_name;
-    {
-        Store scratch;
-        CHECK(scratch.open(dir + "-name", id, 1ull << 30, err) && scratch.put(image(d_ids, {1000}), 1ull << 30));
-        scratch.flush();
-        const std::vector<std::string> names = files_of(dir + "-name", 0);
-        CHECK(names.size() == 1);
-        if (!names.empty()) d_name = names[0];
-    }
-    remove_dir(dir + "-name");
-    const std::string blocker =
-        dir + "/" + d_name + "." + std::to_string((long long) basalt::platform::process_id()) + ".tmp";
+    // the write of d fails (a directory where its temporary file goes): it stays parked, and e is not given up after it
+    const auto blocker_of = [&](const std::string& in, const SavedConversation& k) {
+        std::string name;
+        {
+            Store scratch;
+            CHECK(scratch.open(dir + "-name", id, 1ull << 30, err) && scratch.put(SavedConversation(k), 1ull << 30));
+            scratch.flush();
+            const std::vector<std::string> names = files_of(dir + "-name", 0);
+            CHECK(names.size() == 1);
+            if (!names.empty()) name = names[0];
+        }
+        remove_dir(dir + "-name");
+        return in + "/" + name + "." + std::to_string((long long) basalt::platform::process_id()) + ".tmp";
+    };
+    const std::string blocker = blocker_of(dir, image(d_ids, {1000}));
     CHECK(basalt::platform::make_dirs(blocker));
+    const size_t parked_bytes = cache.bytes();
     moved = conversation_cache_to_store(cache, st, 4096, stored, [] { return false; });
-    CHECK(!moved.admitted && moved.left == 1 && moved.written == 0 && cache.size() == 2 && parked(e_ids));
+    CHECK(!moved.admitted && moved.left == 0 && moved.written == 0 && moved.bytes == 0);
+    CHECK(cache.size() == 3 && cache.bytes() == parked_bytes && parked(d_ids) && parked(e_ids));
+    CHECK(st.stats().written == 2 && !st.holds(d_ids, {}, true));
     basalt::platform::remove_file(blocker);
-    // nothing in the way: e goes, the short one stays whatever the condition
+    // nothing in the way: e and d go, the short one stays whatever the condition
     moved = conversation_cache_to_store(cache, st, 4096, stored, [] { return false; });
-    CHECK(!moved.admitted && moved.left == 1 && moved.written == 1 && cache.size() == 1 && parked(s_ids));
-    CHECK(st.holds(e_ids, {}, true) && st.stats().written == 3);
+    CHECK(!moved.admitted && moved.left == 2 && moved.written == 2 && cache.size() == 1 && parked(s_ids));
+    CHECK(st.holds(e_ids, {}, true) && st.holds(d_ids, {}, true) && st.stats().written == 4);
+    // an idle slot's conversation whose write fails goes back as an idle slot's
+    {
+        Store other;
+        CHECK(other.open(dir + "-slot", id, 1ull << 30, err));
+        const std::string c_blocker = blocker_of(dir + "-slot", c);
+        CHECK(basalt::platform::make_dirs(c_blocker));
+        ConversationCache slots(1ull << 30, 8);
+        slots.put_slot(SavedConversation(c), 4);
+        moved = conversation_cache_to_store(slots, other, 4096, [](const SavedConversation&) { return false; },
+                                            [] { return false; });
+        CHECK(moved.left == 0 && moved.written == 0 && slots.size() == 1 && slots.slot_size() == 1 &&
+              slots.slot_bytes() == SavedConversation(c).bytes());
+        basalt::platform::remove_file(c_blocker);
+    }
+    remove_dir(dir + "-slot");
     // a store whose budget is smaller than the conversation takes none of it
     Store small;
     CHECK(small.open(dir + "-small", id, SavedConversation(c).bytes() - 1, err));
