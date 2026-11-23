@@ -1007,7 +1007,10 @@ void test_attention_window() {
             }
             std::vector<uint8_t> all = host((uint8_t*) aa[1].q8, q8b);
             for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
-                const std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
+                std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
+                if (kv == kI8)   // the hash covers codes and scales: the padding is checked above
+                    for (size_t i = 0; i < b.size(); ++i)
+                        if (i % kv_bytes(kv) >= kHeadDim + 4) b[i] = 0;
                 all.insert(all.end(), b.begin(), b.end());
             }
             print_hash("q8_1 output and caches", all);
