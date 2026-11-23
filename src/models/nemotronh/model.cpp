@@ -34,9 +34,12 @@ NemotronModel::~NemotronModel() {
 }
 
 size_t NemotronModel::expert_stride() const {
+    // MMQ steps from expert to expert in whole blocks (NVFP4's 36 bytes) and reads up to 256 values past a matrix's last
+    // row: the blob, then room past it, rounded to 36 and 16 bytes
     size_t blob = 0;
     for (const ExpertLayer& el : pack_.experts) blob = std::max<size_t>(blob, el.blob_bytes);
-    return (blob + 255) / 256 * 256;
+    constexpr size_t kUnit = 144, kReadPast = 256 / 64 * 36;   // lcm(36, 16); the most an NVFP4 row is read past
+    return (blob + kReadPast + kUnit - 1) / kUnit * kUnit;
 }
 
 core::ExpertTierSpec NemotronModel::tier_spec() const {

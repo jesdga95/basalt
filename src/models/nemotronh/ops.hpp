@@ -11,6 +11,10 @@ namespace basalt::models::nemotronh {
 /// array of T K pointers.
 void weighted_sum(const float* const* rows, const float* w, int T, int K, int n, float* out, void* stream);
 
+/// h[r][c] = relu(h[r][c] s_in)^2 s_down for rows of n values grouped by expert: row r's expert j has bounds[j] <= r <
+/// bounds[j + 1] (device, n_experts + 1 entries), its scales tails[4 j] and tails[4 j + 2] (an NVFP4 blob's tail).
+void relu2_scaled_rows(float* h, int64_t rows, int n, const int32_t* bounds, int n_experts, const float* tails, void* stream);
+
 /// x[i] = relu(x[i])^2 for n values.
 void relu2(float* x, int64_t n, void* stream);
 

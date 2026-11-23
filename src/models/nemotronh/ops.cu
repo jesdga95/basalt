@@ -16,6 +16,19 @@ __global__ void weighted_sum_kernel(const float* const* rows, const float* w, in
     }
 }
 
+__global__ void relu2_scaled_kernel(float* h, int64_t rows, int n, const int32_t* bounds, int ne, const float* tails) {
+    const int64_t r = blockIdx.y;
+    if (r >= rows) return;
+    int j = 0;
+    while (j + 1 < ne && bounds[j + 1] <= r) ++j;
+    const float si = tails[4 * j], sd = tails[4 * j + 2];
+    float* row = h + r * n;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n; c += gridDim.x * blockDim.x) {
+        const float x = fmaxf(__fmul_rn(row[c], si), 0.0f);
+        row[c] = __fmul_rn(__fmul_rn(x, x), sd);
+    }
+}
+
 __global__ void relu2_kernel(float* x, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
         const float r = fmaxf(x[i], 0.0f);
@@ -43,6 +56,12 @@ void weighted_sum(const float* const* rows, const float* w, int T, int K, int n,
     if (T <= 0) return;
     const dim3 grid((unsigned) ((n + 255) / 256), (unsigned) T);
     weighted_sum_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(rows, w, K, n, out);
+}
+
+void relu2_scaled_rows(float* h, int64_t rows, int n, const int32_t* bounds, int n_experts, const float* tails, void* stream) {
+    if (rows <= 0) return;
+    const dim3 grid((unsigned) ((n + 255) / 256), (unsigned) rows);
+    relu2_scaled_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(h, rows, n, bounds, n_experts, tails);
 }
 
 void relu2(float* x, int64_t n, void* stream) {

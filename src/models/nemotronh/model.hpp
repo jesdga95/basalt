@@ -72,7 +72,7 @@ public:
     SharedTier& shared_tier() const { return shared_tier_; }
     /// The start's reads while it plans (null after): what the first session's tier queues into.
     core::LoadPlan* planning() const { return planning_; }
-    /// Bytes between two staged experts of the prompt path (the blob rounded to 256).
+    /// Bytes between two staged experts of the prompt path: the blob and what MMQ reads past it, in whole NVFP4 blocks.
     size_t expert_stride() const;
 
 private:

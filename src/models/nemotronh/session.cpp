@@ -11,7 +11,7 @@
 // The routed experts of a window go to the tier in groups of up to five rows (five rows of 22 experts fit one lookup):
 // the card computes those its slots hold, the CPU pool the rest from the pinned RAM tier, and the router's weights sum
 // both on the card.  A prompt chunk stages every expert its rows use on the card (from a slot, the RAM tier or the pack)
-// and computes them there.
+// and computes them there with llama.cpp's MMQ (q8_1 activations against the NVFP4 blobs).
 #include "models/nemotronh/model.hpp"
 #include "models/nemotronh/ops.hpp"
 
@@ -28,6 +28,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -43,17 +44,18 @@ namespace wg = basalt::kernels::wgemm;
 
 constexpr int kMaxWindow = 16;    // a decode window's rows (the window gemm's)
 constexpr int kMoeGroup = 5;      // rows of one tier lookup: 5 x 22 entries fit core::ExpertTier::kMaxK
-constexpr int kChunk = 512;       // rows of a prompt chunk
-constexpr int kStage = 32;        // experts a prompt chunk stages on the card at a time
-constexpr int kStageEntries = 2048;   // the most (row, expert) entries of one staged launch
+constexpr int kChunk = 4096;      // rows of a prompt chunk: each restages its layers' experts, so fewer, longer chunks
+constexpr int kGroupRows = 4096;  // the most gathered rows of one group of a prompt chunk's experts
+constexpr int kGroupExperts = 16; // the most experts of one group (a staging half)
+static_assert(kChunk <= kGroupRows, "an expert's rows of a chunk fit one group");
 constexpr int kTypeNvfp4 = 40;
 
-struct GroupPlan {   // a grouped expert launch's tables, uploaded together
-    unsigned long long ptr[kStage > core::ExpertTier::kMaxK ? kStage : core::ExpertTier::kMaxK];
+struct GroupPlan {   // a window group's grouped expert launch tables, uploaded together
+    unsigned long long ptr[core::ExpertTier::kMaxK];
     int32_t start[core::ExpertTier::kMaxK + 1];
     int32_t ng;
-    int32_t dst[kStageEntries];
-    int32_t tok[kStageEntries];
+    int32_t dst[core::ExpertTier::kMaxK];
+    int32_t tok[core::ExpertTier::kMaxK];
 };
 
 class Session final : public model::ModelSession {
@@ -65,6 +67,10 @@ public:
         if (stream_) cudaStreamSynchronize(stream_);
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
+        if (copy_) cudaStreamSynchronize(copy_);
+        for (cudaEvent_t e : {ev_ready_, ev_copied_[0], ev_copied_[1], ev_done_[0], ev_done_[1]})
+            if (e) cudaEventDestroy(e);
+        if (copy_) cudaStreamDestroy(copy_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
@@ -137,12 +143,42 @@ public:
         gs4_ = f(R);
         // the routed experts: a window group's q8_1 latent rows, the grouped kernels' scratch and rows, the plan tables
         exq_ = alloc((size_t) std::max<int64_t>(R, kMaxWindow) * (size_t) (L / 32) * 36, ok);   // q8_1 rows of the latent
-        const int64_t cap = std::max<int64_t>(kStageEntries, (int64_t) kMoeGroup * K);
-        exscr_ = alloc(bk::native_expert_scratch_bytes(cap, g_.n_ff_exp), ok);
+        exscr_ = alloc(bk::native_expert_scratch_bytes((int64_t) kMoeGroup * K, g_.n_ff_exp), ok);
         exrows_ = f(R * K * L);
         plan_d_ = (GroupPlan*) alloc(sizeof(GroupPlan), ok);
         rowtab_d_ = (const float**) alloc((size_t) R * K * sizeof(float*), ok);
-        stage_ = (uint8_t*) alloc((size_t) kStage * m_.expert_stride(), ok);
+        {   // the prompt path's experts
+            namespace mmq = basalt::prefill::mmq;
+            const int64_t rows = R * K, ng_max = g_.n_expert;   // at worst a group an expert
+            if (!mmq::built() || !mmq::fits(kTypeNvfp4, g_.n_ff_exp) || !mmq::fits(kTypeNvfp4, L) ||
+                m_.expert_stride() + 16 - (size_t) bk::native_expert_layout_relu2(kTypeNvfp4, kTypeNvfp4, L, g_.n_ff_exp).bytes < mmq::read_past_bytes(kTypeNvfp4, g_.n_ff_exp)) {
+                err = "the prompt path's MMQ does not take these experts";
+                return false;
+            }
+            mmq::load(kTypeNvfp4, g_.n_ff_exp);
+            mmq::load(kTypeNvfp4, L);
+            mmq_ = std::make_unique<mmq::Context>();
+            stage_ = (uint8_t*) alloc((size_t) 2 * kGroupExperts * m_.expert_stride(), ok);
+            d_gtok_ = (int32_t*) alloc((size_t) rows * 4, ok);
+            d_gbounds_ = (int32_t*) alloc((size_t) ng_max * (kGroupExperts + 1) * 4, ok);
+            tails_d_ = f((int64_t) 2 * kGroupExperts * 4);
+            mxq_ = alloc(mmq::q8_bytes(kGroupRows, L), ok);
+            mhq_ = alloc(mmq::q8_bytes(kGroupRows, g_.n_ff_exp), ok);
+            hbuf_ = f((int64_t) kGroupRows * g_.n_ff_exp);
+            ident_d_ = (int32_t*) alloc((size_t) kGroupRows * 4, ok);
+            if (ok) {
+                std::vector<int32_t> id(kGroupRows);
+                for (int i = 0; i < kGroupRows; ++i) id[(size_t) i] = i;
+                cudaMemcpy(ident_d_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
+            }
+            if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ev_ready_, cudaEventDisableTiming) != cudaSuccess)
+                ok = false;
+            for (int i = 0; i < 2; ++i)
+                if (cudaEventCreateWithFlags(&ev_copied_[i], cudaEventDisableTiming) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&ev_done_[i], cudaEventDisableTiming) != cudaSuccess)
+                    ok = false;
+        }
         const auto pin = [&](size_t n) {
             void* p = nullptr;
             if (cudaHostAlloc(&p, n, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) ok = false;
@@ -155,6 +191,8 @@ public:
         h_lat_ = (float*) pin((size_t) R * L * 4);
         keep_h_ = (int32_t*) pin(16);
         bounce_ = (uint8_t*) pin(m_.expert_stride());
+        h_gtok_ = (int32_t*) pin((size_t) R * K * 4);
+        h_gbounds_ = (int32_t*) pin((size_t) g_.n_expert * (kGroupExperts + 1) * 4);
         // the recurrent state of each Mamba-2 layer (two buffers), its history and a window's rows a commit replays; the
         // attention layers' caches
         const size_t st = sg_.state_floats(), hs = sg_.hist_floats();
@@ -680,20 +718,25 @@ private:
         return true;
     }
 
-    // A prompt chunk's routed experts: every expert its rows route to, staged on the card kStage at a time (its slot's
-    // copy in place, else copied from the RAM tier or read from the pack), computed by the grouped kernels into a row per
-    // (token, choice), then the weighted sum.
+    // A prompt chunk's routed experts on the int8 tensor cores (llama.cpp's MMQ over the NVFP4 blobs, q8_1 activations):
+    // every expert its rows route to, in groups of up to kGroupExperts.  A group's blobs are copied (from a card slot, the
+    // RAM tier or the pack) into one of two staging halves on the copy stream while the group before computes, at one
+    // stride; each blob's scale tail is kept aside and its place zeroed, as MMQ reads a little past a down matrix.  The
+    // group's rows (the latent of each token that chose the expert, gathered by expert) go through the input product, the
+    // squared ReLU with both tail scales applied, and the down product, one latent row per (token, choice) for the
+    // weighted sum.
     bool moe_chunk(const Layer& L, int R, std::string& err) {
-        const int64_t E = g_.n_embd, Ln = g_.n_latent, K = g_.n_used;
+        namespace mmq = basalt::prefill::mmq;
+        const int64_t E = g_.n_embd, Ln = g_.n_latent, K = g_.n_used, FF = g_.n_ff_exp;
         bk::rms_norm_rows(X_, L.norm, XN_, R, E, g_.rms_eps, stream_);
         moe_head(L, R, false);
-        bk::quantize_q8_1_rows(lat_, R, Ln, exq_, stream_);
         cudaMemcpyAsync(h_ids_, ids_, (size_t) R * K * 4, cudaMemcpyDeviceToHost, stream_);
         if (cudaStreamSynchronize(stream_) != cudaSuccess) {
             err = "the router failed";
             return false;
         }
-        std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // entry = t * K + k
+        // the entries (t K + k) of each expert, the experts in id order, and each entry's gathered row
+        std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);
         for (int64_t r = 0; r < R * K; ++r) {
             const int32_t e = h_ids_[r];
             if (e < 0 || e >= g_.n_expert) {
@@ -702,67 +745,122 @@ private:
             }
             by[(size_t) e].push_back((int32_t) r);
         }
+        std::vector<int> order;
+        for (int e = 0; e < g_.n_expert; ++e)
+            if (!by[(size_t) e].empty()) order.push_back(e);
+        // the host tables of every group, uploaded once: a gathered row's token, each group's relative row bounds
+        int32_t* gtok = h_gtok_;
+        int32_t* gb = h_gbounds_;
+        std::vector<int> g_first, g_n, g_row0;   // per group: its first expert in `order`, its experts, its first row
+        int64_t row = 0;
+        for (size_t i = 0; i < order.size();) {
+            int n = 0;   // up to kGroupExperts experts and kGroupRows rows (an expert has at most R <= kGroupRows)
+            for (int64_t rows = 0; i + (size_t) n < order.size() && n < kGroupExperts; ++n) {
+                rows += (int64_t) by[(size_t) order[i + (size_t) n]].size();
+                if (rows > kGroupRows) break;
+            }
+            g_first.push_back((int) i);
+            g_n.push_back(n);
+            g_row0.push_back((int) row);
+            int32_t* bb = gb + (g_first.size() - 1) * (kGroupExperts + 1);
+            bb[0] = 0;
+            for (int j = 0; j < n; ++j) {
+                for (int32_t r : by[(size_t) order[i + (size_t) j]]) {
+                    gtok[row] = r / (int32_t) K;
+                    rowtab_h_[r] = exrows_ + (size_t) row * Ln;
+                    ++row;
+                }
+                bb[j + 1] = (int32_t) (row - g_row0.back());
+            }
+            i += (size_t) n;
+        }
+        const int ng = (int) g_first.size();
+        cudaMemcpyAsync(d_gtok_, gtok, (size_t) row * 4, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(d_gbounds_, gb, (size_t) ng * (kGroupExperts + 1) * 4, cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(rowtab_d_, rowtab_h_, (size_t) R * K * sizeof(float*), cudaMemcpyHostToDevice, stream_);
+        cudaEventRecord(ev_ready_, stream_);   // the tables are in before any copy
+        cudaStreamWaitEvent(copy_, ev_ready_, 0);
         const int tl = L.tier_layer;
         const size_t stride = m_.expert_stride();
         const uint64_t blob = lay_.bytes;
         const core::FileRange& er = m_.pack().experts_range;
         const uint64_t layer_off = m_.pack().experts[(size_t) (&L - &m_.layer(0))].offset;
-        // the experts in launches of at most kStage blobs and kStageEntries entries; an expert's entries may span launches
-        std::vector<int> order;
-        for (int e = 0; e < g_.n_expert; ++e)
-            if (!by[(size_t) e].empty()) order.push_back(e);
-        size_t oi = 0, done = 0;   // the next expert, and its entries already launched
-        while (oi < order.size()) {
-            GroupPlan& p = *plan_h_;
-            int ng = 0, ne = 0, staged = 0;
-            while (oi < order.size() && ng < kStage && ne < kStageEntries) {
-                const int e = order[oi];
-                const std::vector<int32_t>& rows = by[(size_t) e];
+        // group gi's blobs into staging half gi & 1 on the copy stream, their tails aside and zeroed
+        const auto stage = [&](int gi) {
+            const int h = gi & 1;
+            cudaStreamWaitEvent(copy_, ev_done_[h], 0);   // the group two before has read this half
+            for (int j = 0; j < g_n[(size_t) gi]; ++j) {
+                const int e = order[(size_t) g_first[(size_t) gi] + (size_t) j];
                 const core::ExpertTier::Source src = tier_->locate(tl, e);
-                const uint8_t* dev = src.dev;
-                if (!dev) {   // to the card: from the RAM tier, or read from the pack
-                    uint8_t* slot = stage_ + (size_t) staged++ * stride;
-                    if (src.pinned) {
-                        cudaMemcpyAsync(slot, src.pinned, blob, cudaMemcpyHostToDevice, stream_);
-                    } else {
-                        cudaStreamSynchronize(stream_);   // the bounce buffer's last copy has left
-                        if (!platform::pread_all(m_.fd(), bounce_, blob, er.offset + layer_off + (uint64_t) e * blob)) {
-                            err = "reading an expert from the pack failed";
-                            return false;
-                        }
-                        cudaMemcpyAsync(slot, bounce_, blob, cudaMemcpyHostToDevice, stream_);
-                    }
-                    dev = slot;
+                uint8_t* slot = stage_ + ((size_t) h * kGroupExperts + (size_t) j) * stride;
+                if (src.dev) {
+                    cudaMemcpyAsync(slot, src.dev, blob, cudaMemcpyDeviceToDevice, copy_);
+                } else if (src.pinned) {
+                    cudaMemcpyAsync(slot, src.pinned, blob, cudaMemcpyHostToDevice, copy_);
+                } else {
+                    cudaStreamSynchronize(copy_);   // the bounce buffer's last copy has left
+                    if (!platform::pread_all(m_.fd(), bounce_, blob, er.offset + layer_off + (uint64_t) e * blob)) return false;
+                    cudaMemcpyAsync(slot, bounce_, blob, cudaMemcpyHostToDevice, copy_);
                 }
-                p.ptr[ng] = (unsigned long long) dev;
-                p.start[ng] = ne;
-                while (done < rows.size() && ne < kStageEntries) {
-                    p.dst[ne] = rows[done];
-                    p.tok[ne] = rows[done] / (int32_t) K;
-                    ++ne;
-                    ++done;
-                }
-                ++ng;
-                if (done == rows.size()) {
-                    ++oi;
-                    done = 0;
-                }
+                cudaMemcpyAsync(tails_d_ + ((size_t) h * kGroupExperts + (size_t) j) * 4, slot + blob - 16, 16,
+                                cudaMemcpyDeviceToDevice, copy_);
+                cudaMemsetAsync(slot + blob - 16, 0, stride - blob + 16, copy_);
             }
-            p.start[ng] = ne;
-            p.ng = ng;
-            cudaMemcpyAsync(plan_d_, plan_h_, sizeof(GroupPlan), cudaMemcpyHostToDevice, stream_);
-            bk::native_expert_grouped(lay_, plan_d_->ptr, plan_d_->start, &plan_d_->ng, plan_d_->dst, plan_d_->tok, ng, ne, exq_,
-                                      exscr_, exrows_, stream_);
-            // the staging and the plan are this launch's until it has run
-            if (cudaStreamSynchronize(stream_) != cudaSuccess) {
-                err = "a prompt's experts failed";
+            cudaEventRecord(ev_copied_[h], copy_);
+            return true;
+        };
+        if (ng > 0 && !stage(0)) {
+            err = "reading an expert from the pack failed";
+            return false;
+        }
+        for (int gi = 0; gi < ng; ++gi) {
+            const int h = gi & 1, n = g_n[(size_t) gi];
+            if (gi + 1 < ng && !stage(gi + 1)) {   // the next group's copies go out while this one runs
+                err = "reading an expert from the pack failed";
                 return false;
             }
+            const int32_t* bounds = d_gbounds_ + (size_t) gi * (kGroupExperts + 1);
+            const int32_t* bh = gb + (size_t) gi * (kGroupExperts + 1);
+            const int64_t rows = bh[n];
+            int64_t maxr = 0;
+            for (int j = 0; j < n; ++j) maxr = std::max<int64_t>(maxr, bh[j + 1] - bh[j]);
+            const uint8_t* base = stage_ + (size_t) h * kGroupExperts * stride;
+            mmq::quantize(lat_, d_gtok_ + g_row0[(size_t) gi], mxq_, kTypeNvfp4, Ln, Ln, rows, stream_);
+            cudaStreamWaitEvent(stream_, ev_copied_[h], 0);
+            mmq::Product up;
+            up.w = base;
+            up.type = kTypeNvfp4;
+            up.w_rows = FF;
+            up.w_cols = Ln;
+            up.expert_bytes = stride;
+            up.n = n;
+            up.xq = mxq_;
+            up.bounds = bounds;
+            up.ids = ident_d_;
+            up.total_rows = rows;
+            up.max_rows = maxr;
+            up.dst = hbuf_;
+            up.ld_dst = FF;
+            mmq_->run(up, stream_);
+            relu2_scaled_rows(hbuf_, rows, (int) FF, bounds, n, tails_d_ + (size_t) h * kGroupExperts * 4, stream_);
+            mmq::quantize(hbuf_, nullptr, mhq_, kTypeNvfp4, FF, FF, rows, stream_);
+            mmq::Product dn = up;
+            dn.w = base + lay_.down_off;
+            dn.w_rows = Ln;
+            dn.w_cols = FF;
+            dn.xq = mhq_;
+            dn.dst = exrows_ + (size_t) g_row0[(size_t) gi] * Ln;
+            dn.ld_dst = Ln;
+            mmq_->run(dn, stream_);
+            cudaEventRecord(ev_done_[h], stream_);
         }
-        for (int64_t r = 0; r < R * K; ++r) rowtab_h_[r] = exrows_ + (size_t) r * Ln;
-        cudaMemcpyAsync(rowtab_d_, rowtab_h_, (size_t) R * K * sizeof(float*), cudaMemcpyHostToDevice, stream_);
         weighted_sum(rowtab_d_, rw_, R, (int) K, (int) Ln, latout_, stream_);
         moe_tail(L, R);
+        // the host tables are this layer's until the stream has read them
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "a prompt's experts failed";
+            return false;
+        }
         return true;
     }
 
@@ -873,6 +971,14 @@ private:
     int32_t *h_ids_ = nullptr, *keep_h_ = nullptr;
     float* h_lat_ = nullptr;
     uint8_t *stage_ = nullptr, *bounce_ = nullptr;
+    // the prompt path's experts: gathered rows' tokens and the groups' bounds (pinned and on the card), an identity row
+    // table, the staged blobs' tails, the q8_1 input and H, H; the MMQ context; the copy stream and its events
+    int32_t *h_gtok_ = nullptr, *h_gbounds_ = nullptr, *d_gtok_ = nullptr, *d_gbounds_ = nullptr, *ident_d_ = nullptr;
+    float *tails_d_ = nullptr, *hbuf_ = nullptr;
+    void *mxq_ = nullptr, *mhq_ = nullptr;
+    std::unique_ptr<basalt::prefill::mmq::Context> mmq_;
+    cudaStream_t copy_ = nullptr;
+    cudaEvent_t ev_ready_ = nullptr, ev_copied_[2] = {}, ev_done_[2] = {};
     std::shared_ptr<core::ExpertTier> tier_;
     float *h_rows_ = nullptr, *d_rows_ = nullptr;
     // the last window, until the next call says how many of its rows were kept
