@@ -182,6 +182,16 @@ std::vector<std::vector<int>> cpu_l3_groups() {
     return groups;
 }
 
+bool pin_current_thread(int cpu) {
+    if (cpu < 0) return false;
+    // A processor past 64 lives in another processor group; group affinity names both at once, so one call covers the
+    // common single-group machine and the many-core one alike.
+    GROUP_AFFINITY want = {};
+    want.Group = (WORD) (cpu / 64);
+    want.Mask = (KAFFINITY) 1 << (cpu % 64);
+    return SetThreadGroupAffinity(GetCurrentThread(), &want, nullptr) != 0;
+}
+
 #else
 // --------------------------------------------------------------------------------------------- Linux
 
@@ -418,6 +428,14 @@ std::vector<std::vector<int>> cpu_l3_groups() {
         }
     }
     return groups;
+}
+
+bool pin_current_thread(int cpu) {
+    if (cpu < 0) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
 }
 
 #endif
