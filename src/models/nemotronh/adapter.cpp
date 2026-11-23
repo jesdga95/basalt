@@ -20,8 +20,13 @@ public:
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
     std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<NemotronModel>(); }
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "nemotronh"}; }
-    // the checkpoint's chat template asks for Qwen's form: <tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...
-    program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
+    // Qwen's form, as the checkpoint's template writes it: <tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n
+    // </function>\n</tool_call>\n, the newline after a call part of it (the grammar then ends there, and the turn may end)
+    program::grammar::ToolForm tool_form() const override {
+        program::grammar::ToolForm f = program::qwen_tool_form();
+        f.call_close = "\n</tool_call>\n";
+        return f;
+    }
     PreTokenizer pretokenizer() const override { return {"nemotronh", pretok_nemotronh}; }
     int max_expert_cards() const override { return 0; }
     const char* model_name() const override { return "Nemotron-3.5-Super"; }
