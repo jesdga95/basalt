@@ -119,7 +119,7 @@ jobs:
           set -euo pipefail
           plan="${RUNNER_TEMP}/plan.json"
           marker='<!-- community-gate -->'
-          for l in "community: needs review" "community: rejected" "community: needs changes" "community: would auto-merge"; do
+          for l in "community: needs review" "community: rejected" "community: needs changes" "community: automatic merge"; do
             gh label create "$l" --repo "${GITHUB_REPOSITORY}" --color F9D0C4 --force >/dev/null
             if jq -e --arg l "$l" '.labels | index($l)' "$plan" >/dev/null; then
               gh pr edit "${PR}" --repo "${GITHUB_REPOSITORY}" --add-label "$l"
