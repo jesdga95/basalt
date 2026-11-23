@@ -57,9 +57,9 @@ Basalt is a local inference engine for NVIDIA Blackwell GPUs. Every rule below e
 ## Other ways to help
 
 - Cannot contribute code? Add a benchmark run from your hardware to the community table (details in [community runs](docs/community.md)):
-  1. Run `basalt-bench --community --model PACK --submitter YourName`. It adds the row to `docs/community/benchmarks.json` ([building](docs/building.md)).
-  2. Review the row. After a hand edit, format and check it with `python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json`.
-  3. Commit it.
+  1. Run `basalt-bench --community --model PACK --submitter YourName`. It writes the row to its own file under `docs/community/runs/` ([building](docs/building.md)).
+  2. Review the file. After a hand edit, format and check it with `python3 tools/check_benchmarks.py --fix docs/community`.
+  3. Commit the new or changed file.
   4. Open a pull request; the `community` workflow runs the same check.
   5. Once merged, the row appears on the [runs page](https://basalt.jgulfo.com/community/).
 - Any Blackwell (sm_120) machine with spare hours helps; bigger setups help most: 96 GB+ VRAM (single large cards or multi-GPU), quad- or octa-channel DDR5.

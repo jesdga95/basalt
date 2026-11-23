@@ -19,7 +19,7 @@ def note(log: str, rc, last_err: str = "") -> str:
         path = Path(d) / "engine.log"
         path.write_text(log)
         fake = SimpleNamespace(silent_note=None, log_path=str(path), last_err=last_err,
-                               proc=SimpleNamespace(poll=lambda: rc),
+                               proc=SimpleNamespace(poll=lambda: rc), log_start=0,
                                _format_exit_status=ProcessEngine._format_exit_status)
         return ProcessEngine.death_note(fake)
 
@@ -49,6 +49,39 @@ class DeathNote(unittest.TestCase):
         got = note("", None)
         self.assertNotIn("RAM", got)
         self.assertIn("no exit status", got)
+
+    def test_an_earlier_runs_lines_are_not_this_runs_verdict(self):
+        # a restart appends to the shared log: an earlier run's watchdog line must not name this one
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "engine.log"
+            earlier = b"basalt serve: the engine's watchdog stopped it: issue #29 earlier run stalled\n"
+            path.write_bytes(earlier + b"basalt serve: run2 ready\n")
+            fake = SimpleNamespace(silent_note=None, log_path=str(path), last_err="",
+                                   proc=SimpleNamespace(poll=lambda: 1), log_start=len(earlier),
+                                   _format_exit_status=ProcessEngine._format_exit_status)
+            got = ProcessEngine.death_note(fake)
+        self.assertNotIn("earlier run", got)
+        self.assertIn("run2 ready", got)
+
+    def test_a_reaped_child_keeps_its_exit_status(self):
+        # reap() closes the ended child so the load path is not blocked; its exit status must survive
+        fake = SimpleNamespace(silent_note=None, log_path=str(Path(tempfile.mkdtemp()) / "none.log"), last_err="",
+                               proc=None, _reaped=SimpleNamespace(poll=lambda: 137),
+                               _format_exit_status=ProcessEngine._format_exit_status)
+        got = ProcessEngine.death_note(fake)
+        self.assertIn("137", got)
+
+    def test_an_offset_outside_the_file_attributes_nothing(self):
+        # a known boundary beyond the file means truncation or replacement: no line speaks for this run
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "engine.log"
+            path.write_text("basalt serve: somebody else's crash\n")
+            fake = SimpleNamespace(silent_note=None, log_path=str(path), last_err="",
+                                   proc=SimpleNamespace(poll=lambda: 1), log_start=10 ** 9,
+                                   _format_exit_status=ProcessEngine._format_exit_status)
+            got = ProcessEngine.death_note(fake)
+        self.assertNotIn("somebody else", got)
+        self.assertIn("exited (code 1)", got)
 
     def test_windows_ntstatus_crash_code_is_decoded(self):
         got = note("basalt crash: error: EXCEPTION_ACCESS_VIOLATION (0xC0000005) in decode (17)\n", 0xC0000005)

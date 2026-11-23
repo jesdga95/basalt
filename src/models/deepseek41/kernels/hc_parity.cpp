@@ -77,6 +77,15 @@ std::vector<float> run_coef(const DevW& w, const std::vector<float>& x, int T, c
     return coef.down();
 }
 
+// the partial sums themselves, kHcSplits * (kHcCoef + 1) floats a token: what the partial kernels write, before the
+// rsqrtf/sigmoid/Sinkhorn chain can hide a one-ulp difference in it
+constexpr size_t kPartStride = kHcSplits * (kHcCoef + 1);
+std::vector<float> run_ws(const DevW& w, const std::vector<float>& x, int T, const HcArgs& a) {
+    Dev<float> dx(x), ws(hc_mixes_workspace_floats(T)), coef((size_t) T * kHcCoef);
+    hc_mixes(dx.p, w.fn.p, w.scale.p, w.base.p, T, a, ws.p, coef.p, nullptr);
+    return ws.down();
+}
+
 std::vector<float> run_pre(const std::vector<float>& x, const std::vector<float>& pre, int stride, int T) {
     Dev<float> dx(x), dp(pre), out((size_t) T * D);
     hc_pre(dx.p, dp.p, stride, T, D, out.p, nullptr);
@@ -132,7 +141,9 @@ int main(int argc, char** argv) {
     w.scale = {0.4f, 0.3f, 0.5f};
     w.base = randn(24, 12, 0.5f);
     DevW dw(w);
-    const int Tmax = 9;
+    // 64 tokens is where hc_partial_tok_kernel takes over, and 64 to 71 give the eight tail sizes the launcher can
+    // hand to hc_partial_kernel, 0 to 7 tokens. That tail launch is what this test exists to cover.
+    const int Tmax = 71;
     auto x_h = randn((size_t) Tmax * FLAT, 13, 1.5f);
     auto f_h = randn((size_t) Tmax * D, 14);
     std::vector<float> coef = run_coef(dw, x_h, Tmax, a);
@@ -161,9 +172,9 @@ int main(int argc, char** argv) {
     v.expect(pre_e < 1e-4 * pre_n, "hc_pre error");
     v.expect(post_e < 1e-4 * post_n, "hc_post error");
 
-    // ---- window width and position independence (bitwise)
+    // ---- window width and position independence (bitwise), across the width where the token-blocked partials start (64)
     bool bitwise = true;
-    for (int T : {1, 2, 3, 4})
+    for (int T : {1, 2, 3, 4, 64, 65, 66, 67, 68, 69, 70, 71})
         for (int start : {0, 2, 5}) {
             if (start + T > Tmax) continue;
             std::vector<float> xs(x_h.begin() + (size_t) start * FLAT, x_h.begin() + (size_t)(start + T) * FLAT);
@@ -177,6 +188,24 @@ int main(int argc, char** argv) {
         }
     std::printf("window/position independence: %s\n", bitwise ? "bitwise identical" : "DIFFERS");
     v.expect(bitwise, "output depends on window width or position");
+
+    // ---- the kernel it replaces, token by token: one 68-token call takes hc_partial_tok_kernel for the first 64
+    // tokens and hc_partial_kernel for the 4-token tail, a one-token call takes hc_partial_kernel alone
+    {
+        bool same = true, same_ws = true;
+        const std::vector<float> ws_all = run_ws(dw, x_h, Tmax, a);
+        for (int t = 0; t < Tmax; ++t) {
+            std::vector<float> x1(x_h.begin() + (size_t) t * FLAT, x_h.begin() + (size_t)(t + 1) * FLAT);
+            auto c1 = run_coef(dw, x1, 1, a);
+            same = same && !std::memcmp(c1.data(), &coef[(size_t) t * 24], 24 * 4);
+            const std::vector<float> w1 = run_ws(dw, x1, 1, a);
+            same_ws = same_ws && !std::memcmp(w1.data(), &ws_all[(size_t) t * kPartStride], kPartStride * 4);
+        }
+        std::printf("hc_partial_tok_kernel vs hc_partial_kernel, one token at a time: %s; the %zu partial floats a token: %s\n",
+                    same ? "bitwise identical" : "DIFFERS", kPartStride, same_ws ? "bitwise identical" : "DIFFER");
+        v.expect(same, "the token-blocked partials differ from hc_partial_kernel");
+        v.expect(same_ws, "the tok kernel's partial sums differ from hc_partial_kernel's");
+    }
 
     // ---- the shared RMS norm at this model's epsilon (a tiny eps must not change the result)
     {
@@ -197,8 +226,8 @@ int main(int argc, char** argv) {
         v.expect(e.rms_rel < 1e-6, "rms norm at tiny eps");
     }
 
-    // ---- microbench
-    for (int T : {1, 4}) {
+    // ---- microbench (68 crosses the width where the token-blocked partials start, 64)
+    for (int T : {1, 4, 68, 71}) {
         std::vector<float> xs(x_h.begin(), x_h.begin() + (size_t) T * FLAT), fs(f_h.begin(), f_h.begin() + (size_t) T * D);
         Dev<float> dx(xs), df(fs), ws(hc_mixes_workspace_floats(T)), dc((size_t) T * 24), o1((size_t) T * D), o2((size_t) T * FLAT);
         char name[64];

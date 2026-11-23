@@ -981,8 +981,8 @@ basalt_embed_manifest(iq_parity)
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
-# appending a community row to docs/community/benchmarks.json: formatting cases, and a byte comparison with
-# tools/check_benchmarks.py --fix (python3)
+# writing a community run file under docs/community/runs: formatting cases, and a byte comparison with
+# tools/check_benchmarks.py (python3)
 add_executable(community_row_test tests/program/community_row_test.cpp)
 target_link_libraries(community_row_test PRIVATE engine_session platform warnings)
 basalt_embed_manifest(community_row_test)
@@ -1885,6 +1885,9 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME peer_share_parity COMMAND peer_share_parity)
   set_tests_properties(peer_share_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   if(BASALT_MODEL_QWEN4EXP)
+  add_executable(prefill_pinned_copy_test tests/models/qwen4exp/prefill/prefill_pinned_copy_test.cpp)
+  target_include_directories(prefill_pinned_copy_test PRIVATE src)
+  basalt_cpu_test(NAME prefill_pinned_copy_test COMMAND prefill_pinned_copy_test)
   # the prompt path's routed-entry histogram against a host count
   add_executable(prefill_route_count_test tests/models/qwen4exp/prefill/prefill_route_count_test.cpp)
   target_link_libraries(prefill_route_count_test PRIVATE model_qwen4exp_prefill ${_gpu_runtime_target})
@@ -1974,9 +1977,9 @@ if(BUILD_TESTING)
   # DEC_MOE's kernels on real GGUF experts, bitwise vs the path they replace (--bench: timings)
   add_executable(dec_moe_parity tests/models/qwen4exp/kernels/dec_moe_parity.cpp)
   target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
-  target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ${_gpu_runtime_target})
+  target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ggml_quants ${_gpu_runtime_target})
   basalt_gpu_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
-  basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic experts at the real geometry (K-quant gate/up with Q5_1 / Q8_0 down, i-quant gate/up with Q5_0 down)
+  basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic K-quant and i-quant experts at the real geometry
   endif()
   # native expert pairs on synthetic ggml-quantized weights at 2560/640: GPU and CPU experts against the float
   # reference, GPU dequantizers against to_float.

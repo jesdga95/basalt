@@ -2,7 +2,7 @@ name: community review
 
 # Decides what happens to a community benchmark pull request: deterministic gate first, a model review only if the
 # gate passed, then labels, a comment or a squash merge. The privileged context never runs anything from the PR:
-# it checks out the base commit and reads the PR's file as data through the API. See docs/development/community-automerge.md.
+# it checks out the base commit and reads the PR's run files as data through the API. See docs/development/community-automerge.md.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -39,9 +39,23 @@ jobs:
         run: |
           set -euo pipefail
           gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[] | [.filename, .status]' | jq -s . > "${RUNNER_TEMP}/changed.json"
-          gh api "repos/${GITHUB_REPOSITORY}/contents/docs/community/benchmarks.json?ref=${HEAD_SHA}" \
-            -H "Accept: application/vnd.github.raw+json" > "${RUNNER_TEMP}/head.json"
-          git show "${BASE_SHA}:docs/community/benchmarks.json" > "${RUNNER_TEMP}/base.json"
+          # Compare against the commit the branch started from, not main's tip: a branch made before
+          # newer runs landed would otherwise look like it removes or edits them.
+          MERGE_BASE=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}" --jq .merge_base_commit.sha)
+          mkdir -p "${RUNNER_TEMP}/base" "${RUNNER_TEMP}/head"
+          if git cat-file -e "${MERGE_BASE}:docs/community/runs" 2>/dev/null; then
+            git archive --format=tar "${MERGE_BASE}" -- docs/community/runs | tar -x -C "${RUNNER_TEMP}/base"
+          fi
+          # The head files are read only when the pull request is within the gate's size limit (it refuses a larger one
+          # without reading them) and only for names that look like a run file: the name is used as a path below.
+          if [ "$(jq '[.[] | select(.[1] == "added" or .[1] == "modified")] | length' "${RUNNER_TEMP}/changed.json")" -le 12 ]; then
+            { jq -r '.[] | select(.[1] == "added" or .[1] == "modified") | .[0]' "${RUNNER_TEMP}/changed.json" \
+                | grep -E '^docs/community/runs/[^/]+/[0-9a-f]{12}\.json$' || true; } | while read -r f; do
+              mkdir -p "${RUNNER_TEMP}/head/$(dirname "$f")"
+              gh api "repos/${GITHUB_REPOSITORY}/contents/${f}?ref=${HEAD_SHA}" \
+                -H "Accept: application/vnd.github.raw+json" > "${RUNNER_TEMP}/head/${f}"
+            done
+          fi
 
       - name: Gate (deterministic checks, no secrets)
         id: gate
@@ -49,7 +63,7 @@ jobs:
           AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
-          python3 tools/community_gate.py "${RUNNER_TEMP}/base.json" "${RUNNER_TEMP}/head.json" "${AUTHOR}" \
+          python3 tools/community_gate.py "${RUNNER_TEMP}/base" "${RUNNER_TEMP}/head" "${AUTHOR}" \
             "${RUNNER_TEMP}/changed.json" "${RUNNER_TEMP}/gate.json"
           echo "status=$(jq -r .status "${RUNNER_TEMP}/gate.json")" >> "${GITHUB_OUTPUT}"
 

@@ -248,6 +248,26 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
     return c;
 }
 
+void keep_main_card(const GpuSpec& spec, const std::vector<GpuCard>& visible, const std::string& why, GpuChoice& c) {
+    if (!c.error.empty()) return;
+    // unset: the other cards stay unused either way, and the advice to name them would only lead to the refusal below
+    if (spec.kind == GpuSpec::Kind::Unset) { c.warning.clear(); return; }
+    if (c.cards.size() <= 1) return;
+    if (spec.kind == GpuSpec::Kind::List) {
+        // asked for by name: refused before any card is touched, rather than a card silently left out
+        std::string list;
+        for (int i : spec.list) list += (list.empty() ? "" : ",") + std::to_string(i);
+        c.error = "gpu " + list + ": " + why + "; give one card (gpu " + std::to_string(spec.list.front()) + ")";
+        c.cards.clear();
+        return;
+    }
+    // auto only offered the other cards: the main card it picked runs alone
+    std::string names;
+    for (size_t k = 1; k < c.cards.size(); ++k) names += (names.empty() ? "" : ", ") + gpu_label(visible, c.cards[k]);
+    c.notes.push_back("gpu auto: " + names + " left idle, " + why);
+    c.cards.resize(1);
+}
+
 const char* gpu_role_name(GpuRole r) {
     return r == GpuRole::Main ? "main" : r == GpuRole::ExpertTier ? "expert tier" : r == GpuRole::PromptSplit ? "prompt split"
          : r == GpuRole::LayerStage ? "layer stage" : "idle";
