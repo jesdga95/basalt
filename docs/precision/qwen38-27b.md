@@ -87,6 +87,11 @@ The base scores 6.7411 on the same rows. Each chunk's first half is read as one 
 decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote, W4A4 on the NVFP4 matrices at
 any chunk length (as the checkpoints and Infernix do). Decode never uses it.
 
+## Two cards
+
+`gpu-mode peer` and `gpu-mode split` give the tokens of one card, greedy, at 65,536 context on conversation, struct, prose and a
+16,672-token prompt (`tools/gpu_identity.py` against `--gpu 0`): the second card runs the main card's kernels on the same rows.
+
 ## Context past 262,144
 
 `--rope-scaling yarn --rope-scale F` rotates every query and key by YaRN, as transformers' Qwen3.5 rotary and llama.cpp's
