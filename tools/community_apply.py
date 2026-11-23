@@ -42,6 +42,7 @@ def plan(outcome, mode_value):
     else:
         p["labels"] = ["community: needs review"]
         p["request_review"] = True
+        p["comment"] = outcome.get("comment", "")
     if p["comment"] and mode != "live":   # live needs no note; shadow says why nothing merged
         p["comment"] += f"\n\nMode: {shown}."
     return p
