@@ -4824,6 +4824,42 @@
       "draft_len_prose": 1.9,
       "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
       "notes": "Uncensored (abliterated) NVFP4-DQ6_K pack from klee100/Qwen3.8-Flash-Next-Uncensored-Basalt. 2nd card on a chipset slot (PCIe 4.0 x4, peer tier). 4x32 GB DDR5 at 4533 MT/s; 0 SSD spill."
+    },
+    {
+      "submitter": "BottegaAlu",
+      "date": "2026-11-23",
+      "commit": "ae30a3cc43",
+      "preset": "community-1",
+      "model": "Inkling-2-Mini",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+      "ram_gbps": 37.9,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "kv": "fp16",
+      "prefill_16k_tps": 4920.0,
+      "prefill_64k_tps": 4330.9,
+      "decode_tps": 55.7,
+      "decode_conv_tps": 57.0,
+      "decode_struct_tps": 54.9,
+      "decode_prose_tps": 61.2,
+      "accept_conv_pct": 76.9,
+      "accept_struct_pct": 98.3,
+      "accept_prose_pct": 54.6,
+      "draft_len_conv": 1.2,
+      "draft_len_struct": 5.0,
+      "draft_len_prose": 1.0,
+      "engine_args": "--gpu 0 --max-context 63233",
+      "notes": "Inkling-2-Mini-NVFP4-MX8 pack. 4x32 GB DDR5 at 3600 MT/s (4 DIMMs, 2DPC); 0 SSD spill."
     }
   ]
 }
