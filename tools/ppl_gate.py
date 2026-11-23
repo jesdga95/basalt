@@ -114,7 +114,7 @@ def run(a) -> int:
         args += ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
     args += ["--max-context", "4096"]
     if gpu_count() > 1:
-        args += ["--gpu", "0,1"]
+        args += ["--gpu", "0,1", "--gpu-mode", "peer"]   # a model that only splits: add --gpu-mode split
     args = set_args(args, a.engine_args + ["--ppl-base", str(Path(a.base).resolve())])
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
