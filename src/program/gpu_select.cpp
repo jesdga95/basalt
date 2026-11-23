@@ -125,7 +125,7 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
     out.kind = GpuSpec::Kind::List;
     for (const std::string& w : split_commas(t)) {
         if (!all_digits(w)) {
-            err = "gpu \"" + t + "\": expected a card number like 0, a list like 0,1 (the first is the main card), or all";
+            err = "gpu \"" + t + "\": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md";
             return false;
         }
         const int v = std::atoi(w.c_str());
@@ -145,7 +145,7 @@ bool parse_gpu_mode(const std::string& text, GpuMode& out, std::string& err) {
     if (t.empty()) return true;
     for (GpuMode m : {GpuMode::Peer, GpuMode::Split, GpuMode::Tensor})
         if (t == gpu_mode_name(m)) { out = m; return true; }
-    err = "gpu-mode \"" + t + "\": expected peer, split or tensor";
+    err = "gpu-mode \"" + t + "\": expected peer, split or tensor; see docs/configuration/gpus.md";
     return false;
 }
 
@@ -245,7 +245,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
         return c;
     }
     if (mode == GpuMode::One)
-        return refuse("gpu " + shown + " names " + std::to_string(count) + " cards: set gpu-mode to peer, split or tensor");
+        return refuse("gpu " + shown + " names " + std::to_string(count) + " cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
     c.mode = mode;
     if (!trim(share_text).empty()) {
         std::vector<double> shares;

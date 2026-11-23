@@ -57,7 +57,7 @@ static std::string cards(const GpuChoice& c) {
 int main() {
     // Parsing: a number, a list, all; any other word (the removed "auto" too) gets the one error.
     {
-        const char* want = "gpu \"%s\": expected a card number like 0, a list like 0,1 (the first is the main card), or all";
+        const char* want = "gpu \"%s\": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md";
         GpuSpec s;
         std::string err;
         CHECK(parse_gpu_spec("", s, err) && s.kind == GpuSpec::Kind::Unset);
@@ -79,7 +79,7 @@ int main() {
         CHECK(parse_gpu_mode(" split ", m, err) && m == GpuMode::Split);
         CHECK(parse_gpu_mode("tensor", m, err) && m == GpuMode::Tensor);
         CHECK(!parse_gpu_mode("auto", m, err));
-        CHECK_STR(err, "gpu-mode \"auto\": expected peer, split or tensor");
+        CHECK_STR(err, "gpu-mode \"auto\": expected peer, split or tensor; see docs/configuration/gpus.md");
         CHECK(!parse_gpu_mode("Peer", m, err));
     }
     // A 5090 and a 5060 Ti, in nvidia-smi order.
@@ -129,10 +129,10 @@ int main() {
                   "\"lossy\":\"--route-tail-skip\",\"spec\":8,\"max_context\":8192,\"devices\":\"\",\"cards\":[],\"mode\":\"\",\"shares\":[],"
                   "\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
         // every error text of the setting rules
-        CHECK_STR(pick("0,1", v).error, "gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor");
-        CHECK_STR(pick("1,0", v).error, "gpu 1,0 names 2 cards: set gpu-mode to peer, split or tensor");
-        CHECK_STR(pick("all", v).error, "gpu all names 2 cards: set gpu-mode to peer, split or tensor");
-        CHECK_STR(pick("0,1", v, "auto").error, "gpu-mode \"auto\": expected peer, split or tensor");
+        CHECK_STR(pick("0,1", v).error, "gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK_STR(pick("1,0", v).error, "gpu 1,0 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK_STR(pick("all", v).error, "gpu all names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK_STR(pick("0,1", v, "auto").error, "gpu-mode \"auto\": expected peer, split or tensor; see docs/configuration/gpus.md");
         CHECK_STR(pick("0", v, "peer").error, "gpu-mode peer: gpu names one card (gpu \"0\"); a mode needs two or more");
         CHECK_STR(pick("", v, "split").error, "gpu-mode split: gpu names one card (gpu \"0\"); a mode needs two or more");
         CHECK_STR(pick("1", v, "tensor").error, "gpu-mode tensor: gpu names one card (gpu \"1\"); a mode needs two or more");
@@ -254,7 +254,7 @@ int main() {
         CHECK_STR(cards(pick("", none, "", "", false)), "0");
         CHECK(pick("", none, "", "", false).warning.empty());
         CHECK_STR(cards(pick("3,1", none, "peer", "", false)), "3,1");
-        CHECK_STR(pick("3,1", none, "", "", false).error, "gpu 3,1 names 2 cards: set gpu-mode to peer, split or tensor");
+        CHECK_STR(pick("3,1", none, "", "", false).error, "gpu 3,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
         CHECK(!pick("all", none, "", "", false).error.empty());
         CHECK_STR(pick("", none, "", "", true).error, "gpu: no GPU is visible");
     }
