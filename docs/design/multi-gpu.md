@@ -87,43 +87,43 @@ The shares are normalized to sum to 1 and stay fixed for the run. What a share d
 | --- | --- |
 | Parsing `gpu`, `gpu-mode`, `gpu-share`; `GpuMode`, `GpuModes` and their refusals; card table; `CUDA_VISIBLE_DEVICES` narrowing; `--gpu-plan` JSON with mode and shares | `program/gpu_select.hpp` (kept, trimmed) |
 | The card set a model receives, mode support, refusals, shares, start lines | `model/multi_gpu.hpp` (new) |
+| Peer's driver: the deal by block, expert or stage, the would-hold-nothing refusal, each card's part (step 4) | `model/peer_hooks.hpp` |
 | Expert deal by share, layer cuts by share and bytes, prompt-stage cuts | `model/multi_gpu.cpp` (from `gpu_select.cpp:266-300`, `dense/split_plan.cpp`) |
 | Transfers: peer access for every pair, device-to-device or host-staged copies, link probes | `core/card_link.hpp` (from `cli/gpu.cpp:76-97` and Flash-Next's `probe_pcie_h2d_gbps`) |
 | Prompt stages and peer expert storage (shared already) | `core/prompt_stage.hpp`, `core/peer_experts.hpp`, `core/expert_tier.cpp` |
 | The conformance check | `model/gpu_check.hpp`, `--diag-gpu-check`, `tools/gpu_identity.py` |
 
 ```cpp
-// include/basalt/model/multi_gpu.hpp (sketch; GpuMode and GpuModes live in program/gpu_select.hpp, the parser needs them)
-struct GpuCards {                                   // what the load request carries, main first
-    struct Card { int device; program::GpuCard info; int index; std::string label; uint64_t free; };
-    GpuMode mode = GpuMode::One;
-    std::vector<Card> cards;
-    std::vector<double> given;                      // gpu-share normalized; empty: each use's default (shares_for)
-    int diag_cut = 0;                               // --diag-gpu-cut
+// GpuCards (model/multi_gpu.hpp): the cards main first (device, info, index, label, free), the mode, gpu-share, diag_cut
+// include/basalt/model/peer_hooks.hpp (built): like BatchSession, a shared driver over the hooks a model writes
+enum class PeerDeal { None, Blocks, Experts };     // experts by layer block (split_by_bytes) or one by one (deal_experts)
+struct PeerSpec { PeerDeal deal; std::vector<uint64_t> unit; int block_most; uint64_t reserve; bool main_holds_all;
+                  int stage_layers, stage_lo; };   // unit: per layer one expert's bytes (Blocks), per expert hottest first
+struct PeerPlacement { std::vector<int> first, end; int homes; std::vector<int> owner; std::vector<int64_t> held;
+                       std::vector<uint64_t> bytes; std::vector<int> stage_first; };   // per card, 0 = the main card
+class PeerHooks {
+public:   // peer_card on every peer, peer_room, deal_peers (refuses a peer with nothing), peer_place; then the parts line
+    bool peer_open(const GpuCards&, std::string& err);  std::string peer_report(size_t card) const;
+protected:
+    virtual bool peer_card(size_t card, int device, std::string& err) = 0;  // its own buffers, whatever it is dealt
+    virtual uint64_t peer_room(size_t card) const = 0;        // what is left for the deal, once every peer is open
+    virtual PeerSpec peer_spec() const = 0;  virtual bool peer_place(const PeerPlacement&, std::string& err) = 0;
+    virtual std::string peer_main() const = 0;                // the main card's part of the parts line
 };
-struct PeerHooks {                                  // peer: the main card runs every layer
-    virtual std::vector<PeerUnit> peer_units() = 0;           // experts outside the main card, hottest first, with bytes
-    virtual StageSpec peer_stages() const = 0;                // layers a stage may read, their bytes, a chunk's rows
-    virtual Result peer_open(const GpuCards&, const PeerPlacement&) = 0;   // its experts and stages on each card
+struct SplitHooks {   // sketch (steps 6-8): split_spec(GpuCards) per layer weights + KV/state, per card fixed; split_open(cards, ranges)
 };
-struct SplitHooks {                                 // split: layers divided, KV with its layers
-    virtual SplitSpec split_spec(const GpuCards&) const = 0;  // per layer: weights + KV/state; per card: fixed bytes
-    virtual Result split_open(const GpuCards&, const std::vector<LayerRange>&) = 0;
+struct TensorHooks {  // tensor, reserved: tensor_check(cards) says why it can't run (empty: it can); tensor_open(cards)
 };
-struct TensorHooks {                                // tensor: reserved
-    virtual std::string tensor_check(int cards) const = 0;    // why it can't run; empty = it can
-    virtual Result tensor_open(const GpuCards&) = 0;
-};
-virtual std::string gpu_report(int card) const;     // LoadedModel, whatever the mode: the card's part after the load
+virtual std::string gpu_report(int card) const;     // LoadedModel: the card's part after the load; peer()->peer_report by default
 // ModelAdapter, in place of max_expert_cards, second_card_reads_prompts, second_card_runs_layers; every model states it
-virtual program::GpuModes gpu_modes() const = 0;   // the most cards per mode, 0 = not run
-// LoadedModel: each mode's hooks, null for a mode the model does not run
-virtual PeerHooks* peer() { return nullptr; }  virtual SplitHooks* split() { return nullptr; }  virtual TensorHooks* tensor() { return nullptr; }
+virtual program::GpuModes gpu_modes() const = 0;   // the most cards per mode, 0 = not run; peer_ada: its peer runs on sm_89
+// LoadedModel: each mode's hooks, null for a mode the model does not run (peer() built; split(), tensor() in their steps)
+virtual PeerHooks* peer() const { return nullptr; }  virtual SplitHooks* split() { return nullptr; }  virtual TensorHooks* tensor() { return nullptr; }
 ```
 
 The flow is the same for every model: parse and narrow the cards; check `gpu_modes()` (an unsupported mode or too many cards is
 refused before the load, and in `--gpu-plan`); the model's spec in, the shared deal or cut out (a part that does not fit is
-refused with its numbers); `*_open`; both start lines. `GpuCards` replaced `LoadRequest::peer_devices`, `card_gbps` and `diag_split_at` (step 2).
+refused with its numbers); `*_open`; both start lines. `GpuCards` replaced `LoadRequest::peer_devices`, `card_gbps`, `diag_split_at`.
 
 ### Who runs what at 0.5.7
 
@@ -143,13 +143,9 @@ D = deleted. H = moves behind a hook. K = kept as a mechanic inside its mode.
 
 | What | Where | Auto decision | Fate |
 | --- | --- | --- | --- |
-| `gpu auto`: every sm_120 card, fastest as main | `program/gpu_select.cpp:115-130`, `:158-215` | main-card pick by bandwidth | D (`all` takes the listed order) |
-| `choose_roles`, `RoleInputs`, `GpuRole` | `gpu_select.cpp:250-264`, `gpu_select.hpp:59-73` | role per card from the model's two booleans | D |
-| `plan_multi_gpu`, `MgModel`, `MgPlan`, `cards_alike`, the 5% margin | `program/multi_gpu_plan.cpp:14-180`, `.hpp:16-75` | expert tier vs layer split vs tensor, alike only | D |
-| `price_prompt_split`, `prompt_split_windows`, `prompt_split_order`, `PsCard` | `multi_gpu_plan.cpp:183-366` | prompt split on or off, its cuts, stage count | D |
+| `gpu auto` (fastest as main), `choose_roles`, `plan_multi_gpu` (tier vs split vs tensor, alike only), `price_prompt_split` and its cuts | `program/gpu_select.cpp`, `program/multi_gpu_plan.cpp` | main card, roles, mode, prompt split | D (steps 1-2; `all` takes the listed order) |
 | `prompt_split_draft_room`, `prompt_one_card_chunks`, `prompt_chunk_list` | `multi_gpu_plan.cpp:367-407` | none (chunk geometry) | K, moved to `prefill` |
-| `spread_experts`, `tiers_holding` | `gpu_select.cpp:266-300` | deal weighted by bandwidth; idle a tier with nothing | H (deal by share); the idle tier becomes a refusal |
-| Start line `gpus: ...` and the "later cards idle" warning | `cli/gpu.cpp:47-75` | idle cards beyond the model's cap | D (refused instead), new line |
+| `spread_experts`, `tiers_holding`; the start line's "later cards idle" warning | `gpu_select.cpp:266-300`, `cli/gpu.cpp:47-75` | deal by bandwidth; idle cards | H (deal by share); idle becomes a refusal, new line |
 | Peer access for every pair | `cli/gpu.cpp:76-97` | none | K, moved to `core/card_link` |
 | `max_expert_cards`, `second_card_reads_prompts`, `second_card_runs_layers` | `model/adapter.hpp:359-367`, `generate/configure.cpp:27-31` | the 27B's layer stage when it does not fit | D, replaced by `gpu_modes()` |
 | `--gpu-plan` JSON, `select_gpus` for the launchers | `gpu_select.cpp:360-395` | none | K, gains mode and shares |
@@ -177,9 +173,9 @@ D = deleted. H = moves behind a hook. K = kept as a mechanic inside its mode.
 
 | Model | What | Where | Auto decision | Fate |
 | --- | --- | --- | --- | --- |
-| DeepSeek | peer cards capped at 4, extra cards idle with a warning | `deepseek41/model.cpp:256-272`, `model.hpp:44` | idle cards | D: refused before the load |
-| DeepSeek, Hy4 | layer blocks sized to rooms, prompt share rates | `core/expert_tier.cpp:107-140`, `:288-325`, `core/tier_policy.hpp:130` | none | H: blocks by share, rooms capped at the share (step 2; the default is the rooms); a peer with no home refused |
-| Hy4 | peer cards capped at 3 | `hy4flash/model.cpp:223-228`, `model.hpp:28` | idle cards | D: refused |
+| DeepSeek, Hy4 | peer cards capped at 4 and 3, extra cards idle | `model.hpp` `kMaxSecondCards` | idle cards | D: `gpu_modes()`, refused before the load |
+| DeepSeek, Hy4 | layer blocks sized to rooms, the refusal, the parts line, prompt share prices | `core/expert_tier.cpp` | none | H (step 4): `ExpertTier` is their `PeerHooks`; `deal_peers` caps the rooms at a given share |
+| DeepSeek | its peer card must be sm_120, checked in its plan | `deepseek41/model.cpp` | | D (step 4): `GpuModes::peer_ada` false, refused before the load |
 | 27B | `plan_split`: no split if it fits; otherwise alike = half the bytes, unlike = the faster card fullest | `dense/split_plan.cpp:46-58`, `qwen35/adapter.cpp:319-330` | alike/unlike, main card alone | D (step 2): `dense::split_spec` + `split_cut` |
 | 27B | `second_card_runs_layers` | `qwen35/adapter.cpp:630-645` | split vs prompt stage | D |
 | 27B | prompt stage priced per read, `kPriceMargin` 0.95 | `dense/stage.cpp:177`, `:316-365`, `:680` | on/off and cut per read | D (step 2): `stage_cuts` within the last 20 layers, the main card keeps the last chunk; the start's timing is gone |
@@ -200,8 +196,12 @@ Docs that describe the auto logic go with it: `docs/configuration/gpus.md` (rewr
 - **Flash-Next, split** (today's auto layer split, now chosen): `split_spec` reports the per-layer bytes the placement already
   computes (`pool_bytes_by_layer`, `plan_bytes_by_layer`, `hc8_plan_bytes`, `session_bytes`, `layer_plan.cpp:84-100`); the
   shared cut replaces `predict`.
-- **DeepSeek, Hy4:** peer only. `ExpertTier` already owns the peers; `split_by_bytes` takes the shares as weights on the rooms.
-  `kMaxSecondCards` goes into `gpu_modes()`.
+- **DeepSeek, Hy4 (built, step 4):** `ExpertTier` derives `PeerHooks` once for both: `peer_card` opens a card's plain slots and
+  prompt share, `peer_room` is what they leave, `peer_spec` deals `Blocks` (one 256-rounded slot per layer, the reserve
+  `--peer-reserve-mib`), `peer_place` sets the blocks and the prompt-share prices, `peer_main` the main card's part. The models
+  pass `GpuCards` in `ExpertTierSpec::gpus` and return the tier from `peer()`; `ExpertTier::peer_take` holds their one prompt
+  share pricing. Jay's flags: the 15K check bitwise vs the step-3 build; greedy identical to v0.5.6 on two cards and one with
+  the tier frozen (unfrozen, DeepSeek's conv and prose differ v0.5.6 against itself); two-card decode ABBA no loss.
 - **Qwen3.8-27B:** peer is the one prompt stage, its cut from the share in place of `price()`; decoding stays on the main card.
   Split is the layer stage, its cut from `plan_split` without the alike/unlike branches. With `gpu 0` a model that does not
   fit is refused and pointed at `gpu 0,1` with `gpu-mode split`. The split's batch path (`batch_captured` false) stays.
@@ -283,7 +283,7 @@ Everything happens on the unpushed box branch `mgpu`, one agent at a time. Every
 | 1 | Settings: parse `gpu` / `gpu-mode` / `gpu-share`, the error texts, `all`, `--gpu-plan` with mode and shares, server config keys and forwarding, bench and probe | unit tests for every error text; `serve/tests`; `--gpu-plan` JSON for each mode |
 | 2 | Shared layer: `model/multi_gpu.hpp`, refusals, shares, start lines, `core/card_link`; every pricing and auto pick deleted (`plan_multi_gpu`, `price_prompt_split`, `plan_split`, the alike gates, the 27B stage's pricing, Flash-Next's `predict`, `choose_roles`); every model takes `GpuCards` and the shared cut, deal and stage cuts | builds; cut, deal and refusal tests; single-card identity on three models; two-card starts per mode |
 | 3 | Conformance: `model/gpu_check.hpp`, `--diag-gpu-check`, `tools/gpu_identity.py` | the check passes on the 27B prompt stage (bitwise) before any migration |
-| 4 | DeepSeek and Hy4 peer on the hooks | greedy identical to v0.5.6 on two cards; two-card decode ABBA x1 no loss (DeepSeek is judged on two cards) |
+| 4 | DeepSeek and Hy4 peer on the hooks (done) | greedy identical to v0.5.6 on two cards; two-card decode ABBA x1 no loss (DeepSeek is judged on two cards) |
 | 5 | Flash-Next peer on the hooks; the FP4 streamed share measured or deleted | no speed loss vs v0.5.6 with Jay's config (see below); greedy identical; prompt stages bitwise |
 | 6 | Flash-Next split on the hooks; `split_same` set by `--diag-gpu-check` | bitwise vs `split_same`; it runs on 5090 + 5060 Ti, numbers reported |
 | 7 | Qwen3.8-27B peer and split on the hooks; `second_card_runs_layers` gone | both modes bitwise vs single card; 64K prefill in peer mode no loss vs v0.5.6 on two cards |
