@@ -91,10 +91,35 @@ __device__ __forceinline__ void unpack16_fp8(const uint4 u, float (&f)[16]) {
         f[4 * i + 3] = b.y;
     }
 }
+// 16 INT8 codes times their fp16 scale as fp32 (exact: a code times an fp16 scale fits fp32's mantissa). A code's float is
+// its byte, biased by 128, placed under 2^23's exponent, less 2^23 + 128: no integer conversion.
 __device__ __forceinline__ void unpack16_int8(const uint4 u, float scale, float (&f)[16]) {
-    const int8_t* q = reinterpret_cast<const int8_t*>(&u);
+    const uint32_t w[4] = {u.x ^ 0x80808080u, u.y ^ 0x80808080u, u.z ^ 0x80808080u, u.w ^ 0x80808080u};
 #pragma unroll
-    for (int i = 0; i < 16; ++i) f[i] = (float) q[i] * scale;
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            f[4 * i + j] = (__uint_as_float(__byte_perm(w[i], 0x4b000000u, 0x7650u | j)) - 8388736.f) * scale;
+}
+// 16 INT8 codes times their fp16 scale, rounded to fp16 pairs: the same bits as the fp32 product rounded (the product of a
+// code and an fp16 scale is exact before the one rounding). A code's half is its biased byte under 1024's exponent, less 1152.
+__device__ __forceinline__ void unpack16_int8_h2(const uint4 u, __half2 scale, uint32_t (&h)[8]) {
+    const uint32_t w[4] = {u.x ^ 0x80808080u, u.y ^ 0x80808080u, u.z ^ 0x80808080u, u.w ^ 0x80808080u};
+    const __half2 bias = __half2half2(__ushort_as_half(0x6480u));   // 1152
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint32_t b = __byte_perm(w[i], 0x64646464u, j ? 0x7362u : 0x5140u);
+            const __half2 v = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&b), bias), scale);
+            h[2 * i + j] = *reinterpret_cast<const uint32_t*>(&v);
+        }
+}
+// A row's two fp16 scales (after its kHeadDim codes) as fp32.
+__device__ __forceinline__ void row_scales(const uint8_t* row, float (&s)[2]) {
+    const __half2 h = *reinterpret_cast<const __half2*>(row + kHeadDim);
+    s[0] = __low2float(h);
+    s[1] = __high2float(h);
 }
 
 struct Smem {
@@ -137,10 +162,8 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
             if constexpr (INT8) {
-                const __half* ksc = reinterpret_cast<const __half*>(kbase + cell + kHeadDim);
-                const __half* vsc = reinterpret_cast<const __half*>(vbase + cell + kHeadDim);
-#pragma unroll
-                for (int i = 0; i < 2; ++i) { ks[i] = __half2float(ksc[i]); vs[i] = __half2float(vsc[i]); }
+                row_scales(kbase + cell, ks);
+                row_scales(vbase + cell, vs);
             }
         } else {
 #pragma unroll
@@ -202,12 +225,19 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
         }
         // the lane's value row into shared memory as fp16 pairs (E4M3 is exact in fp16)
         uint32_t* vrow = sm.v[w][lane];
-        if constexpr (FP8 || INT8) {
+        if constexpr (INT8) {
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) {
+                uint32_t h[8];
+                unpack16_int8_h2(vr[i], __float2half2_rn(vs[i / 4]), h);
+#pragma unroll
+                for (int d = 0; d < 8; ++d) vrow[8 * i + d] = h[d];
+            }
+        } else if constexpr (FP8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
                 float f[16];
-                if constexpr (FP8) unpack16_fp8(vr[i], f);
-                else unpack16_int8(vr[i], vs[i / 4], f);
+                unpack16_fp8(vr[i], f);
 #pragma unroll
                 for (int d = 0; d < 8; ++d) {
                     const __half2 hv = __floats2half2_rn(f[2 * d], f[2 * d + 1]);
@@ -369,10 +399,8 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) vr[i] = reinterpret_cast<const uint4*>(vbase + cell)[i];
         if constexpr (INT8) {
-            const __half* ksc = reinterpret_cast<const __half*>(kbase + cell + kHeadDim);
-            const __half* vsc = reinterpret_cast<const __half*>(vbase + cell + kHeadDim);
-#pragma unroll
-            for (int i = 0; i < 2; ++i) { ks[i] = __half2float(ksc[i]); vs[i] = __half2float(vsc[i]); }
+            row_scales(kbase + cell, ks);
+            row_scales(vbase + cell, vs);
         }
     } else {
 #pragma unroll
@@ -436,10 +464,8 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
             if constexpr (INT8) {
-                const __half* ksc = reinterpret_cast<const __half*>(fs.kw[key - p0] + kHeadDim);
-                const __half* vsc = reinterpret_cast<const __half*>(fs.vw[key - p0] + kHeadDim);
-#pragma unroll
-                for (int i = 0; i < 2; ++i) { ks[i] = __half2float(ksc[i]); vs[i] = __half2float(vsc[i]); }
+                row_scales(fs.kw[key - p0], ks);
+                row_scales(fs.vw[key - p0], vs);
             }
         }
         float m[kGroup], l[kGroup], acc[kGroup][4];
@@ -479,12 +505,19 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                 sc[h] = valid ? sc[h] * a.scale + b : -INFINITY;
             }
             uint32_t* vrow = sm.v[w][lane];
-            if constexpr (FP8 || INT8) {
+            if constexpr (INT8) {
+#pragma unroll
+                for (int i = 0; i < kLoads; ++i) {
+                    uint32_t h[8];
+                    unpack16_int8_h2(vr[i], __float2half2_rn(vs[i / 4]), h);
+#pragma unroll
+                    for (int d = 0; d < 8; ++d) vrow[8 * i + d] = h[d];
+                }
+            } else if constexpr (FP8) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) {
                     float f[16];
-                    if constexpr (FP8) unpack16_fp8(vr[i], f);
-                    else unpack16_int8(vr[i], vs[i / 4], f);
+                    unpack16_fp8(vr[i], f);
 #pragma unroll
                     for (int d = 0; d < 8; ++d) {
                         const __half2 hv = __floats2half2_rn(f[2 * d], f[2 * d + 1]);
