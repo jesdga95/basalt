@@ -39,6 +39,16 @@ std::vector<float> randn(size_t n, float s = 1.f, float mean = 0.f) {
     for (auto& x : v) x = d(rng);
     return v;
 }
+std::vector<float> fixed_values(size_t n, float scale, uint32_t state) {
+    std::vector<float> v(n);
+    for (float& x : v) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        x = ((float) (state >> 8) * (1.f / 16777216.f) * 2.f - 1.f) * scale;
+    }
+    return v;
+}
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
@@ -81,10 +91,11 @@ void same_bits(const char* what, const void* a, const void* b, size_t bytes) {
     failures += !ok;
 }
 // An FNV-1a hash of a result's bytes: a change meant to keep the bits keeps it.
-void print_hash(const char* what, const std::vector<uint8_t>& b) {
+uint64_t print_hash(const char* what, const std::vector<uint8_t>& b) {
     uint64_t h = 1469598103934665603ull;
     for (uint8_t x : b) h = (h ^ x) * 1099511628211ull;
     std::printf("  %s hash %016llx\n", what, (unsigned long long) h);
+    return h;
 }
 template <class T> std::vector<uint8_t> bytes_of(const std::vector<T>& v) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(v.data());
@@ -471,15 +482,18 @@ void test_attention() {
             vb.assign(rows * kv_bytes(kv), 0);
             kd.resize(rows * kHeadDim);
             vd.resize(rows * kHeadDim);
+            const std::vector<float> ksrc = fixed_values(rows * kHeadDim, 0.6f, 0x21a48d3bu);
+            const std::vector<float> vsrc = fixed_values(rows * kHeadDim, 1.0f, 0x7b51c2e9u);
             for (size_t i = 0; i < rows; ++i) {
-                const std::vector<float> kf = randn(kHeadDim, 0.6f), vf = randn(kHeadDim, 1.0f);
-                put_row(kv, kf.data(), &kb[i * kv_bytes(kv)], &kd[i * kHeadDim]);
-                put_row(kv, vf.data(), &vb[i * kv_bytes(kv)], &vd[i * kHeadDim]);
+                put_row(kv, &ksrc[i * kHeadDim], &kb[i * kv_bytes(kv)], &kd[i * kHeadDim]);
+                put_row(kv, &vsrc[i * kHeadDim], &vb[i * kv_bytes(kv)], &vd[i * kHeadDim]);
             }
         }
-        const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.8f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
-        const std::vector<float> sink = randn((size_t) R * kHeads, 2.0f), table = randn((size_t) kRel * kExtent, 0.3f);
-        const std::vector<float> gate = randn((size_t) R * kProjQ, 1.5f);
+        const std::vector<float> q = fixed_values((size_t) R * kHeads * kHeadDim, 0.8f, 0x44b13a97u);
+        const std::vector<float> rs = fixed_values((size_t) R * kHeads * kRel, 1.0f, 0x2f9d08c5u);
+        const std::vector<float> sink = fixed_values((size_t) R * kHeads, 2.0f, 0xd650a317u);
+        const std::vector<float> table = fixed_values((size_t) kRel * kExtent, 0.3f, 0x94ce725bu);
+        const std::vector<float> gate = fixed_values((size_t) R * kProjQ, 1.5f, 0xa17e4c03u);
         void* dk = dev(kb);
         void* dv = dev(vb);
         float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table), *out = zeros<float>((size_t) R * kHeads * kHeadDim);
@@ -521,7 +535,14 @@ void test_attention() {
         char tag[64];
         std::snprintf(tag, sizeof tag, "attention (%s%s)", window ? "window ring" : "full, 3k keys", kv_tag(kv));
         report(tag, got, ref, 2e-3);
-        print_hash("output", bytes_of(got));
+        const uint64_t hash = print_hash("output", bytes_of(got));
+        // Frozen outputs from main's FP16/FP8 kernels on the fixed attention fixture.
+        static constexpr uint64_t kBaseHashes[] = {0x37a69c7be6281e30ull, 0xde59e213bef8dbb9ull, 0x8302535765d7601full};
+        if (mode < 3) {
+            const bool baseline = hash == kBaseHashes[mode];
+            std::printf("  previous FP16/FP8 baseline %s\n", baseline ? "matches" : "FAIL");
+            failures += !baseline;
+        }
         // row 2 alone, and under a launch bound of a million keys
         AttnArgs one = a;
         one.q = dq + 2 * kHeads * kHeadDim; one.r = drs + 2 * kHeads * kRel; one.sink = dsink + 2 * kHeads; one.pos = dpos + 2;
