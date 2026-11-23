@@ -137,12 +137,12 @@ class BenchFlags(unittest.TestCase):
         self.assertIn('gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more', r.stderr)
         r = subprocess.run([*base, "--gpu", "auto"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
-        self.assertIn('gpu "auto": expected a card number like 0, a list like 0,1 (the first is the main card), or all', r.stderr)
+        self.assertIn('gpu "auto": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md', r.stderr)
 
     def test_a_card_list_needs_a_mode(self):
         r = subprocess.run([str(BENCH), "--model", "m.basalt", "--print-command", "--gpu", "0,1"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
-        self.assertIn("gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor" if "names 2" in r.stderr else "gpu 1: ", r.stderr)
+        self.assertIn("gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md" if "names 2" in r.stderr else "gpu 1: ", r.stderr)
 
     def test_help_lists_the_engine_flags(self):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)

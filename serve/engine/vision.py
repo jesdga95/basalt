@@ -512,13 +512,13 @@ def check_gpu(value, mode=None, share=None) -> None:
         items = [x.strip() for x in text.split(",")]
         if not all(x.isdigit() for x in items) or len(set(int(x) for x in items)) != len(items):
             raise ValueError(f'gpu "{text}": expected a card number like 0, a list like 0,1 (the first is the main card), '
-                             "or all")
+                             "or all; see docs/configuration/gpus.md")
         cards = len(items)
     if mode_text and mode_text not in GPU_MODES:
-        raise ValueError(f'gpu-mode "{mode_text}": expected peer, split or tensor')
+        raise ValueError(f'gpu-mode "{mode_text}": expected peer, split or tensor; see docs/configuration/gpus.md')
     shown = text or "0"
     if cards is not None and cards > 1 and not mode_text:
-        raise ValueError(f"gpu {text} names {cards} cards: set gpu-mode to peer, split or tensor")
+        raise ValueError(f"gpu {text} names {cards} cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md")
     if cards == 1 and mode_text:
         raise ValueError(f'gpu-mode {mode_text}: gpu names one card (gpu "{shown}"); a mode needs two or more')
     if cards == 1 and share_text:
