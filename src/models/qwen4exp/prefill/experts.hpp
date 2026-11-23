@@ -67,7 +67,6 @@ struct Prefill::Run::Chunk::Experts {
     decltype(Chunk::lay0)& lay0 = chunk.lay0;
     decltype(Chunk::stream_all)& stream_all = chunk.stream_all;
     decltype(Chunk::ppc)& ppc = chunk.ppc;
-    decltype(Chunk::peer_fp4)& peer_fp4 = chunk.peer_fp4;
     decltype(Chunk::seq)& seq = chunk.seq;
     decltype(Chunk::seq_start)& seq_start = chunk.seq_start;
     decltype(Chunk::consumed)& consumed = chunk.consumed;
@@ -169,7 +168,6 @@ struct Prefill::Run::Chunk::Experts::Group {
     decltype(Experts::lay0)& lay0 = experts.lay0;
     decltype(Experts::stream_all)& stream_all = experts.stream_all;
     decltype(Experts::ppc)& ppc = experts.ppc;
-    decltype(Experts::peer_fp4)& peer_fp4 = experts.peer_fp4;
     decltype(Experts::seq)& seq = experts.seq;
     decltype(Experts::seq_start)& seq_start = experts.seq_start;
     decltype(Experts::consumed)& consumed = experts.consumed;
