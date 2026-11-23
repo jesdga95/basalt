@@ -4,12 +4,13 @@
 // A row's keys split in slices whose size comes from the row's own key count alone (whole tiles of the block's four warps,
 // at most kMaxSplits slices), so a row's bits do not depend on the other rows of its call or on the launch's bound. A block
 // takes one row, one key/value head (its three query heads) and one slice; each warp walks its tiles of 32 keys with a lane
-// a key: the lane loads its key's row and scores it in registers, puts its value row in shared memory, and the lanes then
-// sum the values with four channels a lane. A second kernel merges a row's slices with the sink, gates the heads and rounds
-// them to the q8_1 blocks of the output projection.
+// a key: the lane loads and scores its key in registers, stages V in shared memory, then sums four output channels.
+// For deep INT8 reads, a block instead shares its slice's K/V tiles across consecutive rows of the same conversation.
+// Both paths merge a row's slices with its sink, gate the heads and round to the output projection's q8_1 blocks.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "attn_mma.cuh"
 #include "prep.cuh"
 
 #include <cooperative_groups.h>
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -32,6 +34,8 @@ constexpr int kTile = 32;
 constexpr int kUnit = kWarps * kTile;        // keys of one pass of the block's warps
 constexpr int kGroup = kHeads / kKvHeads;    // 3 query heads a key/value head
 constexpr int kMaxSplits = 64;
+constexpr int kMmaMinKeys = kMmaDeepMinKeys;
+constexpr bool kMmaSingleton = true;  // a deep row uses the same arithmetic alone and in a verify window
 constexpr int kVStride = kHeadDim / 2 + 4;   // words a value row takes in shared memory (the lanes' stores do not collide)
 
 struct Q81 {
@@ -130,7 +134,7 @@ struct Smem {
     float acc[kWarps][kGroup][kHeadDim];
 };
 
-template <bool FP8, bool INT8>
+template <bool FP8, bool INT8, bool SkipDeep = false>
 __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int z, float* __restrict__ part_ml,
                                                                  float* __restrict__ part_acc) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -141,6 +145,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     bk::pdl_launch_dependents();
     int p, lo, n;
     row_keys(a, r, p, lo, n);
+    if constexpr (SkipDeep) {
+        if (n >= kMmaMinKeys) return;
+    }
     const int span = span_of(n);
     if (s * span >= n) return;   // past this row's slices
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
@@ -306,6 +313,401 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
             part_ml[slot * 2 + 1] = ll;
         }
     }
+}
+
+// A split streams one tile of keys at a time. Q and the running numerator stay live across tiles.
+constexpr int kMmaRows = 16;
+constexpr int kMmaLd = kHeadDim + 8;
+constexpr int kMmaPanel = kHeadDim / kWarps;
+
+struct MmaVTile {
+    __half row[kTile][kMmaLd];
+};
+
+struct MmaRawTile {
+    uint4 code[2][kTile][kHeadDim / 16];
+    uint32_t scale[2][kTile];
+};
+
+__device__ __forceinline__ void mma_copy16(void* dst, const void* src, bool valid) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
+                 "r"(attn_mma::smem_u32(dst)), "l"(src), "r"(valid ? 16 : 0) : "memory");
+}
+
+__device__ __forceinline__ void mma_prefetch(MmaRawTile& raw, const uint8_t* kc, const uint8_t* vc,
+                                            int tile, int hi, int g, int64_t cap, int tid) {
+    constexpr int pieces = kHeadDim / 16;
+    constexpr int keys_per_pass = kWarps * 32 / pieces;
+    const int piece = tid % pieces;
+    if (tile < hi) {
+        const bool whole = tile + kTile <= hi;
+        const bool unwrapped = hi <= cap;
+#pragma unroll
+        for (int j = tid / pieces; j < kTile; j += keys_per_pass) {
+            const int key = tile + j;
+            const bool valid = whole || key < hi;
+            const int64_t cell = !valid ? 0 : unwrapped ? key : key % cap;
+            const size_t offset = ((size_t) cell * kKvHeads + g) * kKvInt8RowBytes;
+            mma_copy16(&raw.code[0][j][piece], kc + offset + 16 * piece, valid);
+            mma_copy16(&raw.code[1][j][piece], vc + offset + 16 * piece, valid);
+            if (piece == 0) {
+                const auto copy_scale = [valid](uint32_t* dst, const uint8_t* src) {
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::
+                                 "r"(attn_mma::smem_u32(dst)), "l"(src), "r"(valid ? 4 : 0) : "memory");
+                };
+                copy_scale(&raw.scale[0][j], kc + offset + kHeadDim);
+                copy_scale(&raw.scale[1][j], vc + offset + kHeadDim);
+            }
+        }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ __forceinline__ void mma_wait(int outstanding) {
+    if (outstanding == 2) asm volatile("cp.async.wait_group 2;" ::: "memory");
+    else if (outstanding == 1) asm volatile("cp.async.wait_group 1;" ::: "memory");
+    else asm volatile("cp.async.wait_group 0;" ::: "memory");
+}
+
+constexpr int kMmaPieces = kHeadDim / 16;
+constexpr int kMmaKeysPerPass = kWarps * 32 / kMmaPieces;
+constexpr int kMmaPasses = kTile / kMmaKeysPerPass;
+static_assert(kTile % kMmaKeysPerPass == 0);
+
+__device__ __forceinline__ void mma_store_piece(uint4 code, unsigned scales, __half* dst, int piece) {
+    scales = __shfl_sync(0xffffffffu, scales, 0, kMmaPieces);
+    const __half scale = __ushort_as_half((uint16_t) (scales >> (16 * (piece / 4))));
+    uint32_t halves[8];
+    unpack16_int8_h2(code, __half2half2(scale), halves);
+    *reinterpret_cast<uint4*>(dst) = make_uint4(halves[0], halves[1], halves[2], halves[3]);
+    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(halves[4], halves[5], halves[6], halves[7]);
+}
+
+__device__ __forceinline__ void mma_expand(const MmaRawTile& raw, __half (&k)[kTile][kMmaLd], MmaVTile& v, int tid) {
+    const int piece = tid % kMmaPieces;
+#pragma unroll
+    for (int value = 0; value < 2; ++value) {
+#pragma unroll
+        for (int j = tid / kMmaPieces; j < kTile; j += kMmaKeysPerPass) {
+            const unsigned scales = piece == 0 ? raw.scale[value][j] : 0u;
+            __half* dst = value ? &v.row[j][piece * 16] : &k[j][piece * 16];
+            mma_store_piece(raw.code[value][j][piece], scales, dst, piece);
+        }
+    }
+}
+
+// Each lane holds its own part of the next tile, without a shared raw-copy ring.
+struct MmaRegisterTile {
+    uint4 code[2][kMmaPasses];
+    uint32_t scale[2][kMmaPasses];
+};
+
+__device__ __forceinline__ MmaRegisterTile mma_load_register_tile(const uint8_t* kc, const uint8_t* vc,
+                                                                 int tile, int hi, int g, int64_t cap, int tid) {
+    MmaRegisterTile result{};
+    const int piece = tid % kMmaPieces;
+    const bool unwrapped = hi <= cap;
+#pragma unroll
+    for (int pass = 0; pass < kMmaPasses; ++pass) {
+        const int key = tile + tid / kMmaPieces + pass * kMmaKeysPerPass;
+        if (key < hi) {
+            const int64_t cell = unwrapped ? key : key % cap;
+            const size_t offset = ((size_t) cell * kKvHeads + g) * kKvInt8RowBytes;
+            result.code[0][pass] = *reinterpret_cast<const uint4*>(kc + offset + 16 * piece);
+            result.code[1][pass] = *reinterpret_cast<const uint4*>(vc + offset + 16 * piece);
+            if (piece == 0) {
+                result.scale[0][pass] = *reinterpret_cast<const uint32_t*>(kc + offset + kHeadDim);
+                result.scale[1][pass] = *reinterpret_cast<const uint32_t*>(vc + offset + kHeadDim);
+            }
+        }
+    }
+    return result;
+}
+
+__device__ __forceinline__ void mma_expand(const MmaRegisterTile& raw, __half (&k)[kTile][kMmaLd], MmaVTile& v, int tid) {
+    const int piece = tid % kMmaPieces;
+#pragma unroll
+    for (int value = 0; value < 2; ++value) {
+#pragma unroll
+        for (int pass = 0; pass < kMmaPasses; ++pass) {
+            const int j = tid / kMmaPieces + pass * kMmaKeysPerPass;
+            __half* dst = value ? &v.row[j][piece * 16] : &k[j][piece * 16];
+            mma_store_piece(raw.code[value][pass], raw.scale[value][pass], dst, piece);
+        }
+    }
+}
+
+template <int Slabs>
+struct alignas(16) MmaSmem {
+    __half k[kTile][kMmaLd];
+    MmaVTile v;
+    float score[Slabs * kMmaRows][kTile + 2];
+    __half prob[Slabs * kMmaRows][kTile + 8];
+    float m[Slabs * kMmaRows], l[Slabs * kMmaRows], corr[Slabs * kMmaRows];
+};
+
+template <int Slabs, bool Direct = false>
+__device__ __forceinline__ void attn_mma_slice(const AttnArgs& a, int first, int end, int g, int lo, int hi, int s, int z,
+                                               const uint8_t* kc, const uint8_t* vc, MmaSmem<Slabs>& sm,
+                                               MmaRawTile* raw, MmaVTile* alternate_v, int stages, bool primed,
+                                               float* part_ml, float* part_acc, int tid) {
+    using namespace attn_mma;
+    constexpr int m_rows = Slabs * kMmaRows;
+    constexpr int warps_per_slab = kWarps / Slabs;
+    const int active = (end - first) * kGroup;
+    const int warp = tid / 32, lane = tid % 32;
+    const int lane_row = lane / 4, lane_pair = 2 * (lane % 4);
+    if (tid < m_rows) {
+        sm.m[tid] = -INFINITY;
+        sm.l[tid] = 0.f;
+    }
+    const int score_m = (warp / warps_per_slab) * kMmaRows;
+    constexpr int n_fragments = kTile / (8 * warps_per_slab);
+    const int score_n = (warp % warps_per_slab) * n_fragments * 8;
+    const int quad = tid / 4, member = tid % 4;
+    const int pos = quad < active ? a.pos[first + quad / kGroup] : -1;
+    const size_t query_head = (size_t) (first + quad / kGroup) * kHeads + g * kGroup + quad % kGroup;
+    const auto query = [&](int m) -> const float* {
+        const size_t qh = (size_t) (first + m / kGroup) * kHeads + g * kGroup + m % kGroup;
+        return m < active ? a.q + qh * kHeadDim + lane_pair : nullptr;
+    };
+    const auto pack = [](const float* q, int d) -> unsigned {
+        const float2 f = q ? *reinterpret_cast<const float2*>(q + d) : make_float2(0.f, 0.f);
+        const __half2 pair = __floats2half2_rn(f.x, f.y);
+        return *reinterpret_cast<const unsigned*>(&pair);
+    };
+    const float* qa = query(score_m + lane_row);
+    const float* qb = query(score_m + lane_row + 8);
+    MmaRegisterTile next{};
+    if constexpr (Direct) {
+        next = mma_load_register_tile(kc, vc, lo, hi, g, a.cap, tid);
+    } else {
+        for (int ahead = primed ? 1 : 0; ahead < stages - 1; ++ahead)
+            mma_prefetch(raw[ahead], kc, vc, lo + ahead * kTile, hi, g, a.cap, tid);
+    }
+    unsigned q_frag[kHeadDim / 16][4];
+#pragma unroll
+    for (int d = 0; d < kHeadDim / 16; ++d) {
+        q_frag[d][0] = pack(qa, d * 16);
+        q_frag[d][1] = pack(qb, d * 16);
+        q_frag[d][2] = pack(qa, d * 16 + 8);
+        q_frag[d][3] = pack(qb, d * 16 + 8);
+    }
+    float acc[Slabs][kMmaPanel / 8][4] = {};
+    int current = 0, future = stages - 1;
+    bool odd = false;
+    for (int tile = lo; tile < hi; tile += kTile) {
+        MmaVTile& v = alternate_v && odd ? *alternate_v : sm.v;
+        if constexpr (Direct) {
+            const MmaRegisterTile current_tile = next;
+            if (tile + kTile < hi) next = mma_load_register_tile(kc, vc, tile + kTile, hi, g, a.cap, tid);
+            mma_expand(current_tile, sm.k, v, tid);
+        } else {
+            if (!primed || stages > 1 || tile != lo)
+                mma_prefetch(raw[future], kc, vc, tile + (stages - 1) * kTile, hi, g, a.cap, tid);
+            mma_wait(stages - 1);
+            // Each thread consumes its own copies; the scale's copying lane broadcasts inside its warp.
+            mma_expand(raw[current], sm.k, v, tid);
+        }
+        __syncthreads();
+
+        // QK: one warp owns one or two eight-key columns of its M slab.
+        float scores[n_fragments][4] = {};
+#pragma unroll
+        for (int d = 0; d < kHeadDim; d += 16) {
+            const auto& q = q_frag[d / 16];
+#pragma unroll
+            for (int n = 0; n < n_fragments; ++n) {
+                unsigned b0, b1;
+                ldsm_x2(b0, b1, &sm.k[score_n + 8 * n + (lane & 7)][d + ((lane >> 3) & 1) * 8]);
+                mma16816(scores[n], q[0], q[1], q[2], q[3], b0, b1);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < n_fragments; ++n) {
+            const int col = score_n + 8 * n + lane_pair;
+            *reinterpret_cast<float2*>(&sm.score[score_m + lane_row][col]) = make_float2(scores[n][0], scores[n][1]);
+            *reinterpret_cast<float2*>(&sm.score[score_m + lane_row + 8][col]) = make_float2(scores[n][2], scores[n][3]);
+        }
+        __syncthreads();
+
+        // A quad reduces one row. The denominator keeps the full FP32 weights, not the rounded PV operands.
+        if (quad < active) {
+            const unsigned quad_mask = 0xfu << (lane & ~3);
+            float weights[kTile / 4];
+            float m = sm.m[quad];
+#pragma unroll
+            for (int j = 0; j < kTile / 4; ++j) {
+                const int key_col = 4 * j + member;
+                const int dist = pos - (tile + key_col);
+                float score = -INFINITY;
+                if (dist >= 0) {
+                    float bias = 0.f;
+                    if (dist < kExtent) {
+#pragma unroll
+                        for (int i = 0; i < kRel; ++i)
+                            bias = fmaf(a.r[query_head * kRel + i], a.rel_table[i * kExtent + dist], bias);
+                    }
+                    score = sm.score[quad][key_col] * a.scale + bias;
+                }
+                weights[j] = score;
+                m = fmaxf(m, score);
+            }
+            m = fmaxf(m, __shfl_xor_sync(quad_mask, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(quad_mask, m, 2));
+            const float corr = m == -INFINITY ? 1.f : expf(sm.m[quad] - m);
+            float sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < kTile / 4; ++j) {
+                const float p = weights[j] == -INFINITY ? 0.f : expf(weights[j] - m);
+                sm.prob[quad][4 * j + member] = __float2half_rn(p);
+                sum += p;
+            }
+            sum += __shfl_xor_sync(quad_mask, sum, 1);
+            sum += __shfl_xor_sync(quad_mask, sum, 2);
+            // All lanes finish reading the old maximum before the first lane changes it.
+            __syncwarp(quad_mask);
+            if (member == 0) {
+                sm.m[quad] = m;
+                sm.l[quad] = sm.l[quad] * corr + sum;
+                sm.corr[quad] = corr;
+            }
+        } else if (quad < m_rows) {
+#pragma unroll
+            for (int j = 0; j < kTile / 4; ++j) sm.prob[quad][4 * j + member] = __float2half_rn(0.f);
+            if (member == 0) sm.corr[quad] = 1.f;
+        }
+        __syncthreads();
+
+        // PV: each warp keeps its channel panel in registers through the whole slice.
+#pragma unroll
+        for (int slab = 0; slab < Slabs; ++slab) {
+            const int m = slab * kMmaRows;
+            const float c0 = sm.corr[m + lane_row], c1 = sm.corr[m + lane_row + 8];
+#pragma unroll
+            for (int n = 0; n < kMmaPanel / 8; ++n) {
+                acc[slab][n][0] *= c0;
+                acc[slab][n][1] *= c0;
+                acc[slab][n][2] *= c1;
+                acc[slab][n][3] *= c1;
+            }
+#pragma unroll
+            for (int j = 0; j < kTile; j += 16) {
+                unsigned a0, a1, a2, a3;
+                ldsm_x4(a0, a1, a2, a3, &sm.prob[m + (lane & 15)][j + (lane >> 4) * 8]);
+#pragma unroll
+                for (int n = 0; n < kMmaPanel / 8; n += 2) {
+                    const int col = warp * kMmaPanel + n * 8;
+                    unsigned b0, b1, b2, b3;
+                    ldsm_x4_t(b0, b1, b2, b3, &v.row[j + (lane & 15)][col + (lane >> 4) * 8]);
+                    mma16816(acc[slab][n], a0, a1, a2, a3, b0, b1);
+                    mma16816(acc[slab][n + 1], a0, a1, a2, a3, b2, b3);
+                }
+            }
+        }
+        // K is dead after the score barrier. With alternating V buffers the next iteration can
+        // stage K/V before the other warps finish PV; the next score barrier protects P and corr.
+        if (!alternate_v) __syncthreads();
+        odd = !odd;
+        if constexpr (!Direct) {
+            if (++current == stages) current = 0;
+            if (++future == stages) future = 0;
+        }
+    }
+    if constexpr (!Direct) mma_wait(0);
+
+#pragma unroll
+    for (int slab = 0; slab < Slabs; ++slab)
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const int m = slab * kMmaRows + lane_row + pair * 8;
+            if (m >= active) continue;
+            const size_t qh = (size_t) (first + m / kGroup) * kHeads + g * kGroup + m % kGroup;
+            const size_t slot = qh * z + s;
+#pragma unroll
+            for (int n = 0; n < kMmaPanel / 8; ++n) {
+                const int col = warp * kMmaPanel + n * 8 + lane_pair;
+                *reinterpret_cast<float2*>(part_acc + slot * kHeadDim + col) =
+                    make_float2(acc[slab][n][2 * pair], acc[slab][n][2 * pair + 1]);
+            }
+            if (warp == 0 && lane_pair == 0) {
+                part_ml[slot * 2] = sm.m[m];
+                part_ml[slot * 2 + 1] = sm.l[m];
+            }
+        }
+    __syncthreads();
+}
+
+template <int MaxSlabs, bool Narrow, bool Direct = false>
+__global__ void __launch_bounds__(kWarps * 32, 2) attn_mma_split_kernel(AttnArgs a, int rows, int min_keys, int z,
+                                                                       int stages, bool ping_pong, int prime_span,
+                                                                       float* part_ml, float* part_acc) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto* extra = smem_raw + sizeof(MmaSmem<MaxSlabs>);
+    auto* alternate_v = ping_pong ? reinterpret_cast<MmaVTile*>(extra) : nullptr;
+    auto* raw = reinterpret_cast<MmaRawTile*>(extra + (ping_pong ? sizeof(MmaVTile) : 0));
+    const int seg = blockIdx.x, g = blockIdx.y;
+    const bool batched = a.seg.at.n > 0;
+    const int begin = batched ? a.seg.at.row0[seg] : 0;
+    const int end = batched ? a.seg.at.row0[seg + 1] : rows;
+    const auto* kc = static_cast<const uint8_t*>(batched ? a.seg.c[seg].k : a.k_cache);
+    const auto* vc = static_cast<const uint8_t*>(batched ? a.seg.c[seg].v : a.v_cache);
+    int primed_tile = -1;
+    if constexpr (Narrow && !Direct) {
+        // Only the already committed, unwrapped prefix is safe to touch before the prepare wait.
+        const int tile = blockIdx.z * prime_span;
+        if (prime_span > 0 && tile + kTile < a.min_full_keys && tile + kTile <= a.cap) {
+            mma_prefetch(raw[0], kc, vc, tile, tile + kTile, g, a.cap, threadIdx.x);
+            primed_tile = tile;
+        }
+    }
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    if constexpr (Direct) {
+        const int n = a.pos[begin] + 1;
+        if (n < min_keys) return;
+        const int span = span_of(n), splits = (n + span - 1) / span;
+        auto& sm = *reinterpret_cast<MmaSmem<1>*>(smem_raw);
+        for (int s = blockIdx.z; s < splits; s += gridDim.z) {
+            const int lo = s * span, hi = min(n, lo + span);
+            attn_mma_slice<1, true>(a, begin, begin + 1, g, lo, hi, s, z, kc, vc, sm, nullptr,
+                                    alternate_v, 0, false, part_ml, part_acc, threadIdx.x);
+        }
+        return;
+    }
+    for (int s = blockIdx.z; s < z; s += gridDim.z) {
+        // Partition at a span or a tail tile boundary so a row takes the same steps in every window.
+        for (int first = begin; first < end;) {
+            const int n = a.pos[first] + 1, span = span_of(n), lo = s * span;
+            if (n < min_keys || lo >= n) {
+                ++first;
+                continue;
+            }
+            int hi = min(n, lo + span);
+            const int tiles = (hi + kTile - 1) / kTile;
+            int last = first + 1;
+            for (; last < end; ++last) {
+                const int next = a.pos[last] + 1, next_hi = min(next, lo + span);
+                if (next < min_keys || next <= lo || span_of(next) != span || (next_hi + kTile - 1) / kTile != tiles) break;
+                hi = max(hi, next_hi);
+            }
+            const bool primed = primed_tile == lo && hi >= lo + kTile;
+            if (primed_tile >= 0 && !primed) mma_wait(0);
+            primed_tile = -1;
+            if constexpr (MaxSlabs == 2) {
+                if ((last - first) * kGroup > kMmaRows) {
+                    attn_mma_slice(a, first, last, g, lo, hi, s, z, kc, vc, *reinterpret_cast<MmaSmem<2>*>(smem_raw),
+                                   raw, alternate_v, stages, primed, part_ml, part_acc, threadIdx.x);
+                    first = last;
+                    continue;
+                }
+            }
+            attn_mma_slice(a, first, last, g, lo, hi, s, z, kc, vc, *reinterpret_cast<MmaSmem<1>*>(smem_raw),
+                           raw, alternate_v, stages, primed, part_ml, part_acc, threadIdx.x);
+            first = last;
+        }
+    }
+    if (primed_tile >= 0) mma_wait(0);
 }
 
 // A block per (row, head), a thread a channel: the row's slices merged with the sink, gated, written in fp32 and/or as
@@ -648,22 +1050,144 @@ size_t attention_decode_scratch(int rows, int64_t max_keys) {
     return slots * (2 + kHeadDim) * sizeof(float);
 }
 
-void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream) {
+namespace {
+
+struct MmaLaunch {
+    size_t shared = 0;
+    int stages = 0, resident = 0;
+    bool ping_pong = false;
+};
+
+struct MmaDevice {
+    int sms = 0, l2 = 0;
+    MmaLaunch plans[3][2];  // narrow, one slab, two slabs; L2-resident/streaming
+    MmaLaunch singleton;
+};
+
+void check_mma_probe(cudaError_t error) {
+    if (error != cudaSuccess) throw std::runtime_error(std::string("inkling2 attention device probe: ") + cudaGetErrorString(error));
+}
+
+int mma_attribute(int dev, cudaDeviceAttr attr) {
+    int value = 0;
+    check_mma_probe(cudaDeviceGetAttribute(&value, attr, dev));
+    return value;
+}
+
+template <int Slabs, bool Narrow>
+void mma_probe_plans(MmaLaunch (&plans)[2], int per_block, int per_sm, int reserved) {
+    const auto kernel = attn_mma_split_kernel<Slabs, Narrow>;
+    check_mma_probe(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, per_block));
+    if constexpr (!Narrow)
+        check_mma_probe(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+    const size_t compact_budget = (size_t) std::max(0, std::min(per_block / 2, per_sm / 2 - reserved));
+    for (int streaming = 0; streaming < 2; ++streaming) {
+        MmaLaunch best;
+        bool best_compact = false;
+        // Prefer two resident CTAs, then an alternating V tile, then more copies in flight.
+        for (const bool ping_pong : {true, false}) {
+            for (int stages = streaming ? 3 : 2; stages >= 1; --stages) {
+                const size_t shared = sizeof(MmaSmem<Slabs>) + (ping_pong ? sizeof(MmaVTile) : 0) + stages * sizeof(MmaRawTile);
+                if (shared > (size_t) per_block) continue;
+                int resident = 0;
+                check_mma_probe(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, kWarps * 32, shared));
+                resident = std::min({resident, 2, per_sm / ((int) shared + reserved)});
+                const bool compact = !Narrow || shared <= compact_budget;
+                if (resident > 0 && (best.resident == 0 || compact > best_compact ||
+                                     (compact == best_compact && resident > best.resident))) {
+                    best = {shared, stages, resident, ping_pong};
+                    best_compact = compact;
+                }
+                if (best_compact && best.resident == 2) break;
+            }
+            if (best_compact && best.resident == 2) break;
+        }
+        if (best.resident == 0) throw std::runtime_error("inkling2: no resident attention MMA block");
+        plans[streaming] = best;
+    }
+}
+
+const MmaDevice& mma_device(int dev) {
+    static MmaDevice devices[kOptInDevices];
+    static std::once_flag probed[kOptInDevices];
+    std::call_once(probed[dev], [dev] {
+        MmaDevice& d = devices[dev];
+        d.sms = mma_attribute(dev, cudaDevAttrMultiProcessorCount);
+        d.l2 = mma_attribute(dev, cudaDevAttrL2CacheSize);
+        const int per_block = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerBlockOptin);
+        const int per_sm = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerMultiprocessor);
+        const int reserved = mma_attribute(dev, cudaDevAttrReservedSharedMemoryPerBlock);
+        mma_probe_plans<1, true>(d.plans[0], per_block, per_sm, reserved);
+        mma_probe_plans<1, false>(d.plans[1], per_block, per_sm, reserved);
+        mma_probe_plans<2, false>(d.plans[2], per_block, per_sm, reserved);
+        constexpr int shared = sizeof(MmaSmem<1>) + sizeof(MmaVTile);
+        if (shared <= per_block) {
+            int resident = 0;
+            check_mma_probe(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &resident, attn_mma_split_kernel<1, true, true>, kWarps * 32, shared));
+            resident = std::min({resident, per_sm / (shared + reserved), 3});
+            d.singleton = {shared, 0, resident, true};
+        }
+    });
+    return devices[dev];
+}
+
+template <int Slabs, bool Narrow = false, bool Direct = false>
+void launch_mma(const AttnArgs& a, int rows, int min_keys, int64_t max_keys, int z, float* part_ml,
+                float* part_acc, cudaStream_t stream, const MmaDevice& device) {
+    const int segments = std::max(a.seg.at.n, 1);
+    const int64_t bytes_per_segment = max_keys * (2 * kKvHeads * kKvInt8RowBytes);
+    const auto& plan = Direct ? device.singleton : device.plans[Narrow ? 0 : Slabs][bytes_per_segment > device.l2 / segments];
+    // Longer slices need more waves around concurrent side streams. Short singleton slices can
+    // share a block while keeping the logical split order and filling the device.
+    const int wave_floor = device.sms * plan.resident * (Narrow && !Direct ? 2 : 1);
+    int shards = z;
+    while (shards % 2 == 0 && shards / 2 * segments * kKvHeads >= wave_floor) shards /= 2;
+    const auto& pdl = bk::pdl_state();
+    const int prime_span = Narrow && !Direct && pdl.on && pdl.plain == 0 && a.seg.at.n == 0 &&
+                           a.min_full_keys >= min_keys && max_keys <= a.cap ? span_of((int) a.min_full_keys) : 0;
+    const dim3 grid(segments, kKvHeads, shards);
+    bk::launch_pdl(attn_mma_split_kernel<Slabs, Narrow, Direct>, grid, dim3(kWarps * 32), plan.shared, stream,
+                   a, rows, min_keys, z, plan.stages, plan.ping_pong, prime_span, part_ml, part_acc);
+}
+
+}  // namespace
+
+// Only full-cache INT8 has an MMA reader. Its cutoff is a property of the row, not the padded launch bound.
+static bool mma_decode(const AttnArgs& a, int rows, int64_t max_keys) {
+    return a.int8 && a.window == 0 && rows <= kDecodeRows && (kMmaSingleton || rows >= 2) && max_keys >= kMmaMinKeys;
+}
+
+static void launch_attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream,
+                                    bool mma, int mma_min_keys, bool scalar_prefix) {
     if (rows <= 0) return;
     cudaStream_t s = (cudaStream_t) stream;
     const int z = launch_splits(max_keys);
     float* part_ml = static_cast<float*>(scratch);
     float* part_acc = part_ml + (size_t) rows * kHeads * z * 2;
     static bool attr[kOptInDevices] = {};   // the opt-in is per device: a layer split launches these on two cards
-    if (bool& set = attr[opt_in_device()]; !set) {
+    const int dev = opt_in_device();
+    if (bool& set = attr[dev]; !set) {
         cudaFuncSetAttribute(attn_split_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         set = true;
 
     }
     const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
-    if (a.int8) bk::launch_pdl(attn_split_kernel<false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+    if (mma) {
+        if (scalar_prefix) {
+            bk::launch_pdl(attn_split_kernel<false, true, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+            check("attention_decode/shallow");
+        }
+        const MmaDevice& device = mma_device(dev);
+        if (rows == 1 && max_keys <= kMmaSingletonShallowKeys && device.singleton.resident > 0)
+            launch_mma<1, true, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
+        else if (rows <= 2) launch_mma<1, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
+        else if (rows * kGroup <= kMmaRows) launch_mma<1>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
+        else launch_mma<2>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device);
+    } else if (a.int8) bk::launch_pdl(attn_split_kernel<false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     else if (a.fp8) bk::launch_pdl(attn_split_kernel<true, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     else bk::launch_pdl(attn_split_kernel<false, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     check("attention_decode");
@@ -671,9 +1195,21 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
     check("attention_decode/combine");
 }
 
+void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream) {
+    launch_attention_decode(a, rows, max_keys, scratch, out, stream, mma_decode(a, rows, max_keys), kMmaMinKeys,
+                            a.min_full_keys < kMmaMinKeys);
+}
+
+void attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream, bool mma) {
+    if (!a.int8 || a.window != 0 || rows < 1 || rows > kDecodeRows)
+        throw std::invalid_argument("inkling2: test needs a full-cache INT8 decode window");
+    launch_attention_decode(a, rows, max_keys, scratch, out, stream, mma, 1, false);
+}
+
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0) {
+    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0 ||
+        mma_decode(a, rows, max_keys)) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;
