@@ -87,6 +87,8 @@ public:
     }
     /// What the driver dealt (empty until peer_open).
     const PeerPlacement& peer_placement() const { return placed_; }
+    /// The prompt stages dealt are not read after all (their buffers do not fit): the start line shows none.
+    void peer_drop_stages() { placed_.stage_first.clear(); }
 
 protected:
     // ---- the hooks a model writes (docs/design/multi-gpu.md, "Peer")
