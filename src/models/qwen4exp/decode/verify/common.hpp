@@ -63,4 +63,15 @@ void note_fallback(const char* what, int a, int b);
 void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int n_in, int n_out, int n, void* s);
 double card_bandwidth(int dev);
 
+// A card's compute capability, major * 10 + minor, or -1 when it cannot be read.  The head's and the GDN mixer's
+// kernels are built for the main card's architecture; a peer of another one (an Ada card built in with
+// -DPEER_ADA=ON, say) runs the expert tier's kernels only, so the split planners below refuse it and the head and
+// the mixers stay whole on CUDA0.
+inline int card_cc(int dev) {
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) return -1;
+    return major * 10 + minor;
+}
+
 }  // namespace basalt::core::verify_detail
