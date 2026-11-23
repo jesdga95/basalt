@@ -103,8 +103,9 @@ basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.66 GiB on the
 
 ## Parallel slots
 
-Not measured. `--parallel N` starts N sessions, each with its own caches, rings and drafter scratch, over the one expert tier;
-their windows run one after another, with no shared pass through the weights.
+`--parallel N` starts N sessions, each with its own caches, rings and drafter context, over the one expert tier and one forward
+scratch. The busy slots decode together, one pass of up to 8 rows ([batched decoding](../design/batching.md)); a request alone in
+its slot gives the tokens it gives with `--parallel 1`. Speed with several slots is not measured.
 
 ## Images
 
