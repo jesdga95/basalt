@@ -17,7 +17,6 @@
 #include "basalt/core/conversation_store.hpp"
 
 #include "basalt/log.hpp"
-#include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 
@@ -32,16 +31,6 @@
 #include <new>
 
 namespace basalt::core {
-
-// one aligned buffer, freed on scope exit
-struct ConversationStoreBuffer {
-    void* p = nullptr;
-    explicit ConversationStoreBuffer(size_t n) : p(basalt::platform::DirectFile::alloc_aligned(n)) {}
-    ~ConversationStoreBuffer() { basalt::platform::DirectFile::free_aligned(p); }
-    ConversationStoreBuffer(const ConversationStoreBuffer&) = delete;
-    ConversationStoreBuffer& operator=(const ConversationStoreBuffer&) = delete;
-    uint8_t* data() const { return static_cast<uint8_t*>(p); }
-};
 
 namespace {
 
@@ -502,7 +491,8 @@ struct Part {
 enum class Read { kDone, kFault, kStopped };
 
 // Reads the parts with a few threads (each its own aligned buffer of kPiece bytes from `bufs`, allocated on first
-// use and kept), up to the first failure; a fault names the file it was in.
+// use and kept; one that could not be allocated is tried again on the next read), up to the first failure; a fault
+// names the file it was in.
 Read read_parts(const std::vector<Source>& files, const std::vector<Part>& parts, uint64_t& bytes_read,
                 std::string& error, size_t& bad_file, std::vector<std::unique_ptr<Aligned>>& bufs) {
     struct Piece { const Part* part; uint64_t from, to; };   // [from, to): whole blocks of one section
@@ -518,6 +508,8 @@ Read read_parts(const std::vector<Source>& files, const std::vector<Part>& parts
     std::mutex emu;
     const int n_threads = (int) std::min<size_t>(kReaders, std::max<size_t>(1, pieces.size()));
     while ((int) bufs.size() < n_threads) bufs.push_back(std::make_unique<Aligned>(kPiece));
+    for (int t = 0; t < n_threads; ++t)
+        if (!bufs[(size_t) t]->p) bufs[(size_t) t] = std::make_unique<Aligned>(kPiece);
     auto fail = [&](const char* why, size_t file) {   // `file`: at fault, SIZE_MAX when none is
         failed = true;
         if (file != SIZE_MAX) fault = true;
@@ -672,7 +664,12 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
                                     return true; }};
                     uint64_t read = 0;
                     size_t bad = 0;
-                    ok = read_parts({Source{rf.fd, &hashes}}, parts, read, why, bad, read_bufs_) == Read::kDone;
+                    const Read end = read_parts({Source{rf.fd, &hashes}}, parts, read, why, bad, read_bufs_);
+                    if (end == Read::kStopped) {   // no read buffer: the files stay, for an open that has one
+                        error = "conversation store: cannot index " + dir + " (" + why + ")";
+                        return false;
+                    }
+                    ok = end == Read::kDone;
                 }
                 ok = ok && key_of(e->ids, e->imgs, e->head.cvec != 0) == e->head.key;
                 for (int64_t c : e->checks) ok = ok && c > 0 && c <= e->head.n_ids;
@@ -1253,7 +1250,13 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     size_t bad = SIZE_MAX;
     std::vector<Source> sources;
     for (const auto& f : opened) sources.push_back({f.rf->fd, &f.hashes});
-    if (read_parts(sources, parts, read, error, bad, read_bufs_) != Read::kDone) return fail(error, bad);
+    const Read end = read_parts(sources, parts, read, error, bad, read_bufs_);
+    if (end == Read::kStopped) {   // no read buffer: the files are as good as they were and stay
+        for (auto& f : opened) f.rf->close();
+        error = "conversation store: " + name + ": " + error;
+        return false;
+    }
+    if (end != Read::kDone) return fail(error, bad);
     auto source_of = [&](int j) {
         return j >= 0 && (size_t) j < kinds.size() ? (ConversationCheckpoint::Source) kinds[(size_t) j]
                                                       : ConversationCheckpoint::kTurnEnd;

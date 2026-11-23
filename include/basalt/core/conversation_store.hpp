@@ -21,6 +21,7 @@
 
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/conversation_stream.hpp"
+#include "basalt/platform/direct_file.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -42,7 +43,15 @@ namespace basalt::core {
 /// layout, a checkpoint state.
 inline constexpr uint32_t kConversationFormat = 2;
 
-struct ConversationStoreBuffer;
+/// One aligned buffer of a read or a write, freed with it; `p` is null when it could not be allocated.
+struct ConversationStoreBuffer {
+    void* p = nullptr;
+    explicit ConversationStoreBuffer(size_t n) : p(basalt::platform::DirectFile::alloc_aligned(n)) {}
+    ~ConversationStoreBuffer() { basalt::platform::DirectFile::free_aligned(p); }
+    ConversationStoreBuffer(const ConversationStoreBuffer&) = delete;
+    ConversationStoreBuffer& operator=(const ConversationStoreBuffer&) = delete;
+    uint8_t* data() const { return static_cast<uint8_t*>(p); }
+};
 
 class ConversationStore {
 public:
@@ -80,7 +89,8 @@ public:
 
     /// The image of `m` cut at m.tokens: `out.live` is the state there, `out.kv` the K/V up to it, `out.checkpoints`
     /// the chain's root (its shortest checkpoint) and that state once more when it is a checkpoint.  A file that fails
-    /// any check is deleted and false returned with `error`; the file stays otherwise (a later prompt may match it).
+    /// any check is deleted and false returned with `error`; the file stays otherwise (a later prompt may match it),
+    /// and so does one whose read stopped for want of a read buffer.
     /// With `kv`, the K/V is not copied: `out.kv` holds the layers' shapes with empty buffers and `*kv` reads their
     /// bytes later (the store outlives it; one load or K/V read runs at a time).
     bool load(const Match& m, SavedConversation& out, std::string& error,
@@ -114,6 +124,7 @@ public:
     bool fits(uint64_t bytes) const;
 
 private:
+    friend struct ConversationStoreFixture;   // loses the read buffers for the test of a read that has none
     struct Entry;
     struct Job;
     struct PartFile {                        ///< a block or state file: its size and the conversations that use it

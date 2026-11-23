@@ -264,8 +264,7 @@ Flow Request::restore() {
                                   : basalt::core::conversation_refusal(why).c_str());
         } else if (!runtime_.disk.load(on_disk, image, de, in_files ? &incoming_kv : nullptr)) {
             incoming_kv.reset();
-            basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
-                              "dropped", de.c_str());
+            basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s)", de.c_str());
         } else {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             if (incoming_kv) {

@@ -7,7 +7,8 @@
 // read that leaves the K/V in its files gives the same bytes through its sink as a whole read.  A conversation
 // written from its source a buffer at a time (as from a session's device buffers) leaves the same files as the queued
 // write of its image, and a write that fails leaves the files and the index as they were; one the budget does not
-// hold is refused or reported, and the budget does not count what a read still holds open.
+// hold is refused or reported, and the budget does not count what a read still holds open.  A read buffer that could
+// not be allocated is allocated again by the next read, and the conversation stays.
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
@@ -813,6 +814,42 @@ void kv_left_in_files(const std::string& dir, uint64_t id) {
     }
 }
 
+namespace basalt::core {
+struct ConversationStoreFixture {
+    // the read buffers as an allocation that failed leaves them; how many there were
+    static size_t lose_read_buffers(ConversationStore& st) {
+        for (auto& b : st.read_bufs_) {
+            basalt::platform::DirectFile::free_aligned(b->p);
+            b->p = nullptr;
+        }
+        return st.read_bufs_.size();
+    }
+};
+}  // namespace basalt::core
+
+// A read buffer that could not be allocated is allocated again by the next read, whole or with the K/V left in its
+// files, and the conversation stays stored.
+void read_without_buffers(const std::string& dir, uint64_t id) {
+    std::string err;
+    std::vector<int32_t> ids;
+    const SavedConversation x = shaped(kShapes[0], ids);
+    const std::vector<int32_t> p = prompt_at(ids, ids.size());
+    Store st;
+    CHECK(st.open(dir, id, 1ull << 30, err));
+    CHECK(st.put(SavedConversation(x), 1ull << 30));
+    st.flush();
+    const auto m = st.best(p.data(), p.size(), {}, true);
+    SavedConversation got;
+    CHECK(m.tokens == (int64_t) ids.size() && st.load(m, got, err));
+    CHECK(ConversationStoreFixture::lose_read_buffers(st) > 0);
+    CHECK(st.load(m, got, err) && st.stats().files == 1);
+    CHECK(same_state(got.live, x.live) && same_kv(got.kv, x.kv));
+    CHECK(ConversationStoreFixture::lose_read_buffers(st) > 0);
+    check_kv_read(st, m);
+    CHECK(st.stats().files == 1 && st.stats().dropped == 0);
+    remove_dir(dir);
+}
+
 // A model with compressed caches: its layers hold rows of `page_size` cells, no scales or pooled rows, and only one
 // part of running state.
 void compressed_rows(const std::string& dir) {
@@ -1255,6 +1292,7 @@ int main() {
     same_name_again(dir + "-again", id);
     interrupted_write(dir + "-interrupted", id);
     ram_tier_to_store(dir + "-tiers", id);
+    read_without_buffers(dir + "-buffers", id);
     {
         const std::string dir2 = dir + "-rows";
         compressed_rows(dir2);
