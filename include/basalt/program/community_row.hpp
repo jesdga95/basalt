@@ -1,5 +1,5 @@
-// include/basalt/program/community_row.hpp - one row of docs/community/benchmarks.json and the edit that adds or updates it.
-// Host only. The text it produces is the canonical file form tools/check_benchmarks.py enforces.
+// include/basalt/program/community_row.hpp - one community run: its row, the file it lives in and the edit that writes it.
+// Host only. The text it produces is the house form tools/check_benchmarks.py enforces.
 #pragma once
 
 #include <string>
@@ -55,32 +55,37 @@ std::vector<std::string> split_gpu_ids(const std::string& csv);
 
 /// True when the two rows are one setup: submitter (ASCII letters compared without case), model, quant, every GPU
 /// (name, vram_gib, power_w, in order), cpu, ram_gib and os all match. A field empty or 0 in either row matches; kv is
-/// not compared. tools/check_benchmarks.py (same_setup) applies the same rule and refuses a file holding two such rows.
+/// not compared. tools/check_benchmarks.py (same_setup) applies the same rule and refuses two files holding such rows.
 bool community_same_setup(const CommunityRow& a, const CommunityRow& b);
 
-/// The rows of a file in the canonical form, with the fields the rule above and the notes use (the others are left
-/// default). False with `err` set when the runs list is not laid out as the canonical form lays it out.
-bool community_parse_rows(const std::string& file, std::vector<CommunityRow>& rows, std::string& err);
+/// The lowercase hex SHA-256 of `data`.
+std::string sha256_hex(const std::string& data);
 
-/// What an edit of the file did: whether it replaced a row of the same setup (at `index` in "runs") instead of appending.
-struct CommunityEdit {
-    bool replaced = false;
-    size_t index = 0;
-    std::string notes;       ///< the replaced row's notes, carried over to the new row; empty when it had none
-    std::string row_text;    ///< the row as it stands in the file now
-};
+/// The folder name of a model's runs: the model's name with its ASCII letters in lower case.
+std::string community_model_slug(const std::string& model);
 
-/// The row as the file spells it: 4-space indent, fixed key order, gpus expanded, no trailing newline.
+/// The file name (without ".json") of a run: the first 12 hex digits of the SHA-256 of the setup the rule above
+/// compares, taken as exact values. tools/check_benchmarks.py (row_id) spells the same text and computes the same id.
+std::string community_run_id(const CommunityRow& row);
+
+/// The fields of one row file in the house form that the setup rule and the notes use (the others are left default).
+/// False with `err` set when the text is not laid out as the house form lays a row out.
+bool community_parse_row(const std::string& text, CommunityRow& row, std::string& err);
+
+/// The row as the run file spells it, without the final newline: 2-space indent, fixed key order, gpus expanded.
 std::string community_row_text(const CommunityRow& row);
 
-/// `file` with the row added as the last element of "runs", or, when a row of the same setup is already there,
-/// replacing it in its place with that row's notes kept. False with `err` set when the file does not end in the
-/// canonical tail.
-bool community_add_row(const std::string& file, const CommunityRow& row, std::string& out, std::string& err,
-                       CommunityEdit* edit = nullptr);
+/// What writing a run did: whether the file of this setup was already there (it is then overwritten, its notes kept).
+struct CommunityEdit {
+    bool replaced = false;
+    std::string path;        ///< <dir>/runs/<model slug>/<id>.json
+    std::string notes;       ///< the replaced row's notes, carried over to the new row; empty when it had none
+    std::string row_text;    ///< the row as the file holds it now
+};
 
-/// Reads `path`, adds the row and writes it back. False with `err` set on any failure; the file is then unchanged
-/// unless the write itself failed part way.
-bool community_add_row_file(const std::string& path, const CommunityRow& row, std::string& err, CommunityEdit* edit = nullptr);
+/// Writes the row to <dir>/runs/<model slug>/<id>.json, where `dir` is the community folder (docs/community). A file
+/// already there is this setup's earlier run: it is overwritten and, when `row` has no notes of its own, its notes are
+/// kept. False with `err` set on any failure.
+bool community_write_run(const std::string& dir, const CommunityRow& row, std::string& err, CommunityEdit* edit = nullptr);
 
 }  // namespace basalt::program

@@ -30,6 +30,14 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
     return v;
 }
+__device__ __forceinline__ void int8_scales(const float (&v)[4], float f, int lane, float (&scale)[2]) {
+    float a = 0.f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) a = fmaxf(a, fabsf(v[u] * f));
+#pragma unroll
+    for (int m = 8; m; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    scale[lane >> 4] = __half2float(__float2half_rn(a / 127.f));
+}
 
 // Sums of N values per thread over a block of kThreads, in a fixed order; every thread gets the N results.
 template <int N>
@@ -226,6 +234,24 @@ __device__ __forceinline__ void store_kv4(void* cache, bool fp8, size_t idx, flo
     }
 }
 
+__device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t idx, float v, const float (&scale)[2], int lane) {
+    if (int8) {
+        const int group = (int) idx / 64;
+        const float s = scale[group];
+        const int q = s > 0.f ? max(-127, min(127, __float2int_rn(v / s))) : 0;
+        static_cast<int8_t*>(row)[idx] = (int8_t) q;
+        if (lane == group * 16)
+            reinterpret_cast<__half*>(static_cast<uint8_t*>(row) + kHeadDim)[group] = __float2half_rn(s);
+        if (idx == kHeadDim - 1)   // the last channel writes the row padding as zeros
+            for (int b = kHeadDim + 4; b < kKvInt8RowBytes; b += 4) *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + b) = 0u;
+    } else if (fp8) {
+        __nv_fp8_e4m3 q(v);
+        static_cast<uint8_t*>(row)[idx] = *reinterpret_cast<uint8_t*>(&q);
+    } else {
+        static_cast<__half*>(row)[idx] = __float2half_rn(v);
+    }
+}
+
 // A block per row: warp w holds kv head w's 128 key and value channels (4 a lane), then three query heads and their
 // relative states.
 __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
@@ -271,10 +297,20 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         ss = fmaf(val3, val3, ss);
         ss = warp_sum(ss);
         const float f = which == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
+        float scale[2] = {};
         const int64_t cell = p % a.cap;
+        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
         void* cache = which ? a.v_cache : a.k_cache;
-        store_kv4(cache, a.fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4,
-                  val0 * f, val1 * f, val2 * f, val3 * f);
+        if (a.int8) {
+            float val[4] = {val0, val1, val2, val3};
+            int8_scales(val, f, lane, scale);
+            void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) store_kv(row, false, true, lane * 4 + u, val[u] * f, scale, lane);
+        } else {
+            store_kv4(cache, a.fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4,
+                      val0 * f, val1 * f, val2 * f, val3 * f);
+        }
     }
     // queries: warp w takes heads 3w .. 3w + 2
     for (int h = w * 3; h < w * 3 + 3; ++h) {

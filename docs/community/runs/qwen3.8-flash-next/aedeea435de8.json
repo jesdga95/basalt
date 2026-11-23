@@ -1,0 +1,40 @@
+{
+  "submitter": "tarb-infra",
+  "date": "2026-11-22",
+  "commit": "ad274aa8dc",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "5.0 x8"
+    },
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "5.0 x8"
+    }
+  ],
+  "ram_gib": 61,
+  "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+  "ram_gbps": 75.9,
+  "os": "Linux",
+  "quant": "IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 4192.1,
+  "prefill_64k_tps": 6296.5,
+  "decode_tps": 326.0,
+  "decode_conv_tps": 222.1,
+  "decode_struct_tps": 398.5,
+  "decode_prose_tps": 191.7,
+  "accept_conv_pct": 68.4,
+  "accept_struct_pct": 93.7,
+  "accept_prose_pct": 64.2,
+  "draft_len_conv": 2.5,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 1.9,
+  "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+}

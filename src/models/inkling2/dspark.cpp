@@ -747,7 +747,7 @@ void DsparkHook::count_backed() {
 
 uint64_t DsparkHook::grow_bytes(int64_t positions) const {
     uint64_t n = 0;
-    for (const auto& a : full_) n += a->to_back((uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2);
+    for (const auto& a : full_) n += a->growth((uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2);
     return n;
 }
 

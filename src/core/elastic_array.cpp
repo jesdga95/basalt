@@ -57,9 +57,9 @@ bool ElasticArray::open(uint64_t bytes, std::string& err) {
     return true;
 }
 
-uint64_t ElasticArray::to_back(uint64_t bytes) const {
-    if (bytes <= backed_ || bytes > reserved_ || plain_) return 0;
-    // grow in steps of a few granules so a long generation maps rarely
+// grow in steps of a few granules so a long generation maps rarely
+uint64_t ElasticArray::growth(uint64_t bytes) const {
+    if (bytes <= backed_ || bytes > reserved_) return 0;
     const uint64_t step = gran_ * 4;
     return std::min(reserved_, (bytes + step - 1) / step * step) - backed_;
 }
@@ -75,7 +75,8 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
         err = "the array is full";
         return false;
     }
-    const uint64_t n = to_back(bytes), want = backed_ + n;
+    const uint64_t n = growth(bytes);
+    const uint64_t want = backed_ + n;
     if (keep_free > 0) {
         uint64_t free_b = 0, total_b = 0;
         std::string why;

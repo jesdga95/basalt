@@ -28,7 +28,8 @@ int run(int argc, char** argv) {
         return adapter != nullptr && adapter->second_card_runs_layers(common, main_gbps, peer_gbps);
     };
     if (const auto code = cli::select_gpus(common, chosen_cards, (adapter != nullptr ? adapter->max_expert_cards() : basalt::model::max_expert_cards()) + 1,
-                                         adapter != nullptr && adapter->second_card_reads_prompts(), layer_stage)) return *code;
+                                         adapter != nullptr && adapter->second_card_reads_prompts(), layer_stage,
+                                         adapter != nullptr ? adapter->one_card_reason(common) : std::string())) return *code;
     // ---- where every loader reads from: the sections of the .basalt file
     if (const auto code = cli::prepare_model_process(common)) return *code;
     if (const std::optional<int> code = adapter->run(common, chosen_cards)) return *code;

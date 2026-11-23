@@ -1,0 +1,36 @@
+{
+  "submitter": "Zigenzag",
+  "date": "2026-11-20",
+  "commit": "d3b7574296",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 280,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 55.9
+    }
+  ],
+  "ram_gib": 123,
+  "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+  "ram_gbps": 87.5,
+  "os": "Linux",
+  "quant": "IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 5151.5,
+  "prefill_64k_tps": 5324.9,
+  "decode_tps": 224.5,
+  "decode_conv_tps": 155.0,
+  "decode_struct_tps": 262.0,
+  "decode_prose_tps": 153.9,
+  "accept_conv_pct": 66.0,
+  "accept_struct_pct": 94.8,
+  "accept_prose_pct": 61.1,
+  "draft_len_conv": 2.1,
+  "draft_len_struct": 6.6,
+  "draft_len_prose": 1.7,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "GSQ-RCO IQ3_S GGUF converted with convert.py (Strata's MTP tensors and draft vocab); GPU capped at 280 W; Ubuntu 26.04, iommu=pt"
+}
