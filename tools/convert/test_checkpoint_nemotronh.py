@@ -232,7 +232,7 @@ class ConvertTest(unittest.TestCase):
     def test_the_metadata(self):
         kv = self.meta["gguf_kv"]
         self.assertEqual((self.meta["arch"], kv["general.architecture"]), ("nemotronh", "nemotronh"))
-        self.assertEqual(kv["nemotronh.layer_kinds"], [0, 1, 2])
+        self.assertEqual(kv["nemotronh.layer_pattern"], "M*E")
         for k, want in (("block_count", 3), ("embedding_length", H), ("vocab_size", VOCAB), ("attention.head_count", NH),
                         ("attention.head_count_kv", NKV), ("attention.key_length", HD), ("ssm.conv_kernel", DC),
                         ("ssm.state_size", DS), ("ssm.head_count", MH), ("ssm.head_dim", MHD), ("ssm.group_count", NG),

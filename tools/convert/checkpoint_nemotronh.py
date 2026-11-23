@@ -7,6 +7,7 @@ nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4), for tools/convert/convert.
                         {s_up, 0, s_down, 0} from each matrix's weight_scale_2.  The experts are squared-ReLU, h =
                         relu(up x)^2, with no gate rows.
   experts.layout      one `layer gu_type d_type offset blob_bytes` line per MoE layer (gu_type: the up rows' type)
+  layer kinds         nemotronh.layer_pattern, one letter a layer: M Mamba-2, * attention, E MoE
   gguf                every other language-model tensor in llama.cpp's nemotron_h_moe names:
                         FP8 projections (the Mamba in / out, attention q / k / v / o and the head): the E4M3 codes as
                           stored (F8_E4M3), the FP32 weight_scale as `<name>.scale` (F32 [1])
@@ -47,9 +48,10 @@ ROWS_PER_JOB = 1 << 22
 EXPERTS_PER_JOB = 16
 NVFP4_TAIL = 16
 E4M3 = S.fp8_e4m3_table()
-# the layer kinds as the pack records them (nemotronh.layer_kinds)
-KIND = {"mamba": 0, "attention": 1, "moe": 2}
+# the layer kinds and the letters the pack records them by (nemotronh.layer_pattern: a string, as a GGUF array of 88
+# would pass the pack's meta parser's 64 items)
 PATTERN = {"M": "mamba", "*": "attention", "E": "moe"}
+KIND = {v: k for k, v in PATTERN.items()}
 # the Mistral (tekken) split of the checkpoint's tokenizer.json: o200k's expression without the contractions, one
 # digit a piece
 NEMOTRONH_HF_SPLIT = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
@@ -414,7 +416,7 @@ def model_kv(ck: C.Checkpoint, g: Geometry, tc: dict, name: str | None) -> dict:
         kv["general.license.name"] = card["license_name"]
     kv.update({
         A + "block_count": g.n_layers,
-        A + "layer_kinds": [KIND[k] for k in g.kinds],
+        A + "layer_pattern": "".join(KIND[k] for k in g.kinds),
         A + "context_length": g.context,
         A + "embedding_length": g.h,
         A + "vocab_size": g.vocab,
