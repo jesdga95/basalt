@@ -1,0 +1,35 @@
+{
+  "submitter": "jesdga95",
+  "date": "2026-11-10",
+  "commit": "37c2c1a8ad",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 28.8
+    }
+  ],
+  "ram_gib": 121,
+  "cpu": "AMD Ryzen 9 9950X, 16 cores",
+  "ram_gbps": 58.6,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 2695.3,
+  "prefill_64k_tps": 2704.2,
+  "decode_tps": 107.5,
+  "decode_conv_tps": 78.6,
+  "decode_struct_tps": 120.8,
+  "decode_prose_tps": 80.2,
+  "accept_conv_pct": 77.2,
+  "accept_struct_pct": 98.7,
+  "accept_prose_pct": 70.5,
+  "draft_len_conv": 2.3,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.9,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}
