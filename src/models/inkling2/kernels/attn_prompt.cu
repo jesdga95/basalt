@@ -122,18 +122,14 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
             const int64_t key = k0 + j;
             const bool ok = key >= lo && key <= hi;
             uint4 u = make_uint4(0u, 0u, 0u, 0u);
-            float sc[2] = {1.f, 1.f};
+            __half sc = __float2half(1.f);   // INT8: the scale of the piece's 16 codes (one 64-channel group)
             if (ok) {
                 const bool fresh = key >= a.pos0;
                 const int64_t cap = fresh ? a.chunk_cap : a.cap;
                 const uint8_t* base = static_cast<const uint8_t*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache));
                 const size_t row = ((size_t) (key % cap) * kKvHeads + kvh) * (FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : 2 * kHeadDim);
                 u = *reinterpret_cast<const uint4*>(base + row + col);
-                if constexpr (INT8) {
-                    const __half* p = reinterpret_cast<const __half*>(base + row + kHeadDim);
-                    sc[0] = __half2float(p[0]);
-                    sc[1] = __half2float(p[1]);
-                }
+                if constexpr (INT8) sc = reinterpret_cast<const __half*>(base + row + kHeadDim)[col / 64];
             }
             uint32_t h[8];
             if constexpr (FP8) {
@@ -144,11 +140,17 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
                     h[2 * i + 1] = e4m3x2_to_h2((uint16_t) (w[i] >> 16));
                 }
             } else {
-                const int8_t* q = reinterpret_cast<const int8_t*>(&u);
+                // a code times its fp16 scale rounded once (the product is exact before it), as the decode path's values
+                const uint32_t w[4] = {u.x ^ 0x80808080u, u.y ^ 0x80808080u, u.z ^ 0x80808080u, u.w ^ 0x80808080u};
+                const __half2 bias = __half2half2(__ushort_as_half(0x6480u)), s2 = __half2half2(sc);   // 1152
 #pragma unroll
-                for (int i = 0; i < 8; ++i)
-                    h[i] = pack_h2((float) q[2 * i] * sc[(col + 2 * i) / 64],
-                                   (float) q[2 * i + 1] * sc[(col + 2 * i + 1) / 64]);
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const uint32_t b = __byte_perm(w[i], 0x64646464u, j ? 0x7362u : 0x5140u);
+                        const __half2 v = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&b), bias), s2);
+                        h[2 * i + j] = *reinterpret_cast<const uint32_t*>(&v);
+                    }
             }
             __half* dst = isv ? &sm.v[j][col] : &sm.k[j][col];
             *reinterpret_cast<uint4*>(dst) = make_uint4(h[0], h[1], h[2], h[3]);
