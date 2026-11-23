@@ -4824,6 +4824,41 @@
       "draft_len_prose": 1.9,
       "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
       "notes": "Uncensored (abliterated) NVFP4-DQ6_K pack from klee100/Qwen3.8-Flash-Next-Uncensored-Basalt. 2nd card on a chipset slot (PCIe 4.0 x4, peer tier). 4x32 GB DDR5 at 4533 MT/s; 0 SSD spill."
+    },
+    {
+      "submitter": "tselle",
+      "date": "2026-11-23",
+      "commit": "fae6d5b187",
+      "preset": "community-1",
+      "model": "Inkling-2-Mini",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 56.9
+        }
+      ],
+      "ram_gib": 90,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 66.3,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "fp16",
+      "prefill_16k_tps": 6896.4,
+      "prefill_64k_tps": 6386.6,
+      "decode_tps": 106.2,
+      "decode_conv_tps": 93.8,
+      "decode_struct_tps": 109.2,
+      "decode_prose_tps": 98.7,
+      "accept_conv_pct": 76.5,
+      "accept_struct_pct": 98.2,
+      "accept_prose_pct": 60.2,
+      "draft_len_conv": 0.9,
+      "draft_len_struct": 5.6,
+      "draft_len_prose": 0.8,
+      "engine_args": "--gpu 0 --max-context 63233"
     }
   ]
 }
