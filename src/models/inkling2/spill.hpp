@@ -3,8 +3,9 @@
 // RAM holds a copy of every expert that leaves; the card keeps the rest. A layer that gives some up lays its experts out
 // by slot in one reserved range: the ones it keeps first (their own memory, rounded up to the allocation granularity),
 // then the ones in RAM, whose part of the range maps one staging allocation that every such layer shares. Decode reads a
-// RAM expert where it is (its blob table entry is the mapped host address); a prompt chunk copies the layer's RAM experts
-// into the shared staging first, so its products read every expert of the layer in place, by slot.
+// RAM expert where it is (its blob table entry is the mapped host address, or its card copy's); a prompt chunk first copies
+// the RAM experts it reads into the shared staging (each from its card copy when it has one; a short chunk only the ones
+// its rows route to), so its products read every expert they need in place, by slot.
 #pragma once
 
 #include <cstdint>
@@ -14,10 +15,11 @@
 
 namespace basalt::models::inkling2 {
 
-/// Zeroed bytes after a spilled layer's last slot: the prompt path's products read past the end of a weight matrix (a
-/// tile's last K step runs over a down matrix whose rows are not a whole number of steps) and multiply what they find by
-/// zero activations, so those bytes must hold finite values. A resident layer's are its allocation's neighbours; a
-/// spilled layer's would be the shared staging, which holds whatever layer copied there last.
+/// Zeroed bytes after a spilled layer's last slot, and at the start of a RAM slot a chunk does not stage when the slot
+/// before it is read: the prompt path's products read past the end of a weight matrix (a tile's last K step runs over a
+/// down matrix whose rows are not a whole number of steps) and multiply what they find by zero activations, so those bytes
+/// must hold finite values. A resident layer's are its allocation's neighbours; a spilled layer's would be the shared
+/// staging, which holds whatever layer copied there last.
 constexpr uint64_t kSlotGuard = 64 << 10;
 
 struct SpillPlan {
@@ -42,15 +44,17 @@ bool plan_spill(int n_layers, int n_expert, const std::vector<uint64_t>& stride,
                 std::string& err);
 
 /// One step of a prompt chunk's staging of a spilled layer: `n` RAM slots from `slot` (0 = the layer's first RAM slot)
-/// copied from their adjacent RAM blobs, or one slot copied from its card copy.
+/// copied from their adjacent RAM blobs, one slot copied from its card copy, or the zeroed guard at one slot's start.
 struct StageOp {
-    enum Kind : uint8_t { Ram, Card } kind = Ram;
+    enum Kind : uint8_t { Ram, Card, Guard } kind = Ram;
     int32_t slot = 0;
     int32_t n = 1;
 };
 
-/// The staging of a layer's `n_spill` RAM slots, `card[j]` whether slot j has a card copy: a slot with one is copied from
-/// it, a run of adjacent slots without one in a single RAM copy.
-std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card);
+/// The staging of a layer's `n_spill` RAM slots: `card[j]` whether slot j has a card copy, `want[j]` whether the chunk
+/// reads it (null: every one), `kept` whether kept slots precede them. A wanted slot is staged from its card copy, or with
+/// its adjacent wanted slots without one in a single RAM copy; a slot left out right after one the products may read (a
+/// wanted or kept one) gets the guard (kSlotGuard: the products read past a matrix's end into the next slot).
+std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card, const uint8_t* want, bool kept);
 
 }  // namespace basalt::models::inkling2

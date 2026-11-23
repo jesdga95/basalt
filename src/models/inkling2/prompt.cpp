@@ -41,6 +41,7 @@ constexpr int kTypeNvfp4 = 40;
 constexpr int kTypeMxfp8 = 46;
 constexpr int kOut = kHeads * kHeadDim;    // the attention output's width
 constexpr uint64_t kMmqSpare = 32ull << 20;   // MMQ's stream-k fixup pool
+constexpr int kRoutedRows = 1024;          // a chunk of at most this many rows stages only the RAM experts it routes to
 
 // One allocation carved into the chunk's buffers; with no base it only counts, so the sizing and the allocation agree.
 struct Carve {
@@ -156,6 +157,7 @@ public:
             if (k.mem) cudaFree(k.mem);
         }
         if (hand_) cudaFreeHost(hand_);
+        if (routed_ids_) cudaFreeHost(routed_ids_);
     }
 
     bool init(std::string& err) {
@@ -183,6 +185,14 @@ public:
                 return false;
             }
             if (!init_lane(err)) return false;
+        }
+        if (m_.spill().any()) {
+            if (cudaHostAlloc((void**) &routed_ids_, (size_t) kRoutedRows * g_.n_used * 4, cudaHostAllocPortable) != cudaSuccess) {
+                cudaGetLastError();
+                err = "cannot pin the prompt path's routed slots";
+                return false;
+            }
+            routed_.assign((size_t) g_.n_expert, 0);
         }
         if (m_.cards() > 1) {   // the crossings' page-locked slots, then one per drafter tap
             size_t pulls = 0;
@@ -348,7 +358,12 @@ private:
                     if (cur_ == 0) cudaMemcpyAsync(ds_->tap(k), buf(s.hid), (size_t) rows * E * 4, cudaMemcpyDeviceToDevice, strm());
                     else tap_across(k, buf(s.hid), rows);
                 }
-                layer(s, rows, pos0);
+                if (!layer(s, rows, pos0)) {
+                    const cudaError_t e = cudaGetLastError();
+                    err = std::string("staging a layer's RAM experts failed") +
+                          (e != cudaSuccess ? std::string(": ") + cudaGetErrorString(e) : "");
+                    return false;
+                }
             }
         }
         if (ds_->on()) {   // and every row's final normed state, then the rows' context keys and values
@@ -393,7 +408,8 @@ private:
         attnres_mix(st, w.msg_query, 4, rows, 1e-6f, b().msg, (int64_t) rows * g_.n_embd, strm());
     }
 
-    void layer(const Step& s, int rows, int64_t pos0) {
+    // False when the experts' staging failed (nothing of the visit's experts is queued then).
+    bool layer(const Step& s, int rows, int64_t pos0) {
         const Visit& v = g_.visits[(size_t) s.visit];
         const int l = v.layer;
         const LayerWeights& w = m_.layer(l);
@@ -501,13 +517,14 @@ private:
         attnres_mix(st, w.ffn_query, 1, rows, 1e-6f, b().mix, (int64_t) RE, strm());
         if (s.msgs) controller(w, 3, b().mix, b().msg + 3 * RE, rows, b().mix);
         bk::rms_norm_rows(b().mix, w.ffn_norm, rows, E, g_.rms_eps, b().nrm, strm());
-        experts(w, l, rows);
+        if (!experts(w, l, rows)) return false;
         post_conv(b().moe, b().pos, w.ffn_post_conv, c.m_ring, b().resid, rows, out, strm());
+        return true;
     }
 
     // The routed experts of the chunk's normed MLP inputs (nrm) into moe: the router's scores as one product, the pairs
     // sorted by expert, the gate/up and down products per expert in two MMQ launches over the experts in place.
-    void experts(const LayerWeights& w, int l, int rows) {
+    bool experts(const LayerWeights& w, int l, int rows) {
         const int E = g_.n_embd, F = g_.n_ff_exp, k = g_.n_used, pairs = rows * k;
         bk::f32_rows_dot(b().nrm, w.router, b().rlog, rows, g_.n_expert, E, strm());
         bk::RouterArgs ra;
@@ -519,17 +536,20 @@ private:
         bk::router_select(b().rlog, w.router_bias, rows, ra, b().ids, b().rw, strm());
         if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot, its RAM experts copied into the staging
             remap_ids(b().ids, pairs, w.slot_map, strm());
-            m_.stage(l, strm());
-            cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm());   // spill.hpp
+            const uint8_t* want = nullptr;
+            if (rows <= kRoutedRows && !(want = routed(pairs))) return false;
+            if (!m_.stage(l, want, strm()) ||
+                cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm()) != cudaSuccess)
+                return false;   // the guard after the last slot: spill.hpp
         }
         moe_sort(b().ids, rows, k, g_.n_expert, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());
         if (w.gu_type == kTypeNvfp4 && w.d_type == kTypeNvfp4 && fp4_shape()) {
             experts_fp4(w, rows);
-            return;
+            return true;
         }
         if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) {
             experts_mxfp8(w, rows);
-            return;
+            return true;
         }
         mmq::quantize(b().nrm, b().tok, b().xq, w.gu_type, E, E, pairs, strm());
         mmq::Product p;
@@ -569,6 +589,19 @@ private:
         d.ld_dst = E;
         lane().mmq.run(d, strm());
         moe_combine(b().gu, b().rw, rows, k, b().moe, strm());
+        return true;
+    }
+
+    // The slots a short chunk's pairs route to, for the staging: the host waits for the router, since a short chunk reads a
+    // part of a layer's RAM experts and copying the rest costs more than the wait. Null when the readback failed.
+    const uint8_t* routed(int pairs) {
+        if (cudaMemcpyAsync(routed_ids_, b().ids, (size_t) pairs * 4, cudaMemcpyDeviceToHost, strm()) != cudaSuccess ||
+            cudaStreamSynchronize(strm()) != cudaSuccess)
+            return nullptr;
+        std::fill(routed_.begin(), routed_.end(), (uint8_t) 0);
+        for (int i = 0; i < pairs; ++i)
+            if (routed_ids_[i] >= 0 && routed_ids_[i] < g_.n_expert) routed_[(size_t) routed_ids_[i]] = 1;
+        return routed_.data();
     }
 
     // The NVFP4 experts on the FP4 block-scaled tensor cores, the weights read once a tile in place: each activation row
@@ -677,6 +710,8 @@ private:
     float* hand_ = nullptr;       // the layer split: page-locked slots of a chunk's rows crossing between the cards
     int tap_slot0_ = 0;           // the first drafter tap's slot
     cudaEvent_t done_[2] = {};
+    int32_t* routed_ids_ = nullptr;   // page-locked: a short chunk's pairs by slot (routed)
+    std::vector<uint8_t> routed_;     // [slot] whether a pair of the chunk routes to it
 };
 
 }  // namespace

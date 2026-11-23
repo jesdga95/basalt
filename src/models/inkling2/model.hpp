@@ -117,8 +117,9 @@ public:
     bool resize_reserve(uint64_t free_bytes, void* stream);
     void lend(bool low, void* stream);
     /// A prompt chunk's staging of layer l's RAM experts into their slots: each from its card copy while the elastic spill
-    /// holds one, from RAM otherwise, a run of adjacent slots with no copy in one copy (spill.hpp stage_plan).
-    void stage(int l, void* stream) const;
+    /// holds one, from RAM otherwise, a run of adjacent slots with no copy in one copy (spill.hpp stage_plan). `want`
+    /// [slot]: only the slots set (null: every one). False when a copy could not be queued.
+    bool stage(int l, const uint8_t* want, void* stream) const;
     const SpillPlan& spill() const { return spill_; }
     /// Expert e of layer l's blob in RAM when the CPU computes it (it spilled and has no card copy; its blob table entry is
     /// 0), else null (cpu_experts.hpp).

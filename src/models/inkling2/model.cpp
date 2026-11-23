@@ -776,9 +776,9 @@ uint64_t InklingModel::cpu_layers() const {
     return mask;
 }
 
-void InklingModel::stage(int l, void* stream) const {
+bool InklingModel::stage(int l, const uint8_t* want, void* stream) const {
     const LayerWeights& w = layers_[(size_t) l];
-    if (w.n_spill == 0) return;
+    if (w.n_spill == 0) return true;
     const int ne = geo().n_expert, keep = ne - w.n_spill;
     std::vector<const void*> card((size_t) w.n_spill, nullptr);   // [RAM slot] the expert's card copy, null: none
     std::vector<uint8_t> has((size_t) w.n_spill, 0);
@@ -789,14 +789,17 @@ void InklingModel::stage(int l, void* stream) const {
                 has[(size_t) (s - keep)] = card[(size_t) (s - keep)] != nullptr;
             }
     const cudaStream_t st = (cudaStream_t) stream;
-    for (const StageOp& op : stage_plan(w.n_spill, has.data())) {
+    for (const StageOp& op : stage_plan(w.n_spill, has.data(), want ? want + keep : nullptr, keep > 0)) {
         uint8_t* dst = w.experts + (uint64_t) (keep + op.slot) * w.expert_stride;
-        if (op.kind == StageOp::Card)
-            cudaMemcpyAsync(dst, card[(size_t) op.slot], w.expert_stride, cudaMemcpyDeviceToDevice, st);
-        else
-            cudaMemcpyAsync(dst, w.spill_host + (uint64_t) op.slot * w.expert_stride, (size_t) op.n * w.expert_stride,
-                            cudaMemcpyHostToDevice, st);
+        const cudaError_t e =
+            op.kind == StageOp::Guard ? cudaMemsetAsync(dst, 0, kSlotGuard, st)
+            : op.kind == StageOp::Card
+                ? cudaMemcpyAsync(dst, card[(size_t) op.slot], w.expert_stride, cudaMemcpyDeviceToDevice, st)
+                : cudaMemcpyAsync(dst, w.spill_host + (uint64_t) op.slot * w.expert_stride, (size_t) op.n * w.expert_stride,
+                                  cudaMemcpyHostToDevice, st);
+        if (e != cudaSuccess) return false;
     }
+    return true;
 }
 
 uint64_t InklingModel::demote(uint64_t bytes, void* stream) {

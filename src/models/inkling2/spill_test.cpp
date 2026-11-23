@@ -61,33 +61,49 @@ int main() {
     // more than the experts can give
     SpillPlan q;
     expect(!plan_spill(L, E, stride, gran, rank, p.full + 1, -1, q, err) && !err.empty(), "an impossible need fails");
-    // the staging plan against a slot-by-slot model, over random copies: every slot is staged once, from its card copy
-    // when it has one, and adjacent slots without one go in one RAM copy
+    // the staging plan against a slot-by-slot model, over random copies and routing: every slot a chunk reads holds its
+    // expert, every slot the products can read into (after a read or kept one) is staged or guarded, adjacent RAM slots go
+    // in one copy, and a slot neither read nor reachable is left alone
     uint32_t rng = 12345;
     const auto next = [&] { return rng = rng * 1664525u + 1013904223u; };
     for (int trial = 0; trial < 20000; ++trial) {
         const int n = 1 + (int) (next() % 40);
-        const int pc = (int) (next() % 3);   // copy density
-        std::vector<uint8_t> card((size_t) n);
-        for (int j = 0; j < n; ++j) card[(size_t) j] = pc == 0 ? 0 : pc == 1 ? (uint8_t) (next() % 2) : 1;
+        const bool kept = next() % 4 != 0;
+        const int pc = (int) (next() % 3), pw = (int) (next() % 4);   // copy and routing densities
+        std::vector<uint8_t> card((size_t) n), want((size_t) n);
+        for (int j = 0; j < n; ++j) {
+            card[(size_t) j] = pc == 0 ? 0 : pc == 1 ? (uint8_t) (next() % 2) : 1;
+            want[(size_t) j] = pw == 3 ? 1 : (uint8_t) (next() % 4 < (uint32_t) pw + 1 ? 1 : 0);
+        }
+        const bool all = next() % 5 == 0;
+        enum : uint8_t { Stale, Expert, Zero };
+        std::vector<uint8_t> state((size_t) n, Stale);
         std::vector<int> touched((size_t) n, 0);
         bool ok = true, adjacent_ram = false;
         int last_ram_end = -1;
-        for (const StageOp& op : stage_plan(n, card.data())) {
+        for (const StageOp& op : stage_plan(n, card.data(), all ? nullptr : want.data(), kept)) {
             if (op.slot < 0 || op.n < 1 || op.slot + op.n > n) { ok = false; break; }
+            if (op.kind != StageOp::Ram && op.n != 1) ok = false;
             for (int j = op.slot; j < op.slot + op.n; ++j) {
                 ++touched[(size_t) j];
-                if ((op.kind == StageOp::Card) != (card[(size_t) j] != 0)) ok = false;   // a slot with a copy comes from the card
+                state[(size_t) j] = op.kind == StageOp::Guard ? Zero : Expert;
+                if (op.kind == StageOp::Ram && card[(size_t) j]) ok = false;    // a slot with a copy comes from the card
+                if (op.kind == StageOp::Card && !card[(size_t) j]) ok = false;
             }
-            if (op.kind == StageOp::Card && op.n != 1) ok = false;
             if (op.kind == StageOp::Ram) {
                 if (op.slot == last_ram_end) adjacent_ram = true;
                 last_ram_end = op.slot + op.n;
             }
         }
-        for (int j = 0; j < n; ++j)
-            if (touched[(size_t) j] != 1) ok = false;
-        expect(ok, "stage plan: every slot staged once, from its card copy when it has one");
+        for (int j = 0; j < n; ++j) {
+            const bool read = all || want[(size_t) j];
+            const bool reachable = j > 0 ? (all || want[(size_t) j - 1]) : kept;
+            if (touched[(size_t) j] > 1) ok = false;
+            if (read && state[(size_t) j] != Expert) ok = false;
+            if (!read && reachable && state[(size_t) j] != Zero) ok = false;
+            if (!read && !reachable && state[(size_t) j] != Stale) ok = false;
+        }
+        expect(ok, "stage plan: read slots staged, reachable ones guarded, the rest untouched");
         expect(!adjacent_ram, "stage plan: adjacent RAM slots in one copy");
         if (!ok || adjacent_ram) break;
     }
