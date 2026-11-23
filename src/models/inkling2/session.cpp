@@ -408,6 +408,7 @@ protected:
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
+        if (cpu_) sh_->cpu->wake();
         return check(err);
     }
     bool batch_forward(const model::BatchView& v, std::string&) override {
@@ -1021,6 +1022,7 @@ private:
     // as they are until the window's sync); then the head over the last `head` rows (0: none).
     bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
         cpu_ = cpu_layers();
+        if (cpu_) sh_->cpu->wake();
         if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err) || !check(err)) return false;
         dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
         return true;
