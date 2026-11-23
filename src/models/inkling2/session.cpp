@@ -645,6 +645,7 @@ public:
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
+        if (save && stale_) return stale();
         if (save && (int64_t) hist_.size() - pos > kMaxRows)
             return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kMaxRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "inkling2: a checkpoint past the session's position"};
@@ -687,6 +688,7 @@ public:
 
     // A full-attention visit's cache is cell-major ([cell][head][dim]): its first `positions` cells are one run.
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        if (stale_) return stale();
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         cudaStreamSynchronize(stream_);
         kv.clear();

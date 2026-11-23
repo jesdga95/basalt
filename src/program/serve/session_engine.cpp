@@ -6,6 +6,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -825,6 +826,7 @@ int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::m
                 basalt::model::Started& started) {
     std::string err;
     SessionRuntime runtime(o, file, err, started);
+    const basalt::core::GpuLeftRunningExit left_running;
     runtime.pre_ = adapter.pretokenizer();
     return runtime.execute();
 }
