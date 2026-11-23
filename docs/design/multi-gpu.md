@@ -294,7 +294,7 @@ Everything happens on the unpushed box branch `mgpu`, one agent at a time. Every
 | 7 | Qwen3.8-27B peer and split on the hooks (done) | both modes greedy identical to one card; 64K prefill in peer mode gains over one card, decode no worse; split's cells on the second card |
 | 8 | Inkling split on the hooks (from `inksplit`) | bitwise vs single card at a context it fits (done) |
 | 9 | Inkling peer: spilled experts on the peer through the `CpuExperts` shape (done) | pp16384 and decode gain vs one card at `--expert-cache` 1500 and 2400 (64K equal at 2400); KLD and top-1 same or better; a peer is refused when nothing spills |
-| 10 | Docs: `configuration/gpus.md` rewritten, index rows, model pages, `adding-a-model.md` (a "Several GPUs" step like batching's), 0.5.7 changelog's breaking note | docs under 300 lines each; serve tests; no-GPU ctest |
+| 10 | Docs (done): `configuration/gpus.md` rewritten, index rows, model pages, `adding-a-model.md` (a "Several GPUs" step like batching's), 0.5.7 changelog's breaking note | docs under 300 lines each; serve tests; no-GPU ctest |
 
 After the docs land, Jay's config (his call) becomes `"gpu": "all", "gpu-mode": "peer"` for Flash-Next, DeepSeek and Hy4, `"gpu": "0"`
 for the 27B and Inkling; every entry says `"gpu": "auto"` today, so the old config stops loading on `mgpu`.
