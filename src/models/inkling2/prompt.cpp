@@ -119,7 +119,9 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
     b.sort_scr = c.take<uint8_t>(moe_sort_scratch((int) P, g.n_expert));
-    const size_t stage = (size_t) kKvHeads * R * kHeadDim * 2;   // fp16 at most
+    const size_t row_bytes = (size_t) std::max(kv_cache_row_bytes(false, false),
+                                               std::max(kv_cache_row_bytes(true, false), kv_cache_row_bytes(false, true)));
+    const size_t stage = (size_t) kKvHeads * R * row_bytes;   // staging must fit the widest cache format
     b.k_stage = c.take<uint8_t>(stage);
     b.v_stage = c.take<uint8_t>(stage);
     b.pos = c.take<int32_t>(R);
@@ -444,6 +446,7 @@ private:
         }
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
         const bool fp8 = m_.cache_fp8();
+        const bool int8 = m_.cache_int8();
         AttnPrep ap;
         ap.yq = b().yq;
         ap.yk = one ? b().yq + kProjQ : b().yk;
@@ -466,6 +469,7 @@ private:
         ap.v_cache = c.ring ? b().v_stage : c.v;
         ap.cap = c.ring ? kChunk : c.cap;
         ap.fp8 = fp8;
+        ap.int8 = int8;
         ap.q = b().q;
         ap.r = b().r;
         ap.sink = b().sink;
@@ -483,10 +487,12 @@ private:
         aa.v_chunk = ap.v_cache;
         aa.chunk_cap = ap.cap;
         aa.fp8 = fp8;
+        aa.int8 = int8;
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
-        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, strm());
+        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
+                                  kv_cache_row_bytes(fp8, int8), strm());
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
                  q8::Epilogue::Store, strm());
