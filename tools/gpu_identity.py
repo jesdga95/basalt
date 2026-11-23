@@ -55,7 +55,7 @@ def main() -> int:
         if not path.is_file():
             print(f"gpu_identity: {path} is missing", file=sys.stderr)
             return 2
-        prompts.append(path.read_text().strip())
+        prompts.append(",".join(path.read_text().split()))   # prefill.ids: its lines (before, body, after) are one prompt
     common = ["--model", a.model, "--max-context", "32768", *extra]
     logs = Path(tempfile.mkdtemp(prefix="gpu-identity-"))
     results = {}
