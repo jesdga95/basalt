@@ -50,6 +50,13 @@ template <class T> std::vector<T> host(const T* d, size_t n) {
     cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
+// Device memory of `n` bytes filled with 0xa5: what a kernel leaves unwritten shows.
+uint8_t* poisoned(size_t n) {
+    uint8_t* p = nullptr;
+    cudaMalloc(&p, n + 16);
+    cudaMemset(p, 0xa5, n + 16);
+    return p;
+}
 template <class T> T* zeros(size_t n) {
     T* p = nullptr;
     cudaMalloc(&p, n * sizeof(T) + 16);
@@ -370,11 +377,11 @@ void test_prepare() {
                     for (int d = 0; d < kHeadDim; ++d) (which ? rv : rk).push_back(val[d] * f);
                 }
             }
-        // each cache format from the same rings: the values its cells hold against the reference (INT8: within half a
-        // step of its group's scale, and the row's padding untouched)
+        // each cache format from the same rings, into poisoned caches: the values its cells hold against the reference
+        // (INT8: within half a step of its group's scale, and the row's padding written as zeros)
         for (const Kv kv : kAllKv) {
             const size_t kvb = (size_t) kKvHeads * cap * kv_bytes(kv);
-            uint8_t *kcache = zeros<uint8_t>(kvb), *vcache = zeros<uint8_t>(kvb);
+            uint8_t *kcache = poisoned(kvb), *vcache = poisoned(kvb);
             cudaMemcpy(dkr, kr.data(), kr.size() * 4, cudaMemcpyHostToDevice);
             cudaMemcpy(dvr, vr.data(), vr.size() * 4, cudaMemcpyHostToDevice);
             a.k_cache = kcache; a.v_cache = vcache;
@@ -400,7 +407,7 @@ void test_prepare() {
             std::snprintf(tag, sizeof tag, "attn_prepare values (%s%s)", full ? "full" : "window", kv == kF16 ? ", fp16" : kv_tag(kv));
             report(tag, gv, rv, tol);
             if (kv == kI8) {
-                std::printf("%-34s %s\n", "  INT8 rows' padding", pad ? "ok" : "FAIL");
+                std::printf("%-34s %s\n", "  INT8 rows' padding zeroed", pad ? "ok" : "FAIL");
                 failures += !pad;
             }
             if (!full) std::printf("  %.1f us a call (1 row%s)\n", time_us([&] { attn_prepare(a, 1, nullptr); }), kv_tag(kv));
@@ -907,7 +914,7 @@ void test_decode_prepare() {
         AttnPrep b = a;
         for (AttnPrep* x : {&a, &b}) {
             x->k_ring = dev(kr); x->v_ring = dev(vr);
-            x->k_cache = zeros<uint8_t>(kvb); x->v_cache = zeros<uint8_t>(kvb);
+            x->k_cache = poisoned(kvb); x->v_cache = poisoned(kvb);
             x->q = zeros<float>((size_t) R * kHeads * kHeadDim); x->r = zeros<float>((size_t) R * kHeads * kRel); x->sink = zeros<float>((size_t) R * kHeads);
         }
         decode_prepare(a, R, nullptr);
@@ -941,7 +948,10 @@ void test_attention_window() {
             const int R = k.R;
             std::vector<int> pos(R);
             for (int r = 0; r < R; ++r) pos[r] = k.p0 + r;
-            const std::vector<uint8_t> kc = kv_rows(kv, (size_t) kKvHeads * k.cap, 0.6f), vc = kv_rows(kv, (size_t) kKvHeads * k.cap, 1.0f);
+            std::vector<uint8_t> kc = kv_rows(kv, (size_t) kKvHeads * k.cap, 0.6f), vc = kv_rows(kv, (size_t) kKvHeads * k.cap, 1.0f);
+            if (kv == kI8)   // the padding poisoned: the rows the window writes must come out zero-padded
+                for (size_t i = 0; i < kc.size(); ++i)
+                    if (i % kv_bytes(kv) >= kHeadDim + 4) kc[i] = vc[i] = 0xa5;
             const std::vector<float> y = randn((size_t) R * kProj, 1.5f);
             const std::vector<float> tk = randn(1024 * kConv, 0.3f), tv = randn(1024 * kConv, 0.3f);
             const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
@@ -983,6 +993,18 @@ void test_attention_window() {
             std::snprintf(tag, sizeof tag, "attention_window (%s%s, %d rows at %d)", k.window ? "window" : "full", kv_tag(kv), R, k.p0);
             std::printf("%-46s %s\n", tag, same ? "bitwise = prepare + attention" : "FAIL");
             failures += !same;
+            if (kv == kI8) {
+                bool pad = true;
+                for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
+                    const std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
+                    for (int r = 0; r < R; ++r)
+                        for (int h = 0; h < kKvHeads; ++h)
+                            for (size_t x = kHeadDim + 4; x < kv_bytes(kv); ++x)
+                                pad = pad && b[((size_t) (pos[r] % k.cap) * kKvHeads + h) * kv_bytes(kv) + x] == 0;
+                }
+                std::printf("%-46s %s\n", "  the written rows' padding zeroed", pad ? "ok" : "FAIL");
+                failures += !pad;
+            }
             std::vector<uint8_t> all = host((uint8_t*) aa[1].q8, q8b);
             for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
                 const std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
