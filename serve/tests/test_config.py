@@ -287,6 +287,18 @@ class Precedence(unittest.TestCase):
             _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
             self.assertEqual(file_words, words)
 
+    def test_no_prompt_split_config_words(self):
+        for value, words in ((True, ["--no-prompt-split"]), (False, [])):
+            _, _, file_words, _ = parse([], {"engine": {"no-prompt-split": value}})
+            self.assertEqual(file_words, words)
+        # a switch: the parser lists it with no value, and the engine-flag check accepts that word
+        flags = engine_parser_flags()
+        self.assertIs(flags["--no-prompt-split"], False)
+        check_engine_flags(["--no-prompt-split"], set(flags), "config")
+        _, _, _, cli_words = parse(["--no-prompt-split"])
+        self.assertEqual(cli_words, ["--no-prompt-split"])
+        check_engine_flags(cli_words, set(flags), "cli")
+
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
         self.assertEqual(file_words, ["--route-prior", "1.5"])
