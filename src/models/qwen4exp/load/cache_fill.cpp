@@ -73,23 +73,6 @@ int cache_fill(Context& context) {
         (void) cudaGetLastError();
         return room;
     };
-    // each tier's room for experts: its card's, shared by the tiers the card holds
-    auto peer_tier_rooms = [&]() -> std::vector<uint64_t> {
-        std::vector<uint64_t> rooms(o.peer_devices.size(), 0);
-        int cur = 0, count = 0;
-        if (cudaGetDevice(&cur) != cudaSuccess || cudaGetDeviceCount(&count) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return rooms;
-        }
-        for (size_t i = 0; i < rooms.size(); ++i) {
-            const int dev = o.peer_devices[i];
-            const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
-            rooms[i] = dev < count ? card_room(dev, cur) / share : 0;
-        }
-        (void) cudaSetDevice(cur);
-        (void) cudaGetLastError();
-        return rooms;
-    };
     if (model_bytes > 0 && o.mmap_experts) {
         const auto free_ram = basalt::core::conversation_available_memory();
         if (free_ram) {
@@ -242,7 +225,6 @@ int cache_fill(Context& context) {
     context.cache_fill_bytes = &cache_fill_bytes;
     context.peer_split_bytes = peer_split_bytes;
     context.peer_expert_room = peer_expert_room;
-    context.peer_tier_rooms = peer_tier_rooms;
     return token_path(context);
 }
 

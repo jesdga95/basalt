@@ -126,7 +126,9 @@ int dispatch(Context& context) {
             std::snprintf(b, sizeof b, "%lld experts (%.1f GiB)", (long long) n, gib);
             return std::string(b);
         };
-        if (multi_gpu) {
+        if (!multi_gpu) {
+            for (size_t c = 0; c < parts.size(); ++c) parts[c] = context.peers->peer_report(c);
+        } else {
             parts[0] = "layers 0-" + std::to_string(split_at.empty() ? g.n_layers - 1 : split_at[0] - 1) + ", " +
                        experts(xcache.slots(), xcache.gib());
             for (const auto& st : stages)
@@ -134,18 +136,9 @@ int dispatch(Context& context) {
                     if (o.gpus.cards[c].device == st->dev)
                         parts[c] = "layers " + std::to_string(st->lb) + "-" + std::to_string(st->le - 1) + ", " +
                                    experts(st->cache.slots(), st->cache.gib());
-        } else {
-            parts[0] = "dense, KV, " + experts(xcache.slots(), xcache.gib());
-            for (size_t i = 0; i < o.peer_devices.size(); ++i) {
-                const basalt::core::PeerExperts& t = i == 0 ? peer : *xpeers[i - 1];
-                std::string part = t.valid() ? experts(t.resident(), t.gib()) : "no experts";
-                for (const auto& st : pstages)
-                    if (split_stages > 0 && st->tier_at == i)
-                        part += ", prompt layers " + std::to_string(st->lo) + "-" + std::to_string(st->hi - 1);
-                parts[i + 1] = part;
-            }
         }
-        basalt::log::info("basalt", "%s", basalt::model::gpu_parts_line(o.gpus, parts).c_str());
+        const std::string line = basalt::model::gpu_parts_line(o.gpus, parts);
+        if (!line.empty()) basalt::log::info("basalt", "%s", line.c_str());
     }
     if (!o.serve) report_expert_tiers();
     if (o.serve) {

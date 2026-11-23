@@ -84,7 +84,7 @@ int prompt_split(Context& context) {
     auto& src = *context.src;
     auto& xcache = *context.xcache;
     auto& peer = *context.peer;
-    auto& xpeers = *context.xpeers;
+    auto& peers = *context.peers;
     auto& drive = *context.drive;
     auto& host_res = *context.host_res;
     auto& kMaxAutoChunk = *context.kMaxAutoChunk;
@@ -99,8 +99,9 @@ int prompt_split(Context& context) {
     }
     // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
     // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
-    if (o.peer_device >= 1 && !peer.valid() && !open_peer()) return 1;
-    for (auto& st : pstages) st->tier = st->tier_at == 0 ? &peer : xpeers[st->tier_at - 1].get();
+    if (o.peer_device >= 1 && !peer.valid())
+        if (const int rc = open_peer()) return rc;
+    for (auto& st : pstages) st->tier = &peers.tier(st->tier_at + 1);
     // ---- the prompt-time split: a part of a prompt longer than a chunk is read across the cards at the cuts the shares give
     // (model::stage_cuts).  The split reads a part in the chunks the main card alone would, so the chunk boundaries and the
     // rounding of the K/V there are the same.  The largest chunk a read alone takes now (the loan's chunk follows the slots
@@ -169,18 +170,18 @@ int prompt_split(Context& context) {
         }
         return t;
     };
-    // the layers each stage reads, fixed for the run: the cards' Stages shares over the layers past the second
-    // (model::stage_cuts); card i of gpu is pstages[n - 1 - i]
+    // the layers each stage reads, fixed for the run: the shared driver's cut of the cards' Stages shares over the layers
+    // past the second (PeerPlacement::stage_first); card i of gpu is pstages[n - 1 - i]
     int split_stages = 0;   // the stages a read uses, the main card's included (0: no split)
     std::vector<int> split_cuts;   // stage k (1 .. split_stages - 1) reads [split_cuts[k - 1], split_cuts[k] or the last layer)
-    if (split_want && peer.valid() && !pstages.empty()) {
+    if (split_want && peer.valid() && !pstages.empty() && peers.peer_placement().stage_first.size() == pstages.size() + 1) {
         bool ok = true;
         const int64_t longest = std::min<int64_t>(o.max_context, kSplitRefCells) - 1;
         if (split_part(0, longest, longest).chunk <= 0) {
             basalt::core::log_prompt_split_off("basalt generate", "a " + std::to_string((long long) o.max_context) +
                                                                       "-token context is too short for it");
         } else {
-            const std::vector<int> first = basalt::model::stage_cuts(o.gpus, (int) g.n_layers, 2);
+            const std::vector<int>& first = peers.peer_placement().stage_first;
             const size_t n = first.size();
             split_cuts.assign(first.begin() + 1, first.end());
             for (size_t i = 1; i < n; ++i) {
@@ -269,6 +270,7 @@ int prompt_split(Context& context) {
         }
         basalt::core::log_prompt_split("basalt generate", on);
     }
+    if (split_stages == 0) peers.peer_drop_stages();   // the start line shows no prompt layers
     // ---- the start's one pass: every byte the phases queued lands, then what needs them landed runs
     if (!basalt::core::place_start(*context.loader, *context.reads, err)) return fatal_start_error("reading the model: " + err);
     for (auto& step : *context.after)

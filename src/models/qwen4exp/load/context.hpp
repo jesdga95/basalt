@@ -23,7 +23,6 @@ struct Context {
     const basalt::core::PackFiles* pack_files = nullptr;
     const basalt::core::ExpertFiles* expert_files = nullptr;
     bool* split_want = nullptr;
-    std::function<std::vector<uint64_t> ()> peer_tier_rooms;
     std::vector<int64_t>* split_at = nullptr;
     std::vector<int>* split_devs = nullptr;
     bool* split_same = nullptr;
@@ -95,6 +94,7 @@ struct Context {
     std::function<uint64_t()> peer_expert_room;
     basalt::core::PeerExperts* peer = nullptr;
     std::vector<std::unique_ptr<basalt::core::PeerExperts>>* xpeers = nullptr;
+    TierPeers* peers = nullptr;   ///< gpu-mode peer: the tiers above, behind the shared PeerHooks driver
     Drive* drive = nullptr;
     std::FILE ** routing = nullptr;
     basalt::core::SessionGraphs* gr = nullptr;
@@ -126,7 +126,7 @@ struct Context {
     int64_t* auto_lend_pct = nullptr;
     const int64_t* kMaxAutoChunk = nullptr;
     int64_t* auto_ceiling = nullptr;
-    std::function<bool()> open_peer;
+    std::function<int()> open_peer;   ///< 0, or the start's exit code
     const bool* adapt_fast_on = nullptr;
     int64_t* lend_from = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* stage_held = nullptr;
