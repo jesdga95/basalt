@@ -61,9 +61,10 @@ the text model.
   the windows' graphs). The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
   another program, can take it. Placement counts the card's free memory itself: it reads it when the copies are first
   placed, at a VRAM resize and at a wake, and counts every map and release of the copies and the caches after that (what
-  loads later comes out of the spare and the 256 MiB). A cache grow that finds less memory than counted (another
-  program took it, or the windows' graphs needed more than the spare) ends the engine with an error naming
-  `--vram-reserve-mib`: copies placed by a fresh reading would make placement depend on that. The copies lie back to back in one address
+  loads later comes out of the spare and the 256 MiB). A grow or a copy that cannot map what was counted (another
+  program took the memory, or graphs and modules needed more than the spare) reads the card again, sends copies back for it
+  and goes on; a grow that does not fit even then refuses its request, as when the context does not fit. The log says
+  `placement changed by a memory shortage at P`. The copies lie back to back in one address
   range; a demote packs the survivors together so whole pages go back. A window whose graph finds no device memory runs
   direct, and windows of its shape keep running without a graph (no copy moves); a batched window's graph has no such
   fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A copy table update or a cache's
@@ -80,9 +81,10 @@ the text model.
   card's own reached first. A prompt read through the staging takes the memory
   back first; a read through the decode path leaves the loan in place. Loaned copies use the card's arithmetic
   ([precision](../precision/inkling2.md)).
-- **Same tokens on every run:** with one session, placement only changes at positions the requests fix (a request's start,
-  the rebalances, the loan, a cache grow) and by counted memory, and a decode window never crosses such a position, so the
-  same greedy requests give the same tokens run to run whatever the windows' widths. The log's `copy set` names the copied
+- **Same tokens on every run:** with one session and no device map failing, placement only changes at positions the requests
+  fix (a request's start, the rebalances, the loan, a cache grow) and by counted memory, and a decode window never crosses
+  such a position, so the same greedy requests give the same tokens run to run whatever the windows' widths. A memory
+  shortage logs where placement left that rule. The log's `copy set` names the copied
   experts after each change. A different free VRAM at start, a VRAM command, a sleep, a conversation restored from the
   parked store or several sessions decoding together can give a different placement.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.

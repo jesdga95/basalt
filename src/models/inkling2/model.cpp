@@ -839,6 +839,7 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
     const uint64_t gran = copy_lay_.gran;
     uint64_t moved = 0;
     keep_free += late_room();
+    bool short_map = false;
     for (const size_t pair : by_score_desc(heat_, copy_candidates())) {
         const uint64_t stride = copy_stride(pair);
         const uint64_t start = copy_lay_.end.empty() ? 0 : CopyLayout::aligned(copy_lay_.end.back());
@@ -855,7 +856,12 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
                 mapped_ok = false;
             }
         }
-        if (!mapped_ok) break;
+        if (!mapped_ok) {   // the card had less free memory than counted: the copies stop here and the count follows the card
+            basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage: a copy's page could not be "
+                              "mapped after %lld copies", (long long) promoted());
+            short_map = true;
+            break;
+        }
         uint8_t* ptr = copies_va_ + start;
         if (cudaMemcpy(ptr, copy_source(pair), stride, cudaMemcpyHostToDevice) != cudaSuccess) break;
         if (!publish_copy(pair, ptr)) return moved;
@@ -866,6 +872,7 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         moved += stride;
     }
     if (join_placement()) trim_copies();   // a step that stopped part-way leaves no granule behind
+    if (short_map) sync_room();
     return moved;
 }
 

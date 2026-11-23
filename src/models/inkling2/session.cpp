@@ -759,43 +759,58 @@ public:
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
         const uint64_t grow = grow_bytes(target);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
+        const int64_t at = backed_;
         // the copies go back until the grow leaves the reserve free by the counted room (the caches take the reserve itself
         // only once no copy is left: the reserve is the copies' target, not a floor the caches stop at)
         const int64_t before = m_.card_copies();
-        bool room_ok = true;
-        while (m_.promoted() > 0 && m_.room() < grow + keep_free) {
-            uint64_t freed = 0;
-            if (!feed_heat() || !m_.demote(grow + keep_free - m_.room(), freed)) {
-                err = "the caches cannot grow: the expert copies could not go back to RAM";
-                room_ok = false;
-                break;
+        const auto make_room = [&] {   // false: a demote failed (the model is wedged then)
+            while (m_.promoted() > 0 && m_.room() < grow + keep_free) {
+                uint64_t freed = 0;
+                if (!feed_heat() || !m_.demote(grow + keep_free - m_.room(), freed)) {
+                    err = "the caches cannot grow: the expert copies could not go back to RAM";
+                    return false;
+                }
+                if (freed == 0) break;
             }
-            if (freed == 0) break;
-        }
-        if (m_.card_copies() != before || m_.wedged()) {
-            const std::string event = (room_ok ? "cache grow to " : "cache grow failed for ") + std::to_string(target) +
-                                      " positions at " + std::to_string(backed_);
-            m_.log_copy_change(event.c_str(), before, grow);
-        }
-        if (!room_ok) return false;
-        const uint64_t backing0 = backing_bytes();
-        bool mapped = true;
-        for (auto& a : elastic_) mapped = mapped && a->ensure(bytes, 0, err);
-        mapped = mapped && dspark_.ensure(target, err);   // DSPARK HOOK
-        if (!mapped) {
-            // the card has less free memory than placement counted: something outside it (another program, or more
-            // graph memory than the spare holds) took it. Placing copies by a fresh reading would make placement depend on
-            // that, so the engine stops instead.
-            if (caches_usable()) {
-                m_.wedge();
-                basalt::log::error("basalt inkling2", "the caches cannot grow to %lld positions: the card has less free memory than "
-                                   "the expert copies leave (%s); restart with a larger --vram-reserve-mib", (long long) target, err.c_str());
-            }
-            err = "the caches cannot grow to " + std::to_string(target) + " positions: the card has less free memory than counted";
+            return true;
+        };
+        const auto log_grow = [&](bool ok) {
+            if (m_.card_copies() != before || m_.wedged())
+                m_.log_copy_change(((ok ? "cache grow to " : "cache grow failed for ") + std::to_string(target) + " positions at " +
+                                    std::to_string(at)).c_str(), before, grow);
+        };
+        if (!make_room()) {
+            log_grow(false);
             return false;
         }
+        uint64_t backing0 = backing_bytes();
+        const auto map = [&] {
+            bool ok = true;
+            for (auto& a : elastic_) ok = ok && a->ensure(bytes, 0, err);
+            return ok && dspark_.ensure(target, err);   // DSPARK HOOK
+        };
+        bool mapped = map();
+        if (!mapped && caches_usable()) {
+            // The card has less free memory than placement counted (another program, or graphs and modules past the spare
+            // took it). As without the count: read the card again, send copies back for the grow and try once more. From
+            // here placement depends on that reading, which the line says.
+            basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage at %lld (%s)", (long long) at,
+                              err.c_str());
+            m_.sync_room();
+            backing0 = backing_bytes();   // the reading includes what the first try mapped
+            if (make_room()) {
+                err.clear();
+                mapped = map();
+            }
+        }
         m_.account((int64_t) backing_bytes() - (int64_t) backing0);
+        log_grow(mapped);
         count_backed();
+        if (!mapped) {   // no room even with every copy back: this request is refused, as when the context does not fit
+            caches_usable();
+            err = "the caches cannot grow to " + std::to_string(target) + " positions: " + err;
+            return false;
+        }
         if (positions <= backed_) return true;
         err = "the caches do not back the requested positions";
         return false;

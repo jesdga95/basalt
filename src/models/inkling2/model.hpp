@@ -143,7 +143,7 @@ public:
     /// The card's free bytes as placement counts them: read when the copies are first placed, at a VRAM resize and at a
     /// wake, and moved by every map and release of the copies and the sessions' caches (account). What else allocates
     /// (kernels, graphs) is left to the spare and the late room. Placement reads this, never a fresh query, so it follows
-    /// the requests alone.
+    /// the requests alone while no device map fails; a map that fails reads the card again (a warning says so).
     uint64_t room() const { return room_ > 0 ? (uint64_t) room_ : 0; }
     void account(int64_t mapped) { room_ -= mapped; }
     void sync_room();
