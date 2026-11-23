@@ -900,6 +900,24 @@ class ClientShapes(unittest.TestCase):
         status, _ = self.post("/v1/nothing?beta=true", body)
         self.assertEqual(status, 404)
 
+    def test_a_base_url_that_ends_in_v1(self):
+        # an Anthropic client adds /v1/messages to its base URL itself: given ".../v1" it posts /v1/v1/messages
+        body = {"model": "basalt", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+        status, b = self.post("/v1/v1/messages?beta=true", body)
+        self.assertEqual((status, b.get("type")), (200, "message"), b)
+        status, b = self.post("/v1/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, b)
+        self.assertGreater(b["input_tokens"], 0)
+        req = urllib.request.Request(self.base + "/v1/v1/messages", data=json.dumps({**body, "stream": True}).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            events = r.read().decode()
+        self.assertIn("event: message_start", events)
+        self.assertIn("event: message_stop", events)
+        for path in ("/v1/v1/chat/completions", "/v1/v1/responses"):   # only the two Anthropic paths are aliased
+            status, _ = self.post(path, body)
+            self.assertEqual(status, 404, path)
+
     def test_anthropic_mid_conversation_system(self):
         status, b = self.post("/v1/messages?beta=true", {
             "model": "basalt", "max_tokens": 50,
