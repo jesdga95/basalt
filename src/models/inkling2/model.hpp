@@ -111,10 +111,6 @@ public:
     /// until `lend(false)`.
     uint64_t reserve() const { return reserve_; }
     bool lent() const { return lent_; }
-    /// A prompt read failed and its queued work could not be run out: the staging, the card copies and the caches may still
-    /// be written, so every later request of every session is refused (wedged()).
-    void wedge() { wedged_ = true; }
-    bool wedged() const { return wedged_; }
     uint64_t held_free(uint64_t base) const { return std::max(base, reserve_); }
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
     /// room. False when even no copy at all leaves that much.
@@ -183,7 +179,6 @@ private:
     bool elastic_ = false;
     uint64_t reserve_ = 0;
     bool lent_ = false;
-    bool wedged_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;

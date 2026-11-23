@@ -4,6 +4,7 @@
 #include "models/inkling2/spill.hpp"
 
 #include <cstdio>
+#include <random>
 #include <vector>
 
 using namespace basalt::models::inkling2;
@@ -64,8 +65,27 @@ int main() {
     // the staging plan against a slot-by-slot model, over random copies and routing: every slot a chunk reads holds its
     // expert, every slot the products can read into (after a read or kept one) is staged or guarded, adjacent RAM slots go
     // in one copy, and a slot neither read nor reachable is left alone
-    uint32_t rng = 12345;
-    const auto next = [&] { return rng = rng * 1664525u + 1013904223u; };
+    // fixed layouts: card, a RAM run, a guard after a read slot, an untouched one, a RAM run, card; a kept layer whose first
+    // RAM slot is skipped; a layer all in RAM with nothing kept
+    const auto same = [](const std::vector<StageOp>& a, const std::vector<StageOp>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].kind != b[i].kind || a[i].slot != b[i].slot || a[i].n != b[i].n) return false;
+        return true;
+    };
+    {
+        const uint8_t card[8] = {1, 0, 0, 1, 0, 0, 0, 1}, want[8] = {1, 1, 1, 0, 0, 1, 1, 1};
+        expect(same(stage_plan(8, card, want, true), {{StageOp::Card, 0, 1}, {StageOp::Ram, 1, 2}, {StageOp::Guard, 3, 1},
+                                                      {StageOp::Ram, 5, 2}, {StageOp::Card, 7, 1}}),
+               "stage plan: mixed copies with sparse routing");
+        const uint8_t none[3] = {0, 0, 0}, mid[3] = {0, 1, 0};
+        expect(same(stage_plan(3, none, mid, true), {{StageOp::Guard, 0, 1}, {StageOp::Ram, 1, 1}, {StageOp::Guard, 2, 1}}),
+               "stage plan: a skipped slot after the kept ones is guarded");
+        const uint8_t ram[5] = {0, 0, 0, 0, 0};
+        expect(same(stage_plan(5, ram, nullptr, false), {{StageOp::Ram, 0, 5}}), "stage plan: a layer all in RAM is one copy");
+    }
+    std::mt19937 gen(12345);
+    const auto next = [&] { return (uint32_t) gen(); };
     for (int trial = 0; trial < 20000; ++trial) {
         const int n = 1 + (int) (next() % 40);
         const bool kept = next() % 4 != 0;

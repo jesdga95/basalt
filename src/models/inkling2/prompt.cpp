@@ -7,6 +7,7 @@
 // its last positions moved in) and the convolution rings' last kConvRing positions.
 #include "models/inkling2/prompt.hpp"
 
+#include "basalt/core/progress.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/router.hpp"
@@ -158,7 +159,6 @@ public:
             Lane& k = lane_[i];
             cudaSetDevice(k.device);
             if (k.hand) cudaEventDestroy(k.hand);
-            if (k.copy) cudaStreamSynchronize(k.copy);
             if (k.freed) cudaEventDestroy(k.freed);
             if (k.staged) cudaEventDestroy(k.staged);
             if (k.copy) cudaStreamDestroy(k.copy);
@@ -331,9 +331,17 @@ private:
     }
 
     // `n` rows (tokens, or host embedding rows) in chunks of about equal size; one chunk stays queued ahead of the host,
-    // which reports a chunk once the card has run it.
+    // which reports a chunk once the card has run it. A read that ends any other way than its final wait (an error, an
+    // exception) runs out its streams first (drain).
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
                       std::vector<int32_t>& hist, int32_t pad) {
+        struct Guard {
+            Prompt* p;
+            bool armed = true;
+            ~Guard() {
+                if (armed) p->drain();
+            }
+        } guard{this};
         const int chunks = (n + kChunk - 1) / kChunk;
         const int per = (n + chunks - 1) / chunks;
         std::string err;
@@ -341,30 +349,25 @@ private:
         for (int t0 = 0; t0 < n; t0 += per, ++k) {
             if (r.stop && r.stop()) break;
             const int rows = std::min(per, n - t0);
-            if (!chunk(tokens ? tokens + t0 : nullptr, emb ? emb + (size_t) t0 * g_.n_embd : nullptr, rows, pos + t0, err)) {
-                drain();
+            if (!chunk(tokens ? tokens + t0 : nullptr, emb ? emb + (size_t) t0 * g_.n_embd : nullptr, rows, pos + t0, err))
                 return {model::Status::Error, "inkling2: " + err};
-            }
             ds_->note(pos + t0, rows);
             if (tokens) hist.insert(hist.end(), tokens + t0, tokens + t0 + rows);
             else hist.insert(hist.end(), (size_t) rows, pad);
-            if (!ok(cudaEventRecord(done_[k % 2], strm())) || (k > 0 && !ok(cudaEventSynchronize(done_[(k - 1) % 2])))) {
-                drain();
+            if (!ok(cudaEventRecord(done_[k % 2], strm())) || (k > 0 && !ok(cudaEventSynchronize(done_[(k - 1) % 2]))))
                 return {model::Status::Error, std::string("inkling2: a prompt chunk's completion could not be waited for: ") +
                                                   cudaGetErrorString(fail_)};
-            }
             if (k > 0 && r.progress) r.progress(reported);   // the chunk before this one has run
             reported = t0 + rows;
         }
-        if (cudaStreamSynchronize(strm()) != cudaSuccess) {
-            drain();
-            return {model::Status::Error, "inkling2: the prompt failed"};
-        }
+        if (cudaStreamSynchronize(strm()) != cudaSuccess) return {model::Status::Error, "inkling2: the prompt failed"};
+        guard.armed = false;
         if (r.progress && reported > 0) r.progress(reported);
         return {};
     }
     // A failed read: every stream it queued work on runs out before the staging, the chunk buffers or a card copy it reads
-    // can be used again; when one cannot, the model refuses every later request (InklingModel::wedge).
+    // can be used again. When one cannot, the engine ends without the CUDA teardown, which would wait for that work
+    // (core::gpu_left_running).
     void drain() {
         bool out = true;
         for (int i = m_.cards() - 1; i >= 0; --i) {
@@ -380,8 +383,8 @@ private:
         if (cudaSetDevice(lane_[0].device) != cudaSuccess) out = false;
         cudaGetLastError();
         if (!out) {
-            m_.wedge();
-            basalt::log::error("basalt inkling2", "a failed prompt read's work could not be run out: every later request is refused");
+            basalt::core::gpu_left_running().store(true);
+            basalt::log::error("basalt inkling2", "a failed prompt read's work could not be run out");
         }
     }
     // The first failing call's status of the read (staging_failed), for its error.
@@ -677,8 +680,8 @@ private:
         return std::string("staging a layer's RAM experts failed") + (e != cudaSuccess ? std::string(": ") + cudaGetErrorString(e) : "");
     }
 
-    // The slots a short chunk's pairs route to, for the staging: the host waits for the router, since a short chunk reads a
-    // part of a layer's RAM experts and copying the rest costs more than the wait. Null when the readback failed.
+    // The slots a short chunk's pairs route to, for the staging: the host waits for the router, as a short chunk reads only a
+    // part of a layer's RAM experts. Null when the readback failed.
     const uint8_t* routed(int pairs) {
         if (cudaMemcpyAsync(routed_ids_, b().ids, (size_t) pairs * 4, cudaMemcpyDeviceToHost, strm()) != cudaSuccess ||
             cudaStreamSynchronize(strm()) != cudaSuccess)
