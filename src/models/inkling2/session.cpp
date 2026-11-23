@@ -739,15 +739,16 @@ public:
         return n;
     }
 
-    // ---- the console's experts: a lookup is a hit when its expert is on the card. With every expert resident that is each
-    // window's rows times the experts a row takes at each of its visits; with a spill the card's running counts say which
-    // experts the lookups went to, and those whose experts are in RAM are no hits
+    // ---- the console's experts: a lookup is a hit when its expert is on a GPU (the main card or the peer). With every expert
+    // resident that is each window's rows times the experts a row takes at each of its visits; with a spill the card's running
+    // counts say which experts the lookups went to, and those whose experts are in RAM are no hits
     ExpertCounts expert_counts() const override {
         if (!m_.spill().any() || !ex_tally_) return {lookups_, lookups_, 0, 0};
         std::vector<uint32_t> t;
         if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) return {lookups_, lookups_, 0, 0};
-        const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); }, [](int, int) { return false; });
-        return {(int64_t) sh.card, (int64_t) sh.all, 0, 0};
+        const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); },
+                                        [&](int l, int e) { return m_.peer_held(l, e); });
+        return {(int64_t) (sh.card + sh.peer), (int64_t) sh.all, 0, 0};
     }
     std::vector<CardExperts> experts_by_card() const override {
         std::vector<CardExperts> out;   // each card its layers' (the layer split spills none)
