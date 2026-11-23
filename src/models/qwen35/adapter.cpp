@@ -332,6 +332,12 @@ private:
         opt_ = &o;
         bd_ = &bd;
         req_ = &req;
+        if (o.kv_fp4) {   // neither the layer cut nor the stage copies NVFP4 cells between the cards
+            err = std::string("gpu-mode ") + (req.gpus.mode == program::GpuMode::Split ? "split" : "peer") +
+                  ": --kv nvfp4 keeps every cell on the main card, and the stage and the layer cut move fp16 and int8 cells; "
+                  "use one card (gpu 0) or --kv int8";
+            return false;
+        }
         if (req.gpus.mode == program::GpuMode::Split) return split_open(req.gpus, err);
         const model::SplitSpec s = split_spec(req.gpus);
         uint64_t all = s.fixed[0];
