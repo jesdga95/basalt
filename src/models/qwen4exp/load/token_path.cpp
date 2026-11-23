@@ -22,29 +22,14 @@ int token_path(Context& context) {
     auto& srcp = *context.srcp;
     auto& xcache = *context.xcache;
 
-    // ---- Multi-GPU: the second GPU's expert tier (filled after the RAM complement below, from it), and the further
-    // cards' tiers beside it
+    // ---- gpu-mode peer: an expert tier on each card after the main one (filled after the RAM complement below, from it),
+    // opened by the shared driver (TierPeers, model::PeerHooks)
     basalt::core::PeerExperts peer;
     std::vector<std::unique_ptr<basalt::core::PeerExperts>> xpeers;
+    TierPeers peers(peer, xpeers);
     if (o.peer_device >= 1 && (profile.empty() || srcp == nullptr || o.expert_cache <= 0)) {
         basalt::log::error("basalt generate", "a second GPU as expert tier needs an expert profile and the expert cache; run on one GPU (--gpu 0)");
         return 1;
-    }
-    // A tier card with no expert to hold is refused, not left idle: the pairs the main card does not hold, dealt out by room
-    // and share as the fill will (model::deal_experts), leave it nothing (the main card holds every expert, or the card has
-    // no room for one).
-    if (o.peer_device >= 1) {
-        std::vector<uint64_t> outside;
-        for (const auto& pr : profile)
-            if (xcache.slot_of(pr.first, pr.second) < 0) outside.push_back(basalt::core::PeerExperts::slot_bytes(pr.first));
-        const std::vector<int> owner =
-            basalt::model::deal_experts(outside, context.peer_tier_rooms(), basalt::model::peer_shares(o.gpus, basalt::model::ShareUse::Experts));
-        for (size_t i = 0; i < o.peer_devices.size(); ++i)
-            if (std::find(owner.begin(), owner.end(), (int) i) == owner.end()) {
-                basalt::log::error("basalt", "%s", basalt::model::peer_holds_nothing(o.gpus, i + 1, outside.empty() ? "the main card holds every expert"
-                                                                                                              : "no room for an expert").c_str());
-                return 2;
-            }
     }
 
     Drive drive;
@@ -322,6 +307,7 @@ int token_path(Context& context) {
 
     context.peer = &peer;
     context.xpeers = &xpeers;
+    context.peers = &peers;
     context.drive = &drive;
     context.routing = &routing;
     context.gr = &gr;
