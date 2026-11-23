@@ -757,7 +757,7 @@ public:
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
-        const uint64_t grow = grow_bytes(target);
+        uint64_t grow = grow_bytes(target);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
         const int64_t at = backed_;
         // the copies go back until the grow leaves the reserve free by the counted room (the caches take the reserve itself
@@ -798,6 +798,7 @@ public:
                               (long long) at, err.c_str());
             m_.sync_room();
             backing0 = backing_bytes();   // the reading includes what the first try mapped
+            grow = grow_bytes(target);    // and the retry needs only what it left
             if (make_room()) {
                 err.clear();
                 mapped = map();

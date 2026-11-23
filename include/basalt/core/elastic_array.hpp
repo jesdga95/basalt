@@ -25,7 +25,7 @@ public:
     /// Gives back the whole allocations that lie past `bytes` (the device is synchronised first); the address range stays.
     /// Nothing is released when the device cannot be confirmed idle or the array's backing is uncertain.
     void trim(uint64_t bytes);
-    /// False once a new extent's clear or a release could not be confirmed: the array is not grown or trimmed again.
+    /// False once a new extent's map, clear or release could not be confirmed: the array is not grown or trimmed again.
     bool usable() const { return !unusable_; }
     uint8_t* data() const { return base_; }
     uint64_t backed() const { return backed_; }

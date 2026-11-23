@@ -496,11 +496,14 @@ public:
         d.history_len = hist_n;
         req_sp.counter = draws_;
         const basalt::model::Result r = rt_.session().decode_window(d);
+        refused_ = r.status == basalt::model::Status::Refused;
+        if (refused_) basalt::log::warn("basalt serve", "%s", r.message.c_str());
         if (!r.ok()) error_ = r.message;
         return r.ok();
     }
     bool take_held(int) { return false; }
     bool window_failed() const { return false; }
+    bool window_refused() const { return refused_; }
     const char* window_error() const { return error_.c_str(); }
     void relax_note_forced(int) {}
     int accept_drafts(int T) {
@@ -664,6 +667,7 @@ private:
     FILE* draft_log_ = nullptr;
     basalt::model::ModelSession::ExpertCounts counts0_;
     std::string error_;
+    bool refused_ = false;   // the last window was refused (Status::Refused): the request ends, the engine serves on
     size_t next_block_ = 0;
     double live_ms_ = -1e9;
 };

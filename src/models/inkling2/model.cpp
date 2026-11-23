@@ -836,7 +836,12 @@ bool InklingModel::publish_copy(size_t pair, const void* ptr) {
 }
 
 uint64_t InklingModel::promote(uint64_t keep_free) {
-    if (copies_retired_ || wedged() || (size_t) promoted() == spill_order_.size() || !copy_range() || !join_placement()) return 0;
+    if (copies_retired_ || wedged() || (size_t) promoted() == spill_order_.size()) return 0;
+    if (!copy_range()) {   // no address range for the copies (with virtual memory management): placement leaves its rule
+        map_short_ = copy_lay_.gran != 0;
+        return 0;
+    }
+    if (!join_placement()) return 0;
     const size_t ne = geo().n_expert;
     const uint64_t gran = copy_lay_.gran;
     uint64_t moved = 0;
@@ -847,9 +852,9 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         const uint64_t mapped = (uint64_t) copy_maps_.size() * gran, end = start + stride;
         const uint64_t grow = end > mapped ? (end - mapped + gran - 1) / gran * gran : 0;
         if (room() < keep_free + grow) break;
-        bool mapped_ok = true;
+        bool mapped_ok = true, out_of_memory = false;
         for (uint64_t g = 0; g < grow && mapped_ok; g += gran) {
-            const unsigned long long h = core::vmm::map(copies_va_ + mapped + g, gran);
+            const unsigned long long h = core::vmm::map(copies_va_ + mapped + g, gran, &out_of_memory);
             if (h) {
                 copy_maps_.push_back(h);
                 room_ -= (int64_t) gran;
@@ -857,12 +862,21 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
                 mapped_ok = false;
             }
         }
+        if (!mapped_ok && !out_of_memory) {   // the range may hold a mapping nothing tracks
+            wedge();
+            basalt::log::error("basalt inkling2", "an expert copy's page could not be mapped; restart the engine");
+            return moved;
+        }
         if (!mapped_ok) {   // the card had less free memory than counted: the copies stop here and the count follows the card
             map_short_ = true;
             break;
         }
         uint8_t* ptr = copies_va_ + start;
-        if (cudaMemcpy(ptr, copy_source(pair), stride, cudaMemcpyHostToDevice) != cudaSuccess) break;
+        if (cudaMemcpy(ptr, copy_source(pair), stride, cudaMemcpyHostToDevice) != cudaSuccess) {
+            wedge();
+            basalt::log::error("basalt inkling2", "an expert copy upload failed; restart the engine");
+            return moved;
+        }
         if (!publish_copy(pair, ptr)) return moved;
         copy_lay_.append(stride);
         copy_slots_.push_back(pair);

@@ -51,6 +51,7 @@ public:
     bool run_window(int T, int e0, int& TB);
     bool take_held(int T);
     bool window_failed() const { return runtime_.drive.d.failed; }
+    bool window_refused() const { return false; }
     const char* window_error() const {
         return runtime_.drive.d.failed && runtime_.drive.d.fail ? runtime_.drive.d.fail : runtime_.err.c_str();
     }

@@ -64,12 +64,13 @@ the text model.
   loads later comes out of the spare and the 256 MiB). A grow or a copy that cannot map what was counted (another
   program took the memory, or graphs and modules needed more than the spare) reads the card again, sends copies back for it
   and goes on; a grow that does not fit even then refuses its request, as when the context does not fit. The log says
-  `placement changed by a memory shortage at` the position (or the start, wake or resize) where it happened. The copies lie back to back in one address
-  range; a demote packs the survivors together so whole pages go back. A window whose graph finds no device memory runs
-  direct, and windows of its shape keep running without a graph (no copy moves); a batched window's graph has no such
-  fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A copy table update or a cache's
-  backing that cannot be confirmed (a CUDA failure) stops the engine: every later request is refused. Nothing changes when
-  everything fits.
+  `placement changed by a memory shortage at` the position (or the start, wake or resize) where it happened. The copies
+  lie back to back in one address range; a demote packs the survivors together so whole pages go back. A window whose
+  graph finds no device memory runs direct, and windows of its shape keep running without a graph (no copy moves); a
+  batched window's graph has no such fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A
+  copy table update, a copy's upload, or a map or cache backing that fails for any reason but a clean lack of memory (a
+  CUDA failure) stops the engine: every later request is refused. A refused decode window ends its request with an error
+  and the engine serves the next. Nothing changes when everything fits.
 - **Which experts get a copy:** the profile's order until the session has looked experts up, then the lookups of the rows its
   windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
   grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies

@@ -87,9 +87,11 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
             return false;
         }
     }
-    const unsigned long long h = vmm::map(base_ + backed_, n);
-    if (!h) {
-        err = "out of device memory for the array";
+    bool out_of_memory = false;
+    const unsigned long long h = vmm::map(base_ + backed_, n, &out_of_memory);
+    if (!h) {   // any failure but a clean out-of-memory may leave the range mapped untracked
+        unusable_ = !out_of_memory;
+        err = out_of_memory ? "out of device memory for the array" : "the array's new backing could not be mapped";
         return false;
     }
     bool idle = false;

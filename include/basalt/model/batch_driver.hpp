@@ -55,9 +55,11 @@ public:
             ss.push_back(s);
         }
         if (ss[0] != this) return {Status::Error, who + ": a batch runs on its first session"};
+        // Refused means no session of the batch ran: a refusal after an earlier window ran is an error
         if (std::any_of(ss.begin(), ss.end(), [](const BatchSession* s) { return !s->batch_ready(); })) {
             for (int i = 0; i < n; ++i)
-                if (Result r = peers[i]->decode_window(reqs[i]); !r.ok()) return r;
+                if (Result r = peers[i]->decode_window(reqs[i]); !r.ok())
+                    return i == 0 || r.status != Status::Refused ? r : Result{Status::Error, r.message};
             return {};
         }
         BatchWindow w;
