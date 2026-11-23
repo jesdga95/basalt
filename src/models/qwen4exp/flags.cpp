@@ -145,6 +145,10 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
 }
 
 std::optional<int> finish_flags(Options& o) {
+    if (o.diag_gpu_check) {
+        basalt::log::error("basalt generate", "--diag-gpu-check does not run in Qwen3.8-Flash-Next's serving engine; tools/gpu_identity.py compares its greedy tokens");
+        return 2;
+    }
     if (o.diag_batch_check) o.serve = true;   // the batch slots exist in the serving engine, which runs the check
     if (o.resident_budget_given) {   // the resident mode with a RAM budget
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;

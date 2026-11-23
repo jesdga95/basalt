@@ -85,13 +85,32 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // path has its own buffers).  Parking saves every stage (SavedConversation::stage_images).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
-    bool split_same = false;   // both stages on one GPU, sharing everything: the hand-off's bit-exact A/B (no flag sets it)
+    bool split_same = false;   // both stages on one GPU, sharing everything: the hand-off's bit-exact A/B (--diag-gpu-same)
+    if (o.diag_gpu_same && !split_mode) {
+        basalt::log::error("basalt generate", "--diag-gpu-same needs gpu-mode split (and --diag-gpu-cut L, the layer the second stage starts at)");
+        return 2;
+    }
     if (split_mode) {
         if (!o.serve) {
             basalt::log::error("basalt generate", "gpu-mode split runs Qwen3.8-Flash-Next with --serve");
             return 2;
         }
-        split_devs = o.gpus.peers();
+        if (o.diag_gpu_same) {   // the split's reference: the same cut, the second stage on CUDA0 too, the second card untouched
+            if (o.diag_gpu_cut < 2) {
+                basalt::log::error("basalt generate", "--diag-gpu-same takes its cut from --diag-gpu-cut L, a layer from 2");
+                return 2;
+            }
+            if (o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
+                basalt::log::error("basalt serve", "conversation parking does not support a layer split on one GPU (--diag-gpu-same); "
+                                   "disable parking with --conversation-cache-mib 0");
+                return 2;
+            }
+            split_same = true;
+            split_devs = {0};
+            split_at = {o.diag_gpu_cut};
+        } else {
+            split_devs = o.gpus.peers();
+        }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;
     // two stages with the drafter and one conversation at a time pipeline their windows: a second chain of verifiers over

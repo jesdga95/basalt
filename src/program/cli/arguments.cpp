@@ -44,6 +44,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--diag-batch-check") o.diag_batch_check = true;
         else if (a == "--diag-gpu-check") o.diag_gpu_check = true;
+        else if (a == "--diag-gpu-same") o.diag_gpu_same = true;
         else if (a == "--diag-gpu-trace") o.diag_gpu_trace = next("--diag-gpu-trace");
         else if (a == "--diag-gpu-ref") o.diag_gpu_ref = next("--diag-gpu-ref");
         else if (a == "--image") o.images.push_back(next("--image"));

@@ -430,6 +430,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
             std::printf("batch check: %d windows compared, %d differ: %s\n", bc.compared, bc.differ, bc.differ ? "FAILED" : "PASSED");
             return bc.differ ? 1 : 0;
         }
+        if (o.diag_gpu_same) return fatal_start_error("--diag-gpu-same: this model does not run a layer split with both stages on one GPU");
         if (o.diag_gpu_check) {   // the prompt and its greedy steps recorded, and compared with a reference run's trace
             const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
             basalt::model::GpuTrace trace;
