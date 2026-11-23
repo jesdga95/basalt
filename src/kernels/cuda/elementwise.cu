@@ -349,6 +349,57 @@ __global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const
     }
 }
 
+// [W2] Like doorbell_publish_value_kernel, but with no router weights: the ring's own number is STORED, never
+// read-modify-written over the link.  Inkling 2's hand-off has no weights to publish (its merge re-reads them), so this
+// avoids both the RMW (which loses increments when publishes are back to back) and a dummy weights buffer.
+__global__ void doorbell_publish_store_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, int n, int k,
+                                              float* x_out, int32_t* ids_out, uint32_t* seq, uint32_t value) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    if ((int) threadIdx.x < k) ids_out[threadIdx.x] = ids[threadIdx.x];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *(volatile uint32_t*) seq = value;
+        __threadfence_system();
+    }
+}
+
+// [W2] A visit's publish that also carries what the host needs to run it (its layer and row count), and bumps its slot's
+// counter with an ATOMIC add: an atomic on system memory is safe where a plain read-modify-write loses increments.  The
+// host compares that counter against the slot's done word at run time (`doorbell_wait`), so nothing depends on a value
+// captured into the graph.
+__global__ void doorbell_publish_visit_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, int n, int k,
+                                              float* x_out, int32_t* ids_out, uint32_t* info, uint32_t layer, uint32_t rows,
+                                              uint32_t* seq) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    if ((int) threadIdx.x < k) ids_out[threadIdx.x] = ids[threadIdx.x];
+    if (threadIdx.x == 0) { info[0] = layer; info[1] = rows; }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        atomicAdd((unsigned int*) seq, 1u);
+        __threadfence_system();
+    }
+}
+
+void doorbell_publish_visit(const float* x, const int32_t* ids, int64_t n, int64_t k, float* x_out, int32_t* ids_out,
+                            uint32_t* info, uint32_t layer, uint32_t rows, uint32_t* d_seq, void* stream) {
+    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish_visit: k too large"); std::exit(1); }
+    doorbell_publish_visit_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, (int) n, (int) k, x_out, ids_out, info,
+                                                                         layer, rows, d_seq);
+    check_launch("doorbell_publish_visit");
+}
+
+void doorbell_publish_store(const float* x, const int32_t* ids, int64_t n, int64_t k, float* x_out, int32_t* ids_out,
+                            uint32_t* d_seq, uint32_t value, void* stream) {
+    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish_store: k too large"); std::exit(1); }
+    doorbell_publish_store_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, (int) n, (int) k, x_out, ids_out, d_seq,
+                                                                         value);
+    check_launch("doorbell_publish_store");
+}
+
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
     if (k > 1024) { basalt::log::error("basalt", "doorbell_publish: k too large"); std::exit(1); }

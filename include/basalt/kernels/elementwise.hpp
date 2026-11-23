@@ -112,6 +112,13 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
 /// Plan v0.3 P3: the doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
 /// (k each) into the mapped host regions, fences, and increments the mapped sequence number - replacing three
 /// device-to-host memcpy nodes (copy-engine operations in the middle of the layer chain) and the ring kernel.
+/// [W2] The same publish without router weights, storing `value` (the ring's own number) instead of incrementing: one store,
+/// no read of host memory from the card.  This is the variant a host-issued (uncaptured) doorbell wants.
+/// [W2] A visit's publish: payload + ids + (layer, rows) into mapped memory, then an atomic bump of the slot's counter.
+void doorbell_publish_visit(const float* x, const int32_t* ids, int64_t n, int64_t k, float* x_out, int32_t* ids_out,
+                            uint32_t* info, uint32_t layer, uint32_t rows, uint32_t* d_seq, void* stream);
+void doorbell_publish_store(const float* x, const int32_t* ids, int64_t n, int64_t k, float* x_out, int32_t* ids_out,
+                            uint32_t* d_seq, uint32_t value, void* stream);
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream);
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
