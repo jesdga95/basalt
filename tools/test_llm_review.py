@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -181,10 +182,35 @@ class CodeReview(unittest.TestCase):
     def test_large_diff_is_chunked_within_budget(self):
         big = "".join(f"diff --git a/src/f{i}.cpp b/src/f{i}.cpp\n--- a/src/f{i}.cpp\n+++ b/src/f{i}.cpp\n@@ -1,1 +1,1 @@\n" + "+x = 1;\n" * 1500
                       for i in range(40))
-        chunks, skipped = cr.build_chunks(big)
-        self.assertGreater(len(chunks), 1)
-        self.assertTrue(skipped)
-        self.assertLessEqual(sum(len(c) for c in chunks) / cr.CHARS_PER_TOKEN, cr.TOTAL_TOKENS + cr.FILE_TOKENS)
+        with mock.patch.object(cr, "CHUNK_TOKENS", 7000), mock.patch.object(cr, "TOTAL_TOKENS", 40000), \
+                mock.patch.object(cr, "FILE_TOKENS", 6000):
+            chunks, skipped = cr.build_chunks(big)
+            self.assertGreater(len(chunks), 1)
+            self.assertTrue(skipped)
+            self.assertLessEqual(sum(len(c) for c in chunks) / cr.CHARS_PER_TOKEN, cr.TOTAL_TOKENS + cr.FILE_TOKENS)
+
+    def test_whole_changed_files_ride_along_within_budget(self):
+        diff = "diff --git a/src/a.cpp b/src/a.cpp\n--- a/src/a.cpp\n+++ b/src/a.cpp\n@@ -1,1 +1,1 @@\n-a\n+b\n" \
+               "diff --git a/src/big.cpp b/src/big.cpp\n--- a/src/big.cpp\n+++ b/src/big.cpp\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+        full = {"src/a.cpp": "int helper();  // defined in a.cpp\n", "src/big.cpp": "x" * int(cr.FULL_FILE_TOKENS * cr.CHARS_PER_TOKEN + 10)}
+        sent = []
+        body = cr.review(diff, "", "", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m[1]["content"]) or '{"findings": []}',
+                         cfg={"model": "m"}, full=full)
+        self.assertIn("=== src/a.cpp (whole file after the change) ===", sent[0])
+        self.assertIn("int helper();", sent[0])
+        self.assertNotIn("=== src/big.cpp", sent[0])
+        self.assertIn("Seen as a diff only (too large to send whole): `src/big.cpp`", body)
+
+    def test_a_normal_pull_request_goes_whole_with_its_description(self):
+        diff = "".join(f"diff --git a/src/f{i}.cpp b/src/f{i}.cpp\n--- a/src/f{i}.cpp\n+++ b/src/f{i}.cpp\n@@ -1,1 +1,1 @@\n"
+                       + "+x = 1;\n" * 300 for i in range(12))
+        sent = []
+        cr.review(diff, "", "", chat_fn=lambda c, m, max_tokens, effort=None: sent.append(m[1]["content"]) or '{"findings": []}',
+                  cfg={"model": "m"}, context="# inkling2: doorbell\n\nParity 20/20, ABBA +9.5%")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("ABBA +9.5%", sent[0])
+        self.assertIn("src/f0.cpp, src/f1.cpp", sent[0])
+        self.assertIn("diff --git a/src/f11.cpp", sent[0])
 
 
 if __name__ == "__main__":
