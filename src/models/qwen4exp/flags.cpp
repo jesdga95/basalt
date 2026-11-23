@@ -36,7 +36,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
     else if (a == "--no-capture") o.no_capture = true;
     else if (a == "--no-pool") o.no_pool = true;
-    else if (a == "--diag-gpu-experts") o.diag_gpu_experts = true;
+    else if (a == "--diag-fixed-experts") o.diag_fixed_experts = true;
     else if (a == "--stage-timing") o.stage_timing = true;
     else if (a == "--graph-only") { o.graph_only = true; o.generates = false; }
     else if (a == "--gpu-only-full") o.gpu_only_full = true;

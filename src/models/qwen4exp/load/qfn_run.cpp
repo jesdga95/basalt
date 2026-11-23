@@ -232,7 +232,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
     // the default stays.
     double main_link_gbps = 0;   // the probed host->device bandwidth
-    if (o.diag_gpu_experts) {   // every missed expert over PCIe on the GPU, no CPU rows of the prompt either
+    if (o.diag_fixed_experts) {   // a prompt's missed experts over PCIe on the GPU, no CPU rows (the windows: serve/verify)
         o.pcie_frac = 1.0;
         o.prefill_cpu_share = 0.0;
     }

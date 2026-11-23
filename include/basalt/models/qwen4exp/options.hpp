@@ -96,9 +96,10 @@ struct Options : CommonOptions {
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
-    /// --diag-gpu-experts: a GPU computes every expert row, in the windows and the prompt (the missed experts read over
-    /// PCIe, no CPU share): placements that differ (a split and its reference on one card) then compute the same rows
-    bool diag_gpu_experts = false;
+    /// --diag-fixed-experts: every expert row runs the same way whatever the cards hold: a prompt's on the GPU (the
+    /// missed experts read over PCIe, no CPU share), a window's on the CPU pool (the windows see no expert in VRAM), so
+    /// placements that differ (a split and its reference on one card) compute the same rows
+    bool diag_fixed_experts = false;
     /// gpu-mode peer: the expert tier's cards after the main one (the first is `peer_device`; -1 and empty: none), from
     /// the run's cards (CommonOptions::gpus)
     int peer_device = -1;
