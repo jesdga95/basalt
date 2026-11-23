@@ -1,0 +1,34 @@
+{
+  "submitter": "Stephen304",
+  "date": "2026-11-20",
+  "commit": "d3b7574296",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "3.0 x16"
+    }
+  ],
+  "ram_gib": 94,
+  "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+  "ram_gbps": 56.0,
+  "os": "Windows",
+  "quant": "IQ1_M",
+  "kv": "int8",
+  "prefill_16k_tps": 3771.5,
+  "prefill_64k_tps": 4125.8,
+  "decode_tps": 202.6,
+  "decode_conv_tps": 129.8,
+  "decode_struct_tps": 240.7,
+  "decode_prose_tps": 137.1,
+  "accept_conv_pct": 66.3,
+  "accept_struct_pct": 93.7,
+  "accept_prose_pct": 62.7,
+  "draft_len_conv": 2.6,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 1.8,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

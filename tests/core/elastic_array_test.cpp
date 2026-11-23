@@ -1,4 +1,4 @@
-// core::ElasticArray: growing by steps keeps every byte already backed at its address, zeroes the new bytes, and `to_back`
+// core::ElasticArray: growing by steps keeps every byte already backed at its address, zeroes the new bytes, and `growth`
 // names exactly what a grow maps; a trim followed by a grow zeroes again. Needs a CUDA device; skips (77) without one.
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/vmm.hpp"
@@ -43,10 +43,10 @@ int main() {
     std::string err;
     check(a.open(step * 12 + 12345, err), "open reserves the range");
     check(a.backed() == 0 && a.capacity() >= step * 12 + 12345, "nothing is backed after open");
-    check(a.to_back(1) == step && a.to_back(step) == step && a.to_back(step + 1) == 2 * step, "to_back rounds up to whole steps");
-    check(a.to_back(a.capacity() + 1) == 0, "to_back of more than the range is 0 (ensure refuses it)");
+    check(a.growth(1) == step && a.growth(step) == step && a.growth(step + 1) == 2 * step, "growth rounds up to whole steps");
+    check(a.growth(a.capacity() + 1) == 0, "growth of more than the range is 0 (ensure refuses it)");
     check(a.ensure(step / 3, 0, err) && a.backed() == step, "the first ensure backs one step");
-    check(a.to_back(step / 3) == 0, "to_back of what is backed is 0");
+    check(a.growth(step / 3) == 0, "growth of what is backed is 0");
     uint8_t* const base = a.data();
     std::vector<uint8_t> want(step);
     for (uint64_t i = 0; i < step; ++i) want[i] = pattern(i);
@@ -54,9 +54,9 @@ int main() {
     // grow past each step boundary: the old bytes stay where they were, the new ones are zero, the address does not move
     for (int k = 2; k <= 9; ++k) {
         const uint64_t ask = step * (uint64_t) (k - 1) + 1;
-        const uint64_t g = a.to_back(ask), before = a.backed();
+        const uint64_t g = a.growth(ask), before = a.backed();
         check(a.ensure(ask, 0, err), "ensure past a step boundary");
-        check(a.backed() == before + g && a.backed() == step * (uint64_t) k, "to_back named what the ensure mapped");
+        check(a.backed() == before + g && a.backed() == step * (uint64_t) k, "growth named what the ensure mapped");
         check(a.data() == base, "the address does not move");
         check(read(a, 0, before) == want, "the bytes backed before the grow are unchanged");
         const std::vector<uint8_t> fresh = read(a, before, a.backed());
@@ -72,7 +72,7 @@ int main() {
     check(a.backed() == step * 3 && a.data() == base, "trim keeps the steps up to the bytes asked");
     check(read(a, 0, step * 3) == want, "trim leaves the kept steps as they were");
     check(a.ensure(step * 6, 0, err) && a.backed() == step * 6, "a grow after a trim backs the range again");
-    check(read(a, 0, step * 3) == want, "reto_back leaves the retained steps unchanged");
+    check(read(a, 0, step * 3) == want, "regrowth leaves the retained steps unchanged");
     const std::vector<uint8_t> again = read(a, step * 3, step * 6);
     bool zero = !again.empty();
     for (uint8_t b : again) zero = zero && b == 0;

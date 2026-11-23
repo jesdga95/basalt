@@ -119,6 +119,9 @@ struct Options {
     uint64_t gpu_weight_bytes = 0;      ///< the weights the adapter put on the main card (its "GiB on the GPU" load figure, no KV cache)
     bool vision = false;                ///< requests may carry images
     bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
+    bool kv_fp4 = false;                ///< with kv_int8: NVFP4 codes in those buffers instead (kernels::KvInt8::fp4)
+    /// The cache format the size helpers take: 0 fp16, 1 int8, 2 NVFP4.
+    int kv_format() const { return kv_fp4 ? 2 : kv_int8 ? 1 : 0; }
     /// K/V streaming: each attention layer keeps its first kv_resident cells on the card and the rest in page-locked RAM,
     /// read over the bus by every decode window and staged to the card for each prompt chunk (0, or at least max_context:
     /// all on the card)
@@ -169,14 +172,14 @@ uint64_t prompt_split_main_bytes(const Geometry& g, const BlockDrafter& drafter,
 int64_t resident_cells(int64_t max_context, int64_t kv_resident);
 /// Device bytes one session takes (its KV cells on the card, recurrent states and window rows) on a card that holds layers
 /// [lb, le) (le 0: to the last); the logits and the drafter's state on the card that holds layer 0.
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8 = false, int64_t kv_resident = 0, int lb = 0,
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, int kv = 0, int64_t kv_resident = 0, int lb = 0,
                        int le = 0);
 /// Device bytes one session's cells and recurrent state take in layer `il`.
-uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident);
+uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, int kv, int64_t kv_resident);
 /// Page-locked host bytes one session's streamed K/V takes (0 without streaming).
-uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident);
+uint64_t session_host_bytes(const Geometry& g, int64_t max_context, int kv, int64_t kv_resident);
 /// Device bytes the model's shared scratch takes (with streaming, the VRAM copy a prompt chunk reads one layer's far cells from).
-uint64_t shared_bytes(const Geometry& g, int64_t max_context, bool kv_int8 = false, int64_t kv_resident = 0);
+uint64_t shared_bytes(const Geometry& g, int64_t max_context, int kv = 0, int64_t kv_resident = 0);
 /// Device bytes a session's block drafter keeps (its context ring and its window rows); 0 without one.
 uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd);
 /// The layer split's inputs for `o` (its sessions, context and drafter) on a main card with `main_free` bytes free and a second

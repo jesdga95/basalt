@@ -2781,18 +2781,30 @@ private:
     // generation past the prompt, the expert tier holding the rest), the tier gives back its spare slots and the mapping is
     // tried again, then lends all its slots and takes back what is left once the caches have grown (as DeepSeek's caches do).
     bool grow_failed_ = false;   // the last ensure_positions found no room (a refusal: nothing was run past `backed_`)
-    // the device bytes the sparse layers' caches take to grow from `backed_` to `target` positions (a page more each array)
+    // the exact remaining device bytes the sparse layers' caches will map to reach `target` positions
+    // (ElasticArray::ensure grows each array in steps of 4 granules = 8 MiB on 2 MiB VMM pages)
     uint64_t grow_bytes(int64_t target) const {
-        int sparse = 0;
-        for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
-        return (uint64_t) ((double) (target - backed_) * cell_bytes()) + (uint64_t) sparse * 2 * (2ull << 20);
+        constexpr uint64_t kStep = 8ull << 20;
+        auto need = [&](const std::unique_ptr<core::ElasticArray>& a, uint64_t bytes) -> uint64_t {
+            if (!a || bytes <= a->backed()) return 0;
+            const uint64_t want = std::min(a->capacity(), (bytes + kStep - 1) / kStep * kStep);
+            return want > a->backed() ? want - a->backed() : 0;
+        };
+        uint64_t total = 0;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) continue;
+            total += need(ea_[(size_t) l], (uint64_t) target * sparse_row_bytes());
+            total += need(pea_[(size_t) l], (uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2);
+        }
+        return total;
     }
     bool ensure_positions(int64_t positions, std::string& err) {
         grow_failed_ = false;
         if (positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
         const uint64_t keep = tier_ ? tier_->free_floor() : 256ull << 20;
-        for (int attempt = 0; attempt < 3; ++attempt) {
+        bool lent = false, lent_all = false;
+        for (int attempt = 0; attempt < 4; ++attempt) {
             std::string e;
             bool ok = true;
             for (int l = 0; ok && l < g_.n_layers; ++l) {
@@ -2802,20 +2814,28 @@ private:
             }
             if (ok) {
                 backed_ = target;
-                if (attempt == 2 && !big_.rows) {   // lent here, outside a prompt (which takes its slots back at its end)
+                if (lent && !big_.rows) {   // lent here, outside a prompt (which takes its slots back at its end)
                     std::string r;
                     if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "the latent caches took expert slots at %lld positions: %s", (long long) target, r.c_str());
                 }
                 return true;
             }
-            if (!tier_ || attempt == 2) {
+            if (!tier_ || attempt == 3 || lent_all) {
+                if (lent && !big_.rows) {
+                    std::string r;
+                    tier_->reclaim(r);
+                }
                 err = "the latent caches cannot grow to " + std::to_string(target) + " positions: " + e + "; a smaller --max-context leaves more for the expert tier";
                 grow_failed_ = true;
                 return false;
             }
             cudaStreamSynchronize(stream_);
             if (attempt == 0) tier_->shrink();
-            else if (!tier_->partial_lend() || !tier_->lend(grow_bytes(target))) tier_->lend_all();
+            else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) lent = true;
+            else {
+                tier_->lend_all();
+                lent = lent_all = true;
+            }
         }
         return false;
     }

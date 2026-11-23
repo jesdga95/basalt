@@ -279,7 +279,7 @@ public:
         bool ok = true;
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
         const int64_t E = g_.n_embd, R = kMaxRows;
-        const size_t elem = m_.cache_fp8() ? 1 : 2;
+        const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8());
         const int64_t ctx = m_.context();
         int max_slot = 0;
         for (const Visit& v : g_.visits) max_slot = std::max(max_slot, v.slot);
@@ -291,7 +291,7 @@ public:
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
-            const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem;
+            const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
                     auto a = std::make_unique<core::ElasticArray>();
@@ -602,8 +602,8 @@ public:
     // the convolutions' rings by checkpoint (running_state). A window ring holds window + kMaxRows positions and a
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
     // rows past it.
-    size_t elem() const { return m_.cache_fp8() ? 1 : 2; }
-    uint64_t cell_bytes() const { return (uint64_t) kKvHeads * kHeadDim * elem(); }
+    size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
+    uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
 
     static model::Result wedged() { return {model::Status::Error, "inkling2: the model is wedged; restart the engine"}; }
     // False once a cache's backing could not be confirmed (a clear or a release): the model stops then.
@@ -686,7 +686,7 @@ public:
     // The device bytes the caches map to back `positions` positions (ensure_positions), the allocation rounding included.
     uint64_t grow_bytes(int64_t positions) const {
         uint64_t n = dspark_.grow_bytes(positions);   // DSPARK HOOK
-        for (const auto& a : elastic_) n += a->to_back(cell_bytes() * (uint64_t) positions);
+        for (const auto& a : elastic_) n += a->growth(cell_bytes() * (uint64_t) positions);
         return n;
     }
     // A conversation starts over (a prompt at position 0): the caches give back the cells past what it needs (never below
@@ -706,7 +706,7 @@ public:
             m_.promote(m_.held_free(kElasticKeep) + grow_bytes(keep));
         }
     }
-    size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem(); }
+    size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * row_bytes(); }
     size_t conv_ring_bytes() const { return (size_t) kConvRing * (2 * kKvHeads * kHeadDim + 2 * (size_t) g_.n_embd) * 4; }
 
     size_t running_bytes() const override {
@@ -746,12 +746,12 @@ public:
         return {};
     }
 
-    int cell_format() const { return m_.cache_fp8() ? 1 : 3; }   // 3: fp16 rows, 1: unit-scale E4M3
+    int cell_format() const { return m_.cache_int8() ? 4 : m_.cache_fp8() ? 1 : 3; }   // 3: fp16, 1: E4M3, 4: scaled INT8
 
     size_t cells_bytes(int64_t positions) const override {
         size_t n = 0;
         for (const VisitCache& c : vc_)
-            if (!c.ring) n += 2 * (size_t) positions * kKvHeads * kHeadDim * elem();
+            if (!c.ring) n += 2 * (size_t) positions * cell_bytes();
         return n + dspark_.cells_bytes(positions);   // DSPARK HOOK
     }
 
@@ -761,7 +761,7 @@ public:
         if (positions < 0 || positions > backed_) return {model::Status::Error, "inkling2: positions past the backed caches"};
         cudaStreamSynchronize(stream_);
         kv.clear();
-        const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
+        const size_t run = (size_t) positions * cell_bytes();
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
             core::ConversationKv k;
@@ -789,7 +789,7 @@ public:
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
         cudaStreamSynchronize(stream_);
-        const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
+        const size_t run = (size_t) positions * cell_bytes();
         size_t i = 0;
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
@@ -847,7 +847,7 @@ public:
         const std::string n = std::to_string(expert_pairs() - m_.spill().spilled);
         uint64_t ram = 0;
         for (int l = 0; l < g_.n_layers; ++l) ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
-        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") +
+        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_int8() ? " kv=int8 " : m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") +
                program::spill_words({0, expert_pairs(), 0});
     }
 
@@ -991,6 +991,7 @@ private:
         ap.v_cache = c.v;
         ap.cap = c.cap;
         ap.fp8 = m_.cache_fp8();
+        ap.int8 = m_.cache_int8();
         ap.q = x.q_;
         ap.r = x.r_;
         ap.sink = x.sink_;
@@ -1005,6 +1006,7 @@ private:
         aa.v_cache = c.v;
         aa.cap = c.cap;
         aa.fp8 = m_.cache_fp8();
+        aa.int8 = m_.cache_int8();
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         aa.gate = ap.yq + kOffGate;

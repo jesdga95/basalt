@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
     bias_h[201] = bias_h[77];
     Dev<float> gate(gate_h), bias(bias_h);
 
-    const int Tmax = 11;
+    const int Tmax = 68;   // 64 tokens is where the router takes four gate rows a block; 65 leaves a tail block of one
     auto x_h = randn((size_t) Tmax * ND, 3);
     Out all = run(gate, bias, x_h, Tmax, a);
     double worst_logit = 0, worst_w = 0, rms_num = 0, rms_den = 0;
@@ -112,9 +112,9 @@ int main(int argc, char** argv) {
     v.expect(worst_w < 1e-4, "weights rel error");
     v.expect(id_mismatch == near_ties, "ids differ beyond near-ties");
 
-    // ---- window width and position independence: bitwise
+    // ---- window width and position independence: bitwise, across the width where the four-row path starts (64)
     bool bitwise = true;
-    for (int T : {1, 2, 3, 4}) {
+    for (int T : {1, 2, 3, 4, 64, 65}) {
         for (int start : {0, 3, 7}) {
             if (start + T > Tmax) continue;
             std::vector<float> xs(x_h.begin() + (size_t) start * ND, x_h.begin() + (size_t)(start + T) * ND);
@@ -128,6 +128,22 @@ int main(int argc, char** argv) {
     }
     std::printf("window/position independence: %s\n", bitwise ? "bitwise identical" : "DIFFERS");
     v.expect(bitwise, "output depends on window width or position");
+
+    // ---- the kernel it replaces, token by token: a one-token call is below the four-row path's 64-token threshold,
+    // so it runs the row-at-a-time kernel while the 68-token call runs four rows a block
+    {
+        bool same = true;
+        for (int t = 0; t < Tmax; ++t) {
+            std::vector<float> xs(x_h.begin() + (size_t) t * ND, x_h.begin() + (size_t)(t + 1) * ND);
+            Out o = run(gate, bias, xs, 1, a);
+            same = same && !std::memcmp(&o.logits[0], &all.logits[(size_t) t * NE], NE * 4);
+            same = same && !std::memcmp(&o.ids[0], &all.ids[(size_t) t * K], K * 4);
+            same = same && !std::memcmp(&o.w[0], &all.w[(size_t) t * K], K * 4);
+        }
+        std::printf("four gate rows a block vs the row-at-a-time kernel, one token at a time: %s\n",
+                    same ? "bitwise identical" : "DIFFERS");
+        v.expect(same, "the four-row path differs from the row-at-a-time kernel");
+    }
 
     // ---- tie order: experts 77 and 201 are identical; a token that selects either selects 77 first
     {
@@ -202,8 +218,8 @@ int main(int argc, char** argv) {
         v.expect(h == kFrozen, "ids and weights equal the frozen kernel");
     }
 
-    // ---- microbench
-    for (int T : {1, 4}) {
+    // ---- microbench (68 crosses the width where the four-row path starts, 64)
+    for (int T : {1, 4, 68}) {
         Dev<float> dx(std::vector<float>(x_h.begin(), x_h.begin() + (size_t) T * ND)), dl((size_t) T * NE), dw((size_t) T * K);
         Dev<int32_t> di((size_t) T * K);
         const double us = bench_stream_us([&](void* st) { router(dx.p, gate.p, bias.p, T, a, dl.p, di.p, dw.p, st); });
@@ -220,7 +236,7 @@ int main(int argc, char** argv) {
             check(cudaMalloc(&g, (size_t) NE * ND * 4), "cudaMalloc");
             check(cudaMemcpy(g, gate.p, (size_t) NE * ND * 4, cudaMemcpyDeviceToDevice), "copy");
         }
-        for (int T : {1, 4}) {
+        for (int T : {1, 4, 68}) {
             Dev<float> dx(std::vector<float>(x_h.begin(), x_h.begin() + (size_t) T * ND)), dl((size_t) T * NE), dw((size_t) T * K);
             Dev<int32_t> di((size_t) T * K);
             int i = 0;

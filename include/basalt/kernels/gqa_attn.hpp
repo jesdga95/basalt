@@ -24,12 +24,19 @@ constexpr int kGqaMaxWindow = 16;
 
 /// An int8 K/V cache in place of the fp16 one: codes [cell][n_kv][256], fp16 scales [cell][n_kv][4] (one per 64 values,
 /// amax / 127, codes rounded to nearest).  `k` null: the fp16 cache.
+/// `fp4`: the same four buffers hold NVFP4 instead: E2M1 codes [cell][n_kv][128] bytes (value 2i in byte i's low nibble),
+/// E4M3 scales [cell][n_kv][16] bytes (one per 16 values, amax / 6) in `ks` / `vs`.  K (and every query read against it)
+/// is turned by the normalized 256-point Hadamard transform before it is rounded; V is stored as it is.
 struct KvInt8 {
     int8_t* k = nullptr;
     int8_t* v = nullptr;
     uint16_t* ks = nullptr;
     uint16_t* vs = nullptr;
+    bool fp4 = false;
 };
+/// Bytes of a run of `values` cache values' codes, and of their scales, in either quantized format.
+constexpr size_t kv_code_bytes(size_t values, bool fp4) { return fp4 ? values / 2 : values; }
+constexpr size_t kv_scale_bytes(size_t values, bool fp4) { return fp4 ? values / 16 : values / 64 * 2; }
 
 /// A cache in two places: cells from `at` on are in these buffers instead (cell c at row c - at there, the same layout:
 /// fp16 `k`, `v`, or the int8 `q8`), cells below `at` in the main ones.  A cache streamed from page-locked host memory
@@ -77,6 +84,9 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
 /// The device whose SM count plans the int8 prompt attention's launch (its key splits, so its rounding); -1 (the default):
 /// the current one.  A card that reads some of the main card's layers plans as the main card, so its rows are the main card's.
 void gqa_prompt_plan_device(int device);
+/// The first `cells` cells of an NVFP4 cache `f4` (every KV head, K and V) into the int8 buffers `out`: the decoded
+/// values rounded by the int8 cache's rule.  A prompt chunk reads them through the int8 kernel.
+void kv4_to_int8(const KvInt8& f4, const KvInt8& out, int64_t cells, int n_kv, void* stream);
 /// Scratch floats gqa_prompt_attn needs to split a T-row chunk's cells `splits` ways (an int8 cache).
 size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits);
 /// `split_scratch` (optional, `split_floats` floats): lets an int8-cache launch split its cells over more blocks.
