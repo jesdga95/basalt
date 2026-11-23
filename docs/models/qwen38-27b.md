@@ -35,7 +35,8 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   scale per 64 values), `--kv nvfp4` 18 KiB (E2M1 codes with an E4M3 scale per 16 values, keys turned by a Hadamard
   transform; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16 and the
   full 262,144 in int8. `--kv nvfp4` adds one int8 copy of a layer's positions that prompt chunks read (2 KiB per position
-  of `--max-context`), runs on one card and not with `--kv-resident`. The start refuses a context that does not fit and
+  of `--max-context`), runs on one card (`gpu auto` leaves the others idle, a list of several is refused) and not with
+  `--kv-resident`. The start refuses a context that does not fit and
   names the free memory.
 - **K/V streaming:** `--kv-resident N` (default 0, off) keeps each attention layer's first N positions on the card and the
   rest in page-locked RAM, so a context or `--parallel` whose cache does not fit the card still starts. Attention reads every
