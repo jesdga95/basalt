@@ -340,7 +340,8 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         return false;
     }
     const auto& f = lay.fmt[(size_t) layer];
-    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
+    const auto L = f.relu2 ? basalt::kernels::native_expert_layout_relu2(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                           : basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
     return launch_layout(layer, L, x, ids, n_tok, k, kind, err, out);
 }
 
@@ -392,7 +393,7 @@ namespace {
 /// Whether two layouts run the same grouped kernels.
 bool same_kernels(const basalt::kernels::NativeExpertLayout& a, const basalt::kernels::NativeExpertLayout& b) {
     return a.gu_type == b.gu_type && a.up_type == b.up_type && a.d_type == b.d_type && a.n_embd == b.n_embd &&
-           a.n_ff == b.n_ff && (a.swiglu_limit > 0.0f) == (b.swiglu_limit > 0.0f);
+           a.n_ff == b.n_ff && (a.swiglu_limit > 0.0f) == (b.swiglu_limit > 0.0f) && a.relu2 == b.relu2;
 }
 
 }  // namespace

@@ -302,6 +302,29 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_NEMOTRONH)
+add_library(nemotronh_kernels STATIC src/models/nemotronh/ops.cu)
+target_include_directories(nemotronh_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(nemotronh_kernels PUBLIC ${_gpu_runtime_target})
+add_library(model_nemotronh STATIC src/models/nemotronh/adapter.cpp src/models/nemotronh/pretok_nemotronh.cpp
+  src/models/nemotronh/pack.cpp src/models/nemotronh/model.cpp src/models/nemotronh/session.cpp)
+target_include_directories(model_nemotronh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
+target_link_libraries(model_nemotronh PUBLIC model tokenizer nemotronh_kernels expert_tier tiers kernels window_gemm prefill_fp4
+  prefill_fp8 core ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  add_executable(nemotronh_pretok_test src/models/nemotronh/pretok_test.cpp src/models/nemotronh/pretok_nemotronh.cpp)
+  target_include_directories(nemotronh_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(nemotronh_pretok_test PRIVATE tokenizer)
+  basalt_cpu_test(NAME nemotronh_pretok_test COMMAND nemotronh_pretok_test)
+  # the whole model against tests/models/nemotronh/reference.py's float64 logits (a converted pack and its REF.bin as
+  # arguments; skipped without them)
+  add_executable(nemotronh_model_parity tests/models/nemotronh/model_parity.cpp)
+  target_link_libraries(nemotronh_model_parity PRIVATE model_nemotronh ${_gpu_runtime_target})
+  basalt_gpu_test(NAME nemotronh_model_parity COMMAND nemotronh_model_parity)
+  set_tests_properties(nemotronh_model_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+endif()
+endif()
+
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp

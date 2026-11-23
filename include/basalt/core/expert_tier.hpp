@@ -45,6 +45,7 @@ struct ExpertTierSpec {
         int gu_type = 0, d_type = 0;
         uint64_t offset = 0, blob_bytes = 0;
         float clamp = 0;   ///< the SwiGLU clamp of the layer's experts (0: none)
+        bool relu2 = false;   ///< squared-ReLU experts with no gate rows (kernels::native_expert_layout_relu2)
     };
     std::string area;   ///< log area, "basalt <model>"
     std::string name;   ///< the model's name in refusals
