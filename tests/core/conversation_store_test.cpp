@@ -7,8 +7,9 @@
 // read that leaves the K/V in its files gives the same bytes through its sink as a whole read.  A conversation
 // written from its source a buffer at a time (as from a session's device buffers) leaves the same files as the queued
 // write of its image, and a write that fails leaves the files and the index as they were; one the budget does not
-// hold is refused or reported, and the budget does not count what a read still holds open.  A read buffer that could
-// not be allocated is allocated again by the next read, and the conversation stays.
+// hold is refused or reported, and the budget does not count what a read still holds open; one that fails before its
+// entry is indexed leaves the copy it would replace.  A read buffer that could not be allocated is allocated again by
+// the next read, and the conversation stays.
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
@@ -16,8 +17,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -30,6 +33,23 @@
 #include <vector>
 
 using namespace basalt::core;
+
+// The test's operator new: one allocation of exactly `fail_new_of` bytes fails (0: none).  Its delete frees through a
+// pointer, which the compiler does not pair with a new it sees.
+namespace {
+std::atomic<size_t> fail_new_of{0};
+void free_new(void* p) { std::free(p); }
+void (*volatile release)(void*) = free_new;
+}  // namespace
+
+void* operator new(std::size_t n) {
+    size_t want = n;
+    if (n != 0 && fail_new_of.compare_exchange_strong(want, 0)) throw std::bad_alloc();
+    if (void* p = std::malloc(n != 0 ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { release(p); }
+void operator delete(void* p, std::size_t) noexcept { release(p); }
 
 namespace {
 int failures = 0;
@@ -496,6 +516,39 @@ void failed_write_keeps_stored(const std::string& dir, uint64_t id) {
         CHECK(basalt::platform::file_size(dir + "/" + fresh, bytes));
         CHECK(d.stats().bytes == 0);
     }
+    remove_dir(dir);
+}
+
+// A write's entry in the index is made before its file takes the conversation's name: an allocation that fails there
+// leaves the stored copy it would replace as it was, after a restart too.
+void index_before_name(const std::string& dir, uint64_t id) {
+    std::string err;
+    std::vector<int32_t> ids;
+    const SavedConversation x = shaped(kShapes[0], ids);
+    const SavedConversation y = shaped(kShapes[0], ids);   // the same tokens, other bytes: the same file name
+    const std::vector<int32_t> p = prompt_at(ids, ids.size());
+    const auto holds = [&](ConversationStore& st, const SavedConversation& want) {
+        const auto m = st.best(p.data(), p.size(), {}, true);
+        SavedConversation got;
+        CHECK(m.tokens == (int64_t) ids.size() && st.load(m, got, err));
+        CHECK(same_state(got.live, want.live) && same_kv(got.kv, want.kv));
+    };
+    {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        CHECK(st.write(source(x), err));
+        fail_new_of = ids.size() * sizeof(int32_t);   // the entry's tokens
+        CHECK(!st.write(source(y), err) && err == "conversation store: allocation failed");
+        CHECK(fail_new_of == 0 && st.stats().written == 1);
+        fail_new_of = 0;
+        CHECK(st.stats().files == 1);
+        holds(st, x);
+    }
+    Store st;
+    CHECK(st.open(dir, id, 1ull << 30, err));
+    holds(st, x);
+    CHECK(st.write(source(y), err));
+    holds(st, y);
     remove_dir(dir);
 }
 
@@ -1308,6 +1361,7 @@ int main() {
     kv_left_in_files(dir + "-kv", id);
     written_from_source(dir + "-source", id);
     failed_write_keeps_stored(dir + "-failed", id);
+    index_before_name(dir + "-index", id);
     written_within_budget(dir + "-budget", id);
     same_name_again(dir + "-again", id);
     interrupted_write(dir + "-interrupted", id);

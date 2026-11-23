@@ -135,7 +135,10 @@ private:
     class KvFileRead;
     class KvQueuedRead;
     void writer();
-    Entry& index_locked(const ConversationSource& c, uint64_t bytes, bool own_file);
+    std::unique_ptr<Entry> entry_of(const ConversationSource& c, uint64_t bytes) const;
+    std::vector<const Entry*> superseded_locked(const Entry& e) const;
+    Entry& place_locked(std::unique_ptr<Entry> e);
+    void supersede_locked(std::vector<const Entry*>& superseded, const Entry& e, bool own_file);
     bool write_now(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& why,
                    std::string* staged);
     bool write_job(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& error,

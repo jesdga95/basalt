@@ -1336,49 +1336,64 @@ size_t stored_end(const std::vector<int32_t>& ids, const Checks& checks) {
 
 }  // namespace
 
-// Indexes a conversation of `bytes` in place of the entries it supersedes: its own earlier copy and the same
-// conversation a turn back.  `own_file`: the file of its name is this one's already and stays.
-ConversationStore::Entry& ConversationStore::index_locked(const ConversationSource& c, uint64_t bytes, bool own_file) {
-    const std::vector<int32_t>& ids = *c.ids;
-    const std::vector<ConversationImageKey>& imgs = *c.imgs;
-    ++revision_;
+// The entry of a conversation of `bytes`, not indexed yet: what its indexing allocates, allocated.
+std::unique_ptr<ConversationStore::Entry> ConversationStore::entry_of(const ConversationSource& c, uint64_t bytes) const {
     auto e = std::make_unique<Entry>();
-    e->key = key_of(ids, imgs, c.cvec);
+    e->key = key_of(*c.ids, *c.imgs, c.cvec);
     e->name = conversation_name(identity_, e->key);
-    // the same conversation a turn back: its deepest checkpoint is one this chain holds
-    auto held = [&](const std::vector<int32_t>& eids, int64_t len) {
-        if ((size_t) len > ids.size() || std::memcmp(eids.data(), ids.data(), (size_t) len * 4) != 0) return false;
-        if ((size_t) len == ids.size()) return true;
-        for (const ConversationCheckpoint* k : c.checkpoints) if ((int64_t) k->ids.size() == len) return true;
-        return false;
-    };
-    for (size_t i = 0; i < entries_.size();) {
-        Entry& old = *entries_[i];
-        int64_t deepest = 0;
-        for (int64_t k : old.checks) deepest = std::max(deepest, k);
-        const bool same = old.mine && old.key == e->key;
-        const bool superseded = old.mine && old.cvec == c.cvec && deepest > 0 && held(old.ids, deepest) &&
-                                imgs_below(old.imgs, deepest) == imgs_below(imgs, deepest);
-        if (same || superseded) {
-            if (!same) ++stats_.dropped;
-            // its block and state files stay until the write of this one has used them
-            drop_locked(i, own_file && old.name == e->name);
-            continue;
-        }
-        ++i;
-    }
     e->bytes = bytes;
-    e->used = ++clock_;
-    e->id = ++next_id_;
     e->cvec = c.cvec;
-    e->ids = ids;
-    e->imgs = imgs;
+    e->ids = *c.ids;
+    e->imgs = *c.imgs;
     for (const ConversationCheckpoint* k : c.checkpoints) {
         e->checks.push_back((int64_t) k->ids.size());
         e->sources.push_back((uint8_t) k->source);
     }
+    return e;
+}
+
+// The entries `e` takes the place of: its own earlier copy and the same conversation a turn back.
+std::vector<const ConversationStore::Entry*> ConversationStore::superseded_locked(const Entry& e) const {
+    // the same conversation a turn back: its deepest checkpoint is one this chain holds
+    auto held = [&](const std::vector<int32_t>& eids, int64_t len) {
+        if ((size_t) len > e.ids.size() || std::memcmp(eids.data(), e.ids.data(), (size_t) len * 4) != 0) return false;
+        if ((size_t) len == e.ids.size()) return true;
+        return std::find(e.checks.begin(), e.checks.end(), len) != e.checks.end();
+    };
+    std::vector<const Entry*> out;
+    for (const auto& p : entries_) {
+        const Entry& old = *p;
+        int64_t deepest = 0;
+        for (int64_t k : old.checks) deepest = std::max(deepest, k);
+        const bool same = old.mine && old.key == e.key;
+        const bool superseded = old.mine && old.cvec == e.cvec && deepest > 0 && held(old.ids, deepest) &&
+                                imgs_below(old.imgs, deepest) == imgs_below(e.imgs, deepest);
+        if (same || superseded) out.push_back(&old);
+    }
+    return out;
+}
+
+// Indexes `e`.  With room for one more entry reserved, nothing here allocates.
+ConversationStore::Entry& ConversationStore::place_locked(std::unique_ptr<Entry> e) {
+    ++revision_;
+    e->used = ++clock_;
+    e->id = ++next_id_;
     entries_.push_back(std::move(e));
     return *entries_.back();
+}
+
+// What `e` superseded leaves the index: its own earlier copy first (`own_file`: the file of its name is `e`'s already
+// and stays), then the same conversation a turn back (its block and state files stay while `e` uses them).
+void ConversationStore::supersede_locked(std::vector<const Entry*>& superseded, const Entry& e, bool own_file) {
+    std::partition(superseded.begin(), superseded.end(), [&](const Entry* old) { return old->key == e.key; });
+    for (const Entry* old : superseded)
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (entries_[i].get() == old) {
+                const bool same = old->key == e.key;
+                if (!same) ++stats_.dropped;
+                drop_locked(i, same && own_file);
+                break;
+            }
 }
 
 bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
@@ -1404,7 +1419,10 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     if (queue_bytes_ + bytes > queue_cap) return false;
     auto job = std::make_shared<Job>();
     job->image = std::move(image);
-    Entry& e = index_locked(image_source(job->image), bytes, false);
+    auto fresh = entry_of(image_source(job->image), bytes);
+    std::vector<const Entry*> superseded = superseded_locked(*fresh);
+    Entry& e = place_locked(std::move(fresh));
+    supersede_locked(superseded, e, false);
     job->key = e.key;
     job->name = e.name;
     job->bytes = bytes;
@@ -1509,6 +1527,15 @@ bool ConversationStore::write(const ConversationSource& src, std::string& error,
              read_index(rf.fd, file_bytes, head, table, hashes, why);
         if (!ok && why.empty()) why = "cannot read " + staged;
     }
+    // its entry before the file takes its name: from there to the index taking it, nothing allocates
+    std::unique_ptr<Entry> fresh;
+    if (ok) {
+        fresh = entry_of(img, file_bytes);
+        fresh->head = head;
+        fresh->table = std::move(table);
+        fresh->blocks = std::move(job.blocks);
+        fresh->check_keys = std::move(job.check_keys);
+    }
     std::unique_lock<std::shared_mutex> publication(publish_mu_);
     std::lock_guard<std::mutex> lk(mu_);
     stats_.written_bytes += wrote;
@@ -1516,22 +1543,27 @@ bool ConversationStore::write(const ConversationSource& src, std::string& error,
         ok = false;
         why = "the index changed during the write";
     }
+    std::vector<const Entry*> superseded;
+    if (ok) {
+        superseded = superseded_locked(*fresh);
+        entries_.reserve(entries_.size() + 1);
+    }
     if (ok && !basalt::platform::rename_replace(staged, dir_ + "/" + job.name)) {
         ok = false;
         why = "cannot replace " + job.name;
     }
     if (ok) {
-        Entry& e = index_locked(img, file_bytes, true);
-        e.head = head;
-        e.table = std::move(table);
-        e.blocks = std::move(job.blocks);
-        e.check_keys = std::move(job.check_keys);
-        e.refs = std::move(job.held);
+        fresh->refs = std::move(job.held);
+        Entry& e = place_locked(std::move(fresh));
         const uint64_t entry_id = e.id;
         end.published = true;
         ++stats_.written;
         stats_.whole_bytes += whole;
-        evict_locked();
+        try {   // indexed: an allocation that fails from here leaves the rest to a later write's eviction
+            supersede_locked(superseded, e, true);
+            evict_locked();
+        } catch (const std::bad_alloc&) {
+        }
         ok = std::any_of(entries_.begin(), entries_.end(), [&](const auto& k) { return k->id == entry_id; });
         if (!ok) why = "the budget did not hold it: evicted as it was written";
     }
