@@ -5,21 +5,20 @@ supports next to the others: [models](index.md). Rounding and quality: [precisio
 
 ## Pack
 
-The default download is `Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB), built from the official release with its vision encoder and
-DSpark drafter:
+The default download is `Inkling-2-Mini-NVFP4-MX8.basalt` (19.6 GB, needs 0.5.6 or later, SHA-256
+`28ec70723feaa037942a02f55b9d5e898276f3e62a3b1fa083745f932a041b99`), built from the official release with its vision encoder
+and DSpark drafter:
 
 - Routed experts, layers 0 to 19: the release's NVFP4 codes and scales, bit for bit (14.7 GiB for all 24 layers).
-- Routed experts, layers 20 to 23: the release's MXFP8 values as Q8_0.
+- Routed experts, layers 20 to 23: the release's MXFP8 codes and UE8M0 scales, bit for bit (`GGML_TYPE_MXFP8 = 46`).
 - Attention, gate, short-convolution and output projections: Q8_0 of the BF16 values.
 - Output head: BF16 in the file; the engine rounds it to Q8_0 as it loads. Token embedding BF16. Norms, router, biases and the
   loop's small tensors F32; loop controllers BF16.
 - Vision encoder and projector (BF16, 0.6 GB) and the DSpark drafter (BF16, 0.6 GB), whole.
 
-`Inkling-2-Mini-NVFP4-MX8.basalt` (19.6 GB, needs 0.5.6 or later, SHA-256
-`28ec70723feaa037942a02f55b9d5e898276f3e62a3b1fa083745f932a041b99`) is the alternative: layers 20 to 23 keep the release's MXFP8
-codes and UE8M0 scales bit for bit (`GGML_TYPE_MXFP8 = 46`), everything else as above. A prompt reads about 5% faster on the card,
-with the release's native bits on block-scaled MXFP8 tensor cores; its quality is level
-([precision](../precision/inkling2.md#against-the-reference)). Both load.
+`Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB), the 0.5.5 pack, stores layers 20 to 23 as Q8_0 of the release's MXFP8 values,
+everything else as above. The MX8 pack reads a prompt about 5% faster on the card, with the release's native bits on
+block-scaled MXFP8 tensor cores, at level quality ([precision](../precision/inkling2.md#against-the-reference)). Both load.
 
 Build it from the release directory: `tools/convert/convert.py --checkpoint DIR` reads both safetensors files, the quant config,
 the tokenizer and the template, and writes the MX8 form.
@@ -49,8 +48,10 @@ the text model.
   drafter's full layer; the window layers' rings do not grow.
 - **Experts in RAM when the context needs the room:** when the asked context does not fit beside every expert, the least
   routed experts (by the shipped profile `data/profiles/inkling2-24x128.prof`) are planned into page-locked RAM, just enough,
-  and decode computes them on the CPU: after a layer's router its rows go to RAM, the CPU pool (`--pool-workers`) runs the
-  pairs whose expert is in RAM while the card runs the rest, and the card takes their rows before it combines them. The
+  and decode computes them on the CPU. After routing, a visit with RAM experts publishes its choices and the input rows
+  those experts need to mapped memory, then rings the CPU coordinator. The CPU pool (`--pool-workers`) runs those pairs
+  while the card runs the rest. The card takes the CPU's rows only when the completion ticket matches the visit. Visits
+  with no RAM pairs skip the hand-off, and the watchdog can release a stalled wait. The
   full visits' caches then back their first 32,768 positions and grow as prompts
   need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
   giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a

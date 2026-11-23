@@ -54,7 +54,7 @@ jobs:
       - name: Server tests
         run: python -m pytest serve/tests -q
       - name: Tool tests
-        run: python -m pytest tools/test_bench_flags.py tools/test_bench_fixtures.py tools/test_serve_launcher.py tools/test_tokenizer.py -q
+        run: python -m pytest tools/test_bench_flags.py tools/test_bench_fixtures.py tools/test_serve_launcher.py tools/test_tokenizer.py tools/test_community_gate.py tools/test_llm_review.py -q
       - name: Converter tests
         run: python -m unittest discover -s tools/convert -p "test_*.py"
       - name: Migration tests

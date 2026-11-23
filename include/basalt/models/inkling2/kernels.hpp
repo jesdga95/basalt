@@ -148,11 +148,29 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
+/// Doorbell words in mapped host memory, accessed atomically at system scope. The ring's release publishes the choices,
+/// RAM rows and nonzero visit ticket. The host acquires the ring, takes the ticket, clears the ring and computes its rows.
+/// Its release store to `done` publishes those rows with that ticket. The merge acquires only a completion for its visit.
+/// `abort` is sticky: a RAM visit that observes it does not publish, and waiting merges check it periodically.
+struct CpuBell {
+    alignas(64) uint32_t ring;
+    uint32_t ticket;
+    alignas(64) uint32_t done;
+    uint32_t abort;
+};
+
+/// Each visit with a RAM pair advances the device word `seq` (initialized to zero), even after an abort. A live RAM visit
+/// publishes its choices to ids_m, its RAM rows to x_m, and its ticket before raising `ring` with `layer` and `rows`.
+/// A visit with no RAM pair touches neither `seq` nor mapped host memory. rows <= kDecodeRows, rows * k <= 1024.
+void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
+                  int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream);
+
 /// The CPU's rows of a window's experts (cpu_experts.hpp): pair p = r * k + slot whose expert is not on the card (blobs[e]
 /// 0) takes row p of `cpu` (mapped host memory, the pool's output) into row p of `output`, and adds its lookup to tally[e]
-/// when `tally` is set; the card's pairs are left as they are.
+/// when `tally` is set; the card's pairs are left as they are. With `bell` set, wait for its completion ticket to match the
+/// visit's `seq`, or take nothing if abort is seen first. Visits sharing a sequence run ring and merge in order.
 void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu, float* output,
-                   uint32_t* tally, void* stream);
+                   uint32_t* tally, void* stream, CpuBell* bell = nullptr, const uint32_t* seq = nullptr);
 
 /// The grouped expert kernel's plan from the router's choices: group g is an expert on the card (its blob at blobs[e], a
 /// device address; 0 when it is not on the card) and its entries are the (row, slot) pairs that chose it, in row order;
