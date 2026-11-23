@@ -221,10 +221,6 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     flags_ = req;
     path_ = path;
     std::vector<int> peers = req.peer_devices;
-    if (peers.size() > (size_t) kMaxSecondCards) {
-        basalt::log::warn("basalt hy4flash", "%zu second cards given, %d hold experts; later cards idle", peers.size(), kMaxSecondCards);
-        peers.resize((size_t) kMaxSecondCards);
-    }
     peer_devices_ = std::move(peers);
     planning_ = &reads;
     model::Result r;
