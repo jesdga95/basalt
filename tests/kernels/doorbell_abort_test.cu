@@ -5,8 +5,10 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 namespace {
@@ -43,12 +45,59 @@ cudaError_t poll_stream(cudaStream_t stream, Clock::duration timeout) {
     return cudaErrorNotReady;
 }
 
-[[noreturn]] void fail(const char* what, const char* reason, Bell* bell = nullptr, cudaStream_t stream = nullptr) {
-    if (bell) {
-        SystemWord(bell->abort).store(1, cuda::memory_order_release);
-        // The legacy wait only observes the flag.
-        SystemWord(bell->flag).store(kWant, cuda::memory_order_release);
+void release_waiters(Bell& bell) {
+    SystemWord(bell.abort).store(1, cuda::memory_order_release);
+    // The legacy wait only observes the flag.
+    SystemWord(bell.flag).store(kWant, cuda::memory_order_release);
+}
+
+class Watchdog {
+public:
+    Watchdog() : thread_([this, deadline = Clock::now() + 300s] {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (wake_.wait_until(lock, deadline, [this] { return done_; })) return;
+        if (bell_) release_waiters(*bell_);
+        std::printf("doorbell_abort_test: watchdog: %s\n", current_case_);
+        std::fflush(stdout);
+        std::_Exit(1);
+    }) {}
+
+    ~Watchdog() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+        }
+        wake_.notify_one();
+        thread_.join();
     }
+
+    void set_bell(Bell* bell) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bell_ = bell;
+    }
+
+    void set_case(const char* name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_case_ = name;
+    }
+
+    void reset_bell() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        *bell_ = Bell{};
+    }
+
+private:
+    // Protects the bell's lifetime and whole-bell resets without locking across CUDA calls.
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    Bell* bell_ = nullptr;
+    const char* current_case_ = "setup";
+    bool done_ = false;
+    std::thread thread_;
+};
+
+[[noreturn]] void fail(const char* what, const char* reason, Bell* bell = nullptr, cudaStream_t stream = nullptr) {
+    if (bell) release_waiters(*bell);
     const cudaError_t cleanup = stream ? poll_stream(stream, 5s) : cudaSuccess;
     std::printf("doorbell_abort_test: %s: %s\n", what, reason);
     if (cleanup != cudaSuccess)
@@ -90,6 +139,7 @@ void publish(Bell& bell, uint32_t payload) {
 }  // namespace
 
 int main() {
+    Watchdog watchdog;
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
 
@@ -97,27 +147,32 @@ int main() {
     uint32_t* seq = nullptr;
     cudaStream_t stream = nullptr;
     check(cudaHostAlloc((void**) &host, sizeof(*host), cudaHostAllocMapped), "allocate mapped bell");
+    *host = Bell{};
+    watchdog.set_bell(host);
     check(cudaHostGetDevicePointer((void**) &device, host, 0), "get device bell");
     check(cudaMalloc(&seq, sizeof(*seq)), "allocate sequence");
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
     check(cudaMemcpyAsync(seq, &kWant, sizeof(kWant), cudaMemcpyHostToDevice, stream), "initialize sequence");
 
+    watchdog.set_case("abort a waiting stream");
     auto start = Clock::now();
-    *host = Bell{};
+    watchdog.reset_bell();
     bk::doorbell_wait(&device->flag, seq, &device->abort, stream);
     const bool waiting = cudaStreamQuery(stream) == cudaErrorNotReady;
     SystemWord(host->abort).store(1, cuda::memory_order_release);
     drain(*host, stream, "abort a waiting stream");
-    if (host->flag != 0 || host->abort != 1 || host->payload != kPoison ||
+    if (SystemWord(host->flag).load(cuda::memory_order_relaxed) != 0 ||
+        SystemWord(host->abort).load(cuda::memory_order_relaxed) != 1 || host->payload != kPoison ||
         host->started != 0 || host->matched != kPoison || host->observed != kPoison)
         fail("abort a waiting stream", "unexpected bell state", host, stream);
     std::printf("  abortable wait: immediate not-ready observed: %s (diagnostic only)\n", waiting ? "yes" : "no");
     passed("abort a waiting stream", start);
 
+    watchdog.set_case("published payload");
     start = Clock::now();
     constexpr uint32_t rounds = 1000;
     for (uint32_t i = 0; i < rounds; ++i) {
-        *host = Bell{};
+        watchdog.reset_bell();
         consume<<<1, 1, 0, stream>>>(device, seq);
         check(cudaGetLastError(), "launch payload consumer", host, stream);
         wait_for_consumer(*host, stream);
@@ -131,9 +186,10 @@ int main() {
     std::printf("  published payload: %u rounds\n", rounds);
     passed("published payload", start);
 
+    watchdog.set_case("pre-aborted stale flag");
     start = Clock::now();
-    *host = Bell{};
-    host->flag = kWant - 1;
+    watchdog.reset_bell();
+    SystemWord(host->flag).store(kWant - 1, cuda::memory_order_relaxed);
     SystemWord(host->abort).store(1, cuda::memory_order_release);
     consume<<<1, 1, 0, stream>>>(device, seq);
     check(cudaGetLastError(), "launch pre-aborted consumer", host, stream);
@@ -142,21 +198,30 @@ int main() {
         fail("pre-aborted stale flag", "accepted a stale completion", host, stream);
     passed("pre-aborted stale flag", start);
 
+    watchdog.set_case("legacy three-argument wait");
     start = Clock::now();
-    *host = Bell{};
+    watchdog.reset_bell();
+    constexpr uint32_t legacy_payload = 0x87dea123u;
+    // Plain launches enqueue during the sleep (an early read sees poison); serialized launches enqueue the reader after the wait.
+    std::thread publisher([host] {
+        std::this_thread::sleep_for(100ms);
+        publish(*host, legacy_payload);
+    });
     bk::doorbell_wait(&device->flag, seq, stream);
     read_payload<<<1, 1, 0, stream>>>(device);
     check(cudaGetLastError(), "launch legacy payload read", host, stream);
     const bool legacy_waiting = cudaStreamQuery(stream) == cudaErrorNotReady;
-    publish(*host, 0x87dea123u);
     drain(*host, stream, "legacy three-argument wait");
-    if (host->observed != 0x87dea123u)
+    publisher.join();
+    if (host->observed != legacy_payload)
         fail("legacy three-argument wait", "sequence did not order the payload read", host, stream);
     std::printf("  legacy wait: immediate not-ready observed: %s (diagnostic only)\n", legacy_waiting ? "yes" : "no");
     passed("legacy three-argument wait", start);
 
+    watchdog.set_case("teardown");
     check(cudaStreamDestroy(stream), "destroy stream");
     check(cudaFree(seq), "free sequence");
+    watchdog.set_bell(nullptr);
     check(cudaFreeHost(host), "free bell");
     std::printf("doorbell_abort_test: ok\n");
     return 0;
