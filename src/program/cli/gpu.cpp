@@ -54,6 +54,7 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     gc.mode = choice.mode;
     gc.given = choice.shares;
     gc.diag_cut = o.diag_gpu_cut;
+    gc.diag_same = o.diag_gpu_same;
     for (size_t d = 0; d < choice.cards.size(); ++d) {
         const int i = choice.cards[d];
         basalt::model::GpuCards::Card c;
