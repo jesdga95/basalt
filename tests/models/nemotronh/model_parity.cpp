@@ -1,17 +1,22 @@
 // tests/models/nemotronh/model_parity.cpp - the whole Nemotron-H model against reference.py's float64 logits, and its
 // paths against each other.
 //
-//     nemotronh_model_parity PACK REF.bin [--vram N] [--ram N]
+//     nemotronh_model_parity PACK REF.bin [--vram N] [--ram N] [--frozen]
 //
 // PACK is a converted checkpoint (synth_checkpoint.py's small one, or a real one), REF.bin reference.py's logits of its
-// tokens.  --vram / --ram pin the expert tier (experts per layer on the card / in RAM; the rest stay in the file), so
-// the card's, the CPU's and the file's experts all run.  Exits 77 without both files or a GPU.
+// tokens.  --vram / --ram set the expert tier's homes (experts per layer on the card / in RAM; the rest stay in the file),
+// so the card's, the CPU's and the file's experts all run; --frozen keeps every expert where it starts.  Exits 77
+// without both files or a GPU.
+//
+// An expert the CPU computes rounds its activations as Q8_0, one on the card as q8_1: the paths below agree bitwise only
+// while every expert stays where it was (a small pack whose experts all fit on the card, or --frozen); a tier that moves
+// experts between them is held to the reference's KL instead.
 //
 //   (a) decode: every token alone (one-row windows), each row's logits against the reference: the relative error of the
 //       logits, the KL divergence of the reference's softmax from the engine's, top-1 agreement
 //   (b) prompt: the first half of the tokens as one prompt, the rest one-row windows: against the reference
 //   (c) windows: windows of up to 8 rows that keep a random number of their rows (the rest run again in the next): the
-//       kept rows' logits bitwise those of (a) when every expert is on the card, else within the CPU's rounding
+//       kept rows' logits bitwise those of (a) when no expert moves, else within the reference's KL
 //   (d) checkpoint: the running state saved mid-way, the session decoding on, the state restored: the same tokens again
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/model/adapter.hpp"
@@ -157,11 +162,14 @@ int main(int argc, char** argv) {
     model::LoadRequest req;
     req.paths = {argv[1]};
     req.max_context = 4096;
-    for (int i = 3; i + 1 < argc; i += 2) {
-        if (std::string(argv[i]) == "--vram") req.diag_tier_vram = std::atoi(argv[i + 1]);
-        if (std::string(argv[i]) == "--ram") req.diag_tier_ram = std::atoi(argv[i + 1]);
+    bool frozen = false;
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--frozen") frozen = true;
+        else if (a == "--vram" && i + 1 < argc) req.diag_tier_vram = std::atoi(argv[++i]);
+        else if (a == "--ram" && i + 1 < argc) req.diag_tier_ram = std::atoi(argv[++i]);
     }
-    const bool all_on_card = req.diag_tier_vram < 0 && req.diag_tier_ram < 0;
+    req.diag_tier_frozen = frozen;
     auto adapter = models::nemotronh::make_adapter();
     model::Started st;
     if (const model::Result e = adapter->start(req, st); !e.ok()) {
@@ -175,6 +183,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     const int32_t* tok = ref.tokens.data();
+    const model::ModelSession::ExpertCounts c0 = s.expert_counts();
+    (void) c0;
 
     // (a) one-row windows
     std::vector<float> dec((size_t) N * V), w;
@@ -203,6 +213,7 @@ int main(int argc, char** argv) {
     int t = 0, windows = 0;
     double worst = 0;
     bool bitwise = true;
+    Score sc;
     while (t < N) {
         const int n = std::min(N - t, 1 + (int) (rng() % 8));
         if (!window(s, tok + t, n, t, V, w)) return 1;
@@ -212,14 +223,17 @@ int main(int argc, char** argv) {
             const float* b = dec.data() + (size_t) (t + i) * V;
             if (std::memcmp(a, b, (size_t) V * 4)) bitwise = false;
             for (int j = 0; j < V; ++j) worst = std::max(worst, (double) std::fabs(a[j] - b[j]));
+            sc.add(a, b, V);
         }
         t += keep;
         ++windows;
     }
     char buf[200];
-    std::snprintf(buf, sizeof buf, "%d windows of 1-8 rows keeping some: the kept rows %s one-row decode's (max abs %.2e)", windows,
-                  bitwise ? "bitwise" : "close to", worst);
-    check(all_on_card ? bitwise : worst < 0.05, buf);
+    // the placement moved when the tier promoted or swapped an expert since the start
+    const bool fixed = frozen || s.expert_counts().lookups == s.expert_counts().hits;
+    std::snprintf(buf, sizeof buf, "%d windows of 1-8 rows keeping some: the kept rows %s one-row decode's (max abs %.2e; %s)",
+                  windows, bitwise ? "bitwise" : "close to", worst, sc.str().c_str());
+    check(fixed ? bitwise : sc.kl / sc.n < 5e-3, buf);
 
     // (d) the running state saved at P, decoding on to the end, restored: the same logits again
     {
@@ -239,9 +253,13 @@ int main(int argc, char** argv) {
             again.insert(again.end(), w.begin(), w.end());
         }
         double d = 0;
+        Score sd;
         for (size_t i = 0; ok && i < first.size(); ++i) d = std::max(d, (double) std::fabs(first[i] - again[i]));
-        std::snprintf(buf, sizeof buf, "the state saved at %d and restored: decoding on gives the same logits (max abs %.2e)", P, d);
-        check(ok && (all_on_card ? d == 0 : d < 0.05), buf);
+        for (size_t r = 0; ok && r < first.size() / (size_t) V; ++r) sd.add(again.data() + r * V, first.data() + r * V, V);
+        const bool fixed = frozen || s.expert_counts().lookups == s.expert_counts().hits;
+        std::snprintf(buf, sizeof buf, "the state saved at %d and restored: decoding on gives the same logits (max abs %.2e; %s)", P,
+                      d, sd.str().c_str());
+        check(ok && (fixed ? d == 0 : sd.kl / sd.n < 5e-3), buf);
     }
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;

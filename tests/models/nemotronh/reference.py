@@ -71,7 +71,7 @@ def softplus(x):
     return np.where(x > 20.0, x, np.log1p(np.exp(np.minimum(x, 20.0))))
 
 
-def run(W: Weights, tokens) -> np.ndarray:
+def run(W: Weights, tokens, verbose: bool = False) -> np.ndarray:
     """Layer by layer over all the tokens (each matrix dequantized once); the recurrence and the attention in order."""
     g, p = W.g, W.p
     eps = g.eps
@@ -140,6 +140,8 @@ def run(W: Weights, tokens) -> np.ndarray:
             o = o + np.maximum(su, 0.0) ** 2 @ W.mat(m + "shared_experts.down_proj").T
         x = x + o
         W.cache.clear()
+        if verbose:
+            print(f"layer {l} ({kind}) done", flush=True)
     hn = np.stack([rms(r, W.f(p + "norm_f.weight"), eps) for r in x])
     return hn @ W.mat(W.head).T
 
@@ -149,10 +151,11 @@ def main():
     ap.add_argument("checkpoint")
     ap.add_argument("--tokens", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--verbose", action="store_true", help="a line per layer")
     a = ap.parse_args()
     tokens = [int(t) for t in a.tokens.split(",")]
     W = Weights(pathlib.Path(a.checkpoint))
-    lg = run(W, tokens)
+    lg = run(W, tokens, a.verbose)
     with open(a.out, "wb") as f:
         f.write(struct.pack("<ii", len(tokens), lg.shape[1]))
         f.write(np.array(tokens, "<i4").tobytes())
