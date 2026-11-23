@@ -143,14 +143,17 @@ def decide(gate, review_fn):
                            + "\n".join("- " + plain(r) for r in gate["reasons"]) + "\n\nA maintainer will look once they are fixed."}
     if gate["status"] != "pass":
         return {"outcome": "needs_human", "reviewed": False, "label": "community: needs review",
-                "reason": "; ".join(gate["reasons"]), "comment": ""}
+                "reason": "; ".join(gate["reasons"]),
+                "comment": "The automatic checks passed, but this row needs a maintainer's look:\n\n"
+                           + "\n".join("- " + plain(r) for r in gate["reasons"]) + "\n\nA maintainer will review it."}
     v = review_fn(gate["new_rows"], gate["notes"])   # may only downgrade: a pass gate plus auto_merge is the one merge
     if v["verdict"] == "auto_merge":
         return {"outcome": "merge", "reviewed": True, "label": "", "reason": v["reason"], "comment": ""}
     if v["verdict"] == "reject":
         return {"outcome": "reject", "reviewed": True, "label": "community: rejected", "reason": v["reason"],
                 "comment": "This benchmark row was flagged by the automatic review and needs changes before it can be listed. A maintainer will follow up."}
-    return {"outcome": "needs_human", "reviewed": True, "label": "community: needs review", "reason": v["reason"], "comment": ""}
+    return {"outcome": "needs_human", "reviewed": True, "label": "community: needs review", "reason": v["reason"],
+            "comment": "The automatic checks passed and the automatic review asked for a maintainer's look. A maintainer will review it."}
 
 
 def main(argv):

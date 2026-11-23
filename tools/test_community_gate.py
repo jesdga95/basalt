@@ -211,6 +211,16 @@ class Mode(unittest.TestCase):
         self.assertNotIn("Mode:", p["comment"])   # live comments carry no mode note
         self.assertEqual(p["labels"], ["community: rejected"])
 
+    def test_needs_human_comments_with_the_reasons(self):
+        r = good_row()
+        r["gpus"][0]["name"] = "RTX PRO 9999 Blackwell"
+        o = llm.decide(run([r]).to_json(), None)
+        self.assertEqual(o["outcome"], "needs_human")
+        self.assertIn("no earlier row", o["comment"])
+        p = apply_.plan(o, "live")
+        self.assertIn("needs a maintainer's look", p["comment"])
+        self.assertEqual(p["labels"], ["community: needs review"])
+
     def test_needs_human_labels_and_requests_review(self):
         p = apply_.plan({"outcome": "needs_human", "comment": ""}, "live")
         self.assertEqual((p["labels"], p["request_review"], p["merge"]), (["community: needs review"], True, False))
