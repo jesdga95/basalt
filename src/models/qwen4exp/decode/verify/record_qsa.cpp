@@ -250,7 +250,6 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     }
     }
     stamp(l, 10);
-    bool fused_gate = false;
     bool gated_merge = false;   // the fused chunks and their merge both run, and the merge applies the gate
     bool chunk_attn = false;    // the fused chunks run (the gate, if any, is the caller's)
     bool attn_q8 = false;   // the merge wrote the q8_1 rows
@@ -261,7 +260,6 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         // KV streaming: each streamed slot's selections resident in its own pool (device-side, in the graph)
         if (v_.batch_stream_) kv_stream_resolve_seg(seg_tab, v_.sel_, v_.step_, v_.cap_, s, cs);
         stamp(l, 12);
-        fused_gate = true;
         attn_q8 = true;
         qsa_dec_attn_seg(v_.qcur_, seg_tab, true, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs, v_.qfull_,
                          v_.attn32_, v_.xq_);
@@ -286,7 +284,6 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     // un-rotated one. It takes the same chunks and the caller gates after the rotation.
     gated_merge = !st.kv_rot && !st.kv_hybrid && qsa_dec_attn_supported(pools, s);
     chunk_attn = gated_merge || (fused_q4 && qsa_dec_attn_supported(pools, s));
-    fused_gate = gated_merge;
     attn_q8 = gated_merge;
     PdlScope pa(pdl);   // the chunks after the top-k, the merge after them
     if (chunk_attn)
