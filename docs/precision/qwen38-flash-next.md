@@ -206,6 +206,13 @@ Costs: the Q6_K head adds KLD 0.0022 [0.0018, 0.0025] (1.5%) and PPL 0.25% (IQ3_
 25,500 rows. The Q8_0 two-stage head is 350 us per window against 439 us for the Q8_0 head (NVFP4, cold prose, 400 W + 180 W).
 Greedy output with the tiers pinned matches the exact head token for token.
 
+## Several cards
+
+`gpu-mode peer` on two cards against one card (BF16 KLD through the decode path, 100 chunks, `--kv int8`, window 3): 0.06174 against
+0.06221 (paired difference -0.0005 [-0.0013, +0.0004]), top-1 91.84% against 91.80%. A peer's prompt stages run each card's own
+cuBLAS algorithms; `--diag-main-card-bits` gives them the main card's and the stages are then bitwise
+([diagnostics](../configuration/diagnostics.md)). `gpu-mode split` against `--diag-gpu-same` is bitwise under the same flag, tokens and logits.
+
 ## GDN split across two cards
 
 With a peer card faster than the main card, each GDN mixer may be split by key head. The split changes reduction order, so output

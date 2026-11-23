@@ -79,10 +79,12 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | DQ8 pack, 20 chunks (the quick gate) | 0.00264 | 97.80% | 7.6642 (base 7.6534) |
 | DQ8 pack, 90 chunks, RTX 5060 Ti alone, 1,047 experts in RAM on the CPU | 0.00298 | 97.70% | |
 | DQ8 pack, the same 90 chunks, the whole model on the card | 0.00304 | 97.76% | |
-| DQ8 pack, 100 chunks, layer split: 0 to 11 on the RTX 5090, 12 to 23 on an RTX 5060 Ti | 0.00304 | 97.70% | 7.0718 (base 7.0633) |
+| DQ8 pack, 100 chunks, `gpu-mode split`: layers 0 to 11 on the RTX 5090, 12 to 23 on an RTX 5060 Ti | 0.00304 | 97.70% | 7.0718 (base 7.0633) |
 | MX8 pack, 100 chunks, the whole model on the card | 0.00297 | 97.83% | |
 | MX8 pack, 20 chunks | 0.00265 | | |
 | MX8 pack, 100 chunks, experts in RAM on the CPU | 0.00303 | 97.72% | |
+| MX8 pack, 100 chunks, `--expert-cache 1500`, one card with the spilled experts on the CPU | 0.00444 | 97.15% | |
+| MX8 pack, 100 chunks, `--expert-cache 1500`, `gpu-mode peer` (the spilled experts on the second card) | 0.00440 | 97.25% | |
 | 100 chunks, `--kv int8` (#552's build) | 0.00344 | 97.79% | 7.0762 (base 7.0644) |
 | 100 chunks, `--kv fp8` (#552's build) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | 100 chunks, `--kv fp16` (#552's build), the same set of runs as the two rows above | 0.00310 | 97.78% | 7.0695 (base 7.0644) |
