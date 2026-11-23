@@ -459,7 +459,9 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         const int c = threadIdx.x + j * kThreads;
-        const float g = tanhf(gf[c]), f = tanhf(gf[kWidth + c]);
+        float g, f;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(g) : "f"(gf[c]));
+        asm("tanh.approx.f32 %0, %1;" : "=f"(f) : "f"(gf[kWidth + c]));
         y[j] = (1.f - f) * de[j] + g * ms[j];
     }
     norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
