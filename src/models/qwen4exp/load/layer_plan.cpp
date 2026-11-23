@@ -40,7 +40,6 @@ int layer_plan(Context& context) {
     const int64_t kWindowMib = 96;       // the verify windows, with margin
     const int64_t kDrafterMib = 1000;    // the MTP drafter and its copy of the head, on the first stage
     const int64_t kHeadMib = 600;        // the head, on the last stage
-    const uint64_t kStage0OtherBytes = 100ull << 20;   // what CUDA0 holds beside its dense weights before the experts: buffers and tables
     auto stage_room = [&](int dev, bool later, int64_t extra_mib) -> int64_t {
         const basalt::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -51,41 +50,31 @@ int layer_plan(Context& context) {
                                  extra_mib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
-    if (multi_gpu) {
-        const int ns = (int) split_devs.size() + 1;
-        // What a stage's card holds before its experts, by block: its layers' dense weights (the arena, the native
-        // projections, the 8-bit hyper-connection copies) and session, and what every stage holds whatever its layers.
-        std::vector<uint64_t> pool_l, nat_l, hc8_l((size_t) g.n_layers, 0);
-        uint64_t pool_sh = 0, nat_sh = 0, hc8_sh = 0;
-        if (!basalt::core::WeightTable::pool_bytes_by_layer(pack_files, g.n_layers, pool_l, pool_sh, err, &skip) ||
-            !basalt::core::NativeDense::plan_bytes_by_layer(o.native_shards, true, g.n_layers, nat_l, nat_sh, err)) {
-            return fatal_start_error(err);
-        }
-        auto block_of = [](const std::string& n) -> long {
-            return n.rfind("blk.", 0) == 0 ? std::strtol(n.c_str() + 4, nullptr, 10) : -1;
+    if (multi_gpu || *context.split_same) {
+        // the cut by the shares (or --diag-gpu-cut) over what each card holds before its experts: the shared driver over
+        // LayerSplit (model::SplitHooks), which gives split_at and the stages' devices
+        const size_t ns = o.gpus.cards.size();
+        LayerSplit& split = *context.split;
+        LayerSplit::Open in;
+        in.pack = &pack_files;
+        in.native_shards = &o.native_shards;
+        in.skip = &skip;
+        in.g = &g;
+        in.k = K;
+        in.max_context = o.max_context;
+        in.room = [&, ns](size_t i) -> uint64_t {
+            return (uint64_t) stage_room(i == 0 ? -1 : o.gpus.cards[i].device, i > 0, i == 0 ? kDrafterMib : i + 1 == ns ? kHeadMib : 0);
         };
-        for (int64_t l = 0; l < g.n_layers; ++l)
-            hc8_l[(size_t) l] = basalt::core::Verifier::hc8_plan_bytes([&](const std::string& n) { return block_of(n) == l; }, g);
-        hc8_sh = basalt::core::Verifier::hc8_plan_bytes([&](const std::string& n) { return block_of(n) < 0; }, g);
-        basalt::model::SplitSpec spec;
-        const uint64_t sess0 = basalt::core::session_bytes(g, o.max_context, K, 0, 0);   // a session's part outside any layer
-        for (int64_t l = 0; l < g.n_layers; ++l)
-            spec.layer.push_back(pool_l[(size_t) l] + nat_l[(size_t) l] + hc8_l[(size_t) l] +
-                                 basalt::core::session_bytes(g, o.max_context, K, l, l + 1) - sess0);
-        for (int i = 0; i < ns; ++i) {
-            const int dev = i == 0 ? 0 : split_devs[(size_t) i - 1];
-            spec.fixed.push_back(pool_sh + nat_sh + hc8_sh + sess0 + (i == 0 ? kStage0OtherBytes : 0));
-            spec.room.push_back((uint64_t) stage_room(i == 0 ? -1 : dev, i > 0, i == 0 ? kDrafterMib : i + 1 == ns ? kHeadMib : 0));
-        }
-        const basalt::model::SplitCut cut = basalt::model::split_cut(o.gpus, spec);
-        if (!cut.error.empty()) return fatal_start_error(cut.error);
-        split_at.assign(cut.first.begin() + 1, cut.first.end());
+        in.split_at = &split_at;
+        in.split_devs = &split_devs;
+        split.set_open(in);
+        if (!split.split_open(o.gpus, err)) return fatal_start_error(err);
+        const basalt::model::SplitCut& cut = split.split_placement();
         std::string ks, needs;
         for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
-        for (int i = 0; i < ns; ++i)
-            needs += (i ? ", " : "") + basalt::model::gib(cut.need[(size_t) i]) + " of " + basalt::model::gib(spec.room[(size_t) i]);
-        basalt::log::info("basalt generate", "layer split: K=%s by the shares; dense weights and sessions %s free, the rest "
-                                             "expert cache", ks.c_str(), needs.c_str());
+        for (size_t i = 0; i < ns; ++i) needs += (i ? ", " : "") + basalt::model::gib(cut.need[i]);
+        basalt::log::info("basalt generate", "layer split: K=%s %s; dense weights and sessions %s, the rest expert cache", ks.c_str(),
+                          o.gpus.diag_same ? "at --diag-gpu-cut, every stage on CUDA0" : "by the shares", needs.c_str());
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere), the cut being
     // known before any weight is placed.  The VRAM a full copy would take goes back to the expert cache.
