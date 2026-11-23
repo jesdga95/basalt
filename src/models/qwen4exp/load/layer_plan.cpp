@@ -94,9 +94,10 @@ int layer_plan(Context& context) {
                      (long long) split_at[0] - 1);
     }
     // One GPU: the hyper-connection down/up matrices are held only as 8-bit copies - the arena leaves their bf16 form
-    // out and they are staged, copied and dropped right after the load
+    // out and they are staged, copied and dropped right after the load.  A split keeps their bf16 form on every card, and
+    // so does its reference with both stages on CUDA0 (--diag-gpu-same), so that the two read a prompt alike.
     std::set<std::string> hc8_names;
-    if (basalt::kernels::hc8_only() && !multi_gpu) {
+    if (basalt::kernels::hc8_only() && !multi_gpu && !*context.split_same) {
         for_each_index_name(pack_files.index, [&](const std::string& n) {
             const bool blk = n.rfind("blk.", 0) == 0 &&
                              (n.ends_with(".hc_attn_down.weight") || n.ends_with(".hc_attn_up.weight") ||
