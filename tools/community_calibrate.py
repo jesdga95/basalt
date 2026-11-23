@@ -4,7 +4,7 @@
     community_calibrate.py [--limit N] [--state all|merged|closed|open] [--review]
 
 Prints one row per pull request: the gate status and reasons and, with --review and LLM_API_KEY, LLM_BASE_URL and
-LLM_MODEL set, the model's verdict for the ones whose gate passed. Needs `gh` logged in and a full clone with
+LLM_DEFAULT_MODEL set, the model's verdict for the ones whose gate passed. Needs `gh` logged in and a full clone with
 origin/main fetched (for the commit check). Nothing is changed on GitHub.
 """
 import json

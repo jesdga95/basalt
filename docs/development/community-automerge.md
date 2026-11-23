@@ -27,7 +27,7 @@ Security model: the review runs from base code with secrets only in the one mode
 
 ### Setup (once, on GitHub)
 
-1. Secret `LLM_API_KEY` (repository secrets). Variables `LLM_BASE_URL` (the API root, such as `https://host/v1`; a secret of the same name is the fallback) and `LLM_MODEL` (`gpt-6-luna`).
+1. Secret `LLM_API_KEY` (repository secrets). Variables `LLM_BASE_URL` (the API root, such as `https://api.openai.com/v1`) and `LLM_DEFAULT_MODEL` (`gpt-6-luna`).
 2. Variable `COMMUNITY_AUTOMERGE` = `test` (shadow). The workflow creates the labels itself.
 3. GitHub App (`basalt-code-review-bot`), which merges and also posts the community and `/review` comments (they fall back to `github-actions` while it is not configured): Settings, Developer settings, GitHub Apps, New. Name it such as `basalt-code-review-bot`, no webhook, repository permissions Contents: read and write, Pull requests: read and write, installable on this account only. Generate a private key. Install it on `jesdga95/basalt` only.
 4. Repository variable `BASALT_REVIEW_APP_CLIENT_ID` (the App's client ID) and secret `BASALT_REVIEW_APP_PRIVATE_KEY` (the whole `.pem`).
@@ -40,12 +40,12 @@ Security model: the review runs from base code with secrets only in the one mode
 A comment on a pull request that starts with `/review` and is written by `jesdga95` with author association OWNER runs `review.yml`. The command takes optional settings before the focus text:
 
 ```
-/review                                    the defaults: LLM_REVIEW_EFFORT (medium if unset) and LLM_MODEL (gpt-6-luna)
+/review                                    the defaults: LLM_REVIEW_EFFORT (medium if unset) and LLM_DEFAULT_MODEL (gpt-6-luna)
 /review effort=high                        low | medium | high (16k, 32k, 64k output tokens, reasoning included)
 /review effort=low model=gpt-6.2-sol check the locking in cpu_experts.cpp
 ```
 
-`model` must be `LLM_MODEL` or listed in the variable `LLM_REVIEW_MODELS` (comma-separated, such as `gpt-6.1-terra,gpt-6.2-sol`); an unknown effort or model is answered with a one-line comment and no model call. Settings stop at the first word that is not one, so `check that x=5` stays focus text. The rest of the comment, newlines kept, is the focus. The footer names the model and the effort. The workflow reacts with 👀 while it runs, reads the diff with `gh pr diff` (data; no checkout of the pull request), and posts one comment.
+`model` must be `LLM_DEFAULT_MODEL` or listed in the variable `LLM_REVIEW_MODELS` (comma-separated, such as `gpt-6.1-terra,gpt-6.2-sol`); an unknown effort or model is answered with a one-line comment and no model call. Settings stop at the first word that is not one, so `check that x=5` stays focus text. The rest of the comment, newlines kept, is the focus. The footer names the model and the effort. The workflow reacts with 👀 while it runs, reads the diff with `gh pr diff` (data; no checkout of the pull request), and posts one comment.
 
 `tools/code_review.py` splits the diff per file, skips generated, data and binary files (`data/`, `*.ids`, lock files, images, the community table), numbers the new-file lines, cuts a file past about 6k tokens at a hunk, sends chunks of about 7k tokens within a 40k token budget, and tells the model the rules of `AGENTS.md` and `CONTRIBUTING.md`. Replies must match the findings schema; the comment is built from validated findings, ranked high to low with `file:line`, or says `No findings.` Parts that failed or were skipped are named.
 
