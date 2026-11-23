@@ -599,6 +599,7 @@ def make_handler(target: Service | Router):
                     return
                 self.svc.request_ctx.path = path
                 self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
+                self.svc.request_ctx.arrived = time.time()   # arrival timestamp for end-to-end / TTFT histograms
                 with document_sources(self._image_access()):   # a document by URL or path follows the image rules
                     if path == "/v1/responses":
                         self._responses(req)

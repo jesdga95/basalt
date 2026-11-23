@@ -1410,6 +1410,7 @@ class Service:
         st = {} if par else self.status
         rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate
         wait_key = object()                             # this request's entry in self.waiting
+        arrived = getattr(self.request_ctx, "arrived", None) or time.time()
         with self.status_lock:
             self.status["queued"] += 1
             if not par:
@@ -1761,9 +1762,11 @@ class Service:
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}
                             ft = st.get("first_token")
                             ttft = ft - st["started"] if ft and st.get("started") else None
-                            duration = time.time() - started
+                            now_done = time.time()
                             self.prom.record(
-                                finish=finish, ttft_s=ttft, duration_s=duration,
+                                finish=finish,
+                                ttft_s=(ft - arrived) if ft else None,
+                                duration_s=now_done - arrived,
                                 decode_ms=last.get("decode_ms"), output_tokens=n,
                                 drafts_offered=last.get("drafts_offered"), drafts_accepted=last.get("drafts_accepted"),
                             )
@@ -1771,7 +1774,7 @@ class Service:
                             dl = window_tokens / windows if windows else None
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
-                                "time": started, "duration_s": round(duration, 1), "finish": finish,
+                                "time": started, "duration_s": round(now_done - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
