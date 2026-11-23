@@ -41,4 +41,16 @@ bool plan_spill(int n_layers, int n_expert, const std::vector<uint64_t>& stride,
                 const std::vector<std::pair<int32_t, int32_t>>& rank, uint64_t need, int64_t keep, SpillPlan& out,
                 std::string& err);
 
+/// One step of a prompt chunk's staging of a spilled layer: `n` RAM slots from `slot` (0 = the layer's first RAM slot)
+/// copied from their adjacent RAM blobs, or one slot copied from its card copy.
+struct StageOp {
+    enum Kind : uint8_t { Ram, Card } kind = Ram;
+    int32_t slot = 0;
+    int32_t n = 1;
+};
+
+/// The staging of a layer's `n_spill` RAM slots, `card[j]` whether slot j has a card copy: a slot with one is copied from
+/// it, a run of adjacent slots without one in a single RAM copy.
+std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card);
+
 }  // namespace basalt::models::inkling2

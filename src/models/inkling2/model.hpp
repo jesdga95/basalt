@@ -100,7 +100,7 @@ public:
     /// KV's base (core/elastic_kv.hpp).
     bool elastic() const { return elastic_; }
     /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
-    /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
+    /// point at the copies (decode reads them there, a prompt chunk's staging copies from them). Bytes copied.
     uint64_t promote(uint64_t keep_free);
     /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries go back to 0, the CPU
     /// computes them again (on `stream`, which is waited for before the copies are freed). Bytes freed.
@@ -116,9 +116,9 @@ public:
     /// room. False when even no copy at all leaves that much.
     bool resize_reserve(uint64_t free_bytes, void* stream);
     void lend(bool low, void* stream);
-    /// A prompt chunk's staging of layer l's RAM experts: each from its card copy when the elastic spill still holds one,
-    /// from its RAM copy otherwise (false: none has a copy, the caller copies the layer's from RAM).
-    bool stage_from_card(int l, void* stream) const;
+    /// A prompt chunk's staging of layer l's RAM experts into their slots: each from its card copy while the elastic spill
+    /// holds one, from RAM otherwise, a run of adjacent slots with no copy in one copy (spill.hpp stage_plan).
+    void stage(int l, void* stream) const;
     const SpillPlan& spill() const { return spill_; }
     /// Expert e of layer l's blob in RAM when the CPU computes it (it spilled and has no card copy; its blob table entry is
     /// 0), else null (cpu_experts.hpp).

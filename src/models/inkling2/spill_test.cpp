@@ -1,6 +1,6 @@
 // src/models/inkling2/spill_test.cpp - the spill plan: nothing leaves when nothing is needed, the coldest experts leave
 // first, slots are a permutation with the kept experts first, and the bytes it frees cover what was asked net of the shared
-// staging and the rounding.
+// staging and the rounding; a prompt chunk's staging plan puts every expert it reads in its slot.
 #include "models/inkling2/spill.hpp"
 
 #include <cstdio>
@@ -61,6 +61,36 @@ int main() {
     // more than the experts can give
     SpillPlan q;
     expect(!plan_spill(L, E, stride, gran, rank, p.full + 1, -1, q, err) && !err.empty(), "an impossible need fails");
+    // the staging plan against a slot-by-slot model, over random copies: every slot is staged once, from its card copy
+    // when it has one, and adjacent slots without one go in one RAM copy
+    uint32_t rng = 12345;
+    const auto next = [&] { return rng = rng * 1664525u + 1013904223u; };
+    for (int trial = 0; trial < 20000; ++trial) {
+        const int n = 1 + (int) (next() % 40);
+        const int pc = (int) (next() % 3);   // copy density
+        std::vector<uint8_t> card((size_t) n);
+        for (int j = 0; j < n; ++j) card[(size_t) j] = pc == 0 ? 0 : pc == 1 ? (uint8_t) (next() % 2) : 1;
+        std::vector<int> touched((size_t) n, 0);
+        bool ok = true, adjacent_ram = false;
+        int last_ram_end = -1;
+        for (const StageOp& op : stage_plan(n, card.data())) {
+            if (op.slot < 0 || op.n < 1 || op.slot + op.n > n) { ok = false; break; }
+            for (int j = op.slot; j < op.slot + op.n; ++j) {
+                ++touched[(size_t) j];
+                if ((op.kind == StageOp::Card) != (card[(size_t) j] != 0)) ok = false;   // a slot with a copy comes from the card
+            }
+            if (op.kind == StageOp::Card && op.n != 1) ok = false;
+            if (op.kind == StageOp::Ram) {
+                if (op.slot == last_ram_end) adjacent_ram = true;
+                last_ram_end = op.slot + op.n;
+            }
+        }
+        for (int j = 0; j < n; ++j)
+            if (touched[(size_t) j] != 1) ok = false;
+        expect(ok, "stage plan: every slot staged once, from its card copy when it has one");
+        expect(!adjacent_ram, "stage plan: adjacent RAM slots in one copy");
+        if (!ok || adjacent_ram) break;
+    }
     if (failures) return 1;
     std::printf("spill plan: ok\n");
     return 0;

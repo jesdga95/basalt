@@ -776,23 +776,27 @@ uint64_t InklingModel::cpu_layers() const {
     return mask;
 }
 
-bool InklingModel::stage_from_card(int l, void* stream) const {
+void InklingModel::stage(int l, void* stream) const {
     const LayerWeights& w = layers_[(size_t) l];
-    if (copy_.empty() || w.n_spill == 0) return false;
-    const int ne = geo().n_expert;
-    const uint64_t keep = (uint64_t) (ne - w.n_spill);
-    for (int e = 0; e < ne; ++e) {
-        const size_t s = (size_t) spill_.slot[(size_t) l][(size_t) e];
-        if (s < keep) continue;   // a kept expert: its own memory, already in place
-        const size_t i = (size_t) l * ne + (size_t) e;
-        void* dst = w.experts + (uint64_t) s * w.expert_stride;
-        if (const void* c = copy_[i])
-            cudaMemcpyAsync(dst, c, w.expert_stride, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
-        else   // a demoted one: its RAM copy, the elastic spill's least routed first
-            cudaMemcpyAsync(dst, w.spill_host + (s - keep) * w.expert_stride, w.expert_stride, cudaMemcpyHostToDevice,
-                            (cudaStream_t) stream);
+    if (w.n_spill == 0) return;
+    const int ne = geo().n_expert, keep = ne - w.n_spill;
+    std::vector<const void*> card((size_t) w.n_spill, nullptr);   // [RAM slot] the expert's card copy, null: none
+    std::vector<uint8_t> has((size_t) w.n_spill, 0);
+    if (layer_copies_[(size_t) l] > 0)
+        for (int e = 0; e < ne; ++e)
+            if (const int s = spill_.slot[(size_t) l][(size_t) e]; s >= keep) {
+                card[(size_t) (s - keep)] = copy_[(size_t) l * ne + e];
+                has[(size_t) (s - keep)] = card[(size_t) (s - keep)] != nullptr;
+            }
+    const cudaStream_t st = (cudaStream_t) stream;
+    for (const StageOp& op : stage_plan(w.n_spill, has.data())) {
+        uint8_t* dst = w.experts + (uint64_t) (keep + op.slot) * w.expert_stride;
+        if (op.kind == StageOp::Card)
+            cudaMemcpyAsync(dst, card[(size_t) op.slot], w.expert_stride, cudaMemcpyDeviceToDevice, st);
+        else
+            cudaMemcpyAsync(dst, w.spill_host + (uint64_t) op.slot * w.expert_stride, (size_t) op.n * w.expert_stride,
+                            cudaMemcpyHostToDevice, st);
     }
-    return true;
 }
 
 uint64_t InklingModel::demote(uint64_t bytes, void* stream) {

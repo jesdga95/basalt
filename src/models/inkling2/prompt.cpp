@@ -519,9 +519,7 @@ private:
         bk::router_select(b().rlog, w.router_bias, rows, ra, b().ids, b().rw, strm());
         if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot, its RAM experts copied into the staging
             remap_ids(b().ids, pairs, w.slot_map, strm());
-            const uint64_t kept = (uint64_t) (g_.n_expert - w.n_spill) * w.expert_stride;
-            if (!m_.stage_from_card(l, strm()))   // the spill's card copies where it still holds them; a demoted one from RAM
-                cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) w.n_spill * w.expert_stride, cudaMemcpyHostToDevice, strm());
+            m_.stage(l, strm());
             cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm());   // spill.hpp
         }
         moe_sort(b().ids, rows, k, g_.n_expert, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());

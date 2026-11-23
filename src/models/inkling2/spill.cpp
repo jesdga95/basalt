@@ -84,4 +84,20 @@ bool plan_spill(int n_layers, int n_expert, const std::vector<uint64_t>& stride,
     return true;
 }
 
+std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card) {
+    std::vector<StageOp> out;
+    for (int j = 0; j < n_spill;) {
+        if (card[j]) {
+            out.push_back({StageOp::Card, j, 1});
+            ++j;
+        } else {
+            int n = 1;
+            while (j + n < n_spill && !card[j + n]) ++n;
+            out.push_back({StageOp::Ram, j, n});
+            j += n;
+        }
+    }
+    return out;
+}
+
 }  // namespace basalt::models::inkling2
