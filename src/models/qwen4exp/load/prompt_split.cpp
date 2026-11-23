@@ -80,13 +80,10 @@ int prompt_split(Context& context) {
     auto& g = *context.g;
     auto& skip_base = *context.skip_base;
     auto& add_foreign = context.add_foreign;
-    auto& ss = *context.ss;
     auto& src = *context.src;
-    auto& xcache = *context.xcache;
     auto& peer = *context.peer;
     auto& peers = *context.peers;
     auto& drive = *context.drive;
-    auto& host_res = *context.host_res;
     auto& kMaxAutoChunk = *context.kMaxAutoChunk;
     auto& open_peer = context.open_peer;
     auto& pstages = *context.pstages;
