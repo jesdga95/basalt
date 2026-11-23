@@ -119,6 +119,10 @@ public:
     /// until `lend(false)`.
     uint64_t reserve() const { return reserve_; }
     bool lent() const { return lent_; }
+    /// Device work or placement that could not be confirmed: every later request is refused and the engine ends without
+    /// the CUDA teardown.
+    void wedge();
+    bool wedged() const { return wedged_; }
     uint64_t held_free(uint64_t base) const { return std::max(spare_ ? spare_ : base, reserve_); }
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
     /// room. False when even no copy at all leaves that much, or when the copies could not go back.
@@ -188,6 +192,7 @@ private:
     uint64_t reserve_ = 0;
     uint64_t spare_ = 0;   ///< --vram-reserve-mib: the free VRAM the copies leave (0: each step's own default)
     bool lent_ = false;
+    bool wedged_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;

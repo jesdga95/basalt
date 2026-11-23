@@ -162,6 +162,11 @@ public:
     bool ensure(int64_t positions, std::string& err);
     void trim(int64_t positions);
     int64_t backed_cells() const { return backed_cells_; }
+    bool usable() const {
+        for (const auto& a : full_)
+            if (!a->usable()) return false;
+        return true;
+    }
     bool save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const;
     /// Restores from kv[at..]; `at` moves past what it read. False when kv holds no drafter cells of that shape.
     bool restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream);

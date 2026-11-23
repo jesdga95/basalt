@@ -4,6 +4,7 @@
 
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/log.hpp"
@@ -766,10 +767,15 @@ uint64_t InklingModel::late_room() const {
     return loaded < kLateRoom ? kLateRoom - loaded : 0;
 }
 
+void InklingModel::wedge() {
+    wedged_ = true;
+    core::gpu_left_running().store(true);
+}
+
 uint64_t InklingModel::promote(uint64_t keep_free) {
     const int ne = geo().n_expert;
     uint64_t moved = 0;
-    if (copies_retired_ || !copy_range()) return 0;
+    if (wedged_ || copies_retired_ || !copy_range()) return 0;
     const uint64_t gran = copy_lay_.gran;
     keep_free += late_room();
     for (size_t k = (size_t) n_copy_; k < spill_order_.size(); ++k) {
@@ -793,8 +799,12 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         const uint8_t* src = w.spill_host + (uint64_t) (spill_.slot[(size_t) l][(size_t) e] - keep) * w.expert_stride;
         const unsigned long long at = (unsigned long long) p;
         if (cudaMemcpy(p, src, w.expert_stride, cudaMemcpyHostToDevice) != cudaSuccess ||
-            cudaMemcpy(w.blob_table + e, &at, 8, cudaMemcpyHostToDevice) != cudaSuccess)
-            break;
+            cudaMemcpy(w.blob_table + e, &at, 8, cudaMemcpyHostToDevice) != cudaSuccess) {
+            // the entry may or may not point at the copy now: nothing may run on the table
+            wedge();
+            basalt::log::error("basalt inkling2", "an expert copy could not be placed: every later request is refused");
+            return moved;
+        }
         copy_[i] = p;
         ++n_copy_;
         ++layer_copies_[(size_t) l];
@@ -805,19 +815,26 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
 }
 
 bool InklingModel::resize_reserve(uint64_t free_bytes, void* stream) {
-    reserve_ = free_bytes;
-    if (lent_) return true;   // the wake takes the copies back against this reserve
+    if (wedged_) return false;
+    if (lent_) {   // the wake takes the copies back against this reserve
+        reserve_ = free_bytes;
+        return true;
+    }
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
-    const uint64_t want = held_free(kCardSpare);
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+    const uint64_t want = std::max(spare_ ? spare_ : kCardSpare, free_bytes);
     if (free_b < want) {
+        // refused before anything moves when even every copy's pages would not leave that much
+        const uint64_t reclaimable = copies_retired_ ? 0 : (uint64_t) copy_maps_.size() * copy_lay_.gran;
+        if (want - free_b > reclaimable) return false;
         uint64_t freed = 0;
         if (!demote(want - free_b, stream, freed)) return false;
     } else {
         promote(want);
     }
-    cudaMemGetInfo(&free_b, &total_b);
-    return free_b >= want;
+    if (wedged_) return false;
+    reserve_ = free_bytes;
+    return true;
 }
 
 bool InklingModel::lend(bool low, void* stream) {
@@ -859,6 +876,7 @@ bool InklingModel::stage_from_card(int l, void* stream) const {
 
 bool InklingModel::demote(uint64_t bytes, void* stream, uint64_t& freed) {
     freed = 0;
+    if (wedged_) return false;
     if (n_copy_ == 0) return true;
     const int ne = geo().n_expert;
     // the last copies, the least routed, whose granules make up `bytes` (a granule another copy still uses stays); each one
@@ -881,8 +899,10 @@ bool InklingModel::demote(uint64_t bytes, void* stream, uint64_t& freed) {
     if (dropped > 0) ++epoch_;
     // every reader of the copies is done before their granules go (the blob tables' readers run on this stream)
     if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) ok = false;
-    if (!ok) {
-        basalt::log::error("basalt inkling2", "expert copies could not go back to RAM (%lld went)", (long long) dropped);
+    if (!ok) {   // a queued clear may not have run: the host's view and the device's table are not known to agree
+        wedge();
+        basalt::log::error("basalt inkling2", "expert copies could not go back to RAM (%lld went): every later request is refused",
+                           (long long) dropped);
         return false;
     }
     const uint64_t mapped = (uint64_t) copy_maps_.size();

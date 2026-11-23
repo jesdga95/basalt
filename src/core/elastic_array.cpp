@@ -105,14 +105,20 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
 }
 
 void ElasticArray::trim(uint64_t bytes) {
-    if (plain_ || !base_ || extents_.empty() || extents_.back().off < bytes) return;
-    cudaDeviceSynchronize();
+    if (unusable_ || plain_ || !base_ || extents_.empty() || extents_.back().off < bytes) return;
+    if (cudaDeviceSynchronize() != cudaSuccess) {   // a reader may still use what would go
+        unusable_ = true;
+        return;
+    }
     while (!extents_.empty() && extents_.back().off >= bytes) {
         const Extent& e = extents_.back();
-        vmm::unmap(base_ + e.off, e.bytes, e.handle);
+        if (!vmm::unmap(base_ + e.off, e.bytes, e.handle)) {   // its record stays: the range is not reused
+            unusable_ = true;
+            break;
+        }
         extents_.pop_back();
     }
-    backed_ = extents_.empty() ? 0 : extents_.back().off + extents_.back().bytes;
+    backed_ = std::min(backed_, extents_.empty() ? 0 : extents_.back().off + extents_.back().bytes);
 }
 
 }  // namespace basalt::core

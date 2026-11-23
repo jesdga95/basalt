@@ -374,6 +374,7 @@ public:
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        if (m_.wedged()) return wedged();
         if (r.n_tokens < 1) return {model::Status::Error, "inkling2: an empty window"};
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
         std::string err;
@@ -409,6 +410,7 @@ public:
 protected:
     // the hooks of the shared driver (model/batch_driver.hpp)
     const char* batch_name() const override { return "inkling2"; }
+    bool batch_ready() const override { return !m_.wedged(); }
     int64_t batch_context() const override { return m_.context(); }
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
@@ -455,8 +457,10 @@ protected:
 
 public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
+        if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
         if (r.pos == 0) restart_positions(r.n_tokens);
+        if (m_.wedged()) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) r.pos);
         if (sh_->prompt && r.n_tokens > 16) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
@@ -479,6 +483,7 @@ public:
     // ---- [vision] images (vision.hpp, vision_encoder.hpp): a picture's rows stand in for its pad tokens' embeddings, taken
     // as they are (no embedding norm); the history holds the pad token at their positions.
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        if (m_.wedged()) return wedged();
         ImageEncoder& enc = m_.encoder();
         if (!enc.staged()) return {model::Status::NotImplemented, "inkling2: started without --vision"};
         std::string err;
@@ -489,6 +494,7 @@ public:
     }
     void images_done() override { m_.encoder().release(); }
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
+        if (m_.wedged()) return wedged();
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
         if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) pos);
@@ -544,6 +550,7 @@ public:
     // SLEEP / WAKE: the card's copies of the RAM experts go back to RAM (decode reads them there) and return at the wake; the
     // driver moves the rest. A model that kept every expert on the card has nothing to lend: ok, no slots, SLEEP goes on.
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
+        if (m_.wedged()) return wedged();
         if (!m_.copies()) return {};
         cudaStreamSynchronize(stream_);
         const int64_t before = m_.promoted();
@@ -557,6 +564,7 @@ public:
     // VRAM: the copies resize to leave `mib` free (< 0: the start's --vram-reserve-mib). A card that holds every expert has
     // no copies to resize: refused unless it already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        if (m_.wedged()) return wedged();
         cudaStreamSynchronize(stream_);
         const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20, stream_);
         expert_slots = m_.copies() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
@@ -579,8 +587,12 @@ public:
     // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
     int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kMaxRows) : 1; }
     bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
-    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override { return dspark_.draft_begin(anchor, pos, n, stream_); }
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        if (m_.wedged()) return wedged();
+        return dspark_.draft_begin(anchor, pos, n, stream_);
+    }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        if (m_.wedged()) return wedged();
         return dspark_.draft_end(ids, conf, max_n, n, need, stream_);
     }
 
@@ -590,6 +602,18 @@ public:
     // rows past it.
     size_t elem() const { return m_.cache_fp8() ? 1 : 2; }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * kHeadDim * elem(); }
+
+    static model::Result wedged() { return {model::Status::Error, "inkling2: the model is wedged; restart the engine"}; }
+    // False once a cache's backing could not be confirmed (a clear or a release): the model stops then.
+    bool caches_usable() {
+        bool ok = dspark_.usable();   // DSPARK HOOK
+        for (const auto& a : elastic_) ok = ok && a->usable();
+        if (!ok && !m_.wedged()) {
+            m_.wedge();
+            basalt::log::error("basalt inkling2", "a cache's device memory could not be confirmed: every later request is refused");
+        }
+        return ok;
+    }
 
     // The positions every full-attention cache backs: the visits' and the drafter's full layers'.
     void count_backed() {
@@ -645,9 +669,13 @@ public:
         for (auto& a : elastic_)
             if (!a->ensure(bytes, 0, err)) {
                 err = "the caches cannot grow to " + std::to_string(target) + " positions: " + err;
+                caches_usable();
                 return false;
             }
-        if (!dspark_.ensure(target, err)) return false;   // DSPARK HOOK
+        if (!dspark_.ensure(target, err)) {   // DSPARK HOOK
+            caches_usable();
+            return false;
+        }
         count_backed();
         if (positions <= backed_) return true;
         err = "the caches do not back the requested positions";
@@ -669,6 +697,7 @@ public:
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
             dspark_.trim(keep);
             count_backed();
+            if (!caches_usable()) return;
         }
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             cudaStreamSynchronize(stream_);
@@ -726,6 +755,7 @@ public:
 
     // A full-attention visit's cache is cell-major ([cell][head][dim]): its first `positions` cells are one run.
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        if (m_.wedged()) return wedged();
         if (positions < 0 || positions > backed_) return {model::Status::Error, "inkling2: positions past the backed caches"};
         cudaStreamSynchronize(stream_);
         kv.clear();
@@ -753,6 +783,7 @@ public:
     }
 
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        if (m_.wedged()) return wedged();
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
         cudaStreamSynchronize(stream_);

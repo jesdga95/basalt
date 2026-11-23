@@ -63,9 +63,9 @@ the text model.
   The 256 MiB is judged from the card's total use (anything that allocates counts as loaded). The copies lie back to back
   in one address range, the least routed last, so the ones a grow sends back free whole pages. A window whose graph finds
   no device memory runs direct, and windows of its shape keep running without a graph (no copy moves); a batched window's
-  graph has no such fallback. If copies
-  cannot be sent back (a CUDA failure), the grow, the sleep or the resize fails with an error and the copies that did go
-  stay in RAM. Nothing changes when everything fits.
+  graph has no such fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A copy table update or a
+  cache's backing that cannot be confirmed (a CUDA failure) stops the engine: every later request is refused. Nothing
+  changes when everything fits.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
   At a sleep the card's copies of the RAM experts go back to RAM (the CPU computes them) and the driver moves the rest
   of the GPU state to host memory; the wake takes the copies back while the card has room. `reserve_mib` resizes them the
