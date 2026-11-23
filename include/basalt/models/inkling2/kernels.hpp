@@ -193,7 +193,7 @@ void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64
 /// before the experts run. Reads only; `sink` (4 bytes) is written on a 2^-32 chance so the loads are kept.
 void expert_prefetch(const int32_t* ids, int n, const unsigned long long* blobs, uint64_t bytes, uint32_t* sink, void* stream);
 /// y[r] = sum_slot w[r][slot] * out[r * k + slot] in slot order (fp32).
-void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream);
+void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream, const int32_t* ids = nullptr);
 
 // ---- a decode window's fused glue (kernels/glue.cu): at most kDecodeRows rows --------------------------------------------
 //
