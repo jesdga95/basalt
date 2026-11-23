@@ -36,6 +36,29 @@ inline std::vector<int> batch_shares(const std::vector<std::vector<double>>& joi
     return rows;
 }
 
+/// The same for drafters that set their own windows' length (no chances to weigh): from the rows each window would take
+/// alone (`want`, at least 1 each). With no more slots than rows one pass serves them all: windows that fit together keep their rows, else the
+/// rows are shared max-min fairly (the windows wanting least are served in full, the others split what is left evenly, a
+/// remainder row going to the window wanting less, then the earlier slot), so no slot is held to one row while another
+/// takes the pass. With more slots than rows each may take the cap.
+inline std::vector<int> batch_fair_shares(const std::vector<int>& want, int cap) {
+    const size_t n = want.size();
+    if (n == 0) return {};
+    if ((int) n > cap) return std::vector<int>(n, cap);
+    std::vector<size_t> ord(n);
+    for (size_t i = 0; i < n; ++i) ord[i] = i;
+    std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return want[a] < want[b]; });
+    std::vector<int> rows(n, 1);
+    int left = cap;
+    for (size_t k = 0; k < n; ++k) {
+        const int rest = (int) (n - k);
+        const int share = std::max(1, (left + rest - 1) / rest);
+        rows[ord[k]] = std::max(1, std::min(want[ord[k]], share));
+        left -= rows[ord[k]];
+    }
+    return rows;
+}
+
 /// The windows of `rows` packed into groups of at most `cap` rows, first fit in slot order: each group starts at the
 /// first window not yet taken and takes every later one that still fits.
 inline std::vector<std::vector<size_t>> batch_groups(const std::vector<int>& rows, int cap) {
