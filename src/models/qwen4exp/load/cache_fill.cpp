@@ -43,14 +43,13 @@ int cache_fill(Context& context) {
                                                     std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
         return hs + gs;
     };
-    // what one peer card can hold of experts: its free memory less its buffers (one set per tier it holds) and reserve
+    // what one peer card can hold of experts: its free memory less its tier's buffers and reserve
     auto card_room = [&](int dev, int cur) -> uint64_t {
         size_t pfree = 0, ptotal = 0;
         if (cudaSetDevice(dev) != cudaSuccess || cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) return 0;
-        const uint64_t tiers = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
         const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                  (dev == o.peer_device ? peer_prompt_bytes() : 0) +
-                                 tiers * basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
+                                 basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
                                  (dev == o.peer_device ? (uint64_t) peer_split_bytes(cur) : 0);
         return (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
     };
@@ -62,12 +61,8 @@ int cache_fill(Context& context) {
             (void) cudaGetLastError();
             return 0;
         }
-        std::vector<int> seen;   // each card once; its tiers share its free memory
-        for (int dev : o.peer_devices) {
-            if (dev >= count || std::find(seen.begin(), seen.end(), dev) != seen.end()) continue;
-            seen.push_back(dev);
-            room += card_room(dev, cur);
-        }
+        for (int dev : o.peer_devices)   // (each card once: gpu names a card once)
+            if (dev < count) room += card_room(dev, cur);
         (void) cudaSetDevice(cur);
         (void) cudaGetLastError();
         return room;
