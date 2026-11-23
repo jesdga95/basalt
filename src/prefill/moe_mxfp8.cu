@@ -14,19 +14,19 @@ namespace basalt::prefill::mxfp8 {
 namespace {
 
 constexpr int kTileTokens = 64;
-constexpr int kBlockTiles = 4;
-constexpr int kBT = kBlockTiles * kTileTokens;   // 256 tokens per CTA
-constexpr int kBR = 64;                          // 64 weight rows per CTA (32 gate + 32 up for SWIGLU)
+constexpr int kBlockTiles = 2;
+constexpr int kBT = kBlockTiles * kTileTokens;   // 128 tokens per CTA
+constexpr int kBR = 128;                         // 128 weight rows per CTA (64 gate + 64 up for SWIGLU)
 constexpr int kBK = 128;                         // 128 K per stage (= 1 block_mxfp8 = 4 x k32 MMA)
-constexpr int kThreads = 256;                    // 8 warps: 4 (tokens) x 2 (weight rows)
+constexpr int kThreads = 256;                    // 8 warps: 2 (tokens) x 4 (weight rows)
 constexpr int kNS = 2;                           // double-buffered cp.async stages
 constexpr int kBlockBytes = 132;                 // sizeof(block_mxfp8): 4 UE8M0 + 128 E4M3
 constexpr int kBRowStride = 144;                 // 16B-aligned staging per weight row (covers pad <= 12 + 132)
-constexpr int kACodeBytes = kBT * kBK;           // 32768 B
-constexpr int kAScaleBytes = kBT * 4;            // 1024 B (1 uint32_t = 4 UE8M0 per row)
+constexpr int kACodeBytes = kBT * kBK;           // 16384 B
+constexpr int kAScaleBytes = kBT * 4;            // 512 B (1 uint32_t = 4 UE8M0 per row)
 constexpr int kAStage = kACodeBytes + kAScaleBytes;
-constexpr int kBStage = kBR * kBRowStride;       // 9216 B
-constexpr int kSmemBytes = kNS * (kAStage + kBStage);   // 86016 B (< 99 KiB)
+constexpr int kBStage = kBR * kBRowStride;       // 18432 B
+constexpr int kSmemBytes = kNS * (kAStage + kBStage);   // 70656 B (< 99 KiB)
 
 void ck(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -98,10 +98,32 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
     return r;
 }
 
-__device__ __forceinline__ void quant_block32(float v, int lane, uint8_t* code_out, uint8_t* scale_out) {
-    float amax = fabsf(v);
+// One warp processes 128 contiguous elements (4 MXFP8 32-element blocks): 4 elements per thread via vectorized
+// float4 / uint2 loads, packed uint32_t (4x E4M3) stores, and 1 coalesced uint32_t (4x UE8M0) scale store per warp.
+template <typename T>
+__global__ void quantize_mxfp8_kernel(const T* __restrict__ x, int64_t rows, int64_t cols, int64_t ld,
+                                      uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
+    const int gpr = (int) (cols >> 7);   // 128-element groups per row
+    const int64_t r = (int64_t) blockIdx.x;
+    const int g = (int) blockIdx.y * (blockDim.x >> 5) + (int) (threadIdx.x >> 5);
+    if (r >= rows || g >= gpr) return;
+    const int lane = threadIdx.x & 31;
+    const int col = (g << 7) + (lane << 2);
+
+    float4 v;
+    if constexpr (sizeof(T) == 4) {
+        v = *reinterpret_cast<const float4*>(x + r * ld + col);
+    } else {
+        const uint2 raw = *reinterpret_cast<const uint2*>(x + r * ld + col);
+        const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+        const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+        v = make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
 #pragma unroll
-    for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    for (int m = 4; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+
     uint8_t sb = 0u;
     float inv = 0.0f;
     if (amax > 0.0f) {
@@ -113,29 +135,19 @@ __device__ __forceinline__ void quant_block32(float v, int lane, uint8_t* code_o
         sb = (uint8_t) (e + 127);
         inv = sb == 0u ? __uint_as_float(0x7F000000u) : __uint_as_float((uint32_t) (254 - sb) << 23);
     }
-    *code_out = (uint8_t) __nv_cvt_float_to_fp8(v * inv, __NV_SATFINITE, __NV_E4M3);
-    if (lane == 0) *scale_out = sb;
-}
 
-template <typename T>
-__global__ void quantize_mxfp8_kernel(const T* __restrict__ x, int64_t rows, int64_t cols, int64_t ld,
-                                      uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
-    const uint32_t bpr = (uint32_t) (cols >> 5);
-    const uint32_t blk = ((uint32_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    const int lane = threadIdx.x & 31;
-    if ((int64_t) blk >= rows * (int64_t) bpr) return;
-    const int64_t r = (int64_t) (blk / bpr);
-    const int64_t b = (int64_t) (blk - (uint32_t) r * bpr);
-    float v;
-    if constexpr (sizeof(T) == 4) {
-        v = x[r * ld + (b << 5) + lane];
-    } else {
-        __half h;
-        const uint16_t raw = x[r * ld + (b << 5) + lane];
-        memcpy(&h, &raw, 2);
-        v = __half2float(h);
+    const uint16_t p0 = (uint16_t) __nv_cvt_float2_to_fp8x2(make_float2(v.x * inv, v.y * inv), __NV_SATFINITE, __NV_E4M3);
+    const uint16_t p1 = (uint16_t) __nv_cvt_float2_to_fp8x2(make_float2(v.z * inv, v.w * inv), __NV_SATFINITE, __NV_E4M3);
+    *reinterpret_cast<uint32_t*>(codes + r * cols + col) = (uint32_t) p0 | ((uint32_t) p1 << 16);
+
+    const uint32_t s0 = __shfl_sync(0xffffffffu, (uint32_t) sb, 0);
+    const uint32_t s1 = __shfl_sync(0xffffffffu, (uint32_t) sb, 8);
+    const uint32_t s2 = __shfl_sync(0xffffffffu, (uint32_t) sb, 16);
+    const uint32_t s3 = __shfl_sync(0xffffffffu, (uint32_t) sb, 24);
+    if (lane == 0) {
+        *reinterpret_cast<uint32_t*>(scales + r * (cols >> 5) + (g << 2)) =
+            s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
     }
-    quant_block32(v, lane, codes + r * cols + (b << 5) + lane, scales + blk);
 }
 
 // ---------------------------------------------------------------------------------------- GEMM
@@ -155,11 +167,11 @@ struct GemmArgs {
 
 template <bool SWIGLU>
 __device__ __forceinline__ int b_row(int rb, int sr, int half) {
-    return SWIGLU ? (sr < 32 ? rb * 32 + sr : half + rb * 32 + (sr - 32)) : rb * kBR + sr;
+    return SWIGLU ? (sr < 64 ? rb * 64 + sr : half + rb * 64 + (sr - 64)) : rb * kBR + sr;
 }
 template <bool SWIGLU>
 __device__ __forceinline__ int b_tile_row(int warp_n, int r) {
-    return SWIGLU ? (r < 2 ? warp_n * 16 + r * 8 : 32 + warp_n * 16 + (r - 2) * 8) : warp_n * 32 + r * 8;
+    return SWIGLU ? (r < 2 ? warp_n * 16 + r * 8 : 64 + warp_n * 16 + (r - 2) * 8) : warp_n * 32 + r * 8;
 }
 
 template <bool GATHER, bool SWIGLU>
@@ -219,12 +231,20 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     }
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int warp_m = warp >> 1, warp_n = warp & 1;   // 4 token tiles x 2 row halves
+    const int warp_m = warp >> 2, warp_n = warp & 3;   // 2 token tiles x 4 row quarters
     const bool live = warp_m < ntiles;
     const int group = lane >> 2, tig = lane & 3;
     const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3);
     const int a_col = ((lane >> 4) & 1) * 16;
     const int sfa_row = ((lane & 1) << 3) | group;
+
+    unsigned b_base_mod16[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int sr = b_tile_row<SWIGLU>(warp_n, r) + group;
+        const uint8_t* base_row = w_src + (size_t) b_row<SWIGLU>(rb, sr, a.half) * row_bytes;
+        b_base_mod16[r] = (unsigned) (reinterpret_cast<uintptr_t>(base_row) & 15u);
+    }
 
     float acc[4][4][4] = {};
 
@@ -253,11 +273,11 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
 
             unsigned sfb[4];
             const uint8_t* bp[4];
+            const unsigned kt_pad = (unsigned) (kt * kBlockBytes);
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
                 const int sr = b_tile_row<SWIGLU>(warp_n, r) + group;
-                const uint8_t* src = w_src + (size_t) b_row<SWIGLU>(rb, sr, a.half) * row_bytes + (size_t) kt * kBlockBytes;
-                const int pad = (int) (reinterpret_cast<uintptr_t>(src) & 15u);
+                const int pad = (int) ((b_base_mod16[r] + kt_pad) & 15u);
                 const uint8_t* p = bs + sr * kBRowStride + pad;
                 bp[r] = p + 4;
                 unsigned v = *reinterpret_cast<const uint32_t*>(p);
@@ -304,7 +324,7 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                 const int64_t out_row = a.dst_ids ? (int64_t) a.dst_ids[brow0 + lr] : (int64_t) (brow0 + lr);
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
-                    const int col = rb * 32 + warp_n * 16 + r * 8 + 2 * tig;
+                    const int col = rb * 64 + warp_n * 16 + r * 8 + 2 * tig;
                     const float g0 = acc[mt][r][2 * h], g1 = acc[mt][r][2 * h + 1];
                     const float u0 = acc[mt][r + 2][2 * h], u1 = acc[mt][r + 2][2 * h + 1];
                     float v0, v1;
@@ -365,10 +385,11 @@ void quantize_tokens(const float* x, int64_t rows, int64_t cols, int64_t ld, voi
         basalt::log::error("basalt", "prefill mxfp8: quantize_tokens cols %lld", (long long) cols);
         std::exit(1);
     }
-    const int64_t nblk = rows * (cols >> 5);
-    const unsigned grid = (unsigned) ((nblk + 7) / 8);
+    const int gpr = (int) (cols >> 7);
+    const int threads = gpr <= 32 ? gpr * 32 : 256;
+    const dim3 grid((unsigned) rows, (unsigned) (gpr <= 32 ? 1 : (gpr + 7) / 8));
     auto* codes = static_cast<uint8_t*>(act);
-    quantize_mxfp8_kernel<float><<<grid, 256, 0, (cudaStream_t) stream>>>(
+    quantize_mxfp8_kernel<float><<<grid, threads, 0, (cudaStream_t) stream>>>(
         x, rows, cols, ld, codes, codes + scale_off(rows, cols));
     ck("quantize_tokens");
 }
@@ -379,10 +400,11 @@ void quantize_f16(const uint16_t* x, int64_t rows, int64_t cols, int64_t ld, voi
         basalt::log::error("basalt", "prefill mxfp8: quantize_f16 cols %lld", (long long) cols);
         std::exit(1);
     }
-    const int64_t nblk = rows * (cols >> 5);
-    const unsigned grid = (unsigned) ((nblk + 7) / 8);
+    const int gpr = (int) (cols >> 7);
+    const int threads = gpr <= 32 ? gpr * 32 : 256;
+    const dim3 grid((unsigned) rows, (unsigned) (gpr <= 32 ? 1 : (gpr + 7) / 8));
     auto* codes = static_cast<uint8_t*>(act);
-    quantize_mxfp8_kernel<uint16_t><<<grid, 256, 0, (cudaStream_t) stream>>>(
+    quantize_mxfp8_kernel<uint16_t><<<grid, threads, 0, (cudaStream_t) stream>>>(
         x, rows, cols, ld, codes, codes + scale_off(rows, cols));
     ck("quantize_f16");
 }
