@@ -2487,6 +2487,41 @@
       "engine_args": "--gpu 0 --max-context 66661 --kv int8"
     },
     {
+      "submitter": "stanislav-malchev",
+      "date": "2026-11-20",
+      "commit": "ad274aa8dc",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 13.9
+        }
+      ],
+      "ram_gib": 64,
+      "cpu": "11th Gen Intel Core i5-11400, 6 cores",
+      "ram_gbps": 49.0,
+      "os": "Windows",
+      "quant": "IQ3_XXS",
+      "kv": "int8",
+      "prefill_16k_tps": 2143.4,
+      "prefill_64k_tps": 2280.1,
+      "decode_tps": 50.8,
+      "decode_conv_tps": 41.4,
+      "decode_struct_tps": 54.6,
+      "decode_prose_tps": 40.9,
+      "accept_conv_pct": 73.1,
+      "accept_struct_pct": 96.1,
+      "accept_prose_pct": 67.2,
+      "draft_len_conv": 2.3,
+      "draft_len_struct": 6.7,
+      "draft_len_prose": 1.8,
+      "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+    },
+    {
       "submitter": "roger",
       "date": "2026-11-09",
       "commit": "4998eb3733",
@@ -4034,7 +4069,7 @@
       "kv": "fp16",
       "prefill_16k_tps": 12714.1,
       "prefill_64k_tps": 10494.6,
-      "decode_tps": 537.1,
+      "decode_tps": 536.1,
       "decode_conv_tps": 357.9,
       "decode_struct_tps": 633.0,
       "decode_prose_tps": 294.5,
@@ -4663,6 +4698,132 @@
       "draft_len_struct": 6.8,
       "draft_len_prose": 1.9,
       "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "gweyer-dual5090",
+      "date": "2026-11-15",
+      "commit": "71be0a452b",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 550,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        },
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 550,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        }
+      ],
+      "ram_gib": 61,
+      "cpu": "AMD Ryzen 9 5950X, 16 cores",
+      "ram_gbps": 47.7,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 1602.9,
+      "prefill_64k_tps": 1872.5,
+      "decode_tps": 511.3,
+      "decode_conv_tps": 357.4,
+      "decode_struct_tps": 626.3,
+      "decode_prose_tps": 299.3,
+      "accept_conv_pct": 69.5,
+      "accept_struct_pct": 98.1,
+      "accept_prose_pct": 64.2,
+      "draft_len_conv": 2.7,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 2.0,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "Peer access on between the two 5090s (patched open-driver build, P2P verified with data check)."
+    },
+    {
+      "submitter": "tselle",
+      "date": "2026-11-23",
+      "commit": "8667cc8abd",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 59,
+      "cpu": "AMD Ryzen 5 9600X, 6 cores",
+      "ram_gbps": 56.7,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 2752.9,
+      "prefill_64k_tps": 2775.7,
+      "decode_tps": 178.6,
+      "decode_conv_tps": 108.6,
+      "decode_struct_tps": 221.7,
+      "decode_prose_tps": 103.4,
+      "accept_conv_pct": 69.0,
+      "accept_struct_pct": 98.5,
+      "accept_prose_pct": 66.5,
+      "draft_len_conv": 2.1,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.7,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+    },
+    {
+      "submitter": "wisdommen",
+      "date": "2026-11-23",
+      "commit": "ff0b978d2e",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8"
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x4"
+        }
+      ],
+      "ram_gib": 128,
+      "cpu": "13th Gen Intel Core i9-13900KF, 24 cores",
+      "ram_gbps": 68.8,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 2520.6,
+      "prefill_64k_tps": 2980.9,
+      "decode_tps": 135.7,
+      "decode_conv_tps": 83.5,
+      "decode_struct_tps": 170.1,
+      "decode_prose_tps": 84.1,
+      "accept_conv_pct": 72.8,
+      "accept_struct_pct": 98.6,
+      "accept_prose_pct": 68.6,
+      "draft_len_conv": 2.2,
+      "draft_len_struct": 6.9,
+      "draft_len_prose": 1.9,
+      "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+      "notes": "Uncensored (abliterated) NVFP4-DQ6_K pack from klee100/Qwen3.8-Flash-Next-Uncensored-Basalt. 2nd card on a chipset slot (PCIe 4.0 x4, peer tier). 4x32 GB DDR5 at 4533 MT/s; 0 SSD spill."
     }
   ]
 }

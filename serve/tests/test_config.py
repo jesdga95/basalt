@@ -23,6 +23,7 @@ from serve.config import (  # noqa: E402
     SAMPLING_KEYS,
     budget_count,
     build_parser,
+    cost_rate,
     check_engine_flags,
     engine_flags_of,
     load_config_file,
@@ -515,7 +516,7 @@ class EveryOption(unittest.TestCase):
             return "1"
         if act.type is video_tokens:
             return 1024
-        if act.type is float:
+        if act.type is float or act.type is cost_rate:   # --cost-*: a price per million tokens
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
             return 0.5 if SAMPLING_KEYS[act.dest][0] is float else 7

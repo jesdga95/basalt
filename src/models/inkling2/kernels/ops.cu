@@ -1,5 +1,6 @@
 // src/models/inkling2/kernels/ops.cu - Inkling 2's block-residual mixes, loop-controller glue, attention preparation
 // (short convolutions, clips, cache writes), output gate, post-sublayer convolutions, expert plan and sum, and softcap.
+#include "basalt/kernels/doorbell.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
@@ -507,14 +508,62 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
     }
 }
 
+// One block classifies rows before touching the sequence or mapped memory. A RAM visit reserves a ticket even if
+// aborted, so its merge cannot match an earlier visit's completion.
+constexpr int kRingThreads = 256;
+static_assert(kDecodeRows <= 32, "a visit's rows fit one mask word");
+__global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_t* __restrict__ ids, int rows, int k,
+                                                                    const unsigned long long* __restrict__ blobs,
+                                                                    const float* __restrict__ x, int layer, float* x_m,
+                                                                    int32_t* ids_m, CpuBell* bell, uint32_t* seq) {
+    __shared__ uint32_t ram_rows, stopped;
+    const int n = rows * k;
+    if (threadIdx.x == 0) ram_rows = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += kRingThreads)
+        if (!blobs[ids[i]]) atomicOr(&ram_rows, 1u << (i / k));
+    __syncthreads();
+    const uint32_t m = ram_rows;
+    if (!m) return;
+    uint32_t ticket = 0;
+    if (threadIdx.x == 0) {
+        ticket = *seq + 1;
+        if (!ticket) ticket = 1;
+        *seq = ticket;
+        stopped = bk::doorbell_load_acquire(&bell->abort);
+    }
+    __syncthreads();
+    if (stopped) return;
+    for (int i = threadIdx.x; i < n; i += kRingThreads) ids_m[i] = ids[i];
+    constexpr int kVecs = kWidth / 4;
+    for (int r = 0; r < rows; ++r)
+        if (m >> r & 1)
+            for (int c = threadIdx.x; c < kVecs; c += kRingThreads)
+                reinterpret_cast<float4*>(x_m)[(size_t) r * kVecs + c] = reinterpret_cast<const float4*>(x)[(size_t) r * kVecs + c];
+    if (threadIdx.x == 0) bk::doorbell_store_relaxed(&bell->ticket, ticket);
+    __threadfence_system();   // every writer's payload before the barrier, so the release below covers it
+    __syncthreads();
+    if (threadIdx.x == 0) bk::doorbell_store_release(&bell->ring, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
+}
+
 constexpr int kMergeThreads = 256;
 __global__ void __launch_bounds__(kMergeThreads) moe_cpu_merge_kernel(const int32_t* __restrict__ ids,
                                                                       const unsigned long long* __restrict__ blobs,
-                                                                      const float* __restrict__ cpu, float* __restrict__ output,
-                                                                      uint32_t* __restrict__ tally) {
+                                                                      const float* cpu, float* __restrict__ output,
+                                                                      uint32_t* __restrict__ tally, CpuBell* bell,
+                                                                      const uint32_t* seq) {
     const int p = blockIdx.x, e = ids[p];
     if (blobs[e]) return;
-    for (int c = threadIdx.x; c < kWidth; c += kMergeThreads) output[(size_t) p * kWidth + c] = cpu[(size_t) p * kWidth + c];
+    if (bell) {   // the pool's rows land in mapped memory while this waits
+        __shared__ uint32_t taken;
+        if (threadIdx.x == 0) {
+            const uint32_t ticket = *seq;
+            taken = bk::doorbell_spin(&bell->done, ticket, &bell->abort, 8);
+        }
+        __syncthreads();
+        if (!taken) return;
+    }
+    for (int c = threadIdx.x; c < kWidth; c += kMergeThreads) output[(size_t) p * kWidth + c] = __ldcv(cpu + (size_t) p * kWidth + c);
     if (threadIdx.x == 0 && tally) atomicAdd(tally + e, 1u);
 }
 
@@ -652,10 +701,19 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
     check("post_conv/ring");
 }
 
-void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu, float* output,
-                   uint32_t* tally, void* stream) {
+void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
+                  int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream) {
     if (rows <= 0) return;
-    moe_cpu_merge_kernel<<<rows * k, kMergeThreads, 0, (cudaStream_t) stream>>>(ids, blobs, cpu, output, tally);
+    if (rows > kDecodeRows || rows * k > 1024 || layer < 0 || layer > 0xff)
+        throw std::runtime_error("inkling2 moe_cpu_ring: rows, pairs or layer");
+    moe_cpu_ring_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(ids, rows, k, blobs, x, layer, x_m, ids_m, bell, seq);
+    check("moe_cpu_ring");
+}
+
+void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu, float* output,
+                   uint32_t* tally, void* stream, CpuBell* bell, const uint32_t* seq) {
+    if (rows <= 0) return;
+    moe_cpu_merge_kernel<<<rows * k, kMergeThreads, 0, (cudaStream_t) stream>>>(ids, blobs, cpu, output, tally, bell, seq);
     check("moe_cpu_merge");
 }
 
