@@ -47,7 +47,8 @@ SYSTEM = (
     "as missing when another changed file provides it. Do not report style or taste. If unsure, leave it out. "
     "Separately from bugs, name any product decision the change makes: a changed default, a user-visible behavior or "
     "wording change, a removed or renamed option, or a new dependency, even when the code is correct. Those are the "
-    "maintainer's call, not a code question. Project rules:\n\n{rules}\n\n"
+    "maintainer's call, not a code question. A change that makes the code do what the project's docs already say is a "
+    "fix, not a product decision. Project rules:\n\n{rules}\n\n"
     'Answer with one JSON object and nothing else: {{"summary": "<two or three plain sentences a non-expert can follow: '
     'what the change does and why>", "product_decision": "<one or two plain sentences naming the decision and what '
     'users would notice, or an empty string when the change makes none>", "verdict": "merge" | "merge_with_changes" | '
