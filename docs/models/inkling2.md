@@ -61,8 +61,9 @@ the text model.
   the windows' graphs). The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
   another program, can take it. Placement counts the card's free memory itself: it reads it when the copies are first
   placed, at a VRAM resize and at a wake, and counts every map and release of the copies and the caches after that (what
-  loads later comes out of the spare and the 256 MiB). A cache grow that finds less memory than counted is refused (the
-  request gets an error) and the caches stay as they were; no copy moves for it. The copies lie back to back in one address
+  loads later comes out of the spare and the 256 MiB). A cache grow that finds less memory than counted (another
+  program took it, or the windows' graphs needed more than the spare) ends the engine with an error naming
+  `--vram-reserve-mib`: copies placed by a fresh reading would make placement depend on that. The copies lie back to back in one address
   range; a demote packs the survivors together so whole pages go back. A window whose graph finds no device memory runs
   direct, and windows of its shape keep running without a graph (no copy moves); a batched window's graph has no such
   fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A copy table update or a cache's

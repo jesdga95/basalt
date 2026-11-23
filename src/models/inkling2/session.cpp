@@ -400,7 +400,7 @@ public:
         std::string err;
         const int64_t loaned_before = m_.loaned();
         if (heat_tally_) settle_window(r.pos);
-        if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
+        if (!ensure_positions(r.pos + r.n_tokens, err)) return grow_failed(err);
         if (heat_tally_) {   // the placement changes due at this position, before any row at or past it runs
             if (rebalances() && next_rebalance_ >= 0 && r.pos >= next_rebalance_) rebalance_copies(r.pos, false);
             if (m_.loan_pending() && r.pos >= m_.loan_publish_at() && !publish_loan(r.pos)) return wedged();
@@ -535,7 +535,7 @@ public:
         const bool staged = sh_->prompt && r.n_tokens > 16;
         if (heat_tally_) settle_window(r.pos);
         if (r.pos == 0 && !restart_positions(r.n_tokens)) return wedged();
-        if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
+        if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return grow_failed(e);
         // a request's start: the copies follow the lookups so far (a staged read takes the loan's memory back first)
         if (heat_tally_ && !staged) rebalance_copies(r.pos + r.n_tokens, true);
         if (m_.wedged()) return wedged();
@@ -587,7 +587,7 @@ public:
         if (m_.wedged()) return wedged();
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
         if (heat_tally_) settle_window(pos);
-        if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
+        if (std::string e; !ensure_positions(pos + n_rows, e)) return grow_failed(e);
         hist_.resize((size_t) pos);
         if (sh_->prompt && n_rows > 16) {
             PromptRunner::Prepare prepare;
@@ -746,6 +746,11 @@ public:
         seen_epoch_ = epoch;
         return true;
     }
+    // A refused grow: request-local while the model goes on (no room even with every copy back), the end of the engine when
+    // it stopped (a shortage of counted memory, an unconfirmed step).
+    model::Result grow_failed(const std::string& err) const {
+        return {m_.wedged() ? model::Status::Error : model::Status::Refused, "inkling2: " + err};
+    }
     bool ensure_positions(int64_t positions, std::string& err) {
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
@@ -772,22 +777,19 @@ public:
         }
         if (!room_ok) return false;
         const uint64_t backing0 = backing_bytes();
-        std::vector<uint64_t> was;
-        for (const auto& a : elastic_) was.push_back(a->backed());
-        const int64_t drafter_was = dspark_.backed_cells() - kDsBlock;
         bool mapped = true;
         for (auto& a : elastic_) mapped = mapped && a->ensure(bytes, 0, err);
         mapped = mapped && dspark_.ensure(target, err);   // DSPARK HOOK
         if (!mapped) {
-            // the card has less free memory than placement counted (something past the spare took it): the request is
-            // refused and the caches go back to what they backed, so the counted room and the placement stay as they were
-            if (!caches_usable()) return false;
-            for (size_t i = 0; i < elastic_.size(); ++i) elastic_[i]->trim(was[i]);
-            if (dspark_.on()) dspark_.trim(drafter_was);
-            count_backed();
-            if (!caches_usable()) return false;
-            err = "the caches cannot grow to " + std::to_string(target) + " positions: the card has less free memory than "
-                  "counted (" + err + ")";
+            // the card has less free memory than placement counted: something outside it (another program, or more
+            // graph memory than the spare holds) took it. Placing copies by a fresh reading would make placement depend on
+            // that, so the engine stops instead.
+            if (caches_usable()) {
+                m_.wedge();
+                basalt::log::error("basalt inkling2", "the caches cannot grow to %lld positions: the card has less free memory than "
+                                   "the expert copies leave (%s); restart with a larger --vram-reserve-mib", (long long) target, err.c_str());
+            }
+            err = "the caches cannot grow to " + std::to_string(target) + " positions: the card has less free memory than counted";
             return false;
         }
         m_.account((int64_t) backing_bytes() - (int64_t) backing0);
@@ -1017,7 +1019,7 @@ public:
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (m_.wedged()) return wedged();
         if (positions < 0 || positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
-        if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
+        if (std::string e; !ensure_positions(positions, e)) return grow_failed(e);
         cudaStreamSynchronize(stream_);
         const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
         size_t i = 0;

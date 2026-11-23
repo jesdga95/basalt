@@ -1211,7 +1211,11 @@ bool InklingModel::drain_loan_upload() {
 }
 
 bool InklingModel::recall_loan(void* stream, const std::string& event) {
-    if (wedged() || !drain_loan_upload()) return false;
+    if (wedged()) {   // nothing confirms a reader of a published loan finished: its memory is kept
+        if (loaned() > 0 || loan_inflight_) loan_stuck_ = true;
+        return false;
+    }
+    if (!drain_loan_upload()) return false;
     loan_plan_.clear();
     loan_next_ = 0;
     loan_publish_at_ = -1;
