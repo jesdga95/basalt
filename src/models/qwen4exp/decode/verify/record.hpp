@@ -58,13 +58,11 @@ struct Verifier::WindowRecorder {
     const bool pdl = v_.pdl_rec_ && !v_.prof_on_;
     // the chain's kernels let their dependents in early (pdl.hpp), which stage their weights
     const bool pdl2 = pdl && kernels::pdl2_requested();
-    const int hrow0 = v_.batch_rec_ ? v_.row_base_ : 0;   // a slot group's own hand-off rows
 
     bool ple_side = false;
     bool ple_open = false;   // the PLE side branch is forked and not joined yet
     const int32_t* pos_k = nullptr;
     const int32_t* pos_i = nullptr;
-    const int64_t HB = Verifier::handoff_floats(g);
     std::vector<int64_t> gdn_idx, qsa_idx;
     int64_t gdn_first = -1;
     bool lazy = false;
