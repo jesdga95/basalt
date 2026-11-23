@@ -9,6 +9,7 @@
 #include "basalt/core/route_report.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
+#include <cstdio>
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
@@ -122,9 +123,16 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
         }
         if (ok) {
             // every card is open with its share's buffers, so its room is what its slots will get: the blocks are sized
-            // to the rooms (bigger late layers go to more cards), then each block's prompt-share prices are set
+            // to the rooms (bigger late layers go to more cards), or with gpu-share to each card's share of them (never past
+            // its room), then each block's prompt-share prices are set
             std::vector<uint64_t> rooms, layer_bytes;   // one slot of each layer, as one_each counts them
             for (const auto& p : peers_) rooms.push_back(p->room());
+            if (s_.peer_shares.size() == rooms.size() && rooms.size() > 1) {
+                uint64_t all = 0;
+                for (uint64_t r : rooms) all += r;
+                for (size_t c = 0; c < rooms.size(); ++c)
+                    rooms[c] = std::min<uint64_t>(rooms[c], (uint64_t) (s_.peer_shares[c] * (double) all));
+            }
             for (int l = 0; l < n_layers_; ++l) layer_bytes.push_back((s_.layers[(size_t) l].blob_bytes + 255) / 256 * 256);
             const uint64_t reserve_peer = (uint64_t) s_.peer_reserve_mib << 20;
             blocks_ = core::policy::split_by_bytes(layer_bytes, rooms, reserve_peer, n_expert_, peer_slots);
@@ -132,10 +140,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
                 for (int l = blocks_.lo[c]; l < blocks_.hi[c]; ++l) layer_card_[(size_t) l] = (int) c;
             fill_share_rates();
         } else {
-            shares_.clear();
-            basalt::log::warn(s_.area.c_str(), "second card not used: %s", pe.c_str());
-            peers_.clear();
-            layer_card_.assign((size_t) n_layers_, 0);
+            err = s_.name + ": a second card cannot open: " + pe;
+            return false;
         }
     }
 
@@ -183,9 +189,19 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     }
     const uint64_t ram_floor =
         tier_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
-    if (homes_.peer == 0) {
-        shares_.clear();
-        peers_.clear();
+    if (!peers_.empty() && homes_.peer == 0) {   // a second card that would hold nothing is refused, not left idle
+        size_t card = 0;   // the first card whose block does not take one home a layer (the first card when none)
+        if (homes_.main < n_expert_) {
+            const uint64_t reserve_peer = (uint64_t) s_.peer_reserve_mib << 20;
+            for (size_t c = peers_.size(); c-- > 0;) {
+                uint64_t one = 0;
+                for (int l = blocks_.lo[c]; l < blocks_.hi[c]; ++l) one += (s_.layers[(size_t) l].blob_bytes + 255) / 256 * 256;
+                if (peers_[c]->room() < reserve_peer + one) card = c;
+            }
+        }
+        const std::string why = homes_.main >= n_expert_ ? "the main card holds every expert" : "no room for an expert";
+        err = s_.refuse_peer ? s_.refuse_peer(card + 1, why) : s_.name + ": a second card would hold nothing: " + why;
+        return false;
     }
 
     // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; plan_ext() sizes what fills it
@@ -283,6 +299,19 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     // the RAM the tier took emptied the file cache; with no expert read from the file, it takes the token embedding back
     if (homes_.file == 0 && s_.host.ram_only) s_.host.ram_only();
     return true;
+}
+
+std::string ExpertTier::card_report(size_t card) const {
+    char b[160];
+    if (card == 0) {
+        std::snprintf(b, sizeof b, "dense, KV, %lld of %d experts per layer (%.1f GiB)", (long long) per_layer_, n_expert_, cache_.gib());
+        return b;
+    }
+    const size_t c = card - 1;
+    if (c >= peers_.size()) return {};
+    const int nl = blocks_.hi[c] - blocks_.lo[c];
+    std::snprintf(b, sizeof b, "%lld experts, layers %d-%d", (long long) nl * homes_.peer, blocks_.lo[c], blocks_.hi[c] - 1);
+    return b;
 }
 
 // Second card `card`'s prompt share takes its buffers before the card's slots are sized, and the prices of its layers.

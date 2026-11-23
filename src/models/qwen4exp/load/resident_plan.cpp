@@ -6,7 +6,6 @@ namespace basalt::models::qwen4exp::generate {
 
 int resident_plan(Context& context) {
     auto& o = *context.o;
-    auto& set_stream_all_min = context.set_stream_all_min;
     auto& err = *context.err;
     auto& g = *context.g;
     auto& profile = *context.profile;
@@ -96,7 +95,7 @@ int resident_plan(Context& context) {
             return true;
         }
         // several tiers: every card's buffers first, then the pairs the primary does not hold dealt out by room and
-        // bandwidth (gpu_select.hpp), each card's room shared by the tiers it holds
+        // share (model::deal_experts), each card's room shared by the tiers it holds
         const size_t np = o.peer_devices.size();
         xpeers.clear();
         for (size_t i = 1; i < np; ++i) xpeers.push_back(std::make_unique<basalt::core::PeerExperts>());
@@ -106,7 +105,7 @@ int resident_plan(Context& context) {
                 basalt::log::error("basalt generate", "%s", err.c_str());
                 return false;
             }
-        std::vector<basalt::program::TierRoom> rooms(np);
+        std::vector<uint64_t> rooms(np, 0);
         for (size_t i = 0; i < np; ++i) {
             const int dev = o.peer_devices[i];
             size_t fb = 0, tb = 0;
@@ -117,8 +116,7 @@ int resident_plan(Context& context) {
             const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) + pin_map +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);
             const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
-            rooms[i].bytes = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
-            rooms[i].gbps = o.peer_gbps[i];
+            rooms[i] = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
         }
         std::vector<std::pair<int32_t, int32_t>> ranked;
         std::vector<uint64_t> bytes;
@@ -127,7 +125,8 @@ int resident_plan(Context& context) {
                 ranked.push_back(pr);
                 bytes.push_back(basalt::core::PeerExperts::slot_bytes(pr.first));
             }
-        const std::vector<int> owner = basalt::program::spread_experts(bytes, rooms);
+        const std::vector<int> owner =
+            basalt::model::deal_experts(bytes, rooms, basalt::model::peer_shares(o.gpus, basalt::model::ShareUse::Experts));
         int64_t held = xcache.slots();
         for (size_t i = 0; i < np; ++i) {
             std::vector<std::pair<int32_t, int32_t>> pick;
@@ -268,10 +267,7 @@ int resident_plan(Context& context) {
         }
         const bp::AutoPlan plan = bp::choose_auto(in);
         auto_resident_bytes = plan.resident_bytes;
-        if (plan.peer_exclusive_src == bp::AutoSource::Auto && plan.peer_exclusive != o.peer_exclusive) {
-            o.peer_exclusive = plan.peer_exclusive;
-            set_stream_all_min();
-        }
+        if (plan.peer_exclusive_src == bp::AutoSource::Auto) o.peer_exclusive = plan.peer_exclusive;
         const cpu::PoolAffinity affinity = plan.pool_affinity == bp::AutoAffinity::All    ? cpu::PoolAffinity::All
                                            : plan.pool_affinity == bp::AutoAffinity::PCores ? cpu::PoolAffinity::PCores
                                                                                             : cpu::PoolAffinity::Auto;

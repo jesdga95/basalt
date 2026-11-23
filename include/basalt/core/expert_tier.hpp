@@ -56,6 +56,10 @@ struct ExpertTierSpec {
     int fd = -1;                ///< a descriptor of it
     FileRange range;            ///< the experts section
     std::vector<int> peer_devices;   ///< the second cards, in block order
+    /// Each second card's share of the blocks (gpu-share given, summing to 1); empty: the blocks follow the cards' rooms.
+    std::vector<double> peer_shares;
+    /// The refusal of second card `card` (1 = the first) that would hold nothing, for `why` (model/multi_gpu.hpp).
+    std::function<std::string(size_t card, const std::string& why)> refuse_peer;
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< fixed experts per layer (-1: sized from free memory)
     bool diag_tier_frozen = false;
     int vram_reserve_mib = 0, peer_reserve_mib = 600;
@@ -139,6 +143,8 @@ public:
     /// Sizes the tiers and queues their experts' reads in `reads` (the start's one pass places them). `h_rows`: the mapped
     /// rows a second card shares with the CPU pool.
     bool open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err);
+    /// Card `card`'s part once open (0 = the main card), for the start line after the load.
+    std::string card_report(size_t card) const;
     /// Once the experts have landed: the RAM tier pinned, the main card's copies seeded, and the slots beside the base arena
     /// planned once (an exact --expert-cache that does not fit stops the start here) and opened.
     bool attach(std::string& err);

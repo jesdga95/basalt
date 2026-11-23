@@ -99,12 +99,10 @@ struct Options : CommonOptions {
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
-    /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
-    /// from each GPU's free VRAM); empty = one GPU
-    std::string layer_split;
-    /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
-    /// GPU, sharing everything - the bit-exact A/B of the hand-off)
-    std::string split_device;
+    /// gpu-mode peer: the expert tier's cards after the main one (the first is `peer_device`; -1 and empty: none), from
+    /// the run's cards (CommonOptions::gpus)
+    int peer_device = -1;
+    std::vector<int> peer_devices;
     /// The most experts one adaptive round swaps into the main card's tier; a saturated pipeline (see `kSatBoost`) may
     /// swap `kSatBoost` times as many.
     int adapt_swaps = 96;

@@ -12,7 +12,7 @@
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/q8_gemm.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
 
@@ -40,13 +40,6 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 constexpr uint64_t kSharedFixed = 768 * kMiB;
 constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
-// The multi-GPU price of a decode window (multi_gpu_plan.hpp): what one moves at the kernels' rate (3.57 ms a token on an
-// RTX 5090), what the experts no card holds add when the CPU computes them all, how the hottest share x of the experts
-// serves x^kHitExponent of the lookups, and one hand-off of a window's rows from card to card through page-locked RAM
-constexpr double kWindowGB = 6.4;
-constexpr double kMissMs = 130.0;
-constexpr double kHitExponent = 0.55;
-constexpr double kHandoffMs = 0.1;
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
 struct ProjPart {
@@ -231,9 +224,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 
     uint64_t dense = n_vocab * kQ8Row, experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
-    // two cards (gpu-mode split): the layer split's cut, priced (multi_gpu_plan.hpp)
-    if (req.diag_split_at > 0 && req.peer_devices.empty()) return fail("--diag-split-at needs a second card (--gpu 0,1 --gpu-mode split)");
-    if (!req.peer_devices.empty())
+    // two cards (gpu-mode split): the layer split's cut from the shares (model/multi_gpu.hpp)
+    if (req.gpus.mode == program::GpuMode::Split)
         if (model::Result r = plan_cards(req); !r.ok()) return r;
     // the loop's message queries of every core layer in one array on each card that runs a core layer: a pass's messages
     // are one launch
@@ -604,66 +596,49 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
 
 model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
     const Geometry& g = pack_.geo;
-    std::vector<program::GpuCard> cards;
-    const int devs[2] = {device_, req.peer_devices[0]};
-    for (int i = 0; i < 2; ++i) {
-        cudaDeviceProp p{};
-        cudaGetDeviceProperties(&p, devs[i]);
-        program::GpuCard c;
-        c.name = p.name;
-        c.cc_major = p.major;
-        c.cc_minor = p.minor;
-        // what the card has free before the weights (a desktop, another process): the head is already on the first
-        size_t free_b = 0, total_b = 0;
-        cudaSetDevice(devs[i]);
-        c.vram = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b + (i == 0 ? (uint64_t) g.n_vocab * kQ8Row : 0) : p.totalGlobalMem;
-        c.mem_gbps = (size_t) i < req.card_gbps.size() ? req.card_gbps[(size_t) i] : 0;
-        cards.push_back(c);
-    }
-    cudaSetDevice(device_);
-    program::MgModel mm;
-    mm.layers = g.n_layers;
-    mm.pairs = (int64_t) g.n_layers * g.n_expert;
-    mm.window_gb = kWindowGB;
-    mm.miss_ms = kMissMs;
-    mm.hit_exponent = kHitExponent;
-    mm.tier_built = false;
-    mm.handoff_ms = kHandoffMs;
-    mm.split_spills = false;   // a split card holds every expert of its layers
-    mm.split_unlike = true;    // and the split beats the CPU's experts on unlike cards too (an RTX 5090 with 16 GB free)
-    uint64_t experts = 0, dense = (uint64_t) g.n_vocab * kQ8Row;
-    std::vector<int> visits((size_t) g.n_layers, 0);
-    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
+    // the bytes the share divides: per layer its experts (a split card holds every expert of its layers), its dense rows and
+    // every slot's caches of its visits at the context; per card what it holds whatever its layers (the head is on the main
+    // card already, so its room is what is free now)
     const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
+    const bool fp8 = req.kv == "fp8", int8 = req.kv == "int8";
+    std::vector<int> visits((size_t) g.n_layers, 0);
+    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
+    model::SplitSpec s;
     for (int l = 0; l < g.n_layers; ++l) {
         const ExpertLayer& el = pack_.experts[(size_t) l];
-        mm.layer_bytes.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes));
-        experts += mm.layer_bytes.back();
-        mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8", req.kv == "int8") * n_sess);
-        mm.layer_share.push_back((double) visits[(size_t) l] / (double) g.visits.size());
-        dense += (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34) +
-                 prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
-                 2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
-                 prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
+        const uint64_t dense = (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34) +
+                               prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
+                               2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
+                               prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
+        s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense +
+                          (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8) * n_sess);
     }
-    for (int c = 0; c <= g.n_layers; ++c) mm.split_handoffs.push_back(split_handoffs(g, c));
-    mm.blob_bytes = experts / (uint64_t) mm.pairs;
-    mm.peer_overhead = kCardSpare + shared_bytes(g, false);
-    mm.main_overhead = kCardSpare + shared_bytes(g, req.spec >= 2) + dense + session_bytes(g, want, req.kv == "fp8", req.kv == "int8") * n_sess +
-                       (1000ull << 20);   // the drafter, as multi_gpu_plan counts it on the first card
-    const program::MgPlan mp = program::plan_multi_gpu(cards, mm);
-    basalt::log::info("basalt inkling2", "%s", mp.line.c_str());
-    cut_ = req.diag_split_at > 0 ? std::min(req.diag_split_at, g.n_layers - 1) : mp.best_cut;
-    if (cut_ <= 0)
-        return {model::Status::Error, "gpu-mode split: no cut of the layers fits both cards; lower --max-context or --parallel"};
-    second_ = devs[1];
-    basalt::log::info("basalt inkling2", "layer split%s: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window",
-                      req.diag_split_at > 0 ? " (--diag-split-at)" : "", cut_ - 1, devs[0], cut_, g.n_layers - 1, devs[1],
-                      split_handoffs(g, cut_));
+    const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
+    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
+               kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
+    for (const model::GpuCards::Card& c : req.gpus.cards) {
+        cudaSetDevice(c.device);
+        size_t free_b = 0, total_b = 0;
+        s.room.push_back(cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b : 0);
+    }
+    cudaSetDevice(device_);
+    const model::SplitCut cut = model::split_cut(req.gpus, s);
+    if (!cut.error.empty()) return {model::Status::Error, cut.error};
+    cut_ = cut.first[1];
+    second_ = req.gpus.cards[1].device;
+    split_need_ = cut.need;
+    basalt::log::info("basalt inkling2", "layer split: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window", cut_ - 1,
+                      device_, cut_, g.n_layers - 1, second_, split_handoffs(g, cut_));
     return {};
 }
 
+std::string InklingModel::gpu_report(int card) const {
+    if (cut_ <= 0 || card < 0 || card > 1) return {};
+    const int n = pack_.geo.n_layers;
+    return "layers " + std::to_string(card == 0 ? 0 : cut_) + "-" + std::to_string(card == 0 ? cut_ - 1 : n - 1) +
+           " with their experts and caches (" + model::gib(split_need_[(size_t) card]) + ")" + (card == 0 ? ", head" : "");
+}
 
 model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     {   // Convert loaded Q8_0 w.proj and w.out blocks in-place to wgemm::q8_planes + coalesced prefill scale planes.

@@ -277,10 +277,10 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
 void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
 
 /// The stage on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights on `dev`, the other layers empty):
-/// its memory, before the weights land (attach_prompt_split times both cards' rates once they have).
+/// its memory, before the weights land.
 StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, std::string& err);
-/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
-/// true; false with empty `err` when it does not (the caller reads them on the main card).
+/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards, true; false with empty `err` when the
+/// read is too short for it (more than two chunks) or the session cannot take it (the caller reads them on the main card).
 /// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
 /// only, as after a stopped read on the main card), true returned.
 bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,

@@ -78,37 +78,6 @@ struct GpuModes {
 /// Empty when `model` runs the choice's mode on that many cards; else the refusal naming the model and the modes it runs.
 std::string check_gpu_modes(const GpuChoice& choice, const std::string& model, const GpuModes& modes);
 
-/// What a chosen card does.
-enum class GpuRole { Main, ExpertTier, PromptSplit, LayerStage };
-const char* gpu_role_name(GpuRole r);
-
-/// The inputs of the role decision: the chosen cards, main first, and the mode.
-struct RoleInputs {
-    std::vector<GpuCard> cards;
-    GpuMode mode = GpuMode::One;
-    bool prompt_split = false;      ///< the model puts its helper cards on long prompts (a dense model), not on experts
-};
-
-/// The role of each card, in order: the cards after the main one are layer stages in split mode, else prompt splits for a
-/// model that reads prompts on its second card (`prompt_split`), else expert tiers. What a model does with its helper cards
-/// beyond that is its own.
-std::vector<GpuRole> choose_roles(const RoleInputs& in);
-
-/// One expert tier's room for experts (bytes) and its card's memory bandwidth (0: unknown, counted as equal).
-struct TierRoom {
-    uint64_t bytes = 0;
-    double gbps = 0;
-};
-
-/// Deals ranked experts (their slot bytes, hottest first) to the expert tiers: each goes to the tier that has taken the
-/// fewest so far for its bandwidth among those it still fits, so the hot experts split by bandwidth and every tier
-/// fills. A tier closes at the first expert that no longer fits it. Returns each expert's tier, -1 when none takes it.
-std::vector<int> spread_experts(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
-
-/// The tiers, ascending, that spread_experts gives at least one expert. A tier left out has nothing to hold (no expert
-/// outside the main card, or no room for one) and takes no part in the expert tier.
-std::vector<size_t> tiers_holding(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
-
 /// The visible cards: CUDA_VISIBLE_DEVICES when set (integers read as nvidia-smi numbers), else every card the NVIDIA
 /// management library lists, with what that library says about each. `known` false: neither was available.
 std::vector<GpuCard> visible_gpus(bool& known);

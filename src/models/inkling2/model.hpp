@@ -61,6 +61,7 @@ public:
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_; }
+    std::string gpu_report(int card) const override;
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -156,6 +157,7 @@ private:
     const float* output_query_ = nullptr;
     float* msg_queries_[2] = {};
     int cut_ = 0, second_ = -1;              ///< the layer split's cut (0: none) and the second card's device
+    std::vector<uint64_t> split_need_;       ///< the split's bytes on each card, as the cut counted them
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
     int ldev_ = 0;                           ///< the card the weights being planned load to

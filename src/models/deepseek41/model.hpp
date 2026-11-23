@@ -57,6 +57,7 @@ public:
 
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
+    std::string gpu_report(int card) const override;
     /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Called
     /// once the dense tensors are allocated, before a session is made. False with `err` when the request cannot be honoured.
     bool resolve_context(int64_t requested, std::string& err);
@@ -135,6 +136,7 @@ private:
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
     std::vector<int> peer_devices_;
+    model::GpuCards gpus_;                    ///< the cards the load received
     int device_ = 0;
     model::LoadRequest tiers_;
     mutable PromptHost prompt_host_;   // before the tier: the tier goes first
