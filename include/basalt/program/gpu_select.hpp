@@ -55,6 +55,10 @@ struct GpuChoice {
 /// management library and no CUDA_VISIBLE_DEVICES): numbers are then taken as given and `auto` is an error.
 GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known = true);
 
+/// A run whose flags keep it on its main card (`why` says which): `auto` keeps only the main card it picked, with a
+/// note naming the cards left idle; a list of several is an error; unset drops the warning about unused cards.
+void keep_main_card(const GpuSpec& spec, const std::vector<GpuCard>& visible, const std::string& why, GpuChoice& c);
+
 /// What a chosen card does.
 enum class GpuRole { Main, ExpertTier, PromptSplit, LayerStage, Idle };
 const char* gpu_role_name(GpuRole r);

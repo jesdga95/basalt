@@ -133,6 +133,8 @@ public:
     // K/V streaming: the VRAM copy of one attention layer's far cells a prompt chunk reads (at = the resident cells; at
     // INT64_MAX without streaming), filled on stage_side from stage_free (the stage's last reader done) to stage_ready
     kernels::KvFar stage;
+    // an NVFP4 cache: the int8 copy of one attention layer's cells a prompt chunk reads (prompt_cells)
+    kernels::KvInt8 kv8;
     cudaStream_t stage_side = nullptr;
     cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;

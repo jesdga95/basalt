@@ -100,6 +100,47 @@ int main() {
                   "\"lossy\":\"--route-tail-skip\",\"spec\":8,\"max_context\":8192,\"devices\":\"\",\"cards\":[],\"notes\":[],"
                   "\"warning\":\"\",\"error\":\"\"}");
     }
+    // A run kept on its main card: auto leaves the others idle, a list of several is refused, unset stops suggesting more.
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 5060 Ti", 12, 0, 448, 16)};
+        const auto keep = [&](const std::string& text) {
+            GpuSpec s;
+            std::string err;
+            CHECK(parse_gpu_spec(text, s, err));
+            GpuChoice c = choose_gpus(s, v);
+            keep_main_card(s, v, "one card only", c);
+            return c;
+        };
+        GpuChoice c = keep("auto");
+        CHECK_STR(cards(c), "0");
+        CHECK(c.error.empty());
+        CHECK(c.notes.size() == 1);
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 5060 Ti) left idle, one card only");
+        CHECK_STR(roles(v, c, 1, true), "main");
+        c = keep("0,1");
+        CHECK_STR(cards(c), "");
+        CHECK_STR(c.error, "gpu 0,1: one card only; give one card (gpu 0)");
+        CHECK_STR(keep("1,0").error, "gpu 1,0: one card only; give one card (gpu 1)");
+        c = keep("");
+        CHECK_STR(cards(c), "0");
+        CHECK(c.warning.empty() && c.error.empty());
+        c = keep("1");
+        CHECK_STR(cards(c), "1");
+        CHECK(c.error.empty() && c.notes.empty());
+        CHECK_STR(keep("2").error, "gpu 2: 2 GPUs are visible (0-1)");   // the choice's own error stands
+    }
+    {   // auto over three cards keeps the fastest, and names every card it leaves
+        const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, 0, 896, 16), card(1, "RTX 5090", 12, 0, 1792, 32),
+                                        card(2, "RTX 5060 Ti", 12, 0, 448, 16)};
+        GpuSpec s;
+        std::string err;
+        CHECK(parse_gpu_spec("auto", s, err));
+        GpuChoice c = choose_gpus(s, v);
+        keep_main_card(s, v, "why", c);
+        CHECK_STR(cards(c), "1");
+        CHECK(c.notes.size() == 1);
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 0 (RTX 5070 Ti), GPU 2 (RTX 5060 Ti) left idle, why");
+    }
     // The same cards with the slower one first: auto still makes the 5090 main.
     {
         const std::vector<GpuCard> v = {card(0, "RTX 5060 Ti", 12, 0, 448, 16), card(1, "RTX 5090", 12, 0, 1792, 32)};

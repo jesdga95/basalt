@@ -398,6 +398,14 @@ kernels::KvFar stage_far(Model& m, const kernels::KvFar& far_kv, int64_t pos, in
     return m.stage;
 }
 
+// An NVFP4 cache's prompt chunk reads through the int8 kernel: the layer's cells so far rounded to int8 in the model's
+// copy (an int8 cache or an fp16 one as it is).
+kernels::KvInt8 prompt_cells(Model& m, const kernels::KvInt8& q8, int64_t cells, cudaStream_t s) {
+    if (!q8.fp4) return q8;
+    kernels::kv4_to_int8(q8, m.kv8, cells, m.g.n_kv, s);
+    return m.kv8;
+}
+
 // `cells_only`: nothing reads the layer's rows (a chunk's last layer), so only its K and V cells are made: the same k
 // and v products and the same cache write, without the queries, the attention and the output projection.  `far`: a
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
@@ -442,7 +450,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         uint8_t* e4 = (uint8_t*) b.xq;
         float* e4s = prefill::fp8::act_scales(b.xq, T, AQ);
         if (q8.k) {   // BF16 queries and output rows
-            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, q8, b.attn_split, split, read);
+            const kernels::KvInt8 r8 = prompt_cells(m, q8, pos + T, s);
+            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, r8, b.attn_split, split, read);
             if (f8) kernels::attn_gate_e4m3(bf(b.ao), bf(b.qfull), T, g.n_head, e4, e4s, s);
             else kernels::attn_gate_bf16(bf(b.ao), bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         } else {      // an fp16 cache's prompt kernel reads FP32 queries (the gate's BF16 rows reuse their buffer)
@@ -471,7 +480,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     gemm(m, L.v, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, nullptr, q8, far_kv);
-    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
+    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, prompt_cells(m, q8, pos + T, s), b.attn_split,
                              kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, pos, T, s));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     chunk_residual(m, L.o, b.ag, AQ, T, s);
