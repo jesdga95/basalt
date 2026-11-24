@@ -1,6 +1,6 @@
 # Platforms
 
-Linux x64 and Windows x64, NVIDIA Blackwell (sm_120). Linux is where the engine is tested and benchmarked. CI builds both and runs
+Linux x64 and Windows x64, NVIDIA Blackwell (sm_120); Arm64 Linux with the integrated sm_121 GPU is in [arm64](arm64.md). Linux is where the engine is tested and benchmarked. CI builds both and runs
 the CPU tests on each. The GPU tests and the quality gate need a card.
 
 The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON`, a second card of sm_89 (Ada) can be a Flash-Next peer that holds and
