@@ -1,0 +1,46 @@
+{
+  "submitter": "Hazelhof",
+  "date": "2026-10-26",
+  "commit": "31aacda2d4",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 26.7
+    },
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 26.7
+    },
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 26.7
+    },
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 26.7
+    }
+  ],
+  "ram_gib": 125,
+  "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+  "ram_gbps": 86.9,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 5045.4,
+  "prefill_64k_tps": 5581.2,
+  "decode_tps": 343.0
+}

@@ -3,6 +3,7 @@
 
 #include "basalt/dense/model.hpp"
 #include "basalt/kernels/window_gemm.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
@@ -21,7 +22,7 @@ class CudaEncoder;
 namespace basalt::dense {
 
 constexpr int kWindow = 16;       // rows one session's decode window holds
-constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
+constexpr int kBatch = 32;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
@@ -132,22 +133,17 @@ public:
     // K/V streaming: the VRAM copy of one attention layer's far cells a prompt chunk reads (at = the resident cells; at
     // INT64_MAX without streaming), filled on stage_side from stage_free (the stage's last reader done) to stage_ready
     kernels::KvFar stage;
+    // an NVFP4 cache: the int8 copy of one attention layer's cells a prompt chunk reads (prompt_cells)
+    kernels::KvInt8 kv8;
     cudaStream_t stage_side = nullptr;
     cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
     int lb = 0, le = 0;                          // the layers this card runs: [lb, le)
     int n_gdn = 0, n_attn = 0;                   // the GDN and attention layers among them
     std::vector<int> gdn_index, attn_index;      // per layer: its index among the card's GDN or attention layers (-1)
-    // the batch windows' graphs, one per composition (the sessions in the window and their rows), the least recently used out
-    using BatchKey = std::vector<std::pair<const SessionState*, int>>;
-    struct BatchGraph {
-        BatchKey key;
-        cudaGraphExec_t exec = nullptr;
-        uint64_t used = 0;
-    };
-    static constexpr size_t kBatchGraphs = 64;
-    std::vector<BatchGraph> batch_graphs;
-    uint64_t batch_clock = 0;
+    // the batch windows' graphs, one per composition (model/batch_driver.hpp captures them on one card; a layer split's
+    // forward_batch keeps each card's here itself)
+    model::BatchShared batch;
     // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
     cudaStream_t gate_side = nullptr;
     cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
@@ -250,13 +246,17 @@ bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float*
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
                     std::string& err);
 /// One window of S sessions as one batch: segment k is segs[k].T rows (tokens and pos3 [row][3] packed in segment order, at
-/// most kWindow rows in all) at cells segs[k].pos.. of its session.  Each session is left as after its own forward_window
-/// (logits, the GDN rows for its commit, the drafter's rows); runs on the first session's stream.
+/// most kBatch rows in all) at cells segs[k].pos.. of its session.  Each session is left as after its own forward_window
+/// (logits, the GDN rows for its commit, the drafter's rows); runs on the first session's stream.  stage_batch puts the rows'
+/// inputs and the segment table on the card, batch_body launches the window from them (capturable: a composition's graph
+/// replays at any positions); forward_batch is both on a layer split's two cards, each card's graphs in its model's batch.
 struct BatchSeg {
     SessionState* st = nullptr;
     int T = 0;
     int64_t pos = 0;
 };
+void stage_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3);
+void batch_body(Model& m, const BatchSeg* segs, int S);
 bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err);
 /// Runs a prompt chunk; rows are token embeddings, or `rows` (fp32 [T][n_embd]) when given.  `pos3` [T][3].
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
@@ -277,10 +277,10 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
 void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
 
 /// The stage on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights on `dev`, the other layers empty):
-/// its memory, before the weights land (attach_prompt_split times both cards' rates once they have).
+/// its memory, before the weights land.
 StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, std::string& err);
-/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
-/// true; false with empty `err` when it does not (the caller reads them on the main card).
+/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards, true; false with empty `err` when the
+/// read is too short for it (more than two chunks) or the session cannot take it (the caller reads them on the main card).
 /// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
 /// only, as after a stopped read on the main card), true returned.
 bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,

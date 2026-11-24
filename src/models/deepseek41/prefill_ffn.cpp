@@ -123,7 +123,7 @@ public:
         all = routed;
         const int64_t nf = (int64_t) g_.n_ff_exp * std::max(g_.n_shared, 1);
         const std::pair<const char*, int64_t> shexp[] = {{"ffn_gate_shexp.weight", nf}, {"ffn_up_shexp.weight", nf},
-                                                         {"ffn_down_shexp.weight", g_.n_embd}};
+                                                         {"ffn_down_shexp.weight", g_.n_embd}, {"engram_kv.weight", 5 * g_.n_embd}};
         for (int il = 0; il < g_.n_layers; ++il)
             for (const auto& [name, rows] : shexp)
                 if (const DevTensor* t = m_.tensor(il, name); t && mmq::fits(t->type, rows)) add(all, t->type, rows);
@@ -322,6 +322,33 @@ public:
         return true;
     }
 
+    bool dense_rows(const void* w, int type, int rows, int cols, const float* x, int T, float* out, void* stream) override {
+        namespace mmq = basalt::prefill::mmq;
+        if (!mmq::fits(type, rows) || mmq::q8_bytes(kSharedRows, cols) > mmq::q8_bytes(max_rows_, g_.n_embd)) return false;
+        for (int t0 = 0; t0 < T; t0 += kSharedRows) {
+            const int nc = std::min(kSharedRows, T - t0);
+            const int32_t b[2] = {0, nc};
+            cudaMemcpyAsync(sbnd_, b, sizeof b, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+            mmq::quantize(x + (size_t) t0 * cols, nullptr, xq1_, type, cols, cols, nc, stream);
+            basalt::prefill::mmq::Product p;
+            p.w = w;
+            p.type = type;
+            p.w_rows = rows;
+            p.w_cols = cols;
+            p.expert_bytes = mmq::matrix_bytes(type, rows, cols);
+            p.n = 1;
+            p.xq = xq1_;
+            p.bounds = sbnd_;
+            p.ids = ident_;
+            p.total_rows = nc;
+            p.max_rows = nc;
+            p.dst = out + (size_t) t0 * rows;
+            p.ld_dst = rows;
+            ctx_.run(p, stream);
+        }
+        return true;
+    }
+
 private:
     struct Share {
         std::vector<kernels::cpu::ExpertJobMulti> jobs;
@@ -402,12 +429,7 @@ private:
     // long chunk (`tokens` > 0) the main card's link reads ahead while the layer's attention runs.
     int peer_count(int il, const std::vector<int64_t>& ram_rows, int64_t main_rows, double main_bytes, int64_t peer_rows,
                    int tokens = 0) const {
-        const ExpertLayer& el = m_.pack().experts[(size_t) il];
-        const prefill::ShareRates& r = tier_->share_rates(il);
-        const double lead = r.sm_hz0 > 0 ? (double) tokens * prefillp::kPreRouteCycles / r.sm_hz0 : 0;
-        return prefill::peer_take(r, ram_rows, main_rows, main_bytes, peer_rows, (double) el.blob_bytes,
-                                  (double) (basalt::prefill::mmq::q8_bytes(2, g_.n_embd) - basalt::prefill::mmq::q8_bytes(1, g_.n_embd)),
-                                  4.0 * (double) g_.n_embd, lead);
+        return tier_->peer_take(il, ram_rows, main_rows, main_bytes, peer_rows, tokens, prefillp::kPreRouteCycles);
     }
 
     bool share_buffers(std::string& err) {

@@ -900,6 +900,24 @@ class ClientShapes(unittest.TestCase):
         status, _ = self.post("/v1/nothing?beta=true", body)
         self.assertEqual(status, 404)
 
+    def test_a_base_url_that_ends_in_v1(self):
+        # an Anthropic client adds /v1/messages to its base URL itself: given ".../v1" it posts /v1/v1/messages
+        body = {"model": "basalt", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+        status, b = self.post("/v1/v1/messages?beta=true", body)
+        self.assertEqual((status, b.get("type")), (200, "message"), b)
+        status, b = self.post("/v1/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, b)
+        self.assertGreater(b["input_tokens"], 0)
+        req = urllib.request.Request(self.base + "/v1/v1/messages", data=json.dumps({**body, "stream": True}).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            events = r.read().decode()
+        self.assertIn("event: message_start", events)
+        self.assertIn("event: message_stop", events)
+        for path in ("/v1/v1/chat/completions", "/v1/v1/responses"):   # only the two Anthropic paths are aliased
+            status, _ = self.post(path, body)
+            self.assertEqual(status, 404, path)
+
     def test_anthropic_mid_conversation_system(self):
         status, b = self.post("/v1/messages?beta=true", {
             "model": "basalt", "max_tokens": 50,
@@ -1227,16 +1245,36 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(gpu_text([0, 1]), "0,1")
         self.assertEqual(gpu_text(1), "1")
         self.assertEqual(gpu_text(None), "")
-        for good in (None, "", "auto", "0", "1,0", [0, 1]):
-            check_gpu(good)
-        for bad in ("a,b", "0,0", "-1", "0,"):
-            with self.assertRaises(ValueError):
-                check_gpu(bad)
+        for good in ((None,), ("",), ("0",), ("1,0", "peer"), ([0, 1], "split"), ("all", "tensor"), ("all",), (0,), ("0,1", "peer", "3,1"),
+                     ([0, 1], "split", [3, 1]), ("all", "peer", "1,1,1")):
+            check_gpu(*good)
+        texts = {("auto",): 'gpu "auto": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("a,b",): 'gpu "a,b": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("0,0",): 'gpu "0,0": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("-1",): 'gpu "-1": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("0,",): 'gpu "0,": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("0,1",): "gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md",
+                 ("0,1,2", None, "1,1,1"): "gpu 0,1,2 names 3 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md",
+                 ("0,1", "auto"): 'gpu-mode "auto": expected peer, split or tensor; see docs/configuration/gpus.md',
+                 ("0", "peer"): 'gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more',
+                 (None, "split"): 'gpu-mode split: gpu names one card (gpu "0"); a mode needs two or more',
+                 ("0", None, "1"): 'gpu-share: gpu names one card (gpu "0"); shares need two or more',
+                 ("0,1", "peer", "3"): 'gpu-share "3": expected one positive number per card of gpu (2 cards), like 3,1',
+                 ("0,1", "peer", "0,1"): 'gpu-share "0,1": expected one positive number per card of gpu (2 cards), like 3,1',
+                 ("0,1", "peer", "a,b"): 'gpu-share "a,b": expected one positive number per card of gpu (2 cards), like 3,1',
+                 ("all", "peer", "-1,1"): 'gpu-share "-1,1": expected one positive number per card of gpu, like 3,1'}
+        for args, text in texts.items():
+            with self.assertRaises(ValueError, msg=args) as e:
+                check_gpu(*args)
+            self.assertEqual(str(e.exception), text)
         ok = mock.Mock(returncode=0, stderr="",
                        stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
         with mock.patch("subprocess.run", return_value=ok) as run:
             self.assertEqual(model_plan("/x/basalt", "/m.basalt", "1,0", ["--kv", "int8"])["devices"], "1,0")
             self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--kv", "int8", "--gpu-plan", "--gpu", "1,0"])
+            model_plan("/x/basalt", "/m.basalt", [1, 0], [], "peer", [3, 1])
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--gpu-plan", "--gpu", "1,0", "--gpu-mode", "peer",
+                                                     "--gpu-share", "3,1"])
             model_plan("/x/basalt", "/m.basalt", None, [])
             self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--gpu-plan"])
         bad = mock.Mock(returncode=2, stderr="", stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')

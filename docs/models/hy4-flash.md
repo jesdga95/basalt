@@ -37,7 +37,7 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 ## Memory
 
 - **Experts:** the shared expert tier, placed as DeepSeek's ([memory](deepseek41.md#memory)): the main card holds copies of
-  the most routed experts, each second card holds experts of its own, and system RAM holds the rest (the routed experts are
+  the most routed experts, each peer card holds experts of its own, and system RAM holds the rest (the routed experts are
   77.8 GiB), computed there by the CPU. The start line `expert homes of 512 per layer: ...` gives the split. The start places
   experts by the shipped routing profile `data/profiles/hy4flash-42x512.prof`, so the first request after a start finds the
   most routed ones resident. The early layers route more widely and get more of the main card's copies (layers 0 to 3 about
@@ -46,9 +46,9 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   lookup counts, up to 15; the counts halve every 256 tokens and start again with each prompt), the one used longest ago among
   equals. An expert that recurs every few tokens keeps its copy through runs of experts that come once, and the experts of an
   earlier topic do not hold the card through the next one. DeepSeek's slots give way by age alone.
-- **Cards:** the main card holds the dense weights (6.76 GiB with the Q8_0 head), the caches and the drafter (0.87 GiB). Up to three more cards
-  (`--gpu 0,1,2,3`) each hold the experts of one block of layers; later cards idle.
-- **Waits:** while a decode layer's expert sum waits for the CPU's and the second card's rows, the main card's memory is idle
+- **Cards:** the main card holds the dense weights (6.76 GiB with the Q8_0 head), the caches and the drafter (0.87 GiB); the other cards
+  are peers ([cards](#cards)).
+- **Waits:** while a decode layer's expert sum waits for the CPU's and a peer's rows, the main card's memory is idle
   once its own experts are done. It then reads the next layer's attention gate and output products (the head after the last
   layer) into its L2, up to 56 MB, and stops when the rows are in; those products then read L2 instead of memory.
 - **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
@@ -70,13 +70,23 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   positions that fit.
 - **VRAM:** `--vram-reserve-mib` and `POST /v1/vram` set what stays free, as for DeepSeek.
 
+## Cards
+
+`gpu` names the cards and `gpu-mode` what they do ([GPUs](../configuration/gpus.md)): `"gpu": "all", "gpu-mode": "peer"` on a
+machine with several. The model runs `peer` only, on up to four cards (the main card and three peers); `split` and `tensor` are
+refused with the modes it runs.
+
+- **Peer:** the shared expert tier as DeepSeek's: each peer holds the experts of one block of layers, sized to its free memory (or by
+  `gpu-share`), computes them in every decode window and takes its share of each prompt chunk. A peer that would hold nothing is
+  refused; an sm_89 peer is refused too.
+
 ## Long prompts
 
 - Chunks are up to 16,384 tokens, halved to fit memory. Inside a chunk the attention runs in steps of 2,048 rows.
 - A prompt of 1,024 tokens or more borrows only the tier slots its buffers and the expert ring need; the ring copies the next
   layer's experts to the card while a layer computes. The slots it leaves keep their experts, and the next turn finds them. A
   shorter prompt keeps the card's slots and puts its buffers beside them; the CPU takes RAM experts of 8 rows or fewer.
-- With a second card, each chunk's experts split between the cards: the second card computes its own and the RAM experts its
+- With a peer, each chunk's experts split between the cards: the peer computes its own and the RAM experts its
   link prices lower.
 - The indexer scores every pooled key for every row, so its cost grows with the context. At 1,015,207 tokens with `--kv fp8`
   the prompt read in 486 s (2,090 tok/s, both cards at their default power limits) and a needle at 50 % was found. Needles at
@@ -103,8 +113,9 @@ basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.66 GiB on the
 
 ## Parallel slots
 
-Not measured. `--parallel N` starts N sessions, each with its own caches, rings and drafter scratch, over the one expert tier;
-their windows run one after another, with no shared pass through the weights.
+`--parallel N` starts N sessions, each with its own caches, rings and drafter context, over the one expert tier and one forward
+scratch. The busy slots decode together, one pass of up to 8 rows ([batched decoding](../design/batching.md)); a request alone in
+its slot gives the tokens it gives with `--parallel 1`. Speed with several slots is not measured.
 
 ## Images
 
@@ -137,7 +148,7 @@ different tier size can change the text ([precision](../precision/hy4-flash.md#e
 ## Limits
 
 - No video.
-- No layer split: further cards hold experts only.
+- No split: further cards are peers that hold experts.
 - After a very long prompt the main card holds fewer expert slots, as the caches took their room: 75 of 129 per layer after
   1,015,207 tokens with `--kv fp8`, against 114 to 122 after 253,410. Decode then computes more experts on the CPU.
 

@@ -4,6 +4,7 @@
 
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/pack.hpp"
@@ -23,7 +24,7 @@ struct DevTensor {
     std::vector<uint64_t> shape;
 };
 
-/// The second cards whose expert tiers a start uses; later cards idle.
+/// The most second cards whose expert tiers a start uses (gpu-mode peer takes no more cards than the main card and these).
 constexpr int kMaxSecondCards = 3;
 constexpr int64_t kDefaultContext = 8192;
 constexpr uint64_t kExpertLendSegment = 256ull << 20;
@@ -37,6 +38,8 @@ public:
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_; }
+    /// The second cards are the expert tier's (model/peer_hooks.hpp).
+    model::PeerHooks* peer() const override;
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -60,7 +63,11 @@ public:
         float* h_rows = nullptr;
     };
     SharedTier& shared_tier() const { return shared_tier_; }
-    const std::vector<int>& peer_devices() const { return peer_devices_; }
+    /// What every session's batch windows share (model/batch_driver.hpp).
+    model::BatchShared& batch_shared() const { return batch_; }
+    /// The forward scratch every session shares (session.cpp's Scratch, allocated by the first session): row buffers, expert
+    /// staging and workspaces. Sessions hold only their conversation's state.
+    std::shared_ptr<void>& forward_scratch() const { return scratch_; }
     const model::LoadRequest& flags() const { return flags_; }
     const std::string& path() const { return path_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
@@ -84,7 +91,9 @@ private:
     std::map<std::string, DevTensor> dev_;
     core::LoadPlan* planning_ = nullptr;
     mutable SharedTier shared_tier_;
-    std::vector<int> peer_devices_;
+    mutable model::BatchShared batch_;
+    mutable std::shared_ptr<void> scratch_;
+    model::GpuCards gpus_;                    ///< the cards the load received
     model::LoadRequest flags_;
     std::string path_;
     std::vector<uint8_t> embd_;

@@ -8,7 +8,6 @@
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/core/device.hpp"
-#include "basalt/core/draft_cum.hpp"
 #include "basalt/core/logit_bias.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/progress.hpp"
@@ -68,6 +67,8 @@ void stall_report(std::FILE* f, uint64_t layers_during);
 
 enum class Flow { proceed, next, quit, error };
 
+struct SlotWin;
+
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
 // a driver that pages GPU memory do so, and a graph spinning on a host flag then never finishes.  A driver that
 // fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
@@ -103,10 +104,7 @@ public:
     basalt::model::ModelAdapter::PreTokenizer pre_{};
     static constexpr int kPenaltyWindowCap = 4096;
     // ---- what a model answers: one call per batch window at most, the rest per command or per request
-    virtual bool windows_in_flight() = 0;
     virtual bool next_batch_window() = 0;
-    virtual bool drain_windows() = 0;
-    virtual void script_command(const std::string& line) = 0;
     virtual void probe_command(const std::string& line, std::string& e) = 0;
     virtual bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) = 0;
     virtual void sleep_command(bool down, std::string& e) = 0;
@@ -129,7 +127,6 @@ public:
     /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
     /// starts. The disk tier keeps a GiB above that floor either way.
     void start_guard();
-    virtual bool pipelined() const { return false; }   // batch groups pipelined through layer split stages
     virtual int64_t slot_context(int slot) const = 0;
     virtual bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) = 0;
     virtual bool slots_share_cells() const { return true; }   // one slot's positional state can be copied to another
@@ -238,7 +235,7 @@ public:
     /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
     const std::vector<int32_t>* idle_ids(int b) const;
     struct SlotMeet {
-        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation covers, the same ones the request would reuse from it
+        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation continues (another conversation sharing a head: 0)
         int64_t held = 0;    ///< the tokens it holds
     };
     std::vector<SlotMeet> slot_meets(const std::vector<int32_t>& prompt, bool media) const;
@@ -287,32 +284,37 @@ public:
         // `chunk`: the chunk of a read beside decoding slots, whose rest is read beside them in it, else 0)
         bool partial = false, partial_from0 = false;
         int64_t partial_chunk = 0;
-        // BSCRIPT (a test drive of the multi-token segments): the tokens this slot's request is known to produce
-        // (script[0] is its first token); the windows draft from it, some drafts wrong, and keep what matches
-        std::vector<int32_t> script;
-        std::mt19937_64 rng;
         // the request's grammar (the batch windows' form of the solo loop's `gguard`): the window's kept picks are
         // scanned, the first refused one is resampled under the mask, and the segment ends there
         std::unique_ptr<basalt::program::grammar::Guard> guard;
         int lp_top = -1;   ///< the request's logprobs=K: a BP line ahead of the BT line for every kept pick (-1: off)
-        // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
-        // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
-        // history and last proposal
+        // the drafter's side of the slot: the drafts its session left for the slot's next window and their chances, its
+        // prompt-lookup history and last proposal
         int32_t dr[basalt::spec::DraftPolicy::kMaxT] = {};
         float dprob[basalt::spec::DraftPolicy::kMaxT] = {};
         int n_dr = 0;
-        basalt::core::DraftCumAdapt cum;
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
         int32_t sbuf[basalt::spec::DraftPolicy::kMaxT] = {};
-        int sk = 0, smatch = 0;
         int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
-        bool from_sfx = false;
-        double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
-        int64_t since_draft = 0;   ///< windows since the slot last drafted
         int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
     };
     std::vector<BSlot> bs{};
+    // ---- --batch: the slots' rounds (batch_round.cpp), the same for every model
+    /// The session slot `b` decodes in.
+    virtual basalt::model::ModelSession& slot_session(int b) = 0;
+    /// False while active slot `b` sits out the next round (its model cannot run its window yet); it keeps its place.
+    virtual bool slot_ready(int b) { (void) b; return true; }
+    /// One window of every ready active slot: the windows share batch_rows() rows, each group runs as one batch
+    /// (decode_batch) or a lone window (decode_window), then every slot takes its tokens and drafts its next window.
+    bool batch_round();
+    /// The batch windows' draft policy, which the runtime sets up, and each slot's sampling (slot_set_sampling).
+    std::optional<basalt::spec::DraftPolicy> bpolicy{};
+    std::vector<basalt::kernels::SamplerParams> slot_sampling{};
+    void slot_window_begin(int b, SlotWin& w, int limit);
+    bool slot_window_finish(int b, SlotWin& w);
+    bool slot_window_accept(int b, SlotWin& w);
+    bool slot_window_end(int b, SlotWin& w);
     // ---- idle conversations out of VRAM.  An idle conversation (a cached batch slot's, or the solo session's while
     // no request works there) keeps its KV in VRAM until the work beside it has run kParkAfterBusy seconds: the
     // expert-cache slots its cells hold have then cost that work about what moving it out and back costs, both

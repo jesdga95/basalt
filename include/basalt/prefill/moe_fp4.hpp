@@ -7,7 +7,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 namespace basalt::prefill::fp4 {
 
@@ -33,6 +32,9 @@ void rebase(const int32_t* bounds, int n, int32_t* out, void* stream);
 /// (size them as for 2 * cols), the k-tiles alternating the two terms of the same 128 columns.
 void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
               float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream, bool two = false);
+/// Same as quantize(..., two = true) reading fp16 rows (halves intermediate H traffic between gate/up and down).
+void quantize_f16(const uint16_t* x, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
+                  float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream);
 
 /// The plan of a layer's experts all at once (n <= 1024, rows grouped by expert, bounds on the device): tile_off as
 /// plan() gives it, and blk_off[0..n] the first GEMM block (two tiles, 128 rows) of each expert and the total.
@@ -65,6 +67,7 @@ struct Product {
     const int32_t* bounds = nullptr;
     const int32_t* tile_off = nullptr;
     float* dst = nullptr;
+    uint16_t* dst_f16 = nullptr;   ///< optional fp16 output for FLAT (replaces dst)
     int64_t ld_dst = 0, max_rows = 0;
     bool swiglu = false;
     const int32_t* ids = nullptr;
@@ -111,15 +114,5 @@ void run_experts(const Group& g, int i0, int n, void* stream);
 int run_length(const Group& g, int i0, int64_t row_cap);
 /// The whole group as runs of at most `row_cap` rows each (H holds a run's rows); returns the number of runs.
 int run_group(const Group& g, int64_t row_cap, void* stream);
-
-/// The rows of n consecutive experts ([bounds[j], bounds[j + 1]), on the host) in pieces for buffers of `cap` rows
-/// (cap >= kTileTokens): an expert above the cap is cut at whole tiles from its first row, so each piece's tiles hold
-/// the rows the expert's own tiles hold.  The pieces form groups of up to kMaxExperts pieces and at most `cap` rows.
-struct Pieces {
-    std::vector<int32_t> expert;   ///< per piece: its expert's index j
-    std::vector<int32_t> bounds;   ///< per piece its first row, then the last piece's end
-    std::vector<int32_t> group;    ///< per group its first piece, then the piece count
-};
-void cut_pieces(const int32_t* bounds, int n, int64_t cap, Pieces& out);
 
 }  // namespace basalt::prefill::fp4

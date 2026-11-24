@@ -499,8 +499,8 @@ int QfnRuntime::init_prompt() {
         return 1;
     }
     if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
-    if (peer.valid() && !o.no_peer_prefill) {
-        if (!sp.set_peer(&peer, peer_streamed_share, err)) {
+    if (peer.valid()) {
+        if (!sp.set_peer(&peer, err)) {   // the routed-only chunks' rows, up to kPeerSlowRows
             basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
             err.clear();
         }
@@ -538,7 +538,7 @@ int QfnRuntime::init_prompt() {
         size_t fb0 = 0, tb0 = 0;
         cudaMemGetInfo(&fb0, &tb0);
         uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
-        // (a read of the longest prompt the start priced must fit; a longer one checks its own fit)
+        // (a read of the longest prompt the start sizes the regions for must fit; a longer one checks its own fit)
         bool ok = split_chunk_max >= 1024 &&
                   split_region(st, std::min<int64_t>(o.max_context, kSplitRefCells), split_chunk_max, st.lo, st.hi,
                                w_at, s_at, b_at);

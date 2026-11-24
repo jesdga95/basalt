@@ -36,6 +36,8 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
     else if (a == "--no-capture") o.no_capture = true;
     else if (a == "--no-pool") o.no_pool = true;
+    else if (a == "--diag-main-card-bits") basalt::core::diagnostics().main_card_bits = true;
+    else if (a == "--diag-fixed-experts") o.diag_fixed_experts = true;
     else if (a == "--stage-timing") o.stage_timing = true;
     else if (a == "--graph-only") { o.graph_only = true; o.generates = false; }
     else if (a == "--gpu-only-full") o.gpu_only_full = true;
@@ -110,7 +112,6 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(args.next("--adapt-swaps"));
     else if (a == "--peer-exclusive") { o.peer_exclusive = true; o.peer_exclusive_given = true; }
     else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(args.next("--peer-adapt-swaps"));
-    else if (a == "--no-peer-prefill") o.no_peer_prefill = true;
     else if (a == "--expert-profile-save") o.expert_profile_save = args.next("--expert-profile-save");
     else if (a == "--expert-profile-save-every")
         o.expert_profile_save_min = std::atof(args.next("--expert-profile-save-every"));
@@ -145,6 +146,11 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
 }
 
 std::optional<int> finish_flags(Options& o) {
+    if (o.diag_gpu_check) {
+        basalt::log::error("basalt generate", "--diag-gpu-check does not run in Qwen3.8-Flash-Next's serving engine; tools/gpu_identity.py compares its greedy tokens");
+        return 2;
+    }
+    if (o.diag_batch_check) o.serve = true;   // the batch slots exist in the serving engine, which runs the check
     if (o.resident_budget_given) {   // the resident mode with a RAM budget
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
         o.resident_headroom = 0;

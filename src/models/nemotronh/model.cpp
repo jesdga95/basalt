@@ -224,9 +224,6 @@ model::Result NemotronModel::plan(const model::LoadRequest& req, core::LoadPlan&
     // queued in the start's plan
     flags_ = req;
     path_ = path;
-    if (!req.peer_devices.empty())
-        basalt::log::warn("basalt nemotronh", "%zu second cards given: this model's experts stay on the main card and in RAM",
-                          req.peer_devices.size());
     planning_ = &reads;
     model::Result r;
     for (int i = 0; r.ok() && i < std::max(req.sessions, 1); ++i) {

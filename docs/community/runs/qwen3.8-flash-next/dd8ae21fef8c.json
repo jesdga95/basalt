@@ -1,0 +1,26 @@
+{
+  "submitter": "beastrobin",
+  "date": "2026-11-01",
+  "commit": "9175e7a321",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 6000 Blackwell Workstation Edition",
+      "vram_gib": 96,
+      "power_w": 300,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 54.5
+    }
+  ],
+  "ram_gib": 253,
+  "cpu": "Intel Core Ultra 9 285K, 24 cores",
+  "ram_gbps": 81.2,
+  "os": "Windows",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 8117.2,
+  "prefill_64k_tps": 8488.7,
+  "decode_tps": 423.1,
+  "notes": "same rig at a 300 W limit (half its default); experts still fully resident, 0 SSD spill; pairs with the 600 W row above"
+}

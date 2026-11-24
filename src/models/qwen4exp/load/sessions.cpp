@@ -132,8 +132,8 @@ int sessions(Context& context) {
         st.pcie_frac = o.pcie_frac;
         {
             std::string bursts;
-            const double bw = probe_pcie_h2d_gbps(&bursts);
-            if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
+            const double bw = basalt::core::probe_h2d_gbps(&bursts);
+            if (bw > 0.0 && !o.diag_fixed_experts) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
             basalt::log::info("basalt generate", "layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }
@@ -144,12 +144,6 @@ int sessions(Context& context) {
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
-    for (size_t i = 0; i < split_at.size(); ++i)
-        if (split_at[i] >= g.n_layers) {
-            basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
-                         (long long) split_at[i], (long long) (g.n_layers - 1));
-            return 2;
-        }
     // the stage that runs a layer (0: CUDA0's)
     auto stage_of = [&](int64_t l) -> int {
         int st = 0;
@@ -261,7 +255,9 @@ int sessions(Context& context) {
     bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
+        // one slot of a KV format batch windows cannot read is no slot: requests run one at a time, as without --batch
+        const char* off = !o.serve ? "it needs --serve" : o.batch < 1 ? "it needs 1 or more slots"
+                        : o.batch == 1 && !cli::kv_batch_refusal(o.kv, 2).empty() ? "one slot runs batch windows only with --kv int8"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
             basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
@@ -278,11 +274,6 @@ int sessions(Context& context) {
             basalt::log::error("basalt generate", "%s", why.c_str());
             return 1;
         }
-    }
-    if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
-        basalt::log::warn("basalt generate", "--batch-groups %d needs a layer split and to divide --batch %d; "
-                             "one group", o.batch_groups, o.batch);
-        o.batch_groups = 1;
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
@@ -329,8 +320,8 @@ int sessions(Context& context) {
                          (int) bslot_ss[k].size(), dev, (double) total / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
-        if (fit < 2) {
-            basalt::log::warn("basalt generate", "--batch is off: not two slot sessions fit (a smaller "
+        if (fit < 1) {
+            basalt::log::warn("basalt generate", "--batch is off: no slot session fits (a smaller "
                                  "--max-context, or KV streaming, --kv-resident, makes them smaller)");
             bslot_ss.clear();
             slot_cap.clear();
@@ -350,7 +341,6 @@ int sessions(Context& context) {
                         sb + basalt::core::session_kv_bytes_for(u, u.max_cells));
                 }
             slot_cap.resize((size_t) fit);
-            if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (the slots carved on CUDA0 may be fewer than
             // were first carved when a later stage ran out)
             uint64_t kept = 0;

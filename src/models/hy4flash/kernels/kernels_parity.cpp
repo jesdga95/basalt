@@ -556,7 +556,7 @@ void test_engram() {
                 xi[j] = x[((size_t) t * 4 + i) * n + j];
                 key[j] = (double) kv[((size_t) t * 5 + i) * n + j] + kvb[(size_t) i * n + j];
             }
-            const double rx = rms(xi, a.gate_eps), rk = rms(key, a.gate_eps);
+            const double rx = rms(xi, a.eps), rk = rms(key, a.eps);
             double d = 0;
             for (int j = 0; j < n; ++j) d += xi[j] * rx * key[j] * rk * gw[(size_t) i * n + j];
             d /= std::sqrt((double) n);

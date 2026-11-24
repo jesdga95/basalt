@@ -60,7 +60,8 @@ void usage() {
         "  --engine BIN          engine binary (default: basalt beside this program, else the build's)\n"
         "  --fixtures DIR        fixture ids (default %s, or the model's own folder in it)\n"
         "  --logs DIR            keep the engine log there\n"
-        "  --gpu A,B,..|auto     the GPUs, as for the server and the engine (default: GPU 0 alone)\n"
+        "  --gpu A,B,..|all      the GPUs, as for the server and the engine (default: GPU 0 alone)\n"
+        "  --gpu-mode MODE       what two or more GPUs do together (peer, split or tensor), --gpu-share A,B,.. their shares\n"
         "  -- ARGS...            engine flags, as for basalt-bench (--kv, --spec, ...)\n"
         "\n"
         "It runs conv, struct and prose once each (cold: the first request after load counts), %lld tokens each,\n"
@@ -92,7 +93,7 @@ bool parse_args(int argc, char** argv, ProbeOptions& o, std::string& err) {
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "--logs") o.logs = next("--logs");
-        else if (a == "--gpu") o.passthrough.insert(o.passthrough.end(), {a, next("--gpu")});
+        else if (a == "--gpu" || a == "--gpu-mode" || a == "--gpu-share") o.passthrough.insert(o.passthrough.end(), {a, next(a.c_str())});
         else err = "unknown argument " + a + " (engine flags go after --; see --help)";
         if (!err.empty()) return false;
     }
@@ -269,7 +270,7 @@ int main(int argc, char** argv) {
     {
         std::string gpu_value;
         std::vector<GpuCard> used;
-        if (!select_gpus(gpu_given, "basalt-probe", gpu_value, used, err)) {
+        if (!select_gpus(gpu_given, arg_value(args, "--gpu-mode"), arg_value(args, "--gpu-share"), "basalt-probe", gpu_value, used, err)) {
             basalt::log::error("basalt-probe", "%s", err.c_str());
             return 2;
         }

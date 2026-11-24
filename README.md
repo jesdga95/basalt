@@ -8,6 +8,12 @@ in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Ant
 
 **Help wanted:** spare Blackwell compute for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
 
+<p align="center">
+  <a href="https://github.com/sponsors/jesdga95"><img src="assets/donate/github.svg" height="44" alt="Sponsor on GitHub"></a>
+  <a href="https://ko-fi.com/jesdga"><img src="assets/donate/kofi.svg" height="44" alt="Support on Ko-fi"></a>
+  <a href="https://paypal.me/jesdga"><img src="assets/donate/paypal.svg" height="44" alt="Donate on PayPal"></a>
+</p>
+
 ## Requirements
 
 - Linux x86-64 with AVX2, or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
@@ -33,7 +39,7 @@ Put the settings in `basalt_config.json`:
 ```json
 {
   "version": 2,
-  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "kv": "int8" }],
+  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "gpu-mode": "peer", "kv": "int8" }],
   "engine": { "resident-experts": true },
   "server": { "port": 8080 }
 }
@@ -49,9 +55,9 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 ## Models
 
 | | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B | Hy4-flash | Inkling 2 Mini | Nemotron 3.5 Super |
-|---|---|---|---|---|---| --- |
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) | `Hy4-flash-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt) | `Inkling-2-Mini-NVFP4-q8`, [Hugging Face](https://huggingface.co/jesdga/Inkling-2-Mini-Basalt) | `Nemotron-3.5-Super-NVFP4`, [built](docs/model-file.md#nemotron-35-super-pack) from NVIDIA's checkpoint |
-| Context | up to 262,144 (longer with YaRN) | up to 1,048,576 | up to 262,144 | up to 1,048,576 | up to 1,048,576 | default 8,192 (tested to 16,384) |
+|---|---|---|---|---|---|---|
+| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) | `Hy4-flash-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt) | `Inkling-2-Mini-NVFP4-MX8`, [Hugging Face](https://huggingface.co/jesdga/Inkling-2-Mini-Basalt) | `Nemotron-3.5-Super-NVFP4`, [built](docs/model-file.md#nemotron-35-super-pack) from NVIDIA's checkpoint |
+| Context | up to 262,144 (longer with YaRN) | up to 1,048,576 | up to 262,144 | up to 1,048,576 | up to 1,048,576 | up to 1,048,576; tested to 250K |
 | Drafting | MTP, on by default | DSpark, on by default | DFlash 2, on by default | DFly2, on by default | DSpark, on by default | MTP and prompt lookup, on by default |
 | Images | yes | yes | yes | yes | yes | no |
 | Documents (PDF, text) | yes | yes | yes | yes | yes | yes |

@@ -459,7 +459,9 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         const int c = threadIdx.x + j * kThreads;
-        const float g = tanhf(gf[c]), f = tanhf(gf[kWidth + c]);
+        float g, f;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(g) : "f"(gf[c]));
+        asm("tanh.approx.f32 %0, %1;" : "=f"(f) : "f"(gf[kWidth + c]));
         y[j] = (1.f - f) * de[j] + g * ms[j];
     }
     norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
@@ -477,13 +479,18 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
     bk::pdl_launch_dependents();
     const int p = a.pos[r];
     if (w < 2) {
-        float val[4], raw[4], f;
-        prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f);
-        void* cache = w ? a.v_cache : a.k_cache;
-        const size_t cell = ((size_t) (p % a.cap) * kKvHeads + g) * kHeadDim + lane * 4;
+        // a batch window's row: its conversation's caches, and its rows of the window from its segment's first
+        const int k = bk::seg_of(a.seg.at, r);
+        const bool b = a.seg.at.n > 0;
+        const SegCaches& sc = a.seg.c[k];
+        float* ring = w ? (b ? sc.v_ring : a.v_ring) : (b ? sc.k_ring : a.k_ring);
+        void* cache = w ? (b ? sc.v : a.v_cache) : (b ? sc.k : a.k_cache);
+        float val[4], raw[4], f, scale[2] = {};
+        prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f, ring, b ? a.seg.at.row0[k] : 0, scale);
+        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
+        void* row = static_cast<uint8_t*>(cache) + ((size_t) (p % a.cap) * kKvHeads + g) * row_bytes;
 #pragma unroll
-        for (int u = 0; u < 4; ++u) prep::store_kv(cache, a.fp8, cell + u, val[u] * f);
-        float* ring = w ? a.v_ring : a.k_ring;
+        for (int u = 0; u < 4; ++u) prep::store_kv(row, a.fp8, a.int8, lane * 4 + u, val[u] * f, scale, lane);
         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
             make_float4(raw[0], raw[1], raw[2], raw[3]);
         return;
@@ -506,6 +513,9 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
     // waits before this one starts): the finished blocks, the layer's input, the ring's entries of the positions before
     // the window; every input is read before the first store (the ring is one of them)
     const int r = blockIdx.x, pr = a.pos[r];
+    // a batch window's row: its conversation's ring, and its rows of the window from its segment's first
+    const int sk = bk::seg_of(a.seg.at, r), first = a.seg.at.n > 0 ? a.seg.at.row0[sk] : 0;
+    float* const ring = a.seg.at.n > 0 ? a.seg.c[sk].a_ring : a.ring;
     float v[kMaxMix][kPer];
     const int nb = a.n_blocks + (a.boundary ? 1 : 0), n = nb + 1;
 #pragma unroll
@@ -521,7 +531,7 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
         const int c = threadIdx.x + j * kThreads;
 #pragma unroll
         for (int k = 1; k < kConv; ++k)
-            if (r - k < 0) xin[j][k] = prep::conv_ring(a.ring, kWidth, pr - k, c);
+            if (r - k < first) xin[j][k] = prep::conv_ring(ring, kWidth, pr - k, c);
         hres[j] = a.boundary ? 0.f : a.hid[(size_t) r * kWidth + c];
     }
     bk::pdl_wait();
@@ -532,7 +542,7 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
     for (int j = 0; j < kPer; ++j)
 #pragma unroll
         for (int k = 0; k < kConv; ++k)
-            if (r - k >= 0) xin[j][k] = a.o[(size_t) (r - k) * kWidth + threadIdx.x + j * kThreads];
+            if (r - k >= first) xin[j][k] = a.o[(size_t) (r - k) * kWidth + threadIdx.x + j * kThreads];
     const int slot = pr % kConvRing;
     float res[kPer];
 #pragma unroll
@@ -544,7 +554,7 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
         const float conv = __fmul_rn(acc + xin[j][0], rsqrtf((float) kConv + 1.f));
         res[j] = a.boundary ? conv : conv + hres[j];
         a.resid[(size_t) r * kWidth + c] = res[j];
-        a.ring[(size_t) slot * kWidth + c] = xin[j][0];
+        ring[(size_t) slot * kWidth + c] = xin[j][0];
     }
 #pragma unroll
     for (int i = 0; i < kMaxMix; ++i)
@@ -569,13 +579,16 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
 __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
     const int r = blockIdx.x;
     const int c = blockIdx.y * 256 + threadIdx.x;
+    // a batch window's row: its conversation's ring, and its rows of the window from its segment's first
+    const int sk = bk::seg_of(a.seg.at, r), first = a.seg.at.n > 0 ? a.seg.at.row0[sk] : 0;
+    float* const ring = a.seg.at.n > 0 ? a.seg.c[sk].m_ring : a.ring;
     float taps[kConv];   // read while the kernel before finishes
 #pragma unroll
     for (int j = 0; j < kConv; ++j) taps[j] = a.taps[c * kConv + (kConv - 1 - j)];
     if (threadIdx.x < kConv - 1) {   // the block's ring entries of the three positions before this row into L2
         const int pj = a.pos[r] - 1 - (int) threadIdx.x;
         if (pj >= 0)
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(a.ring + (size_t) (pj % kConvRing) * kWidth + blockIdx.y * 256),
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ring + (size_t) (pj % kConvRing) * kWidth + blockIdx.y * 256),
                          "r"(256u * 4u) : "memory");
     }
     bk::pdl_wait();
@@ -585,12 +598,12 @@ __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
 #pragma unroll
         for (int j = 0; j < kConv; ++j) {
             float x;
-            if (r - j >= 0) {
+            if (r - j >= first) {
                 x = 0.f;
                 for (int s = 0; s < a.k; ++s) x = fmaf(a.w[(r - j) * a.k + s], a.rows[((size_t) (r - j) * a.k + s) * kWidth + c], x);
             } else {
                 const int p = a.pos[r] - j;
-                x = p < 0 ? 0.f : a.ring[(size_t) (p % kConvRing) * kWidth + c];
+                x = p < 0 ? 0.f : ring[(size_t) (p % kConvRing) * kWidth + c];
             }
             if (j == 0) x0 = x;
             acc = fmaf(taps[j], x, acc);
@@ -599,7 +612,7 @@ __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
         const float y = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];
         a.out[i] = y;
         if (a.tap) a.tap[i] = y;
-        a.ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;
+        ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;
     }
 }
 

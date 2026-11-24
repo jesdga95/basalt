@@ -29,7 +29,7 @@ namespace basalt::models::deepseek41 {
 namespace {
 
 constexpr uint64_t kModuleRoom = 7ull << 27;    // kernel modules still to load when the tier opens
-constexpr uint64_t kVisionRoom = 3ull << 29;    // the image encoder, when the pack carries one
+constexpr uint64_t kVisionRoom = 3ull << 29;    // what the homes leave beside them when the pack carries a projector, whether or not vision is on: it sets the homes-or-copies plan, so the plan is the same in both; the encoder borrows the copies per picture and holds no memory of its own at rest
 // One layer's GPU plan for the grouped expert kernel, uploaded with a single copy.
 struct ExpertPlan {
     unsigned long long ptr[8];

@@ -29,7 +29,7 @@ Every score is against the original model in BF16:
 | Qwen3.8-Flash-Next | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp commit 436f6f89e), 100 chunks of 512, `-b 8192 -ub 8192` | 3.2749 (3.2733 on the scored rows) |
 | DeepSeek-V4.1-Flash | a BF16 GGUF by @giveen, made with `convert_hf_to_gguf --outtype bf16` (llama.cpp 330f0189), wikitext-2, 100 chunks of 512 | 2.7394 (2.7314 from the stored rows) |
 | Qwen3.8-27B | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp 5676dfbe), wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192` | 6.7437 (6.7411 on the scored rows) |
-| Hy4-flash | Tencent's BF16 checkpoint converted to a BF16 GGUF (llama.cpp 0a054d0b0), through `llama-perplexity` with the llama.cpp port's Engram key/query norm epsilon set to vLLM's and `add_bos_token=true`, wikitext-2, 100 chunks of 512; `hy4flash-bf16-base.kld` | 18.572 (over the 25,500 scored rows) |
+| Hy4-flash | Tencent's BF16 checkpoint converted to a BF16 GGUF (llama.cpp 0a054d0b0), through `llama-perplexity` with the llama.cpp port's Engram gate norm epsilon set to FP32's (#556) and `add_bos_token=true`, wikitext-2, 100 chunks of 512; `hy4flash-bf16-base.kld` | 18.416 (over the 25,500 scored rows) |
 | Inkling 2 Mini | the official release with its experts dequantized to BF16 (no BF16 checkpoint exists; the release ships NVFP4 and MXFP8 experts): a BF16 GGUF from `convert_hf_to_gguf --outtype bf16` (llama.cpp 29b52d398), through `llama-perplexity`, wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192`; `inkling2-bf16-base.kld`. Not comparable with the other models' true-BF16 bases | 7.0714 |
 
 The official Flash-Next packs are scored against the first base on their
@@ -74,7 +74,7 @@ a fixed `--expert-cache N`, and a fixed peer tier.
 Forced-window identity (the same window width must give the same rows):
 
 ```sh
-python3 tools/ppl_gate.py --model PACK.basalt --engine-bin bin/basalt --base flashnext-bf16-base.kld \
+python3 tools/ppl_gate.py --model PACK.basalt --architecture qwen4exp --engine-bin bin/basalt --base flashnext-bf16-base.kld \
     --chunks 20 --t {1|3|7} --out DIR --expert-cache N --kv int8 --resident-experts --peer-exclusive --prefill auto
 python3 tools/ppl_gate.py --diff DIR1/rows.tsv DIR7/rows.tsv
 ```
@@ -83,7 +83,7 @@ MTP on and off, token by token: one engine session per configuration over `--ser
 
 ```sh
 bin/basalt --serve --model MODEL.basalt {--spec 0 | --spec 7} --expert-cache N --prefill auto --kv int8 \
-    --vram-reserve-mib 700 --resident-experts --peer-exclusive --gpu 0,1 --max-context 8192 \
+    --vram-reserve-mib 700 --resident-experts --peer-exclusive --gpu 0,1 --gpu-mode peer --max-context 8192 \
     --adapt-swaps 0 --peer-adapt-swaps 0 --exp concur9_logit_hash=1
 ```
 

@@ -28,6 +28,7 @@ struct RouterArgs {
 /// logits = gate . x (fp32, gate row-major [n_expert][n_embd]); s = the gate function of the logit; the top-k of s + bias
 /// are chosen (the lower index wins a tie); weights are the unbiased s of those experts, divided by their sum plus
 /// 1e-20, times weight_scale. `logits` is a [T][n_expert] output (workspace); ids and weights are [T][k].
+void router_logits(const float* x, const float* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream);
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
             int32_t* ids, float* weights, void* stream);
 

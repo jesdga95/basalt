@@ -79,9 +79,9 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
             e = "PROBE adapt: " + e;
             return false;
         }
-        if (peer_hot_share) {
+        if (peer_hot_share > 0) {
             size_t at = 0, fill = 0;
-            (void) peer_hot_share_order(q, at, fill);
+            (void) peer_hot_share_order(q, peer_hot_share, at, fill);
         }
         // the start's slots in its ranking's order take the file's ranks in order
         std::vector<int32_t> main_slots, peer_slots;

@@ -6,6 +6,7 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/hy4flash/context_policy.hpp"
@@ -91,7 +92,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.path = path_;
     s.fd = fd_;
     s.range = pack_.experts_range;
-    s.peer_devices = peer_devices_;
+    s.gpus = gpus_;
     s.diag_tier_ram = flags_.diag_tier_ram;
     s.diag_tier_vram = flags_.diag_tier_vram;
     s.diag_tier_frozen = flags_.diag_tier_frozen;
@@ -171,7 +172,11 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
             d.type = kTypeQ8_0;
             d.bytes = t.shape[0] * t.shape[1] / 32 * 34;
         }
-        if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
+        // the prompt products (MMQ) read the last row of a matrix whose rows are not a multiple of 256 values on to the next
+        // multiple: zeros past the end, so the read stays inside the allocation wherever it lies
+        const uint64_t past = !t.shape.empty() && prefill::mmq::supported(d.type) ? prefill::mmq::read_past_bytes(d.type, (int64_t) t.shape[0]) : 0;
+        if (cudaMalloc(&d.ptr, d.bytes + past) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
+        if (past > 0 && cudaMemset((uint8_t*) d.ptr + d.bytes, 0, past) != cudaSuccess) return {model::Status::Error, "hy4flash: cannot clear the tail of " + name};
         core::LoadItem it;
         it.file = file;
         it.off = t.offset;
@@ -220,12 +225,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     // queued in the start's plan
     flags_ = req;
     path_ = path;
-    std::vector<int> peers = req.peer_devices;
-    if (peers.size() > (size_t) kMaxSecondCards) {
-        basalt::log::warn("basalt hy4flash", "%zu second cards given, %d hold experts; later cards idle", peers.size(), kMaxSecondCards);
-        peers.resize((size_t) kMaxSecondCards);
-    }
-    peer_devices_ = std::move(peers);
+    gpus_ = req.gpus;
     planning_ = &reads;
     model::Result r;
     for (int i = 0; r.ok() && i < std::max(req.sessions, 1); ++i) {
@@ -247,5 +247,7 @@ model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::uniqu
     }
     return {};
 }
+
+model::PeerHooks* Hy4Model::peer() const { return shared_tier_.tier.get(); }
 
 }  // namespace basalt::models::hy4flash

@@ -40,7 +40,6 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/image_loan.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
@@ -57,6 +56,7 @@
 #include "basalt/program/ppl_gate.hpp"
 #include "basalt/program/probe_rates.hpp"
 namespace basalt::models::qwen4exp { std::shared_ptr<basalt::program::ProbePeerPath> make_probe_peer_path(); }
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/spec/draft_policy.hpp"
 #include "basalt/spec/suffix_drafter.hpp"
 #include "basalt/core/progress.hpp"
@@ -146,6 +146,61 @@ void seed_usage_from_prompt(std::vector<float>& usage, const std::vector<uint32_
 
 
 class QfnRequest;
+class QfnRuntime;
+
+// A batch slot as a session of the shared batch driver (docs/design/batching.md): its windows run on the runtime's
+// verifier over the slot's own state (Verifier::run_slot_segs), a window's kept rows are committed at once (decode_kept),
+// and its drafts come from the drafter's store of the slot, by the drafter's own length rule.
+class QfnSlotSession final : public basalt::model::BatchSession {
+public:
+    QfnSlotSession(QfnRuntime& rt, int b) : rt_(rt), b_(b) {}
+    basalt::model::Result decode_window(const basalt::model::DecodeRequest& r) override;
+    basalt::model::Result prefill_chunk(const basalt::model::PrefillRequest& r) override;
+    int batch_rows() const override;
+    basalt::model::Result decode_kept(basalt::model::ModelSession* const* sessions, const int* kept, int n) override;
+    int max_window() const override;
+    int own_window(const float* chance, int n) const override;
+    basalt::model::Result draft_begin(int32_t anchor, int64_t pos, int n) override;
+    basalt::model::Result draft_batch(basalt::model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos,
+                                      const int* n, int count) override;
+    basalt::model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override;
+    basalt::model::Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override;
+    basalt::model::Result copy_logits(int row, float* out) override;
+    basalt::model::Result resample_row(int row, const float* bias, int32_t& token) override;
+    /// A new request in the slot: its drafter's length rule and draft share start over.
+    void reset();
+
+protected:
+    const char* batch_name() const override { return "qwen4exp"; }
+    int64_t batch_context() const override;
+    basalt::model::BatchShared& batch_shared() override;
+    cudaStream_t batch_stream() const override;
+    bool batch_reserve(const basalt::model::DecodeRequest& r, std::string& err) override;
+    bool batch_stage(const basalt::model::BatchView&, basalt::model::GraphLru<basalt::core::CapturedGraph>::Key&, std::string&) override {
+        return true;
+    }
+    bool batch_forward(const basalt::model::BatchView& v, std::string& err) override;
+    bool batch_captured() const override { return false; }
+    void batch_take(const basalt::model::BatchView& v, int i) override;
+    const int32_t* batch_draw(const basalt::model::BatchView& v, int i, std::string& err) override;
+
+private:
+    friend class QfnRuntime;
+    QfnRuntime& rt_;
+    const int b_;
+    // its segment of the last window: first row, rows, position, whether the drafts were its drafter's, the rows kept
+    int r0_ = 0, rows_ = 0, kept_ = 0;
+    int64_t pos0_ = 0;
+    bool own_ = false;
+    // the drafter's side: the draft-length rule, the share of drafts accepted and the windows since it last drafted (who
+    // takes a draft chain when not every slot can), the drafts it made and their probabilities
+    basalt::core::DraftCumAdapt cum_;
+    double acc_ = 0.6;
+    int64_t since_draft_ = 0;
+    int32_t dr_[basalt::spec::DraftPolicy::kMaxT] = {};
+    float dp_[basalt::spec::DraftPolicy::kMaxT] = {};
+    int n_dr_ = 0;
+};
 
 // Flash-Next's serving state over the shared one.
 class QfnRuntime final : public Runtime, private Context {
@@ -162,20 +217,20 @@ public:
     bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override;
     std::vector<CardFacts> card_facts() override;
     void at_exit() override;
-    bool windows_in_flight() override;
     bool next_batch_window() override;
-    bool drain_windows() override;
-    void script_command(const std::string& line) override;
+    basalt::model::ModelSession& slot_session(int b) override { return *slot_ss[(size_t) b]; }
+    bool slot_ready(int b) override { return kv_wait.empty() || !kv_wait[(size_t) b]; }
     void probe_command(const std::string& line, std::string& e) override;
     void sleep_command(bool down, std::string& e) override;
     void between_requests(const std::string& line) override;
     Flow run_request() override;
+    int batch_check();
     bool slot0_solo() const override { return slot0_is_solo; }
-    bool pipelined() const override { return piped; }
     int64_t slot_context(int slot) const override { return slot_cap[(size_t) slot]; }
 
 private:
     friend class QfnRequest;
+    friend class QfnSlotSession;
     using Context::o;
     using Context::model_file;
     using Context::err;
@@ -233,6 +288,10 @@ private:
     int hist_dev{};
     basalt::core::Verifier ver{};
     basalt::core::VerifyHits vh{};
+    // --diag-fixed-experts: the windows' residency tables, no expert in VRAM (the host's, and one per card), so the CPU
+    // pool computes every row of a window whatever the cards hold
+    std::vector<int32_t> fixed_res{};
+    std::vector<std::pair<int, int32_t*>> fixed_res_d{};
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
     basalt::core::Verifier ver_same{};
@@ -332,14 +391,21 @@ private:
     /// the solo conversation's draft K/V waits in slot 0's store while a request in another slot holds the main one
     bool solo_draft_in0{};
     int S_all{};
-    std::optional<basalt::spec::DraftPolicy> bpolicy;
+    // the batch slots' sessions (the shared rounds run them), their driver state, the last window's picks and rows, its
+    // commit while it runs beside the drafts, and the slots whose next cells wait for a prompt read beside them
+    std::vector<std::unique_ptr<QfnSlotSession>> slot_ss{};
+    basalt::model::BatchShared slot_shared{};
+    int32_t win_out[basalt::kernels::kVerifyMaxT] = {};
+    int win_rows{};
+    int win_segs{};
+    bool commit_open{};
+    std::vector<uint8_t> kv_wait{};
+    bool slot_windows(QfnSlotSession* const* ss, const basalt::model::DecodeRequest* reqs, int n, std::string& e);
+    bool commit_settle(std::string& e);
     double bt_draft{};
-    double bt_draft_last{};
     int64_t bt_slotwin{};
     int64_t bt_dr_off{};
     int64_t bt_dr_acc{};
-    std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript{};
-    bool bdigest{};
     bool logit_hash{};
     std::vector<float> lh_buf{};
     bool batch_adapt{};
@@ -356,7 +422,6 @@ private:
     bool ba_job{};
     double bt_run{};
     double bt_commit{};
-    double bt_emit{};
     double bt_wait0{};
     double bt_pool0{};
     int64_t bt_miss0{};
@@ -369,20 +434,6 @@ private:
     bool ov_active{};
     std::function<bool ()> ov_post{};   // what the overlapped read's thread does right after its last chunk
     bool ov_post_done{};
-    int n_pipe{};
-    bool piped{};
-    int GS{};
-    struct PGroup {
-        bool inflight = false;
-        int stage = 0;                  ///< the stage it runs on or waits for
-        int32_t tok[basalt::kernels::kVerifyMaxT] = {};
-        int64_t pos[basalt::kernels::kVerifyMaxT] = {};
-        int64_t since = 0;              ///< tick it started waiting (fairness)
-    };
-    std::vector<PGroup> pg{};
-    std::vector<int> stage_group{};
-    int64_t pipe_tick{};
-    int64_t rr{};
 
     int64_t part_slots(const PfPart& p, int64_t c);
     uint64_t part_bytes(const PfPart& p, int32_t first);
@@ -391,6 +442,7 @@ private:
     basalt::core::Verifier& stage_ver(int st);
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
+    bool fixed_experts(basalt::core::VerifyHits& h, int dev);
     bool capture_admit(uint64_t need, uint64_t floor) override;
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();
@@ -435,13 +487,6 @@ private:
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);
     bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) override;
     void solo_draft_back(bool keep) override;
-    bool slot_digest(int b, int64_t upto, uint64_t* part);
-    bool batch_step();
-    basalt::core::Verifier& stage_verifier(int k);
-    bool pipe_inflight();
-    bool group_active(int gi);
-    bool pump(bool may_start);
-    bool pipe_drain();
     size_t spill_to_disk(bool at_exit, size_t limit) override;
     int64_t disk_min_tokens() const override { return 8192; }
     bool probe_adapt(const std::string& cmd, std::string& e);

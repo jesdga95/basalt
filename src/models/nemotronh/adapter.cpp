@@ -33,7 +33,7 @@ public:
         return f;
     }
     PreTokenizer pretokenizer() const override { return {"nemotronh", pretok_nemotronh}; }
-    int max_expert_cards() const override { return 0; }
+    program::GpuModes gpu_modes() const override { return {}; }   // one card: the experts stay on it and in RAM
     const char* model_name() const override { return "Nemotron-3.5-Super"; }
     int quality_window() const override { return 16; }
 

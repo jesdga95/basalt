@@ -14,8 +14,9 @@ Protocol (one line each):
     The slot and batch forms are SGENT and BGENT; the server uses only GENT.
   * held prompts (--batch): `PROMPT <nbytes> [plain=a:b,...]` + text (the engine tokenizes) or `PROMPTI [img] <ids>` ->
     `PROMPT <handle> <n>` at once, even while a request runs (or `PROMPT ERR <why>`). `PMATCH <handle>` -> `PMATCH
-    <handle> <match>:<held> ...`, one pair per slot: the tokens of the prompt the slot's idle conversation covers (the
-    engine's own matching: an exact prefix, or the model's own pieces for the same bytes) and the tokens it holds.
+    <handle> <match>:<held> ...`, one pair per slot: the tokens of the prompt the slot's idle conversation continues
+    (its reply the client sent back, cut into other pieces, still counts; another conversation sharing a head does not)
+    and the tokens it holds.
     `BGEN`/`SGEN` then name the prompt where the ids go: `#<handle>[+<id>,...]` (the ids a request that ran in several
     engine runs adds after it); `PFREE <handle>` drops it.
   * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`; with
@@ -403,10 +404,11 @@ class ProcessEngine:
         self.slot_held: list[int] = [0] * self.batch
         self.slot_used = [0.0] * self.batch
         self.slot_epoch = [0] * self.batch
-        # session identity (a load-balancer header) -> its slot: a conversation stays in one slot, so its next
-        # turn continues the K/V that is already there instead of being admitted wherever and copied in
+        # session identity (a load-balancer header) -> the slots its conversations run in, one owner per slot: a
+        # conversation stays in the slot where its K/V sits, so its next turn continues it instead of being admitted
+        # wherever and copied in.  A session may hold several slots: parallel agents of one session (a subagent
+        # sends its parent's header), a retry while the first request runs.
         self.slot_owner: dict[int, str] = {}
-        self.session_slot: dict[str, int] = {}
         # the request thread that last took each slot: the slot table shows a running request on its own slot
         self.slot_thread: list[int | None] = [None] * self.batch
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
@@ -550,14 +552,21 @@ class ProcessEngine:
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
+                size = f.tell()
+                start = getattr(self, "log_start", None)
+                if isinstance(start, bool) or not isinstance(start, int):
+                    start = max(0, size - 4096)      # no boundary recorded: the bounded tail
+                if 0 <= start <= size:               # a boundary outside the file is not this run's: nothing to attribute
+                    f.seek(max(start, size - 4096))
+                    tail = f.read(4096).decode("utf-8", "replace")
         except (OSError, TypeError):
             pass
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return "the engine's watchdog stopped it: " + line.strip()
         proc = self.proc                                 # None between restart's close and start
+        if proc is None:
+            proc = getattr(self, "_reaped", None)        # a reaped child keeps its exit status
         rc = proc.poll() if proc is not None else None
         status = self._format_exit_status(rc)
         if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
@@ -593,6 +602,30 @@ class ProcessEngine:
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
         self.close()
         self.unloaded = True
+
+    def discard(self):
+        """End the engine without giving a sleeping one its GPU state back: the VRAM it left is in use by another model,
+        so it is killed where it sleeps and its RAM-only conversations are lost."""
+        with self.sleep_lock:
+            if self.asleep and self.proc is not None:
+                self.asleep = False
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=20)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        self.unload()
+
+    def held_mib(self) -> int | None:
+        """The RAM this engine's process holds besides file-backed pages: anonymous and shared memory from
+        /proc/PID/status; None where that is unreadable."""
+        try:
+            with open(f"/proc/{self.proc.pid}/status", encoding="ascii") as f:
+                kb = {k: int(v.split()[0]) for k, _, v in (line.partition(":") for line in f)
+                      if k in ("RssAnon", "RssShmem")}
+        except (OSError, AttributeError, ValueError, IndexError):
+            return None
+        return sum(kb.values()) >> 10 if len(kb) == 2 else None
 
     RESTART_RETRY_S = 15.0   # between restart() tries, for VRAM to be released
 
@@ -753,6 +786,20 @@ class ProcessEngine:
         `OK <groups> <nx> <ny> <ms> <time,...>` line. As encode_images otherwise."""
         return self._encode(f"ENCV {video} {out} {words}".rstrip(), 1, "video", timeout)[0]
 
+    def _retire(self, why: str) -> None:
+        """End the engine after an encode timeout: a late reply leaves the command stream unsafe to
+        reuse, so the next request restarts a fresh one; the child is stopped now, not left holding
+        the VRAM the restart needs."""
+        self.ended = True
+        proc = self.proc
+        if proc is not None and proc.poll() is None and not self.silent_note:   # a live child: retirement is the cause
+            self.silent_note = why + "; the engine was retired"
+            try:
+                proc.kill()
+                proc.wait(timeout=20)                   # restart()/close() handles one still exiting
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
     def _encode(self, command: str, replies: int, what: str, timeout: float | None) -> list[str]:
         if not self.alive():
             raise EngineDied("the engine is not running")
@@ -767,12 +814,13 @@ class ProcessEngine:
                 have_ctl = True
         try:
             self._send(command)
-            deadline = time.time() + timeout
+            deadline = time.monotonic() + timeout
             got: list[str] = []
             while len(got) < replies:
                 try:
-                    line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                    line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
                 except queue.Empty:
+                    self._retire(f"the {what} command timed out")
                     raise EngineDied(f"the engine did not answer the {what} command") from None
                 if line is None:
                     raise EngineDied("the engine ended")
@@ -781,7 +829,8 @@ class ProcessEngine:
                     raise ValueError(f"the {what} could not be read: " + (line[8:].strip() or "the engine refused it"))
                 if line.startswith("ENC OK "):
                     got.append(line[4:])
-                elif time.time() > deadline:
+                elif time.monotonic() > deadline:
+                    self._retire(f"the {what} command timed out")
                     raise EngineDied(f"the engine did not answer the {what} command")
             return got
         finally:
@@ -1546,39 +1595,39 @@ class ProcessEngine:
 
     def pick_slot(self, meet: list[int], size: int, session: str | None = None) -> int | None:
         """A free slot for a prompt of `size` tokens (caller holds slot_cv; `meet`: the tokens of it each slot's idle
-        conversation covers, as the engine matched them): this session's own slot first (a conversation stays
-        where its K/V sits), then the longest held prefix, else an empty one, then the least recently used; None
-        when none is free.  A slot owned by another session is taken only when no unowned one is free: the owner
-        lost its conversation either way, and the least recently used goes first.  Read-only: `claim_slot` records
-        the choice."""
+        conversation covers, as the engine matched them): one of this session's own slots whose conversation this
+        prompt continues first (the longest held prefix - a conversation stays where its K/V sits), then an unowned
+        slot (the longest held prefix, else an empty one, then the least recently used), then the session's other
+        own slot, and only then another session's: that owner lost its conversation.  None when none is free.
+        Read-only: `claim_slot` records the choice."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
-        own = self.session_slot.get(session) if session is not None else None
-        if own is not None and own in free:
-            return own
 
         def held_prefix(b):
             return meet[b] if 0 < meet[b] < size else 0
-        pool = [b for b in free if b not in self.slot_owner] or free   # slot_owner is keyed by slot
-        best = max(pool, key=held_prefix)
-        return best if held_prefix(best) > 0 else min(pool, key=lambda b: (self.slot_held[b] > 0, self.slot_used[b]))
+
+        def best(pool: list[int]) -> int:
+            top = max(pool, key=held_prefix)
+            return top if held_prefix(top) > 0 else min(pool, key=lambda b: (self.slot_held[b] > 0, self.slot_used[b]))
+
+        mine = [b for b in free if session is not None and self.slot_owner.get(b) == session]
+        if mine:
+            top = best(mine)
+            if held_prefix(top) > 0:
+                return top
+        unowned = [b for b in free if b not in self.slot_owner]   # slot_owner is keyed by slot
+        if unowned:
+            return best(unowned)
+        return best(mine or free)
 
     def claim_slot(self, slot: int, session: str | None) -> None:
-        """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it and the session's own previous
-        slot: two owners of one slot, or one session in two slots, would both be lies the next turn acts on."""
+        """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it: one slot, one owner.  A session
+        keeps every slot it took: its agents' conversations may run in several at once."""
         self.slot_thread[slot] = threading.get_ident()
         if session is None:
             return
-        for s, o in list(self.session_slot.items()):    # anyone else owning this slot loses it
-            if o == slot:
-                del self.session_slot[s]
-                self.slot_owner.pop(slot, None)
-        old = self.session_slot.get(session)           # the session's previous slot, replaced
-        if old is not None and old != slot and self.slot_owner.get(old) == session:
-            del self.slot_owner[old]
         self.slot_owner[slot] = session
-        self.session_slot[session] = slot
 
     def slot_view(self) -> list[dict]:
         """Per batch slot: the thread whose request runs in it (None when idle) and the tokens it holds for the
@@ -1748,6 +1797,15 @@ class ProcessEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
         return EngineSilent(f"{what}; the server ended the engine")
+
+    def reap(self) -> None:
+        """Close the child of an engine that already ended (a retirement, a stall, a crash): it may still be
+        releasing GPU/RAM, and the load path's free-VRAM check would otherwise blame another program and
+        keep rejecting the restart that cleans it up. The child is kept for death_note: close() clears
+        self.proc, which would turn a crash's exit status into "no exit status"."""
+        if getattr(self, "proc", None) is not None and not self.alive():
+            self._reaped = self.proc                     # its returncode survives the close
+            self.close()   # EngineStuck here means it is genuinely still exiting: the honest answer
 
     def close(self):
         """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""
