@@ -88,12 +88,14 @@ struct ggml_type_traits_cpu {
     int64_t nrows;
 };
 
-// The dot products run on the widest x86 vector unit the CPU has (AVX-512 build, else AVX2).  nullptr for a type
-// without a dot product, and for every type on a CPU with neither.
+// The dot products run on the widest x86 vector unit the CPU has (AVX-512 build, else AVX2), or on NEON with the dot
+// product on Arm64.  nullptr for a type without a dot product, and for every type on a CPU with none of them.
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu(enum ggml_type type);
 // Each instruction set's table, whatever this CPU has (parity tests compare them).
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx2(enum ggml_type type);
 const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx512(enum ggml_type type);
+// The Arm64 build's table (ggml_cpu_dots_neon.c); the two above exist on x86-64 only, this one on Arm64 only.
+const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_neon(enum ggml_type type);
 
 // MXFP8 rows (type 46) with the activation converted once: `prep` turns a Q8_0 row (n a multiple of 128) into
 // n / 128 * GGML_MXFP8_PREP_BLOCK floats in the layout of the instruction set that made it, and `rows` takes `nt` (at

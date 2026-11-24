@@ -42,4 +42,10 @@ CpuInfo cpu_info();
 /// Intel die. Processors are named as above. Empty when the OS does not say.
 std::vector<std::vector<int>> cpu_l3_groups();
 
+/// Arm64: whether the CPU, as the OS reports it, has the Armv8.2 dot product (sdot / udot), which every NEON kernel
+/// of the engine uses. False on x86-64.
+bool cpu_has_arm_dotprod();
+/// Arm64: whether it also has the int8 matrix multiply extension (I8MM: smmla, usdot). False on x86-64.
+bool cpu_has_arm_i8mm();
+
 }  // namespace basalt::platform

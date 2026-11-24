@@ -1,6 +1,8 @@
 // src/program/gpu_select.cpp - see gpu_select.hpp.
 #include "basalt/program/gpu_select.hpp"
 
+#include "basalt/core/cuda_cc.hpp"
+
 #include "basalt/log.hpp"
 #include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/process.hpp"
@@ -167,18 +169,18 @@ std::string arch_name(const GpuCard& c) { return "sm_" + std::to_string(c.cc_maj
 
 }  // namespace
 
-// The main GPU runs the model's decode kernels (NVFP4 tensor cores, Blackwell instructions) — sm_120 only.
+// The main GPU runs the model's decode kernels (NVFP4 tensor cores, Blackwell instructions) — this build's compute capability only.
 // A peer GPU runs only the expert tier's standard CUDA kernels (Q8_1/Q2_0 rows, shared-memory rings,
 // doorbells), which a build with -DPEER_ADA=ON also compiles for sm_89 (Ada).
-bool gpu_main_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
+bool gpu_main_supported(const GpuCard& c) { return c.cc_major == 0 || core::cuda_cc_is_ours(c.cc_major, c.cc_minor); }
 // sm_89 (Ada) is the one older architecture the peer kernels can be compiled for (when built with PEER_ADA);
 // a peer card of any other pre-Blackwell arch (or an sm_89 card without PEER_ADA) is rejected here
 // rather than failing later with 'no kernel image' at the first peer launch.
 bool gpu_peer_supported(const GpuCard& c) {
 #if defined(BASALT_PEER_ADA)
-    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 8 && c.cc_minor == 9);
+    return c.cc_major == 0 || core::cuda_cc_is_ours(c.cc_major, c.cc_minor) || (c.cc_major == 8 && c.cc_minor == 9);
 #else
-    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0);
+    return c.cc_major == 0 || core::cuda_cc_is_ours(c.cc_major, c.cc_minor);
 #endif
 }
 
@@ -219,10 +221,10 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
         c.cards.clear();
         return c;
     };
-    // the main card runs the model's own kernels: sm_120 only
+    // the main card runs the model's own kernels: this build's compute capability only
     if (known && !gpu_main_supported(visible[(size_t) c.cards[0]]))
         return refuse("gpu " + shown + ": " + gpu_label(visible, c.cards[0]) + " is " + arch_name(visible[(size_t) c.cards[0]]) +
-                      "; the main card must be sm_120");
+                      "; the main card must be " + core::cuda_cc_name());
     // what the settings say about the number of cards
     const size_t count = c.cards.size();
     const std::string mode_text = gpu_mode_name(mode);
@@ -256,7 +258,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
         for (double v : shares) sum += v;
         for (double v : shares) c.shares.push_back(v / sum);
     }
-    // the cards after the main one: a peer takes sm_120, or sm_89 in a -DPEER_ADA=ON build; split and tensor sm_120 only
+    // the cards after the main one: a peer takes this build's capability, or sm_89 in a -DPEER_ADA=ON build; split and tensor this capability only
     for (size_t idx = 1; known && idx < count; ++idx) {
         const GpuCard& g = visible[(size_t) c.cards[idx]];
         const std::string who = gpu_label(visible, c.cards[idx]);
@@ -264,9 +266,9 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
         if (mode == GpuMode::Peer) {
             if (!gpu_peer_supported(g))
                 return refuse("gpu-mode peer: " + who + " is " + arch_name(g) +
-                              (ada ? "; peer takes sm_89 in a -DPEER_ADA=ON build" : "; peer runs on sm_120 cards"));
+                              (ada ? "; peer takes sm_89 in a -DPEER_ADA=ON build" : "; peer runs on " + core::cuda_cc_name() + " cards"));
         } else if (!gpu_main_supported(g)) {
-            return refuse("gpu-mode " + mode_text + ": " + who + " is " + arch_name(g) + "; split and tensor run on sm_120 cards" +
+            return refuse("gpu-mode " + mode_text + ": " + who + " is " + arch_name(g) + "; split and tensor run on " + core::cuda_cc_name() + " cards" +
                           (ada ? " (peer takes sm_89 in a -DPEER_ADA=ON build)" : ""));
         }
     }
@@ -294,7 +296,7 @@ std::string check_gpu_modes(const GpuChoice& c, const std::string& model, const 
     for (size_t i = 1; c.mode == GpuMode::Peer && !m.peer_ada && i < c.cards.size(); ++i) {
         const int k = c.cards[i];
         if (k >= 0 && (size_t) k < visible.size() && visible[(size_t) k].cc_major == 8 && visible[(size_t) k].cc_minor == 9)
-            return "gpu-mode peer: " + gpu_label(visible, k) + " is " + arch_name(visible[(size_t) k]) + "; " + model + " runs peer on sm_120 cards";
+            return "gpu-mode peer: " + gpu_label(visible, k) + " is " + arch_name(visible[(size_t) k]) + "; " + model + " runs peer on " + core::cuda_cc_name() + " cards";
     }
     return {};
 }
