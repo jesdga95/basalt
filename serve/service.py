@@ -14,7 +14,7 @@ from typing import Iterator
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
 from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
-from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
+from serve.api.grammar import GPROMPT_KEY, REQUEST_KEY as GRAMMAR_KEY
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
 from serve.util.logbuf import LogBuffer
@@ -1398,10 +1398,13 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        has_grammar = isinstance((sampling or {}).get(GRAMMAR_KEY), dict)
         one_call = self.dialect.forced_call_ends_reply and bool(force) and force.rstrip().endswith(">")     # a named choice: the reply is that one call
         opening = []                                    # without thinking the prompt ends with the forced opening:
-        if force and not thinking:                      # the parser reads it as if the model had written it
-            opening, force = parser.feed(self.dialect.nothink_lead + force), None
+        forced_now = bool(force and not thinking)
+        opening_text = (self.dialect.nothink_lead + force) if forced_now else ""
+        if forced_now:                                  # the parser reads it as if the model had written it
+            opening, force = parser.feed(opening_text), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
         prompt_ms0 = None                               # the first engine run's prompt read time
@@ -1475,6 +1478,19 @@ class Service:
                     # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
+                    gprompt0 = None
+                    if forced_now and has_grammar:
+                        if isinstance(ids, PromptText) and ids.tail:
+                            tail_n = len(self.tok.encode(ids.tail, parse_special=True))
+                            ids, max_new = ids.resolve(max_new, self.engine.max_context)
+                            gprompt0 = len(ids) - tail_n
+                        elif not isinstance(ids, PromptText):
+                            tail_n = len(self.tok.encode(opening_text, parse_special=True))
+                            gprompt0 = len(ids) - tail_n
+                        if gprompt0 is not None and 0 < gprompt0 < len(ids):
+                            sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
+                        else:
+                            gprompt0 = None
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -1682,6 +1698,7 @@ class Service:
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
+                        forced_here = bool(force) and (ended_thinking or wrap)
                         if ended_thinking:
                             closed_early = True
                             extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
@@ -1729,7 +1746,19 @@ class Service:
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
+                        base_len = len(prompt.ids()) if isinstance(prompt, PromptText) else len(prompt)
                         prompt = prompt + seg + extra
+                        if has_grammar:
+                            if resumed:
+                                gprompt0 = gprompt0 if gprompt0 is not None else base_len
+                            elif opens or forced_here:
+                                gprompt0 = base_len + len(seg)
+                            else:
+                                gprompt0 = None
+                            if gprompt0 is not None and 0 < gprompt0 < len(prompt):
+                                sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
+                            elif sampling and GPROMPT_KEY in sampling:
+                                sampling = {k: v for k, v in sampling.items() if k != GPROMPT_KEY}
                     if cancel.is_set():
                         finish = "cancel"
                     elif finish == "length" and n < max_new and self.stopping.is_set():

@@ -234,6 +234,82 @@ class GrammarOn(Fixture, unittest.TestCase):
         self.assertEqual([o["type"] for o in out if o["type"] != "reasoning"], ["message"])
         self.assertEqual(json.loads(out[-1]["content"][0]["text"]), {"a": 1})
 
+    def test_responses_namespaced_tool_choice_flattens_for_grammar(self):
+        g = self.sent("/v1/responses", {
+            "model": "basalt",
+            "input": "hi",
+            "tools": [{"type": "namespace", "name": "crm", "description": "CRM", "tools": [
+                {"type": "function", "name": "get_user", "description": "get user",
+                 "parameters": {"type": "object", "properties": {"id": {"type": "string"}}}}
+            ]}],
+            "tool_choice": {"type": "function", "namespace": "crm", "name": "get_user"},
+        })
+        self.assertEqual(g["kind"], "tools")
+        self.assertEqual(g["tools"][0]["function"]["name"], "crm.get_user")
+        self.assertEqual(g["tool_choice"], {"type": "function", "function": {"name": "crm.get_user"}})
+
+    def test_gprompt_set_for_forced_tool_without_thinking_and_after_thinking(self):
+        import threading
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
+        # 1) enable_thinking=False with forced tool choice: pass 1 sets _gprompt before the forced opening
+        eng1 = MockEngine(tok, '<parameter=city>\nNYC\n</parameter>\n</function>\n</tool_call>', max_context=4096)
+        svc1 = Service(eng1, tok, tpl, grammar=True)
+        msgs = [{"role": "user", "content": "hi"}]
+        ids, thinking, max_new = svc1.prepare(msgs, [TOOL], {"enable_thinking": False}, 64,
+                                              force=svc1.dialect.forced_opening("get_weather"))
+        g = svc1.grammar_for([TOOL], {"type": "function", "function": {"name": "get_weather"}}, [TOOL], None)
+        list(svc1.run(ids, thinking, [TOOL], max_new, {"_grammar": g}, threading.Event(),
+                      force=svc1.dialect.forced_opening("get_weather")))
+        req_ids, req_samp = eng1.requests[0]
+        gp = req_samp.get("_gprompt")
+        self.assertIsNotNone(gp)
+        self.assertEqual(tok.decode(req_ids[gp:]), svc1.dialect.forced_opening("get_weather"))
+
+        # 2) thinking closes itself then pass 2 opens forced call: pass 2 sets _gprompt right before forced opening
+        eos = tok.encode("<|im_end|>", parse_special=True)[0]
+        replies = iter(["hmm</think>", '<parameter=city>\nNYC\n</parameter>\n</function>\n</tool_call>'])
+
+        class TwoPass(MockEngine):
+            def generate(self, prompt_ids, max_new, sampling, cancel, **kw):
+                self.requests.append((list(prompt_ids), dict(sampling)))
+                text = next(replies)
+                for tid in self.tok.encode(text, parse_special=True):
+                    yield tid
+                yield eos
+
+        eng2 = TwoPass(tok, "", max_context=4096)
+        svc2 = Service(eng2, tok, tpl, grammar=True)
+        ids2, thinking2, max_new2 = svc2.prepare(msgs, [TOOL], {"enable_thinking": True}, 128,
+                                                 force=svc2.dialect.forced_opening("get_weather"))
+        list(svc2.run(ids2, thinking2, [TOOL], max_new2, {"_grammar": g}, threading.Event(),
+                      force=svc2.dialect.forced_opening("get_weather")))
+        self.assertEqual(len(eng2.requests), 2)
+        self.assertNotIn("_gprompt", eng2.requests[0][1])
+        p2_ids, p2_samp = eng2.requests[1]
+        gp2 = p2_samp.get("_gprompt")
+        self.assertIsNotNone(gp2)
+        self.assertIn("<tool_call>", tok.decode(p2_ids[gp2:]))
+
+        # 3) plain thinking-budget wrap-up for json_object (no force): pass 2 must NOT set _gprompt (avoids feeding \n\n)
+        replies3 = iter(["abcde", '{"a": 1}'])
+
+        class WrapPass(MockEngine):
+            def generate(self, prompt_ids, max_new, sampling, cancel, **kw):
+                self.requests.append((list(prompt_ids), dict(sampling)))
+                text = next(replies3)
+                for tid in self.tok.encode(text, parse_special=True):
+                    yield tid
+                yield eos
+
+        eng3 = WrapPass(tok, "", max_context=4096)
+        svc3 = Service(eng3, tok, tpl, grammar=True)
+        ids3, thinking3, max_new3 = svc3.prepare(msgs, None, {"enable_thinking": True}, 128)
+        list(svc3.run(ids3, thinking3, None, max_new3,
+                      {"_grammar": {"kind": "json_object"}, "reasoning_max_tokens": 5}, threading.Event()))
+        self.assertEqual(len(eng3.requests), 2)
+        self.assertNotIn("_gprompt", eng3.requests[1][1])
+
 
 class EngineWithoutTheFlag(unittest.TestCase):
     def test_no_key_sent(self):
@@ -253,6 +329,11 @@ class Wire(unittest.TestCase):
     def test_no_spec_no_key(self):
         self.assertEqual(engine_key(None), "")
         self.assertNotIn("grammar", ProcessEngine.sampling_keys({"_grammar": None}))
+        self.assertNotIn("gprompt", ProcessEngine.sampling_keys({"_gprompt": 42}))
+
+    def test_gprompt_wire_key(self):
+        keys = ProcessEngine.sampling_keys({"_grammar": {"kind": "json_object"}, "_gprompt": 42})
+        self.assertIn(" gprompt=42", keys)
 
     def test_engine_words(self):
         self.assertEqual(grammar_words({"--kv"}), [])           # an engine without the flag
