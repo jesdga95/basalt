@@ -669,6 +669,89 @@ class Q6KRequantTest(unittest.TestCase):
             deq = self.dequant(g[ta["offset"]:ta["offset"] + ta["bytes"]]).reshape(a.shape)
             self.assertLess(np.sqrt(((deq - a) ** 2).mean()), 0.03 * a.std())
 
+    def test_pack_rewrite_preserves_own_section_tensors(self):
+        rng = np.random.default_rng(7)
+        a = (rng.standard_normal((6, 512)) * 0.03).astype(np.float32)
+        qa = S.q8_0(a)
+        engram_blob = bytes(range(200))
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            w = ModelWriter(str(t / "base.basalt"))
+            w.add_bytes("dense", b"d" * 100)
+            offs = w.add_parts("gguf", [qa], 32)
+            w.add_bytes("engram", engram_blob)
+            tens = {
+                "blk.0.attn_qkv.weight": {"type": "Q8_0", "type_id": 8, "shape": [512, 6], "bytes": len(qa), "offset": offs[0]},
+                "blk.0.engram.weight": {"section": "engram", "type": "Q8_0", "type_id": 8, "shape": [64, 2],
+                                        "bytes": len(engram_blob), "offset": 0},
+            }
+            w.add_bytes("meta", json.dumps({"tensors": tens}).encode())
+            w.close()
+            out = t / "out.basalt"
+            args = type("A", (), {"out": str(out), "requant_dense_q6k": str(t / "base.basalt"), "checkpoint": None,
+                                  "workers": 2, "force": False})
+            convert.requant_dense(args)
+            m = ModelFile(str(out))
+            meta = json.loads(m.read("meta"))
+            self.assertEqual(m.read("engram"), engram_blob)
+            self.assertEqual(meta["tensors"]["blk.0.engram.weight"], tens["blk.0.engram.weight"])
+            ta = meta["tensors"]["blk.0.attn_qkv.weight"]
+            self.assertEqual((ta["type"], ta["type_id"], ta["bytes"]), ("Q6_K", 14, 6 * 2 * S.Q6K_BYTES))
+            # gguf must hold only the gguf tensor (not a spurious copy of engram)
+            self.assertEqual(len(m.read("gguf")), ta["offset"] + ta["bytes"])
+
+    def test_verify_pack_kind3_dense_file_offset(self):
+        import verify_pack
+        rng = np.random.default_rng(9)
+        t1 = rng.standard_normal((16, 32)).astype(np.float32)       # 2048 B stored F32 -> 1024 B F16 runtime (kind 3)
+        t2 = rng.standard_normal((16, 32)).astype(np.float32)       # 2048 B stored F32 -> 2048 B F32 runtime (kind 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            gw = GGUFWriter()
+            gw.add("general.architecture", "qwen4exp")
+            gw.add_f32("blk.0.ssm_a", t1)
+            gw.add_f32("blk.0.attn_norm.weight", t2)
+            gguf_path = gw.write(t / "src.gguf")
+
+            src = S.SourceModel([gguf_path])
+            # Custom arch: ssm_a wants F16 (stored as kind "3", F32->F16 narrowing), attn_norm wants F32 (kind "2")
+            class Kind3Arch:
+                not_in_dense = frozenset()
+                @staticmethod
+                def form_of(name):
+                    return "F16" if name == "blk.0.ssm_a" else "F32"
+                @staticmethod
+                def native(name, tname):
+                    return False
+
+            dense = S.Dense(src, arch=Kind3Arch())
+            blob = b"".join(dense.chunks())
+            idx = dense.index_text()
+            # Sanity: r[3] (file offset = 2048) != r[5] (pool offset = 1024) for the second tensor!
+            rows = verify_pack.parse_index(idx)
+            self.assertNotEqual(int(rows["blk.0.attn_norm.weight"][3]), int(rows["blk.0.attn_norm.weight"][5]))
+
+            pack = t / "pack.basalt"
+            w = ModelWriter(str(pack))
+            w.add_bytes("dense", blob)
+            w.add_bytes("dense.index", idx)
+            w.add_bytes("tokenizer/vocab.json", b"{}")
+            w.add_bytes("tokenizer/merges.txt", b"")
+            w.add_bytes("tokenizer/token_type.json", b"[]")
+            w.add_bytes("tokenizer/tokenizer.json", b"{}")
+            w.add_bytes("tokenizer/chat_template.jinja", b"tpl")
+            w.add_bytes("meta", json.dumps({
+                "tensors": {},
+                "gguf_kv": {"tokenizer.ggml.tokens": [], "tokenizer.chat_template": "tpl"},
+                "license": {"text": "Apache-2.0"},
+            }).encode())
+            w.close()
+            del dense, src
+            import gc
+            gc.collect()
+            self.assertTrue(verify_pack.verify(pack, gguf_path, workers=1))
+            gc.collect()
+
 
 class Qwen4ExpDefaultNameTest(unittest.TestCase):
     """Qwen4Exp.default_name takes the pack name and its quant from the GGUF file name (both the plain and the
