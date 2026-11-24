@@ -67,6 +67,7 @@ constexpr int kRowWidth = 576;                 // a cache row: 512 latent values
 constexpr int kMaxChunk = 16384;               // rows a prompt chunk may carry (the residual streams and the experts' pairs)
 constexpr int kAttRows = 2048;                 // rows of one attention step inside a chunk (the rings are sized for it)
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
+constexpr int kMmqTile = 128;                  // the widest column tile of an MMQ product
 constexpr int kLaunchRows = 16384;              // most (row, expert) pairs of one prompt launch
 constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
 constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
@@ -293,13 +294,14 @@ public:
         // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
         const size_t stride = m_.expert_stride();
         for (Scratch::Staged& b : sc.stage) {
-            b.blobs = (uint8_t*) alloc(stride * kStageExperts, ok);
+            b.blobs = (uint8_t*) alloc(stride * kStageExperts + expert_past(), ok);
+            if (ok) cudaMemset(b.blobs + stride * kStageExperts, 0, expert_past());
             b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
             b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
         }
         sc.xq1 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
         sc.xq2 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
-        sc.heads_ids = (int32_t*) alloc((size_t) max_heads_ * kAttRows * 4, ok);
+        sc.heads_ids = (int32_t*) alloc(((size_t) max_heads_ * kAttRows + kMmqTile) * 4, ok);
         sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
         sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
         {
@@ -394,8 +396,9 @@ public:
         b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
         b.erows = f((int64_t) A * g_.n_embd); b.ekv = f((int64_t) A * 5 * E); b.evalid = f(A);
         b.pair_rows = f((int64_t) R * g_.n_used * g_.n_latent);
-        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
-        b.mmq_ident = (int32_t*) f(A);
+        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); // the identity maps are the ids of MMQ products: a tile reads the ids of its 128 columns, past the last row of the product
+        b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used + kMmqTile);
+        b.mmq_ident = (int32_t*) f(A + kMmqTile);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
         if (count) {
             f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
@@ -417,8 +420,8 @@ public:
             return false;
         }
         if (basalt::prefill::mmq::built()) {
-            basalt::prefill::mmq::iota(b.mmq_ident, A, nullptr);
-            basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used, nullptr);
+            basalt::prefill::mmq::iota(b.mmq_ident, A + kMmqTile, nullptr);
+            basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used + kMmqTile, nullptr);
         }
         cudaDeviceSynchronize();
         return true;
@@ -1436,10 +1439,27 @@ private:
     std::thread ring_thr_[2];
     bool ring_ok_[2] = {false, false};
 
-    size_t expert_ring_bytes() const { return 2 * (size_t) g_.n_expert * stride_; }
+    // The bytes the prompt products read past the last expert of a buffer of blobs: the last row of a matrix whose rows are not a
+    // multiple of 256 values is read on to the next multiple (zeros there, as a stray scale could be a NaN)
+    size_t expert_past() const {
+        namespace mmq = basalt::prefill::mmq;
+        size_t past = 16;
+        for (const ExpertLayer& el : m_.pack().experts) {
+            if (mmq::supported(el.gu_type)) past = std::max(past, mmq::read_past_bytes(el.gu_type, g_.n_latent));
+            if (mmq::supported(el.d_type)) past = std::max(past, mmq::read_past_bytes(el.d_type, g_.n_ff_exp));
+        }
+        return past;
+    }
+    size_t expert_ring_bytes() const { return 2 * (size_t) g_.n_expert * stride_ + expert_past(); }
     bool ring_open() {
         if (cudaMalloc((void**) &ring_, expert_ring_bytes()) != cudaSuccess) {
             cudaGetLastError();
+            ring_ = nullptr;
+            return false;
+        }
+        if (cudaMemset((uint8_t*) ring_ + 2 * (size_t) g_.n_expert * stride_, 0, expert_past()) != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(ring_);
             ring_ = nullptr;
             return false;
         }
