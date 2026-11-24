@@ -184,6 +184,12 @@ void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
               int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally = nullptr,
               unsigned long long* rec_blobs = nullptr, int32_t* rec_n = nullptr);
+/// Fused sigmoid router selection + moe_plan for decode windows (n_expert == 128, rows <= kDecodeRows): bitwise equal to
+/// router_select + moe_plan without intermediate HBM round-trip or shared atomicAdd.
+void router_select_plan(const float* logits, const float* bias, int rows, int k, int n_expert, float weight_scale,
+                        int32_t* ids, float* weights, const unsigned long long* blobs, unsigned long long* ptr,
+                        int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream,
+                        uint32_t* tally = nullptr, unsigned long long* rec_blobs = nullptr, int32_t* rec_n = nullptr);
 constexpr int kAheadExperts = 8;   ///< the groups of a visit moe_plan records (rec_blobs, rec_n) for the next window
 /// Requests into L2 the first `bytes` of each of the *n blobs (moe_plan's record of a visit), 32 blocks each keeping one
 /// 128 KiB step in flight: run on a side stream while the glue before the experts runs; reads only.

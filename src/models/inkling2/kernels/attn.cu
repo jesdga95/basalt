@@ -67,6 +67,16 @@ __device__ __forceinline__ void row_keys(const AttnArgs& a, int r, int& p, int& 
     n = p + 1 - lo;
 }
 
+__device__ __forceinline__ int wrap_cap(int key, int cap, bool pow2) {
+    if (key < cap) return key;
+    return pow2 ? (key & (cap - 1)) : (key % cap);
+}
+
+__device__ __forceinline__ void attn_cp16(void* dst, const void* src, bool ok) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(src), "r"(ok ? 16 : 0) : "memory");
+}
+
 // 8 cache values as fp32 from 16 bytes of fp16 (or the first 8 of 16 bytes of E4M3, `hi` picking the other 8)
 __device__ __forceinline__ void unpack8_f16(const uint4 u, float (&f)[8]) {
     const uint32_t w[4] = {u.x, u.y, u.z, u.w};
@@ -178,31 +188,49 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     const SegCaches& sc = a.seg.c[bk::seg_of(a.seg.at, r)];   // a batch window's row: its conversation's caches
     const uint8_t* kbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
     const uint8_t* vbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
-    // a tile's key and value rows, the lane's key's (zero past the slice); the warp's first tile is loaded with the queries
-    const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads], float (&ks)[2], float (&vs)[2]) {
+    const bool cap_pow2 = a.cap > 0 && (a.cap & (a.cap - 1)) == 0;
+    uint32_t* vrow = sm.v[w][lane];
+    constexpr int kVRegs = (FP8 || INT8) ? kLoads : 1;
+    const auto load_k_and_v = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kVRegs], float (&ks)[2], float (&vs)[2]) {
         const int key = t0 + lane;
+        const bool valid = key < s_hi;
         ks[0] = ks[1] = vs[0] = vs[1] = 1.f;
-        if (key < s_hi) {
-            const size_t cell = (size_t) (key % a.cap) * kKvHeads * kRowBytes;
-            const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
-            const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
+        const size_t cell = valid ? (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kRowBytes : 0;
+        const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
+        const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
+        if (valid) {
 #pragma unroll
-            for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
+            for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
+            if constexpr (!FP8 && !INT8) {
 #pragma unroll
-            for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
-            if constexpr (INT8) {
-                row_scales(kbase + cell, ks);
-                row_scales(vbase + cell, vs);
+                for (int i = 0; i < kLoads; ++i) attn_cp16(vrow + 4 * i, vp + i, true);
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            } else {
+#pragma unroll
+                for (int i = 0; i < kLoads; ++i) vr[i] = __ldg(vp + i);
+                if constexpr (INT8) {
+                    row_scales(kbase + cell, ks);
+                    row_scales(vbase + cell, vs);
+                }
             }
         } else {
 #pragma unroll
-            for (int i = 0; i < kLoads; ++i) kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
+            for (int i = 0; i < kLoads; ++i) kr[i] = make_uint4(0, 0, 0, 0);
+            if constexpr (!FP8 && !INT8) {
+#pragma unroll
+                for (int i = 0; i < kLoads; ++i) attn_cp16(vrow + 4 * i, vbase, false);
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            } else {
+#pragma unroll
+                for (int i = 0; i < kLoads; ++i) vr[i] = make_uint4(0, 0, 0, 0);
+            }
         }
     };
     const int t_first = s_lo + w * kTile;
-    uint4 kr[kLoads], vr[kLoads];
+    uint4 kr[kLoads];
+    uint4 vr[kVRegs];
     float ks[2], vs[2];
-    if (t_first < s_hi) load_tile(t_first, kr, vr, ks, vs);
+    if (t_first < s_hi) load_k_and_v(t_first, kr, vr, ks, vs);
     for (int i = threadIdx.x; i < kGroup * kHeadDim; i += blockDim.x)
         sm.q[i / kHeadDim][i % kHeadDim] = a.q[((size_t) r * kHeads + g * kGroup) * kHeadDim + i];
     for (int i = threadIdx.x; i < kGroup * kRel; i += blockDim.x)
@@ -219,8 +247,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     for (int t0 = t_first; t0 < s_hi; t0 += kUnit) {
         const int key = t0 + lane;
         const bool valid = key < s_hi;
-        if (t0 != t_first) load_tile(t0, kr, vr, ks, vs);
-        // the lane's key scored for the three heads
+        if (t0 != t_first) load_k_and_v(t0, kr, vr, ks, vs);
         float sc[kGroup] = {0.f, 0.f, 0.f};
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {
@@ -242,18 +269,19 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
             }
         }
         const int dist = p - key;
-        float tv[kRel];
+        const bool has_rel = valid && dist < kExtent;
+        float b_acc[kGroup] = {0.f, 0.f, 0.f};
+        if (has_rel) {
 #pragma unroll
-        for (int i = 0; i < kRel; ++i) tv[i] = valid && dist < kExtent ? a.rel_table[i * kExtent + dist] : 0.f;
+            for (int i = 0; i < kRel; ++i) {
+                const float tv = __ldg(a.rel_table + i * kExtent + dist);
 #pragma unroll
-        for (int h = 0; h < kGroup; ++h) {
-            float b = 0.f;
-#pragma unroll
-            for (int i = 0; i < kRel; ++i) b = fmaf(sm.rs[h][i], tv[i], b);
-            sc[h] = valid ? sc[h] * a.scale + b : -INFINITY;
+                for (int h = 0; h < kGroup; ++h) b_acc[h] = fmaf(sm.rs[h][i], tv, b_acc[h]);
+            }
         }
-        // the lane's value row into shared memory as fp16 pairs (E4M3 is exact in fp16)
-        uint32_t* vrow = sm.v[w][lane];
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) sc[h] = valid ? sc[h] * a.scale + b_acc[h] : -INFINITY;
+        // INT8 and FP8 convert V into sm.v[w][lane]; FP16 V is already streaming via cp.async
         if constexpr (INT8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
@@ -265,19 +293,18 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
         } else if constexpr (FP8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
-                float f[16];
-                unpack16_fp8(vr[i], f);
+                const uint4 u = vr[i];
+                const uint32_t ww[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
-                for (int d = 0; d < 8; ++d) {
-                    const __half2 hv = __floats2half2_rn(f[2 * d], f[2 * d + 1]);
-                    vrow[8 * i + d] = *reinterpret_cast<const uint32_t*>(&hv);
+                for (int j = 0; j < 4; ++j) {
+                    const __half2_raw h0 = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (ww[j] & 0xFFFFu), __NV_E4M3);
+                    const __half2_raw h1 = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (ww[j] >> 16), __NV_E4M3);
+                    vrow[8 * i + 2 * j + 0] = (uint32_t) h0.x | ((uint32_t) h0.y << 16);
+                    vrow[8 * i + 2 * j + 1] = (uint32_t) h1.x | ((uint32_t) h1.y << 16);
                 }
             }
-        } else {
-#pragma unroll
-            for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(vrow + 4 * i) = vr[i];
         }
-        // the online softmax over the tile
+        // the online softmax over the tile (overlaps with in-flight FP16 V cp.async)
         float pr[kGroup];
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) {
@@ -290,6 +317,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
             for (int u = 0; u < 4; ++u) acc[h][u] *= corr;
             m[h] = mn;
         }
+        if constexpr (!FP8 && !INT8) asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncwarp();
         for (int j = 0; j < kTile; ++j) {
             const uint2 u = *reinterpret_cast<const uint2*>(&sm.v[w][j][lane * 2]);
@@ -653,21 +681,41 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     const bool valid = active && key < s_hi;
     const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
     const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
-    uint4 kr[kLoads], vr[kLoads];
+    const bool cap_pow2 = a.cap > 0 && (a.cap & (a.cap - 1)) == 0;
+    constexpr int kVRegs = (FP8 || INT8) ? kLoads : 1;
+    uint4 kr[kLoads];
+    uint4 vr[kVRegs];
     float ks[2] = {1.f, 1.f}, vs[2] = {1.f, 1.f};
-    if (valid && key < p0) {
-        const size_t cell = (size_t) (key % a.cap) * kKvHeads * kRowBytes;
+    const bool old_kv = valid && key < p0;
+    if (old_kv) {
+        const size_t cell = (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kRowBytes;
+        const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
+        const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
 #pragma unroll
-        for (int i = 0; i < kLoads; ++i) kr[i] = reinterpret_cast<const uint4*>(kbase + cell)[i];
+        for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
+        if constexpr (!FP8 && !INT8) {
 #pragma unroll
-        for (int i = 0; i < kLoads; ++i) vr[i] = reinterpret_cast<const uint4*>(vbase + cell)[i];
-        if constexpr (INT8) {
-            row_scales(kbase + cell, ks);
-            row_scales(vbase + cell, vs);
+            for (int i = 0; i < kLoads; ++i) attn_cp16(sm.v[w][lane] + 4 * i, vp + i, true);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        } else {
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) vr[i] = __ldg(vp + i);
+            if constexpr (INT8) {
+                row_scales(kbase + cell, ks);
+                row_scales(vbase + cell, vs);
+            }
         }
     } else {
 #pragma unroll
-        for (int i = 0; i < kLoads; ++i) kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
+        for (int i = 0; i < kLoads; ++i) kr[i] = make_uint4(0, 0, 0, 0);
+        if constexpr (!FP8 && !INT8) {
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) attn_cp16(sm.v[w][lane] + 4 * i, vbase, false);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        } else {
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) vr[i] = make_uint4(0, 0, 0, 0);
+        }
     }
     const int dist = p - key;
     float tv[kRel];
@@ -719,16 +767,22 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // started at the wait they put those reads in front of the preparation's (2-3x its time in the window)
     bk::pdl_launch_dependents();
     if (active) {
+        if constexpr (!FP8 && !INT8) asm volatile("cp.async.wait_group 0;" ::: "memory");
         if (valid && key >= p0) {   // a row of this window, as prepared above
             const uint4* kp = reinterpret_cast<const uint4*>(fs.kw[key - p0]);
             const uint4* vp = reinterpret_cast<const uint4*>(fs.vw[key - p0]);
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
+            if constexpr (!FP8 && !INT8) {
 #pragma unroll
-            for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
-            if constexpr (INT8) {
-                row_scales(fs.kw[key - p0], ks);
-                row_scales(fs.vw[key - p0], vs);
+                for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(sm.v[w][lane] + 4 * i) = vp[i];
+            } else {
+#pragma unroll
+                for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
+                if constexpr (INT8) {
+                    row_scales(fs.kw[key - p0], ks);
+                    row_scales(fs.vw[key - p0], vs);
+                }
             }
         }
         float m[kGroup], l[kGroup], acc[kGroup][4];
@@ -787,9 +841,6 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                         vrow[8 * i + d] = *reinterpret_cast<const uint32_t*>(&hv);
                     }
                 }
-            } else {
-#pragma unroll
-                for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(vrow + 4 * i) = vr[i];
             }
             float pr[kGroup];
 #pragma unroll

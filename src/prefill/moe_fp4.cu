@@ -380,10 +380,17 @@ template <bool SWIGLU> __device__ __forceinline__ int b_tile_row(int warp_n, int
 // mmq::swiglu's tail-scaled SwiGLU in the instructions of its fast-math build (FTZ products, ex2 and rcp
 // approximations, the division as a reciprocal product), so h is the same bits
 // mmq::swiglu's softcapped form: (cg tanh(g / cg)) sigmoid(g) (cu tanh(u / cu)) s_down, g and u tail-scaled
-__device__ __forceinline__ float swiglu_cap(float g, float u, float4 s, float cg, float cu) {
+__device__ __forceinline__ float swiglu_cap(float g, float u, float4 s, float cg, float cu, float inv_cg, float inv_cu) {
     g *= s.x;
     u *= s.y;
-    return __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu)) * s.z;
+    float tg, tu, t, e, d, sig;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(tg) : "f"(g * inv_cg));
+    asm("tanh.approx.f32 %0, %1;" : "=f"(tu) : "f"(u * inv_cu));
+    asm("mul.rn.ftz.f32 %0, %1, 0fBFB8AA3B;" : "=f"(t) : "f"(g));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(t));
+    asm("add.rn.ftz.f32 %0, %1, 0f3F800000;" : "=f"(d) : "f"(e));
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sig) : "f"(d));
+    return __fmul_rn(__fmul_rn(cg * tg, sig), cu * tu) * s.z;
 }
 
 __device__ __forceinline__ float swiglu_tail(float g, float u, float4 s) {
@@ -579,6 +586,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     const int64_t row0 = a.bounds[j] + (int64_t) tl * kTileTokens;
     float4 tail = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (SWIGLU) tail = *(const float4*) (blob + a.tail_off);
+    const float inv_cg = (SWIGLU && a.cg > 0.0f) ? 1.0f / a.cg : 0.0f;
+    const float inv_cu = (SWIGLU && a.cu > 0.0f) ? 1.0f / a.cu : 0.0f;
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
@@ -591,8 +600,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
 #pragma unroll
                 for (int r = 0; r < 2; ++r)
                     *(float2*) (out + 8 * r) =
-                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 2][2 * h] * g, tail, a.cg, a.cu),
-                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 2][2 * h + 1] * g, tail, a.cg, a.cu));
+                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 2][2 * h] * g, tail, a.cg, a.cu, inv_cg, inv_cu),
+                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 2][2 * h + 1] * g, tail, a.cg, a.cu, inv_cg, inv_cu));
             } else if (FLAT) {
                 const int64_t orow = a.dst_ids ? a.dst_ids[row0 + t] : row0 + t;
                 float* out = a.dst + orow * a.ld_dst + rb * kRowsPerBlock + warp_n * 32 + 2 * tig;
@@ -652,23 +661,24 @@ __device__ __forceinline__ void load_stage256(int stage, int kt, uint8_t* smem, 
             }
         }
     }
-    // 256 threads cover 256 B rows: exactly 1 row per thread (4x cp_async16 .cg + 1x cp_async8)
-    const int row = (int) threadIdx.x;
-    const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
-    const int odd = (int) (((uintptr_t) src >> 3) & 1u);
-    uint8_t* dst = bs + row * kBRowStride;
-    if (!odd) {
-        cp_async16(dst + 0, src + 0);
-        cp_async16(dst + 16, src + 16);
-        cp_async16(dst + 32, src + 32);
-        cp_async16(dst + 48, src + 48);
-        cp_async8(dst + 64, src + 64);
-    } else {
-        cp_async8(dst + 8, src + 0);
-        cp_async16(dst + 16, src + 8);
-        cp_async16(dst + 32, src + 24);
-        cp_async16(dst + 48, src + 40);
-        cp_async16(dst + 64, src + 56);
+    // Coalesced 4-lane-per-row cp_async16 (.cg): 4 consecutive lanes read 64 contiguous bytes of each B row
+    // (2 full 32B L2 sectors, branchless odd offset), plus 1 pass of cp_async8 for the 8-byte edge.
+    const int r_base = (int) (threadIdx.x >> 2);
+    const int c16 = (int) (threadIdx.x & 3) * 16;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int row = p * 64 + r_base;
+        const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
+        const int odd = (int) (((uintptr_t) src >> 3) & 1u);
+        uint8_t* dst = bs + row * kBRowStride;
+        cp_async16(dst + (odd ? 16 : 0) + c16, src + (odd ? 8 : 0) + c16);
+    }
+    {
+        const int row = (int) threadIdx.x;
+        const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
+        const int odd = (int) (((uintptr_t) src >> 3) & 1u);
+        uint8_t* dst = bs + row * kBRowStride;
+        cp_async8(dst + (odd ? 8 : 64), src + (odd ? 0 : 64));
     }
 }
 
@@ -786,6 +796,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
     const int64_t row0 = a.bounds[j] + (int64_t) tl * kTileTokens;
     float4 tail = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (SWIGLU) tail = *(const float4*) (blob + a.tail_off);
+    const float inv_cg = (SWIGLU && a.cg > 0.0f) ? 1.0f / a.cg : 0.0f;
+    const float inv_cu = (SWIGLU && a.cu > 0.0f) ? 1.0f / a.cu : 0.0f;
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
@@ -798,8 +810,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     const __half2 h2 = __floats2half2_rn(
-                        swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu),
-                        swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu));
+                        swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu, inv_cg, inv_cu),
+                        swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu, inv_cg, inv_cu));
                     *reinterpret_cast<uint32_t*>(out + 8 * r) = *reinterpret_cast<const uint32_t*>(&h2);
                 }
             } else if (SWIGLU) {
@@ -807,8 +819,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
 #pragma unroll
                 for (int r = 0; r < 4; ++r)
                     *(float2*) (out + 8 * r) =
-                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu),
-                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu));
+                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu, inv_cg, inv_cu),
+                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu, inv_cg, inv_cu));
             } else if (a.dst_f16) {
                 const int64_t orow = a.dst_ids ? a.dst_ids[row0 + t] : row0 + t;
                 uint16_t* out = a.dst_f16 + orow * a.ld_dst + rb * kRows256 + warp_n * 64 + 2 * tig;
