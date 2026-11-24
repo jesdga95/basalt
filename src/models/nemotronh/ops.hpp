@@ -6,10 +6,6 @@
 
 namespace basalt::models::nemotronh {
 
-/// h[r][c] = relu(h[r][c] s_in)^2 s_down for rows of n values grouped by expert: row r's expert j has bounds[j] <= r <
-/// bounds[j + 1] (device, n_experts + 1 entries), its scales tails[4 j] and tails[4 j + 2] (an NVFP4 blob's tail).
-void relu2_scaled_rows(float* h, int64_t rows, int n, const int32_t* bounds, int n_experts, const float* tails, void* stream);
-
 /// For each of n experts staged at blobs + e stride (blob bytes each, an NVFP4 blob's 16-byte scale tail last): the tail into
 /// tails[4 e ...] and the bytes from it to the next expert zeroed (what MMQ reads past a down matrix).
 void tails_aside(uint8_t* blobs, size_t stride, uint64_t blob, int n, float* tails, void* stream);

@@ -1446,8 +1446,7 @@ private:
             up.dst = hbuf_;
             up.ld_dst = FF;
             mmq_->run(up, stream_);
-            relu2_scaled_rows(hbuf_, rows, (int) FF, bounds, n, tails, stream_);
-            mmq::quantize(hbuf_, nullptr, mhq_, kTypeNvfp4, FF, FF, rows, stream_);
+            mmq::quantize_relu2(hbuf_, mhq_, kTypeNvfp4, FF, FF, rows, bounds, n, tails, stream_);
             mmq::Product dn = up;
             dn.w = base + lay_.down_off;
             dn.w_rows = Ln;

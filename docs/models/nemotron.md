@@ -114,6 +114,7 @@ projections on the FP8 tensor cores, the shared expert on the FP4 tensor cores, 
 | 12,000 tokens | 4,096 | the ring | 7.8 s | 1,531 |
 | 12,000 tokens | 4,096 | the ring, BF16 products on cuBLAS | 7.1 s | 1,697 |
 | 12,000 tokens | 4,096 | and the router's logits on cuBLAS (FP32) | 6.4 s | 1,880 |
+| 12,000 tokens | 4,096 | and the squared ReLU inside the q8_1 quantize | 6.0 s | 1,996 |
 
 RTX PRO 4000 at 145 W with the card to itself, one session, the experts in RAM; with an RTX 5050 as a second card the ring
 gives the same 7.8 s. The ring groups experts by consecutive ids (some with no rows), staging by the experts routed to: MMQ

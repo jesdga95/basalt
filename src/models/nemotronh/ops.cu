@@ -9,19 +9,6 @@
 namespace basalt::models::nemotronh {
 namespace {
 
-__global__ void relu2_scaled_kernel(float* h, int64_t rows, int n, const int32_t* bounds, int ne, const float* tails) {
-    const int64_t r = blockIdx.y;
-    if (r >= rows) return;
-    int j = 0;
-    while (j + 1 < ne && bounds[j + 1] <= r) ++j;
-    const float si = tails[4 * j], sd = tails[4 * j + 2];
-    float* row = h + r * n;
-    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n; c += gridDim.x * blockDim.x) {
-        const float x = fmaxf(__fmul_rn(row[c], si), 0.0f);
-        row[c] = __fmul_rn(__fmul_rn(x, x), sd);
-    }
-}
-
 __global__ void relu2_kernel(float* x, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
         const float r = fmaxf(x[i], 0.0f);
@@ -44,12 +31,6 @@ __global__ void add2_kernel(float* x, const float* a, const float* b, int64_t n)
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096); }
 
 }  // namespace
-
-void relu2_scaled_rows(float* h, int64_t rows, int n, const int32_t* bounds, int n_experts, const float* tails, void* stream) {
-    if (rows <= 0) return;
-    const dim3 grid((unsigned) ((n + 255) / 256), (unsigned) rows);
-    relu2_scaled_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(h, rows, n, bounds, n_experts, tails);
-}
 
 __global__ void tails_aside_kernel(uint8_t* blobs, size_t stride, uint64_t blob, float* tails) {
     uint8_t* b = blobs + (size_t) blockIdx.x * stride;
