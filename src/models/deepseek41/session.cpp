@@ -2,6 +2,7 @@
 //
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
@@ -489,7 +490,7 @@ public:
 
     model::Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(stream_);
-        if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (basalt::core::device_copy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return {model::Status::Error, "the head logits copy failed"};
         return {};
     }
@@ -840,7 +841,7 @@ private:
                 allocs_.push_back(v);
                 d_hist_ = (int32_t*) v;
             }
-            if (cudaMemcpy(d_hist_, r.history, (size_t) r.n_tokens * history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (basalt::core::device_copy(d_hist_, r.history, (size_t) r.n_tokens * history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "the penalty history upload failed";
                 return false;
             }
@@ -863,7 +864,7 @@ private:
         if (dump_dir_.empty()) return;
         std::vector<char> h(bytes);
         cudaStreamSynchronize(stream_);
-        cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDefault);   // device or mapped host memory
+        basalt::core::device_copy(h.data(), dev, bytes, cudaMemcpyDefault);   // device or mapped host memory
         const std::string path = dump_dir_ + "/" + name + "." + std::to_string(layer) + "." + std::to_string(pos) + ".bin";
         if (FILE* f = std::fopen(path.c_str(), "wb")) {
             std::fwrite(h.data(), 1, bytes, f);

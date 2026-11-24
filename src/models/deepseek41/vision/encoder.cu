@@ -1,6 +1,7 @@
 // DeepSeek-V4.1 vision encoder on one CUDA device. Weights stay bf16 as stored; the residual stream, attention scores
 // and aligner output are fp32; the inputs of the products are bf16. Attention runs one head at a time as two products
 // around a row softmax. The graph follows llama.cpp's mtmd deepseek4v encoder (MIT).
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 
 #include <cublas_v2.h>
@@ -179,7 +180,7 @@ struct VisionEncoder::Impl {
             return nullptr;
         }
         owned.push_back(p);
-        if (cudaMemcpy(p, t->data, t->bytes, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
+        if (basalt::core::device_copy(p, t->data, t->bytes, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
         return (T*) p;
     }
     template <class T>
@@ -363,7 +364,7 @@ bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl,
         return false;
     }
     if (!reserve(pl, err)) return false;
-    cudaMemcpy(s.d_rows, rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(s.d_rows, rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice);
     // patch embedding (fp32 product) + bias
     s.gemm(CUDA_R_32F, s.d_rows, kVisionPatchValues, s.wpatch, kVisionPatchValues, s.x, E, n, E, kVisionPatchValues);
     k_bias_add<<<blocks((size_t) n * E), 256>>>(s.x, s.bpatch, (size_t) n * E, E);
@@ -404,7 +405,7 @@ bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl,
     k_bias_add<<<blocks((size_t) ng * s.proj), 256>>>(s.aout, s.b2, (size_t) ng * s.proj, s.proj);
     k_assemble<<<ntok, 256>>>(s.aout, s.start, s.endv, s.nl, s.dout, pl.lw, pl.lh, s.proj);
     out.resize((size_t) ntok * s.proj);
-    const cudaError_t ce = cudaMemcpy(out.data(), s.dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    const cudaError_t ce = basalt::core::device_copy(out.data(), s.dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
     if (!ok || ce != cudaSuccess) {
         err = ok ? std::string("encode failed: ") + cudaGetErrorString(ce) : "a product failed";
         return false;

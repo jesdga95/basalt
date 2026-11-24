@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "expert_plan.hpp"
@@ -367,7 +368,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
         // --wait-stats: the last wstat_every windows' counters
         std::vector<unsigned long long> w((size_t) kDmStatWords);
-        cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
         cudaMemset(dm_->wstat, 0, w.size() * 8);
         const double nw = (double) dm_->wstat_windows;
         basalt::log::raw("basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,

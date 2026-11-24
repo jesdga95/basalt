@@ -7,6 +7,7 @@
 // the tier places in groups of up to 8 rows beside the shared expert, routed_up). A row's result does not depend on the other
 // rows of its call: the dense products take 8 rows at most per launch with the single-row kernels' reduction order, the
 // attention kernels take a block per row, and the experts are run per row.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/elastic_array.hpp"
@@ -314,7 +315,7 @@ public:
         if (ok) {
             std::vector<int32_t> tab((size_t) 2 * (kAttRows + 1));
             for (int n = 0; n <= kAttRows; ++n) tab[(size_t) 2 * n + 1] = n;
-            cudaMemcpy(sc.bounds_tab, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(sc.bounds_tab, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
         }
         if (cudaHostAlloc(&sc.h_plan, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
         else sc.pinned.push_back(sc.h_plan);
@@ -954,7 +955,7 @@ public:
             k.k.resize_for_overwrite((size_t) positions * rb);
             k.pooled.resize_for_overwrite(pools * pb);
             const auto down = [&](const uint8_t* dev, core::ConversationBuffer& to) {
-                return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) { return cudaMemcpy(p, dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess; });
+                return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) { return basalt::core::device_copy(p, dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess; });
             };
             if (!down(cache_[(size_t) l], k.k) || !down((const uint8_t*) ipool_[(size_t) l], k.pooled))
                 return {model::Status::Error, "hy4flash: reading a cache back failed"};
@@ -975,7 +976,7 @@ public:
                 kv[i].pooled_rows != pools)
                 return {model::Status::Error, "hy4flash: a parked conversation has other caches"};
             const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
-                return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) { return cudaMemcpy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });
+                return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) { return basalt::core::device_copy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });
             };
             if (!up(cache_[(size_t) l], kv[i].k) || !up((uint8_t*) ipool_[(size_t) l], kv[i].pooled))
                 return {model::Status::Error, "hy4flash: writing a cache back failed"};
@@ -1018,7 +1019,7 @@ public:
 
     model::Result copy_logits(int row, float* out) override {
         if (row < 0 || row >= last_rows_) return {model::Status::Error, "hy4flash: the session keeps the last window's logits only"};
-        cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
         return {};
     }
 
@@ -1293,8 +1294,8 @@ private:
             dump("q_resid-" + std::to_string(l), qan_, (int64_t) R * g_.q_lora);
             std::vector<float> rows((size_t) R * kRowWidth), lat((size_t) R * rank), pe((size_t) R * g_.rope_dim), qp((size_t) R * H * g_.rope_dim),
                                qc((size_t) R * H * kRowWidth);
-            cudaMemcpy(rows.data(), (const float*) cache + (size_t) pos0 * kRowWidth, rows.size() * 4, cudaMemcpyDeviceToHost);
-            cudaMemcpy(qc.data(), qcur_, qc.size() * 4, cudaMemcpyDeviceToHost);
+            basalt::core::device_copy(rows.data(), (const float*) cache + (size_t) pos0 * kRowWidth, rows.size() * 4, cudaMemcpyDeviceToHost);
+            basalt::core::device_copy(qc.data(), qcur_, qc.size() * 4, cudaMemcpyDeviceToHost);
             for (int t = 0; t < R; ++t) {
                 for (int c = 0; c < rank; ++c) lat[(size_t) t * rank + c] = rows[(size_t) t * kRowWidth + c];
                 for (int c = 0; c < g_.rope_dim; ++c) pe[(size_t) t * g_.rope_dim + c] = rows[(size_t) t * kRowWidth + rank + c];
@@ -1685,7 +1686,7 @@ private:
         }
         if (s.jobs.empty()) return true;
         used.erase(std::remove_if(used.begin(), used.end(), [&](int e) { return takes[(size_t) e] != 0; }), used.end());
-        if (cudaMemcpy(cpu_x_, xlat_, (size_t) R * L * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (basalt::core::device_copy(cpu_x_, xlat_, (size_t) R * L * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
             err = "reading the chunk's latent rows for the CPU failed";
             return false;
         }
@@ -1932,7 +1933,7 @@ private:
         float* nrm = lookup_host_.data() + (size_t) e * n_cols * W;
         if (lookup_loaded_.empty()) lookup_loaded_.assign(en.layers.size(), false);
         if (!lookup_loaded_[(size_t) e]) {
-            cudaMemcpy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
+            basalt::core::device_copy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
             lookup_loaded_[(size_t) e] = true;
         }
         // row t's n_cols rows: from the window's own reads or from its early ones
@@ -2251,7 +2252,7 @@ private:
         const double t0 = now_ms();
         cudaStreamSynchronize(st);
         stage_at_ = 0;   // the stream has drained: what was staged is read
-        cudaMemcpy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hid.data(), ids_, hid.size() * 4, cudaMemcpyDeviceToHost);
         const double t1 = now_ms();
         t_pre_ms_ += t1 - t0;
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot

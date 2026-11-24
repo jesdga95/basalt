@@ -5,6 +5,7 @@
 //
 // The forward follows vLLM's Inkling 2 DSpark draft (vllm/models/inkling2/nvidia/dspark.py, Apache-2.0, Copyright
 // contributors to the vLLM project).
+#include "basalt/core/device_copy.hpp"
 #include "models/inkling2/dspark.hpp"
 
 #include "basalt/core/diag.hpp"
@@ -237,7 +238,7 @@ model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, co
     if (finished_) return {};
     const cudaStream_t s = (cudaStream_t) stream;
     float raw[kDsMixes * kDsTargets], al[kDsMixes * kDsTargets];
-    if (cudaMemcpy(raw, alpha, sizeof(raw), cudaMemcpyDeviceToHost) != cudaSuccess)
+    if (basalt::core::device_copy(raw, alpha, sizeof(raw), cudaMemcpyDeviceToHost) != cudaSuccess)
         return {model::Status::Error, "inkling2: the drafter's fuse weights cannot be read"};
     for (int j = 0; j < kDsMixes; ++j) {   // softmax over the targets, in double
         double m = raw[j * kDsTargets], z = 0;
@@ -358,7 +359,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     ring_bounds_ = (int32_t*) dev(2 * 4, ok);
     if (ok) {
         const int32_t rb[2] = {0, (int32_t) ring_cells(d)};
-        if (cudaMemcpy(ring_bounds_, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+        if (basalt::core::device_copy(ring_bounds_, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
     }
     kb_ = f(kSlice * kKV);
     vb_ = f(kSlice * kKV);
@@ -521,7 +522,7 @@ void DsparkHook::note(int64_t pos0, int rows) {
         std::vector<float> h((size_t) kDsTargets * rows * kE), row((size_t) kDsTargets * kE);
         cudaDeviceSynchronize();
         for (int k = 0; k < kDsTargets; ++k)
-            cudaMemcpy(h.data() + (size_t) k * rows * kE, tap(k), (size_t) rows * kE * 4, cudaMemcpyDeviceToHost);
+            basalt::core::device_copy(h.data() + (size_t) k * rows * kE, tap(k), (size_t) rows * kE * 4, cudaMemcpyDeviceToHost);
         const int32_t n = rows;
         std::fputc('C', dump_);
         std::fwrite(&pos0, 8, 1, dump_);
@@ -691,8 +692,8 @@ model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n
         const size_t V = (size_t) w_->n_vocab;
         const int32_t m = pending_;
         std::vector<float> hf((size_t) kDsBlock * kE), base((size_t) m * V);
-        cudaMemcpy(hf.data(), h_, hf.size() * 4, cudaMemcpyDeviceToHost);
-        cudaMemcpy(base.data(), dump_logits_, base.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hf.data(), h_, hf.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(base.data(), dump_logits_, base.size() * 4, cudaMemcpyDeviceToHost);
         for (int i = 0; i < m; ++i) {   // the screened pick against the exact head's first argmax
             const float* l = base.data() + (size_t) i * V;
             const size_t best = (size_t) (std::max_element(l, l + V) - l);
@@ -784,7 +785,7 @@ bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t posit
         k.v.resize_for_overwrite((size_t) positions * kKV * 2);
         const auto down = [&](const uint16_t* dev, core::ConversationBuffer& to) {
             return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                return basalt::core::device_copy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
             });
         };
         if (!down(c.k, k.k) || !down(c.v, k.v)) return false;
@@ -806,7 +807,7 @@ bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size
             return false;
         const auto up = [&](uint16_t* dev, const core::ConversationBuffer& from) {
             return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t off) {
-                return cudaMemcpy((uint8_t*) dev + off, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                return basalt::core::device_copy((uint8_t*) dev + off, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
             });
         };
         if (!up(c.k, k.k) || !up(c.v, k.v)) return false;
