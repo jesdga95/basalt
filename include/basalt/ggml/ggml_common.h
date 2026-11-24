@@ -144,6 +144,17 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// MXFP4: 32 values with one E8M0 scale (the byte is the fp32 exponent: d = 2^(e - 127), halved against the
+// doubled kvalues_mxfp4); byte j of qs holds value j (low nibble) and value j + 16 (high nibble).
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+#define QR_MXFP4 2
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP4/2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
 // NVFP4: 64 values in four 16-value sub-blocks, each with a UE4M3 scale. Sub-block s keeps its E2M1 codes in
 // qs[8 s .. 8 s + 7]: byte j holds value j (low nibble) and value j + 8 (high nibble). The FP32 scale per
 // expert matrix is not part of the block; it multiplies the projection's output.
@@ -1039,6 +1050,7 @@ GGML_TABLE_END()
 GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+#define kvalues_mxfp4 kvalues_fp4
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f
