@@ -41,6 +41,7 @@ enum ggml_type {
     GGML_TYPE_IQ2_S = 22,
     GGML_TYPE_IQ4_XS = 23,
     GGML_TYPE_IQ1_M = 29,
+    GGML_TYPE_MXFP4 = 39,
     GGML_TYPE_NVFP4 = 40,
     GGML_TYPE_Q2_0 = 42,
     GGML_TYPE_MXFP8 = 46,
@@ -116,6 +117,9 @@ void ggml_vec_dot_mxfp8_q8_0_scalar_avx512(int n, float* s, const void* x, const
 // NVFP4 / MXFP8 row . Q8_0 row in plain C: the reference for the SIMD vec_dot (ggml_quants.c).
 void ggml_vec_dot_nvfp4_q8_0_ref(int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT x, const void* GGML_RESTRICT y);
 void ggml_vec_dot_mxfp8_q8_0_ref(int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT x, const void* GGML_RESTRICT y);
+
+// MXFP4 row . Q8_0 row in plain C (ggml's scalar fallback): the reference for the SIMD vec_dot (ggml_quants.c).
+void ggml_vec_dot_mxfp4_q8_0_ref(int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT x, const void* GGML_RESTRICT y);
 
 #if defined(__cplusplus)
 }

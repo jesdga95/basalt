@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 using namespace basalt::model;
@@ -49,7 +50,7 @@ int main() {
     c = compare_gpu_traces(a, b);
     CHECK(c.kld > 1.0 && c.top1 < 1.0 && c.max_kld > c.kld);   // one step of five holds all of it
     // the file round-trips
-    const std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/gpu_check_test.trace";
+    const std::string path = (std::filesystem::temp_directory_path() / "gpu_check_test.trace").string();
     std::string err;
     CHECK(write_gpu_trace(path, a, err));
     GpuTrace r;

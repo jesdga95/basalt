@@ -702,6 +702,9 @@ public:
                     return {model::Status::Refused, "hy4flash: elastic KV: " + std::to_string(need) + " positions would take the expert tier below the " +
                                                       std::to_string(prompt_floor_bytes() / stride_) + " slots a prompt chunk needs (about " +
                                                       std::to_string(ceiling) + " fit; --kv fp8 halves a position's bytes)"};
+                // the caches take their memory before open_prompt sizes the chunk buffers and optional expert ring
+                if (!ensure_positions(need, err))
+                    return {grow_failed_ ? model::Status::Refused : model::Status::Error, "hy4flash: " + err};
             }
         }
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
@@ -800,9 +803,10 @@ public:
         for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
         return (double) sparse * ((double) sparse_row_bytes() + (double) g_.idx_dim * 2.0 / (double) g_.idx_pool);
     }
-    // the free memory a prompt chunk needs: the expert ring and the buffers of a chunk of attention-step rows
+    // the free memory a prompt chunk needs: the buffers of a chunk of attention-step rows; the expert ring is optional
+    // (open_prompt falls back to per-layer staging when it does not fit)
     static constexpr uint64_t kPromptFloorBuffers = 1ull << 30;
-    uint64_t prompt_floor_bytes() const { return 2ull * (uint64_t) g_.n_expert * stride_ + kPromptFloorBuffers; }
+    uint64_t prompt_floor_bytes() const { return kPromptFloorBuffers; }
     // the positions the caches can back before the expert tier's slots and the free memory above its floor would no longer hold
     // a prompt chunk's needs
     int64_t kv_ceiling() override {
@@ -917,6 +921,8 @@ public:
         return ctxp::cache_bytes(positions, sparse, fp8()) * (f32() ? 2 : 1);
     }
 
+    int64_t disk_row_cells() const override { return g_.idx_pool; }
+
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
         cudaStreamSynchronize(stream_);
@@ -926,7 +932,7 @@ public:
             if (g_.swa[(size_t) l]) continue;
             core::ConversationKv k;
             k.format = cell_format();
-            k.page_size = g_.idx_pool;
+            k.page_size = 1;
             k.cells = positions;
             k.pooled_rows = (int64_t) pools;
             k.idx_dim = g_.idx_dim;
@@ -946,10 +952,12 @@ public:
         std::string e;
         if (!ensure_positions(positions, e)) return {model::Status::Error, "hy4flash: " + e};
         cudaStreamSynchronize(stream_);
+        const int64_t pools = positions / g_.idx_pool + 1;
         size_t i = 0;
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
-            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != g_.idx_pool || kv[i].cells != positions)
+            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != 1 || kv[i].cells != positions ||
+                kv[i].pooled_rows != pools)
                 return {model::Status::Error, "hy4flash: a parked conversation has other caches"};
             const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) { return cudaMemcpy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });
@@ -2846,9 +2854,12 @@ private:
                 return false;
             }
             cudaStreamSynchronize(stream_);
-            if (attempt == 0) tier_->shrink();
-            else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) lent = true;
-            else {
+            if (attempt == 0) {
+                if (ring_) ring_close();
+                tier_->shrink();
+            } else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) {
+                lent = true;
+            } else {
                 tier_->lend_all();
                 lent = lent_all = true;
             }
