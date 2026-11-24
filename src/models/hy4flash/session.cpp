@@ -475,9 +475,12 @@ public:
             }
         }
         lent_ = true;
-        int want = kMaxWindow;
-        while (want < total && want < kMaxChunk) want *= 2;
-        want = std::min(want, kMaxChunk);
+        // A chunk carries up to kMaxChunk rows, but a prompt that runs past that by less than one attention step still
+        // reads as one chunk: the step costs its rows either way, while the second call a tail would need streams every
+        // expert of every layer again for them (measured here: a 25-row tail over the cap, 278 ms of expert stream and
+        // the tail's slow routed path, +7% on a 16k prompt's time per token).  The split it replaces was on a step
+        // boundary, so the steps inside the one chunk are the ones the two chunks ran.
+        int want = std::min<int>(total, kMaxChunk + kAttRows);
         const bool ringed = total >= kRingRows && tier_ && !ring_;
         // a bounded lend: the tier gives up only the slots the chunk's buffers and the ring need, and the rest keep their experts
         // (the ring stages those card to card, and the first turn after the prompt finds them); all of them when that is not enough
@@ -497,7 +500,7 @@ public:
             }
         }
         if (tier_) tier_->lend_all();
-        for (int R = want; R >= kMaxWindow; R /= 2)
+        for (int R = want; R >= kMaxWindow; R = R > kMaxChunk ? std::min<int>(kMaxChunk, R) : R / 2)
             if (make_bufs(big_, R, err)) {
                 use(big_);
                 if (ringed && !ring_open())

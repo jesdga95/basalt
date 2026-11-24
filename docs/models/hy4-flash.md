@@ -82,7 +82,9 @@ refused with the modes it runs.
 
 ## Long prompts
 
-- Chunks are up to 16,384 tokens, halved to fit memory. Inside a chunk the attention runs in steps of 2,048 rows.
+- Chunks are up to 16,384 tokens, plus one more attention step of 2,048 so a prompt that overruns the cap by less than a step
+  still reads in one chunk: a second call for a few rows streams every expert of every layer again for them. A chunk larger
+  than that is halved to fit memory. Inside a chunk the attention runs in steps of 2,048 rows.
 - A prompt of 1,024 tokens or more borrows only the tier slots its buffers and the expert ring need; the ring copies the next
   layer's experts to the card while a layer computes. The slots it leaves keep their experts, and the next turn finds them. A
   shorter prompt keeps the card's slots and puts its buffers beside them; the CPU takes RAM experts of 8 rows or fewer.
