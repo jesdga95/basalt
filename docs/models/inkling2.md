@@ -56,6 +56,9 @@ the text model.
   need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
   giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a
   smaller card the spill is static: what does not fit stays in RAM. Nothing changes when everything fits.
+  The copies leave 1 GiB free until the first window has run, for the kernels' modules and the driver; after that they
+  leave `--vram-reserve-mib` free (512 MiB without it), so a small reserve gives the experts that VRAM after the first
+  request. `--expert-cache N` turns the copies off: the card then keeps at most N experts and the rest stay on the CPU.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
   At a sleep the card's copies of the RAM experts go back to RAM (the CPU computes them) and the driver moves the rest
   of the GPU state to host memory; the wake takes the copies back while the card has room. `reserve_mib` resizes them the
