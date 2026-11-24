@@ -536,9 +536,9 @@ __global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int total_row
         if (chunk + z < n_chunks) fetch((chunk + z) * CHUNK);
 
         // Online softmax (+ relative bias only within last kExtent keys)
-        const bool maybe_rel = (p_max - c0) < (kExtent + CHUNK);
         for (int i = warp; i < BM; i += 4) {
             const int p = rpos[i], lo = rlo[i];
+            const bool maybe_rel = p >= 0 && (p - c0) < (kExtent + CHUNK);
             float pv_row[CHUNK / 32], mx = -INFINITY;
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
