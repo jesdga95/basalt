@@ -55,9 +55,10 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kMaxRows = kDecodeRows;    // rows of one forward call (a decode window, a step of a prompt)
-// a read of up to this many tokens runs as decode windows: the prompt path's fixed cost (staging the spilled layers'
-// experts on the card) is more than eight of them
-constexpr int kWindowRead = 8 * kMaxRows;
+constexpr int kChunkRead = 16;          // a longer read runs on the prompt path, a shorter one as decode windows
+// with experts in RAM, a read of up to this many tokens runs as decode windows: the prompt path's fixed cost (staging the
+// spilled layers' experts on the card) is more than eight of them
+constexpr int kSpillWindowRead = 8 * kMaxRows;
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
 constexpr int kStage = 64;               // windows whose tokens and positions are in flight from the pinned ring at once
@@ -548,7 +549,7 @@ public:
         if (stale_ && r.pos > 0) return stale();
         if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
-        const bool staged = sh_->prompt && r.n_tokens > kWindowRead;
+        const bool staged = sh_->prompt && r.n_tokens > (m_.has_spill() ? kSpillWindowRead : kChunkRead);
         if (heat_tally_) settle_window(r.pos);
         if (!restart_positions(r.pos == 0 ? r.n_tokens : r.pos + std::max(r.n_tokens, r.total_tokens), r.pos)) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return grow_failed(e);
@@ -614,7 +615,7 @@ public:
         if (std::string e; !ensure_positions(pos + n_rows, e)) return grow_failed(e);
         hist_.resize((size_t) pos);
         stale_ = true;
-        if (sh_->prompt && n_rows > 16) {
+        if (sh_->prompt && n_rows > kChunkRead) {
             PromptRunner::Prepare prepare;
             if (heat_tally_) prepare = [&] { return recall_loan(pos); };
             const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_, prepare);

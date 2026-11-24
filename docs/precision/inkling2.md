@@ -47,7 +47,7 @@ Formats measured for layers 20 to 23 over 20 chunks: native MXFP8 0.00265 KLD, Q
 | Short-convolution state | fp32 | fp32 |
 
 A decode row's arithmetic does not depend on how many rows share its window. Prompt chunks round differently from decoded rows;
-a read of up to 64 tokens runs as decode windows and rounds as decoded rows.
+a read of up to 16 tokens (64 with experts in RAM) runs as decode windows and rounds as decoded rows.
 
 The prompt path's NVFP4 experts, measured over 20 chunks: one FP4 term per activation (the release's W4A4) 0.00407 KLD, two
 terms 0.00264; the same chunks through MMQ (q8_1 activations) 0.00252. Two terms were taken: the prompt reads about 1.5 times
