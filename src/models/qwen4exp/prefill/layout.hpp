@@ -60,17 +60,9 @@ struct MmqPlan {
 
 // A chunk shorter than this leaves most expert tiles nearly empty and the per-expert launches dominate: MMQ is faster.
 constexpr int64_t FP4_MIN_TOKENS = 1024;
-// The peer computes its experts' rows of a streamed chunk of up to this many
-// tokens (PeerPrefill::T_fp4).  The layer's activations go to it and its rows come back through host memory, and the
-// layer's end waits for that round trip; it grows with the chunk while the blobs it saves do not, so a longer chunk
-// streams the blobs instead.
-constexpr int64_t kPeerFp4Tokens = 5120;
-// A peer card slower than the main one takes the rows of routed-only chunks up to this size, no more.
+// The peer card takes the rows of routed-only chunks up to this size, no more: past it a slower peer's share binds the
+// chunk.
 constexpr int64_t kPeerSlowRows = 2559;
-// In such a chunk the issuing thread keeps at most this many expert copies queued on the primary's link (the ring still
-// runs as far ahead): copies on one link are served in the order they were queued, and the peer's result rows, which
-// the layer's end waits for, would otherwise queue behind the copies for the layers after it.
-constexpr int kPeerInFlight = 16;
 constexpr size_t al256(size_t v) { return (v + 255) & ~(size_t) 255; }
 
 struct Fp4Ptrs {

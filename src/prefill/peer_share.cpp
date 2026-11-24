@@ -433,26 +433,20 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         cudaStreamWaitEvent(m.s_main, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_rows, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);
-        if (L.quantize) {
-            L.quantize(x, n_tokens, m.hxq, m.s_main);
-        } else {   // block column kb of row r lies at (kb n_tokens + r) blocks: a piece's rows are a strided copy
-            const size_t kb = (size_t) mmq::q8_blocks(d.n_embd);
-            const size_t bb = (mmq::q8_bytes(1, d.n_embd) - mmq::q8_bytes(0, d.n_embd)) / kb;   // bytes of one block
-            for (int64_t r0 = 0; r0 < n_tokens; r0 += kQuantRows) {
-                const int64_t nr = std::min<int64_t>(kQuantRows, n_tokens - r0);
-                mmq::quantize(x + (size_t) r0 * (size_t) d.n_embd, nullptr, m.dxq, L.gu_type, d.n_embd, d.n_embd, nr,
-                              m.s_main);
-                cudaMemcpy2DAsync((uint8_t*) m.hxq + (size_t) r0 * bb, (size_t) n_tokens * bb, m.dxq, (size_t) nr * bb,
-                                  (size_t) nr * bb, kb, cudaMemcpyDeviceToHost, m.s_main);
-            }
+        // block column kb of row r lies at (kb n_tokens + r) blocks: a piece's rows are a strided copy
+        const size_t kb = (size_t) mmq::q8_blocks(d.n_embd);
+        const size_t bb = (mmq::q8_bytes(1, d.n_embd) - mmq::q8_bytes(0, d.n_embd)) / kb;   // bytes of one block
+        for (int64_t r0 = 0; r0 < n_tokens; r0 += kQuantRows) {
+            const int64_t nr = std::min<int64_t>(kQuantRows, n_tokens - r0);
+            mmq::quantize(x + (size_t) r0 * (size_t) d.n_embd, nullptr, m.dxq, L.gu_type, d.n_embd, d.n_embd, nr, m.s_main);
+            cudaMemcpy2DAsync((uint8_t*) m.hxq + (size_t) r0 * bb, (size_t) n_tokens * bb, m.dxq, (size_t) nr * bb,
+                              (size_t) nr * bb, kb, cudaMemcpyDeviceToHost, m.s_main);
         }
         cudaEventRecord(m.ev_xq, m.s_main);
     }
     // the group numbers: the prepared ones, then new ones
     std::vector<uint64_t> nums;
     std::vector<std::vector<std::pair<const uint8_t*, bool>>> blobs(groups.size());
-    std::vector<const uint8_t*> all_blobs;
-    for (const Expert& e : experts) all_blobs.push_back(e.blob);
     for (size_t gi = 0; gi < groups.size(); ++gi) {
         nums.push_back((int) gi < prepared ? m.prepared_at + gi : m.group++);
         if ((int) gi >= prepared)
@@ -460,7 +454,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
     }
     Impl* w = &m;
     m.post([w, L, n_tokens, dst, r, nb, tok, bounds, prepared, groups = std::move(groups), nums = std::move(nums),
-            blobs = std::move(blobs), all_blobs = std::move(all_blobs)] {
+            blobs = std::move(blobs)] {
         Impl& m = *w;
         const Dims& d = m.d;
         const cudaStream_t mr = m.s_rows, ps = m.s_prod, so = m.s_out;
@@ -470,7 +464,6 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             cudaMemcpyAsync(m.bounds_dev, bounds, (size_t) nb * 4, cudaMemcpyHostToDevice, ps);
             cudaStreamWaitEvent(ps, m.ev_xq, 0);
         }
-        bool first = true;
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             const Group& g = groups[gi];
             if ((int) gi >= prepared) m.stage_group(L, blobs[gi], nums[gi]);
@@ -483,23 +476,14 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 lv.stage = m.stage[sb];
                 lv.q0 = l.q0;
                 lv.n = l.n;
-                lv.blob = all_blobs.data() + g.i0 + l.q0;
                 lv.tok = m.tok_dev + l.r0;
                 lv.bounds = m.bounds_dev + l.b0;
-                lv.bounds_host = bounds + l.b0;
                 lv.rows = l.rows;
                 lv.max_rows = l.max_rows;
                 lv.act = m.hxq;
                 lv.n_tokens = n_tokens;
-                lv.first = first;
                 lv.out = m.out[b];
-                first = false;
-                if (L.products) {
-                    cudaStreamWaitEvent(ps, m.ev_out[b], 0);   // the last rows out of this buffer have left
-                    L.products(lv, ps);
-                } else {
-                    m.products(L, lv, b, ps);
-                }
+                m.products(L, lv, b, ps);
                 cudaEventRecord(m.ev_done[b], ps);
                 // the rows out, once the main card has copied the last ones from there
                 const size_t bytes = (size_t) l.rows * (size_t) d.n_embd * 4;

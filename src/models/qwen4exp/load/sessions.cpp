@@ -132,8 +132,8 @@ int sessions(Context& context) {
         st.pcie_frac = o.pcie_frac;
         {
             std::string bursts;
-            const double bw = probe_pcie_h2d_gbps(&bursts);
-            if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
+            const double bw = basalt::core::probe_h2d_gbps(&bursts);
+            if (bw > 0.0 && !o.diag_fixed_experts) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
             basalt::log::info("basalt generate", "layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }
@@ -144,12 +144,6 @@ int sessions(Context& context) {
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
-    for (size_t i = 0; i < split_at.size(); ++i)
-        if (split_at[i] >= g.n_layers) {
-            basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
-                         (long long) split_at[i], (long long) (g.n_layers - 1));
-            return 2;
-        }
     // the stage that runs a layer (0: CUDA0's)
     auto stage_of = [&](int64_t l) -> int {
         int st = 0;

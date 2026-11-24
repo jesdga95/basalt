@@ -39,7 +39,7 @@ Put the settings in `basalt_config.json`:
 ```json
 {
   "version": 2,
-  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "kv": "int8" }],
+  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "gpu-mode": "peer", "kv": "int8" }],
   "engine": { "resident-experts": true },
   "server": { "port": 8080 }
 }

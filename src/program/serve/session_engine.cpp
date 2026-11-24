@@ -95,7 +95,8 @@ public:
     std::string identity_words() const {
         const basalt::core::Json* nm = model_file.meta().get("name");
         std::string ids;
-        for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices, {})) {
+        for (const basalt::model::GpuCards::Card& c : o.gpus.cards) {
+            const int d = c.device;
             std::string bus;
             if (basalt::core::device_pci_bus_id(d, bus)) ids += (ids.empty() ? "" : ",") + bus;
         }

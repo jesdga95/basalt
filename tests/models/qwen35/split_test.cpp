@@ -99,6 +99,21 @@ int32_t window(model::ModelSession& s, const int32_t* tok, int T, int64_t pos, O
     return rows.back();
 }
 
+// CUDA devices 0 and 1 in `mode`, a split's cut given (0: from the shares)
+basalt::model::GpuCards two_cards(basalt::program::GpuMode mode, int cut = 0) {
+    basalt::model::GpuCards c;
+    c.mode = mode;
+    c.diag_cut = cut;
+    for (int d = 0; d < 2; ++d) {
+        basalt::model::GpuCards::Card k;
+        k.device = d;
+        k.index = d;
+        k.label = "GPU " + std::to_string(d);
+        c.cards.push_back(k);
+    }
+    return c;
+}
+
 Out run(const model::ModelAdapter& a, const std::string& pack, const Setup& su) {
     model::LoadRequest req;
     req.paths = {pack};
@@ -108,8 +123,7 @@ Out run(const model::ModelAdapter& a, const std::string& pack, const Setup& su) 
     req.spec = su.draft ? 16 : 0;
     if (su.int8) req.kv = "int8";
     if (su.cut) {
-        req.peer_devices = {1};
-        req.diag_split_at = su.cut;
+        req.gpus = two_cards(basalt::program::GpuMode::Split, su.cut);
     }
     req.sessions = 2;
     model::Started started;
@@ -202,8 +216,7 @@ std::vector<uint64_t> vision_run(const model::ModelAdapter& a, const std::string
     req.max_context = 8192;
     req.vision = true;
     if (cut) {
-        req.peer_devices = {1};
-        req.diag_split_at = cut;
+        req.gpus = two_cards(basalt::program::GpuMode::Split, cut);
     }
     model::Started started;
     if (const model::Result e = a.start(req, started); !e.ok()) die("start", e.message);

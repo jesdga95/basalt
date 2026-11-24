@@ -8,9 +8,9 @@ and starts the next.
   "version": 2,
   "engine": { "conversation-cache-disk-mib": 32768, "idle-sleep": 300, "vram-reserve-mib": 500 },
   "models": [
-    { "alias": "Flash-Next", "model": "flash-next.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144, "parallel": 4,
+    { "alias": "Flash-Next", "model": "flash-next.basalt", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144, "parallel": 4,
       "slot-full-context": true, "vision": "dynamic" },
-    { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "auto", "max-context": 1048576, "vision": "dynamic" }
+    { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "all", "gpu-mode": "peer", "max-context": 1048576, "vision": "dynamic" }
   ],
   "server": { "host": "127.0.0.1", "port": 8080 }
 }

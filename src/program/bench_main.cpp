@@ -237,7 +237,7 @@ struct Options {
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec;                    // --spec N: the engine argument of the same name
-    std::string gpu;                     // --gpu: the cards (gpu_select.hpp); one after -- wins
+    std::string gpu, gpu_mode, gpu_share;   // --gpu, --gpu-mode, --gpu-share: the cards (gpu_select.hpp); one after -- wins
     std::vector<std::string> decode;     // -t: conv, struct, prose
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
@@ -294,7 +294,8 @@ void usage(const std::string& engine) {
         "\n"
         "engine\n"
         "  --model FILE       a .basalt model file\n"
-        "  --gpu A,B,..|auto  the GPUs, as for the server and the engine (default: GPU 0 alone). Every\n"
+        "  --gpu A,B,..|all   the GPUs, as for the server and the engine (default: GPU 0 alone); --gpu-mode MODE and\n"
+        "                     --gpu-share A,B,.. as for the engine (two or more GPUs need a mode; --community takes all three). Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
         "  --engine BIN       engine binary (default: basalt beside this program, else the build's)\n"
@@ -376,6 +377,8 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--community") o.community = true;
         else if (a == "--gpu") o.gpu = next("--gpu");
+        else if (a == "--gpu-mode") o.gpu_mode = next("--gpu-mode");
+        else if (a == "--gpu-share") o.gpu_share = next("--gpu-share");
         else if (a == "--hardware") o.hardware = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
         else if (a == "--community-dir") o.community_dir = next("--community-dir");
@@ -427,7 +430,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
-                        : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -758,19 +761,30 @@ int main(int argc, char** argv) {
     if (!o.model.empty()) {
         std::string gerr;
         std::vector<basalt::program::GpuCard> used;
-        // a community run uses every visible card; CUDA_VISIBLE_DEVICES picks them
-        const std::string want = o.community ? "auto" : has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
-        if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
+        // a community run takes the user's cards and mode like any other, and its row records them in engine_args
+        const auto given = [&](const char* flag, const std::string& own) { return has_arg(args, flag) ? arg_value(args, flag) : own; };
+        const std::string want = given("--gpu", o.gpu), mode = given("--gpu-mode", o.gpu_mode), share = given("--gpu-share", o.gpu_share);
+        if (!basalt::program::select_gpus(want, mode, share, "basalt-bench", gpu_value, used, gerr)) {
             basalt::log::error("basalt-bench", "%s", gerr.c_str());
             return 2;
         }
         set_arg(args, "--gpu", gpu_value);
+        if (!mode.empty()) set_arg(args, "--gpu-mode", mode);
+        if (!share.empty()) set_arg(args, "--gpu-share", share);
     }
     // the plan probes ask about these cards and not about GPU 0: on a box whose first visible card is not the main
     // card's architecture - a Blackwell card with an older expert-tier peer, where enumeration may name the older
     // one first - a probe at --gpu 0 plans an engine that could never start, and an answer with no plan in it has
     // no model name in it either.  A probe is not a measurement, so a row made this way is the same row.
     const std::string probe_gpu = gpu_value.empty() ? std::string("0") : gpu_value;
+    // the model, then the cards as the run has them (cards, mode, shares), then `tail`: what a plan probe passes the engine
+    const auto probe_args = [&](const std::string& model, const std::vector<std::string>& tail) {
+        std::vector<std::string> v = {"--model", model, "--gpu", probe_gpu};
+        for (const char* flag : {"--gpu-mode", "--gpu-share"})
+            if (has_arg(args, flag)) v.insert(v.end(), {flag, arg_value(args, flag)});
+        v.insert(v.end(), tail.begin(), tail.end());
+        return v;
+    };
     if (o.community && (!o.passthrough.empty() || !o.sets.empty())) {
         // any engine flag is refused; the engine's plan for them says which are lossy, so the refusal can name those
         std::vector<std::string> extra = o.passthrough;
@@ -778,7 +792,7 @@ int main(int argc, char** argv) {
             extra.push_back(kv.first);
             extra.push_back(kv.second);
         }
-        std::vector<std::string> plan_args = {"--model", fs::absolute(o.model).string(), "--gpu", probe_gpu};
+        std::vector<std::string> plan_args = probe_args(fs::absolute(o.model).string(), {});
         merge_args(plan_args, extra);
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
@@ -801,7 +815,7 @@ int main(int argc, char** argv) {
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
         const std::string abs_model = fs::absolute(o.model).string();
-        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu}, plan_log, answer);
+        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, probe_args(abs_model, {}), plan_log, answer);
         if (o.community) {
             community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
             community_arch = basalt::program::plan_field(answer, "arch");
@@ -809,10 +823,10 @@ int main(int argc, char** argv) {
             if (asked != 0) community_plan_err = plan_complaint(plan_log);   // read it before the probes below reuse the log
             // the cache format users run, when the engine accepts one of the flags for this model
             std::string unused;
-            if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", "int8"}, plan_log, unused) == 0) community_kv = "int8";
+            if (engine_plan(engine_bin, probe_args(abs_model, {"--kv", "int8"}), plan_log, unused) == 0) community_kv = "int8";
             // else the format the model's adapter names for community rows; a model that names none runs its default
             else if (!adapter_kv.empty() &&
-                     engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", adapter_kv}, plan_log, unused) == 0) community_kv = adapter_kv;
+                     engine_plan(engine_bin, probe_args(abs_model, {"--kv", adapter_kv}), plan_log, unused) == 0) community_kv = adapter_kv;
         }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
@@ -822,7 +836,7 @@ int main(int argc, char** argv) {
     if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id()) + ".log";
-        const int asked = engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", probe_gpu, "--ppl-base", o.kld_base}, plan_log, answer);
+        const int asked = engine_plan(engine_bin, probe_args(fs::absolute(o.model).string(), {"--ppl-base", o.kld_base}), plan_log, answer);
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
         if (asked != 0) {

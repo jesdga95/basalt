@@ -69,12 +69,11 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
 }
 
-// A peer card as fast as the main one gets a share `f` of the hot pairs, so both cards compute routed experts every
-// layer.  Of the first `at` ranks, every pair with floor((r+1)f) > floor(rf) moves to just after that point: the
-// primary fills past them and the peer, which takes what the primary does not hold, gets them first.  Returns the
-// pairs moved; `at` and `fill` get the ranks the log names.
-size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, size_t& at, size_t& fill) {
-    const double f = 0.45;
+// The peer card gets a share `f` of the hot pairs (its gpu-share), so both cards compute routed experts every layer.  Of
+// the first `at` ranks, every pair with floor((r+1)f) > floor(rf) moves to just after that point: the primary fills past
+// them and the peer, which takes what the primary does not hold, gets them first.  Returns the pairs moved; `at` and
+// `fill` get the ranks the log names.
+size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, double f, size_t& at, size_t& fill) {
     at = std::min(profile.size(), (size_t) 8700);
     fill = at;
     if (at == 0) return 0;

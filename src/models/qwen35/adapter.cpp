@@ -8,6 +8,8 @@
 #include "basalt/core/prompt_stage.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/model/peer_hooks.hpp"
+#include "basalt/model/split_hooks.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/program/options.hpp"
 #include "basalt/log.hpp"
@@ -90,11 +92,10 @@ dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions
     return o;
 }
 
-// Where the layers go with a second card: all on the main card when the model, its cells and scratch fit there (the second card
-// then reads long prompts), else split across the two (dense::plan_split), from the pack's bytes per layer and both cards'
-// free memory (CUDA device 0 and `peer`).  `forced`: a cut taken as given.
-dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd, int peer,
-                           double main_gbps, double peer_gbps, int reserve_mib, int forced) {
+// What a two-card split divides (dense::split_spec) from the pack's bytes per layer, with each card's room: what CUDA device 0
+// and `peer` have free now, less the reserve and a margin.
+model::SplitSpec plan_pack(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd, int peer,
+                           int reserve_mib) {
     std::vector<uint64_t> layer((size_t) g.n_layers, 0);
     uint64_t main_weights = 0;
     for (const TensorInfo& t : gg.tensors()) {
@@ -116,14 +117,12 @@ dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const d
     }
     constexpr uint64_t kMargin = 512ull << 20;
     const uint64_t reserve = ((uint64_t) std::max(reserve_mib, 0) << 20) + kMargin;
-    const dense::SplitCard mc{main_free > reserve ? main_free - reserve : 0, main_gbps};
-    const dense::SplitCard pc{peer_free > kMargin ? peer_free - kMargin : 0, peer_gbps};
-    dense::SplitInputs in = dense::split_inputs(g, o, bd, layer, main_weights, mc, pc);
-    in.forced = forced;
-    return dense::plan_split(in);
+    model::SplitSpec s = dense::split_spec(g, o, bd, layer, main_weights);
+    s.room = {main_free > reserve ? main_free - reserve : 0, peer_free > kMargin ? peer_free - kMargin : 0};
+    return s;
 }
 
-class Loaded final : public model::LoadedModel {
+class Loaded final : public model::LoadedModel, private model::PeerHooks, private model::SplitHooks {
 public:
     ~Loaded() override {
         model_.reset();
@@ -132,6 +131,13 @@ public:
     }
 
     const model::ModelDesc& desc() const override { return desc_; }
+
+    std::string gpu_report(int card) const override {
+        if (card < 0) return {};
+        if (split_at_ > 0) return split_report((size_t) card);
+        if (card == 0) return peer_main();
+        return peer_report((size_t) card);
+    }
 
     // The weights and the model are planned, the sessions made in attach(): the prompt split times its cards on the landed
     // weights before them, as it is measured.
@@ -144,7 +150,11 @@ public:
 
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override {
         if (std::string err; !dense::attach_drafter(*model_, err)) return {model::Status::Error, err};
-        if (stage_.device >= 0) attach_stage();
+        if (stage_.device >= 0) {
+            std::string err;
+            if (!dense::warm_prompt_split(*model_, err)) return {model::Status::Error, err};
+            core::log_prompt_split("basalt qwen35", {stage_});
+        }
         for (int i = 0; i < std::max(req.sessions, 1); ++i) {
             std::string err;
             std::unique_ptr<model::ModelSession> s = dense::make_session(*model_, err);
@@ -186,23 +196,19 @@ private:
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
-        if (o.kv_fp4 && !req.peer_devices.empty()) {
-            err = "qwen35: --kv nvfp4 runs on one card; leave out the second";
-            return false;
-        }
-        if (!req.peer_devices.empty() && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
+        if (req.gpus.cards.size() > 1 && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
         plan_file_ = plan_.file(path);
         stage_file_ = stage_plan_.file(path);
         {   // each card's weights in one block: the main card's, and a split's later layers on the second card
             const int end = split_at_ > 0 ? split_at_ : g.n_layers;
             if (!reserve_block(gg, o, 0, end, err)) return false;
             if (split_at_ > 0) {
-                const core::OnDevice on(req.peer_devices.front());
+                const core::OnDevice on(req.gpus.cards[1].device);
                 if (!reserve_block(gg, o, split_at_, g.n_layers, err)) return false;
             }
         }
         // the prompt split's copy of the last layers: its card's block reserved now, its weights read in the start's pass
-        if (split_at_ == 0 && !req.peer_devices.empty()) plan_stage(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
+        if (split_at_ == 0 && req.gpus.cards.size() > 1 && !plan_stage(gg, g, req.gpus, err)) return false;
         dense::Weights w;
         const int H = g.n_embd;
         // the token embedding stays in page-locked host memory; the kernels read the rows they need
@@ -233,7 +239,7 @@ private:
             L.kind = P.kind = g.kinds[(size_t) il];
             if (split_at_ > 0 && il >= split_at_) {
                 const uint64_t before = dev_bytes_;
-                const core::OnDevice on(req.peer_devices.front());
+                const core::OnDevice on(req.gpus.cards[1].device);
                 if (!layer(gg, g, il, P, err)) return false;
                 peer_bytes_ += dev_bytes_ - before;
                 dev_bytes_ = before;
@@ -284,7 +290,7 @@ private:
                           (double) free_b / 1073741824.0);
         if (split_at_ > 0)
             basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
-                              g.n_layers - 1, req.peer_devices.front());
+                              g.n_layers - 1, req.gpus.cards[1].device);
         o.host_embedding_bytes = tensor_payload_bytes(*te);
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
         o.layer_end = split_at_;
@@ -298,7 +304,7 @@ private:
         const uint64_t need_b = dense::shared_bytes(g, o.max_context, o.kv_format(), o.kv_resident) +
                                 (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_format(),
                                                                              o.kv_resident, 0, split_at_) +
-                                (req.peer_devices.empty() ? 0
+                                (req.gpus.cards.size() < 2 ? 0
                                  : split_at_ > 0           ? dense::stage_main_bytes(g, w.dflash)
                                                            : dense::prompt_split_main_bytes(g, w.dflash, o.max_context));
         if (const uint64_t host_b = dense::session_host_bytes(g, o.max_context, o.kv_format(), o.kv_resident))
@@ -314,87 +320,110 @@ private:
         }
         model_ = dense::make_model(g, w, o, err);
         if (!model_) return false;
-        if (split_at_ > 0 && !dense::attach_split(*model_, req.peer_devices.front(), split_at_, peer_w, err)) return false;
-        if (stage_.device >= 0) plan_stage_memory(stage_w);
+        if (split_at_ > 0 && !dense::attach_split(*model_, req.gpus.cards[1].device, split_at_, peer_w, err)) return false;
+        if (stage_.device >= 0 && !plan_stage_memory(stage_w, err)) return false;
         reads.append(plan_);
         if (stage_.device >= 0) reads.append(stage_plan_);
         return true;
     }
 
-    // Where the layers go with a second card (plan_pack); --diag-split-at takes its cut as given.
+    // Where the layers go with a second card: split mode cuts them by the shares (SplitHooks); peer mode keeps every layer on the
+    // main card, refused when they do not fit there, and gives the second card the last layers of a long prompt (PeerHooks).
     bool plan_cards(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd,
                     const model::LoadRequest& req, std::string& err) {
-        const int peer = req.peer_devices.front();
-        const dense::SplitPlan p = plan_pack(gg, g, o, bd, peer, req.card_gbps.size() > 0 ? req.card_gbps[0] : 0,
-                                             req.card_gbps.size() > 1 ? req.card_gbps[1] : 0, req.vram_reserve_mib, req.diag_split_at);
-        if (!p.error.empty()) {
-            err = "qwen35: " + p.error + "; lower --max-context or --parallel";
+        gg_ = &gg;
+        geo_ = &g;
+        opt_ = &o;
+        bd_ = &bd;
+        req_ = &req;
+        if (o.kv_fp4) {   // neither the layer cut nor the stage copies NVFP4 cells between the cards
+            err = std::string("gpu-mode ") + (req.gpus.mode == program::GpuMode::Split ? "split" : "peer") +
+                  ": --kv nvfp4 keeps every cell on the main card, and the stage and the layer cut move fp16 and int8 cells; "
+                  "use one card (gpu 0) or --kv int8";
             return false;
         }
-        split_at_ = p.cut;
-        if (p.cut > 0)
-            basalt::log::info("basalt qwen35", "layer split: layers 0-%d (%.2f GiB) on CUDA0, %d-%d (%.2f GiB) on CUDA%d", p.cut - 1,
-                              (double) p.main_bytes / 1073741824.0, p.cut, g.n_layers - 1, (double) p.peer_bytes / 1073741824.0, peer);
+        if (req.gpus.mode == program::GpuMode::Split) return split_open(req.gpus, err);
+        const model::SplitSpec s = split_spec(req.gpus);
+        uint64_t all = s.fixed[0];
+        for (uint64_t b : s.layer) all += b;
+        if (all > s.room[0]) {
+            err = "gpu-mode peer: Qwen3.8-27B and its cells need " + model::gib(all) + " on " + req.gpus.cards[0].label + ", " +
+                  model::gib(s.room[0]) + " free; use gpu-mode split or lower --max-context or --parallel";
+            return false;
+        }
+        if (dense::resident_cells(o.max_context, o.kv_resident) < o.max_context) {   // the stage copies cells between the cards' caches
+            err = "gpu-mode peer: " + req.gpus.cards[1].label + " would read nothing: K/V streaming (--kv-resident) keeps part of the cache in RAM";
+            return false;
+        }
+        if (dense::prompt_split_main_bytes(g, dense::BlockDrafter{}, o.max_context) == 0) {
+            err = "gpu-mode peer: " + req.gpus.cards[1].label + " would read nothing: a context of " + std::to_string((long long) o.max_context) +
+                  " holds no prompt that a second card would read; raise --max-context";
+            return false;
+        }
+        return peer_open(req.gpus, err);
+    }
+
+    // ---- gpu-mode split (SplitHooks): the layers cut by the shares, each layer's cells and state on its card
+    model::SplitSpec split_spec(const model::GpuCards& c) const override {
+        return plan_pack(*gg_, *geo_, *opt_, *bd_, c.cards[1].device, req_->vram_reserve_mib);
+    }
+    bool split_place(const model::SplitCut& cut, const std::vector<int>& devices, std::string& err) override {
+        if (devices.size() != 2 || devices[1] == devices[0]) {
+            err = "Qwen3.8-27B does not run a layer split with both parts on one GPU (--diag-gpu-same)";
+            return false;
+        }
+        split_at_ = cut.first[1];
+        split_need_ = cut.need;
+        basalt::log::info("basalt qwen35", "layer split: layers 0-%d (%.2f GiB) on CUDA0, %d-%d (%.2f GiB) on CUDA%d", split_at_ - 1,
+                          (double) cut.need[0] / 1073741824.0, split_at_, geo_->n_layers - 1, (double) cut.need[1] / 1073741824.0,
+                          devices[1]);
+        return true;
+    }
+    std::string split_part(size_t card) const override {
+        return std::string(card == 0 ? "head, drafter, " : "") + "their cells and state (" + model::gib(split_need_[card]) + ")";
+    }
+
+    // ---- gpu-mode peer (PeerHooks): the second card reads the last layers of a long prompt (the prompt split's one stage)
+    bool peer_card(size_t, int, std::string&) override { return true; }   // its stage's buffers are made with its weights (plan_stage)
+    uint64_t peer_room(size_t card) const override {
+        constexpr uint64_t kMargin = 512ull << 20;
+        const uint64_t free = req_->gpus.cards[card].free;
+        return free > kMargin ? free - kMargin : 0;
+    }
+    model::PeerSpec peer_spec() const override {
+        model::PeerSpec s;
+        s.stage_layers = geo_->n_layers;
+        s.stage_lo = std::max(0, geo_->n_layers - dense::kPromptSplitLayers);
+        return s;
+    }
+    bool peer_place(const model::PeerPlacement& p, std::string&) override {
+        stage_lo_ = p.stage_first[1];
+        return true;
+    }
+    std::string peer_main() const override { return "every layer and its cells"; }
+
+    // The stage's one block on the second card, from the cut the share gave (stage_lo_): reserved here, before the rest is
+    // sized; without room on that card the mode is refused.
+    bool plan_stage(const GgufFile& gg, const dense::Geometry& g, const model::GpuCards& gpus, std::string& err) {
+        const int dev = gpus.cards[1].device;
+        {
+            const core::OnDevice on(dev);
+            if (!reserve_block(gg, dense::Options{}, stage_lo_, g.n_layers, err)) {
+                err = "gpu-mode peer: " + gpus.cards[1].label + " has no room for the prompt layers: " + err;
+                return false;
+            }
+        }
+        stage_ = core::PromptStage{dev, stage_lo_, g.n_layers, core::StageHome::Card, 0};
+        for (const TensorInfo& t : gg.tensors())
+            if (t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= stage_lo_) stage_.bytes += tensor_payload_bytes(t);
         return true;
     }
 
-    // The prompt split's one stage: a second card reads long prompts' last layers (dense::plan_prompt_split), their weights
-    // resident there.  Its block is reserved here, before the rest is sized; without room on that card the prompts stay on
-    // the main card.
-    void plan_stage(const GgufFile& gg, const dense::Geometry& g, int dev, int64_t max_context, int64_t kv_resident) {
-        if (dense::resident_cells(max_context, kv_resident) < max_context) {   // the stage copies cells between the cards' caches
-            core::log_prompt_split_off("basalt qwen35", "K/V streaming (--kv-resident) keeps part of the cache in RAM");
-            return;
-        }
-        if (dense::prompt_split_main_bytes(g, dense::BlockDrafter{}, max_context) == 0) {
-            core::log_prompt_split_off("basalt qwen35", "a context of " + std::to_string((long long) max_context) +
-                                                               " holds no prompt that a second card would read");
-            return;
-        }
-        const int l_min = std::max(0, g.n_layers - dense::kPromptSplitLayers);
-        std::string err;
-        bool ok = false;
-        {
-            const core::OnDevice on(dev);
-            ok = reserve_block(gg, dense::Options{}, l_min, g.n_layers, err);
-        }
-        if (!ok) {
-            core::log_prompt_split_off("basalt qwen35", err, true);
-            return;
-        }
-        stage_ = core::PromptStage{dev, l_min, g.n_layers, core::StageHome::Card, 0};
-        for (const TensorInfo& t : gg.tensors())
-            if (t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= l_min) stage_.bytes += tensor_payload_bytes(t);
-    }
-
-    // The stage's memory beside its weights' block, before the sessions; when it does not fit, the split is off and its
-    // weights are not read.
-    void plan_stage_memory(const dense::Weights& sw) {
-        std::string err;
-        if (dense::plan_prompt_split(*model_, stage_.device, stage_.lo, sw, err)) return;
-        core::log_prompt_split_off("basalt qwen35", err, true);
-        drop_stage();
-    }
-
-    // Once its weights have landed the stage times both cards; the split is on, or off and its block freed.
-    void attach_stage() {
-        std::string err;
-        if (dense::attach_prompt_split(*model_, err)) {
-            core::log_prompt_split("basalt qwen35", {stage_});
-            return;
-        }
-        core::log_prompt_split_off("basalt qwen35", err, true);
-        drop_stage();
-    }
-
-    void drop_stage() {
-        if (auto it = blocks_.find(stage_.device); it != blocks_.end()) {
-            cudaFree(it->second.base);
-            blocks_.erase(it);
-        }
-        (void) cudaGetLastError();
-        stage_ = core::PromptStage{};
-        stage_plan_ = core::LoadPlan();
+    // The stage's memory beside its weights' block, before the sessions; when it does not fit, the mode is refused.
+    bool plan_stage_memory(const dense::Weights& sw, std::string& err) {
+        if (dense::plan_prompt_split(*model_, stage_.device, stage_.lo, sw, err)) return true;
+        err = "gpu-mode peer: " + err;
+        return false;
     }
 
     // layer il's weights (on the current device)
@@ -614,8 +643,16 @@ private:
     core::LoadPlan* queue_to_ = &plan_;
     int plan_file_ = 0, stage_file_ = 0;
     int split_at_ = 0;                   // the first layer on the second card (0: no split)
+    std::vector<uint64_t> split_need_;   // the split's bytes on each card, as the cut counted them
     uint64_t peer_bytes_ = 0;            // the weights there
     core::PromptStage stage_;         // the prompt split's stage (device -1: none)
+    int stage_lo_ = 0;                // its first layer, as the share cut it
+    // what the hooks read while a start plans its cards
+    const GgufFile* gg_ = nullptr;
+    const dense::Geometry* geo_ = nullptr;
+    const dense::Options* opt_ = nullptr;
+    const dense::BlockDrafter* bd_ = nullptr;
+    const model::LoadRequest* req_ = nullptr;
 };
 
 class Adapter final : public model::ModelAdapter {
@@ -630,30 +667,7 @@ public:
     PreTokenizer pretokenizer() const override { return {"qwen35", program::tokenizer::pretok_qwen35}; }
     model::TokenNames token_names() const override { return program::qwen_token_names(); }
     program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
-    int max_expert_cards() const override { return 0; }
-    bool second_card_reads_prompts() const override { return true; }
-    // neither the prompt split nor the layer split reads NVFP4 cells; the load refuses a second card too, for a caller
-    // that skips the card choice
-    std::string one_card_reason(const program::CommonOptions& o) const override {
-        return o.kv == "nvfp4" ? "--kv nvfp4 runs on one card" : "";
-    }
-    // the load's own plan (plan_pack) on the flags and both cards' free memory before it
-    bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const override {
-        if (o.kv == "nvfp4") return false;   // one card (one_card_reason)
-        if (o.diag_split_at > 0) return true;
-        core::ModelFile file;   // the pack's tensor table, read in place (as the load reads it)
-        std::string err;
-        if (!file.open(o.model, err) || !file.load_meta(err) || !file.register_gguf_view(err)) return false;
-        const GgufFile gg(o.model);
-        const dense::Geometry g = geometry(gg, err);
-        if (!err.empty()) return false;
-        const bool draft = o.spec >= 2 && o.spec_oracle.empty();
-        const dense::Options opt = run_options(gg, o.max_context, std::max(o.batch, 1), o.spec, draft, o.vision, o.kv, o.kv_resident);
-        dense::BlockDrafter bd;
-        if (opt.drafter == dense::Drafter::Block && !block_meta(gg, bd, g.n_embd, err)) return false;
-        const dense::SplitPlan p = plan_pack(gg, g, opt, bd, 1, main_gbps, peer_gbps, o.vram_reserve_given ? o.vram_reserve_mib : 0, 0);
-        return p.error.empty() && p.cut > 0;
-    }
+    program::GpuModes gpu_modes() const override { return {2, 2, 0}; }   // peer: one prompt stage; split: the layer stage
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
@@ -661,7 +675,6 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
-        else if (a == "--diag-split-at") o.diag_split_at = std::atoi(args.next("--diag-split-at"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;

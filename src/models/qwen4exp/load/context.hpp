@@ -22,16 +22,11 @@ struct Context {
     basalt::core::ModelFile* model_file = nullptr;
     const basalt::core::PackFiles* pack_files = nullptr;
     const basalt::core::ExpertFiles* expert_files = nullptr;
-    const bool* peer_streamed_share = nullptr;
     bool* split_want = nullptr;
-    const int* split_cap = nullptr;
-    std::function<void ()> set_split_cap;
-    std::function<std::vector<basalt::program::TierRoom> ()> peer_tier_rooms;
-    std::function<void ()> set_stream_all_min;
     std::vector<int64_t>* split_at = nullptr;
     std::vector<int>* split_devs = nullptr;
-    bool* split_auto = nullptr;
     bool* split_same = nullptr;
+    LayerSplit* split = nullptr;   ///< gpu-mode split: the stages' cut, behind the shared SplitHooks driver
     bool* multi_gpu = nullptr;
     const bool* pipe_want = nullptr;
     const int* kPairMibLater = nullptr;
@@ -43,7 +38,7 @@ struct Context {
     int64_t* K = nullptr;
     std::set<std::string>* skip = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* profile = nullptr;
-    bool* peer_hot_share = nullptr;
+    double* peer_hot_share = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* profile_loaded = nullptr;
     const bool* pf_borrow = nullptr;
     const int64_t* kWindowMib = nullptr;
@@ -100,6 +95,7 @@ struct Context {
     std::function<uint64_t()> peer_expert_room;
     basalt::core::PeerExperts* peer = nullptr;
     std::vector<std::unique_ptr<basalt::core::PeerExperts>>* xpeers = nullptr;
+    TierPeers* peers = nullptr;   ///< gpu-mode peer: the tiers above, behind the shared PeerHooks driver
     Drive* drive = nullptr;
     std::FILE ** routing = nullptr;
     basalt::core::SessionGraphs* gr = nullptr;
@@ -131,7 +127,7 @@ struct Context {
     int64_t* auto_lend_pct = nullptr;
     const int64_t* kMaxAutoChunk = nullptr;
     int64_t* auto_ceiling = nullptr;
-    std::function<bool()> open_peer;
+    std::function<int()> open_peer;   ///< 0, or the start's exit code
     const bool* adapt_fast_on = nullptr;
     int64_t* lend_from = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* stage_held = nullptr;
@@ -139,15 +135,14 @@ struct Context {
     std::vector<std::pair<int32_t, int32_t>>* peer_only = nullptr;
     uint64_t* peer_only_bytes = nullptr;
     std::vector<std::unique_ptr<PromptStage>>* pstages = nullptr;
-    double* split_host_gbps = nullptr;
     std::function<int64_t()> read_cap;
     const int64_t* kSplitRefCells = nullptr;
     int64_t* split_hand_rows = nullptr;
     int64_t* split_chunk_cap = nullptr;
     int64_t* split_peer_rows = nullptr;
-    std::function<engine_local::SplitPricing(int64_t, int64_t, int64_t, int)> split_price;
+    std::function<engine_local::SplitPart(int64_t, int64_t, int64_t)> split_part;
     std::function<std::string (int, const std::vector<int> &)> split_layers_text;
-    std::function<std::basic_string<char> (const basalt::program::PsPrice &)> split_stages_text;
+    const std::vector<int>* split_cuts = nullptr;
     int* split_stages = nullptr;
     int64_t* spec_pos = nullptr;
 };
