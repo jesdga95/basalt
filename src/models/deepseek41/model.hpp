@@ -61,7 +61,7 @@ public:
     model::PeerHooks* peer() const override;
     /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Called
     /// once the dense tensors are allocated, before a session is made. False with `err` when the request cannot be honoured.
-    bool resolve_context(int64_t requested, std::string& err);
+    bool resolve_context(int64_t requested, int64_t kv_resident, std::string& err);
     /// The caches' format (--kv); set before resolve_context.
     CacheFormat cache_format() const { return cache_format_; }
     void set_cache_format(CacheFormat f) { cache_format_ = f; }
@@ -108,6 +108,8 @@ public:
     prefillp::Dims prompt_dims() const;
     /// Device bytes of the compressed caches of a full context.
     uint64_t context_bytes() const;
+    /// Device bytes of the prompt path's copy of one cache's latents with --kv-resident (0 without).
+    uint64_t prompt_stage_bytes() const;
     /// Positions a new sequence keeps backed of `backed` (prefill_plan.hpp's keep_positions with this model's caches).
     int64_t keep_positions(int64_t backed) const;
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
@@ -140,6 +142,7 @@ private:
     mutable model::BatchShared batch_;
     mutable VisionBlas vision_blas_;
     int64_t ctx_ = 0;
+    uint64_t kv_granule_ = 1;   // what a cache with latents in RAM rounds its device part up to
     static int64_t ctxp_default();
     int embd_fd_ = -1;
     int experts_fd_ = -1;

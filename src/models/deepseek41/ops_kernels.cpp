@@ -137,6 +137,7 @@ public:
         ring_.assign((size_t) nl, nullptr);
         comp_kv_.assign((size_t) nl, nullptr);
         comp_ik_.assign((size_t) nl, nullptr);
+        host_rows_.assign((size_t) nl, INT64_MAX);
         el_kv_.resize((size_t) nl);
         el_ik_.resize((size_t) nl);
         st_kv_.assign((size_t) nl, nullptr);
@@ -146,12 +147,19 @@ public:
             if (!alloc((void**) &ring_[il], (size_t) kWindowSlots * win_row_bytes(fmt_))) return oom(err);
             if (g_.compress_ratio[(size_t) il] && kv_source(il) == il) {
                 const int ratio = g_.compress_ratio[(size_t) il];
-                // the caches reserve the address range of the whole context and are backed as positions arrive
+                // the caches reserve the address range of the whole context and are backed as positions arrive;
+                // --kv-resident: later latents in pinned RAM
                 const size_t cap = (size_t) ctx_ / ratio + 1;
+                const int64_t kept = ctxp::resident_positions(ctx_, m_.tiers().kv_resident);
+                const uint64_t host_from = kept < ctx_ ? ctxp::cache_rows(kept, ratio) * lat_b_ : UINT64_MAX;
                 el_kv_[il] = std::make_unique<core::ElasticArray>();
                 el_ik_[il] = std::make_unique<core::ElasticArray>();
-                if (!el_kv_[il]->open(cap * lat_b_, err) || !el_ik_[il]->open(cap * idx_b_, err))
+                if (!el_kv_[il]->open(cap * lat_b_, err, host_from)) {
+                    if (host_from != UINT64_MAX) err = "deepseek41: --kv-resident: " + err;
                     return false;
+                }
+                if (!el_ik_[il]->open(cap * idx_b_, err)) return false;
+                host_rows_[il] = (int64_t) ((el_kv_[il]->capacity() - el_kv_[il]->host_bytes()) / lat_b_);
                 comp_kv_[il] = el_kv_[il]->data();
                 comp_ik_[il] = el_ik_[il]->data();
                 if (!alloc((void**) &st_kv_[il], (size_t) ratio * kLatent * 4) ||
@@ -319,6 +327,8 @@ public:
         c.ring = &ring_;
         c.comp_kv = &comp_kv_;
         c.comp_ik = &comp_ik_;
+        c.host_rows = &host_rows_;
+        c.stage_bytes = m_.prompt_stage_bytes();
         c.st_kv = &st_kv_;
         c.st_sc = &st_sc_;
         c.format = fmt_;
@@ -1038,6 +1048,7 @@ private:
     std::vector<void*> allocs_;
     std::vector<uint8_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<core::ElasticArray>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
+    std::vector<int64_t> host_rows_;   // per kv-source layer, the first row of comp_kv_ in pinned RAM
     int64_t backed_positions_ = 0;
     bool lent_here_ = false;   // ensure_positions lent the tier's slots; stage_token takes back what is left
     int ctx_ = 0;

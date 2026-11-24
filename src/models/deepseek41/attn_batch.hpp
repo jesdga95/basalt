@@ -19,6 +19,8 @@ struct AttnCaches {
     std::vector<uint8_t*>* ring = nullptr;       ///< window rows [kWindowSlots][win_row_bytes] per layer
     std::vector<uint8_t*>* comp_kv = nullptr;    ///< compressed rows of the kv-source layers
     std::vector<uint8_t*>* comp_ik = nullptr;    ///< their index keys
+    std::vector<int64_t>* host_rows = nullptr;   ///< per layer, the first compressed row in pinned RAM (--kv-resident)
+    uint64_t stage_bytes = 0;                    ///< VRAM copy of the rows a chunk reads once they reach RAM (0: none)
     std::vector<float*>* st_kv = nullptr;        ///< partial-group compressor state
     std::vector<float*>* st_sc = nullptr;
     const float* freq[2] = {nullptr, nullptr};   ///< rotary tables of the two layer kinds
