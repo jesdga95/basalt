@@ -1,0 +1,157 @@
+{
+ "plain": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi there"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "system": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "no_think": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ "efficient": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true,
+   "medium_effort": true
+  },
+  "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHi\n\n{reasoning effort: efficient}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "history": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b",
+    "reasoning_content": "think b"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\n<think></think>b<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "history_kept": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b",
+    "reasoning_content": "think b"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true,
+   "truncate_history_thinking": false
+  },
+  "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\n<think>\nthink b</think>b<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ "tools": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather of a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "the city"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Weather of a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>the city</description>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+}

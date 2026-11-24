@@ -60,12 +60,17 @@ struct NativeExpertLayout {
     /// > 0: the softcapped SwiGLU instead, h = gate_softcap tanh(g / gate_softcap) sigmoid(g) up_softcap tanh(u / up_softcap)
     /// (the sigmoid sees the raw gate; the caps bound its linear factor and up). Both set together.
     float gate_softcap = 0.0f, up_softcap = 0.0f;
+    /// A squared-ReLU expert, h = relu(in . x)^2: one input matrix of n_ff rows in the gate rows' place and no up rows
+    /// (up_row 0, down_off = up_off); an NVFP4 blob's tail is {s_in, 0, s_down, 0}.
+    bool relu2 = false;
 };
 /// `swiglu_limit` rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
 /// the peer card, the remote tier) applies it without a signature change.
 /// `up_type`: the up rows' type (-1: gu_type).
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.0f,
                                         int up_type = -1);
+/// The layout of a squared-ReLU expert blob: [input rows (n_ff of n_embd) | down rows], `in_type`'s blocks for the input.
+NativeExpertLayout native_expert_layout_relu2(int in_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).  A layer
 /// whose up type differs (`up_type`, -1: the same) is covered only for the mixes the kernels are built for.
@@ -79,7 +84,8 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 /// and write row ent_dst[e] of `out` (n_embd floats).  Counts are read on the device.
 /// `grid_groups` (1 .. cap_groups; 0 = cap_groups) groups run side by side, a block row each striding over the rest:
 /// a call that usually has few groups or none (the verify window's PCIe share) launches less for the ones it does
-/// not have.  The results do not depend on it.
+/// not have.  The results do not depend on it.  A relu2 layout runs its n_ff input rows on the gate rows' kernels and
+/// squares their ReLU in place of the SwiGLU.
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,

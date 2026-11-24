@@ -3391,6 +3391,15 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     return L;
 }
 
+NativeExpertLayout native_expert_layout_relu2(int in_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    NativeExpertLayout L = native_expert_layout(in_type, d_type, n_embd, n_ff);
+    L.relu2 = true;
+    L.up_row = 0;
+    L.down_off = L.up_off;
+    L.bytes = L.down_off + (size_t) n_embd * L.d_row + (in_type == 40 ? kNvfp4Tail : 0);
+    return L;
+}
+
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
@@ -3452,7 +3461,24 @@ __global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const 
     }
 }
 
-enum class Act { Plain, Clamp, Softcap };
+// The squared ReLU of a relu2 expert's input rows (in the gate buffer), then the q8_1 blocks (the same pass as
+// swiglu_q8_1_entries_kernel): the square is rounded on its own, as the SwiGLU product is.
+template<bool PDL>
+__global__ void __launch_bounds__(256) relu2_q8_1_entries_kernel(const float* __restrict__ in,
+                                                                 const int32_t* __restrict__ grp_start,
+                                                                 const int32_t* __restrict__ n_groups, int n_ff,
+                                                                 block_q8_1* __restrict__ hq) {
+    if constexpr (PDL) pdl_trigger();
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    if constexpr (PDL) pdl_wait();
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float r = fmaxf(in[i], 0.0f);
+        q8_1_store(__fmul_rn(r, r), hq, i);
+    }
+}
+
+enum class Act { Plain, Clamp, Softcap, Relu2 };
 
 // native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
 // launch sequence.
@@ -3475,8 +3501,15 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     const bool chain = g_gu2 >= 2 && !v1 && !g_old_kernels;   // SwiGLU and down as dependents
     int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
-    const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
+    // a relu2 expert's n_ff input rows are the gate rows: the launch covers them alone, on the kernels that take its grid
+    constexpr bool RELU2 = ACT == Act::Relu2;
+    const int64_t gu_rows = RELU2 ? L.n_ff : 2 * L.n_ff;
+    const dim3 ggu((unsigned) ((gu_rows + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
     if (g_exp_phase != 2) {
+    if (RELU2 && L.up_type != L.gu_type) {
+        basalt::log::error("basalt", "native_expert_grouped: a relu2 expert with an up type");
+        std::exit(1);
+    }
     if (L.up_type != L.gu_type) {   // a mixed layer: the gu2 rows only
         if (v1 || !g_gu2 || g_old_kernels || !gu2_usable(L)) {
             basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d rows need the default kernels",
@@ -3493,7 +3526,7 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
         }
     } else
     switch (L.gu_type) {
-#define GU_CASE(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1); break;
+#define GU_CASE(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1 && !RELU2); break;
         GU_FMTS(GU_CASE)
 #undef GU_CASE
         default: basalt::log::error("basalt", "native_expert_grouped: gate/up type %d", L.gu_type); std::exit(1);
@@ -3501,7 +3534,14 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     const bool sw_v1 = v1;
-    if constexpr (ACT == Act::Softcap) {
+    if constexpr (RELU2) {
+        if (chain)
+            launch_dependent(relu2_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
+                             grp_start, n_groups, (int) L.n_ff, hq);
+        else
+            relu2_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, grp_start, n_groups,
+                                                                                         (int) L.n_ff, hq);
+    } else if constexpr (ACT == Act::Softcap) {
         if (chain)
             launch_dependent(swiglu_softcap_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
                              (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap,
@@ -3546,7 +3586,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
-    if (L.gate_softcap > 0.0f)
+    if (L.relu2)
+        grouped_impl<Act::Relu2>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                                 out, stream, grid_groups, 0.0f);
+    else if (L.gate_softcap > 0.0f)
         grouped_impl<Act::Softcap>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
                                    scratch, out, stream, grid_groups, 0.0f);
     else if (L.swiglu_limit > 0.0f)

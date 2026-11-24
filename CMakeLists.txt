@@ -322,6 +322,29 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_NEMOTRONH)
+add_library(nemotronh_kernels STATIC src/models/nemotronh/ops.cu)
+target_include_directories(nemotronh_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(nemotronh_kernels PUBLIC ${_gpu_runtime_target})
+add_library(model_nemotronh STATIC src/models/nemotronh/adapter.cpp src/models/nemotronh/pretok_nemotronh.cpp
+  src/models/nemotronh/pack.cpp src/models/nemotronh/model.cpp src/models/nemotronh/session.cpp)
+target_include_directories(model_nemotronh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
+target_link_libraries(model_nemotronh PUBLIC model tokenizer nemotronh_kernels expert_tier tiers kernels window_gemm prefill_fp4
+  prefill_fp8 core ${_gpu_runtime_target} ${_gpu_blas_target})
+if(BUILD_TESTING)
+  add_executable(nemotronh_pretok_test src/models/nemotronh/pretok_test.cpp src/models/nemotronh/pretok_nemotronh.cpp)
+  target_include_directories(nemotronh_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(nemotronh_pretok_test PRIVATE tokenizer)
+  basalt_cpu_test(NAME nemotronh_pretok_test COMMAND nemotronh_pretok_test)
+  # the whole model against tests/models/nemotronh/reference.py's float64 logits (a converted pack and its REF.bin as
+  # arguments; skipped without them)
+  add_executable(nemotronh_model_parity tests/models/nemotronh/model_parity.cpp)
+  target_link_libraries(nemotronh_model_parity PRIVATE model_nemotronh ${_gpu_runtime_target})
+  basalt_gpu_test(NAME nemotronh_model_parity COMMAND nemotronh_model_parity)
+  set_tests_properties(nemotronh_model_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+endif()
+endif()
+
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
@@ -577,6 +600,8 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_window.cu
                         src/kernels/cuda/gdn_commit.cu
                         src/kernels/cuda/gdn_prompt.cu
+                        src/kernels/cuda/ssd.cu
+                        src/kernels/cuda/window_handoff.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
@@ -823,7 +848,8 @@ target_link_libraries(grammar PRIVATE warnings)
 
 # the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
 add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp
-            src/program/tokenizer/unicode_flags.cpp src/program/tokenizer/pretok_qwen35.cpp)
+            src/program/tokenizer/unicode_flags.cpp src/program/tokenizer/pretok_qwen35.cpp
+            src/program/tokenizer/pretok_o200k.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
 if(BUILD_TESTING)
@@ -987,6 +1013,14 @@ target_link_libraries(gqa_attn_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_attn_parity COMMAND gqa_attn_parity)
 set_tests_properties(gqa_attn_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # a cache split in two places (K/V streaming): every attention kernel and the cache writes bitwise their one-buffer launches
+add_executable(router_k22_parity tests/kernels/router_k22_parity.cpp)
+target_link_libraries(router_k22_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME router_k22_parity COMMAND router_k22_parity)
+set_tests_properties(router_k22_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+add_executable(gqa_h128_parity tests/kernels/gqa_h128_parity.cpp)
+target_link_libraries(gqa_h128_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME gqa_h128_parity COMMAND gqa_h128_parity)
+set_tests_properties(gqa_h128_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(gqa_far_parity tests/kernels/gqa_far_parity.cpp)
 target_link_libraries(gqa_far_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_far_parity COMMAND gqa_far_parity)
@@ -2002,6 +2036,17 @@ if(BUILD_TESTING)
   add_executable(native_expert_parity tests/kernels/native_expert_parity.cpp)
   target_include_directories(native_expert_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(native_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+  # squared-ReLU NVFP4 experts (no gate rows) at Nemotron-H's geometry: CPU tier and GPU grouped kernels against double
+  add_executable(relu2_expert_parity tests/kernels/relu2_expert_parity.cpp)
+  target_include_directories(relu2_expert_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(relu2_expert_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
+  basalt_gpu_test(NAME relu2_expert_parity COMMAND relu2_expert_parity)
+  basalt_cpu_test(NAME relu2_expert_parity_cpu COMMAND relu2_expert_parity --cpu)
+  # the Mamba-2 mixer (ssd.hpp) at Nemotron-H's geometry: a prompt run and committed decode windows, bitwise, against double
+  add_executable(ssd_parity tests/kernels/ssd_parity.cpp)
+  target_include_directories(ssd_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(ssd_parity PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME ssd_parity COMMAND ssd_parity)
   add_executable(native_expert_bench tests/kernels/native_expert_bench.cpp)
   target_include_directories(native_expert_bench PRIVATE ${_gpu_include_directories})
   target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})

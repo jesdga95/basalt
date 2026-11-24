@@ -245,6 +245,13 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 
 int64_t q8_blocks(int64_t cols) { return pad512(cols) / (4 * QK8_1); }
 
+void quantize_relu2(const float* x, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, const int32_t* bounds,
+                    int n_experts, const float* tails, void* stream) {
+    if (rows <= 0) return;
+    quantize_mmq_q8_1_relu2_cuda(x, xq, (ggml_type) t, cols, ld, pad512(cols), rows, bounds, n_experts, tails, (cudaStream_t) stream);
+    ck(cudaGetLastError(), "quantize_relu2");
+}
+
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,

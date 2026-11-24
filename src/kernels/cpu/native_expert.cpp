@@ -147,6 +147,11 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: expert geometry is not whole blocks";
         return false;
     }
+    if (n_ff > kNativeMaxFF) {
+        err = "native experts: an expert intermediate of " + std::to_string(n_ff) + " is wider than the pool's buffers (" +
+              std::to_string(kNativeMaxFF) + ")";
+        return false;
+    }
     f.gu_type = gu_type;
     f.d_type = d_type;
     f.gu_act = (int) tg->vec_dot_type;
@@ -179,6 +184,15 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     return true;
 }
 
+bool native_fmt_relu2(int in_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+    if (!native_fmt(in_type, d_type, n_embd, n_ff, f, err)) return false;
+    f.relu2 = true;
+    f.up_row = 0;
+    f.down_off = f.up_off;
+    f.bytes = f.down_off + f.d_row * (size_t) n_embd + f.tail;
+    return true;
+}
+
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     static const bool avx512 = cpu_avx512_ok();
     if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
@@ -196,8 +210,39 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
+// A relu2 expert's rows: each input row's dot through the down rows' kernels (one matrix, the same activation type),
+// then the squared ReLU.  A token's rows round the same alone as in a group.
+static void relu2_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    static const bool avx512 = cpu_avx512_ok();
+    float s = 1.f;
+    if (f.tail) std::memcpy(&s, blob + f.bytes - f.tail, 4);
+    const int n = (int) f.n_embd;
+    if (avx512 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_512_fits(n, (int) f.n_ff))
+        nvfp4_512_down_rows(blob, f.gu_row, n, s, act, nt, ff, r0, r1);
+    else if (!avx512 && cpu_avx2_ok() && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_256_fits(n, (int) f.n_ff))
+        nvfp4_256_down_rows(blob, f.gu_row, n, s, act, nt, ff, r0, r1);
+    else {
+        const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+        for (int r = r0; r < r1; ++r)
+            for (int t = 0; t < nt; ++t) {
+                float v = 0.f;
+                dot(n, &v, 0, blob + (size_t) r * f.gu_row, 0, act[t], 0, 1);
+                ff[t][r] = f.tail ? v * s : v;
+            }
+    }
+    for (int t = 0; t < nt; ++t)
+        for (int r = r0; r < r1; ++r) {
+            const float v = std::fmax(ff[t][r], 0.f);
+            ff[t][r] = v * v;
+        }
+}
+
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.relu2) {
+        relu2_rows(f, blob, act, nt, ff, r0, r1);
+        return;
+    }
     // The multi-token kernels decode the weights once for all tokens; the single-token ggml dot below serves the
     // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
     // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs

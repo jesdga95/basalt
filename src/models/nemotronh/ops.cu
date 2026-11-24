@@ -1,0 +1,72 @@
+// src/models/nemotronh/ops.cu - see ops.hpp.
+#include "models/nemotronh/ops.hpp"
+
+#include "basalt/kernels/bf16_bits.hpp"
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+namespace basalt::models::nemotronh {
+namespace {
+
+__global__ void relu2_kernel(float* x, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const float r = fmaxf(x[i], 0.0f);
+        x[i] = __fmul_rn(r, r);
+    }
+}
+
+__global__ void kv_store_kernel(const float* k, const float* v, int64_t n, int64_t base, __half* kc, __half* vc) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        kc[base + i] = __float2half_rn(k[i]);
+        vc[base + i] = __float2half_rn(v[i]);
+    }
+}
+
+__global__ void add2_kernel(float* x, const float* a, const float* b, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        x[i] = b ? __fadd_rn(x[i], __fadd_rn(a[i], b[i])) : __fadd_rn(x[i], a[i]);
+}
+
+unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096); }
+
+}  // namespace
+
+__global__ void tails_aside_kernel(uint8_t* blobs, size_t stride, uint64_t blob, float* tails) {
+    uint8_t* b = blobs + (size_t) blockIdx.x * stride;
+    if (threadIdx.x < 4) tails[(size_t) blockIdx.x * 4 + threadIdx.x] = ((const float*) (b + blob - 16))[threadIdx.x];
+    __syncthreads();
+    for (size_t i = blob - 16 + threadIdx.x; i < stride; i += blockDim.x) b[i] = 0;
+}
+
+void tails_aside(uint8_t* blobs, size_t stride, uint64_t blob, int n, float* tails, void* stream) {
+    if (n > 0) tails_aside_kernel<<<n, 256, 0, (cudaStream_t) stream>>>(blobs, stride, blob, tails);
+}
+
+__global__ void bf16_rows_kernel(const float* __restrict__ x, int64_t ld_x, int64_t n, uint16_t* __restrict__ y) {
+    const float* xr = x + (size_t) blockIdx.y * ld_x;
+    uint16_t* yr = y + (size_t) blockIdx.y * n;
+    for (int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; c < n; c += (int64_t) gridDim.x * blockDim.x)
+        yr[c] = basalt::kernels::bf16_from_f32(xr[c]);
+}
+
+void bf16_rows(const float* x, int64_t ld_x, int64_t n, int R, uint16_t* y, void* stream) {
+    if (R > 0 && n > 0)
+        bf16_rows_kernel<<<dim3((unsigned) ((n + 1023) / 1024), (unsigned) R), 256, 0, (cudaStream_t) stream>>>(x, ld_x, n, y);
+}
+
+void relu2(float* x, int64_t n, void* stream) {
+    if (n > 0) relu2_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, n);
+}
+
+void kv_store(const float* k, const float* v, int T, int64_t pos0, int n_kv, int hd, uint16_t* kc, uint16_t* vc, void* stream) {
+    const int64_t n = (int64_t) T * n_kv * hd;
+    if (n > 0)
+        kv_store_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(k, v, n, pos0 * n_kv * hd, (__half*) kc, (__half*) vc);
+}
+
+void add2(float* x, const float* a, const float* b, int64_t n, void* stream) {
+    if (n > 0) add2_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, a, b, n);
+}
+
+}  // namespace basalt::models::nemotronh

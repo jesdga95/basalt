@@ -5,6 +5,8 @@
 // synchronises).
 #pragma once
 
+#include "basalt/kernels/window_handoff.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -137,30 +139,14 @@ void add_norm_hc_post(const float* a, const float* b, const float* w, float eps,
 
 // ---- MoE ----------------------------------------------------------------------------------------------------------
 
-/// Most words put_words carries: a decode window's expert plan and its row pointers (the kernel's parameters stay under 4 KB).
-constexpr int kPutWords = 960;
-/// dst[0..n_words) = src[0..n_words) for `src` in host memory, n_words <= kPutWords: the words travel in the kernel's
-/// parameters, so a plan reaches the device in stream order without a copy-engine job (which would queue behind the tier's
-/// copies) and the host may reuse `src` at once.
-void put_words(const void* src, void* dst, int n_words, void* stream);
-
-/// out[t][i] = sum_k w[t * K + k] * rows[t * K + k][i] for k < K, in that order (rows: device array of T * K row pointers, each
-/// device or mapped host memory).
-void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream);
-
-/// Holds the stream until *word (mapped host memory the host writes) equals `value`, fences, then stores `value` in mark[0]
-/// (device memory), which an l2_read_ahead on another stream stops at.
-void wait_word_mark(const uint32_t* word, uint32_t value, uint32_t* mark, void* stream);
-/// Byte ranges of device memory (16-byte aligned, 16-byte multiples) in the order the kernels after a wait read them; empty
-/// ones last.
-constexpr int kL2Ranges = 4;
-struct L2Ranges {
-    const void* p[kL2Ranges] = {};
-    uint64_t n[kL2Ranges] = {};
-};
-/// Requests the ranges into L2, in order, until mark[0] equals `value` (mark: 2 words of device memory; mark[1] is scratch
-/// the kernel never writes in practice). Reads only: nothing queued after it waits for it.
-void l2_read_ahead(const L2Ranges& r, uint32_t* mark, uint32_t value, void* stream);
+// put_words, weighted_sum_window, wait_word_mark and l2_read_ahead: basalt/kernels/window_handoff.hpp
+using kernels::kPutWords;
+using kernels::put_words;
+using kernels::weighted_sum_window;
+using kernels::wait_word_mark;
+using kernels::kL2Ranges;
+using kernels::L2Ranges;
+using kernels::l2_read_ahead;
 
 /// h[r][k] = silu(min(gu[r][k], limit)) * clamp(gu[r][n_ff + k], -limit, limit) for rows of 2 * n_ff values (the gate rows' products
 /// then the up rows').

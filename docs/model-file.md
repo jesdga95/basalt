@@ -251,3 +251,34 @@ python3 tools/convert/convert.py --checkpoint Inkling-2-Mini --out Inkling-2-Min
   ranges, the loop's passes, the experts) and its license; the pretokenizer is the checkpoint's o200k split.
 - 18.38 GiB: experts 14.71, `gguf` 3.03 (drafter included), vision 0.60. Every rounding is deterministic and runs once, in pieces by
   worker processes. How each tensor rounds and what it costs in quality: [precision](precision/inkling2.md).
+
+## Nemotron 3.5 Super pack
+
+The pack (`Nemotron-3.5-Super-NVFP4.basalt`, 68.5 GiB) comes from NVIDIA's NVFP4 checkpoint alone
+([nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4),
+OpenMDW-1.1): the safetensors files, `config.json`, `hf_quant_config.json`, the tokenizer files and the chat template.
+[checkpoint_nemotronh.py](../tools/convert/checkpoint_nemotronh.py) is what `convert.py --checkpoint` runs on it; `--drafter`
+and `--head` do not apply.
+
+```sh
+hf download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 --local-dir nemotron
+python3 tools/convert/convert.py --checkpoint nemotron --out Nemotron-3.5-Super-NVFP4.basalt --name "Nemotron 3.5 Super"
+```
+
+- `experts` and `experts.layout`: the routed experts of the 40 MoE layers and the MTP head's (layer 89), 512 to a layer,
+  one NVFP4 (type 40) blob per expert, `[up | down]` then an FP32 tail `{s_up, 0, s_down, 0}` (each matrix's `weight_scale_2`): 3,096,592 bytes. The
+  E2M1 codes and the UE4M3 scale of every 16 values move bit for bit, regrouped into 64-value blocks; there are no gate rows
+  (the experts are squared-ReLU, and the layout's header says `relu2`).
+- `gguf`: every other language-model tensor in llama.cpp's `nemotron_h_moe` names. The FP8 projections (Mamba in and out,
+  attention q, k, v, o, the output head) as their E4M3 codes (F8_E4M3) with the FP32 `weight_scale` as `<name>.scale`; the
+  shared experts as NVFP4_PLANES (the code plane, then the UE4M3 scales in 128-row by 4-group tiles) with `weight_scale_2`;
+  the latent projections and token embedding BF16 as stored; the router, its bias, norms, convolutions, `dt` bias and `D`
+  F32; `ssm_a = -exp(A_log)` F32, from the BF16 value in float64, rounded once.
+- The multi-token-prediction head as layers 88 (attention, its projections BF16 as stored) and 89 (MoE), in the names
+  above, plus `blk.88.mtp_eh_proj` (BF16, the fusion of the two halves), `blk.88.mtp_enorm`, `blk.88.mtp_hnorm` and
+  `blk.89.mtp_final_norm` (F32). A pack without it (an older one, or `num_nextn_predict_layers` 0) runs without drafts.
+- `meta`: the geometry, with the layer kinds as `nemotronh.layer_pattern` (one letter a layer: `M` Mamba-2, `*` attention,
+  `E` MoE) and the head's as `nemotronh.mtp_pattern` (`*E`), and the license. `tokenizer/*`: the checkpoint's tokenizer
+  files and chat template.
+- Not converted: the vision tower. The activation scales (`input_scale`, `k_scale`, `v_scale`) are unused.
+- 68.5 GiB: experts 60.54, `gguf` 7.90. How each tensor rounds: [precision](precision/nemotron.md).

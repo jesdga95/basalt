@@ -36,6 +36,7 @@ constexpr int kMaxTok = 8;          // tokens per logits launch
 constexpr int kLogitThreads = 256;  // one block per gate row
 constexpr int kMaxVec = 8;          // float4 per thread: n_embd <= 4 * kMaxVec * kLogitThreads
 constexpr int kMaxExpert = 512;
+constexpr int kMaxTopK = 32;   // the most experts a token may choose
 constexpr int kRowsMinTok = 64;     // tokens from which a launch takes several gate rows a block
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -159,7 +160,7 @@ struct SelectScratch {
     int le[kMaxExpert];
     float thr;
     int n;
-    float sel[16];
+    float sel[kMaxTopK];
 };
 
 // Stage: one token, one thread per expert. An expert's rank counts the experts ahead of it (higher biased score, or
@@ -235,7 +236,7 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
 }  // namespace
 
 void router_logits(const float* x, const float* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
-    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 16 || a.k > a.n_expert)
+    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > kMaxTopK || a.k > a.n_expert)
         throw std::invalid_argument("router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
     constexpr int kLaunchTok = kMaxTok * 65535;   // grid.y limit
@@ -268,7 +269,7 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
 
 void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,
                    void* stream) {
-    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.k < 1 || a.k > 16 || a.k > a.n_expert)
+    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.k < 1 || a.k > kMaxTopK || a.k > a.n_expert)
         throw std::invalid_argument("router_select: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
     if (a.prior > 0.0f && a.held.n > 0)

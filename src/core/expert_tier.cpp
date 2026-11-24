@@ -209,7 +209,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     for (int l = 0; l < n_layers_; ++l) {
         const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
         kernels::cpu::NativeFmt f;
-        if (!kernels::cpu::native_fmt(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err, s_.layers[(size_t) l].clamp))
+        if (el.relu2 ? !kernels::cpu::native_fmt_relu2(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err)
+                     : !kernels::cpu::native_fmt(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err, el.clamp))
             return false;
         fmt_.push_back(f);
     }
@@ -365,7 +366,8 @@ class PeerPath final : public program::ProbePeerPath {
 public:
     PeerPath(core::PeerExperts& peer, int top_k) : peer_(peer), k_(top_k) {}
     bool setup(const program::ProbeEnv& env, const kernels::cpu::NativeFmt& f, std::string& why) override {
-        L_ = kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        L_ = f.relu2 ? kernels::native_expert_layout_relu2(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                     : kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
         for (int64_t e = 0; e < env.n_expert && (int) ids_.size() < 8; ++e)
             if (peer_.slot_ptr(0, e) != nullptr) ids_.push_back((int32_t) e);
         if (ids_.empty()) { why = "no_experts_on_peer"; return false; }

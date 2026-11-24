@@ -16,8 +16,8 @@ namespace basalt::kernels::cpu {
 /// Bytes of the largest quantized activation any native layer uses (5120 values as Q8_K: 20 x 292).
 inline constexpr size_t kNativeActBytes = 6144;
 /// The widest expert intermediate a native layer may have (the float buffers between gate/up and down).
-inline constexpr int kNativeMaxFF = 2304;
-/// Bytes of the largest quantized down activation (2304 values as Q8_K: 9 x 292, or Q8_0 72 x 34).
+inline constexpr int kNativeMaxFF = 2688;
+/// Bytes of the largest quantized down activation (2304 values as Q8_K: 9 x 292, or 2688 as Q8_0: 84 x 34).
 inline constexpr size_t kNativeHBytes = 3072;
 
 /// One layer's native expert geometry.  Gate and up usually share a type; a layer whose up rows have their own type
@@ -35,6 +35,9 @@ struct NativeFmt {
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
     float gate_softcap = 0.f, up_softcap = 0.f;   ///< > 0: the softcapped SwiGLU (swiglu.hpp); the caller sets them
+    /// A squared-ReLU expert, h = relu(in . x)^2: one input matrix of n_ff rows in the gate rows' place, no up rows
+    /// (up_row 0, down_off = up_off); an NVFP4 blob's tail is {s_in, 0, s_down, 0}.
+    bool relu2 = false;
 };
 
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
@@ -42,6 +45,8 @@ struct NativeFmt {
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 float swiglu_limit = 0.f, int up_type = -1);
 
+/// native_fmt for a squared-ReLU expert: [input rows (n_ff of n_embd, `in_type`) | down rows].
+bool native_fmt_relu2(int in_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
@@ -51,7 +56,8 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 inline constexpr size_t kNvfp4Tail = 16;
 
 /// ff[t][r] = swiglu(gate_r . a[t], up_r . a[t]) for rows r in [r0, r1), `nt` tokens, the layer's SwiGLU (swiglu.hpp;
-/// NVFP4: gate and up times s_gate and s_up first).
+/// NVFP4: gate and up times s_gate and s_up first); a relu2 expert's ff[t][r] = relu(in_r . a[t])^2 (NVFP4: the dot
+/// times s_in first).
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1) (NVFP4: times s_down).

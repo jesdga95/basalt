@@ -928,6 +928,12 @@ def main():
             import checkpoint_inkling2 as I
             I.build(a, Job, fingerprint, die)
             return
+        import checkpoint_nemotronh as N
+        if N.checkpoint_kind(json.loads((Path(a.checkpoint) / "config.json").read_text(encoding="utf-8"))):
+            if a.drafter or a.head:
+                ap.error("--drafter and --head go with a qwen35 checkpoint")
+            N.build(a, Job, fingerprint, die)
+            return
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return

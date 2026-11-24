@@ -17,7 +17,7 @@
 namespace basalt::kernels {
 namespace {
 
-constexpr int GMAX = 8;               // query heads per KV head
+constexpr int GMAX = 16;              // query heads per KV head
 constexpr int CHUNK = 32;             // cells per decode chunk
 constexpr int kDecSplits = 64;        // a decode row's blocks per KV head (its chunks dealt round robin)
 constexpr int HD = 256;              // the prompt kernel's head width
@@ -663,20 +663,25 @@ __device__ __forceinline__ float quad_sum(float v) {
 // a K/V tile is read once for every head of the group.  Warp w owns rows 16 w .. 16 w + 15.  Cells stream in tiles of
 // 32.  QK^T on fp16 tensor cores with fp32 accumulation; P V on fp16 tensor cores accumulating each 32-cell tile in
 // fp16, added to the fp32 output.  Online softmax in fp32.
+// Head width PHD (128 or 256): the rows padded to PHD + 8 halves, the scores scaled by 1 / sqrt(PHD).
 constexpr int PNW = 6, PROWS = 16 * PNW, PBN = 32;
-constexpr int LDH = HD + 8;    // padded fp16 row (halves)
 
+template <int PHD>
 struct PromptSmem16 {
-    __half q[PROWS][LDH];
-    __half k[PBN][LDH];
-    __half v[PBN][LDH];
+    __half q[PROWS][PHD + 8];
+    __half k[PBN][PHD + 8];
+    __half v[PBN][PHD + 8];
 };
 
+template <int PHD>
+__host__ __device__ constexpr float prompt_scale_log2() { return (PHD == 256 ? 0.0625f : 0.08838834764831845f) * 1.4426950408889634f; }
+
+template <int HD>
 __global__ void __launch_bounds__(PNW * 32) prompt_f16_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
                                                               const __half* __restrict__ vc, int n_head, int n_kv,
                                                               int64_t pos0, int64_t T, float* __restrict__ out, KvFar far_kv) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    PromptSmem16& sm = *reinterpret_cast<PromptSmem16*>(smem_raw);
+    PromptSmem16<HD>& sm = *reinterpret_cast<PromptSmem16<HD>*>(smem_raw);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int G = n_head / n_kv, PB = PROWS / G;   // query heads per KV head, positions per tile
     const int kvh = blockIdx.y;
@@ -744,7 +749,7 @@ __global__ void __launch_bounds__(PNW * 32) prompt_f16_kernel(const float* __res
                 const int64_t cell = c0 + n * 8 + tq * 2 + (i & 1);
                 const int64_t pos = i < 2 ? pos_a : pos_b;
                 const bool vis = cell <= pos0 + pos && cell < cells;
-                s[n][i] = vis ? s[n][i] * kScaleLog2 : kNeg;
+                s[n][i] = vis ? s[n][i] * prompt_scale_log2<HD>() : kNeg;
                 if (i < 2) mx_a = fmaxf(mx_a, s[n][i]);
                 else mx_b = fmaxf(mx_b, s[n][i]);
             }
@@ -1266,8 +1271,9 @@ size_t gqa_decode_scratch_floats(int64_t max_cells, int T, int n_head, int head_
 
 void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int T, float* scratch, int64_t max_cells, float* out, void* stream,
-                     const int32_t* pos_dev, KvInt8 q8, const float* gate_q, uint16_t* gated16, KvFar far_kv) {
-    if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || pos0 + T > max_cells) {
+                     const int32_t* pos_dev, KvInt8 q8, const float* gate_q, uint16_t* gated16, KvFar far_kv, int head_dim) {
+    if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || pos0 + T > max_cells ||
+        (head_dim != 128 && head_dim != 256)) {
         basalt::log::error("basalt", "gqa_decode_attn: invalid arguments");
         std::exit(1);
     }
@@ -1276,13 +1282,18 @@ void gqa_decode_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     r.cap = max_cells;
     r.pos_dev = pos_dev;
     const int n_chunks = (int) ((max_cells + CHUNK - 1) / CHUNK);
-    launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8, gate_q, gated16,
-                       far_kv);
+    if (head_dim == 128)
+        launch_window<128>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8, gate_q,
+                           gated16, far_kv);
+    else
+        launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8, gate_q,
+                           gated16, far_kv);
 }
 
 void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* segs, int n_seg, float* scratch,
-                          int64_t max_cells, float* out, void* stream, const float* gate_q, uint16_t* gated16) {
-    if (n_seg < 1 || n_seg > kMaxSegs || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX) {
+                          int64_t max_cells, float* out, void* stream, const float* gate_q, uint16_t* gated16, int head_dim) {
+    if (n_seg < 1 || n_seg > kMaxSegs || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX ||
+        (head_dim != 128 && head_dim != 256)) {
         basalt::log::error("basalt", "gqa_decode_attn_segs: invalid arguments");
         std::exit(1);
     }
@@ -1304,7 +1315,8 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
         d.r[k].pos_dev = g.pos_dev;
     }
     const int n_chunks = (int) ((max_cells + CHUNK - 1) / CHUNK);
-    launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream, gate_q, gated16);
+    if (head_dim == 128) launch_segs<128>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream, gate_q, gated16);
+    else launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream, gate_q, gated16);
 }
 
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
@@ -1334,6 +1346,27 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
 }
 
+namespace {
+template <int PHD>
+void launch_prompt_f16(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int64_t pos0,
+                       int64_t T, float* out, cudaStream_t st, KvFar far_kv) {
+    static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
+    const int dev = opt_in_device();
+    if (!raised[dev].load(std::memory_order_acquire)) {
+        if (cudaFuncSetAttribute(prompt_f16_kernel<PHD>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int) sizeof(PromptSmem16<PHD>)) != cudaSuccess) {
+            basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
+            std::exit(1);
+        }
+        raised[dev].store(true, std::memory_order_release);
+    }
+    const int pb = PROWS / (n_head / n_kv);
+    const dim3 grid((unsigned) ((T + pb - 1) / pb), (unsigned) n_kv);
+    prompt_f16_kernel<PHD><<<grid, PNW * 32, sizeof(PromptSmem16<PHD>), st>>>(q, (const __half*) k_cache, (const __half*) v_cache,
+                                                                            n_head, n_kv, pos0, T, out, far_kv);
+}
+}  // namespace
+
 void gqa_prompt_plan_device(int device) { plan_device.store(device, std::memory_order_relaxed); }
 
 size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits) {
@@ -1359,9 +1392,10 @@ void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0,
 
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8, float* split_scratch, size_t split_floats,
-                     KvFar far_kv) {
+                     KvFar far_kv, int head_dim) {
     if (T <= 0) return;
-    if (n_kv < 1 || n_head % n_kv || (!q8.k && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX || q8.fp4) {
+    if (n_kv < 1 || n_head % n_kv || (!q8.k && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX || q8.fp4 ||
+        (head_dim != 128 && head_dim != 256) || (q8.k && head_dim != 256)) {
         basalt::log::error("basalt", "gqa_prompt_attn: unsupported head layout or cell count (an NVFP4 cache: kv4_to_int8 first)");
         std::exit(1);
     }
@@ -1371,21 +1405,10 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
         if (p.warps == 4) launch_prompt_i8<4, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far_kv);
         else if (p.splits == 1) launch_prompt_i8<8, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far_kv);
         else launch_prompt_i8<8, true>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, p.splits, split_scratch, st, far_kv);
+    } else if (head_dim == 128) {
+        launch_prompt_f16<128>(q, k_cache, v_cache, n_head, n_kv, pos0, T, out, st, far_kv);
     } else {
-        static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
-        const int dev = opt_in_device();
-        if (!raised[dev].load(std::memory_order_acquire)) {
-            if (cudaFuncSetAttribute(prompt_f16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(PromptSmem16)) !=
-                cudaSuccess) {
-                basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
-                std::exit(1);
-            }
-            raised[dev].store(true, std::memory_order_release);
-        }
-        const int pb = PROWS / (n_head / n_kv);
-        const dim3 grid((unsigned) ((T + pb - 1) / pb), (unsigned) n_kv);
-        prompt_f16_kernel<<<grid, PNW * 32, sizeof(PromptSmem16), st>>>(q, (const __half*) k_cache, (const __half*) v_cache,
-                                                                         n_head, n_kv, pos0, T, out, far_kv);
+        launch_prompt_f16<256>(q, k_cache, v_cache, n_head, n_kv, pos0, T, out, st, far_kv);
     }
     check("gqa_prompt_attn");
 }
