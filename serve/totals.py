@@ -29,6 +29,15 @@ def totals_path_of(given: str, config: str | None) -> str | None:
     return str(Path(config).with_suffix("")) + ".totals.json"
 
 
+def totals_path_for_model(path: str, model: str) -> str:
+    """With several models each keeps its own file: the model's name lowercased, with only letters, digits and dots kept
+    ('Qwen 3.8 FN' -> '<config>.totals.qwen3.8fn.json')."""
+    slug = "".join(c for c in model.lower() if c.isascii() and (c.isalnum() or c == "."))
+    if not slug.strip("."):
+        raise ValueError(f"model name {model!r} has no letters or digits to name its totals file")
+    return str(Path(path).with_suffix("")) + f".{slug}.json"
+
+
 def totals_load_file(path: str | Path) -> dict:
     """Read a saved totals file. A missing or broken file is a first start: returns {}.
     A file whose top-level value is not a dict (a list, string, number, etc.) is treated the same way."""

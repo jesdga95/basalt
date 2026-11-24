@@ -669,7 +669,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "least 512, at most half) or a whole number of tokens (0 = none); an explicit request budget "
                          "of 0 opts out")
     ap.add_argument("--totals-file", default="", metavar="PATH",
-                    help="file for persistent token counts (default: <config>.totals.json next to the config; "
+                    help="file for persistent token counts (default: <config>.totals.json next to the config, and with several "
+                         "models <config>.totals.<model>.json, the name lowercased with spaces dropped; "
                          "'none' disables)")
     ap.add_argument("--totals-reset", action="store_true",
                     help="reset the persistent counters: move the current file to .prev.json and start fresh")
