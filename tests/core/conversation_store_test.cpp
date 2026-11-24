@@ -8,8 +8,9 @@
 // written from its source a buffer at a time (as from a session's device buffers) leaves the same files as the queued
 // write of its image, and a write that fails leaves the files and the index as they were; one the budget does not
 // hold is refused or reported, and the budget does not count what a read still holds open; one that fails before its
-// entry is indexed leaves the copy it would replace.  A match reads the entry it matched or none.  A read buffer that
-// could not be allocated is allocated again by the next read, and the conversation stays.
+// entry is indexed leaves the copy it would replace.  A match reads the entry it matched or none, and one touched is
+// evicted last.  A read buffer that could not be allocated is allocated again by the next read, and the conversation
+// stays.
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
@@ -587,6 +588,44 @@ void stale_match(const std::string& dir, uint64_t id) {
     CHECK(st.load_bytes(m) == 0 && !st.load(m, got, err));
     CHECK(st.stats().files == 2 && st.stats().dropped == 2);
     remove_dir(dir);
+}
+
+// A match that is touched is evicted last: with the budget holding two of three conversations, the one matched and
+// touched before the third is written stays, and the least recently used other goes.
+void touched_evicted_last(const std::string& dir, uint64_t id) {
+    std::string err;
+    const auto ids_of = [](size_t n, int salt) {
+        std::vector<int32_t> v(n);
+        for (size_t i = 0; i < v.size(); ++i) v[i] = (int32_t) (i * 29 + (size_t) salt);
+        return v;
+    };
+    const std::vector<int32_t> a_ids = ids_of(9001, 1), b_ids = ids_of(9001, 2), c_ids = ids_of(9001, 3);
+    uint64_t three = 0;   // the bytes of all three, as the budget counts them
+    {
+        Store sizes;
+        CHECK(sizes.open(dir + "-sizes", id, 1ull << 40, err));
+        for (const auto* ids : {&a_ids, &b_ids, &c_ids}) CHECK(sizes.put(image(*ids, {1000}), 1ull << 30));
+        sizes.flush();
+        three = sizes.stats().bytes;
+    }
+    remove_dir(dir + "-sizes");
+    for (const bool touched : {false, true}) {
+        Store st;
+        CHECK(st.open(dir, id, three - 1, err));
+        CHECK(st.put(image(a_ids, {1000}), 1ull << 30));
+        st.flush();
+        CHECK(st.put(image(b_ids, {1000}), 1ull << 30));
+        st.flush();
+        const std::vector<int32_t> p = prompt_at(a_ids, a_ids.size());
+        const auto m = st.best(p.data(), p.size(), {}, true);
+        CHECK(m.tokens == (int64_t) a_ids.size());
+        if (touched) st.touch(m);
+        CHECK(st.put(image(c_ids, {1000}), 1ull << 30));
+        st.flush();
+        CHECK(st.stats().files == 2 && st.holds(c_ids, {}, true));
+        CHECK(st.holds(a_ids, {}, true) == touched && st.holds(b_ids, {}, true) == !touched);
+        remove_dir(dir);
+    }
 }
 
 // A write from a source against the budget: a conversation larger than it is not begun, one its files exceed is
@@ -1447,6 +1486,7 @@ int main() {
     failed_write_keeps_stored(dir + "-failed", id);
     index_before_name(dir + "-index", id);
     stale_match(dir + "-stale", id);
+    touched_evicted_last(dir + "-touched", id);
     written_within_budget(dir + "-budget", id);
     same_name_again(dir + "-again", id);
     interrupted_write(dir + "-interrupted", id);

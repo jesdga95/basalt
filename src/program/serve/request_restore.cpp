@@ -253,6 +253,7 @@ Flow Request::restore() {
         const int64_t wanted = on_disk.tokens;
         if (in_files) {   // only the running states come to RAM
             need = runtime_.disk.load_bytes(on_disk, false);
+            runtime_.disk.touch(on_disk);   // the writes that make room for it evict it last
             admitted = runtime_.admit_streamed(need, floor, &why);
             // what left RAM for it went into the disk tier's index: the match is looked up again
             on_disk = runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec);

@@ -804,6 +804,11 @@ ConversationStore::Entry* ConversationStore::find_entry_locked(const Match& m) c
     return nullptr;
 }
 
+void ConversationStore::touch(const Match& m) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (Entry* e = find_entry_locked(m)) e->used = ++clock_;
+}
+
 uint64_t ConversationStore::load_bytes(const Match& m, bool kv) const {
     std::lock_guard<std::mutex> lk(mu_);
     const Entry* ep = find_entry_locked(m);

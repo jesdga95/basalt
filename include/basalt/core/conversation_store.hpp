@@ -86,6 +86,9 @@ public:
     /// Bytes `load` allocates for `m` (the RAM admission's figure); with `kv` false, those of a load that leaves the
     /// K/V in its files.
     uint64_t load_bytes(const Match& m, bool kv = true) const;
+    /// Makes the entry of `m` the most recently used, so the budget evicts it last: what a caller does before the
+    /// writes that make room to load it.
+    void touch(const Match& m);
 
     /// The image of `m` cut at m.tokens: `out.live` is the state there, `out.kv` the K/V up to it, `out.checkpoints`
     /// the chain's root (its shortest checkpoint) and that state once more when it is a checkpoint.  A file that fails
