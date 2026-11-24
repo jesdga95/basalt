@@ -61,15 +61,15 @@ void iq_exact_512_rows(int, const uint8_t*, size_t, int, const void* const*, int
 void iq4nl256_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     absent("iq4nl256_down_rows");
 }
-void nvfp4_512_gu_rows(const uint8_t*, size_t, size_t, int, float, float, float, const void* const*, int, float* const*, int,
-                       int) {
+void nvfp4_512_gu_rows(const uint8_t*, size_t, size_t, int, float, float, const SwiGlu&, const void* const*, int, float* const*,
+                       int, int) {
     absent("nvfp4_512_gu_rows");
 }
 void nvfp4_512_down_rows(const uint8_t*, size_t, int, float, const void* const*, int, float* const*, int, int) {
     absent("nvfp4_512_down_rows");
 }
-void nvfp4_256_gu_rows(const uint8_t*, size_t, size_t, int, float, float, float, const void* const*, int, float* const*, int,
-                       int) {
+void nvfp4_256_gu_rows(const uint8_t*, size_t, size_t, int, float, float, const SwiGlu&, const void* const*, int, float* const*,
+                       int, int) {
     absent("nvfp4_256_gu_rows");
 }
 void nvfp4_256_down_rows(const uint8_t*, size_t, int, float, const void* const*, int, float* const*, int, int) {
