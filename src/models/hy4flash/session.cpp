@@ -702,6 +702,9 @@ public:
                     return {model::Status::Refused, "hy4flash: elastic KV: " + std::to_string(need) + " positions would take the expert tier below the " +
                                                       std::to_string(prompt_floor_bytes() / stride_) + " slots a prompt chunk needs (about " +
                                                       std::to_string(ceiling) + " fit; --kv fp8 halves a position's bytes)"};
+                // the caches take their memory before open_prompt sizes the chunk buffers and optional expert ring
+                if (!ensure_positions(need, err))
+                    return {grow_failed_ ? model::Status::Refused : model::Status::Error, "hy4flash: " + err};
             }
         }
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
@@ -800,9 +803,10 @@ public:
         for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
         return (double) sparse * ((double) sparse_row_bytes() + (double) g_.idx_dim * 2.0 / (double) g_.idx_pool);
     }
-    // the free memory a prompt chunk needs: the expert ring and the buffers of a chunk of attention-step rows
+    // the free memory a prompt chunk needs: the buffers of a chunk of attention-step rows; the expert ring is optional
+    // (open_prompt falls back to per-layer staging when it does not fit)
     static constexpr uint64_t kPromptFloorBuffers = 1ull << 30;
-    uint64_t prompt_floor_bytes() const { return 2ull * (uint64_t) g_.n_expert * stride_ + kPromptFloorBuffers; }
+    uint64_t prompt_floor_bytes() const { return kPromptFloorBuffers; }
     // the positions the caches can back before the expert tier's slots and the free memory above its floor would no longer hold
     // a prompt chunk's needs
     int64_t kv_ceiling() override {
@@ -2846,9 +2850,12 @@ private:
                 return false;
             }
             cudaStreamSynchronize(stream_);
-            if (attempt == 0) tier_->shrink();
-            else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) lent = true;
-            else {
+            if (attempt == 0) {
+                if (ring_) ring_close();
+                tier_->shrink();
+            } else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) {
+                lent = true;
+            } else {
                 tier_->lend_all();
                 lent = lent_all = true;
             }
