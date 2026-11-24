@@ -91,4 +91,3 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 - `concur9_logit_hash=1`: print a hash of each accepted row's head logits on stderr.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.
-- `conv_ram_mib=N`: a conversation's RAM admission sees at most N MiB free above its floor.

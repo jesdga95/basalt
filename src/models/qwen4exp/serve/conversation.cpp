@@ -614,7 +614,6 @@ int QfnRuntime::init_conversations() {
         (size_t) o.conversation_cache_slots);
 
     disk_floor = 0;                              // the RAM a capture or a read leaves free (set below)
-    ram_seen_cap = (uint64_t) std::max(0.0, basalt::core::exp_flag("conv_ram_mib", 0)) << 20;
 
     if (o.conversation_cache_disk_mib > 0) {
         std::string de;

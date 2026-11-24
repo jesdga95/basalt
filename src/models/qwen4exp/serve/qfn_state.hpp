@@ -443,7 +443,6 @@ private:
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
     bool fixed_experts(basalt::core::VerifyHits& h, int dev);
-    uint64_t ram_seen_cap{};   // --exp conv_ram_mib: the most RAM above its floor a conversation's admission sees
     bool disk_write(const basalt::core::ConversationSource& src, std::string& e);
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();
