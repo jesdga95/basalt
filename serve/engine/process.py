@@ -44,7 +44,7 @@ import threading
 import time
 from pathlib import Path
 
-from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
+from serve.api.grammar import GPROMPT_KEY, REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key, gprompt_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
@@ -880,8 +880,10 @@ class ProcessEngine:
             keys += " relax=0"
         elif _number(rd):
             keys += f" relax={float(rd)!r}"
+        gram = grammar_key(sampling.get(GRAMMAR_KEY))
+        gp = gprompt_key(sampling.get(GPROMPT_KEY)) if gram else ""
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + grammar_key(sampling.get(GRAMMAR_KEY)) + logprobs_key(sampling.get(LOGPROBS_KEY))
+            + gram + gp + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1216,7 +1218,7 @@ class ProcessEngine:
                 epoch = list(self.slot_epoch)
 
         def gen_keys() -> str:      # a run that continues after tokens were generated tells the grammar where the prompt ends
-            return keys + (f" gprompt={n}" if out and " grammar=" in keys else "")
+            return keys + (f" gprompt={n}" if out and " grammar=" in keys and " gprompt=" not in keys else "")
 
         def size() -> int:
             return n + len(extra)
