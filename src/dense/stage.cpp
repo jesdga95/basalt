@@ -426,7 +426,9 @@ bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* toke
     const int64_t cap = block ? st.dctx_cap : 0, b0 = pos + n;
     const int chunks = (n + T - 1) / T;
     const int t_last = n - (chunks - 1) * T;
-    const int lc = chunks - 1;   // the chunks the stage reads; the main card keeps the last
+    // The chunks the stage reads: the main card keeps the last one, and with it the one before when the last is a part of a chunk, so
+    // that the first layers of a whole chunk fill the time the stage takes to finish its last chunk.
+    const int lc = t_last == T ? chunks - 1 : chunks - 2;
     const int ai0 = count_kind(g, l0, Mixer::Attention), gi0 = count_kind(g, l0, Mixer::Gdn);
     const size_t gdn_off = (size_t) gi0 * st.gdn_floats, gdn_bytes = (size_t) (g.gdn_layers() - gi0) * st.gdn_floats * 4;
     // the bounds of a whole chunk and of the last one, then the positions, page-locked so that every upload is queued
