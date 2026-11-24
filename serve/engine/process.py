@@ -1209,7 +1209,7 @@ class ProcessEngine:
         if not ok:
             return
         holding, born = True, self.gen                  # born: engine generation holding the control lines
-        slot, gen0, reserved = None, None, None
+        slot, slot_gen, gen0, reserved, reserved_gen = None, None, None, None, None
         solo_slot, run0, run_size, ctl_epoch = None, 0, 0, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
@@ -1241,7 +1241,7 @@ class ProcessEngine:
                         else:
                             self.slot_busy[solo_slot] = True
                             self.claim_slot(solo_slot, session)
-                            reserved = solo_slot
+                            reserved, reserved_gen = solo_slot, self.gen
                 if alone and left > 1:
                     if solo_slot is not None:
                         head = f"SGENI {solo_slot} {left}{gen_keys()} {embeddings}" if embeddings else \
@@ -1272,6 +1272,7 @@ class ProcessEngine:
                                         if reserved is not None:
                                             self.slot_busy[reserved] = True
                                             self.claim_slot(reserved, session)
+                                            reserved_gen = self.gen
                                 if reserved is not None:    # (a solo run in a slot parks its read in that slot)
                                     self._send(f"BYIELD {reserved}")
                                     yield_sent = True
@@ -1283,15 +1284,16 @@ class ProcessEngine:
                         out.append(t)
                         yield t
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
-                        slot, reserved = reserved, None     # gave way: the read continues in that slot
+                        slot, slot_gen, reserved, reserved_gen = reserved, reserved_gen, None, None
                     elif reserved is not None:              # did not give way: release the slot
-                        self._solo_kept(solo_slot, run_size, out[run0:])
-                        if solo_slot is not None:
-                            note(solo_slot)
-                        with self.slot_cv:
-                            self.slot_busy[reserved] = False
-                            self.slot_cv.notify_all()
-                        reserved = None
+                        if self.gen == reserved_gen:
+                            self._solo_kept(solo_slot, run_size, out[run0:])
+                            if solo_slot is not None:
+                                note(solo_slot)
+                            with self.slot_cv:
+                                self.slot_busy[reserved] = False
+                                self.slot_cv.notify_all()
+                        reserved, reserved_gen = None, None
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
@@ -1312,6 +1314,7 @@ class ProcessEngine:
                                     if slot is not None and self.admission.may_go(ticket, self._resumes(slot, meets(), size())):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
+                                        slot_gen = self.gen
                                         break
                                     slot = None
                                     if holding:
@@ -1332,6 +1335,10 @@ class ProcessEngine:
                             return
                         holding, born = True, self.gen
                         attach()
+                        if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                            slot, slot_gen = None, None
+                            self._yielded = None
+                            continue
                     if self._yielded is not None:           # gave way: waiting requests go first
                         self._hold(slot, self._yielded[1])
                         note(slot)
@@ -1346,6 +1353,9 @@ class ProcessEngine:
                             return
                         holding, born = True, self.gen
                         attach()
+                        if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                            slot, slot_gen = None, None
+                            continue
                     left = max(1, min(left, self.max_context - size() - SLOT_MARGIN))   # the slot's room
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
@@ -1437,11 +1447,12 @@ class ProcessEngine:
                         self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path
-                            self.slot_used[slot] = time.time()
-                            with self.slot_cv:
-                                self.slot_busy[slot] = False
-                                self.slot_cv.notify_all()
-                            slot, gen0 = None, None
+                            if self.gen == slot_gen:
+                                self.slot_used[slot] = time.time()
+                                with self.slot_cv:
+                                    self.slot_busy[slot] = False
+                                    self.slot_cv.notify_all()
+                            slot, slot_gen, gen0 = None, None, None
                             extra, left = list(out), int(max_new) - len(out)
                             solo_again += 1
                             break
@@ -1467,13 +1478,13 @@ class ProcessEngine:
                 pass
             if holding:
                 self.ctl.release()
-            if reserved is not None:
+            if reserved is not None and self.gen == reserved_gen:
                 if reserved == solo_slot:
                     self._solo_kept(solo_slot, run_size, out[run0:])
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_cv.notify_all()
-            if slot is not None:
+            if slot is not None and self.gen == slot_gen:
                 self.slot_used[slot] = time.time()
                 if phase == "slot":
                     self._hold(slot, 0)
@@ -1515,23 +1526,25 @@ class ProcessEngine:
         The engine answers at once, whatever it is doing. Returns (handle, tokens)."""
         with self.prompt_lock:                  # the answers come in the order the prompts were sent
             try:
-                if isinstance(ids, PromptText):
-                    body = ids.text
-                    spans = ids.byte_spans()
-                    plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
-                    with self.wlock:
+                with self.wlock:
+                    q, gen = self.prompt_q, self.gen
+                    if isinstance(ids, PromptText):
+                        body = ids.text
+                        spans = ids.byte_spans()
+                        plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
                         self.proc.stdin.write(f"PROMPT {len(body.encode('utf-8'))}{plain}\n{body}")
-                        self.proc.stdin.flush()
-                else:
-                    self._send("PROMPTI" + (" img" if embeddings else "") + " " + ",".join(str(int(t)) for t in ids))
+                    else:
+                        self.proc.stdin.write("PROMPTI" + (" img" if embeddings else "") + " " +
+                                              ",".join(str(int(t)) for t in ids) + "\n")
+                    self.proc.stdin.flush()
             except (OSError, AttributeError):
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
             while True:
                 try:
-                    line = self.prompt_q.get(timeout=1.0)
+                    line = q.get(timeout=1.0)
                     break
                 except queue.Empty:
-                    if not self.alive():
+                    if self.gen != gen or not self.alive():
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         if line is None:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
