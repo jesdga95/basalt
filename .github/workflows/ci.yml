@@ -180,7 +180,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: [qwen4exp, deepseek41, qwen35, hy4flash, inkling2]
+        model: [qwen4exp, deepseek41, qwen35, hy4flash, inkling2, nemotronh]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
