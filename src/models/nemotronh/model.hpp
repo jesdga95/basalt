@@ -48,6 +48,8 @@ struct MtpHead {
 };
 /// The most second cards whose expert tiers a start uses (gpu-mode peer takes the main card and up to these).
 constexpr int kMaxSecondCards = 3;
+/// The piece the card's expert slots are opened in, so a long prompt borrows only what its expert ring needs.
+constexpr uint64_t kExpertLendSegment = 256ull << 20;
 
 class NemotronModel final : public model::LoadedModel {
 public:

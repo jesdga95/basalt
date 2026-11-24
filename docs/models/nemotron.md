@@ -97,20 +97,25 @@ windows are bitwise one-row decode ([precision](../precision/nemotron.md#against
 
 ## Long prompts
 
-A prompt reads in chunks of up to 4,096 rows. Each chunk stages, layer by layer, every expert its rows route to on the
-card (from its slot, RAM or the file), 16 at a time on a copy stream while the group before computes. The routed experts run
-on llama.cpp's MMQ (int8 tensor cores, q8_1 activations against the NVFP4 blocks), the Mamba projections on the FP8
-tensor cores, the shared expert on the FP4 tensor cores. Staging dominates: a chunk copies nearly every expert of every
-layer, so longer chunks are faster.
+A prompt reads in chunks of up to 4,096 rows. A chunk this long routes to nearly every expert of every layer, so each MoE
+layer needs all of them on the card. From 1,024 tokens a prompt borrows the room of two layers' experts from the card's
+expert slots (3.2 GB; the tier lends them and takes them back, with their experts, when the prompt ends): one half holds the
+layer that computes, the other is filled with the next MoE layer's experts on a copy stream (from the card's slots, RAM in
+runs of consecutive experts, a second card or the file) while this layer and the Mamba or attention layer after it run.
+Without the room (a card nearly full) the experts a chunk routes to are staged 16 at a time while the group before computes.
+The routed experts run on llama.cpp's MMQ (int8 tensor cores, q8_1 activations against the NVFP4 blocks), the Mamba
+projections on the FP8 tensor cores, the shared expert on the FP4 tensor cores.
 
-| Prompt | Chunk | Time | tok/s |
-| --- | --- | --- | --- |
-| 4,000 tokens | 512 | 12.2 s | 329 |
-| 4,000 tokens | 2,048 | 4.5 s | 883 |
-| 12,000 tokens | 2,048 | 13.6 s | 882 |
-| 12,000 tokens | 4,096 | 9.5 s | 1,258 |
+| Prompt | Chunk | Experts | Time | tok/s |
+| --- | --- | --- | --- | --- |
+| 4,000 tokens | 512 | staged per group | 12.2 s | 329 |
+| 4,000 tokens | 2,048 | staged per group | 4.5 s | 883 |
+| 12,000 tokens | 4,096 | staged per group | 9.5 s | 1,258 |
+| 12,000 tokens | 4,096 | the ring | 7.8 s | 1,531 |
 
-RTX PRO 4000 at 145 W, one session, the experts in RAM. The engine uses 4,096.
+RTX PRO 4000 at 145 W with the card to itself, one session, the experts in RAM; with an RTX 5050 as a second card the ring
+gives the same 7.8 s. The ring groups experts by consecutive ids (some with no rows), staging by the experts routed to: MMQ
+then splits its sums differently, so the two paths round differently (both run the same products on the same blobs).
 
 **Long contexts.** Only the 8 attention layers (and the MTP head's) keep a cache, 9 KiB a position, so the prompt rate falls
 slowly with length and decode stays flat. Five facts planted at 5% to 95% depth in Basalt's own source, asked for

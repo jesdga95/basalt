@@ -78,6 +78,7 @@ core::ExpertTierSpec NemotronModel::tier_spec() const {
     s.claims_per_row = kClaimsPerRow;
     s.victim_half_life = kVictimHalfLife;
     s.share_stride = expert_stride();
+    s.lend_segment = kExpertLendSegment;
     return s;
 }
 

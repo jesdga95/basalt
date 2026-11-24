@@ -64,6 +64,7 @@ constexpr int kMoeGroup = 5;      // rows of one tier lookup: 5 x 22 entries fit
 constexpr int kChunk = 4096;      // rows of a prompt chunk: each restages its layers' experts, so fewer, longer chunks
 constexpr int kGroupRows = 4096;  // the most gathered rows of one group of a prompt chunk's experts
 constexpr int kGroupExperts = 16; // the most experts of one group (a staging half)
+constexpr int kRingRows = 1024;   // a prompt from this long routes to every expert: it borrows the card's room for the ring
 static_assert(kChunk <= kGroupRows, "an expert's rows of a chunk fit one group");
 constexpr int kTypeNvfp4 = 40;
 
@@ -103,10 +104,12 @@ public:
         if (ra_st_) cudaStreamSynchronize(ra_st_);
         if (ra_ev_) cudaEventDestroy(ra_ev_);
         if (ra_st_) cudaStreamDestroy(ra_st_);
+        close_ring();
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
         if (copy_) cudaStreamSynchronize(copy_);
-        for (cudaEvent_t e : {ev_ready_, ev_copied_[0], ev_copied_[1], ev_done_[0], ev_done_[1]})
+        for (cudaEvent_t e : {ev_ready_, ev_copied_[0], ev_copied_[1], ev_done_[0], ev_done_[1], ring_filled_[0], ring_filled_[1],
+                              ring_freed_[0], ring_freed_[1]})
             if (e) cudaEventDestroy(e);
         if (copy_) cudaStreamDestroy(copy_);
         if (stream_) cudaStreamDestroy(stream_);
@@ -222,6 +225,7 @@ public:
             d_gtok_ = (int32_t*) alloc((size_t) rows * 4, ok);
             d_gbounds_ = (int32_t*) alloc((size_t) ng_max * (kGroupExperts + 1) * 4, ok);
             tails_d_ = f((int64_t) 2 * kGroupExperts * 4);
+            ring_tails_ = f((int64_t) 2 * g_.n_expert * 4);
             mxq_ = alloc(mmq::q8_bytes(kGroupRows, L), ok);
             mhq_ = alloc(mmq::q8_bytes(kGroupRows, g_.n_ff_exp), ok);
             hbuf_ = f((int64_t) kGroupRows * g_.n_ff_exp);
@@ -236,7 +240,9 @@ public:
                 ok = false;
             for (int i = 0; i < 2; ++i)
                 if (cudaEventCreateWithFlags(&ev_copied_[i], cudaEventDisableTiming) != cudaSuccess ||
-                    cudaEventCreateWithFlags(&ev_done_[i], cudaEventDisableTiming) != cudaSuccess)
+                    cudaEventCreateWithFlags(&ev_done_[i], cudaEventDisableTiming) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&ring_filled_[i], cudaEventDisableTiming) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&ring_freed_[i], cudaEventDisableTiming) != cudaSuccess)
                     ok = false;
         }
         const auto pin = [&](size_t n) {
@@ -391,21 +397,29 @@ public:
         if (tier_) {
             tier_->forget_use();
             tier_->settle();
+            if (std::max(r.total_tokens, r.n_tokens) >= kRingRows) open_ring();
         }
+        const auto fail = [&](const std::string& e) {
+            close_ring();
+            return model::Result{model::Status::Error, "nemotronh: " + e};
+        };
         for (int t0 = 0; t0 < r.n_tokens; t0 += kChunk) {
             if (r.stop && r.stop()) break;
             const int n = std::min(kChunk, r.n_tokens - t0);
-            if (!run_rows(r.tokens + t0, n, r.pos + t0, false, 0, err)) return {model::Status::Error, "nemotronh: " + err};
+            ring_more_ = t0 + n < r.n_tokens || r.more;
+            if (!run_rows(r.tokens + t0, n, r.pos + t0, false, 0, err)) return fail(err);
             // the head's cache through the chunk's rows but its last (the token after it comes with the next call)
-            if (mtp_on_ && !mtp_flush(r.pos + t0 + n - 1, -1, false, err)) return {model::Status::Error, "nemotronh: " + err};
+            if (mtp_on_ && !mtp_flush(r.pos + t0 + n - 1, -1, false, err)) return fail(err);
             if (r.progress) {
                 cudaStreamSynchronize(stream_);
                 r.progress(t0 + n);
             }
         }
+        if (!r.more) close_ring();
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "nemotronh: the prompt failed"};
         return {};
     }
+    void end_prompt() override { close_ring(); }
 
     size_t running_bytes() const override {
         return mamba_.size() * (sg_.state_floats() + sg_.hist_floats()) * 4 + (mtp_on_ ? (size_t) g_.n_embd * 4 : 0);
@@ -1173,6 +1187,105 @@ private:
         return ok;
     }
 
+    // The expert ring of a long prompt: the tier lends the room of two layers' experts for the prompt (and takes it back,
+    // with the experts it held, at its end); without the room the prompt stages its experts a group at a time.
+    size_t ring_half() const { return (size_t) g_.n_expert * m_.expert_stride(); }
+    void open_ring() {
+        if (ring_ || !tier_) return;
+        if (!tier_->partial_lend() || !tier_->lend(2 * ring_half())) {
+            basalt::log::info("basalt nemotronh", "cannot borrow the expert ring (%.1f GB): the prompt stages its experts a group at a time",
+                              (double) (2 * ring_half()) / 1e9);
+            return;
+        }
+        if (cudaMalloc((void**) &ring_, 2 * ring_half()) != cudaSuccess) {
+            cudaGetLastError();
+            ring_ = nullptr;
+            std::string e;
+            if (!tier_->reclaim(e, /*restore=*/true)) basalt::log::warn("basalt nemotronh", "the expert tier stays small: %s", e.c_str());
+            return;
+        }
+        ring_layer_[0] = ring_layer_[1] = -1;
+        ring_last_ = 1;
+    }
+    void close_ring() {
+        if (!ring_) return;
+        cudaStreamSynchronize(copy_);
+        cudaStreamSynchronize(stream_);
+        cudaFree(ring_);
+        ring_ = nullptr;
+        ring_layer_[0] = ring_layer_[1] = -1;
+        std::string e;
+        if (tier_ && !tier_->reclaim(e, /*restore=*/true)) basalt::log::warn("basalt nemotronh", "the expert tier stays small: %s", e.c_str());
+    }
+    // The MoE layer a prompt chunk runs after layer li: the model's next, then the MTP head's, then (another chunk to come)
+    // the first again; -1 when none.
+    int next_moe(int li) const {
+        const int n = g_.n_layers;
+        if (li < n)
+            for (int l = li + 1; l < n; ++l)
+                if (g_.kind(l) == Kind::Moe) return l;
+        if (li < n && mtp_on_) return n + 1;
+        if (!ring_more_) return -1;
+        for (int l = 0; l < n; ++l)
+            if (g_.kind(l) == Kind::Moe) return l;
+        return -1;
+    }
+    // Every expert of MoE layer li into half h on the copy stream, once the layer before in that half has been read: from
+    // the card's slots, runs of the RAM tier in one strided copy each, a second card, or the pack; then the tails aside.
+    bool fill_ring(int h, int li, std::string& err) {
+        const int tl = m_.layer(li).tier_layer;
+        const size_t stride = m_.expert_stride();
+        const uint64_t blob = lay_.bytes;
+        uint8_t* base = ring_ + (size_t) h * ring_half();
+        cudaStreamWaitEvent(copy_, ring_freed_[h], 0);
+        ring_layer_[h] = li;
+        for (int e = 0; e < g_.n_expert;) {
+            const core::ExpertTier::Source src = tier_->locate(tl, e);
+            uint8_t* dst = base + (size_t) e * stride;
+            if (src.dev) {
+                cudaMemcpyAsync(dst, src.dev, blob, cudaMemcpyDeviceToDevice, copy_);
+                ++e;
+            } else if (src.pinned) {
+                int k = 1;
+                while (e + k < g_.n_expert) {
+                    const core::ExpertTier::Source nx = tier_->locate(tl, e + k);
+                    if (nx.dev || nx.pinned != src.pinned + (size_t) k * blob) break;
+                    ++k;
+                }
+                cudaMemcpy2DAsync(dst, stride, src.pinned, blob, blob, (size_t) k, cudaMemcpyHostToDevice, copy_);
+                e += k;
+            } else if (src.peer) {
+                cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), blob, copy_);
+                ++e;
+            } else {
+                const core::FileRange& er = m_.pack().experts_range;
+                cudaStreamSynchronize(copy_);   // the bounce buffer's last copy has left
+                if (!platform::pread_all(m_.fd(), bounce_, blob, er.offset + m_.pack().experts[(size_t) li].offset + (uint64_t) e * blob)) {
+                    err = "reading an expert from the pack failed";
+                    return false;
+                }
+                cudaMemcpyAsync(dst, bounce_, blob, cudaMemcpyHostToDevice, copy_);
+                ++e;
+            }
+        }
+        tails_aside(base, stride, blob, g_.n_expert, ring_tails_ + (size_t) h * g_.n_expert * 4, copy_);
+        cudaEventRecord(ring_filled_[h], copy_);
+        return true;
+    }
+    // The half MoE layer li runs from (filled now unless the layer before filled it), and the next MoE layer's fill into
+    // the other half, which runs while this one computes.
+    int ring_slot(int li, std::string& err) {
+        int h = ring_layer_[0] == li ? 0 : ring_layer_[1] == li ? 1 : -1;
+        if (h < 0) {
+            h = 1 - ring_last_;
+            if (!fill_ring(h, li, err)) return -1;
+        }
+        ring_last_ = h;
+        const int nx = next_moe(li);
+        if (nx >= 0 && nx != li && ring_layer_[1 - h] != nx && !fill_ring(1 - h, nx, err)) return -1;
+        return h;
+    }
+
     // A prompt chunk's routed experts on the int8 tensor cores (llama.cpp's MMQ over the NVFP4 blobs, q8_1 activations):
     // every expert its rows route to, in groups of up to kGroupExperts.  A group's blobs are copied (from a card slot, the
     // RAM tier or the pack) into one of two staging halves on the copy stream while the group before computes, at one
@@ -1201,9 +1314,13 @@ private:
             }
             by[(size_t) e].push_back((int32_t) r);
         }
+        // with the ring every expert is in order (a group is a run of ids, those without rows empty), else the routed ones
+        const int li = (int) (&L - &m_.layer(0));
+        const int slot = ring_ ? ring_slot(li, err) : -1;
+        if (ring_ && slot < 0) return false;
         std::vector<int> order;
         for (int e = 0; e < g_.n_expert; ++e)
-            if (!by[(size_t) e].empty()) order.push_back(e);
+            if (slot >= 0 || !by[(size_t) e].empty()) order.push_back(e);
         // the host tables of every group, uploaded once: a gathered row's token, each group's relative row bounds
         int32_t* gtok = h_gtok_;
         int32_t* gb = h_gbounds_;
@@ -1267,13 +1384,14 @@ private:
             cudaEventRecord(ev_copied_[h], copy_);
             return true;
         };
-        if (ng > 0 && !stage(0)) {
+        if (slot < 0 && ng > 0 && !stage(0)) {
             err = "reading an expert from the pack failed";
             return false;
         }
+        if (slot >= 0) cudaStreamWaitEvent(stream_, ring_filled_[slot], 0);
         for (int gi = 0; gi < ng; ++gi) {
             const int h = gi & 1, n = g_n[(size_t) gi];
-            if (gi + 1 < ng && !stage(gi + 1)) {   // the next group's copies go out while this one runs
+            if (slot < 0 && gi + 1 < ng && !stage(gi + 1)) {   // the next group's copies go out while this one runs
                 err = "reading an expert from the pack failed";
                 return false;
             }
@@ -1282,9 +1400,14 @@ private:
             const int64_t rows = bh[n];
             int64_t maxr = 0;
             for (int j = 0; j < n; ++j) maxr = std::max<int64_t>(maxr, bh[j + 1] - bh[j]);
-            const uint8_t* base = stage_ + (size_t) h * kGroupExperts * stride;
+            if (rows == 0) continue;   // a run of the ring's experts no row chose
+            const int e0 = order[(size_t) g_first[(size_t) gi]];
+            const uint8_t* base = slot >= 0 ? ring_ + (size_t) slot * ring_half() + (size_t) e0 * stride
+                                            : stage_ + (size_t) h * kGroupExperts * stride;
+            const float* tails = slot >= 0 ? ring_tails_ + ((size_t) slot * g_.n_expert + (size_t) e0) * 4
+                                           : tails_d_ + (size_t) h * kGroupExperts * 4;
             mmq::quantize(lat_, d_gtok_ + g_row0[(size_t) gi], mxq_, kTypeNvfp4, Ln, Ln, rows, stream_);
-            cudaStreamWaitEvent(stream_, ev_copied_[h], 0);
+            if (slot < 0) cudaStreamWaitEvent(stream_, ev_copied_[h], 0);
             mmq::Product up;
             up.w = base;
             up.type = kTypeNvfp4;
@@ -1300,7 +1423,7 @@ private:
             up.dst = hbuf_;
             up.ld_dst = FF;
             mmq_->run(up, stream_);
-            relu2_scaled_rows(hbuf_, rows, (int) FF, bounds, n, tails_d_ + (size_t) h * kGroupExperts * 4, stream_);
+            relu2_scaled_rows(hbuf_, rows, (int) FF, bounds, n, tails, stream_);
             mmq::quantize(hbuf_, nullptr, mhq_, kTypeNvfp4, FF, FF, rows, stream_);
             mmq::Product dn = up;
             dn.w = base + lay_.down_off;
@@ -1310,8 +1433,9 @@ private:
             dn.dst = exrows_ + (size_t) g_row0[(size_t) gi] * Ln;
             dn.ld_dst = Ln;
             mmq_->run(dn, stream_);
-            cudaEventRecord(ev_done_[h], stream_);
+            if (slot < 0) cudaEventRecord(ev_done_[h], stream_);
         }
+        if (slot >= 0) cudaEventRecord(ring_freed_[slot], stream_);
         bk::weighted_sum_window(rowtab_d_, rw_, R, (int) K, (int) Ln, latout_, stream_);
         moe_tail(L, R);
         // the host tables are this layer's until the stream has read them
@@ -1475,6 +1599,13 @@ private:
     std::unique_ptr<basalt::prefill::mmq::Context> mmq_;
     cudaStream_t copy_ = nullptr;
     cudaEvent_t ev_ready_ = nullptr, ev_copied_[2] = {}, ev_done_[2] = {};
+    // a long prompt's expert ring: two MoE layers' every expert at e x stride (the card's room the tier lends for the
+    // prompt), the layer each half holds, their tails; a half is filled on the copy stream while the other computes
+    uint8_t* ring_ = nullptr;
+    float* ring_tails_ = nullptr;
+    int ring_layer_[2] = {-1, -1}, ring_last_ = 1;
+    bool ring_more_ = false;   // another chunk of this prompt follows: the last MoE layer fills the first's half
+    cudaEvent_t ring_filled_[2] = {}, ring_freed_[2] = {};
     std::shared_ptr<core::ExpertTier> tier_;
     float *h_rows_ = nullptr, *d_rows_ = nullptr, *h_x_ = nullptr, *d_x_ = nullptr;   // the CPU's rows and its input (mapped)
     // the last window, until the next call says how many of its rows were kept

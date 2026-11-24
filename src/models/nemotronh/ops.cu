@@ -49,6 +49,17 @@ void relu2_scaled_rows(float* h, int64_t rows, int n, const int32_t* bounds, int
     relu2_scaled_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(h, rows, n, bounds, n_experts, tails);
 }
 
+__global__ void tails_aside_kernel(uint8_t* blobs, size_t stride, uint64_t blob, float* tails) {
+    uint8_t* b = blobs + (size_t) blockIdx.x * stride;
+    if (threadIdx.x < 4) tails[(size_t) blockIdx.x * 4 + threadIdx.x] = ((const float*) (b + blob - 16))[threadIdx.x];
+    __syncthreads();
+    for (size_t i = blob - 16 + threadIdx.x; i < stride; i += blockDim.x) b[i] = 0;
+}
+
+void tails_aside(uint8_t* blobs, size_t stride, uint64_t blob, int n, float* tails, void* stream) {
+    if (n > 0) tails_aside_kernel<<<n, 256, 0, (cudaStream_t) stream>>>(blobs, stride, blob, tails);
+}
+
 void relu2(float* x, int64_t n, void* stream) {
     if (n > 0) relu2_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, n);
 }
