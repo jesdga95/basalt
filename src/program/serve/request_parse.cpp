@@ -1,7 +1,10 @@
 // src/program/serve/request_parse.cpp - request parse operations.
 #include "request.hpp"
+#include "basalt/core/progress.hpp"
 #include "../cli/tokens.hpp"
 #include "logprobs.hpp"
+
+#include <algorithm>
 
 namespace basalt::program::serve {
 
@@ -148,7 +151,17 @@ Flow Request::parse() {
         if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
         else if (gp < ids.size() && gguard->on()) {
             const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
-            if (gguard->scan(done.data(), (int) done.size(), 0) >= 0) {
+            constexpr int kScanChunk = 4096;
+            bool bad = false;
+            for (int off = 0; off < (int) done.size(); off += kScanChunk) {
+                const int n_chunk = (std::min)(kScanChunk, (int) done.size() - off);
+                if (gguard->scan(done.data() + off, n_chunk, 0) >= 0) {
+                    bad = true;
+                    break;
+                }
+                basalt::core::progress_beat();
+            }
+            if (bad) {
                 gerr = "the tokens already generated do not satisfy the grammar";
                 gguard.reset();
             }
