@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 
@@ -32,7 +33,7 @@ bool sync(std::string& error) {
 bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    const auto status = cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
+    const auto status = basalt::core::device_copy(dst, src, bytes, cudaMemcpyDefault);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;

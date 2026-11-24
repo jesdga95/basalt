@@ -3,6 +3,7 @@
 // Built WITHOUT fast math, like fused_gr.cu, so the hc arithmetic below is fused_gr.cu's expressions compiled the
 // same way.  The router part reproduces kernels built WITH fast math (the MMVF GEMV and the native top-10): those
 // operations are spelled out as the flush-to-zero PTX instructions that build emits.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -1197,7 +1198,7 @@ const DevInfo& dev_info() {
             if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
                 std::vector<float> f(NE);
                 for (int e = 0; e < NE; ++e) f[e] = (float) (((e * 389) % NE) / 64.0 - 4.0 + (e % 97 == 0 ? 0.0 : 0.001));
-                d.ok = cudaMemcpy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+                d.ok = basalt::core::device_copy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
             }
             for (int t = 0; t < MAXT && d.ok; ++t)
                 d.ok = cudaFuncSetAttribute(kKernels[0][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&

@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -175,12 +176,12 @@ void Verifier::gs_init() {
     auto down = [&](const void* d, size_t n) {
         full.resize(n);
         const OnDevice on(device_);
-        ok = ok && cudaMemcpy(full.data(), d, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+        ok = ok && basalt::core::device_copy(full.data(), d, n, cudaMemcpyDeviceToHost) == cudaSuccess;
     };
     size_t own_bytes = 0;
     auto up = [&](size_t n, void** dst, int dev) {
         const OnDevice on(dev);
-        ok = ok && cudaMalloc(dst, n) == cudaSuccess && cudaMemcpy(*dst, part.data(), n, cudaMemcpyHostToDevice) == cudaSuccess;
+        ok = ok && cudaMalloc(dst, n) == cudaSuccess && basalt::core::device_copy(*dst, part.data(), n, cudaMemcpyHostToDevice) == cudaSuccess;
         (dev == device_ ? own_bytes : peer_bytes) += n;
     };
     auto rows = [&](const void* d, size_t row_bytes, int64_t n_rows, const std::vector<basalt::core::GdnRun>& runs,
@@ -237,7 +238,7 @@ void Verifier::gs_init() {
         std::vector<uint8_t> mix((size_t) dm_->rings, 0);
         for (int64_t l = lb_; l < le_; ++l) mix[(size_t) (l - lb_)] = is_qsa_layer(g, l) ? 0 : 1;
         ok = ok && cudaMalloc((void**) &gs_mix_, mix.size()) == cudaSuccess &&
-             cudaMemcpy(gs_mix_, mix.data(), mix.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
+             basalt::core::device_copy(gs_mix_, mix.data(), mix.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
              cudaMalloc(&gs_pxq_, dm_->xq_stride) == cudaSuccess;
         // the peer's scratch: per layer qkv, h, gate, beta (kept for its commit); shared x, z, o, yq
         const int64_t MT = max_t_, C1 = sl.c(), Z1 = sl.zv(), V1 = sl.nv();
@@ -273,7 +274,7 @@ void Verifier::gs_init() {
         gs_ca_.state_stride = basalt::core::gdn_slice_state_floats(sl, HIST); gs_ca_.h_stride = per; gs_ca_.gb_stride = per;
         gs_ca_.C = (int) C1; gs_ca_.h_k = HK - nk0; gs_ca_.h_v = (int) V1; gs_ca_.n_layers = (int) nl;
         ok = ok && cudaMalloc((void**) &gs_mixl_, tab.size() * sizeof(tab[0])) == cudaSuccess &&
-             cudaMemcpy(gs_mixl_, tab.data(), tab.size() * sizeof(tab[0]), cudaMemcpyHostToDevice) == cudaSuccess;
+             basalt::core::device_copy(gs_mixl_, tab.data(), tab.size() * sizeof(tab[0]), cudaMemcpyHostToDevice) == cudaSuccess;
     }
     ok = ok && mapped((size_t) dm_->rings * dm_->xq_stride, (void**) &gs_h_xq_, (void**) &gs_m_xq_) &&
          mapped((size_t) dm_->rings * dm_->x_stride * 4, (void**) &gs_h_x_, (void**) &gs_m_x_) &&
@@ -358,23 +359,23 @@ bool Verifier::gs_move(bool to_peer, std::string& err) {
     {
         const OnDevice on(device_);
         ok = cudaStreamSynchronize(cs_) == cudaSuccess && cudaStreamSynchronize(cm_) == cudaSuccess &&
-             cudaMemcpy(full, full_d, full_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+             basalt::core::device_copy(full, full_d, full_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
     }
     if (to_peer) {
         for (size_t i = 0; i < nl; ++i) basalt::core::gdn_slice_state(sl, HIST, full + full_f * i, part + part_f * i);
         const OnDevice on(gs_dev_);
         ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
-             cudaMemcpy(gs_state_, part, part_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+             basalt::core::device_copy(gs_state_, part, part_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
         gs_ss_ = ss_;
     } else {
         {
             const OnDevice on(gs_dev_);
             ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
-                 cudaMemcpy(part, gs_state_, part_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+                 basalt::core::device_copy(part, gs_state_, part_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         for (size_t i = 0; i < nl; ++i) basalt::core::gdn_unslice_state(sl, HIST, part + part_f * i, full + full_f * i);
         const OnDevice on(device_);
-        ok = ok && cudaMemcpy(full_d, full, full_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+        ok = ok && basalt::core::device_copy(full_d, full, full_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
     }
     if (!ok) {
         err = std::string("verify: the GDN state slice did not move: ") + cudaGetErrorString(cudaGetLastError());

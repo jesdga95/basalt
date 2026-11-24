@@ -1,4 +1,5 @@
 // src/models/qwen4exp/decode/kv_arena.cpp - the elastic KV pools.  Read the header first.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 #include "basalt/core/vmm.hpp"
 
@@ -108,7 +109,7 @@ bool KvArena::map(int64_t cells, std::string& err) {
             a.extents.push_back({at, end - at, h});
             const uint64_t have = at < a.contents.size() ? std::min<uint64_t>(end - at, a.contents.size() - at) : 0;
             if (cudaMemset(a.base + at, 0, (size_t) (end - at)) != cudaSuccess ||
-                (have > 0 && cudaMemcpy(a.base + at, a.contents.data() + at, (size_t) have, cudaMemcpyHostToDevice) != cudaSuccess)) {
+                (have > 0 && basalt::core::device_copy(a.base + at, a.contents.data() + at, (size_t) have, cudaMemcpyHostToDevice) != cudaSuccess)) {
                 recount();
                 err = std::string("zeroing new KV pages failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;

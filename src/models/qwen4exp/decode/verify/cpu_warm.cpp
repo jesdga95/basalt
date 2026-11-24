@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "cpu_warm.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
@@ -150,7 +151,7 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
     for (int64_t l = 0; l < L; ++l) {
         const WeightRef* w = LayerView(wt, l).get("ffn_gate_inp.weight");
         if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) return false;
-        if (cudaMemcpy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault) != cudaSuccess) {
+        if (basalt::core::device_copy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault) != cudaSuccess) {
             cudaGetLastError();
             return false;
         }
@@ -186,8 +187,8 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
 // The peer warm-up's predictor rows (router_codes' int8 ones) on the current device.
 bool warm_router(const std::vector<int8_t>& q, const std::vector<float>& sc, int8_t** rq, float** rs) {
     if (cudaMalloc((void**) rq, q.size()) != cudaSuccess || cudaMalloc((void**) rs, sc.size() * 4) != cudaSuccess ||
-        cudaMemcpy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(*rs, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        basalt::core::device_copy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+        basalt::core::device_copy(*rs, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaGetLastError();
         if (*rq) cudaFree(*rq);
         if (*rs) cudaFree(*rs);

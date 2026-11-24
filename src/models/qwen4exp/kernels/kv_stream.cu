@@ -1,4 +1,5 @@
 // src/models/qwen4exp/kernels/kv_stream.cu - see include/basalt/models/qwen4exp/kernels/kv_stream.hpp.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
@@ -322,7 +323,7 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     int32_t c[kKvCtlInts] = {};
     KvStreamCounters r;
-    if (m.ctl == nullptr || cudaMemcpy(c, m.ctl, sizeof(c), cudaMemcpyDeviceToHost) != cudaSuccess) return r;
+    if (m.ctl == nullptr || basalt::core::device_copy(c, m.ctl, sizeof(c), cudaMemcpyDeviceToHost) != cudaSuccess) return r;
     const unsigned long long* u = reinterpret_cast<const unsigned long long*>(c + 4);
     r.misses = u[0];
     r.lookups = u[1];

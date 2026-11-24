@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/probe_peer.cpp - the peer path `PROBE rates` measures: dec_moe_parity's host-rung rings on a
 // small synthetic expert set on the peer card, so no tier's residency or cache is read or written.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/program/probe_rates.hpp"
 
@@ -50,8 +51,8 @@ public:
                 pt[(size_t) e] = (unsigned long long) ((uint8_t*) blob.p + (size_t) e * L.bytes);
             ok = cudaMemset(blob.p, 0, L.bytes * kExperts) == cudaSuccess &&
                  cudaMemset(scr.p, 0, K::dec_moe_peer_scratch_bytes((int) f.n_embd, (int) f.n_ff)) == cudaSuccess &&
-                 cudaMemcpy(ptab.p, pt.data(), nexp * 8, cudaMemcpyHostToDevice) == cudaSuccess &&
-                 cudaMemcpy(lay.p, &L, sizeof L, cudaMemcpyHostToDevice) == cudaSuccess;
+                 basalt::core::device_copy(ptab.p, pt.data(), nexp * 8, cudaMemcpyHostToDevice) == cudaSuccess &&
+                 basalt::core::device_copy(lay.p, &L, sizeof L, cudaMemcpyHostToDevice) == cudaSuccess;
         }
         const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
         ok = ok && ring_buf.alloc(sizeof(K::DmRing) * kRings + 256, fl) && xq.alloc(xq_stride * kRings + 256, fl) &&

@@ -1,4 +1,5 @@
 // src/dense/model.cpp - the dense stack's shared scratch and geometry checks.
+#include "basalt/core/device_copy.hpp"
 #include "internal.hpp"
 
 #include "basalt/kernels/gdn_prompt.hpp"
@@ -176,7 +177,7 @@ bool decode_drafter(Model& m, std::string& err) {
         void* w = const_cast<void*>(l.w);
         const int rows = l.rows, cols = l.cols;
         steps.push_back([=](void* tmp) {
-            if (cudaMemcpy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+            if (basalt::core::device_copy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
             kernels::wgemm::q8_planes(tmp, rows, cols, w, nullptr);
             return cudaDeviceSynchronize() == cudaSuccess;
         });
@@ -210,7 +211,7 @@ bool decode_drafter(Model& m, std::string& err) {
         void* w = const_cast<void*>(l.w);
         const int rows = l.rows, cols = l.cols;
         steps.push_back([=](void* tmp) {
-            if (cudaMemcpy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+            if (basalt::core::device_copy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
             kernels::nvfp4p::from_q8(tmp, rows, cols, w, (float*) sc, nullptr);
             return cudaDeviceSynchronize() == cudaSuccess;
         });

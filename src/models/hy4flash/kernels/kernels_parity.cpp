@@ -1,6 +1,7 @@
 // src/models/hy4flash/kernels/kernels_parity.cpp - the Hy4-flash decode kernels against plain CPU references (double
 // accumulation) at the model's geometry: the identity hyper-connections, the per-head Q8_0 products, the MLA
 // preparation and attention with a sink, the router and the Engram apply. Exit 77 without a GPU.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/router.hpp"
@@ -36,12 +37,12 @@ std::vector<float> randn(size_t n, float s = 1.f) {
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
-    cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return p;
 }
 template <class T> std::vector<T> host(const T* d, size_t n) {
     std::vector<T> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 float* devf(size_t n) {
@@ -772,7 +773,7 @@ void test_select_long() {
             for (int r = 0; r < 8; ++r) m8.insert(m8.end(), {NP, NP * P, tail_n});
             int32_t* dm8 = dev(m8);
             float* ds8 = devf((size_t) 8 * NP);
-            for (int r = 0; r < 8; ++r) cudaMemcpy(ds8 + (size_t) r * NP, ds, (size_t) NP * 4, cudaMemcpyDeviceToDevice);
+            for (int r = 0; r < 8; ++r) basalt::core::device_copy(ds8 + (size_t) r * NP, ds, (size_t) NP * 4, cudaMemcpyDeviceToDevice);
             int32_t* dc8 = nullptr;
             cudaMalloc(&dc8, (size_t) 8 * cs * 4);
             idx_select(ds, NP, K, P, NP * P, tail_n, d1, nullptr);
@@ -1103,7 +1104,7 @@ void test_read_ahead() {
     cudaMemset(mark, 0, 8);
     wait_word_mark(d_word, 7, mark, st);
     std::vector<uint32_t> m0(2);
-    cudaMemcpy(m0.data(), mark, 8, cudaMemcpyDeviceToHost);   // another stream: the wait is still holding its own
+    basalt::core::device_copy(m0.data(), mark, 8, cudaMemcpyDeviceToHost);   // another stream: the wait is still holding its own
     const bool held = cudaStreamQuery(st) == cudaErrorNotReady && m0[0] == 0;
     *(volatile uint32_t*) h_word = 7;
     cudaStreamSynchronize(st);
@@ -1277,7 +1278,7 @@ void test_mmq_dense() {
     cudaMalloc(&ident, R * 4);
     mmq::iota(ident, R, nullptr);
     const int32_t b[2] = {0, R};
-    cudaMemcpy(bounds, b, 8, cudaMemcpyHostToDevice);
+    basalt::core::device_copy(bounds, b, 8, cudaMemcpyHostToDevice);
     mmq::load(8, rows);
     mmq::quantize(dx, nullptr, xq, 8, K, K, R, nullptr);
     mmq::Product p;

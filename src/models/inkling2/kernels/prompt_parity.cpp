@@ -5,6 +5,7 @@
 // against native_expert_grouped, and the NVFP4 experts on the FP4 tensor cores (moe_fp4, activations as two FP4 terms)
 // against a CPU reference that rounds the activations the same way. Rows are checked for not depending on the chunk's width or their place in it, and timed.
 // Exit 77 without a GPU.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
@@ -54,12 +55,12 @@ std::vector<float> randn(size_t n, float s = 1.f, float mean = 0.f) {
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
-    cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return p;
 }
 template <class T> std::vector<T> host(const T* d, size_t n) {
     std::vector<T> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 template <class T> T* zeros(size_t n) {

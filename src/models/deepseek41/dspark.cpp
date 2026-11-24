@@ -3,6 +3,7 @@
 // experts, the latent rotation and the Markov and confidence heads are in dspark_kernels.cu.
 //
 // The stage structure follows llama.cpp's DeepSeek-V4.1 DSpark graph (MIT, Copyright (c) 2023-2026 The ggml authors).
+#include "basalt/core/device_copy.hpp"
 #include "models/deepseek41/dspark.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
@@ -180,7 +181,7 @@ struct DsparkDrafter::Impl {
 
     bool upload(const void* src, size_t bytes, void** dst, size_t pad = 0) {
         if (bytes == 0 || !alloc(dst, bytes + pad)) return false;
-        return cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        return basalt::core::device_copy(*dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
     }
 
     bool load(const core::FileRange& section, const std::string& ranking, int keep, std::string& err) {
@@ -412,7 +413,7 @@ struct DsparkDrafter::Impl {
         {
             std::vector<float> rows((size_t) 4 * (kT - 1) * kN);
             for (size_t r = 0; r < (size_t) 4 * (kT - 1); ++r) std::memcpy(rows.data() + r * kN, mask_emb.data(), (size_t) kN * 4);
-            if (cudaMemcpy(x_mask, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (basalt::core::device_copy(x_mask, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "dspark: cannot upload the mask rows";
                 return false;
             }
