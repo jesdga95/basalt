@@ -61,6 +61,7 @@ public:
             const uint64_t identity = basalt::core::conversation_store_hash_file(
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;
+            disk.set_row_cells(session().disk_row_cells());
             if (o.prompt_cache <= 0) {
                 basalt::log::warn("basalt serve", "conversation cache on disk off: --prompt-cache 0");
             } else if (!disk.open(o.conversation_cache_dir, identity, (uint64_t) o.conversation_cache_disk_mib << 20, de)) {
@@ -270,8 +271,8 @@ public:
         image.cvec = cvec;
         return true;
     }
-    // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
-    // session goes on holding it (`kept`) and only the disk lacks it.
+    // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no RAM tier or
+    // no room in it.
     bool park_current(size_t held, int64_t kept) override {
         ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
@@ -279,10 +280,16 @@ public:
         int64_t deepest = 0;
         for (const ConvCheckpoint& c : checks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
         const bool disk_wants = disk.enabled() && !(kept > 0 && kept >= deepest) && !disk_has(live, live_imgs, checks, cvec_cached);
-        bool to_disk = !conversations->enabled() || kept > 0;
+        bool to_disk = !conversations->enabled();
         if (to_disk && !disk_wants) return true;
+        if (!to_disk)
+            if (const size_t dropped = conversations->drop_superseded(live, live_imgs, checks, cvec_cached))
+                basalt::log::info("basalt serve", "conversation cache: dropped %zu superseded cop%s of this "
+                                  "conversation; parked=%zu", dropped, dropped == 1 ? "y" : "ies", conversations->size());
         const int64_t positions = (int64_t) live.size();
-        const size_t estimate = session().running_bytes() + session().cells_bytes(positions);
+        size_t estimate = session().running_bytes() + session().cells_bytes(positions) +
+                          live.size() * sizeof(int32_t) + live_imgs.size() * sizeof(ImgKey);
+        for (const ConvCheckpoint& c : checks) estimate += c.bytes();
         const bool ram_room = !to_disk && conversations->make_room(estimate, held);
         if (!to_disk && !ram_room && disk_wants) to_disk = true;
         if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
