@@ -914,6 +914,8 @@ public:
         return ctxp::cache_bytes(positions, sparse, fp8()) * (f32() ? 2 : 1);
     }
 
+    int64_t disk_row_cells() const override { return g_.idx_pool; }
+
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
         cudaStreamSynchronize(stream_);
@@ -923,7 +925,7 @@ public:
             if (g_.swa[(size_t) l]) continue;
             core::ConversationKv k;
             k.format = cell_format();
-            k.page_size = g_.idx_pool;
+            k.page_size = 1;
             k.cells = positions;
             k.pooled_rows = (int64_t) pools;
             k.idx_dim = g_.idx_dim;
@@ -943,10 +945,12 @@ public:
         std::string e;
         if (!ensure_positions(positions, e)) return {model::Status::Error, "hy4flash: " + e};
         cudaStreamSynchronize(stream_);
+        const int64_t pools = positions / g_.idx_pool + 1;
         size_t i = 0;
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
-            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != g_.idx_pool || kv[i].cells != positions)
+            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != 1 || kv[i].cells != positions ||
+                kv[i].pooled_rows != pools)
                 return {model::Status::Error, "hy4flash: a parked conversation has other caches"};
             const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) { return cudaMemcpy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });

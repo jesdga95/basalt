@@ -238,6 +238,8 @@ public:
     virtual Result probe_env(program::ProbeEnv& env) { (void) env; return {Status::NotImplemented, "this model has no probe"}; }
     /// Conversations shorter than this are cheaper to read again than to keep on disk.
     virtual int64_t disk_min_tokens() const { return 8192; }
+    /// Positions per pooled indexer row in the conversation disk store (1 when the model has no pooled rows).
+    virtual int64_t disk_row_cells() const { return 1; }
     /// The routed experts of decode so far: `lookups` the main card or the CPU served, `hits` the main card's share of
     /// those, `offloaded` what a bus copy or another card served, `files` those of `lookups`
     /// read from the file.
