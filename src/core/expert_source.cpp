@@ -495,7 +495,8 @@ bool FileExpertSource::pin_cache_complement(
 bool FileExpertSource::plan_cache_complement(
     LoadPlan& load_plan, const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    bool allow_empty) {
     err.clear();
     headroom_bytes = std::max(headroom_bytes, platform::ram_reserve());   // never lock into the reserve
     const auto pin_t0 = std::chrono::steady_clock::now();
@@ -605,9 +606,12 @@ bool FileExpertSource::plan_cache_complement(
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // nothing to keep - the caller's plain mmap fallback, not an empty copy
-            err = "FileExpertSource: the RAM has no room for any expert of the complement";
-            return false;
+        if (what_fits && held == 0) {
+            if (!allow_empty) {   // nothing to keep - the caller's plain mmap fallback, not an empty copy
+                err = "FileExpertSource: the RAM has no room for any expert of the complement";
+                return false;
+            }
+            basalt::log::info("basalt", "FileExpertSource: the complement starts empty for a later top-up");
         }
         basalt::log::info("basalt", "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
                              "not hold, by profile rank; the rest are read from the files",
