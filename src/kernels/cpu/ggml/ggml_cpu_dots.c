@@ -20,18 +20,17 @@
 #error "ggml_cpu_dots.c needs AVX2 and F16C"
 #endif
 
-#if defined(_MSC_VER)
-// MSVC gives the scalar F16C pair no working code of its own: the definitions live in
-// f16c_scalar_msvc.c, compiled without __F16C__ so the compiler does not claim the names as its own
-// intrinsics. #pragma function keeps the calls real, and the prototypes keep them from compiling as
-// implicit declarations, which would pass the float as a double.
-#pragma function(_cvtss_sh, _cvtsh_ss)
-unsigned short _cvtss_sh(float a, const int rounding);
-float _cvtsh_ss(unsigned short a);
-#endif
+// The vector F16C intrinsics also give the scalar conversions inline code in the dot loops.
+static inline float ggml_cpu_fp16_to_fp32(unsigned short x) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) x)));
+}
 
-#define GGML_CPU_FP16_TO_FP32(x) _cvtsh_ss(x)
-#define GGML_CPU_FP32_TO_FP16(x) _cvtss_sh(x, 0)
+static inline unsigned short ggml_cpu_fp32_to_fp16(float x) {
+    return (unsigned short) _mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(x), 0));
+}
+
+#define GGML_CPU_FP16_TO_FP32(x) ggml_cpu_fp16_to_fp32(x)
+#define GGML_CPU_FP32_TO_FP16(x) ggml_cpu_fp32_to_fp16(x)
 #define UNUSED GGML_UNUSED
 
 void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int64_t k);
