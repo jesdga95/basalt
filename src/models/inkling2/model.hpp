@@ -107,7 +107,7 @@ public:
     /// KV's base (core/elastic_kv.hpp).
     bool elastic() const { return elastic_; }
     /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
-    /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
+    /// point at the copies (decode reads them there, a prompt chunk's staging copies from them). Bytes copied.
     uint64_t promote(uint64_t keep_free);
     /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries go back to 0, the CPU
     /// computes them again (on `stream`, which is waited for before the copies are freed). Bytes freed.
@@ -130,10 +130,11 @@ public:
     /// room. False when even no copy at all leaves that much.
     bool resize_reserve(uint64_t free_bytes, void* stream);
     void lend(bool low, void* stream);
-    /// A prompt chunk's staging of layer l's RAM experts: each from its card copy when the elastic spill still holds one,
-    /// from its RAM copy otherwise (false: none has a copy, the caller copies the layer's from RAM). `with_peer`: the second
-    /// card's experts too (all_copied).
-    bool stage_from_card(int l, void* stream, bool with_peer) const;
+    /// A prompt chunk's staging of layer l's RAM experts into their slots: each from its card copy while the elastic spill
+    /// holds one, from RAM otherwise, a run of adjacent slots with no copy in one copy (spill.hpp stage_plan). `want`
+    /// [slot]: only the slots set (null: every one). `with_peer`: the second card's experts' slots too, from their card
+    /// copies (all_copied). False when a copy could not be queued.
+    bool stage(int l, const uint8_t* want, void* stream, bool with_peer) const;
     /// Every expert of layer l that left the card has a copy on it again (the elastic spill): the layer runs on the main card alone.
     bool all_copied(int l) const { return !layer_copies_.empty() && layers_[(size_t) l].n_spill > 0 && layer_copies_[(size_t) l] >= layers_[(size_t) l].n_spill; }
     /// A prompt chunk sends layer l's rows to the second card: it holds experts of the layer that the main card has no copy of.

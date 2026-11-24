@@ -7,6 +7,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/core/shipped_profiles.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
@@ -363,6 +364,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         const basalt::model::ModelDesc desc = adapter->describe(model_gguf);
         g_n_vocab = desc.n_vocab;
         basalt::model::Started started;
+        const basalt::core::GpuLeftRunningExit left_running;
         basalt::model::LoadRequest lreq;
         lreq.paths = o.native_shards;
         lreq.diag_dump = o.diag_dump;
