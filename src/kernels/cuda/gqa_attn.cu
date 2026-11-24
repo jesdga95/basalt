@@ -158,6 +158,9 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 // arithmetic is its own (mma columns and rows never meet, a row keeps its place in its tile), the chunks follow positions
 // and the splits the capacity, so a row's bits are the same at any window width and any NTL.
 template <int HD, bool I8, bool F4, int NTL>
+// Two tiles: warp w takes tile w / 2 and the dims (w % 2) HD / 2 .. of its P V; S, the softmax and P of the tile's rows
+// stay in its registers (the tile's two warps compute them alike), each row's sum taken in the order of the one-tile
+// path's warp sum over the cell index, so a chunk needs two block barriers and the bits are the one-tile path's.
 // (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__;
 // three blocks an SM at head width 128)
 // F4 (with I8): the quantized cache is NVFP4 (KvInt8::fp4), each 8 values from 4 code bytes and their group's scale byte
@@ -337,6 +340,9 @@ __global__ void __launch_bounds__(128, HD == 128 ? 3 : 1)
     for (int j = 0; j < NTL; ++j)
 #pragma unroll
         for (int n = 0; n < NT; ++n) acc[j][n][0] = acc[j][n][1] = acc[j][n][2] = acc[j][n][3] = 0.0f;
+    float acc2[HD / 16][4], rmr[2] = {kNeg, kNeg}, rlr[2] = {0.0f, 0.0f};   // two tiles: a warp's rows g, g + 8 of its tile
+#pragma unroll
+    for (int n = 0; n < HD / 16; ++n) acc2[n][0] = acc2[n][1] = acc2[n][2] = acc2[n][3] = 0.0f;
     for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
         const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
         if (c0 >= hi_max) break;   // past every row's cells
@@ -351,108 +357,216 @@ __global__ void __launch_bounds__(128, HD == 128 ? 3 : 1)
                 staged = true;
             }
         }
-        // S = Q K^T: warp w the cells 8w .. 8w + 7 of each tile
+        if constexpr (NTL == 2) {
+            const int j = warp >> 1, dh = warp & 1;
+            if (c0 < tile_hi[j]) {
+                // S of the tile's 16 rows and the chunk's 32 cells: s[nc] the cells nc 8 .. nc 8 + 7
+                float s[CHUNK / 8][4];
 #pragma unroll
-        for (int job = warp; job < NTL * (CHUNK / 8); job += 4) {
-            const int j = job / (CHUNK / 8), nc = job - j * (CHUNK / 8);
-            if (c0 >= tile_hi[j]) continue;
-            float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int nc = 0; nc < CHUNK / 8; ++nc) s[nc][0] = s[nc][1] = s[nc][2] = s[nc][3] = 0.0f;
 #pragma unroll
-            for (int k = 0; k < HD; k += 16) {
-                unsigned a0, a1, a2, a3, b0, b1;
-                ldsm_x4(a0, a1, a2, a3, &qs[16 * j + (lane & 15)][k + (lane >> 4) * 8]);
-                ldsm_x2(b0, b1, &ks[nc * 8 + (lane & 7)][k + ((lane >> 3) & 1) * 8]);
-                mma16816(s4, a0, a1, a2, a3, b0, b1);
-            }
-            ss[16 * j + g][nc * 8 + 2 * c] = s4[0];
-            ss[16 * j + g][nc * 8 + 2 * c + 1] = s4[1];
-            ss[16 * j + g + 8][nc * 8 + 2 * c] = s4[2];
-            ss[16 * j + g + 8][nc * 8 + 2 * c + 1] = s4[3];
-        }
-        __syncthreads();
-        // each row: the chunk's max over its cells, p = exp2(s - max') there (0 elsewhere), the running {max, sum}
-        for (int i = warp; i < R; i += 4) {
-            if (c0 >= tile_hi[i / 16]) continue;
-            float pv[CHUNK / 32], mx = kNeg;
+                for (int k = 0; k < HD; k += 16) {
+                    unsigned a0, a1, a2, a3;
+                    ldsm_x4(a0, a1, a2, a3, &qs[16 * j + (lane & 15)][k + (lane >> 4) * 8]);
 #pragma unroll
-            for (int u = 0; u < CHUNK / 32; ++u) {
-                const int cc = lane + 32 * u;
-                const int64_t pos = c0 + cc;
-                pv[u] = pos >= rlo[i] && pos < rhi[i] ? ss[i][cc] : -INFINITY;
-                mx = fmaxf(mx, pv[u]);
-            }
+                    for (int nc = 0; nc < CHUNK / 8; ++nc) {
+                        unsigned b0, b1;
+                        ldsm_x2(b0, b1, &ks[nc * 8 + (lane & 7)][k + ((lane >> 3) & 1) * 8]);
+                        mma16816(s[nc], a0, a1, a2, a3, b0, b1);
+                    }
+                }
+                // rows ia (s[..][0..1]) and ib (s[..][2..3]), cell nc 8 + 2 c + e; a row's cells are its quad's
+                const int ia = 16 * j + g, ib = ia + 8;
+                float mxa = kNeg, mxb = kNeg;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-            const float mold = rm[i], mnew = fmaxf(mold, mx);
-            __syncwarp();   // every lane has read rm[i] before lane 0 writes it
-            float l = 0.0f;
+                for (int nc = 0; nc < CHUNK / 8; ++nc)
 #pragma unroll
-            for (int u = 0; u < CHUNK / 32; ++u) {
-                const float p = pv[u] == -INFINITY ? 0.0f : exp2f(pv[u] - mnew);
-                ps[i * PL + lane + 32 * u] = __float2half_rn(p);
-                l += p;
-            }
-            l = warp_sum(l);
-            if (lane == 0) {
-                const float alpha = exp2f(mold - mnew);
-                ra[i] = alpha;
-                rl[i] = fmaf(rl[i], alpha, l);
-                rm[i] = mnew;
-            }
-        }
-        __syncthreads();
-        // O = O alpha + P V: warp w the dims w HD / 4 .. of each tile, a V fragment loaded once for every tile
-        {
-            bool on[NTL];
+                    for (int e = 0; e < 2; ++e) {
+                        const int64_t pos = c0 + nc * 8 + 2 * c + e;
+                        s[nc][e] = pos >= rlo[ia] && pos < rhi[ia] ? s[nc][e] : -INFINITY;
+                        s[nc][2 + e] = pos >= rlo[ib] && pos < rhi[ib] ? s[nc][2 + e] : -INFINITY;
+                        mxa = fmaxf(mxa, s[nc][e]);
+                        mxb = fmaxf(mxb, s[nc][2 + e]);
+                    }
 #pragma unroll
-            for (int j = 0; j < NTL; ++j) {
-                on[j] = c0 < tile_hi[j];
-                if (!on[j]) continue;
-                const float ag = ra[16 * j + g], ag8 = ra[16 * j + g + 8];
+                for (int o = 1; o <= 2; o <<= 1) {
+                    mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, o));
+                    mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, o));
+                }
+                const float mna = fmaxf(rmr[0], mxa), mnb = fmaxf(rmr[1], mxb);
 #pragma unroll
-                for (int n = 0; n < NT; ++n) {
-                    acc[j][n][0] *= ag;
-                    acc[j][n][1] *= ag;
-                    acc[j][n][2] *= ag8;
-                    acc[j][n][3] *= ag8;
+                for (int nc = 0; nc < CHUNK / 8; ++nc)
+#pragma unroll
+                    for (int q4 = 0; q4 < 4; ++q4)
+                        s[nc][q4] = s[nc][q4] == -INFINITY ? 0.0f : exp2f(s[nc][q4] - (q4 < 2 ? mna : mnb));
+                // each row's sum over the cell index's bits 4, 3 (the n blocks), 2, 1 (the quad), 0 (the pair)
+                float l[2];
+#pragma unroll
+                for (int hr = 0; hr < 2; ++hr) {
+                    float w[2];
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const float u0 = s[0][2 * hr + e] + s[2][2 * hr + e], u1 = s[1][2 * hr + e] + s[3][2 * hr + e];
+                        w[e] = u0 + u1;
+                        w[e] += __shfl_xor_sync(0xffffffffu, w[e], 2);
+                        w[e] += __shfl_xor_sync(0xffffffffu, w[e], 1);
+                    }
+                    l[hr] = w[0] + w[1];
+                }
+                const float ala = exp2f(rmr[0] - mna), alb = exp2f(rmr[1] - mnb);
+                rlr[0] = fmaf(rlr[0], ala, l[0]);
+                rlr[1] = fmaf(rlr[1], alb, l[1]);
+                rmr[0] = mna;
+                rmr[1] = mnb;
+#pragma unroll
+                for (int n = 0; n < HD / 16; ++n) {
+                    acc2[n][0] *= ala;
+                    acc2[n][1] *= ala;
+                    acc2[n][2] *= alb;
+                    acc2[n][3] *= alb;
+                }
+                // O = O alpha + P V: P as the A fragments (k step kk the cells 16 kk ..), the warp's half of the dims
+                const auto h2 = [](float lo, float hi) {
+                    const __half2 h = __floats2half2_rn(lo, hi);
+                    return *reinterpret_cast<const unsigned*>(&h);
+                };
+#pragma unroll
+                for (int kk = 0; kk < CHUNK / 16; ++kk) {
+                    const unsigned a0 = h2(s[2 * kk][0], s[2 * kk][1]), a1 = h2(s[2 * kk][2], s[2 * kk][3]);
+                    const unsigned a2 = h2(s[2 * kk + 1][0], s[2 * kk + 1][1]), a3 = h2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+#pragma unroll
+                    for (int n = 0; n < HD / 16; ++n) {
+                        unsigned b0, b1;
+                        ldsm_x2_t(b0, b1, &vs[kk * 16 + (lane & 15)][dh * (HD / 2) + n * 8]);
+                        mma16816(acc2[n], a0, a1, a2, a3, b0, b1);
+                    }
                 }
             }
+        } else {
+            // S = Q K^T: warp w the cells 8w .. 8w + 7 of each tile
 #pragma unroll
-            for (int kk = 0; kk < CHUNK; kk += 16) {
-                unsigned a[NTL][4];
+            for (int job = warp; job < NTL * (CHUNK / 8); job += 4) {
+                const int j = job / (CHUNK / 8), nc = job - j * (CHUNK / 8);
+                if (c0 >= tile_hi[j]) continue;
+                float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-                for (int j = 0; j < NTL; ++j)
-                    if (on[j]) ldsm_x4(a[j][0], a[j][1], a[j][2], a[j][3], &ps[(16 * j + (lane & 15)) * PL + kk + (lane >> 4) * 8]);
+                for (int k = 0; k < HD; k += 16) {
+                    unsigned a0, a1, a2, a3, b0, b1;
+                    ldsm_x4(a0, a1, a2, a3, &qs[16 * j + (lane & 15)][k + (lane >> 4) * 8]);
+                    ldsm_x2(b0, b1, &ks[nc * 8 + (lane & 7)][k + ((lane >> 3) & 1) * 8]);
+                    mma16816(s4, a0, a1, a2, a3, b0, b1);
+                }
+                ss[16 * j + g][nc * 8 + 2 * c] = s4[0];
+                ss[16 * j + g][nc * 8 + 2 * c + 1] = s4[1];
+                ss[16 * j + g + 8][nc * 8 + 2 * c] = s4[2];
+                ss[16 * j + g + 8][nc * 8 + 2 * c + 1] = s4[3];
+            }
+            __syncthreads();
+            // each row: the chunk's max over its cells, p = exp2(s - max') there (0 elsewhere), the running {max, sum}
+            for (int i = warp; i < R; i += 4) {
+                if (c0 >= tile_hi[i / 16]) continue;
+                float pv[CHUNK / 32], mx = kNeg;
 #pragma unroll
-                for (int n = 0; n < NT; ++n) {
-                    unsigned b0, b1;
-                    ldsm_x2_t(b0, b1, &vs[kk + (lane & 15)][warp * (HD / 4) + n * 8]);
+                for (int u = 0; u < CHUNK / 32; ++u) {
+                    const int cc = lane + 32 * u;
+                    const int64_t pos = c0 + cc;
+                    pv[u] = pos >= rlo[i] && pos < rhi[i] ? ss[i][cc] : -INFINITY;
+                    mx = fmaxf(mx, pv[u]);
+                }
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                const float mold = rm[i], mnew = fmaxf(mold, mx);
+                __syncwarp();   // every lane has read rm[i] before lane 0 writes it
+                float l = 0.0f;
+#pragma unroll
+                for (int u = 0; u < CHUNK / 32; ++u) {
+                    const float p = pv[u] == -INFINITY ? 0.0f : exp2f(pv[u] - mnew);
+                    ps[i * PL + lane + 32 * u] = __float2half_rn(p);
+                    l += p;
+                }
+                l = warp_sum(l);
+                if (lane == 0) {
+                    const float alpha = exp2f(mold - mnew);
+                    ra[i] = alpha;
+                    rl[i] = fmaf(rl[i], alpha, l);
+                    rm[i] = mnew;
+                }
+            }
+            __syncthreads();
+            // O = O alpha + P V: warp w the dims w HD / 4 .. of each tile, a V fragment loaded once for every tile
+            {
+                bool on[NTL];
+#pragma unroll
+                for (int j = 0; j < NTL; ++j) {
+                    on[j] = c0 < tile_hi[j];
+                    if (!on[j]) continue;
+                    const float ag = ra[16 * j + g], ag8 = ra[16 * j + g + 8];
+#pragma unroll
+                    for (int n = 0; n < NT; ++n) {
+                        acc[j][n][0] *= ag;
+                        acc[j][n][1] *= ag;
+                        acc[j][n][2] *= ag8;
+                        acc[j][n][3] *= ag8;
+                    }
+                }
+#pragma unroll
+                for (int kk = 0; kk < CHUNK; kk += 16) {
+                    unsigned a[NTL][4];
 #pragma unroll
                     for (int j = 0; j < NTL; ++j)
-                        if (on[j]) mma16816(acc[j][n], a[j][0], a[j][1], a[j][2], a[j][3], b0, b1);
+                        if (on[j])
+                            ldsm_x4(a[j][0], a[j][1], a[j][2], a[j][3], &ps[(16 * j + (lane & 15)) * PL + kk + (lane >> 4) * 8]);
+#pragma unroll
+                    for (int n = 0; n < NT; ++n) {
+                        unsigned b0, b1;
+                        ldsm_x2_t(b0, b1, &vs[kk + (lane & 15)][warp * (HD / 4) + n * 8]);
+#pragma unroll
+                        for (int j = 0; j < NTL; ++j)
+                            if (on[j]) mma16816(acc[j][n], a[j][0], a[j][1], a[j][2], a[j][3], b0, b1);
+                    }
                 }
             }
         }
         __syncthreads();   // the shared tiles are free for the next chunk
     }
-#pragma unroll
-    for (int j = 0; j < NTL; ++j)
+    if constexpr (NTL == 2) {
+        const int j = warp >> 1, dh = warp & 1;
 #pragma unroll
         for (int hr = 0; hr < 2; ++hr) {
-            const int i = 16 * j + g + 8 * hr, m = m0 + i;
+            const int m = m0 + 16 * j + g + 8 * hr;
             if (m >= M) continue;
             float* out = part + (((int64_t) (m / G) * n_head + (int64_t) kvh * G + m % G) * gx + blockIdx.x) * (HD + 2);
-            if (warp == 0 && c == 0) {
-                out[0] = rm[i];
-                out[1] = rl[i];
+            if (dh == 0 && c == 0) {
+                out[0] = rmr[hr];
+                out[1] = rlr[hr];
             }
 #pragma unroll
-            for (int n = 0; n < NT; ++n) {
-                const int d = warp * (HD / 4) + n * 8 + 2 * c;
-                out[2 + d] = acc[j][n][2 * hr];
-                out[3 + d] = acc[j][n][2 * hr + 1];
+            for (int n = 0; n < HD / 16; ++n) {
+                const int d = dh * (HD / 2) + n * 8 + 2 * c;
+                out[2 + d] = acc2[n][2 * hr];
+                out[3 + d] = acc2[n][2 * hr + 1];
             }
         }
+    } else {
+#pragma unroll
+        for (int j = 0; j < NTL; ++j)
+#pragma unroll
+            for (int hr = 0; hr < 2; ++hr) {
+                const int i = 16 * j + g + 8 * hr, m = m0 + i;
+                if (m >= M) continue;
+                float* out = part + (((int64_t) (m / G) * n_head + (int64_t) kvh * G + m % G) * gx + blockIdx.x) * (HD + 2);
+                if (warp == 0 && c == 0) {
+                    out[0] = rm[i];
+                    out[1] = rl[i];
+                }
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const int d = warp * (HD / 4) + n * 8 + 2 * c;
+                    out[2 + d] = acc[j][n][2 * hr];
+                    out[3 + d] = acc[j][n][2 * hr + 1];
+                }
+            }
+    }
 }
 
 // segs.n and segs.row0 set: the blocks' tiles from the rows, then both kernels over every segment.  At head width 128 a
