@@ -24,8 +24,9 @@ void free_host(uint8_t* ptr, uint64_t mapped);
 uint8_t* reserve(uint64_t bytes);
 void release_range(uint8_t* va, uint64_t bytes);
 /// Backs `[va, va + bytes)` with a new physical allocation on the current device, readable and writable by it.
-/// Returns the handle (0 on failure: nothing is left mapped).
-unsigned long long map(uint8_t* va, uint64_t bytes);
+/// Returns the handle (0 on failure). `out_of_memory`, when given, is set when the failure was the device lacking the
+/// memory and nothing was allocated or mapped; any other failure may leave the range in an unknown state.
+unsigned long long map(uint8_t* va, uint64_t bytes, bool* out_of_memory = nullptr);
 /// Unmaps what `map` mapped there and frees its physical memory.  The caller has made sure no work reads it.
 bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// A physical allocation of `bytes` on the current device, mapped nowhere yet (0 on failure): one backing that

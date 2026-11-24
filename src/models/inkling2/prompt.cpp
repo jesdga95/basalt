@@ -155,6 +155,8 @@ class Prompt final : public PromptRunner {
 public:
     Prompt(InklingModel& m, cudaStream_t s) : m_(m), g_(m.geo()) { lane_[0].stream = s; }
     ~Prompt() override {   // every read synced its streams before it returned
+        // the copies decode keeps in the arena go back to RAM; an upload into it that may still run keeps the arena
+        if (m_.has_spill() && m_.cards() == 1 && !m_.set_prompt_arena(nullptr, 0)) return;
         for (cudaEvent_t& e : done_)
             if (e) cudaEventDestroy(e);
         for (int i = lanes() - 1; i >= 0; --i) {
@@ -270,6 +272,10 @@ public:
         cudaMemsetAsync(b().tok, 0, pair_bytes, strm());
         cudaMemsetAsync(b().dst, 0, pair_bytes, strm());
         cudaMemsetAsync(b().exp, 0, pair_bytes, strm());
+        // the arena before `ident` (the one buffer set once) is scratch outside a prompt: decode may keep expert copies there
+        // (InklingModel::set_prompt_arena); not under gpu-mode peer, which reads the zeros above
+        if (cur_ == 0 && m_.has_spill() && m_.cards() == 1 && m_.peer_device() < 0)
+            m_.set_prompt_arena(static_cast<uint8_t*>(lane().mem), (uint64_t) (reinterpret_cast<uint8_t*>(b().ident) - static_cast<uint8_t*>(lane().mem)));
         // the products' tiles
         const int E = g_.n_embd, F = g_.n_ff_exp;
         const auto ready = [&](int type, int64_t rows) {
@@ -294,18 +300,19 @@ public:
     }
 
     model::Result read(const model::PrefillRequest& r, std::vector<int32_t>& hist, const std::vector<VisitCache>& caches,
-                       DsparkHook& dspark, void* stream) override {
+                       DsparkHook& dspark, void* stream, const Prepare& prepare) override {
         bind(caches, dspark, stream);
-        return run(r.tokens, nullptr, r.n_tokens, r.pos, r, hist, 0);
+        return run(r.tokens, nullptr, r.n_tokens, r.pos, r, hist, 0, prepare);
     }
 
     model::Result read_rows(const float* rows, int n, int64_t pos, int32_t pad, std::vector<int32_t>& hist,
-                            const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream) override {
+                            const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream,
+                            const Prepare& prepare) override {
         bind(caches, dspark, stream);
         model::PrefillRequest r;
         r.n_tokens = n;
         r.pos = pos;
-        return run(nullptr, rows, n, pos, r, hist, pad);
+        return run(nullptr, rows, n, pos, r, hist, pad, prepare);
     }
 
 private:
@@ -362,7 +369,7 @@ private:
     // which reports a chunk once the card has run it. A read that ends any other way than its final wait (an error, an
     // exception) runs out its streams first (drain).
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
-                      std::vector<int32_t>& hist, int32_t pad) {
+                      std::vector<int32_t>& hist, int32_t pad, const Prepare& prepare) {
         struct Guard {
             Prompt* p;
             bool armed = true;
@@ -376,6 +383,8 @@ private:
         int reported = 0, k = 0;
         for (int t0 = 0; t0 < n; t0 += per, ++k) {
             if (r.stop && r.stop()) break;
+            if (k == 0 && prepare && (!prepare() || m_.wedged() || m_.loaned() > 0))
+                return {model::Status::Error, "inkling2: the prompt path's memory could not be taken back"};
             const int rows = std::min(per, n - t0);
             if (!chunk(tokens ? tokens + t0 : nullptr, emb ? emb + (size_t) t0 * g_.n_embd : nullptr, rows, pos + t0, err))
                 return {model::Status::Error, "inkling2: " + err};
