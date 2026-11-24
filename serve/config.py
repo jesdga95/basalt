@@ -628,6 +628,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded; load on first request; a sidecar image encoder is dropped, --vision dynamic stays")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")
+    ap.add_argument("--model-cache-mib", type=int, default=0, metavar="MIB",
+                    help="park a model the router switches away from in RAM, up to this many MiB across all parked "
+                         "models (least recently used out first), so switching back is a RAM copy and not a load from the "
+                         "SSD; 0 = off (Linux; the driver suspends the engine's GPU state)")
     ap.add_argument("--idle-sleep", type=float, default=None, metavar="SECONDS",
                     help="put the model to sleep after this many seconds without requests: its VRAM is freed, its RAM "
                          "copy, conversations and learned expert placement stay, and the next request wakes it in a few "

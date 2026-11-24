@@ -312,6 +312,7 @@ private:
                 const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
                 if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
                 const int in = n_cols * 256;
+                if (!(ffn_ && ffn_->dense_rows(kvw->ptr, kvw->type, (int) (5 * n), in, rows_all_, T, kv_dev_, st)))
                 for (int t0 = 0; t0 < T; t0 += 8) {
                     const int nc = std::min(8, T - t0);
                     dense_f32(*kvw, rows_all_ + (size_t) t0 * in, q8_, kv_dev_ + (size_t) t0 * 5 * n, in,

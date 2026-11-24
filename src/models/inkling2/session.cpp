@@ -416,7 +416,9 @@ public:
             if (last && r.logits)
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
-        return end_call("the window failed");
+        const model::Result done = end_call("the window failed");
+        if (done.ok()) m_.warm_up();
+        return done;
     }
 
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
@@ -444,7 +446,11 @@ protected:
         return true;
     }
     bool batch_end(std::optional<cudaError_t> synced) override {
-        if (synced) return complete(*synced);
+        if (synced) {
+            const bool kept = complete(*synced);
+            if (kept && *synced == cudaSuccess) m_.warm_up();
+            return kept;
+        }
         release();
         return false;
     }
@@ -577,7 +583,7 @@ public:
     // copies to resize: refused unless the card already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
         cudaStreamSynchronize(stream_);
-        const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20, stream_);
+        const bool fits = m_.resize_reserve((mib < 0 ? m_.asked_reserve() : (uint64_t) mib << 20), stream_);
         expert_slots = m_.elastic() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
         if (!fits) return {model::Status::Error, "inkling2: the card cannot leave " + std::to_string(mib) + " MiB free: the experts it holds are not copies"};
         return {};
@@ -1024,7 +1030,11 @@ private:
         ra.gate = bk::RouterGate::Sigmoid;
         const bool guess_next = guess && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card;
         if (guess_next) cudaEventRecord(k.ra_ev, k.stream);   // the MLP input is in
-        bk::router(nrm, w.router, w.router_bias, rows, ra, x.rlog_, x.ids_, x.rw_, k.stream);
+        if (g_.n_expert == 128 && rows == 1) {
+            bk::router_logits(nrm, w.router, rows, ra, x.rlog_, k.stream);
+        } else {
+            bk::router(nrm, w.router, w.router_bias, rows, ra, x.rlog_, x.ids_, x.rw_, k.stream);
+        }
         if (guess_next) {   // the next visit's experts: its router on this visit's MLP input, beside this visit's router
             const LayerWeights& nw = m_.layer(g_.visits[(size_t) vi + 1].layer);
             bk::RouterArgs ga = ra;
@@ -1034,8 +1044,14 @@ private:
             cudaEventRecord(k.gs_ev, k.ra_st);
             k.ra_on = true;
         }
-        moe_plan(x.ids_, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
-                 k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
+        if (g_.n_expert == 128 && rows == 1) {
+            router_select_plan(x.rlog_, w.router_bias, rows, g_.n_used, g_.n_expert, g_.expert_scale, x.ids_, x.rw_,
+                               w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
+                               k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
+        } else {
+            moe_plan(x.ids_, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
+                     k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
+        }
         const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
         if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
             fork_open_ = true;

@@ -94,6 +94,110 @@ std::vector<double> ref_expert(const Expert& e, const float* x) {
     return out;
 }
 
+// The Engram projection's change, at the pack's geometry: PrefillFfn::dense_rows runs the [5 * n_embd][n_cols * 256]
+// Q6_K weight through the MMQ tiles, a GEMM per 1,024-token tile, where the loop it replaces ran a matrix-vector
+// product per 8 tokens (dense_f32: native_quantize_q8_1 then native_mmvq). Both against a double-precision reference.
+constexpr int kEngramRows = 5 * H, kEngramCols = 6144, kEngramT = 1024, kEngramCheck = 4;
+
+std::vector<uint8_t> q6k_rows(int64_t rows, int64_t n, float sd, std::mt19937& rng) {
+    const size_t rb = ggml_row_size(GGML_TYPE_Q6_K, n);
+    std::vector<uint8_t> w((size_t) rows * rb);
+    std::vector<float> x((size_t) n);
+    std::normal_distribution<float> nd(0.f, sd);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (auto& v : x) v = nd(rng);
+        ggml_get_type_traits(GGML_TYPE_Q6_K)->from_float_ref(x.data(), w.data() + (size_t) r * rb, n);
+    }
+    return w;
+}
+
+void test_engram_dense_rows(dstest::Verdict& v, void* st) {
+    std::mt19937 rng(77);
+    const std::vector<uint8_t> w = q6k_rows(kEngramRows, kEngramCols, 0.05f, rng);
+    const std::vector<float> x = dstest::randn((size_t) kEngramT * kEngramCols, 78, 1.f);
+    Dev<uint8_t> dw(w);
+    Dev<float> dx(x), dnew((size_t) kEngramT * kEngramRows), dold((size_t) kEngramT * kEngramRows);
+    Dev<uint8_t> xq(mmq::q8_bytes(kEngramT, kEngramCols));
+    Dev<uint8_t> xq1(kg::native_q8_1_bytes(kEngramCols, 8));
+    mmq::Context ctx;
+    mmq::load(GGML_TYPE_Q6_K, kEngramRows);
+    // dense_rows: the q8 tiles of a 1,024-token tile, one product over all rows
+    auto rows_path = [&](void* s) {
+        const int32_t b[2] = {0, kEngramT};
+        Dev<int32_t> sbnd(std::vector<int32_t>(b, b + 2)), ident((size_t) kEngramT);
+        std::vector<int32_t> ih((size_t) kEngramT);
+        for (int i = 0; i < kEngramT; ++i) ih[(size_t) i] = i;
+        ident.up(ih);
+        mmq::quantize(dx.p, nullptr, xq.p, GGML_TYPE_Q6_K, kEngramCols, kEngramCols, kEngramT, s);
+        mmq::Product p;
+        p.w = dw.p;
+        p.type = GGML_TYPE_Q6_K;
+        p.w_rows = kEngramRows;
+        p.w_cols = kEngramCols;
+        p.expert_bytes = mmq::matrix_bytes(GGML_TYPE_Q6_K, kEngramRows, kEngramCols);
+        p.n = 1;
+        p.xq = xq.p;
+        p.bounds = sbnd.p;
+        p.ids = ident.p;
+        p.total_rows = kEngramT;
+        p.max_rows = kEngramT;
+        p.dst = dnew.p;
+        p.ld_dst = kEngramRows;
+        ctx.run(p, s);
+    };
+    rows_path(st);
+    // the loop it replaces: a q8_1 vector and a matrix-vector product per 8 tokens
+    for (int t0 = 0; t0 < kEngramT; t0 += 8) {
+        const int nc = std::min(8, kEngramT - t0);
+        kg::native_quantize_q8_1(dx.p + (size_t) t0 * kEngramCols, xq1.p, kEngramCols, nc, st);
+        kg::native_mmvq(GGML_TYPE_Q6_K, dw.p, xq1.p, dold.p + (size_t) t0 * kEngramRows, kEngramCols, kEngramRows, nc, st);
+    }
+    check(cudaStreamSynchronize((cudaStream_t) st), "engram rows");
+    const std::vector<float> gn = dnew.down(), go = dold.down();
+    // the double-precision reference on the first rows of the first tokens, from the dequantized weights
+    std::vector<float> wf((size_t) kEngramCheck * kEngramCols);
+    const size_t rb = ggml_row_size(GGML_TYPE_Q6_K, kEngramCols);
+    for (int r = 0; r < kEngramCheck; ++r)
+        ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(w.data() + (size_t) r * rb, wf.data() + (size_t) r * kEngramCols, kEngramCols);
+    std::vector<double> ref((size_t) kEngramCheck * kEngramCheck);
+    std::vector<float> got_n, got_o;
+    for (int t = 0; t < kEngramCheck; ++t)
+        for (int r = 0; r < kEngramCheck; ++r) {
+            double a = 0;
+            for (int c = 0; c < kEngramCols; ++c) a += (double) wf[(size_t) r * kEngramCols + c] * x[(size_t) t * kEngramCols + c];
+            ref[(size_t) t * kEngramCheck + r] = a;
+            got_n.push_back(gn[(size_t) t * kEngramRows + r]);
+            got_o.push_back(go[(size_t) t * kEngramRows + r]);
+        }
+    const dstest::Err en = dstest::compare(got_n, ref), eo = dstest::compare(got_o, ref);
+    double big = 1;
+    for (double r : ref) big = std::max(big, std::fabs(r));
+    double dmax = 0, dmax_rel = 0;
+    for (size_t i = 0; i < gn.size(); ++i) {
+        const double d = std::fabs((double) gn[i] - (double) go[i]);
+        dmax = std::max(dmax, d);
+        dmax_rel = std::max(dmax_rel, d / std::max(std::fabs((double) go[i]), 1e-3));
+    }
+    std::printf("engram %d x %d, T=%d: MMQ tiles vs double rms_rel %.2e (max abs %.2e); per-8-token mmvq vs double %.2e "
+                "(max abs %.2e); tiles vs mmvq max abs %.2e max rel %.2e\n", kEngramRows, kEngramCols, kEngramT,
+                en.rms_rel, en.max_abs, eo.rms_rel, eo.max_abs, dmax, dmax_rel);
+    const double bytes = (double) kEngramRows * kEngramCols * 5040.0 / kEngramCols;   // the weight bytes
+    const double us_new = dstest::bench_stream_us(rows_path, 10);
+    const double us_old = dstest::bench_stream_us([&](void* s) {
+        for (int t0 = 0; t0 < kEngramT; t0 += 8) {
+            const int nc = std::min(8, kEngramT - t0);
+            kg::native_quantize_q8_1(dx.p + (size_t) t0 * kEngramCols, xq1.p, kEngramCols, nc, s);
+            kg::native_mmvq(GGML_TYPE_Q6_K, dw.p, xq1.p, dold.p + (size_t) t0 * kEngramRows, kEngramCols, kEngramRows, nc, s);
+        }
+    }, 10);
+    dstest::bench_line("  engram MMQ tiles T=1024", us_new, bytes);
+    dstest::bench_line("  engram 8-token mmvq x128", us_old, bytes * (kEngramT / 8));
+    // both paths quantize the activations to q8, so their error against the reference is that quantization's, not the
+    // tile's: what is asserted is that the tiles are no further from the reference than the loop they replace
+    v.expect(en.rms_rel <= 1.2 * eo.rms_rel, "the MMQ tiles are no further from the reference than the 8-token loop");
+    v.expect(dmax < 1e-2 * big, "the tiles and the loop agree to the q8 quantization's error");
+}
+
 }  // namespace
 
 int main() {
@@ -103,6 +207,7 @@ int main() {
     cudaStream_t st;
     check(cudaStreamCreate(&st), "stream");
     std::mt19937 rng(41);
+    test_engram_dense_rows(v, st);
 
     ExpertLayer el;
     el.gu_type = el.d_type = GGML_TYPE_NVFP4;

@@ -192,8 +192,12 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
         }
     }
     __syncthreads();
-    const bool cand = b >= sh.thr;
-    if (cand) {
+    const bool cand = nw < k || b >= sh.thr;
+    if (nw < k) {
+        sh.lb[e] = b;
+        sh.le[e] = e;
+        if (e == 0) sh.n = n_expert;
+    } else if (cand) {
         const int i = atomicAdd(&sh.n, 1);
         sh.lb[i] = b;
         sh.le[i] = e;
@@ -230,8 +234,7 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
 
 }  // namespace
 
-void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
-            int32_t* ids, float* weights, void* stream) {
+void router_logits(const float* x, const float* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 16 || a.k > a.n_expert)
         throw std::invalid_argument("router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
@@ -255,6 +258,11 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
         launch_pdl(router_logits_kernel, dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
                    x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
+}
+
+void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
+            int32_t* ids, float* weights, void* stream) {
+    router_logits(x, gate, n_tokens, a, logits, stream);
     router_select(logits, bias, n_tokens, a, ids, weights, stream);
 }
 
