@@ -599,9 +599,19 @@ void written_within_budget(const std::string& dir, uint64_t id) {
     for (size_t i = 0; i < other.size(); ++i) other[i] = (int32_t) (i * 5 + 2);
     const SavedConversation y = image(other, {1000});
     const uint64_t state = source(x).bytes();
+    {   // what may_take() says of it: what write() then does
+        Store closed, st;
+        CHECK(!closed.may_take(1));
+        CHECK(st.open(dir, id, state, err));
+        CHECK(st.may_take(state) && !st.may_take(state + 1));
+        Store wide;
+        CHECK(wide.open(dir, id, 1ull << 62, err));
+        CHECK(!wide.may_take(basalt::platform::disk_free_bytes(dir)));
+    }
     {
         Store st;
         CHECK(st.open(dir, id, state - 1, err));
+        CHECK(!st.may_take(state));
         uint64_t largest = 0;
         CHECK(!st.write(source(x, nullptr, &largest), err) && largest == 0);
         CHECK(st.stats().files == 0 && st.stats().written == 0 && dir_bytes(dir) == 0);

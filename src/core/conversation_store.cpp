@@ -1438,6 +1438,10 @@ uint64_t ConversationStore::write_bytes(size_t tokens) {
     return kStage + (2ull << 20) + (uint64_t) tokens * 8;
 }
 
+bool ConversationStore::may_take(uint64_t bytes) const {
+    return open_ && bytes <= budget_ && basalt::platform::disk_free_bytes(dir_) >= bytes + kSpaceFloor;
+}
+
 bool ConversationStore::write(const ConversationSource& src, std::string& error,
                               const std::function<void()>& progress) try {
     if (!open_ || !src.ids || !src.imgs) { error = "conversation store: nothing to write"; return false; }

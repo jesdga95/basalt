@@ -159,6 +159,16 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
     // What only the disk tier takes is written from the session, with no image of it in RAM; so is a park into the
     // RAM cache whose image RAM does not admit.
     if (disk_wants && n_st == 0 && disk_stream > 0 && (to_disk || !whole_ok)) {
+        // before anything makes room for a write the disk tier refuses: the least it writes, its checkpoints'
+        // states counted out (the store keeps only some of them)
+        size_t states = 0;
+        for (const ConvCheckpoint& c : checks) states += c.bytes();
+        const size_t least = fresh_estimate > states ? fresh_estimate - states : 0;
+        if (!disk.may_take(least)) {
+            basalt::log::info("basalt serve", "conversation cache: skip parking (%zu MiB do not fit the disk tier)",
+                              least >> 20);
+            return true;
+        }
         reuse = {};   // its RAM goes before the write
         const size_t need = basalt::core::ConversationStore::write_bytes(live.size());
         if (basalt::core::Admission why; !admit_streamed(need, floor, &why)) {
@@ -310,6 +320,15 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
         size_t bytes = 0;
         std::string se;
         if (disk_stream > 0) {   // from the session, with no image of it in RAM
+            size_t est = 0, states = 0;   // the least it writes: its checkpoints' states counted out
+            for (const ConvCheckpoint& c : cks) states += c.bytes();
+            if (basalt::core::conversation_snapshot_bytes(view, s, g, mtp_kv, est, se) &&
+                !disk.may_take(est > states ? est - states : 0)) {
+                basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (%zu MiB do not "
+                                  "fit the disk tier)", ids.size(), (est > states ? est - states : 0) >> 20);
+                return;
+            }
+            se.clear();
             const uint64_t need = basalt::core::ConversationStore::write_bytes(ids.size());
             if (basalt::core::Admission why; !admit_streamed(need, floor, &why)) {
                 refuse_parking(why, "disk write", ids.size(), need);
@@ -491,8 +510,13 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     bool written = false;
     double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;   // what is said once per idle stretch
     const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
-    if (disk_takes && !on_disk && disk_stream > 0 &&
-        admit_streamed(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+    // what the disk tier refuses at once is not made room for
+    const size_t least = est > moved ? est - moved : 0;   // the least it writes: its checkpoints' states counted out
+    const bool disk_room = disk_takes && !on_disk && disk_stream > 0 && disk.may_take(least);
+    if (disk_takes && !on_disk && disk_stream > 0 && !disk_room && noted != since)
+        basalt::log::info("basalt serve", "%s's idle conversation is not written to disk: %zu MiB do not fit the disk "
+                          "tier", who.c_str(), least >> 20);
+    if (disk_room && admit_streamed(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
         ckd_finish();   // the write reads its checkpoints' bytes
         // its own K/V from the session, its draft layer's from the store that holds it
         basalt::core::ConversationSource src;

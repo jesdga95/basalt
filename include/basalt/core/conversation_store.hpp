@@ -111,6 +111,10 @@ public:
     bool write(const ConversationSource& src, std::string& error, const std::function<void()>& progress = {});
     /// The RAM a write() of `tokens` tokens takes beside its source.
     static uint64_t write_bytes(size_t tokens);
+    /// Whether a conversation of `bytes` could be written now: what write() and the writer refuse before they begin
+    /// (one larger than the budget, or than the volume's free space past the room it keeps), so a caller can tell
+    /// before it makes room for the write.
+    bool may_take(uint64_t bytes) const;
 
     /// Whether an image with these live tokens is stored or queued.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
