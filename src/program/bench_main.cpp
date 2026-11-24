@@ -430,7 +430,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
-                        : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -1328,6 +1328,10 @@ int main(int argc, char** argv) {
                               "with the system's power limit";
                     break;
                 }
+            }
+            if (!integrated && !o.power_label.empty()) {   // a discrete card's row takes the limit NVML reads, never a label
+                gpu_err = "--power-label is for an integrated GPU; NVML reads the limit of the GPU at " + id;
+                break;
             }
             if (g.vram_gib <= 0 || g.power_enforced_w <= 0) {
                 gpu_err = "NVML could not read the GPU at " + id;
