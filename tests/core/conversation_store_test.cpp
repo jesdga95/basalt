@@ -713,7 +713,7 @@ void same_name_again(const std::string& dir, uint64_t id) {
 }
 
 // A write from a source says how it moves, and one whose source runs out of memory partway ends as a failed write:
-// nothing left behind, and the writer thread goes on.
+// nothing left behind, and the writer thread goes on, writing every block file of a conversation queued meanwhile.
 void interrupted_write(const std::string& dir, uint64_t id) {
     std::string err;
     std::vector<int32_t> ids;
@@ -748,6 +748,36 @@ void interrupted_write(const std::string& dir, uint64_t id) {
         CHECK(st.open(dir, id, 1ull << 30, err));
         int moved = 0;
         CHECK(st.write(source(x), err, [&] { ++moved; }) && moved > 0);
+        remove_dir(dir);
+    }
+    // the same conversation queued while such a write fails partway: it writes every block file it refers to, the
+    // ones the failed write had begun too
+    for (int upto = 0; upto < 120; upto += 3) {
+        Store st;
+        CHECK(st.open(dir, id, 1ull << 30, err));
+        ConversationSource src = source(x);
+        int left = upto;
+        const auto failing = [&](ConversationBytes& b) {
+            b.read = [read = b.read, &left, &st, &x](uint64_t o, uint8_t* d, uint64_t n) {
+                if (left-- == 0) {
+                    CHECK(st.put(SavedConversation(x), 1ull << 30));
+                    throw std::bad_alloc();
+                }
+                return read(o, d, n);
+            };
+        };
+        for (auto& part : src.live) failing(part);
+        for (auto& layer : src.kv)
+            for (auto& part : layer.parts) failing(part);
+        if (st.write(src, err)) {   // fewer reads than `upto`: nothing failed
+            remove_dir(dir);
+            break;
+        }
+        st.flush();
+        const std::vector<int32_t> p = prompt_at(ids, ids.size());
+        const auto m = st.best(p.data(), p.size(), {}, true);
+        SavedConversation got;
+        CHECK(m.tokens == (int64_t) ids.size() && st.load(m, got, err) && same_kv(got.kv, x.kv));
         remove_dir(dir);
     }
 }

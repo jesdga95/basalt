@@ -1817,10 +1817,20 @@ bool ConversationStore::write_job(Job& job, const ConversationSource& img, uint6
         h.layer_hi = img.layer_hi;
         uint64_t file_bytes = 0;
         const std::string path = dir_ + "/" + name, tmp = temp_path(path);
-        if (!write_container(tmp, h, srcs, &hashes, stage, file_bytes, error) || !place(tmp, path, error)) {
+        auto unnamed = [&] {   // not written: the name goes, or a later write takes the file for there
             std::lock_guard<std::mutex> lk(mu_);
             parts_.erase(name);
             job.held.pop_back();
+        };
+        bool placed = false;
+        try {
+            placed = write_container(tmp, h, srcs, &hashes, stage, file_bytes, error) && place(tmp, path, error);
+        } catch (const std::bad_alloc&) {
+            unnamed();
+            throw;
+        }
+        if (!placed) {
+            unnamed();
             return false;
         }
         wrote += file_bytes;
