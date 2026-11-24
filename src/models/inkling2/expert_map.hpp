@@ -28,6 +28,47 @@ CardShare card_share(const std::vector<uint32_t>& counts, int n_expert, OnCard o
     return s;
 }
 
+/// Where a pair's lookups are served now.
+enum class Served : uint8_t { Ram, Card, Loan, Peer };
+
+/// The card's share of the running counts, banked at every placement change (settle): each lookup counts where its expert
+/// was when it ran, so the share between two reads is a rate even when copies move between them. A loaned copy's lookups
+/// count for the card, and `loan` counts them again. `where(layer, expert)`: the pair's Served now.
+class SettledShare {
+public:
+    template <class Where>
+    CardShare read(const std::vector<uint32_t>& counts, int n_expert, Where where, uint64_t& loan) const {
+        CardShare s = bank_;
+        loan = loan_;
+        add(counts, n_expert, where, s, loan);
+        return s;
+    }
+    template <class Where>
+    void settle(const std::vector<uint32_t>& counts, int n_expert, Where where) {
+        add(counts, n_expert, where, bank_, loan_);
+        seen_ = counts;
+    }
+
+private:
+    template <class Where>
+    void add(const std::vector<uint32_t>& counts, int n_expert, Where where, CardShare& s, uint64_t& loan) const {
+        for (size_t i = 0; i < counts.size(); ++i) {
+            const uint64_t d = (uint32_t) (counts[i] - (i < seen_.size() ? seen_[i] : 0u));   // wraps
+            if (d == 0) continue;
+            s.all += d;
+            switch (where((int) (i / (size_t) n_expert), (int) (i % (size_t) n_expert))) {
+                case Served::Card: s.card += d; break;
+                case Served::Loan: s.card += d; loan += d; break;
+                case Served::Peer: s.peer += d; break;
+                case Served::Ram: break;
+            }
+        }
+    }
+    std::vector<uint32_t> seen_;   // the counts at the last settle
+    CardShare bank_;               // the lookups before it, by where they were served
+    uint64_t loan_ = 0;
+};
+
 class ResidentExpertMap {
 public:
     /// The map from `counts` (the card's running counts, [layer * n_expert + e]): the sample of all `counts.size()`

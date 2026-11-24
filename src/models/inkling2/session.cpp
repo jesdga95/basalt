@@ -587,7 +587,10 @@ public:
             return {model::Status::Error, "inkling2: the projector's rows are not the model's width"};
         return {};
     }
-    void images_done() override { m_.encoder().release(); }
+    void images_done() override {
+        for (Session* o : sh_->heat_sessions) o->settle_hits();   // the refill places copies again
+        m_.encoder().release();
+    }
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
         if (m_.wedged()) return wedged();
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
@@ -853,6 +856,8 @@ public:
         if (m_.wedged()) return false;
         if (!heat_tally_) return true;
         const auto& owners = sh_->heat_sessions;
+        for (Session* o : owners)
+            if (!o->settle_hits()) return false;
         std::vector<std::vector<uint32_t>> samples(owners.size());
         for (size_t i = 0; i < owners.size(); ++i) {
             Session& o = *owners[i];
@@ -894,52 +899,37 @@ public:
         const int n = m_.rebalance(kRebalanceSwaps);   // paid copies only; the loan stays
         if (n > 0 || m_.wedged()) m_.log_copy_change(("rebalance at " + std::to_string(at) + " (" + std::to_string(n) + " swaps)").c_str(), before, 0, true);
     }
-    bool publish_loan(int64_t at) {
-        const size_t before = m_.loaned_pairs().size();
-        if (!m_.publish_loan(stream_, at)) return false;
-        const auto& pairs = m_.loaned_pairs();
-        if (pairs.size() == before) return true;
-        std::vector<uint32_t> counts;   // the lookup counts the loaned copies' hits start from
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(counts)) {
-            m_.wedge();
-            basalt::log::error("basalt inkling2", "the prompt loan lookup baseline could not be read; restart the engine");
-            return false;
-        }
-        loan_start_.resize(counts.size());
-        for (size_t i = before; i < pairs.size(); ++i) loan_start_[pairs[i]] = counts[pairs[i]];
-        return true;
-    }
+    bool publish_loan(int64_t at) { return settle_hits() && m_.publish_loan(stream_, at); }
     // `at`: the prompt's position (-1: a sleep)
     bool recall_loan(int64_t at) {
         if (m_.wedged()) return false;
-        if (m_.loaned() > 0) {
-            std::vector<uint32_t> t;
-            if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) {
-                m_.wedge();
-                basalt::log::error("basalt inkling2", "the prompt loan lookup counters could not be read; restart the engine");
-                return false;
-            }
-            loan_hits_.resize(t.size());
-            for (size_t pair : m_.loaned_pairs()) loan_hits_[pair] += t[pair] - loan_start_[pair];
-            loan_start_.clear();
-        }
+        if (m_.loaned() > 0 && !settle_hits()) return false;
         return m_.recall_loan(stream_, at < 0 ? std::string("prompt loan recall at sleep") : "prompt loan recall at " + std::to_string(at));
     }
-    // How the lookups fell between the card and RAM; a loaned copy's hits count for the card while it held the copy.
-    CardShare lookup_share(const std::vector<uint32_t>& t, uint64_t& loan) const {
-        CardShare sh{};
-        const size_t ne = g_.n_expert;
-        for (size_t pair = 0; pair < t.size(); ++pair) {
-            const int l = (int) (pair / ne), e = (int) (pair % ne);
-            const uint64_t past = loan_hits_.empty() ? 0 : loan_hits_[pair];
-            const uint64_t active = !loan_start_.empty() && m_.on_loan(l, e) ? t[pair] - loan_start_[pair] : 0;
-            const uint64_t hits = std::min<uint64_t>(t[pair], past + active);
-            loan += hits;
-            sh.all += t[pair];
-            sh.card += m_.on_card(l, e) ? t[pair] : hits;
-            if (!m_.on_card(l, e) && m_.peer_held(l, e)) sh.peer += t[pair] - hits;   // the second card's, when not on loan
+    Served served(int l, int e) const {
+        if (m_.on_card(l, e)) return Served::Card;
+        if (m_.on_loan(l, e)) return Served::Loan;
+        return m_.peer_held(l, e) ? Served::Peer : Served::Ram;
+    }
+    // Banks the lookups so far where their experts were: runs before every placement change, so a lookup counts where it
+    // was served, not where its expert is later.
+    bool settle_hits() {
+        if (!m_.has_spill() || !ex_tally_) return true;
+        std::vector<uint32_t> t;
+        bool ok = true;
+        for (const Lane& k : lane_)
+            if (k.stream && cudaStreamSynchronize(k.stream) != cudaSuccess) ok = false;
+        if (!ok || !read_tally(t)) {
+            m_.wedge();
+            basalt::log::error("basalt inkling2", "expert lookup counters could not be read; restart the engine");
+            return false;
         }
-        return sh;
+        hits_.settle(t, g_.n_expert, [&](int l, int e) { return served(l, e); });
+        return true;
+    }
+    // How the lookups fell between the card and RAM; `loan`: the card's that went to loaned copies.
+    CardShare lookup_share(const std::vector<uint32_t>& t, uint64_t& loan) const {
+        return hits_.read(t, g_.n_expert, [&](int l, int e) { return served(l, e); }, loan);
     }
     // A conversation starts over (a prompt at position 0, `at`), or resumes at `at` needing at most half the positions its
     // caches back (resume_trims): the caches give back the cells past what the prompt needs (never below the base), and the
@@ -1768,8 +1758,7 @@ private:
     };
     std::vector<BatchSeg> batch_segs_;          // a batch window's sessions and their rows, as its leader, until decode_kept
     int64_t next_rebalance_ = -1;               // the position of the next rebalance between windows (-1: before a request)
-    std::vector<uint32_t> loan_start_;          // the lookup counts when the loaned copies were published
-    std::vector<uint64_t> loan_hits_;           // the loaned copies' hits, banked at each recall
+    SettledShare hits_;                         // the lookups by where they were served (settle_hits)
     ResidentExpertMap map_;
     int64_t lookups_ = 0;                    // decode's routed lookups so far
     // the elastic KV (model.hpp elastic()): the full visits' caches back their first backed_ cells

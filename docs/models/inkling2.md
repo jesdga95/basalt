@@ -218,8 +218,8 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
   so a spilled card decodes slower than a full one: an RTX 5060 Ti alone at 180 W with a Ryzen 9 9950X and about 1,100 experts in RAM decodes conversation at 59 tok/s,
   struct at 118 and prose at 53, about 2.6 times as fast as reading them over the bus; prompts read as before (2,430 tok/s
   at 16K).
-- The server's `decode expert cache hit rate` counts a lookup as a hit when its expert is on a GPU, the second card's included;
-  the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.
+- The server's `decode expert cache hit rate` counts a lookup as a hit when its expert was on a GPU when it ran, the second
+  card's included (a copy that moves later leaves its past lookups where they were); the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.
 - No video.
 
 ## Speed
