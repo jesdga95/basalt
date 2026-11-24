@@ -1368,6 +1368,7 @@ class Service:
             # the grammar guard lets a reply of blocks think only when the request does
             sampling = {**sampling, GRAMMAR_KEY: dict(sampling[GRAMMAR_KEY], think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
+        budget_asked = budget           # the request's own budget, before the answer room
         budget_req = sampling
         budget_ready = False
         if self.sampling_defaults:     # the request's own fields win
@@ -1507,8 +1508,9 @@ class Service:
                         more = {"stop_soon": soft} if soft is not None else {}
                         # A thinking budget caps the pass itself, so the engine stops on the budget's token and holds
                         # exactly what was kept: the next pass extends its live state instead of reading the overshoot
-                        # again through the prompt path (which rounds differently from decoding).
-                        if thinking and not budget_ready and not isinstance(ids, PromptText):
+                        # again through the prompt path (which rounds differently from decoding). A text prompt the
+                        # engine may clip learns its cap, and so its budget, from the engine's count (below).
+                        if thinking and not budget_ready and not (isinstance(ids, PromptText) and ids.clip):
                             budget = self.answer_budget(budget_req, max_new, budget)
                             budget_ready = True
                         cap = max_new - n
@@ -1520,6 +1522,7 @@ class Service:
                             else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
                         n_pass0 = n
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
+                        over = False                    # the budget was reached in a pass it does not cap: stopping soon
                         looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
@@ -1538,9 +1541,14 @@ class Service:
                                     pt_settled = True
                                     if ids.max_new and ids.max_new < cap:
                                         max_new = min(max_new, n_pass0 + ids.max_new)
+                                        cap = ids.max_new
+                                        if thinking and budget_ready:   # a budget set from the cap the engine cut
+                                            budget, budget_ready = budget_asked, False
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
+                                    # the pass the engine settled ends on the budget only if the budget is past its cap
+                                    capped = bool(budget) and parser.state == "reasoning" and budget - thought >= cap
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
@@ -1603,9 +1611,14 @@ class Service:
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # only at a clean point: no held tag or split character
-                                    if thought >= budget and not parser.buf and not detok.pending():
-                                        wrap = True
-                                        break
+                                    if thought >= budget and not over and not parser.buf and not detok.pending():
+                                        if capped or soft is None:
+                                            wrap = True
+                                            break
+                                        # the pass goes on past the budget: the engine stops at its own pace and the
+                                        # tokens it still writes are kept, so the next pass extends what it holds
+                                        soft.set()
+                                        over = True
                                 if live is not None:
                                     live.state = "thinking" if parser.state == "reasoning" else "answering"
                                     if live.answer_now.is_set() and parser.state == "reasoning":
@@ -1675,7 +1688,8 @@ class Service:
                                 resumed = True
                         if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
-                                wrap = asked = True
+                                wrap = True
+                                asked = not over
                             else:                       # a split tag or character, or the thinking ended meanwhile
                                 resumed = True
                         if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():
