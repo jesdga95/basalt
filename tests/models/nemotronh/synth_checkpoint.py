@@ -1,7 +1,8 @@
 """A small Nemotron-H checkpoint in the layout of NVIDIA's NVFP4 export (Model Optimizer's mixed precision: FP8
 projections and head with a per-tensor scale, NVFP4 routed and shared experts, BF16 the rest), with weights drawn so
 the activations stay in range: the engine's end-to-end parity test (model_parity.cpp) converts it and compares the
-engine's logits with reference.py's.
+engine's logits with reference.py's.  It has an MTP head as the real model's (its attention BF16), whose drafts the test
+compares with reference.py's.
 
 Every shape satisfies the kernels the real model runs: 128 SSM heads of 64 (the FP8 product's rows come in 128s),
 d_state 128, 8 groups, 128-wide attention heads, a latent and widths in whole blocks.
@@ -129,6 +130,27 @@ def write(out: pathlib.Path, seed: int) -> None:
             for e in range(NE):
                 w.nvfp4(m + f"experts.{e}.up_proj", w.normal((FF, LAT), 1.0 / np.sqrt(LAT)))
                 w.nvfp4(m + f"experts.{e}.down_proj", w.normal((LAT, FF), 0.5 / np.sqrt(FF)))
+    # the MTP head: the fusion, a BF16 attention layer, a MoE layer, the final norm
+    P = "mtp.layers."
+    w.bf(P + "0.eh_proj.weight", w.normal((H, 2 * H), 1.0 / np.sqrt(2 * H)))
+    w.bf(P + "0.enorm.weight", rng.uniform(0.5, 1.5, H))
+    w.bf(P + "0.hnorm.weight", rng.uniform(0.5, 1.5, H))
+    w.bf(P + "0.norm.weight", rng.uniform(0.5, 1.5, H))
+    for n, rows in (("q_proj", NH * HD), ("k_proj", NKV * HD), ("v_proj", NKV * HD)):
+        w.bf(P + f"0.mixer.{n}.weight", w.normal((rows, H), 1.0 / np.sqrt(H)))
+    w.bf(P + "0.mixer.o_proj.weight", w.normal((H, NH * HD), 0.5 / np.sqrt(NH * HD)))
+    m = P + "1.mixer."
+    w.bf(P + "1.norm.weight", rng.uniform(0.5, 1.5, H))
+    w.bf(P + "1.final_layernorm.weight", rng.uniform(0.5, 1.5, H))
+    w.bf(m + "gate.weight", w.normal((NE, H), 1.0 / np.sqrt(H)))
+    w.f32(m + "gate.e_score_correction_bias", w.normal((NE,), 0.02))
+    w.bf(m + "fc1_latent_proj.weight", w.normal((LAT, H), 1.0 / np.sqrt(H)))
+    w.bf(m + "fc2_latent_proj.weight", w.normal((H, LAT), 0.5 / np.sqrt(LAT)))
+    w.nvfp4(m + "shared_experts.up_proj", w.normal((FFS, H), 1.0 / np.sqrt(H)))
+    w.nvfp4(m + "shared_experts.down_proj", w.normal((H, FFS), 0.5 / np.sqrt(FFS)))
+    for e in range(NE):
+        w.nvfp4(m + f"experts.{e}.up_proj", w.normal((FF, LAT), 1.0 / np.sqrt(LAT)))
+        w.nvfp4(m + f"experts.{e}.down_proj", w.normal((LAT, FF), 0.5 / np.sqrt(FF)))
     names = list(w.t)
     half = len(names) // 2
     write_safetensors(out / "model-00001-of-00002.safetensors", {k: w.t[k] for k in names[:half]})
@@ -141,7 +163,8 @@ def write(out: pathlib.Path, seed: int) -> None:
            "mlp_hidden_act": "relu2", "use_conv_bias": True, "mamba_proj_bias": False, "use_bias": False,
            "attention_bias": False, "mlp_bias": False, "n_group": 1, "topk_group": 1, "norm_topk_prob": True,
            "tie_word_embeddings": False, "residual_in_fp32": False, "n_shared_experts": 1, "sliding_window": None,
-           "routed_scaling_factor": 2.5, "layer_norm_epsilon": 1e-5, "max_position_embeddings": 262144}
+           "routed_scaling_factor": 2.5, "layer_norm_epsilon": 1e-5, "max_position_embeddings": 262144,
+           "num_nextn_predict_layers": 1, "mtp_layers_block_type": ["attention", "moe"]}
     (out / "config.json").write_text(json.dumps(cfg))
     (out / "generation_config.json").write_text(json.dumps({"temperature": 1.0, "top_p": 0.95}))
     (out / "README.md").write_text("---\nlicense: other\nlicense_name: synthetic\n---\n# a synthetic Nemotron-H\n")

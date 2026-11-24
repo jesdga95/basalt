@@ -7,8 +7,9 @@ Where Nemotron 3.5 Super rounds and how its output compares. Method: [quality](q
 
 - **The weights are the checkpoint's bits.** Every NVFP4 and FP8 matrix keeps its codes and scales; nothing is
   re-rounded by the converter except `A = -exp(A_log)`, computed once in float64.
-- **Against a float64 reference of the same weights:** decode KL 4.2e-4 and top-1 54/54 on a 54-token chat; a prompt then
-  decode KL 6.1e-4, top-1 28/28 ([below](#against-the-reference)).
+- **Against a float64 reference of the same weights:** decode KL 3.8e-4 and top-1 54/54 on a 54-token chat; a prompt then
+  decode KL 6.4e-4, top-1 28/28 ([below](#against-the-reference)).
+- **The MTP head's drafts** match the reference's: the first at 53 of 53 positions, the second at 51 of 53.
 - **No `basalt-bench --quality` base yet:** that needs a BF16 run of the full model.
 
 ## Weights
@@ -19,6 +20,7 @@ Where Nemotron 3.5 Super rounds and how its output compares. Method: [quality](q
 | Shared experts | NVFP4 planes | bit for bit |
 | Mamba in / out, attention q / k / v / o, output head | FP8 E4M3, an FP32 scale per matrix | bit for bit |
 | Latent projections (down to 1,024, back up) | BF16 | as stored |
+| MTP head: attention q / k / v / o, `eh_proj` | BF16 | as stored |
 | Token embedding | BF16 | as stored |
 | Norms, router, its bias, convolutions, `dt` bias, `D` | F32 | as stored |
 | `A` | F32 | `-exp(A_log)` in float64, rounded once |
@@ -47,10 +49,15 @@ the placement frozen:
 
 | Path | KL mean | KL max | Top-1 |
 | --- | --- | --- | --- |
-| Decode, one row at a time | 4.2e-4 | 5.6e-3 | 54/54 |
-| A prompt of 26, then decode | 6.1e-4 | 1.8e-3 | 28/28 |
+| Decode, one row at a time | 3.8e-4 | 5.6e-3 | 54/54 |
+| A prompt of 26, then decode | 6.4e-4 | 2.4e-3 | 28/28 |
 | Windows of 1 to 8 rows keeping some | bitwise one-row decode | | |
 | State saved at 27, restored | bitwise | | |
 
-With the tier moving experts between the card (q8_1) and the CPU (Q8_0), windows against one-row decode give KL 2.4e-4 and
-the restored state 2.0e-4: the two activation roundings differ, so moved experts are not bitwise.
+The reference also runs the MTP head after each token: its two drafts and their probabilities. The engine's, one row at
+a time from the start: the first draft the same at 53 of 53 (its probability off by 6.7e-3 on average), the second at 51
+of 53. After the prompt of 26: 26 of 27 and 25 of 26. The misses are near ties.
+
+With the tier moving experts between the card (q8_1) and the CPU (Q8_0), windows against one-row decode give KL 4.2e-4 and
+the restored state 1.5e-4: the two activation roundings differ, so moved experts are not bitwise. The MTP
+drafts there: 53 of 53 and 52 of 53, after the prompt 27 of 27 and 26 of 27.

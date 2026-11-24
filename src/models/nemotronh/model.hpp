@@ -40,6 +40,12 @@ struct Layer {
     int tier_layer = -1;   ///< the expert tier's layer of a MoE layer
 };
 
+/// The MTP head's own tensors: eh_proj over [enorm(embedding) | hnorm(hidden)] (BF16 [n_embd][2 n_embd]), the two norms
+/// and the norm before the output head; its attention and MoE layers are layer(n_layers) and layer(n_layers + 1).
+struct MtpHead {
+    Mat eh;
+    const float *enorm = nullptr, *hnorm = nullptr, *final_norm = nullptr;
+};
 class NemotronModel final : public model::LoadedModel {
 public:
     NemotronModel();
@@ -52,7 +58,9 @@ public:
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
-    const Layer& layer(int l) const { return layers_[(size_t) l]; }
+    const Layer& layer(int l) const { return layers_[(size_t) l]; }   ///< l < geo().all_layers()
+    bool has_mtp() const { return !pack_.geo.mtp_kinds.empty(); }
+    const MtpHead& mtp() const { return mtp_; }
     const uint16_t* embedding() const { return embd_dev_; }   ///< BF16 [n_vocab][n_embd], mapped host memory
     const float* out_norm() const { return out_norm_; }
     const Mat& head() const { return head_; }
@@ -61,7 +69,7 @@ public:
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
 
-    /// The tier's descriptor: the MoE layers only, over the latent the experts run in.
+    /// The tier's descriptor: the MoE layers only (the MTP head's last), over the latent the experts run in.
     core::ExpertTierSpec tier_spec() const;
     /// The expert tier and the pinned rows the CPU pool reads and writes: one per model, whatever the sessions.
     struct SharedTier {
@@ -84,6 +92,7 @@ private:
     uint16_t* embd_dev_ = nullptr;
     const float* out_norm_ = nullptr;
     Mat head_;
+    MtpHead mtp_;
     model::LoadRequest flags_;
     std::string path_;
     int device_ = 0, fd_ = -1;

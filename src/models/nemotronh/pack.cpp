@@ -63,6 +63,14 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         }
         g.kinds.push_back((Kind) c);
     }
+    // the MTP head (optional): an attention layer then a MoE layer, after the model's
+    if (const Json* mp = k("mtp_pattern"); mp && mp->is_string() && !mp->s.empty()) {
+        if (mp->s != "*E") {
+            err = path + ": nemotronh.mtp_pattern '" + mp->s + "' (an MTP head of * then E is run)";
+            return false;
+        }
+        g.mtp_kinds = {Kind::Attention, Kind::Moe};
+    }
     if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_vocab <= 0 || g.n_head <= 0 || g.n_kv <= 0 || g.ssm_heads <= 0 ||
         g.n_expert <= 0 || g.n_used <= 0 || g.n_ff_exp <= 0 || g.n_ff_shared <= 0) {
         err = path + ": meta.gguf_kv is incomplete";
@@ -95,7 +103,7 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     if (!p.file.read("experts.layout", text, err)) return false;
     std::istringstream in(std::string(text.begin(), text.end()));
     std::string line;
-    p.experts.assign((size_t) g.n_layers, ExpertLayer{});
+    p.experts.assign((size_t) g.all_layers(), ExpertLayer{});
     int seen = 0;
     bool relu2 = false;
     while (std::getline(in, line)) {
@@ -107,7 +115,7 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         std::istringstream ls(line);
         long long l, gu, d;
         unsigned long long off, by;
-        if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers || g.kinds[(size_t) l] != Kind::Moe) {
+        if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.all_layers() || g.kind((int) l) != Kind::Moe) {
             err = "experts.layout: bad line '" + line + "'";
             return false;
         }
@@ -118,8 +126,8 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         err = path + ": experts.layout does not say its experts are squared-ReLU blobs";
         return false;
     }
-    if (seen != g.count(Kind::Moe)) {
-        err = "experts.layout lists " + std::to_string(seen) + " layers, the model has " + std::to_string(g.count(Kind::Moe)) +
+    if (seen != g.count_all(Kind::Moe)) {
+        err = "experts.layout lists " + std::to_string(seen) + " layers, the model has " + std::to_string(g.count_all(Kind::Moe)) +
               " with experts";
         return false;
     }

@@ -3,6 +3,8 @@
 #include "models/nemotronh/adapter.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
@@ -35,10 +37,17 @@ public:
     const char* model_name() const override { return "Nemotron-3.5-Super"; }
     int quality_window() const override { return 16; }
 
-    // --kv: the attention caches are fp16; --suffix-draft: prompt lookup's least repeat (0: off)
+    // --kv: the attention caches are fp16; --suffix-draft: prompt lookup's least repeat (0: off); --spec: the rows of a
+    // window the MTP head drafts for (0 or 1: none); --draft-log: the windows' log; --diag-tier-frozen:
+    // the card keeps the experts it loaded (windows then bitwise one-row decode)
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
+        else if (a == "--spec") {
+            o.spec = std::atoi(args.next("--spec"));
+            o.spec_given = true;
+        } else if (a == "--draft-log") core::diagnostics().draft_log = args.next("--draft-log");
+        else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
         else return false;
         return true;
     }
@@ -48,8 +57,20 @@ public:
             basalt::log::error("basalt nemotronh", "--kv %s: the attention caches are fp16", o.kv.c_str());
             return 2;
         }
+        // a pack with the MTP head drafts unless --spec says otherwise; the window policy takes the rows that pay
+        core::ModelFile file;
+        std::string err;
+        const core::Json* kv = !o.model.empty() && file.open(o.model, err) && file.load_meta(err) ? file.meta().get("gguf_kv") : nullptr;
+        const core::Json* mp = kv ? kv->get("nemotronh.mtp_pattern") : nullptr;
+        const bool present = mp != nullptr && mp->is_string() && !mp->s.empty();
+        if (!o.spec_given) o.spec = present ? kMtpSpec : 0;
+        if (o.spec >= 2 && !present) {
+            basalt::log::warn("basalt nemotronh", "--spec %d off: the pack has no MTP head", o.spec);
+            o.spec = 0;
+        }
         return std::nullopt;
     }
+    static constexpr int kMtpSpec = 4;   // the rows a drafted window may hold by default
 
     // <|im_end|> (and </s>) end a reply, <|im_start|> opens a turn, `assistant` names the model's own; no pictures yet
     model::TokenNames token_names() const override { return {{"</s>", "<|im_end|>"}, "<|im_start|>", "", "", "assistant"}; }

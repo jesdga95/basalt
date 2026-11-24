@@ -1,7 +1,8 @@
 """Tests for checkpoint_nemotronh.py (convert.py --checkpoint DIR on a Nemotron-H checkpoint) on a tiny synthetic
 checkpoint shaped as NVIDIA's VL NVFP4 export: three layers (Mamba-2, attention, latent MoE) under
 `language_model.backbone.`, FP8 projections and head with a scale each, NVFP4 routed and shared experts, BF16 everything
-else, an MTP head and vision tensors the converter leaves out, and tokenizer files.
+else, vision tensors the converter leaves out, and tokenizer files; once with a stray MTP tensor the config does not
+describe (left out), once with a whole MTP head (converted as layers 3 and 4).
 
     python3 tools/convert/test_checkpoint_nemotronh.py
     python3 -m unittest discover -s tools/convert -p 'test_checkpoint_nemotronh.py'"""
@@ -48,7 +49,7 @@ def llm_config(**over):
 
 
 class Fixture:
-    def __init__(self, d: Path):
+    def __init__(self, d: Path, mtp: bool = False):
         self.rng = np.random.default_rng(7)
         self.v, self.tens, self.f8, self.nv = {}, {}, {}, {}
         B = "language_model.backbone."
@@ -83,15 +84,38 @@ class Fixture:
                 for e in range(NE):
                     self.nvfp4(m + f"experts.{e}.up_proj", FF, LAT)
                     self.nvfp4(m + f"experts.{e}.down_proj", LAT, FF)
-        # left out: the MTP head and the vision tower
-        self.bf("language_model.mtp.layers.0.eh_proj.weight", (H, 2 * H))
+        if mtp:   # the head: the fusion, a BF16 attention layer, a MoE layer, the final norm
+            P = "language_model.mtp.layers."
+            self.bf(P + "0.eh_proj.weight", (H, 2 * H))
+            self.bf(P + "0.enorm.weight", (H,))
+            self.bf(P + "0.hnorm.weight", (H,))
+            self.bf(P + "0.norm.weight", (H,))
+            for n, rows in (("q_proj", NH * HD), ("k_proj", NKV * HD), ("v_proj", NKV * HD)):
+                self.bf(P + f"0.mixer.{n}.weight", (rows, H))
+            self.bf(P + "0.mixer.o_proj.weight", (H, NH * HD))
+            self.tens[P + "0.mixer.k_proj.k_scale"] = ("F32", (1,), np.array([1.0], np.float32).tobytes())
+            m = P + "1.mixer."
+            self.bf(P + "1.norm.weight", (H,))
+            self.bf(P + "1.final_layernorm.weight", (H,))
+            self.bf(m + "gate.weight", (NE, H))
+            self.f32(m + "gate.e_score_correction_bias", (NE,))
+            self.bf(m + "fc1_latent_proj.weight", (LAT, H))
+            self.bf(m + "fc2_latent_proj.weight", (H, LAT))
+            self.nvfp4(m + "shared_experts.up_proj", FFS, H)
+            self.nvfp4(m + "shared_experts.down_proj", H, FFS)
+            for e in range(NE):
+                self.nvfp4(m + f"experts.{e}.up_proj", FF, LAT)
+                self.nvfp4(m + f"experts.{e}.down_proj", LAT, FF)
+        else:   # a stray head tensor the config does not describe: left out
+            self.bf("language_model.mtp.layers.0.eh_proj.weight", (H, 2 * H))
+        # left out: the vision tower
         self.bf("vision_model.radio_model.model.blocks.0.norm1.weight", (32,))
         self.bf("mlp1.0.weight", (64,))
         names = list(self.tens)
         half = len(names) // 2
         write_safetensors(d / "model-00001-of-00002.safetensors", {k: self.tens[k] for k in names[:half]})
         write_safetensors(d / "model-00002-of-00002.safetensors", {k: self.tens[k] for k in names[half:]})
-        llm = llm_config()
+        llm = llm_config(**({"num_nextn_predict_layers": 1, "mtp_layers_block_type": ["attention", "moe"]} if mtp else {}))
         (d / "config.json").write_text(json.dumps({"architectures": ["NemotronH_Omni_Reasoning_V3"], "model_type": "nemotron_h_omni",
                                                    "llm_config": llm}))
         (d / "generation_config.json").write_text(json.dumps({"temperature": 1.0, "top_p": 0.95, "eos_token_id": [2, 20]}))
@@ -136,12 +160,14 @@ class Fixture:
 
 
 class ConvertTest(unittest.TestCase):
+    MTP = False
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         d = Path(cls.tmp.name) / "ckpt"
         d.mkdir()
-        cls.fx = Fixture(d)
+        cls.fx = Fixture(d, cls.MTP)
         cls.out = Path(cls.tmp.name) / "tiny.basalt"
         r = subprocess.run([sys.executable, str(HERE / "convert.py"), "--checkpoint", str(d), "--out", str(cls.out), "--workers", "2"],
                            capture_output=True, text=True)
@@ -253,6 +279,53 @@ class ConvertTest(unittest.TestCase):
         self.assertFalse(any(n.endswith(("k_scale", "input_scale")) for n in names))
 
 
+class MtpConvertTest(unittest.TestCase):
+    """The checkpoint with an MTP head: layers 3 (attention) and 4 (MoE) after the model's three."""
+    setUpClass = classmethod(ConvertTest.setUpClass.__func__)
+    tearDownClass = classmethod(ConvertTest.tearDownClass.__func__)
+    tensor = ConvertTest.tensor
+    f32 = ConvertTest.f32
+    MTP = True
+
+    def bf16(self, name, shape):
+        t, raw = self.tensor(name)
+        self.assertEqual(t["type"], "BF16", name)
+        return (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32).reshape(shape)
+
+    def test_the_head_is_layers_3_and_4(self):
+        P = "language_model.mtp.layers."
+        self.assertEqual(self.meta["gguf_kv"]["nemotronh.mtp_pattern"], "*E")
+        self.assertEqual(self.meta["gguf_kv"]["nemotronh.block_count"], 3)
+        np.testing.assert_array_equal(self.bf16("blk.3.mtp_eh_proj.weight", (H, 2 * H)), self.fx.v[P + "0.eh_proj.weight"])
+        for name, src in (("blk.3.mtp_enorm.weight", "0.enorm.weight"), ("blk.3.mtp_hnorm.weight", "0.hnorm.weight"),
+                          ("blk.3.attn_norm.weight", "0.norm.weight"), ("blk.4.attn_norm.weight", "1.norm.weight"),
+                          ("blk.4.mtp_final_norm.weight", "1.final_layernorm.weight")):
+            np.testing.assert_array_equal(self.f32(name), self.fx.v[P + src], name)
+        for n, rows in (("q", NH * HD), ("k", NKV * HD), ("v", NKV * HD)):   # BF16 as stored, no scale
+            np.testing.assert_array_equal(self.bf16(f"blk.3.attn_{n}.weight", (rows, H)), self.fx.v[P + f"0.mixer.{n}_proj.weight"])
+            self.assertNotIn(f"blk.3.attn_{n}.scale", self.meta["tensors"])
+        np.testing.assert_array_equal(self.bf16("blk.3.attn_output.weight", (H, NH * HD)), self.fx.v[P + "0.mixer.o_proj.weight"])
+        self.assertEqual(self.tensor("blk.4.ffn_up_shexp.weight")[0]["type"], "NVFP4_PLANES")
+        np.testing.assert_array_equal(self.f32("blk.4.ffn_gate_inp.weight").reshape(NE, H), self.fx.v[P + "1.mixer.gate.weight"])
+
+    def test_its_experts_are_the_last_layer(self):
+        lay = [list(map(int, l.split())) for l in self.mf.read("experts.layout").decode().splitlines() if l and l[0] != "#"]
+        self.assertEqual([r[0] for r in lay], [2, 4])
+        l, gu, d, off, blob = lay[1]
+        self.assertEqual(off, NE * blob)
+        experts = self.mf.read("experts")
+        self.assertEqual(len(experts), 2 * NE * blob)
+        up_bytes = FF * S.nvfp4_row_bytes(LAT)
+        m = "language_model.mtp.layers.1.mixer.experts."
+        for e in range(NE):
+            b = np.frombuffer(experts[off + e * blob:off + (e + 1) * blob], np.uint8)
+            uc, us, us2 = self.fx.nv[m + f"{e}.up_proj"]
+            dc, ds, ds2 = self.fx.nv[m + f"{e}.down_proj"]
+            np.testing.assert_array_equal(basalt_values(b[:up_bytes], LAT), modelopt_values(uc, us))
+            np.testing.assert_array_equal(basalt_values(b[up_bytes:blob - 16], FF), modelopt_values(dc, ds))
+            self.assertEqual(np.frombuffer(b[blob - 16:].tobytes(), "<f4").tolist(), [us2, 0.0, ds2, 0.0])
+
+
 class RefusalTest(unittest.TestCase):
     def test_a_sliding_window_is_refused(self):
         N.Geometry(llm_config())
@@ -267,6 +340,14 @@ class RefusalTest(unittest.TestCase):
         self.assertEqual(N.Geometry(tc).n_layers, len(KINDS))
         with self.assertRaises(S.ConvertError):
             N.layer_kinds(llm_config(num_hidden_layers=4))
+
+    def test_an_mtp_head_the_engine_does_not_run_is_refused(self):
+        self.assertEqual(N.Geometry(llm_config(num_nextn_predict_layers=1, mtp_layers_block_type=["attention", "moe"])).mtp_kinds,
+                         ["attention", "moe"])
+        with self.assertRaisesRegex(S.ConvertError, "MTP head"):
+            N.Geometry(llm_config(num_nextn_predict_layers=1, mtp_layers_block_type=["moe"]))
+        with self.assertRaisesRegex(S.ConvertError, "MTP head"):
+            N.Geometry(llm_config(num_nextn_predict_layers=2, mtp_layers_block_type=["attention", "moe"]))
 
     def test_the_pattern_string_is_read(self):
         self.assertEqual(N.layer_kinds({"num_hidden_layers": 4, "hybrid_override_pattern": "ME*E"}),

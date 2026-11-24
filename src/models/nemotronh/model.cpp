@@ -47,12 +47,12 @@ core::ExpertTierSpec NemotronModel::tier_spec() const {
     core::ExpertTierSpec s;
     s.area = "basalt nemotronh";
     s.name = "nemotronh";
-    s.n_layers = g.count(Kind::Moe);
+    s.n_layers = g.count_all(Kind::Moe);
     s.n_expert = g.n_expert;
     s.top_k = g.n_used;
     s.n_embd = g.n_latent;   // the experts run over the latent ffn_latent_down makes
     s.n_ff = g.n_ff_exp;
-    for (int l = 0; l < g.n_layers; ++l) {
+    for (int l = 0; l < g.all_layers(); ++l) {
         const ExpertLayer& e = pack_.experts[(size_t) l];
         if (!e.present) continue;
         core::ExpertTierSpec::Layer tl{e.gu_type, e.d_type, e.offset, e.blob_bytes, 0.0f};
@@ -170,12 +170,13 @@ model::Result NemotronModel::plan(const model::LoadRequest& req, core::LoadPlan&
         return true;
     };
     const int64_t E = g.n_embd, PW = g.proj_width(), DI = g.ssm_inner, C = g.conv_dim(), H = g.ssm_heads;
-    layers_.resize((size_t) g.n_layers);
+    layers_.resize((size_t) g.all_layers());
     int tl = 0;
-    for (int l = 0; l < g.n_layers; ++l) {
+    for (int l = 0; l < g.all_layers(); ++l) {
         Layer& L = layers_[(size_t) l];
         const std::string b = "blk." + std::to_string(l) + ".";
-        L.kind = g.kinds[(size_t) l];
+        L.kind = g.kind(l);
+        const int at = l < g.n_layers ? kTypeF8 : kTypeBf16;   // the MTP head's attention is BF16
         bool ok = f32(b + "attn_norm.weight", (uint64_t) E, L.norm);
         if (L.kind == Kind::Mamba) {
             ok = ok && mat(b + "ssm_in", kTypeF8, PW, E, L.in) && mat(b + "ssm_out", kTypeF8, E, DI, L.out) &&
@@ -184,8 +185,8 @@ model::Result NemotronModel::plan(const model::LoadRequest& req, core::LoadPlan&
                  f32(b + "ssm_d", (uint64_t) H, L.D) && f32(b + "ssm_norm.weight", (uint64_t) DI, L.ssm_norm);
         } else if (L.kind == Kind::Attention) {
             const int64_t qw = (int64_t) g.n_head * g.head_dim, kw = (int64_t) g.n_kv * g.head_dim;
-            ok = ok && mat(b + "attn_q", kTypeF8, qw, E, L.q) && mat(b + "attn_k", kTypeF8, kw, E, L.k) &&
-                 mat(b + "attn_v", kTypeF8, kw, E, L.v) && mat(b + "attn_output", kTypeF8, E, qw, L.o);
+            ok = ok && mat(b + "attn_q", at, qw, E, L.q) && mat(b + "attn_k", at, kw, E, L.k) &&
+                 mat(b + "attn_v", at, kw, E, L.v) && mat(b + "attn_output", at, E, qw, L.o);
         } else {
             ok = ok && f32(b + "ffn_gate_inp.weight", (uint64_t) g.n_expert * E, L.router) &&
                  f32(b + "exp_probs_b.bias", (uint64_t) g.n_expert, L.router_bias) &&
@@ -204,14 +205,20 @@ model::Result NemotronModel::plan(const model::LoadRequest& req, core::LoadPlan&
     }
     if (!f32("output_norm.weight", (uint64_t) E, out_norm_) || !mat("output", kTypeF8, g.n_vocab, E, head_))
         return {model::Status::Error, "nemotronh: " + err};
+    if (has_mtp()) {   // the MTP head's own tensors, on its first and last layers
+        const std::string b0 = "blk." + std::to_string(g.n_layers) + ".", b1 = "blk." + std::to_string(g.all_layers() - 1) + ".";
+        if (!mat(b0 + "mtp_eh_proj", kTypeBf16, E, 2 * E, mtp_.eh) || !f32(b0 + "mtp_enorm.weight", (uint64_t) E, mtp_.enorm) ||
+            !f32(b0 + "mtp_hnorm.weight", (uint64_t) E, mtp_.hnorm) || !f32(b1 + "mtp_final_norm.weight", (uint64_t) E, mtp_.final_norm))
+            return {model::Status::Error, "nemotronh: the MTP head: " + err};
+    }
 
     ctx_ = req.max_context > 0 ? req.max_context : kDefaultContext;
     if (g.context_length > 0 && ctx_ > g.context_length)
         return {model::Status::Error, "nemotronh: --max-context " + std::to_string(ctx_) + " is past the model's " +
                                           std::to_string(g.context_length)};
-    basalt::log::info("basalt nemotronh", "%zu dense tensors, %.2f GiB on the GPU; %d Mamba-2, %d attention and %d MoE layers",
+    basalt::log::info("basalt nemotronh", "%zu dense tensors, %.2f GiB on the GPU; %d Mamba-2, %d attention and %d MoE layers%s",
                       placed.size(), (double) dense / (double) kGiB, g.count(Kind::Mamba), g.count(Kind::Attention),
-                      g.count(Kind::Moe));
+                      g.count(Kind::Moe), has_mtp() ? "; an MTP head" : "");
 
     // the sessions first, then the expert tier, sized from what they leave and opened by the first session; its reads are
     // queued in the start's plan

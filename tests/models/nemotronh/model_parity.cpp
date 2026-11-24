@@ -18,6 +18,8 @@
 //   (c) windows: windows of up to 8 rows that keep a random number of their rows (the rest run again in the next): the
 //       kept rows' logits bitwise those of (a) when no expert moves, else within the reference's KL
 //   (d) checkpoint: the running state saved mid-way, the session decoding on, the state restored: the same tokens again
+//   (e) with REF.bin.mtp (reference.py's MTP drafts; the session then drafts, so (a)-(d) keep its cache too): after each
+//       token, the MTP head's first two greedy drafts against the reference's: the ids, and the first's probability
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/model/adapter.hpp"
 #include "models/nemotronh/adapter.hpp"
@@ -111,6 +113,15 @@ bool window(model::ModelSession& s, const int32_t* tok, int n, int64_t pos, int 
     return true;
 }
 
+// reference.py's MTP drafts: per position, the first draft's id and probability, the second's
+bool read_mtp(const std::string& path, std::vector<float>& d) {
+    std::ifstream f(path, std::ios::binary);
+    int32_t n = 0;
+    if (!f.read((char*) &n, 4) || n <= 0) return false;
+    d.resize((size_t) n * 4);
+    return (bool) f.read((char*) d.data(), (std::streamsize) d.size() * 4);
+}
+
 bool prompt(model::ModelSession& s, const int32_t* tok, int n, int64_t pos) {
     model::PrefillRequest r;
     r.tokens = tok;
@@ -170,6 +181,12 @@ int main(int argc, char** argv) {
         else if (a == "--ram" && i + 1 < argc) req.diag_tier_ram = std::atoi(argv[++i]);
     }
     req.diag_tier_frozen = frozen;
+    std::vector<float> mtp;
+    const bool drafts = read_mtp(std::string(argv[2]) + ".mtp", mtp);
+    if (drafts) {   // the session drafts: every check below keeps the MTP head's cache
+        req.draft = true;
+        req.spec = 4;
+    }
     auto adapter = models::nemotronh::make_adapter();
     model::Started st;
     if (const model::Result e = adapter->start(req, st); !e.ok()) {
@@ -260,6 +277,41 @@ int main(int argc, char** argv) {
         std::snprintf(buf, sizeof buf, "the state saved at %d and restored: decoding on gives the same logits (max abs %.2e; %s)", P,
                       d, sd.str().c_str());
         check(ok && (fixed ? d == 0 : sd.kl / sd.n < 5e-3), buf);
+    }
+    // (e) the MTP head's drafts after each token, against the reference's: token by token from the start, then after a
+    // prompt of the first half (the head's cache filled by the prompt's chunk)
+    if (drafts) {
+        const int M = std::min((int) mtp.size() / 4, N - 1);
+        for (int from : {0, P - 1}) {
+            if (from > 0 && !prompt(s, tok, from, 0)) return 1;
+            int agree0 = 0, agree1 = 0, both = 0;
+            double dp = 0;
+            for (int t = from; t < M; ++t) {
+                if (!window(s, tok + t, 1, t, V, w)) return 1;   // from 0: a new conversation
+                if (!s.draft_begin(tok[t + 1], t + 1, 2).ok()) return 1;
+                int32_t ids[2] = {-1, -1};
+                float conf[2] = {0, 0};
+                int n = 0;
+                if (!s.draft_end(ids, conf, 2, n, nullptr).ok()) return 1;
+                const float* r = mtp.data() + (size_t) t * 4;
+                if (n >= 1 && ids[0] == (int32_t) r[0]) {
+                    ++agree0;
+                    dp += std::fabs(conf[0] - r[1]);
+                    if (n >= 2) {
+                        ++both;
+                        agree1 += ids[1] == (int32_t) r[2];
+                    }
+                }
+            }
+            char eb[300];
+            std::snprintf(eb, sizeof eb, "MTP drafts after tokens %d-%d%s: the first agrees at %d of %d (probability off by %.2e on average), the second at %d of %d",
+                          from + 1, M, from ? " (a prompt first)" : "", agree0, M - from, agree0 ? dp / agree0 : 0.0, agree1, both);
+            // after a prompt the model's hidden rows come from the prompt path (8-bit activations: on the synthetic pack its
+            // KL is ~100x one-row decode's), and the synthetic head's near-flat rows (top probabilities 0.02-0.1) flip at
+            // near ties: three in four there, all but two token by token
+            const int need0 = from ? (3 * (M - from) + 3) / 4 : M - from - 2;
+            check(agree0 >= need0 && agree1 >= both - 3 && (agree0 == 0 || dp / agree0 < 0.05), eb);
+        }
     }
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;

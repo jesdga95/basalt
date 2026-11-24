@@ -18,7 +18,13 @@ nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4), for tools/convert/convert.
                           exponential of the BF16 value in float64, rounded once
   tokenizer/*, meta   from config.json, generation_config.json, the tokenizer files and the model card
 
-The vision tower and the multi-token-prediction head are not converted.  Activation scales (input_scale) are unused:
+  the MTP head      (when the config has one: num_nextn_predict_layers 1, mtp_layers_block_type [attention, moe]) as
+                      layers n_layers and n_layers + 1 (blk.88, blk.89 for Super), their tensors by the rules above
+                      (the attention projections BF16 as stored), plus mtp_eh_proj (BF16), mtp_enorm, mtp_hnorm and
+                      mtp_final_norm (F32); its routed experts are the experts section's last layer; the kinds in
+                      nemotronh.mtp_pattern
+
+The vision tower is not converted.  Activation scales (input_scale) are unused:
 the engine scales activations at run time.  Needs numpy.
 """
 from __future__ import annotations
@@ -97,7 +103,16 @@ NEEDS = {
             "mixer.fc2_latent_proj.weight", "mixer.shared_experts.up_proj.weight", "mixer.shared_experts.down_proj.weight"),
 }
 QUANT_SIDE = re.compile(r"\.(weight_scale|weight_scale_2|input_scale|k_scale|v_scale)$")
-SKIP = re.compile(r"^(vision_model\.|vision_projector\.|mlp1\.|(language_model\.)?mtp\.)")
+SKIP = re.compile(r"^(vision_model\.|vision_projector\.|mlp1\.)")
+MTP = re.compile(r"^(language_model\.)?mtp\.")
+# the MTP head's own tensors, after `mtp.layers.N.` -> (GGUF name after `blk.<n_layers + N>.`, form, transform)
+MTP_OWN = {
+    "eh_proj.weight": ("mtp_eh_proj.weight", "BF16", "id"),
+    "enorm.weight": ("mtp_enorm.weight", "F32", "id"),
+    "hnorm.weight": ("mtp_hnorm.weight", "F32", "id"),
+    "final_layernorm.weight": ("mtp_final_norm.weight", "F32", "id"),
+}
+MTP_KINDS = ["attention", "moe"]   # the MTP head the engine runs: the fusion, an attention layer, a MoE layer, a norm
 
 
 def text_config(cfg: dict) -> dict:
@@ -121,6 +136,13 @@ def layer_kinds(tc: dict) -> list[str]:
         raise S.ConvertError(f"config.json: {len(kinds)} layer kinds for {n} layers, or a kind other than mamba, "
                              "attention and moe")
     return kinds
+
+
+def need_scalar(ck: C.Checkpoint, name: str) -> None:
+    """An F32 scale of one value: shape [] (the backbone's) or [1] (the MTP head's)."""
+    ck.need(name, "F32")
+    if ck.t[name][3] not in ([], [1]):
+        raise S.ConvertError(f"{name} has shape {ck.t[name][3]}, expected one value")
 
 
 class Tensor:
@@ -173,27 +195,39 @@ class Geometry:
         self.scale = float(need("routed_scaling_factor"))
         self.eps = float(tc.get("layer_norm_epsilon", tc.get("norm_eps", 1e-5)))
         self.context = int(need("max_position_embeddings"))
+        self.mtp_kinds = []
+        if int(tc.get("num_nextn_predict_layers") or 0) > 0:
+            mk = list(tc.get("mtp_layers_block_type") or [])
+            if int(tc["num_nextn_predict_layers"]) != 1 or mk != MTP_KINDS:
+                raise S.ConvertError(f"config.json: an MTP head of {tc['num_nextn_predict_layers']} x {mk}; the engine runs "
+                                     f"one of {MTP_KINDS}")
+            self.mtp_kinds = mk
+
+    def all_kinds(self) -> list[str]:
+        """The kinds of every pack layer: the model's, then the MTP head's."""
+        return self.kinds + self.mtp_kinds
 
 
 class Experts:
     """The `experts` section: per MoE layer the blobs of its routed experts, from the per-expert NVFP4 tensors."""
 
-    def __init__(self, ck: C.Checkpoint, g: Geometry, prefix: str):
-        self.ck, self.g, self.prefix = ck, g, prefix
-        self.layers, offset = [], 0
+    def __init__(self, ck: C.Checkpoint, g: Geometry, prefix: str, mtp_prefix: str):
+        self.ck, self.g = ck, g
+        self.layers, offset = [], 0   # (pack layer, the checkpoint's prefix of its experts, offset)
         self.blob = g.ff * S.nvfp4_row_bytes(g.latent) + g.latent * S.nvfp4_row_bytes(g.ff) + NVFP4_TAIL
-        for l, kind in enumerate(g.kinds):
+        for l, kind in enumerate(g.all_kinds()):
             if kind != "moe":
                 continue
+            src = f"{prefix}layers.{l}." if l < g.n_layers else f"{mtp_prefix}layers.{l - g.n_layers}."
             for e in range(g.n_expert):
-                p = f"{prefix}layers.{l}.mixer.experts.{e}."
+                p = f"{src}mixer.experts.{e}."
                 ck.need(p + "up_proj.weight", "U8", (g.ff, g.latent // 2))
                 ck.need(p + "up_proj.weight_scale", "F8_E4M3", (g.ff, g.latent // 16))
-                ck.need(p + "up_proj.weight_scale_2", "F32", ())
+                need_scalar(ck, p + "up_proj.weight_scale_2")
                 ck.need(p + "down_proj.weight", "U8", (g.latent, g.ff // 2))
                 ck.need(p + "down_proj.weight_scale", "F8_E4M3", (g.latent, g.ff // 16))
-                ck.need(p + "down_proj.weight_scale_2", "F32", ())
-            self.layers.append((l, offset))
+                need_scalar(ck, p + "down_proj.weight_scale_2")
+            self.layers.append((l, src, offset))
             offset += self.blob * g.n_expert
         self.total = offset
 
@@ -201,15 +235,15 @@ class Experts:
         head = ("# experts v7 relu2: layer gu_type d_type offset blob_bytes (n_expert %d, total %d); a blob is [up | down] "
                 "with no gate rows, then FP32 {s_up, 0, s_down, 0}\n" % (self.g.n_expert, self.total))
         return (head + "".join("%d %d %d %d %d\n" % (l, S.NVFP4, S.NVFP4, off, self.blob)
-                               for l, off in self.layers)).encode()
+                               for l, _, off in self.layers)).encode()
 
     def jobs(self):
         ck, g = self.ck, self.g
-        for l, _ in self.layers:
+        for _, src, _ in self.layers:
             for s in range(0, g.n_expert, EXPERTS_PER_JOB):
                 ents = []
                 for e in range(s, min(g.n_expert, s + EXPERTS_PER_JOB)):
-                    p = f"{self.prefix}layers.{l}.mixer.experts.{e}."
+                    p = f"{src}mixer.experts.{e}."
                     ents.append(tuple((str(ck.t[p + w + k][0]), ck.t[p + w + k][1])
                                       for w in ("up_proj.", "down_proj.") for k in ("weight", "weight_scale", "weight_scale_2")))
                 yield ("experts", ents, g.latent, g.ff)
@@ -244,27 +278,39 @@ def _expert_blobs(ents, lat, ff) -> bytes | str:
 class Plan:
     """The pack's `gguf` tensors in checkpoint order, each with how it is made."""
 
-    def __init__(self, ck: C.Checkpoint, g: Geometry, prefix: str, head_src: str):
+    def __init__(self, ck: C.Checkpoint, g: Geometry, prefix: str, head_src: str, mtp_prefix: str):
         self.ck, self.g, self.prefix = ck, g, prefix
         self.tensors: dict[str, Tensor] = {}
         self.scales: dict[str, str] = {}   # <name>.scale -> the checkpoint's scalar
         unknown = []
         lp = re.escape(prefix) + r"layers\.(\d+)\.(.+)"
+        mp = re.escape(mtp_prefix) + r"layers\.(\d+)\.(.+)"
         for k in ck.order:
             if SKIP.match(k) or QUANT_SIDE.search(k) or re.search(r"\.mixer\.experts\.\d+\.", k):
                 continue
+            if MTP.match(k) and not g.mtp_kinds:   # a head the config does not describe
+                continue
             _, _, dt, shape, _ = ck.t[k]
             m = re.fullmatch(lp, k)
-            if m:
+            mm = re.fullmatch(mp, k)
+            if mm:
+                rule = MTP_OWN.get(mm.group(2)) or LAYER.get(mm.group(2))
+                if rule is None or int(mm.group(1)) >= len(g.mtp_kinds):
+                    unknown.append(k)
+                    continue
+                form = "BF16" if rule[1] == "F8" and dt == "BF16" else rule[1]   # the head's attention is BF16
+                gname, how = f"blk.{g.n_layers + int(mm.group(1))}.{rule[0]}", rule[2]
+                form_ = form
+            elif m:
                 rule = LAYER.get(m.group(2))
                 if rule is None:
                     unknown.append(k)
                     continue
-                gname, form, how = f"blk.{m.group(1)}.{rule[0]}", rule[1], rule[2]
+                gname, form_, how = f"blk.{m.group(1)}.{rule[0]}", rule[1], rule[2]
             elif k.startswith(prefix) and k[len(prefix):] in GLOBAL:
-                gname, form, how = GLOBAL[k[len(prefix):]]
+                gname, form_, how = GLOBAL[k[len(prefix):]]
             elif k == head_src:
-                gname, form, how = HEAD
+                gname, form_, how = HEAD
             else:
                 unknown.append(k)
                 continue
@@ -274,7 +320,7 @@ class Plan:
                 ne = [shape[2], shape[0]]
             else:
                 ne = list(reversed(shape))
-            self._add(gname, form, k, how, ne, dt)
+            self._add(gname, form_, k, how, ne, dt)
         if unknown:
             raise S.ConvertError("checkpoint tensors with no pack counterpart: " + ", ".join(unknown[:8]))
         self._check_complete()
@@ -289,14 +335,14 @@ class Plan:
         if form == "F8":
             if len(ne) != 2 or ne[0] % 256:
                 raise S.ConvertError(f"{src}: F8_E4M3 rows of {ne[0]} values (the kernels read multiples of 256)")
-            self.ck.need(base + ".weight_scale", "F32", ())
+            need_scalar(self.ck, base + ".weight_scale")
             self.scales[gname[:-len(".weight")] + ".scale"] = base + ".weight_scale"
         elif form == "FP4":
             rows, K = ne[1], ne[0] * 2   # U8 [rows, K / 2]
             if rows % 128 or K % 64:
                 raise S.ConvertError(f"{src}: an NVFP4 matrix of {rows} x {K} (NVFP4_PLANES needs rows in 128s, K in 64s)")
             self.ck.need(base + ".weight_scale", "F8_E4M3", (rows, K // 16))
-            self.ck.need(base + ".weight_scale_2", "F32", ())
+            need_scalar(self.ck, base + ".weight_scale_2")
             self.scales[gname[:-len(".weight")] + ".scale"] = base + ".weight_scale_2"
             ne = [K, rows]
         self.tensors[gname] = Tensor(gname, form, src, how, ne)
@@ -304,13 +350,21 @@ class Plan:
     def _check_complete(self):
         g = self.g
         need = [r[0] for r in GLOBAL.values()] + [HEAD[0]]
-        for l, kind in enumerate(g.kinds):
+        for l, kind in enumerate(g.all_kinds()):
             need += [f"blk.{l}.{LAYER[k][0]}" for k in NEEDS[kind]]
+        if g.mtp_kinds:
+            first, last = g.n_layers, g.n_layers + len(g.mtp_kinds) - 1
+            need += [f"blk.{first}.{MTP_OWN[k][0]}" for k in ("eh_proj.weight", "enorm.weight", "hnorm.weight")]
+            need.append(f"blk.{last}.mtp_final_norm.weight")
         missing = [n for n in need if n not in self.tensors]
         if missing:
             raise S.ConvertError(f"the checkpoint lacks {len(missing)} tensors the engine reads: " + ", ".join(missing[:8]))
         shapes = {"token_embd.weight": [g.h, g.vocab], "output.weight": [g.h, g.vocab], "output_norm.weight": [g.h]}
-        for l, kind in enumerate(g.kinds):
+        if g.mtp_kinds:
+            first, last = g.n_layers, g.n_layers + len(g.mtp_kinds) - 1
+            shapes.update({f"blk.{first}.mtp_eh_proj.weight": [2 * g.h, g.h], f"blk.{first}.mtp_enorm.weight": [g.h],
+                           f"blk.{first}.mtp_hnorm.weight": [g.h], f"blk.{last}.mtp_final_norm.weight": [g.h]})
+        for l, kind in enumerate(g.all_kinds()):
             b = f"blk.{l}."
             shapes[b + "attn_norm.weight"] = [g.h]
             if kind == "mamba":
@@ -417,6 +471,7 @@ def model_kv(ck: C.Checkpoint, g: Geometry, tc: dict, name: str | None) -> dict:
     kv.update({
         A + "block_count": g.n_layers,
         A + "layer_pattern": "".join(KIND[k] for k in g.kinds),
+        A + "mtp_pattern": "".join(KIND[k] for k in g.mtp_kinds),
         A + "context_length": g.context,
         A + "embedding_length": g.h,
         A + "vocab_size": g.vocab,
@@ -467,8 +522,9 @@ def build(a, Job, fingerprint, die) -> None:
         vl = any(k.startswith("language_model.") for k in ck.t)
         prefix = "language_model.backbone." if vl else "backbone."
         head_src = ("language_model." if vl else "") + "lm_head.weight"
-        plan = Plan(ck, g, prefix, head_src)
-        experts = Experts(ck, g, prefix)
+        mtp_prefix = "language_model.mtp." if vl else "mtp."
+        plan = Plan(ck, g, prefix, head_src, mtp_prefix)
+        experts = Experts(ck, g, prefix, mtp_prefix)
         name = a.name or str(ck.config.get("_name_or_path") or ck.dir.name)
         kv = model_kv(ck, g, tc, name)
     except S.ConvertError as e:

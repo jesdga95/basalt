@@ -14,6 +14,12 @@
 // waits on the card for a word the joiner thread writes once the CPU's rows landed, while the host queues the next
 // layers and the card reads their first weights into L2 (Hy4-flash's and DeepSeek's decode, window_handoff.hpp).  A prompt chunk stages every expert its rows use on the card (from a slot, the RAM tier or the pack)
 // and computes them there with llama.cpp's MMQ (q8_1 activations against the NVFP4 blobs).
+//
+// The MTP head (when the pack has one and drafting is on) drafts: its cache position p holds the pair (the model's normed
+// hidden row h_p, the token t_{p+1}).  The model's rows queue their h until the tokens after them are accepted; the queue
+// is flushed through the head (its fusion, attention layer and MoE layer) at a window's start, at draft_begin (whose
+// anchor is the last token) and in a prompt chunk.  The first draft comes from the last flushed row; each further draft
+// feeds the head's own normed output back with the draft before.
 #include "models/nemotronh/model.hpp"
 #include "models/nemotronh/ops.hpp"
 
@@ -39,6 +45,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
@@ -80,7 +87,8 @@ static_assert(sizeof(WindowPut) <= 4 * bk::kPutWords, "a window's plan fits put_
 class Session final : public model::ModelSession {
 public:
     explicit Session(NemotronModel& m)
-        : m_(m), g_(m.geo()), sg_{g_.ssm_heads, g_.ssm_head_dim, g_.ssm_state, g_.ssm_groups, g_.ssm_conv} {}
+        : m_(m), g_(m.geo()), sg_{g_.ssm_heads, g_.ssm_head_dim, g_.ssm_state, g_.ssm_groups, g_.ssm_conv},
+          mtp_on_(m.has_mtp() && m.flags().draft) {}
 
     ~Session() override {
         if (joiner_.joinable()) {
@@ -161,6 +169,22 @@ public:
             need(wg::Format::Nvfp4, E, g_.n_ff_shared);
             need(wg::Format::Bf16, L, E);
             need(wg::Format::Bf16, E, L);
+            if (mtp_on_) {   // the MTP head's fusion and its BF16 attention
+                need(wg::Format::Bf16, E, 2 * E);
+                need(wg::Format::Bf16, E, QW);
+            }
+            for (wg::Format fmt : {wg::Format::F8, wg::Format::Bf16}) {   // q, k and v in one call (their rows together)
+                wg::Call c;
+                c.fmt = fmt;
+                c.K = E;
+                c.n = 3;
+                c.m[0].rows = QW;
+                c.m[1].rows = c.m[2].rows = KW;
+                size_t a = 0, b = 0;
+                wg::workspace_need(c, a, b);
+                pf = std::max(pf, a);
+                tk = std::max(tk, b);
+            }
             ws_.partial_floats = pf;
             ws_.tickets_n = tk;
             ws_.partial = pf ? f((int64_t) pf) : nullptr;
@@ -258,6 +282,17 @@ public:
                 vc_.push_back((uint16_t*) alloc(cells * 2, ok));
             }
         }
+        if (mtp_on_) {   // the MTP head's cache (after the model's), its queue of hidden rows, its output row, its logits
+            const size_t cells = (size_t) m_.context() * (size_t) KW;
+            kc_.push_back((uint16_t*) alloc(cells * 2, ok));
+            vc_.push_back((uint16_t*) alloc(cells * 2, ok));
+            hq_ = f((int64_t) (kChunk + kMaxWindow + 1) * E);
+            hm_ = f(E);
+            dlogits_ = f(g_.n_vocab);
+            dlp_ = f((int64_t) bk::row_logprobs_scratch_floats(1, g_.n_vocab) + bk::kLogprobStride);
+            dpick_ = (int32_t*) alloc(16, ok);
+            if (ok) cudaMemset(dpick_, 0, 16);
+        }
         attw_ = f((int64_t) bk::gqa_decode_scratch_floats(m_.context(), kMaxWindow, g_.n_head, g_.head_dim));
         if (!ok) {
             err = "out of device memory for the session's buffers (--max-context sets the caches)";
@@ -276,6 +311,42 @@ public:
     int max_window() const override { return kMaxWindow; }
     bool copy_drafts() const override { return true; }   // prompt lookup: any window's rows verify alike
 
+    // The MTP head's drafts after `anchor` at `pos`: made in draft_end, one at a time, so a draft the window policy rules
+    // out is never made.
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        if (!mtp_on_) return {model::Status::NotImplemented, "nemotronh: the pack has no MTP head, or --spec is off"};
+        draft_anchor_ = anchor;
+        draft_pos_ = pos;
+        draft_n_ = std::max(0, std::min(n, kMaxWindow - 1));
+        return {};
+    }
+
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        n = 0;
+        if (!mtp_on_) return {model::Status::NotImplemented, "nemotronh: the pack has no MTP head, or --spec is off"};
+        const int want = std::min({draft_n_, max_n, std::max(0, m_.flags().spec - 1)});
+        const int64_t pos = draft_pos_;
+        if (want <= 0 || pos < 1) return {};
+        std::string err;
+        // the head's row at pos - 1 runs again if it ran already: its output is the first draft
+        if (mtp_valid_ > pos - 1 && hq_pos_ <= pos - 1 && hq_pos_ + hq_n_ > pos - 1) mtp_valid_ = pos - 1;
+        if (!mtp_flush(pos, draft_anchor_, true, err)) return {model::Status::Error, "nemotronh: " + err};
+        if (!head_ready_) return {};   // the queue lacked the row (a restored state without it): no drafts this time
+        for (int j = 0; j < want; ++j) {
+            if (j > 0) {
+                if (pos + j >= m_.context()) break;
+                const int32_t prev = ids[j - 1];
+                if (!mtp_rows(hm_, &prev, 1, pos + j - 1, true, err)) return {model::Status::Error, "nemotronh: " + err};
+            }
+            float lp = 0.f;
+            if (!draft_top(ids[j], lp, err)) return {model::Status::Error, "nemotronh: " + err};
+            conf[j] = std::exp(lp);
+            if (need && !need(conf, j, want)) break;
+            n = j + 1;
+        }
+        return {};
+    }
+
     model::Result prepare() override {
         std::string e;
         if (!ensure_tier(e)) return {model::Status::Error, "nemotronh: " + e};
@@ -289,6 +360,8 @@ public:
         const bool want = r.row_tokens || r.next_token || r.logits;
         const int head = !want ? 0 : r.row_tokens ? r.n_tokens : 1;
         if (tier_) tier_->begin_token(r.n_tokens);
+        // the head's cache through the accepted rows (the window's first token follows them)
+        if (mtp_on_ && !mtp_flush(r.pos, r.tokens[0], false, err)) return {model::Status::Error, "nemotronh: " + err};
         // CUDA loads a kernel lazily at its first launch, which can wait for the card, and the card may be holding at a word
         // the host writes only after that launch: the first window of each row count (which picks its kernels) joins its
         // groups itself, so every kernel it needs is loaded while nothing holds the card
@@ -323,6 +396,8 @@ public:
             if (r.stop && r.stop()) break;
             const int n = std::min(kChunk, r.n_tokens - t0);
             if (!run_rows(r.tokens + t0, n, r.pos + t0, false, 0, err)) return {model::Status::Error, "nemotronh: " + err};
+            // the head's cache through the chunk's rows but its last (the token after it comes with the next call)
+            if (mtp_on_ && !mtp_flush(r.pos + t0 + n - 1, -1, false, err)) return {model::Status::Error, "nemotronh: " + err};
             if (r.progress) {
                 cudaStreamSynchronize(stream_);
                 r.progress(t0 + n);
@@ -332,24 +407,39 @@ public:
         return {};
     }
 
-    size_t running_bytes() const override { return mamba_.size() * (sg_.state_floats() + sg_.hist_floats()) * 4; }
+    size_t running_bytes() const override {
+        return mamba_.size() * (sg_.state_floats() + sg_.hist_floats()) * 4 + (mtp_on_ ? (size_t) g_.n_embd * 4 : 0);
+    }
 
+    // The Mamba-2 states and histories, and with the MTP head the model's hidden row at pos - 1 (its cache through pos - 1
+    // is flushed first; the cells travel with the attention caches)
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
         if (save) {
             std::string err;
             if (!settle(pos, err)) return {model::Status::Error, "nemotronh: " + err};
+            if (mtp_on_ && pos > 0 && !mtp_flush(pos - 1, -1, false, err)) return {model::Status::Error, "nemotronh: " + err};
+            if (mtp_on_ && pos > 0) queue_from(pos - 1);   // the row the state carries first
+            if (mtp_on_ && pos > 0 && !(hq_pos_ == pos - 1 && hq_n_ >= 1))
+                return {model::Status::Error, "nemotronh: the MTP head has no hidden row at the saved position"};
         }
         for (const Mamba& mb : mamba_) {
             st.regions.push_back({mb.state, sg_.state_floats() * 4});
             st.regions.push_back({mb.hist, sg_.hist_floats() * 4});
         }
+        if (mtp_on_) st.regions.push_back({hq_, (size_t) g_.n_embd * 4});
         st.stream = stream_;
         return {};
     }
 
-    model::Result running_restored(int64_t, const uint8_t*) override {
+    model::Result running_restored(int64_t pos, const uint8_t*) override {
         pend_T_ = 0;
         alt_ready_ = false;
+        if (mtp_on_) {   // the head's cache holds positions before pos - 1; the hidden row of pos - 1 waits for its token
+            mtp_valid_ = std::max<int64_t>(pos - 1, 0);
+            hq_pos_ = mtp_valid_;
+            hq_n_ = pos > 0 ? 1 : 0;
+            tok_hist_.assign((size_t) pos, -1);
+        }
         return {};
     }
 
@@ -491,6 +581,8 @@ private:
         if (pos == 0) {
             pend_T_ = 0;
             alt_ready_ = false;
+            mtp_valid_ = hq_pos_ = hq_n_ = 0;
+            tok_hist_.clear();
             for (const Mamba& mb : mamba_) {
                 cudaMemsetAsync(mb.state, 0, sg_.state_floats() * 4, stream_);
                 cudaMemsetAsync(mb.hist, 0, sg_.hist_floats() * 4, stream_);
@@ -543,6 +635,10 @@ private:
                 return false;
             }
         const int64_t E = g_.n_embd;
+        if (mtp_on_) {   // the tokens by position (a call that starts earlier drops those after it)
+            tok_hist_.resize((size_t) pos0, -1);
+            tok_hist_.insert(tok_hist_.end(), tokens, tokens + R);
+        }
         cudaMemcpyAsync(tok_, tokens, (size_t) R * 4, cudaMemcpyHostToDevice, stream_);
         bk::iq_embed_rows(kTypeBf16, m_.embedding(), (size_t) E * 2, tok_, R, E, X_, stream_);
         int mi = 0, ai = 0;
@@ -557,6 +653,7 @@ private:
                 return false;
             }
         }
+        if (mtp_on_) queue_rows(pos0, R);
         if (head > 0) {
             const Mat& h = m_.head();
             wg::norm_pack(X_ + (size_t) (R - head) * E, m_.out_norm(), g_.rms_eps, E, head, act_, nullptr, stream_);
@@ -617,7 +714,7 @@ private:
         const int64_t E = g_.n_embd, QW = (int64_t) g_.n_head * g_.head_dim, KW = (int64_t) g_.n_kv * g_.head_dim;
         wg::norm_pack(X_, L.norm, g_.rms_eps, E, R, act_, nullptr, stream_);
         wg::Call c;
-        c.fmt = wg::Format::F8;
+        c.fmt = L.q.type == kTypeF8 ? wg::Format::F8 : wg::Format::Bf16;   // the MTP head's attention is BF16
         c.K = E;
         c.n = 3;
         c.m[0] = wg::Matrix{L.q.w, L.q.rows, L.q.scale, q_, QW};
@@ -634,6 +731,21 @@ private:
 
     bool attn_chunk(const Layer& L, int ai, int R, int64_t pos0) {
         const int64_t E = g_.n_embd, QW = (int64_t) g_.n_head * g_.head_dim, KW = (int64_t) g_.n_kv * g_.head_dim;
+        if (L.q.type == kTypeBf16) {   // the MTP head's: BF16 projections in window gemm calls
+            bk::rms_norm_rows(X_, L.norm, XN_, R, E, g_.rms_eps, stream_);
+            bf16_rows(L.q, XN_, E, q_, R);
+            bf16_rows(L.k, XN_, E, k_, R);
+            bf16_rows(L.v, XN_, E, v_, R);
+            kv_store(k_, v_, R, pos0, g_.n_kv, g_.head_dim, kc_[(size_t) ai], vc_[(size_t) ai], stream_);
+            bk::gqa_prompt_attn(q_, kc_[(size_t) ai], vc_[(size_t) ai], g_.n_head, g_.n_kv, pos0, R, att_, stream_, {}, nullptr, 0, {},
+                                g_.head_dim);
+            for (int t0 = 0; t0 < R; t0 += kMaxWindow) {
+                const int n = std::min(kMaxWindow, R - t0);
+                wg::pack(att_ + (size_t) t0 * QW, QW, QW, n, act_, stream_);
+                gemm(L.o, X_ + (size_t) t0 * E, E, n, true);
+            }
+            return true;
+        }
         prefill::fp8::rms_norm_quantize(X_, L.norm, g_.rms_eps, R, E, xq8_, nullptr, stream_);
         prefill::fp8::gemm(L.q.w, L.q.rows, L.q.cols, L.q.scale, xq8_, R, q_, QW, prefill::fp8::Epilogue::Store, stream_);
         prefill::fp8::gemm(L.k.w, L.k.rows, L.k.cols, L.k.scale, xq8_, R, k_, KW, prefill::fp8::Epilogue::Store, stream_);
@@ -644,6 +756,122 @@ private:
         prefill::fp8::quantize(att_, R, QW, QW, xq8_, stream_);
         prefill::fp8::gemm(L.o.w, L.o.rows, L.o.cols, L.o.scale, xq8_, R, X_, E, prefill::fp8::Epilogue::Add, stream_);
         return true;
+    }
+
+    // ---- the MTP head ----------------------------------------------------------------------------------------------------
+    static constexpr int kQueueRows = kChunk + kMaxWindow + 1;   // a chunk's rows and the one before it, or a window's
+
+    // The model's normed hidden rows of R rows at pos0 (X_ after the last layer) into the queue: its rows are positions
+    // hq_pos_ .. hq_pos_ + hq_n_; a call that starts earlier drops those from pos0 on, and the head's cache is good only
+    // before pos0.
+    void queue_rows(int64_t pos0, int R) {
+        const int64_t E = g_.n_embd;
+        mtp_valid_ = std::min(mtp_valid_, pos0);
+        if (hq_n_ == 0 || pos0 < hq_pos_ || pos0 > hq_pos_ + hq_n_ || pos0 - hq_pos_ + R > kQueueRows) {
+            hq_pos_ = pos0;   // a fresh queue: a row before pos0 it lacks leaves the head's cache as it is there
+            hq_n_ = 0;
+        }
+        hq_n_ = pos0 - hq_pos_;
+        bk::rms_norm_rows(X_, m_.out_norm(), hq_ + (size_t) hq_n_ * E, R, E, g_.rms_eps, stream_);
+        hq_n_ += R;
+    }
+
+    // The head's cache through position p_end - 1: the pairs (h_p, t_{p+1}) of the queued rows from mtp_valid_ on, t_{p_end}
+    // `last_tok` (or the token history's when -1).  `want_head`: the last row's draft logits to dlogits_ and its output to hm_
+    // (head_ready_ says they are there).  The queue keeps its rows from p_end - 1 on.
+    bool mtp_flush(int64_t p_end, int32_t last_tok, bool want_head, std::string& err) {
+        const int64_t E = g_.n_embd;
+        head_ready_ = false;
+        if (mtp_valid_ < hq_pos_) mtp_valid_ = hq_pos_;   // positions the queue never held keep what the cache has
+        const int64_t end = std::min(p_end, hq_pos_ + hq_n_);
+        std::vector<int32_t> toks;
+        for (int64_t p = mtp_valid_; p < end;) {
+            const int n = (int) std::min<int64_t>(kChunk, end - p);
+            toks.assign((size_t) n, -1);
+            for (int i = 0; i < n; ++i) {
+                const int64_t q = p + i + 1;
+                toks[(size_t) i] = q == p_end && last_tok >= 0 ? last_tok : q < (int64_t) tok_hist_.size() ? tok_hist_[(size_t) q] : -1;
+                if (toks[(size_t) i] < 0 || toks[(size_t) i] >= g_.n_vocab) {
+                    err = "the MTP head has no token at position " + std::to_string((long long) q);
+                    return false;
+                }
+            }
+            const bool head = want_head && p + n == p_end;
+            if (!mtp_rows(hq_ + (size_t) (p - hq_pos_) * E, toks.data(), n, p, head, err)) return false;
+            head_ready_ = head;
+            p += n;
+        }
+        mtp_valid_ = std::max(mtp_valid_, end);
+        queue_from(end - 1);
+        return true;
+    }
+
+    // The queue's rows from position `pos` on to its front (through proj_: they may overlap).
+    void queue_from(int64_t pos) {
+        if (pos <= hq_pos_) return;
+        const int64_t E = g_.n_embd, drop = pos - hq_pos_, keep = hq_n_ - drop;
+        if (keep > 0) {
+            cudaMemcpyAsync(proj_, hq_ + (size_t) drop * E, (size_t) keep * E * 4, cudaMemcpyDeviceToDevice, stream_);
+            cudaMemcpyAsync(hq_, proj_, (size_t) keep * E * 4, cudaMemcpyDeviceToDevice, stream_);
+        }
+        hq_pos_ = pos;
+        hq_n_ = std::max<int64_t>(keep, 0);
+    }
+
+    // n rows of the head at pos0: the fusion of enorm(embedding of toks) and hnorm(h), its attention layer and its MoE
+    // layer; with `head` the last row's normed output to hm_ and its logits to dlogits_.
+    bool mtp_rows(const float* h, const int32_t* toks, int n, int64_t pos0, bool head, std::string& err) {
+        const int64_t E = g_.n_embd;
+        const MtpHead& H = m_.mtp();
+        const int la = g_.n_layers, lm = g_.n_layers + 1;
+        if (pos0 + n > m_.context()) {
+            err = "the MTP head's position " + std::to_string((long long) (pos0 + n - 1)) + " is past the context";
+            return false;
+        }
+        cudaMemcpyAsync(tok_, toks, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
+        bk::iq_embed_rows(kTypeBf16, m_.embedding(), (size_t) E * 2, tok_, n, E, XN_, stream_);
+        float* cat = proj_;   // [n][2 E]: the normed embedding, then the normed hidden row
+        bk::rms_norm_rows(XN_, H.enorm, cat, n, E, g_.rms_eps, stream_, 2 * E);
+        bk::rms_norm_rows(h, H.hnorm, cat + E, n, E, g_.rms_eps, stream_, 2 * E);
+        const bool window = n <= kMaxWindow;
+        if (window) {
+            wg::pack(cat, 2 * E, 2 * E, n, act_, stream_);
+            gemm(H.eh, X_, E, n);
+        } else {
+            bf16_rows(H.eh, cat, 2 * E, X_, n);
+        }
+        const int ai = (int) kc_.size() - 1;   // the head's cache, after the model's
+        join_now_ = window && !(mtp_warmed_ >> n & 1u);   // as a window's first run of n rows (decode_window)
+        bool ok = window ? attn_window(m_.layer(la), ai, n, pos0) : attn_chunk(m_.layer(la), ai, n, pos0);
+        ok = ok && (window ? moe_window(lm, m_.layer(lm), n, err) : moe_chunk(m_.layer(lm), n, err));
+        if (!join_moe(err)) ok = false;
+        if (!ok) {
+            cudaStreamSynchronize(stream_);
+            if (err.empty()) err = "the MTP head failed";
+            return false;
+        }
+        if (window) mtp_warmed_ |= 1u << n;
+        if (head) {
+            bk::rms_norm_rows(X_ + (size_t) (n - 1) * E, H.final_norm, hm_, 1, E, g_.rms_eps, stream_);
+            wg::pack(hm_, E, E, 1, act_, stream_);
+            gemm(m_.head(), dlogits_, g_.n_vocab, 1);
+        }
+        return true;
+    }
+
+    // The likeliest token of dlogits_ and its log probability.
+    bool draft_top(int32_t& id, float& logprob, std::string& err) {
+        float* out = dlp_ + bk::row_logprobs_scratch_floats(1, g_.n_vocab);
+        bk::row_logprobs(dlogits_, 1, g_.n_vocab, dpick_, 1, out, dlp_, stream_);
+        float top[2];
+        if (cudaMemcpyAsync(top, out + 2, 8, cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+            cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "the draft's logits failed";
+            return false;
+        }
+        std::memcpy(&id, &top[0], 4);
+        logprob = top[1];
+        return id >= 0 && id < g_.n_vocab;
     }
 
     // ---- the MoE ---------------------------------------------------------------------------------------------------------
@@ -736,8 +964,8 @@ private:
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
             const uint64_t budget = (uint64_t) l2 * 3 / 5;
-            ra_.resize((size_t) g_.n_layers);
-            for (int k = 0; k < g_.n_layers; ++k) {
+            ra_.resize((size_t) g_.all_layers());
+            for (int k = 0; k < g_.all_layers(); ++k) {
                 bk::L2Ranges& r = ra_[(size_t) k];
                 uint64_t left = budget;
                 int n = 0;
@@ -751,7 +979,7 @@ private:
                 };
                 const Layer& L = m_.layer(k);
                 if (L.kind == Kind::Moe) add(L.lat_up);
-                if (k + 1 < g_.n_layers) {
+                if (k + 1 < g_.n_layers) {   // the model's next layer; after its last and after the MTP head's, the head
                     const Layer& N = m_.layer(k + 1);
                     if (N.kind == Kind::Mamba) add(N.in);
                     else if (N.kind == Kind::Attention) {
@@ -1162,6 +1390,7 @@ private:
     NemotronModel& m_;
     const Geometry& g_;
     const bk::SsdGeometry sg_;
+    const bool mtp_on_;   // the pack's MTP head drafts (drafting is on)
     cudaStream_t stream_ = nullptr;
     std::vector<void*> bufs_, pinned_;
     float *X_ = nullptr, *XN_ = nullptr, *proj_ = nullptr, *xbc_ = nullptr, *y_ = nullptr, *gn_ = nullptr;
@@ -1193,6 +1422,17 @@ private:
         core::ExpertTier::Use use[kLookupK];
     } pend_;
     uint32_t warmed_ = 0;     // bit T: a window of T rows ran (its kernels are loaded)
+    uint32_t mtp_warmed_ = 0; // the same for the MTP head's runs
+    // the MTP head: the queue of the model's normed hidden rows (positions hq_pos_ ...), the head's output row, the draft
+    // logits and their top token; its cache is good through mtp_valid_ - 1; the tokens by position; the draft asked for
+    float *hq_ = nullptr, *hm_ = nullptr, *dlogits_ = nullptr, *dlp_ = nullptr;
+    int32_t* dpick_ = nullptr;
+    int64_t hq_pos_ = 0, hq_n_ = 0, mtp_valid_ = 0;
+    std::vector<int32_t> tok_hist_;
+    bool head_ready_ = false;
+    int32_t draft_anchor_ = 0;
+    int64_t draft_pos_ = 0;
+    int draft_n_ = 0;
     bool join_now_ = false;   // this window's groups are joined as they are queued
     std::thread joiner_;
     std::mutex jm_;
