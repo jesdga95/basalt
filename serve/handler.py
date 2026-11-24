@@ -836,6 +836,7 @@ def make_handler(target: Service | Router):
             check_format(req.get("response_format"))
             self.svc.require_grammar(req.get("response_format"))
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
+            self.svc.require_more_samplers(req)              # likewise a sampler the server was not started for
             checked_return_progress(req)                      # and a return_progress that is not a boolean
             max_new = _checked_max_tokens(req, "max_completion_tokens", "max_tokens")   # 0/-1: the rest of the context
             self._open_live("chatcmpl-" + uuid.uuid4().hex[:24], req)
@@ -1002,6 +1003,7 @@ def make_handler(target: Service | Router):
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             try:
                 checked_sampling(req)
+                self.svc.require_more_samplers(req)
             except ValueError as e:
                 raise ResponsesError(str(e), str(e).split(":")[0]) from None
             req[LOGPROBS_KEY] = responses_api.requested_logprobs(req)
@@ -1025,6 +1027,29 @@ def make_handler(target: Service | Router):
             asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, rid=self.live.id)
             return ids, thinking, tools, max_new, asm, req, force
+
+        def _raw_grammar(self, req, sampling: dict) -> None:
+            """The raw APIs' `grammar` (GBNF text) or `grammar_schema` (a JSON schema) into the engine key of
+            `sampling`; nothing when the request has neither."""
+            text, schema = req.get("grammar"), req.get("grammar_schema")
+            if text is None and schema is None:
+                return
+            if not self.svc.gbnf_grammar:
+                raise ValueError("grammar, grammar_schema: start the server with --gbnf-grammar on")
+            if text is not None:
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("grammar: a GBNF string")
+                spec = {"kind": "gbnf", "bnf": text}
+            else:
+                if isinstance(schema, str):
+                    try:
+                        schema = json.loads(schema)
+                    except ValueError:
+                        raise ValueError("grammar_schema: a JSON object, or a string holding one") from None
+                if not isinstance(schema, dict):
+                    raise ValueError("grammar_schema: a JSON object, or a string holding one")
+                spec = {"kind": "json_schema", "schema": schema}
+            sampling[GRAMMAR_KEY] = dict(spec, think=False)      # held from the first generated token
 
         def _sampling_from_raw(self, req, kobold: bool) -> dict:
             """The raw APIs' sampling fields into the engine's sampling dict; checked_sampling validates it.
@@ -1056,6 +1081,7 @@ def make_handler(target: Service | Router):
             if _num(lo) and _num(hi) and float(lo) > float(hi):
                 raise ValueError("dynatemp_min must not exceed dynatemp_max")
             checked_sampling(s)
+            self.svc.require_more_samplers(s)
             # koboldcpp's field is singular, the horde's plural; both name the same thing
             order = g("samplers_order")
             if order is None:
@@ -1066,7 +1092,8 @@ def make_handler(target: Service | Router):
 
         def _completions(self, req):
             """OpenAI's POST /v1/completions: the raw prompt continues as the model writes it - no chat
-            template, no thinking, no tools.  The samplers are the chat path's plus the horde set."""
+            template, no thinking, no tools.  The samplers are the chat path's plus the horde set (--more-samplers
+            on); `grammar` or `grammar_schema` holds the text to a GBNF grammar (--gbnf-grammar on)."""
             prompt = req.get("prompt")
             if isinstance(prompt, list):
                 if not all(isinstance(x, str) for x in prompt):
@@ -1088,6 +1115,7 @@ def make_handler(target: Service | Router):
             if stop is not None and not isinstance(stop, (str, list)):
                 raise ValueError("stop: a string or a list of strings")
             sampling = self._sampling_from_raw(req, kobold=False)
+            self._raw_grammar(req, sampling)
             if suffix:
                 sampling = dict(sampling)               # stop applies to the pre-suffix completion
                 stop_list = ([stop] if isinstance(stop, str) else list(stop or [])) + [suffix]
@@ -1186,6 +1214,7 @@ def make_handler(target: Service | Router):
                 raise ValueError("prompt: a string")
             max_new = int(req.get("max_length") or 0)
             sampling = self._sampling_from_raw(req, kobold=True)
+            self._raw_grammar(req, sampling)
             stop = req.get("stop_sequence")
             if stop is not None and not isinstance(stop, list):
                 raise ValueError("stop_sequence: a list of strings")
@@ -1281,6 +1310,7 @@ def make_handler(target: Service | Router):
             req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
+            self.svc.require_more_samplers(req)              # likewise a sampler the server was not started for
             req[LOGPROBS_KEY] = checked_logprobs(req)         # Basalt's logprobs, as Chat Completions takes them
             stop_strings(req)                                 # likewise a bad stop
             self._open_live("msg_" + uuid.uuid4().hex[:24], req)

@@ -112,6 +112,17 @@ endpoint above is served, `"logprobs"` that logprobs come back on all three APIs
 while video is on) that this model takes video parts now (image input on, a model that reads video, FFmpeg found:
 [video](../running.md#video)). Later features add their names to the same list.
 
+## The optional samplers and raw grammars
+
+`tfs`, `typical`, `top_a`, `xtc_*`, `dynatemp_*` and `smoothing_factor` are off until the server is started with
+`--more-samplers on`: without it, a request on any API that switches one on gets a 400 naming the flag. The values
+that switch nothing (`tfs` 1, `top_a` 0, `smoothing_factor` 0, `dynatemp_min` = `dynatemp_max`...) pass either way.
+
+`POST /v1/completions` and the KoboldCpp API (`POST /api/v1/generate`, `POST /api/extra/generate/stream`) continue the
+prompt as plain text: no chat template, no thinking, no tool parsing. With `--gbnf-grammar on` a request there may
+hold its text to a grammar: `grammar` is GBNF (llama.cpp's syntax), `grammar_schema` a JSON schema; both are enforced
+from the first generated token. Without the flag such a request gets a 400. The chat APIs' grammar is `--grammar`'s.
+
 ## Thinking loops
 
 - **Loops:** when one token repeats 256 times inside the thinking, the server closes the thinking and the model answers

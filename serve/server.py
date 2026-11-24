@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
-                          engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
+                          engine_flags_of, grammar_words, model_line, model_settings, more_samplers_on,
+                          sampling_defaults_from_config,
                           sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine import suspend  # noqa: E402
@@ -259,6 +260,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         pre = json.loads(files["tokenizer.json"].decode("utf-8")).get("pre", "qwen35") if "tokenizer.json" in files else "qwen35"
         tok = ST.Tokenizer(tokens, merges, types, pre=pre)
     has_grammar = False
+    more_samplers, gbnf_grammar = a.more_samplers == "on", a.gbnf_grammar == "on"
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
@@ -282,6 +284,18 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         if a.grammar and not has_grammar:
             print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
         gwords = grammar_words(known)
+        if not more_samplers and more_samplers_on(sampling_defaults):
+            fail("--more-samplers is off: a default that sets " + ", ".join(more_samplers_on(sampling_defaults))
+                 + " needs --more-samplers on")
+        if more_samplers and (known is None or "--more-samplers" not in known):
+            print(tagged("warning", "--more-samplers is on but this engine has no --more-samplers; a request that sets "
+                         "one is refused"), flush=True)
+            more_samplers = False
+        if more_samplers:
+            gwords += ["--more-samplers", "on"]
+        if gbnf_grammar and not has_grammar:
+            print(tagged("warning", "--gbnf-grammar is on but this engine has no --grammar; a grammar request gets a 400"),
+                  flush=True)
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
         if cdir and cmib != "0" and a.debug:
@@ -301,6 +315,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
+        has_grammar = True
     # the model's exported template, else the bundled one
     dialect = dialect_for(cfg.get("arch"))
     template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else \
@@ -308,7 +323,8 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     svc = Service(engine, tok, dialect.template(template),
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
-                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens)
+                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens,
+                  more_samplers=more_samplers, gbnf_grammar=gbnf_grammar and (a.mock_engine or has_grammar))
     svc.logs = logs
     svc.idle_unload_s = a.idle_unload or 0
     svc.idle_sleep_s = a.idle_sleep or 0

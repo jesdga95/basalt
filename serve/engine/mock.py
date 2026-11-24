@@ -6,6 +6,7 @@ import time
 from typing import Iterator, Protocol
 
 from serve.engine.slots import AdmissionQueue
+from serve.prompt import PromptText
 from serve.util.text import IM_END
 
 
@@ -61,6 +62,8 @@ class MockEngine:
                 self.cv.notify_all()
 
     def _run(self, ids, max_new, sampling, cancel, embeddings=None):
+        if isinstance(ids, PromptText):
+            ids = ids.ids()          # the raw APIs' prompt: the engine tokenizes
         self.requests.append((list(ids), dict(sampling or {})))
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings

@@ -136,6 +136,8 @@ void usage() {
                  "                       Default off (exact)\n"
                  "  --grammar on|off     --serve: enforce a request's \"grammar\" (tool-call, JSON-schema or JSON-object\n"
                  "                       grammar) on the sampled tokens; the vocabulary comes from the pack.  Default off\n"
+                 "  --more-samplers on|off  --serve: a request may set tfs, typ, top_a, xtc, dyna and sm (koboldcpp's tail\n"
+                 "                       filters and dynamic temperature; top_k 1..64).  Default off: such a request is refused\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"

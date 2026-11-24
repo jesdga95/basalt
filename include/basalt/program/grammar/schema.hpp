@@ -49,6 +49,7 @@ struct RequestGrammar {
 ///   {"kind":"tools","tools":[<OpenAI tool objects>],"tool_choice":<as received>}   lazy, trigger "<tool_call>"
 ///   {"kind":"json_schema","schema":{...}}                                          from the first answer token
 ///   {"kind":"json_object"}                                                         any JSON object
+///   {"kind":"gbnf","bnf":"<grammar text>"}                                         as written, from the first answer token
 ///   {"kind":"text","calls":bool}   no grammar; "calls": false makes every block of a reply of blocks a text block
 /// Any of them may say "think": false (the request's thinking is off).
 /// A json_schema or json_object request may carry "tools" too: from the first answer token, either tool calls or the

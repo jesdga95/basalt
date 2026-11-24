@@ -25,6 +25,7 @@ from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_str
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
+from serve.config import more_samplers_on
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobChannels, entry as logprob_entry
 from serve.config import GRAMMAR_DEFAULT
 
@@ -104,7 +105,8 @@ class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
-                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS):
+                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS,
+                 more_samplers: bool = False, gbnf_grammar: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written
         self.literals = self.dialect.literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
@@ -112,6 +114,8 @@ class Service:
         self.video_max_tokens = video_max_tokens      # one video's merged tokens over all its groups
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
         self.grammar_engine = grammar_engine          # the engine understands the request key
+        self.more_samplers = more_samplers            # --more-samplers on: requests may set the MORE_SAMPLERS keys
+        self.gbnf_grammar = gbnf_grammar              # --gbnf-grammar on and the engine has --grammar: raw grammars
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
         self.vram_cv = threading.Condition()            # guards the queued resize; new requests wait while one is queued
@@ -542,6 +546,12 @@ class Service:
         else:
             why = f"{e}: {note}" if note else str(e)
         print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
+
+    def require_more_samplers(self, req: dict) -> None:
+        """A sampler --more-samplers did not turn on is refused rather than served without it."""
+        on = more_samplers_on(req)
+        if on and not self.more_samplers:
+            raise ValueError(", ".join(on) + ": start the server with --more-samplers on")
 
     def require_grammar(self, response_format) -> None:
         """A JSON response format the engine would not enforce is refused rather than silently served as free text."""
@@ -2037,7 +2047,9 @@ class Service:
         no template, no thinking, no tool parsing; what the model writes is what the client gets.  Yields
         ("piece", str) per decoded piece, ("ping", None) as heartbeat, ("done", {...}) last (finish,
         completion_tokens, prompt_tokens, reused, timings).  `text` may be a PromptText (the engine tokenizes)
-        or a list of ids."""
+        or a list of ids.  The server's sampling defaults fill the fields the request leaves out, as on the chat path."""
+        if self.sampling_defaults:
+            sampling = {**self.sampling_defaults, **{k: v for k, v in (sampling or {}).items() if v is not None}}
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
         rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate

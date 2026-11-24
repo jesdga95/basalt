@@ -67,6 +67,9 @@ struct CommonOptions {
     /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
     /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
     bool grammar = false;
+    /// --more-samplers on|off: --serve takes a request's tfs, typ, top_a, xtc, dyna and sm keys.  Off (the default)
+    /// a request that sets one of them to more than off is refused, naming the flag.
+    bool more_samplers = false;
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).

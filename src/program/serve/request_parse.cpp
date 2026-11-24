@@ -125,6 +125,10 @@ Flow Request::parse() {
     else if (!std::isfinite(req_dyna_exp) || req_dyna_exp < 0.0f) bad = "dyna_exp: a number >= 0";
     else if (!std::isfinite(req_smooth_factor) || req_smooth_factor < 0.0f) bad = "sm_f: a number >= 0";
     else if (!std::isfinite(req_smooth_curve)) bad = "sm_c: a number";
+    else if (!runtime_.o.more_samplers &&
+             ((req_tfs > 0.0f && req_tfs < 1.0f) || (req_typical > 0.0f && req_typical < 1.0f) || req_top_a > 0.0f ||
+              req_xtc_prob > 0.0f || req_dyna_low != req_dyna_high || req_smooth_factor > 0.0f))
+        bad = "tfs, typ, top_a, xtc_p, dyna_*, sm_f: start the engine with --more-samplers on";
     else if ((req_tfs > 0.0f && req_tfs < 1.0f) || (req_typical > 0.0f && req_typical < 1.0f) || req_top_a > 0.0f ||
              req_xtc_prob > 0.0f) {
         // the list filters run on the top_k survivors (koboldcpp's chain applies them after top_k too); the

@@ -437,6 +437,25 @@ SAMPLING_KEYS = {
     "smoothing_factor": (float, lambda v: _num(v) and v >= 0, "a number >= 0 (0 = off)"),
     "smoothing_curve": (float, _num, "a number"),
 }
+# the samplers --more-samplers on lets a request set (off: a request that switches one on is refused); the value
+# that switches each one on
+MORE_SAMPLERS = {
+    "tfs": lambda v: _num(v) and 0 < v < 1,
+    "typical": lambda v: _num(v) and 0 < v < 1,
+    "top_a": lambda v: _num(v) and v > 0,
+    "xtc_probability": lambda v: _num(v) and v > 0,
+    "dynatemp_min": None,             # on when dynatemp_min differs from dynatemp_max (checked_sampling_more)
+    "smoothing_factor": lambda v: _num(v) and v > 0,
+}
+
+
+def more_samplers_on(req: dict) -> list[str]:
+    """The MORE_SAMPLERS names the request (or a defaults dict) switches on, in MORE_SAMPLERS order; [] when none."""
+    on = [k for k, ok in MORE_SAMPLERS.items() if ok is not None and ok(req.get(k))]
+    lo, hi = req.get("dynatemp_min"), req.get("dynatemp_max")
+    if _num(lo) and _num(hi) and float(lo) != float(hi) and "dynatemp_min" not in on:
+        on.insert(list(MORE_SAMPLERS).index("dynatemp_min"), "dynatemp_min")
+    return on
 
 
 def checked_sampling(req: dict) -> None:
@@ -653,6 +672,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--grammar", action=argparse.BooleanOptionalAction, default=GRAMMAR_DEFAULT,
                     help="hold every tool call and JSON response format to a grammar in the engine (on by default; a request "
                          "with strict: true gets it either way); --no-grammar turns it off")
+    ap.add_argument("--more-samplers", choices=("on", "off"), default=None,
+                    help="on: a request may set tfs, typical, top_a, xtc, dynatemp and smoothing (they need top_k 1..64); "
+                         "off (the default) such a request gets a 400. Command line only")
+    ap.add_argument("--gbnf-grammar", choices=("on", "off"), default=None,
+                    help="on: /v1/completions and the KoboldCpp API enforce a request's `grammar` (GBNF text) or "
+                         "`grammar_schema` (a JSON schema); off (the default) such a request gets a 400. The chat APIs' "
+                         "grammar is --grammar's. Command line only")
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "
                          "not allowed in a --config file")
