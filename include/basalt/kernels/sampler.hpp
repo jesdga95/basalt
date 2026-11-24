@@ -1,9 +1,14 @@
 // include/basalt/kernels/sampler.hpp - the sampler chain, host-callable.
 //
-//     penalties -> top_k -> top_p -> min_p -> temperature -> pick
+//     penalties -> top_k -> tfs -> typical -> top_a -> top_p -> min_p -> xtc -> temperature -> pick
 //
 // llama.cpp's default chain: ONE penalties stage, first, and temperature AFTER the truncation filters;
-// top_p cuts before min_p.  `src/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
+// top_p cuts before min_p.  tfs, typical, top_a and xtc run where llama.cpp's do (after top_k, before the
+// temperature stage); xtc keeps the TAIL of the list (it drops top tokens, llama_sample_xtc_apply).  The
+// temperature stage is temperature, or koboldcpp's dynatemp + smoothing when their keys are set (the
+// temperature-0 greedy path never reaches the tail).  tfs/typical/top_a/xtc are list-scoped like
+// koboldcpp's: they run on the top_k survivors, so they need top_k <= 64 (the narrow path) and are
+// refused wider.  `src/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
 #pragma once
 
 #include <algorithm>
@@ -23,6 +28,24 @@ struct SamplerParams {
     float min_p = 0.0f;          // 0 disables; keeps tokens with p >= min_p * p_max (a prefix of the top_k list)
     float temperature = 1.0f;    // <= 0 means greedy
     int min_keep = 1;            // top_p keeps at least this many
+    // The horde/koboldcpp truncation filters, list-scoped (the top_k survivors, in selection order).  All off
+    // at 0 (or typical at >= 1, tfs at >= 1).  xtc keeps the tail below xtc_thresh with chance xtc_prob
+    // (llama_sample_xtc_apply), its draw from a Philox stream tagged apart from the pick's.  typical needs
+    // the narrow path (k <= 64): it re-orders by |entropy-shifted score|, which the wide path does not do.
+    float tfs_z = 0.0f;          // tail-free sampling's z: cut where the normalized second-derivative mass passes 1-z
+    float typical_p = 0.0f;      // locally typical: keep the smallest shifted-score set holding this much mass
+    float top_a = 0.0f;          // keep p >= top_a * p_max^2
+    float xtc_prob = 0.0f;       // chance of dropping the top tokens at/above xtc_thresh (0..0.5)
+    float xtc_thresh = 0.1f;
+    // The temperature stage, koboldcpp's dynamic temperature and smoothing (sample_entropy/sample_temperature):
+    // dynatemp off when dyna_low == dyna_high; else temp' = low + (high-low) * (normalized list entropy)^exp.
+    // smoothing then reshapes the divided logits: l' = -(k*sf*(l-h)^2) + (s*sf*(l-h)^3) + h, h their max,
+    // k = (3-curve)/2, s = (curve-1)/2, and the pick softmaxes those.  temperature 0 (greedy) never reaches here.
+    float dyna_low = 0.0f;
+    float dyna_high = 0.0f;
+    float dyna_exp = 1.0f;
+    float smooth_factor = 0.0f;  // 0 disables the smoothing transform
+    float smooth_curve = 1.0f;
     int penalty_last_n = 0;      // 0 disables; the window over `history` to count occurrences in
     float penalty_repeat = 1.0f;
     float penalty_freq = 0.0f;

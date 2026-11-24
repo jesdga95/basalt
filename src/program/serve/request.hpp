@@ -28,6 +28,19 @@ protected:
     float req_penalty_freq{};
     float req_penalty_present{};
     int req_penalty_last_n{};
+    // the horde/koboldcpp truncation filters and the temperature stage's dynamic temperature + smoothing
+    // (SamplerParams in basalt/kernels/sampler.hpp has the semantics); request_parse refuses the filters
+    // on the wide path (top_k 0 or over 64)
+    float req_tfs{};
+    float req_typical{};
+    float req_top_a{};
+    float req_xtc_prob{};
+    float req_xtc_thresh{};
+    float req_dyna_low{};
+    float req_dyna_high{};
+    float req_dyna_exp{};
+    float req_smooth_factor{};
+    float req_smooth_curve{};
     std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     bool req_bias_present{};
     int64_t req_gprompt{};

@@ -14,6 +14,7 @@ enum PhiloxPurpose : uint32_t {
     kPhiloxPick = 0,         // the sampler's draw of a row's token
     kPhiloxDraft = 1,        // a drafter's drawn draft (counter: the draft's position)
     kPhiloxKeep = 2,         // the keep test of a drawn draft (counter: the row's draw index)
+    kPhiloxXtc = 3,          // the xtc drop test (counter: the row's draw index)
 };
 
 __device__ __forceinline__ void philox4x32_round(uint32_t& c0, uint32_t& c1, uint32_t& c2, uint32_t& c3, uint32_t k0,

@@ -25,6 +25,16 @@ Flow Request::read_prompt() {
     req_sp.penalty_repeat = req_penalty_repeat;
     req_sp.penalty_freq = req_penalty_freq;
     req_sp.penalty_present = req_penalty_present;
+    req_sp.tfs_z = req_tfs;
+    req_sp.typical_p = req_typical;
+    req_sp.top_a = req_top_a;
+    req_sp.xtc_prob = req_xtc_prob;
+    req_sp.xtc_thresh = req_xtc_thresh;
+    req_sp.dyna_low = req_dyna_low;
+    req_sp.dyna_high = req_dyna_high;
+    req_sp.dyna_exp = req_dyna_exp;
+    req_sp.smooth_factor = req_smooth_factor;
+    req_sp.smooth_curve = req_smooth_curve;
     req_sp.counter = 0;
     if (const Flow flow = set_sampling(); flow != Flow::proceed) return flow;
     cancelled = false;

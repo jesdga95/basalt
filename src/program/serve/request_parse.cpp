@@ -33,6 +33,18 @@ Flow Request::parse() {
     req_penalty_freq = 0.0f;
     req_penalty_present = 0.0f;
     req_penalty_last_n = 0;
+    // the horde/koboldcpp filters (tfs/typical/top_a/xtc) and the temperature stage (dynatemp + smoothing):
+    // every one off by default; dynatemp is off while dyna_low == dyna_high
+    req_tfs = 0.0f;
+    req_typical = 0.0f;
+    req_top_a = 0.0f;
+    req_xtc_prob = 0.0f;
+    req_xtc_thresh = 0.1f;
+    req_dyna_low = 0.0f;
+    req_dyna_high = 0.0f;
+    req_dyna_exp = 1.0f;
+    req_smooth_factor = 0.0f;
+    req_smooth_curve = 1.0f;
     req_bias_present = false;
     req_reply = -1;         // reply=N: the ids past the first N are the reply this request continues, the server's close tokens included
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
@@ -69,6 +81,16 @@ Flow Request::parse() {
             else if (key == "penalty_repeat") req_penalty_repeat = fv;
             else if (key == "penalty_freq") req_penalty_freq = fv;
             else if (key == "penalty_present") req_penalty_present = fv;
+            else if (key == "tfs") req_tfs = fv;
+            else if (key == "typ") req_typical = fv;
+            else if (key == "top_a") req_top_a = fv;
+            else if (key == "xtc_p") req_xtc_prob = fv;
+            else if (key == "xtc_t") req_xtc_thresh = fv;
+            else if (key == "dyna_lo") req_dyna_low = fv;
+            else if (key == "dyna_hi") req_dyna_high = fv;
+            else if (key == "dyna_exp") req_dyna_exp = fv;
+            else if (key == "sm_f") req_smooth_factor = fv;
+            else if (key == "sm_c") req_smooth_curve = fv;
             else if (key == "seed") { req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10); req_seed_given = true; }
             else if (key == "relax") req_relax = fv;
             else if (key == "logprobs") req_logprobs = std::atoi(tok.c_str() + eq + 1);
@@ -90,6 +112,31 @@ Flow Request::parse() {
     else if (!std::isfinite(req_penalty_repeat) || req_penalty_repeat <= 0.0f) bad = "penalty_repeat: a number > 0";
     else if (!std::isfinite(req_penalty_freq) || !std::isfinite(req_penalty_present))
         bad = "penalty_freq, penalty_present: numbers";
+    else if (!std::isfinite(req_tfs) || req_tfs < 0.0f || req_tfs > 1.0f) bad = "tfs: 0 <= tfs <= 1 (0 or 1 = off)";
+    else if (!std::isfinite(req_typical) || req_typical < 0.0f || req_typical > 1.0f)
+        bad = "typ: 0 <= typical <= 1 (0 or 1 = off)";
+    else if (!std::isfinite(req_top_a) || req_top_a < 0.0f || req_top_a > 1.0f) bad = "top_a: 0 <= top_a <= 1";
+    else if (!std::isfinite(req_xtc_prob) || req_xtc_prob < 0.0f || req_xtc_prob > 1.0f)
+        bad = "xtc_p: 0 <= xtc_p <= 1";
+    else if (!std::isfinite(req_xtc_thresh) || req_xtc_thresh < 0.0f || req_xtc_thresh > 0.5f)
+        bad = "xtc_t: 0 <= xtc_t <= 0.5";
+    else if (!std::isfinite(req_dyna_low) || !std::isfinite(req_dyna_high) || req_dyna_low < 0.0f || req_dyna_high < 0.0f)
+        bad = "dyna_lo, dyna_hi: numbers >= 0";
+    else if (!std::isfinite(req_dyna_exp) || req_dyna_exp < 0.0f) bad = "dyna_exp: a number >= 0";
+    else if (!std::isfinite(req_smooth_factor) || req_smooth_factor < 0.0f) bad = "sm_f: a number >= 0";
+    else if (!std::isfinite(req_smooth_curve)) bad = "sm_c: a number";
+    else if ((req_tfs > 0.0f && req_tfs < 1.0f) || (req_typical > 0.0f && req_typical < 1.0f) || req_top_a > 0.0f ||
+             req_xtc_prob > 0.0f) {
+        // the list filters run on the top_k survivors (koboldcpp's chain applies them after top_k too); the
+        // wide path (top_k off or over 64) does not carry them
+        if (req_top_k <= 0 || req_top_k > basalt::kernels::kSamplerNarrowMax)
+            bad = "tfs, typ, top_a, xtc_p: the list filters need top_k 1..64";
+    } else if (req_dyna_low != req_dyna_high || req_smooth_factor > 0.0f) {
+        // dynatemp and smoothing reshape the list the pick softmaxes; the engine implements them on the
+        // narrow path only (the same list scope), so they are refused on the wide path too
+        if (req_top_k <= 0 || req_top_k > basalt::kernels::kSamplerNarrowMax)
+            bad = "dyna_lo/dyna_hi, sm_f: the dynamic temperature needs top_k 1..64";
+    }
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
     else if (req_logprobs < -1 || req_logprobs > kMaxTopLogprobs) bad = "logprobs: 0 to 20 alternatives";
     if (bad != nullptr) {

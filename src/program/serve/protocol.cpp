@@ -196,9 +196,11 @@ int Runtime::init_protocol() {
             std::string head = tk[0] == "PROMPT" ? tk[0] : tk[0].substr(0, tk[0].size() - 1);
             long long nbytes = -1;
             std::string plain_text;
+            bool sp = true;   // sp=0: tokenize the payload as plain text (no special tokens; the raw-completion API)
             for (size_t i = 1; i < tk.size(); ++i) {
                 if (i < lead) head += " " + tk[i];
                 else if (tk[i].rfind("plain=", 0) == 0) plain_text = tk[i].substr(6);
+                else if (tk[i] == "sp=0") sp = false;
                 else if (tk[i].find('=') != std::string::npos) head += " " + tk[i];
                 else if (nbytes < 0) nbytes = std::atoll(tk[i].c_str());
             }
@@ -222,7 +224,7 @@ int Runtime::init_protocol() {
             }
             std::vector<int32_t> tids;
             std::string terr;
-            if (!text_tokenizer.encode(payload, true, spans, tids, terr)) { line_out = "ERR_GENT tokenizer: " + terr; return true; }
+            if (!text_tokenizer.encode(payload, sp, spans, tids, terr)) { line_out = "ERR_GENT tokenizer: " + terr; return true; }
             if (tk[0] == "PROMPT") {
                 const size_t n = tids.size();
                 const uint64_t handle = hold_prompt({std::move(tids), false});

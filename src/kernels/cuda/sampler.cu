@@ -1,6 +1,12 @@
 // src/kernels/cuda/sampler.cu - the sampler chain, in llama.cpp's order.
 //
-//     penalties -> top_k -> top_p -> min_p -> temperature -> pick
+//     penalties -> top_k -> top_a -> tfs -> typical -> top_p -> min_p -> xtc -> temperature -> pick
+//
+// koboldcpp's default order (gpttype_adapter.cpp SampleLogits): rep_pen, top_k, top_a, tfs, typical, top_p
+// (+ min_p), temp; xtc sits before the temperature stage as llama.cpp's does.  The list filters and
+// dynatemp/smoothing are koboldcpp's semantics (sample_top_a / sample_tail_free / sampler_typical /
+// llama_sample_xtc_apply / sample_entropy / sample_temperature) and need top_k <= 64 (request_parse refuses
+// them wider).
 //
 // THE ORDER IS THE WHOLE CONTENT OF THIS FILE.  llama.cpp builds its chain by walking `params.samplers`, whose default
 // is { PENALTIES, DRY, TOP_N_SIGMA, TOP_K, TYPICAL_P, TOP_P, MIN_P, XTC, TEMPERATURE } - ONE penalties stage, first,
@@ -377,6 +383,162 @@ __device__ int drawn_pick(const int* ids, Prob prob, int n, const SamplerParams&
     return last >= 0 ? ids[last] : pick;
 }
 
+// The horde/koboldcpp list filters, after top_k and before top_p (koboldcpp's default order: top_k, top_a,
+// tfs, typical, top_p).  `x` holds the list's logits in selection order (sorted descending) and the filters
+// only NARROW n_keep.  Each softmaxes the surviving list into `scr` (k doubles, the caller's top_p terms are
+// free until top_p runs).  One warp: lane 0 runs every ordered sum exactly like the tail's top_p, so both
+// tails and all narrow variants agree bitwise.  The semantics are koboldcpp's (gpttype_adapter.cpp):
+// top_a keeps p >= top_a * p_max^2 (sample_top_a); tfs cuts where the normalized second-derivative mass
+// exceeds z - koboldcpp compares against z, llama.cpp against 1 - z (sample_tail_free); typical re-orders by
+// |shifted score| and keeps the smallest set holding typical_p of the original mass (sampler_typical).
+__device__ __forceinline__ int tail_list_filters(float* x, int k, int n_keep, const SamplerParams& p, double* scr) {
+    const int lane = (int) (threadIdx.x & 31);
+    auto softmax_into = [&](int n) {
+        float mx = x[0];
+        for (int i = 1; i < n; ++i) mx = fmaxf(mx, x[i]);
+        for (int i = lane; i < n; i += 32) scr[i] = exp((double) (x[i] - mx));
+        __syncwarp();
+        double sum = 0.0;
+        if (lane == 0) for (int i = 0; i < n; ++i) sum += scr[i];
+        sum = __shfl_sync(kFullMask, sum, 0);
+        __syncwarp();
+        for (int i = lane; i < n; i += 32) scr[i] = scr[i] / sum;
+        __syncwarp();
+    };
+    if (p.top_a > 0.0f && n_keep > 1) {
+        softmax_into(n_keep);
+        if (lane == 0) {
+            const float thresh = p.top_a * (float) scr[0] * (float) scr[0];
+            for (int i = p.min_keep; i < n_keep; ++i)
+                if ((float) scr[i] < thresh) { n_keep = i; break; }
+        }
+        n_keep = __shfl_sync(kFullMask, n_keep, 0);
+    }
+    if (p.tfs_z > 0.0f && p.tfs_z < 1.0f && n_keep > 2) {
+        softmax_into(n_keep);
+        if (lane == 0) {
+            double dsum = 0.0;
+            for (int i = 0; i + 2 < n_keep; ++i)
+                dsum += fabs((scr[i] - scr[i + 1]) - (scr[i + 1] - scr[i + 2]));
+            if (dsum > 1e-6) {
+                double cum = 0.0;
+                for (int i = 0; i + 2 < n_keep; ++i) {
+                    cum += fabs((scr[i] - scr[i + 1]) - (scr[i + 1] - scr[i + 2])) / dsum;
+                    if (cum > (double) p.tfs_z && i >= p.min_keep) { n_keep = i; break; }
+                }
+            }
+        }
+        n_keep = __shfl_sync(kFullMask, n_keep, 0);
+    }
+    if (p.typical_p > 0.0f && p.typical_p < 1.0f && n_keep > 1) {
+        softmax_into(n_keep);
+        if (lane == 0) {
+            double entropy = 0.0;
+            for (int i = 0; i < n_keep; ++i) entropy += -(double) scr[i] * ::log((double) scr[i]);
+            float score[64];
+            int idx[64];
+            for (int i = 0; i < n_keep; ++i) {
+                score[i] = fabsf(-logf((float) scr[i]) - (float) entropy);
+                idx[i] = i;
+            }
+            for (int i = 1; i < n_keep; ++i) {              // insertion sort by score, ascending
+                const float s = score[i];
+                const int d = idx[i];
+                int j = i - 1;
+                while (j >= 0 && score[j] > s) { score[j + 1] = score[j]; idx[j + 1] = idx[j]; --j; }
+                score[j + 1] = s;
+                idx[j + 1] = d;
+            }
+            float cum = 0.0f;
+            int last = n_keep;
+            for (int i = 0; i < n_keep; ++i) {
+                cum += (float) scr[idx[i]];
+                if (cum > p.typical_p && (p.min_keep == 0 || i >= p.min_keep - 1)) { last = i + 1; break; }
+            }
+            n_keep = last;
+            if (n_keep < p.min_keep) n_keep = p.min_keep < n_keep ? p.min_keep : n_keep;
+        }
+        n_keep = __shfl_sync(kFullMask, n_keep, 0);
+    }
+    return n_keep;
+}
+
+// XTC (llama_sample_xtc_apply): with chance xtc_prob, drop the top tokens at or above xtc_thresh and keep the
+// tail below it (an anti-repetition cut; the survivors stay in the list's order).  koboldcpp/llama.cpp draw
+// this from the sampler's own stream - here it is a Philox stream tagged apart from the pick's, so toggling
+// xtc does not shift the pick draws.  Returns the new n_keep, the survivors moved to the front of x / ids.
+__device__ __forceinline__ int tail_xtc(float* x, int* ids, int n_keep, const SamplerParams& p, int t, double* scr) {
+    const int lane = (int) (threadIdx.x & 31);
+    if (p.xtc_prob <= 0.0f || p.xtc_thresh > 0.5f || n_keep < 2) return n_keep;
+    const float u = philox_uniform(p.seed, p.counter + (uint64_t) t, kPhiloxXtc);
+    if (u > p.xtc_prob) return n_keep;
+    float mx = x[0];
+    for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, x[i]);
+    for (int i = lane; i < n_keep; i += 32) scr[i] = exp((double) (x[i] - mx));
+    __syncwarp();
+    double sum = 0.0;
+    if (lane == 0) for (int i = 0; i < n_keep; ++i) sum += scr[i];
+    sum = __shfl_sync(kFullMask, sum, 0);
+    __syncwarp();
+    for (int i = lane; i < n_keep; i += 32) scr[i] = scr[i] / sum;
+    __syncwarp();
+    if (lane == 0) {
+        int pos_last = 0;
+        for (int i = 0; i < n_keep; ++i)
+            if ((float) scr[i] >= p.xtc_thresh) pos_last = i; else break;
+        if (n_keep - pos_last >= p.min_keep && pos_last > 0) {
+            for (int i = 0; i < n_keep - pos_last; ++i) { x[i] = x[i + pos_last]; ids[i] = ids[i + pos_last]; }
+            n_keep -= pos_last;
+        }
+    }
+    n_keep = __shfl_sync(kFullMask, n_keep, 0);
+    __syncwarp();
+    return n_keep;
+}
+
+// The temperature stage: the survivors' logits divided by the temperature in place - the same float multiply
+// the pick's inv_t applied, so with dynatemp and smoothing off the pick sees the old arithmetic bitwise - then
+// koboldcpp's dynamic temperature replacing that scale when its range is set (temp' = low + (high - low) *
+// (the survivors' normalized softmax entropy)^exp, sample_entropy), then the smoothing transform
+// (sample_temperature's tail: l' = -(k*sf*(l-h)^2) + (s*sf*(l-h)^3) + h, h the divided maximum,
+// k = (3 - curve)/2, s = (curve - 1)/2).  The pick softmaxes the transformed logits.
+__device__ __forceinline__ void tail_temp_stage(float* x, int n_keep, const SamplerParams& p, double* scr) {
+    const int lane = (int) (threadIdx.x & 31);
+    if (n_keep <= 1) return;
+    float scale = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    if (p.dyna_low != p.dyna_high) {
+        float mx = x[0];
+        for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, x[i]);
+        for (int i = lane; i < n_keep; i += 32) scr[i] = exp((double) (x[i] - mx));
+        __syncwarp();
+        double sum = 0.0;
+        if (lane == 0) for (int i = 0; i < n_keep; ++i) sum += scr[i];
+        sum = __shfl_sync(kFullMask, sum, 0);
+        __syncwarp();
+        double entropy = 0.0;
+        if (lane == 0)
+            for (int i = 0; i < n_keep; ++i) {
+                const double q = scr[i] / sum;
+                entropy -= q * ::log(q);
+            }
+        entropy = __shfl_sync(kFullMask, entropy, 0);
+        const float normalized = (float) entropy / logf((float) n_keep);   // max_entropy = -log(1/n_keep)
+        const float dyn = p.dyna_low + (p.dyna_high - p.dyna_low) * powf(normalized, p.dyna_exp);
+        scale = 1.0f / fmaxf(dyn, 1e-6f);
+    }
+    if (scale != 1.0f)
+        for (int i = 0; i < n_keep; ++i) x[i] *= scale;
+    if (p.smooth_factor > 0.0f) {
+        const float h = x[0];
+        const float kq = (3.0f - p.smooth_curve) * 0.5f, sq = (p.smooth_curve - 1.0f) * 0.5f;
+        for (int i = 0; i < n_keep; ++i) {
+            const float d = x[i] - h;
+            x[i] = -(kq * p.smooth_factor * d * d) + (sq * p.smooth_factor * d * d * d) + h;
+        }
+    }
+}
+
+
 /// /// **THE TAIL ON ONE WARP.**  `sel_ids` / `sel_logit` (shared, `k` entries) are the top_k list in selection order;
 /// /// the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The tail's doubles run on one warp (FP64 issues
 /// /// at a small fraction of FP32): the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and
@@ -386,35 +548,34 @@ __device__ int drawn_pick(const int* ids, Prob prob, int n, const SamplerParams&
 /// /// `qprob` (optional): for t < nq, qprob[t] <- the final probability of token query[t] (0 outside the kept list),
 /// /// written after the pick, which it does not touch.
 template <bool kProb = false>
-__device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& p, int t,
+__device__ void sampled_tail_warp(int* sel_ids, float* sel_logit, int k, const SamplerParams& p, int t,
                                   int* __restrict__ out, double* ex, float* prob_out = nullptr,
                                   const int* query = nullptr, int nq = 0, float* qprob = nullptr) {
     const int lane = (int) (threadIdx.x & 31);
-    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    int n_keep = k;
-    float mx = sel_logit[0];
-    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
+    int n_keep = tail_list_filters(sel_logit, k, k, p, ex);
     if (p.top_p < 1.0f) {
-        for (int i = lane; i < k; i += 32) ex[i] = exp((double) sel_logit[i] - (double) mx);
+        float mx = sel_logit[0];
+        for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, sel_logit[i]);
+        for (int i = lane; i < n_keep; ++i) ex[i] = exp((double) sel_logit[i] - (double) mx);
         __syncwarp();
         double sum = 0.0;
         if (lane == 0)
-            for (int i = 0; i < k; ++i) sum += ex[i];
+            for (int i = 0; i < n_keep; ++i) sum += ex[i];
         sum = __shfl_sync(kFullMask, sum, 0);
-        __syncwarp();                            // lane 0 has read every `ex` before it is overwritten
-        for (int i = lane; i < k; i += 32) ex[i] = ex[i] / sum;
+        __syncwarp();
+        for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
         __syncwarp();
         int cut = k;
         if (lane == 0) {
             double cum = 0.0;
-            for (int i = 0; i < k; ++i) {
+            for (int i = 0; i < n_keep; ++i) {
                 cum += ex[i];
                 if (cum >= (double) p.top_p) { cut = i + 1; break; }
             }
         }
         cut = __shfl_sync(kFullMask, cut, 0);
         if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
-        n_keep = cut;
+        n_keep = cut < n_keep ? cut : n_keep;
         __syncwarp();                            // `ex` is written again below
     }
    // min_p on top_p's survivors (every lane, the same float arithmetic)
@@ -423,12 +584,14 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    n_keep = tail_xtc(sel_logit, sel_ids, n_keep, p, t, ex);
     if (p.top_ids != nullptr)
         for (int i = lane; i < p.n_top; i += 32) p.top_ids[(size_t) t * p.n_top + i] = i < n_keep ? sel_ids[i] : -1;
-    // temperature, then one Philox draw
-    float smx = sel_logit[0] * inv_t;
-    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
-    for (int i = lane; i < n_keep; i += 32) ex[i] = exp((double) (sel_logit[i] * inv_t) - (double) smx);
+    tail_temp_stage(sel_logit, n_keep, p, ex);
+    // one Philox draw over the transformed survivors
+    float smx = sel_logit[0];
+    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i]);
+    for (int i = lane; i < n_keep; i += 32) ex[i] = exp((double) sel_logit[i] - (double) smx);
     __syncwarp();
     double sum = 0.0;
     if (lane == 0)
@@ -464,11 +627,6 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
     }
 }
 
-/// /// **THE ONE-BLOCK SAMPLED PATH.**  Round i's candidates are the logits strictly AFTER round i-1's pick in the
-/// /// selection order, `s < prev_v || (s == prev_v && v > prev_i)`: the picks so far are the first i of the order, so
-/// /// what comes after the last one is what has not been picked.  The round is a block argmax with the same tie rule.
-/// /// An empty round leaves (-inf, id 0), and every round after it is empty (nothing after -inf beats -inf).
-/// /// O(k x n_vocab) per row, then warp 0 runs the tail.  The fallback when the split path cannot run.
 __global__ void __launch_bounds__(1024)
 sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
                          int history_len, const SamplerParams p, int* __restrict__ out,
@@ -543,7 +701,6 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
     if (warp != 0) return;
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex, nullptr, query, nq, qprob);
 }
-
 // ---- THE SPLIT top_k.  The one-block kernel keeps a row on ONE SM and walks its logits k times.  Here a warp keeps the
 // top_k of 1,024 logits held in registers, four warps make a block of 4,096 logits that merges their lists, and a row
 // is 61 such blocks over the whole GPU; one warp per row then merges the 61 lists and runs the tail.  Exact, because
@@ -894,6 +1051,7 @@ struct TailShared {
     double pre2[kSortSpan];                  // the ordered prefix sums of e2
     float x[kSortSpan];
     int id[kSortSpan];
+    int nk;                                  // the list stage's survivors (warp 0 -> warp 1)
 };
 
 // the warp's 32 values sorted, largest first (values only: no NaN reaches here)
@@ -990,56 +1148,62 @@ __device__ __forceinline__ void ordered_scan(const double* a, int n, At&& at) {
 
 /// **THE TAIL ON TWO WARPS** (k <= 32): the sorted list's first 32 entries are in `ts.x` / `ts.id` (the ids mapped as
 /// `sampled_tail_warp` reads them), and warps 0 and 1 of the block call this.  The arithmetic is
-/// `sampled_tail_warp`'s, value for value: the same `exp` arguments, every ordered sum and cumulative scan in the same
-/// order (on one lane), the same correctly rounded quotients.  Only where the work waits changes:
-/// - the list is sorted, so its first entry is its maximum (`fmaxf` over it gives that value up to the sign of a zero,
-///   and the `exp` of a difference that is a zero of either sign is 1), and the temperature pass's maximum is the first
-///   entry's too: warp 1 runs that pass's `exp`s and its ordered prefix sums while warp 0 runs top_p, and the sum over
-///   the first n_keep is the n_keep-th prefix sum;
-/// - a scan reads its terms ahead of its adds and records where it first crosses, so no compare waits in the chain
-///   of adds (the few sums past the crossing are never read).
+/// `sampled_tail_warp`'s, value for value: the same list filters, the same `exp` arguments, every ordered sum and
+/// cumulative scan in the same order (on lane 0 of warp 0), the same correctly rounded quotients.  Only where the
+/// work waits changes: warp 0 alone runs the list filters, top_p, min_p, xtc and the temperature stage (the
+/// transformed survivors land in ts.x), publishes n_keep in ts.nk, and warp 1 then runs the temperature pass's
+/// `exp`s and its ordered prefix sums over the survivors before the pick.
 __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p, int t, int* __restrict__ out,
                                   const int* query, int nq, float* qprob) {
     const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
-    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    const float x0 = ts.x[0];
     const bool mine = lane < k;
     if (warp == 1) {
-        const float smx = x0 * inv_t;
-        if (mine) ts.e2[lane] = exp((double) (ts.x[lane] * inv_t) - (double) smx);
-        __syncwarp();
-        if (lane == 0) ordered_scan(ts.e2, k, [&](int i, double acc) { ts.pre2[i] = acc; return false; });
+        tail_pair_sync();                    // warp 0's list stage
+        const int nk = ts.nk;
+        if (nk > 0) {
+            float mx = ts.x[0];
+            for (int i = 1; i < nk; ++i) mx = fmaxf(mx, ts.x[i]);
+            if (lane < nk) ts.e2[lane] = exp((double) ts.x[lane] - (double) mx);
+            __syncwarp();
+            if (lane == 0) ordered_scan(ts.e2, nk, [&](int i, double acc) { ts.pre2[i] = acc; return false; });
+        }
         tail_pair_sync();
         return;
     }
-    int n_keep = k;
+    int n_keep = tail_list_filters(ts.x, k, k, p, ts.e1);
     if (p.top_p < 1.0f) {
-        if (mine) ts.e1[lane] = exp((double) ts.x[lane] - (double) x0);
+        float mx = ts.x[0];
+        for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, ts.x[i]);
+        if (mine) ts.e1[lane] = exp((double) ts.x[lane] - (double) mx);
         __syncwarp();
         double sum = 0.0;
-        if (lane == 0) ordered_scan(ts.e1, k, [&](int, double acc) { sum = acc; return false; });
+        if (lane == 0) ordered_scan(ts.e1, n_keep, [&](int, double acc) { sum = acc; return false; });
         sum = __shfl_sync(kFullMask, sum, 0);
         if (mine) ts.e1[lane] = ts.e1[lane] / sum;
         __syncwarp();
         int cut = k;
         if (lane == 0)
-            ordered_scan(ts.e1, k, [&](int i, double cum) {
+            ordered_scan(ts.e1, n_keep, [&](int i, double cum) {
                 if (cut == k && cum >= (double) p.top_p) cut = i + 1;
                 return cut != k;
             });
         cut = __shfl_sync(kFullMask, cut, 0);
         if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
-        n_keep = cut;
+        n_keep = cut < n_keep ? cut : n_keep;
     }
     if (p.min_p > 0.0f) {
-        const float thresh = x0 + logf(p.min_p);
-        const unsigned below = __ballot_sync(kFullMask, mine && ts.x[lane] < thresh);
+        const float thresh = ts.x[0] + logf(p.min_p);
+        const unsigned below = __ballot_sync(kFullMask, mine && lane < n_keep && ts.x[lane] < thresh);
         const int first = below ? __ffs(below) - 1 : k;
         if (first < n_keep) n_keep = first;
     }
+    n_keep = tail_xtc(ts.x, ts.id, n_keep, p, t, ts.e1);
     if (p.top_ids != nullptr)
         for (int i = lane; i < p.n_top; i += 32) p.top_ids[(size_t) t * p.n_top + i] = i < n_keep ? ts.id[i] : -1;
-    tail_pair_sync();                        // warp 1's terms and prefix sums
+    tail_temp_stage(ts.x, n_keep, p, ts.e1);
+    ts.nk = n_keep;
+    tail_pair_sync();                        // release warp 1: it computes e2/pre2 over the transformed survivors
+    tail_pair_sync();                        // and re-joins us when they are written (both warps arrive twice)
     const double sum2 = n_keep > 0 ? ts.pre2[n_keep - 1] : 0.0;
     if (lane < n_keep) ts.e2[lane] = ts.e2[lane] / sum2;
     __syncwarp();
