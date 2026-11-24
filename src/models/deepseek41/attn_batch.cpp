@@ -132,7 +132,7 @@ public:
 
 private:
     // Compressed rows [0, rows) of kv-source layer ks: the cache while they are all on the card, else the VRAM stage,
-    // topped up with the rows written since (a written row is final).
+    // topped up with the rows written since (a written row is final). Null when the copy is refused.
     const uint8_t* comp_rows(int ks, int64_t rows, cudaStream_t st) {
         uint8_t* src = (*c_.comp_kv)[(size_t) ks];
         if (!comp_stage_ || rows <= (*c_.host_rows)[(size_t) ks]) return src;
@@ -142,8 +142,9 @@ private:
         }
         if (rows > stage_rows_) {
             const size_t rb = (size_t) comp_row_bytes(c_.format);
-            cudaMemcpyAsync(comp_stage_ + stage_rows_ * rb, src + stage_rows_ * rb, (size_t) (rows - stage_rows_) * rb,
-                            cudaMemcpyDefault, st);
+            if (cudaMemcpyAsync(comp_stage_ + stage_rows_ * rb, src + stage_rows_ * rb, (size_t) (rows - stage_rows_) * rb,
+                                cudaMemcpyDefault, st) != cudaSuccess)
+                return nullptr;
             stage_rows_ = rows;
         }
         return comp_stage_;
@@ -364,6 +365,10 @@ private:
             a.win_n = d_n + l0;
             if (ratio) {
                 a.comp = comp_rows(kv_source(il), (p0 + S) / ratio, (cudaStream_t) stream);
+                if (!a.comp) {
+                    err = "deepseek41: cannot copy the compressed rows in RAM to the card";
+                    return false;
+                }
                 a.comp_type = c_.format == CacheFormat::Fp8 ? LatentType::Fp4 : LatentType::F16;
                 a.sel = ids_ + (size_t) (s0 + l0) * kTopK;
                 a.n_sel = sel;

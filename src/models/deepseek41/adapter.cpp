@@ -18,8 +18,11 @@
 
 #include <cuda_runtime.h>
 
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
+#include <system_error>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
@@ -83,7 +86,15 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
         else if (a == "--kv") o.kv = args.next("--kv");
-        else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
+        else if (a == "--kv-resident") {
+            const std::string v = args.next("--kv-resident");
+            const auto r = std::from_chars(v.data(), v.data() + v.size(), o.kv_resident);
+            if (r.ec != std::errc{} || r.ptr != v.data() + v.size() || o.kv_resident < 0) {
+                basalt::log::error("basalt deepseek41", "--kv-resident %s: positions whose compressed latents stay in VRAM, "
+                                   "a whole number, or 0 (all)", v.c_str());
+                code = 2;
+            }
+        }
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
