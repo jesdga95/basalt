@@ -13,7 +13,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0; the same seed gives the same text on every model, and `--temperature 0` stays greedy. |
 | `--stop-eos` | CLI | off | Stop at an end-of-turn token. |
 | `--eos-ids` | engine | the pack's | The end-of-turn tokens. |
-| `--gpu-plan` | engine | | Print the `--gpu` choice as JSON and exit. |
+| `--gpu-plan` | engine | | Print the `--gpu`, `--gpu-mode` and `--gpu-share` choice as JSON and exit. |
 
 ## Timing and profiles
 
@@ -24,8 +24,8 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--no-capture` | CLI | Run layers directly, not as graphs. Needs `--no-pool`. |
 | `--stage-timing` | CLI | Per-stage shares by kernel count. Needs `--no-capture`. |
 | `--graph-only` | CLI | Time the per-layer `pre` graphs only. |
-| `--gpu-only-full` | CLI | Replay every graph and the head, no pool: the per-token GPU floor. Not with a layer split. |
-| `--gpu-stages` | CLI | Time each layer's three graphs, print, exit. Not with a layer split. |
+| `--gpu-only-full` | CLI | Replay every graph and the head, no pool: the per-token GPU floor. Not with `gpu-mode split`. |
+| `--gpu-stages` | CLI | Time each layer's three graphs, print, exit. Not with `gpu-mode split`. |
 | `--profile` | serve | GPU stage times per request. Not for A/B timing. |
 | `--wait-stats` | serve | Host wait times in the decode loop. |
 | `--decode-timing` | serve | One line per request on where decode time went. |
@@ -41,6 +41,11 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--prefill-until P` | CLI | Batch the first P prompt positions; run the rest teacher-forced. |
 | `--spec-corrupt N` | CLI | Replace every Nth draft with a wrong token, to test rejection. |
 | `--diag-batch-check` | CLI | With `--batch N` (2 or more) and a prompt: every session's windows alone against the same windows batched, bitwise ([batched decoding](../design/batching.md)). |
+| `--diag-gpu-check` | CLI | With `--tokens-file`, `--max-new N` and two or more cards: the prompt and N greedy steps, each step's logits recorded (`--diag-gpu-trace FILE`) or compared with a reference run's (`--diag-gpu-ref FILE`, which feeds the reference's picks so every step sees the same context): bitwise steps, greedy identity, KLD (mean and worst step), top-1 ([several GPUs](../design/multi-gpu.md)). |
+| `--diag-gpu-cut L` | CLI, serve | With `gpu-mode split`: the first layer of the second card, in place of the cut the shares make. One flag for every model. |
+| `--diag-gpu-same` | serve | Flash-Next with `gpu-mode split` and `--diag-gpu-cut L`: both stages of the split on GPU 0, the split's reference. |
+| `--diag-main-card-bits` | CLI, serve | Flash-Next: the other cards' stages run the main card's cuBLAS algorithms and plan by its SM count, so a peer's prompt stages and a split are bitwise against the main card (and `--diag-gpu-same`). A normal run lets each card use its own, which costs nothing and keeps the BF16 KLD level; the flag costs about 0.6% of a 64K prefill. |
+| `--diag-fixed-experts` | CLI, serve | Flash-Next: a prompt's experts all run on the GPU and a window's verifiers see none in VRAM, so the CPU pool computes every window row; two placements of the same experts (a split and its `--diag-gpu-same` reference) then compute the same rows. |
 | `--diag-teacher` | CLI | DeepSeek with `--spec-oracle`: teacher-forces the file's tokens and counts differing picks. |
 | `--diag-tier-frozen` | CLI, serve | DeepSeek: fixed placement (no copies or promotion). |
 | `--diag-drafter-gpu DEV` | CLI, serve | DeepSeek: the card the drafter runs on. |

@@ -162,6 +162,8 @@ class Gate(unittest.TestCase):
         self.assertEqual(run([good_row(notes="LOSSY run")]).status, "fail")
         self.assertEqual(run([good_row(engine_args="--gpu 0 --max-context 66661 --kv int8 --draft-off 1")]).status, "fail")
         self.assertEqual(run([good_row(engine_args="--gpu 0 --max-context 66661 --kv int8")]).status, "pass")
+        self.assertEqual(run([good_row(engine_args="--gpu 0,1 --gpu-mode peer --gpu-share 3,1 --max-context 66661 --kv int8")]).status, "pass")
+        self.assertEqual(run([good_row(engine_args="--gpu 0,1 --gpu-mode auto --max-context 66661 --kv int8")]).status, "fail")
         self.assertEqual(run([good_row(preset="mine")]).status, "fail")
 
     def test_a_second_file_of_one_setup_fails(self):

@@ -219,9 +219,14 @@ public:
                 uint64_t loan = 0;
                 const CardShare sh = lookup_share(t, loan);
                 const uint64_t all = sh.all, card = sh.card;
-                basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on the CPU",
-                                  (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
-                                  (unsigned long long) (all - card));
+                if (m_.peer_device() >= 0)
+                    basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on GPU %d, %llu on the CPU",
+                                      (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
+                                      (unsigned long long) sh.peer, m_.peer_device(), (unsigned long long) (all - card - sh.peer));
+                else
+                    basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on the CPU",
+                                      (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
+                                      (unsigned long long) (all - card));
                 if (loan > 0)
                     basalt::log::info("basalt inkling2", "experts: %llu of the card's decode lookups went to loaned copies",
                                       (unsigned long long) loan);
@@ -932,6 +937,7 @@ public:
             loan += hits;
             sh.all += t[pair];
             sh.card += m_.on_card(l, e) ? t[pair] : hits;
+            if (!m_.on_card(l, e) && m_.peer_held(l, e)) sh.peer += t[pair] - hits;   // the second card's, when not on loan
         }
         return sh;
     }
@@ -1068,16 +1074,16 @@ public:
         return n;
     }
 
-    // ---- the console's experts: a lookup is a hit when its expert is on the card. With every expert resident that is each
-    // window's rows times the experts a row takes at each of its visits; with a spill the card's running counts say which
-    // experts the lookups went to, and those whose experts are in RAM are no hits
+    // ---- the console's experts: a lookup is a hit when its expert is on a GPU (the main card or the peer). With every expert
+    // resident that is each window's rows times the experts a row takes at each of its visits; with a spill the card's running
+    // counts say which experts the lookups went to, and those whose experts are in RAM are no hits
     ExpertCounts expert_counts() const override {
         if (!m_.has_spill() || !ex_tally_) return {lookups_, lookups_, 0, 0};
         std::vector<uint32_t> t;
         if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) return {lookups_, lookups_, 0, 0};
         uint64_t loan = 0;
         const CardShare sh = lookup_share(t, loan);
-        return {(int64_t) sh.card, (int64_t) sh.all, 0, 0};
+        return {(int64_t) (sh.card + sh.peer), (int64_t) sh.all, 0, 0};
     }
     std::vector<CardExperts> experts_by_card() const override {
         std::vector<CardExperts> out;   // each card its layers' (the layer split spills none)

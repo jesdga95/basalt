@@ -43,6 +43,10 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--diag-serial-prompt") o.diag_serial_prompt = true;
         else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--diag-batch-check") o.diag_batch_check = true;
+        else if (a == "--diag-gpu-check") o.diag_gpu_check = true;
+        else if (a == "--diag-gpu-same") o.diag_gpu_same = true;
+        else if (a == "--diag-gpu-trace") o.diag_gpu_trace = next("--diag-gpu-trace");
+        else if (a == "--diag-gpu-ref") o.diag_gpu_ref = next("--diag-gpu-ref");
         else if (a == "--image") o.images.push_back(next("--image"));
         else if (a == "--image-at") o.image_at.push_back(std::atoll(next("--image-at")));
         else if (a == "--image-pad-id") { o.image_pad_id = std::atoll(next("--image-pad-id")); o.image_pad_given = true; }
@@ -71,7 +75,10 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
         else if (a == "--gpu") o.gpu = next("--gpu");
+        else if (a == "--gpu-mode") o.gpu_mode = next("--gpu-mode");
+        else if (a == "--gpu-share") o.gpu_share = next("--gpu-share");
         else if (a == "--gpu-plan") o.gpu_plan = true;
+        else if (a == "--diag-gpu-cut") o.diag_gpu_cut = std::atoi(next("--diag-gpu-cut"));
         else if (a == "--ppl-base") o.ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") o.ppl_out = next("--ppl-out");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }

@@ -29,7 +29,6 @@ struct Context {
     std::string& ppl_base;
     std::string& ppl_out;
     basalt::core::ModelFile& model_file;
-    const bool& peer_streamed_share;
     std::vector<int64_t>& split_at;
     std::vector<int>& split_devs;
     bool& split_same;
@@ -41,7 +40,7 @@ struct Context {
     basalt::core::ModelGeometry& g;
     int64_t& K;
     std::vector<std::pair<int32_t, int32_t>>& profile;
-    bool& peer_hot_share;
+    double& peer_hot_share;
     std::vector<std::pair<int32_t, int32_t>>& profile_loaded;
     const bool& pf_borrow;
     basalt::core::WeightTable& wt;
@@ -88,9 +87,9 @@ struct Context {
     int64_t& split_hand_rows;
     int64_t& split_chunk_cap;
     int64_t& split_peer_rows;
-    std::function<engine_local::SplitPricing(int64_t, int64_t, int64_t, int)> split_price;
+    std::function<engine_local::SplitPart(int64_t, int64_t, int64_t)> split_part;
     std::function<std::string(int, const std::vector<int>&)> split_layers_text;
-    std::function<std::string(const PsPrice&)> split_stages_text;
+    const std::vector<int>& split_cuts;
     int& split_stages;
     basalt::program::ExpertSpill& tier_spill;
     std::function<void()> report_expert_tiers;

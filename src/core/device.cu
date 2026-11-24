@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -28,6 +29,32 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
 
 
 }  // namespace
+
+namespace {
+std::atomic<int> g_plan_device{-1};   // plan_sms_device
+std::atomic<int> g_plan_sms[64];      // per ordinal, 0 until read
+}  // namespace
+
+void plan_sms_device(int ordinal) { g_plan_device.store(ordinal, std::memory_order_relaxed); }
+
+int plan_sms(int ordinal) {
+    int dev = g_plan_device.load(std::memory_order_relaxed);
+    if (dev < 0) dev = ordinal;
+    if (dev < 0 && cudaGetDevice(&dev) != cudaSuccess) {
+        cudaGetLastError();
+        dev = 0;
+    }
+    if (dev < 0 || dev >= 64) dev = 0;
+    int v = g_plan_sms[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || v <= 0) {
+            cudaGetLastError();
+            v = 1;
+        }
+        g_plan_sms[dev].store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
 
 int device_count() {
     int count = 0;
