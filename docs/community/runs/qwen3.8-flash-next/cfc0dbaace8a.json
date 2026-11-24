@@ -1,0 +1,41 @@
+{
+  "submitter": "jomeier",
+  "date": "2026-11-18",
+  "commit": "d3b7574296",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8"
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8"
+    }
+  ],
+  "ram_gib": 121,
+  "cpu": "AMD Ryzen 9 9950X, 16 cores",
+  "ram_gbps": 66.3,
+  "os": "Linux",
+  "quant": "Q2_0",
+  "kv": "int8",
+  "prefill_16k_tps": 2803.8,
+  "prefill_64k_tps": 3540.4,
+  "decode_tps": 228.1,
+  "decode_conv_tps": 166.6,
+  "decode_struct_tps": 266.5,
+  "decode_prose_tps": 146.1,
+  "accept_conv_pct": 73.7,
+  "accept_struct_pct": 98.4,
+  "accept_prose_pct": 66.3,
+  "draft_len_conv": 2.6,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 2.1,
+  "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+  "notes": "Self-converted pack: unsloth UD-Q2_0 GGUF converted to .basalt (no official Basalt Q2_0 pack). 2x RTX 5060 Ti 16GB at 180W, PCIe 5.0 x8/x8, no P2P (2nd card = expert tier); 0 SSD spill."
+}

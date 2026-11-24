@@ -142,6 +142,13 @@ class Service:
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
         self.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}   # their sums
+        from serve.prometheus import PromStats
+        self.prom = PromStats()                          # latency histograms & finish/draft totals for /metrics
+        self.totals_path = None                          # persistent counters file (None: this start only)
+        self.cost_input_per_million = 0.0                # what a million input tokens costs (US dollars)
+        self.cost_output_per_million = 0.0               # what a million output tokens costs
+        self.cost_cache_write_per_million = None          # cache write rate (None: use input rate)
+        self.cost_cache_hit_per_million = None             # cache hit rate (None: use input rate)
         self.last_timings = None                         # last request's timings
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
@@ -163,6 +170,58 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    _totals_broken = False   # disk errors: print once then stop trying
+
+    def load_totals(self, pricing_cli: set[str] | None = None) -> None:
+        """Read saved lifetime counters and pricing on startup.  Called once from server.py after
+        totals_path and cost_* fields are set.  CLI flags win over the file: a pricing field is
+        restored from the file only when the CLI did not explicitly set it."""
+        if not self.totals_path:
+            return
+        from serve.totals import totals_load_file, totals_add_saved
+        saved = totals_load_file(self.totals_path)
+        if saved:
+            with self.status_lock:
+                snap = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+                merged = totals_add_saved(snap, saved)
+                for k in ("prompt", "reused", "written", "prompt_ms", "decode_ms"):
+                    if k in merged:
+                        self.totals[k] = merged[k]
+                if "requests" in merged:
+                    self.requests_done = merged["requests"]
+                if "since" in merged:
+                    self.started_at = merged["since"]
+            cli_set = pricing_cli or set()
+            field_to_cli = {"cost_input_per_million": "cost_in",
+                            "cost_output_per_million": "cost_out",
+                            "cost_cache_write_per_million": "cost_cache_write",
+                            "cost_cache_hit_per_million": "cost_cache_hit"}
+            for field, cli_name in field_to_cli.items():
+                if cli_name in cli_set:
+                    continue
+                file_val = saved.get(field)
+                if file_val is not None and isinstance(file_val, (int, float)):
+                    setattr(self, field, float(file_val))
+
+    def _save_totals(self) -> None:
+        """Write the lifetime counters to disk after a request finishes.  Call with status_lock held."""
+        if not self.totals_path or self._totals_broken:
+            return
+        from serve.totals import totals_write_file, totals_with_cost
+        try:
+            snap = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+            totals_with_cost(snap, self.cost_input_per_million, self.cost_output_per_million,
+                             self.cost_cache_write_per_million, self.cost_cache_hit_per_million)
+            # Save the raw cache rates, not the resolved ones: a None rate stays null in the
+            # file so it does not override "same as input" on reload.
+            snap["cost_cache_write_per_million"] = self.cost_cache_write_per_million
+            snap["cost_cache_hit_per_million"] = self.cost_cache_hit_per_million
+            totals_write_file(self.totals_path, snap)
+        except OSError as e:
+            if not self._totals_broken:
+                self._totals_broken = True
+                print(f"[server] warning: could not write totals to {self.totals_path}: {e}", flush=True)
 
     def reasoning_budget(self, req, *, use_default: bool = True) -> int | None:
         """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer.
@@ -287,6 +346,12 @@ class Service:
                 subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
                 print(f"[server] warning: before_load command failed ({e}), loading anyway", flush=True)
+        reap = getattr(self.engine, "reap", None)
+        if callable(reap):
+            # an engine that ended (retired on an encode timeout, silent, crashed) may still have a child
+            # releasing GPU/RAM: reap it now, or the free-VRAM check below would blame "another program" and
+            # keep rejecting the very restart that cleans it up
+            reap()   # EngineStuck here means it is genuinely still exiting: the honest answer
         if self.min_free_vram_mib:
             free = self.free_vram_mib()
             deadline = time.time() + 15                 # memory just released elsewhere may take a moment
@@ -378,6 +443,9 @@ class Service:
             if not self.loaded():
                 self.vram_reserve = reserve_mib
                 out = {"status": "not loaded", "reserve_mib": reserve_mib, "note": "applied when the model loads"}
+            elif getattr(self.engine, "asleep", False) is True:   # its process is suspended: a command would never be read
+                self.vram_reserve = reserve_mib
+                out = {"status": "asleep", "reserve_mib": reserve_mib, "note": "applied when the model wakes"}
             else:
                 got = self.engine.vram(reserve_mib)
                 self.vram_reserve = reserve_mib
@@ -497,6 +565,11 @@ class Service:
             return
         print(f"[server] model awake in {time.time() - t:.1f} s (driver restore {self.engine.restore_s:.1f} s)",
               flush=True)
+        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # a POST /v1/vram that came while it slept
+            try:
+                self.engine.vram(self.vram_reserve)
+            except (ValueError, EngineDied) as e:
+                print(f"[server] warning: VRAM reserve of {self.vram_reserve} MiB not applied ({e})", flush=True)
 
     WAKE_VRAM_WAIT_S = 15.0                              # for memory just released elsewhere
 
@@ -816,6 +889,9 @@ class Service:
             decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
             hist = list(self.history)
             totals = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+            from serve.totals import totals_with_cost
+            totals_with_cost(totals, self.cost_input_per_million, self.cost_output_per_million,
+                             self.cost_cache_write_per_million, self.cost_cache_hit_per_million)
         busy = bool(s.get("busy"))
         if self.loading:
             state = "loading"
@@ -855,6 +931,11 @@ class Service:
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
                 "hardware": hardware_view(tel["now"], tel["static"], info, cards, l3), "hardware_static": tel["static"],
                 "history": tel["history"]}
+
+    def prom_snapshot(self) -> dict:
+        """Thread-safe snapshot of Prometheus counters and latency histograms."""
+        with self.status_lock:
+            return self.prom.snapshot()
 
     def _drop_stale_best(self) -> None:
         """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
@@ -1246,21 +1327,23 @@ class Service:
         return "[server] live | " + " | ".join(parts) + f" | total {total:.0f}t/s"
 
     def _progress(self, last_print, every=1.0, st=None):
-        """Print progress while a request runs: its prompt read, then the shared live line."""
+        """Print progress while a request runs: its prompt read, then the shared live line. The common case, nothing
+        due, takes no lock and copies nothing: the two fields that decide it are plain scalar reads."""
         now = time.time()
-        with self.status_lock:
-            s = dict(self.status if st is None else st)
+        s = self.status if st is None else st
         if now - last_print < (READ_PRINT_EVERY if s.get("first_token") is None else every):
             return last_print
         if s.get("first_token") is None:
+            with self.status_lock:
+                cur = st if st is not None else self.status
+                slot = self._slot_of(cur)
+                prompt_tokens, started = cur.get("prompt_tokens", 0), cur.get("started", now)
             pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
-            done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{s.get('prompt_tokens', 0)}"   # as read
+            done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{prompt_tokens}"   # as read
             # the engine's average over the tokens it read for this request (a reused prefix is not in it)
             pp = getattr(self.engine, "prefill_tok_s_mean", None) if pr and pr[1] else None
             speed = f" {pp:.0f}t/s" if pp and pp > 0 else ""
-            with self.status_lock:
-                slot = self._slot_of(st if st is not None else self.status)
-            print(f"[server] {slot_tag(slot)} read  pp={done}{speed} {now - s.get('started', now):.0f}s", flush=True)
+            print(f"[server] {slot_tag(slot)} read  pp={done}{speed} {now - started:.0f}s", flush=True)
         else:
             with self.live_lock:
                 due = now - self.live_at >= LIVE_EVERY_S
@@ -1335,6 +1418,7 @@ class Service:
         st = {} if par else self.status
         rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate
         wait_key = object()                             # this request's entry in self.waiting
+        arrived = getattr(self.request_ctx, "arrived", None) or time.time()
         with self.status_lock:
             self.status["queued"] += 1
             if not par:
@@ -1680,16 +1764,25 @@ class Service:
                                              ("prompt_ms", last.get("prompt_ms") or 0.0),
                                              ("decode_ms", last.get("decode_ms") or 0.0)):
                                 self.totals[key] += add
+                            self._save_totals()
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}
                             ft = st.get("first_token")
                             ttft = ft - st["started"] if ft and st.get("started") else None
+                            now_done = time.time()
+                            self.prom.record(
+                                finish=finish,
+                                ttft_s=(ft - arrived) if ft else None,
+                                duration_s=now_done - arrived,
+                                decode_ms=last.get("decode_ms"), output_tokens=n,
+                                drafts_offered=last.get("drafts_offered"), drafts_accepted=last.get("drafts_accepted"),
+                            )
                             windows, window_tokens = st.get("windows") or 0, st.get("window_tokens") or 0
                             dl = window_tokens / windows if windows else None
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
-                                "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                "time": started, "duration_s": round(now_done - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)

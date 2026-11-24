@@ -74,7 +74,7 @@ a fixed `--expert-cache N`, and a fixed peer tier.
 Forced-window identity (the same window width must give the same rows):
 
 ```sh
-python3 tools/ppl_gate.py --model PACK.basalt --engine-bin bin/basalt --base flashnext-bf16-base.kld \
+python3 tools/ppl_gate.py --model PACK.basalt --architecture qwen4exp --engine-bin bin/basalt --base flashnext-bf16-base.kld \
     --chunks 20 --t {1|3|7} --out DIR --expert-cache N --kv int8 --resident-experts --peer-exclusive --prefill auto
 python3 tools/ppl_gate.py --diff DIR1/rows.tsv DIR7/rows.tsv
 ```
@@ -83,7 +83,7 @@ MTP on and off, token by token: one engine session per configuration over `--ser
 
 ```sh
 bin/basalt --serve --model MODEL.basalt {--spec 0 | --spec 7} --expert-cache N --prefill auto --kv int8 \
-    --vram-reserve-mib 700 --resident-experts --peer-exclusive --gpu 0,1 --max-context 8192 \
+    --vram-reserve-mib 700 --resident-experts --peer-exclusive --gpu 0,1 --gpu-mode peer --max-context 8192 \
     --adapt-swaps 0 --peer-adapt-swaps 0 --exp concur9_logit_hash=1
 ```
 

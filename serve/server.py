@@ -128,9 +128,9 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
     cfg = {}                                            # what the model file implies
     lines = cfg["start_lines"] = []                     # printed with the model's other lines once all are checked
     try:
-        check_gpu(a.gpu)
-    except ValueError:
-        fail(f"--gpu {gpu_text(a.gpu)}: expected numbers like 0 or 0,1, or auto")
+        check_gpu(a.gpu, a.gpu_mode, a.gpu_share)
+    except ValueError as e:
+        fail(str(e))
     if not a.mock_engine and not (a.model and a.engine_bin):
         fail("the server needs --model and the engine binary: run it as basalt serve --config FILE (or --mock-engine)")
     if (file_engine or cli_engine) and not a.model:
@@ -157,7 +157,7 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
             # the engine's own choice and its own flag rules, printed once here; the engine then sees only these cards,
             # main first
             try:
-                plan = model_plan(a.engine_bin, a.model, spec.gpu, list(spec.engine_words))
+                plan = model_plan(a.engine_bin, a.model, spec.gpu, list(spec.engine_words), a.gpu_mode, a.gpu_share)
             except ValueError as e:
                 fail(f"{a.model}: {e}")
             card = vision_card(mode)
@@ -178,6 +178,9 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
                 cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
+            for flag, value in (("--gpu-mode", gpu_text(a.gpu_mode)), ("--gpu-share", gpu_text(a.gpu_share))):
+                if value:                                  # the engine checks them again on the cards it was given
+                    cfg["args"] += [flag, value]
     for flag in a.skipped:
         lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
     cfg["items"] = start_items(file_engine, cli_engine,
@@ -413,6 +416,25 @@ def main() -> int:
         print(tagged("cors", ",".join(svc.cors_origins)), flush=True)
         if "*" in svc.cors_origins and not svc.api_key:
             print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
+    from serve.totals import totals_path_of, totals_reset_file
+    pricing_cli = getattr(a, "pricing_cli", set())
+    for s in services:
+        s.cost_input_per_million = a.cost_in
+        s.cost_output_per_million = a.cost_out
+        s.cost_cache_write_per_million = a.cost_cache_write
+        s.cost_cache_hit_per_million = a.cost_cache_hit
+    for s in services:
+        tp = totals_path_of(a.totals_file, a.config)
+        if tp and multi:
+            tp = str(Path(tp).with_suffix("")) + f".{s.model}.json"
+        if tp:
+            if a.totals_reset:
+                prev = totals_reset_file(tp)
+                if prev:
+                    print(tagged("totals", f"reset {s.model}, previous saved to {prev}"), flush=True)
+            s.totals_path = tp
+            s.load_totals(pricing_cli)
+            print(tagged("totals", f"persistent{' ' + s.model if multi else ''}, {tp}"), flush=True)
     httpd = serve(router, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 

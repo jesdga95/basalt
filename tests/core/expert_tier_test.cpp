@@ -373,7 +373,9 @@ int main() {
         spec.admit_uses = 2;
         spec.share_stride = blob;
         spec.share_max_tokens = 64;
-        spec.peer_devices = {1};
+        spec.gpus.mode = basalt::program::GpuMode::Peer;   // GPU 0 main, GPU 1 its peer
+        spec.gpus.cards.resize(2);
+        spec.gpus.cards[1].device = 1;
         // the card is left room for only some of the homes
         size_t free1 = 0, total1 = 0;
         cudaSetDevice(1);

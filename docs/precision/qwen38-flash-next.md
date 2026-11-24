@@ -127,6 +127,10 @@ The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
 the prompt's.
 
+IQ2_S, IQ3_XXS and IQ3_S gate/up with Q5_1 down can use the device-planned tail. On the mixed IQ3_S-Q4 pack, enabling
+these pairs changes the decode path. With tiers pinned, the BF16 gate (100 chunks, T 3, INT8 KV) measured PPL 3.23857 to
+3.24341, mean KLD 0.0954673 to 0.0954654, and top-1 agreement 89.8314% to 89.8471%.
+
 ## 6-bit dense projections
 
 The NVFP4 pack's default `DQ6_K` stores attention q/k/v/o, GDN qkv/z/out and the shared experts' gate/up as Q6_K. The `DQ8` variant
@@ -201,6 +205,13 @@ The verify window reads all 248,320 rows of the head for every column. Two stage
 Costs: the Q6_K head adds KLD 0.0022 [0.0018, 0.0025] (1.5%) and PPL 0.25% (IQ3_S, 100 chunks, 400 W + 180 W), with no argmax change on
 25,500 rows. The Q8_0 two-stage head is 350 us per window against 439 us for the Q8_0 head (NVFP4, cold prose, 400 W + 180 W).
 Greedy output with the tiers pinned matches the exact head token for token.
+
+## Several cards
+
+`gpu-mode peer` on two cards against one card (BF16 KLD through the decode path, 100 chunks, `--kv int8`, window 3): 0.06174 against
+0.06221 (paired difference -0.0005 [-0.0013, +0.0004]), top-1 91.84% against 91.80%. A peer's prompt stages run each card's own
+cuBLAS algorithms; `--diag-main-card-bits` gives them the main card's and the stages are then bitwise
+([diagnostics](../configuration/diagnostics.md)). `gpu-mode split` against `--diag-gpu-same` is bitwise under the same flag, tokens and logits.
 
 ## GDN split across two cards
 

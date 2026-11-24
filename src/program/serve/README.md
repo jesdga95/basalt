@@ -17,6 +17,7 @@ pays no indirect call. `Flow::next` returns to command dispatch; `Flow::error` e
 | Prompts held by handle and what each slot holds of them | `prompt_handles.cpp` |
 | Sampling setup, turn and root parts | `request_prefill.cpp` |
 | The window's order | `decode_loop.hpp`, `reply_rows.hpp` |
+| The batch slots' rounds: windows, shared rows, groups, accept, drafts | `batch_round.cpp`, `batch_plan.hpp` |
 | Completion, slot admission and reports | `request_finish.cpp` |
 | A model that offers only sessions | `session_engine.cpp` |
 | The console's figures once the server sends `STATS` (XSLOT, XMAP, INFO cards=) | `console_stats.hpp`, `commands.cpp` |

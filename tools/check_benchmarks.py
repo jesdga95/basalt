@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Validate docs/community/benchmarks.json (stdlib only). Exits 1 with per-row messages.
+"""Validate the community run files (stdlib only). Exits 1 with per-file messages.
 
---fix rewrites a valid-JSON file in the canonical format, then validates it.
+    check_benchmarks.py [--fix] [DIR]       DIR is docs/community by default
+
+DIR holds preset.json and runs/<model slug>/<id>.json, one row per file. Every file must be in the house format, named
+by its content (the id of row_id) and in the folder of its model's slug, and no two files may hold the same setup.
+--fix rewrites the files that are valid JSON in the house format, then validates.
 """
+import hashlib
 import json
+import os
 import re
 import sys
 
@@ -123,8 +129,11 @@ ROW_ORDER = ("submitter", "date", "commit", "preset", "model", "gpus", "ram_gib"
              "quant", "kv", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", *TEST_TPS, *TEST_ACCEPT, *TEST_DRAFT,
              "engine_args", "notes")
 GPU_ORDER = ("name", "vram_gib", "power_w", "pcie", "h2d_gbps")
-TOP_ORDER = ("preset", "runs")
-FIX_HINT = "python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json"
+RUNS_DIR = "runs"
+PRESET_FILE = "preset.json"
+DEFAULT_DIR = "docs/community"
+ID_LEN = 12
+FIX_HINT = "python3 tools/check_benchmarks.py --fix"
 
 
 def ordered(d, order):
@@ -134,23 +143,51 @@ def ordered(d, order):
     return {**{k: d[k] for k in order if k in d}, **{k: v for k, v in d.items() if k not in order}}
 
 
-def canonical(data):
-    """The one accepted file form: fixed key order, 2-space indent, no trailing newline."""
-    data = ordered(data, TOP_ORDER)
-    if isinstance(data.get("runs"), list) if isinstance(data, dict) else False:
-        rows = []
-        for r in data["runs"]:
-            r = ordered(r, ROW_ORDER)
-            if isinstance(r, dict) and isinstance(r.get("gpus"), list):
-                r["gpus"] = [ordered(g, GPU_ORDER) for g in r["gpus"]]
-            rows.append(r)
-        data["runs"] = rows
-    return json.dumps(data, indent=2, ensure_ascii=False)
+def canonical_row(row):
+    """The one accepted form of a run file: fixed key order, 2-space indent, one trailing newline."""
+    row = ordered(row, ROW_ORDER)
+    if isinstance(row, dict) and isinstance(row.get("gpus"), list):
+        row["gpus"] = [ordered(g, GPU_ORDER) for g in row["gpus"]]
+    return json.dumps(row, indent=2, ensure_ascii=False) + "\n"
+
+
+def canonical_preset(preset):
+    return json.dumps({"preset": preset}, indent=2, ensure_ascii=False) + "\n"
 
 
 def lower_ascii(s):
     """Case folding that C++ (community_row.cpp) reproduces exactly: ASCII letters only."""
     return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in s)
+
+
+def model_slug(model):
+    """The folder of a model's runs: its name in ASCII lower case."""
+    return lower_ascii(model)
+
+
+def row_id(row):
+    """The file name (without .json) of a run: the first ID_LEN hex digits of the sha256 of the setup the "same setup"
+    rule compares, taken as exact values: the submitter in ASCII lower case, model, quant, cpu, ram_gib, os and every
+    GPU's name, vram_gib and power_w. A field the row lacks is empty. The text hashed is a compact JSON array, numbers
+    as "%.0f" and strings quoted as json_quote in community_row.cpp does, so the bench computes the same id."""
+    def q(v):
+        return json.dumps(v if isinstance(v, str) else "", ensure_ascii=False)
+
+    def n(v):
+        return "%.0f" % v if is_num(v) else ""
+    gpus = row.get("gpus")
+    gpus = [g for g in gpus if isinstance(g, dict)] if isinstance(gpus, list) else []
+    sub = row.get("submitter")
+    parts = [q(lower_ascii(sub) if isinstance(sub, str) else ""), q(row.get("model")), q(row.get("quant")), q(row.get("cpu")),
+             n(row.get("ram_gib")), q(row.get("os")),
+             "[" + ",".join(f"[{q(g.get('name'))},{n(g.get('vram_gib'))},{n(g.get('power_w'))}]" for g in gpus) + "]"]
+    text = "[" + ",".join(parts) + "]"
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:ID_LEN]
+
+
+def run_path(row):
+    """<model slug>/<id>.json, relative to the runs folder."""
+    return f"{model_slug(row['model'])}/{row_id(row)}.json"
 
 
 def same_setup(a, b):
@@ -178,55 +215,123 @@ def same_setup(a, b):
     return True
 
 
-def validate(data):
+def read_text(path):
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def list_runs(root):
+    """(relative path, absolute path) of every entry under root/runs, sorted; problems for what is not a run file."""
+    found, problems = [], []
+    base = os.path.join(root, RUNS_DIR)
+    if not os.path.isdir(base):
+        return found, [f"{RUNS_DIR}: the runs folder is missing"]
+    for slug in sorted(os.listdir(base)):
+        d = os.path.join(base, slug)
+        rel = f"{RUNS_DIR}/{slug}"
+        if not os.path.isdir(d):
+            problems.append(f"{rel}: only model folders belong directly in {RUNS_DIR}/")
+            continue
+        for name in sorted(os.listdir(d)):
+            full = os.path.join(d, name)
+            if os.path.isfile(full) and re.fullmatch(r"[0-9a-f]{%d}\.json" % ID_LEN, name):
+                found.append((f"{rel}/{name}", full))
+            else:
+                problems.append(f"{rel}/{name}: not a run file (<{ID_LEN} hex digits>.json)")
+    return found, problems
+
+
+def check_file(rel, text, err):
+    """Validate one run file's text; returns the row when it parsed to an object."""
+    try:
+        row = json.loads(text)
+    except ValueError as e:
+        err(f"not valid JSON: {e}")
+        return None
+    if not isinstance(row, dict):
+        err("the file must hold one row object")
+        return None
     problems = []
-    if not isinstance(data, dict):
-        problems.append("top level must be an object")
-    else:
-        if not is_text(data.get("preset")):
-            problems.append("top-level 'preset' must be a non-empty string")
-        if not isinstance(data.get("runs"), list):
-            problems.append("top-level 'runs' must be a list")
-        for key in sorted(set(data) - {"preset", "runs"}):
-            problems.append(f"unknown top-level key '{key}'")
-        rows = data["runs"] if isinstance(data.get("runs"), list) else []
-        for i, r in enumerate(rows):
-            who = r.get("submitter") if isinstance(r, dict) else None
-            label = f"runs[{i}]" + (f" ({who})" if isinstance(who, str) and who else "")
-            check_row(r, lambda m, label=label: problems.append(f"{label}: {m}"))
-            first = next((j for j in range(i) if isinstance(r, dict) and isinstance(rows[j], dict) and same_setup(rows[j], r)), None)
+    check_row(row, problems.append)
+    for p in problems:
+        err(p)
+    if not problems:
+        want = run_path(row)
+        if rel.split("/", 1)[1] != want:
+            err(f"the file belongs at {RUNS_DIR}/{want} (the model's folder and the id of its setup)")
+    if text != canonical_row(row):
+        err(f"not in the house format; run: {FIX_HINT}")
+    return row
+
+
+def check_dir(root, fix=False):
+    """Validate root. Returns (problems, rows) where rows is [(relative path, row)] of the files that parsed."""
+    problems, rows = [], []
+    found, stray = list_runs(root)
+    problems += stray
+    rewritten = 0
+    for rel, full in found:
+        text = read_text(full)
+        if fix:
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict) and text != canonical_row(parsed):
+                text = canonical_row(parsed)
+                write_text(full, text)
+                rewritten += 1
+        row = check_file(rel, text, lambda m, rel=rel: problems.append(f"{rel}: {m}"))
+        if row is not None:
+            rows.append((rel, row))
+    pp = os.path.join(root, PRESET_FILE)
+    try:
+        text = read_text(pp)
+        data = json.loads(text)
+        if not isinstance(data, dict) or set(data) != {"preset"} or not is_text(data["preset"]):
+            problems.append(f"{PRESET_FILE}: must be an object with one key, 'preset', a non-empty string")
+        elif text != canonical_preset(data["preset"]):
+            if fix:
+                write_text(pp, canonical_preset(data["preset"]))
+                rewritten += 1
+            else:
+                problems.append(f"{PRESET_FILE}: not in the house format; run: {FIX_HINT}")
+    except (OSError, ValueError) as e:
+        problems.append(f"{PRESET_FILE}: {e}")
+    # one run per setup: the same submitter, model, quant and hardware (a missing field matches, so a row from before
+    # a field existed still collides with the same setup that has it). Only rows of one submitter and model can match.
+    buckets = {}
+    for rel, row in rows:
+        if isinstance(row.get("submitter"), str):
+            buckets.setdefault((row.get("model"), lower_ascii(row["submitter"])), []).append((rel, row))
+    for group in buckets.values():
+        for i, (rel, row) in enumerate(group):
+            first = next((o for o, orow in group[:i] if same_setup(orow, row)), None)
             if first is not None:
-                problems.append(f"{label}: same submitter, model, quant and hardware as runs[{first}]: update your run instead")
-    return problems
+                problems.append(f"{rel}: same submitter, model, quant and hardware as {first}: update that run (the same file) instead")
+    if fix and rewritten:
+        print(f"{rewritten} file(s) rewritten in the house format")
+    return problems, rows
 
 
 def main(argv):
     args = argv[1:]
     fix = "--fix" in args
     args = [a for a in args if a != "--fix"]
-    path = args[0] if args else "docs/community/benchmarks.json"
-    try:
-        with open(path, encoding="utf-8", newline="") as f:
-            text = f.read()
-        data = json.loads(text)
-    except (OSError, ValueError) as e:
-        print(f"{path}: {e}")
-        return 1
-    problems = validate(data)
-    want = canonical(data)
-    if fix and text != want:
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(want)
-        print(f"{path}: rewritten in the canonical format")
-        text = want
-    elif text != want:
-        problems.append(f"not in the canonical format; run: {FIX_HINT}")
+    root = args[0] if args else DEFAULT_DIR
+    problems, rows = check_dir(root, fix)
     for p in problems:
-        print(f"{path}: {p}")
+        print(f"{root}/{p}")
     if problems:
         return 1
-    print(f"{path}: ok, {len(data['runs'])} runs")
+    print(f"{root}: ok, {len(rows)} runs")
     return 0
 
 
-sys.exit(main(sys.argv))
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

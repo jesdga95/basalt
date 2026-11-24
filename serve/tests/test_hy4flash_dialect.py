@@ -388,7 +388,7 @@ class Config(unittest.TestCase):
     def test_a_config_entry_names_it_and_its_flags(self):
         conf = self.dir / "c.json"
         conf.write_text(json.dumps({"engine": {"spec": 4, "vram-reserve-mib": 2048}, "models": [
-            {"alias": "Hy4", "model": "hy.basalt", "gpu": "auto", "max-context": 1048576}]}), encoding="utf-8")
+            {"alias": "Hy4", "model": "hy.basalt", "gpu": "all", "gpu-mode": "peer", "max-context": 1048576}]}), encoding="utf-8")
         args, _, file_words, cli_words = model_settings(build_parser(), ["--config", str(conf)])[0]
         self.assertTrue(args.model.endswith("hy.basalt"))
         words = " ".join(file_words + cli_words)

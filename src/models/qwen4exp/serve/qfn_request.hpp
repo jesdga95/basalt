@@ -123,8 +123,8 @@ private:
     bool batch_fatal{};
     int64_t il_parts{};
     double il_ms{};
-    // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
-    // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
+    // ---- the prompt-time layer split: a part of the prompt longer than a chunk is read across the cards at the start's
+    // fixed cuts (split_part says when it cannot be); the chunk, its head chunk, the stage count and the cuts, or none
     struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
     bool relax_on{};
     bool in_call{};

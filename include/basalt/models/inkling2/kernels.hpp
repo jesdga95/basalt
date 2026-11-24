@@ -18,6 +18,8 @@ constexpr int kWidth = 2304;        ///< the hidden width the kernels are built 
 constexpr int kHeads = 24;          ///< query heads
 constexpr int kKvHeads = 8;         ///< key/value heads
 constexpr int kHeadDim = 128;
+constexpr int kKvInt8RowBytes = (kHeadDim + 4 + 15) & ~15;   ///< INT8 values and two fp16 scales, zero-padded to 16 bytes
+constexpr int kv_cache_row_bytes(bool fp8, bool int8) { return fp8 ? kHeadDim : int8 ? kKvInt8RowBytes : 2 * kHeadDim; }
 constexpr int kRel = 16;            ///< relative state per head
 constexpr int kExtent = 1024;       ///< distances the relative bias covers (also the window)
 constexpr int kConv = 4;            ///< short convolution taps
@@ -95,6 +97,7 @@ struct AttnPrep {
     void* v_cache = nullptr;
     int64_t cap = 0;
     bool fp8 = false;                  ///< unit-scale E4M3 codes (keys are clipped and values normed, so they fit)
+    bool int8 = false;                 ///< symmetric INT8 codes with two per-row FP16 scales
     float* q = nullptr;                ///< out: the clipped (and scaled) queries [rows][kHeads][kHeadDim]
     float* r = nullptr;                ///< out: the relative states [rows][kHeads][kRel]
     float* sink = nullptr;             ///< out: [rows][kHeads]
@@ -116,6 +119,7 @@ struct AttnArgs {
     const void* v_cache = nullptr;
     int64_t cap = 0;                   ///< the cache's cells (a ring when window is set)
     bool fp8 = false;
+    bool int8 = false;
     int window = 0;                    ///< > 0: keys at distance < window only (the cache is then a ring of cap >= window + rows)
     float scale = 0.08838834764831845f;
     const float* gate = nullptr;       ///< set: the output is gated by sigmoid(gate[r * gate_ld + h * kHeadDim + d])
@@ -148,11 +152,29 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
+/// Doorbell words in mapped host memory, accessed atomically at system scope. The ring's release publishes the choices,
+/// RAM rows and nonzero visit ticket. The host acquires the ring, takes the ticket, clears the ring and computes its rows.
+/// Its release store to `done` publishes those rows with that ticket. The merge acquires only a completion for its visit.
+/// `abort` is sticky: a RAM visit that observes it does not publish, and waiting merges check it periodically.
+struct CpuBell {
+    alignas(64) uint32_t ring;
+    uint32_t ticket;
+    alignas(64) uint32_t done;
+    uint32_t abort;
+};
+
+/// Each visit with a RAM pair advances the device word `seq` (initialized to zero), even after an abort. A live RAM visit
+/// publishes its choices to ids_m, its RAM rows to x_m, and its ticket before raising `ring` with `layer` and `rows`.
+/// A visit with no RAM pair touches neither `seq` nor mapped host memory. rows <= kDecodeRows, rows * k <= 1024.
+void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
+                  int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream);
+
 /// The CPU's rows of a window's experts (cpu_experts.hpp): pair p = r * k + slot whose expert is not on the card (blobs[e]
 /// 0) takes row p of `cpu` (mapped host memory, the pool's output) into row p of `output`, and adds its lookup to tally[e]
-/// when `tally` is set; the card's pairs are left as they are.
+/// when `tally` is set; the card's pairs are left as they are. With `bell` set, wait for its completion ticket to match the
+/// visit's `seq`, or take nothing if abort is seen first. Visits sharing a sequence run ring and merge in order.
 void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu, float* output,
-                   uint32_t* tally, void* stream);
+                   uint32_t* tally, void* stream, CpuBell* bell = nullptr, const uint32_t* seq = nullptr);
 
 /// The grouped expert kernel's plan from the router's choices: group g is an expert on the card (its blob at blobs[e], a
 /// device address; 0 when it is not on the card) and its entries are the (row, slot) pairs that chose it, in row order;
@@ -171,7 +193,7 @@ void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64
 /// before the experts run. Reads only; `sink` (4 bytes) is written on a 2^-32 chance so the loads are kept.
 void expert_prefetch(const int32_t* ids, int n, const unsigned long long* blobs, uint64_t bytes, uint32_t* sink, void* stream);
 /// y[r] = sum_slot w[r][slot] * out[r * k + slot] in slot order (fp32).
-void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream);
+void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream, const int32_t* ids = nullptr);
 
 // ---- a decode window's fused glue (kernels/glue.cu): at most kDecodeRows rows --------------------------------------------
 //

@@ -1,8 +1,9 @@
-// src/program/community_row.cpp - adds a community benchmark row to docs/community/benchmarks.json, or updates the row of the same setup.
+// src/program/community_row.cpp - one community run: the row text, the id and folder of its file, and the write of that file.
 #include "basalt/program/community_row.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -105,43 +106,43 @@ std::string pack_quant_label(const std::string& name) {
 }
 
 std::string community_row_text(const CommunityRow& r) {
-    std::string t = "    {\n";
-    t += "      \"submitter\": " + json_quote(r.submitter) + ",\n";
-    t += "      \"date\": " + json_quote(r.date) + ",\n";
-    t += "      \"commit\": " + json_quote(r.commit) + ",\n";
-    t += "      \"preset\": " + json_quote(r.preset) + ",\n";
-    t += "      \"model\": " + json_quote(r.model) + ",\n";
-    t += "      \"gpus\": [\n";
+    std::string t = "{\n";
+    t += "  \"submitter\": " + json_quote(r.submitter) + ",\n";
+    t += "  \"date\": " + json_quote(r.date) + ",\n";
+    t += "  \"commit\": " + json_quote(r.commit) + ",\n";
+    t += "  \"preset\": " + json_quote(r.preset) + ",\n";
+    t += "  \"model\": " + json_quote(r.model) + ",\n";
+    t += "  \"gpus\": [\n";
     for (size_t i = 0; i < r.gpus.size(); ++i) {
         const CommunityGpu& g = r.gpus[i];
-        t += "        {\n";
-        t += "          \"name\": " + json_quote(g.name) + ",\n";
-        t += "          \"vram_gib\": " + num(g.vram_gib, 0) + ",\n";
-        t += "          \"power_w\": " + num(g.power_w, 0);
-        if (!g.pcie.empty()) t += ",\n          \"pcie\": " + json_quote(g.pcie);
-        if (g.h2d_gbps > 0) t += ",\n          \"h2d_gbps\": " + num(g.h2d_gbps, 1);
+        t += "    {\n";
+        t += "      \"name\": " + json_quote(g.name) + ",\n";
+        t += "      \"vram_gib\": " + num(g.vram_gib, 0) + ",\n";
+        t += "      \"power_w\": " + num(g.power_w, 0);
+        if (!g.pcie.empty()) t += ",\n      \"pcie\": " + json_quote(g.pcie);
+        if (g.h2d_gbps > 0) t += ",\n      \"h2d_gbps\": " + num(g.h2d_gbps, 1);
         t += "\n";
-        t += i + 1 < r.gpus.size() ? "        },\n" : "        }\n";
+        t += i + 1 < r.gpus.size() ? "    },\n" : "    }\n";
     }
-    t += "      ],\n";
-    t += "      \"ram_gib\": " + num(r.ram_gib, 0) + ",\n";
-    if (!r.cpu.empty()) t += "      \"cpu\": " + json_quote(r.cpu) + ",\n";
-    if (r.ram_gbps > 0) t += "      \"ram_gbps\": " + num(r.ram_gbps, 1) + ",\n";
-    t += "      \"os\": " + json_quote(r.os) + ",\n";
-    t += "      \"quant\": " + json_quote(r.quant) + ",\n";
-    t += "      \"kv\": " + json_quote(r.kv) + ",\n";
-    t += "      \"prefill_16k_tps\": " + num(r.prefill_16k_tps, 1) + ",\n";
-    t += "      \"prefill_64k_tps\": " + num(r.prefill_64k_tps, 1) + ",\n";
-    t += "      \"decode_tps\": " + num(r.decode_tps, 1);
+    t += "  ],\n";
+    t += "  \"ram_gib\": " + num(r.ram_gib, 0) + ",\n";
+    if (!r.cpu.empty()) t += "  \"cpu\": " + json_quote(r.cpu) + ",\n";
+    if (r.ram_gbps > 0) t += "  \"ram_gbps\": " + num(r.ram_gbps, 1) + ",\n";
+    t += "  \"os\": " + json_quote(r.os) + ",\n";
+    t += "  \"quant\": " + json_quote(r.quant) + ",\n";
+    t += "  \"kv\": " + json_quote(r.kv) + ",\n";
+    t += "  \"prefill_16k_tps\": " + num(r.prefill_16k_tps, 1) + ",\n";
+    t += "  \"prefill_64k_tps\": " + num(r.prefill_64k_tps, 1) + ",\n";
+    t += "  \"decode_tps\": " + num(r.decode_tps, 1);
     for (int k = 0; k < 3; ++k)
-        if (r.tests[k].decode_tps > 0) t += std::string(",\n      \"decode_") + kCommunityTestNames[k] + "_tps\": " + num(r.tests[k].decode_tps, 1);
+        if (r.tests[k].decode_tps > 0) t += std::string(",\n  \"decode_") + kCommunityTestNames[k] + "_tps\": " + num(r.tests[k].decode_tps, 1);
     for (int k = 0; k < 3; ++k)
-        if (r.tests[k].draft_len > 0) t += std::string(",\n      \"accept_") + kCommunityTestNames[k] + "_pct\": " + num(r.tests[k].accept_pct, 1);
+        if (r.tests[k].draft_len > 0) t += std::string(",\n  \"accept_") + kCommunityTestNames[k] + "_pct\": " + num(r.tests[k].accept_pct, 1);
     for (int k = 0; k < 3; ++k)
-        if (r.tests[k].draft_len > 0) t += std::string(",\n      \"draft_len_") + kCommunityTestNames[k] + "\": " + num(r.tests[k].draft_len, 1);
-    if (!r.engine_args.empty()) t += ",\n      \"engine_args\": " + json_quote(r.engine_args);
-    if (!r.notes.empty()) t += ",\n      \"notes\": " + json_quote(r.notes);
-    t += "\n    }";
+        if (r.tests[k].draft_len > 0) t += std::string(",\n  \"draft_len_") + kCommunityTestNames[k] + "\": " + num(r.tests[k].draft_len, 1);
+    if (!r.engine_args.empty()) t += ",\n  \"engine_args\": " + json_quote(r.engine_args);
+    if (!r.notes.empty()) t += ",\n  \"notes\": " + json_quote(r.notes);
+    t += "\n}";
     return t;
 }
 
@@ -217,55 +218,33 @@ bool json_unquote(const std::string& lit, std::string& out) {
     return true;
 }
 
-struct ParsedRow {
-    CommunityRow row;
-    size_t begin = 0, end = 0;   // the row's text in the file: from its "    {" to its "    }"
-};
+}  // namespace
 
-// Reads the rows of a canonical file: a row opens with "    {", its keys sit at 6 spaces, its GPUs at 8 and theirs at 10.
-bool parse_rows(const std::string& file, std::vector<ParsedRow>& rows, std::string& err) {
-    rows.clear();
-    static const std::string head = "\n  \"runs\": [";
-    const size_t h = file.find(head);
-    if (h == std::string::npos) { err = "the file has no runs list"; return false; }
-    size_t pos = h + head.size();
-    if (pos < file.size() && file[pos] == ']') return true;   // an empty list
-    const auto bad = [&](const char* why) { err = std::string("the runs list is not in the canonical form (") + why + ")"; return false; };
-    if (pos >= file.size() || file[pos] != '\n') return bad("after \"runs\": [");
-    ++pos;
-    bool in_row = false, in_gpus = false, in_gpu = false;
-    ParsedRow cur;
-    while (pos < file.size()) {
-        size_t eol = file.find('\n', pos);
-        if (eol == std::string::npos) eol = file.size();
-        const std::string line = file.substr(pos, eol - pos);
-        const size_t line_at = pos;
+bool community_parse_row(const std::string& text, CommunityRow& row, std::string& err) {
+    row = CommunityRow();
+    const auto bad = [&](const char* why) { err = std::string("the row is not in the house form (") + why + ")"; return false; };
+    // the house form: "{", keys at 2 spaces, the GPUs' "{" at 4 and their keys at 6, "}" at the start of the last line
+    bool in_row = false, closed = false, in_gpus = false, in_gpu = false;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        std::string line = text.substr(pos, eol - pos);
         pos = eol + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (closed) return bad("text after the closing }");
+        if (!in_row) {
+            if (line != "{") return bad("the row does not open with {");
+            in_row = true;
+            continue;
+        }
+        if (line == "}") { closed = true; continue; }
         size_t ind = 0;
         while (ind < line.size() && line[ind] == ' ') ++ind;
-        std::string body = line.substr(ind);
-        if (!in_row) {
-            if (line == "  ]") return true;
-            if (line != "    {") return bad("a row does not open with 4 spaces and {");
-            in_row = true;
-            cur = ParsedRow();
-            cur.begin = line_at;
-            continue;
-        }
-        if (ind == 4) {
-            if (body != "}" && body != "},") return bad("a row does not close with }");
-            cur.end = line_at + 5;
-            rows.push_back(cur);
-            in_row = false;
-            continue;
-        }
-        if (ind == 6 && in_gpus) {
-            if (body != "]" && body != "],") return bad("gpus does not close with ]");
-            in_gpus = false;
-            continue;
-        }
-        if (ind == 8 && in_gpus) {
-            if (body == "{") { in_gpu = true; cur.row.gpus.emplace_back(); continue; }
+        const std::string body = line.substr(ind);
+        if (ind == 2 && in_gpus && (body == "]" || body == "],")) { in_gpus = false; continue; }
+        if (ind == 4 && in_gpus) {
+            if (body == "{") { in_gpu = true; row.gpus.emplace_back(); continue; }
             if (body == "}" || body == "},") { in_gpu = false; continue; }
             return bad("a GPU does not open with {");
         }
@@ -273,35 +252,33 @@ bool parse_rows(const std::string& file, std::vector<ParsedRow>& rows, std::stri
         if (body.size() < 5 || body[0] != '"' || colon == std::string::npos) return bad("a line is not a key and a value");
         const std::string key = body.substr(1, colon - 1);
         std::string val = body.substr(colon + 3);
-        if (key == "gpus" && ind == 6) {
+        if (key == "gpus" && ind == 2) {
             if (val != "[") return bad("gpus does not open with [");
             in_gpus = true;
             continue;
         }
         if (!val.empty() && val.back() == ',') val.pop_back();
-        std::string text;
+        std::string s;
         const bool is_text = !val.empty() && val.front() == '"';
-        if (is_text && !json_unquote(val, text)) return bad("a string is not valid JSON");
+        if (is_text && !json_unquote(val, s)) return bad("a string is not valid JSON");
         const double number = is_text ? 0.0 : std::strtod(val.c_str(), nullptr);
-        if (in_gpu && ind == 10) {
-            CommunityGpu& g = cur.row.gpus.back();
-            if (key == "name") g.name = text;
+        if (in_gpu && ind == 6) {
+            CommunityGpu& g = row.gpus.back();
+            if (key == "name") g.name = s;
             else if (key == "vram_gib") g.vram_gib = number;
             else if (key == "power_w") g.power_w = number;
-        } else if (ind == 6) {
-            CommunityRow& r = cur.row;
-            if (key == "submitter") r.submitter = text;
-            else if (key == "model") r.model = text;
-            else if (key == "quant") r.quant = text;
-            else if (key == "os") r.os = text;
-            else if (key == "cpu") r.cpu = text;
-            else if (key == "notes") r.notes = text;
-            else if (key == "ram_gib") r.ram_gib = number;
+        } else if (ind == 2) {
+            if (key == "submitter") row.submitter = s;
+            else if (key == "model") row.model = s;
+            else if (key == "quant") row.quant = s;
+            else if (key == "os") row.os = s;
+            else if (key == "cpu") row.cpu = s;
+            else if (key == "notes") row.notes = s;
+            else if (key == "ram_gib") row.ram_gib = number;
         }
     }
-    return bad("the list is not closed");
+    return closed ? true : bad("the row is not closed");
 }
-}  // namespace
 
 bool community_same_setup(const CommunityRow& a, const CommunityRow& b) {
     if (!same_text(lower_ascii(a.submitter), lower_ascii(b.submitter)) || !same_text(a.model, b.model) || !same_text(a.quant, b.quant) ||
@@ -316,86 +293,93 @@ bool community_same_setup(const CommunityRow& a, const CommunityRow& b) {
     return true;
 }
 
-bool community_parse_rows(const std::string& file, std::vector<CommunityRow>& rows, std::string& err) {
-    std::vector<ParsedRow> parsed;
-    if (!parse_rows(file, parsed, err)) return false;
-    rows.clear();
-    for (const ParsedRow& p : parsed) rows.push_back(p.row);
-    return true;
+std::string sha256_hex(const std::string& data) {
+    static const uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,
+        0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa,
+        0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85,
+        0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
+        0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    std::string m = data;
+    m += (char) 0x80;
+    while (m.size() % 64 != 56) m += (char) 0;
+    const uint64_t bits = (uint64_t) data.size() * 8;
+    for (int i = 7; i >= 0; --i) m += (char) ((bits >> (8 * i)) & 0xff);
+    const auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+    for (size_t off = 0; off < m.size(); off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i)
+            w[i] = ((uint32_t) (unsigned char) m[off + 4 * i] << 24) | ((uint32_t) (unsigned char) m[off + 4 * i + 1] << 16) |
+                   ((uint32_t) (unsigned char) m[off + 4 * i + 2] << 8) | (uint32_t) (unsigned char) m[off + 4 * i + 3];
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t v[8];
+        std::copy(h, h + 8, v);
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t s1 = rotr(v[4], 6) ^ rotr(v[4], 11) ^ rotr(v[4], 25);
+            const uint32_t t1 = v[7] + s1 + ((v[4] & v[5]) ^ (~v[4] & v[6])) + K[i] + w[i];
+            const uint32_t s0 = rotr(v[0], 2) ^ rotr(v[0], 13) ^ rotr(v[0], 22);
+            const uint32_t t2 = s0 + ((v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]));
+            std::copy_backward(v, v + 7, v + 8);
+            v[4] += t1;
+            v[0] = t1 + t2;
+        }
+        for (int i = 0; i < 8; ++i) h[i] += v[i];
+    }
+    std::string out;
+    char b[16];
+    for (uint32_t x : h) {
+        std::snprintf(b, sizeof b, "%08x", (unsigned) x);
+        out += b;
+    }
+    return out;
 }
 
-bool community_add_row(const std::string& file_in, const CommunityRow& row_in, std::string& out, std::string& err, CommunityEdit* edit) {
-    // The canonical form is LF; a file with CRLF line endings (a checkout that translated them) is edited as LF and
-    // written back as CRLF. Raw CR never occurs inside the JSON text itself, so the conversion is lossless.
-    const bool crlf = file_in.find("\r\n") != std::string::npos;
-    std::string file;
-    if (crlf) {
-        file.reserve(file_in.size());
-        for (size_t i = 0; i < file_in.size(); ++i)
-            if (file_in[i] != '\r' || i + 1 >= file_in.size() || file_in[i + 1] != '\n') file += file_in[i];
-    } else {
-        file = file_in;
-    }
-    static const std::string tail = "\n    }\n  ]\n}", empty = "\n  \"runs\": []\n}", close = "\n  ]\n}";
-    const auto ends = [&](const std::string& s) { return file.size() >= s.size() && file.compare(file.size() - s.size(), s.size(), s) == 0; };
+std::string community_model_slug(const std::string& model) { return lower_ascii(model); }
+
+std::string community_run_id(const CommunityRow& r) {
+    std::string t = "[" + json_quote(lower_ascii(r.submitter)) + "," + json_quote(r.model) + "," + json_quote(r.quant) + "," + json_quote(r.cpu) +
+                    "," + num(r.ram_gib, 0) + "," + json_quote(r.os) + ",[";
+    for (size_t i = 0; i < r.gpus.size(); ++i)
+        t += std::string(i ? "," : "") + "[" + json_quote(r.gpus[i].name) + "," + num(r.gpus[i].vram_gib, 0) + "," + num(r.gpus[i].power_w, 0) + "]";
+    return sha256_hex(t + "]]").substr(0, 12);
+}
+
+bool community_write_run(const std::string& dir, const CommunityRow& row_in, std::string& err, CommunityEdit* edit) {
     CommunityRow row = row_in;
-    for (CommunityGpu& g : row.gpus) {   // compared as the file spells them
-        g.vram_gib = std::strtod(num(g.vram_gib, 0).c_str(), nullptr);
-        g.power_w = std::strtod(num(g.power_w, 0).c_str(), nullptr);
-    }
-    row.ram_gib = std::strtod(num(row.ram_gib, 0).c_str(), nullptr);
-    if (ends(tail)) {
-        std::vector<ParsedRow> old;
-        if (!parse_rows(file, old, err)) return false;
-        const auto same = std::find_if(old.begin(), old.end(), [&](const ParsedRow& p) { return community_same_setup(p.row, row); });
-        if (same != old.end()) {
-            if (row.notes.empty()) row.notes = same->row.notes;
-            out = file.substr(0, same->begin) + community_row_text(row) + file.substr(same->end);
-            if (edit) {
-                edit->replaced = true;
-                edit->index = (size_t) (same - old.begin());
-                edit->notes = same->row.notes;
-            }
-        } else {
-            out = file.substr(0, file.size() - close.size()) + ",\n" + community_row_text(row) + close;
-        }
-    } else if (ends(empty)) {
-        out = file.substr(0, file.size() - 4) + "[\n" + community_row_text(row) + close;
-    } else {
-        err = "the file does not end in the canonical runs list (run python3 tools/check_benchmarks.py --fix on it first)";
-        return false;
-    }
-    if (edit) edit->row_text = community_row_text(row);
-    if (crlf) {
-        std::string t;
-        t.reserve(out.size() + out.size() / 20);
-        for (char ch : out) {
-            if (ch == '\n') t += '\r';
-            t += ch;
-        }
-        out.swap(t);
-    }
-    return true;
-}
-
-bool community_add_row_file(const std::string& path, const CommunityRow& row, std::string& err, CommunityEdit* edit) {
-    std::string text;
-    {
-        std::FILE* f = platform::open_file_utf8(path, "rb");
-        if (!f) { err = "cannot open " + path; return false; }
+    const std::string folder = dir + "/runs/" + community_model_slug(row.model);
+    const std::string path = folder + "/" + community_run_id(row) + ".json";
+    if (std::FILE* f = platform::open_file_utf8(path, "rb")) {   // the earlier run of this setup: overwritten, its notes kept
+        std::string text;
         char buf[1 << 14];
         size_t n;
         while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
         const bool bad = std::ferror(f) != 0;
         std::fclose(f);
         if (bad) { err = "cannot read " + path; return false; }
+        CommunityRow old;
+        if (!community_parse_row(text, old, err)) { err += " in " + path; return false; }
+        if (row.notes.empty()) row.notes = old.notes;
+        if (edit) {
+            edit->replaced = true;
+            edit->notes = old.notes;
+        }
     }
-    std::string out;
-    if (!community_add_row(text, row, out, err, edit)) return false;
+    if (!platform::make_dirs(folder)) { err = "cannot create " + folder; return false; }
+    const std::string text = community_row_text(row) + "\n";
     std::FILE* f = platform::open_file_utf8(path, "wb");
     if (!f) { err = "cannot write " + path; return false; }
-    const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+    const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
     if (std::fclose(f) != 0 || !ok) { err = "cannot write " + path; return false; }
+    if (edit) {
+        edit->path = path;
+        edit->row_text = community_row_text(row);
+    }
     return true;
 }
 

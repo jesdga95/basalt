@@ -73,16 +73,21 @@ bool ElasticArray::map_host_tail(std::string& err) {
     return true;
 }
 
+// grow in steps of a few granules so a long generation maps rarely; the bytes from host_from_ on are host memory
+uint64_t ElasticArray::growth(uint64_t bytes) const {
+    if (bytes <= backed_ || bytes > reserved_ || backed_ == host_from_) return 0;
+    const uint64_t step = gran_ * 4;
+    return std::min(host_from_, (bytes + step - 1) / step * step) - backed_;
+}
+
 bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     if (bytes > reserved_) {
         err = "the array is full";
         return false;
     }
-    if (bytes <= backed_ || backed_ == host_from_) return true;   // the rest is host memory
-    // grow in steps of a few granules so a long generation maps rarely
-    const uint64_t step = gran_ * 4;
-    const uint64_t want = std::min(host_from_, (bytes + step - 1) / step * step);
-    const uint64_t n = want - backed_;
+    const uint64_t n = growth(bytes);
+    if (n == 0) return true;   // backed already, or the rest is host memory
+    const uint64_t want = backed_ + n;
     if (keep_free > 0) {
         uint64_t free_b = 0, total_b = 0;
         std::string why;

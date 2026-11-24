@@ -40,12 +40,9 @@ struct Options : CommonOptions {
     uint64_t resident_headroom = 8ull << 30;
     bool resident_soft = false;
     bool resident_cpu_explicit = false;   // --resident-cpu-experts given by itself (not only implied)
-    int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
     /// The peer's experts are held only on the peer, not also in the RAM complement (needs --resident-experts).
     bool peer_exclusive = false;
-    /// --no-peer-prefill: the prompt path stays on the primary, the peer computes none of its rows
-    bool no_peer_prefill = false;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
     /// then the routing counted since the start; the format of data/profiles); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
@@ -84,9 +81,6 @@ struct Options : CommonOptions {
     /// between the tool-call tags, so tool calls are sampled exactly.
     int64_t relax_special_from = 248044;
     int64_t relax_call_open = 248058, relax_call_close = 248059;
-    /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
-    /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
-    int batch_groups = 1;
     int spec_corrupt = 0;         // --spec-corrupt N > 0 replaces every Nth draft with a wrong token
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
@@ -102,12 +96,14 @@ struct Options : CommonOptions {
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
-    /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
-    /// from each GPU's free VRAM); empty = one GPU
-    std::string layer_split;
-    /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
-    /// GPU, sharing everything - the bit-exact A/B of the hand-off)
-    std::string split_device;
+    /// --diag-fixed-experts: every expert row runs the same way whatever the cards hold: a prompt's on the GPU (the
+    /// missed experts read over PCIe, no CPU share), a window's on the CPU pool (the windows see no expert in VRAM), so
+    /// placements that differ (a split and its reference on one card) compute the same rows
+    bool diag_fixed_experts = false;
+    /// gpu-mode peer: the expert tier's cards after the main one (the first is `peer_device`; -1 and empty: none), from
+    /// the run's cards (CommonOptions::gpus)
+    int peer_device = -1;
+    std::vector<int> peer_devices;
     /// The most experts one adaptive round swaps into the main card's tier; a saturated pipeline (see `kSatBoost`) may
     /// swap `kSatBoost` times as many.
     int adapt_swaps = 96;

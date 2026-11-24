@@ -402,12 +402,7 @@ private:
     // long chunk (`tokens` > 0) the main card's link reads ahead while the layer's attention runs.
     int peer_count(int il, const std::vector<int64_t>& ram_rows, int64_t main_rows, double main_bytes, int64_t peer_rows,
                    int tokens = 0) const {
-        const ExpertLayer& el = m_.pack().experts[(size_t) il];
-        const prefill::ShareRates& r = tier_->share_rates(il);
-        const double lead = r.sm_hz0 > 0 ? (double) tokens * prefillp::kPreRouteCycles / r.sm_hz0 : 0;
-        return prefill::peer_take(r, ram_rows, main_rows, main_bytes, peer_rows, (double) el.blob_bytes,
-                                  (double) (basalt::prefill::mmq::q8_bytes(2, g_.n_embd) - basalt::prefill::mmq::q8_bytes(1, g_.n_embd)),
-                                  4.0 * (double) g_.n_embd, lead);
+        return tier_->peer_take(il, ram_rows, main_rows, main_bytes, peer_rows, tokens, prefillp::kPreRouteCycles);
     }
 
     bool share_buffers(std::string& err) {

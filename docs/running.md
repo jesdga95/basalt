@@ -89,12 +89,13 @@ The engine's own figures, which the server asks for with `STATS` once the engine
   for its current or last request `accept_pos` (drafts accepted over offered by draft position) and `accept_hist` (tokens per
   decode window, a sample a second over 60 s); for a model with routed experts `hit`: its windows' lookups split `vram`, `peer`
   (a bus copy or another card) and `cpu`, with `lookups_s`, `peer_s` and `ram_s` a second. A batch window several slots share
-  counts its lookups for each of them; a model whose slots run through layer split stages counts none per slot.
+  counts its lookups for each of them; a model whose slots run through the stages of `gpu-mode split` counts none per slot.
 - `/metrics` `engine`: `commit` (the build's), and `expert_slots`, the experts every card holds now (fewer while asleep).
 - `/metrics` `hardware`: each card's `sm_clock` and `mem_clock` (MHz), `throttle` (what holds the clocks down, empty for nothing),
   `expert_slots` and `h2d_gbps` (the host-to-device link as the start measured it; Flash-Next measures it, the other models
   leave it out); `cpu_ccd` (the load of each group of cores that share an L3 cache), `ram_parts` (`experts` the engine holds in
   RAM, `page_cache`, `other`; Linux only) and `disk_hist` (the read rate's last 60 s).
+- **Prometheus:** `GET /metrics` returns Prometheus text exposition format (`text/plain; version=0.0.4`) when `Accept` asks for `text/plain` or `application/openmetrics-text`, or with `?format=prometheus` (JSON otherwise, so the stats page is unchanged). Every metric is named `basalt_*` (requests, tokens, latency histograms, draft acceptance, engine state, GPU and RAM); a dashboard made for another engine's names can use Prometheus relabeling.
 
 The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs. The conversation cache
 figures come from the engine's `conversation cache:` lines and clear when the engine unloads, sleeps or restarts; a model that prints
@@ -119,7 +120,8 @@ With `--vram-elastic`, `POST /v1/vram` with `{"reserve_mib": N}` resizes the exp
 A resize needs a gap between requests. Idle, it applies at once and answers `200` with the new figures. While a request runs it is
 queued and answered `202 {"status": "pending"}`: it applies when the running requests have finished, and requests that arrive meanwhile
 wait for it, so steady traffic cannot hold it off. A later POST replaces a queued one (`"replaced": true`). A malformed body is a
-`400`. `GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
+`400`. While the model sleeps, the reserve is kept and applied at the wake (`200 {"status": "asleep"}`), as when it is not loaded.
+`GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
 the queued one).
 
 ## Memory floors

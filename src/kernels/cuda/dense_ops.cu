@@ -1,6 +1,7 @@
 // src/kernels/cuda/dense_ops.cu - see include/basalt/kernels/dense_ops.hpp.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "philox.cuh"
 
@@ -431,6 +432,11 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         }
         y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     }
+    // an NVFP4 cache holds the keys turned by the Hadamard transform, so the queries read against it are turned too (the
+    // transform is orthonormal: every dot product is the same); the whole block takes this branch or none of it
+    if constexpr (HDW == 256) {
+        if (q8.fp4) y = kv4_hadamard256(y, xs, d);
+    }
     if (is_q) {
         stf(q_out + (t * n_head + head) * HDW + d, y);
         return;
@@ -447,6 +453,23 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         return;
     }
     if (fa) q8 = far_kv.q8;
+    if (q8.fp4) {
+        // NVFP4: per 16 values (16 lanes of a warp) the E4M3 scale amax / 6, each value the nearest E2M1 code against the
+        // decoded scale; a lane pair packs its two codes into one byte, the even dim in the low nibble
+        const int64_t row = cell * n_kv + head;
+        const uint32_t sk = kv4_group_scale(kv4_amax16(y)), sv = kv4_group_scale(kv4_amax16(vv));
+        const uint32_t ck = kv4_group_code(y, kv4_e4m3_value(sk)), cv = kv4_group_code(vv, kv4_e4m3_value(sv));
+        const uint32_t nk = __shfl_down_sync(0xffffffffu, ck, 1), nv = __shfl_down_sync(0xffffffffu, cv, 1);
+        if ((d & 1) == 0) {
+            reinterpret_cast<uint8_t*>(q8.k)[row * (HDW / 2) + d / 2] = (uint8_t) (ck | (nk << 4));
+            reinterpret_cast<uint8_t*>(q8.v)[row * (HDW / 2) + d / 2] = (uint8_t) (cv | (nv << 4));
+        }
+        if ((d & 15) == 0) {
+            reinterpret_cast<uint8_t*>(q8.ks)[row * (HDW / 16) + d / 16] = (uint8_t) sk;
+            reinterpret_cast<uint8_t*>(q8.vs)[row * (HDW / 16) + d / 16] = (uint8_t) sv;
+        }
+        return;
+    }
     // int8: per 64 values, scale = amax / 127 (stored fp16), codes rounded to nearest against the stored scale; a group
     // is two warps: each warp's max by shuffles, then the pair's (a max is exact in any order)
     float ak = fabsf(y), av = fabsf(vv);
