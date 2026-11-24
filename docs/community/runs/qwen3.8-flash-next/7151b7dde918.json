@@ -1,0 +1,25 @@
+{
+  "submitter": "fukc-gihtub",
+  "date": "2026-10-24",
+  "commit": "91bc15a580",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 4000 Blackwell",
+      "vram_gib": 24,
+      "power_w": 145,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 24.2
+    }
+  ],
+  "ram_gib": 126,
+  "cpu": "Intel Core i9-14900T, 24 cores",
+  "ram_gbps": 29.0,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 3315.6,
+  "prefill_64k_tps": 4015.6,
+  "decode_tps": 96.1
+}

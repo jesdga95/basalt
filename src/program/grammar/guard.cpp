@@ -32,7 +32,12 @@ const std::unordered_map<uint32_t, uint8_t>& char_to_byte() {
     return table;
 }
 
+ReplyForm g_reply_form;
+
 }  // namespace
+
+void set_reply_form(const ReplyForm& form) { g_reply_form = form; }
+const ReplyForm& reply_form() { return g_reply_form; }
 
 bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, size_t n_vocab,
                      const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err) {
@@ -51,7 +56,9 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
         }
     }
     std::vector<std::string> bytes(n_vocab);
-    out.think_open = out.think_close = -1;
+    out.think_open = out.think_close = out.block_header = out.answer_open = -1;
+    const ReplyForm& form = reply_form();
+    const bool blocks = !form.header.empty();
     const auto& to_byte = char_to_byte();
     Scan sc{vocab_json};
     if (!sc.eat('{')) { err = "vocab.json: not an object"; return false; }
@@ -63,11 +70,18 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
             if (id < 0 || (size_t) id >= n_vocab) continue;
             const int ty = types[(size_t) id];
             std::string& b = bytes[(size_t) id];
+            if (blocks && (ty == 3 || ty == 4)) {   // a reply of blocks: its tokens may be control tokens
+                if (key == form.header) out.block_header = (int32_t) id;
+                else if (key == form.think_open) out.think_open = (int32_t) id;
+                else if (key == form.think_close) out.think_close = (int32_t) id;
+                else if (key == form.answer_open) out.answer_open = (int32_t) id;
+            }
             if (ty == 3 || ty == 5 || ty == 6) continue;   // control, unused and byte entries never appear as text
             if (ty == 4) {
                 b = key;   // an added token keeps its literal text
-                if (key == "<think>") out.think_open = (int32_t) id;
-                else if (key == "</think>") out.think_close = (int32_t) id;
+                if (blocks) continue;
+                if (key == form.think_open) out.think_open = (int32_t) id;
+                else if (key == form.think_close) out.think_close = (int32_t) id;
                 continue;
             }
             for (size_t i = 0; i < key.size();) {
@@ -79,7 +93,12 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
         } while (sc.eat(','));
     }
     if (!sc.eat('}')) { err = "vocab.json: unterminated"; return false; }
-    out.vocab = std::make_shared<const Vocab>(std::move(bytes), end_ids);
+    std::vector<int32_t> ends = end_ids;
+    if (blocks && (out.block_header < 0 || out.think_close < 0))   // not this vocabulary's form: no thinking known
+        out.think_open = out.think_close = out.block_header = out.answer_open = -1;
+    if (out.block_header >= 0 && std::find(ends.begin(), ends.end(), out.think_close) == ends.end())
+        ends.push_back(out.think_close);   // the answer block's end: allowed where the grammar can end
+    out.vocab = std::make_shared<const Vocab>(std::move(bytes), std::move(ends));
     return true;
 }
 
@@ -90,28 +109,70 @@ bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t
     if (!err.empty()) return false;
     if (!rg.grammar) return true;
     st_ = GrammarState(rg.grammar, rg.triggers);
-    // generation starts inside a thinking block when the prompt's last think tag opens one
+    // A reply of blocks under a grammar from the first answer token: thinking blocks, then the answer block. A lazy
+    // grammar (tool calls) finds its own start.
+    blocks_ = pv_.block_header >= 0 && !rg.triggers.lazy();
+    allow_think_ = rg.think;
+    phase_ = blocks_ ? Phase::between : Phase::answer;
+    // generation starts inside a thinking block when the prompt's last think tag opens one (a reply of blocks: after
+    // the prompt's last block marker)
     thinking_ = false;
     for (size_t i = n_prompt; i-- > 0;) {
         const int64_t t = prompt[i];
         if (t == pv_.think_close) break;
         if (t == pv_.think_open) { thinking_ = true; break; }
+        if (blocks_ && t == pv_.block_header) { phase_ = Phase::opened; break; }
+        if (blocks_ && t == pv_.answer_open) { phase_ = Phase::answer; break; }
     }
     on_ = true;
     return true;
 }
 
+bool Guard::is_end(int32_t token) const {
+    const auto& ends = pv_.vocab->end_ids();
+    return token != pv_.think_close && std::find(ends.begin(), ends.end(), token) != ends.end();
+}
+
 bool Guard::feed(int32_t token) {
     if (thinking_) {
-        if (token == pv_.think_close) thinking_ = false;
-        return true;
+        if (token == pv_.think_close) {
+            thinking_ = false;
+            if (blocks_) phase_ = Phase::between;
+            return true;
+        }
+        if (!blocks_) return true;
+        if (token == pv_.block_header) {   // the next block opened without closing this one
+            thinking_ = false;
+            phase_ = Phase::opened;
+            return true;
+        }
+        return !is_end(token);   // the reply does not end before its answer
+    }
+    if (blocks_) {
+        if (phase_ == Phase::between) {
+            if (token != pv_.block_header) return false;
+            phase_ = Phase::opened;
+            return true;
+        }
+        if (phase_ == Phase::done) return is_end(token);
+        if (phase_ == Phase::opened) {
+            if (token == pv_.think_open && allow_think_) { thinking_ = true; return true; }
+            if (token == pv_.answer_open) { phase_ = Phase::answer; return true; }
+            // else the answer's first text, right after the header
+        }
     }
     const auto& ends = pv_.vocab->end_ids();
-    if (std::find(ends.begin(), ends.end(), token) != ends.end()) return !st_.active() || st_.allows_end();
+    if (std::find(ends.begin(), ends.end(), token) != ends.end()) {
+        if (st_.active() && !st_.allows_end()) return false;
+        if (blocks_ && token == pv_.think_close) phase_ = Phase::done;   // the answer block ended
+        return true;
+    }
     if (token < 0 || (size_t) token >= pv_.vocab->size()) return !st_.active();
     const std::string& b = pv_.vocab->bytes(token);
     if (b.empty()) return !st_.active();   // a control token is not text
-    return st_.accept(b, token);
+    if (!st_.accept(b, token)) return false;
+    if (blocks_) phase_ = Phase::answer;
+    return true;
 }
 
 int Guard::scan(const int32_t* out, int rows, int first) {
@@ -127,6 +188,24 @@ int Guard::scan(const int32_t* out, int rows, int first) {
 
 void Guard::mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias) {
     st_.fill_mask(*pv_.vocab, mask_, use_cache);
+    if (blocks_) {   // a reply of blocks before or after its answer: the tokens feed() takes there
+        const auto allow = [&](int32_t t) { if (t >= 0 && (size_t) t < mask_.size()) mask_[(size_t) t] = 1; };
+        if (thinking_) {
+            std::fill(mask_.begin(), mask_.end(), (uint8_t) 1);
+            for (int32_t e : pv_.vocab->end_ids())
+                if (is_end(e)) mask_[(size_t) e] = 0;
+        } else if (phase_ == Phase::between) {
+            std::fill(mask_.begin(), mask_.end(), (uint8_t) 0);
+            allow(pv_.block_header);
+        } else if (phase_ == Phase::opened) {   // the grammar's first text, or a block's tag
+            allow(pv_.answer_open);
+            if (allow_think_) allow(pv_.think_open);
+        } else if (phase_ == Phase::done) {
+            std::fill(mask_.begin(), mask_.end(), (uint8_t) 0);
+            for (int32_t e : pv_.vocab->end_ids())
+                if (is_end(e)) allow(e);
+        }
+    }
     const size_t n = mask_.size();
     bias.resize(n);
     const bool u = user_bias.size() == n;

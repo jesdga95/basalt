@@ -228,6 +228,13 @@ class Vocabulary(unittest.TestCase):
                 with self.subTest(model=svc.model, effort=effort):
                     self.assertTrue(self.render(svc, effort))
 
+    def test_minimal_is_off_without_the_level(self):
+        for svc in (qwen_service(), deepseek_service()):
+            msgs, tools, kw = openai_to_messages({"messages": HISTORY[:1], "reasoning_effort": "minimal"})
+            self.assertEqual(svc.thinking_kwargs(kw), {"enable_thinking": False}, svc.model)
+            self.assertEqual(svc.render_prompt(msgs, tools, kw),
+                             svc.render_prompt(msgs, tools, {"enable_thinking": False}), svc.model)
+
     def test_qwen_levels(self):
         svc = qwen_service()
         for effort, word in (("low", "low"), ("high", "xhigh"), ("xhigh", "xhigh"), ("max", "xhigh")):

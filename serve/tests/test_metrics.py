@@ -75,7 +75,7 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "hardware", "hardware_static",
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "experts_map", "hardware", "hardware_static",
                                  "history", "models", "swap"})
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
@@ -85,7 +85,8 @@ class Http(unittest.TestCase):
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
-        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb", "disk_hist", "cpu_ccd",
+                                              "ram_parts"})
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
@@ -309,11 +310,13 @@ class PerGpu(unittest.TestCase):
     def test_static_and_snapshot(self):
         tel = self.telemetry([0, 1])
         snap = tel.snapshot()
-        self.assertEqual(snap["static"]["gpus"], [{"index": 0, "name": "Card 0"}, {"index": 1, "name": "Card 1"}])
+        self.assertEqual(snap["static"]["gpus"], [{"index": 0, "name": "Card 0", "bus": None},
+                                                  {"index": 1, "name": "Card 1", "bus": None}])
         self.assertEqual((snap["static"]["driver"], snap["static"]["cuda"]), ("610.57.04", "13.3"))
         self.assertEqual(set(snap["static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
-        self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(snap["now"]), {"gpus", "cpu", "cpu_cores", "ram_used", "ram_total", "ram_cached", "disk_read_mb",
+                                            "disk_hist"})
 
     def test_history_keeps_the_speeds_slots_and_cards(self):
         tel = self.sampler(extra=lambda: {"tok_s": 12.3456, "prefill_tok_s_mean": None, "tok_s_mean": 9,

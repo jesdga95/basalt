@@ -141,9 +141,10 @@ int main(int argc, char** argv) {
             std::vector<float> v(raw.size() / 2);
             for (size_t i = 0; i < v.size(); ++i) v[i] = bf(((const uint16_t*) raw.data())[i]);
             cudaMemcpy(w.slot(s.name), v.data(), v.size() * 4, cudaMemcpyHostToDevice);
-        } else if (s.q8) {
+        } else if (s.q8 || s.q4) {
             std::vector<uint8_t> q(s.bytes());
-            basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), s.elems(), q.data());
+            if (s.q4) basalt::core::quantize_bf16_q4_0((const uint16_t*) raw.data(), s.elems(), q.data());
+            else basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), s.elems(), q.data());
             cudaMemcpy(w.slot(s.name), q.data(), q.size(), cudaMemcpyHostToDevice);
         } else cudaMemcpy(w.slot(s.name), raw.data(), raw.size(), cudaMemcpyHostToDevice);
     }
@@ -157,6 +158,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(head, q.data(), q.size(), cudaMemcpyHostToDevice);
     }
     w.head_q8 = head;
+    if (!w.pack_screen(nullptr, err)) { std::printf("%s\n", err.c_str()); return 1; }
     const DflyTensor& ew = dense.t.at("model.embed_tokens.weight");
     const int E = d.E;
 
@@ -207,7 +209,8 @@ int main(int argc, char** argv) {
         const auto t1 = std::chrono::steady_clock::now();
         int32_t tok[8];
         float conf[8];
-        if (!run->finish(tok, conf, st, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        int made = 0;
+        if (!run->finish(tok, conf, made, st, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         const auto t2 = std::chrono::steady_clock::now();
         if (rep < 2) continue;
         std::printf("block %.2f ms (enqueue), heads %.2f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count(),

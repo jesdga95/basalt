@@ -389,10 +389,14 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
+    double cpu_max_abs = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        cpu_max_abs = (std::max)(cpu_max_abs, std::fabs((double) got_c[i] - ref[i]));
+    }
     const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
-    std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", label.c_str(),
-                ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
-                ok ? "ok" : "FAIL");
+    std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  cpu max abs %.6g  gpu rel %.2e  cpu-gpu %.2e  %s\n",
+                label.c_str(), ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type),
+                f.bytes, ec, cpu_max_abs, eg, ecg, ok ? "ok" : "FAIL");
     return failures + (ok ? 0 : 1);
 }
 
@@ -480,7 +484,7 @@ int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob,
     const void* const* hp_ = hp;
     // the kernel under test: the AVX2 one is called directly, so an AVX-512 CPU checks it too
     auto new_gu = [&](int nt, float* const* ff, int r0, int r1) {
-        if (avx2) cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], 0.f, a_, nt, ff, r0, r1);
+        if (avx2) cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], {}, a_, nt, ff, r0, r1);
         else cpu::native_gu_rows(f, blob.data(), a_, nt, ff, r0, r1);
     };
     auto new_down = [&](int nt, float* const* out, int r0, int r1) {

@@ -186,6 +186,50 @@ void test_hc() {
     }
 }
 
+// add_norm_hc_post at a window's row counts (4 blocks a row) and a chunk's (a block a row): against add_vectors, rms_norm_rows and
+// hc_post bit for bit, a row alone as it is among 12, and its time at 2 rows
+void test_add_norm_rows() {
+    const int E = 3072, stride = 24, T = 12;
+    std::vector<float> ra = randn((size_t) T * E), rb = randn((size_t) T * E, 0.3f), w = randn(E, 0.2f), x = randn((size_t) T * 4 * E),
+                       cf = randn((size_t) T * stride, 0.5f);
+    for (float& v : w) v += 1.0f;
+    float *da = dev(ra), *db = dev(rb), *dw = dev(w), *dx = dev(x), *dc = dev(cf), *dsum = devf((size_t) T * E), *dn = devf((size_t) T * E);
+    float *d3 = devf((size_t) T * 4 * E), *d1 = devf((size_t) T * 4 * E);
+    cudaStream_t st;
+    cudaStreamCreate(&st);
+    bool same = true;
+    for (const float* b : {(const float*) db, (const float*) nullptr}) {
+        if (b) add_vectors(da, db, dsum, T * E, st);
+        bk::rms_norm_rows(b ? dsum : da, dw, dn, T, E, 1e-6f, st);
+        bk::hc_post(dn, dx, dc, stride, T, E, d3, st);
+        const std::vector<float> want = host(d3, (size_t) T * 4 * E);
+        for (int rows : {1, 2, 8, 12}) {
+            cudaMemset(d1, 0, (size_t) T * 4 * E * 4);
+            add_norm_hc_post(da, b, dw, 1e-6f, dx, dc, stride, rows, E, d1, st);
+            cudaStreamSynchronize(st);
+            same = same && std::memcmp(host(d1, (size_t) rows * 4 * E).data(), want.data(), (size_t) rows * 4 * E * 4) == 0;
+        }
+        // row 5 alone (4 blocks) against row 5 of the 12-row call (one block)
+        add_norm_hc_post(da + 5 * E, b ? db + 5 * E : nullptr, dw, 1e-6f, dx + 5 * 4 * E, dc + 5 * stride, stride, 1, E, d1, st);
+        cudaStreamSynchronize(st);
+        same = same && std::memcmp(host(d1, (size_t) 4 * E).data(), want.data() + (size_t) 5 * 4 * E, (size_t) 4 * E * 4) == 0;
+    }
+    std::printf("%-30s %s\n", "add_norm_hc_post 1/2/8/12 rows", same ? "bitwise" : "FAIL");
+    failures += !same;
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    add_norm_hc_post(da, db, dw, 1e-6f, dx, dc, stride, 2, E, d1, st);
+    cudaEventRecord(e0, st);
+    for (int i = 0; i < 200; ++i) add_norm_hc_post(da, db, dw, 1e-6f, dx, dc, stride, 2, E, d1, st);
+    cudaEventRecord(e1, st);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    std::printf("bench: add_norm_hc_post 2 rows %.2f us a launch (back to back)\n", 1000.0 * ms / 200);
+    cudaStreamDestroy(st);
+}
+
 void test_router() {
     const int NE = 512, E = 3072, K = 16;
     std::vector<float> x = randn(E), gate = randn((size_t) NE * E, 0.05f), bias = randn(NE, 0.3f);
@@ -512,7 +556,7 @@ void test_engram() {
                 xi[j] = x[((size_t) t * 4 + i) * n + j];
                 key[j] = (double) kv[((size_t) t * 5 + i) * n + j] + kvb[(size_t) i * n + j];
             }
-            const double rx = rms(xi, a.gate_eps), rk = rms(key, a.gate_eps);
+            const double rx = rms(xi, a.eps), rk = rms(key, a.eps);
             double d = 0;
             for (int j = 0; j < n; ++j) d += xi[j] * rx * key[j] * rk * gw[(size_t) i * n + j];
             d /= std::sqrt((double) n);
@@ -998,7 +1042,7 @@ void bench_mla() {
         int32_t* dpos = dev(pos);
         uint16_t* cache = nullptr;
         cudaMalloc(&cache, (size_t) 4096 * W * 2);
-        for (int T : {1, 6}) {
+        for (int T : {1, 2, 6}) {
             const double uq = timed(200, [&](int i) { mla_query(wp + (size_t) (i % nkb) * kb, dq, dkv, dn, a, dpos, T, 0, qc, cache, st); });
             const double uv = timed(200, [&](int i) { q8_0_heads_gemv(wp + (size_t) (i % nvb) * vb, lat, a.rank, heads * a.rank, heads, 256, a.rank, T, vo, st); });
             std::printf("bench: %d heads, %d rows: mla_query %.1f us (%.0f GB/s of k_b), v_b %.1f us (%.0f GB/s)\n", heads, T, uq, kb / uq / 1e3, uv,
@@ -1030,7 +1074,7 @@ void bench_mla() {
             rs.cells = dl;
             rs.cells_stride = stride;
         }
-        for (int T : {1, 6}) {
+        for (int T : {1, 2, 6}) {
             const double u = timed(200, [&](int i) {
                 mla_attend(qc, (const uint16_t*) (wp + (size_t) (i % ncopies) * cap * W * 2), rs, T, sk, a, ring, maxc, work, lat, st);
             });
@@ -1040,6 +1084,91 @@ void bench_mla() {
         cudaFree(work);
     }
     cudaFree(wp);
+    cudaStreamDestroy(st);
+}
+
+// The wait with a mark and the L2 read-ahead: the wait holds its stream until the host's word and then marks; the read-ahead
+// stops at the mark and writes nothing; and the gate product's time (2 rows, 64 heads) with its rows in memory and read ahead.
+void test_read_ahead() {
+    cudaStream_t st;
+    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    uint32_t *h_word = nullptr, *d_word = nullptr, *mark = nullptr;
+    cudaHostAlloc((void**) &h_word, 64, cudaHostAllocMapped);
+    cudaHostGetDevicePointer((void**) &d_word, h_word, 0);
+    *(volatile uint32_t*) h_word = 0;
+    cudaMalloc(&mark, 8);
+    cudaMemset(mark, 0, 8);
+    wait_word_mark(d_word, 7, mark, st);
+    std::vector<uint32_t> m0(2);
+    cudaMemcpy(m0.data(), mark, 8, cudaMemcpyDeviceToHost);   // another stream: the wait is still holding its own
+    const bool held = cudaStreamQuery(st) == cudaErrorNotReady && m0[0] == 0;
+    *(volatile uint32_t*) h_word = 7;
+    cudaStreamSynchronize(st);
+    std::vector<uint32_t> m1 = host(mark, 2);
+    const bool marked = m1[0] == 7 && m1[1] == 0;
+    std::printf("%-30s held %s, marked %s  %s\n", "wait_word_mark", held ? "yes" : "no", marked ? "yes" : "no", held && marked ? "ok" : "FAIL");
+    failures += !(held && marked);
+    // a gate product's rows (3072 -> 16384) as two ranges, and a buffer past L2's size that evicts them
+    const int n_in = 3072, n_out = 16384, R = 2;
+    const size_t wb = (size_t) n_out * (n_in / 32) * 34, flush_b = (size_t) 256 << 20;
+    const Q8 q = make_q8(256, n_in);
+    std::vector<uint8_t> wbytes(wb);
+    for (size_t i = 0; i < wb; ++i) wbytes[i] = q.bytes[i % q.bytes.size()];
+    uint8_t *w = dev(wbytes), *flush = nullptr;
+    cudaMalloc(&flush, flush_b);
+    cudaMemset(flush, 0, flush_b);
+    L2Ranges r, rf;
+    r.p[0] = w;
+    r.n[0] = (wb / 2) & ~15ull;
+    r.p[1] = w + r.n[0];
+    r.n[1] = (wb - r.n[0]) & ~15ull;
+    rf.p[0] = flush;
+    rf.n[0] = flush_b;
+    auto timed = [&](auto&& before, auto&& fn) {
+        double us = 0;
+        for (int i = 0; i < 20; ++i) {
+            before();
+            cudaEventRecord(e0, st);
+            fn();
+            cudaEventRecord(e1, st);
+            cudaEventSynchronize(e1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            us += 1000.0 * ms / 20;
+        }
+        return us;
+    };
+    const uint32_t never = 0xffffffffu;   // a mark the wait never writes: the read-ahead goes through its ranges
+    const auto cold = [&] { l2_read_ahead(rf, mark, never, st); };
+    const double stopped = timed(cold, [&] { l2_read_ahead(r, mark, 7, st); });   // the mark is already 7
+    const double ra = timed(cold, [&] { l2_read_ahead(r, mark, 8, st); });
+    const bool kept = host(mark, 2)[1] == 0 && fnv(std::vector<float>((const float*) wbytes.data(), (const float*) wbytes.data() + wb / 4)) ==
+                                                   fnv(host((const float*) w, wb / 4));
+    std::printf("%-30s at the mark %.1f us, through %.1f MB %.1f us (%.0f GB/s), reads only %s  %s\n", "l2_read_ahead", stopped, wb / 1e6, ra,
+                wb / ra / 1e3, kept ? "yes" : "no", kept && stopped < 0.5 * ra ? "ok" : "FAIL");
+    failures += !(kept && stopped < 0.5 * ra);
+    float *x = dev(randn((size_t) R * n_in)), *y = devf((size_t) R * n_out);
+    void* xq = nullptr;
+    cudaMalloc(&xq, bk::native_q8_1_bytes(n_in, R));
+    bk::native_quantize_q8_1(x, xq, n_in, R, st);
+    const auto product = [&] { bk::native_mmvq(8, w, xq, y, n_in, n_out, R, st); };
+    const double u_cold = timed(cold, product);
+    const std::vector<float> y_cold = host(y, (size_t) R * n_out);
+    const double u_ahead = timed([&] { cold(); l2_read_ahead(r, mark, never, st); }, product);
+    const bool same = fnv(host(y, (size_t) R * n_out)) == fnv(y_cold);
+    std::printf("bench: gate product %d -> %d, %d rows: %.1f us from memory (%.0f GB/s), %.1f us read ahead (%.0f GB/s), same bits %s\n", n_in, n_out,
+                R, u_cold, wb / u_cold / 1e3, u_ahead, wb / u_ahead / 1e3, same ? "yes" : "NO");
+    failures += !same;
+    cudaFree(w);
+    cudaFree(flush);
+    cudaFree(x);
+    cudaFree(y);
+    cudaFree(xq);
+    cudaFree(mark);
+    cudaFreeHost(h_word);
     cudaStreamDestroy(st);
 }
 
@@ -1343,6 +1472,7 @@ int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return 77;
     test_hc();
+    test_add_norm_rows();
     test_gemv();
     test_mla();
     test_router();
@@ -1358,6 +1488,7 @@ int main() {
     test_mmq_expert(12, "mmq experts Q4_K");
     test_mmq_expert(14, "mmq experts Q6_K");
     test_prompt_vs_decode_nvfp4();
+    test_read_ahead();
     bench_mla();
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;

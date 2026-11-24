@@ -10,6 +10,8 @@
 using basalt::program::serve::HeldMeet;
 using basalt::program::serve::meet_held;
 using basalt::program::serve::respell_fits;
+using basalt::program::serve::shared_start;
+using basalt::program::serve::slot_cover;
 using basalt::program::serve::splice_held;
 using Ids = std::vector<int32_t>;
 
@@ -28,6 +30,11 @@ std::string_view bytes(int32_t id) {
 }
 HeldMeet meet(const Ids& prompt, const Ids& held, bool respell = true) {
     return meet_held(prompt.data(), (int64_t) prompt.size(), held.data(), (int64_t) held.size(), respell, bytes);
+}
+int64_t cover(const Ids& prompt, const Ids& held, bool respell = true) {
+    return slot_cover(prompt.data(), (int64_t) prompt.size(), held.data(), (int64_t) held.size(),
+                      shared_start(prompt.data(), (int64_t) prompt.size(), held.data(), (int64_t) held.size()),
+                      respell, bytes);
 }
 }  // namespace
 
@@ -79,6 +86,18 @@ int main() {
         const Ids prompt = {10, 11, 3, 4, 5, 6};
         const Ids slot_a = {10, 11, 1, 2}, slot_b = {10, 99, 1, 2};
         check(meet(prompt, slot_a).held == 4 && meet(prompt, slot_b).held == 0, "the slot with the conversation meets the prompt, the other does not");
+    }
+    {   // the slot a conversation sits in: the ids its held conversation continues, not the head two conversations share
+        check(cover({10, 11, 1, 6, 5, 4}, {10, 11, 1, 2}) == 0,
+              "a shared start whose bytes part: another conversation, not the slot's");
+        check(cover({10, 11, 6, 5}, {10, 11, 3, 4, 5}) == 0, "a system prompt two conversations share is no conversation of the slot's");
+        check(cover({10, 11, 3}, {10, 11, 1, 2}) == 2,
+              "the reply the client sent back, the tokenizer's last token spilling past the held ids: still the slot's");
+        check(cover({10, 11, 3, 4, 5, 6}, {10, 11, 1, 2}) == 4, "a respelled reply covers all its held ids");
+        check(cover({10, 11, 3}, {10, 11, 3}) == 2, "a slot holding the whole prompt covers it but for its last token");
+        check(cover({10, 11, 3}, {10, 11, 3, 4}) == 2, "nor does one holding more of the conversation");
+        check(cover({3, 4, 5}, {1, 2}) == 0, "another conversation covers nothing");
+        check(cover({10, 11, 1, 6, 5, 4}, {10, 11, 1, 2}, false) == 0, "without a tokenizer table only a whole prefix continues");
     }
     check(respell_fits(7, 6, 16, 8 + 7 + 16), "a longer prompt that leaves max_new room is taken");
     check(!respell_fits(7, 6, 16, 8 + 6 + 16), "a longer prompt that leaves no max_new room is not");

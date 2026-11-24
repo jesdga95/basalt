@@ -823,6 +823,14 @@ def requant_dense(a) -> None:
           f" max BF16-to-Q8_0 distance {plan.worst:.3f} steps -> {out}")
 
 
+def checkpoint_model_type(d: Path) -> str | None:
+    """The `model_type` of a checkpoint directory's config.json (None when it has none)."""
+    cfg = d / "config.json"
+    if not cfg.is_file():
+        return None
+    return json.loads(cfg.read_text(encoding="utf-8")).get("model_type")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sections-from", metavar="PACK.basalt",
@@ -853,7 +861,7 @@ def main():
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
     ap.add_argument("--checkpoint", metavar="DIR",
                     help="an NVFP4 or FP4-Local safetensors checkpoint: with --sections-from, the language model is read from it; "
-                         "with --requant-dense-q6k, the BF16 projections")
+                         "with --requant-dense-q6k, the BF16 projections; alone, a whole qwen35 or inkling2 pack")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
     ap.add_argument("--stream-shards", action="store_true",
@@ -913,6 +921,12 @@ def main():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
+        if checkpoint_model_type(Path(a.checkpoint)) == "inkling2_loop":
+            if a.drafter or a.head:
+                ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 carries its drafter")
+            import checkpoint_inkling2 as I
+            I.build(a, Job, fingerprint, die)
+            return
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return

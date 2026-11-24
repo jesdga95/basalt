@@ -12,7 +12,6 @@
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
-#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -201,6 +200,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     if (!open_base(per_layer_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
+    if (s_.victim_half_life > 0) looks_.assign((size_t) n_layers_ * n_expert_, 0);
     owner_.assign((size_t) base_slots(), -1);
     busy_.assign((size_t) base_slots(), 0);
     int lo_prio = 0, hi_prio = 0;
@@ -245,21 +245,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);
     const kernels::cpu::PoolAffinity affinity = s_.pool_affinity_given ? s_.pool_affinity : kernels::cpu::PoolAffinity::All;
-    int workers = s_.pool_workers;
-    if (workers <= 0) {
-        // The start-up pick the pool's own rule makes: a hybrid CPU runs on its P-cores and half the E-cores, and the
-        // cgroup quota caps the workers and the host thread together.  It holds whatever the quant and whatever the peer
-        // cards, so no model decides it.
-        const kernels::cpu::CpuTopology topo = kernels::cpu::detect_cpu_topology(true);
-        const kernels::cpu::PoolAffinity auto_affinity = !s_.pool_affinity_given || affinity == kernels::cpu::PoolAffinity::Auto
-                                                             ? kernels::cpu::PoolAffinity::Auto
-                                                         : affinity == kernels::cpu::PoolAffinity::PCores
-                                                             ? kernels::cpu::PoolAffinity::PCores
-                                                             : kernels::cpu::PoolAffinity::All;
-        workers = kernels::cpu::auto_pool_workers((int) topo.worker_cores.size(), topo.p_cores, topo.e_cores, topo.is_hybrid,
-                                                  kernels::cpu::cgroup_cpu_quota(), auto_affinity);
-    }
-    pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, affinity);
+    pool_ = std::make_unique<kernels::cpu::ExpertPool>(
+        kernels::cpu::start_pool_workers(s_.pool_workers, s_.pool_affinity_given, affinity), affinity);
 
     if (!load_ram(reads, err)) return false;
     if (homes_.file > 0 && cover_ > 0) {
@@ -780,10 +767,14 @@ void ExpertTier::settle() {
 void ExpertTier::begin_token(int n_tokens) {
     if (!uses_.empty() && core::policy::use_half_life(token_, (uint64_t) n_tokens))
         for (uint16_t& u : uses_) u >>= 1;
+    if (!looks_.empty() && core::policy::crosses(token_, (uint64_t) n_tokens, (uint64_t) s_.victim_half_life))
+        for (uint16_t& u : looks_) u >>= 1;
     token_ += (uint64_t) n_tokens;
     claims_ = 0;
     claim_cap_ = s_.claims_per_row > 0 ? s_.claims_per_row * std::max(n_tokens, 1) : (int) kMaxPending;
 }
+
+void ExpertTier::forget_use() { std::fill(looks_.begin(), looks_.end(), (uint16_t) 0); }
 
 bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err) {
     land(layer);
@@ -806,6 +797,8 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         }
         const size_t idx = (size_t) layer * n_expert_ + e;
         stamp_[idx] = now;
+        map_.note(layer, e);
+        if (!looks_.empty()) core::policy::count_look(looks_[idx]);
         const int32_t s = res_[idx];
         lk.peer[i] = nullptr;
         if (s >= 0) {
@@ -827,6 +820,40 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         }
     }
     return true;
+}
+
+std::vector<ExpertTier::CardSlots> ExpertTier::slots_by_card() const {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    std::vector<CardSlots> out{{dev, slots(), (uint64_t) (cache_.mapped_bytes() + ext_.mapped_bytes())}};
+    for (const auto& p : peers_)
+        if (p) out.push_back({p->device(), p->cache().slots(), (uint64_t) p->cache().mapped_bytes()});
+    return out;
+}
+
+uint64_t ExpertTier::ram_bytes() const {
+    if (ram_.empty()) return 0;
+    uint64_t n = 0;
+    for (const ExpertTierSpec::Layer& l : s_.layers) n += (uint64_t) (cover_ + 1) * l.blob_bytes;
+    return n;
+}
+
+int64_t ExpertTier::gpu_slots() const {
+    int64_t n = slots();
+    for (const auto& p : peers_)
+        if (p) n += p->cache().slots();
+    return n;
+}
+
+void ExpertTier::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+    if (!map_.is_open()) map_.open(n_layers_, n_expert_);
+    total = map_.total();
+    homes.clear();
+    for (const int32_t p : map_.pairs()) {
+        const Source s = locate(p / n_expert_, p % n_expert_);
+        homes.push_back((uint8_t) (s.dev ? ExpertHome::Vram : s.peer ? ExpertHome::Peer : s.pinned ? ExpertHome::Ram : ExpertHome::File));
+    }
+    map_.take(routed);
 }
 
 ExpertTier::Source ExpertTier::locate(int layer, int e) const {
@@ -887,11 +914,23 @@ void ExpertTier::finish_cpu() { pool_->finish_split_multi_native(); }
 int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
     int32_t slot = -1;
     best = ~0ull;
+    uint16_t best_looks = 0;
+    const size_t base = (size_t) layer * n_expert_;
     auto scan = [&](int64_t lo, int64_t n) {
         for (int64_t s = lo; s < lo + n; ++s) {
             if (busy_[(size_t) s]) continue;
             const int32_t o = owner_[(size_t) s];
-            const uint64_t st = o < 0 ? 0 : stamp_[(size_t) layer * n_expert_ + o];
+            const uint64_t st = o < 0 ? 0 : stamp_[base + o];
+            if (!looks_.empty()) {   // by use: an empty slot first, and an expert this very lookup uses stays
+                if (o >= 0 && st == tick_) continue;
+                const uint16_t lk = o < 0 ? 0 : looks_[base + o];
+                if (slot < 0 || core::policy::yields_before(lk, st, best_looks, best)) {
+                    best = st;
+                    best_looks = lk;
+                    slot = (int32_t) s;
+                }
+                continue;
+            }
             if (st < best) {
                 best = st;
                 slot = (int32_t) s;
@@ -901,6 +940,7 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
     if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0))
         scan(base_lo_[(size_t) layer], live_n(layer));
     if (ext_per_layer_) scan(base_slots() + (int64_t) layer * ext_per_layer_, ext_per_layer_);
+    if (slot < 0 && !looks_.empty()) best = tick_;
     return slot;
 }
 

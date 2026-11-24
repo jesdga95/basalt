@@ -1,0 +1,35 @@
+{
+  "submitter": "redsoul1905",
+  "date": "2026-11-21",
+  "commit": "ff0b978d2e",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 56.5
+    }
+  ],
+  "ram_gib": 123,
+  "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+  "ram_gbps": 59.6,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 5872.9,
+  "prefill_64k_tps": 6034.7,
+  "decode_tps": 117.8,
+  "decode_conv_tps": 88.7,
+  "decode_struct_tps": 127.6,
+  "decode_prose_tps": 98.8,
+  "accept_conv_pct": 72.7,
+  "accept_struct_pct": 98.5,
+  "accept_prose_pct": 68.9,
+  "draft_len_conv": 2.2,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.7,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

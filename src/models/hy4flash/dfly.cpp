@@ -4,7 +4,7 @@
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/sampler.hpp"
+#include "basalt/kernels/q80_screen.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
@@ -28,13 +28,24 @@ namespace bk = basalt::kernels;
 DflyWeights::~DflyWeights() {
     for (auto& [name, p] : slots_)
         if (p) cudaFree(p);
+    if (head_screen) cudaFree(head_screen);
 }
 
 bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
     dims = d;
+    if (!bk::q80_screen_supported(d.E)) {
+        err = "no draft head screen for a width of " + std::to_string(d.E);
+        return false;
+    }
+    const size_t screen = bk::q80_screen_bytes(d.E, d.vocab);
+    if (cudaMalloc(&head_screen, screen) != cudaSuccess) {
+        err = "out of device memory for the drafter's head screen";
+        return false;
+    }
+    bytes_ += screen;
     for (const DflySpec& s : dfly_specs(d)) {
-        if (s.q8 && (s.shape.size() != 2 || s.shape[1] % 32 != 0)) {
-            err = "the drafter's " + s.name + " rows are not whole Q8_0 blocks";
+        if ((s.q8 || s.q4) && (s.shape.size() != 2 || s.shape[1] % 32 != 0)) {
+            err = "the drafter's " + s.name + " rows are not whole blocks of 32";
             return false;
         }
         const uint64_t b = s.bytes();
@@ -90,6 +101,19 @@ void* DflyWeights::slot(const std::string& name) const {
     return it == slots_.end() ? nullptr : it->second;
 }
 
+bool DflyWeights::pack_screen(void* stream, std::string& err) {
+    if (!head_q8 || !head_screen) {
+        err = "the drafter has no head to screen";
+        return false;
+    }
+    bk::q80_screen_pack(head_q8, dims.E, dims.vocab, head_screen, stream);
+    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) {
+        err = std::string("packing the drafter's head screen: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
 model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DflyWeights>& out) {
     out.reset();
     const core::Json* meta = pack.file.meta().get("dfly2");
@@ -123,10 +147,10 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
         it.bytes = t.bytes;
         it.dev = w->slot(s.name);
         it.device = device;
-        it.conv = s.f32 ? core::Conv::Bf16ToF32 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
+        it.conv = s.f32 ? core::Conv::Bf16ToF32 : s.q4 ? core::Conv::Bf16ToQ4_0 : s.q8 ? core::Conv::Bf16ToQ8_0 : core::Conv::Copy;
         reads.add(it);
     }
-    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 projections)", d.layers,
+    basalt::log::info("basalt hy4flash", "drafter: %d layers reading target layers %d..%d, %.2f GiB on the GPU (Q8_0 and Q4_0 projections)", d.layers,
                       d.kv_layers.front(), d.kv_layers.back(), (double) w->bytes() / (double) (1ull << 30));
     out = std::move(w);
     return {};
@@ -196,7 +220,8 @@ struct DflyRunner::Impl {
     int32_t *meta_d = nullptr, *meta_h = nullptr;   ///< per layer, the rows' first cells (0) and counts
     void* attw = nullptr;                           ///< the attention's workspace (zeroed once)
     float *cat = nullptr, *fused = nullptr, *emb0 = nullptr, *pe = nullptr, *hg = nullptr, *hu = nullptr, *hh = nullptr,
-          *hd = nullptr, *hcout = nullptr, *logits = nullptr, *craw = nullptr;
+          *hd = nullptr, *hcout = nullptr, *craw = nullptr;
+    void* screen = nullptr;   ///< the head screen's scratch
     int32_t* pick = nullptr;
     float *h_emb = nullptr, *h_pe = nullptr, *h_conf = nullptr;
     int32_t* h_tok = nullptr;
@@ -230,13 +255,20 @@ struct DflyRunner::Impl {
         return (float*) p;
     }
 
-    // y[r] = W x[r] for `rows` (at most a block's) packed rows, W Q8_0 [n_out][n_in]: the rows in q8_1, then MMVQ
-    void mm(const void* wt, const float* x, int ldx, float* y, int ldy, int n_in, int n_out, int rows, void* st) {
+    // y[r] = W x[r] for `rows` (at most a block's) packed rows, W [n_out][n_in] in Q8_0 (or Q4_0 with q4): the rows in q8_1,
+    // then MMVQ
+    void mm(const void* wt, const float* x, int ldx, float* y, int ldy, int n_in, int n_out, int rows, void* st, bool q4 = false) {
         if (ldx != n_in || ldy != n_out || rows > kDflyBlock) throw std::logic_error("dfly: a projection's rows are not packed");
         bk::native_quantize_q8_1(x, act_q8, n_in, rows, st);
-        bk::native_mmvq(8, wt, act_q8, y, n_in, n_out, rows, st);
+        mmq(wt, act_q8, y, n_in, n_out, rows, st, q4);
+    }
+    // the MMVQ alone, over rows already in q8_1
+    void mmq(const void* wt, const void* xq, float* y, int n_in, int n_out, int rows, void* st, bool q4 = false) {
+        if (rows > kDflyBlock) throw std::logic_error("dfly: a projection's rows are not packed");
+        bk::native_mmvq(q4 ? 2 : 8, wt, xq, y, n_in, n_out, rows, st);   // GGUF type ids: Q4_0, Q8_0
     }
     void* act_q8 = nullptr;   // a projection's input rows in q8_1
+    void* in_q8 = nullptr;    // rows that several projections read, in q8_1 once
 };
 
 std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err) {
@@ -263,9 +295,11 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     if (ok) cudaMemset(p.attw, 0, attw);
     p.cat = p.dev(2 * E, ok); p.fused = p.dev(E, ok); p.emb0 = p.dev(E, ok); p.pe = p.dev(E, ok);
     p.hg = p.dev(d.hc_ffn, ok); p.hu = p.dev(d.hc_ffn, ok); p.hh = p.dev(d.hc_ffn, ok); p.hd = p.dev(E, ok); p.hcout = p.dev(E, ok);
-    p.logits = p.dev(d.vocab, ok); p.craw = p.dev(1, ok);
+    p.craw = p.dev(1, ok);
+    p.screen = p.dev(bk::q80_screen_scratch_bytes(d.vocab) / 4 + 1, ok);
     const int widest_in = std::max({2 * d.E, d.q_lora, d.heads * (int) kDflyV, d.ffn, d.hc_ffn});
     p.act_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
+    p.in_q8 = p.dev(bk::native_q8_1_bytes(widest_in, kDflyBlock) / 4 + 1, ok);
     p.pick = (int32_t*) p.dev(1, ok);
     p.h_emb = p.host(R * E, ok); p.h_pe = p.host(E, ok); p.h_conf = p.host(1, ok);
     p.h_tok = (int32_t*) p.host(1, ok);
@@ -349,10 +383,11 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             else dfly_gather_rows((const uint16_t*) cache[i], cells, nctx, kDflyRowWidth, p.ctx, st);
 
             bk::rms_norm_rows(p.X, L.in_ln, p.xn, R, E, d.rms_eps, st);
-            p.mm(L.q_a, p.xn, E, p.qa, d.q_lora, E, d.q_lora, R, st);
+            bk::native_quantize_q8_1(p.xn, p.in_q8, E, R, st);   // q_a, kv_a and the gate read it
+            p.mmq(L.q_a, p.in_q8, p.qa, E, d.q_lora, R, st);
             bk::rms_norm_rows(p.qa, L.q_a_ln, p.qan, R, d.q_lora, d.rms_eps, st);
             p.mm(L.q_b, p.qan, d.q_lora, p.q, H * QW, d.q_lora, H * QW, R, st);
-            p.mm(L.kv_a, p.xn, E, p.kvraw, kDflyRowWidth, E, kDflyRowWidth, R, st);
+            p.mmq(L.kv_a, p.in_q8, p.kvraw, E, kDflyRowWidth, R, st);
             dfly_absorb_k(L.kv_b, p.q, H * QW, QW, R, H, p.qabs, st);
             // the block's rows land after the selected ones, turned by their rotary positions: position rp + r of this base is
             // row nctx + r of ctx
@@ -368,16 +403,17 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             rs.counts = p.meta_d + i * 16 + 8;
             mla_attend(p.qcur, p.ctx, rs, R, L.sink, a, 0, p.env.sel_cap + kDflyBlock, p.attw, p.olat, st);
             dfly_expand_v(L.kv_b, p.olat, R, H, p.vout, st);
-            p.mm(L.gate, p.xn, E, p.gate, H * kDflyV, E, H * kDflyV, R, st);
+            p.mmq(L.gate, p.in_q8, p.gate, E, H * kDflyV, R, st, true);
             mul_sigmoid(p.gate, p.vout, R * H * kDflyV, st);
-            p.mm(L.o, p.vout, H * kDflyV, p.o, E, H * kDflyV, E, R, st);
+            p.mm(L.o, p.vout, H * kDflyV, p.o, E, H * kDflyV, E, R, st, true);
             bk::rms_norm_rows(p.o, L.post_proj_ln, p.o2, R, E, d.rms_eps, st);
             add_vectors(p.X, p.o2, p.X1, R * E, st);
             bk::rms_norm_rows(p.X1, L.post_attn_ln, p.xn, R, E, d.rms_eps, st);
-            p.mm(L.mlp_gate, p.xn, E, p.g, d.ffn, E, d.ffn, R, st);
-            p.mm(L.mlp_up, p.xn, E, p.u, d.ffn, E, d.ffn, R, st);
+            bk::native_quantize_q8_1(p.xn, p.in_q8, E, R, st);   // the MLP's gate and up read it
+            p.mmq(L.mlp_gate, p.in_q8, p.g, E, d.ffn, R, st, true);
+            p.mmq(L.mlp_up, p.in_q8, p.u, E, d.ffn, R, st, true);
             bk::swiglu_scaled(p.g, p.u, nullptr, nullptr, p.h, R, d.ffn, d.ffn, st);
-            p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st);
+            p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st, true);
             add_vectors(p.X1, p.mlp, p.X, R * E, st);
         }
         bk::rms_norm_rows(p.X, w.final_norm, p.z, R, E, d.rms_eps, st);
@@ -401,8 +437,10 @@ void DflyRunner::copy_block(float* host, int rows, void* stream) const {
     cudaStreamSynchronize((cudaStream_t) stream);
 }
 
-bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& err) {
+bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std::string& err,
+                        const std::function<void(int, int32_t)>& on_row, const std::function<bool(const float*, int)>& need) {
     Impl& p = *p_;
+    made = 0;
     if (!p.pending) {
         err = "dfly: no block was begun";
         return false;
@@ -412,11 +450,15 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
     const DflyWeights& w = *p.w;
     cudaStream_t st = (cudaStream_t) stream;
     const int E = d.E;
-    bk::SamplerParams sp;
-    sp.greedy = true;
-    sp.temperature = 0.f;
     std::string why;
-    const auto step = [&](int j, int32_t prev, int32_t& tok, float& chance) {
+    const auto synced = [&] {
+        if (cudaStreamSynchronize(st) == cudaSuccess) return true;
+        why = std::string("dfly: CUDA: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    };
+    // a draft's chance comes before its head: with `need`, the head (the whole vocabulary's rows) runs only for a draft
+    // a window can hold
+    const auto step = [&](int j, int32_t prev, int32_t& tok, float& chance, bool& go) {
         try {
             if (!p.env.embed(prev, p.h_pe)) {
                 why = "dfly: a draft token has no embedding row";
@@ -427,20 +469,28 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
             const float* zrow = p.z + (size_t) (j + 1) * E;
             bk::rms_norm_rows(zrow, w.hc_hidden_norm, p.cat, 1, E, d.rms_eps, st, 2 * E);
             bk::rms_norm_rows(p.pe, w.hc_embed_norm, p.cat + E, 1, E, d.rms_eps, st, 2 * E);
-            p.mm(w.hc_gate, p.cat, 2 * E, p.hg, d.hc_ffn, 2 * E, d.hc_ffn, 1, st);
-            p.mm(w.hc_up, p.cat, 2 * E, p.hu, d.hc_ffn, 2 * E, d.hc_ffn, 1, st);
+            bk::native_quantize_q8_1(p.cat, p.in_q8, 2 * E, 1, st);   // the gate and up read it
+            p.mmq(w.hc_gate, p.in_q8, p.hg, 2 * E, d.hc_ffn, 1, st);
+            p.mmq(w.hc_up, p.in_q8, p.hu, 2 * E, d.hc_ffn, 1, st);
             bk::swiglu_scaled(p.hg, p.hu, nullptr, nullptr, p.hh, 1, d.hc_ffn, d.hc_ffn, st);
             p.mm(w.hc_down, p.hh, d.hc_ffn, p.hd, E, d.hc_ffn, E, 1, st);
             add_vectors(zrow, p.hd, p.hcout, E, st);
-            p.mm(w.head_q8, p.hcout, E, p.logits, d.vocab, E, d.vocab, 1, st);
-            bk::sample_tokens(p.logits, 1, d.vocab, nullptr, 0, sp, p.pick, st);
             f32_gemm_rows(p.hcout, w.conf_w, 1, E, 1.0f, 1, p.craw, st);
-            cudaMemcpyAsync(p.h_tok, p.pick, 4, cudaMemcpyDeviceToHost, st);
             cudaMemcpyAsync(p.h_conf, p.craw, 4, cudaMemcpyDeviceToHost, st);
-            if (cudaStreamSynchronize(st) != cudaSuccess) {
-                why = std::string("dfly: CUDA: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
+            if (need) {
+                if (!synced()) return false;
+                chance = 1.0f / (1.0f + std::exp(-(*p.h_conf + p.bias)));   // conf[j]: the chances so far
+                if (!need(conf, j)) {
+                    if (on_row && j > 0) on_row(j, prev);   // the token before it may still be in the window
+                    go = false;
+                    return true;
+                }
             }
+            bk::native_quantize_q8_1(p.hcout, p.act_q8, E, 1, st);
+            bk::q80_screen_top1(w.head_screen, w.head_q8, p.act_q8, E, d.vocab, p.screen, p.pick, st);
+            cudaMemcpyAsync(p.h_tok, p.pick, 4, cudaMemcpyDeviceToHost, st);
+            if (on_row && j > 0) on_row(j, prev);
+            if (!synced()) return false;
         } catch (const std::exception& e) {
             why = std::string("dfly: ") + e.what();
             return false;
@@ -449,7 +499,7 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
         chance = 1.0f / (1.0f + std::exp(-(*p.h_conf + p.bias)));
         return true;
     };
-    if (!dfly_draft_loop(p.n, p.anchor, step, ids, conf)) {
+    if (!dfly_draft_loop(p.n, p.anchor, step, ids, conf, made)) {
         err = why.empty() ? "dfly: the heads failed" : why;
         return false;
     }
@@ -513,19 +563,23 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
     return {};
 }
 
-model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream) {
+model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream,
+                                  const model::ModelSession::DraftNeed& need) {
     if (!runner_) return {model::Status::NotImplemented, "hy4flash: the pack has no drafter, or --spec is 0"};
     n = 0;
     if (pending_ == 0) return {};
     std::string err;
     int32_t tok[kDflyDrafts];
     float ch[kDflyDrafts];
-    const int made = pending_;
+    const int block = pending_, most = std::min(max_n, block);
     pending_ = 0;
-    if (!runner_->finish(tok, ch, stream, err)) return {model::Status::Error, "hy4flash: " + err};
+    int made = 0;
+    std::function<bool(const float*, int)> wanted;
+    if (need) wanted = [&](const float* c, int j) { return j < most && need(c, j, most); };
+    if (!runner_->finish(tok, ch, made, stream, err, on_row_, wanted)) return {model::Status::Error, "hy4flash: " + err};
     if (dump_pos_ >= 0 && !dump_.empty()) {   // --diag-dump: what the block computed
-        std::vector<float> z((size_t) (made + 1) * w_->dims.E), a(w_->dims.E), m(w_->dims.E);
-        runner_->copy_block(z.data(), made + 1, stream);
+        std::vector<float> z((size_t) (block + 1) * w_->dims.E), a(w_->dims.E), m(w_->dims.E);
+        runner_->copy_block(z.data(), block + 1, stream);
         embed_(dump_anchor_, a.data());
         embed_(w_->dims.mask_id, m.data());
         const std::string base = dump_ + "/dfly_" + std::to_string(dump_pos_) + "_out_";

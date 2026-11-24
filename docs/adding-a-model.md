@@ -38,6 +38,8 @@ The router then needs one config entry. Nothing in the server names a model.
   its bytes arrive; a tier sized before that pin leaves the VRAM the pin maps on its card free (`pin_mapping_bytes`);
   a prompt split's stages take the shared `core::PromptStage` and its start lines (`basalt/core/prompt_stage.hpp`).
 - Conversations: `save_cells` and `restore_cells` give the RAM and disk tiers what they need.
+- `--parallel` slots in one pass through the weights: derive the session from `model::BatchSession`, write its hooks and run
+  the batch check, see [batched decoding](design/batching.md#adding-batching-to-a-model).
 - A model with its own fast path derives from `serve::Runtime` and `serve::Request`; see `src/models/qwen4exp/`.
 - A dense model of GDN and gated attention layers (the Qwen3.5 family) needs only its pack read into `dense::Geometry` and
   `dense::Weights` (`include/basalt/dense/model.hpp`): the shared dense stack runs the layers, the drafters (MTP layer or DFlash

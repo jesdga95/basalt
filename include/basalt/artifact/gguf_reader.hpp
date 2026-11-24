@@ -104,6 +104,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "F8_E4M3";
     case 45:
         return "NVFP4_PLANES";
+    case 46:
+        return "MXFP8";
     default:
         return "?";
     }
@@ -216,6 +218,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 45:   // NVFP4_PLANES: NVFP4 as a code plane then tiled scales (kernels/nvfp4_planes.hpp), 36 bytes per 64 values
         elems = 64;
         bytes = 36;
+        return true;
+    case 46:   // MXFP8: 128 values in four 32-value sub-blocks (4 UE8M0 scales + 128 E4M3 codes)
+        elems = 128;
+        bytes = 132;
         return true;
     default:
         return false;

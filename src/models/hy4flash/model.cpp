@@ -25,6 +25,10 @@ constexpr int kTypeBF16 = 30;   // ggml's BF16
 constexpr int kAdmitUses = 2;
 // copies a decode window may claim per row (a window's rows route to mostly different experts)
 constexpr int kClaimsPerRow = 128;
+// tokens after which the lookup counts that choose the main card's victims halve: the experts that recur over hundreds of
+// tokens keep their slots through runs of experts that come once (core::ExpertTierSpec::victim_half_life; a prompt clears
+// the counts, session.cpp)
+constexpr int kVictimHalfLife = 256;
 // The main card's copies by layer (core::ExpertTierSpec::layer_weights) for the 41 layers of 512 experts: the early layers
 // route more widely and miss far more often (layers 0-3 sent 2.3-2.9 experts a token to the CPU at 141 copies each,
 // layers 15, 27 and 31-33 under 0.6). From 768-token plain decode routing traces of one prose and one code prompt
@@ -103,6 +107,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.expert_profile = flags_.expert_profile;
     s.admit_uses = kAdmitUses;
     s.claims_per_row = kClaimsPerRow;
+    s.victim_half_life = kVictimHalfLife;
     if (s.n_layers == 41 && s.n_expert == 512) s.layer_weights.assign(std::begin(kLayerSlotWeights), std::end(kLayerSlotWeights));
     s.share_max_tokens = 16384;
     s.share_stride = expert_stride();
@@ -236,6 +241,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
 model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, "hy4flash: " + err};
+    if (dfly_) {   // the drafts' head screen, made from the head the reads placed
+        cudaSetDevice(device_);
+        if (!dfly_->pack_screen(nullptr, err)) return {model::Status::Error, "hy4flash: " + err};
+    }
     return {};
 }
 
