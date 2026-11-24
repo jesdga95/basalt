@@ -40,22 +40,42 @@ inline int64_t resident_positions(int64_t positions, int64_t kv_resident) {
     return kv_resident > 0 && kv_resident < positions ? kv_resident : positions;
 }
 
+/// Device bytes of one cache's latents at `positions`. With --kv-resident the array keeps the rows of the first N
+/// positions, rounded up to `granule` (the array's mapping granule), on the card; a tail the rounding leaves nothing of
+/// keeps the whole cache there.
+inline uint64_t device_latent_bytes(int64_t positions, int ratio, CacheFormat f, int64_t kv_resident, uint64_t granule) {
+    const uint64_t all = cache_rows(positions, ratio) * latent_row_bytes(f);
+    const int64_t kept = resident_positions(positions, kv_resident);
+    if (kept >= positions) return all;
+    const uint64_t g = std::max<uint64_t>(granule, 1);
+    return std::min(all, (cache_rows(kept, ratio) * latent_row_bytes(f) + g - 1) / g * g);
+}
+
+/// Pinned host bytes of one cache's latents: the rest of the array, whose size is rounded up to `granule` too.
+inline uint64_t host_latent_bytes(int64_t positions, int ratio, CacheFormat f, int64_t kv_resident, uint64_t granule) {
+    const uint64_t all = cache_rows(positions, ratio) * latent_row_bytes(f);
+    const uint64_t dev = device_latent_bytes(positions, ratio, f, kv_resident, granule);
+    if (dev >= all) return 0;
+    const uint64_t g = std::max<uint64_t>(granule, 1);
+    return (all + g - 1) / g * g - dev;
+}
+
 /// Device bytes of the compressed latents and index keys of every kv-source layer at `positions`. With --kv-resident
 /// the later latents are in RAM; the index keys stay on the card.
-inline uint64_t cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident = 0) {
-    const int64_t kept = resident_positions(positions, kv_resident);
+inline uint64_t cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident = 0,
+                            uint64_t granule = 1) {
     uint64_t b = 0;
     for (int r : ratios)
-        if (r > 0) b += cache_rows(kept, r) * latent_row_bytes(f) + cache_rows(positions, r) * index_row_bytes(f);
+        if (r > 0) b += device_latent_bytes(positions, r, f, kv_resident, granule) + cache_rows(positions, r) * index_row_bytes(f);
     return b;
 }
 
 /// Pinned host bytes of the latents --kv-resident keeps in RAM.
-inline uint64_t host_cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident) {
-    const int64_t kept = resident_positions(positions, kv_resident);
+inline uint64_t host_cache_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident,
+                                 uint64_t granule = 1) {
     uint64_t b = 0;
     for (int r : ratios)
-        if (r > 0) b += (cache_rows(positions, r) - cache_rows(kept, r)) * latent_row_bytes(f);
+        if (r > 0) b += host_latent_bytes(positions, r, f, kv_resident, granule);
     return b;
 }
 
@@ -63,18 +83,20 @@ inline uint64_t host_cache_bytes(int64_t positions, const std::vector<int>& rati
 inline uint64_t workspace_bytes(int64_t positions) { return (uint64_t) kDecodeTokens * ((uint64_t) positions + 1) * 9; }
 
 /// Device bytes of the prompt path's VRAM copy of one kv-source layer's latents, for chunks that reach the ones in
-/// RAM (0 without --kv-resident).
-inline uint64_t prompt_stage_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident) {
-    if (resident_positions(positions, kv_resident) >= positions) return 0;
+/// RAM: the largest cache with rows there (0 when none has any).
+inline uint64_t prompt_stage_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident,
+                                   uint64_t granule = 1) {
     uint64_t b = 0;
     for (int r : ratios)
-        if (r > 0) b = std::max(b, cache_rows(positions, r) * latent_row_bytes(f));
+        if (r > 0 && host_latent_bytes(positions, r, f, kv_resident, granule) > 0)
+            b = std::max(b, cache_rows(positions, r) * latent_row_bytes(f));
     return b;
 }
 
 /// Device bytes that grow with the context.
-inline uint64_t context_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident = 0) {
-    return cache_bytes(positions, ratios, f, kv_resident) + workspace_bytes(positions);
+inline uint64_t context_bytes(int64_t positions, const std::vector<int>& ratios, CacheFormat f, int64_t kv_resident = 0,
+                              uint64_t granule = 1) {
+    return cache_bytes(positions, ratios, f, kv_resident, granule) + workspace_bytes(positions);
 }
 
 struct Plan {
@@ -86,8 +108,9 @@ struct Plan {
 /// The context from --max-context (`requested`, the shared default when not given), the model's native maximum and the
 /// free device memory once the dense weights are resident: below kMinContext or past the native maximum is refused, so
 /// are buffers that need more than half the free memory; a quarter or more gives a warning (the expert tier needs the
-/// rest).
-inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, const std::vector<int>& ratios, CacheFormat f) {
+/// rest). The buffers are the ones on the card: --kv-resident's latents in RAM do not count.
+inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, const std::vector<int>& ratios, CacheFormat f,
+                         int64_t kv_resident = 0, uint64_t granule = 1) {
     Plan p;
     if (native <= 0) native = kLegacyContext;
     const uint64_t quarter = free_bytes / 4, half = free_bytes / 2;
@@ -101,11 +124,11 @@ inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes,
                   std::to_string(native) + " tokens";
         return p;
     }
-    const uint64_t need = context_bytes(requested, ratios, f);
+    const uint64_t need = context_bytes(requested, ratios, f, kv_resident, granule);
     if (need > half) {
         p.error = "--max-context " + std::to_string(requested) + " needs " + std::to_string(need >> 20) +
                   " MiB of compressed caches, more than half of the " + std::to_string(free_bytes >> 20) +
-                  " MiB free after the weights (a smaller --max-context makes them smaller)";
+                  " MiB free after the weights (a smaller --max-context or --kv-resident makes them smaller)";
         return p;
     }
     if (need > quarter)

@@ -59,7 +59,7 @@ public:
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
     /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Called
     /// once the dense tensors are allocated, before a session is made. False with `err` when the request cannot be honoured.
-    bool resolve_context(int64_t requested, std::string& err);
+    bool resolve_context(int64_t requested, int64_t kv_resident, std::string& err);
     /// The caches' format (--kv); set before resolve_context.
     CacheFormat cache_format() const { return cache_format_; }
     void set_cache_format(CacheFormat f) { cache_format_ = f; }
@@ -145,6 +145,7 @@ private:
     mutable model::BatchShared batch_;
     mutable VisionBlas vision_blas_;
     int64_t ctx_ = 0;
+    uint64_t kv_granule_ = 1;   // what a cache with latents in RAM rounds its device part up to
     static int64_t ctxp_default();
     int embd_fd_ = -1;
     int experts_fd_ = -1;

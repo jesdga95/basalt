@@ -46,6 +46,19 @@ int main() {
     CHECK(host_cache_bytes(1000000, ratios, F8, 65536) == (3 * (500001 - 32769) + (1000001 - 65537)) * 288ull);
     CHECK(prompt_stage_bytes(1000000, ratios, F8, 0) == 0 && prompt_stage_bytes(1000000, ratios, F8, 65536) == 1000001ull * 288);
     CHECK(context_bytes(1000000, ratios, F8, 65536) == cache_bytes(1000000, ratios, F8, 65536) + workspace_bytes(1000000));
+    // the array rounds the rows on the card up to its granule: 65,536 positions are 9,437,472 and 18,874,656 B of rows
+    constexpr uint64_t kGran = 2ull << 20;
+    CHECK(device_latent_bytes(1000000, 2, F8, 65536, kGran) == 5 * kGran && device_latent_bytes(1000000, 1, F8, 65536, kGran) == 10 * kGran);
+    CHECK(host_latent_bytes(1000000, 2, F8, 65536, kGran) == 69 * kGran - 5 * kGran);   // 144,000,288 B round up to 69 granules
+    CHECK(cache_bytes(1000000, ratios, F8, 65536, kGran) == 25 * kGran + (3 * 500001 + 1000001) * 80ull);
+    CHECK(host_cache_bytes(1000000, ratios, F8, 65536, kGran) == (3 * 64 + 128) * kGran);
+    // a tail the rounding leaves nothing of: the whole cache on the card, nothing pinned, no prompt copy
+    CHECK(device_latent_bytes(8192, 2, F8, 8000, kGran) == 4097 * 288ull && host_latent_bytes(8192, 2, F8, 8000, kGran) == 0);
+    CHECK(cache_bytes(8192, ratios, F8, 8000, kGran) == cache_bytes(8192, ratios, F8) && host_cache_bytes(8192, ratios, F8, 8000, kGran) == 0 &&
+          prompt_stage_bytes(8192, ratios, F8, 8000, kGran) == 0);
+    // only the caches with rows in RAM size the prompt copy: at 8,192 positions the ratio-1 cache alone passes a granule
+    CHECK(host_latent_bytes(8192, 2, F8, 1024, kGran) == 0 && host_latent_bytes(8192, 1, F8, 1024, kGran) == kGran &&
+          prompt_stage_bytes(8192, ratios, F8, 1024, kGran) == 8193 * 288ull);
     CHECK(cell_format(F8) == 1 && cell_format(F16) == 0);
     CacheFormat f = F16;
     CHECK(cache_format("fp8", f) && f == F8 && cache_format("fp16", f) && f == F16 && !cache_format("int8", f) &&
@@ -53,6 +66,9 @@ int main() {
     // fp16 caches of a full context need 3.2 GiB: refused beside 6 GiB free, a warning beside 12 GiB
     CHECK(!plan_context(kNative, kNative, 6 * GiB, ratios, F16).error.empty());
     CHECK(!plan_context(kNative, kNative, 12 * GiB, ratios, F16).note.empty());
+    // with --kv-resident only the part on the card counts: the same context fits beside 6 GiB
+    CHECK(plan_context(kNative, kNative, 6 * GiB, ratios, F16, 65536, kGran).error.empty());
+    CHECK(!plan_context(kNative, kNative, GiB, ratios, F16, 65536, kGran).error.empty());
     CHECK(owns_cache(2, 2) && owns_cache(20, 1) && !owns_cache(3, 2) && !owns_cache(2, 0));
 
     // the shared default and an explicit value are honoured from kMinContext up to the model's maximum

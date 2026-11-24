@@ -1,5 +1,6 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
 #include "basalt/core/device.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/core/loader.hpp"
@@ -107,11 +108,11 @@ static std::vector<int> cache_ratios(const Geometry& g) {
 }
 
 uint64_t DsModel::context_bytes() const {
-    return ctxp::context_bytes(context(), cache_ratios(pack_.geo), cache_format_, tiers_.kv_resident);
+    return ctxp::context_bytes(context(), cache_ratios(pack_.geo), cache_format_, tiers_.kv_resident, kv_granule_);
 }
 
 uint64_t DsModel::prompt_stage_bytes() const {
-    return ctxp::prompt_stage_bytes(context(), cache_ratios(pack_.geo), cache_format_, tiers_.kv_resident);
+    return ctxp::prompt_stage_bytes(context(), cache_ratios(pack_.geo), cache_format_, tiers_.kv_resident, kv_granule_);
 }
 
 int64_t DsModel::keep_positions(int64_t backed) const {
@@ -180,7 +181,7 @@ prefillp::Dims DsModel::prompt_dims() const {
     return d;
 }
 
-bool DsModel::resolve_context(int64_t requested, std::string& err) {
+bool DsModel::resolve_context(int64_t requested, int64_t kv_resident, std::string& err) {
     const Geometry& g = pack_.geo;
     const std::vector<int> ratios = cache_ratios(g);
     uint64_t free_b = 0, total_b = 0;
@@ -189,13 +190,14 @@ bool DsModel::resolve_context(int64_t requested, std::string& err) {
         err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
-    const ctxp::Plan p = ctxp::plan_context(requested, g.context_length, free_b, ratios, cache_format_);
+    kv_granule_ = std::max<uint64_t>(core::ElasticArray::host_granule(), 1);
+    const ctxp::Plan p = ctxp::plan_context(requested, g.context_length, free_b, ratios, cache_format_, kv_resident, kv_granule_);
     if (!p.error.empty()) {
         err = "deepseek41: " + p.error;
         return false;
     }
     ctx_ = p.context;
-    const uint64_t full = ctxp::context_bytes(ctx_, ratios, cache_format_);
+    const uint64_t full = ctxp::context_bytes(ctx_, ratios, cache_format_, kv_resident, kv_granule_);
     core::LoadProgress::kv(core::LoadProgress::cuda(0), ctxp::context_bytes(0, ratios, cache_format_), ctx_, "", full);
     basalt::log::info("basalt deepseek41", "context %lld tokens (caches of a full context: %.2f GiB, --kv %s)%s%s", (long long) ctx_,
                  (double) full / (1024.0 * 1024.0 * 1024.0), cache_format_ == CacheFormat::Fp8 ? "fp8" : "fp16",
@@ -257,11 +259,11 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     CacheFormat fmt = CacheFormat::Fp8;
     if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
     set_cache_format(fmt);
-    if (!resolve_context(req.max_context, err)) return {model::Status::Error, err};
+    if (!resolve_context(req.max_context, req.kv_resident, err)) return {model::Status::Error, err};
     set_diag_dump(req.diag_dump);
     set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
     set_tiers(req);
-    if (const uint64_t host_b = ctxp::host_cache_bytes(ctx_, cache_ratios(pack_.geo), cache_format_, req.kv_resident))
+    if (const uint64_t host_b = ctxp::host_cache_bytes(ctx_, cache_ratios(pack_.geo), cache_format_, req.kv_resident, kv_granule_))
         basalt::log::info("basalt deepseek41", "K/V streaming: the compressed latents of %lld of %lld positions in VRAM, "
                           "%.2f GiB in page-locked RAM per slot", (long long) ctxp::resident_positions(ctx_, req.kv_resident),
                           (long long) ctx_, (double) host_b / 1073741824.0);

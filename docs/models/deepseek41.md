@@ -56,8 +56,9 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   card. Decode reads the indexer's selected rows over the bus (at most 512 per layer); a prompt chunk that reaches the rows in
   RAM reads them from a VRAM copy of one cache, counted with the prompt's workspaces. Output is unchanged. The VRAM saved
   goes to the expert tier: a 1M context with `--kv-resident 16384` on a 16 GB card holds 22 copies per layer against 20.
-  After a 15,431-token prompt with `--kv-resident 1024`, decode runs at 9.9 against 10.4 tok/s and the prompt reads at the
-  same speed. N is rounded up to 2 MiB of rows per layer. Needs host virtual memory management; the start is refused without it.
+  After a 15,498-token prompt with `--kv-resident 1024`, a decode window takes 146.6 against 125.7 ms (6.8 against 8.0
+  passes/s, 35.5 against 40.2 tok/s; 16 GB card at 300 W, 14 copies per layer) and the prompt reads at the same speed.
+  N is rounded up to 2 MiB of rows per layer; the context check at the start and the expert tier count the rounded part. Needs host virtual memory management; the start is refused without it.
 - **Refused flags:** `--rope-*`, `--yarn-*` (YaRN is part of the model).
 
 ## Long prompts
