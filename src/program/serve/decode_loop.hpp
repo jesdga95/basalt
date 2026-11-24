@@ -79,7 +79,7 @@ Flow Request::decode_loop(B& b) {
         if constexpr (kSpec) held_run = b.take_held(T);
         if (!ran || b.window_failed()) {
             std::printf("ERR %s\n", b.window_error());
-            return Flow::error;
+            return b.window_refused() ? Flow::next : Flow::error;   // refused: the session holds what it held, the engine serves on
         }
         int a = 0;
         if (e0 > 0) {

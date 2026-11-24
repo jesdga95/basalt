@@ -14,7 +14,7 @@ from typing import Iterator
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
 from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
-from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
+from serve.api.grammar import GPROMPT_KEY, REQUEST_KEY as GRAMMAR_KEY
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
 from serve.util.logbuf import LogBuffer
@@ -29,16 +29,21 @@ from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobC
 from serve.config import GRAMMAR_DEFAULT
 
 
-def available_ram_mib() -> int | None:
-    """MemAvailable from /proc/meminfo, in MiB; None where there is no such file."""
+def meminfo_mib(field: str) -> int | None:
+    """A field of /proc/meminfo in MiB; None where there is no such file."""
     try:
         with open("/proc/meminfo", encoding="ascii") as f:
             for line in f:
-                if line.startswith("MemAvailable:"):
+                if line.startswith(field + ":"):
                     return int(line.split()[1]) >> 10
     except (OSError, ValueError, IndexError):
         pass
     return None
+
+
+def available_ram_mib() -> int | None:
+    """MemAvailable, in MiB."""
+    return meminfo_mib("MemAvailable")
 
 
 # trailing effort turn (effort_end): sentences for the non-default efforts
@@ -552,6 +557,47 @@ class Service:
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
 
+    def park(self, fits) -> str:
+        """End this model's turn by sleeping its engine, state kept in RAM, its sidecar encoder (if any) ended; see
+        `sleep` for the answers. The router calls it between requests."""
+        out = self.sleep(fits=fits)
+        if out == "asleep" and self.vision is not None and hasattr(self.vision, "unload"):
+            self.vision.unload()
+        return out
+
+    def _gpu_state_mib(self) -> int | None:
+        """The GPU memory this engine's process holds: what the driver moves into RAM when it sleeps."""
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        return vram.process_mib(pid) if pid else None
+
+    def park_need_mib(self) -> int | None:
+        """The RAM this engine would hold asleep, before it sleeps: its own memory and its GPU state."""
+        own, state = self.engine.held_mib(), self._gpu_state_mib()
+        return None if own is None or state is None else own + state
+
+    def held_mib(self) -> int | None:
+        """The RAM a sleeping engine holds: its process's own memory, which by then includes the GPU state the driver
+        moved there."""
+        return self.engine.held_mib()
+
+    def park_refusal(self, floor_mib: int) -> str | None:
+        """Why this engine may not be held asleep (RAM): the sleep's own margin, and the RAM floor once its state is
+        in RAM; None when it may."""
+        why = self._sleep_fits()
+        if why is not None:
+            return why
+        avail, state = available_ram_mib(), self._gpu_state_mib()
+        if avail is not None and state is not None and avail - state < floor_mib:
+            return f"RAM: {avail} MiB free, {state} MiB of GPU state to hold and the {floor_mib} MiB floor to keep"
+        return None
+
+    def evict(self):
+        """End a parked engine without waking it: its VRAM is another model's now."""
+        with self.fifo:
+            self.engine.discard()
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                self.vision.unload()
+
     def _wake(self):
         """Wake a sleeping engine (caller holds fifo); a failed wake ends it and the next start loads it again."""
         t = time.time()
@@ -597,9 +643,10 @@ class Service:
     sleep_refused_at = None                              # the request an idle sleep was last refused after
     SLEEP_RAM_MARGIN_MIB = 8192                          # RAM left free once the GPU state is in host memory
 
-    def sleep(self, idle_for: float | None = None) -> str:
+    def sleep(self, idle_for: float | None = None, fits=None) -> str:
         """Put the engine to sleep between requests: its VRAM released, its process and RAM state kept, the next
-        request wakes it. "asleep", "not loaded", "busy", "no ram" or "unsupported"."""
+        request wakes it. `fits()` replaces the RAM check (it says why the state may not be held, None if it may).
+        "asleep", "not loaded", "busy", "no ram" or "unsupported"."""
         if not hasattr(self.engine, "sleep") or not self.engine.can_sleep():
             return "unsupported"
         if self.stopping.is_set():                      # shutdown: the engine is being ended, not put to sleep
@@ -625,7 +672,7 @@ class Service:
                 return "unsupported"
             t = time.time()
             try:
-                self.engine.sleep(ram_check=self._sleep_fits)
+                self.engine.sleep(ram_check=fits or self._sleep_fits)
             except ValueError as e:
                 if idle_for is not None:
                     self.sleep_refused_at = self.last_request_at or self.started_at
@@ -1398,10 +1445,13 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        has_grammar = isinstance((sampling or {}).get(GRAMMAR_KEY), dict)
         one_call = self.dialect.forced_call_ends_reply and bool(force) and force.rstrip().endswith(">")     # a named choice: the reply is that one call
         opening = []                                    # without thinking the prompt ends with the forced opening:
-        if force and not thinking:                      # the parser reads it as if the model had written it
-            opening, force = parser.feed(self.dialect.nothink_lead + force), None
+        forced_now = bool(force and not thinking)
+        opening_text = (self.dialect.nothink_lead + force) if forced_now else ""
+        if forced_now:                                  # the parser reads it as if the model had written it
+            opening, force = parser.feed(opening_text), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
         prompt_ms0 = None                               # the first engine run's prompt read time
@@ -1475,6 +1525,19 @@ class Service:
                     # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
+                    gprompt0 = None
+                    if forced_now and has_grammar:
+                        if isinstance(ids, PromptText) and ids.tail:
+                            tail_n = len(self.tok.encode(ids.tail, parse_special=True))
+                            ids, max_new = ids.resolve(max_new, self.engine.max_context)
+                            gprompt0 = len(ids) - tail_n
+                        elif not isinstance(ids, PromptText):
+                            tail_n = len(self.tok.encode(opening_text, parse_special=True))
+                            gprompt0 = len(ids) - tail_n
+                        if gprompt0 is not None and 0 < gprompt0 < len(ids):
+                            sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
+                        else:
+                            gprompt0 = None
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -1682,6 +1745,7 @@ class Service:
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
+                        forced_here = bool(force) and (ended_thinking or wrap)
                         if ended_thinking:
                             closed_early = True
                             extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
@@ -1729,7 +1793,19 @@ class Service:
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
+                        base_len = len(prompt.ids()) if isinstance(prompt, PromptText) else len(prompt)
                         prompt = prompt + seg + extra
+                        if has_grammar:
+                            if resumed:
+                                gprompt0 = gprompt0 if gprompt0 is not None else base_len
+                            elif opens or forced_here:
+                                gprompt0 = base_len + len(seg)
+                            else:
+                                gprompt0 = None
+                            if gprompt0 is not None and 0 < gprompt0 < len(prompt):
+                                sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
+                            elif sampling and GPROMPT_KEY in sampling:
+                                sampling = {k: v for k, v in sampling.items() if k != GPROMPT_KEY}
                     if cancel.is_set():
                         finish = "cancel"
                     elif finish == "length" and n < max_new and self.stopping.is_set():

@@ -20,18 +20,17 @@
 #error "ggml_cpu_dots.c needs AVX2 and F16C"
 #endif
 
-#if defined(_MSC_VER)
-// MSVC gives the scalar F16C pair no working code of its own: the definitions live in
-// f16c_scalar_msvc.c, compiled without __F16C__ so the compiler does not claim the names as its own
-// intrinsics. #pragma function keeps the calls real, and the prototypes keep them from compiling as
-// implicit declarations, which would pass the float as a double.
-#pragma function(_cvtss_sh, _cvtsh_ss)
-unsigned short _cvtss_sh(float a, const int rounding);
-float _cvtsh_ss(unsigned short a);
-#endif
+// The vector F16C intrinsics also give the scalar conversions inline code in the dot loops.
+static inline float ggml_cpu_fp16_to_fp32(unsigned short x) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) x)));
+}
 
-#define GGML_CPU_FP16_TO_FP32(x) _cvtsh_ss(x)
-#define GGML_CPU_FP32_TO_FP16(x) _cvtss_sh(x, 0)
+static inline unsigned short ggml_cpu_fp32_to_fp16(float x) {
+    return (unsigned short) _mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(x), 0));
+}
+
+#define GGML_CPU_FP16_TO_FP32(x) ggml_cpu_fp16_to_fp32(x)
+#define GGML_CPU_FP32_TO_FP16(x) ggml_cpu_fp32_to_fp16(x)
 #define UNUSED GGML_UNUSED
 
 void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int64_t k);
@@ -1507,6 +1506,72 @@ static void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+// ggml uses a precomputed table for the E8M0 half scale on x86 (ggml-cpu/simd-mappings.h); the table holds exactly
+// the values of ggml_e8m0_to_fp32_half (ggml-impl.h), so the function is what the table would return, bit for bit.
+#define GGML_CPU_E8M0_TO_FP32_HALF(x) GGML_E8M0_TO_FP32_HALF(x)
+
+// MXFP4 x Q8_0: a 32-value block with one E8M0 scale meets one Q8_0 block (QK_MXFP4 == QK8_0).  Ported from
+// ggml_vec_dot_mxfp4_q8_0 of ggml/src/ggml-cpu/arch/x86/quants.c (the AVX-512 build runs the same AVX2 code there)
+// with the scalar tail of the last block; ggml's scalar fallback (ggml_vec_dot_mxfp4_q8_0_generic, ggml-cpu/
+// quants.c) is extracted as ggml_vec_dot_mxfp4_q8_0_ref in ggml_quants.c.
+static void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP4 == 0);
+    static_assert(QK_MXFP4 == QK8_0, "QK_MXFP4 and QK8_0 must be the same");
+
+    const block_mxfp4 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP4;
+
+    int ib = 0;
+    float sumf = 0;
+
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_mxfp4);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+
+    __m256 accum1 = _mm256_setzero_ps();
+    __m256 accum2 = _mm256_setzero_ps();
+
+    for (; ib + 1 < nb; ib += 2) {
+        const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)x[ib + 0].qs);
+        const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)x[ib + 1].qs);
+        const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)y[ib + 0].qs);
+        const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+        const __m256i q4b_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+        const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+        const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
+        const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
+        const __m256i p_1 = _mm256_madd_epi16(p16_1, mone);
+        const __m256i p_2 = _mm256_madd_epi16(p16_2, mone);
+        const __m256 scale0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 0].e));
+        const __m256 scale1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 1].e));
+        accum1 = _mm256_fmadd_ps(scale0, _mm256_cvtepi32_ps(p_1), accum1);
+        accum2 = _mm256_fmadd_ps(scale1, _mm256_cvtepi32_ps(p_2), accum2);
+    }
+
+    sumf = hsum_float_8(_mm256_add_ps(accum1, accum2));
+
+    for (; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(y[ib].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib].e);
+        int sumi1 = 0;
+        int sumi2 = 0;
+        for (int j = 0; j < QK_MXFP4/2; ++j) {
+            sumi1 += y[ib].qs[j +          0] * kvalues_mxfp4[x[ib].qs[j] & 0xf];
+            sumi2 += y[ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >>  4];
+        }
+        sumf += d * (sumi1 + sumi2);
+    }
+    *s = sumf;
+}
+
 // UE4M3 scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0x7F as 0; bit 7 ignored), built from
 // its bits: exact, and the same as dequantize_row_nvfp4.
 static inline float nvfp4_scale(uint8_t x) {
@@ -2097,6 +2162,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ4_XS]  = {NULL, ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_S]   = {NULL, ggml_vec_dot_iq1_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_M]   = {NULL, ggml_vec_dot_iq1_m_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_MXFP4]   = {NULL, ggml_vec_dot_mxfp4_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_NVFP4]   = {NULL, ggml_vec_dot_nvfp4_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_MXFP8]   = {NULL, ggml_vec_dot_mxfp8_q8_0, GGML_TYPE_Q8_0, 1},
 };

@@ -4,8 +4,10 @@
 // holds the later layers' weights, experts and caches instead (cards(), card_of()).
 #pragma once
 
+#include "basalt/core/progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/model/adapter.hpp"
+#include "models/inkling2/copy_heat.hpp"
 #include "basalt/model/peer_hooks.hpp"
 #include "basalt/model/split_hooks.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
@@ -96,36 +98,95 @@ public:
     /// What the sessions share (session.cpp's Shared): made by the first, gone with the last.
     std::weak_ptr<void>& shared() { return shared_; }
     const DsparkWeights* dspark() const { return dspark_.get(); }   // DSPARK HOOK: null without a drafter or with --spec 1
-    /// Whether expert e of layer l is on the card (every one, unless the context asked for made some spill to RAM).
+    /// Whether expert e of layer l is on the card (every one, unless the context asked for made some spill to RAM), a
+    /// loaned copy aside.
     bool on_card(int l, int e) const {
         return spill_.slot.empty() || spill_.slot[(size_t) l].empty() ||
                spill_.slot[(size_t) l][(size_t) e] < geo().n_expert - spill_.n_spill[(size_t) l] ||
-               (!copy_.empty() && copy_[(size_t) l * geo().n_expert + e]);
+               (!copy_.empty() && copy_[(size_t) l * geo().n_expert + e] && !on_loan(l, e));
     }
+    bool on_loan(int l, int e) const { return !loan_flag_.empty() && loan_flag_[(size_t) l * geo().n_expert + e]; }
+    const std::vector<size_t>& loaned_pairs() const { return loan_list_; }
     /// The elastic spill: the experts the asked context sent to RAM come back to the card as copies while its caches back
     /// only the positions in use. On with a spill the context made (not --expert-cache) and a context above the elastic
     /// KV's base (core/elastic_kv.hpp).
+    bool has_spill() const { return has_spill_; }
     bool elastic() const { return elastic_; }
-    /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
-    /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
+    /// Whether the RAM experts come back to the card as copies while it has room beyond its spare: any spill the context
+    /// made (not --expert-cache), static or elastic.
+    bool copies() const { return has_spill_ && flags_.expert_cache <= 0; }
+    /// Copies RAM experts to the card, the highest ranked first (copy_heat.hpp), while `keep_free` bytes stay free; their
+    /// blob table entries point at the copies. A map the card refuses reads the card again, and copies go back, the lowest
+    /// ranked first, until `keep_free` is free. Bytes copied.
     uint64_t promote(uint64_t keep_free);
-    /// Sends copies back, the least routed first, until at least `bytes` are freed: their entries go back to 0, the CPU
-    /// computes them again (on `stream`, which is waited for before the copies are freed). Bytes freed.
-    uint64_t demote(uint64_t bytes, void* stream);
-    int64_t promoted() const { return n_copy_; }
+    /// One warning when the last promote found less free memory than counted: placement then follows a fresh reading of
+    /// the card, not the requests alone.
+    void note_shortage(const std::string& where);
+    /// Sends the lowest-ranked copies back until at least `bytes` are freed (their entries go back to 0, the CPU computes
+    /// them again), packs the rest to the front and returns whole granules. `freed`: the bytes given back. False when a
+    /// table or copy update could not be confirmed: the placement is then wedged.
+    bool demote(uint64_t bytes, uint64_t& freed);
+    /// Adds a sample of lookups (each pair's, since the last) that covers `rows` kept rows to the copies' ranking.
+    void learn(const std::vector<uint32_t>& lookups, int64_t rows);
+    /// Swaps up to `max_swaps` copies for hotter RAM experts of the same size, between windows; joins every reader of the
+    /// tables first. The swaps made.
+    int rebalance(int max_swaps);
+    int64_t promoted() const { return (int64_t) copy_slots_.size(); }
+    int64_t card_copies() const { return promoted() + loaned(); }
+    /// One line on the copies after a placement event (paid and loaned counts, free VRAM, the paid range's backing).
+    void log_copy_change(const char* event, int64_t before, uint64_t to_map = 0, bool always = false, bool warning = false) const;
+    /// Advances when an address a session saved from the blob tables (the decode read-ahead's) may no longer hold that expert.
+    uint64_t placement_epoch() const { return epoch_; }
     /// The free VRAM the session holds the card at from now on (VRAM / POST /v1/vram; 0: its own spare only): a grow of
-    /// the caches and a promote keep at least this much free. `lend(true)` gives every card copy back for a sleep and holds them off (nothing promotes)
+    /// the caches and a promote keep at least this much free. `held_free(base)`: the free VRAM a step keeps, `base` its own
+    /// default unless --vram-reserve-mib set the card's spare. `lend(true)` gives every card copy back for a sleep and holds them off (nothing promotes)
     /// until `lend(false)`.
     uint64_t reserve() const { return reserve_; }
     bool lent() const { return lent_; }
-    uint64_t held_free(uint64_t base) const { return std::max(base, reserve_); }
+    /// Device work or placement that could not be confirmed: every later request is refused and the engine ends without
+    /// the CUDA teardown.
+    void wedge() {
+        wedged_ = true;
+        core::gpu_left_running().store(true);
+    }
+    bool wedged() const { return wedged_; }
+    uint64_t held_free(uint64_t base) const { return std::max(spare_ ? spare_ : base, reserve_); }
+    /// The card's free bytes as placement counts them: read when the copies are first placed, at a VRAM resize and at a
+    /// wake, and moved by every map and release of the copies and the sessions' caches (account). What else allocates
+    /// (kernels, graphs) is left to the spare and the late room. Placement reads this, never a fresh query, so it follows
+    /// the requests alone unless a map lacks the memory: then it reads the card again and a warning says so.
+    uint64_t room() const { return room_ > 0 ? (uint64_t) room_ : 0; }
+    void account(int64_t mapped) { room_ -= mapped; }
+    void sync_room();
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
-    /// room. False when even no copy at all leaves that much.
-    bool resize_reserve(uint64_t free_bytes, void* stream);
-    void lend(bool low, void* stream);
-    /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
-    /// issued; the caller copies them from RAM). `with_peer`: the second card's experts too (all_copied).
-    bool stage_from_card(int l, void* stream, bool with_peer) const;
+    /// room. False, with nothing moved, when even no copy at all leaves that much; false when the copies could not go back.
+    bool resize_reserve(uint64_t free_bytes);
+    /// False when the copies could not all go back (a low `lend` then does not hold them off).
+    bool lend(bool low);
+    /// The prompt loan: with an elastic spill, one card and one session, the prompt path's idle device memory (its chunk
+    /// arena and the experts' staging) holds copies of the next highest-ranked RAM experts while decode runs. They count
+    /// for decode but take no slot or page of the paid copies.
+    /// Null `base`: the arena goes; false when a loan upload into it could not be confirmed finished (its memory must not be
+    /// freed then).
+    bool set_prompt_arena(uint8_t* base, uint64_t bytes);
+    /// After a decode window: starts the loan's uploads when one is due (`publish_at`: the position its copies become
+    /// visible at) and queues their next bounded part. Never makes a copy visible.
+    bool submit_loan(int64_t publish_at);
+    /// Whether uploads wait to be published, and the position they are published at.
+    bool loan_pending() const { return loan_publish_at_ >= 0; }
+    int64_t loan_publish_at() const { return loan_publish_at_; }
+    /// Queues what is left of the loan, waits for all of it and points the table entries at the copies (on `stream`).
+    /// `at`: the position it is published at (the log line names it).
+    bool publish_loan(void* stream, int64_t at);
+    /// Waits for the uploads, sets the loaned entries back to 0 (the CPU computes them again) and frees the regions.
+    /// `event`: the log line's event.
+    bool recall_loan(void* stream, const std::string& event = "prompt loan recall");
+    int64_t loaned() const { return (int64_t) loan_list_.size(); }
+    /// A prompt chunk's staging of layer l's RAM experts into their slots: each from its card copy while the elastic spill
+    /// holds one, from RAM otherwise, a run of adjacent slots with no copy in one copy (spill.hpp stage_plan). `want`
+    /// [slot]: only the slots set (null: every one). `with_peer`: the second card's experts' slots too, from their card
+    /// copies (all_copied). False when a copy could not be queued.
+    bool stage(int l, const uint8_t* want, void* stream, bool with_peer) const;
     /// Every expert of layer l that left the card has a copy on it again (the elastic spill): the layer runs on the main card alone.
     bool all_copied(int l) const { return !layer_copies_.empty() && layers_[(size_t) l].n_spill > 0 && layer_copies_[(size_t) l] >= layers_[(size_t) l].n_spill; }
     /// A prompt chunk sends layer l's rows to the second card: it holds experts of the layer that the main card has no copy of.
@@ -215,14 +276,58 @@ private:
     std::vector<unsigned long long> staging_;   ///< granule-sized pieces (the driver maps whole allocations only)
     uint8_t* spill_host_ = nullptr;
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none)
+    bool has_spill_ = false;
     bool elastic_ = false;
     uint64_t reserve_ = 0;
+    uint64_t spare_ = 0;   ///< --vram-reserve-mib: the free VRAM the copies leave (0: each step's own default)
     bool lent_ = false;
+    bool wedged_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
-    int64_t n_copy_ = 0;
-    std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
-    std::vector<int> layer_ram_copies_;   ///< [layer] those the second card does not hold (a prompt chunk stages the others' copies)
+    CopyHeat heat_;
+    std::vector<size_t> copy_slots_;   ///< the paid copies' pairs in range order
+    std::vector<size_t> copy_candidates() const;
+    bool join_placement();
+    uint64_t copy_stride(size_t pair) const;
+    const uint8_t* copy_source(size_t pair) const;
+    bool publish_copy(size_t pair, const void* ptr);
+    // the copies back to back in one reserved range (spill.hpp CopyLayout); its granules are mapped while a copy uses them,
+    // one handle each from the range's start
+    bool copy_range();
+    bool trim_copies();
+    /// With --vram-reserve-mib: kLateRoom, the room the copies leave for what loads after them (room() does not see it
+    /// load); 0 without it.
+    uint64_t late_room() const;
+    int64_t room_ = 0;   ///< room(): may run below 0 when the caches grow past what placement counted
+    bool map_short_ = false;   ///< a promote could not map a page it counted (note_shortage)
+    uint8_t* copies_va_ = nullptr;
+    CopyLayout copy_lay_;
+    uint64_t copy_reserved_ = 0;
+    std::vector<unsigned long long> copy_maps_;
+    uint64_t epoch_ = 0;   ///< address invalidations
+    bool copies_retired_ = false;   ///< a granule of the range could not be unmapped: no promote copies into it again
+    std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy (paid or loaned)
+    // the prompt loan: the idle regions, the loaned (layer, expert) pairs in loan order (flag per pair, copy_ holds the address)
+    bool loan_ready();
+    bool queue_loan(uint64_t budget);
+    bool drain_loan_upload();
+    struct LoanUpload { size_t pair; uint8_t* ptr; };
+    void* loan_stream_ = nullptr;
+    void* loan_event_ = nullptr;
+    std::vector<LoanUpload> loan_plan_;   ///< the loan fixed at its start: each pair and its place, in rank order
+    size_t loan_next_ = 0;                ///< the plan's uploads queued so far
+    bool loan_inflight_ = false;          ///< uploads queued since the copy stream was last confirmed idle
+    bool loan_stuck_ = false;             ///< an upload or a reader of the loan could not be confirmed finished: its memory is never released
+    uint8_t* loan_arena_ = nullptr;
+    uint64_t loan_arena_bytes_ = 0;
+    uint8_t* loan_stage_ = nullptr;   ///< the shared staging's second address range
+    uint64_t loan_stage_bytes_ = 0;
+    unsigned long long* loan_addr_ = nullptr;   ///< pinned: the table entries a loan writes
+    std::vector<uint8_t> loan_flag_;
+    std::vector<size_t> loan_list_;
+    int loan_state_ = 0;              ///< 0: not set up, 1: ready, -1: not available
+    bool loan_due_ = true;            ///< the next decode window starts a new ranked fill
+    int64_t loan_publish_at_ = -1;    ///< the position the queued uploads are published at (-1: none queued)
     // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill
     struct LentRange {
         size_t range = 0;

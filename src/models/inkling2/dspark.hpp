@@ -33,6 +33,7 @@
 
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
@@ -122,8 +123,10 @@ public:
     /// `w` null: no drafter. `context` the session's positions; `tap_rows` the most rows one forward fills the tap with.
     /// `dump` (--diag-dump's directory, may be empty): every committed run's features and the first blocks' outputs (their
     /// final rows, every draft's logits, the drafts) go to dspark.bin there in order, to replay against a reference.
-    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes).
-    bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump, std::string& err);
+    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). `backed` > 0: the full layers' caches reserve the context and
+    /// back only the cells of the first `backed` positions (and a block past them), growing with the target's (ensure).
+    bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
+              int64_t backed, std::string& err);
     bool on() const { return w_ != nullptr; }
     /// The tap slot visit `visit` fills with its input rows, or -1.
     int slot_of_visit(int visit) const;
@@ -153,6 +156,28 @@ public:
     size_t running_bytes() const;
     void running_regions(core::RunningState& st) const;
     size_t cells_bytes(int64_t positions) const;
+    /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
+    /// positions and a block past them; trim gives back what lies past them.
+    uint64_t grow_bytes(int64_t positions) const;
+    bool ensure(int64_t positions, std::string& err);
+    void trim(int64_t positions);
+    int64_t backed_cells() const { return backed_cells_; }
+    bool usable() const {
+        for (const auto& a : full_)
+            if (!a->usable()) return false;
+        return true;
+    }
+    /// The last ensure failed only because the device lacked the memory.
+    bool out_of_memory() const {
+        for (const auto& a : full_)
+            if (a->out_of_memory()) return true;
+        return false;
+    }
+    uint64_t backing_bytes() const {
+        uint64_t n = 0;
+        for (const auto& a : full_) n += a->backed();
+        return n;
+    }
     bool save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const;
     /// Restores from kv[at..]; `at` moves past what it read. False when kv holds no drafter cells of that shape.
     bool restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream);
@@ -164,11 +189,14 @@ private:
         bool ring = false;
     };
     void* dev(size_t bytes, bool& ok);
+    void count_backed();                    ///< backed_cells_ from the elastic caches
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
     std::vector<Cache> cache_;
+    std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V when elastic
+    int64_t backed_cells_ = 0;              ///< cells every full layer's cache backs
     std::vector<int> slot_;                 ///< by visit
     int tap_rows_ = 0;
     int64_t context_ = 0;

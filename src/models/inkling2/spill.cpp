@@ -84,4 +84,37 @@ bool plan_spill(int n_layers, int n_expert, const std::vector<uint64_t>& stride,
     return true;
 }
 
+std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card, const uint8_t* want, bool kept) {
+    std::vector<StageOp> out;
+    const auto staged = [&](int j) { return !want || want[j]; };
+    for (int j = 0; j < n_spill;) {
+        if (!staged(j)) {
+            if (j > 0 ? staged(j - 1) : kept) out.push_back({StageOp::Guard, j, 1});
+            ++j;
+        } else if (card[j]) {
+            out.push_back({StageOp::Card, j, 1});
+            ++j;
+        } else {
+            int n = 1;
+            while (j + n < n_spill && staged(j + n) && !card[j + n]) ++n;
+            out.push_back({StageOp::Ram, j, n});
+            j += n;
+        }
+    }
+    return out;
+}
+
+CopyLayout copy_layout(const std::vector<uint64_t>& strides, uint64_t gran) {
+    CopyLayout c;
+    c.gran = gran;
+    for (uint64_t stride : strides) c.append(stride);
+    return c;
+}
+
+int64_t CopyLayout::keep_for(int64_t n, uint64_t mapped, uint64_t bytes) const {
+    int64_t m = n;
+    while (m > 0 && (mapped - std::min(mapped, pages(m))) * gran < bytes) --m;
+    return m;
+}
+
 }  // namespace basalt::models::inkling2
