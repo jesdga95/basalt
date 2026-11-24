@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <stdexcept>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -790,7 +791,18 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
         const size_t out_b = (size_t) E * (size_t) (3072 / 32 * 34);
         const int64_t nb_e = E / 32;
         for (int c = 0; c < cards(); ++c) {
-            cudaSetDevice(card_device(c));
+            if (const auto error = cudaSetDevice(card_device(c)); error != cudaSuccess) {
+                cudaSetDevice(device_);
+                return {model::Status::Error, std::string("inkling2: cannot select the layer's device: ") + cudaGetErrorString(error)};
+            }
+            if (int8_) {
+                try {
+                    attention_decode_int8_init();
+                } catch (const std::runtime_error& error) {
+                    cudaSetDevice(device_);
+                    return {model::Status::Error, error.what()};
+                }
+            }
             void* tmp = nullptr;
             if (cudaMalloc(&tmp, std::max(proj_b, out_b)) != cudaSuccess) {
                 cudaSetDevice(device_);

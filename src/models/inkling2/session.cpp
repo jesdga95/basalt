@@ -443,7 +443,7 @@ protected:
     }
     bool batch_forward(const model::BatchView& v, std::string&) override {
         view_ = &v;
-        body(v.w.rows, v.w.rows, full_keys_of(v.w.max_pos));
+        body(v.w.rows, v.w.rows, full_keys_of(v.w.max_pos, v.w.rows));
         view_ = nullptr;
         return true;
     }
@@ -974,6 +974,13 @@ private:
         aa.q8 = x.xo_;
         const Segments seg = segments(v.slot);   // a batch window's: each conversation's caches of this visit
         ap.seg = aa.seg = seg;
+        // The previous graph bucket bounds the first consecutive row from below.
+        if (seg.at.n == 0 && full_keys > 1024) {
+            int64_t previous = full_keys / 2;
+            if (rows == 1 && m_.cache_int8() && full_keys == 2 * kMmaDeepMinKeys)
+                previous = kMmaDeepMinKeys - 1;
+            aa.min_full_keys = previous + 2 - rows;
+        }
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, x.att_scr_, k.stream);
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
@@ -1106,10 +1113,12 @@ private:
         return true;
     }
 
-    // The full-attention visits' launch bound of a call whose last row sits at `last`: its keys rounded up to a power of two.
-    static int64_t full_keys_of(int64_t last) {
+    // Separate the scalar and MMA singleton buckets at the INT8 cutoff.
+    int64_t full_keys_of(int64_t last, int rows) const {
         int64_t full_keys = 1024;
         while (full_keys < last + 1) full_keys <<= 1;
+        if (rows == 1 && m_.cache_int8() && full_keys == kMmaDeepMinKeys)
+            return last + 1 < kMmaDeepMinKeys ? kMmaDeepMinKeys - 1 : 2 * kMmaDeepMinKeys;
         return full_keys;
     }
 
@@ -1146,7 +1155,7 @@ private:
             bk::iq_embed_rows(kTypeBF16, m_.embedding(), (size_t) E * 2, tok_d_, rows, E, emb_, stream_);
             bk::rms_norm_rows(emb_, m_.embed_norm(), rows, E, g_.rms_eps, x0, stream_);
         }
-        return full_keys_of(last);
+        return full_keys_of(last, rows);
     }
 
     // The layers with experts on the CPU (bit l: layer l) for the next window: part of its shape.

@@ -126,11 +126,14 @@ struct AttnArgs {
     int64_t gate_ld = 0;
     void* q8 = nullptr;                ///< set: the (gated) output also as q8_1 blocks, [rows][kHeads * kHeadDim / 32]
     Segments seg;                      ///< a batch window's: each segment's caches
+    int64_t min_full_keys = 0;          ///< proven lower bound for all rows, or zero; skips the shallow split launch
 };
 /// The kernels' shared-memory opt-ins are per device (a layer split runs them on two cards): the current device's index
 /// into their flags, below kOptInDevices.
 constexpr int kOptInDevices = 64;
 int opt_in_device();
+
+constexpr int kMmaDeepMinKeys = 32 * 1024;  ///< first key count using the full-cache INT8 MMA arithmetic
 
 /// Bytes of scratch attention_decode needs for `rows` rows over at most `max_keys` keys.
 size_t attention_decode_scratch(int rows, int64_t max_keys);
@@ -138,6 +141,28 @@ size_t attention_decode_scratch(int rows, int64_t max_keys);
 /// window), with exp(sink[r][h]) beside them in the softmax's denominator. `max_keys` bounds the keys any row reads (it
 /// sizes the launch only: a row's keys split in slices fixed by its own key count). `out` may be null when q8 is set.
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream);
+
+/// Initialize the INT8 MMA plans for the current device during model load.
+void attention_decode_int8_init();
+
+enum class Int8MmaPlan { Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct };
+/// Auto: the shard model; Previous: the halving rule the model falls back to.
+enum class Int8MmaShards { Auto, Previous };
+struct Int8MmaPlanInfo {
+    size_t shared = 0;
+    int stages = 0, resident = 0;
+    bool ping_pong = false;
+    int shards = 0, blocks = 0, slots = 0;
+    int busy = 0;       ///< the blocks that hold a slice of the row at max_keys
+    double units = 0.;  ///< that row's modeled time in slice times of one block
+};
+
+/// Parity and microbenchmark entry point. Returns false if a forced MMA plan cannot run on this device. shard_count > 0
+/// launches that many shards (at most the launch's splits) in place of the rule's.
+bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream,
+                                bool mma, Int8MmaPlan plan = Int8MmaPlan::Auto, Int8MmaPlanInfo* info = nullptr,
+                                Int8MmaShards shards = Int8MmaShards::Auto, int shard_count = 0);
+int attention_decode_int8_test_min_keys();
 
 /// out[r] = attn[r] * sigmoid(yq[r][kOffGate..]), the attention output gated by its own row's gate projection.
 void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream, int64_t yq_ld = kProjQ);
