@@ -16,7 +16,8 @@ architecture is Blackwell-only.
 
 ## Release archives
 
-Each release carries `basalt-vX.Y.Z-linux-x64.tar.gz` and `basalt-vX.Y.Z-windows-x64.zip`: `bin/` (`basalt`, `basalt-bench`,
+Each release carries `basalt-vX.Y.Z-linux-x64.tar.gz`, `basalt-vX.Y.Z-linux-arm64.tar.gz` (the DGX Spark's, built for 12.1) and
+`basalt-vX.Y.Z-windows-x64.zip`: `bin/` (`basalt`, `basalt-bench`,
 `basalt-probe`, `basalt-vision`), `serve/`, `tools/` (what the server imports), `data/`, `docs/`, `requirements.txt` and the licences.
 They hold no CUDA libraries and no Python environment. Needs:
 

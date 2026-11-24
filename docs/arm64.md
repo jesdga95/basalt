@@ -6,6 +6,8 @@ described in [platforms](platforms.md). Windows on Arm is not supported.
 
 ## Building
 
+Each release carries a `linux-arm64` archive built for 12.1 ([release archives](platforms.md#release-archives)); to build from source:
+
 Needs CUDA 13, GCC 13+ and CMake 3.24+, as on x86.
 
 ```sh
