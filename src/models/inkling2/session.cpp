@@ -305,7 +305,6 @@ public:
                     (j ? c.v : c.k) = a->data();
                     elastic_.push_back(std::move(a));
                 }
-                backed_ = core::kElasticKvBase;
             } else {
                 c.k = alloc(bytes, ok);
                 c.v = alloc(bytes, ok);
@@ -369,11 +368,19 @@ public:
         }
         if (ok) cudaMemsetAsync(ex_tally_, 0, (size_t) expert_pairs() * 4, stream_);
         if (ok) cudaMemsetAsync(rec_n_, 0, (size_t) g_.visits.size() * 4, stream_);
-        cudaStreamSynchronize(stream_);
-        return dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), sh_->tap, m_.flags().diag_dump, err);   // DSPARK HOOK
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "the session stream failed during initialization";
+            return false;
+        }
+        if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
+                          elastic_.empty() ? 0 : core::kElasticKvBase, err))
+            return false;
+        count_backed();
+        return true;
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        if (m_.wedged()) return wedged();
         if (r.n_tokens < 1) return {model::Status::Error, "inkling2: an empty window"};
         if (stale_) return stale();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
@@ -399,9 +406,7 @@ public:
             if (last && r.logits)
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
-        const model::Result done = end_call("the window failed");
-        if (done.ok()) m_.warm_up();
-        return done;
+        return end_call("the window failed");
     }
 
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
@@ -412,6 +417,7 @@ public:
 protected:
     // the hooks of the shared driver (model/batch_driver.hpp)
     const char* batch_name() const override { return "inkling2"; }
+    bool batch_ready() const override { return !m_.wedged(); }
     int64_t batch_context() const override { return m_.context(); }
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
@@ -425,6 +431,7 @@ protected:
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         if (!admit(err)) return false;
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
+        if (!drop_stale_read_ahead(err)) return false;
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
@@ -433,11 +440,7 @@ protected:
         return true;
     }
     bool batch_end(std::optional<cudaError_t> synced) override {
-        if (synced) {
-            const bool kept = complete(*synced);
-            if (kept && *synced == cudaSuccess) m_.warm_up();
-            return kept;
-        }
+        if (synced) return complete(*synced);
         release();
         return false;
     }
@@ -468,8 +471,10 @@ protected:
 public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         if (stale_ && r.pos > 0) return stale();
+        if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
         if (r.pos == 0) restart_positions(r.n_tokens);
+        if (m_.wedged()) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) r.pos);
         stale_ = true;   // until the rows are in (an error or an exception leaves it set)
@@ -499,6 +504,7 @@ public:
     // ---- [vision] images (vision.hpp, vision_encoder.hpp): a picture's rows stand in for its pad tokens' embeddings, taken
     // as they are (no embedding norm); the history holds the pad token at their positions.
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        if (m_.wedged()) return wedged();
         ImageEncoder& enc = m_.encoder();
         if (!enc.staged()) return {model::Status::NotImplemented, "inkling2: started without --vision"};
         std::string err;
@@ -510,6 +516,7 @@ public:
     void images_done() override { m_.encoder().release(); }
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
         if (stale_ && pos > 0) return stale();
+        if (m_.wedged()) return wedged();
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
         if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) pos);
@@ -572,23 +579,27 @@ public:
     // SLEEP / WAKE: the card's copies of the RAM experts go back to RAM (decode reads them there) and return at the wake; the
     // driver moves the rest. A model that kept every expert on the card has nothing to lend: ok, no slots, SLEEP goes on.
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
-        if (!m_.elastic()) return {};
+        if (m_.wedged()) return wedged();
+        if (!m_.copies()) return {};
         cudaStreamSynchronize(stream_);
         const int64_t before = m_.promoted();
-        m_.lend(low, stream_);
+        if (!m_.lend(low, stream_))
+            return {model::Status::Error, low ? "inkling2: the expert copies could not go back to RAM"
+                                              : "inkling2: the expert copies could not come back to the card"};
         basalt::log::info("basalt inkling2", low ? "sleep: %lld expert copies go back to RAM (decode reads them there)" : "wake: %lld expert copies return to the card",
                           (long long) (low ? before : m_.promoted()));
         expert_slots = expert_pairs() - m_.spill().spilled + m_.promoted();
         return {};
     }
 
-    // VRAM: the copies resize to leave `mib` free (< 0: the start's --vram-reserve-mib). A static spill or none has no
-    // copies to resize: refused unless the card already leaves that much.
+    // VRAM: the copies resize to leave `mib` free (< 0: the start's --vram-reserve-mib). A card that holds every expert has
+    // no copies to resize: refused unless it already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        if (m_.wedged()) return wedged();
         cudaStreamSynchronize(stream_);
-        const bool fits = m_.resize_reserve((mib < 0 ? m_.asked_reserve() : (uint64_t) mib << 20), stream_);
-        expert_slots = m_.elastic() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
-        if (!fits) return {model::Status::Error, "inkling2: the card cannot leave " + std::to_string(mib) + " MiB free: the experts it holds are not copies"};
+        const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20, stream_);
+        expert_slots = m_.copies() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
+        if (!fits) return {model::Status::Error, "inkling2: the card cannot leave " + std::to_string(mib) + " MiB free: the experts it holds are not copies, or the copies could not go back"};
         return {};
     }
 
@@ -607,8 +618,12 @@ public:
     // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
     int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kMaxRows) : 1; }
     bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
-    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override { return dspark_.draft_begin(anchor, pos, n, stream_); }
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        if (m_.wedged()) return wedged();
+        return dspark_.draft_begin(anchor, pos, n, stream_);
+    }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        if (m_.wedged()) return wedged();
         return dspark_.draft_end(ids, conf, max_n, n, need, stream_);
     }
 
@@ -622,46 +637,105 @@ public:
     }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
 
-    // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
-    // and when the card has no room the RAM experts' card copies go back to RAM first, the least routed first. False when
-    // even without any copy there is no room.
+    static model::Result wedged() { return {model::Status::Error, "inkling2: the model is wedged; restart the engine"}; }
+    // False once a cache's backing could not be confirmed (a clear or a release): the model stops then.
+    bool caches_usable() {
+        bool ok = dspark_.usable();   // DSPARK HOOK
+        for (const auto& a : elastic_) ok = ok && a->usable();
+        if (!ok && !m_.wedged()) {
+            m_.wedge();
+            basalt::log::error("basalt inkling2", "a cache's device memory could not be confirmed: every later request is refused");
+        }
+        return ok;
+    }
+
+    // The positions every full-attention cache backs: the visits' and the drafter's full layers'.
+    void count_backed() {
+        backed_ = m_.context();
+        for (const auto& a : elastic_) backed_ = std::min(backed_, (int64_t) (a->backed() / cell_bytes()));
+        if (dspark_.on() && !elastic_.empty()) backed_ = std::min(backed_, std::max<int64_t>(0, dspark_.backed_cells() - kDsBlock));
+    }
+
+    // The elastic KV: before a run reaches `positions`, the full visits' caches and the drafter's full layers back them (in
+    // steps of kElasticKvStep cells), and when the card has no room the RAM experts' card copies go back to RAM first, the
+    // least routed first. False when even without any copy there is no room.
     static constexpr int64_t kElasticKvStep = 8192;
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
+
+    // The decode read-ahead's saved expert addresses (rec_blobs_, written by the window before) are dropped once copies
+    // have gone back to RAM since: their memory may be unmapped. The epoch counts as seen once the drop is queued.
+    bool drop_stale_read_ahead(std::string& err) {
+        const uint64_t epoch = m_.placement_epoch();
+        if (seen_epoch_ == epoch) return true;
+        if (cudaMemsetAsync(rec_n_, 0, (size_t) g_.visits.size() * 4, stream_) != cudaSuccess) {
+            err = "inkling2: the read-ahead records could not be dropped";
+            return false;
+        }
+        seen_epoch_ = epoch;
+        return true;
+    }
     bool ensure_positions(int64_t positions, std::string& err) {
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
-        uint64_t grow = 64ull << 20;   // what the arrays will map, each rounded as it maps, and a margin
-        for (const auto& a : elastic_) grow += a->growth(bytes);
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        const uint64_t grow = grow_bytes(target);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
-        if (free_b < grow + keep_free) {
-            const uint64_t freed = m_.demote(grow + keep_free - free_b, stream_);
+        // the copies go back until the grow leaves the reserve free (the caches take the reserve itself only once no copy
+        // is left: the reserve is the copies' target, not a floor the caches stop at)
+        uint64_t freed = 0;
+        for (size_t free_b = 0, total_b = 0; m_.promoted() > 0;) {
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+                err = "the caches cannot grow: the card's free memory is unknown";
+                return false;
+            }
+            if (free_b >= grow + keep_free) break;
+            uint64_t f = 0;
+            if (!m_.demote(grow + keep_free - free_b, stream_, f)) {
+                err = "the caches cannot grow: the expert copies could not go back to RAM";
+                return false;
+            }
+            if (f == 0) break;
+            freed += f;
+        }
+        if (freed > 0)
             basalt::log::info("basalt inkling2", "elastic spill: the caches grow to %lld positions; %.2f GiB of expert copies go back to RAM "
                               "(%lld stay on the card)", (long long) target, (double) freed / (double) (1ull << 30), (long long) m_.promoted());
-        }
         for (auto& a : elastic_)
             if (!a->ensure(bytes, 0, err)) {
                 err = "the caches cannot grow to " + std::to_string(target) + " positions: " + err;
+                caches_usable();
                 return false;
             }
-        backed_ = target;
-        return true;
+        if (!dspark_.ensure(target, err)) {   // DSPARK HOOK
+            caches_usable();
+            return false;
+        }
+        count_backed();
+        if (positions <= backed_) return true;
+        err = "the caches do not back the requested positions";
+        return false;
+    }
+    // The device bytes the caches map to back `positions` positions (ensure_positions), the allocation rounding included.
+    uint64_t grow_bytes(int64_t positions) const {
+        uint64_t n = dspark_.grow_bytes(positions);   // DSPARK HOOK
+        for (const auto& a : elastic_) n += a->growth(cell_bytes() * (uint64_t) positions);
+        return n;
     }
     // A conversation starts over (a prompt at position 0): the caches give back the cells past what it needs (never below
     // the base), and the RAM experts come back to the card while it has room.
     void restart_positions(int64_t positions) {
         if (elastic_.empty()) return;
-        const int64_t keep = std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
+        const int64_t keep = std::min(m_.context(),
+            std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep));
         if (keep < backed_) {
-            cudaStreamSynchronize(stream_);
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
-            backed_ = std::min<int64_t>(backed_, (int64_t) (elastic_[0]->backed() / cell_bytes()));
+            dspark_.trim(keep);
+            count_backed();
+            if (!caches_usable()) return;
         }
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             cudaStreamSynchronize(stream_);
-            m_.promote(m_.held_free(kElasticKeep) + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
+            m_.promote(m_.held_free(kElasticKeep) + grow_bytes(keep));
         }
     }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * row_bytes(); }
@@ -718,7 +792,8 @@ public:
     // A full-attention visit's cache is cell-major ([cell][head][dim]): its first `positions` cells are one run.
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (stale_) return stale();
-        if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
+        if (m_.wedged()) return wedged();
+        if (positions < 0 || positions > backed_) return {model::Status::Error, "inkling2: positions past the backed caches"};
         cudaStreamSynchronize(stream_);
         kv.clear();
         const size_t run = (size_t) positions * cell_bytes();
@@ -745,6 +820,7 @@ public:
     }
 
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        if (m_.wedged()) return wedged();
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
         cudaStreamSynchronize(stream_);
@@ -1164,10 +1240,11 @@ private:
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
     // window (its first runs direct, outside a capture).
     bool layers(int rows, int head, int64_t full_keys, std::string& err) {
+        if (!drop_stale_read_ahead(err)) return false;
         const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
         if (it != graphs_.end()) return it->second.launch(stream_, err);
-        if (direct_.insert(key).second) {
+        if (direct_.insert(key).second || graphless_.count(key)) {
             body(rows, head, full_keys);
             return true;
         }
@@ -1182,7 +1259,19 @@ private:
             cudaGetLastError();
             throw;
         }
-        if (!g.end(stream_, err)) return false;
+        if (!g.end(stream_, err)) {
+            // the graph's own device memory can be what the card is short of when the experts' copies fill it to its spare:
+            // the window runs direct and its shape keeps running without a graph. No copy moves: which shape meets the
+            // shortage first depends on the windows' widths, and the placement must not. Any other failure fails the window.
+            if (g.status() != cudaErrorMemoryAllocation) return false;
+            (void) cudaGetLastError();
+            err.clear();
+            if (graphless_.empty())
+                basalt::log::warn("basalt inkling2", "a window's graph found no device memory: windows of its shape run without one");
+            graphless_.insert(key);
+            body(rows, head, full_keys);
+            return true;
+        }
         return graphs_.emplace(key, std::move(g)).first->second.launch(stream_, err);
     }
 
@@ -1441,6 +1530,7 @@ private:
     using Shape = std::pair<uint64_t, uint64_t>;
     std::map<Shape, core::CapturedGraph> graphs_;      // by window shape
     std::set<Shape> direct_;                           // the shapes whose first window has run
+    std::set<Shape> graphless_;                        // the shapes whose graph found no device memory: always direct
     uint64_t cpu_ = 0;                                 // the window in flight's layers with experts on the CPU
     bool admitted_ = false;                            // holds admission to the CPU experts' windows (admit)
     bool fork_open_ = false;                           // a start whose finish has not queued its join
@@ -1449,6 +1539,7 @@ private:
     uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups
     unsigned long long* rec_blobs_ = nullptr;   // [visit][kAheadExperts] the experts each visit took in the last window
     int32_t* rec_n_ = nullptr;                  // [visit] how many
+    uint64_t seen_epoch_ = 0;                   // the model's placement epoch rec_blobs_ was written in
     cudaStream_t ra_st_ = nullptr;              // the side stream (the read-ahead, the guesses), its fork and join events
     cudaEvent_t ra_ev_ = nullptr, ra_join_ = nullptr, gs_ev_ = nullptr;   // gs_ev_: a guess is in
     cudaStream_t pf_st_ = nullptr;              // the guesses' prefetch stream, its fork and join events

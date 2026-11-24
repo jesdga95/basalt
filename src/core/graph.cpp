@@ -25,6 +25,7 @@ CapturedGraph& CapturedGraph::operator=(CapturedGraph&& o) noexcept {
         exec_ = o.exec_;
         done_ = o.done_;
         nodes_ = o.nodes_;
+        status_ = o.status_;
         o.graph_ = nullptr;
         o.exec_ = nullptr;
         o.done_ = nullptr;
@@ -47,28 +48,28 @@ void CapturedGraph::reset() {
 bool CapturedGraph::begin(void* stream, std::string& err) {
     if (graph_ || exec_) { err = "begin: this CapturedGraph is already recorded"; return false; }
     const cudaError_t e = cudaStreamBeginCapture((cudaStream_t) stream, cudaStreamCaptureModeThreadLocal);
-    if (e != cudaSuccess) return fail(err, "cudaStreamBeginCapture", e);
+    if (e != cudaSuccess) { status_ = e; return fail(err, "cudaStreamBeginCapture", e); }
     return true;
 }
 
 bool CapturedGraph::end(void* stream, std::string& err) {
     cudaError_t e = cudaStreamEndCapture((cudaStream_t) stream, &graph_);
-    if (e != cudaSuccess) { graph_ = nullptr; return fail(err, "cudaStreamEndCapture", e); }
+    if (e != cudaSuccess) { graph_ = nullptr; status_ = e; return fail(err, "cudaStreamEndCapture", e); }
 
     nodes_ = 0;
     e = cudaGraphGetNodes(graph_, nullptr, &nodes_);
-    if (e != cudaSuccess) return fail(err, "cudaGraphGetNodes", e);
+    if (e != cudaSuccess) { status_ = e; reset(); return fail(err, "cudaGraphGetNodes", e); }
     // A capture that recorded NOTHING is a wiring mistake, and a graph that replays nothing produces no error
     // and no output - the silent kind of failure this project keeps paying for.
     if (nodes_ == 0) { err = "end: the capture recorded ZERO nodes - the body launched nothing"; reset(); return false; }
 
     e = cudaGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0);
-    if (e != cudaSuccess) return fail(err, "cudaGraphInstantiate", e);
+    if (e != cudaSuccess) { status_ = e; reset(); return fail(err, "cudaGraphInstantiate", e); }
 
     // The completion event is recorded ONCE and reused: `launch` records it again after each replay, which is
     // what makes `wait_ms` a query rather than a sync.
     e = cudaEventCreateWithFlags(&done_, cudaEventDisableTiming);
-    if (e != cudaSuccess) return fail(err, "cudaEventCreateWithFlags", e);
+    if (e != cudaSuccess) { status_ = e; reset(); return fail(err, "cudaEventCreateWithFlags", e); }
     return true;
 }
 
