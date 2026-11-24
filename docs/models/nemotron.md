@@ -100,6 +100,21 @@ layer, so longer chunks are faster.
 
 RTX PRO 4000 at 145 W, one session, the experts in RAM. The engine uses 4,096.
 
+**Long contexts.** Only the 8 attention layers (and the MTP head's) keep a cache, 9 KiB a position, so the prompt rate falls
+slowly with length and decode stays flat. Five facts planted at 5% to 95% depth in Basalt's own source, asked for
+at the end, at temperature 0:
+
+| Prompt | `--max-context` | Read | Decode | Facts found |
+| --- | --- | --- | --- | --- |
+| 64,192 tokens | 163,840 | 57.4 s (1,117 tok/s) | 41.1 tok/s | 5/5 |
+| 128,207 tokens | 163,840 | 126.3 s (1,015 tok/s) | 46.6 tok/s | 5/5 |
+| 155,206 tokens | 163,840 | 156.3 s (993 tok/s) | 45.8 tok/s | 5/5 |
+| 250,208 tokens | 262,144 | 271.0 s (923 tok/s) | 42.0 tok/s | 5/5 |
+
+The caches at 262,144 take 2.25 GiB of the card, beside 4.5 GiB of buffers and 6.9 GiB of dense weights; the tier needs
+22 slots a layer on what is left. With 9 GiB of the 24 GB card taken by other programs the start stops at about 165K
+(`not enough device memory for the expert tier`); the 250K row ran with the card to itself.
+
 ## Chat, tools, thinking
 
 ChatML turns (`<|im_start|>`, `<|im_end|>`) with the checkpoint's chat template. Thinking is on by default, in
