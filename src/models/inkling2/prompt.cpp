@@ -646,9 +646,7 @@ private:
         const int on_peer = peer ? peer_send(w, l, rows) : 0;   // the second card's rows run beside the main card's
         if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot (the second card's left out), its RAM experts copied into the staging
             remap_ids(b().ids, pairs, peer ? w.slot_map : w.slot_full, strm());
-            if (ahead_) {   // the copy stream staged it (stage_ahead)
-                if (!ok(cudaStreamWaitEvent(strm(), lane().staged, 0))) return false;
-            } else {
+            if (!ahead_) {   // else the copy stream stages it (stage_ahead) and the first product waits (staged_ready)
                 const uint8_t* want = nullptr;
                 if (rows <= kRoutedRows && !(want = routed(pairs))) return false;
                 if (!m_.stage(l, want, strm(), !peer) ||
@@ -727,6 +725,7 @@ private:
         p.opt_rows = (pairs + n - 1) / n;
         p.dst = b().gu;
         p.ld_dst = 2 * F;
+        if (!staged_ready(w)) return false;
         lane().mmq.run(p, strm());
         // an NVFP4 expert's {s_gate, s_up, s_down, 0} tail is read in its blob
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
@@ -764,6 +763,9 @@ private:
                ok(cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, k.copy)) &&
                ok(cudaEventRecord(k.staged, k.copy));
     }
+    // Before a spilled visit's first product over the staging: on the copy stream's chunk, it waits for the copies, so the
+    // sort and the activations' rounding before it run under them.
+    bool staged_ready(const LayerWeights& w) { return !ahead_ || !w.slot_map || ok(cudaStreamWaitEvent(strm(), lane().staged, 0)); }
     // A spilled visit's products are queued over the staging: the chunk's next spilled visit's copies may start.
     bool staging_read() { return !ahead_ || next_spill_[(size_t) step_] < 0 || stage_ahead(next_spill_[(size_t) step_]); }
     std::string staging_failed() {
@@ -813,6 +815,7 @@ private:
         gu.swiglu = true;
         gu.gate_softcap = g_.gate_softcap;
         gu.up_softcap = g_.up_softcap;
+        if (!staged_ready(w)) return false;
         mxfp8::run(gu, strm());
         mxfp8::quantize_f16(h16, pairs, F, F, b().xq, strm());
         mxfp8::Product d = gu;
@@ -859,6 +862,7 @@ private:
         gu.dst_f16 = h16;
         gu.ld_dst = F;
         gu.two = true;
+        if (!staged_ready(w)) return false;
         fp4::run(gu, strm());
         fp4::quantize_f16(h16, b().bounds, b().tile_off, n, b().a4h, b().gsh, F, F, pairs, strm());
         fp4::Product d = gu;
