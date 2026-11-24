@@ -43,7 +43,7 @@ Formats measured for layers 20 to 23 over 20 chunks: native MXFP8 0.00265 KLD, Q
 | Q8_0 projections (`w.proj`, `w.out`), head | Q8_0 (loaded into `q8_planes` for `w.proj`/`w.out`) | q8_1 activations via `native_q8_planes_mmvq` (decode, bitwise `native_q8_0_mmvq`); block-32 Q8_0 2-CTA TMA int8 tensor cores (`prefill::q8`, prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
-| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), or fp8 (E4M3, unit scale) | decode: fp32 scores and softmax; prompt: values dequantized to fp16 tiles, fp32 accumulation |
+| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), or fp8 (E4M3, unit scale) | decode: fp32 scores and softmax (a full int8 cache at 32,768 keys and more: fp16 tensor-core tiles, [below](#attention-caches)); prompt: values dequantized to fp16 tiles, fp32 accumulation |
 | Short-convolution state | fp32 | fp32 |
 
 A decode row's arithmetic does not depend on how many rows share its window. Prompt chunks round differently from decoded rows.
@@ -60,7 +60,35 @@ as fast as through MMQ.
 - **`--kv int8`:** signed INT8 codes, with an FP16 scale for each 64-channel group: the scale is the group's largest
   magnitude over 127 rounded to fp16, a code the value over it rounded to nearest even and clamped to ±127. A row uses 144
   bytes (128 codes, 2 scales, 12 zero bytes), about 44% less than FP16's 256 bytes and 12.5% more than FP8. Decode scores
-  keys in fp32 from code × scale (exact), values go to fp16 tiles rounded once from the same product.
+  keys in fp32 from code × scale (exact), values go to fp16 tiles rounded once from the same product. Decode rows of a
+  full-attention cache at 32,768 keys and more read it on the tensor cores instead: the key codes are staged to fp16
+  exactly and each 64-channel group's fp32 QK partial takes its scale after the accumulation; queries and the dequantized
+  values round to fp16; the probabilities are scaled by 2^15 before they round to fp16 for the value product, and the fp32
+  numerator drops that scale before the split merge, while the softmax denominator sums the unscaled fp32 probabilities. A
+  row's arithmetic is the same alone and in a verify window at the same key count, but not bit-identical to the scalar
+  reader, which shallower rows and the sliding-window layers keep.
+
+### Cost of the tensor-core INT8 reader
+
+The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16`, `--kv fp8` and shallower INT8 rows run the scalar reader unchanged.
+
+Two measurements against the scalar INT8 reader of the same build, with the same weights and forced tokens (and the same expert placement, except where a row says otherwise).
+
+The BF16-reference gate cannot reach the shipped path (its rows are 512 keys, below the cutoff), so it runs as a stress probe: a build with the cutoff at 1 sends every row through the tensor-core reader. The deltas are paired per scored row.
+
+| Probe (DQ8 pack, RTX 5080, 360 W, 100 chunks of 512, T=3) | Mean KLD | Top-1 | Paired dNLL | PPL |
+| --- | ---: | ---: | ---: | ---: |
+| `--kv int8`, scalar reader | 0.00343 | 97.51% | | 7.0762 |
+| tensor-core reader on every row, change | +0.00011 ± 0.00006 | -0.12 pt | +0.00036 ± 0.00046 | +0.036% |
+
+The depth the probe cannot reach is measured by scoring 1,000 forced tokens after each of 8 distinct 131,072-token prompts (a code corpus under a chat framing: the absolute NLL is high and only the paired differences carry meaning). The paired dNLL is the 95% interval over the 8,000 tokens; the scalar reader run twice scores byte-identically, so a difference is the reader and not run-to-run noise. A flip is a token whose NLL differs by more than 5 nats.
+
+| Deep comparison (DQ8 pack, RTX 5080, 360 W, 131,072 keys, 8 × 1,000 tokens) | Paired dNLL | Same top token | p90 \|dNLL\| | Flips (of 8,000) |
+| --- | ---: | ---: | ---: | ---: |
+| tensor-core reader against scalar INT8 | +0.0024 ± 0.025 | 93.92% | 0.37 | 102 |
+| `--kv fp16` against scalar INT8 (fp16 plans 2,033 experts in RAM, INT8 plans 1,614) | -0.0055 ± 0.028 | 93.08% | 0.48 | 130 |
+
+56 of the flips are at the same token in both comparisons. Flips go both ways at about equal rates, and the mean shift is inside its interval; the reader moves the deep output no more than changing the cache format does, though the fp16 row also changes the expert placement, so it is a yardstick and not a pure cache-format cost.
 
 ## Against the reference
 
