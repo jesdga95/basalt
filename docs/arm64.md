@@ -15,6 +15,8 @@ cmake --build build -j
 ctest --test-dir build -L cpu -LE avx512 -j 8 --output-on-failure
 ```
 
+`-DBASALT_MODELS="inkling2;qwen4exp"` builds only the models named, which is much quicker for a first build.
+
 `CUDACXX` names the toolkit's own `nvcc`: the `nvcc` of a distribution's CUDA package can stop on an SVE declaration in
 `math-vector.h` from the system's glibc. CMake picks Arm64 from the machine and defaults the architecture to 121 there, so
 `-DCMAKE_CUDA_ARCHITECTURES=121` only says it. `-DCMAKE_CUDA_ARCHITECTURES=120` on an Arm64 host builds for a discrete card.
@@ -37,20 +39,38 @@ The tests that need a GPU run on the machine as they do on x86. The AVX tests an
 
 ## Memory
 
-The CPU and the GPU share one pool of memory. What `cudaMemGetInfo` reports for an integrated GPU follows the system's free
-memory, which moves with the page cache and with whatever else runs, so the VRAM the planner sees is not a fixed card size. At
-start Basalt logs one line per integrated card:
+The CPU and the GPU share one pool of memory. The GB10's driver reports the system's free memory (MemFree) as the GPU's free
+memory, so the page cache counts as used: right after a large download or file read it can report a small fraction of what the
+system has available. Its allocations take the page cache back on demand, so the planners read an integrated GPU's free memory
+as the host's MemAvailable (`core/gpu_mem_info.hpp`), at most the pool's total. At start Basalt logs one line per integrated card
+with the driver's own figure beside the host's:
 
 ```
 basalt: gpu 0 is integrated: cudaMemGetInfo <free> MiB free of <total> MiB; host RAM <avail> MiB available of <total> MiB; --vram-reserve-mib <n>
 ```
 
-The planner sizes the weights and caches from the free figure and keeps the reserve clear of it. Anything the RAM tiers hold comes
-out of the same pool, so `--vram-reserve-mib` and `--ram-reserve-mib` together are the room left for the rest of the system. The
-reserve has no integrated-GPU default: set it by hand.
+The planner sizes the weights and caches from what is available and keeps the reserve clear of it. Anything the RAM tiers hold
+comes out of the same pool, so `--vram-reserve-mib` and `--ram-reserve-mib` together are the room left for the rest of the system.
+The reserve has no integrated-GPU default: set it to what the OS and anything else on the machine need (a few GiB).
+
+## Benchmarks
+
+NVML reads an integrated GPU's name only: no memory size, power limit or PCIe link. `basalt-bench --hardware` shows it as
+`integrated`, and an Arm CPU is named by its core types from `/proc/cpuinfo` (`10x Cortex-A725 + 10x Cortex-X925`). A
+`--community` row records the machine's memory as the GPU's and takes its power from `--power-label W`, which it requires on an
+integrated GPU (the SoC's limit is the system's, not the GPU's) and refuses beside a discrete card.
+
+## Quality
+
+The GPU kernels are the discrete card's, compiled for 12.1, and give the same output: Inkling 2 Mini's 100-chunk KLD on a GB10
+matched an RTX 5090's to every printed digit. The NEON expert kernels sum in a different order from the AVX-512 ones, so CPU
+experts are not bit-identical to an x86 build, at the same quality: with `--expert-cache 1500` the GB10 scored KLD 0.00435, top-1
+97.20% against the 5090's 0.00451 and 97.20%.
 
 ## Limits
 
 - Linux only. The platform seams have no Windows-on-Arm body.
 - The GPU kernels are the ones of the discrete card, compiled for 12.1; nothing is tuned for the integrated GPU's memory.
-- Output of the NEON kernels is not bit-identical to the x86 kernels: greedy tokens can differ from an x86 build of the same pack.
+- Output of the NEON kernels is not bit-identical to the x86 kernels: greedy tokens can differ from an x86 build of the same pack
+  when experts run on the CPU.
+- No NEON MXFP4 dot: a pack with MXFP4 experts (DeepSeek UD-Q2_K_XL) needs them on the GPU on Arm64.
