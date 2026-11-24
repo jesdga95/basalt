@@ -1,14 +1,14 @@
 // tests/kernels/gqa_window_parity.cpp - gqa_window_attn (basalt/kernels/gqa_attn.hpp) at Inkling 2's DSpark geometry
-// (24 x 128 query heads, 8 KV heads: a block of 8 rows is 24 rows of a KV group, two 16-row tiles; 16 rows are three)
+// (24 x 128 query heads, 8 KV heads: a block of 8 rows is 24 rows of a KV group, two 16-row tiles; 32 rows are six)
 // against a CPU reference in double precision, over block and per-row windows, a full and a wrapped sliding cache,
-// widths 1..16 and odd depths, short calls (one tile a block) and deep ones (two).
+// widths 1..32 and odd depths, short calls (one tile a block) and deep ones (two).
 //
 // Checks: max abs and rel error to the reference; a row's bits are the same at every width of a window with the same
 // end, and in a one-row window (another place in another tile); the outputs' bits against a frozen hash (a change that
 // must not move a bit leaves it as it is).  The inputs come from mt19937's raw output alone, so they are the same on
 // every platform.
-// --bench: the full-attention layer's call (a block of T rows over every cell) at 4K..160K cells, us per call and the
-// K/V bytes read once per call over that time, and the sliding layer's call.  Exit 77 without a GPU.
+// --bench: the full-attention layer's call (a window of 1..32 rows over every cell) at 4K..160K cells, us per call and
+// the K/V bytes read once per call over that time, and the sliding layer's call.  Exit 77 without a GPU.
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 
@@ -25,7 +25,9 @@
 
 namespace {
 
-constexpr int NH = 24, NKV = 8, HD = 128, B = 8, BW = basalt::kernels::kGqaMaxWindow;
+constexpr int NH = 24, NKV = 8, HD = 128;
+constexpr int BW = 32;   // the widest window checked and hashed (fixed, so the hash does not move with kGqaMaxWindow)
+static_assert(BW <= basalt::kernels::kGqaMaxWindow, "gqa_window_parity: windows of BW rows");
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -190,7 +192,7 @@ int main(int argc, char** argv) {
     std::printf("gqa_window_attn: a deep window's rows bitwise their one-row windows: %s (%d of %d differ)\n",
                 place_diff || !placed ? "NO" : "yes", place_diff, placed);
     if (place_diff || !placed) ++fails;
-    const unsigned long long frozen = 0x42549f805dda40afull;   // the one-tile kernel's
+    const unsigned long long frozen = 0x966f4088b1f5f753ull;   // the one-tile kernel's
     std::printf("gqa_window_attn hash: %016llx (bits against the frozen hash: %s)\n", hash, hash == frozen ? "identical" : "DIFFERENT");
     if (hash != frozen) ++fails;
     cudaFree(full.dk); cudaFree(full.dv); cudaFree(ring.dk); cudaFree(ring.dv); cudaFree(dscr); cudaFree(dwide);
@@ -203,12 +205,12 @@ int main(int argc, char** argv) {
         uint16_t* bv = dev<uint16_t>((size_t) cap * NKV * HD);
         ck(cudaMemset(bk, 0x2c, (size_t) cap * NKV * HD * 2), "memset");   // finite fp16 (0x2c2c = 0.0659)
         ck(cudaMemset(bv, 0x2c, (size_t) cap * NKV * HD * 2), "memset");
-        float* bs = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap, B, NH, HD));
+        float* bs = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap, BW, NH, HD));
         cudaEvent_t e0, e1;
         cudaEventCreate(&e0);
         cudaEventCreate(&e1);
         for (int64_t depth : {4096LL, 8192LL, 16384LL, 32768LL, 65536LL, 102400LL, 163840LL - 64}) {
-            for (int T : {1, 5, 8}) {
+            for (int T : {1, 5, 8, 16, 32}) {
                 const int64_t pos = depth - T, hi = pos + T, window = pos + T;
                 const int64_t cells = hi + 64;
                 const auto call = [&] {
