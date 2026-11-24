@@ -35,7 +35,9 @@ function(basalt_arm64_kernels_cpu)
   add_library(ggml_dots_neon OBJECT src/kernels/cpu/ggml/ggml_cpu_dots_neon.c)
   target_include_directories(ggml_dots_neon PRIVATE include src/kernels/cpu/ggml)
   target_compile_options(ggml_dots_neon PRIVATE ${BASALT_NEON_FLAGS})
-  target_compile_definitions(ggml_dots_neon PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_neon)
+  target_compile_definitions(ggml_dots_neon PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_neon
+                             ggml_vec_dot_mxfp8_q8_0_scalar=ggml_vec_dot_mxfp8_q8_0_scalar_neon
+                             ggml_mxfp8_q8_0_prep=ggml_mxfp8_q8_0_prep_neon ggml_mxfp8_q8_0_rows=ggml_mxfp8_q8_0_rows_neon)
   set_target_properties(ggml_dots_neon PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
   target_sources(kernels_cpu PRIVATE src/kernels/cpu/q2_neon.cpp src/kernels/cpu/x86_absent.cpp
                                      $<TARGET_OBJECTS:ggml_dots_neon>)

@@ -102,7 +102,7 @@ const struct ggml_type_traits_cpu* ggml_get_type_traits_cpu_neon(enum ggml_type 
 // most 8) such rows against the weight rows [r0, r1) `stride` bytes apart: out[t][r] is the bits of the table's
 // vec_dot of the weight row r and the token t's Q8_0 row, whatever `nt` is.  Each weight block is decoded once for
 // all the tokens.  The plain names pick the widest set this CPU has; the suffixed ones are each set's own (parity
-// tests and benchmarks), and `_scalar_` is the table-lookup row the vector rows equal.
+// tests and benchmarks; `_neon` exists on Arm64 only, the AVX ones on x86-64 only), and `_scalar_` is the table-lookup row the vector rows equal.
 #define GGML_MXFP8_PREP_BLOCK 144
 void ggml_mxfp8_q8_0_prep(int n, const void* y, float* out);
 void ggml_mxfp8_q8_0_rows(int n, const void* w, size_t stride, const float* const* prep, int nt, float* const* out, int r0,
@@ -113,6 +113,10 @@ void ggml_mxfp8_q8_0_rows_avx2(int n, const void* w, size_t stride, const float*
 void ggml_mxfp8_q8_0_prep_avx512(int n, const void* y, float* out);
 void ggml_mxfp8_q8_0_rows_avx512(int n, const void* w, size_t stride, const float* const* prep, int nt,
                                  float* const* out, int r0, int r1);
+void ggml_mxfp8_q8_0_prep_neon(int n, const void* y, float* out);
+void ggml_mxfp8_q8_0_rows_neon(int n, const void* w, size_t stride, const float* const* prep, int nt, float* const* out,
+                               int r0, int r1);
+void ggml_vec_dot_mxfp8_q8_0_scalar_neon(int n, float* s, const void* x, const void* y);
 void ggml_vec_dot_mxfp8_q8_0_scalar_avx2(int n, float* s, const void* x, const void* y);
 void ggml_vec_dot_mxfp8_q8_0_scalar_avx512(int n, float* s, const void* x, const void* y);
 
