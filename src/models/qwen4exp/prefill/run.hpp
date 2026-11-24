@@ -24,6 +24,9 @@
 namespace basalt::prefill {
 using namespace detail;
 
+/// The two-pass QSA scorer's device counters (--exp qsa_two_pass_check=1), logged and zeroed at a prompt's end.
+void log_two_pass_counts(cudaStream_t cs);
+
 struct Prefill::Run {
     struct Chunk;
     Run(Prefill& owner, const int64_t* tokens, int64_t n, int64_t pos0, std::string& err)

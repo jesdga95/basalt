@@ -458,6 +458,11 @@ if(BUILD_TESTING)
   target_include_directories(peer_take_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_embed_manifest(peer_take_test)
   basalt_cpu_test(NAME peer_take_test COMMAND peer_take_test)
+  # the two-pass QSA scorer's bound and cut-off rule (no GPU)
+  add_executable(qsa_two_pass_test tests/models/qwen4exp/kernels/qsa_two_pass_test.cpp)
+  target_include_directories(qsa_two_pass_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  basalt_embed_manifest(qsa_two_pass_test)
+  basalt_cpu_test(NAME qsa_two_pass_test COMMAND qsa_two_pass_test)
   # shared code must not include a model; models must not include each other
   # a check of the tree's text, in bash and python3: Linux's run covers it for every platform
   if(NOT WIN32)
@@ -1236,6 +1241,12 @@ add_executable(decode_cluster_parity tests/models/qwen4exp/kernels/decode_cluste
 target_include_directories(decode_cluster_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(decode_cluster_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME decode_cluster_parity COMMAND decode_cluster_parity --selftest)
+# the two-pass QSA block scores vs the 3xTF32 prompt scorer (the same ids, scored-again blocks bitwise) and vs a
+# CPU reference (GPU, synthetic, no model); --bench: per-call times
+add_executable(qsa_two_pass_parity tests/models/qwen4exp/kernels/qsa_two_pass_parity.cpp)
+target_include_directories(qsa_two_pass_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(qsa_two_pass_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME qsa_two_pass_parity COMMAND qsa_two_pass_parity --selftest)
 
 add_executable(rope_parity tests/models/qwen4exp/kernels/rope_parity.cpp)
 target_include_directories(rope_parity PRIVATE ${_gpu_include_directories})
