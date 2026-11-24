@@ -55,6 +55,9 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kMaxRows = kDecodeRows;    // rows of one forward call (a decode window, a step of a prompt)
+// a read of up to this many tokens runs as decode windows: the prompt path's fixed cost (staging the spilled layers'
+// experts on the card) is more than eight of them
+constexpr int kWindowRead = 8 * kMaxRows;
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
 constexpr int kStage = 64;               // windows whose tokens and positions are in flight from the pinned ring at once
@@ -458,7 +461,7 @@ public:
         if (r.pos == 0) restart_positions(r.n_tokens);
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) r.pos);
-        if (sh_->prompt && r.n_tokens > 16) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
+        if (sh_->prompt && r.n_tokens > kWindowRead) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};

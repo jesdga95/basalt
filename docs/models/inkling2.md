@@ -125,9 +125,11 @@ RTX 5060 Ti runs the 5090 alone (355, 642 and 306 tok/s); a split forced at 12 t
 
 ## Long prompts
 
-Prompts of more than 16 tokens read in chunks of up to 4,096 rows on the tensor cores: the NVFP4 experts on the FP4 block-scaled
+Prompts of more than 64 tokens read in chunks of up to 4,096 rows on the tensor cores: the NVFP4 experts on the FP4 block-scaled
 tensor cores (each activation row as two FP4 terms, [precision](../precision/inkling2.md#where-each-stage-rounds)), the other
-products through MMQ. The drafter sees every chunk. With experts in RAM a chunk stages each spilled layer's experts on the card,
+products through MMQ. A read of up to 64 tokens, such as a turn's new tokens, runs as decode windows: with experts in RAM a
+chunk's fixed cost is more than eight windows. The drafter sees every chunk.
+With experts in RAM a chunk stages each spilled layer's experts on the card,
 from their card copies when it has them all. At `--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are
 found; decode runs at 264 tok/s on a short chat, 173 at 131K and 108 at 400K (plain decoding), and a 400K prompt reads at about
 4,110 tok/s. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server
