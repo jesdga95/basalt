@@ -17,6 +17,7 @@
 
 #include "basalt/core/conversation_cache.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -84,6 +85,9 @@ public:
 
     Stats stats() const;
     uint64_t queued_bytes() const;
+    /// Whether an image of `bytes` would be written: the volume keeps its floor free after the queue and the image. A
+    /// caller asks before it copies a conversation off the card, so a full disk costs no copy the writer then drops.
+    bool fits(uint64_t bytes) const;
 
 private:
     struct Entry;
@@ -101,6 +105,7 @@ private:
     void gc_locked(int64_t min_age);         ///< removes unused block and state files at least `min_age` s old
 
     std::string dir_;
+    mutable std::atomic<bool> full_said_{false};   ///< fits() said the volume is full, once until it has room again
     uint64_t identity_ = 0, budget_ = 0;
     bool open_ = false;
     mutable std::mutex mu_;
