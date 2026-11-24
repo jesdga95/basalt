@@ -102,6 +102,9 @@ requests find the session a read on the main card alone leaves: the output is th
 main card's kernels on the same rows). Log lines start with `prompt split:`. Decoding never uses the second card.
 A 64K prefill reads 17% faster than on one card (7,410 against 6,336 tok/s, an RTX 5090 at 400 W with an RTX 5060 Ti at 180 W,
 ABBA); decode is unchanged.
+A prompt read is compute-bound, so a card with less compute than its memory bandwidth suggests reads fewer layers than the bandwidth
+default gives it: on an RTX 5090 with an RTX 5060 Ti, `"gpu-share": "3,1"` (the 5060 Ti reads layers 48 to 63) reads 16K and 64K
+prompts a few percent faster than the default shares (layers 51 to 63).
 
 The start line names it (`gpus: peer; RTX 5090 (nvidia-smi 0) main, share ...; RTX 5060 Ti (nvidia-smi 1) peer, share ...`), then
 `prompt split: CUDA1 reads layers 51-63 of prompts over 8192 tokens; N GiB of page-locked hand-off buffers`. The second card holds
