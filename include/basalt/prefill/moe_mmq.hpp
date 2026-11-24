@@ -39,6 +39,12 @@ int64_t q8_blocks(int64_t cols);
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
 
+/// `quantize` of `rows` rows of a squared-ReLU expert group's input product, each value first relu(x s_in)^2 s_down with its
+/// row's expert's scales: row r is expert j's for bounds[j] <= r < bounds[j + 1] (device, n_experts + 1 entries), its
+/// scales tails[4 j] and tails[4 j + 2] (an NVFP4 blob's tail).
+void quantize_relu2(const float* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, const int32_t* bounds,
+                    int n_experts, const float* tails, void* stream);
+
 /// Rows ids[0..rows) of `xq` (`src_rows` rows quantized for MMQ, `cols` values each) into `dst` as `rows` rows: the same
 /// bytes `quantize` writes when given those ids.
 void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream);
