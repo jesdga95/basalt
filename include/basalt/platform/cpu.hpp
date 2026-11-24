@@ -38,6 +38,11 @@ struct CpuInfo {
 };
 CpuInfo cpu_info();
 
+/// An Arm processor's name from /proc/cpuinfo text, which has no "model name" there: each core type's count and name from
+/// its implementer and part ids, the most numerous first ("10x Cortex-X925 + 10x Cortex-A725"). A part this table does
+/// not know is named by its ids ("Arm 0x41:0xd99"). Empty when the text lists no Arm parts.
+std::string arm_cpu_name(const std::string& cpuinfo);
+
 /// The logical processors that share each last-level (L3) cache, one group per cache in the OS's order: an AMD CCD, or an
 /// Intel die. Processors are named as above. Empty when the OS does not say.
 std::vector<std::vector<int>> cpu_l3_groups();
