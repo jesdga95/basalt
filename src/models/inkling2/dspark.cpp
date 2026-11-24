@@ -41,7 +41,7 @@ constexpr int kTypeBF16 = 30;
 constexpr int kE = kWidth;
 constexpr int kQ = kHeads * kHeadDim;      // 3072
 constexpr int kKV = kKvHeads * kHeadDim;   // 1024
-constexpr int kFrRing = 16;                // positions whose Markov context the ring keeps
+constexpr int kFrRing = 32;                // positions whose Markov context the ring keeps
 constexpr int kSlice = 8;                  // rows of one commit step (MMVQ's widest)
 constexpr int kRingExtra = 64;             // a sliding-window layer's ring: its window, a block and a window's rows past it
 constexpr int kDumpBlocks = 24;            // blocks --diag-dump writes
@@ -821,6 +821,8 @@ bool dspark_parse_flag(const std::string& a, model::FlagArgs& args, program::Com
     if (a == "--spec") {
         o.spec = std::atoi(args.next("--spec"));
         o.spec_given = true;
+    } else if (a == "--suffix-draft") {
+        o.suffix_draft = std::atoi(args.next("--suffix-draft"));
     } else if (a == "--draft-log") {
         core::diagnostics().draft_log = args.next("--draft-log");
     } else {
@@ -835,7 +837,7 @@ void dspark_finish_flags(program::CommonOptions& o) {
     const core::Json* kv = !o.model.empty() && file.open(o.model, err) && file.load_meta(err) ? file.meta().get("gguf_kv") : nullptr;
     const bool present = kv != nullptr && kv->get("inkling2.dspark.block_count") != nullptr;
     // the pack's drafter offers a whole block (the window policy takes the rows that pay) unless --spec caps it
-    if (!o.spec_given) o.spec = present ? kDsBlock : 0;
+    if (!o.spec_given) o.spec = present ? (o.suffix_draft > 0 ? kDecodeRows : kDsBlock) : 0;
     if (o.spec >= 2 && !present) {
         basalt::log::warn("basalt inkling2", "--spec %d off: the pack has no drafter", o.spec);
         o.spec = 0;
