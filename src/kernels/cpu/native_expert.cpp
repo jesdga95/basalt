@@ -277,8 +277,13 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         mx8_down_rows(f, blob, hq, nt, out, r0, r1);
         return;
     }
-    const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
+    // Larger Q5_1 groups amortize the shared unpack; small groups keep the per-token dot.
+    if (f.d_type == GGML_TYPE_Q5_1 && nt >= 3 && cpu_avx2_ok()) {
+        kq256_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+        return;
+    }
+    const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     float sd = 1.f;
     if (f.tail) std::memcpy(&sd, blob + f.bytes - f.tail + 8, 4);
     static const bool avx512 = cpu_avx512_ok();

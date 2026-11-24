@@ -52,10 +52,44 @@ the text model.
   those experts need to mapped memory, then rings the CPU coordinator. The CPU pool (`--pool-workers`) runs those pairs
   while the card runs the rest. The card takes the CPU's rows only when the completion ticket matches the visit. Visits
   with no RAM pairs skip the hand-off, and the watchdog can release a stalled wait. The
-  full visits' caches then back their first 32,768 positions and grow as prompts
-  need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
-  giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a
-  smaller card the spill is static: what does not fit stays in RAM. Nothing changes when everything fits.
+  full visits' caches and the drafter's full layer then back their first 32,768 positions and grow as prompts need them, and
+  the experts planned into RAM are copied back to the card while the caches leave room. A conversation that starts over, or
+  resumes needing at most half the positions the caches back (a compacted one, or another on a shared prefix), trims them
+  to what its prompt needs and copies experts back into the memory freed; a conversation's own turns never trim. A short chat at
+  `--max-context 1048576 --kv fp8` keeps every expert on the card. On a smaller card the spill is static: the caches are whole
+  from the start and the RAM experts are copied back while the card has room. Either way the copies leave the card's spare
+  free: 1 GiB at the start and 512 MiB after a cache grow, or `--vram-reserve-mib N` for both (at least 128, 256 where the
+  driver pages GPU memory); with the flag they also leave 256 MiB for what loads after them (kernels at their first launch,
+  the windows' graphs). The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
+  another program, can take it. Placement counts the card's free memory itself: it reads it when the copies are first
+  placed, at a VRAM resize and at a wake, and counts every map and release of the copies and the caches after that (what
+  loads later comes out of the spare and the 256 MiB). A grow or a copy that cannot map what was counted (another
+  program took the memory, or graphs and modules needed more than the spare) reads the card again, sends copies back for it
+  and goes on; a grow that does not fit even then refuses its request, as when the context does not fit. The log says
+  `placement changed by a memory shortage at` the position (or the start, wake or resize) where it happened. The copies
+  lie back to back in one address range; a demote packs the survivors together so whole pages go back. A window whose
+  graph finds no device memory runs direct, and windows of its shape keep running without a graph (no copy moves); a
+  batched window's graph has no such fallback. A VRAM resize the copies cannot meet is refused before any copy moves. A
+  copy table update, a copy's upload, or a map or cache backing that fails for any reason but a clean lack of memory (a
+  CUDA failure) stops the engine: every later request is refused. With one session, a refused decode window ends its
+  request with an error and the engine serves the next. Nothing changes when everything fits.
+- **Which experts get a copy:** the profile's order until the session has looked experts up, then the lookups of the rows its
+  windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
+  grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies
+  move to clearly hotter RAM experts of the same size.
+- **Prompt loan:** with an elastic spill, one session and one card, the prompt path's device memory that decode leaves idle (the
+  chunk buffers' arena and the experts' prompt staging) holds copies of the next highest-ranked RAM experts, chosen after the
+  turn's first decode window. Their uploads run beside the next windows, a bounded part after each, and the copies are used
+  from 32 positions after that first window (that window waits for an upload still running), except those a copy of the
+  card's own reached first. A prompt read through the staging takes the memory
+  back first; a read through the decode path leaves the loan in place. Loaned copies use the card's arithmetic
+  ([precision](../precision/inkling2.md)).
+- **Same tokens on every run:** with one session, placement follows the token stream and the start state unless the log
+  shows `placement changed by a memory shortage`: it only changes at positions the requests fix (a request's start, the
+  rebalances, the loan, a cache grow) and by counted memory, and a decode window never crosses such a position, so the
+  same greedy requests give the same tokens run to run whatever the windows' widths. The log's `copy set` names the copied
+  experts after each change. A different free VRAM at start, a VRAM command, a sleep, a conversation restored from the
+  parked store or several sessions decoding together can give a different placement.
 - **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
   At a sleep the card's copies of the RAM experts go back to RAM (the CPU computes them) and the driver moves the rest
   of the GPU state to host memory; the wake takes the copies back while the card has room. `reserve_mib` resizes them the
@@ -128,7 +162,10 @@ RTX 5060 Ti runs the 5090 alone (355, 642 and 306 tok/s); a split forced at 12 t
 Prompts of more than 16 tokens read in chunks of up to 4,096 rows on the tensor cores: the NVFP4 experts on the FP4 block-scaled
 tensor cores (each activation row as two FP4 terms, [precision](../precision/inkling2.md#where-each-stage-rounds)), the other
 products through MMQ. The drafter sees every chunk. With experts in RAM a chunk stages each spilled layer's experts on the card,
-from their card copies when it has them all. At `--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are
+each from its card copy while the spill still holds one and from RAM where the caches' growth sent it back; a chunk of at
+most 1,024 rows (a tool result, a short turn) stages only the experts its rows route to; a longer chunk copies a layer's
+experts on a second stream once the spilled visit before it has read the staging, under the kernels in between. At
+`--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are
 found; decode runs at 264 tok/s on a short chat, 173 at 131K and 108 at 400K (plain decoding), and a 400K prompt reads at about
 4,110 tok/s. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server
 (`--max-context 262144`). On an RTX 5090 at 400 W with every expert on the card, prompts of 2K, 16K, 32K and 128K tokens read at
@@ -186,8 +223,8 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
   so a spilled card decodes slower than a full one: an RTX 5060 Ti alone at 180 W with a Ryzen 9 9950X and about 1,100 experts in RAM decodes conversation at 59 tok/s,
   struct at 118 and prose at 53, about 2.6 times as fast as reading them over the bus; prompts read as before (2,430 tok/s
   at 16K).
-- The server's `decode expert cache hit rate` counts a lookup as a hit when its expert is on a GPU, the second card's included;
-  the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.
+- The server's `decode expert cache hit rate` counts a lookup as a hit when its expert was on a GPU when it ran, the second
+  card's included (a copy that moves later leaves its past lookups where they were); the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.
 - No video.
 
 ## Speed

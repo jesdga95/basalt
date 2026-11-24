@@ -38,7 +38,7 @@ RATIO_LOW, RATIO_HIGH = 0.3, 6.0
 CAPS = {"submitter": 40, "notes": 200, "cpu": 80, "engine_args": 300, "quant": 40, "preset": 30, "gpu_name": 80}
 TEXT_RE = re.compile(r"^[^<>`\\]*$")
 URL_RE = re.compile(
-    r"(?i)(https?|ftp|file|data|javascript|ssh|git)\s*:|//|www\.|\bt\.me\b|@"
+    r"(?i)\b(https?|ftp|file|data|javascript|ssh|git)\s*:|//|www\.|\bt\.me\b|@"
     r"|\b[a-z0-9-]+\.(com|net|org|io|dev|ai|app|xyz|co|me|gg|ly|sh|to|cc|info|ru|cn|link|site|top|tk|ml|ga|cf|gq|zip|mov)\b"
     r"|\]\(")
 BIDI_RE = re.compile(r"[​-‏‪-‮⁠-⁩﻿]")

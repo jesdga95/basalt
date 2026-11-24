@@ -6,6 +6,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -60,6 +61,7 @@ public:
             const uint64_t identity = basalt::core::conversation_store_hash_file(
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;
+            disk.set_row_cells(session().disk_row_cells());
             if (o.prompt_cache <= 0) {
                 basalt::log::warn("basalt serve", "conversation cache on disk off: --prompt-cache 0");
             } else if (!disk.open(o.conversation_cache_dir, identity, (uint64_t) o.conversation_cache_disk_mib << 20, de)) {
@@ -151,6 +153,17 @@ public:
         char* end = nullptr;
         const long long reserve = cmd.size() > 4 ? std::strtoll(cmd.c_str() + 4, &end, 10) : -1;
         if (cmd.size() > 4 && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+        if (reserve >= 0) {
+            const int floor = vram_floor_mib();
+            if (reserve < floor) {
+                e = "VRAM reserve is below " + std::to_string(floor) + " MiB";
+                return false;
+            }
+            if ((uint64_t) reserve > (UINT64_MAX >> 20)) {
+                e = "VRAM reserve is too large";
+                return false;
+            }
+        }
         int64_t slots = 0;
         if (const basalt::model::Result r = session().set_vram_reserve(reserve, slots); !r.ok()) {
             e = r.message;
@@ -258,8 +271,8 @@ public:
         image.cvec = cvec;
         return true;
     }
-    // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
-    // session goes on holding it (`kept`) and only the disk lacks it.
+    // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no RAM tier or
+    // no room in it.
     bool park_current(size_t held, int64_t kept) override {
         ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
@@ -267,10 +280,16 @@ public:
         int64_t deepest = 0;
         for (const ConvCheckpoint& c : checks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
         const bool disk_wants = disk.enabled() && !(kept > 0 && kept >= deepest) && !disk_has(live, live_imgs, checks, cvec_cached);
-        bool to_disk = !conversations->enabled() || kept > 0;
+        bool to_disk = !conversations->enabled();
         if (to_disk && !disk_wants) return true;
+        if (!to_disk)
+            if (const size_t dropped = conversations->drop_superseded(live, live_imgs, checks, cvec_cached))
+                basalt::log::info("basalt serve", "conversation cache: dropped %zu superseded cop%s of this "
+                                  "conversation; parked=%zu", dropped, dropped == 1 ? "y" : "ies", conversations->size());
         const int64_t positions = (int64_t) live.size();
-        const size_t estimate = session().running_bytes() + session().cells_bytes(positions);
+        size_t estimate = session().running_bytes() + session().cells_bytes(positions) +
+                          live.size() * sizeof(int32_t) + live_imgs.size() * sizeof(ImgKey);
+        for (const ConvCheckpoint& c : checks) estimate += c.bytes();
         const bool ram_room = !to_disk && conversations->make_room(estimate, held);
         if (!to_disk && !ram_room && disk_wants) to_disk = true;
         if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
@@ -440,13 +459,19 @@ public:
     int max_window() const { return rt_.session().max_window(); }
     int draft_window() {
         const int T = rt_.policy->window(conf_.data(), n_draft_);
-        return (int) std::max<int64_t>(1, std::min<int64_t>(T, runtime_.o.max_context - p));
+        return (int) std::max<int64_t>(1, std::min<int64_t>(T, most_rows()));
+    }
+    // the context's end, or a position the session changes state at (window_limit)
+    int64_t most_rows() const {
+        const int limit = rt_.session().window_limit(p);
+        const int64_t room = runtime_.o.max_context - p;
+        return limit > 0 ? std::min<int64_t>(room, limit) : room;
     }
     // a lookup proposal takes the window when its first token is the drafter's (or the drafter has none) and the policy
     // expects more tokens per ms from it
     void lookup_window(int& T, bool& from_sfx, int& sfx_match) {
         if (!rt_.sfx || first_window || ppl != nullptr) return;
-        const int most = (int) std::min<int64_t>(max_window(), runtime_.o.max_context - p);
+        const int most = (int) std::min<int64_t>(max_window(), most_rows());
         if (most < 2) return;
         const int k = rt_.sfx->propose(most - 1, sbuf_.data());
         sfx_match = rt_.sfx->last_match();
@@ -480,11 +505,14 @@ public:
         d.history_len = hist_n;
         req_sp.counter = draws_;
         const basalt::model::Result r = rt_.session().decode_window(d);
+        refused_ = r.status == basalt::model::Status::Refused;
+        if (refused_) basalt::log::warn("basalt serve", "%s", r.message.c_str());
         if (!r.ok()) error_ = r.message;
         return r.ok();
     }
     bool take_held(int) { return false; }
     bool window_failed() const { return false; }
+    bool window_refused() const { return refused_; }
     const char* window_error() const { return error_.c_str(); }
     void relax_note_forced(int) {}
     int accept_drafts(int T) {
@@ -511,9 +539,13 @@ public:
     }
     void stamp_before_commit() {}
     // each row's pick is the draw of its own index, whatever the width of the window
-    bool commit(int keep, std::string&, int phase) {
-        if (phase == 2) draws_ += (uint64_t) keep;
-        return true;
+    bool commit(int keep, std::string& e, int phase) {
+        if (phase != 2) return true;
+        draws_ += (uint64_t) keep;
+        basalt::model::ModelSession* s = &rt_.session();
+        const basalt::model::Result r = s->decode_kept(&s, &keep, 1);
+        if (!r.ok()) e = r.message;
+        return r.ok();
     }
     void on_token(int32_t tok) {
         if (rt_.sfx) rt_.sfx->append(tok);
@@ -644,6 +676,7 @@ private:
     FILE* draft_log_ = nullptr;
     basalt::model::ModelSession::ExpertCounts counts0_;
     std::string error_;
+    bool refused_ = false;   // the last window was refused (Status::Refused): the request ends, the engine serves on
     size_t next_block_ = 0;
     double live_ms_ = -1e9;
 };
@@ -826,6 +859,7 @@ int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::m
                 basalt::model::Started& started) {
     std::string err;
     SessionRuntime runtime(o, file, err, started);
+    const basalt::core::GpuLeftRunningExit left_running;
     runtime.pre_ = adapter.pretokenizer();
     return runtime.execute();
 }

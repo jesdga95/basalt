@@ -7,10 +7,13 @@
 // windows beat; the stage is two relaxed stores per layer, which the token path does not notice.
 #pragma once
 
+#include "basalt/log.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 namespace basalt::core {
 
@@ -42,6 +45,16 @@ inline void release_gpu_waits(std::FILE* f) {
 /// Set when a release's GPU did not finish: the CUDA teardown of an ending engine would wait for that work forever,
 /// so an engine ending on an error leaves without it.
 inline std::atomic<bool>& gpu_left_running() { static std::atomic<bool> f{false}; return f; }
+/// Declared after the GPU's owners: a scope left (a return or an exception) with gpu_left_running() set ends the engine
+/// there, before their teardown runs.
+struct GpuLeftRunningExit {
+    ~GpuLeftRunningExit() {
+        if (!gpu_left_running().load()) return;
+        basalt::log::error("basalt", "the GPU did not finish its work: ending without the CUDA teardown");
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+};
 
 inline Progress& progress() {
     static Progress p;

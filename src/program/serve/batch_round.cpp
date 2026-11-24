@@ -35,7 +35,9 @@ struct SlotWin {
 void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
     BSlot& sl = bs[(size_t) b];
     basalt::model::ModelSession& s = slot_session(b);
-    const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit});
+    const int own_limit = s.window_limit(sl.p);
+    const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit,
+                                              own_limit > 0 ? (int64_t) own_limit : INT64_MAX});
     const int own = s.own_window(sl.dprob, sl.n_dr);
     w.T = std::max(1, std::min(own > 0 ? own : bpolicy->window(sl.dprob, sl.n_dr), most));
     w.from_sfx = false;

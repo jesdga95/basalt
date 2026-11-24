@@ -9,13 +9,13 @@
 
 namespace basalt::prefill::mxfp8 {
 
-constexpr int kBlockTokens = 256;
+constexpr int kBlockTokens = 128;
 
 /// Bytes of activation planes for `rows` rows of `cols` values (cols a multiple of 128): E4M3 codes [rows][cols],
 /// then UE8M0 block scales [rows][cols / 32] (padded to 16 bytes).
 size_t act_bytes(int64_t rows, int64_t cols);
 
-/// Plans 256-row GEMM blocks per expert into blk_off[0..n] (n <= 1024).
+/// Plans 128-row GEMM blocks per expert into blk_off[0..n] (n <= 1024).
 void plan_blocks(const int32_t* bounds, int n, int32_t* blk_off, void* stream);
 inline int64_t max_blocks(int64_t rows, int n) { return (rows + kBlockTokens - 1) / kBlockTokens + n; }
 
@@ -28,12 +28,12 @@ struct Product {
     const uint8_t* base = nullptr;      ///< expert 0's blob; expert j is at base + j * stride
     size_t stride = 0;
     size_t w_off = 0;
-    int64_t w_rows = 0, w_cols = 0;     ///< w_rows a multiple of 64 (128 when swiglu), w_cols a multiple of 128
+    int64_t w_rows = 0, w_cols = 0;     ///< w_rows a multiple of 128, w_cols a multiple of 128
     int n = 0;                          ///< number of experts (<= 1024)
     const void* act = nullptr;          ///< MXFP8 activation planes (act_bytes(act_rows, w_cols))
     int64_t act_rows = 0;               ///< rows in `act` (tokens for GATHER, pairs otherwise)
     const int32_t* bounds = nullptr;    ///< [n + 1] expert row bounds
-    const int32_t* blk_off = nullptr;   ///< [n + 1] from plan_blocks (256-row GEMM blocks per expert)
+    const int32_t* blk_off = nullptr;   ///< [n + 1] from plan_blocks (128-row GEMM blocks per expert)
     int64_t blocks = 0;                 ///< max GEMM blocks (max_blocks(pairs, n))
     const int32_t* ids = nullptr;       ///< GATHER: row i reads act row ids[i]; null: row i reads act row i
     const int32_t* dst_ids = nullptr;   ///< optional output scatter: row i writes dst[dst_ids[i] * ld_dst]

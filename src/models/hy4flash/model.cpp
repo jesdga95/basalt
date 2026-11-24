@@ -6,6 +6,7 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/hy4flash/context_policy.hpp"
@@ -171,7 +172,11 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
             d.type = kTypeQ8_0;
             d.bytes = t.shape[0] * t.shape[1] / 32 * 34;
         }
-        if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
+        // the prompt products (MMQ) read the last row of a matrix whose rows are not a multiple of 256 values on to the next
+        // multiple: zeros past the end, so the read stays inside the allocation wherever it lies
+        const uint64_t past = !t.shape.empty() && prefill::mmq::supported(d.type) ? prefill::mmq::read_past_bytes(d.type, (int64_t) t.shape[0]) : 0;
+        if (cudaMalloc(&d.ptr, d.bytes + past) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
+        if (past > 0 && cudaMemset((uint8_t*) d.ptr + d.bytes, 0, past) != cudaSuccess) return {model::Status::Error, "hy4flash: cannot clear the tail of " + name};
         core::LoadItem it;
         it.file = file;
         it.off = t.offset;

@@ -67,6 +67,7 @@ constexpr int kRowWidth = 576;                 // a cache row: 512 latent values
 constexpr int kMaxChunk = 16384;               // rows a prompt chunk may carry (the residual streams and the experts' pairs)
 constexpr int kAttRows = 2048;                 // rows of one attention step inside a chunk (the rings are sized for it)
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
+constexpr int kMmqTile = 128;                  // the widest column tile of an MMQ product
 constexpr int kLaunchRows = 16384;              // most (row, expert) pairs of one prompt launch
 constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
 constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
@@ -293,13 +294,14 @@ public:
         // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
         const size_t stride = m_.expert_stride();
         for (Scratch::Staged& b : sc.stage) {
-            b.blobs = (uint8_t*) alloc(stride * kStageExperts, ok);
+            b.blobs = (uint8_t*) alloc(stride * kStageExperts + expert_past(), ok);
+            if (ok) cudaMemset(b.blobs + stride * kStageExperts, 0, expert_past());
             b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
             b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
         }
         sc.xq1 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
         sc.xq2 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
-        sc.heads_ids = (int32_t*) alloc((size_t) max_heads_ * kAttRows * 4, ok);
+        sc.heads_ids = (int32_t*) alloc(((size_t) max_heads_ * kAttRows + kMmqTile) * 4, ok);
         sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
         sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
         {
@@ -394,8 +396,9 @@ public:
         b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
         b.erows = f((int64_t) A * g_.n_embd); b.ekv = f((int64_t) A * 5 * E); b.evalid = f(A);
         b.pair_rows = f((int64_t) R * g_.n_used * g_.n_latent);
-        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
-        b.mmq_ident = (int32_t*) f(A);
+        b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); // the identity maps are the ids of MMQ products: a tile reads the ids of its 128 columns, past the last row of the product
+        b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used + kMmqTile);
+        b.mmq_ident = (int32_t*) f(A + kMmqTile);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
         if (count) {
             f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
@@ -417,8 +420,8 @@ public:
             return false;
         }
         if (basalt::prefill::mmq::built()) {
-            basalt::prefill::mmq::iota(b.mmq_ident, A, nullptr);
-            basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used, nullptr);
+            basalt::prefill::mmq::iota(b.mmq_ident, A + kMmqTile, nullptr);
+            basalt::prefill::mmq::iota(b.pair_ident, (int64_t) R * g_.n_used + kMmqTile, nullptr);
         }
         cudaDeviceSynchronize();
         return true;
@@ -699,6 +702,9 @@ public:
                     return {model::Status::Refused, "hy4flash: elastic KV: " + std::to_string(need) + " positions would take the expert tier below the " +
                                                       std::to_string(prompt_floor_bytes() / stride_) + " slots a prompt chunk needs (about " +
                                                       std::to_string(ceiling) + " fit; --kv fp8 halves a position's bytes)"};
+                // the caches take their memory before open_prompt sizes the chunk buffers and optional expert ring
+                if (!ensure_positions(need, err))
+                    return {grow_failed_ ? model::Status::Refused : model::Status::Error, "hy4flash: " + err};
             }
         }
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
@@ -770,8 +776,8 @@ public:
             emb_rows_ = rows + (size_t) at * (size_t) g_.n_embd;
             img_j_ = at;
             const bool ok = run_rows(dead.data(), n, pos + at, 0, err);
-            if (!ok && grow_failed_) return {model::Status::Refused, "hy4flash: " + err};
             emb_rows_ = nullptr;
+            if (!ok && grow_failed_) return {model::Status::Refused, "hy4flash: " + err};
             if (!ok) return {model::Status::Error, "hy4flash: " + err};
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the image rows failed"};
@@ -797,9 +803,10 @@ public:
         for (int l = 0; l < g_.n_layers; ++l) sparse += !g_.swa[(size_t) l];
         return (double) sparse * ((double) sparse_row_bytes() + (double) g_.idx_dim * 2.0 / (double) g_.idx_pool);
     }
-    // the free memory a prompt chunk needs: the expert ring and the buffers of a chunk of attention-step rows
+    // the free memory a prompt chunk needs: the buffers of a chunk of attention-step rows; the expert ring is optional
+    // (open_prompt falls back to per-layer staging when it does not fit)
     static constexpr uint64_t kPromptFloorBuffers = 1ull << 30;
-    uint64_t prompt_floor_bytes() const { return 2ull * (uint64_t) g_.n_expert * stride_ + kPromptFloorBuffers; }
+    uint64_t prompt_floor_bytes() const { return kPromptFloorBuffers; }
     // the positions the caches can back before the expert tier's slots and the free memory above its floor would no longer hold
     // a prompt chunk's needs
     int64_t kv_ceiling() override {
@@ -914,6 +921,8 @@ public:
         return ctxp::cache_bytes(positions, sparse, fp8()) * (f32() ? 2 : 1);
     }
 
+    int64_t disk_row_cells() const override { return g_.idx_pool; }
+
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
         cudaStreamSynchronize(stream_);
@@ -923,7 +932,7 @@ public:
             if (g_.swa[(size_t) l]) continue;
             core::ConversationKv k;
             k.format = cell_format();
-            k.page_size = g_.idx_pool;
+            k.page_size = 1;
             k.cells = positions;
             k.pooled_rows = (int64_t) pools;
             k.idx_dim = g_.idx_dim;
@@ -943,10 +952,12 @@ public:
         std::string e;
         if (!ensure_positions(positions, e)) return {model::Status::Error, "hy4flash: " + e};
         cudaStreamSynchronize(stream_);
+        const int64_t pools = positions / g_.idx_pool + 1;
         size_t i = 0;
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
-            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != g_.idx_pool || kv[i].cells != positions)
+            if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != 1 || kv[i].cells != positions ||
+                kv[i].pooled_rows != pools)
                 return {model::Status::Error, "hy4flash: a parked conversation has other caches"};
             const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) { return cudaMemcpy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });
@@ -1436,10 +1447,27 @@ private:
     std::thread ring_thr_[2];
     bool ring_ok_[2] = {false, false};
 
-    size_t expert_ring_bytes() const { return 2 * (size_t) g_.n_expert * stride_; }
+    // The bytes the prompt products read past the last expert of a buffer of blobs: the last row of a matrix whose rows are not a
+    // multiple of 256 values is read on to the next multiple (zeros there, as a stray scale could be a NaN)
+    size_t expert_past() const {
+        namespace mmq = basalt::prefill::mmq;
+        size_t past = 16;
+        for (const ExpertLayer& el : m_.pack().experts) {
+            if (mmq::supported(el.gu_type)) past = std::max(past, mmq::read_past_bytes(el.gu_type, g_.n_latent));
+            if (mmq::supported(el.d_type)) past = std::max(past, mmq::read_past_bytes(el.d_type, g_.n_ff_exp));
+        }
+        return past;
+    }
+    size_t expert_ring_bytes() const { return 2 * (size_t) g_.n_expert * stride_ + expert_past(); }
     bool ring_open() {
         if (cudaMalloc((void**) &ring_, expert_ring_bytes()) != cudaSuccess) {
             cudaGetLastError();
+            ring_ = nullptr;
+            return false;
+        }
+        if (cudaMemset((uint8_t*) ring_ + 2 * (size_t) g_.n_expert * stride_, 0, expert_past()) != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(ring_);
             ring_ = nullptr;
             return false;
         }
@@ -2826,9 +2854,12 @@ private:
                 return false;
             }
             cudaStreamSynchronize(stream_);
-            if (attempt == 0) tier_->shrink();
-            else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) lent = true;
-            else {
+            if (attempt == 0) {
+                if (ring_) ring_close();
+                tier_->shrink();
+            } else if (attempt == 1 && tier_->partial_lend() && tier_->lend(grow_bytes(target))) {
+                lent = true;
+            } else {
                 tier_->lend_all();
                 lent = lent_all = true;
             }
@@ -2927,7 +2958,7 @@ private:
                 if (cudaMalloc((void**) &d_hist_, n * 4) != cudaSuccess) { cudaGetLastError(); err = "out of device memory for the sampling history"; return false; }
                 d_hist_len_ = n;
             }
-            cudaMemcpyAsync(d_hist_, r.history, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * (size_t) history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
         }
         sampling_ = sp;
         bk::sample_tokens(logits_, rows, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);

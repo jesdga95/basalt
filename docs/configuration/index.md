@@ -67,6 +67,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `lazy` | server | switch | off | Start unloaded; load on the first request. Drops a sidecar encoder. |
 | `idle-unload` | entry | seconds | off | Unload after this long idle. Frees VRAM for other programs. |
 | `idle-sleep` | entry | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
+| `model-cache-mib` | server | MiB | off | Park a model the router switches away from in RAM, up to this many MiB over all parked models (least recently used out first), so switching back is a RAM copy and not an SSD load. Several models and Linux only. [models](models.md#parking-models-in-ram) |
 | `min-free-vram-mib` | entry | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
 | `grammar` | entry | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
 | `max-payload-mib` | server | MiB | `256` | Largest request body the server reads; a bigger one gets a 413. |

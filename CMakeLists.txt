@@ -301,6 +301,12 @@ if(BUILD_TESTING)
   add_executable(inkling2_spill_test src/models/inkling2/spill_test.cpp src/models/inkling2/spill.cpp)
   target_include_directories(inkling2_spill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   basalt_cpu_test(NAME inkling2_spill_test COMMAND inkling2_spill_test)
+  add_executable(inkling2_loan_layout_test src/models/inkling2/loan_layout_test.cpp)
+  target_include_directories(inkling2_loan_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_cpu_test(NAME inkling2_loan_layout_test COMMAND inkling2_loan_layout_test)
+  add_executable(inkling2_copy_heat_test src/models/inkling2/copy_heat_test.cpp)
+  target_include_directories(inkling2_copy_heat_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  basalt_cpu_test(NAME inkling2_copy_heat_test COMMAND inkling2_copy_heat_test)
   add_executable(inkling2_expert_map_test src/models/inkling2/expert_map_test.cpp)
   target_include_directories(inkling2_expert_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_cpu_test(NAME inkling2_expert_map_test COMMAND inkling2_expert_map_test)
@@ -447,6 +453,12 @@ if(BUILD_TESTING)
   target_include_directories(engram_rows_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_embed_manifest(engram_rows_test)
   basalt_cpu_test(NAME engram_rows_test COMMAND engram_rows_test)
+  # the grouped expert kernels take every published pack's quantization pair (no GPU)
+  add_executable(expert_support_test src/models/deepseek41/expert_support_test.cpp)
+  target_include_directories(expert_support_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(expert_support_test PRIVATE kernels ${_gpu_runtime_target})
+  basalt_embed_manifest(expert_support_test)
+  basalt_cpu_test(NAME expert_support_test COMMAND expert_support_test)
   # the DeepSeek prompt chunk choice and the cache give-back rule (no GPU)
   add_executable(prefill_plan_test src/models/deepseek41/prefill_plan_test.cpp)
   target_include_directories(prefill_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -458,6 +470,11 @@ if(BUILD_TESTING)
   target_include_directories(peer_take_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_embed_manifest(peer_take_test)
   basalt_cpu_test(NAME peer_take_test COMMAND peer_take_test)
+  # the two-pass QSA scorer's bound and cut-off rule (no GPU)
+  add_executable(qsa_two_pass_test tests/models/qwen4exp/kernels/qsa_two_pass_test.cpp)
+  target_include_directories(qsa_two_pass_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  basalt_embed_manifest(qsa_two_pass_test)
+  basalt_cpu_test(NAME qsa_two_pass_test COMMAND qsa_two_pass_test)
   # shared code must not include a model; models must not include each other
   # a check of the tree's text, in bash and python3: Linux's run covers it for every platform
   if(NOT WIN32)
@@ -524,6 +541,7 @@ if(PEER_ADA)
     src/prefill/mmq/instances/mmq_iq3_xxs.cu
     src/prefill/mmq/instances/mmq_iq3_s.cu
     src/prefill/mmq/instances/mmq_iq4_nl.cu
+    src/prefill/mmq/instances/mmq_mxfp4.cu
     src/prefill/mmq/instances/mmq_iq4_xs.cu
     src/prefill/mmq/instances/mmq_q8_0.cu
     src/prefill/mmq/instances/mmq_q5_0.cu
@@ -973,6 +991,11 @@ add_executable(gqa_far_parity tests/kernels/gqa_far_parity.cpp)
 target_link_libraries(gqa_far_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_far_parity COMMAND gqa_far_parity)
 set_tests_properties(gqa_far_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+# the block drafters' window attention at the DSpark geometry (--bench times the full layer's call at 4K..160K cells)
+add_executable(gqa_window_parity tests/kernels/gqa_window_parity.cpp)
+target_link_libraries(gqa_window_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME gqa_window_parity COMMAND gqa_window_parity)
+set_tests_properties(gqa_window_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(iq_parity tests/kernels/iq_parity.cpp)
 target_include_directories(iq_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(iq_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -1236,6 +1259,12 @@ add_executable(decode_cluster_parity tests/models/qwen4exp/kernels/decode_cluste
 target_include_directories(decode_cluster_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(decode_cluster_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME decode_cluster_parity COMMAND decode_cluster_parity --selftest)
+# the two-pass QSA block scores vs the 3xTF32 prompt scorer (the same ids, scored-again blocks bitwise) and vs a
+# CPU reference (GPU, synthetic, no model); --bench: per-call times
+add_executable(qsa_two_pass_parity tests/models/qwen4exp/kernels/qsa_two_pass_parity.cpp)
+target_include_directories(qsa_two_pass_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(qsa_two_pass_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME qsa_two_pass_parity COMMAND qsa_two_pass_parity --selftest)
 
 add_executable(rope_parity tests/models/qwen4exp/kernels/rope_parity.cpp)
 target_include_directories(rope_parity PRIVATE ${_gpu_include_directories})
@@ -1343,6 +1372,8 @@ add_executable(qsa_dec_fused_parity tests/models/qwen4exp/kernels/qsa_dec_fused_
 target_include_directories(qsa_dec_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(qsa_dec_fused_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_dec_fused_parity COMMAND qsa_dec_fused_parity 20)
+basalt_gpu_test(NAME qsa_dec_fused_q4_parity COMMAND qsa_dec_fused_parity 20 0 1)
+basalt_gpu_test(NAME qsa_dec_fused_q4_split_parity COMMAND qsa_dec_fused_parity 20 1 1)
 add_executable(qsa_seg_parity tests/models/qwen4exp/kernels/qsa_seg_parity.cpp)
 target_include_directories(qsa_seg_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(qsa_seg_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
@@ -1392,6 +1423,11 @@ add_executable(kv_q4_parity tests/models/qwen4exp/kernels/kv_q4_parity.cpp)
 target_include_directories(kv_q4_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(kv_q4_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+# The fused decode attention on a q4_0 cache against int8: us per call and the GB/s over the bytes each reads.
+add_executable(q4_attn_bench tests/models/qwen4exp/kernels/q4_attn_bench.cpp)
+target_include_directories(q4_attn_bench PRIVATE ${_gpu_include_directories})
+target_link_libraries(q4_attn_bench PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q4_attn_bench COMMAND q4_attn_bench)
 add_executable(cvec_parity tests/models/qwen4exp/kernels/cvec_parity.cpp)
 target_include_directories(cvec_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(cvec_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
@@ -1630,6 +1666,10 @@ add_executable(device_memory_test tests/core/device_memory_test.cpp)
 target_link_libraries(device_memory_test PRIVATE core ${_gpu_runtime_target})
 basalt_gpu_test(NAME device_memory_test COMMAND device_memory_test)
 set_tests_properties(device_memory_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+add_executable(elastic_array_test tests/core/elastic_array_test.cpp)
+target_link_libraries(elastic_array_test PRIVATE core ${_gpu_runtime_target})
+basalt_gpu_test(NAME elastic_array_test COMMAND elastic_array_test)
+set_tests_properties(elastic_array_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(shipped_profiles_test tests/core/shipped_profiles_test.cpp)
 target_link_libraries(shipped_profiles_test PRIVATE platform)
 target_include_directories(shipped_profiles_test PRIVATE include)
@@ -1770,16 +1810,6 @@ set_source_files_properties(src/kernels/cpu/nvfp4_avx2_vnni.cpp PROPERTIES COMPI
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
-# MSVC gives the scalar F16C conversions no working code: its headers declare them nowhere, and with
-# __F16C__ defined the compiler claims the names as its own, so a definition compiled under that macro does not
-# build as written. The file below supplies the pair from the vector intrinsics, which are the same instruction,
-# and it must be compiled without __F16C__ for its definitions to survive; the callers carry prototypes and
-# #pragma function so the calls reach it. The file is empty for every other compiler, and it is not added to the
-# library at all there.
-if(MSVC)
-  target_sources(kernels_cpu PRIVATE src/kernels/cpu/ggml/f16c_scalar_msvc.c)
-  set_source_files_properties(src/kernels/cpu/ggml/f16c_scalar_msvc.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-endif()
 target_link_libraries(kernels_cpu PUBLIC ggml_quants)
 if(BUILD_TESTING)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
@@ -1789,7 +1819,7 @@ if(BUILD_TESTING)
 endif()
 # MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
 # activation quantizer; mmq_host.cu holds its few host symbols
-set(_mmq_types q2_0 iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k nvfp4)
+set(_mmq_types q2_0 iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs mxfp4 q8_0 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k nvfp4)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
 add_library(mmq STATIC src/prefill/moe_mmq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
@@ -1930,6 +1960,10 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_mmq_nvfp4_test PRIVATE mmq ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_nvfp4_test COMMAND prefill_mmq_nvfp4_test --no-bench)
   set_tests_properties(prefill_mmq_nvfp4_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(prefill_mmq_mxfp4_test tests/cuda/prefill_mmq_mxfp4_test.cpp)
+  target_link_libraries(prefill_mmq_mxfp4_test PRIVATE mmq ${_gpu_runtime_target})
+  basalt_gpu_test(NAME prefill_mmq_mxfp4_test COMMAND prefill_mmq_mxfp4_test --no-bench)
+  set_tests_properties(prefill_mmq_mxfp4_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 if(BUILD_TESTING)
   # NVFP4 block decode against the E2M1/UE4M3 spec (exhaustive) and ggml's row dequantizer; with an experts.bin,
@@ -2007,6 +2041,8 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
   # the AVX-512 Q8_K activation quantizer bit for bit against ggml's reference
   basalt_cpu_test(NAME native_expert_parity_q8k_quant COMMAND native_expert_parity --q8k-quant)
+  # MXFP4 down experts at the deepseek41 geometry: dequantizer, the AVX-2/AVX-512 dots and one native expert
+  basalt_cpu_test(NAME native_expert_parity_mxfp4 COMMAND native_expert_parity --mxfp4)
   # the BF16 token embedding gathered and dequantized bit for bit
   basalt_gpu_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
   # the Q6_K token embedding dequantized against ggml's reference

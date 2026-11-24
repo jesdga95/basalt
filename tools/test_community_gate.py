@@ -113,6 +113,10 @@ class Gate(unittest.TestCase):
             with self.subTest(note=note):
                 self.assertEqual(run([good_row(notes=note)]).status, "fail")
 
+    def test_a_scheme_inside_a_word_is_not_a_url(self):
+        self.assertEqual(run([good_row(notes="AC + performance profile: on")]).status, "pass")
+        self.assertEqual(run([good_row(notes="see file:///etc/passwd")]).status, "fail")
+
     def test_url_in_other_free_text_fails(self):
         self.assertEqual(run([good_row(cpu="Ryzen www.spam.example")]).status, "fail")
         r = good_row()

@@ -46,7 +46,7 @@ struct EngramInfo {
     bool present = false;
     uint64_t file_offset = 0;      ///< absolute offset of row 0
     uint64_t rows = 0;
-    int type = 20;                 ///< ggml type of the rows: IQ4_NL (20) or MXFP4 (39)
+    int type = 20;                 ///< ggml type of the rows: IQ4_NL (20), Q5_K (13) or MXFP4 (39)
     uint32_t row_bytes = 144;
     int row_values = 256;
     std::vector<int> layers;       ///< model layers with an Engram

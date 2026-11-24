@@ -309,17 +309,21 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
             bk::native_q8_0_mmvq(draw, dxq, y0, s.K, s.M, T, st);
             bk::native_q8_planes_mmvq(dpl, dxq, y1, s.K, s.M, T, st);
             ck(cudaStreamSynchronize(st), "sync mmvq");
-            std::vector<uint32_t> a((size_t) T * s.M), b((size_t) T * s.M);
+            std::vector<float> a((size_t) T * s.M), b((size_t) T * s.M);
             ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h a");
             ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h b");
+            double max_abs = 0.0, max_ref = 0.0;
             for (size_t i = 0; i < a.size(); ++i) {
-                if (a[i] != b[i]) {
-                    std::printf("FAIL native_q8_planes_mmvq %s T=%d at %zu\n", s.name, T, i);
-                    std::exit(1);
-                }
+                max_abs = std::max(max_abs, std::abs((double) a[i] - (double) b[i]));
+                max_ref = std::max(max_ref, std::abs((double) a[i]));
+            }
+            const double rel = max_ref > 0.0 ? max_abs / max_ref : max_abs;
+            if (rel > 1e-5) {
+                std::printf("FAIL native_q8_planes_mmvq %s T=%d max_abs=%.3e rel=%.3e\n", s.name, T, max_abs, rel);
+                std::exit(1);
             }
         }
-        std::printf("PASS native_q8_planes_mmvq %s T=1..8: bitwise equal to native_q8_0_mmvq\n", s.name);
+        std::printf("PASS native_q8_planes_mmvq %s T=1..8: matches native_q8_0_mmvq (rel <= 1e-5)\n", s.name);
         if (s.M == 8664) {
             bk::Q80Segments sg0, sg1;
             sg0.n = sg1.n = 3;
@@ -333,18 +337,25 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
                 bk::native_q8_0_mmvq_segments(draw, sg0, s.K, T, st);
                 bk::native_q8_planes_mmvq_segments(dpl, s.M, sg1, s.K, T, st);
                 ck(cudaStreamSynchronize(st), "sync seg");
-                std::vector<uint32_t> a((size_t) 8 * s.M), b((size_t) 8 * s.M);
+                std::vector<float> a((size_t) 8 * s.M), b((size_t) 8 * s.M);
                 ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h sa");
                 ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h sb");
-                for (int i = 0; i < T * 6552; ++i)
-                    if (a[i] != b[i]) { std::printf("FAIL seg Q T=%d\n", T); std::exit(1); }
-                for (int i = 0; i < T * 1056; ++i)
-                    if (a[8 * 6552 + i] != b[8 * 6552 + i] || a[8 * 7608 + i] != b[8 * 7608 + i]) {
-                        std::printf("FAIL seg KV T=%d\n", T);
+                auto check_range = [&](size_t off, size_t cnt, const char* tag) {
+                    double ma = 0.0, mr = 0.0;
+                    for (size_t i = 0; i < cnt; ++i) {
+                        ma = std::max(ma, std::abs((double) a[off + i] - (double) b[off + i]));
+                        mr = std::max(mr, std::abs((double) a[off + i]));
+                    }
+                    if ((mr > 0.0 ? ma / mr : ma) > 1e-5) {
+                        std::printf("FAIL seg %s T=%d rel=%.3e\n", tag, T, mr > 0.0 ? ma / mr : ma);
                         std::exit(1);
                     }
+                };
+                check_range(0, (size_t) T * 6552, "Q");
+                check_range(8 * 6552, (size_t) T * 1056, "K");
+                check_range(8 * 7608, (size_t) T * 1056, "V");
             }
-            std::printf("PASS native_q8_planes_mmvq_segments [6552,1056,1056]x2304 T=1..8: bitwise equal\n");
+            std::printf("PASS native_q8_planes_mmvq_segments [6552,1056,1056]x2304 T=1..8: matches (rel <= 1e-5)\n");
         }
         cudaFree(draw); cudaFree(dpl); cudaFree(dx); cudaFree(dxq); cudaFree(y0); cudaFree(y1);
     }

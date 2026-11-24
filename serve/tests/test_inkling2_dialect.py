@@ -208,6 +208,20 @@ class Parse(unittest.TestCase):
         svc = service(HEADER + TEXT + "done" + END)
         self.assertEqual(svc.dialect.stop_texts, (END_TURN,))
 
+    def test_zero_arg_and_spaced_args_streaming_emit_valid_tool_args(self):
+        for reply, want in (
+            (HEADER + "get_time" + TOOL_JSON + '{"name":"get_time"}' + END, {}),
+            (HEADER + "get_weather" + TOOL_JSON + '{"name":"get_weather","args" : {"city":"NYC"}}' + END,
+             {"city": "NYC"}),
+        ):
+            for chunk in (None, 1, 3, 7):
+                events = parse(reply, chunk)
+                args_text = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(args_text), want, (reply, chunk, events))
+                calls = [e.call for e in events if e.kind == "tool_call"]
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].arguments, want)
+
 
 class Tokens(unittest.TestCase):
     def test_the_markers(self):

@@ -26,6 +26,9 @@ struct QsaDecKvPost {
     const int32_t* steps = nullptr;     ///< [n][kStepCount]: each row's cell at kStepPos
     int8_t *k_q = nullptr, *v_q = nullptr;
     uint16_t *k_scale = nullptr, *v_scale = nullptr;
+    /// q4_0 K/V (`--kv q4_0`): non-null switches the append from INT8 to packed Q4_0 after the rotation, in the
+    /// same launch. Mode 0 only (the streaming copy keeps the per-token path).
+    uint8_t *k_q4 = nullptr, *v_q4 = nullptr;
     const int32_t* page_table = nullptr;
     KvHostPools host;                   ///< the host copy, when the cache streams
     const float* idx_raw = nullptr;     ///< [n][idx_dim] raw indexer keys; null: no indexer (a dense layer)
@@ -47,6 +50,8 @@ struct QsaDecQPost {
     const int32_t* pos_i = nullptr;     ///< [n][idx_n_head]
     const float* idx_q_norm = nullptr;  ///< [idx_dim]
     float eps = 1e-6f;
+    /// Rotate the attention query after its RoPE, for a `--kv q4_0` cache whose keys are stored rotated
+    bool rot = false;
 };
 
 bool qsa_dec_fused_supported(const QsaShapes& s);
