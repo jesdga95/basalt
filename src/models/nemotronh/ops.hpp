@@ -14,6 +14,9 @@ void relu2_scaled_rows(float* h, int64_t rows, int n, const int32_t* bounds, int
 /// tails[4 e ...] and the bytes from it to the next expert zeroed (what MMQ reads past a down matrix).
 void tails_aside(uint8_t* blobs, size_t stride, uint64_t blob, int n, float* tails, void* stream);
 
+/// y[r][c] = bf16(x[r ld_x + c]) for R rows of n values (y dense, n apart), the engine's one bf16 rounding.
+void bf16_rows(const float* x, int64_t ld_x, int64_t n, int R, uint16_t* y, void* stream);
+
 /// x[i] = relu(x[i])^2 for n values.
 void relu2(float* x, int64_t n, void* stream);
 

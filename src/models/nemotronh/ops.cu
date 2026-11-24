@@ -1,6 +1,8 @@
 // src/models/nemotronh/ops.cu - see ops.hpp.
 #include "models/nemotronh/ops.hpp"
 
+#include "basalt/kernels/bf16_bits.hpp"
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -58,6 +60,18 @@ __global__ void tails_aside_kernel(uint8_t* blobs, size_t stride, uint64_t blob,
 
 void tails_aside(uint8_t* blobs, size_t stride, uint64_t blob, int n, float* tails, void* stream) {
     if (n > 0) tails_aside_kernel<<<n, 256, 0, (cudaStream_t) stream>>>(blobs, stride, blob, tails);
+}
+
+__global__ void bf16_rows_kernel(const float* __restrict__ x, int64_t ld_x, int64_t n, uint16_t* __restrict__ y) {
+    const float* xr = x + (size_t) blockIdx.y * ld_x;
+    uint16_t* yr = y + (size_t) blockIdx.y * n;
+    for (int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; c < n; c += (int64_t) gridDim.x * blockDim.x)
+        yr[c] = basalt::kernels::bf16_from_f32(xr[c]);
+}
+
+void bf16_rows(const float* x, int64_t ld_x, int64_t n, int R, uint16_t* y, void* stream) {
+    if (R > 0 && n > 0)
+        bf16_rows_kernel<<<dim3((unsigned) ((n + 1023) / 1024), (unsigned) R), 256, 0, (cudaStream_t) stream>>>(x, ld_x, n, y);
 }
 
 void relu2(float* x, int64_t n, void* stream) {

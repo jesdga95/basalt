@@ -41,6 +41,7 @@
 #include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -112,6 +113,7 @@ public:
                               ring_freed_[0], ring_freed_[1]})
             if (e) cudaEventDestroy(e);
         if (copy_) cudaStreamDestroy(copy_);
+        if (blas_) cublasDestroy(blas_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
@@ -127,6 +129,13 @@ public:
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
         X_ = f(R * E);
         XN_ = f(R * E);
+        // a chunk's BF16 products (the latent projections, the MTP head's fusion and attention) on cuBLAS, over its rows
+        // rounded to bf16 (the widest, the head's [embedding | hidden])
+        xb16_ = (uint16_t*) alloc((size_t) R * (mtp_on_ ? 2 * E : E) * 2, ok);
+        if (cublasCreate(&blas_) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas_, stream_) != CUBLAS_STATUS_SUCCESS) {
+            err = "cannot create the cuBLAS handle";
+            return false;
+        }
         proj_ = f(R * PW);
         xbc_ = f(R * C);
         y_ = f(R * DI);
@@ -690,13 +699,18 @@ private:
         c.m[0] = wg::Matrix{w.w, w.rows, w.scale, y, ld};
         wg::gemm(c, act_, T, ws_, stream_);
     }
-    // a BF16 projection of R rows (any R): window gemm calls of 16 rows
+    // a BF16 projection of R rows, y [R][w.rows]: a window's on the window gemm, a chunk's on cuBLAS (its rows rounded to bf16
+    // as the window gemm's are, fp32 accumulation)
     void bf16_rows(const Mat& w, const float* x, int64_t ld_x, float* y, int R) {
-        for (int t0 = 0; t0 < R; t0 += kMaxWindow) {
-            const int n = std::min(kMaxWindow, R - t0);
-            wg::pack(x + (size_t) t0 * ld_x, ld_x, w.cols, n, act_, stream_);
-            gemm(w, y + (size_t) t0 * w.rows, w.rows, n);
+        if (R <= kMaxWindow) {
+            wg::pack(x, ld_x, w.cols, R, act_, stream_);
+            gemm(w, y, w.rows, R);
+            return;
         }
+        nemotronh::bf16_rows(x, ld_x, w.cols, R, xb16_, stream_);
+        const float one = 1.f, zero = 0.f;
+        cublasGemmEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, (int) w.rows, R, (int) w.cols, &one, w.w, CUDA_R_16BF, (int) w.cols, xb16_,
+                     CUDA_R_16BF, (int) w.cols, &zero, y, CUDA_R_32F, (int) w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     }
 
     bool mamba_window(const Layer& L, Mamba& mb, int R) {
@@ -1547,6 +1561,8 @@ private:
     float *logits_ = nullptr, *lp_ = nullptr, *gs4_ = nullptr, *exrows_ = nullptr;
     int32_t *ids_ = nullptr, *tok_ = nullptr, *pick_ = nullptr, *keep_d_ = nullptr;
     void *act_ = nullptr, *xq8_ = nullptr, *a4_ = nullptr, *exq_ = nullptr, *exscr_ = nullptr;
+    uint16_t* xb16_ = nullptr;
+    cublasHandle_t blas_ = nullptr;
     wg::Workspace ws_;
     std::vector<Mamba> mamba_;
     std::vector<uint16_t*> kc_, vc_;

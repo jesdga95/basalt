@@ -8,7 +8,7 @@ Where Nemotron 3.5 Super rounds and how its output compares. Method: [quality](q
 - **The weights are the checkpoint's bits.** Every NVFP4 and FP8 matrix keeps its codes and scales; nothing is
   re-rounded by the converter except `A = -exp(A_log)`, computed once in float64.
 - **Against a float64 reference of the same weights:** decode KL 3.8e-4 and top-1 54/54 on a 54-token chat; a prompt then
-  decode KL 6.4e-4, top-1 28/28 ([below](#against-the-reference)).
+  decode KL 6.0e-4, top-1 27/28 ([below](#against-the-reference)).
 - **The MTP head's drafts** match the reference's: the first at 53 of 53 positions, the second at 51 of 53.
 - **No `basalt-bench --quality` base yet:** that needs a BF16 run of the full model.
 
@@ -29,7 +29,7 @@ Where Nemotron 3.5 Super rounds and how its output compares. Method: [quality](q
 
 | Stage | Decode (windows of up to 16 rows) | Prompt (chunks) |
 | --- | --- | --- |
-| FP8 and BF16 products | BF16 activations, FP32 accumulate | Mamba in / out: FP8 activations (W8A8); the rest as decode |
+| FP8 and BF16 products | BF16 activations, FP32 accumulate | Mamba in / out: FP8 activations (W8A8); BF16 ones on cuBLAS, BF16 activations, FP32 accumulate |
 | Shared expert | BF16 activations | FP4 activations (W4A4) |
 | Routed experts, on the card | q8_1 activations (dp4a) | q8_1 activations (MMQ, int8 tensor cores) |
 | Routed experts, on the CPU | Q8_0 activations | staged on the card, as above |
@@ -50,7 +50,7 @@ the placement frozen:
 | Path | KL mean | KL max | Top-1 |
 | --- | --- | --- | --- |
 | Decode, one row at a time | 3.8e-4 | 5.6e-3 | 54/54 |
-| A prompt of 26, then decode | 6.4e-4 | 2.4e-3 | 28/28 |
+| A prompt of 26, then decode | 6.0e-4 | 4.2e-3 | 27/28 (a near tie) |
 | Windows of 1 to 8 rows keeping some | bitwise one-row decode | | |
 | State saved at 27, restored | bitwise | | |
 

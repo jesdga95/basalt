@@ -318,13 +318,13 @@ endif()
 
 if(BASALT_MODEL_NEMOTRONH)
 add_library(nemotronh_kernels STATIC src/models/nemotronh/ops.cu)
-target_include_directories(nemotronh_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(nemotronh_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(nemotronh_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_nemotronh STATIC src/models/nemotronh/adapter.cpp src/models/nemotronh/pretok_nemotronh.cpp
   src/models/nemotronh/pack.cpp src/models/nemotronh/model.cpp src/models/nemotronh/session.cpp)
 target_include_directories(model_nemotronh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_nemotronh PUBLIC model tokenizer nemotronh_kernels expert_tier tiers kernels window_gemm prefill_fp4
-  prefill_fp8 core ${_gpu_runtime_target})
+  prefill_fp8 core ${_gpu_runtime_target} ${_gpu_blas_target})
 if(BUILD_TESTING)
   add_executable(nemotronh_pretok_test src/models/nemotronh/pretok_test.cpp src/models/nemotronh/pretok_nemotronh.cpp)
   target_include_directories(nemotronh_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
