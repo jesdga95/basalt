@@ -54,12 +54,31 @@ Shares shares_for(const GpuCards& c, ShareUse use) {
         s.from = "gpu-share";
         return s;
     }
+    const bool stages = use == ShareUse::Stages || use == ShareUse::StreamedStages;
     std::vector<double> w;
-    for (const GpuCards::Card& k : c.cards) w.push_back(use == ShareUse::Stages ? k.info.mem_gbps : (double) k.free);
+    for (const GpuCards::Card& k : c.cards) w.push_back(stages ? k.info.mem_gbps : (double) k.free);
     bool known = !w.empty();
     for (double v : w) known = known && v > 0;
     s.of = normalized(w);
-    s.from = !known ? "equal" : use == ShareUse::Stages ? "bandwidth" : "free VRAM";
+    s.from = !known ? "equal" : stages ? "bandwidth" : "free VRAM";
+    // a stage that streams its layers' weights over its card's link reads them no faster than that link: each peer
+    // keeps at most its link's share, the main card the rest
+    bool links = known && use == ShareUse::StreamedStages;
+    for (const GpuCards::Card& k : c.cards) links = links && k.link_bytes > 0;
+    if (links) {
+        std::vector<double> l;
+        for (const GpuCards::Card& k : c.cards) l.push_back(k.link_bytes);
+        l = normalized(l);
+        double peers = 0;
+        for (size_t i = 1; i < s.of.size(); ++i) {
+            if (l[i] < s.of[i]) {
+                s.of[i] = l[i];
+                s.from = "bandwidth, links";
+            }
+            peers += s.of[i];
+        }
+        s.of[0] = 1.0 - peers;
+    }
     return s;
 }
 
@@ -186,11 +205,11 @@ std::string peer_holds_nothing(const GpuCards& c, size_t card, const std::string
            (c.cards.size() == 2 ? "; use gpu " + std::to_string(c.cards[0].index) : std::string("; leave it out of gpu"));
 }
 
-std::vector<int> stage_cuts(const GpuCards& c, int n_layers, int lo) {
+std::vector<int> stage_cuts(const GpuCards& c, int n_layers, int lo, ShareUse use) {
     const size_t n = c.cards.size();
     std::vector<int> first(n, 0);
     if (n < 2) return first;
-    const Shares sh = shares_for(c, ShareUse::Stages);
+    const Shares sh = shares_for(c, use);
     double cum = 0;
     for (size_t i = 1; i < n; ++i) {
         cum += sh.of[i - 1];
@@ -205,6 +224,9 @@ std::string gpu_start_line(const GpuCards& c) {
     if (c.cards.empty()) return "gpus: none";
     if (c.cards.size() == 1) return "gpus: " + card_name(c.cards[0]);
     const char* mode = mode_name(c.mode);
+    // a peer's own shares are the model's (its stages may follow the links, PeerSpec::stage_streams), known once it is
+    // loaded: the line after the load shows its part, so this one names a peer's shares only when gpu-share gives them
+    const bool named = c.mode != program::GpuMode::Peer || !c.given.empty();
     Shares sh;
     if (c.mode == program::GpuMode::Peer) sh = shares_for(c, ShareUse::Stages);
     else if (c.mode == program::GpuMode::Split) sh = shares_for(c, ShareUse::Split);
@@ -212,8 +234,9 @@ std::string gpu_start_line(const GpuCards& c) {
     else sh = {std::vector<double>(c.cards.size(), 1.0 / (double) c.cards.size()), "equal"};
     std::string line = std::string("gpus: ") + mode;
     for (size_t i = 0; i < c.cards.size(); ++i)
-        line += "; " + card_name(c.cards[i]) + (i == 0 ? " main" : std::string(" ") + mode) + ", share " + share_text(sh.of[i]);
-    return line + " (" + sh.from + ")";
+        line += "; " + card_name(c.cards[i]) + (i == 0 ? " main" : std::string(" ") + mode) +
+                (named ? ", share " + share_text(sh.of[i]) : std::string());
+    return named ? line + " (" + sh.from + ")" : line;
 }
 
 std::string gpu_parts_line(const GpuCards& c, const std::vector<std::string>& parts) {

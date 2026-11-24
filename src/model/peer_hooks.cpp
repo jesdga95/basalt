@@ -65,7 +65,11 @@ PeerPlacement deal_peers(const GpuCards& c, const PeerSpec& s, const std::vector
                 return p;
             }
     }
-    if (s.stage_layers > 0) p.stage_first = stage_cuts(c, s.stage_layers, s.stage_lo);
+    if (s.stage_layers > 0) {
+        const ShareUse use = s.stage_streams ? ShareUse::StreamedStages : ShareUse::Stages;
+        p.stage_first = stage_cuts(c, s.stage_layers, s.stage_lo, use);
+        p.stage_from = shares_for(c, use).from;
+    }
     return p;
 }
 
@@ -83,6 +87,7 @@ std::string peer_part(const PeerPlacement& p, size_t card, int stage_layers) {
     if (card > 0 && card < p.stage_first.size()) {
         const int e = card + 1 < p.stage_first.size() ? p.stage_first[card + 1] : stage_layers;
         part += (part.empty() ? "" : ", ") + std::string("prompt layers ") + std::to_string(p.stage_first[card]) + "-" + std::to_string(e - 1);
+        if (p.stage_from == "bandwidth, links") part += " (by the links)";
     }
     return part;
 }

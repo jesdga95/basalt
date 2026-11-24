@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 
 #include "basalt/core/card_link.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/multi_gpu.hpp"
 #include "basalt/platform/system.hpp"
@@ -62,7 +63,10 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
         c.info = (size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{};
         c.index = i;
         c.label = bp::gpu_label(visible, i);
-        if (choice.cards.size() > 1) c.free = basalt::core::card_free_bytes((int) d);   // (one card: no context made here)
+        if (choice.cards.size() > 1) {   // (one card: no context made here)
+            c.free = basalt::core::card_free_bytes((int) d);
+            c.link_bytes = basalt::core::device_rates((int) d).link_bytes;
+        }
         gc.cards.push_back(c);
         chosen_cards.push_back(c.info);
     }

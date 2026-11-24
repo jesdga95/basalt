@@ -64,12 +64,12 @@ A visible card `gpu` does not name is no error: every model warns once at start,
 One line before the load and one after, the same for every model; the first replaces `gpus: ... expert tier` (`cli/gpu.cpp:72`):
 
 ```
-gpus: peer; RTX 5090 (nvidia-smi 0) main, share 0.80; RTX 5060 Ti (nvidia-smi 1) peer, share 0.20 (bandwidth)
+gpus: peer; RTX 5090 (nvidia-smi 0) main; RTX 5060 Ti (nvidia-smi 1) peer
 gpus: RTX 5090 dense, KV, 9,812 experts (21.3 GiB); RTX 5060 Ti 5,120 experts (13.9 GiB), prompt layers 38-47
 ```
 
-The tag says where the shares came from (`gpu-share`, `free VRAM`, `bandwidth`); peer shows the prompt stages' shares, split
-the layers'. Each card's part of the second line is the model's `gpu_report(card)`; the shared layer prints it. One card: `gpus: RTX 5090 (nvidia-smi 0)`.
+The tag says where the shares came from (`gpu-share`, `free VRAM`); split shows the layers' shares, peer only `gpu-share`'s:
+a peer's default shares are the model's (Flash-Next's prompt stages follow the links too), so its cut is in the second line. Each card's part of the second line is the model's `gpu_report(card)`; the shared layer prints it. One card: `gpus: RTX 5090 (nvidia-smi 0)`.
 
 ## Shares
 

@@ -106,7 +106,8 @@ A prompt read is compute-bound, so a card with less compute than its memory band
 default gives it: on an RTX 5090 with an RTX 5060 Ti, `"gpu-share": "3,1"` (the 5060 Ti reads layers 48 to 63) reads 16K and 64K
 prompts a few percent faster than the default shares (layers 51 to 63).
 
-The start line names it (`gpus: peer; RTX 5090 (nvidia-smi 0) main, share ...; RTX 5060 Ti (nvidia-smi 1) peer, share ...`), then
+The start line names it (`gpus: peer; RTX 5090 (nvidia-smi 0) main; RTX 5060 Ti (nvidia-smi 1) peer`, with each card's share when
+`gpu-share` is given), then
 `prompt split: CUDA1 reads layers 51-63 of prompts over 8192 tokens; N GiB of page-locked hand-off buffers`. The second card holds
 its layers, their attention layers' cells and a chunk's scratch: 6 to 9 GiB, 8.7 GiB at 262,144 positions in `int8`. A peer that
 would read nothing is refused with the reason, instead of idling: a context of 8,192 or less holds no prompt that a second card

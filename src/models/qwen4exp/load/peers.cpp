@@ -33,6 +33,7 @@ basalt::model::PeerSpec TierPeers::peer_spec() const {
     if (in_.stages) {
         s.stage_layers = (int) in_.n_layers;
         s.stage_lo = 2;   // the first two layers stay on the main card
+        s.stage_streams = true;   // a stage streams its layers' experts from the RAM copy over its card's link
     }
     return s;
 }
