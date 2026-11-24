@@ -425,6 +425,17 @@ SAMPLING_KEYS = {
     "penalty_last_n": (int, lambda v: _whole(v) and 0 <= v <= PENALTY_WINDOW_MAX,
                        f"an integer 0..{PENALTY_WINDOW_MAX} (the engine's penalty window)"),
     "seed": (int, lambda v: _whole(v) and -2 ** 63 <= v < 2 ** 64, "an integer"),
+    # the horde/koboldcpp samplers (koboldcpp's semantics, on the engine's narrow path: top_k 1..64)
+    "tfs": (float, lambda v: _num(v) and 0 <= v <= 1, "a number 0..1 (0 or 1 = off)"),
+    "typical": (float, lambda v: _num(v) and 0 <= v <= 1, "a number 0..1 (0 or 1 = off)"),
+    "top_a": (float, lambda v: _num(v) and 0 <= v <= 1, "a number 0..1 (0 = off)"),
+    "xtc_threshold": (float, lambda v: _num(v) and 0 <= v <= 0.5, "a number 0..0.5"),
+    "xtc_probability": (float, lambda v: _num(v) and 0 <= v <= 1, "a number 0..1 (0 = off)"),
+    "dynatemp_min": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
+    "dynatemp_max": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
+    "dynatemp_exponent": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
+    "smoothing_factor": (float, lambda v: _num(v) and v >= 0, "a number >= 0 (0 = off)"),
+    "smoothing_curve": (float, _num, "a number"),
 }
 
 
@@ -439,6 +450,26 @@ def checked_sampling(req: dict) -> None:
     rd = req.get("relaxed_drafting")
     if rd is not None and rd is not False and not (_num(rd) and 0 <= rd <= 1):
         raise ValueError(f"relaxed_drafting: expected false or a number 0..1, not {rd!r}")
+    m = req.get("mirostat")
+    if m is not None and _num(m) and m > 0:
+        raise ValueError("mirostat: not supported (its state spans the reply, which the speculative windows "
+                         "cannot follow); use top_k/top_p/min_p or the horde list filters")
+    order = req.get("samplers_order")
+    if order is not None:
+        # koboldcpp's KCPP_SAMPLER_* enum (top_k=0, top_a=1, top_p=2, tfs=3, typ=4, temp=5, rep_pen=6) or names
+        kcpp = ["top_k", "top_a", "top_p", "tfs", "typical", "temp", "rep_pen"]
+        default = ["rep_pen", "top_k", "top_a", "tfs", "typical", "top_p", "temp"]
+        names = None
+        if isinstance(order, list) and all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 6 for v in order):
+            names = [kcpp[v] for v in order]
+        elif isinstance(order, list) and all(isinstance(v, str) for v in order):
+            names = order
+        if names != default:
+            raise ValueError("samplers_order: only the default order (koboldcpp's [6,0,1,3,4,2,5] = "
+                             "rep_pen,top_k,top_a,tfs,typical,top_p,temp) is supported; the engine's chain is fixed")
+    if _num(req.get("rep_pen_slope")) and float(req["rep_pen_slope"]) not in (0.0, 1.0):
+        print("[server] warning: rep_pen_slope is ignored (the engine's repetition penalty has no slope)",
+              flush=True)
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
@@ -658,7 +689,17 @@ def build_parser() -> argparse.ArgumentParser:
             ("frequency-penalty", "penalty growing with how often a token was seen"),
             ("repetition-penalty", "multiplicative penalty on seen tokens, > 0 (1 = off)"),
             ("penalty-last-n", "the window the penalties look back over, in tokens (at most 4096)"),
-            ("seed", "fix the random draw, an integer")):
+            ("seed", "fix the random draw, an integer"),
+            ("tfs", "tail-free cutoff 0..1 (0 or 1 = off)"),
+            ("typical", "locally typical cutoff 0..1 (0 or 1 = off)"),
+            ("top-a", "keep p >= top_a * p_max^2, 0..1 (0 = off)"),
+            ("xtc-threshold", "xtc's drop threshold 0..0.5"),
+            ("xtc-probability", "xtc's drop chance 0..1 (0 = off)"),
+            ("dynatemp-min", "dynamic temperature floor >= 0 (off when = dynatemp-max)"),
+            ("dynatemp-max", "dynamic temperature ceiling >= 0"),
+            ("dynatemp-exponent", "dynamic temperature entropy exponent >= 0"),
+            ("smoothing-factor", "koboldcpp smoothing strength >= 0 (0 = off)"),
+            ("smoothing-curve", "koboldcpp smoothing curve (a number)")):
         ap.add_argument(f"--{key}", type=sampling_option(key.replace("-", "_")), metavar="N", default=None,
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,

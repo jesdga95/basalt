@@ -26,11 +26,11 @@ from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStart
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, checked as checked_logprobs
-from serve.config import checked_sampling
+from serve.config import PENALTY_WINDOW_MAX, _num, checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import checked_return_progress, openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
-from serve.prompt import primed
+from serve.prompt import CTX_SLACK, PromptText, primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.live import AnswerNowRefused
 from serve.router import Router
@@ -483,6 +483,8 @@ def make_handler(target: Service | Router):
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
+            elif path == "/api/extra/version":
+                self._json(200, {"result": "KoboldCpp", "version": "1.122.1-basalt-raw"})
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     models = router.models()
@@ -634,8 +636,10 @@ def make_handler(target: Service | Router):
                     return
                 requested = req.get("model")
                 # llama.cpp's tokenizer routes name no model: the shown one's tokenizer, as /props describes it
-                self.svc = router.shown() if requested is None and path in ("/tokenize", "/detokenize") else \
-                    router.service_for(requested)
+                raw_model_optional = requested is None and path in (
+                    "/tokenize", "/detokenize", "/v1/completions", "/api/v1/generate",
+                    "/api/extra/generate/stream", "/api/extra/tokencount")
+                self.svc = router.shown() if raw_model_optional else router.service_for(requested)
                 if self.svc is None:
                     self._unknown_model(path, requested)
                     return
@@ -647,6 +651,15 @@ def make_handler(target: Service | Router):
                         self._responses(req)
                     elif path == "/v1/chat/completions":
                         self._openai(req)
+                    elif path == "/v1/completions":
+                        self._completions(req)
+                    elif path == "/api/v1/generate" or path == "/api/extra/generate/stream":
+                        self._kobold_generate(req)
+                    elif path == "/api/extra/tokencount":
+                        text = req.get("prompt")
+                        if not isinstance(text, str):
+                            raise ValueError("prompt: a string")
+                        self._json(200, {"results": [{"value": len(self.svc.tok.encode(text, parse_special=True))}]})
                     elif path == "/v1/messages":
                         self._anthropic(req)
                     elif path == "/v1/messages/count_tokens":
@@ -1012,6 +1025,221 @@ def make_handler(target: Service | Router):
             asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, rid=self.live.id)
             return ids, thinking, tools, max_new, asm, req, force
+
+        def _sampling_from_raw(self, req, kobold: bool) -> dict:
+            """The raw APIs' sampling fields into the engine's sampling dict; checked_sampling validates it.
+            `kobold` adds the KoboldCpp/Horde field names (rep_pen, max_length as max_tokens elsewhere...)."""
+            s = {}
+            g = req.get
+            for k in ("temperature", "top_p", "min_p", "top_k", "presence_penalty", "frequency_penalty",
+                      "repetition_penalty", "penalty_last_n", "seed", "tfs", "typical", "top_a",
+                      "xtc_threshold", "xtc_probability", "dynatemp_min", "dynatemp_max", "dynatemp_exponent",
+                      "smoothing_factor", "smoothing_curve"):
+                v = g(k)
+                if v is not None:
+                    s[k] = v
+            if kobold:
+                for k_src, k_dst in (("rep_pen", "repetition_penalty"), ("rep_pen_range", "penalty_last_n"),
+                                     ("sampler_seed", "seed")):
+                    v = g(k_src)
+                    if v is not None:
+                        s[k_dst] = v
+                if g("rep_pen_range") == 0 and _num(g("rep_pen")) and float(g("rep_pen")) != 1.0:
+                    # koboldcpp reads a range of 0 as the whole context; the engine's cap is the window max
+                    s["penalty_last_n"] = PENALTY_WINDOW_MAX
+                dr = g("dynatemp_range")
+                if dr is not None and _num(dr) and float(dr) > 0 and "dynatemp_min" not in s:
+                    temp = float(g("temperature") or 1.0)
+                    s["dynatemp_min"] = max(0.0, temp - float(dr))
+                    s["dynatemp_max"] = max(0.0, temp + float(dr))
+            lo, hi = s.get("dynatemp_min"), s.get("dynatemp_max")
+            if _num(lo) and _num(hi) and float(lo) > float(hi):
+                raise ValueError("dynatemp_min must not exceed dynatemp_max")
+            checked_sampling(s)
+            # koboldcpp's field is singular, the horde's plural; both name the same thing
+            order = g("samplers_order")
+            if order is None:
+                order = g("sampler_order")
+            checked_sampling({"mirostat": g("mirostat"), "samplers_order": order,
+                              "rep_pen_slope": g("rep_pen_slope")})
+            return s
+
+        def _completions(self, req):
+            """OpenAI's POST /v1/completions: the raw prompt continues as the model writes it - no chat
+            template, no thinking, no tools.  The samplers are the chat path's plus the horde set."""
+            prompt = req.get("prompt")
+            if isinstance(prompt, list):
+                if not all(isinstance(x, str) for x in prompt):
+                    raise ValueError("prompt: a string or a list of strings (one completion; a list of one is taken)")
+                if len(prompt) != 1:
+                    raise ValueError("prompt: a list names exactly one prompt (n is not supported)")
+                prompt = prompt[0]
+            if not isinstance(prompt, str):
+                raise ValueError("prompt: a string or a list of strings")
+            if req.get("n") not in (None, 1):
+                raise ValueError("n: only 1 completion per request")
+            suffix = req.get("suffix")
+            if suffix is not None and not isinstance(suffix, str):
+                raise ValueError("suffix: a string")
+            echo = bool(req.get("echo"))
+            max_new = int(req.get("max_tokens") if req.get("max_tokens") is not None
+                          else req.get("max_completion_tokens") or 0)
+            stop = req.get("stop")
+            if stop is not None and not isinstance(stop, (str, list)):
+                raise ValueError("stop: a string or a list of strings")
+            sampling = self._sampling_from_raw(req, kobold=False)
+            if suffix:
+                sampling = dict(sampling)               # stop applies to the pre-suffix completion
+                stop_list = ([stop] if isinstance(stop, str) else list(stop or [])) + [suffix]
+                sampling["stop"] = stop_list
+            elif stop is not None:
+                sampling["stop"] = stop
+            req[BIAS_KEY] = checked_bias(req, self.svc.engine)
+            self._open_live("cmpl-" + uuid.uuid4().hex[:24], req)
+            self._take_turn(bool(req.get("stream")))
+            self.svc.load()
+            ctx = self.svc.engine.max_context
+            if ctx <= 0:
+                ctx = getattr(self.svc.engine, "known_ctx", 0)
+            unset = max_new <= 0
+            if unset:
+                max_new = max(0, ctx - CTX_SLACK) if ctx else 4096
+            prompt_text = PromptText(self.svc.tok, prompt, (), clip=unset or self.svc.fit_max_tokens)
+            prompt_text.max_new = max_new
+            cancel = self._client_cancel()
+            stream = bool(req.get("stream"))
+
+            def pieces():
+                text = []
+                for kind, x in self.svc.run_raw(prompt_text, max_new, sampling, cancel, session=self._session_id(req),
+                                                live=self.live):
+                    if kind == "piece":
+                        text.append(x)
+                        yield x, None
+                    elif kind == "ping":
+                        yield None, None
+                    elif kind == "done":
+                        yield None, (x, "".join(text))
+
+            def chunk(text_piece, finish=None):
+                return {"id": self.live.id, "object": "text_completion.chunk", "created": int(time.time()),
+                        "model": self.svc.model,
+                        "choices": [{"index": 0, "text": text_piece or "", "finish_reason": finish}]}
+
+            def final(finish, text, prompt_tokens, completion_tokens, stop_hit=None):
+                body_text = prompt + text if echo else text
+                if suffix and finish == "stop" and stop_hit == (suffix if isinstance(suffix, str) else None):
+                    body_text += suffix
+                out = {"id": self.live.id, "object": "text_completion", "created": int(time.time()),
+                       "model": self.svc.model,
+                       "choices": [{"index": 0, "text": body_text, "finish_reason": finish,
+                                    "stop_reason": stop_hit}]}
+                if suffix and finish == "stop" and stop_hit:
+                    out["choices"][0]["text"] = body_text + suffix
+                out["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens}
+                return out
+
+            if not stream:
+                text, tail = [], None
+                for piece, done in pieces():
+                    if piece:
+                        text.append(piece)
+                    elif done is not None:
+                        tail = done
+                d, full = tail
+                stop_hit = d.get("stop_sequence")
+                body_text = (prompt + full) if echo else full
+                if suffix and d["finish"] == "stop":
+                    body_text += suffix
+                out = {"id": self.live.id, "object": "text_completion", "created": int(time.time()),
+                       "model": self.svc.model,
+                       "choices": [{"index": 0, "text": body_text, "finish_reason": d["finish"],
+                                    "stop_reason": stop_hit}],
+                       "usage": {"prompt_tokens": d["prompt_tokens"], "completion_tokens": d["completion_tokens"],
+                                 "total_tokens": d["prompt_tokens"] + d["completion_tokens"]}}
+                return self._json(200, out)
+            self._sse()
+            try:
+                for piece, done in pieces():
+                    if piece:
+                        self.wfile.write(b"data: " + json.dumps(chunk(piece)).encode() + b"\n\n")
+                    elif done is not None:
+                        d, full = done
+                        last = chunk("", finish=d["finish"])
+                        last["choices"][0]["stop_reason"] = d.get("stop_sequence")
+                        self.wfile.write(b"data: " + json.dumps(last).encode() + b"\n\n")
+                        self.wfile.write(b"data: [DONE]\n\n")
+                    else:
+                        self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+            except ClientGone:
+                pass
+
+        def _kobold_generate(self, req):
+            """KoboldCpp's POST /api/v1/generate (sync) and /api/extra/generate/stream (SSE): the horde worker's
+            text API.  The prompt continues raw; the samplers are the horde set (rep_pen, top_a, tfs, typical,
+            dynatemp, smoothing, xtc; mirostat is refused)."""
+            kobold_stream = self.path.split("?")[0].rstrip("/") == "/api/extra/generate/stream"
+            prompt = req.get("prompt")
+            if not isinstance(prompt, str):
+                raise ValueError("prompt: a string")
+            max_new = int(req.get("max_length") or 0)
+            sampling = self._sampling_from_raw(req, kobold=True)
+            stop = req.get("stop_sequence")
+            if stop is not None and not isinstance(stop, list):
+                raise ValueError("stop_sequence: a list of strings")
+            if stop:
+                sampling["stop"] = stop
+            trim_stop = req.get("trim_stop")
+            self._open_live("kcpp-" + uuid.uuid4().hex[:24], req)
+            self._take_turn(kobold_stream)
+            self.svc.load()
+            ctx = self.svc.engine.max_context
+            if ctx <= 0:
+                ctx = getattr(self.svc.engine, "known_ctx", 0)
+            unset = max_new <= 0
+            if unset:
+                max_new = max(0, ctx - CTX_SLACK) if ctx else 4096
+            prompt_text = PromptText(self.svc.tok, prompt, (), clip=unset or self.svc.fit_max_tokens)
+            prompt_text.max_new = max_new
+            cancel = self._client_cancel()
+            pieces = []
+            held_tail = ""                      # stop-string holdback released at the end when nothing hit
+
+            def collect():
+                text, done = [], None
+                for kind, x in self.svc.run_raw(prompt_text, max_new, sampling, cancel,
+                                                session=self._session_id(req), live=self.live):
+                    if kind == "piece":
+                        text.append(x)
+                    elif kind == "done":
+                        done = x
+                return "".join(text), done
+
+            if not kobold_stream:
+                text, done = collect()
+                if trim_stop and done.get("stop_sequence"):
+                    text = text.rstrip()
+                return self._json(200, {"results": [{"text": text}]})
+            self._sse()
+            try:
+                for kind, x in self.svc.run_raw(prompt_text, max_new, sampling, cancel,
+                                                session=self._session_id(req), live=self.live):
+                    if kind == "piece":
+                        pieces.append(x)
+                        self.wfile.write(b"data: " + json.dumps({"token": x}).encode() + b"\n\n")
+                    elif kind == "ping":
+                        self.wfile.write(b": keep-alive\n\n")
+                    elif kind == "done":
+                        text = "".join(pieces)
+                        if trim_stop and x.get("stop_sequence"):
+                            text = text.rstrip()
+                        self.wfile.write(b"data: " + json.dumps({"text": text, "events": None,
+                                                                 "finish_reason": x["finish"]}).encode() + b"\n\n")
+                    self.wfile.flush()
+            except ClientGone:
+                pass
 
         def _tokenize(self, req):
             """llama.cpp's /tokenize: the model's token ids for `content`, special-token text read as its token unless
