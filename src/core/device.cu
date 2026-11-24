@@ -1,4 +1,5 @@
 // src/core/device.cu - the CUDA side of the runtime core.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/cuda_cc.hpp"
 #include "basalt/platform/dynlib.hpp"
@@ -140,7 +141,7 @@ bool device_memory(int ordinal, uint64_t& free_bytes, uint64_t& total_bytes, std
     size_t f = 0, t = 0;
     if (e == cudaSuccess) {
         call = "cudaMemGetInfo";
-        e = cudaMemGetInfo(&f, &t);
+        e = basalt::core::gpu_mem_info(&f, &t);
         if (ordinal >= 0 && ordinal != prev) cudaSetDevice(prev);
     }
     if (e != cudaSuccess) {
@@ -254,7 +255,7 @@ DeviceInfo device_info(int ordinal) {
     d.multi_processor_count = p.multiProcessorCount;
 
     size_t free_b = 0, total_b = 0;
-    check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    check(basalt::core::gpu_mem_info(&free_b, &total_b), "cudaMemGetInfo");
     d.free_bytes = free_b;
     d.total_bytes = total_b;
 

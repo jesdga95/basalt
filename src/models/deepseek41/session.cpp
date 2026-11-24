@@ -2,6 +2,7 @@
 //
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/log.hpp"
@@ -510,7 +511,7 @@ public:
         core::ExpertTier* t = ops_->expert_tier(te);
         const auto above_floor = [&] {
             size_t free_b = 0, total_b = 0;
-            return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
+            return !t || basalt::core::gpu_mem_info(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
         };
         const auto lend = [&] {
             if (!t) return false;
@@ -713,7 +714,7 @@ private:
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
             const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
-            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
+            if (prefill_ && basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
                 return true;
             }
