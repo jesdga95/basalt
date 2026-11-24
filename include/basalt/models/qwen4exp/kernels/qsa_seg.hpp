@@ -78,7 +78,7 @@ constexpr int kQsaSegMaxRows = 16;
 /// row's slot; `a.tail_snap` non-null: each segment's indexer block first copies its slot's tail to the slot's
 /// tail_snap. `n` is the window's row count.
 void qsa_dec_kv_post_seg(const QsaDecKvPost& a, const QsaSegTable& t, int n, const QsaShapes& s,
-                         const RopeScaling& scaling, void* stream);
+                         const RopeScaling& scaling, bool int8, void* stream);
 
 /// qsa_block_scores over rows of different sequences: row r reads its slot's pooled / dead. nq <= kQsaSegMaxRows.
 void qsa_block_scores_seg(const QsaSegTable& t, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks,
