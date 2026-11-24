@@ -5,8 +5,8 @@
 // the second card reads layers [l0, n) of chunk i while the main card reads layers [0, l0) of chunk i + 1, and sends its
 // attention layers' cells of the chunk back as it goes.  The main card keeps the last chunks: once the second card's
 // recurrent state is back it reads them whole, so the session ends as after a read on the main card alone and decoding is
-// untouched.  The split (l0, and how many chunks the main card keeps) is priced per read from both cards' rates, timed at
-// start.  The second card runs the main card's kernels on the same inputs (its int8 attention planned as the main
+// untouched.  The stage reads layers [lo, n), its cut set at start from the cards' shares (model/multi_gpu.hpp stage_cuts), and
+// the main card keeps the last chunk.  The second card runs the main card's kernels on the same inputs (its int8 attention planned as the main
 // card's), so its cells and state are the main card's to the bit.  The block drafter's features are made on the main card
 // only (a product's rounding may follow the card's SM count): for the chunks whose rows its context ring keeps, the
 // second card sends back the rows of its target layers and the main card projects them and makes their cells after the
@@ -21,7 +21,6 @@
 #include "basalt/log.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -50,19 +49,14 @@ public:
     // stage card: lin_ready (landed), lin_free (taken by the read), l_done (read), taps_ready
     cudaEvent_t m_done[kSlots] = {}, handed[kSlots] = {};
     cudaEvent_t lin_ready[kSlots] = {}, lin_free[kSlots] = {}, l_done[kSlots] = {}, taps_ready = nullptr;
-    std::vector<cudaEvent_t> main_ev, stage_ev;   // timing: each stage chunk's reads on either card, begin and end
+    std::vector<cudaEvent_t> stage_ev;           // each stage chunk's read on the stage's card, begin and end
     // the prompt split's: its session (every GDN layer's state, the cells of attention layers >= lo), the cells and state going
-    // back, and each card's prompt rates, timed at start over the card's layers: ms per row per layer, and per row per visible
-    // cell per attention layer; a chunk's residual crossing over (ms per row), the state's return (ms)
+    // back
     SessionState st;
     cudaStream_t l_out = nullptr, m_back = nullptr;   // stage card: cells and state out; main card: them in
     uint8_t* kv[kSlots] = {};                    // page-locked: a chunk's cells of the stage's attention layers
     uint8_t* state = nullptr;                    // page-locked: the stage's GDN states
     size_t kv_bytes = 0, state_bytes = 0;
-    struct Rate {
-        double row = 0, cell = 0;
-    } main_rate, stage_rate;
-    double hand_row_ms = 0, state_ms = 0;
     // main card: kv_free, back; stage card: kv_ready, state_ready
     cudaEvent_t kv_free[kSlots] = {}, back = nullptr, kv_ready[kSlots] = {}, state_ready = nullptr;
     ~Stage();
@@ -105,7 +99,6 @@ Stage::~Stage() {
         for (cudaEvent_t* set : {m_done, handed, kv_free})
             for (int k = 0; k < kSlots; ++k) if (set[k]) cudaEventDestroy(set[k]);
         if (back) cudaEventDestroy(back);
-        for (cudaEvent_t e : main_ev) if (e) cudaEventDestroy(e);
         if (main_mem) cudaFree(main_mem);
     }
     for (uint8_t* p : hand) if (p) cudaFreeHost(p);
@@ -174,11 +167,7 @@ size_t cell_bytes(const Geometry& g, bool int8) {
 // the attention layers and GDN layers before layer l
 int count_kind(const Geometry& g, int l, Mixer k) { return (int) std::count(g.kinds.begin(), g.kinds.begin() + l, k); }
 
-constexpr double kPriceMargin = 0.95;   // a split must price this far below the main card alone
-constexpr int kRefitChunks = 6;             // stage chunks a read needs for its timings to refit both rates
 constexpr int kAhead = 2;                   // chunks the host queues ahead of the stage's finished ones: a stop waits for at most these
-constexpr int kCalRuns = 4;                 // timed runs per card and position at start (the later half counts)
-constexpr int64_t kCalFar = 11 * kChunk;   // the furthest position timed at start
 constexpr size_t kStatePiece = 8u << 20;   // the pieces a read's starting state crosses over in
 
 // page-locked host memory (portable: both cards copy to and from it)
@@ -247,255 +236,7 @@ bool take_cells(Arena& a, SessionState& s, const Geometry& g, bool int8, int ai0
     return true;
 }
 
-// Timed runs of one chunk of rows through layers [l0, n) of a card's model at a position (its cells below it hold whatever
-// they hold), each between its own events.
-struct Runs {
-    Model* md = nullptr;
-    SessionState* s = nullptr;
-    const uint16_t* x = nullptr;   // the rows (BF16, on the card)
-    int dev = 0, reps = 0;
-    std::vector<cudaEvent_t> ev;
-    ~Runs() {
-        const core::OnDevice on(dev);
-        for (cudaEvent_t e : ev) if (e) cudaEventDestroy(e);
-    }
-    bool queue(int l0, int64_t p, const int32_t* bnd, const int32_t* pos3) {
-        const core::OnDevice on(dev);
-        if (ev.empty()) {
-            ev.assign(2 * (size_t) reps, nullptr);
-            for (cudaEvent_t& e : ev)
-                if (cudaEventCreate(&e) != cudaSuccess) return false;
-        }
-        for (int r = 0; r < reps; ++r) {
-            cudaMemcpyAsync(md->cs.x, x, (size_t) kChunk * md->g.n_embd * 2, cudaMemcpyDeviceToDevice, s->stream);
-            chunk_start(*md, *s, nullptr, nullptr, kChunk, pos3, bnd);
-            cudaEventRecord(ev[2 * (size_t) r], s->stream);
-            chunk_layers(*md, *s, kChunk, p, l0, md->g.n_layers, nullptr);
-            cudaEventRecord(ev[2 * (size_t) r + 1], s->stream);
-        }
-        return true;
-    }
-    // the mean of the later half of the runs (the card settled into its sustained clocks), -1 on failure
-    float ms() {
-        const core::OnDevice on(dev);
-        if (cudaStreamSynchronize(s->stream) != cudaSuccess) return -1;
-        float sum = 0;
-        int n = 0;
-        for (int r = reps / 2; r < reps; ++r) {
-            float t = 0;
-            if (cudaEventElapsedTime(&t, ev[2 * (size_t) r], ev[2 * (size_t) r + 1]) != cudaSuccess) return -1;
-            sum += t;
-            ++n;
-        }
-        return n ? sum / n : -1;
-    }
-};
-
-// a card's rates from a chunk timed at position 0 (t0) and at p (t1) over nl layers, na of them attention layers
-Stage::Rate fit_rate(float t0, float t1, int64_t p, int nl, int na) {
-    Stage::Rate r;
-    const double T = kChunk;
-    r.cell = p > 0 && na > 0 ? std::max(0.0, (double) (t1 - t0)) / ((double) na * T * (double) p) : 0.0;
-    r.row = std::max(0.0, (double) t0 - r.cell * na * T * T / 2) / (nl * T);
-    return r;
-}
-
-// ms of layers [l0, l1) of a chunk of t rows at position p at rate r
-double layers_ms(const Stage::Rate& r, const Geometry& g, int l0, int l1, int64_t p, int t) {
-    const int na = count_kind(g, l1, Mixer::Attention) - count_kind(g, l0, Mixer::Attention);
-    return r.row * t * (l1 - l0) + r.cell * t * ((double) p + t / 2.0) * na;
-}
-
-struct Plan {
-    int l0 = 0, keep = 0;
-    double ms = 0, alone_ms = 0;
-};
-// The split of an n-token read at pos that the rates price lowest: the stage reads layers [l0, n) of every chunk but the
-// last `keep` ones, which the main card reads whole once the stage's state is back; keep == 0 when no split is cheaper
-// than the main card alone by a clear margin.
-Plan price(const Stage& L, const Geometry& g, int64_t pos, int n) {
-    const int T = kChunk, chunks = (n + T - 1) / T;
-    const auto rows = [&](int c) { return c == chunks - 1 ? n - c * T : T; };
-    Plan best;
-    for (int c = 0; c < chunks; ++c) best.alone_ms += layers_ms(L.main_rate, g, 0, g.n_layers, pos + (int64_t) c * T, rows(c));
-    best.ms = best.alone_ms;
-    for (int l0 = L.lo; l0 < g.n_layers; ++l0)
-        for (int keep = 1; keep < chunks && keep <= 3; ++keep) {
-            double main_t = 0, stage_t = 0;
-            const int lc = chunks - keep;
-            for (int c = 0; c < lc; ++c) {
-                const int64_t p = pos + (int64_t) c * T;
-                main_t += layers_ms(L.main_rate, g, 0, l0, p, T);
-                stage_t = std::max(main_t + L.hand_row_ms * T, stage_t) + layers_ms(L.stage_rate, g, l0, g.n_layers, p, T);
-            }
-            const int64_t pf = pos + (int64_t) lc * T;
-            main_t += layers_ms(L.main_rate, g, 0, l0, pf, rows(lc));
-            double t = std::max(main_t, stage_t + L.state_ms) + layers_ms(L.main_rate, g, l0, g.n_layers, pf, rows(lc));
-            for (int c = lc + 1; c < chunks; ++c) t += layers_ms(L.main_rate, g, 0, g.n_layers, pos + (int64_t) c * T, rows(c));
-            if (t < best.ms) best = {l0, keep, t, best.alone_ms};
-        }
-    if (best.keep > 0 && best.ms > kPriceMargin * best.alone_ms) best.keep = 0;
-    return best;
-}
-
-// A card's rates refit from the reads of the last stage: segment i of `n` was `ms[i]` over layers [l0, l1) of a whole chunk
-// at pos + i chunks.  With a spread of positions both rates are fitted, else the per-row one alone; what the cards met on
-// real rows is what the next split is priced with.
-void refit(Stage::Rate& r, const Geometry& g, int l0, int l1, int64_t pos, const std::vector<float>& ms) {
-    const int n = (int) ms.size(), T = kChunk;
-    const int na = count_kind(g, l1, Mixer::Attention) - count_kind(g, l0, Mixer::Attention);
-    if (n == 0) return;
-    double sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0, priced = 0, took = 0;
-    for (int i = 0; i < n; ++i) {
-        const double x = (double) T * (l1 - l0), y = (double) T * ((double) (pos + (int64_t) i * T) + T / 2.0) * na, z = ms[(size_t) i];
-        sxx += x * x, sxy += x * y, syy += y * y, sxz += x * z, syz += y * z;
-        priced += layers_ms(r, g, l0, l1, pos + (int64_t) i * T, T);
-        took += z;
-    }
-    const double det = sxx * syy - sxy * sxy;
-    if (n >= kRefitChunks && na > 0 && det > 1e-9 * sxx * syy) {
-        const double row = (sxz * syy - syz * sxy) / det, cell = (sxx * syz - sxy * sxz) / det;
-        if (row > 0 && cell >= 0) {
-            r.row = row;
-            r.cell = cell;
-            return;
-        }
-    }
-    if (priced > 0) r.row *= took / priced;
-}
-
 }  // namespace
-
-// Each card's rates: a chunk of random rows (a card's speed may follow what its products multiply) through its layers (the
-// main card's all, the stage's its own) at position 0 and further on (where attention reads more cells), both cards at
-// once, timed after a first run that loads the kernels; the main card's in a session of its own for the time.  The rows cross over as a chunk's residual does, which
-// times the hand-off.
-static bool calibrate(Stage& L, Model& main, std::string& err) {
-    const Geometry& g = main.g;
-    const size_t T = kChunk, H = (size_t) g.n_embd;
-    const int64_t far_pos = std::max<int64_t>(0, std::min<int64_t>(L.max_context - kChunk, kCalFar)) / kChunk * kChunk;
-    const int nl = g.n_layers - L.lo, na = g.attn_layers() - count_kind(g, L.lo, Mixer::Attention);
-    std::memset(L.pos3, 0, ((size_t) kChunk * 3 + 4) * sizeof(int32_t));
-    L.pos3[1] = kChunk;
-    const int32_t *bnd = L.pos3, *pos3 = L.pos3 + 4;
-    {   // the rows: BF16 of about unit spread, on both cards
-        uint16_t* h = (uint16_t*) L.hand[0];
-        uint32_t x = 0x9e3779b9u;
-        for (size_t i = 0; i < T * H; ++i) {
-            float v = -2.0f;
-            for (int k = 0; k < 4; ++k) {
-                x = x * 1664525u + 1013904223u;
-                v += (float) (x >> 8) * (1.0f / 16777216.0f);
-            }
-            uint32_t bits;
-            std::memcpy(&bits, &v, sizeof bits);
-            h[i] = (uint16_t) (bits >> 16);
-        }
-    }
-    // the rows on both cards, then one hand-off timed as a read makes it: the main card's rows to page-locked memory, then
-    // to the stage's card (each copy synchronous, so the clock sees both whole)
-    bool placed;
-    {
-        const core::OnDevice on(L.main_dev);
-        placed = cudaMemcpy(L.mout[0], L.hand[0], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
-    }
-    const auto t_hand = std::chrono::steady_clock::now();
-    {
-        const core::OnDevice on(L.main_dev);
-        placed = placed && cudaMemcpy(L.hand[1], L.mout[0], T * H * 2, cudaMemcpyDeviceToHost) == cudaSuccess;
-    }
-    {
-        const core::OnDevice on(L.dev);
-        placed = placed && cudaMemcpy(L.lin[0], L.hand[1], T * H * 2, cudaMemcpyHostToDevice) == cudaSuccess;
-    }
-    const double hand_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hand).count();
-    if (!placed) {
-        err = "a copy between the cards failed";
-        return false;
-    }
-    // both cards at once, as a read runs them: the main card's whole stack and the stage's layers at position 0, then the
-    // stage's layers further on beside the main card's same layers at 0 and further on (attention's part is their difference)
-    const core::OnDevice on_main(L.main_dev);
-    if (!main.ensure_chunk(err)) return false;
-    Arena a;
-    SessionState s;
-    s.gdn_floats = L.st.gdn_floats;
-    const int ai0 = count_kind(g, L.lo, Mixer::Attention);
-    const size_t need = (size_t) g.gdn_layers() * s.gdn_floats * 4 + (size_t) na * (size_t) (far_pos + kChunk) * cell_bytes(g, main.o.kv_int8) +
-                        (size_t) ai0 * kChunk * cell_bytes(g, main.o.kv_int8) + (size_t) g.attn_layers() * 4 * 256 + 4096;
-    bool ok = far_pos > 0 && a.reserve(need) && cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) == cudaSuccess;
-    s.gdn = ok ? a.take<float>((size_t) g.gdn_layers() * s.gdn_floats) : nullptr;
-    ok = ok && s.gdn && take_cells(a, s, g, main.o.kv_int8, ai0, far_pos + kChunk, kChunk);
-    // the cells the runs further on read hold random values too: what attention multiplies moves a card's speed as well
-    const auto fill = [&](const SessionState& ss, cudaStream_t st) {
-        for (const Region& r : cell_regions(main, ss, ss, ai0, 0, far_pos)) {
-            for (size_t at = 0; at < r.bytes; at += T * H * 2)
-                if (cudaMemcpyAsync((uint8_t*) r.stage + at, L.hand[0], std::min(T * H * 2, r.bytes - at), cudaMemcpyHostToDevice, st) !=
-                    cudaSuccess)
-                    return false;
-        }
-        return cudaStreamSynchronize(st) == cudaSuccess;
-    };
-    ok = ok && fill(s, s.stream);
-    if (ok) {
-        const core::OnDevice on(L.dev);
-        ok = fill(L.st, L.st.stream);
-    }
-    const auto runs = [&](Runs& r, bool stage, int reps) {
-        r.md = stage ? L.model.get() : &main;
-        r.s = stage ? &L.st : &s;
-        r.x = stage ? L.lin[0] : L.mout[0];
-        r.dev = stage ? L.dev : L.main_dev;
-        r.reps = reps;
-    };
-    float main_all = -1, main_0 = -1, main_far = -1, stage_0 = -1, stage_far = -1;
-    if (ok) {
-        Runs mw, lw;   // a first run of each loads the kernels
-        runs(mw, false, 1);
-        runs(lw, true, 1);
-        ok = mw.queue(0, 0, bnd, pos3) && lw.queue(L.lo, 0, bnd, pos3) && mw.ms() >= 0 && lw.ms() >= 0;
-    }
-    if (ok) {
-        Runs ma, la;
-        runs(ma, false, kCalRuns);
-        runs(la, true, kCalRuns);
-        ok = la.queue(L.lo, 0, bnd, pos3) && ma.queue(0, 0, bnd, pos3);
-        main_all = ok ? ma.ms() : -1;
-        stage_0 = ok ? la.ms() : -1;
-    }
-    if (ok) {
-        Runs m0, mf, lf;
-        runs(m0, false, kCalRuns);
-        runs(mf, false, kCalRuns);
-        runs(lf, true, kCalRuns);
-        ok = lf.queue(L.lo, far_pos, bnd, pos3) && m0.queue(L.lo, 0, bnd, pos3) && mf.queue(L.lo, far_pos, bnd, pos3);
-        main_0 = ok ? m0.ms() : -1;
-        main_far = ok ? mf.ms() : -1;
-        stage_far = ok ? lf.ms() : -1;
-    }
-    if (s.stream) cudaStreamDestroy(s.stream);
-    {
-        const core::OnDevice on(L.dev);
-        cudaMemsetAsync(L.st.gdn, 0, (size_t) g.gdn_layers() * L.st.gdn_floats * 4, L.st.stream);
-        ok = ok && cudaStreamSynchronize(L.st.stream) == cudaSuccess;
-    }
-    ok = ok && main_all >= 0 && main_0 >= 0 && main_far >= 0 && stage_0 >= 0 && stage_far >= 0;
-    if (!ok) {
-        err = far_pos > 0 ? std::string("timing the cards' layers failed: ") + cudaGetErrorString(cudaGetLastError())
-                      : "the context is too short for a split";
-        return false;
-    }
-    L.stage_rate = fit_rate(stage_0, stage_far, far_pos, nl, na);
-    L.main_rate.cell = fit_rate(main_0, main_far, far_pos, nl, na).cell;
-    L.main_rate.row = std::max(0.0, (double) main_all - L.main_rate.cell * g.attn_layers() * (double) T * T / 2) /
-                      ((double) g.n_layers * T);
-    L.hand_row_ms = hand_ms / (double) T;
-    L.state_ms = hand_ms * (double) L.state_bytes / (double) (T * H * 2);
-    basalt::log::info("basalt dense", "prompt split: ms per 1K rows and layer: CUDA%d %.2f, CUDA%d %.2f; per 1K rows and 1K cells of "
-                      "attention: %.3f, %.3f; a chunk's hand-off %.1f ms", L.main_dev, L.main_rate.row * 1000, L.dev,
-                      L.stage_rate.row * 1000, L.main_rate.cell * 1e6, L.stage_rate.cell * 1e6, hand_ms);
-    return true;
-}
 
 bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::string& err) {
     cudaGetDevice(&main_dev);
@@ -576,15 +317,15 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
         return false;
     }
     if (!state_in.init(main_dev, dev, kStatePiece, err)) return false;
-    for (auto [evs, d2] : {std::pair{&main_ev, main_dev}, std::pair{&stage_ev, dev}}) {   // a chunk's timing events
-        const core::OnDevice on(d2);
+    {   // a chunk's events
+        const core::OnDevice on(dev);
         for (int j = 0; j < 2; ++j) {
             cudaEvent_t e = nullptr;
             if (cudaEventCreate(&e) != cudaSuccess) {
                 err = "cannot create CUDA events";
                 return false;
             }
-            evs->push_back(e);
+            stage_ev.push_back(e);
         }
     }
     // the second card's int8 prompt attention splits its keys as the main card's does, so its rows round the same
@@ -664,11 +405,27 @@ bool plan_prompt_split(Model& m, int dev, int l_min, const Weights& w, std::stri
     return m.prompt_split != nullptr;
 }
 
-bool attach_prompt_split(Model& m, std::string& err) {
-    if (!m.prompt_split || calibrate(*m.prompt_split, m, err)) return true;
-    err = "CUDA" + std::to_string(m.prompt_split->dev) + ": " + err;
-    m.prompt_split.reset();
-    return false;
+bool warm_prompt_split(Model& m, std::string& err) {
+    if (!m.prompt_split) return true;
+    Stage& L = *m.prompt_split;
+    Model& lm = *L.model;
+    const Geometry& g = m.g;
+    const size_t T = kChunk, H = (size_t) g.n_embd;
+    const core::OnDevice on(L.dev);
+    std::memset(L.pos3, 0, ((size_t) kChunk * 3 + 4) * sizeof(int32_t));
+    L.pos3[1] = kChunk;
+    const cudaStream_t ls = L.st.stream;
+    const int gi0 = count_kind(g, L.lo, Mixer::Gdn);
+    cudaMemsetAsync(L.lin[0], 0, T * H * 2, ls);
+    cudaMemcpyAsync(lm.cs.x, L.lin[0], T * H * 2, cudaMemcpyDeviceToDevice, ls);
+    chunk_start(lm, L.st, nullptr, nullptr, kChunk, L.pos3 + 4, L.pos3);
+    chunk_layers(lm, L.st, kChunk, 0, L.lo, g.n_layers, nullptr);
+    cudaMemsetAsync(L.st.gdn + (size_t) gi0 * L.st.gdn_floats, 0, (size_t) (g.gdn_layers() - gi0) * L.st.gdn_floats * 4, ls);
+    if (cudaStreamSynchronize(ls) != cudaSuccess) {
+        err = "CUDA" + std::to_string(L.dev) + ": warming the prompt layers failed: " + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
 }
 
 bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos,
@@ -677,13 +434,7 @@ bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* toke
     const int T = kChunk, H = g.n_embd;
     constexpr int S = Stage::kSlots;
     if (n <= 2 * T || st.mtp_kc != nullptr || pos + n > L.max_context) return false;
-    const Plan plan = price(L, g, pos, n);
-    if (plan.keep == 0) {
-        basalt::log::info("basalt dense", "prompt split: %d tokens read on CUDA%d (%.0f ms priced alone, %.0f ms across)", n, L.main_dev,
-                          plan.alone_ms, plan.ms);
-        return false;
-    }
-    const int l0 = plan.l0;
+    const int l0 = L.lo;
     if (!m.ensure_chunk(err)) return false;
     const bool block = m.o.drafter == Drafter::Block;
     const BlockDrafter& bd = m.w.dflash;
@@ -698,7 +449,9 @@ bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* toke
     const int64_t cap = block ? st.dctx_cap : 0, b0 = pos + n;
     const int chunks = (n + T - 1) / T;
     const int t_last = n - (chunks - 1) * T;
-    const int lc = chunks - plan.keep;   // the chunks the stage reads
+    // The chunks the stage reads: the main card keeps the last one, and with it the one before when the last is a part of a chunk, so
+    // that the first layers of a whole chunk fill the time the stage takes to finish its last chunk.
+    const int lc = t_last == T ? chunks - 1 : chunks - 2;
     const int ai0 = count_kind(g, l0, Mixer::Attention), gi0 = count_kind(g, l0, Mixer::Gdn);
     const size_t gdn_off = (size_t) gi0 * st.gdn_floats, gdn_bytes = (size_t) (g.gdn_layers() - gi0) * st.gdn_floats * 4;
     // the bounds of a whole chunk and of the last one, then the positions, page-locked so that every upload is queued
@@ -724,15 +477,15 @@ bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* toke
             if (!ok || !L.state_in.wait(err)) return false;
         }
     }
-    for (auto [evs, dev] : {std::pair{&L.main_ev, L.main_dev}, std::pair{&L.stage_ev, L.dev}}) {
-        const core::OnDevice on(dev);
-        while (evs->size() < 2 * (size_t) lc) {
+    {
+        const core::OnDevice on(L.dev);
+        while (L.stage_ev.size() < 2 * (size_t) lc) {
             cudaEvent_t e = nullptr;
             if (cudaEventCreate(&e) != cudaSuccess) {
                 err = "cannot create CUDA events";
                 return false;
             }
-            evs->push_back(e);
+            L.stage_ev.push_back(e);
         }
     }
     std::vector<int64_t> tail_pos;   // the first cells of the stage's chunks the ring keeps rows of
@@ -765,9 +518,7 @@ bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* toke
         const int32_t* p3 = pos3 + (size_t) i * T * 3;
         // main card: the chunk's first layers, its residual out to page-locked memory beside the next chunk
         chunk_start(m, st, tokens + (size_t) i * T, nullptr, T, p3, bnd);
-        cudaEventRecord(L.main_ev[2 * (size_t) i], ms);
         chunk_layers(m, st, T, p, 0, l0, mtaps);
-        cudaEventRecord(L.main_ev[2 * (size_t) i + 1], ms);
         L.send(m, st, k, again, tail ? L.mtail[tail_pos.size()] : nullptr);
         // the stage reads its last layers beside the main card's next chunk
         L.read(L.st, i, k, again, p, p3, bnd, l0, tap_layers, tail ? (int) tail_pos.size() : -1, read_last);
@@ -873,21 +624,9 @@ bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* toke
         basalt::log::info("basalt dense", "prompt split: stopped after %d of %d tokens", (int) std::min<int64_t>(n, (int64_t) (reaped + 1) * T), n);
         return true;
     }
-    // the cards' rates as this read met them, for the next split
-    std::vector<float> main_ms((size_t) lc), stage_ms((size_t) lc);
-    bool timed = true;
-    for (int i = 0; i < lc; ++i) {
-        timed = timed && cudaEventElapsedTime(&main_ms[(size_t) i], L.main_ev[2 * (size_t) i], L.main_ev[2 * (size_t) i + 1]) == cudaSuccess;
-        const core::OnDevice on(L.dev);
-        timed = timed && cudaEventElapsedTime(&stage_ms[(size_t) i], L.stage_ev[2 * (size_t) i], L.stage_ev[2 * (size_t) i + 1]) == cudaSuccess;
-    }
-    if (timed) {
-        refit(L.main_rate, g, 0, l0, pos, main_ms);
-        refit(L.stage_rate, g, l0, g.n_layers, pos, stage_ms);
-    }
     if (progress) progress(n);
-    basalt::log::info("basalt dense", "prompt split: %d tokens, layers %d-%d of chunks 1-%d on CUDA%d; priced %.0f ms, %.0f ms alone", n,
-                      l0, g.n_layers - 1, lc, L.dev, plan.ms, plan.alone_ms);
+    basalt::log::info("basalt dense", "prompt split: %d tokens, layers %d-%d of chunks 1-%d on CUDA%d", n, l0, g.n_layers - 1, lc,
+                      L.dev);
     return true;
 }
 
@@ -1006,15 +745,15 @@ bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
     bnd[3] = t_last;
     for (int t = 0; t < n; ++t) pos3[t * 3] = pos3[t * 3 + 1] = pos3[t * 3 + 2] = (int32_t) (pos + t + st.rope_delta);
     const cudaStream_t ms = st.stream;
-    for (auto [evs, dev] : {std::pair{&L.main_ev, L.main_dev}, std::pair{&L.stage_ev, L.dev}}) {
-        const core::OnDevice on(dev);
-        while (evs->size() < 2 * (size_t) chunks) {
+    {
+        const core::OnDevice on(L.dev);
+        while (L.stage_ev.size() < 2 * (size_t) chunks) {
             cudaEvent_t e = nullptr;
             if (cudaEventCreate(&e) != cudaSuccess) {
                 err = "cannot create CUDA events";
                 return false;
             }
-            evs->push_back(e);
+            L.stage_ev.push_back(e);
         }
     }
     // the chunks whose drafter features the context ring keeps: the main card's part kept aside, the second card's rows back
@@ -1050,9 +789,7 @@ bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
         const int32_t* p3 = pos3 + (size_t) i * T * 3;
         // the main card's layers, its residual on to the second card, whose layers run beside the main card's next chunk
         chunk_start(m, st, tokens + (size_t) i * T, nullptr, t, p3, bc);
-        cudaEventRecord(L.main_ev[2 * (size_t) i], ms);
         chunk_layers(m, st, t, p, 0, L.lo, block ? &bd : nullptr);
-        cudaEventRecord(L.main_ev[2 * (size_t) i + 1], ms);
         L.send(m, st, k, again, tail ? L.mtail[tail_pos.size()] : nullptr);
         L.read(*st.peer, i, k, again, p, p3, bc, L.lo, h.taps, tail ? (int) tail_pos.size() : -1, read_last, t);
         if (tail) {

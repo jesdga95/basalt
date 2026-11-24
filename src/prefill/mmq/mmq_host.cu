@@ -1,6 +1,7 @@
 // The host side of the MMQ kernels: error reporting, the properties of each device and the cache of scratch buffers
 // that the stream-k fixup of a launch takes from, and the explicit load of a kernel.
 #include "mmq_common.cuh"
+#include "basalt/core/device.hpp"
 
 #include <cuda.h>
 
@@ -55,7 +56,7 @@ const ggml_cuda_device_info & ggml_cuda_info() {
             };
             auto & d = in.devices[id];
             d.smpbo = (size_t) attr(cudaDevAttrMaxSharedMemoryPerBlockOptin);
-            d.nsm = attr(cudaDevAttrMultiProcessorCount);
+            d.nsm = basalt::core::plan_sms(id);   // the stream-k split: the planning card's, so a stage computes its bits
             d.warp_size = attr(cudaDevAttrWarpSize);
         }
         return in;

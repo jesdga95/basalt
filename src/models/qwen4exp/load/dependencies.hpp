@@ -1,6 +1,8 @@
 #pragma once
 
 #include "engine_local.hpp"
+#include "peers.hpp"
+#include "split.hpp"
 #include "../serve/qfn_runtime.hpp"
 #include "../../../program/cli/startup.hpp"
 #include "../cli/options.hpp"
@@ -46,7 +48,9 @@
 #include "basalt/program/auto_plan.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/gpu_select.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"
+#include "basalt/core/card_link.hpp"
+#include "basalt/model/multi_gpu.hpp"
+#include "basalt/prefill/chunk_plan.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/iq_kernels.hpp"

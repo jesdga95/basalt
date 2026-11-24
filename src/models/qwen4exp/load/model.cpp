@@ -7,7 +7,6 @@ namespace basalt::models::qwen4exp::generate {
 
 int model(Context& context) {
     auto& o = *context.o;
-    auto& chosen_cards = *context.chosen_cards;
     auto& pack_files = *context.pack_files;
     auto& no_spec = *context.no_spec;
     auto& rope_cfg = *context.rope_cfg;
@@ -47,8 +46,9 @@ int model(Context& context) {
     basalt::core::Loader loader;
     {   // its copy streams on the cards whose weights are read before their caches are sized (the main card, a layer
         // split's stages), before anything is sized there; a tier card's come with its experts, after its slots are sized
-        std::vector<int> devices = {0};
-        if (context.split_devs != nullptr) devices.insert(devices.end(), context.split_devs->begin(), context.split_devs->end());
+        std::vector<int> devices;
+        if (*context.multi_gpu) devices = o.gpus.peers();   // (the cut comes later; every card runs a stage)
+        devices.push_back(0);
         std::sort(devices.begin(), devices.end());
         devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
         if (!loader.prepare(devices, err)) return fatal_start_error(err);
@@ -90,7 +90,7 @@ int model(Context& context) {
         skip.insert("token_embd.weight");
     }
     std::vector<std::pair<int32_t, int32_t>> profile;
-    bool peer_hot_share = false;   // the profile was reordered for the peer's share of the hot pairs
+    double peer_hot_share = 0;   // the peer's share of the hot pairs the profile was reordered for (0: none)
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
         // --expert-profile-save's file from an earlier run of this model: the start places what that run's adaptive
@@ -118,20 +118,16 @@ int model(Context& context) {
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
         // `--expert-cache 0` means auto: the profile ranks every pair.
         if (o.expert_cache == 0) o.expert_cache = -1;
-        // Multi-GPU: a peer card as fast as the main one gets a share of the hot pairs (peer_hot_share_order).  A
-        // slower peer card takes the pairs after the primary's: its fixed hand-off plus a hot expert's entries at its
-        // bandwidth end the layer after the primary.
-        const bool slow_peer = chosen_cards.size() == 2 && chosen_cards[0].mem_gbps > 0 && chosen_cards[1].mem_gbps > 0 &&
-                               chosen_cards[1].mem_gbps < 0.9 * chosen_cards[0].mem_gbps;
-        if (o.peer_device >= 1 && slow_peer)
-            basalt::log::info("basalt generate", "peer hot share 0: the peer card's memory is slower than the main card's");
-        if (o.peer_device >= 1 && !slow_peer) {   // the peer's share of the hot pairs
+        // Multi-GPU: the main card keeps the hottest pairs and one peer takes the pairs after its own.  With gpu-share given
+        // on two cards the hottest are interleaved main/peer by the peer's share (peer_hot_share_order), so both cards
+        // compute routed experts every layer.
+        if (o.peer_device >= 1 && o.peer_devices.size() == 1 && o.gpus.given.size() == 2) {
             size_t at = 0, fill = 0;
-            const size_t n_moved = peer_hot_share_order(profile, at, fill);
-            peer_hot_share = true;
+            peer_hot_share = o.gpus.given[1];
+            const size_t n_moved = peer_hot_share_order(profile, peer_hot_share, at, fill);
             if (at > 0)
-                basalt::log::info("basalt generate", "peer hot share %.2f: %zu of the first %zu ranked pairs moved "
-                                     "behind rank %zu (the peer's)", 0.45, n_moved, at, fill);
+                basalt::log::info("basalt generate", "peer hot share %.2f (gpu-share): %zu of the first %zu ranked pairs moved "
+                                     "behind rank %zu (the peer's)", peer_hot_share, n_moved, at, fill);
         }
         basalt::log::info("basalt generate", "profile %s: %zu ranked pairs, built for %lld slots",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);

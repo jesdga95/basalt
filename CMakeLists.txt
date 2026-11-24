@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.5.6 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.5.7 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -137,7 +137,7 @@ target_link_libraries(artifact INTERFACE platform warnings)
 # `model` is the registry and the adapter interface (shared code may use it). Each model is its own library under
 # src/models/<arch>/; `models` is the composition root that registers them. tools/check_model_layering.sh keeps
 # shared code from including src/models and models from including each other.
-add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp)
+add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp src/model/split_hooks.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
@@ -145,6 +145,8 @@ target_link_libraries(model PUBLIC artifact warnings)
 if(BASALT_MODEL_QWEN4EXP)
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
   src/models/qwen4exp/load/engine_local.cpp
+  src/models/qwen4exp/load/peers.cpp
+  src/models/qwen4exp/load/split.cpp
   src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
   src/models/qwen4exp/load/model.cpp
@@ -327,7 +329,7 @@ endif()
 if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
-add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp src/dense/split_plan.cpp)
+add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
@@ -355,8 +357,8 @@ if(BUILD_TESTING)
   target_include_directories(qwen35_linear_types_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen35_linear_types_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen35_linear_types_test COMMAND qwen35_linear_types_test)
-  # where the 27B's layers go on two cards: one card when it fits, else the cut for alike and unlike cards (host only)
-  add_executable(qwen35_split_plan_test tests/models/qwen35/split_plan_test.cpp src/dense/split_plan.cpp)
+  # where the 27B's layers go on two cards: the cut by the shares over its bytes, and the refusals (host only)
+  add_executable(qwen35_split_plan_test tests/models/qwen35/split_plan_test.cpp src/model/multi_gpu.cpp)
   target_include_directories(qwen35_split_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen35_split_plan_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen35_split_plan_test COMMAND qwen35_split_plan_test)
@@ -484,7 +486,7 @@ endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
-                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp)
+                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp src/core/card_link.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -618,7 +620,7 @@ target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_targe
 # the routed-expert tier: slots, per-layer LRU, RAM tier with CPU compute, file reads, second cards
 add_library(expert_tier STATIC src/core/expert_tier.cpp)
 target_include_directories(expert_tier PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(expert_tier PUBLIC tiers peer_share mmq core kernels kernels_cpu platform ${_gpu_runtime_target})
+target_link_libraries(expert_tier PUBLIC model tiers peer_share mmq core kernels kernels_cpu platform ${_gpu_runtime_target})
 if(BASALT_MODEL_QWEN4EXP)
 include(src/models/qwen4exp/qwen4exp.cmake)
 endif()
@@ -791,7 +793,7 @@ execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
 add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp src/program/host_rates.cpp
-            src/program/gpu_select.cpp src/program/multi_gpu_plan.cpp src/program/image_loan.cpp)
+            src/program/gpu_select.cpp src/program/image_loan.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(engine_session PUBLIC platform kernels_cpu Threads::Threads)   # the pool's sizing rule (auto_pool_workers)
@@ -1508,11 +1510,21 @@ target_link_libraries(ppl_gate_test PRIVATE engine_session warnings)
 basalt_embed_manifest(ppl_gate_test)
 basalt_cpu_test(NAME ppl_gate_test COMMAND ppl_gate_test)
 set_tests_properties(ppl_gate_test PROPERTIES TIMEOUT 60)
-add_executable(multi_gpu_plan_test tests/program/multi_gpu_plan_test.cpp)
-target_link_libraries(multi_gpu_plan_test PRIVATE engine_session warnings)
-basalt_embed_manifest(multi_gpu_plan_test)
-basalt_cpu_test(NAME multi_gpu_plan_test COMMAND multi_gpu_plan_test)
-set_tests_properties(multi_gpu_plan_test PROPERTIES TIMEOUT 60)
+add_executable(multi_gpu_test tests/model/multi_gpu_test.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp src/model/split_hooks.cpp)
+target_include_directories(multi_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(multi_gpu_test PRIVATE warnings)
+basalt_cpu_test(NAME multi_gpu_test COMMAND multi_gpu_test)
+set_tests_properties(multi_gpu_test PROPERTIES TIMEOUT 60)
+add_executable(gpu_check_test tests/model/gpu_check_test.cpp src/model/gpu_check.cpp)
+target_include_directories(gpu_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gpu_check_test PRIVATE warnings)
+basalt_cpu_test(NAME gpu_check_test COMMAND gpu_check_test)
+set_tests_properties(gpu_check_test PROPERTIES TIMEOUT 60)
+add_executable(chunk_plan_test tests/prefill/chunk_plan_test.cpp)
+target_include_directories(chunk_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(chunk_plan_test PRIVATE warnings)
+basalt_cpu_test(NAME chunk_plan_test COMMAND chunk_plan_test)
+set_tests_properties(chunk_plan_test PROPERTIES TIMEOUT 60)
 
 # basalt-probe's suggested values: the worker pick, the balance share and the suggestion lines (CPU only)
 add_executable(probe_derive_test tests/program/probe_derive_test.cpp)
@@ -1791,7 +1803,7 @@ target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda 
 if(MSVC)
   target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
 endif()
-target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
+target_link_libraries(mmq PUBLIC ggml_quants core ${_gpu_runtime_target})
 # multi-GPU: a second card's share of a prompt chunk's routed experts, on the MMQ products
 add_library(peer_share STATIC src/prefill/peer_share.cpp)
 target_include_directories(peer_share PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
