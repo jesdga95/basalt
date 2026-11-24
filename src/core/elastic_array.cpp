@@ -22,14 +22,18 @@ ElasticArray::~ElasticArray() {
     vmm::release_range(base_, reserved_);
 }
 
+uint64_t ElasticArray::host_granule() {
+    if (!vmm::supported()) return 0;
+    const uint64_t dev = vmm::granularity(), host = vmm::host_granularity();
+    return dev && host ? std::max(dev, host) : 0;   // both are powers of two
+}
+
 bool ElasticArray::open(uint64_t bytes, std::string& err, uint64_t host_from) {
     if (bytes == 0) bytes = 1;
     const bool host = host_from < bytes;
     if (vmm::supported()) {
-        gran_ = vmm::granularity();
-        const uint64_t host_gran = host ? vmm::host_granularity() : 1;
-        if (gran_ && host_gran) {
-            gran_ = std::max(gran_, host_gran);   // both are powers of two
+        gran_ = host ? host_granule() : vmm::granularity();
+        if (gran_) {
             reserved_ = (bytes + gran_ - 1) / gran_ * gran_;
             host_from_ = host ? std::min(reserved_, (host_from + gran_ - 1) / gran_ * gran_) : reserved_;
             base_ = vmm::reserve(reserved_);

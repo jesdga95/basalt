@@ -29,6 +29,9 @@ public:
     uint64_t capacity() const { return reserved_; }
     /// Bytes backed by host memory.
     uint64_t host_bytes() const { return reserved_ - host_from_; }
+    /// The granule `open` rounds an array with a host tail to (its size and `host_from`, both up) on the current device;
+    /// 0 without host virtual memory management.
+    static uint64_t host_granule();
 
 private:
     bool map_host_tail(std::string& err);
