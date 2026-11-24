@@ -15,6 +15,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #define BASALT_NVFP4_VNNI_INT8 0
+#define BASALT_NVFP4_VNNI 0
 #define BASALT_NVFP4_EXPORT(name) name##_base
 #include "nvfp4_avx2_rows.inc"
 
@@ -27,14 +28,18 @@ bool nvfp4_256_fits(int n_embd, int n_ff) noexcept {
 void nvfp4_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, const SwiGlu& glu,
                        const void* const* act, int nt, float* const* ff, int r0, int r1) {
     static const bool vnni8 = cpu_avxvnni_int8_ok();
+    static const bool vnni = !vnni8 && cpu_avxvnni_ok();
     if (vnni8) nvfp4_256_gu_rows_vnni(blob, gu_row, up_off, n, sg, su, glu, act, nt, ff, r0, r1);
+    else if (vnni) nvfp4_256_gu_rows_dpbusd(blob, gu_row, up_off, n, sg, su, glu, act, nt, ff, r0, r1);
     else nvfp4_256_gu_rows_base(blob, gu_row, up_off, n, sg, su, glu, act, nt, ff, r0, r1);
 }
 
 void nvfp4_256_down_rows(const uint8_t* w, size_t row_bytes, int n, float sd, const void* const* act, int nt,
                          float* const* out, int r0, int r1) {
     static const bool vnni8 = cpu_avxvnni_int8_ok();
+    static const bool vnni = !vnni8 && cpu_avxvnni_ok();
     if (vnni8) nvfp4_256_down_rows_vnni(w, row_bytes, n, sd, act, nt, out, r0, r1);
+    else if (vnni) nvfp4_256_down_rows_dpbusd(w, row_bytes, n, sd, act, nt, out, r0, r1);
     else nvfp4_256_down_rows_base(w, row_bytes, n, sd, act, nt, out, r0, r1);
 }
 
