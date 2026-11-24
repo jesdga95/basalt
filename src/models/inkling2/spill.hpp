@@ -8,6 +8,7 @@
 // its rows route to), so its products read every expert they need in place, by slot.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -89,5 +90,17 @@ bool give_back(uint64_t free, Room room, Copies copies, Demote demote) {
     }
     return true;
 }
+
+/// The positions a conversation's elastic caches keep for a prompt that reads up to `need`: whole `step`s, never below
+/// `base` nor past `context`.
+inline int64_t kept_positions(int64_t need, int64_t step, int64_t base, int64_t context) {
+    return std::min(context, std::max(base, (need + step - 1) / step * step));
+}
+
+/// Whether a prompt that resumes past position 0 trims caches backing `backed` positions down to `keep`: only when that
+/// gives back at least half of them. A conversation's own turns only go deeper, so this is a compacted conversation or
+/// another one on a shared prefix; a switch between conversations costs at most one trim and one regrow, each a move of
+/// the memory freed, beside the switch's own read or restore of the deeper conversation.
+inline bool resume_trims(int64_t keep, int64_t backed) { return keep > 0 && 2 * keep <= backed; }
 
 }  // namespace basalt::models::inkling2

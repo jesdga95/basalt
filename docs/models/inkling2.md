@@ -53,7 +53,9 @@ the text model.
   while the card runs the rest. The card takes the CPU's rows only when the completion ticket matches the visit. Visits
   with no RAM pairs skip the hand-off, and the watchdog can release a stalled wait. The
   full visits' caches and the drafter's full layer then back their first 32,768 positions and grow as prompts need them, and
-  the experts planned into RAM are copied back to the card while the caches leave room. A short chat at
+  the experts planned into RAM are copied back to the card while the caches leave room. A conversation that starts over, or
+  resumes needing at most half the positions the caches back (a compacted one, or another on a shared prefix), trims them
+  to what its prompt needs and copies experts back into the memory freed; a conversation's own turns never trim. A short chat at
   `--max-context 1048576 --kv fp8` keeps every expert on the card. On a smaller card the spill is static: the caches are whole
   from the start and the RAM experts are copied back while the card has room. Either way the copies leave the card's spare
   free: 1 GiB at the start and 512 MiB after a cache grow, or `--vram-reserve-mib N` for both (at least 128, 256 where the
@@ -221,8 +223,8 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
   so a spilled card decodes slower than a full one: an RTX 5060 Ti alone at 180 W with a Ryzen 9 9950X and about 1,100 experts in RAM decodes conversation at 59 tok/s,
   struct at 118 and prose at 53, about 2.6 times as fast as reading them over the bus; prompts read as before (2,430 tok/s
   at 16K).
-- The server's `decode expert cache hit rate` counts a lookup as a hit when its expert is on a GPU, the second card's included;
-  the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.
+- The server's `decode expert cache hit rate` counts a lookup as a hit when its expert was on a GPU when it ran, the second
+  card's included (a copy that moves later leaves its past lookups where they were); the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.
 - No video.
 
 ## Speed
