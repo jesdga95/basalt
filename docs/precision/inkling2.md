@@ -88,6 +88,7 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | 100 chunks, `--kv int8` (#552's build) | 0.00344 | 97.79% | 7.0762 (base 7.0644) |
 | 100 chunks, `--kv fp8` (#552's build) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | 100 chunks, `--kv fp16` (#552's build), the same set of runs as the two rows above | 0.00310 | 97.78% | 7.0695 (base 7.0644) |
+| MX8 pack, 100 chunks, the sm_120 prompt and decode kernels (#579's build; 0.00442, 97.17%, 7.0704 before it) | 0.00441 | 97.22% | 7.0647 |
 
 The final rebased quality rows above use the DQ8 pack `/mnt/storage/Projects/basalt/models/Inkling-2-Mini-NVFP4-q8.basalt` and the BF16-derived reference `/mnt/storage/kld/inkling2-q6cr-eval/inkling2-bf16-base.kld`, with the same 100 wikitext-2 chunks (25,500 scored rows), T=3, and RTX 5090 power limit 475 W. The scored-row base PPL was 7.0644 for each run. Earlier quality rows and 256K VRAM readings were measured at 400 W unless noted. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512).
 

@@ -122,6 +122,9 @@ Reference: [quality](quality.md#the-bf16-reference). Two cards, 400 W + 180 W, 2
 
 The cache roundings cost nothing measurable: the same run with `--kv fp16` scores PPL 3.0387, KLD 0.2777, top-1 83.97%.
 
+The Engram projection as one MMQ GEMM and the indexer scores on the tensor cores (#573) change the prompt's rounding, not its quality:
+PPL 3.0520 -> 3.0492, KLD 0.2800 -> 0.2791, top-1 83.81% -> 83.87% (the same rows, before and after).
+
 Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 200 tokens after it match `--no-prompt-skip` closely
 (KL mean 6.2e-4 between the two runs).
 

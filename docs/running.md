@@ -114,6 +114,8 @@ After the given seconds without requests, the engine frees its VRAM (the driver 
 RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
+With several models, [`--model-cache-mib`](configuration/models.md#parking-models-in-ram) keeps a model the router switches away from asleep in RAM in the same way, so its next turn wakes it instead of loading it.
+
 ## Lending VRAM: `POST /v1/vram`
 
 With `--vram-elastic`, `POST /v1/vram` with `{"reserve_mib": N}` resizes the expert cache to keep N MiB free (`null`: the start's reserve).

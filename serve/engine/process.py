@@ -603,6 +603,30 @@ class ProcessEngine:
         self.close()
         self.unloaded = True
 
+    def discard(self):
+        """End the engine without giving a sleeping one its GPU state back: the VRAM it left is in use by another model,
+        so it is killed where it sleeps and its RAM-only conversations are lost."""
+        with self.sleep_lock:
+            if self.asleep and self.proc is not None:
+                self.asleep = False
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=20)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        self.unload()
+
+    def held_mib(self) -> int | None:
+        """The RAM this engine's process holds besides file-backed pages: anonymous and shared memory from
+        /proc/PID/status; None where that is unreadable."""
+        try:
+            with open(f"/proc/{self.proc.pid}/status", encoding="ascii") as f:
+                kb = {k: int(v.split()[0]) for k, _, v in (line.partition(":") for line in f)
+                      if k in ("RssAnon", "RssShmem")}
+        except (OSError, AttributeError, ValueError, IndexError):
+            return None
+        return sum(kb.values()) >> 10 if len(kb) == 2 else None
+
     RESTART_RETRY_S = 15.0   # between restart() tries, for VRAM to be released
 
     def restart(self, tries: int = 3):

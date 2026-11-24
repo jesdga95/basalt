@@ -288,6 +288,7 @@ DsHead DsparkWeights::head_args() const {
     h.fold_b = fold_b;
     h.fold_bp = fold_bp;
     h.head_sc = head_sc;
+    h.head_planes = true;
     h.fold_sc = fold_sc;
     h.n_vocab = n_vocab;
     h.cap = logit_softcap;

@@ -118,7 +118,14 @@ public:
     /// until `lend(false)`.
     uint64_t reserve() const { return reserve_; }
     bool lent() const { return lent_; }
-    uint64_t held_free(uint64_t base) const { return std::max(base, reserve_); }
+    /// The free bytes a promote or a grow leaves: `base` (the card's spare for the kernels' modules, the driver and the graphs)
+    /// until the first window has loaded the modules, then the reserve itself, never below kFloorMin.
+    uint64_t held_free(uint64_t base) const { return warm_ ? std::max(reserve_, kFloorMin) : std::max(base, reserve_); }
+    /// The reserve the start asks for: --vram-reserve-mib, else what a grow kept free before there was one.
+    uint64_t asked_reserve() const;
+    /// The first window has run: the spare gives way to the reserve and the experts it frees come back to the card.
+    void warm_up();
+    static constexpr uint64_t kFloorMin = 128ull << 20;   // the engine's smallest --vram-reserve-mib on Linux
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
     /// room. False when even no copy at all leaves that much.
     bool resize_reserve(uint64_t free_bytes, void* stream);
@@ -217,6 +224,7 @@ private:
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none)
     bool elastic_ = false;
     uint64_t reserve_ = 0;
+    bool warm_ = false;
     bool lent_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
