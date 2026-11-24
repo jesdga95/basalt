@@ -405,6 +405,29 @@ bool plan_prompt_split(Model& m, int dev, int l_min, const Weights& w, std::stri
     return m.prompt_split != nullptr;
 }
 
+bool warm_prompt_split(Model& m, std::string& err) {
+    if (!m.prompt_split) return true;
+    Stage& L = *m.prompt_split;
+    Model& lm = *L.model;
+    const Geometry& g = m.g;
+    const size_t T = kChunk, H = (size_t) g.n_embd;
+    const core::OnDevice on(L.dev);
+    std::memset(L.pos3, 0, ((size_t) kChunk * 3 + 4) * sizeof(int32_t));
+    L.pos3[1] = kChunk;
+    const cudaStream_t ls = L.st.stream;
+    const int gi0 = count_kind(g, L.lo, Mixer::Gdn);
+    cudaMemsetAsync(L.lin[0], 0, T * H * 2, ls);
+    cudaMemcpyAsync(lm.cs.x, L.lin[0], T * H * 2, cudaMemcpyDeviceToDevice, ls);
+    chunk_start(lm, L.st, nullptr, nullptr, kChunk, L.pos3 + 4, L.pos3);
+    chunk_layers(lm, L.st, kChunk, 0, L.lo, g.n_layers, nullptr);
+    cudaMemsetAsync(L.st.gdn + (size_t) gi0 * L.st.gdn_floats, 0, (size_t) (g.gdn_layers() - gi0) * L.st.gdn_floats * 4, ls);
+    if (cudaStreamSynchronize(ls) != cudaSuccess) {
+        err = "CUDA" + std::to_string(L.dev) + ": warming the prompt layers failed: " + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
 bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos,
                       const std::function<void(int)>& progress, const std::function<bool()>& stop, std::string& err) {
     const Geometry& g = m.g;

@@ -150,7 +150,11 @@ public:
 
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override {
         if (std::string err; !dense::attach_drafter(*model_, err)) return {model::Status::Error, err};
-        if (stage_.device >= 0) core::log_prompt_split("basalt qwen35", {stage_});
+        if (stage_.device >= 0) {
+            std::string err;
+            if (!dense::warm_prompt_split(*model_, err)) return {model::Status::Error, err};
+            core::log_prompt_split("basalt qwen35", {stage_});
+        }
         for (int i = 0; i < std::max(req.sessions, 1); ++i) {
             std::string err;
             std::unique_ptr<model::ModelSession> s = dense::make_session(*model_, err);
