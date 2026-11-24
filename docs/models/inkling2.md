@@ -42,7 +42,7 @@ the text model.
 ## Memory
 
 - **One card.** The main card holds the weights: 1.10 GiB dense, 14.71 GiB experts, the drafter 0.48 GiB. The token
-  embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. Two cards: [layer split](#two-cards).
+  embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. Two cards: [peer or split](#two-cards).
 - **Context:** `--max-context` from 1,024 to 1,048,576, default 8,192.
 - **Per position:** the 8 full-attention visits keep every position, 32 KiB with `--kv fp16`, 18 KiB with `--kv int8`, 16 KiB
   with `--kv fp8`, plus the drafter's full layer (fp16 in every mode); the window layers' rings do not grow.
@@ -67,29 +67,52 @@ the text model.
 
 ## Two cards
 
-With two cards (`--gpu 0,1`) the start prices a layer split against the main card alone and prints what it picked
-(`multi-gpu: ... picked layer split at layer N`, or `CUDA1 idles`):
+`gpu` names two cards and `gpu-mode` what they do ([GPUs](../configuration/gpus.md)): `"gpu": "0,1", "gpu-mode": "peer"` or
+`"split"`. The model runs both on two cards and refuses `tensor` and a third card. With `gpu` unset and two cards visible the start warns once that GPU 1 is unused.
+At default settings one card is the fastest setup up to 1M tokens of context: the experts that do not fit are computed on the CPU
+and the elastic copies bring them back while the caches leave room, so most runs need neither mode. Use a mode when a card is too
+small or held back (a desktop, another process).
 
-- **The split:** the second card runs the layers from the cut on, with their experts, caches and rings; the first runs the
-  rest, the embedding gather, the head and the drafter. Every expert stays on a card: the split runs only at a cut where both
-  cards hold their layers' experts beside the caches of the asked context, and when it is cheaper than the main card alone
-  with experts in RAM. The cut is priced at every layer: the faster card takes what fits; alike cards take the cut with the
-  fewest crossings (6 or 18, a loop edge) and, between those, the evener one.
-- **Crossings:** the rows a card reads that the other wrote go through page-locked RAM (no peer access needed): 2 crossings
-  a window at a loop edge, 6 with the cut inside the loop. A window, both cards' launches and its crossings, is one graph;
-  prompt chunks cross the same way.
-- **When it does not split:** a main card that holds everything runs alone (an RTX 5090 next to an RTX 5060 Ti: the second
-  card idles). No cut fits: the main card alone, experts in RAM. `--expert-cache` takes one card.
-- **Exact:** the split's crossings change no bit: with both halves on one card (a diagnostic) the greedy tokens equal the
-  single card's, drafting on or off. A second card of another model can round differently, so greedy tokens may part:
-  layers 12 to 23 on an RTX 5060 Ti score 0.00304 KLD and 97.70 % top-1 over 100 chunks, level with one card
-  ([precision](../precision/inkling2.md)).
+- **Peer:** the main card runs every layer, and the hottest experts that spilled from it live in the second card's VRAM (no RAM
+  copy). In decode the peer computes those experts' rows beside the CPU pool and the card merges them as before; in a prompt the
+  rows with an expert on the peer go to the peer and its partial sums come back. The elastic copies also bring a peer's experts to
+  the main card while it has room, and a layer all of whose experts are copied runs on the main card alone. A peer that would hold
+  nothing (the main card holds every expert) is refused with `use gpu 0`.
+  - Speed (RTX 5090 at 400 W, RTX 5060 Ti at 180 W, `--max-context 262144 --kv fp8`, ABBA x1, one card with the CPU experts against
+    the peer, with `--expert-cache` forcing the spill):
+
+    | | 1,572 spilled (`--expert-cache 1500`) | 672 spilled (`--expert-cache 2400`) |
+    | --- | --- | --- |
+    | Prompt read, 16K | 6,234 against 7,445 tok/s | 9,855 against 10,393 |
+    | Prompt read, 64K | 5,670 against 6,560 | 8,514 against 8,488 |
+    | Conversation | 116.5 against 290.5 | 244 against 345.5 |
+    | Struct | 112.5 against 404 | 246.5 against 597.5 |
+    | Prose | 128.5 against 254.5 | 242 against 297.5 |
+
+    At 1M tokens, where the elastic copies bring all 1,938 spilled experts back, one card reads 8,992 tok/s and decodes 365, 650 and
+    313 (conversation, struct, prose) and the peer 8,895 and 357, 645 and 311: the peer buys nothing there.
+  - Quality: with the experts on the peer the BF16 KLD is level with the CPU's (`--expert-cache 1500`: 0.00440 and 97.25% top-1
+    against 0.00444 and 97.15% on one card, 100 chunks). A peer's prompt differs from a resident card's at summation-order rounding
+    (about 0.01 KLD on `--diag-gpu-check`, the same as reordering any expert sum); its decode rows are exact, and with every spilled
+    expert copied back it is bitwise one card.
+- **Split:** the second card runs the layers from the cut on, with their experts, caches and rings; the first runs the rest, the
+  embedding gather, the head and the drafter. Every expert stays on a card: the cut divides each layer's experts, dense rows and
+  caches at the asked context by the shares (free VRAM by default), and a part that does not fit its card is refused with its
+  numbers. Nothing is priced against the main card alone.
+  - **Crossings:** the rows a card reads that the other wrote go through page-locked RAM (no peer access needed): 2 crossings a
+    window at a loop edge, 6 with the cut inside the loop. A window, both cards' launches and its crossings, is one graph; prompt
+    chunks cross the same way.
+  - **Speed:** about 25% slower than one card where one card holds or copies back its experts (768K tokens: prompt 6,985 against
+    9,083 tok/s, conversation 276 against 356); it does not fit at 1M. The split's value is a card too small to hold the model.
+  - **Exact:** the crossings change no bit: the same tokens and logit rows as one card (a diagnostic with both halves on one card,
+    drafting on or off). A second card of another model can round differently, so greedy tokens may part: layers 12 to 23 on an
+    RTX 5060 Ti score 0.00304 KLD and 97.70 % top-1 over 100 chunks, level with one card ([precision](../precision/inkling2.md)).
+- `--diag-gpu-cut L` (diagnostic) forces the cut at layer L.
 - **Pictures and sleep:** a picture borrows its room from the first card's experts; a sleep moves both cards' state.
-- `--diag-split-at N` (diagnostic) forces a split with the second card from layer N.
 
 Decode and a 16K prompt (`basalt-bench`, seeded, the RTX 5090 held to 16 GB by another process, 400 W + 180 W):
 
-| | RTX 5060 Ti alone, ~1,100 experts in RAM | RTX 5090 at 16 GB + RTX 5060 Ti, split picked at 17 | split at 12 (`--diag-split-at`) |
+| | RTX 5060 Ti alone, ~1,100 experts in RAM | RTX 5090 at 16 GB + RTX 5060 Ti, split | split at 12 (`--diag-gpu-cut 12`) |
 | --- | --- | --- | --- |
 | Conversation | 59.8 tok/s | 246 | 176 |
 | Struct | 109 | 430 | 323 |
@@ -159,12 +182,12 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 
 ## Limits
 
-- Two cards: the layer split only, never with experts in RAM (no expert tier, no third card). Experts in RAM run on the CPU,
+- Two cards: peer (the spilled experts on the second card) or split (never with experts in RAM), no third card. Experts in RAM run on the CPU,
   so a spilled card decodes slower than a full one: an RTX 5060 Ti alone at 180 W with a Ryzen 9 9950X and about 1,100 experts in RAM decodes conversation at 59 tok/s,
   struct at 118 and prose at 53, about 2.6 times as fast as reading them over the bus; prompts read as before (2,430 tok/s
   at 16K).
-- The server's `decode expert cache hit rate` line reads 100 % on a spilled load; the engine's `experts: ... on the card`
-  line at the end of a session is the real share.
+- The server's `decode expert cache hit rate` counts a lookup as a hit when its expert is on a GPU, the second card's included;
+  the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.
 - No video.
 
 ## Speed

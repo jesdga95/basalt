@@ -484,6 +484,28 @@ void test_sort() {
     failures += !ok;
     const double us = time_us([&] { moe_sort(dids, R, K, NE, scr, bounds, tok, dst, ex, S); });
     std::printf("  moe_sort 2,048 rows x 8: %.1f us\n", us);
+
+    // pairs another card computes (id -1) are left out; bounds[NE] counts the rest
+    std::vector<int32_t> part = ids;
+    for (size_t i = 0; i < part.size(); ++i)
+        if (part[i] % 3 == 0) part[i] = -1;
+    moe_sort(dev(part), R, K, NE, scr, bounds, tok, dst, ex, S);
+    std::vector<int32_t> pb(NE + 1, 0), pt, pd, pe;
+    for (int e = 0; e < NE; ++e) {
+        pb[e] = (int32_t) pt.size();
+        for (int i = 0; i < P; ++i)
+            if (part[(size_t) i] == e) {
+                pt.push_back(i / K);
+                pd.push_back(i);
+                pe.push_back(e);
+            }
+    }
+    pb[NE] = (int32_t) pt.size();
+    const std::vector<int32_t> gt = host(tok, P), gd = host(dst, P), ge = host(ex, P);
+    const bool ok2 = host(bounds, NE + 1) == pb && std::equal(pt.begin(), pt.end(), gt.begin()) &&
+                     std::equal(pd.begin(), pd.end(), gd.begin()) && std::equal(pe.begin(), pe.end(), ge.begin());
+    std::printf("%-44s %s\n", "moe_sort leaving pairs out (id -1)", ok2 ? "exact" : "FAIL");
+    failures += !ok2;
 }
 
 // ---- the softcapped SwiGLU of the MMQ path ---------------------------------------------------------------------------------

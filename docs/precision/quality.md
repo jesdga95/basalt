@@ -83,7 +83,7 @@ MTP on and off, token by token: one engine session per configuration over `--ser
 
 ```sh
 bin/basalt --serve --model MODEL.basalt {--spec 0 | --spec 7} --expert-cache N --prefill auto --kv int8 \
-    --vram-reserve-mib 700 --resident-experts --peer-exclusive --gpu 0,1 --max-context 8192 \
+    --vram-reserve-mib 700 --resident-experts --peer-exclusive --gpu 0,1 --gpu-mode peer --max-context 8192 \
     --adapt-swaps 0 --peer-adapt-swaps 0 --exp concur9_logit_hash=1
 ```
 

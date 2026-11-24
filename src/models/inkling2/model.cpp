@@ -12,7 +12,7 @@
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/q8_gemm.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
 
@@ -40,13 +40,6 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 constexpr uint64_t kSharedFixed = 768 * kMiB;
 constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
-// The multi-GPU price of a decode window (multi_gpu_plan.hpp): what one moves at the kernels' rate (3.57 ms a token on an
-// RTX 5090), what the experts no card holds add when the CPU computes them all, how the hottest share x of the experts
-// serves x^kHitExponent of the lookups, and one hand-off of a window's rows from card to card through page-locked RAM
-constexpr double kWindowGB = 6.4;
-constexpr double kMissMs = 130.0;
-constexpr double kHitExponent = 0.55;
-constexpr double kHandoffMs = 0.1;
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
 struct ProjPart {
@@ -97,6 +90,12 @@ uint64_t shared_bytes(const Geometry& g, bool drafter) {
 InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
+    peer_.reset();
+    for (const auto& [d, p] : peer_bufs_) {
+        cudaSetDevice(d);
+        cudaFree(p);
+    }
+    if (!peer_bufs_.empty()) cudaSetDevice(device_);
     for (void* p : dev_) cudaFree(p);
     for (void* p : copy_)
         if (p) cudaFree(p);
@@ -231,9 +230,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 
     uint64_t dense = n_vocab * kQ8Row, experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
-    // two cards: what they do together, priced (multi_gpu_plan.hpp); the layer split's cut
-    if (req.diag_split_at > 0 && req.peer_devices.empty()) return fail("--diag-split-at needs a second card (--gpu 0,1)");
-    if (!req.peer_devices.empty())
+    // two cards (gpu-mode split): the layer split's cut from the shares (model/multi_gpu.hpp)
+    if (req.gpus.mode == program::GpuMode::Split)
         if (model::Result r = plan_cards(req); !r.ok()) return r;
     // the loop's message queries of every core layer in one array on each card that runs a core layer: a pass's messages
     // are one launch
@@ -437,6 +435,14 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                                   rank.empty() ? ", no profile" : " by the profile", (double) spill_.device / (double) kGiB,
                                   (double) spill_.staging / (double) kMiB, (long long) want);
             }
+            if (req.gpus.mode == program::GpuMode::Peer && req.gpus.cards.size() > 1) {   // the second card takes the hottest of what spilled
+                if (!peer_open(req.gpus, err)) return {model::Status::Error, err};
+                int64_t held = 0;
+                for (int n : peer_n_) held += n;
+                basalt::log::info("basalt inkling2", "gpu-mode peer: %lld of the %lld experts in RAM are on CUDA%d (%.2f GiB), %lld stay on the CPU",
+                                  (long long) held, (long long) spill_.spilled, peer_->device(), (double) peer_bytes_ / (double) kGiB,
+                                  (long long) (spill_.spilled - held));
+            }
             if (model::Result r = load_experts(reads, file, experts); !r.ok()) return r;
         }
         size_t free_b = 0, total_b = 0;
@@ -479,6 +485,7 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
     if (spill_.any()) {
         copy_.assign((size_t) g.n_layers * g.n_expert, nullptr);
         layer_copies_.assign((size_t) g.n_layers, 0);
+        layer_ram_copies_.assign((size_t) g.n_layers, 0);
     }
     // the RAM copies, every spilled layer's in slot order, and the staging their ranges share
     std::vector<uint64_t> host_at((size_t) g.n_layers, 0);
@@ -582,6 +589,10 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
                     it.dev = w.experts + (uint64_t) s * w.expert_stride;
                     it.device = device_;
                     table[(size_t) e] = (unsigned long long) it.dev;
+                } else if (peer_held(l, e)) {   // the second card's slot; the CPU's entry is 0 as for any expert off the card
+                    it.dev = peer_->slot_ptr(peer_slot_[(size_t) l * g.n_expert + e]);
+                    it.device = peer_->device();
+                    table[(size_t) e] = 0;
                 } else {
                     it.host = host + (uint64_t) (s - keep) * w.expert_stride;
                     table[(size_t) e] = 0;   // the CPU computes it (cpu_experts.hpp)
@@ -589,10 +600,17 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
                 reads.add(it);
             }
             experts += (uint64_t) keep * w.expert_stride;
+            std::vector<int32_t> by_slot = slot;   // a prompt chunk leaves the second card's experts out (-1)
+            for (int e = 0; e < g.n_expert; ++e)
+                if (peer_held(l, e)) by_slot[(size_t) e] = -1;
             int32_t* map = reinterpret_cast<int32_t*>(device_buf((uint64_t) g.n_expert * 4));
-            if (!map || cudaMemcpy(map, slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+            if (!map || cudaMemcpy(map, by_slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
                 return fail("out of device memory loading layer " + std::to_string(l) + "'s expert slots");
             w.slot_map = map;
+            int32_t* full = reinterpret_cast<int32_t*>(device_buf((uint64_t) g.n_expert * 4));
+            if (!full || cudaMemcpy(full, slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+                return fail("out of device memory loading layer " + std::to_string(l) + "'s expert slots");
+            w.slot_full = full;
         }
         if (!(w.blob_table = reinterpret_cast<unsigned long long*>(device_buf(table.size() * 8))) ||
             cudaMemcpy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
@@ -603,68 +621,167 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
 }
 
 model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
-    const Geometry& g = pack_.geo;
-    std::vector<program::GpuCard> cards;
-    const int devs[2] = {device_, req.peer_devices[0]};
-    for (int i = 0; i < 2; ++i) {
-        cudaDeviceProp p{};
-        cudaGetDeviceProperties(&p, devs[i]);
-        program::GpuCard c;
-        c.name = p.name;
-        c.cc_major = p.major;
-        c.cc_minor = p.minor;
-        // what the card has free before the weights (a desktop, another process): the head is already on the first
-        size_t free_b = 0, total_b = 0;
-        cudaSetDevice(devs[i]);
-        c.vram = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b + (i == 0 ? (uint64_t) g.n_vocab * kQ8Row : 0) : p.totalGlobalMem;
-        c.mem_gbps = (size_t) i < req.card_gbps.size() ? req.card_gbps[(size_t) i] : 0;
-        cards.push_back(c);
-    }
-    cudaSetDevice(device_);
-    program::MgModel mm;
-    mm.layers = g.n_layers;
-    mm.pairs = (int64_t) g.n_layers * g.n_expert;
-    mm.window_gb = kWindowGB;
-    mm.miss_ms = kMissMs;
-    mm.hit_exponent = kHitExponent;
-    mm.tier_built = false;
-    mm.handoff_ms = kHandoffMs;
-    mm.split_spills = false;   // a split card holds every expert of its layers
-    mm.split_unlike = true;    // and the split beats the CPU's experts on unlike cards too (an RTX 5090 with 16 GB free)
-    uint64_t experts = 0, dense = (uint64_t) g.n_vocab * kQ8Row;
-    std::vector<int> visits((size_t) g.n_layers, 0);
-    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
-    const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
-    const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-    for (int l = 0; l < g.n_layers; ++l) {
-        const ExpertLayer& el = pack_.experts[(size_t) l];
-        mm.layer_bytes.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes));
-        experts += mm.layer_bytes.back();
-        mm.layer_caches.push_back((uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, req.kv == "fp8", req.kv == "int8") * n_sess);
-        mm.layer_share.push_back((double) visits[(size_t) l] / (double) g.visits.size());
-        dense += (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34) +
-                 prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
-                 2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
-                 prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
-    }
-    for (int c = 0; c <= g.n_layers; ++c) mm.split_handoffs.push_back(split_handoffs(g, c));
-    mm.blob_bytes = experts / (uint64_t) mm.pairs;
-    mm.peer_overhead = kCardSpare + shared_bytes(g, false);
-    mm.main_overhead = kCardSpare + shared_bytes(g, req.spec >= 2) + dense + session_bytes(g, want, req.kv == "fp8", req.kv == "int8") * n_sess +
-                       (1000ull << 20);   // the drafter, as multi_gpu_plan counts it on the first card
-    const program::MgPlan mp = program::plan_multi_gpu(cards, mm);
-    basalt::log::info("basalt inkling2", "%s", mp.line.c_str());
-    cut_ = req.diag_split_at > 0 ? std::min(req.diag_split_at, g.n_layers - 1) : mp.pick == program::Mechanism::LayerSplit ? mp.cut : 0;
-    second_ = devs[1];
-    if (cut_ > 0)
-        basalt::log::info("basalt inkling2", "layer split%s: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window",
-                          req.diag_split_at > 0 ? " (--diag-split-at)" : "", cut_ - 1, devs[0], cut_, g.n_layers - 1, devs[1],
-                          split_handoffs(g, cut_));
-    else
-        basalt::log::info("basalt inkling2", "CUDA%d idles: CUDA%d runs alone", devs[1], devs[0]);
+    req_ = &req;
+    std::string err;
+    const bool ok = split_open(req.gpus, err);
+    req_ = nullptr;
+    if (!ok) return {model::Status::Error, err};
     return {};
 }
 
+model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
+    const model::LoadRequest& req = *req_;
+    const Geometry& g = pack_.geo;
+    // the bytes the share divides: per layer its experts (a split card holds every expert of its layers), its dense rows and
+    // every slot's caches of its visits at the context; per card what it holds whatever its layers (the head is on the main
+    // card already, so its room is what is free now)
+    const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
+    const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
+    const bool fp8 = req.kv == "fp8", int8 = req.kv == "int8";
+    std::vector<int> visits((size_t) g.n_layers, 0);
+    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
+    model::SplitSpec s;
+    for (int l = 0; l < g.n_layers; ++l) {
+        const ExpertLayer& el = pack_.experts[(size_t) l];
+        const uint64_t dense = (uint64_t) kProj * kQ8Row + (uint64_t) g.n_embd * (3072 / 32 * 34) +
+                               prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
+                               2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
+                               prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
+        s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense +
+                          (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8) * n_sess);
+    }
+    const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
+    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
+               kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
+    for (const model::GpuCards::Card& card : c.cards) {
+        cudaSetDevice(card.device);
+        size_t free_b = 0, total_b = 0;
+        s.room.push_back(cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b : 0);
+    }
+    cudaSetDevice(device_);
+    return s;
+}
+
+bool InklingModel::split_place(const model::SplitCut& cut, const std::vector<int>& devices, std::string&) {
+    const Geometry& g = pack_.geo;
+    cut_ = cut.first[1];
+    second_ = devices[1];
+    split_need_ = cut.need;
+    basalt::log::info("basalt inkling2", "layer split: layers 0..%d on CUDA%d, %d..%d on CUDA%d, %d hand-offs a window", cut_ - 1,
+                      device_, cut_, g.n_layers - 1, second_, split_handoffs(g, cut_));
+    return true;
+}
+
+std::string InklingModel::split_part(size_t card) const {
+    return "with their experts and caches (" + model::gib(split_need_[card]) + ")" + (card == 0 ? ", head" : "");
+}
+
+std::string InklingModel::gpu_report(int card) const {
+    if (card < 0) return {};
+    if (cut_ > 0) return split_report((size_t) card);
+    return peer_ ? peer_report((size_t) card) : std::string();
+}
+
+// ---- gpu-mode peer: the second card holds the hottest of the experts that spilled from the main card, in its VRAM
+
+bool InklingModel::peer_card(size_t, int device, std::string& err) {
+    const Geometry& g = pack_.geo;
+    std::string e;
+    auto p = std::make_unique<core::PeerExperts>();
+    if (!p->open_plain(device, g.n_layers, g.n_expert, g.n_embd, g.n_ff_exp, nullptr, e)) {
+        err = "gpu-mode peer: Inkling-2-Mini cannot open the second card: " + e;
+        return false;
+    }
+    peer_ = std::move(p);
+    return true;
+}
+
+namespace {
+// What the second card keeps beyond the experts: the prompt path's buffers (a lane like the main card's), its kernels'
+// modules and the driver's own rounding.
+constexpr uint64_t kPeerSpare = 1ull << 30;
+}  // namespace
+
+uint64_t InklingModel::peer_room(size_t) const { return peer_->room(); }
+
+model::PeerSpec InklingModel::peer_spec() const {
+    model::PeerSpec s;
+    s.deal = model::PeerDeal::Experts;
+    for (const auto& [l, e] : spill_order_) s.unit.push_back((layers_[(size_t) l].expert_stride + 255) / 256 * 256);
+    s.reserve = prompt_bytes(pack_.geo) + kPeerSpare;
+    return s;
+}
+
+bool InklingModel::peer_place(const model::PeerPlacement& p, std::string& err) {
+    const Geometry& g = pack_.geo;
+    const int ne = g.n_expert;
+    std::vector<uint8_t> mine((size_t) g.n_layers * ne, 0);
+    peer_n_.assign((size_t) g.n_layers, 0);
+    for (size_t i = 0; i < spill_order_.size(); ++i)
+        if (p.owner[i] >= 1) {
+            mine[(size_t) spill_order_[i].first * ne + spill_order_[i].second] = 1;
+            ++peer_n_[(size_t) spill_order_[i].first];
+        }
+    // the slots: layer by layer, the layer's experts in expert order, then a zeroed guard (the products read past the last
+    // expert's down rows, as kSlotGuard says)
+    peer_slot_.assign((size_t) g.n_layers * ne, -1);
+    peer_first_.assign((size_t) g.n_layers, 0);
+    std::vector<int64_t> sizes;
+    for (int l = 0; l < g.n_layers; ++l) {
+        peer_first_[(size_t) l] = (int32_t) sizes.size();
+        for (int e = 0; e < ne; ++e)
+            if (mine[(size_t) l * ne + e]) {
+                peer_slot_[(size_t) l * ne + e] = (int32_t) sizes.size();
+                sizes.push_back((int64_t) peer_stride(l));
+            }
+    }
+    sizes.push_back((int64_t) kSlotGuard);
+    if (!peer_->open_slots(sizes, err)) {
+        err = "gpu-mode peer: " + err;
+        return false;
+    }
+    uint64_t bytes = 0;
+    for (int64_t b : sizes) bytes += (uint64_t) (b + 255) / 256 * 256;
+    peer_bytes_ = bytes - (uint64_t) ((int64_t) kSlotGuard);
+    cudaSetDevice(peer_->device());
+    cudaMemset(peer_->slot_ptr(0), 0, bytes);   // the padding after each blob and the guard
+    peer_map_.assign((size_t) g.n_layers, nullptr);
+    for (int l = 0; l < g.n_layers; ++l) {
+        if (peer_n_[(size_t) l] == 0) continue;
+        std::vector<int32_t> map((size_t) ne, -1);
+        int j = 0;
+        for (int e = 0; e < ne; ++e)
+            if (mine[(size_t) l * ne + e]) {
+                map[(size_t) e] = j++;
+                peer_->admit(l, e, peer_slot_[(size_t) l * ne + e]);
+            }
+        void* d = nullptr;
+        if (cudaMalloc(&d, (size_t) ne * 4) != cudaSuccess || cudaMemcpy(d, map.data(), (size_t) ne * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaSetDevice(device_);
+            err = "gpu-mode peer: out of device memory for the expert maps";
+            return false;
+        }
+        peer_bufs_.emplace_back(peer_->device(), d);
+        peer_map_[(size_t) l] = static_cast<int32_t*>(d);
+    }
+    cudaSetDevice(device_);
+    // the main card's slots: a layer's RAM experts first, the second card's last (a chunk stages the first run only)
+    for (int l = 0; l < g.n_layers; ++l) {
+        if (peer_n_[(size_t) l] == 0) continue;
+        std::vector<int32_t>& slot = spill_.slot[(size_t) l];
+        const int keep = ne - spill_.n_spill[(size_t) l];
+        int ram = keep, held = ne - peer_n_[(size_t) l];
+        for (int e = 0; e < ne; ++e)
+            if (slot[(size_t) e] >= keep) slot[(size_t) e] = mine[(size_t) l * ne + e] ? held++ : ram++;
+    }
+    return true;
+}
+
+std::string InklingModel::peer_main() const {
+    const int64_t all = (int64_t) pack_.geo.n_layers * pack_.geo.n_expert;
+    return "dense, KV, " + std::to_string(all - spill_.spilled) + " of " + std::to_string(all) + " experts (" +
+           model::gib(spill_.device) + ")";
+}
 
 model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     {   // Convert loaded Q8_0 w.proj and w.out blocks in-place to wgemm::q8_planes + coalesced prefill scale planes.
@@ -727,9 +844,11 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
             break;
         }
         const int keep = ne - w.n_spill;
-        const uint8_t* src = w.spill_host + (uint64_t) (spill_.slot[(size_t) l][(size_t) e] - keep) * w.expert_stride;
+        const bool held = peer_held(l, e);   // the second card's copy is the source, there is none in RAM
+        const uint8_t* src = held ? peer_->slot_ptr(peer_slot_[i])
+                                  : w.spill_host + (uint64_t) (spill_.slot[(size_t) l][(size_t) e] - keep) * w.expert_stride;
         const unsigned long long at = (unsigned long long) p;
-        if (cudaMemcpy(p, src, w.expert_stride, cudaMemcpyHostToDevice) != cudaSuccess ||
+        if (cudaMemcpy(p, src, w.expert_stride, held ? cudaMemcpyDefault : cudaMemcpyHostToDevice) != cudaSuccess ||
             cudaMemcpy(w.blob_table + e, &at, 8, cudaMemcpyHostToDevice) != cudaSuccess) {
             cudaFree(p);
             break;
@@ -737,6 +856,7 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
         copy_[i] = p;
         ++n_copy_;
         ++layer_copies_[(size_t) l];
+        layer_ram_copies_[(size_t) l] += !held;
         moved += w.expert_stride;
     }
     return moved;
@@ -766,7 +886,7 @@ void InklingModel::lend(bool low, void* stream) {
 
 const uint8_t* InklingModel::ram_blob(int l, int e) const {
     const LayerWeights& w = layers_[(size_t) l];
-    if (w.n_spill == 0 || copy_[(size_t) l * geo().n_expert + e]) return nullptr;
+    if (w.n_spill == 0 || copy_[(size_t) l * geo().n_expert + e] || peer_held(l, e)) return nullptr;
     const int slot = spill_.slot[(size_t) l][(size_t) e] - (geo().n_expert - w.n_spill);
     return slot < 0 ? nullptr : w.spill_host + (uint64_t) slot * w.expert_stride;
 }
@@ -778,12 +898,13 @@ uint64_t InklingModel::cpu_layers() const {
     return mask;
 }
 
-bool InklingModel::stage_from_card(int l, void* stream) const {
+bool InklingModel::stage_from_card(int l, void* stream, bool with_peer) const {
     const LayerWeights& w = layers_[(size_t) l];
-    if (copy_.empty() || w.n_spill == 0 || layer_copies_[(size_t) l] < w.n_spill) return false;
+    if (copy_.empty() || w.n_spill == 0 || (with_peer ? layer_copies_[(size_t) l] < w.n_spill : layer_ram_copies_[(size_t) l] < ram_n(l)))
+        return false;
     const int ne = geo().n_expert;
     for (int e = 0; e < ne; ++e)
-        if (const void* c = copy_[(size_t) l * ne + e])
+        if (const void* c = !with_peer && peer_held(l, e) ? nullptr : copy_[(size_t) l * ne + e])
             cudaMemcpyAsync(w.experts + (uint64_t) spill_.slot[(size_t) l][(size_t) e] * w.expert_stride, c, w.expert_stride,
                             cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
     return true;
@@ -807,6 +928,7 @@ uint64_t InklingModel::demote(uint64_t bytes, void* stream) {
         copy_[i] = nullptr;
         --n_copy_;
         --layer_copies_[i / (size_t) ne];
+        layer_ram_copies_[i / (size_t) ne] -= !peer_held((int) (i / (size_t) ne), (int) (i % (size_t) ne));
     }
     return freed;
 }

@@ -19,6 +19,10 @@ class InklingModel;
 /// when it runs. A call with such windows holds admission (enter, leave): the abort hook closes it, releases stalled waits
 /// and gives the calls in flight a bounded time to finish; a window it interrupted is discarded. The card's blob table and
 /// the host's RAM blob table agree on placement and change only between windows.
+///
+/// With gpu-mode peer the experts on the second card (InklingModel::peer_held) are off the card for the card's kernels too:
+/// the doorbell's thread has the second card compute those pairs (core::PeerExperts, straight into the pool's rows) while
+/// the pool computes the rest, and the same completion ticket covers both.
 class CpuExperts {
 public:
     ~CpuExperts();

@@ -4,7 +4,10 @@
 // holds the later layers' weights, experts and caches instead (cards(), card_of()).
 #pragma once
 
+#include "basalt/core/peer_experts.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/model/peer_hooks.hpp"
+#include "basalt/model/split_hooks.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/pack.hpp"
 #include "models/inkling2/spill.hpp"
@@ -46,13 +49,14 @@ struct LayerWeights {
     unsigned long long* blob_table = nullptr;   ///< device [n_expert]: each expert's blob address on the card (its copy's), 0: in RAM
     int n_spill = 0;                         ///< experts in RAM (spill.hpp): the layer's last slots
     const int32_t* slot_map = nullptr;       ///< device [n_expert]: each expert's slot in `experts`; null: the expert's own
+    const int32_t* slot_full = nullptr;      ///< gpu-mode peer: slot_map with the second card's experts in their slots too (slot_map has -1 for them)
     const uint8_t* spill_host = nullptr;     ///< the RAM experts' blobs in slot order (pinned), null without a spill
     const float* msg_query = nullptr;        ///< core layers: [kStreams][n_embd]
     const uint16_t* ctrl_down[kStreams] = {};   ///< BF16 [gate_rank][2 n_embd]
     const uint16_t* ctrl_gf[kStreams] = {};     ///< BF16 [2 n_embd][gate_rank]: the gain rows, then the forget rows
 };
 
-class InklingModel final : public model::LoadedModel {
+class InklingModel final : public model::LoadedModel, private model::SplitHooks, private model::PeerHooks {
 public:
     InklingModel();
     ~InklingModel() override;
@@ -61,6 +65,8 @@ public:
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_; }
+    std::string gpu_report(int card) const override;
+    model::PeerHooks* peer() const override { return peer_ ? const_cast<InklingModel*>(this) : nullptr; }
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -118,9 +124,31 @@ public:
     bool resize_reserve(uint64_t free_bytes, void* stream);
     void lend(bool low, void* stream);
     /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
-    /// issued; the caller copies them from RAM).
-    bool stage_from_card(int l, void* stream) const;
+    /// issued; the caller copies them from RAM). `with_peer`: the second card's experts too (all_copied).
+    bool stage_from_card(int l, void* stream, bool with_peer) const;
+    /// Every expert of layer l that left the card has a copy on it again (the elastic spill): the layer runs on the main card alone.
+    bool all_copied(int l) const { return !layer_copies_.empty() && layers_[(size_t) l].n_spill > 0 && layer_copies_[(size_t) l] >= layers_[(size_t) l].n_spill; }
+    /// A prompt chunk sends layer l's rows to the second card: it holds experts of the layer that the main card has no copy of.
+    bool peer_runs(int l) const { return peer_n(l) > 0 && !all_copied(l); }
     const SpillPlan& spill() const { return spill_; }
+    /// gpu-mode peer (docs/design/multi-gpu.md): the experts that spilled from the main card and the second card holds in
+    /// its VRAM, the hottest first as far as its room goes. The main card runs every layer; a decode window's pairs on
+    /// these experts go to the card from the CPU experts' doorbell thread (cpu_experts.hpp), a prompt chunk's rows go to
+    /// it layer by layer (prompt.cpp) and its partial sums come back. They have no RAM copy and no staging.
+    core::PeerExperts* peer_experts() const { return peer_.get(); }
+    int peer_device() const { return peer_ ? peer_->device() : -1; }
+    bool peer_held(int l, int e) const { return !peer_slot_.empty() && peer_slot_[(size_t) l * geo().n_expert + e] >= 0; }
+    /// The second card is the one to compute expert e of layer l now: it holds it and the main card has no copy (the elastic
+    /// spill copies the second card's experts to the main card too, while it has room).
+    bool peer_serves(int l, int e) const { return peer_held(l, e) && !copy_[(size_t) l * geo().n_expert + e]; }
+    /// Experts of layer l on the second card; their blobs are at peer_base(l) + j * peer_stride(l), j in expert order,
+    /// peer_map(l) (a device array on that card) giving each expert's j or -1.
+    int peer_n(int l) const { return peer_n_.empty() ? 0 : peer_n_[(size_t) l]; }
+    uint8_t* peer_base(int l) const { return peer_->slot_ptr(peer_first_[(size_t) l]); }
+    uint64_t peer_stride(int l) const { return (layers_[(size_t) l].expert_stride + 255) / 256 * 256; }
+    const int32_t* peer_map(int l) const { return peer_map_[(size_t) l]; }
+    /// The layer's experts in RAM that a prompt chunk stages and the CPU computes (the spilled ones less the second card's).
+    int ram_n(int l) const { return layers_[(size_t) l].n_spill - peer_n(l); }
     /// Expert e of layer l's blob in RAM when the CPU computes it (it spilled and has no card copy; its blob table entry is
     /// 0), else null (cpu_experts.hpp).
     const uint8_t* ram_blob(int l, int e) const;
@@ -141,8 +169,17 @@ private:
                          uint16_t* dst = nullptr);
     /// Every layer's experts, the ones `spill_` sends to RAM there; their bytes on the card into `experts`.
     model::Result load_experts(core::LoadPlan& reads, int file, uint64_t& experts);
-    /// Two cards: prices what they do together and sets the layer split's cut (0: the first card runs alone).
+    /// Two cards (gpu-mode split): the layer split's cut by the shares (SplitHooks: split_spec and split_place below).
     model::Result plan_cards(const model::LoadRequest& req);
+    // gpu-mode peer (PeerHooks): one second card holding spilled experts
+    bool peer_card(size_t card, int device, std::string& err) override;
+    uint64_t peer_room(size_t card) const override;
+    model::PeerSpec peer_spec() const override;
+    bool peer_place(const model::PeerPlacement& p, std::string& err) override;
+    std::string peer_main() const override;
+    model::SplitSpec split_spec(const model::GpuCards& c) const override;
+    bool split_place(const model::SplitCut& cut, const std::vector<int>& devices, std::string& err) override;
+    std::string split_part(size_t card) const override;
 
     Pack pack_;
     model::ModelDesc desc_;
@@ -155,7 +192,9 @@ private:
     const float* output_norm_ = nullptr;
     const float* output_query_ = nullptr;
     float* msg_queries_[2] = {};
+    const model::LoadRequest* req_ = nullptr;   ///< what split_spec reads while plan_cards runs
     int cut_ = 0, second_ = -1;              ///< the layer split's cut (0: none) and the second card's device
+    std::vector<uint64_t> split_need_;       ///< the split's bytes on each card, as the cut counted them
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
     int ldev_ = 0;                           ///< the card the weights being planned load to
@@ -183,6 +222,7 @@ private:
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;
     std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
+    std::vector<int> layer_ram_copies_;   ///< [layer] those the second card does not hold (a prompt chunk stages the others' copies)
     // [vision] the experts' memory lent to the image encoder: each lent range's bytes, in RAM until refill
     struct LentRange {
         size_t range = 0;
@@ -190,6 +230,14 @@ private:
     };
     std::vector<LentRange> lent_ranges_;
     int64_t lend_copies_ = 0;   ///< card copies demoted for the encoder
+    // gpu-mode peer: the second card's experts, layer by layer in expert order in one cache (peer_first_ the layer's first slot)
+    std::unique_ptr<core::PeerExperts> peer_;
+    std::vector<int32_t> peer_slot_;         ///< [layer * n_expert + e] the expert's slot there, -1: not there
+    std::vector<int> peer_n_;                ///< [layer] experts there
+    std::vector<int32_t> peer_first_;        ///< [layer] first slot
+    std::vector<int32_t*> peer_map_;         ///< [layer] device array on that card: expert -> its index in the layer's run, or -1
+    std::vector<std::pair<int, void*>> peer_bufs_;   ///< (device, allocation) of the maps
+    uint64_t peer_bytes_ = 0;
     double lend_ms_ = 0;
 };
 

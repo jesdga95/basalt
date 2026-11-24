@@ -8,7 +8,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"   // prompt_one_card_chunks, prompt_chunk_list
+#include "basalt/prefill/chunk_plan.hpp"
 
 #include "../load/engine_local.hpp"   // biggest_chunk
 
@@ -40,11 +40,11 @@ int64_t request_chunk(int64_t tokens, int64_t max_chunk) {
 
 std::pair<int64_t, int64_t> one_card_chunks(int64_t tokens, int64_t cap, bool head_ok, bool auto_fit) {
     constexpr int64_t kHeadChunk = 16384;   // the first chunk of a prompt above the chunk cap
-    return basalt::program::prompt_one_card_chunks(tokens, cap, head_ok && auto_fit, kHeadChunk);
+    return basalt::prefill::one_card_chunks(tokens, cap, head_ok && auto_fit, kHeadChunk);
 }
 
 std::vector<int64_t> chunk_list(int64_t tokens, int64_t chunk, int64_t head) {
-    return basalt::program::prompt_chunk_list(tokens, chunk, head);
+    return basalt::prefill::chunk_list(tokens, chunk, head);
 }
 
 int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const basalt::core::ModelGeometry& g,

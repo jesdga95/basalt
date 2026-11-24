@@ -625,11 +625,13 @@ __global__ void __launch_bounds__(kPrefetchThreads) expert_prefetch_kernel(const
     if (acc == 0x9e3779b9u) *sink = acc;   // so the loads are not dropped as unused
 }
 
-__global__ void moe_combine_kernel(const float* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y) {
+__global__ void moe_combine_kernel(const float* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y,
+                                   const int32_t* __restrict__ ids) {
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= kWidth) return;
     float acc = 0.f;
-    for (int s = 0; s < k; ++s) acc = fmaf(w[r * k + s], out[((size_t) r * k + s) * kWidth + c], acc);
+    for (int s = 0; s < k; ++s)
+        if (!ids || ids[r * k + s] >= 0) acc = fmaf(w[r * k + s], out[((size_t) r * k + s) * kWidth + c], acc);
     y[(size_t) r * kWidth + c] = acc;
 }
 
@@ -743,9 +745,9 @@ void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned 
     check("moe_plan");
 }
 
-void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream) {
+void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream, const int32_t* ids) {
     if (rows <= 0) return;
-    moe_combine_kernel<<<dim3((kWidth + 255) / 256, (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(out, w, k, y);
+    moe_combine_kernel<<<dim3((kWidth + 255) / 256, (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(out, w, k, y, ids);
     check("moe_combine");
 }
 

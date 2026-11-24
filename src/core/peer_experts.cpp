@@ -215,12 +215,13 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
         ck(made ? cudaSuccess : cudaErrorMemoryAllocation, "exchange marks", err) &&
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "read stream", err) &&
-        ck(cudaHostGetDevicePointer((void**) &rows_map_, rows, 0), "mapped rows", err) &&
+        ck(rows ? cudaHostGetDevicePointer((void**) &rows_map_, rows, 0) : cudaSuccess, "mapped rows", err) &&
         ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
         ck(cudaHostGetDevicePointer(&meta_map_, h_meta_, 0), "mapped plan", err) &&
         ck(cudaHostAlloc((void**) &go_, 64, cudaHostAllocPortable | cudaHostAllocMapped), "plan word", err) &&
         ck(cudaHostGetDevicePointer((void**) &go_map_, go_, 0), "mapped plan word", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
+        ck(cudaMalloc((void**) &d_x_, row_bytes * CAP), "input", err) &&
         ck(cudaMalloc((void**) &d_out_, row_bytes * CAP), "rows", err) &&
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
         ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) CAP, n_ff)), "scratch", err);

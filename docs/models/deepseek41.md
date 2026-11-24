@@ -15,10 +15,8 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 
 ## Memory
 
-- **Start:** experts are dealt out in routing order and loaded once per start, the same way on one card and two. A second card
-  (`--gpu 0,1`) holds experts nowhere else has. With several (`--gpu 0,1,2,3`, up to four after the main card) each holds the
-  second-card experts of one contiguous block of layers, the blocks sized to each card's free memory so that every layer keeps
-  the same number of second-card slots; a sixth card and later ones idle. When RAM cannot take the rest, the main
+- **Start:** experts are dealt out in routing order and loaded once per start, the same way on one card and two. A peer card
+  ([cards](#cards)) holds experts nowhere else has. When RAM cannot take the rest, the main
   card holds the most routed ones too (homes, sized to stay through a prompt at the full context); then RAM, most routed first; the
   rest are read from the pack by the CPU. When RAM takes them all, the main card's slots copy the RAM tier's head instead. Either way
   the main card fills the rest of its memory with copies, down to what a short prompt needs. The start line
@@ -26,7 +24,7 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
 - **RAM:** the checkpoint blocks (`--prompt-cache` + 1 per slot, about 3 MB each) are allocated page-locked at start, with a
   spare VRAM buffer of the same size, before the RAM tier is sized. The prompt path's host buffers are allocated at
   start, before the RAM tier: the pinned ring of file
-  reads (only when experts may stay in the file, at most 240 experts), the staging of a short read, the second card's prompt
+  reads (only when experts may stay in the file, at most 240 experts), the staging of a short read, a peer card's prompt
   rows, and a chunk's Engram reads. A picture's decoded pixels and patch rows are ordinary memory that grows while a request's pictures are read and
   is freed after them (the largest picture takes a few hundred MiB); with `--vision dynamic` nothing is held for pictures at rest, so the RAM tier,
   the homes and the copies are planned exactly as with `--vision off`. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
@@ -53,15 +51,28 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   `--kv fp16` keeps the unrounded values, 3,200 bytes per position (a 1M context about 3.2 GiB). [precision](../precision/deepseek41.md#where-each-stage-rounds)
 - **Refused flags:** `--rope-*`, `--yarn-*` (YaRN is part of the model).
 
+## Cards
+
+`gpu` names the cards and `gpu-mode` what they do ([GPUs](../configuration/gpus.md)); `"gpu": "0,1", "gpu-mode": "peer"`, or `"gpu":
+"all"`. The model runs `peer` only, on up to five cards (the main card and four peers); `split` and `tensor` are refused with the
+modes it runs.
+
+- **Peer:** each card after the main one holds the second-card experts of one contiguous block of layers, the blocks sized to each
+  card's free memory (or by `gpu-share`) so that every layer keeps the same number of peer slots. A peer that would hold nothing is
+  refused. The peer computes its experts in every decode window and its share of each prompt chunk. An sm_89 peer is refused: its
+  kernels are built for sm_120 only.
+- **Quality:** against one card a peer differs at CPU-against-GPU expert rounding (KLD 0.01 on the reference's own picks, BF16 gate
+  0.2805 against 0.2794); the same text as the earlier release with the tier frozen.
+
 ## Long prompts
 
 - Chunks are 16,384 tokens, halved down to 256 to fit memory.
 - A read of more than 2,048 tokens gives back the copies the main card holds beside the short-prompt workspaces; from 4,096 tokens,
   a main card without homes gives back all its slots. Afterwards the same number of slots reopens, empty, and refills from routing
   order; if the card can no longer hold them, that is an error, not a smaller tier.
-- With a second card, each layer of a chunk splits its experts: the card holding that layer computes its own and a share of the
+- With a peer card, each layer of a chunk splits its experts: the card holding that layer computes its own and a share of the
   RAM ones, read over its own PCIe link, while the main card computes the rest; the share is priced from each card's link and SM
-  clock. Each second card's prompt buffers come out of its own memory before its slots are sized.
+  clock. Each peer card's prompt buffers come out of its own memory before its slots are sized.
 - `--no-prompt-skip` runs every row through every layer. Without it, rows further than 2,668 positions from the read's end stop
   at layer 20 (the math is the same; rounding differs; [precision](../precision/deepseek41.md#prompt-skip)).
 - A next turn that starts with the held tokens (or the checkpoint) reads only the new tail. `pp=N/Mc` in the `done` line shows how many
@@ -127,6 +138,6 @@ different RAM tier size can change the text ([precision](../precision/deepseek41
 
 ## Limits
 
-- **Two-card idle sleep** happens only when the GPU state fits in free RAM with 8 GiB to spare. On 121 GiB of RAM, two cards held
+- **Two-card idle sleep** (peer mode) happens only when the GPU state fits in free RAM with 8 GiB to spare. On 121 GiB of RAM, two cards held
   38 GiB of GPU state against 21 GiB free, so the model stayed awake. One card slept in 1.9 s.
 - **Not measured:** restore drift from the disk tier, and second-card sleep on a larger machine.

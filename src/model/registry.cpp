@@ -46,12 +46,6 @@ const ModelAdapter* find_adapter(const std::string& arch) {
     return it == table().end() ? nullptr : it->second.get();
 }
 
-int max_expert_cards() {
-    int most = 0;
-    for (const std::string& name : adapter_names()) most = std::max(most, find_adapter(name)->max_expert_cards());
-    return most;
-}
-
 std::vector<std::string> adapter_names() {
     std::vector<std::string> v;
     for (const auto& kv : table()) v.push_back(kv.first);
