@@ -119,7 +119,7 @@ int main() {
     spec.fixed = {2 * GiB, 1 * GiB};
     spec.room = {30 * GiB, 14 * GiB};
     {
-        // free VRAM 31 + 15 GiB: shares 0.674 / 0.326 of 27 GiB; the main card's 2 GiB + 32 layers is nearest 18.2 GiB
+        // free VRAM 31 + 15 GiB divides the 24 GiB of layers 0.674 / 0.326; 32 layers is the nearest to 16.2 GiB
         const SplitCut cut = split_cut(two(GpuMode::Split), spec);
         CHECK(cut.error.empty());
         CHECK(cut.first.size() == 2 && cut.first[0] == 0 && cut.first[1] == 32);
@@ -167,6 +167,26 @@ int main() {
         s.room = {30 * GiB, 14 * GiB};
         const SplitCut cut = split_cut(two(GpuMode::Split), s);
         CHECK(cut.error.empty() && cut.first[1] > 12 && cut.first[1] < 23);
+    }
+    {
+        // three equal cards, a heavy fixed cost on the main card: the default cut still splits the layers in thirds.
+        // gpu-share 1,1,1 divides every byte, so that fixed cost takes layers off the main card.
+        SplitSpec s = spec;
+        s.fixed = {8 * GiB, GiB, GiB};
+        s.room = {16 * GiB, 16 * GiB, 16 * GiB};
+        GpuCards c = two(GpuMode::Split, 15 * GiB, 15 * GiB);
+        c.cards.push_back(c.cards[1]);
+        c.cards[2].device = 2;
+        c.cards[2].index = 2;
+        c.cards[2].info.smi = 2;
+        c.cards[2].free = 15 * GiB;
+        c.cards[2].label = "GPU 2 (RTX 5060 Ti)";
+        const SplitCut cut = split_cut(c, s);
+        CHECK(cut.error.empty());
+        CHECK(cut.first == std::vector<int>({0, 16, 32}));
+        c.given = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+        const SplitCut bytes = split_cut(c, s);
+        CHECK(bytes.error.empty() && bytes.first[1] < 16);
     }
 
     // ---- peer: the expert deal by share

@@ -80,7 +80,7 @@ given `gpu-share` is used for every use; otherwise the default depends on what i
 
 | Mode, part | What the share divides | Default without `gpu-share` |
 | --- | --- | --- |
-| split | each card's bytes: its layers' weights plus their KV and state at the context and slots; the cut is the layer boundary nearest the shares | free VRAM at start |
+| split | without `gpu-share`, the free-VRAM shares divide the layers and each card keeps its fixed bytes; with `gpu-share`, the shares divide every byte. A part that does not fit is refused | free VRAM at start |
 | peer, experts | the experts outside the main card, dealt hottest first to the peers by share; the main card always fills first | free VRAM of the peers |
 | peer, prompt stages | the layers of a long prompt's chunk: the main card reads the first part, each stage card the next part by share | memory bandwidth (a slow card must not take a large part of a chunk's layers) |
 | peer, the main card's hot share | only when `gpu-share` is given (Flash-Next): the hottest experts are interleaved between the main card and a peer by share | off: the main card keeps the hottest |
@@ -147,8 +147,9 @@ card that would hold nothing or whose part does not fit, then calls `split_place
 | `split_place(cut, devices, err)` | Card `i` runs layers `[cut.first[i], cut.first[i+1])` on `devices[i]`. |
 | `split_part(card)` | The card's own part beside its layers for the start line; empty: nothing more to say. |
 
-`split_report(card)` prefixes `layers a-b` to the model's part. The cut is the layer boundary where the cumulative bytes come
-nearest the shares of every card's bytes.
+`split_report(card)` prefixes `layers a-b` to the model's part. Without `gpu-share`, the free-VRAM shares divide the layers and
+each card keeps its fixed bytes. With `gpu-share`, the cut is the layer boundary where the cumulative bytes come nearest the
+shares of every card's bytes, fixed included. A part that does not fit is refused.
 
 ### Tensor (reserved)
 

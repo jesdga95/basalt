@@ -56,7 +56,7 @@ Shares are normalized to sum to 1 and stay fixed for the run. What a share divid
 
 | Mode, part | What the share divides | Default without `gpu-share` |
 | --- | --- | --- |
-| split | each card's bytes: its layers' weights plus their KV and state at the context and slots; the cut is the layer nearest the shares | free VRAM at start |
+| split | without `gpu-share`, the free-VRAM shares divide the layers, and each card keeps its own fixed bytes (the head and the drafter on the main card). With `gpu-share`, the shares divide every byte, fixed included | free VRAM at start |
 | peer, experts | the experts the main card does not hold, dealt hottest first to the peers; the main card fills first | free VRAM of the peers |
 | peer, prompt layers | the layers of a long prompt's chunk: the main card reads the first part, each card the next by share | memory bandwidth |
 | peer, the main card's hot share | only with `gpu-share`: Flash-Next interleaves the hottest experts between the main card and a peer by share | off: the main card keeps the hottest |

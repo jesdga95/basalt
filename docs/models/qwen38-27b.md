@@ -126,9 +126,10 @@ head, the drafter and the image encoder, and each later card holds the next band
 cache and recurrent state for every slot. On two cards the start line names the parts, then `layer split: layers 0-N-1 (... GiB) on CUDA0, N-63 (... GiB) on CUDA1`.
 Three or more cards (up to eight) each hold one band; the residual is handed from one card to the next, and a prompt's chunks run as a pipeline across them.
 
-- **The cut** divides each layer's weights plus its cells and state at the context and slots by the shares. A part that does not fit
-  its card is refused with its numbers (lower the card's `gpu-share`, `--max-context` or `--parallel`). Nothing is priced: a model
-  that fits one card splits only when you say so.
+- **The cut** divides the layers by the cards' free VRAM, and the head and the drafter stay on the main card's budget, so they do not
+  take layers off it. `gpu-share` instead divides every byte, fixed cost included. A part that does not fit its card is refused
+  with its numbers (lower that card's `gpu-share`, `--max-context` or `--parallel`). Nothing is priced: a model that fits one
+  card splits only when you say so.
 - **Decode:** each card runs its layers of every window as its own CUDA graph; the residual crosses through page-locked RAM that both
   graphs read and write with kernels, and the main card reads the block drafter's rows of the later layers back. Every product on the
   second card is planned as on the main card, so the output is the main card's alone to the bit, at every window width, with

@@ -102,8 +102,12 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
         }
         cut.first[1] = c.diag_cut;
     } else {
-        uint64_t total = below[(size_t) L];
-        for (size_t i = 0; i < n; ++i) total += fixed(i);
+        const bool given = sh.from == "gpu-share";
+        const uint64_t layers_all = below[(size_t) L];
+        uint64_t fixed_all = 0;
+        for (size_t i = 0; i < n; ++i) fixed_all += fixed(i);
+        // gpu-share divides every byte. The default divides the layers; a card's fixed bytes are already its own.
+        const uint64_t pool = given ? layers_all + fixed_all : layers_all;
         double want = 0;
         uint64_t fixed_upto = 0;
         auto nothing = [&](size_t i) {
@@ -112,13 +116,13 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
             return cut;
         };
         for (size_t i = 0; i + 1 < n; ++i) {
-            // card i ends at the boundary where cards 0..i come nearest their shares of every card's bytes
-            want += sh.of[i] * (double) total;
+            want += sh.of[i] * (double) pool;
             fixed_upto += fixed(i);
+            const double target = given ? want : want + (double) fixed_upto;
             int best = cut.first[i];
             double best_off = -1;
             for (int b = cut.first[i]; b <= L; ++b) {
-                const double off = std::fabs((double) (fixed_upto + below[(size_t) b]) - want);
+                const double off = std::fabs((double) (fixed_upto + below[(size_t) b]) - target);
                 if (best_off < 0 || off < best_off) {
                     best_off = off;
                     best = b;
