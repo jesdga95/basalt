@@ -1,4 +1,5 @@
 // src/program/serve/session_engine.cpp - the shared server over a model's ModelSession: one token per window.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "session_engine.hpp"
 
 #include "batch_plan.hpp"
@@ -407,7 +408,7 @@ public:
 private:
     bool memory_reply(long long reserve, int64_t slots, std::string* reply) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         char line[160];
         char held[48] = "";   // a session with no cache names no slots
         if (slots >= 0) std::snprintf(held, sizeof held, " expert_slots=%lld", (long long) slots);

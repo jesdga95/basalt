@@ -1,4 +1,5 @@
 // src/core/card_link.cpp - see include/basalt/core/card_link.hpp.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/card_link.hpp"
 
 #include "basalt/core/on_device.hpp"
@@ -85,7 +86,7 @@ double probe_h2d_gbps(std::string* samples) {
 uint64_t card_free_bytes(int device) {
     const OnDevice on(device);
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+    if (basalt::core::gpu_mem_info(&free_b, &total_b) != cudaSuccess) {
         (void) cudaGetLastError();
         return 0;
     }

@@ -3,6 +3,7 @@
 // experts, the latent rotation and the Markov and confidence heads are in dspark_kernels.cu.
 //
 // The stage structure follows llama.cpp's DeepSeek-V4.1 DSpark graph (MIT, Copyright (c) 2023-2026 The ggml authors).
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
 #include "models/deepseek41/dspark.hpp"
 
@@ -186,9 +187,9 @@ struct DsparkDrafter::Impl {
 
     bool load(const core::FileRange& section, const std::string& ranking, int keep, std::string& err) {
         size_t free0 = 0, free1 = 0, total_b = 0;
-        cudaMemGetInfo(&free0, &total_b);
+        basalt::core::gpu_mem_info(&free0, &total_b);
         const bool ok = read(section, ranking, keep, err);
-        cudaMemGetInfo(&free1, &total_b);
+        basalt::core::gpu_mem_info(&free1, &total_b);
         bytes_taken = free0 > free1 ? (uint64_t) (free0 - free1) : 0;
         return ok;
     }

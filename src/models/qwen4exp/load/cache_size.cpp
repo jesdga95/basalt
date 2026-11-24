@@ -1,3 +1,4 @@
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -42,9 +43,9 @@ int cache_size(Context& context) {
         int d0 = 0, count = 0;
         size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
         cudaGetDevice(&d0);
-        cudaMemGetInfo(&f0, &t0);
+        basalt::core::gpu_mem_info(&f0, &t0);
         if (cudaGetDeviceCount(&count) == cudaSuccess && o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
-            cudaMemGetInfo(&f1, &t1);
+            basalt::core::gpu_mem_info(&f1, &t1);
             (void) cudaSetDevice(d0);
         }
         (void) cudaGetLastError();
@@ -71,7 +72,7 @@ int cache_size(Context& context) {
         // the prompt path's cuBLAS handle is made now, so the free figure below already has its device memory out
         if (o.serve && o.prefill_chunk > 0 && !basalt::prefill::Gemm::prepare_handle(err)) return fatal_start_error(err);
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         // The batched prompt path's chunk buffers are allocated later, so they are reserved here - an over-subscribed
         // allocation can page to system memory and crawl.  With borrowing - the default with a profile - the prompt
         // path lends cache slots instead (`pf_borrow`, hoisted above so both cache-size branches read the same one).
@@ -118,9 +119,9 @@ int cache_size(Context& context) {
             const size_t pb = (size_t) 1 << 30;
             cudaDeviceSynchronize();
             size_t f0 = 0, f1 = 0, t0 = 0;
-            cudaMemGetInfo(&f0, &t0);
+            basalt::core::gpu_mem_info(&f0, &t0);
             if (cudaHostAlloc(&probe, pb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-                cudaMemGetInfo(&f1, &t0);
+                basalt::core::gpu_mem_info(&f1, &t0);
                 cudaFreeHost(probe);
                 const double per_gib = f0 > f1 ? (double) (f0 - f1) : 0.0;
                 const double outside = std::max(0.0, (double) expert_total_bytes -
@@ -213,7 +214,7 @@ int cache_size(Context& context) {
         // fails with "device buffers ... do not fit" (with borrowing - the default with a profile - the path lends
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) cache_slot_bytes, 0);
@@ -231,7 +232,7 @@ int cache_size(Context& context) {
     std::vector<int64_t> sized_slots;
     if (o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const auto& lay = basalt::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * cache_slot_bytes;   // what the uniform sizing granted
         const size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
@@ -328,7 +329,7 @@ int cache_size(Context& context) {
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::gpu_mem_info(&free_b, &total_b);
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
             if ((int64_t) free_b >= want - (64ll << 20)) break;
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB

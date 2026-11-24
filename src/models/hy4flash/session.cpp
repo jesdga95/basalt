@@ -7,6 +7,7 @@
 // the tier places in groups of up to 8 rows beside the shared expert, routed_up). A row's result does not depend on the other
 // rows of its call: the dense products take 8 rows at most per launch with the single-row kernels' reduction order, the
 // attention kernels take a block per row, and the experts are run per row.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/ggml/ggml.h"
@@ -828,7 +829,7 @@ public:
     int64_t kv_ceiling() override {
         if (!elastic() || !tier_) return -1;
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const double spare = (double) free_b - (double) tier_->free_floor() + (double) tier_->slots() * (double) stride_ - (double) prompt_floor_bytes();
         return std::min<int64_t>(m_.context(), backed_ + (int64_t) (std::max(0.0, spare) / cell_bytes()));
     }
