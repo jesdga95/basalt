@@ -159,9 +159,9 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 // and the splits the capacity, so a row's bits are the same at any window width and any NTL.
 template <int HD, bool I8, bool F4, int NTL>
 // (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__;
-// two tiles keep one tile's three blocks an SM)
+// three blocks an SM at head width 128)
 // F4 (with I8): the quantized cache is NVFP4 (KvInt8::fp4), each 8 values from 4 code bytes and their group's scale byte
-__global__ void __launch_bounds__(128, NTL == 2 ? 3 : 1)
+__global__ void __launch_bounds__(128, HD == 128 ? 3 : 1)
     decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks, float scale, float* part_all) {
     constexpr int LD = HD + 8;          // padded rows (halves): ldmatrix without bank conflicts
     constexpr int NT = HD / 32;         // P V: a warp's 8-dim tiles
