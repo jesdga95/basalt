@@ -1,6 +1,7 @@
 #include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "basalt/core/spin_wait.hpp"
+#include "basalt/platform/compiler.hpp"
 
 namespace basalt::core {
 
@@ -104,6 +105,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
                 // once the wait yields, since each check then takes a scheduler round trip
                 if ((++spins & (spin.yielding() ? 63u : 1023u)) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
+            basalt::platform::load_fence();   // the token was seen: its probability is read after it
         };
         wait_step(0);
         // every draft arrived: the graph's kernels are done, only its skipped steps' conditional nodes remain
