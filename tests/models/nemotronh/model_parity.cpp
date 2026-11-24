@@ -1,12 +1,12 @@
 // tests/models/nemotronh/model_parity.cpp - the whole Nemotron-H model against reference.py's float64 logits, and its
 // paths against each other.
 //
-//     nemotronh_model_parity PACK REF.bin [--vram N] [--ram N] [--frozen]
+//     nemotronh_model_parity PACK REF.bin [--vram N] [--ram N] [--frozen] [--peer]
 //
 // PACK is a converted checkpoint (synth_checkpoint.py's small one, or a real one), REF.bin reference.py's logits of its
 // tokens.  --vram / --ram set the expert tier's homes (experts per layer on the card / in RAM; the rest stay in the file),
-// so the card's, the CPU's and the file's experts all run; --frozen keeps every expert where it starts.  Exits 77
-// without both files or a GPU.
+// so the card's, the CPU's and the file's experts all run; --frozen keeps every expert where it starts; --peer adds
+// CUDA device 1 as a second card (gpu-mode peer), its experts computed there.  Exits 77 without both files or a GPU.
 //
 // An expert the CPU computes rounds its activations as Q8_0, one on the card as q8_1: the paths below agree bitwise only
 // while every expert stays where it was (a small pack whose experts all fit on the card, or --frozen); a tier that moves
@@ -177,6 +177,16 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--frozen") frozen = true;
+        else if (a == "--peer") {   // gpu-mode peer: CUDA devices 0 and 1, the second holding blocks of the expert tier
+            req.gpus.mode = program::GpuMode::Peer;
+            for (int d = 0; d < 2; ++d) {
+                model::GpuCards::Card k;
+                k.device = d;
+                k.index = d;
+                k.label = "GPU " + std::to_string(d);
+                req.gpus.cards.push_back(k);
+            }
+        }
         else if (a == "--vram" && i + 1 < argc) req.diag_tier_vram = std::atoi(argv[++i]);
         else if (a == "--ram" && i + 1 < argc) req.diag_tier_ram = std::atoi(argv[++i]);
     }

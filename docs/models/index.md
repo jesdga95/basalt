@@ -15,7 +15,7 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Images | `--vision dynamic`, a GPU number or `cpu` | `--vision dynamic` only | `--vision dynamic` | `--vision dynamic` only | `--vision dynamic` only | no |
 | Video | with images, and FFmpeg on the machine ([video](../running.md#video)) | no | with images, and FFmpeg on the machine | no | no | no |
 | `--kv` | fp16 (default), int8, q4_0, k8v4 | fp8 (default: FP8 window, FP4 compressed rows), fp16 | fp16 (default), int8, nvfp4 | fp16 (default), fp8 | fp16 (default), fp8 | fp16 |
-| `gpu-mode peer` | up to 4 cards: experts and prompt layers | up to 5 cards: experts | 2 cards: the last layers of long prompts | up to 4 cards: experts | 2 cards: the experts that spill from the main card | refused: the experts stay on the main card and in RAM |
+| `gpu-mode peer` | up to 4 cards: experts and prompt layers | up to 5 cards: experts | 2 cards: the last layers of long prompts | up to 4 cards: experts | 2 cards: the experts that spill from the main card | up to 4 cards: experts |
 | `gpu-mode split` | up to 8 cards | refused | 2 cards | refused | 2 cards | refused |
 | Cards by default | the main card alone | the main card alone | the main card alone | the main card alone | the main card, experts in RAM when the context needs their room | the main card alone; the experts in RAM |
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured | not measured | not measured |

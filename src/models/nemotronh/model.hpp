@@ -46,6 +46,9 @@ struct MtpHead {
     Mat eh;
     const float *enorm = nullptr, *hnorm = nullptr, *final_norm = nullptr;
 };
+/// The most second cards whose expert tiers a start uses (gpu-mode peer takes the main card and up to these).
+constexpr int kMaxSecondCards = 3;
+
 class NemotronModel final : public model::LoadedModel {
 public:
     NemotronModel();
@@ -55,6 +58,8 @@ public:
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_; }
+    /// gpu-mode peer: the second cards hold blocks of the expert tier's layers (model/peer_hooks.hpp).
+    model::PeerHooks* peer() const override;
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }

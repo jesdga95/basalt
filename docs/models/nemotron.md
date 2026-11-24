@@ -38,22 +38,34 @@ are shared, for any later model that uses them.
   slots as the rest of the card allows. The experts that do not fit are in page-locked RAM: about 64 GB of system RAM
   for all 512 x 40. With less, the rest are read from the file.
 - **Per position:** 8 attention layers, 8 KiB with `--kv fp16` (the only format).
-- **No second card.** The expert tier does not place this model's experts on peer cards (`max_expert_cards` 0).
+- **Second cards** (`--gpu 0,1 --gpu-mode peer`, up to three): each holds a block of layers' experts and computes them
+  itself during decode, from the same rows and with the same kernels as the main card's; the CPU runs only what no card
+  holds. A prompt chunk copies a second card's experts over to the main card ([multi-GPU](../design/multi-gpu.md)).
 
 ## Decode
 
 Each token runs its 40 MoE layers' 22 experts where they are: the card's from their slots, a few RAM misses the card
 fetches over the bus, the rest by the CPU workers from RAM. The host never waits for the CPU's share: the card's weighted
 sum waits for a word the host writes once the CPU's rows landed, the host queues the next layers meanwhile, and the card
-reads the next weights into L2 while it waits (the decode of Hy4-flash and DeepSeek). On an RTX PRO 4000 (power limited
-to 145 W) with 59 GiB of experts in RAM and 38 experts a layer on the card: **30.7 ms a token (32.6 tok/s)**. Windows of
-2, 4 and 8 rows take 43, 66 and 125 ms.
+reads the next weights into L2 while it waits (the decode of Hy4-flash and DeepSeek). A 200-token chat reply at
+temperature 0, the RTX PRO 4000 at 145 W (the card to itself: about 113 experts a layer on it), the rest of the experts in
+RAM, the second card an RTX 5050 at 130 W holding 55 experts of every layer:
+
+| Cards | `--spec` | ms a window | Tokens a window | tok/s |
+| --- | --- | --- | --- | --- |
+| one | 0 | 23.2 | 1.00 | 43.0 |
+| one and the RTX 5050 | 0 | 22.0 | 1.00 | 45.5 |
+| one | 4 | 5.7 + 49.6 | 3.55 | 64.1 |
+| one and the RTX 5050 | 4 | 5.1 + 38.8 | 3.70 | **84.3** |
+
+The second card takes 14 to 18% of the expert lookups, nearly all of them from the CPU's share (29% to 20% with drafts).
+It pays most with drafts: a window's rows route to more distinct experts, so more of them would run on the CPU.
 
 **The MTP head drafts** (`--spec N`, default 4: windows of up to N rows; `0` off). It takes the main model's last hidden
 row and the token just picked, and runs one attention and one MoE layer through the same code and expert tier as the
 main model, its own attention cache kept with the conversation's. Each further draft feeds the head its own output. The
-window then verifies every row at once and keeps the drafts the main model agrees with, so only speed changes. A 200-token
-chat reply at temperature 0:
+window then verifies every row at once and keeps the drafts the main model agrees with, so only speed changes. The same
+reply, with 9 GiB of the card taken by other programs (35 experts a layer on it):
 
 | `--spec` | Tokens a window | Draft, verify (ms a window) | ms a token | tok/s |
 | --- | --- | --- | --- | --- |
@@ -126,4 +138,4 @@ switch; `high` and `max` think fully. A number is refused.
 
 - A quality base for `basalt-bench --quality` (needs a BF16 run of the full model). Until then the check is the float64
   reference ([precision](../precision/nemotron.md#against-the-reference)).
-- Images, other `--kv` formats, a second card, idle sleep.
+- Images, other `--kv` formats, idle sleep, a second card's share of a prompt chunk.

@@ -1008,6 +1008,12 @@ private:
         pd = Pending{};
         pd.on = true;
         pd.tl = tl;
+        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
+        core::PeerExperts* peer = tier_->peer_for(tl);
+        if (peer) {
+            if (!peer->arm(lay_, h_x_, G, K, core::policy::peer_groups(G), err)) return false;
+            pd.peer = peer;
+        }
         tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
         if (!await_ids(err)) return false;
         int32_t uniq[kLookupK];
@@ -1035,11 +1041,20 @@ private:
         core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(tl, lk);
-        for (int i = 0; i < nu; ++i) {
-            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.reading[i]);
-            pd.reading = pd.reading || lk.reading[i];
+        // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
+        if (peer) {
+            int32_t kind[kLookupK] = {};
+            for (int r = 0; r < G * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
+            if (!peer->raise(tl, h_wids_, kind, err)) return false;
+            pd.peer_raised = true;
         }
-        if (pd.cpu || pd.reading) pd.word = ++join_seq_;   // the weighted sum waits for the host's rows
+        bool on_peer = false;
+        for (int i = 0; i < nu; ++i) {
+            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            pd.reading = pd.reading || lk.reading[i];
+            on_peer = on_peer || lk.peer[i];
+        }
+        if (pd.cpu || pd.reading || on_peer) pd.word = ++join_seq_;   // the weighted sum waits for the host's rows
         // a promotion only queues its copies (they go out at a later pump); experts still being read from the file are
         // decided once they landed
         if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
@@ -1082,6 +1097,8 @@ private:
             bk::put_words(&p2, ex_plan2_, (int) (sizeof(WindowPlan) / 4), stream_);
             launch(ex_plan2_, ng, ne);
         }
+        // the second card's fetched experts run once their copies land, long after these launches
+        if (peer && !peer->run_fetched(err)) return false;
         if (pd.word) bk::wait_word_mark(d_words_ + 1, pd.word, ra_mark_, stream_);
         const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
         bk::weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, Ln, latout_ + (size_t) g0 * Ln, stream_);
@@ -1143,6 +1160,11 @@ private:
             }
             tier_->promote(pd.tl, pd.lk);
         }
+        // the second card's rows have landed (an armed share not raised is raised empty, so the card is not left waiting)
+        std::string pe;
+        if (pd.peer && pd.peer_raised && !pd.peer->finish(nullptr, pe)) ok = false;
+        if (pd.peer && !pd.peer_raised) pd.peer->raise(0, nullptr, nullptr, pe);
+        if (!pe.empty() && err.empty()) err = pe;
         if (pd.word) {
             std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
             *(volatile uint32_t*) (h_words_ + 1) = pd.word;
@@ -1231,6 +1253,8 @@ private:
                     cudaMemcpyAsync(slot, src.dev, blob, cudaMemcpyDeviceToDevice, copy_);
                 } else if (src.pinned) {
                     cudaMemcpyAsync(slot, src.pinned, blob, cudaMemcpyHostToDevice, copy_);
+                } else if (src.peer) {
+                    cudaMemcpyPeerAsync(slot, m_.device(), src.peer, tier_->peer_for(tl)->device(), blob, copy_);
                 } else {
                     cudaStreamSynchronize(copy_);   // the bounce buffer's last copy has left
                     if (!platform::pread_all(m_.fd(), bounce_, blob, er.offset + layer_off + (uint64_t) e * blob)) return false;
@@ -1416,6 +1440,8 @@ private:
     // the CPU's share of the last group placed, until join_moe; the thread that finishes it
     struct Pending {
         bool on = false, cpu = false, reading = false, handed = false;   // handed: to the joiner thread
+        bool peer_raised = false;
+        core::PeerExperts* peer = nullptr;   // the second card that holds this layer's block, armed for the group
         int tl = 0;
         uint32_t word = 0;
         core::ExpertTier::Lookup lk;

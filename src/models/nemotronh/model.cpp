@@ -62,6 +62,7 @@ core::ExpertTierSpec NemotronModel::tier_spec() const {
     s.path = path_;
     s.fd = fd_;
     s.range = pack_.experts_range;
+    s.gpus = flags_.gpus;
     s.diag_tier_ram = flags_.diag_tier_ram;
     s.diag_tier_vram = flags_.diag_tier_vram;
     s.diag_tier_frozen = flags_.diag_tier_frozen;
@@ -79,6 +80,8 @@ core::ExpertTierSpec NemotronModel::tier_spec() const {
     s.share_stride = expert_stride();
     return s;
 }
+
+model::PeerHooks* NemotronModel::peer() const { return shared_tier_.tier.get(); }
 
 model::Result NemotronModel::plan(const model::LoadRequest& req, core::LoadPlan& reads,
                                   std::vector<std::unique_ptr<model::ModelSession>>& sessions) {

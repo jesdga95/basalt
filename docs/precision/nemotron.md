@@ -61,3 +61,7 @@ of 53. After the prompt of 26: 26 of 27 and 25 of 26. The misses are near ties.
 With the tier moving experts between the card (q8_1) and the CPU (Q8_0), windows against one-row decode give KL 4.2e-4 and
 the restored state 1.5e-4: the two activation roundings differ, so moved experts are not bitwise. The MTP
 drafts there: 53 of 53 and 52 of 53, after the prompt 27 of 27 and 26 of 27.
+
+With a second card (`--peer`: an RTX 5050 holding 55 experts of every layer, computing them with the main card's kernels),
+the placement frozen: decode KL 6.2e-4 and top-1 54/54, a prompt then decode 6.0e-4 and 28/28, windows and the restored
+state bitwise, the MTP drafts 53 of 53 and 52 of 53. With the tiers moving: KL 4.5e-4 and 6.1e-4, all top-1.
