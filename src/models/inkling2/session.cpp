@@ -375,6 +375,7 @@ public:
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "inkling2: an empty window"};
+        if (stale_) return stale();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
         std::string err;
         if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
@@ -414,7 +415,13 @@ protected:
     int64_t batch_context() const override { return m_.context(); }
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
-    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
+    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        if (stale_) {
+            err = stale().message;
+            return false;
+        }
+        return ensure_positions(r.pos + r.n_tokens, err);
+    }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         if (!admit(err)) return false;
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
@@ -460,11 +467,17 @@ protected:
 
 public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
+        if (stale_ && r.pos > 0) return stale();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
         if (r.pos == 0) restart_positions(r.n_tokens);
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) r.pos);
-        if (sh_->prompt && r.n_tokens > 16) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
+        stale_ = true;   // until the rows are in (an error or an exception leaves it set)
+        if (sh_->prompt && r.n_tokens > 16) {   // PROMPT HOOK
+            const model::Result res = sh_->prompt->read(r, hist_, vc_, dspark_, stream_);
+            stale_ = !res.ok();
+            return res;
+        }
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
@@ -478,7 +491,9 @@ public:
                 r.progress(t0 + n);
             }
         }
-        return end_call("the prompt failed");
+        const model::Result res = end_call("the prompt failed");
+        if (res.ok()) stale_ = false;
+        return res;
     }
 
     // ---- [vision] images (vision.hpp, vision_encoder.hpp): a picture's rows stand in for its pad tokens' embeddings, taken
@@ -494,10 +509,16 @@ public:
     }
     void images_done() override { m_.encoder().release(); }
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
+        if (stale_ && pos > 0) return stale();
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
         if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) pos);
-        if (sh_->prompt && n_rows > 16) return sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_);
+        stale_ = true;
+        if (sh_->prompt && n_rows > 16) {
+            const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_);
+            stale_ = !res.ok();
+            return res;
+        }
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
@@ -506,7 +527,9 @@ public:
             if (!forward(nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, 0, err)) return {model::Status::Error, "inkling2: " + err};
             for (int i = 0; i < n; ++i) hist_.push_back(g_.image_token);
         }
-        return end_call("the image rows failed");
+        const model::Result res = end_call("the image rows failed");
+        if (res.ok()) stale_ = false;
+        return res;
     }
 
     model::Result set_logit_bias(const float* bias) override {
@@ -594,6 +617,9 @@ public:
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
     // rows past it.
     size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
+    static model::Result stale() {
+        return {model::Status::Error, "inkling2: a failed read left the conversation's state unknown: start it over or restore a checkpoint"};
+    }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
 
     // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
@@ -648,6 +674,7 @@ public:
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
+        if (save && stale_) return stale();
         if (save && (int64_t) hist_.size() - pos > kMaxRows)
             return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kMaxRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "inkling2: a checkpoint past the session's position"};
@@ -675,6 +702,7 @@ public:
 
     model::Result running_restored(int64_t pos, const uint8_t*) override {
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+        stale_ = false;   // the rings are the checkpoint's again
         return {};
     }
 
@@ -689,6 +717,7 @@ public:
 
     // A full-attention visit's cache is cell-major ([cell][head][dim]): its first `positions` cells are one run.
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        if (stale_) return stale();
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         cudaStreamSynchronize(stream_);
         kv.clear();
@@ -1426,6 +1455,7 @@ private:
     uint64_t stage_n_ = 0;
     std::vector<int32_t> picks_;
     std::vector<int32_t> hist_;
+    bool stale_ = false;   // a read failed past its start: only a new conversation (position 0) or a restored checkpoint goes on
     float *d_bias_ = nullptr, *d_mask_ = nullptr;
     bool bias_on_ = false;
     int32_t* d_hist_ = nullptr;
