@@ -47,7 +47,9 @@ struct PeerPlacement {
     std::vector<int64_t> held;      ///< expert deal: per card, the experts it holds
     std::vector<uint64_t> bytes;    ///< expert deal: per card, their bytes
     std::vector<int> stage_first;   ///< stages: card i reads [stage_first[i], stage_first[i + 1]) of a chunk's layers
-    std::string stage_from;         ///< stages: what the cut follows (Shares::from)
+    std::vector<double> stage_share;      ///< stages: per card, the share the cut follows
+    std::vector<double> stage_link;       ///< stages: per card, its share by PCIe link (empty: a link not known)
+    std::vector<double> stage_bandwidth;  ///< stages: per card, its share by VRAM bandwidth
 };
 
 /// The deal of what `s` divides over the peers of `c`, within each peer's `room` (bytes, per card; the main card's unused)

@@ -65,7 +65,7 @@ One line before the load and one after, the same for every model; the first repl
 
 ```
 gpus: peer; RTX 5090 (nvidia-smi 0) main; RTX 5060 Ti (nvidia-smi 1) peer
-gpus: RTX 5090 dense, KV, 9,812 experts (21.3 GiB); RTX 5060 Ti 5,120 experts (13.9 GiB), prompt layers 38-47
+gpus: RTX 5090 dense, KV, 9,812 experts (21.3 GiB); RTX 5060 Ti 5,120 experts (13.9 GiB), prompt layers 38-47: 10 layers, share 0.20 (PCIe link 0.33, VRAM bandwidth 0.20)
 ```
 
 The tag says where the shares came from (`gpu-share`, `free VRAM`); split shows the layers' shares, peer only `gpu-share`'s:

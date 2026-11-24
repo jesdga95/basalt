@@ -47,6 +47,15 @@ std::vector<int> GpuCards::peers() const {
     return out;
 }
 
+std::vector<double> link_shares(const GpuCards& c) {
+    std::vector<double> l;
+    for (const GpuCards::Card& k : c.cards) {
+        if (k.link_bytes <= 0) return {};
+        l.push_back(k.link_bytes);
+    }
+    return normalized(l);
+}
+
 Shares shares_for(const GpuCards& c, ShareUse use) {
     Shares s;
     if (!c.given.empty() && c.given.size() == c.cards.size()) {
@@ -63,12 +72,8 @@ Shares shares_for(const GpuCards& c, ShareUse use) {
     s.from = !known ? "equal" : stages ? "bandwidth" : "free VRAM";
     // a stage that streams its layers' weights over its card's link reads them no faster than that link: each peer
     // keeps at most its link's share, the main card the rest
-    bool links = known && use == ShareUse::StreamedStages;
-    for (const GpuCards::Card& k : c.cards) links = links && k.link_bytes > 0;
-    if (links) {
-        std::vector<double> l;
-        for (const GpuCards::Card& k : c.cards) l.push_back(k.link_bytes);
-        l = normalized(l);
+    const std::vector<double> l = known && use == ShareUse::StreamedStages ? link_shares(c) : std::vector<double>();
+    if (!l.empty()) {
         double peers = 0;
         for (size_t i = 1; i < s.of.size(); ++i) {
             if (l[i] < s.of[i]) {

@@ -51,6 +51,9 @@ struct Shares {
 /// The shares of `use` for the cards.
 Shares shares_for(const GpuCards& c, ShareUse use);
 
+/// Each card's share by its PCIe link (Card::link_bytes), summing to 1; empty when a card's link is not known.
+std::vector<double> link_shares(const GpuCards& c);
+
 /// The shares of the cards after the main one, summing to 1 among them.
 std::vector<double> peer_shares(const GpuCards& c, ShareUse use);
 

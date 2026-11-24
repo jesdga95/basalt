@@ -295,6 +295,29 @@ int main() {
         CHECK_EQ(err, "gpu-mode peer: GPU 1 (RTX 5060 Ti) would hold nothing: the main card holds every expert; use gpu 0");
     }
     {
+        // a stage's part names its layers and the shares, always: the one the cut follows, the PCIe link's and the VRAM
+        // bandwidth's. Two alike cards on 4.0 x8 and 3.0 x4: a streamed stage follows the link, one that holds its
+        // weights the bandwidth, and gpu-share wins over both
+        GpuCards c = two(GpuMode::Peer);
+        c.cards[0].info.mem_gbps = c.cards[1].info.mem_gbps = 448;
+        c.cards[0].link_bytes = 8 * 1.969e9;
+        c.cards[1].link_bytes = 4 * 0.985e9;
+        PeerSpec s;
+        s.stage_layers = 48;
+        s.stage_lo = 2;
+        s.stage_streams = true;
+        std::string err;
+        PeerPlacement p = deal_peers(c, s, {0, 0}, err);
+        CHECK(err.empty());
+        CHECK_EQ(peer_part(p, 1, 48), "prompt layers 38-47: 10 layers, share 0.20 (PCIe link 0.20, VRAM bandwidth 0.50)");
+        s.stage_streams = false;
+        p = deal_peers(c, s, {0, 0}, err);
+        CHECK_EQ(peer_part(p, 1, 48), "prompt layers 24-47: 24 layers, share 0.50 (PCIe link 0.20, VRAM bandwidth 0.50)");
+        c.given = {0.75, 0.25};
+        p = deal_peers(c, s, {0, 0}, err);
+        CHECK_EQ(peer_part(p, 1, 48), "prompt layers 36-47: 12 layers, share 0.25 (PCIe link 0.20, VRAM bandwidth 0.50)");
+    }
+    {
         // the driver: every peer card opened, then the rooms, the deal and the placement; each card's part after; stages
         FakePeer f;
         f.rooms = {0, 50 + 3 * 1000};
@@ -309,7 +332,8 @@ int main() {
         CHECK(f.peer_open(two(GpuMode::Peer), err) && err.empty() && f.placed && f.opened == std::vector<int>({1}));
         CHECK(f.got.homes == 3 && f.got.stage_first == std::vector<int>({0, 38}));
         CHECK_EQ(f.peer_report(0), "dense, KV");
-        CHECK_EQ(f.peer_report(1), "30 experts, layers 0-9, prompt layers 38-47");
+        CHECK_EQ(f.peer_report(1), "30 experts, layers 0-9, prompt layers 38-47: 10 layers, share 0.20 (PCIe link -, VRAM "
+                                   "bandwidth 0.20)");
         // one card, or another mode: nothing opens
         FakePeer one;
         GpuCards solo = two(GpuMode::One);
