@@ -136,7 +136,7 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
             for name, r in parse_index(m.read(pre + "dense.index")).items():
                 if r[2] == "0" and r[4] == "0":
                     continue           # served from `gguf`; meta.tensors places it
-                place(name, (pre + "dense", int(r[5]), int(r[4]), r[2]))
+                place(name, (pre + "dense", int(r[3]), int(r[4]), r[2]))
     for name, e in meta["tensors"].items():
         place(name, (e.get("section", "gguf"), e["offset"], e["bytes"], e))
     missing = [n for n in src.where if n not in where]
@@ -145,6 +145,7 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
 
     # type, shape, size against the source
     kind = {v: k for k, v in S.KIND.items()}
+    kind["3"] = "F32"                  # stored as F32 in dense; the loader narrows to F16
     for name, loc in ((n, l) for n, ls in where.items() for l in ls):
         g, t, p = src.where[name]
         nb = t.expected_bytes()
