@@ -57,6 +57,7 @@ REASONING_CLOSE = "\n</think>\n\n"
 # ANSWER_ROOM_MIN_CAP is too small to split and is left as it is.
 ANSWER_ROOM_MIN_CAP = 32
 ANSWER_RESERVE_MIN = 512
+WRAP_SOFT_MAX = 32          # tokens a budget wrap that stops the engine softly may keep past the budget
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
@@ -1558,7 +1559,7 @@ class Service:
                         live.state = "prompt"
                     prompt, thought = ids, 0            # reasoning tokens so far
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
-                    soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
+                    soft_stops = "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
                     pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
@@ -1680,13 +1681,16 @@ class Service:
                                     thought += 1
                                     # only at a clean point: no held tag or split character
                                     if thought >= budget and not over and not parser.buf and not detok.pending():
-                                        if capped or soft is None:
+                                        if capped or soft is None or max_new - n < 2 * WRAP_SOFT_MAX:
                                             wrap = True
                                             break
                                         # the pass goes on past the budget: the engine stops at its own pace and the
                                         # tokens it still writes are kept, so the next pass extends what it holds
                                         soft.set()
                                         over = True
+                                    elif over and thought >= budget + WRAP_SOFT_MAX and not parser.buf and not detok.pending():
+                                        wrap = True     # the engine did not stop soon enough: the answer keeps its room
+                                        break
                                 if live is not None:
                                     live.state = "thinking" if parser.state == "reasoning" else "answering"
                                     if live.answer_now.is_set() and parser.state == "reasoning":

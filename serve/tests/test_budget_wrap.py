@@ -2,6 +2,7 @@
 the engine holds (the engine decodes whole windows and cannot take back a token it has written)."""
 import http.client
 import json
+import threading
 import unittest
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from serve.engine.mock import MockEngine
 from serve.frontend import ChatTemplate
 from serve.handler import serve
 from serve.prompt import CTX_SLACK, PromptText
-from serve.service import Service
+from serve.service import WRAP_SOFT_MAX, Service
 from serve.util.text import ByteTokenizer
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -130,6 +131,42 @@ class BudgetWrap(unittest.TestCase):
                 self.assertEqual(code, 400, b)
                 self.assertIn("exceeds the context window", b["error"]["message"])
                 self.assertEqual(self.engine.passes, [], "no token was decoded")
+
+    def clipped_budget(self):
+        return self.svc.answer_budget({}, CTX - CTX_SLACK - self.engine.counted, None)
+
+    def test_a_small_answer_room_is_not_spent_on_the_window(self):
+        # a fixed answer room smaller than what a soft stop may keep: the wrap stops at the budget
+        self.start(WindowEngine)
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        self.engine.WINDOW = 50
+        self.svc.answer_room = 40
+        code, b = self.chat()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:self.clipped_budget()] + "\n")
+        self.assertEqual(msg["content"], WindowEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+
+    def test_a_soft_wrap_keeps_at_most_its_bound_past_the_budget(self):
+        self.start(WindowEngine)
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        self.engine.WINDOW = 80                                 # an engine that stops only after many tokens
+        code, b = self.chat()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        budget, kept = self.clipped_budget(), len(msg["reasoning_content"]) - 1
+        self.assertTrue(budget < kept <= budget + WRAP_SOFT_MAX, (budget, kept))
+        self.assertEqual(msg["content"], WindowEngine.ANSWER)
+
+    def test_soft_stops_need_no_live_tracker(self):
+        self.start(WindowEngine)
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        events = list(self.svc.run(PromptText(self.svc.tok, self.svc.render_text(
+            [{"role": "user", "content": "two plus two?"}], None, {})[0], clip=True), True, None, CTX - CTX_SLACK, {},
+            threading.Event()))
+        self.assertTrue(any(k == "done" for k, _ in events))
+        self.assert_extends()
 
     def test_without_stop_soon_the_clipped_cap_still_answers(self):
         self.start(HardEngine)
