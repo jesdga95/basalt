@@ -155,6 +155,9 @@ constexpr int kPromptSplitLayers = 20;
 /// Allocates the stage (its session, buffers and hand-off memory); called with the main card current, before any session
 /// is made.  True with no stage when the context is too short for one.
 bool plan_prompt_split(Model& m, int dev, int l_min, const Weights& w, std::string& err);
+/// Once the stage's weights have landed: one chunk of zero rows through its layers, so that its kernels are loaded before the first
+/// prompt reads them (a lazily loaded kernel stalls the main card's queue).  Its state is left empty.  True with no stage.
+bool warm_prompt_split(Model& m, std::string& err);
 /// The layer split: CUDA device `dev` holds layers [cut, n) of `w` (their weights already on `dev`, the others empty) with
 /// their cells and recurrent state, and runs them in every decode window and prompt chunk of `m`, which holds layers
 /// [0, cut).  The second card plans its products as the main card, so the output is the main card's alone to the bit.
