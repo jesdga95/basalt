@@ -107,12 +107,7 @@ std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card, const uint8_t*
 CopyLayout copy_layout(const std::vector<uint64_t>& strides, uint64_t gran) {
     CopyLayout c;
     c.gran = gran;
-    uint64_t at = 0;
-    for (uint64_t s : strides) {
-        c.at.push_back(at);
-        c.end.push_back(at + s);
-        at += (s + 255) / 256 * 256;
-    }
+    for (uint64_t stride : strides) c.append(stride);
     return c;
 }
 

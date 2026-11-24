@@ -57,12 +57,18 @@ struct StageOp {
 /// wanted or kept one) gets the guard (kSlotGuard: the products read past a matrix's end into the next slot).
 std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card, const uint8_t* want, bool kept);
 
-/// The RAM experts' card copies back to back in one address range, in spill order (the most routed first), each 256-byte
-/// aligned: copy k spans [at[k], end[k]). The copies are always a prefix of that order (a promote adds the next one, a
-/// demote drops the last), so the first m need the range's first pages(m) granules mapped.
+/// The RAM experts' card copies back to back in one address range, each 256-byte aligned: copy k spans [at[k], end[k]),
+/// in the order they were placed (a demote packs the survivors to the front), so the first m need the range's first
+/// pages(m) granules mapped.
 struct CopyLayout {
     std::vector<uint64_t> at, end;
     uint64_t gran = 0;
+    static uint64_t aligned(uint64_t bytes) { return (bytes + 255) / 256 * 256; }
+    void append(uint64_t stride) {
+        const uint64_t start = end.empty() ? 0 : aligned(end.back());
+        at.push_back(start);
+        end.push_back(start + stride);
+    }
     uint64_t bytes() const { return end.empty() ? 0 : (end.back() + gran - 1) / gran * gran; }
     uint64_t pages(int64_t m) const { return m > 0 ? (end[(size_t) m - 1] + gran - 1) / gran : 0; }
     /// How many of the first n copies stay so that dropping the rest unmaps at least `bytes` of `mapped` granules; 0 when
@@ -70,5 +76,18 @@ struct CopyLayout {
     int64_t keep_for(int64_t n, uint64_t mapped, uint64_t bytes) const;
 };
 CopyLayout copy_layout(const std::vector<uint64_t>& strides, uint64_t gran);
+
+/// Sends copies back until `room()` counts `free` bytes: `demote(bytes, freed)` gives back at least `bytes`, the lowest
+/// ranked copies first, and sets what it freed. Stops when `copies()` is 0 or a step frees nothing; false when a step
+/// failed.
+template <class Room, class Copies, class Demote>
+bool give_back(uint64_t free, Room room, Copies copies, Demote demote) {
+    while (copies() > 0 && room() < free) {
+        uint64_t freed = 0;
+        if (!demote(free - room(), freed)) return false;
+        if (freed == 0) break;
+    }
+    return true;
+}
 
 }  // namespace basalt::models::inkling2
