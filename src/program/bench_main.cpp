@@ -676,7 +676,10 @@ std::string hardware_text(const Hardware& h, const std::vector<std::pair<std::st
     for (const auto& c : cards) {
         const double g = h2d_of(h, c.first);
         const std::string link = pcie_text(c.second);
-        t += "  GPU   " + short_card(c.second.name) + "  PCIe " + (link.empty() ? std::string("unknown") : link) +
+        // an integrated GPU (NVML gives it no memory size) has no PCIe link, whatever NVML answers for one
+        const std::string where = c.second.vram_gib <= 0 ? std::string("integrated")
+                                                         : "PCIe " + (link.empty() ? std::string("unknown") : link);
+        t += "  GPU   " + short_card(c.second.name) + "  " + where +
              (g > 0 ? fmt("  host-to-device %.1f GB/s", g) : std::string("  host-to-device not measured")) + "\n";
     }
     return t;
@@ -1206,7 +1209,10 @@ int main(int argc, char** argv) {
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
-    if (power == "unknown") basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
+    // an integrated GPU has no power limit NVML reads (a GB10's is the system's): no warning, the table says unknown
+    const bool primary_integrated = have_primary && primary.vram_gib <= 0;
+    if (power == "unknown" && !primary_integrated)
+        basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
 
     // one table row per test: values over the repetitions
     struct Row {
