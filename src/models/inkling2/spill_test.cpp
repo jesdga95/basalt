@@ -1,8 +1,9 @@
 // src/models/inkling2/spill_test.cpp - the spill plan: nothing leaves when nothing is needed, the coldest experts leave
 // first, slots are a permutation with the kept experts first, the bytes it frees cover what was asked net of the shared
-// staging and the rounding, and copies go back until a keep is free.
+// staging and the rounding, copies go back until a keep is free, and a resume trims the caches only when it frees half.
 #include "models/inkling2/spill.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -126,6 +127,39 @@ int main() {
         expect(run(c, keep) && c.n == 0 && c.room < keep, "every copy back and still short: stops with none left");
         fill(c, 4, 0);
         expect(!run(c, keep, true) && c.calls == 1, "a failed demote stops and says so");
+    }
+    {   // the caches a prompt keeps, and when a resume trims them
+        const int64_t step = 8192, base = 32768, ctx = 262144;
+        expect(kept_positions(1, step, base, ctx) == base, "keep: never below the base");
+        expect(kept_positions(36986, step, base, ctx) == 40960 && kept_positions(40960, step, base, ctx) == 40960,
+               "keep: whole steps");
+        expect(kept_positions(ctx + 5, step, base, ctx) == ctx, "keep: never past the context");
+        // a long conversation backed to 229376, then a compaction resumes at its 18553-token prefix with 18433 to read
+        int64_t backed = 229376;
+        const int64_t short_keep = kept_positions(18553 + 18433, step, base, ctx);
+        expect(resume_trims(short_keep, backed), "a compaction to a sixth trims");
+        expect(!resume_trims(kept_positions(224008 + 600, step, base, ctx), backed), "the next turn: no trim");
+        expect(!resume_trims(kept_positions(200000, step, base, ctx), backed), "an edit a few turns back: no trim");
+        expect(resume_trims(backed / 2, backed) && !resume_trims(backed / 2 + step, backed), "the rule: half or less");
+        // two conversations on one prefix, alternating: one trim per switch to the short one, none while it goes on
+        int trims = 0;
+        for (int sw = 0; sw < 4; ++sw) {
+            const bool to_short = sw % 2 == 0;
+            const int64_t keep = to_short ? short_keep : kept_positions(229000, step, base, ctx);
+            if (resume_trims(keep, backed)) {
+                ++trims;
+                backed = keep;
+            } else {
+                backed = std::max(backed, keep);   // the deeper one grows back
+            }
+            if (to_short)
+                for (int64_t turn = 1; turn <= 8; ++turn) {   // the short one's turns go deeper by a step each
+                    const int64_t k = kept_positions(short_keep + turn * step, step, base, ctx);
+                    expect(!resume_trims(k, backed), "a conversation's own turns never trim");
+                    backed = std::max(backed, k);
+                }
+        }
+        expect(trims == 2, "alternating: one trim per switch to the shallow conversation");
     }
     if (failures) return 1;
     std::printf("spill plan: ok\n");

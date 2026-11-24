@@ -539,7 +539,7 @@ public:
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
         const bool staged = sh_->prompt && r.n_tokens > 16;
         if (heat_tally_) settle_window(r.pos);
-        if (r.pos == 0 && !restart_positions(r.n_tokens)) return wedged();
+        if (!restart_positions(r.pos == 0 ? r.n_tokens : r.pos + std::max(r.n_tokens, r.total_tokens), r.pos)) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return grow_failed(e);
         // a request's start: the copies follow the lookups so far (a staged read takes the loan's memory back first)
         if (heat_tally_ && !staged) rebalance_copies(r.pos + r.n_tokens, true);
@@ -941,13 +941,14 @@ public:
         }
         return sh;
     }
-    // A conversation starts over (a prompt at position 0): the caches give back the cells past what it needs (never below
-    // the base), and the RAM experts come back to the card while it has room.
-    bool restart_positions(int64_t positions) {
+    // A conversation starts over (a prompt at position 0, `at`), or resumes at `at` needing at most half the positions its
+    // caches back (resume_trims): the caches give back the cells past what the prompt needs (never below the base), and the
+    // RAM experts come back to the card while it has room. Any other resume leaves both as they are.
+    bool restart_positions(int64_t positions, int64_t at) {
         if (elastic_.empty()) return true;
+        const int64_t keep = kept_positions(positions, kElasticKvStep, core::kElasticKvBase, m_.context());
+        if (at > 0 && !resume_trims(keep, backed_)) return true;
         if (!feed_heat()) return false;
-        const int64_t keep = std::min(m_.context(),
-            std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep));
         if (keep < backed_) {
             const uint64_t backing0 = backing_bytes();
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
@@ -960,8 +961,8 @@ public:
             const int64_t before = m_.card_copies();
             const uint64_t grow = grow_bytes(keep);
             m_.promote(m_.held_free(kElasticKeep) + grow);
-            m_.note_shortage("position 0");
-            m_.log_copy_change("new conversation", before, grow);
+            m_.note_shortage("position " + std::to_string(at));
+            m_.log_copy_change(at == 0 ? "new conversation" : ("resume at " + std::to_string(at)).c_str(), before, grow);
         }
         return !m_.wedged();
     }
