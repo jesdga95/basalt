@@ -520,9 +520,9 @@ __global__ void __launch_bounds__(128, BM == 16 ? 3 : 2) attn_mma_kernel(AttnArg
         if (chunk + z < n_chunks) fetch((chunk + z) * CHUNK);
 
         // Online softmax (+ relative bias only within last kExtent keys)
-        const bool maybe_rel = (p_max - c0) < (kExtent + CHUNK);
         for (int i = warp; i < BM; i += 4) {
             const int p = rpos[i];
+            const bool maybe_rel = p >= 0 && (p - c0) < (kExtent + CHUNK);
             float pv_row[CHUNK / 32], mx = -INFINITY;
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
@@ -1745,8 +1745,8 @@ int attention_decode_int8_test_min_keys() { return kMmaMinKeys; }
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0 ||
-        a.seg.at_d != nullptr || mma_decode(a, rows, max_keys)) {
+    if ((!a.int8 && a.window == 0) || rows > kFusedRows || launch_splits(max_keys) > kClusterSplits ||
+        a.q8 == nullptr || a.seg.at.n > 0 || a.seg.at_d != nullptr || mma_decode(a, rows, max_keys)) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;

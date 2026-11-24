@@ -766,10 +766,9 @@ __device__ __forceinline__ float block_sum_128(float v, float* red) {
     return s;
 }
 
-__global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* __restrict__ tap, int64_t tap_stride, DsMixArgs a,
+__global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* tap, int64_t tap_stride, DsMixArgs a,
                                                              float* __restrict__ out, int64_t out_stride,
-                                                             const int32_t* __restrict__ pos, DsCommitSegs segs, int fr_cap) {
-    pdl_launch_dependents();
+                                                             const int32_t* pos, DsCommitSegs segs, int fr_cap) {
     pdl_wait();
     __shared__ float red[kThreads / 32];
     const int r = (int) blockIdx.x, j = (int) blockIdx.y;
@@ -781,7 +780,6 @@ __global__ void __launch_bounds__(kHeadDim) kv_commit_batch_kernel(const float* 
                                                                    const float* __restrict__ k_norm, float eps,
                                                                    DsRopeFreq rope, const int32_t* pos, DsCommitSegs segs,
                                                                    int64_t cap) {
-    pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[kHeadDim / 32];
     __shared__ float xs[kHeadDim];
@@ -805,7 +803,7 @@ __global__ void __launch_bounds__(kHeadDim) kv_commit_batch_kernel(const float* 
 }
 
 __global__ void __launch_bounds__(kThreads) block_inputs_batch_kernel(const uint16_t* __restrict__ emb,
-                                                                      const int32_t* __restrict__ meta,
+                                                                      const int32_t* meta,
                                                                       const float* __restrict__ norm, float eps,
                                                                       const float* __restrict__ mask, int block,
                                                                       float* __restrict__ x, int32_t* __restrict__ prev,
@@ -823,9 +821,8 @@ __global__ void __launch_bounds__(kThreads) block_inputs_batch_kernel(const uint
 __global__ void __launch_bounds__(kHeadDim) block_qk_prep_batch_kernel(const float* q, const float* kb, const float* vb,
                                                                        const float* __restrict__ q_norm,
                                                                        const float* __restrict__ k_norm, float eps,
-                                                                       DsRopeFreq rope, const int32_t* __restrict__ meta,
+                                                                       DsRopeFreq rope, const int32_t* meta,
                                                                        int block, float* q_out, DsBatchKv kv, int64_t cap) {
-    pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[kHeadDim / 32];
     __shared__ float xs[kHeadDim];
@@ -855,9 +852,8 @@ __global__ void __launch_bounds__(kHeadDim) block_qk_prep_batch_kernel(const flo
     reinterpret_cast<__half*>(kv.v[b])[at] = __float2half_rn(vb[((int64_t) row * kKvHeads + head) * kHeadDim + d]);
 }
 
-__global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* __restrict__ h_chunk, int block, int slot0,
+__global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* h_chunk, int block, int slot0,
                                                               int n_max, float* __restrict__ hd_all) {
-    pdl_launch_dependents();
     pdl_wait();
     const int row = (int) blockIdx.x;
     const int c = row / n_max, i = row - c * n_max;
@@ -868,7 +864,7 @@ __global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* __res
 
 // Reads the 2-bit head screen once into registers and scores all `count` sessions' `n_max` draft rows.
 __global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
-                                                              const Q81* __restrict__ x, int count, int n_max,
+                                                              const Q81* x, int count, int n_max,
                                                               int64_t n_pad, float* __restrict__ approx) {
     constexpr int kNw4 = kWidth / 64, NW = kNw4 / 4;
     __shared__ __align__(16) int xi[kDsDrafts][kWidth / 4];
@@ -885,7 +881,6 @@ __global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __res
         s[j] = __ldcs(sc + base + (size_t) j * 32);
     }
     pdl_wait();
-    pdl_launch_dependents();
     const int64_t row = tile * 32 + lane;
     for (int b = 0; b < count; ++b) {
         if (b > 0) __syncthreads();
@@ -902,14 +897,13 @@ __global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __res
     }
 }
 
-__global__ void __launch_bounds__(kStepWarps * 32) markov_step_batch_kernel(const float* __restrict__ ctx_h,
-                                                                            const float* __restrict__ ctx_f,
+__global__ void __launch_bounds__(kStepWarps * 32) markov_step_batch_kernel(const float* ctx_h,
+                                                                            const float* ctx_f,
                                                                             const float* __restrict__ bias,
                                                                             const uint16_t* __restrict__ w_sp,
-                                                                            const uint16_t* __restrict__ w1_row,
-                                                                            float* __restrict__ state, int step_i,
+                                                                            const uint16_t* w1_row,
+                                                                            float* state, int step_i,
                                                                             int n_max, float* __restrict__ latent) {
-    pdl_launch_dependents();
     pdl_wait();
     __shared__ float xs[2 * kDsRank];
     const int blk = (int) blockIdx.x, b = (int) blockIdx.y;
@@ -921,8 +915,8 @@ __global__ void __launch_bounds__(kStepWarps * 32) markov_step_batch_kernel(cons
 
 __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(const uint4* __restrict__ wq,
                                                                               const uint32_t* __restrict__ sc,
-                                                                              const Q81* __restrict__ lat_step,
-                                                                              const float* __restrict__ approx,
+                                                                              const Q81* lat_step,
+                                                                              const float* approx,
                                                                               const float* __restrict__ fold_bp, float cap,
                                                                               int64_t n_rows, int n_tiles, int step_i,
                                                                               int n_max, int64_t n_pad,

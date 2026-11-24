@@ -992,7 +992,6 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
         return wg::Matrix{(const uint8_t*) p, rows, scale, y, ld_y};
     };
     try {
-        bk::PdlScope pdl(true);
         for (int s0 = 0; s0 < B; s0 += kChunkSlots) {
             const int cn = std::min(kChunkSlots, B - s0);
             const int R = cn * kDsBlock;
