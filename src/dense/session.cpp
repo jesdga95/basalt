@@ -730,7 +730,8 @@ public:
         const uint64_t host_vision = m_.encoder ? m_.encoder->weights_bytes() : 0;
         return kv + " gpu_weight_bytes=" + std::to_string(m_.o.gpu_weight_bytes) + " host_weight_bytes=0 host_embedding_bytes=" + std::to_string(m_.o.host_embedding_bytes) +
                " host_vision_bytes=" + std::to_string(host_vision) +
-               " " + program::spill_words({}) + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "");
+               " " + program::spill_words({}) + (block_ ? " drafter=block" : drafter_ ? " drafter=mtp" : "") +
+               (m_.o.cvec_summary.empty() ? "" : " cvec=" + m_.o.cvec_summary);
     }
     int64_t disk_min_tokens() const override { return 4096; }
 

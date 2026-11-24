@@ -8,6 +8,7 @@
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/control_vectors.hpp"
 #include "basalt/model/multi_gpu.hpp"
 #include "basalt/model/peer_hooks.hpp"
 #include "basalt/model/rope_flags.hpp"
@@ -106,6 +107,7 @@ struct LoadRequest {
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
+    CvecFlags cvec;                   ///< --control-vector*: a control vector for the model to load (control_vectors.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
 };

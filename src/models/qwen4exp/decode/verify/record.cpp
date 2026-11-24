@@ -4,7 +4,7 @@
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/elementwise.hpp"
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include <string>
 

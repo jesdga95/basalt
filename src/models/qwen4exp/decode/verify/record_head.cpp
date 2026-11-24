@@ -6,7 +6,7 @@
 #include "basalt/core/on_device.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"

@@ -137,10 +137,12 @@ target_link_libraries(artifact INTERFACE platform warnings)
 # `model` is the registry and the adapter interface (shared code may use it). Each model is its own library under
 # src/models/<arch>/; `models` is the composition root that registers them. tools/check_model_layering.sh keeps
 # shared code from including src/models and models from including each other.
-add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp src/model/split_hooks.cpp)
+add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp src/model/split_hooks.cpp src/model/control_vectors.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(model PUBLIC artifact warnings)
+# `kernels` is a real dependency, not a header one: control_vectors.cpp uploads the vector it read through the
+# kernel's cvec_upload.
+target_link_libraries(model PUBLIC artifact kernels warnings)
 
 if(BASALT_MODEL_QWEN4EXP)
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
@@ -189,7 +191,6 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/measure/gpu_modes.cpp
   src/models/qwen4exp/measure/dump_set.cpp
   src/models/qwen4exp/cli/options.cpp
-  src/models/qwen4exp/cli/control_vectors.cpp
   src/models/qwen4exp/cli/report.cpp
   src/models/qwen4exp/load/qfn_run.cpp)
 target_include_directories(model_qwen4exp PRIVATE ${_gpu_include_directories})
@@ -567,6 +568,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/router.cu
                         src/kernels/cuda/route_tail_skip.cu
                         src/kernels/cuda/row_norm.cu
+                        src/kernels/cuda/cvec.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BASALT_MODEL_QWEN4EXP)
@@ -1278,6 +1280,13 @@ if(BUILD_TESTING)
   set_tests_properties(doorbell_abort_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
+# the control vector on the residual stream, both residual layouts, vs double and vs one rounding of the result
+# (GPU, synthetic, no model)
+add_executable(cvec_parity tests/kernels/cvec_parity.cpp)
+target_include_directories(cvec_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(cvec_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME cvec_parity COMMAND cvec_parity)
+
 add_executable(bf16_gemv_parity tests/kernels/bf16_gemv_parity.cpp)
 target_include_directories(bf16_gemv_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(bf16_gemv_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -1392,10 +1401,11 @@ add_executable(kv_q4_parity tests/models/qwen4exp/kernels/kv_q4_parity.cpp)
 target_include_directories(kv_q4_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(kv_q4_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_q4_parity COMMAND kv_q4_parity)
-add_executable(cvec_parity tests/models/qwen4exp/kernels/cvec_parity.cpp)
-target_include_directories(cvec_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(cvec_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME cvec_parity COMMAND cvec_parity)
+# a loaded vector's write, off, vs the fused read that folds the same write (GPU, synthetic, no model).
+add_executable(cvec_fused_write_parity tests/models/qwen4exp/kernels/cvec_fused_write_parity.cpp)
+target_include_directories(cvec_fused_write_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(cvec_fused_write_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME cvec_fused_write_parity COMMAND cvec_fused_write_parity)
 
 # The rewritten per-hit and grouped expert kernels vs the previous ones, bitwise (GPU, synthetic, no model).
 # `--bench` adds previous/new timings on engine-like shapes.

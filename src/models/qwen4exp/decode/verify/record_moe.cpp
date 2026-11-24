@@ -10,7 +10,7 @@
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/models/qwen4exp/kernels/native_moe.hpp"
 #include "basalt/kernels/elementwise.hpp"
-#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"

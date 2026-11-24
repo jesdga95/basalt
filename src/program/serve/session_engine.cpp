@@ -6,6 +6,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/model/control_vectors.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -57,8 +58,13 @@ public:
             const auto t0 = Clock::now();
             std::string text = "basalt conversation state " + model_.desc().arch + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
             if (const std::string rope = basalt::model::rope_flag_words(o.rope); !rope.empty()) text += " " + rope;
-            const uint64_t identity = basalt::core::conversation_store_hash_file(
-                o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
+            // A state's bytes depend on the vector as much as on the rope: a steered prefix resumed unsteered keeps
+            // answering as though it were not. The flags say which vector was asked for; its bytes are hashed too,
+            // since the same path can hold a regenerated vector.
+            if (const std::string cvec = basalt::model::cvec_identity_words(o.cvec); !cvec.empty()) text += cvec;
+            uint64_t seed = basalt::core::conversation_store_hash(text.data(), text.size(), 1);
+            for (const auto& [path, scale] : o.cvec.files) seed = basalt::core::conversation_store_hash_file(path, seed);
+            const uint64_t identity = basalt::core::conversation_store_hash_file(o.model, seed);
             std::string de;
             if (o.prompt_cache <= 0) {
                 basalt::log::warn("basalt serve", "conversation cache on disk off: --prompt-cache 0");

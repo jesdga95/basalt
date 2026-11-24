@@ -20,6 +20,7 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Cards by default | the main card alone | the main card alone | the main card alone | the main card alone | the main card, experts in RAM when the context needs their room |
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured | not measured |
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none | none |
+| Control vectors | yes, a model-specific vector ([control vectors](../configuration/index.md#control-vectors)) | no | yes, a model-specific vector | no | no |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) | no | no | no |
 | Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) | yes (Linux) |
 | `basalt-bench --quality` | yes | yes, one row per window | yes | yes | yes |

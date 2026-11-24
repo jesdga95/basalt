@@ -1,6 +1,7 @@
 // src/dense/forward.cpp - the layer loop of a decode window and of a prompt chunk, and the drafter's passes.
 #include "internal.hpp"
 
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -634,6 +635,9 @@ void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t 
     size_t next_target = 0, next_tap = 0;
     for (int il = m.lb; il < m.le; ++il) {
         layer(il);
+        // a control vector (the speed projection): the layer's output is in the rows, and everything that reads them
+        // next - a drafter's features, the other card, the next layer - reads the steered residual
+        if (kernels::cvec().covers(il)) kernels::cvec_apply_bf16(b.x, il, rows, g.n_embd, s);
         if (block && next_target < bd.target_layers.size() && bd.target_layers[next_target] == il) win_tap(m, next_target++, b.x, dacc, rows, s);
         if (m.lb > 0 && next_tap < h->taps.size() && h->taps[next_tap] == il)
             kernels::copy_from_mapped((float*) (h->ret + (1 + next_tap++) * slot), (const float*) b.x, half, s);
@@ -965,6 +969,9 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
         }
         if (unread) break;
         chunk_ffn(m, L, T, s);
+        // a control vector (the speed projection): the layer's output is in the rows, and everything that reads them
+        // next - a drafter's features, the next layer, the other card's landing buffer - reads the steered residual
+        if (kernels::cvec().covers(il)) kernels::cvec_apply_bf16(residual(m.cs), il, T, g.n_embd, s);
         if (taps && next_target < taps->target_layers.size() && taps->target_layers[next_target] == il)
             chunk_tap(m, st, T, *taps, next_target++);
     }

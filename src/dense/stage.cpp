@@ -16,6 +16,7 @@
 
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/staged_copy.hpp"
+#include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/log.hpp"
@@ -271,6 +272,8 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
         model = make_model(g, lw, o, err);
         if (!model) return false;
         if (!model->ensure_chunk(err)) return false;
+        // a control vector (the speed projection): its tables here too, since the layers this card runs apply it there
+        if (!kernels::cvec_replicate(err)) return false;
         if (split) {   // the landing residuals
             if (!arena.reserve(kSlots * T * H * 2 + 4096)) {
                 err = "out of device memory for its landing buffers";
