@@ -1,17 +1,18 @@
 # Platforms
 
-Linux x64 and Windows x64, NVIDIA Blackwell (sm_120); Arm64 Linux with the integrated sm_121 GPU is in [arm64](arm64.md). Linux is where the engine is tested and benchmarked. CI builds both and runs
-the CPU tests on each. The GPU tests and the quality gate need a card.
+Linux x64 and Windows x64 with NVIDIA Blackwell (sm_120), and Linux Arm64 with the integrated Blackwell GPU (sm_121) of the DGX
+Spark, described in [arm64](arm64.md). Linux x64 is where the engine is tested and benchmarked. CI builds all three and runs the
+CPU tests on each. The GPU tests and the quality gate need a card.
 
 The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON`, a second card of sm_89 (Ada) can be a Flash-Next peer that holds and
 computes experts (`gpu-mode peer`, [GPUs](configuration/gpus.md#an-older-peer-card)); every other path and every other
 architecture is Blackwell-only.
 
-| | Linux | Windows |
-| --- | --- | --- |
-| OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903+ x64 |
-| Compiler, build | GCC 13+, CMake 3.24+ | MSVC 19.44 (VS 2022), CMake 3.24+, Ninja |
-| CUDA, Python | 13, 3.10+ | 13, 3.10+ |
+| | Linux | Windows | Linux Arm64 |
+| --- | --- | --- | --- |
+| OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903+ x64 | Armv8.2 with the dot product, an integrated sm_121 GPU |
+| Compiler, build | GCC 13+, CMake 3.24+ | MSVC 19.44 (VS 2022), CMake 3.24+, Ninja | GCC 13+, CMake 3.24+ |
+| CUDA, Python | 13, 3.10+ | 13, 3.10+ | 13, 3.10+ |
 
 ## Release archives
 
