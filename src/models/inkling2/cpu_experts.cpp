@@ -8,6 +8,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "models/inkling2/model.hpp"
 
@@ -138,7 +139,10 @@ struct CpuExperts::Impl {
                 kind[(size_t) p] = e >= 0 && e < n_expert && model->peer_serves(layer, e) ? 2 : 0;
                 on_peer += kind[(size_t) p] == 2;
             }
-            if (on_peer && !peer->launch_layout(layer, layout[(size_t) layer], input, ids, rows, k, kind.data(), err, out)) {
+            // the rows straight into `out` where the second card may write the first card's mapped memory; else through
+            // its own buffer, which finish() copies into `out`
+            float* direct = basalt::platform::kPeerWritesMappedHost ? out : nullptr;
+            if (on_peer && !peer->launch_layout(layer, layout[(size_t) layer], input, ids, rows, k, kind.data(), err, direct)) {
                 peer_failed(err);
                 on_peer = 0;
             }
