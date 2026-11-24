@@ -818,6 +818,18 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
     }
     if (dspark_)   // DSPARK HOOK: the drafter's head folds, once the reads have landed
         if (model::Result r = dspark_->finish(head_, embd_dev_, embed_norm_, nullptr); !r.ok()) return r;
+    {   // Repack lm_head from Q8_0 blocks to aligned q8_planes in-place (zero extra persistent VRAM).
+        const int64_t V = pack_.geo.n_vocab, E = pack_.geo.n_embd;
+        const size_t head_b = (size_t) V * (size_t) (E / 32 * 34);
+        cudaSetDevice(device_);
+        void* tmp = nullptr;
+        if (cudaMalloc(&tmp, head_b) != cudaSuccess)
+            return {model::Status::Error, "inkling2: out of device memory converting lm_head to q8_planes"};
+        kernels::wgemm::q8_planes(head_, V, E, tmp, nullptr);
+        cudaMemcpy(head_, tmp, head_b, cudaMemcpyDeviceToDevice);
+        cudaDeviceSynchronize();
+        cudaFree(tmp);
+    }
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
     if (elastic_) {   // the caches back only their base yet: the RAM experts come back while the card has room

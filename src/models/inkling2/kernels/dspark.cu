@@ -248,9 +248,30 @@ __device__ __forceinline__ float q80_dot(const uint8_t* __restrict__ w, const Q8
     return warp_sum(s);
 }
 
+// One q8_planes row (n_in = nb * 32) by a q8_1 row on a warp (16-byte aligned int4 codes + fp16 scales).
+__device__ __forceinline__ float q8p_dot(const void* __restrict__ planes, int64_t n_vocab, int64_t v, const Q81* x, int nb, int lane) {
+    const int n_in = nb * 32;
+    const int8_t* codes = static_cast<const int8_t*>(planes) + v * n_in;
+    const __half* scales = reinterpret_cast<const __half*>(static_cast<const int8_t*>(planes) + n_vocab * n_in) + v * nb;
+    const int half_b = lane & 1;
+    float s = 0.f;
+    for (int b = lane >> 1; b < nb; b += 16) {
+        const int4 q = __ldg(reinterpret_cast<const int4*>(codes + b * 32 + half_b * 16));
+        const int* xq = reinterpret_cast<const int*>(x[b].qs) + half_b * 4;
+        int sumi = __dp4a(q.x, xq[0], 0);
+        sumi = __dp4a(q.y, xq[1], sumi);
+        sumi = __dp4a(q.z, xq[2], sumi);
+        sumi = __dp4a(q.w, xq[3], sumi);
+        s += __half2float(__ldg(scales + b)) * __low2float(x[b].ds) * (float) sumi;
+    }
+    return warp_sum(s);
+}
+
 // Row v's exact logit (every lane gets it).
 __device__ __forceinline__ float exact_logit(const DsHead& h, int64_t v, const Q81* xh, const Q81* xl, int lane) {
-    const float a = q80_dot(static_cast<const uint8_t*>(h.head) + v * kQ8Row, xh, kHeadNb, lane);
+    const float a = h.head_planes
+                        ? q8p_dot(h.head, h.n_vocab, v, xh, kHeadNb, lane)
+                        : q80_dot(static_cast<const uint8_t*>(h.head) + v * kQ8Row, xh, kHeadNb, lane);
     const float b = q80_dot(static_cast<const uint8_t*>(h.fold) + v * kFoldRow, xl, kFoldNb, lane);
     return capf(a + b + h.fold_b[v], h.cap);
 }
