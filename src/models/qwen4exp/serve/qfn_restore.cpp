@@ -146,9 +146,9 @@ Flow QfnRequest::make_room() {
     return Flow::proceed;
 }
 
-// When RAM does not admit the whole image; --exp disk_stream: 0 never, 2 always.
+// When RAM does not admit the whole image.
 bool QfnRequest::disk_kv_in_files(bool whole) const {
-    return runtime_.disk_stream == 2 || (runtime_.disk_stream == 1 && !whole);
+    return !whole;
 }
 
 Flow QfnRequest::restore_image() {

@@ -121,9 +121,10 @@ Off at 0. With a budget, conversations of at least 8,192 tokens are written to `
 RAM, a session, or at exit. Only the system prompt's and the last three turns' states are stored. Files are bound to the model and settings
 they were made with, and checked by hash; a bad file is deleted. The folder is capped by the budget (least recently used first), and a
 write always leaves 4 GiB of the volume free. After a restart, a prompt that starts with a stored conversation reads it back.
-Qwen3.8-Flash-Next writes a conversation that goes only to disk from the session a few MiB at a time (the request waits for the write), and
-reads one that does not fit whole in free RAM with its K/V going from the files straight into the session: neither needs RAM for the
-whole conversation, only for the write buffer or the running states. When even that is not free above the disk tier's floor, the
+Qwen3.8-Flash-Next writes a conversation whose whole image free RAM does not admit to the disk tier from the session a few MiB at a
+time (the request waits for the write), and reads one that does not fit whole in free RAM with its K/V going from the files straight
+into the session: neither needs RAM for the whole conversation, only for the write buffer or the running states. With the RAM free,
+a conversation that goes only to disk is captured and written by the disk tier's writer thread as before. When even that is not free above the disk tier's floor, the
 conversations parked in RAM are written to disk first, the longest parked first, until it is.
 
 ## Sleep: `--idle-sleep`
