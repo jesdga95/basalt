@@ -64,12 +64,17 @@ bool pin_budget(uint64_t& limit, std::string& why, const char* luid = nullptr,
 
 // Portable registrations consume each WDDM adapter's non-local budget. Host VMM instead backs the CPU tier
 // without registering the same pages on every adapter; other platforms keep their existing allocation path.
+// A second card's kernel writing straight into host memory mapped through the first card's context (Inkling's peer rows
+// into its doorbell's buffer) never completes under WDDM (#666); there the second card writes to its own pinned buffer and
+// the host copies the rows over.
 #if defined(_WIN32)
 inline constexpr bool kBoundHostRegistration = true;
 inline constexpr bool kPreferHostVmm = true;
+inline constexpr bool kPeerWritesMappedHost = false;
 #else
 inline constexpr bool kBoundHostRegistration = false;
 inline constexpr bool kPreferHostVmm = false;
+inline constexpr bool kPeerWritesMappedHost = true;
 #endif
 uint64_t system_page_size();
 inline uint64_t pin_reserve(uint64_t budget) { return budget / 20 > (1ull << 30) ? budget / 20 : (1ull << 30); }
