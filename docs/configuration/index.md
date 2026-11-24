@@ -83,7 +83,9 @@ Command line `--name`; the Where column says which config block takes it.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `gpu` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"auto"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card. `auto` takes every Blackwell card and makes the fastest main. [GPUs](gpus.md) |
+| `gpu` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"all"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card; `all` is every visible card in order. Unset with more cards visible: one warning at start. [GPUs](gpus.md) |
+| `gpu-mode` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"peer"`, `"split"`, `"tensor"` | none | What the cards do together. Required when `gpu` names two or more cards, an error with one. [GPUs](gpus.md#modes) |
+| `gpu-share` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"3,1"` | by the mode | Relative shares, one positive number per card in the order of `gpu`. [GPUs](gpus.md#shares) |
 | `peer-reserve-mib` | engine | MiB | 600 | VRAM the second card keeps free after its experts and prompt buffers. Raise it when the start says the peer's buffers do not fit. [GPUs](gpus.md#two-16-gb-cards) |
 
 ## Context and KV cache
@@ -91,7 +93,7 @@ Command line `--name`; the Where column says which config block takes it.
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
-| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16`; Qwen3.8-27B: `fp16`, `int8`; Inkling 2 Mini: `fp16`, `fp8` | Flash-Next `fp16`, DeepSeek `fp8`, Qwen3.8-27B `fp16`, Inkling 2 Mini `fp16` | KV storage. Qwen3.8-27B: `int8` takes about half of `fp16`'s memory per position ([guide](../models/qwen38-27b.md#memory)). Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). Inkling 2 Mini: `fp8` halves the full-attention caches (E4M3, unit scale; [guide](../models/inkling2.md#memory)). A model refuses the other's values. |
+| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16`; Qwen3.8-27B: `fp16`, `int8`, `nvfp4`; Inkling 2 Mini: `fp16`, `fp8` | Flash-Next `fp16`, DeepSeek `fp8`, Qwen3.8-27B `fp16`, Inkling 2 Mini `fp16` | KV storage. Qwen3.8-27B: `int8` takes about half of `fp16`'s memory per position, `nvfp4` about a quarter, on one card and not with `kv-resident` ([guide](../models/qwen38-27b.md#memory)). Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). Inkling 2 Mini: `fp8` halves the full-attention caches (E4M3, unit scale; [guide](../models/inkling2.md#memory)). A model refuses the other's values. |
 | `kv-resident` | engine | cells (Flash-Next: min 20,480) or `0` | 0 | Flash-Next and Qwen3.8-27B. Keep N cells of KV in VRAM and the rest in pinned RAM. Flash-Next: with `parallel` and `kv` `int8`, every slot streams its own K/V this way. Qwen3.8-27B: each attention layer keeps its first N positions on the card and every decoded token reads the rest over the bus, so decode slows with each one ([guide](../models/qwen38-27b.md#memory)); output is unchanged. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next and Qwen3.8-27B. Extend past the trained length (Qwen3.8-27B: `--max-context` up to 262,144 x `rope-scale`). Fixed for the run, and it changes every position's rotation, short prompts too ([precision](../precision/qwen38-27b.md#context-past-262144)). |
 | `rope-scale` | engine | number | model's, else 1 | Flash-Next and Qwen3.8-27B. Factor for `linear` and `yarn`. |
@@ -115,10 +117,10 @@ Command line `--name`; the Where column says which config block takes it.
 | `vram-segment-mib` | engine | MiB, at least 64 | 512 | Flash-Next only. Segment size for `vram-elastic`. |
 | `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. A count is honoured exactly or the start is refused with a one-line message (what fits, the free VRAM, the reserve); it is never trimmed. |
 | `ram-reserve-mib` | engine | MiB | 2048 | RAM left free for the rest of the system. The expert tiers take what is above it after the engine's own host buffers, and the serving RAM guard holds it. `0` keeps nothing and turns the guard off. [memory floors](../running.md#memory-floors) |
-| `adapt-every` | engine | windows | 1 on a server, 4 with a layer split (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
+| `adapt-every` | engine | windows | 1 on a server, 4 with `gpu-mode split` (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Flash-Next only. Most experts one round swaps into the main GPU. [adaptive](adaptive.md) |
 | `peer-adapt-swaps` | engine | integer | `adapt-swaps` | Flash-Next only. Most experts one round swaps into the peer card. |
-| `adapt-decay` | engine | number | 0.85 (0.7 with a layer split) | Flash-Next only. Factor applied to routing counts after each round. [adaptive](adaptive.md) |
+| `adapt-decay` | engine | number | 0.85 (0.7 with `gpu-mode split`) | Flash-Next only. Factor applied to routing counts after each round. [adaptive](adaptive.md) |
 
 ## Prompt processing
 
@@ -128,7 +130,6 @@ Command line `--name`; the Where column says which config block takes it.
 | `prefill-cpu-share` | engine | 0 to 1 | 0.6 | Flash-Next only. Share of streamed prompt experts the CPU computes. Fixed, so output is the same run to run. |
 | `short-read` | engine | tokens | 64 (`0` = off) | Flash-Next only. A fresh part of at most N tokens is read through decode windows. |
 | `no-prompt-skip` | engine | switch | off | DeepSeek only. Run every row through every layer. Slower; the same math. [precision](../precision/deepseek41.md#prompt-skip) |
-| `no-peer-prefill` | engine | switch | off | Flash-Next only. The peer card computes none of the prompt rows; the prompt stays on the main card. |
 
 ## Drafting
 
@@ -182,8 +183,8 @@ Diagnostic flags: [diagnostics](diagnostics.md).
 
 ## Control vectors
 
-A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`. A layer split
-or a prompt split keeps it on every card: each stage applies the vector to the steered layers it reads.
+A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`. A split
+or a peer's prompt stage keeps it on every card: each stage applies the vector to the steered layers it reads.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |

@@ -20,7 +20,7 @@ public:
     std::string validate(const GgufFile& g) const override { return validate_(g); }
     model::ModelDesc describe(const GgufFile& g) const override { return describe_(g); }
     model::TokenizerSpec tokenizer_spec() const override { return {}; }
-    int max_expert_cards() const override { return 0; }
+    program::GpuModes gpu_modes() const override { return {}; }
     model::TokenNames token_names() const override { return {}; }
     PreTokenizer pretokenizer() const override { return {}; }
     program::grammar::ToolForm tool_form() const override { return {}; }

@@ -23,7 +23,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
-    "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
+    "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -125,6 +125,10 @@ def option_words(where: str, key, value, act, here: Path) -> list[str]:
             return [flag, str(answer_room(str(value)))]
         except argparse.ArgumentTypeError as e:
             raise ValueError(f"{where}.{key}: {e}") from None
+    if name in ("gpu", "gpu-share") and isinstance(value, list):     # the cards, or their shares, as a list of numbers
+        if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value):
+            raise ValueError(f"{where}.{key}: a number, a list of numbers or a string")
+        return [flag, ",".join(str(x) for x in value)]
     if act.nargs == 0:                                 # a switch
         if not isinstance(value, bool):
             raise ValueError(f"{where}.{key}: true or false")
@@ -305,8 +309,8 @@ def check_engine_flags(words: list[str], known: set[str] | None, where: str) -> 
     """ValueError naming the first flag (a word starting with `--`) the engine rejects; value words are not names
     (unchecked when the binary is unreadable)."""
     for word in words:
-        if word == "--gpu":
-            raise ValueError(f"{where}: gpu is a server setting (--gpu, or \"gpu\" in the server section)")
+        if word in ("--gpu", "--gpu-mode", "--gpu-share"):
+            raise ValueError(f"{where}: {word[2:]} is a server setting ({word}, or \"{word[2:]}\" in a model entry)")
         if known is not None and word.startswith("--") and word not in known:
             raise ValueError(f"{where}: {word} is not an engine flag")
 
@@ -591,9 +595,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8080, help="the TCP port to listen on (default 8080)")
-    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: exactly these, the first is the main "
-                                  "card and the engine gives the rest their roles (\"0,1\"); auto = every Blackwell "
-                                  "card, the fastest as main (default: GPU 0 alone)")
+    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: a number (0), a list whose first is the main "
+                                  "card (0,1), or all (default: GPU 0 alone)")
+    ap.add_argument("--gpu-mode", help="what the GPUs do together, required with two or more: peer (the main card runs every "
+                                       "layer, the others help), split (the layers are divided) or tensor")
+    ap.add_argument("--gpu-share", help="the cards' relative shares, one positive number per card in the order of --gpu "
+                                        "(3,1); default: by the mode")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="tokenizer directory for the mock engine (a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")

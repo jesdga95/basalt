@@ -20,6 +20,8 @@ public:
     /// Backs at least the first `bytes` bytes (rounded up to the allocation granularity; the new bytes are zeroed).
     /// False with `err` when the device has no memory for them with `keep_free` left; what was backed stays.
     bool ensure(uint64_t bytes, uint64_t keep_free, std::string& err);
+    /// The device bytes ensure(bytes) would back beyond what is backed now (its rounding included); 0 when it backs nothing.
+    uint64_t growth(uint64_t bytes) const;
     /// Gives back the whole allocations that lie past `bytes` (the device is synchronised first); the address range stays.
     void trim(uint64_t bytes);
     uint8_t* data() const { return base_; }

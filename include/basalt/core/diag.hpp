@@ -12,6 +12,7 @@ struct Diag {
     bool decode_timing = false;   ///< --decode-timing: the per-request decode timing line
     std::string draft_log;     ///< --draft-log FILE: one line per verify window (width, accepted, ms)
     bool zero_doorbell = false;   ///< --force-zero-doorbell: every window on the zero-doorbell graph (a scheduling test)
+    bool main_card_bits = false;   ///< --diag-main-card-bits: a stage on another card computes the main card's bits (its cuBLAS algorithms, the SM count its kernels plan by): the bitwise A/B of a peer or a split against one card
     std::map<std::string, double> exp;   ///< --exp NAME=V: short-lived experiment gates, removed when they resolve
 };
 

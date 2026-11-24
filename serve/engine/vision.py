@@ -45,12 +45,14 @@ def _unlink_quietly(path: Path) -> None:
         pass
 
 
-def model_plan(engine_bin: str, path: str, value, words: list[str]) -> dict:
-    """The engine's choice for the gpu setting (`basalt --gpu-plan`) for a model with its flags: the cards, main first, as
-    "devices" (their CUDA_VISIBLE_DEVICES spelling) and "cards", plus the lines to print once. The engine parses the flags
-    by the model's own rules first and loads nothing. ValueError with the engine's reason."""
-    text = gpu_text(value)
-    cmd = [engine_bin, "--model", path, *words, "--gpu-plan"] + (["--gpu", text] if text else [])
+def model_plan(engine_bin: str, path: str, value, words: list[str], mode=None, share=None) -> dict:
+    """The engine's choice for the gpu, gpu-mode and gpu-share settings (`basalt --gpu-plan`) for a model with its flags: the
+    cards, main first, as "devices" (their CUDA_VISIBLE_DEVICES spelling) and "cards", the "mode" and the "shares", plus the
+    lines to print once. The engine parses the flags by the model's own rules first and loads nothing. ValueError with the
+    engine's reason."""
+    text, mode_text, share_text = gpu_text(value), gpu_text(mode), gpu_text(share)
+    cmd = [engine_bin, "--model", path, *words, "--gpu-plan"] + (["--gpu", text] if text else []) + \
+        (["--gpu-mode", mode_text] if mode_text else []) + (["--gpu-share", share_text] if share_text else [])
     try:
         run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
@@ -488,7 +490,7 @@ class EngineVision(Vision):
 
 
 def gpu_text(value) -> str:
-    """The gpu setting as the engine reads it: "" (unset), "auto" or "A,B,..."; a config may give a number or a list."""
+    """A gpu setting as the engine reads it: "" (unset) or the text; a config may give a number or a list of them."""
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
@@ -496,21 +498,47 @@ def gpu_text(value) -> str:
     return str(value).strip()
 
 
-def check_gpu(value) -> None:
-    """ValueError unless the gpu setting reads as auto or distinct GPU numbers."""
-    text = gpu_text(value)
-    if text in ("", "auto"):
-        return
-    items = [x.strip() for x in text.split(",")]
-    if not all(x.isdigit() for x in items) or len(set(int(x) for x in items)) != len(items):
-        raise ValueError(text)
+GPU_MODES = ("peer", "split", "tensor")
+
+
+def check_gpu(value, mode=None, share=None) -> None:
+    """ValueError with the engine's text unless gpu, gpu-mode and gpu-share read as settings. What needs the cards (`all`)
+    or the model is left to the engine's --gpu-plan."""
+    text, mode_text, share_text = gpu_text(value), gpu_text(mode), gpu_text(share)
+    cards = None                                    # how many cards gpu names; None: not known without the engine
+    if text == "":
+        cards = 1
+    elif text != "all":
+        items = [x.strip() for x in text.split(",")]
+        if not all(x.isdigit() for x in items) or len(set(int(x) for x in items)) != len(items):
+            raise ValueError(f'gpu "{text}": expected a card number like 0, a list like 0,1 (the first is the main card), '
+                             "or all; see docs/configuration/gpus.md")
+        cards = len(items)
+    if mode_text and mode_text not in GPU_MODES:
+        raise ValueError(f'gpu-mode "{mode_text}": expected peer, split or tensor; see docs/configuration/gpus.md')
+    shown = text or "0"
+    if cards is not None and cards > 1 and not mode_text:
+        raise ValueError(f"gpu {text} names {cards} cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md")
+    if cards == 1 and mode_text:
+        raise ValueError(f'gpu-mode {mode_text}: gpu names one card (gpu "{shown}"); a mode needs two or more')
+    if cards == 1 and share_text:
+        raise ValueError(f'gpu-share: gpu names one card (gpu "{shown}"); shares need two or more')
+    if share_text:
+        items = [x.strip() for x in share_text.split(",")]
+        try:
+            numbers = [float(x) for x in items]
+        except ValueError:
+            numbers = []
+        if not numbers or not all(n > 0 and n != float("inf") for n in numbers) or (cards is not None and len(numbers) != cards):
+            n = f" ({cards} cards)" if cards is not None else ""
+            raise ValueError(f'gpu-share "{share_text}": expected one positive number per card of gpu{n}, like 3,1')
 
 
 def gpu_list(cfg: dict) -> list:
     """The cards the engine runs on, main first, as CUDA_VISIBLE_DEVICES names them (nvidia-smi numbers, or a UUID
     where the environment gave one); [] when none was chosen (the mock engine)."""
     g = gpu_text(cfg.get("gpu"))
-    if g in ("", "auto"):
+    if g in ("", "all"):
         return []
     return [int(x) if x.isdigit() else x for x in (w.strip() for w in g.split(",")) if x]
 

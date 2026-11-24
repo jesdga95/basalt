@@ -122,7 +122,9 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
     b.sort_scr = c.take<uint8_t>(moe_sort_scratch((int) P, g.n_expert));
-    const size_t stage = (size_t) kKvHeads * R * kHeadDim * 2;   // fp16 at most
+    const size_t row_bytes = (size_t) std::max(kv_cache_row_bytes(false, false),
+                                               std::max(kv_cache_row_bytes(true, false), kv_cache_row_bytes(false, true)));
+    const size_t stage = (size_t) kKvHeads * R * row_bytes;   // staging must fit the widest cache format
     b.k_stage = c.take<uint8_t>(stage);
     b.v_stage = c.take<uint8_t>(stage);
     b.pos = c.take<int32_t>(R);
@@ -155,7 +157,7 @@ public:
     ~Prompt() override {   // every read synced its streams before it returned
         for (cudaEvent_t& e : done_)
             if (e) cudaEventDestroy(e);
-        for (int i = m_.cards() - 1; i >= 0; --i) {
+        for (int i = lanes() - 1; i >= 0; --i) {
             Lane& k = lane_[i];
             cudaSetDevice(k.device);
             if (k.hand) cudaEventDestroy(k.hand);
@@ -166,6 +168,9 @@ public:
             if (k.mem) cudaFree(k.mem);
         }
         if (hand_) cudaFreeHost(hand_);
+        for (void* q : {(void*) px_nrm_, (void*) px_ids_, (void*) px_rw_, (void*) px_out_, (void*) px_cnt_})
+            if (q) cudaFreeHost(q);
+        if (row_ix_) cudaFree(row_ix_);
         if (routed_ids_) cudaFreeHost(routed_ids_);
     }
 
@@ -181,9 +186,9 @@ public:
                 err = "cannot create the prompt path's events";
                 return false;
             }
-        for (int i = m_.cards() - 1; i >= 0; --i) {   // the first card's last: it stays current
+        for (int i = lanes() - 1; i >= 0; --i) {   // the first card's last: it stays current
             cur_ = i;
-            lane_[i].device = m_.card_device(i);
+            lane_[i].device = lane_device(i);
             cudaSetDevice(lane_[i].device);
             if (i > 0 && cudaStreamCreateWithFlags(&lane_[i].stream, cudaStreamNonBlocking) != cudaSuccess) {
                 err = "cannot create the prompt path's second stream";
@@ -194,6 +199,20 @@ public:
                 return false;
             }
             if (!init_lane(err)) return false;
+        }
+        if (m_.peer_device() >= 0) {   // gpu-mode peer: a layer's rows to the second card and its partial sums back
+            const size_t R = kChunk, E = (size_t) g_.n_embd, P = R * (size_t) g_.n_used;
+            constexpr unsigned flags = cudaHostAllocPortable | cudaHostAllocMapped;   // the main card's kernels write the rows there
+            if (cudaHostAlloc((void**) &px_nrm_, R * E * 4, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_ids_, P * 4, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_rw_, P * 4, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_cnt_, 64, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_out_, R * E * 4, cudaHostAllocPortable) != cudaSuccess ||
+                cudaMalloc((void**) &row_ix_, R * 4) != cudaSuccess) {
+                cudaGetLastError();
+                err = "cannot pin the rows the second card's experts take";
+                return false;
+            }
         }
         if (m_.spill().any()) {
             if (cudaHostAlloc((void**) &routed_ids_, (size_t) kRoutedRows * g_.n_used * 4, cudaHostAllocPortable) != cudaSuccess) {
@@ -246,6 +265,11 @@ public:
         c.base = static_cast<uint8_t*>(lane().mem);
         carve(c, b(), g_);
         mmq::iota(b().ident, (int64_t) kChunk * g_.n_used, strm());
+        // the sorted entries past the ones a chunk fills (pairs another card computes are left out) read as row 0 of expert 0
+        const size_t pair_bytes = (size_t) kChunk * g_.n_used * 4;
+        cudaMemsetAsync(b().tok, 0, pair_bytes, strm());
+        cudaMemsetAsync(b().dst, 0, pair_bytes, strm());
+        cudaMemsetAsync(b().exp, 0, pair_bytes, strm());
         // the products' tiles
         const int E = g_.n_embd, F = g_.n_ff_exp;
         const auto ready = [&](int type, int64_t rows) {
@@ -258,7 +282,7 @@ public:
         };
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerWeights& w = m_.layer(l);
-            if (m_.card_of(l) != cur_) continue;
+            if (!lane_runs(l)) continue;
             if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) continue;
             if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
         }
@@ -285,6 +309,10 @@ public:
     }
 
 private:
+    // The second lane: the layer split's card, or gpu-mode peer's, which runs its experts' pairs of every layer that has some.
+    int lanes() const { return m_.cards() > 1 || m_.peer_device() >= 0 ? 2 : 1; }
+    int lane_device(int i) const { return i == 0 ? m_.card_device(0) : m_.cards() > 1 ? m_.card_device(1) : m_.peer_device(); }
+    bool lane_runs(int l) const { return m_.cards() > 1 ? m_.card_of(l) == cur_ : cur_ == 0 || m_.peer_n(l) > 0; }
     Lane& lane() { return lane_[cur_]; }
     Bufs& b() { return lane_[cur_].b; }
     cudaStream_t strm() const { return lane_[cur_].stream; }
@@ -527,6 +555,7 @@ private:
         }
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
         const bool fp8 = m_.cache_fp8();
+        const bool int8 = m_.cache_int8();
         AttnPrep ap;
         ap.yq = b().yq;
         ap.yk = one ? b().yq + kProjQ : b().yk;
@@ -549,6 +578,7 @@ private:
         ap.v_cache = c.ring ? b().v_stage : c.v;
         ap.cap = c.ring ? kChunk : c.cap;
         ap.fp8 = fp8;
+        ap.int8 = int8;
         ap.q = b().q;
         ap.r = b().r;
         ap.sink = b().sink;
@@ -566,10 +596,12 @@ private:
         aa.v_chunk = ap.v_cache;
         aa.chunk_cap = ap.cap;
         aa.fp8 = fp8;
+        aa.int8 = int8;
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
-        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, strm());
+        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
+                                  kv_cache_row_bytes(fp8, int8), strm());
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
                  q8::Epilogue::Store, strm());
@@ -592,7 +624,7 @@ private:
     // The routed experts of the chunk's normed MLP inputs (nrm) into moe: the router's scores as one product, the pairs
     // sorted by expert, the gate/up and down products per expert in two MMQ launches over the experts in place.
     bool experts(const LayerWeights& w, int l, int rows) {
-        const int E = g_.n_embd, F = g_.n_ff_exp, k = g_.n_used, pairs = rows * k;
+        const int E = g_.n_embd, k = g_.n_used, pairs = rows * k;
         bk::f32_rows_dot(b().nrm, w.router, b().rlog, rows, g_.n_expert, E, strm());
         bk::RouterArgs ra;
         ra.n_expert = g_.n_expert;
@@ -601,24 +633,74 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router_select(b().rlog, w.router_bias, rows, ra, b().ids, b().rw, strm());
-        if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot, its RAM experts copied into the staging
-            remap_ids(b().ids, pairs, w.slot_map, strm());
+        const bool peer = m_.peer_runs(l);
+        const int on_peer = peer ? peer_send(w, l, rows) : 0;   // the second card's rows run beside the main card's
+        if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot (the second card's left out), its RAM experts copied into the staging
+            remap_ids(b().ids, pairs, peer ? w.slot_map : w.slot_full, strm());
             if (ahead_) {   // the copy stream staged it (stage_ahead)
                 if (!ok(cudaStreamWaitEvent(strm(), lane().staged, 0))) return false;
             } else {
                 const uint8_t* want = nullptr;
                 if (rows <= kRoutedRows && !(want = routed(pairs))) return false;
-                if (!m_.stage(l, want, strm()) ||
+                if (!m_.stage(l, want, strm(), !peer) ||
                     !ok(cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm())))
                     return false;   // the guard after the last slot: spill.hpp
             }
         }
-        moe_sort(b().ids, rows, k, g_.n_expert, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());
+        if (!local_experts(w, g_.n_expert, rows)) return false;
+        if (on_peer > 0) peer_join(on_peer);
+        return true;
+    }
+
+    // The rows with a choice on the second card, their normed rows, choices and weights to it (the main card's kernel writes them
+    // to page-locked memory), which runs its experts' pairs over the same kernels into its own partial sums (the choices it has
+    // no expert for are left out) and sends them back (peer_join). The rows are counted first: the plan is one small launch and
+    // the host waits for it. Returns the rows sent.
+    int peer_send(const LayerWeights& w, int l, int rows) {
+        const int k = g_.n_used;
+        const Lane& m = lane_[0];
+        peer_rows_plan(b().ids, rows, k, w.slot_map, row_ix_, px_cnt_, strm());
+        cudaStreamSynchronize(strm());
+        const int n = *static_cast<volatile int32_t*>(px_cnt_);
+        if (n == 0) return 0;
+        peer_rows_gather(b().nrm, b().ids, b().rw, k, row_ix_, n, px_nrm_, px_ids_, px_rw_, strm());
+        cudaEventRecord(m.hand, strm());
+        const size_t pairs = (size_t) n * k;
+        cur_ = 1;
+        cudaSetDevice(lane().device);
+        cudaStreamWaitEvent(strm(), m.hand, 0);
+        cudaMemcpyAsync(b().nrm, px_nrm_, (size_t) n * g_.n_embd * 4, cudaMemcpyHostToDevice, strm());
+        cudaMemcpyAsync(b().ids, px_ids_, pairs * 4, cudaMemcpyHostToDevice, strm());
+        cudaMemcpyAsync(b().rw, px_rw_, pairs * 4, cudaMemcpyHostToDevice, strm());
+        LayerWeights pw = w;   // the layer's experts on this card: its own run of blobs, no staging
+        pw.experts = m_.peer_base(l);
+        pw.expert_stride = m_.peer_stride(l);
+        pw.slot_map = nullptr;
+        pw.n_spill = 0;
+        remap_ids(b().ids, pairs, m_.peer_map(l), strm());
+        local_experts(pw, m_.peer_n(l), n);   // no staging on this card (slot_map null): always true
+        cudaMemcpyAsync(px_out_, b().moe, (size_t) n * g_.n_embd * 4, cudaMemcpyDeviceToHost, strm());
+        cudaEventRecord(lane().hand, strm());
+        cur_ = 0;
+        cudaSetDevice(lane().device);
+        return n;
+    }
+    void peer_join(int n) {
+        cudaStreamWaitEvent(strm(), lane_[1].hand, 0);
+        cudaMemcpyAsync(b().gu, px_out_, (size_t) n * g_.n_embd * 4, cudaMemcpyHostToDevice, strm());   // gu is spent
+        peer_rows_add(b().gu, row_ix_, n, b().moe, strm());
+    }
+
+    // The pairs of b().ids (expert slots 0..n-1, or -1 for a pair another card computes) over the experts of `w`, combined into moe.
+    // False when the next spilled visit's staging failed (staging_read).
+    bool local_experts(const LayerWeights& w, int n, int rows) {
+        const int E = g_.n_embd, F = g_.n_ff_exp, k = g_.n_used, pairs = rows * k;
+        moe_sort(b().ids, rows, k, n, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());
         if (w.gu_type == kTypeNvfp4 && w.d_type == kTypeNvfp4 && fp4_shape()) {
-            return experts_fp4(w, rows);
+            return experts_fp4(w, n, rows);
         }
         if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) {
-            return experts_mxfp8(w, rows);
+            return experts_mxfp8(w, n, rows);
         }
         mmq::quantize(b().nrm, b().tok, b().xq, w.gu_type, E, E, pairs, strm());
         mmq::Product p;
@@ -627,13 +709,13 @@ private:
         p.w_rows = 2 * F;
         p.w_cols = E;
         p.expert_bytes = w.expert_stride;
-        p.n = g_.n_expert;
+        p.n = n;
         p.xq = b().xq;
         p.bounds = b().bounds;
         p.ids = b().ident;
         p.total_rows = pairs;
         p.max_rows = rows;
-        p.opt_rows = (pairs + g_.n_expert - 1) / g_.n_expert;
+        p.opt_rows = (pairs + n - 1) / n;
         p.dst = b().gu;
         p.ld_dst = 2 * F;
         lane().mmq.run(p, strm());
@@ -658,7 +740,7 @@ private:
         d.ld_dst = E;
         lane().mmq.run(d, strm());
         if (w.slot_map && !staging_read()) return false;
-        moe_combine(b().gu, b().rw, rows, k, b().moe, strm());
+        moe_combine(b().gu, b().rw, rows, k, b().moe, strm(), b().ids);
         return true;
     }
 
@@ -669,7 +751,7 @@ private:
         Lane& k = lane();
         const int l = g_.visits[(size_t) walk_.steps[(size_t) si].visit].layer;
         const LayerWeights& w = m_.layer(l);
-        return ok(cudaEventRecord(k.freed, k.stream)) && ok(cudaStreamWaitEvent(k.copy, k.freed, 0)) && m_.stage(l, nullptr, k.copy) &&
+        return ok(cudaEventRecord(k.freed, k.stream)) && ok(cudaStreamWaitEvent(k.copy, k.freed, 0)) && m_.stage(l, nullptr, k.copy, !m_.peer_runs(l)) &&
                ok(cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, k.copy)) &&
                ok(cudaEventRecord(k.staged, k.copy));
     }
@@ -698,8 +780,8 @@ private:
     // planes into H as the softcapped SwiGLU, H rounded per expert tile, then down into the pairs' rows.
     bool fp4_shape() const { return g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024; }
     bool mxfp8_shape() const { return g_.n_embd % 128 == 0 && g_.n_ff_exp % 128 == 0 && g_.n_expert <= 1024; }
-    bool experts_mxfp8(const LayerWeights& w, int rows) {
-        const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
+    bool experts_mxfp8(const LayerWeights& w, int n, int rows) {
+        const int E = g_.n_embd, F = g_.n_ff_exp, pairs = rows * g_.n_used;
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
         mxfp8::plan_blocks(b().bounds, n, b().blk_off, strm());
         mxfp8::quantize_tokens(b().nrm, rows, E, E, b().xq, strm());
@@ -739,11 +821,11 @@ private:
         d.ld_dst = E;
         mxfp8::run(d, strm());
         if (w.slot_map && !staging_read()) return false;
-        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm());
+        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm(), b().ids);
         return true;
     }
-    bool experts_fp4(const LayerWeights& w, int rows) {
-        const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
+    bool experts_fp4(const LayerWeights& w, int n, int rows) {
+        const int E = g_.n_embd, F = g_.n_ff_exp, pairs = rows * g_.n_used;
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
         fp4::plan_blocks(b().bounds, n, b().tile_off, b().blk_off, strm());
         fp4::quantize_tokens(b().nrm, rows, E, E, b().a4x, b().gsx, strm(), true);
@@ -787,7 +869,7 @@ private:
         d.ld_dst = E;
         fp4::run(d, strm());
         if (w.slot_map && !staging_read()) return false;
-        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm());
+        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm(), b().ids);
         return true;
     }
 
@@ -799,6 +881,8 @@ private:
     std::vector<Segment> segs_;   // the walk's runs of visits on each card (walk.hpp split_walk)
     Lane lane_[2];                // each card's buffers, products and stream
     int cur_ = 0;                 // the card the launches go to
+    float* px_nrm_ = nullptr, *px_rw_ = nullptr, *px_out_ = nullptr;   // gpu-mode peer: page-locked rows, weights and sums crossing
+    int32_t* px_ids_ = nullptr, *px_cnt_ = nullptr, *row_ix_ = nullptr;   // and the rows sent: their count (page-locked), their rows
     float* hand_ = nullptr;       // the layer split: page-locked slots of a chunk's rows crossing between the cards
     int tap_slot0_ = 0;           // the first drafter tap's slot
     cudaEvent_t done_[2] = {};

@@ -4,6 +4,7 @@ Releases, newest first. Versions are 0.x: a minor release adds a model or anothe
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.5.7](0.5.7.md) | 2026-11-23 | Breaking: `gpu`, `gpu-mode` and `gpu-share` replace every model's own multi-GPU logic (`gpu: auto` is gone, a list of cards needs a mode); peer and split on the 27B and Inkling 2 Mini, one shared layer and a conformance check for every model. |
 | [0.5.6](0.5.6.md) | 2026-11-23 | Inkling 2 Mini on a small card or two cards (experts on the CPU, layer split) with prompts 21 to 25% faster and a second pack (MX8); parallel slots decode together on every model; Hy4-flash stray tokens fixed; `--seed` in the CLI. |
 | [0.5.5](0.5.5.md) | 2026-11-21 | Inkling 2 Mini: a looped mixture of experts on one card, with images, the DSpark drafter and up to 1M tokens of context where the card has room. |
 | [0.5.0](0.5.0.md) | 2026-11-19 | Hy4-flash: a mixture of experts with a 1M-token context (elastic fp16 or FP8 caches), images, the DFly2 drafter and a shipped expert profile; per-layer expert copies, a bounded lend and partial reclaim in the shared expert tier. |

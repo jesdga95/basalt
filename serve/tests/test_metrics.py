@@ -410,7 +410,7 @@ class GpusInPlay(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(gpus_in_play({}), [0])
         self.assertEqual(gpus_in_play({"gpu": 2}), [2])
-        self.assertEqual(gpus_in_play({"gpu": "auto"}), [0])
+        self.assertEqual(gpus_in_play({"gpu": "all"}), [0])
 
 
 

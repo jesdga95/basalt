@@ -239,10 +239,16 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
     // a prompt's many tokens: gate rows four to a block where a thread's columns fit (the same bits, a quarter of the reads of x)
     constexpr int kRowsG = 4;
     const bool rows4 = n_tokens >= kRowsMinTok && a.n_embd == 4 * 3 * kLogitThreads && a.n_expert % kRowsG == 0;
+    const bool rows4w = n_tokens >= kRowsMinTok && a.n_embd == 4 * 5 * kLogitThreads && a.n_expert % kRowsG == 0;
     for (int t0 = 0; t0 < n_tokens; t0 += kLaunchTok) {
         const int nt = n_tokens - t0 < kLaunchTok ? n_tokens - t0 : kLaunchTok;
         if (rows4) {
             router_logits_rows_kernel<3, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
+                x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
+            continue;
+        }
+        if (rows4w) {
+            router_logits_rows_kernel<5, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
                 x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
             continue;
         }

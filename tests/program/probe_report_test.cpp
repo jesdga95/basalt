@@ -94,7 +94,7 @@ int main() {
     {
         const std::vector<std::string> a = {"--model", "m.basalt", "--gpu", "0", "--kv", "int8"};
         CHECK(format_config(a, "1") == "--gpu 1 --kv int8");
-        CHECK(format_config(a, "auto") == "--gpu auto --kv int8");
+        CHECK(format_config(a, "all") == "--gpu all --kv int8");
         CHECK(format_config({"--gpu", "0,1", "--spec", "8"}, "0,1") == "--gpu 0,1 --spec 8");
         CHECK(format_config({"--gpu", "0", "--kv", "int8"}, "0") == "--gpu 0 --kv int8");
         // only the user's settings: swaps and context appear when given, and nothing is added when not

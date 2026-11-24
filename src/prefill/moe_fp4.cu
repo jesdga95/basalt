@@ -279,7 +279,7 @@ __global__ void quantize_f16_kernel(const uint16_t* __restrict__ x, const int32_
                                     float* __restrict__ gs, int cols, int64_t ld, int64_t rows) {
     const int lane = threadIdx.x & 31;
     const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    if (r >= rows) return;
+    if (r >= rows || r >= bounds[n]) return;   // rows past the sorted ones belong to no expert (pairs left out)
     int lo = 0, hi = n;
     while (hi - lo > 1) {
         const int mid = (lo + hi) >> 1;
@@ -1021,30 +1021,6 @@ int run_group(const Group& g, int64_t row_cap, void* stream) {
         ++runs;
     }
     return runs;
-}
-
-void cut_pieces(const int32_t* bounds, int n, int64_t cap, Pieces& out) {
-    out.expert.clear();
-    out.bounds.clear();
-    out.group.clear();
-    const int64_t step = std::max<int64_t>(kTileTokens, cap / kTileTokens * kTileTokens);
-    for (int j = 0; j < n; ++j)
-        for (int64_t r = bounds[j]; r < bounds[j + 1]; r += step) {   // an expert without rows has no piece
-            out.expert.push_back(j);
-            out.bounds.push_back((int32_t) r);
-        }
-    out.bounds.push_back(n > 0 ? bounds[n] : 0);
-    const int np = (int) out.expert.size();
-    int64_t rows = 0;
-    for (int i = 0; i < np; ++i) {
-        const int64_t c = out.bounds[(size_t) i + 1] - out.bounds[(size_t) i];
-        if (out.group.empty() || i - out.group.back() == kMaxExperts || rows + c > cap) {
-            out.group.push_back(i);
-            rows = 0;
-        }
-        rows += c;
-    }
-    out.group.push_back(np);
 }
 
 }  // namespace basalt::prefill::fp4

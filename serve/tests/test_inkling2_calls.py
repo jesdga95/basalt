@@ -254,5 +254,105 @@ class Routes(unittest.TestCase):
                     self.assertEqual((text, calls), (talk, []))
 
 
+
+class NoneChoice(unittest.TestCase):
+    """tool_choice "none" offers no tools, so the reply has no calls: a native call the model writes anyway is text,
+    shown whole and in the order written, with no call event of any kind, whole and streamed. The thinking stays
+    reasoning, and a reply that is cut off or empty shows as such. Under "auto" the same reply is the call."""
+
+    TOOL = {"type": "function", "function": {"name": "read_file", "description": "Read a file from the workspace",
+                                             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+    THOUGHT = "I should look at the file first."
+    CALL = HEADER + "read_file" + TOOL_JSON + '{"name":"read_file","args":{"path":"src/app.py"}}' + END
+    BARE = HEADER + TOOL_JSON + '{"name":"read_file","args":{"path":"src/app.py"}}' + END
+    TEXT_OF = "read_file" + TOOL_JSON + '{"name":"read_file","args":{"path":"src/app.py"}}'
+
+    def ask(self, script, stream, max_tokens=900, **extra):
+        """(reply: content, reasoning, calls, finish and every tool_calls delta, the prompt the engine read)."""
+        svc = service(script)
+        httpd = serve(svc, port=0)
+        body = dict(model="ink", stream=stream, max_tokens=max_tokens, tools=[self.TOOL],
+                    messages=[{"role": "user", "content": "what is in src/app.py?"}], **extra)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        prompt = svc.tok.decode(svc.engine.requests[0][0])
+        if not stream:
+            choice = json.loads(raw)["choices"][0]
+            m = choice["message"]
+            calls = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in m.get("tool_calls") or []]
+            return dict(content=m.get("content"), reasoning=m.get("reasoning_content") or "", calls=calls,
+                        finish=choice["finish_reason"], deltas=len(m.get("tool_calls") or [])), prompt
+        content, reasoning, names, args, deltas, finish = "", "", {}, {}, 0, None
+        for line in raw.splitlines():
+            if not line.startswith("data: {"):
+                continue
+            c = json.loads(line[6:])["choices"][0]
+            content += c["delta"].get("content") or ""
+            reasoning += c["delta"].get("reasoning_content") or ""
+            for tc in c["delta"].get("tool_calls") or []:
+                deltas += 1
+                names.setdefault(tc["index"], tc.get("function", {}).get("name"))
+                args[tc["index"]] = args.get(tc["index"], "") + (tc.get("function", {}).get("arguments") or "")
+            finish = c["finish_reason"] or finish
+        calls = [(names[i], json.loads(args[i])) for i in sorted(names)]
+        return dict(content=content or None, reasoning=reasoning, calls=calls, finish=finish, deltas=deltas), prompt
+
+    def test_a_native_call_under_none_is_text(self):
+        for name, call in (("named", self.CALL), ("headerless", self.BARE)):
+            script = HEADER + THINK + self.THOUGHT + END + call
+            text = self.TEXT_OF if name == "named" else self.TEXT_OF[len("read_file"):]
+            for choice in ("none", {"type": "none"}):
+                for stream in (False, True):
+                    with self.subTest(form=name, choice=choice, stream=stream):
+                        got, prompt = self.ask(script, stream, tool_choice=choice)
+                        self.assertNotIn("Read a file from the workspace", prompt)     # no tools offered
+                        self.assertEqual(got, dict(content=text, reasoning=self.THOUGHT, calls=[], finish="stop",
+                                                   deltas=0))
+
+    def test_text_and_the_call_under_none_keep_their_order(self):
+        script = HEADER + THINK + self.THOUGHT + END + HEADER + TEXT + "Let me read it." + END + self.CALL
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                got, _ = self.ask(script, stream, tool_choice="none")
+                self.assertEqual(got, dict(content="Let me read it." + self.TEXT_OF, reasoning=self.THOUGHT, calls=[],
+                                           finish="stop", deltas=0))
+
+    def test_the_same_reply_under_auto_is_the_call(self):
+        script = HEADER + THINK + self.THOUGHT + END + self.CALL
+        for choice in ("auto", None):
+            for stream in (False, True):
+                with self.subTest(choice=choice, stream=stream):
+                    extra = {} if choice is None else {"tool_choice": choice}
+                    got, prompt = self.ask(script, stream, **extra)
+                    self.assertIn("Read a file from the workspace", prompt)
+                    self.assertEqual({k: got[k] for k in ("content", "reasoning", "calls", "finish")},
+                                     dict(content=None, reasoning=self.THOUGHT, calls=[("read_file", {"path": "src/app.py"})],
+                                          finish="tool_calls"))
+
+    def test_a_call_cut_off_under_none_shows_as_cut_off_text(self):
+        tok = service().tok
+        script = HEADER + THINK + self.THOUGHT + END + self.CALL
+        cut = script.index('"src/app')                  # the output ends inside the arguments
+        n = len(tok.encode(script[:cut], parse_special=True))
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                got, _ = self.ask(script, stream, max_tokens=n, tool_choice="none")
+                self.assertEqual(got, dict(content=self.TEXT_OF[:self.TEXT_OF.index('"src/app')], reasoning=self.THOUGHT,
+                                           calls=[], finish="length", deltas=0))
+
+    def test_an_empty_answer_under_none_is_empty(self):
+        script = HEADER + THINK + self.THOUGHT + END
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                got, _ = self.ask(script, stream, tool_choice="none")
+                self.assertEqual(got, dict(content=None, reasoning=self.THOUGHT, calls=[], finish="stop", deltas=0))
+
+
 if __name__ == "__main__":
     unittest.main()

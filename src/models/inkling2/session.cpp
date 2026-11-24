@@ -211,11 +211,17 @@ public:
         if (m_.spill().any() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {
-                const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); });
+                const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); },
+                                                [&](int l, int e) { return m_.peer_held(l, e); });
                 const uint64_t all = sh.all, card = sh.card;
-                basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on the CPU",
-                                  (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
-                                  (unsigned long long) (all - card));
+                if (m_.peer_device() >= 0)
+                    basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on GPU %d, %llu on the CPU",
+                                      (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
+                                      (unsigned long long) sh.peer, m_.peer_device(), (unsigned long long) (all - card - sh.peer));
+                else
+                    basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on the CPU",
+                                      (unsigned long long) all, all ? 100.0 * (double) card / (double) all : 100.0,
+                                      (unsigned long long) (all - card));
             }
         }
         for (auto [d, p] : bufs_) {
@@ -279,7 +285,7 @@ public:
         bool ok = true;
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
         const int64_t E = g_.n_embd, R = kMaxRows;
-        const size_t elem = m_.cache_fp8() ? 1 : 2;
+        const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8());
         const int64_t ctx = m_.context();
         int max_slot = 0;
         for (const Visit& v : g_.visits) max_slot = std::max(max_slot, v.slot);
@@ -291,7 +297,7 @@ public:
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
-            const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem;
+            const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
                     auto a = std::make_unique<core::ElasticArray>();
@@ -604,11 +610,11 @@ public:
     // the convolutions' rings by checkpoint (running_state). A window ring holds window + kMaxRows positions and a
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
     // rows past it.
-    size_t elem() const { return m_.cache_fp8() ? 1 : 2; }
+    size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
     static model::Result stale() {
         return {model::Status::Error, "inkling2: a failed read left the conversation's state unknown: start it over or restore a checkpoint"};
     }
-    uint64_t cell_bytes() const { return (uint64_t) kKvHeads * kHeadDim * elem(); }
+    uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
 
     // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
     // and when the card has no room the RAM experts' card copies go back to RAM first, the least routed first. False when
@@ -619,7 +625,8 @@ public:
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
-        const uint64_t grow = (uint64_t) elastic_.size() * (bytes - std::min<uint64_t>(bytes, elastic_[0]->backed())) + (64ull << 20);
+        uint64_t grow = 64ull << 20;   // what the arrays will map, each rounded as it maps, and a margin
+        for (const auto& a : elastic_) grow += a->growth(bytes);
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
@@ -651,7 +658,7 @@ public:
             m_.promote(m_.held_free(kElasticKeep) + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
         }
     }
-    size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem(); }
+    size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * row_bytes(); }
     size_t conv_ring_bytes() const { return (size_t) kConvRing * (2 * kKvHeads * kHeadDim + 2 * (size_t) g_.n_embd) * 4; }
 
     size_t running_bytes() const override {
@@ -693,12 +700,12 @@ public:
         return {};
     }
 
-    int cell_format() const { return m_.cache_fp8() ? 1 : 3; }   // 3: fp16 rows, 1: unit-scale E4M3
+    int cell_format() const { return m_.cache_int8() ? 4 : m_.cache_fp8() ? 1 : 3; }   // 3: fp16, 1: E4M3, 4: scaled INT8
 
     size_t cells_bytes(int64_t positions) const override {
         size_t n = 0;
         for (const VisitCache& c : vc_)
-            if (!c.ring) n += 2 * (size_t) positions * kKvHeads * kHeadDim * elem();
+            if (!c.ring) n += 2 * (size_t) positions * cell_bytes();
         return n + dspark_.cells_bytes(positions);   // DSPARK HOOK
     }
 
@@ -708,7 +715,7 @@ public:
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         cudaStreamSynchronize(stream_);
         kv.clear();
-        const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
+        const size_t run = (size_t) positions * cell_bytes();
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
             core::ConversationKv k;
@@ -735,7 +742,7 @@ public:
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
         cudaStreamSynchronize(stream_);
-        const size_t run = (size_t) positions * kKvHeads * kHeadDim * elem();
+        const size_t run = (size_t) positions * cell_bytes();
         size_t i = 0;
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
@@ -761,15 +768,16 @@ public:
         return n;
     }
 
-    // ---- the console's experts: a lookup is a hit when its expert is on the card. With every expert resident that is each
-    // window's rows times the experts a row takes at each of its visits; with a spill the card's running counts say which
-    // experts the lookups went to, and those whose experts are in RAM are no hits
+    // ---- the console's experts: a lookup is a hit when its expert is on a GPU (the main card or the peer). With every expert
+    // resident that is each window's rows times the experts a row takes at each of its visits; with a spill the card's running
+    // counts say which experts the lookups went to, and those whose experts are in RAM are no hits
     ExpertCounts expert_counts() const override {
         if (!m_.spill().any() || !ex_tally_) return {lookups_, lookups_, 0, 0};
         std::vector<uint32_t> t;
         if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) return {lookups_, lookups_, 0, 0};
-        const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); });
-        return {(int64_t) sh.card, (int64_t) sh.all, 0, 0};
+        const CardShare sh = card_share(t, g_.n_expert, [&](int l, int e) { return m_.on_card(l, e); },
+                                        [&](int l, int e) { return m_.peer_held(l, e); });
+        return {(int64_t) (sh.card + sh.peer), (int64_t) sh.all, 0, 0};
     }
     std::vector<CardExperts> experts_by_card() const override {
         std::vector<CardExperts> out;   // each card its layers' (the layer split spills none)
@@ -793,7 +801,7 @@ public:
         const std::string n = std::to_string(expert_pairs() - m_.spill().spilled);
         uint64_t ram = 0;
         for (int l = 0; l < g_.n_layers; ++l) ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
-        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") +
+        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_int8() ? " kv=int8 " : m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") +
                program::spill_words({0, expert_pairs(), 0});
     }
 
@@ -937,6 +945,7 @@ private:
         ap.v_cache = c.v;
         ap.cap = c.cap;
         ap.fp8 = m_.cache_fp8();
+        ap.int8 = m_.cache_int8();
         ap.q = x.q_;
         ap.r = x.r_;
         ap.sink = x.sink_;
@@ -951,6 +960,7 @@ private:
         aa.v_cache = c.v;
         aa.cap = c.cap;
         aa.fp8 = m_.cache_fp8();
+        aa.int8 = m_.cache_int8();
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         aa.gate = ap.yq + kOffGate;

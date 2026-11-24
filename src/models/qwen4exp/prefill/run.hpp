@@ -127,11 +127,8 @@ struct Prefill::Run::Chunk {
     // `used` event recorded), so the copy stream never waits on an event that is not queued yet
     const basalt::kernels::cpu::ExpertLayout& lay0 = basalt::kernels::cpu::expert_layout();
     const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
-    // the peer takes the rows of a chunk only up to its buffers' size; a streamed chunk only up
-    // to T_fp4, and then on the FP4 kernels (PeerPrefill::T_fp4)
-    PeerPrefill* const ppc =
-        m.pp && m.peer_share && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
-    const bool peer_fp4 = ppc && stream_all && ppc->T_fp4 > 0;
+    // the peer takes the rows of a routed-only chunk up to its buffers' size
+    PeerPrefill* const ppc = m.pp && m.peer_share && T <= m.pp->T_max ? m.pp.get() : nullptr;
     std::vector<StreamEntry> seq;
     std::vector<size_t> seq_start;
     size_t consumed = 0;
