@@ -54,10 +54,16 @@ namespace {
 
 namespace bk = basalt::kernels;
 
-constexpr int kMaxRows = kDecodeRows;    // rows of one forward call (a decode window, a step of a prompt)
+constexpr int kWindowRows = kDecodeRows; // rows of one conversation's window (also its ring margin and logits buffer)
+constexpr int kMaxRows = kBatchRows;     // widest batched forward call across conversations
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
 constexpr int kStage = 64;               // windows whose tokens and positions are in flight from the pinned ring at once
+constexpr int kSegWords = (sizeof(bk::WindowSegs) + 15) / 4;   // device WindowSegs words staged alongside tokens & positions
+
+int call_rows_of(const InklingModel& m) {
+    return m.sessions() > 1 ? std::min(kMaxRows, m.sessions() * kWindowRows) : kWindowRows;
+}
 
 // The forward scratch: the rows of one call through the layers and the head. Every session of the model runs on the same
 // buffers (Shared below), one call at a time: each call syncs its stream before it returns, and a batch window syncs every
@@ -82,7 +88,8 @@ struct Scratch {
     uint32_t* pf_sink_ = nullptr;               // the prefetch's keep-alive word
     float* lp_ = nullptr;                       // the log probabilities' scratch
     float* blog_ = nullptr;                     // a batch window's logits, every row, before each session takes its own
-    int32_t *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr;   // a call's tokens, then its positions
+    int32_t *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr;   // a call's tokens, positions, and segment table
+    const bk::WindowSegs* at_d_ = nullptr;
     static constexpr int kGuessExperts = 8;     // the experts a window's guess requests a visit (rows x kGuessExperts / rows)
     static constexpr int kGuessRows = 2;        // the widest window guessed (wider ones keep the read-ahead)
 };
@@ -92,14 +99,17 @@ struct Scratch {
 // reference (InklingModel::shared()).
 struct Shared {
     Scratch x, x1;                          // the first card's scratch, the second card's (the layer split)
+    int max_rows = kWindowRows;             // widest forward call this model's sessions run
     float* hand = nullptr;                  // the layer split: page-locked slots of a call's rows crossing between the cards,
     int hand_slots = 0, tap_slot0 = 0;      // the crossings' first, then one per drafter tap
     std::unique_ptr<PromptRunner> prompt;   // PROMPT HOOK
     std::unique_ptr<CpuExperts> cpu;        // with a spill: the RAM experts' rows
+    std::unique_ptr<DsparkBatch> ds_batch;  // DSPARK HOOK: multi-session batched commit & draft
     float* tap = nullptr;                   // DSPARK HOOK: the drafter's features of a call's rows (dspark_tap_bytes)
     model::BatchShared batch;
     std::vector<std::pair<int, void*>> bufs;   // (device, allocation)
     ~Shared() {
+        ds_batch.reset();
         prompt.reset();
         cpu.reset();
         int dev = 0;
@@ -112,6 +122,7 @@ struct Shared {
         if (hand) cudaFreeHost(hand);
     }
     bool init(InklingModel& m, cudaStream_t stream, int max_pulls, std::string& err) {
+        max_rows = call_rows_of(m);
         if (!alloc_scratch(m, x, m.device(), true, err)) return false;
         if (m.cards() > 1) {
             cudaSetDevice(m.card_device(1));
@@ -120,13 +131,18 @@ struct Shared {
             if (!ok) return false;
             tap_slot0 = max_pulls;
             hand_slots = max_pulls + kDsTargets;
-            if (cudaHostAlloc((void**) &hand, (size_t) hand_slots * kMaxRows * m.geo().n_embd * 4, cudaHostAllocPortable) != cudaSuccess) {
+            if (cudaHostAlloc((void**) &hand, (size_t) hand_slots * max_rows * m.geo().n_embd * 4, cudaHostAllocPortable) != cudaSuccess) {
                 cudaGetLastError();
                 err = "cannot pin the layer split's hand-off rows";
                 return false;
             }
         }
         if (!(cpu = CpuExperts::make(m, err)) && !err.empty()) return false;
+        if (m.sessions() > 1 && m.dspark()) {
+            ds_batch = std::make_unique<DsparkBatch>();
+            if (!ds_batch->init(m.dspark(), m.sessions(), max_rows, std::max(max_rows, kPromptChunk), tap, m.context(), err))
+                return false;
+        }
         prompt = make_prompt(m, stream, err);   // PROMPT HOOK
         return prompt != nullptr || err.empty();
     }
@@ -144,7 +160,7 @@ struct Shared {
             return p;
         };
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4); };
-        const int64_t E = g.n_embd, R = kMaxRows;
+        const int64_t E = g.n_embd, R = max_rows;
         const int64_t ctx = m.context();
         // the row buffers of one call, by their roles in the walk
         for (float*& b : x.role_) b = f(R * E);
@@ -156,9 +172,9 @@ struct Shared {
         x.y_ = f(R * kProj);
         x.q_ = f(R * kHeads * kHeadDim); x.r_ = f(R * kHeads * kRel); x.sink_ = f(R * kHeads);
         x.o_ = f(R * E); x.resid_ = f(R * E); x.fin_ = f(R * E);
-        x.att_scr_ = alloc(attention_decode_scratch(kMaxRows, std::max<int64_t>(ctx, g.window)));
-        for (void*& q : x.xq_) q = alloc(bk::native_q8_1_bytes((int) E, kMaxRows));
-        x.xo_ = alloc(bk::native_q8_1_bytes(kOutRows, kMaxRows));
+        x.att_scr_ = alloc(attention_decode_scratch(max_rows, std::max<int64_t>(ctx, g.window)));
+        for (void*& q : x.xq_) q = alloc(bk::native_q8_1_bytes((int) E, max_rows));
+        x.xo_ = alloc(bk::native_q8_1_bytes(kOutRows, max_rows));
         x.rlog_ = f(R * g.n_expert); x.rw_ = f(R * g.n_used); x.ids_ = (int32_t*) alloc((size_t) R * g.n_used * 4);
         const int64_t pairs = R * g.n_used;
         x.ex_ptr_ = (unsigned long long*) alloc((size_t) pairs * 8);
@@ -173,12 +189,13 @@ struct Shared {
         x.gs_log_ = f((int64_t) Scratch::kGuessRows * g.n_expert);
         x.gs_w_ = f(Scratch::kGuessExperts);
         x.pf_sink_ = (uint32_t*) alloc(4);
-        x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxRows, g.n_vocab) + R * (bk::kLogprobStride + 1));
+        x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(max_rows, g.n_vocab) + R * (bk::kLogprobStride + 1));
         x.blog_ = f(R * (int64_t) g.n_vocab);
-        x.io_d_ = (int32_t*) alloc((size_t) 2 * R * 4);
+        x.io_d_ = (int32_t*) alloc((size_t) (2 * R + kSegWords) * 4);
         x.tok_d_ = x.io_d_;
         x.pos_d_ = x.io_d_ + R;
-        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(std::max(kMaxRows, kPromptChunk)));   // DSPARK HOOK
+        x.at_d_ = reinterpret_cast<const bk::WindowSegs*>(x.io_d_ + 2 * R);
+        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(std::max(max_rows, kPromptChunk)));   // DSPARK HOOK
         if (!ok) {
             cudaGetLastError();
             err = "out of device memory for the sessions' scratch";
@@ -284,7 +301,8 @@ public:
         }
         bool ok = true;
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
-        const int64_t E = g_.n_embd, R = kMaxRows;
+        const int64_t E = g_.n_embd, R = kWindowRows;
+        const int call_rows = call_rows_of(m_);
         const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8());
         const int64_t ctx = m_.context();
         int max_slot = 0;
@@ -296,7 +314,7 @@ public:
             slot_card_[(size_t) v.slot] = m_.card_of(v.layer);
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
-            c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
+            c.cap = c.ring ? (int64_t) g_.window + kWindowRows : ctx;
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
@@ -339,7 +357,7 @@ public:
         pick_ = (int32_t*) alloc(4 * 32, ok);
         if (ok && cudaMallocHost((void**) &pick_h_, 4 * 32) != cudaSuccess) ok = false;
         else if (ok) pinned_.push_back(pick_h_);
-        if (ok && cudaMallocHost((void**) &io_h_, (size_t) kStage * 2 * R * 4) != cudaSuccess) ok = false;
+        if (ok && cudaMallocHost((void**) &io_h_, (size_t) kStage * (2 * call_rows + kSegWords) * 4) != cudaSuccess) ok = false;
         else if (ok) pinned_.push_back(io_h_);
         for (cudaEvent_t& e : stage_ev_)
             if (ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) ok = false;
@@ -370,7 +388,7 @@ public:
         if (ok) cudaMemsetAsync(ex_tally_, 0, (size_t) expert_pairs() * 4, stream_);
         if (ok) cudaMemsetAsync(rec_n_, 0, (size_t) g_.visits.size() * 4, stream_);
         cudaStreamSynchronize(stream_);
-        return dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), sh_->tap, m_.flags().diag_dump, err);   // DSPARK HOOK
+        return dspark_.init(m_.dspark(), g_, m_.context(), std::max(call_rows, kPromptChunk), sh_->tap, m_.flags().diag_dump, err);   // DSPARK HOOK
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
@@ -381,8 +399,8 @@ public:
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
         hist_.resize((size_t) r.pos);
-        for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
-            const int n = std::min(kMaxRows, r.n_tokens - t0);
+        for (int t0 = 0; t0 < r.n_tokens; t0 += kWindowRows) {
+            const int n = std::min(kWindowRows, r.n_tokens - t0);
             const bool last = t0 + n == r.n_tokens;
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
@@ -404,7 +422,7 @@ public:
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
     // session's scratch and stream. Each conversation keeps its caches and rings (the kernels take them per segment), its
     // drafter's context, its logits and its draws; a row gives the bits it gives in its own window.
-    int batch_rows() const override { return kMaxRows; }
+    int batch_rows() const override { return sh_->max_rows; }
 
 protected:
     // the hooks of the shared driver (model/batch_driver.hpp)
@@ -412,11 +430,13 @@ protected:
     int64_t batch_context() const override { return m_.context(); }
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
+    bool batch_key_per_seg() const override { return false; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         if (!admit(err)) return false;
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
-        key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
+        const bk::WindowSegs wsegs = v.w.device_segs();
+        key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data(), &wsegs));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
         if (!check(err)) return false;
@@ -462,12 +482,12 @@ public:
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
-        for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
+        for (int t0 = 0; t0 < r.n_tokens; t0 += kWindowRows) {
             if (r.stop && r.stop()) break;
-            const int n = std::min(kMaxRows, r.n_tokens - t0);
+            const int n = std::min(kWindowRows, r.n_tokens - t0);
             if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, 0, err)) return {model::Status::Error, "inkling2: " + err};
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
-            if (r.progress && ((t0 / kMaxRows) % 64 == 63 || t0 + n == r.n_tokens)) {
+            if (r.progress && ((t0 / kWindowRows) % 64 == 63 || t0 + n == r.n_tokens)) {
                 cudaStreamSynchronize(stream_);
                 r.progress(t0 + n);
             }
@@ -495,8 +515,8 @@ public:
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
-        for (int at = 0; at < n_rows; at += kMaxRows) {
-            const int n = std::min(kMaxRows, n_rows - at);
+        for (int at = 0; at < n_rows; at += kWindowRows) {
+            const int n = std::min(kWindowRows, n_rows - at);
             if (!forward(nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, 0, err)) return {model::Status::Error, "inkling2: " + err};
             for (int i = 0; i < n; ++i) hist_.push_back(g_.image_token);
         }
@@ -576,16 +596,28 @@ public:
     }
 
     // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
-    int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kMaxRows) : 1; }
+    int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kWindowRows) : 1; }
     bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override { return dspark_.draft_begin(anchor, pos, n, stream_); }
+    model::Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
+                              int count) override {
+        if (!sh_->ds_batch || !sh_->ds_batch->on() || count <= 1 || count > bk::kWindowSegsMax)
+            return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        DsparkHook* hooks[bk::kWindowSegsMax] = {};
+        for (int i = 0; i < count; ++i) {
+            Session* s = dynamic_cast<Session*>(peers[i]);
+            if (!s || s->sh_ != sh_) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+            hooks[i] = &s->dspark_;
+        }
+        return sh_->ds_batch->draft(hooks, anchors, pos, n, count, stream_);
+    }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
         return dspark_.draft_end(ids, conf, max_n, n, need, stream_);
     }
 
     // ---- conversations: the full-attention visits' cells by position (save_cells / restore_cells), the window rings and
-    // the convolutions' rings by checkpoint (running_state). A window ring holds window + kMaxRows positions and a
-    // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
+    // the convolutions' rings by checkpoint (running_state). A window ring holds window + kWindowRows positions and a
+    // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kWindowRows
     // rows past it.
     size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
@@ -642,8 +674,8 @@ public:
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
-        if (save && (int64_t) hist_.size() - pos > kMaxRows)
-            return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kMaxRows) + " positions past the checkpoint"};
+        if (save && (int64_t) hist_.size() - pos > kWindowRows)
+            return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kWindowRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "inkling2: a checkpoint past the session's position"};
         const size_t kv_ring = (size_t) kConvRing * kKvHeads * kHeadDim * 4, e_ring = (size_t) kConvRing * g_.n_embd * 4;
         for (size_t i = 0; i < vc_.size(); ++i) {   // the second card's visits go with its stream
@@ -937,7 +969,7 @@ private:
         aa.gate = ap.yq + kOffGate;
         aa.gate_ld = ap.ldq;
         aa.q8 = x.xo_;
-        const Segments seg = segments(v.slot);   // a batch window's: each conversation's caches of this visit
+        const Segments seg = segments(v.slot, card);   // a batch window's: each conversation's caches of this visit
         ap.seg = aa.seg = seg;
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, x.att_scr_, k.stream);
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
@@ -1036,10 +1068,10 @@ private:
     float* buf(Buf b) const { return role_[(int) b]; }
 
     // The kernels' segment table of visit cache `slot` in the batch window in flight (none outside one).
-    Segments segments(int slot) const {
+    Segments segments(int slot, int card) const {
         Segments s;
         if (!view_) return s;
-        s.at = view_->w.device_segs();
+        s.at_d = lane_[card].x->at_d_;
         for (int i = 0; i < view_->n; ++i) {
             const VisitCache& c = static_cast<const Session*>(view_->ss[i])->vc_[(size_t) slot];
             s.c[i] = {c.k, c.v, c.k_ring, c.v_ring, c.a_ring, c.m_ring};
@@ -1070,25 +1102,30 @@ private:
 
     // A call's inputs to the card: its tokens and positions (pos0.., or every row's own in `positions`), its first rows;
     // returns the full visits' launch bound.
-    int64_t stage(const int32_t* tokens, const float* emb, int rows, int64_t pos0, const int32_t* positions) {
+    int64_t stage(const int32_t* tokens, const float* emb, int rows, int64_t pos0, const int32_t* positions,
+                  const bk::WindowSegs* wsegs = nullptr) {
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
-        // the tokens and positions through a ring of pinned slots: a slot is written again once its copy has run
+        const int mr = sh_->max_rows;
+        const int stride = 2 * mr + kSegWords;
+        // the tokens, positions, and segment table through a ring of pinned slots
         const int slot = (int) (stage_n_++ % kStage);
         cudaEventSynchronize(stage_ev_[slot]);
-        int32_t* io = io_h_ + (size_t) slot * 2 * kMaxRows;
+        int32_t* io = io_h_ + (size_t) slot * stride;
         int64_t last = 0;
         for (int i = 0; i < rows; ++i) {
             io[i] = tokens ? tokens[i] : 0;
-            io[kMaxRows + i] = positions ? positions[i] : (int32_t) (pos0 + i);
-            last = std::max<int64_t>(last, io[kMaxRows + i]);
+            io[mr + i] = positions ? positions[i] : (int32_t) (pos0 + i);
+            last = std::max<int64_t>(last, io[mr + i]);
         }
-        cudaMemcpyAsync(io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
+        bk::WindowSegs empty_segs{};
+        std::memcpy(io + 2 * mr, wsegs ? wsegs : &empty_segs, sizeof(bk::WindowSegs));
+        cudaMemcpyAsync(io_d_, io, (size_t) stride * 4, cudaMemcpyHostToDevice, stream_);
         if (Lane& k = lane_[1]; k.stream) {   // the positions to the second card too, after its last window, before this one
             cudaEventRecord(io_ev0_, stream_);
             cudaSetDevice(k.device);
             cudaStreamWaitEvent(k.stream, io_ev0_, 0);
-            cudaMemcpyAsync(k.x->io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, k.stream);
+            cudaMemcpyAsync(k.x->io_d_, io, (size_t) stride * 4, cudaMemcpyHostToDevice, k.stream);
             cudaEventRecord(io_ev1_, k.stream);
             cudaSetDevice(m_.device());
             cudaStreamWaitEvent(stream_, io_ev1_, 0);
@@ -1159,7 +1196,7 @@ private:
     void cross(int from, const Segment& sg, int rows) {
         Lane& a = lane_[from];
         Lane& b = lane_[sg.card];
-        const size_t n = (size_t) rows * g_.n_embd, slot = (size_t) kMaxRows * g_.n_embd;
+        const size_t n = (size_t) rows * g_.n_embd, slot = (size_t) sh_->max_rows * g_.n_embd;
         join_sides(a);
         cudaSetDevice(a.device);
         for (size_t i = 0; i < sg.pull.size(); ++i)
@@ -1176,7 +1213,7 @@ private:
     void tap_across(int t, const float* rows_dev, int rows) {
         Lane& a = lane_[1];
         const size_t n = (size_t) rows * g_.n_embd;
-        float* slot = sh_->hand + (size_t) (sh_->tap_slot0 + t) * kMaxRows * g_.n_embd;
+        float* slot = sh_->hand + (size_t) (sh_->tap_slot0 + t) * sh_->max_rows * g_.n_embd;
         cudaMemcpyAsync(slot, rows_dev, n * 4, cudaMemcpyDeviceToHost, a.stream);
         cudaEventRecord(a.hand, a.stream);
         cudaSetDevice(m_.device());
@@ -1244,15 +1281,22 @@ private:
         hn.eps = g_.rms_eps;
         mix_norm(hn, 1, n_fin, stream_);
         if (tapped && !view_) dspark_.commit(pos_d_, rows, stream_);   // DSPARK HOOK: the rows' context for the drafter
-        if (tapped && view_)   // a batch window's: each conversation's rows of the shared tap into its own drafter's context
-            for (int i = 0; i < view_->n; ++i) {
-                const model::BatchWindow::Seg& sg = view_->w.segs[(size_t) i];
-                static_cast<Session*>(view_->ss[i])->dspark_.commit(pos_d_ + sg.row0, sg.rows, stream_, sg.row0);
+        if (tapped && view_) {   // a batch window's: all conversations' rows committed in one pass (device segment table)
+            if (view_->n > 1 && sh_->ds_batch && sh_->ds_batch->on()) {
+                DsparkHook* hooks[bk::kWindowSegsMax] = {};
+                for (int i = 0; i < view_->n; ++i) hooks[i] = &static_cast<Session*>(view_->ss[i])->dspark_;
+                sh_->ds_batch->commit(hooks, view_->n, at_d_, pos_d_, rows, stream_);
+            } else {
+                for (int i = 0; i < view_->n; ++i) {
+                    const model::BatchWindow::Seg& sg = view_->w.segs[(size_t) i];
+                    static_cast<Session*>(view_->ss[i])->dspark_.commit(pos_d_ + sg.row0, sg.rows, stream_, sg.row0);
+                }
             }
+        }
         if (head <= 0) return;
         const size_t q8_row = (size_t) E / 32 * 36;   // the head's rows' q8_1 blocks follow the rows before them
         float* lg = view_ ? blog_ : logits_;          // a batch window's rows go to each session in batch_take
-        bk::native_q8_0_mmvq(m_.head(), (const uint8_t*) xq_[0] + (size_t) (rows - head - first) * q8_row, lg, E, g_.n_vocab, head,
+        bk::native_q8_planes_mmvq(m_.head(), (const uint8_t*) xq_[0] + (size_t) (rows - head - first) * q8_row, lg, E, g_.n_vocab, head,
                              stream_);
         softcap(lg, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
     }
@@ -1348,7 +1392,7 @@ private:
         sp.logit_bias = bias_on_ ? d_bias_ : nullptr;
         history_len_ = r.history != nullptr ? r.history_len : 0;
         if (history_len_ > 0) {   // the penalties' history of each row of the window
-            const size_t n = (size_t) kMaxRows * history_len_;
+            const size_t n = (size_t) kWindowRows * history_len_;
             if (d_hist_len_ < n) {
                 bool ok = true;
                 d_hist_ = (int32_t*) alloc(n * 4, ok);

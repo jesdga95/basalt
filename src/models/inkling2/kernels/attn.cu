@@ -160,7 +160,7 @@ __device__ __forceinline__ uint4 fp8x8_to_f16x8(uint2 u) {
 }
 
 template <bool FP8, bool INT8>
-__global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int z, float* __restrict__ part_ml,
+__global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, int z, float* __restrict__ part_ml,
                                                                  float* __restrict__ part_acc) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
@@ -175,9 +175,10 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
     constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
-    const SegCaches& sc = a.seg.c[bk::seg_of(a.seg.at, r)];   // a batch window's row: its conversation's caches
-    const uint8_t* kbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
-    const uint8_t* vbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
+    const bk::WindowSegs& at = seg_table(a.seg);
+    const SegCaches& sc = a.seg.c[bk::seg_of(at, r)];   // a batch window's row: its conversation's caches
+    const uint8_t* kbase = static_cast<const uint8_t*>(at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
+    const uint8_t* vbase = static_cast<const uint8_t*>(at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
     // a tile's key and value rows, the lane's key's (zero past the slice); the warp's first tile is loaded with the queries
     const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads], float (&ks)[2], float (&vs)[2]) {
         const int key = t0 + lane;
@@ -341,10 +342,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
 // One block handles up to BM query rows (BM=16: up to 5 verify rows; BM=32: up to 10 verify rows) per KV head and split,
 // reading K and V once per chunk of 64 cells with coalesced 128-bit loads and pipelined prefetch.
 template <bool FP8, int BM>
-__global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int row0, int rows, int z,
-                                                       const void* k_ptr, const void* v_ptr,
-                                                       float* __restrict__ part_ml,
-                                                       float* __restrict__ part_acc) {
+__global__ void __launch_bounds__(128, BM == 16 ? 3 : 2) attn_mma_kernel(AttnArgs a, int total_rows, int tiles_per_seg, int z,
+                                                                         float* __restrict__ part_ml,
+                                                                         float* __restrict__ part_acc) {
     constexpr int HD = kHeadDim;
     constexpr int CHUNK = 64;
     constexpr int LD = HD + 8;       // padded fp16 stride: bank-conflict-free ldmatrix
@@ -353,10 +353,13 @@ __global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int row0, int
     constexpr float kLog2e = 1.4426950408889634f;
     constexpr float kLn2 = 0.6931471805599453f;
 
+    union alignas(16) ScoreRow {
+        float s[CHUNK + 1];
+        __half p[CHUNK + 8];
+    };
     __shared__ __align__(16) __half qs[BM][LD];
     __shared__ __align__(16) __half kvs[CHUNK][LD];
-    __shared__ float ss[BM][CHUNK + 1];
-    __shared__ __align__(16) __half ps[BM][CHUNK + 8];
+    __shared__ ScoreRow sp[BM];
     __shared__ float rs[BM][kRel];
     __shared__ float rm[BM], rl[BM], ra[BM];
     __shared__ int rpos[BM];
@@ -366,7 +369,17 @@ __global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int row0, int
 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     const int kvh = blockIdx.y, s = blockIdx.z;
-    const int M = rows * kGroup, m0 = blockIdx.x * BM;
+    const bk::WindowSegs& at = seg_table(a.seg);
+    const bool segmented = at.n > 0;
+    const int seg = segmented ? (int) blockIdx.x / tiles_per_seg : 0;
+    const int tile = segmented ? (int) blockIdx.x % tiles_per_seg : (int) blockIdx.x;
+    if (segmented && seg >= at.n) return;
+    const int row0 = segmented ? at.row0[seg] : 0;
+    const int rows = (segmented ? at.row0[seg + 1] : total_rows) - row0;
+    const int M = rows * kGroup, m0 = tile * BM;
+    if (m0 >= M) return;
+    const void* k_ptr = segmented ? a.seg.c[seg].k : a.k_cache;
+    const void* v_ptr = segmented ? a.seg.c[seg].v : a.v_cache;
 
     if (tid < BM) {
         const int m = m0 + tid;
@@ -466,10 +479,10 @@ __global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int row0, int
                     ldsm_x2(b0, b1, &kvs[nc * 8 + (lane & 7)][k + ((lane >> 3) & 1) * 8]);
                     mma16816(s4, a0, a1, a2, a3, b0, b1);
                 }
-                ss[t * 16 + g][nc * 8 + 2 * c] = s4[0];
-                ss[t * 16 + g][nc * 8 + 2 * c + 1] = s4[1];
-                ss[t * 16 + g + 8][nc * 8 + 2 * c] = s4[2];
-                ss[t * 16 + g + 8][nc * 8 + 2 * c + 1] = s4[3];
+                sp[t * 16 + g].s[nc * 8 + 2 * c] = s4[0];
+                sp[t * 16 + g].s[nc * 8 + 2 * c + 1] = s4[1];
+                sp[t * 16 + g + 8].s[nc * 8 + 2 * c] = s4[2];
+                sp[t * 16 + g + 8].s[nc * 8 + 2 * c + 1] = s4[3];
             }
         }
         __syncthreads();
@@ -488,7 +501,7 @@ __global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int row0, int
                 const int key = c0 + cc;
                 float val = -INFINITY;
                 if (key <= p) {
-                    val = ss[i][cc];
+                    val = sp[i].s[cc];
                     if (maybe_rel) {
                         const int dist = p - key;
                         if (dist < kExtent) {
@@ -508,7 +521,7 @@ __global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int row0, int
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
                 const float pr = pv_row[u] == -INFINITY ? 0.0f : exp2f(pv_row[u] - mnew);
-                ps[i][lane + 32 * u] = __float2half_rn(pr);
+                sp[i].p[lane + 32 * u] = __float2half_rn(pr);
                 l += pr;
             }
             l = warp_sum(l);
@@ -541,7 +554,7 @@ __global__ void __launch_bounds__(128) attn_mma_kernel(AttnArgs a, int row0, int
 #pragma unroll
             for (int t = 0; t < MT; ++t) {
                 unsigned a0, a1, a2, a3;
-                ldsm_x4(a0, a1, a2, a3, &ps[t * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
+                ldsm_x4(a0, a1, a2, a3, &sp[t * 16 + (lane & 15)].p[kk + (lane >> 4) * 8]);
 #pragma unroll
                 for (int n = 0; n < NT; ++n) mma16816(acc[t][n], a0, a1, a2, a3, b0[n], b1[n]);
             }
@@ -927,24 +940,18 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
     }
     const bool use_mma = a.window == 0 && !a.int8;
     if (use_mma) {
-        const int nseg = a.seg.at.n > 0 ? a.seg.at.n : 1;
-        for (int k = 0; k < nseg; ++k) {
-            const int r0 = a.seg.at.n > 0 ? a.seg.at.row0[k] : 0;
-            const int r1 = a.seg.at.n > 0 ? a.seg.at.row0[k + 1] : rows;
-            const int nr = r1 - r0;
-            if (nr <= 0) continue;
-            const void* kp = a.seg.at.n > 0 ? a.seg.c[k].k : a.k_cache;
-            const void* vp = a.seg.at.n > 0 ? a.seg.c[k].v : a.v_cache;
-            const int bm = nr * kGroup > 16 ? 32 : 16;
-            const int tiles = (nr * kGroup + bm - 1) / bm;
-            const dim3 grid((unsigned) tiles, kKvHeads, (unsigned) z);
-            if (bm == 32) {
-                if (a.fp8) bk::launch_pdl(attn_mma_kernel<true, 32>, grid, dim3(128), 0, s, a, r0, nr, z, kp, vp, part_ml, part_acc);
-                else bk::launch_pdl(attn_mma_kernel<false, 32>, grid, dim3(128), 0, s, a, r0, nr, z, kp, vp, part_ml, part_acc);
-            } else {
-                if (a.fp8) bk::launch_pdl(attn_mma_kernel<true, 16>, grid, dim3(128), 0, s, a, r0, nr, z, kp, vp, part_ml, part_acc);
-                else bk::launch_pdl(attn_mma_kernel<false, 16>, grid, dim3(128), 0, s, a, r0, nr, z, kp, vp, part_ml, part_acc);
-            }
+        const bool seg_mode = a.seg.at.n > 0 || a.seg.at_d != nullptr;
+        const int nseg = a.seg.at.n > 0 ? a.seg.at.n : (a.seg.at_d ? basalt::kernels::kWindowSegsMax : 1);
+        const int max_seg_rows = seg_mode ? std::min(rows, kBatchRows) : rows;
+        const int bm = (seg_mode ? rows > 5 : rows * kGroup > 16) ? 32 : 16;
+        const int tiles_per_seg = (max_seg_rows * kGroup + bm - 1) / bm;
+        const dim3 grid((unsigned) (nseg * tiles_per_seg), kKvHeads, (unsigned) z);
+        if (bm == 32) {
+            if (a.fp8) bk::launch_pdl(attn_mma_kernel<true, 32>, grid, dim3(128), 0, s, a, rows, tiles_per_seg, z, part_ml, part_acc);
+            else bk::launch_pdl(attn_mma_kernel<false, 32>, grid, dim3(128), 0, s, a, rows, tiles_per_seg, z, part_ml, part_acc);
+        } else {
+            if (a.fp8) bk::launch_pdl(attn_mma_kernel<true, 16>, grid, dim3(128), 0, s, a, rows, tiles_per_seg, z, part_ml, part_acc);
+            else bk::launch_pdl(attn_mma_kernel<false, 16>, grid, dim3(128), 0, s, a, rows, tiles_per_seg, z, part_ml, part_acc);
         }
     } else {
         const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
@@ -959,7 +966,7 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0) {
+    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0 || a.seg.at_d != nullptr) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;

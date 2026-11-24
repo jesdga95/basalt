@@ -511,7 +511,7 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
 // One block classifies rows before touching the sequence or mapped memory. A RAM visit reserves a ticket even if
 // aborted, so its merge cannot match an earlier visit's completion.
 constexpr int kRingThreads = 256;
-static_assert(kDecodeRows <= 32, "a visit's rows fit one mask word");
+static_assert(kBatchRows <= 32, "a visit's rows fit one mask word");
 __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_t* __restrict__ ids, int rows, int k,
                                                                     const unsigned long long* __restrict__ blobs,
                                                                     const float* __restrict__ x, int layer, float* x_m,
@@ -706,7 +706,7 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
                   int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream) {
     if (rows <= 0) return;
-    if (rows > kDecodeRows || rows * k > 1024 || layer < 0 || layer > 0xff)
+    if (rows > kBatchRows || rows * k > 1024 || layer < 0 || layer > 0xff)
         throw std::runtime_error("inkling2 moe_cpu_ring: rows, pairs or layer");
     moe_cpu_ring_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(ids, rows, k, blobs, x, layer, x_m, ids_m, bell, seq);
     check("moe_cpu_ring");

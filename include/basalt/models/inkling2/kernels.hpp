@@ -25,7 +25,8 @@ constexpr int kExtent = 1024;       ///< distances the relative bias covers (als
 constexpr int kConv = 4;            ///< short convolution taps
 constexpr int kConvRing = 16;       ///< positions a convolution ring keeps: a window of up to 8 rows and the 3 before it
 constexpr int kMaxMix = 6;          ///< states one mix reads: the finished blocks and the partial
-constexpr int kDecodeRows = 8;      ///< rows of a decode window's fused kernels (the products take 8 columns at most)
+constexpr int kDecodeRows = 8;      ///< rows of one conversation's decode window
+constexpr int kBatchRows = 16;      ///< rows of a batched decode window across conversations
 constexpr int kMaxStreams = 4;      ///< loop controllers one call runs side by side
 
 /// A layer's fused projection rows, in this order: q, r, gate, sink (read from the query input), k and the key
@@ -72,8 +73,15 @@ struct SegCaches {
 /// arguments' own caches. Every row gives the bits it gives in its conversation's own call.
 struct Segments {
     basalt::kernels::WindowSegs at;
-    SegCaches c[kDecodeRows];
+    const basalt::kernels::WindowSegs* at_d = nullptr;
+    SegCaches c[basalt::kernels::kWindowSegsMax];
 };
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline const basalt::kernels::WindowSegs& seg_table(const Segments& s) {
+    return s.at_d ? *s.at_d : s.at;
+}
 
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
