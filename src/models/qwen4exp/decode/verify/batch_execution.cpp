@@ -26,12 +26,12 @@
 namespace basalt::core {
 using namespace verify_detail;
 
-bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, const int32_t* tokens,
-                           const int64_t* pos0, std::string& err) {
+bool Verifier::stage_batch(const int* slots, const int* lens, int S, const int32_t* tokens, const int64_t* pos0,
+                           std::string& err) {
     using namespace basalt::kernels;
     int R = 0;
     for (int s = 0; s < S && s < 9; ++s) R += lens != nullptr ? lens[s] : 1;
-    if (S < 1 || S > max_t_ || R < S || R > max_t_ || hbase < 0 || (hbase > 0 && hbase + R > (int) slots_.size())) {
+    if (S < 1 || S > max_t_ || R < S || R > max_t_) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
     }
@@ -52,7 +52,7 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
             return false;
         }
     refresh_ar();
-    if (!capture_batch(R, hbase, err) || !capture_commit_batch(R, err)) return false;
+    if (!capture_batch(R, err) || !capture_commit_batch(R, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     const int64_t CB = 2 + max_t_;
@@ -105,22 +105,9 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = R;
     last_nseg_ = S;
-    row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
     last_batch_ = true;
     ms_host += ms_since(t0);
     return true;
-}
-
-bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
-                         std::string& err) {
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
-    return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
-}
-
-bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
-                             void* user, int32_t* out, std::string& err) {
-    return run_slot_segs(rows, nullptr, S, tokens, pos, pool, user, out, err);
 }
 
 // The staged share's RAM addresses (a mapped, 16-byte aligned copy or 0), read again when the source's places moved
@@ -155,7 +142,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const ModelGeometry& g = *g_;
     if (gs_live_ && !gs_move(false, err)) return false;
     gs_split_ = false;
-    if (!stage_batch(rows, lens, S, 0, tokens, pos, err)) return false;
+    if (!stage_batch(rows, lens, S, tokens, pos, err)) return false;
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
@@ -163,7 +150,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     order_after_commit();
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
+    const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
@@ -238,8 +225,6 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     return true;
 }
 
-bool Verifier::commit_slots(std::string& err) { return commit_slots(nullptr, err); }
-
 bool Verifier::commit_slots(const int* n_keep, std::string& err) {
     return commit_slots_begin(n_keep, err) && commit_slots_end(err);
 }
@@ -308,104 +293,6 @@ bool Verifier::sample_rows(int S, std::string& err) {
     }
     if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
-}
-
-bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
-    const OnDevice on_device(device_);
-    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
-    if (gs_live_ && !gs_move(false, err)) return false;
-    gs_split_ = false;
-    if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
-    order_after_commit();
-    set_head_keep(0);   // the slots sample with their own parameters: every row exact
-    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
-    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
-    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
-    if (ar_on()) ar_handoff();
-    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
-        for (int t = 0; t < S; ++t) {
-            SessionState& sx = *slots_[(size_t) rows[t]];
-            sx.ple_prev[0] = sx.ple_prev[1];
-            sx.ple_prev[1] = tokens[t];
-        }
-    b_running_ = true;
-    b_k_ = 0;
-    b_steps_ = ar_on() ? 0 : le_ - lb_;   // the zero-doorbell graph rings no layer
-    b_last_ = Clock::now();
-    return true;
-}
-
-int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
-    if (!b_running_) return 1;
-    const OnDevice on_device(device_);
-    volatile uint32_t* const seq = h_seq_;
-    const int S = last_t_;
-    while (b_k_ < b_steps_) {
-        const uint32_t want = (uint32_t) (b_k_ + 1);
-        if (*seq < want) {
-            const auto now = Clock::now();
-            if (now - b_last_ > std::chrono::milliseconds(2)) {
-                const cudaError_t q = cudaStreamQuery(cs_);
-                if (q != cudaErrorNotReady && *seq < want) {
-                    err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
-                    b_running_ = false;
-                    return -1;
-                }
-                if (now - b_last_ > std::chrono::seconds(20)) {
-                    err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) + released_note(release_gpu_waits(5000));
-                    b_running_ = false;
-                    return -1;
-                }
-            }
-            return 0;
-        }
-        const Clock::time_point b = Clock::now();
-        cur_layer_ = want - 1;
-        set_plan_slot();
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
-        progress_tick();
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
-            sink_.counts[0] = 0;
-            sink_.counts[1] = 0;
-            sink_.counts[2] = 0;
-            sink_.start[0] = 0;
-            sink_.start2[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
-        }
-        *(volatile uint32_t*) h_flag_ = want;
-        ms_pool += ms_since(b);
-        b_last_ = Clock::now();
-        ++b_k_;
-    }
-    const cudaError_t q = cudaStreamQuery(cs_);
-    if (q == cudaErrorNotReady) {
-        if (Clock::now() - b_last_ > std::chrono::seconds(20)) {
-            err = "verify batch: timed out at the window's end" + released_note(release_gpu_waits(5000));
-            b_running_ = false;
-            return -1;
-        }
-        return 0;
-    }
-    if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
-    if (!window_intact(err) || !ar_plan_intact(err)) { b_running_ = false; return -1; }
-    if (prof_on_) collect_profile();
-    if (last_stage()) {
-        if (!sample_rows(S, err)) { b_running_ = false; return -1; }
-        for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
-    }
-    ++windows;
-    b_running_ = false;
-    progress_beat();
-    return 1;
 }
 
 }  // namespace basalt::core

@@ -139,3 +139,41 @@ class DeepseekBudget(Budget, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimedEngine(ScriptEngine):
+    """ScriptEngine with a DONE line's figures per pass: the first pass decodes at 100 tok/s, the second at 1000."""
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+        n, ms_per = 0, 10.0 if not self.prompts else 1.0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                n += 1
+                yield t
+        finally:
+            self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": 5.0, "decode_ms": ms_per * n,
+                         "finish": "stop", "reused": 0}
+
+
+class PassesRate(unittest.TestCase):
+    def test_a_request_in_two_passes_reports_both_passes_rate(self):
+        case = QwenCase
+        engine = TimedEngine(case, ANSWER)
+        svc = Service(engine, case.tok, case.template, dialect=case.dialect)
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        body = {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 2000,
+                "reasoning_budget_tokens": 20}
+        req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.status, 200)
+        self.assertEqual(len(engine.prompts), 2)
+        second = len(engine.prompts[1]) and engine.last["generated"]
+        r = svc.metrics()["requests"][0]
+        # 20 tokens in 200 ms, then the rest at 1 ms each: every pass's tokens over every pass's time
+        self.assertEqual(r["decode_tok_s"], round((20 + second) / ((200 + second) / 1000), 1))
+        self.assertLess(r["decode_tok_s"], 1000)
+        t = svc.metrics()["totals"]
+        self.assertEqual(t["decode_ms"], 200 + second)

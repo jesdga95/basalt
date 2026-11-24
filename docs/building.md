@@ -27,12 +27,14 @@ all: its C++ and CUDA sources, its kernels and its tests are skipped, which is m
 | DeepSeek-V4.1-Flash | `deepseek41` |
 | Qwen3.8-27B | `qwen35` |
 | Hy4-flash | `hy4flash` |
+| Inkling 2 Mini | `inkling2` |
 
 ```sh
 cmake -S . -B build -DBASALT_MODELS=qwen4exp                  # Flash-Next only
 cmake -S . -B build -DBASALT_MODELS=deepseek41                # DeepSeek only
 cmake -S . -B build -DBASALT_MODELS=qwen35                    # the 27B only
 cmake -S . -B build -DBASALT_MODELS=hy4flash                  # Hy4-flash only
+cmake -S . -B build -DBASALT_MODELS=inkling2                  # Inkling 2 Mini only
 cmake -S . -B build "-DBASALT_MODELS=qwen4exp;deepseek41"     # two of them; quote the semicolon
 ```
 

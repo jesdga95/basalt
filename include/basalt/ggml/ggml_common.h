@@ -155,6 +155,16 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == QK_NVFP4 / QK_NVFP4_SUB + QK_NVFP4 / 2, "wrong nvfp4 block size/padding");
 
+// MXFP8: 128 values in four 32-value sub-blocks, each with a UE8M0 scale (2^(d - 127), 0 for NaN 0xFF).
+// Sub-block s keeps its 32 OCP FP8 E4M3 codes contiguously in qs[32 * s .. 32 * s + 31].
+#define QK_MXFP8 128
+#define QK_MXFP8_SUB 32
+typedef struct {
+    uint8_t d[QK_MXFP8 / QK_MXFP8_SUB];   // UE8M0 sub-block scales (4 bytes)
+    uint8_t qs[QK_MXFP8];                 // E4M3 codes (128 bytes)
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == QK_MXFP8 / QK_MXFP8_SUB + QK_MXFP8, "wrong mxfp8 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

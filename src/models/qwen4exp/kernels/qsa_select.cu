@@ -330,6 +330,40 @@ __device__ __forceinline__ int block_excl_scan(int v, int* s_warp, int& total) {
     return r;
 }
 
+// Called by warp zero after the per-warp histograms have been folded into one.
+__device__ __forceinline__ void choose_topk_digit(const int* bins, int64_t width, int above,
+                                                  int& digit, int& above_digit) {
+    const int lane = threadIdx.x & 31;
+    // the largest digit d with above + (bins over d) + hist[d] >= width (0 if none), as a warp scan:
+    // lane l holds bins 8l..8l+7
+    int h[8], loc = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { h[i] = bins[lane * 8 + i]; loc += h[i]; }
+    int sfx = loc;                            // inclusive sum over lanes >= this one
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_down_sync(0xffffffffu, sfx, o);
+        if (lane + o < 32) sfx += y;
+    }
+    int cum = above + sfx - loc;              // above plus the bins over this lane's
+    int d = -1, ca = 0;
+#pragma unroll
+    for (int i = 7; i >= 0; --i) {
+        if (d < 0 && cum + h[i] >= width) { d = lane * 8 + i; ca = cum; }
+        cum += h[i];
+    }
+    const unsigned hit = __ballot_sync(0xffffffffu, d >= 0);
+    if (hit) {
+        const int src = 31 - __clz(hit);      // the highest lane with a hit holds the largest digit
+        d = __shfl_sync(0xffffffffu, d, src);
+        ca = __shfl_sync(0xffffffffu, ca, src);
+    } else {
+        d = 0;
+        ca = above + sfx - h[0];                  // read on lane 0: every bin over 0
+    }
+    if (lane == 0) { digit = d; above_digit = ca; }
+}
+
 template <int PER>
 __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __restrict__ scores,
                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
@@ -376,36 +410,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
             hist[0][t] = s;
         }
         __syncthreads();
-        if (warp == 0) {
-            // the largest digit d with above + (bins over d) + hist[d] >= width (0 if none), as a warp scan:
-            // lane l holds bins 8l..8l+7
-            int h[8], loc = 0;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) { h[i] = hist[0][lane * 8 + i]; loc += h[i]; }
-            int sfx = loc;                            // inclusive sum over lanes >= this one
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1) {
-                const int y = __shfl_down_sync(0xffffffffu, sfx, o);
-                if (lane + o < 32) sfx += y;
-            }
-            int cum = above + sfx - loc;              // above plus the bins over this lane's
-            int d = -1, ca = 0;
-#pragma unroll
-            for (int i = 7; i >= 0; --i) {
-                if (d < 0 && cum + h[i] >= width) { d = lane * 8 + i; ca = cum; }
-                cum += h[i];
-            }
-            const unsigned hit = __ballot_sync(0xffffffffu, d >= 0);
-            if (hit) {
-                const int src = 31 - __clz(hit);      // the highest lane with a hit holds the largest digit
-                d = __shfl_sync(0xffffffffu, d, src);
-                ca = __shfl_sync(0xffffffffu, ca, src);
-            } else {
-                d = 0;
-                ca = above + sfx - h[0];                  // read on lane 0: every bin over 0
-            }
-            if (lane == 0) { s_digit = d; s_above = ca; }
-        }
+        if (warp == 0) choose_topk_digit(hist[0], width, above, s_digit, s_above);
         __syncthreads();
         prefix |= (uint32_t) s_digit << shift;
         above = s_above;
@@ -489,15 +494,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
             hist[0][t] = sum;
         }
         __syncthreads();
-        if (t == 0) {
-            int cum = above, d = 255;
-            for (; d > 0; --d) {
-                if (cum + hist[0][d] >= width) break;
-                cum += hist[0][d];
-            }
-            s_digit = d;
-            s_above = cum;
-        }
+        if (warp == 0) choose_topk_digit(hist[0], width, above, s_digit, s_above);
         __syncthreads();
         prefix |= (uint32_t) s_digit << shift;
         above = s_above;

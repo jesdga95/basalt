@@ -252,6 +252,56 @@ int main() {
         CHECK(use_half_life(kUseHalfLife - 1, 1));
     }
 
+    // victims by use: the counts saturate and halve once per period however the tokens come in windows; fewer lookups give
+    // way first, the one used longest ago among equals
+    {
+        uint16_t looks = 0;
+        for (int i = 0; i < 3 * kLookCap; ++i) count_look(looks);
+        CHECK(looks == kLookCap);
+        int halvings = 0;
+        for (uint64_t t = 0; t < 10 * 256; t += 3) halvings += crosses(t, 3, 256);
+        CHECK(halvings == 10);
+        CHECK(!crosses(5, 1000, 0));
+        CHECK(yields_before(1, 100, 2, 50));   // fewer lookups first, however recent
+        CHECK(yields_before(3, 40, 3, 50));    // the older among equals
+        CHECK(!yields_before(3, 50, 3, 50));
+        // 4 slots; expert 0 comes every 6th token and every other token brings a new expert: oldest-first always evicts expert 0
+        // before it returns, by use it keeps the slot its second visit takes
+        for (bool by_use : {false, true}) {
+            std::vector<int> slot(4, -1);
+            std::vector<uint64_t> stamp(400, 0);
+            std::vector<uint16_t> lk(400, 0);
+            int hits0 = 0, visits0 = 0, next = 1;
+            for (uint64_t t = 1; t <= 300; ++t) {
+                if (crosses(t - 1, 1, 64))
+                    for (uint16_t& x : lk) x >>= 1;
+                const int e = t % 6 == 0 ? 0 : next++;
+                visits0 += e == 0;
+                stamp[(size_t) e] = t;
+                count_look(lk[(size_t) e]);
+                if (std::find(slot.begin(), slot.end(), e) != slot.end()) {
+                    hits0 += e == 0;
+                    continue;
+                }
+                int v = -1;
+                for (int s = 0; s < 4 && (v < 0 || slot[(size_t) v] >= 0); ++s) {
+                    const int a = slot[(size_t) s];
+                    if (v < 0 || a < 0) {
+                        v = s;
+                        continue;
+                    }
+                    const int b = slot[(size_t) v];
+                    if (by_use ? yields_before(lk[(size_t) a], stamp[(size_t) a], lk[(size_t) b], stamp[(size_t) b])
+                               : stamp[(size_t) a] < stamp[(size_t) b])
+                        v = s;
+                }
+                slot[(size_t) v] = e;
+            }
+            CHECK(visits0 == 50);
+            CHECK(by_use ? hits0 == visits0 - 2 : hits0 == 0);
+        }
+    }
+
     // several second cards: each owns a contiguous block of layers, larger blocks first
     {
         const PeerBlocks b3 = split_layers(40, 3);

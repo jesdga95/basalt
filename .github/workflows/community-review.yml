@@ -1,0 +1,181 @@
+name: community review
+
+# Decides what happens to a community benchmark pull request: deterministic gate first, a model review only if the
+# gate passed, then labels, a comment or a squash merge. The privileged context never runs anything from the PR:
+# it checks out the base commit and reads the PR's run files as data through the API. See docs/development/community-automerge.md.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "docs/community/**"
+
+permissions: {}
+
+concurrency:
+  group: community-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  decide:
+    if: github.event.pull_request.draft == false && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the pull request as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[] | [.filename, .status]' | jq -s . > "${RUNNER_TEMP}/changed.json"
+          # Compare against the commit the branch started from, not main's tip: a branch made before
+          # newer runs landed would otherwise look like it removes or edits them.
+          MERGE_BASE=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}" --jq .merge_base_commit.sha)
+          mkdir -p "${RUNNER_TEMP}/base" "${RUNNER_TEMP}/head"
+          if git cat-file -e "${MERGE_BASE}:docs/community/runs" 2>/dev/null; then
+            git archive --format=tar "${MERGE_BASE}" -- docs/community/runs | tar -x -C "${RUNNER_TEMP}/base"
+          fi
+          # The head files are read only when the pull request is within the gate's size limit (it refuses a larger one
+          # without reading them) and only for names that look like a run file: the name is used as a path below.
+          if [ "$(jq '[.[] | select(.[1] == "added" or .[1] == "modified")] | length' "${RUNNER_TEMP}/changed.json")" -le 12 ]; then
+            { jq -r '.[] | select(.[1] == "added" or .[1] == "modified") | .[0]' "${RUNNER_TEMP}/changed.json" \
+                | grep -E '^docs/community/runs/[^/]+/[0-9a-f]{12}\.json$' || true; } | while read -r f; do
+              mkdir -p "${RUNNER_TEMP}/head/$(dirname "$f")"
+              gh api "repos/${GITHUB_REPOSITORY}/contents/${f}?ref=${HEAD_SHA}" \
+                -H "Accept: application/vnd.github.raw+json" > "${RUNNER_TEMP}/head/${f}"
+            done
+          fi
+
+      - name: Gate (deterministic checks, no secrets)
+        id: gate
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          python3 tools/community_gate.py "${RUNNER_TEMP}/base" "${RUNNER_TEMP}/head" "${AUTHOR}" \
+            "${RUNNER_TEMP}/changed.json" "${RUNNER_TEMP}/gate.json"
+          echo "status=$(jq -r .status "${RUNNER_TEMP}/gate.json")" >> "${GITHUB_OUTPUT}"
+
+      # A gate that did not pass never reaches the model: this step has no secrets and refuses the call.
+      - name: Outcome without the model
+        if: steps.gate.outputs.status != 'pass'
+        run: python3 tools/llm_review.py --no-model "${RUNNER_TEMP}/gate.json" "${RUNNER_TEMP}/outcome.json"
+
+      - name: Model review (only after the gate passed)
+        if: steps.gate.outputs.status == 'pass'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_DEFAULT_MODEL: ${{ vars.LLM_DEFAULT_MODEL }}
+        run: python3 tools/llm_review.py "${RUNNER_TEMP}/gate.json" "${RUNNER_TEMP}/outcome.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: community-outcome
+          path: ${{ runner.temp }}/outcome.json
+          retention-days: 3
+
+  act:
+    needs: decide
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: community-outcome
+          path: ${{ runner.temp }}
+
+      - name: Plan (only the exact value "live" merges)
+        env:
+          MODE: ${{ vars.COMMUNITY_AUTOMERGE }}
+        run: python3 tools/community_apply.py "${RUNNER_TEMP}/outcome.json" "${MODE}" "${RUNNER_TEMP}/plan.json"
+
+      # Comments (and the reaction) are posted as the GitHub App (basalt-code-review-bot) when it is configured; the token
+      # is pull-requests write only. Without the App they fall back to the workflow's own token.
+      - name: Bot token for comments
+        id: bot
+        if: vars.BASALT_REVIEW_APP_CLIENT_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.BASALT_REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BASALT_REVIEW_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+
+      - name: Labels, review request and comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ steps.bot.outputs.token || github.token }}
+          BOT_LOGIN: ${{ steps.bot.outputs.app-slug && format('{0}[bot]', steps.bot.outputs.app-slug) || 'github-actions[bot]' }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          plan="${RUNNER_TEMP}/plan.json"
+          marker='<!-- community-gate -->'
+          for l in "community: needs review" "community: rejected" "community: needs changes" "community: automatic merge"; do
+            gh label create "$l" --repo "${GITHUB_REPOSITORY}" --color F9D0C4 --force >/dev/null
+            if jq -e --arg l "$l" '.labels | index($l)' "$plan" >/dev/null; then
+              gh pr edit "${PR}" --repo "${GITHUB_REPOSITORY}" --add-label "$l"
+            else
+              gh pr edit "${PR}" --repo "${GITHUB_REPOSITORY}" --remove-label "$l" || true
+            fi
+          done
+          if [ "$(jq -r .request_review "$plan")" = true ] && [ "${AUTHOR}" != jesdga95 ]; then
+            gh pr edit "${PR}" --repo "${GITHUB_REPOSITORY}" --add-reviewer jesdga95 || true
+          fi
+          old="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+            --jq ".[] | select((.user.login == \"${BOT_LOGIN}\" or .user.login == \"github-actions[bot]\") and (.body | startswith(\"${marker}\"))) | .id" | head -n1)"
+          if [ -n "$(jq -r .comment "$plan")" ]; then
+            { echo "${marker}"; jq -r .comment "$plan"; } > "${RUNNER_TEMP}/comment.md"
+            if [ -n "$old" ]; then
+              GH_TOKEN="${BOT_TOKEN}" gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${old}" -F body=@"${RUNNER_TEMP}/comment.md" >/dev/null \
+                || { gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${old}" >/dev/null || true
+                     GH_TOKEN="${BOT_TOKEN}" gh pr comment "${PR}" --repo "${GITHUB_REPOSITORY}" --body-file "${RUNNER_TEMP}/comment.md"; }
+            else
+              GH_TOKEN="${BOT_TOKEN}" gh pr comment "${PR}" --repo "${GITHUB_REPOSITORY}" --body-file "${RUNNER_TEMP}/comment.md"
+            fi
+          elif [ -n "$old" ]; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${old}" >/dev/null || true
+          fi
+          echo "merge=$(jq -r .merge "$plan")" >> "${GITHUB_OUTPUT}"
+        id: apply
+
+      # The merge uses a GitHub App token that is a bypass actor of the main ruleset; it exists only in these two steps.
+      - name: App token for the merge
+        id: app
+        if: steps.apply.outputs.merge == 'true'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.BASALT_REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BASALT_REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Squash-merge the reviewed commit
+        if: steps.apply.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: gh pr merge "${PR}" --repo "${GITHUB_REPOSITORY}" --squash --match-head-commit "${HEAD_SHA}"

@@ -61,6 +61,40 @@ class BusyHeartbeat(unittest.TestCase):
         self.assertEqual(len(fin), 1, cap)
         self.assertIn(f"loaded   {TOTAL / 2**30:.1f}GiB", fin[0])
 
+    def test_off_a_terminal_stages_print_their_own_totals_and_heartbeats_name_no_stage(self):
+        card, ram = 3 * 2**30, 9 * 2**30
+        total = card + ram
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.touch()
+            out = io.StringIO()
+            t, done = narrate(log, out)
+            with open(log, "a") as f:
+                f.write(f"basalt load: total {total}\nbasalt load: weights 0 {total}\n"
+                        f"basalt load: share cuda0 0 {card}\nbasalt load: share ram 0 {ram}\n"
+                        "basalt load: stages cuda0 ram\nbasalt load: into cuda0\n")
+                for i in range(1, 13):                   # 3 s in 12 steps; RAM reads land during the card's too
+                    c, r = min(card, card * i // 4), ram * i // 12
+                    stage = "cuda0" if c < card or i == 4 else "ram"
+                    if i == 5:
+                        f.write("basalt load: into ram\n")
+                    f.write(f"basalt load: weights {c + r} {total}\n")
+                    f.write(f"basalt load: share {stage} {c if stage == 'cuda0' else r} {card if stage == 'cuda0' else ram}\n")
+                    f.flush()
+                    time.sleep(0.25)
+            done.set()
+            t.join(2)
+            cap = out.getvalue()
+        lines = cap.splitlines()
+        placed = [l for l in lines if l.startswith("[server] placed")]
+        self.assertEqual([l.rsplit(" ", 1)[0] for l in placed],
+                         ["[server] placed   cuda0 3.0GiB", "[server] placed   ram 9.0GiB"], cap)
+        rows = weights_rows(cap)
+        self.assertGreaterEqual(len(rows), 2, cap)
+        self.assertFalse(any("weights:" in l for l in rows), cap)   # a sample of the whole load names no stage
+        fin, = [l for l in lines if l.startswith("[server] loaded")]
+        self.assertRegex(fin, r"loaded   12\.0GiB \d+\.\ds  cuda0=3\.0GiB ram=9\.0GiB$")
+
     def test_on_a_terminal_the_heartbeat_adds_no_rows(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "engine.log"

@@ -1,6 +1,8 @@
 // src/program/serve/protocol.cpp - protocol operations for the persistent engine.
 #include "basalt/protocol.hpp"
 #include "state.hpp"
+#include "basalt_git.h"
+#include "basalt/platform/cpu.hpp"
 
 namespace basalt::program::serve {
 
@@ -115,6 +117,7 @@ int Runtime::init_protocol() {
             basalt::core::read_range(model_file.range("tokenizer/tokenizer.json"), cj, terr) &&
             std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"" + std::string(pre_.name) + "\"") != std::string_view::npos) {
             text_tokenizer.set_pretokenize(pre_.split);
+            text_tokenizer.set_ignore_merges(pre_.ignore_merges);
             if (text_tokenizer.load(std::string_view((const char*) vj.data(), vj.size()),
                                     std::string_view((const char*) mj.data(), mj.size()),
                                     std::string_view((const char*) tj.data(), tj.size()), terr))
@@ -303,6 +306,21 @@ int Runtime::announce() {
         std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    {   // the build's commit, and the processors that share each L3 cache (the console's load per CCD)
+        std::string l3;
+        for (const std::vector<int>& g : basalt::platform::cpu_l3_groups()) {
+            std::string part;
+            for (size_t i = 0; i < g.size(); ++i) {
+                size_t j = i;
+                while (j + 1 < g.size() && g[j + 1] == g[j] + 1) ++j;
+                part += (part.empty() ? "" : ",") + std::to_string(g[i]) + (j > i ? "-" + std::to_string(g[j]) : "");
+                i = j;
+            }
+            l3 += (l3.empty() ? "" : ";") + part;
+        }
+        std::printf("INFO commit=%s%s%s%s\n", BASALT_BENCH_GIT, BASALT_BENCH_DIRTY ? "-dirty" : "",
+                    l3.empty() ? "" : " cpu_l3=", l3.c_str());
+    }
     if (!o.lossy.empty()) {   // the flags that change the output, for a client that labels what it measures
         std::string flags;
         for (const auto& f : o.lossy) flags += (flags.empty() ? "" : ",") + f.flag;

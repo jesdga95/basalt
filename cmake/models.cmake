@@ -3,7 +3,7 @@
 # `if(BASALT_MODEL_<ARCH>)`. A model left out is not compiled, not linked and not registered.
 
 # Every model that ships: the architecture ids, as `general.architecture` names them.
-set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35 hy4flash)
+set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35 hy4flash inkling2)
 
 # "all" (the default) follows BASALT_BUILTIN_MODELS, so a build folder picks up a model added later. The cache keeps the
 # word, not the list: a list written as the default would stay in the folder and leave every newer model out.
