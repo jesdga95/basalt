@@ -6,6 +6,7 @@
 #include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/models/qwen4exp/kernels/mrope.hpp"
 
@@ -160,12 +161,76 @@ __device__ __forceinline__ void indexer_append_row(const float* raw, int pos, co
     __syncthreads();
 }
 
-// blocks [0, n * n_kv): row t = b / n_kv, KV head b % n_kv - K norm + RoPE, K and V appends; block n * n_kv: the
-// indexer tail snapshot and the n indexer appends in row order
+// Scale first, then visit the index bits in ascending order, as fwht256_kernel does.
+// Keep the first five butterflies in registers and exchange only across warps through scratch.
+template <int N>
+__device__ __forceinline__ void fwht_row(float (&value)[N], float* scratch, int d) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) value[i] *= 1.0f / 16.0f;
+#pragma unroll
+    for (int bit = 1; bit < 32; bit <<= 1) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            const float peer = __shfl_xor_sync(0xffffffffu, value[i], bit);
+            value[i] = (d & bit) ? __fsub_rn(peer, value[i]) : __fadd_rn(value[i], peer);
+        }
+    }
+#pragma unroll
+    for (int bit = 32; bit < HD; bit <<= 1) {
+        if (bit != 32) __syncthreads();  // the previous exchange must finish before reusing scratch
+#pragma unroll
+        for (int i = 0; i < N; ++i) scratch[i * HD + d] = value[i];
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            const float peer = scratch[i * HD + (d ^ bit)];
+            value[i] = (d & bit) ? __fsub_rn(peer, value[i]) : __fadd_rn(value[i], peer);
+        }
+    }
+}
+
+// kv_q4.cu's q4_group for one 32-value group (one warp: lane = element within the group), packed straight into the
+// pool. The codes are quantized against the UNROUNDED scale and only the stored fp16 scale is rounded, exactly as
+// that kernel does; ties in |x| resolve to the larger value, so every lane agrees on the scale.
+__device__ __forceinline__ void append_q4_row(float x, int d, long long pos, int h, int n_kv_heads, int page_size,
+                                              const int32_t* table, uint8_t* pool, uint8_t* host_pool) {
+    const int lane = d & 31, b = d >> 5;
+    float amax = abs_ieee(x), mval = x;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float a = __shfl_xor_sync(0xffffffffu, amax, o);
+        const float v = __shfl_xor_sync(0xffffffffu, mval, o);
+        if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
+    }
+    const float scale = div_ieee(mval, -8.0f);
+    const float inv = scale != 0.0f ? div_ieee(1.0f, scale) : 0.0f;
+    int q = __float2int_rz(__fmaf_rn(x, inv, 8.5f));
+    q = q < 0 ? 0 : (q > 15 ? 15 : q);
+    const int qhi = __shfl_down_sync(0xffffffffu, q, 16);
+    const uint8_t byte = (uint8_t) (q | (qhi << 4));
+    const uint16_t sbits = f16_from_f32(scale);
+    constexpr int blocks = HD / QK4_0;
+    constexpr int bytes = blocks * (int) sizeof(block_q4_0);
+    const long long page = (long long) table[pos / page_size];
+    if (page >= 0) {
+        const long long row = (page * n_kv_heads + h) * page_size + (pos % page_size);
+        block_q4_0* blk = reinterpret_cast<block_q4_0*>(pool + row * bytes) + b;
+        if (lane == 0) blk->d = sbits;
+        if (lane < 16) blk->qs[lane] = byte;
+    }
+    if (host_pool != nullptr) {
+        const long long row = ((pos / page_size) * n_kv_heads + h) * page_size + (pos % page_size);
+        block_q4_0* blk = reinterpret_cast<block_q4_0*>(host_pool + row * bytes) + b;
+        if (lane == 0) blk->d = sbits;
+        if (lane < 16) blk->qs[lane] = byte;
+    }
+}
+
+// One block per token and KV head, followed by a block for the indexer snapshot and appends.
 template <bool TAB>
 __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_kv, int page_size, const RopeArgs& ra,
                                             int b) {
-    __shared__ float row[HD];
+    __shared__ float row[2 * HD];
     __shared__ float sums[32];
     const int d = threadIdx.x;
     if (b < n * n_kv) {
@@ -177,11 +242,19 @@ __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_
         row[d] = scale * x * a.k_norm[d];
         __syncthreads();
         rope_row<TAB>(row, a.pos_k[t * (a.pos_stride > 0 ? a.pos_stride : n_kv) + h], d, ra);
-        const float y = row[d];
-        kp[d] = y;
-        append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
+        const float k = row[d];
         const float v = a.vcur[((size_t) t * n_kv + h) * HD + d];
-        append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
+        if (a.k_q4 != nullptr) {
+            float kv[] = {k, v};
+            fwht_row(kv, row, d);
+            kp[d] = kv[0];
+            append_q4_row(kv[0], d, pos, h, n_kv, page_size, a.page_table, a.k_q4, a.host.k_q4);
+            append_q4_row(kv[1], d, pos, h, n_kv, page_size, a.page_table, a.v_q4, a.host.v_q4);
+        } else {
+            kp[d] = k;
+            append_q8_row(k, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
+            append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
+        }
         return;
     }
     if (a.tail_snap != nullptr)
@@ -209,7 +282,9 @@ __device__ __forceinline__ void q_post_dev(const QsaDecQPost& a, int n, int n_he
         row[d] = scale * x * a.q_norm[d];
         __syncthreads();
         rope_row<TAB>(row, a.pos_q[b], d, ra);
-        a.qcur[(size_t) b * HD + d] = row[d];
+        float q[] = {row[d]};
+        if (a.rot) fwht_row(q, row, d);
+        a.qcur[(size_t) b * HD + d] = q[0];
         return;
     }
     b -= n * n_head;
