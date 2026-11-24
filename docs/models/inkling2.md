@@ -53,7 +53,9 @@ the text model.
   while the card runs the rest. The card takes the CPU's rows only when the completion ticket matches the visit. Visits
   with no RAM pairs skip the hand-off, and the watchdog can release a stalled wait. The
   full visits' caches and the drafter's full layer then back their first 32,768 positions and grow as prompts need them, and
-  the experts planned into RAM are copied back to the card while the caches leave room. A short chat at
+  the experts planned into RAM are copied back to the card while the caches leave room. A conversation that starts over, or
+  resumes needing at most half the positions the caches back (a compacted one, or another on a shared prefix), trims them
+  to what its prompt needs and copies experts back into the memory freed; a conversation's own turns never trim. A short chat at
   `--max-context 1048576 --kv fp8` keeps every expert on the card. On a smaller card the spill is static: the caches are whole
   from the start and the RAM experts are copied back while the card has room. Either way the copies leave the card's spare
   free: 1 GiB at the start and 512 MiB after a cache grow, or `--vram-reserve-mib N` for both (at least 128, 256 where the
