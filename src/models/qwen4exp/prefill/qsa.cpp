@@ -63,7 +63,7 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
         }
         if (st.kv_q4)
             basalt::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
-                                          host_w, staged ? &m.stage : nullptr);
+                                          host_w, staged ? &m.stage : nullptr, st.kv_fp4);
         else
             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
@@ -151,8 +151,9 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
             }
         }
     }
-    const basalt::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
-                                                       : core::qsa_attn_pools(st);
+    basalt::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                 : core::qsa_attn_pools(st);
+    pools.kv_fp4 = st.kv_fp4;
     // the whole chunk on tensor cores, one block per (query, KV head), FP32-level
     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV (or a shape it does not take): the
     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,

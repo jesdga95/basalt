@@ -164,7 +164,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 // stored in the state's own format (rotated INT8 K/V are not appended as Q4_0)
                 if (st_.kv_q4)
                     kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                      vcur_ + t * NKV * HD, s, cs, &st_.host);
+                                      vcur_ + t * NKV * HD, s, cs, &st_.host, st_.kv_fp4);
                 else if (st_.kv_int8)
                     kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
                                       kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);

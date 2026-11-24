@@ -7,6 +7,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/models/qwen4exp/kernels/mrope.hpp"
 
@@ -193,22 +194,35 @@ __device__ __forceinline__ void fwht_row(float (&value)[N], float* scratch, int 
 // pool. The codes are quantized against the UNROUNDED scale and only the stored fp16 scale is rounded, exactly as
 // that kernel does; ties in |x| resolve to the larger value, so every lane agrees on the scale.
 __device__ __forceinline__ void append_q4_row(float x, int d, long long pos, int h, int n_kv_heads, int page_size,
-                                              const int32_t* table, uint8_t* pool, uint8_t* host_pool) {
+                                              const int32_t* table, uint8_t* pool, uint8_t* host_pool, bool fp4) {
     const int lane = d & 31, b = d >> 5;
-    float amax = abs_ieee(x), mval = x;
+    uint8_t byte;
+    uint16_t sbits;
+    if (fp4) {
+        const float amax = kv4_amax16(x);
+        const uint32_t sc_byte = kv4_group_scale(amax);
+        const float s = kv4_e4m3_value(sc_byte);
+        const uint32_t qc = kv4_group_code(x, s);
+        const uint32_t qhi = __shfl_down_sync(0xffffffffu, qc, 16);
+        byte = (uint8_t) (qc | (qhi << 4));
+        const uint32_t d1 = __shfl_down_sync(0xffffffffu, sc_byte, 16);
+        sbits = (uint16_t) (sc_byte | (d1 << 8));
+    } else {
+        float amax = abs_ieee(x), mval = x;
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        const float a = __shfl_xor_sync(0xffffffffu, amax, o);
-        const float v = __shfl_xor_sync(0xffffffffu, mval, o);
-        if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float a = __shfl_xor_sync(0xffffffffu, amax, o);
+            const float v = __shfl_xor_sync(0xffffffffu, mval, o);
+            if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
+        }
+        const float scale = div_ieee(mval, -8.0f);
+        const float inv = scale != 0.0f ? div_ieee(1.0f, scale) : 0.0f;
+        int q = __float2int_rz(__fmaf_rn(x, inv, 8.5f));
+        q = q < 0 ? 0 : (q > 15 ? 15 : q);
+        const int qhi = __shfl_down_sync(0xffffffffu, q, 16);
+        byte = (uint8_t) (q | (qhi << 4));
+        sbits = f16_from_f32(scale);
     }
-    const float scale = div_ieee(mval, -8.0f);
-    const float inv = scale != 0.0f ? div_ieee(1.0f, scale) : 0.0f;
-    int q = __float2int_rz(__fmaf_rn(x, inv, 8.5f));
-    q = q < 0 ? 0 : (q > 15 ? 15 : q);
-    const int qhi = __shfl_down_sync(0xffffffffu, q, 16);
-    const uint8_t byte = (uint8_t) (q | (qhi << 4));
-    const uint16_t sbits = f16_from_f32(scale);
     constexpr int blocks = HD / QK4_0;
     constexpr int bytes = blocks * (int) sizeof(block_q4_0);
     const long long page = (long long) table[pos / page_size];
@@ -248,8 +262,8 @@ __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_
             float kv[] = {k, v};
             fwht_row(kv, row, d);
             kp[d] = kv[0];
-            append_q4_row(kv[0], d, pos, h, n_kv, page_size, a.page_table, a.k_q4, a.host.k_q4);
-            append_q4_row(kv[1], d, pos, h, n_kv, page_size, a.page_table, a.v_q4, a.host.v_q4);
+            append_q4_row(kv[0], d, pos, h, n_kv, page_size, a.page_table, a.k_q4, a.host.k_q4, a.kv_fp4);
+            append_q4_row(kv[1], d, pos, h, n_kv, page_size, a.page_table, a.v_q4, a.host.v_q4, a.kv_fp4);
         } else {
             kp[d] = k;
             append_q8_row(k, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);

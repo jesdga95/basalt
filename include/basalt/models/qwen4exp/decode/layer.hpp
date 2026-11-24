@@ -204,8 +204,9 @@ struct QsaState {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
-    /// Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
+    /// Q4_0 / NVFP4 KV with Walsh-Hadamard rotation (qsa_set_kv_q4 / qsa_set_kv_fp4, kv_q4.hpp): 144 B per cell and head
     bool kv_q4 = false;
+    bool kv_fp4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
@@ -287,6 +288,8 @@ void qsa_state_release(QsaState& st);
 bool qsa_kv_int8();
 /// Store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
+/// Store K/V as NVFP4 (E2M1 + E4M3/16) after a Hadamard rotation (`--kv nvfp4`): 576 B per cell.
+void qsa_set_kv_fp4(bool enabled);
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell. Not with --kv-resident.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
