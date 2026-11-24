@@ -8,7 +8,8 @@ instruction sets stripped. This does the same for ggml/src/ggml-cpu/arch/arm/qua
     CPU the engine runs on has them, and the engine refuses one that does not); the int8 matrix multiply paths go
     too, since they serve only two rows at once (nrc == 2) and the engine asks for one;
   * the dot products of formats no pack uses are dropped;
-  * NVFP4 is Basalt's own (its scale decode and table), in ggml_nvfp4_neon.inc;
+  * NVFP4 is Basalt's own (its scale decode and table), in ggml_nvfp4_neon.inc, and so are the MXFP8 rows, in
+    ggml_mxfp8_neon.inc (included by the tail template);
   * every kernel becomes static behind one ggml_get_type_traits_cpu table, as in the x86 file.
 
 usage: extract_ggml_neon.py <arch/arm/quants.c of llama.cpp 3cf03257> <repo root>

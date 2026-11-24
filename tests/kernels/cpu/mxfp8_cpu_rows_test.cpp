@@ -8,6 +8,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/swiglu.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -311,12 +312,20 @@ int check_native(int n_embd, int n_ff, float limit) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(BASALT_ARCH_X86)
     const Isa isas[2] = {
         {"AVX2", ggml_get_type_traits_cpu_avx2, ggml_vec_dot_mxfp8_q8_0_scalar_avx2, ggml_mxfp8_q8_0_prep_avx2, ggml_mxfp8_q8_0_rows_avx2, cpu::cpu_avx2_ok()},
         {"AVX512", ggml_get_type_traits_cpu_avx512, ggml_vec_dot_mxfp8_q8_0_scalar_avx512, ggml_mxfp8_q8_0_prep_avx512, ggml_mxfp8_q8_0_rows_avx512, cpu::cpu_avx512_ok()},
     };
+    const char* const first = "AVX2";
+#else
+    const Isa isas[1] = {
+        {"NEON", ggml_get_type_traits_cpu_neon, ggml_vec_dot_mxfp8_q8_0_scalar_neon, ggml_mxfp8_q8_0_prep_neon, ggml_mxfp8_q8_0_rows_neon, cpu::cpu_neon_ok()},
+    };
+    const char* const first = "NEON";
+#endif
     if (!isas[0].ok) {
-        std::printf("no AVX2 on this host, skipped\n");
+        std::printf("no %s on this host, skipped\n", first);
         return 77;
     }
     if (argc > 1 && !std::strcmp(argv[1], "--bench")) {

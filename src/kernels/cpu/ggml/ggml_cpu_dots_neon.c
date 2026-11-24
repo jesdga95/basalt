@@ -3,7 +3,7 @@
 // Taken from ggml/src/ggml-cpu/arch/arm/quants.c of llama.cpp commit
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d (https://github.com/ggml-org/llama.cpp) by
 // tools/port/extract_ggml_neon.py: the SVE branches and the formats no pack uses are stripped, NEON with FMA and the
-// dot product is taken as present, and NVFP4 is Basalt's own (ggml_nvfp4_neon.inc).  Copyright (c) 2023-2026 The ggml
+// dot product is taken as present, and NVFP4 and MXFP8 are Basalt's own (ggml_nvfp4_neon.inc, ggml_mxfp8_neon.inc).  Copyright (c) 2023-2026 The ggml
 // authors.  MIT licence: see THIRD_PARTY_LICENSES.
 //
 // GENERATED: edit the script or neon_head.c.in / neon_tail.c.in beside this file, not this file.
@@ -1657,6 +1657,8 @@ static void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, 
 
 }
 
+#include "ggml_mxfp8_neon.inc"
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q2_0]    = {NULL, ggml_vec_dot_q2_0_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_Q5_0]    = {NULL, ggml_vec_dot_q5_0_q8_0, GGML_TYPE_Q8_0, 1},
@@ -1679,6 +1681,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ1_S]   = {NULL, ggml_vec_dot_iq1_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_M]   = {NULL, ggml_vec_dot_iq1_m_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_NVFP4]   = {NULL, ggml_vec_dot_nvfp4_q8_0, GGML_TYPE_Q8_0, 1},
+    [GGML_TYPE_MXFP8]   = {NULL, ggml_vec_dot_mxfp8_q8_0, GGML_TYPE_Q8_0, 1},
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
