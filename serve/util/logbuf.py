@@ -143,7 +143,7 @@ def tail_file(buffer: LogBuffer, path: str, src: str = "eng", poll_s: float = 0.
                 *done, partial = (partial + data).split(b"\n")
                 for line in done:
                     line_end += len(line) + 1
-                    text = line.decode("utf-8", "replace")
+                    text = line.rstrip(b"\r").decode("utf-8", "replace")
                     if skip is not None and skip(text):
                         continue
                     buffer.add(src, text)

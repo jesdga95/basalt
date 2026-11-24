@@ -191,7 +191,22 @@ class Tail(unittest.TestCase):
             with open(log, "a", encoding="utf-8") as f:
                 f.write("basalt serve: warning: hot\n")
             self.wait_for(b, 1)
-            self.assertEqual(seen, [("basalt serve: warning: hot", len("before\nbasalt serve: warning: hot\n"))])
+            self.assertEqual(seen, [("basalt serve: warning: hot", log.stat().st_size)])
+
+    def test_crlf_lines_strip_cr_and_keep_byte_offsets(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "crlf.log"
+            log.write_bytes(b"before\r\n")
+            b = LogBuffer()
+            seen = []
+            threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
+                             kwargs={"on_line": lambda text, pos: seen.append((text, pos))}, daemon=True).start()
+            time.sleep(0.1)
+            with open(log, "ab") as f:
+                f.write(b"basalt serve: warning: hot\r\n")
+            self.wait_for(b, 1)
+            self.assertEqual(seen, [("basalt serve: warning: hot", len(b"before\r\nbasalt serve: warning: hot\r\n"))])
+            self.assertEqual(b.since(0)[0][0]["msg"], "basalt serve: warning: hot")
 
     def test_skip_omits_matching_lines_from_buffer(self):
         with tempfile.TemporaryDirectory() as d:
