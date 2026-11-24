@@ -29,6 +29,7 @@ OWN_TOKENS = ("<|endoftext|>", "<|message_user|>", HEADER, "<|message_system|>",
 MARK0 = 0xF2400                         # the marks of the dialect's own tokens while a message is rendered
 MAX_EFFORT = 0.99
 _NAME = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")')   # a call object's own name, first key
+_ARGS = re.compile(r'"args"\s*:')
 
 
 class _Blocks:
@@ -152,10 +153,10 @@ class _Blocks:
     def _args_text(self) -> str | None:
         """The arguments' JSON text read so far, once the `{"name":...,"args":` prefix has passed."""
         if not self.head:
-            i = self.raw.find('"args":')
-            if i < 0:
+            m = _ARGS.search(self.raw)
+            if not m:
                 return None
-            self.head = self.raw[:i + len('"args":')]
+            self.head = self.raw[:m.end()]
         return self.raw[len(self.head):]
 
     def _stream_args(self, out: list) -> None:
@@ -205,10 +206,12 @@ class _Blocks:
             self.call = None
             return
         self.call.name = name
-        if self.stream_tools and not self.started:      # the name came with the end: the call is told whole
-            self.started = True
-            out.append(Event("tool_start", call=self.call))
-            out.append(Event("tool_args", json.dumps(args, ensure_ascii=False, separators=(",", ":")), call=self.call))
+        if self.stream_tools:
+            if not self.started:      # the name came with the end: the call is told whole
+                self.started = True
+                out.append(Event("tool_start", call=self.call))
+            if self.streamed == 0:    # zero-arg call (no "args" key) or args never reached a safe prefix before end
+                out.append(Event("tool_args", json.dumps(args, ensure_ascii=False, separators=(",", ":")), call=self.call))
         out.append(Event("tool_call", call=ToolCall(name=name, arguments=args, id=self.call.id)))
         self.call = None
 

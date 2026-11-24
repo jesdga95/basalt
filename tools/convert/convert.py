@@ -760,13 +760,14 @@ def requant_dense(a) -> None:
     meta = json.loads(base.read("meta"))
     gguf_off, _ = base.section("gguf")
     tensors = meta["tensors"]
+    gguf_tensors = {n: info for n, info in tensors.items() if info.get("section", "gguf") == "gguf"}
     try:
-        plan = S.DenseQ6K(tensors, a.checkpoint)
+        plan = S.DenseQ6K(gguf_tensors, a.checkpoint)
     except S.ConvertError as e:
         die(str(e))
     if not plan.plan:
         die(f"{src} has no Q8_0 dense projection to requantize")
-    order = sorted(tensors, key=lambda n: tensors[n]["offset"])
+    order = sorted(gguf_tensors, key=lambda n: gguf_tensors[n]["offset"])
     if partial.exists():
         partial.unlink()
     w = ModelWriter(str(partial))

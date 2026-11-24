@@ -1448,6 +1448,19 @@ uint64_t ConversationStore::queued_bytes() const {
     return queue_bytes_;
 }
 
+bool ConversationStore::fits(uint64_t bytes) const {
+    if (!open_) return false;
+    const uint64_t queued = queued_bytes(), free_bytes = basalt::platform::disk_free_bytes(dir_);
+    const bool room = free_bytes >= queued + bytes + kSpaceFloor;
+    if (!room && !full_said_.exchange(true))
+        basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, so conversations are not written "
+                          "to disk until it has room (%.0f GiB kept free)", dir_.c_str(), (double) free_bytes / 1073741824.0,
+                          (double) kSpaceFloor / 1073741824.0);
+    else if (room && full_said_.exchange(false))
+        basalt::log::info("basalt serve", "conversation cache: %s has room again", dir_.c_str());
+    return room;
+}
+
 uint64_t conversation_store_hash_file(const std::string& path, uint64_t seed) {
     uint64_t h = seed, size = 0;
     basalt::platform::file_size(path, size);

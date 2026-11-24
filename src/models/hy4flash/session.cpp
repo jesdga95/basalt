@@ -776,8 +776,8 @@ public:
             emb_rows_ = rows + (size_t) at * (size_t) g_.n_embd;
             img_j_ = at;
             const bool ok = run_rows(dead.data(), n, pos + at, 0, err);
-            if (!ok && grow_failed_) return {model::Status::Refused, "hy4flash: " + err};
             emb_rows_ = nullptr;
+            if (!ok && grow_failed_) return {model::Status::Refused, "hy4flash: " + err};
             if (!ok) return {model::Status::Error, "hy4flash: " + err};
         }
         if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "hy4flash: the image rows failed"};
@@ -2958,7 +2958,7 @@ private:
                 if (cudaMalloc((void**) &d_hist_, n * 4) != cudaSuccess) { cudaGetLastError(); err = "out of device memory for the sampling history"; return false; }
                 d_hist_len_ = n;
             }
-            cudaMemcpyAsync(d_hist_, r.history, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * (size_t) history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
         }
         sampling_ = sp;
         bk::sample_tokens(logits_, rows, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);
