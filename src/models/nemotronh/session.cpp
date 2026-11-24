@@ -132,7 +132,8 @@ public:
         // a chunk's BF16 products (the latent projections, the MTP head's fusion and attention) on cuBLAS, over its rows
         // rounded to bf16 (the widest, the head's [embedding | hidden])
         xb16_ = (uint16_t*) alloc((size_t) R * (mtp_on_ ? 2 * E : E) * 2, ok);
-        if (cublasCreate(&blas_) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas_, stream_) != CUBLAS_STATUS_SUCCESS) {
+        if (cublasCreate(&blas_) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas_, stream_) != CUBLAS_STATUS_SUCCESS ||
+            cublasSetMathMode(blas_, CUBLAS_DEFAULT_MATH) != CUBLAS_STATUS_SUCCESS) {   // fp32 products stay fp32 (no TF32)
             err = "cannot create the cuBLAS handle";
             return false;
         }
@@ -914,8 +915,16 @@ private:
     }
 
     // the router and the latent of R normed rows (XN_, act_ packed for a window)
+    // (a chunk's logits are one fp32 product on cuBLAS, the window's the router's own; the choice is the router's)
     void route(const Layer& L, int R, bool window) {
-        bk::router(XN_, L.router, L.router_bias, R, router_args(), rlog_, ids_, rw_, stream_);
+        if (window) {
+            bk::router(XN_, L.router, L.router_bias, R, router_args(), rlog_, ids_, rw_, stream_);
+        } else {
+            const float one = 1.f, zero = 0.f;
+            cublasSgemm(blas_, CUBLAS_OP_T, CUBLAS_OP_N, g_.n_expert, R, (int) g_.n_embd, &one, L.router, (int) g_.n_embd, XN_,
+                        (int) g_.n_embd, &zero, rlog_, g_.n_expert);
+            bk::router_select(rlog_, L.router_bias, R, router_args(), ids_, rw_, stream_);
+        }
         if (window) gemm(L.lat_down, lat_, g_.n_latent, R);
         else bf16_rows(L.lat_down, XN_, g_.n_embd, lat_, R);
     }

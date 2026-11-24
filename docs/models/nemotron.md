@@ -104,7 +104,7 @@ layer that computes, the other is filled with the next MoE layer's experts on a 
 runs of consecutive experts, a second card or the file) while this layer and the Mamba or attention layer after it run.
 Without the room (a card nearly full) the experts a chunk routes to are staged 16 at a time while the group before computes.
 The routed experts run on llama.cpp's MMQ (int8 tensor cores, q8_1 activations against the NVFP4 blocks), the Mamba
-projections on the FP8 tensor cores, the shared expert on the FP4 tensor cores, the BF16 latent projections on cuBLAS.
+projections on the FP8 tensor cores, the shared expert on the FP4 tensor cores, the BF16 latent projections and the router's FP32 logits on cuBLAS.
 
 | Prompt | Chunk | Experts | Time | tok/s |
 | --- | --- | --- | --- | --- |
@@ -113,6 +113,7 @@ projections on the FP8 tensor cores, the shared expert on the FP4 tensor cores, 
 | 12,000 tokens | 4,096 | staged per group | 9.5 s | 1,258 |
 | 12,000 tokens | 4,096 | the ring | 7.8 s | 1,531 |
 | 12,000 tokens | 4,096 | the ring, BF16 products on cuBLAS | 7.1 s | 1,697 |
+| 12,000 tokens | 4,096 | and the router's logits on cuBLAS (FP32) | 6.4 s | 1,880 |
 
 RTX PRO 4000 at 145 W with the card to itself, one session, the experts in RAM; with an RTX 5050 as a second card the ring
 gives the same 7.8 s. The ring groups experts by consecutive ids (some with no rows), staging by the experts routed to: MMQ

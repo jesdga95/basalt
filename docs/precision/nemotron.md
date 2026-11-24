@@ -8,7 +8,7 @@ Where Nemotron 3.5 Super rounds and how its output compares. Method: [quality](q
 - **The weights are the checkpoint's bits.** Every NVFP4 and FP8 matrix keeps its codes and scales; nothing is
   re-rounded by the converter except `A = -exp(A_log)`, computed once in float64.
 - **Against a float64 reference of the same weights:** decode KL 3.8e-4 and top-1 54/54 on a 54-token chat; a prompt then
-  decode KL 6.0e-4, top-1 27/28 ([below](#against-the-reference)).
+  decode KL 6.5e-4, top-1 28/28 ([below](#against-the-reference)).
 - **The MTP head's drafts** match the reference's: the first at 53 of 53 positions, the second at 51 of 53.
 - **No `basalt-bench --quality` base yet:** that needs a BF16 run of the full model.
 
@@ -50,7 +50,7 @@ the placement frozen:
 | Path | KL mean | KL max | Top-1 |
 | --- | --- | --- | --- |
 | Decode, one row at a time | 3.8e-4 | 5.6e-3 | 54/54 |
-| A prompt of 26, then decode | 6.0e-4 | 4.2e-3 | 27/28 (a near tie) |
+| A prompt of 26, then decode | 6.5e-4 | 2.6e-3 | 28/28 |
 | Windows of 1 to 8 rows keeping some | bitwise one-row decode | | |
 | State saved at 27, restored | bitwise | | |
 
