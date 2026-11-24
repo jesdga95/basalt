@@ -425,14 +425,23 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             cudaMemGetInfo(&free_b, &total_b);
             std::vector<uint64_t> stride;
             for (const LayerWeights& w : layers_) stride.push_back(w.expert_stride);
+            const bool vmm = core::vmm::supported();
+            const uint64_t vg = vmm ? core::vmm::granularity() : 0;
             uint64_t full = 0;
-            for (uint64_t st : stride) full += st * (uint64_t) g.n_expert;
-            const uint64_t want_b = full + bytes_at(want) * n_sess + shared + spare;
-            // when some must go: a margin for the tables and maps allocated after the plan and the driver's own rounding
-            const uint64_t short_b = want_b > free_b ? want_b - free_b + 128 * kMiB : 0;
+            for (int l = 0; l < g.n_layers; ++l) {
+                const ExpertLayer& el = pack_.experts[(size_t) l];
+                const uint64_t eb = (uint64_t) g.n_expert * stride[(size_t) l];
+                const uint64_t past = std::max<uint64_t>(
+                    16, std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
+                                 prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp)));
+                full += vg ? (eb + past + vg - 1) / vg * vg : eb + past;
+            }
+            // include the margin for tables, maps and driver rounding before deciding whether anything must spill
+            const uint64_t want_b = full + bytes_at(want) * n_sess + shared + spare + (vmm ? 128 * kMiB : 0);
+            const uint64_t short_b = want_b > free_b ? want_b - free_b : 0;
             const int64_t keep = req.expert_cache > 0 ? req.expert_cache : -1;
             if (short_b > 0 || keep >= 0) {
-                if (!core::vmm::supported()) return fail("the experts do not fit beside the context and this card has no virtual memory management");
+                if (!vmm) return fail("the experts do not fit beside the context and this card has no virtual memory management");
                 std::vector<std::pair<int32_t, int32_t>> rank;
                 if (!req.expert_profile.empty()) {
                     uint64_t pb = 0;
