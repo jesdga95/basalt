@@ -398,7 +398,9 @@ public:
             if (last && r.logits)
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
-        return end_call("the window failed");
+        const model::Result done = end_call("the window failed");
+        if (done.ok()) m_.warm_up();
+        return done;
     }
 
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
@@ -424,7 +426,11 @@ protected:
         return true;
     }
     bool batch_end(std::optional<cudaError_t> synced) override {
-        if (synced) return complete(*synced);
+        if (synced) {
+            const bool kept = complete(*synced);
+            if (kept && *synced == cudaSuccess) m_.warm_up();
+            return kept;
+        }
         release();
         return false;
     }
@@ -557,7 +563,7 @@ public:
     // copies to resize: refused unless the card already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
         cudaStreamSynchronize(stream_);
-        const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20, stream_);
+        const bool fits = m_.resize_reserve((mib < 0 ? m_.asked_reserve() : (uint64_t) mib << 20), stream_);
         expert_slots = m_.elastic() ? expert_pairs() - m_.spill().spilled + m_.promoted() : -1;
         if (!fits) return {model::Status::Error, "inkling2: the card cannot leave " + std::to_string(mib) + " MiB free: the experts it holds are not copies"};
         return {};

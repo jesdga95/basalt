@@ -167,6 +167,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     const std::string& path = req.paths.front();
     if (!open_pack(path, pack_, err)) return {model::Status::Error, "inkling2: " + err};
     flags_ = req;
+    reserve_ = asked_reserve();
     cudaGetDevice(&device_);
     ldev_ = device_;
     fp8_ = req.kv == "fp8";
@@ -826,6 +827,20 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
                           (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB);
     }
     return {};
+}
+
+uint64_t InklingModel::asked_reserve() const {
+    return (flags_.vram_reserve_mib > 0 ? (uint64_t) flags_.vram_reserve_mib << 20 : 512ull << 20);
+}
+
+void InklingModel::warm_up() {
+    if (warm_) return;
+    warm_ = true;
+    if (!elastic_ || lent_) return;
+    const uint64_t moved = promote(held_free(0));
+    basalt::log::info("basalt inkling2", "elastic spill: the kernels are loaded, the card keeps %lld MiB free (--vram-reserve-mib): %lld of %lld RAM "
+                      "experts are copies on the card now (%.2f GiB more)", (long long) (held_free(0) >> 20), (long long) n_copy_,
+                      (long long) spill_.spilled, (double) moved / (double) kGiB);
 }
 
 uint64_t InklingModel::promote(uint64_t keep_free) {
