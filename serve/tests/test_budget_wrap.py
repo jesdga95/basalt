@@ -34,8 +34,11 @@ class WindowEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None, stop_soon=None):
         if isinstance(ids, PromptText):
             n = len(ids.ids())
+            self.counted = n
             if ids.clip:
                 max_new = min(max_new, CTX - CTX_SLACK - n)
+            elif max_new > CTX - CTX_SLACK - n:
+                raise ValueError(ids.explain(f"context_overflow prompt={n} max_new={max_new} context={CTX}: too long"))
             ids.set_counted(n, max_new)
             yield None
             ids = ids.ids()
@@ -77,13 +80,14 @@ class BudgetWrap(unittest.TestCase):
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
 
-    def chat(self, **kw):
+    def chat(self, stream=False, **kw):
         c = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=20)
         try:
-            body = {"model": "basalt", "messages": [{"role": "user", "content": "two plus two?"}], **kw}
+            body = {"model": "basalt", "messages": [{"role": "user", "content": "two plus two?"}], "stream": stream, **kw}
             c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
             r = c.getresponse()
-            return r.status, json.loads(r.read().decode())
+            text = r.read().decode()
+            return r.status, (text if stream and r.status == 200 else json.loads(text))
         finally:
             c.close()
 
@@ -116,6 +120,16 @@ class BudgetWrap(unittest.TestCase):
         self.assertEqual(msg["content"], WindowEngine.ANSWER)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         self.assert_extends()
+
+    def test_a_cap_over_the_context_is_a_400_before_any_token(self):
+        # the first pass asks the engine for the thinking budget only, which fits; the whole cap does not
+        self.start(WindowEngine)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                code, b = self.chat(stream=stream, max_tokens=CTX - 200)
+                self.assertEqual(code, 400, b)
+                self.assertIn("exceeds the context window", b["error"]["message"])
+                self.assertEqual(self.engine.passes, [], "no token was decoded")
 
     def test_without_stop_soon_the_clipped_cap_still_answers(self):
         self.start(HardEngine)

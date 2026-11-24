@@ -1602,6 +1602,11 @@ class Service:
                                 # comes back as the budget and must not replace the client's cap.
                                 if isinstance(ids, PromptText) and ids.n is not None and not pt_settled:
                                     pt_settled = True
+                                    # the engine checked this pass's cap, which a thinking budget may have lowered:
+                                    # the whole cap must fit before a token goes out, as an id prompt's does
+                                    ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+                                    if not ids.clip and ctx > 0 and ids.n + CTX_SLACK + max_new > ctx:
+                                        raise overflow_error(ids.n, max_new, ctx)
                                     if ids.max_new and ids.max_new < cap:
                                         max_new = min(max_new, n_pass0 + ids.max_new)
                                         cap = ids.max_new
