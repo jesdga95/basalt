@@ -129,7 +129,17 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted,
         }
         return n;
     };
+    const auto free_buffers = [&] {
+        cudaFree(d_steps);
+        cudaFree(d_scores);
+        cudaFree(ids_ref);
+        cudaFree(ids_new);
+    };
     const int64_t same_tied = same(tied), same_equal = same(equal), same_cont = same(scores);   // d_scores: continuous
+    if (same_tied < 0 || same_equal < 0 || same_cont < 0) {
+        free_buffers();
+        return false;
+    }
     cudaEvent_t e0, e1;
     ck(cudaEventCreate(&e0), "event");
     ck(cudaEventCreate(&e1), "event");
@@ -145,7 +155,7 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted,
     const float t_ref = timed([&] { k::qsa_block_topk_ref(d_scores, d_steps, nq, max_blocks, cap, s, ids_ref, nullptr); });
     const float t_new = timed([&] { k::qsa_block_topk(d_scores, d_steps, nq, max_blocks, cap, s, ids_new, nullptr, active); });
     cudaEventDestroy(e0); cudaEventDestroy(e1);
-    cudaFree(d_steps); cudaFree(d_scores); cudaFree(ids_ref); cudaFree(ids_new);
+    free_buffers();
     const bool ok = same_cont == nq && same_tied == nq && same_equal == nq;
     std::printf("%s context %lld under a capacity of %lld (%lld blocks), %lld queries %s: reference %.3f ms, "
                 "dispatched %.3f ms (%.1fx); identical ids: continuous %lld/%lld, 64 levels %lld/%lld, equal scores "
