@@ -468,7 +468,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                             for (int e = 0; e < g.n_expert; ++e)
                                 if (!on_card(l, e)) spill_order_.emplace_back(l, e);
                     elastic_ = keep < 0 && want > core::kElasticKvBase;
-                    heat_.start((size_t) g.n_layers * g.n_expert, g.n_expert, spill_order_);
+                    std::vector<int> visits((size_t) g.n_layers, 0);
+                    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
+                    heat_.start((size_t) g.n_layers * g.n_expert, g.n_expert, spill_order_, visits);
                     uint64_t ram = 0;
                     for (int l = 0; l < g.n_layers; ++l) ram += (uint64_t) spill_.n_spill[(size_t) l] * stride[(size_t) l];
                     basalt::log::info("basalt inkling2",
