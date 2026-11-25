@@ -31,7 +31,7 @@ struct PromptPath::Carve {
     }
 };
 
-void PromptPath::layout(Carve& c, const Geometry& g, int64_t F) {
+void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, int64_t context, KvType kv) {
     const size_t C = kChunk, E = (size_t) g.n_embd;
     size_t qmax = 0, kmax = 0;
     for (int l = 0; l < g.n_layers; ++l) {
@@ -44,6 +44,11 @@ void PromptPath::layout(Carve& c, const Geometry& g, int64_t F) {
     q_ = c.take<float>(C * qmax), qp_ = c.take<float>(C * qmax), k_ = c.take<float>(C * kmax), v_ = c.take<float>(C * kmax);
     g_ = c.take<float>(C * (size_t) F), u_ = c.take<float>(C * (size_t) F);
     act_ = c.take<uint8_t>(fp8::act_bytes((int64_t) C, (int64_t) std::max({E, qmax, (size_t) F})));
+    size_t one = 0;   // a full layer's cache cell whose keys are its values
+    for (int l = 0; l < g.n_layers; ++l)
+        if (g.shape(l).one) one = std::max(one, (size_t) g.shape(l).n_kv * g.shape(l).hd);
+    k16_ = one ? c.take<uint16_t>((size_t) context * one) : nullptr;
+    v16_ = one && kv == KvType::F8 ? c.take<uint16_t>((size_t) context * one) : nullptr;
     if (!g.moe()) return;
     const size_t NE = (size_t) g.n_expert, P = C * (size_t) g.n_used, Fe = (size_t) g.n_ff_exp;
     rlog_ = c.take<float>(C * NE), rw_ = c.take<float>(P), ids_ = c.take<int32_t>(P);
@@ -56,10 +61,10 @@ void PromptPath::layout(Carve& c, const Geometry& g, int64_t F) {
     h_ = c.take<float>(P * Fe), ex_ = c.take<float>(P * E);
 }
 
-uint64_t PromptPath::bytes(const Geometry& g, int64_t n_ff_pad) {
+uint64_t PromptPath::bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv) {
     PromptPath p;
     Carve c;
-    p.layout(c, g, n_ff_pad);
+    p.layout(c, g, n_ff_pad, context, kv);
     return c.at;
 }
 
@@ -72,7 +77,7 @@ PromptPath::~PromptPath() {
 bool PromptPath::init(const Gemma4Model& m, std::string& err) {
     m_ = &m;
     Carve c;
-    layout(c, m.geo(), m.n_ff_pad());
+    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type());
     if (cudaMalloc(&base_, c.at) != cudaSuccess || cudaMallocHost((void**) &io_h_, 2 * (size_t) kChunk * 4) != cudaSuccess ||
         cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming) != cudaSuccess) {
         cudaGetLastError();
@@ -80,7 +85,7 @@ bool PromptPath::init(const Gemma4Model& m, std::string& err) {
         return false;
     }
     c = Carve{static_cast<uint8_t*>(base_)};
-    layout(c, m.geo(), m.n_ff_pad());
+    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type());
     return true;
 }
 
@@ -118,6 +123,13 @@ void PromptPath::chunk(const int32_t* tokens, int rows, int64_t pos0, const std:
         AttnPrompt a;
         a.q = qp_, a.pos0 = pos0, a.k_norm = w.k_norm, a.rope = w.rope, a.sh = s, a.kv_type = m.kv_type();
         a.kv = caches[(size_t) l];
+        if (s.one) {   // its keys rotated once into fp16, read in place with the values
+            const bool f8 = m.kv_type() == KvType::F8;
+            derive_keys(a.kv, w.k_norm, w.rope, s, m.kv_type(), pos0 + rows, k16_, f8 ? v16_ : nullptr, st);
+            a.kv = {k16_, f8 ? v16_ : a.kv.k, a.kv.cap};
+            a.sh.one = false;
+            a.kv_type = KvType::F16;
+        }
         a.out = q_;   // the projections are spent
         attn_prompt(a, rows, st);
         fp8::quantize(q_, rows, qd, qd, act_, st);

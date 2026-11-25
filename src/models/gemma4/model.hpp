@@ -121,6 +121,6 @@ std::unique_ptr<model::ModelSession> make_session(Gemma4Model& model, std::strin
 /// chunk's rows, a full layer's cells), its logits and graphs.
 uint64_t session_bytes(const Geometry& g, int64_t context, KvType kv);
 /// The device bytes every session shares once on the card: the forward's scratch and the prompt path's.
-uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad);
+uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv);
 
 }  // namespace basalt::models::gemma4

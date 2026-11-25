@@ -441,6 +441,19 @@ void prompt_case(const char* name, const LayerShape& sh, int past, int C, KvType
     attn_prompt(a2, C - c1, nullptr);
     const std::vector<float> split = host(ref, (size_t) C * qd);
     expect(std::memcmp(split.data(), o.data(), o.size() * 4) == 0, "  split in two calls: bitwise the same", 0.0);
+    if (sh.one) {   // the keys rotated once into fp16 and read in place: bitwise the tiles the attention derives itself
+        void *k16 = nullptr, *v16 = nullptr;
+        cudaMalloc(&k16, (size_t) cap * kd * 2);
+        if (kv == KvType::F8) cudaMalloc(&v16, (size_t) cap * kd * 2);
+        derive_keys(pr.kv.c[0], dkn, rt, sh, kv, N, k16, v16, nullptr);
+        AttnPrompt ad = ap;
+        ad.kv = {k16, v16 ? v16 : ck, cap}, ad.sh.one = false, ad.kv_type = KvType::F16, ad.out = ref;
+        attn_prompt(ad, C, nullptr);
+        const std::vector<float> dk16 = host(ref, (size_t) C * qd);
+        expect(std::memcmp(dk16.data(), o.data(), o.size() * 4) == 0, "  derive_keys then fp16 tiles in place: bitwise the same", 0.0);
+        cudaFree(k16);
+        if (v16) cudaFree(v16);
+    }
     for (void* p : {(void*) dq, (void*) dk, (void*) dv, (void*) dqn, (void*) dkn, (void*) rt.lo, (void*) rt.hi, ck, cv, (void*) qp,
                     (void*) ref, (void*) got, (void*) scr, (void*) dpos})
         cudaFree(p);
@@ -474,6 +487,23 @@ void prompt_bench(const char* name, const LayerShape& sh, int past, int C, std::
     double keys = 0;
     for (int r = 0; r < C; ++r) keys += sh.window > 0 ? std::min(past + r + 1, sh.window) : past + r + 1;
     std::printf("bench attn_prompt %s: %.0f us, %.0f TFLOPS (fp16)\n", name, us, keys * sh.n_head * hd * 4 / us / 1e6);
+    if (sh.one) {   // the prompt path's form: keys rotated once into fp16, the tiles read in place
+        void* k16 = nullptr;
+        cudaMalloc(&k16, (size_t) cap * kd * 2);
+        AttnPrompt ad = ap;
+        ad.kv = {k16, ck, cap}, ad.sh.one = false;
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) derive_keys(ap.kv, dkn, ap.rope, sh, KvType::F16, N, k16, nullptr, nullptr);
+        cudaDeviceSynchronize();
+        const double dus = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count() / iters;
+        const auto t2 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) attn_prompt(ad, C, nullptr);
+        cudaDeviceSynchronize();
+        const double aus = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t2).count() / iters;
+        std::printf("bench derive_keys %d keys %.0f us, then attn_prompt on fp16 tiles %.0f us, %.0f TFLOPS\n", N, dus, aus,
+                    keys * sh.n_head * hd * 4 / aus / 1e6);
+        cudaFree(k16);
+    }
     for (void* p : {(void*) dq, (void*) dkn, (void*) out, ck, cv, (void*) ap.rope.lo, (void*) ap.rope.hi}) cudaFree(p);
 }
 

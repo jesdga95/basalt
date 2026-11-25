@@ -97,6 +97,12 @@ struct Attn {
 size_t attn_scratch_floats(int rows, int n_head, int hd);
 void attn_decode(const Attn& a, int rows, void* stream);
 
+/// A layer whose keys are its values (sh.one): its keys 0..n-1 as fp16 rotated keys, K = rope(V * k_norm), into k16
+/// ([cell][n_kv][hd], cell = key % kv.cap), and with an E4M3 cache its values as fp16 into v16 (null with an fp16
+/// cache). The prompt attention then reads them as an fp16 cache with stored keys, its tiles straight from memory.
+void derive_keys(const SegKv& kv, const float* k_norm, RopeTab rope, const LayerShape& sh, KvType kv_type, int64_t n,
+                 void* k16, void* v16, void* stream);
+
 /// The prompt attention: `rows` consecutive positions pos0.. of one conversation, each over the keys attn_decode gives it,
 /// read from the cache (the rows' own keys written by attn_prep first: a window layer's ring holds the window and the
 /// rows), flash style on the fp16 tensor cores (q, k, v and the probabilities rounded to fp16; fp32 products and

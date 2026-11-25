@@ -3,7 +3,8 @@
 // tensor cores (prefill/fp8_gemm.hpp), the router's scores one fp32 product over the chunk, the experts W4A4 (two FP4
 // terms) on the FP4 block-scaled tensor cores grouped by expert and read in place (prefill/moe_fp4.hpp) with the GELU
 // gate between the two products, the attention flash style over the caches (attn_prompt); the rest are the decode
-// forward's kernels over all the rows. A chunk leaves the caches as decode windows of the same tokens would: a window
+// forward's kernels over all the rows. A full layer whose keys are its values has its keys rotated once a chunk into an fp16
+// buffer the attention reads in place. A chunk leaves the caches as decode windows of the same tokens would: a window
 // layer's ring holds the window and a chunk, so the chunk's keys go straight to their cells.
 #pragma once
 
@@ -25,15 +26,15 @@ class PromptPath {
 public:
     ~PromptPath();
     bool init(const Gemma4Model& m, std::string& err);
-    /// The device bytes init takes for a model of geometry `g` and MLP width `n_ff_pad`.
-    static uint64_t bytes(const Geometry& g, int64_t n_ff_pad);
+    /// The device bytes init takes for a model of geometry `g`, MLP width `n_ff_pad`, `context` positions and caches of `kv`.
+    static uint64_t bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv);
     /// One chunk: `rows` (at most kChunk) tokens at positions pos0.. through every layer, their keys and values written to
     /// `caches` ([layer]); no head. Queued on `st`; `tokens` are host memory, staged before the call returns.
     void chunk(const int32_t* tokens, int rows, int64_t pos0, const std::vector<SegKv>& caches, cudaStream_t st);
 
 private:
     struct Carve;
-    void layout(Carve& c, const Geometry& g, int64_t n_ff_pad);
+    void layout(Carve& c, const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv);
 
     const Gemma4Model* m_ = nullptr;
     void* base_ = nullptr;
@@ -52,6 +53,7 @@ private:
     float *gsx_ = nullptr, *gsh_ = nullptr;
     float* h_ = nullptr;                                                      // the experts' H [C k][n_ff_exp]
     float* ex_ = nullptr;                                                     // the experts' outputs [C k][E]
+    void *k16_ = nullptr, *v16_ = nullptr;   // a full layer's keys (and an E4M3 cache's values) as fp16, [context][n_kv][hd]
 };
 
 }  // namespace basalt::models::gemma4

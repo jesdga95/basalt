@@ -143,6 +143,49 @@ __global__ void __launch_bounds__(128) attn_merge_kernel(Attn a, int rows) {
     }
 }
 
+// grid (key, kv head), a thread two rotary pairs: V widened, K = rope(V * k_norm), both rounded to fp16.
+template <int HD>
+__global__ void __launch_bounds__(HD / 4) derive_keys_kernel(SegKv kv, const float* __restrict__ k_norm, RopeTab rope, int n_kv,
+                                                             int rot, bool f8, __half* __restrict__ k16, __half* __restrict__ v16) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    constexpr int H = HD / 2;
+    const int key = blockIdx.x, h = blockIdx.y, i = threadIdx.x * 2;
+    const size_t off = ((size_t) (key % kv.cap) * n_kv + h) * HD;
+    const float2* lo = reinterpret_cast<const float2*>(rope.lo) + (size_t) (key & 255) * H;
+    const float2* hi = reinterpret_cast<const float2*>(rope.hi) + (size_t) (key >> 8) * H;
+    float x[2], y[2];
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        if (f8) {
+            x[c] = float(reinterpret_cast<const __nv_fp8_e4m3*>(kv.k)[off + i + c]);
+            y[c] = float(reinterpret_cast<const __nv_fp8_e4m3*>(kv.k)[off + i + H + c]);
+        } else {
+            x[c] = __half2float(reinterpret_cast<const __half*>(kv.k)[off + i + c]);
+            y[c] = __half2float(reinterpret_cast<const __half*>(kv.k)[off + i + H + c]);
+        }
+    }
+    if (v16) {
+        *reinterpret_cast<__half2*>(v16 + off + i) = __floats2half2_rn(x[0], x[1]);
+        *reinterpret_cast<__half2*>(v16 + off + i + H) = __floats2half2_rn(y[0], y[1]);
+    }
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        const float kx = x[c] * k_norm[i + c], ky = y[c] * k_norm[i + H + c];
+        if (i + c < rot) {
+            const float2 p = hi[i + c], q = lo[i + c];
+            const float co = p.x * q.x - p.y * q.y, si = p.y * q.x + p.x * q.y;
+            x[c] = kx * co - ky * si;
+            y[c] = ky * co + kx * si;
+        } else {
+            x[c] = kx;
+            y[c] = ky;
+        }
+    }
+    *reinterpret_cast<__half2*>(k16 + off + i) = __floats2half2_rn(x[0], x[1]);
+    *reinterpret_cast<__half2*>(k16 + off + i + H) = __floats2half2_rn(y[0], y[1]);
+}
+
 void check_shape(const LayerShape& sh) {
     if ((sh.hd != 256 && sh.hd != 512) || sh.n_kv < 1 || sh.n_head % sh.n_kv || sh.n_head > kMaxHeads ||
         sh.n_head / sh.n_kv > kMaxGroup || sh.rot < 0 || sh.rot > sh.hd / 2)
@@ -177,6 +220,22 @@ void rope_tables(int hd, int rot, double base, int64_t positions, float* lo, flo
 }
 
 size_t attn_scratch_floats(int rows, int n_head, int hd) { return (size_t) rows * n_head * kMaxChunks * (hd + 2); }
+
+void derive_keys(const SegKv& kv, const float* k_norm, RopeTab rope, const LayerShape& sh, KvType kv_type, int64_t n,
+                 void* k16, void* v16, void* stream) {
+    if (n <= 0) return;
+    check_shape(sh);
+    if (!sh.one || (kv_type == KvType::F8) != (v16 != nullptr)) throw std::invalid_argument("gemma4 derive_keys: not a layer whose keys are its values, or v16 against the cache type");
+    const dim3 grid((unsigned) n, (unsigned) sh.n_kv);
+    const bool f8 = kv_type == KvType::F8;
+    if (sh.hd == 256)
+        bk::launch_pdl(derive_keys_kernel<256>, grid, dim3(64), 0, (cudaStream_t) stream, kv, k_norm, rope, sh.n_kv, sh.rot, f8,
+                       (__half*) k16, (__half*) v16);
+    else
+        bk::launch_pdl(derive_keys_kernel<512>, grid, dim3(128), 0, (cudaStream_t) stream, kv, k_norm, rope, sh.n_kv, sh.rot, f8,
+                       (__half*) k16, (__half*) v16);
+    check("derive_keys");
+}
 
 void attn_decode(const Attn& a, int rows, void* stream) {
     if (rows <= 0) return;
