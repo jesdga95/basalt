@@ -5,7 +5,8 @@
 // gate between the two products, the attention flash style over the caches (attn_prompt); the rest are the decode
 // forward's kernels over all the rows. A full layer whose keys are its values has its keys rotated once a chunk into an fp16
 // buffer the attention reads in place. A chunk leaves the caches as decode windows of the same tokens would: a window
-// layer's ring holds the window and a chunk, so the chunk's keys go straight to their cells.
+// layer's ring holds the window and a chunk, so the chunk's keys go straight to their cells. A picture's rows take the place
+// of the token embeddings and are read as one chunk whose window layers attend both ways among its rows.
 #pragma once
 
 #include "basalt/models/gemma4/kernels.hpp"
@@ -31,8 +32,15 @@ public:
     /// One chunk: `rows` (at most kChunk) tokens at positions pos0.. through every layer, their keys and values written to
     /// `caches` ([layer]); no head. Queued on `st`; `tokens` are host memory, staged before the call returns.
     void chunk(const int32_t* tokens, int rows, int64_t pos0, const std::vector<SegKv>& caches, cudaStream_t st);
+    /// One picture: its `rows` (at most kChunk) embedding rows (host [rows][n_embd]) at positions pos0.., as chunk() reads
+    /// tokens but the rows as they are and the window layers' attention both ways among them.
+    void picture(const float* emb, int rows, int64_t pos0, const std::vector<SegKv>& caches, cudaStream_t st);
 
 private:
+    // positions pos0.. (and the tokens, when given) to the card
+    void stage(const int32_t* tokens, int rows, int64_t pos0, cudaStream_t st);
+    // the layers over the chunk's rows in x_, the positions staged
+    void layers(int rows, int64_t pos0, bool span, const std::vector<SegKv>& caches, cudaStream_t st);
     struct Carve;
     void layout(Carve& c, const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv);
 

@@ -323,6 +323,38 @@ public:
         return {};
     }
 
+    // ---- [vision] images (vision.hpp, vision_encoder.hpp): a picture's rows stand in for its <|image|> tokens' embeddings,
+    // read as one prompt chunk whose window layers attend both ways among them.
+    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        ImageEncoder& enc = m_.encoder();
+        if (!enc.staged()) return {model::Status::NotImplemented, "gemma4: started without --vision"};
+        std::string err;
+        if (!enc.encode(data, bytes, rows, n_rows, err)) return {model::Status::Error, "gemma4: " + err};
+        grid = {};
+        return {};
+    }
+    void images_done() override { m_.encoder().release(); }
+    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
+        if (stale_ && pos > 0) return stale();
+        if (n_rows < 1 || n_rows > kChunk) return {model::Status::Error, "gemma4: a picture of more rows than a prompt chunk"};
+        if (pos + n_rows > m_.context()) return {model::Status::Refused, "gemma4: the prompt runs past the context"};
+        hist_.resize((size_t) std::min<int64_t>(pos, (int64_t) hist_.size()));
+        stale_ = true;   // until the rows are in
+        try {
+            sh_->prompt.picture(rows, n_rows, pos, caches_, stream_);
+        } catch (const std::exception& e) {
+            return {model::Status::Error, std::string("gemma4: the picture: ") + e.what()};
+        }
+        std::string err;
+        if (!check(err)) return {model::Status::Error, "gemma4: " + err};
+        hist_.insert(hist_.end(), (size_t) n_rows, g_.image_token);
+        win_rows_ = 0;     // no drafter state and no logits for these rows
+        head_rows_ = 0;
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "gemma4: the picture failed"};
+        stale_ = false;
+        return {};
+    }
+
     model::Result set_logit_bias(const float* bias) override {
         bias_on_ = bias != nullptr;
         if (!bias_on_) return {};

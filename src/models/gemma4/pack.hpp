@@ -26,6 +26,7 @@ struct Geometry {
     float rms_eps = 1e-6f, rope_base = 1e6f, rope_base_swa = 1e4f, partial_rotary = 1.f, softcap = 0.f, embed_scale = 1.f;
     int n_expert = 0, n_used = 0, n_ff_exp = 0;   ///< 0 experts: a dense model
     int image_token = -1;
+    int image_cells = 0;                          ///< the rows a picture becomes at most (vision_config.default_output_length)
     int64_t context_length = 0;
     std::vector<bool> swa;                        ///< per layer: a sliding-window layer
     DrafterGeometry drafter;

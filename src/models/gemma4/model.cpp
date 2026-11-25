@@ -284,12 +284,23 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         drafter_ = std::move(d);
     }
 
+    // [vision] the image encoder staged before the context is sized; it keeps none of the card, but the room of its region
+    // (the weights and the largest picture's work) stays free beside the caches
+    uint64_t vision_room = 0;
+    if (req.vision) {
+        if (!vis_.stage(pack_.vision, g.n_embd, g.image_cells, err)) return fail("vision: " + err);
+        vision_room = vis_.region_bytes();
+        basalt::log::info("basalt gemma4", "image encoder: %.2f GiB staged in page-locked RAM, a request's pictures take %.2f GiB "
+                          "of the card while they are read", (double) vis_.weights_bytes() / (double) kGiB,
+                          (double) vision_room / (double) kGiB);
+    }
+
     // the context: what the weights leave, less the card's spare
     if (want < 1024 || (g.context_length > 0 && want > g.context_length))
         return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
     size_t free_b = 0, total_b = 0;
     basalt::core::gpu_mem_info(&free_b, &total_b);
-    const uint64_t spare = req.vram_reserve_mib > 0 ? (uint64_t) req.vram_reserve_mib * kMiB : kCardSpare;
+    const uint64_t spare = (req.vram_reserve_mib > 0 ? (uint64_t) req.vram_reserve_mib * kMiB : kCardSpare) + vision_room;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
     const uint64_t need = session_bytes(g, want, kv_) * n_sess + shared_bytes(g, n_ff_pad_, want, kv_) + spare;
     if (need > free_b) {

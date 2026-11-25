@@ -89,22 +89,37 @@ bool PromptPath::init(const Gemma4Model& m, std::string& err) {
     return true;
 }
 
+void PromptPath::stage(const int32_t* tokens, int rows, int64_t pos0, cudaStream_t st) {
+    cudaEventSynchronize(staged_);
+    for (int i = 0; i < rows; ++i) {
+        if (tokens) io_h_[i] = tokens[i];
+        io_h_[kChunk + i] = (int32_t) (pos0 + i);
+    }
+    if (tokens) cudaMemcpyAsync(io_, io_h_, (size_t) rows * 4, cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(io_ + kChunk, io_h_ + kChunk, (size_t) rows * 4, cudaMemcpyHostToDevice, st);
+    cudaEventRecord(staged_, st);
+}
+
 void PromptPath::chunk(const int32_t* tokens, int rows, int64_t pos0, const std::vector<SegKv>& caches, cudaStream_t st) {
+    const Geometry& g = m_->geo();
+    stage(tokens, rows, pos0, st);
+    embed_rows(m_->embedding(), io_, rows, g.n_embd, g.embed_scale, x_, st);
+    layers(rows, pos0, false, caches, st);
+}
+
+void PromptPath::picture(const float* emb, int rows, int64_t pos0, const std::vector<SegKv>& caches, cudaStream_t st) {
+    stage(nullptr, rows, pos0, st);
+    cudaMemcpyAsync(x_, emb, (size_t) rows * m_->geo().n_embd * sizeof(float), cudaMemcpyHostToDevice, st);
+    layers(rows, pos0, true, caches, st);
+}
+
+void PromptPath::layers(int rows, int64_t pos0, bool span, const std::vector<SegKv>& caches, cudaStream_t st) {
     const Gemma4Model& m = *m_;
     const Geometry& g = m.geo();
     const int E = g.n_embd;
     const int64_t F = m.n_ff_pad();
     const float eps = g.rms_eps;
-    cudaEventSynchronize(staged_);
-    for (int i = 0; i < rows; ++i) {
-        io_h_[i] = tokens[i];
-        io_h_[kChunk + i] = (int32_t) (pos0 + i);
-    }
-    cudaMemcpyAsync(io_, io_h_, (size_t) rows * 4, cudaMemcpyHostToDevice, st);
-    cudaMemcpyAsync(io_ + kChunk, io_h_ + kChunk, (size_t) rows * 4, cudaMemcpyHostToDevice, st);
-    cudaEventRecord(staged_, st);
     const int32_t* pos = io_ + kChunk;
-    embed_rows(m.embedding(), io_, rows, E, g.embed_scale, x_, st);
     for (int l = 0; l < g.n_layers; ++l) {
         const LayerWeights& w = m.layer(l);
         const LayerShape& s = w.sh;
@@ -121,7 +136,7 @@ void PromptPath::chunk(const int32_t* tokens, int rows, int64_t pos0, const std:
         p.kv.c[0] = caches[(size_t) l];
         attn_prep(p, rows, st);
         AttnPrompt a;
-        a.q = qp_, a.pos0 = pos0, a.k_norm = w.k_norm, a.rope = w.rope, a.sh = s, a.kv_type = m.kv_type();
+        a.q = qp_, a.pos0 = pos0, a.span = span, a.k_norm = w.k_norm, a.rope = w.rope, a.sh = s, a.kv_type = m.kv_type();
         a.kv = caches[(size_t) l];
         if (s.one) {   // its keys rotated once into fp16, read in place with the values
             const bool f8 = m.kv_type() == KvType::F8;

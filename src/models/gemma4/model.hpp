@@ -7,6 +7,7 @@
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/models/gemma4/kernels.hpp"
 #include "models/gemma4/pack.hpp"
+#include "models/gemma4/vision_encoder.hpp"   // [vision]
 
 #include <cstdint>
 #include <memory>
@@ -88,6 +89,8 @@ public:
     const DrafterWeights* drafter() const { return drafter_.get(); }
     /// What the sessions share (session.cpp's Shared): made by the first, gone with the last.
     std::weak_ptr<void>& shared() { return shared_; }
+    /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
+    ImageEncoder& encoder() const { return vis_; }
 
 private:
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err);
@@ -112,6 +115,7 @@ private:
     int64_t ctx_ = kDefaultContext;
     std::weak_ptr<void> shared_;
     std::unique_ptr<DrafterWeights> drafter_;
+    mutable ImageEncoder vis_;   // [vision]
 };
 
 /// A session over `model`; null with `err` set.

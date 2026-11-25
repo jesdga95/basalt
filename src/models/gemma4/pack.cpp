@@ -106,6 +106,10 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     }
 
     p.vision = p.file.range("vision/mmproj");
+    if (const Json* hf = meta.get("hf_config"); hf && hf->get("vision_config")) {
+        const Json* n = hf->get("vision_config")->get("default_output_length");
+        g.image_cells = n && n->is_number() ? (int) n->num() : 0;
+    }
     for (const auto& [name, t] : tj->members) {
         TensorRef r;
         r.name = name;
