@@ -410,14 +410,21 @@ class Service:
         --vram-elastic; an unloaded engine applies it on load."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
+        mine = {"reserve_mib": reserve_mib}
         with self.vram_cv:
             replaced = self.vram_queued is not None
-            self.vram_queued = {"reserve_mib": reserve_mib}
+            self.vram_queued = mine
         out = self._apply_vram(0)
         if out is not None:
             return out
         with self.vram_cv:
             if self.vram_queued is None:                # the worker got there first
+                if "error" in mine:
+                    raise mine["error"]
+                if "result" in mine:
+                    return mine["result"]
+                if self.stopping.is_set():
+                    raise EngineDied("the server is stopping")
                 return {"status": "ok", **(self.vram_applied or {})}
             if self.vram_worker is None:
                 self.vram_worker = threading.Thread(target=self._vram_worker, daemon=True)
@@ -437,9 +444,12 @@ class Service:
             self.fifo.release()
             return None
         job = None
+        out = None
+        err = None
         try:
-            if self.live_reqs:
-                return None
+            with self.status_lock:
+                if self.live_reqs or self.status.get("busy"):
+                    return None
             with self.vram_cv:
                 job = self.vram_queued
             if job is None:
@@ -459,15 +469,24 @@ class Service:
                 print(f"[server] vram: {got.get('vram_free_mib')} MiB free, {cache}({got.get('expert_slots')} experts)",
                       flush=True)
                 out = {"status": "ok", **got}
-            self.vram_applied = {"reserve_mib": reserve_mib, "at": int(time.time())}
-            self.vram_error = None
+            with self.vram_cv:
+                self.vram_applied = {"reserve_mib": reserve_mib, "at": int(time.time())}
+                self.vram_error = None
             return out
+        except Exception as exc:
+            err = exc
+            raise
         finally:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
             if job is not None:
                 with self.vram_cv:
+                    if err is not None:
+                        job["error"] = err
+                        self.vram_error = str(err)
+                    elif out is not None:
+                        job["result"] = out
                     if self.vram_queued is job:         # a newer one stays queued
                         self.vram_queued = None
                     self.vram_cv.notify_all()
@@ -484,7 +503,8 @@ class Service:
                     if self._apply_vram(0.2) is None:
                         time.sleep(0.05)
                 except (ValueError, EngineDied) as e:
-                    self.vram_error = str(e)
+                    with self.vram_cv:
+                        self.vram_error = str(e)
                     print(f"[server] warning: queued VRAM reserve not applied ({e})", flush=True)
         finally:
             with self.vram_cv:
@@ -663,7 +683,7 @@ class Service:
             if getattr(self.engine, "asleep", False) is True:
                 return "asleep"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.live_reqs or self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
@@ -742,11 +762,15 @@ class Service:
             return "unsupported"
         if not self.fifo.acquire(blocking=False):
             return "busy"
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is not None and not ctl.acquire(blocking=False):
+            self.fifo.release()
+            return "busy"
         try:
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.live_reqs or self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
@@ -756,18 +780,24 @@ class Service:
             print(f"[server] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}, the next request loads it", flush=True)
             return "unloaded"
         finally:
+            if ctl is not None:
+                ctl.release()
             self.fifo.release()
 
-    def start_idle_unload(self):
+    def start_idle_unload(self, unloader=None):
+        """Unload the model after idle_unload_s; `unloader(idle_for=...)` defaults to `self.unload`."""
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
         print(f"[server] model unloads after {self.idle_unload_s} s idle", flush=True)
+        unload = unloader or self.unload
 
         def loop():
-            while True:
+            while not self.stopping.is_set():
                 time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+                if self.stopping.is_set():
+                    return
                 try:
-                    self.unload(idle_for=self.idle_unload_s)
+                    unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # retried next turn
                     print(f"[server] warning: idle unload failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
@@ -1237,17 +1267,22 @@ class Service:
             self._video_state_check()
         try:                                            # before the fifo: a slow source must not hold the turn
             read = iter(self.vision.read(images, image_access)) if images else iter(())
-            datas = [next(read) if item["type"] == "image" else self.vision.read_video(item["source"], image_access)
-                     for item in media]
+            datas, video_bytes = [], 0
+            for item in media:
+                if item["type"] == "image":
+                    datas.append(next(read))
+                else:
+                    data = self.vision.read_video(item["source"], image_access)
+                    video_bytes += len(data)
+                    if video_bytes > VIDEO_REQUEST_BYTES:
+                        raise ValueError(f"the request's videos are larger than {VIDEO_REQUEST_BYTES >> 20} MiB")
+                    datas.append(data)
         except ImageRefused as e:
             print(f"[server] error: {e.log_line}", flush=True)
             raise
         except ValueError as e:
             print(f"[server] error: {e}", flush=True)
             raise
-        video_bytes = sum(len(d) for item, d in zip(media, datas) if item["type"] == "video")
-        if video_bytes > VIDEO_REQUEST_BYTES:
-            _refuse_images(f"the request's videos are larger than {VIDEO_REQUEST_BYTES >> 20} MiB")
         held = sum(len(d) for d in {id(d): d for d in datas}.values())
         with self.images_lock:
             if self.images_waiting + held > IMAGE_WAITING_BYTES:
@@ -1524,23 +1559,6 @@ class Service:
                     with self.status_lock:
                         self.status["queued"] -= 1
                         self.waiting.pop(id(wait_key), None)
-                    # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
-                    with (self.fifo if par else contextlib.nullcontext()):
-                        self.ensure_loaded()
-                    gprompt0 = None
-                    if forced_now and has_grammar:
-                        if isinstance(ids, PromptText) and ids.tail:
-                            tail_n = len(self.tok.encode(ids.tail, parse_special=True))
-                            ids, max_new = ids.resolve(max_new, self.engine.max_context)
-                            gprompt0 = len(ids) - tail_n
-                        elif not isinstance(ids, PromptText):
-                            tail_n = len(self.tok.encode(opening_text, parse_special=True))
-                            gprompt0 = len(ids) - tail_n
-                        if gprompt0 is not None and 0 < gprompt0 < len(ids):
-                            sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
-                        else:
-                            gprompt0 = None
-                    with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   path=path, prompt_ms=None, decode_ms=None, decoded=None, passes=None, windows=None,
@@ -1553,6 +1571,33 @@ class Service:
                             self.status.update(st)
                         self.last_request_at = time.time()
                         rate.clear()                    # drop the previous request's samples
+                    # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
+                    try:
+                        with (self.fifo if par else contextlib.nullcontext()):
+                            self.ensure_loaded()
+                        gprompt0 = None
+                        if forced_now and has_grammar:
+                            if isinstance(ids, PromptText) and ids.tail:
+                                tail_n = len(self.tok.encode(ids.tail, parse_special=True))
+                                ids, max_new = ids.resolve(max_new, self.engine.max_context)
+                                gprompt0 = len(ids) - tail_n
+                            elif not isinstance(ids, PromptText):
+                                tail_n = len(self.tok.encode(opening_text, parse_special=True))
+                                gprompt0 = len(ids) - tail_n
+                            if gprompt0 is not None and 0 < gprompt0 < len(ids):
+                                sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
+                            else:
+                                gprompt0 = None
+                    except BaseException:
+                        with self.status_lock:
+                            st["busy"] = False
+                        raise
+                    with self.status_lock:
+                        started = time.time()
+                        st.update(prompt_tokens=len(ids), max_tokens=max_new, started=started)
+                        if par and self.live_reqs and list(self.live_reqs.values())[-1][0] is st:
+                            self.status.update(prompt_tokens=len(ids), max_tokens=max_new, started=started)
+                        self.last_request_at = started
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     if live is not None:
@@ -1667,8 +1712,9 @@ class Service:
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
-                                    # only at a clean point: no held tag or split character
-                                    if thought >= budget and not parser.buf and not detok.pending():
+                                    # only at a clean point: no held tag or split character; let a budget-capped pass drain its own DONE/BDONE
+                                    if thought >= budget and not parser.buf and not detok.pending() \
+                                            and not (capped and n - n_pass0 >= cap):
                                         wrap = True
                                         break
                                 if live is not None:

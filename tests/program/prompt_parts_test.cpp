@@ -49,6 +49,44 @@ int main() {
     ds.insert(ds.end(), 400, kText);
     ds.push_back(kReply);
     check(root_boundary(ds, (int64_t) ds.size() - 1, kTurn, -1, 2048) == 3000, "a user-turn token: the root at the system prompt's end");
+
+    // Batch-slot checkpoint admission: an in_slot admission leaves live at n - 1 (no decode step yet), which equals
+    // the turn checkpoint taken at n - 1; the slot must keep that checkpoint so a later thinking-budget wrap-up matches.
+    struct FakeCk {
+        std::vector<int32_t> ids;
+        std::vector<int32_t> imgs;
+    };
+    auto eq = [](const int32_t* a, size_t n_ids, const int32_t* b) {
+        return std::equal(a, a + n_ids, b);
+    };
+    {
+        const std::vector<int32_t> live = {1, 2, 3, 4, 5};
+        const std::vector<FakeCk> checks = {
+            {{1, 2}, {}},
+            {{1, 2, 3, 4, 5}, {}},        // turn checkpoint at live.size() == n - 1
+            {{1, 2, 3, 4, 5, 6}, {}},     // longer than live: ignored
+            {{1, 9, 3}, {}},              // different branch: ignored
+        };
+        std::vector<FakeCk> kept;
+        basalt::program::serve::select_slot_checkpoints(checks, live, eq, kept);
+        check(kept.size() == 2 && kept[0].ids.size() == 2 && kept[1].ids.size() == 5,
+              "in_slot admission keeps both root and turn checkpoint at live.size()");
+    }
+    {
+        const std::vector<int32_t> live = {1, 2, 3, 4, 5};
+        const std::vector<FakeCk> checks = {{{1, 2, 3, 4, 5}, {}}};
+        std::vector<FakeCk> kept;
+        basalt::program::serve::select_slot_checkpoints(checks, live, eq, kept);
+        check(kept.size() == 1 && kept[0].ids.size() == 5,
+              "single turn checkpoint at live.size() is kept once without root duplication");
+    }
+    {
+        std::vector<FakeCk> dst = {{{1, 2}, {}}, {{1, 2, 3, 4}, {}}};
+        std::vector<FakeCk> src = {{{1, 2}, {}}, {{1, 2, 3, 4}, {7}}, {{1, 2, 3, 4, 5}, {}}};
+        basalt::program::serve::merge_slot_checkpoints(src, dst, eq);
+        check(src.empty() && dst.size() == 4 && dst[2].imgs == std::vector<int32_t>{7} && dst[3].ids.size() == 5,
+              "merging idle slot 0 checkpoints back skips exact duplicates and preserves distinct checkpoints");
+    }
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;
 }

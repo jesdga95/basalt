@@ -106,12 +106,16 @@ def _contain(child: subprocess.Popen) -> bool:
         k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
         k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
         k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
         with _job_lock:
             if _job is None:
                 job = k32.CreateJobObjectW(None, None)  # no security attributes: the handle is not inherited
+                if not job:
+                    return False
                 info = Limits()
                 info.LimitFlags = 0x2000                # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-                if not job or not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                    k32.CloseHandle(job)
                     return False
                 _job = job
         return bool(k32.AssignProcessToJobObject(_job, int(child._handle)))

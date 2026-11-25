@@ -928,6 +928,9 @@ public:
 
     model::Result running_restored(int64_t pos, const uint8_t*) override {
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+        rope_.rewind(pos);
+        rope_on_ = rope_.has_image();
+        rope_uploaded_ = rope_on_ ? std::min(rope_uploaded_, pos) : 0;
         dfly_.invalidate();   // DFLY HOOK
         return {};
     }
@@ -983,6 +986,9 @@ public:
                 return {model::Status::Error, "hy4flash: writing a cache back failed"};
             ++i;
         }
+        rope_.clear();
+        rope_on_ = false;
+        rope_uploaded_ = 0;
         dfly_.invalidate();   // DFLY HOOK
         return {};
     }
@@ -2888,6 +2894,12 @@ private:
     // cell on the host and, once a picture is in the session, on the device where the kernels read them (MlaArgs::cell_rope).
     void sync_rope(int64_t pos) {
         rope_.rewind(pos);
+        if (!rope_.has_image()) {
+            rope_on_ = false;
+            rope_uploaded_ = 0;
+        } else if (rope_uploaded_ > pos) {
+            rope_uploaded_ = pos;
+        }
         while (rope_.size() < pos) rope_.push_text();   // cells the session never placed (a restored history) count as text
     }
     // The rotary position a text token at cell `pos` takes, the track left as it is (the drafter's block, before its window).
@@ -2897,17 +2909,18 @@ private:
     }
     void place_rope(int64_t pos0, int R) {
         sync_rope(pos0);
-        const bool was_on = rope_on_;
         for (int t = 0; t < R; ++t) {
             if (emb_rows_) { rope_.push_row(img_start_, img_nx_, img_j_ + t); rope_on_ = true; }
             else rope_.push_text();
         }
         if (!rope_on_) return;
+        const int64_t from = std::min(pos0, rope_uploaded_);
         std::vector<int32_t> tab;
-        const int64_t from = was_on ? pos0 : 0;
+        tab.reserve((size_t) (pos0 + R - from) * 3);
         for (int64_t c = from; c < pos0 + R; ++c) tab.insert(tab.end(), {rope_.at(c).t, rope_.at(c).h, rope_.at(c).w});
         cudaMemcpyAsync(rope_dev_ + from * 3, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice, stream_);
         cudaStreamSynchronize(stream_);   // the host table is a temporary
+        rope_uploaded_ = pos0 + R;
     }
 
     // diagnostic: a layer whose inner tensors are dumped (the first three)
@@ -3080,6 +3093,7 @@ private:
     bool vis_lent_ = false;              // ... and every slot the tier lends
     RopeTrack rope_;
     int32_t* rope_dev_ = nullptr;
+    int64_t rope_uploaded_ = 0;
     bool rope_on_ = false;               // a picture has been fed: the kernels read the rotary table
     const float* emb_rows_ = nullptr;    // the embeddings of the rows being run, in place of the tokens'
     int32_t img_start_ = 0;              // the first position of the block being fed

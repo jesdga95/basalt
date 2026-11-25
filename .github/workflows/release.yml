@@ -65,6 +65,7 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=OFF
+          -DBASALT_MODELS=all
           -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_arch }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache

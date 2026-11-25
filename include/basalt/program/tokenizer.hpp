@@ -66,6 +66,13 @@ private:
         uint64_t hash = 0;
         uint32_t key_off = 0, key_len = 0, ids_off = 0, ids_len = 0;   // key_len 0: empty slot
     };
+    struct HeapItem {
+        uint32_t rank;
+        uint32_t pos;
+        int32_t left;
+        int32_t right;
+        int32_t result;
+    };
 
     int32_t find_merge(int32_t left, int32_t right, uint32_t& rank) const;
     bool merge_piece(const uint8_t* p, size_t n, std::vector<int32_t>& out, std::string& err);
@@ -90,7 +97,10 @@ private:
     // scratch for the pre-tokenizer and the merger, kept between calls
     std::vector<size_t> ends_;
     std::vector<int32_t> sym_;
-    std::vector<uint32_t> rank_;
+    std::vector<int32_t> next_;
+    std::vector<int32_t> prev_;
+    std::vector<uint8_t> dead_;
+    std::vector<HeapItem> heap_;
 };
 
 }  // namespace basalt::program

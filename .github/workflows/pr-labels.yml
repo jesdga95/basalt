@@ -1,0 +1,104 @@
+name: pr-labels
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+  # Main moving can make any open PR conflict; a sweep every half hour labels those (GitHub has computed mergeable by then).
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number || 'sweep' }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      PR_NUM: ${{ github.event.pull_request.number || '' }}
+    steps:
+      - name: Sync PR labels
+        run: |
+          python3 - << 'EOF'
+          import json, os, re, subprocess, time
+
+          repo = os.environ["REPO"]
+          pr_num = os.environ.get("PR_NUM", "").strip()
+
+          spark_re = re.compile(r"\b(dgx[\s-]?spark|gb10|sm_121)\b|^spark[-/]", re.I)
+          multi_re = re.compile(
+              r"\b(multi[\s-]?gpu|multi[\s-]?card|peer[\s-]?(card|tier|ada|ampere|row|expert|gpu)|"
+              r"second card|layer[\s-]?split|prompt[\s-]?split|tensor[\s-]?parallel|sm_89|sm_86|sm_80)\b",
+              re.I,
+          )
+
+          def gh_json(*args):
+              return json.loads(subprocess.check_output(["gh", *args], text=True))
+
+          def add_label(num, label):
+              # A failed add (a transient API error, a race with the PR's own run) is logged; the next run retries it.
+              r = subprocess.run([
+                  "gh", "api", "--silent", "-X", "POST",
+                  f"repos/{repo}/issues/{num}/labels", "-f", f"labels[]={label}"
+              ])
+              if r.returncode != 0:
+                  print(f"#{num}: could not add {label}")
+              return r.returncode == 0
+
+          def rm_label(num, label):
+              subprocess.call([
+                  "gh", "api", "--silent", "-X", "DELETE",
+                  f"repos/{repo}/issues/{num}/labels/{label}"
+              ])
+
+          def fetch_pr(num):
+              return gh_json("api", f"repos/{repo}/pulls/{num}")
+
+          def sync_one(pr, polls):
+              num = pr["number"]
+              # Poll briefly if GitHub has not computed mergeable yet
+              for _ in range(polls):
+                  if pr.get("mergeable") is not None:
+                      break
+                  time.sleep(3)
+                  pr = fetch_pr(num)
+
+              labels = {l["name"] for l in pr.get("labels", [])}
+              title = pr.get("title") or ""
+              head = (pr.get("head") or {}).get("ref") or ""
+              mergeable = pr.get("mergeable")
+
+              # 1. rebase-needed: auto-add on conflict, auto-remove when mergeable
+              if mergeable is False and "rebase-needed" not in labels:
+                  if add_label(num, "rebase-needed"):
+                      print(f"#{num}: +rebase-needed")
+              elif mergeable is True and "rebase-needed" in labels:
+                  rm_label(num, "rebase-needed")
+                  print(f"#{num}: -rebase-needed")
+
+              # 2. hardware-specific labels (skip community benchmark rows)
+              if title.lower().startswith("community:"):
+                  return
+              # Title and branch are matched apart, so the branch prefix (^spark-) anchors on the branch.
+              def names(rx):
+                  return rx.search(title) or rx.search(head)
+              if names(spark_re) and "dgx-spark" not in labels and add_label(num, "dgx-spark"):
+                  print(f"#{num}: +dgx-spark")
+              if names(multi_re) and "multi-card" not in labels and add_label(num, "multi-card"):
+                  print(f"#{num}: +multi-card")
+
+          if pr_num:
+              sync_one(fetch_pr(pr_num), 4)
+          else:
+              # Scheduled or manual sweep of every open PR, without polling: a PR whose mergeable GitHub has not computed yet
+              # (reading it starts the computation) is labelled by the next sweep or its own next run.
+              pages = gh_json("api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100")
+              for p in (pr for page in pages for pr in page):
+                  sync_one(fetch_pr(p["number"]), 0)
+          EOF

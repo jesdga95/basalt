@@ -47,6 +47,11 @@ class LoadPlan;
 
 namespace detail {
 
+/// Space for one resident expert, including padding before the next registration boundary.
+inline uint64_t cache_complement_stride(uint64_t bytes, uint64_t alignment) {
+    return bytes + (alignment - bytes % alignment) % alignment;
+}
+
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
 inline constexpr uint64_t kNoCacheComplement = ~uint64_t{0};
 
