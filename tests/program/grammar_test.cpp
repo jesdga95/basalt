@@ -383,6 +383,27 @@ static void test_partial_utf8() {
     // a continuation byte after a finished character, or a bad lead, is refused
     GrammarState u(any);
     CHECK(!u.accept("\x80") && !u.accept("\xC0\x80") && !u.accept("\xFF"));
+    // partial UTF-8 prefixes whose only completions are surrogates (0xED 0xA0..0xBF) or > U+10FFFF (0xF4 0x90..0xBF)
+    // must be rejected before the dead continuation byte so masked sampling cannot deadlock
+    CHECK(!u.allows("\xED\xA0") && !u.allows("\xED\xBF") && u.allows("\xED\x9F"));
+    CHECK(!u.allows("\xF4\x90") && !u.allows("\xF4\xBF") && u.allows("\xF4\x8F"));
+    // negated character class excluding a single non-ASCII code point (or a sub-range): lead bytes that still have
+    // valid unexcluded completions must be allowed across token boundaries and in fill_mask()
+    auto not_e = parse("root ::= [^\\u00e9]");
+    GrammarState ne(not_e);
+    CHECK(ne.allows("\xC3\xA0") && !ne.allows("\xC3\xA9"));
+    CHECK(ne.allows("\xC3"));
+    ne.fill_mask(voc, mask);
+    CHECK(mask[0xC3] && !mask[256]);
+    CHECK(ne.accept("\xC3") && !ne.allows("\xA9") && ne.accept("\xA0") && ne.accepting());
+    // negated class excluding C1 controls (0x80..0x9F): lead byte 0xC2 still allows 0xA0..0xBF
+    auto not_c1 = parse("root ::= [^\\x7f-\\u009f]");
+    GrammarState nc1(not_c1);
+    CHECK(nc1.allows("\xC2") && nc1.accept("\xC2") && !nc1.allows("\x80") && nc1.accept("\xA0") && nc1.accepting());
+    // negated class covering the entire range of lead byte 0xC3 (U+00C0..U+00FF) across two adjacent ranges must reject 0xC3
+    auto not_c3 = parse("root ::= [^\\u00c0-\\u00df\\u00e0-\\u00ff]");
+    GrammarState nc3(not_c3);
+    CHECK(!nc3.allows("\xC3") && nc3.allows("\xC2"));
 }
 
 static double now_us() {

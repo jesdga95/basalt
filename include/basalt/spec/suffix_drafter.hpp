@@ -26,6 +26,8 @@ public:
     explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19);
 
     void reset();
+    /// Synchronize the history to `tokens[0..n)`: extends incrementally if the current history is a prefix, else resets.
+    void sync(const int32_t* tokens, size_t n);
     /// Add tokens to the history (the prompt, then every accepted token).
     void append(const int32_t* tokens, size_t n);
     void append(int32_t token) { append(&token, 1); }

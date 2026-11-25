@@ -474,7 +474,7 @@ def make_handler(target: Service | Router):
                 return
             if path == "/unload":                            # unload between requests
                 try:
-                    r = router.shown().unload()
+                    r = router.unload(router.shown())
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
@@ -510,7 +510,7 @@ def make_handler(target: Service | Router):
                         return
                     self.svc = target
                     if path in ("/v1/unload", "/models/unload"):
-                        result = target.unload()
+                        result = router.unload(target)
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
                     elif target.loading:                 # a load in progress: wait for it like any request

@@ -1297,6 +1297,445 @@ class RestartRaces(unittest.TestCase):
         self.assertTrue(e.slot_busy[0])
         self.assertFalse(e.slot_busy[1])
 
+    def test_waiter_refreshes_pmatch_after_busy_slot_finishes(self):
+        """A waiter that ran PMATCH while all slots were busy re-runs PMATCH once a slot finishes with cached state."""
+        import queue
+        from serve.engine.process import AdmissionQueue
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ctl = threading.Lock()
+        e.slot_cv = threading.Condition()
+        e.admission = AdmissionQueue()
+        e.batch = 2
+        e.max_context = 4096
+        e.info = {"slot0_solo": 1}
+        e.gen = 1
+        e.slot_busy = [True, True]
+        e.slot_held = [0, 0]
+        e.slot_epoch = [0, 0]
+        e.slot_used = [1.0, 2.0]   # slot 0 looks older; without refreshed PMATCH slot 0 would be chosen
+        e.slot_order = [0, 1]
+        e.slot_owner = {}
+        e.slot_thread = [None, None]
+        e.slot_q = [queue.Queue(), queue.Queue()]
+        e.slot_live = [None, None]
+        e.waiting = 0
+        e.ctl_epoch = 0
+        e._yielded = None
+
+        sent = []
+        meet_calls = [0]
+        e._send = sent.append
+        e.alive = lambda: True
+        e.eos_ids = lambda: set()
+        e._hold_prompt = lambda ids, emb: (1, len(ids))
+
+        def fake_meet(handle, born):
+            meet_calls[0] += 1
+            return [0, 0] if meet_calls[0] == 1 else [0, 50]
+
+        def fake_take_control(cancel, prompt_size, after_epoch=None):
+            e.ctl.acquire()
+            if False:
+                yield None
+            return True
+
+        def fake_control(cancel, on_tok, **kw):
+            e._ctl_result = ("badm", False, False)
+            if False:
+                yield None
+
+        e._meet = fake_meet
+        e._take_control = fake_take_control
+        e._control = fake_control
+
+        def finish_slots():
+            time.sleep(0.05)
+            # Both slots become idle; slot 1 now holds a matching 50-token prefix
+            e._hold(0, 0)
+            e._hold(1, 50)
+            with e.slot_cv:
+                e.slot_busy[0] = False
+                e.slot_busy[1] = False
+                e.slot_cv.notify_all()
+
+        t = threading.Thread(target=finish_slots)
+        t.start()
+        cancel = threading.Event()
+        list(e._generate_batched(list(range(60)), {"handle": 1, "gen": 1}, 60, 4, {}, cancel, None, None, None))
+        t.join(5)
+        self.assertEqual(meet_calls[0], 2)
+        bgen = [s for s in sent if s.startswith("BGEN ")]
+        self.assertEqual(len(bgen), 1, sent)
+        self.assertTrue(bgen[0].startswith("BGEN 1 "), bgen)
+
+    def test_release_slot_when_done_waits_for_bdone_when_not_cancelled(self):
+        """A non-cancelled early exit waits past BDONE_WAIT_S so the slot is idle and cached before Pass 2 runs PMATCH."""
+        import queue
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.slot_cv = threading.Condition()
+        e.slot_q = [queue.Queue()]
+        e.slot_busy = [True]
+        e.slot_held = [0]
+        e.slot_epoch = [0]
+        e.slot_drafts = [None]
+        e._send = lambda line: None
+        e.alive = lambda: True
+
+        def send_bdone():
+            time.sleep(0.15)
+            e.slot_q[0].put("BDONE 0 10 cancel 1.0")
+
+        t = threading.Thread(target=send_bdone)
+        t.start()
+        cancel = threading.Event()
+        f = e._release_slot_when_done(0, stream=42, wait_s=0.02, cancel=cancel)
+        t.join(5)
+        self.assertIsNotNone(f)
+        self.assertFalse(e.slot_busy[0])
+        self.assertEqual(e.slot_held[0], 41)
+
+    def test_budget_capped_pass_drains_natural_bdone_without_bstop(self):
+        """When a thinking-budget pass is capped at max_new=budget, Service drains natural BDONE instead of sending BSTOP."""
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja")
+        closed_early = []
+        passes = []
+
+        class CapEngine:
+            max_context = 4096
+            last = None
+
+            def generate(self, prompt, max_new, sampling, cancel, session=None, **kw):
+                passes.append(max_new)
+                done = False
+                try:
+                    if len(passes) == 1:
+                        # Emit exactly max_new reasoning tokens (no </think>) and finish cleanly
+                        for b in b"a" * max_new:
+                            yield b
+                        done = True
+                    else:
+                        for b in b"final answer":
+                            yield b
+                        yield 257
+                        done = True
+                finally:
+                    if not done:
+                        closed_early.append(len(passes))
+
+        svc = Service(CapEngine(), tok, tpl)
+        cancel = threading.Event()
+        ids = svc.encode_prompt([{"role": "user", "content": "hi"}], None, {"enable_thinking": True})
+        events = [ev for kind, ev in svc.run(ids, True, None, 64,
+                                             {"temperature": 0.0, "reasoning_budget_tokens": 5},
+                                             cancel) if kind == "event"]
+        self.assertNotIn(1, closed_early, "capped pass 1 should drain natural BDONE without early gen.close()")
+        self.assertEqual(passes[0], 5)
+        self.assertGreaterEqual(len(passes), 2)
+        self.assertIn("final answer", "".join(ev.text for ev in events if ev.kind == "content"))
+
+
+class ConcurrencyLifecycleResources(unittest.TestCase):
+    """Regression coverage for batch admission locking, ProcessEngine FD/EOF handling, _vram_command, and slot room."""
+
+    def test_batch_admission_blocks_unload_sleep_and_vram_during_ensure_loaded(self):
+        from serve.engine.errors import EngineStartError
+        from serve.engine.mock import MockEngine
+
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja")
+        entered, release = threading.Event(), threading.Event()
+        fail_load = [False]
+        unloads = []
+
+        class BatchEngine(MockEngine):
+            def __init__(self):
+                super().__init__(tok, "ok", max_context=4096, batch=2)
+                self.ctl = threading.Lock()
+                self.up = False
+
+            def alive(self):
+                return self.up
+
+            def can_sleep(self):
+                return True
+
+            def sleep(self, ram_check=None, timeout=120.0):
+                return {}
+
+            def unload(self):
+                unloads.append(1)
+                self.up = False
+
+            def vram(self, reserve_mib):
+                return {"reserve_mib": reserve_mib, "vram_free_mib": 1000, "expert_slots": 1}
+
+            def restart(self, tries=3):
+                entered.set()
+                release.wait(5)
+                if fail_load[0]:
+                    raise EngineStartError("boom", None)
+                self.up = True
+
+        eng = BatchEngine()
+        svc = Service(eng, tok, tpl)
+        ids = svc.encode_prompt([{"role": "user", "content": "hi"}], None, {})
+        observed = {}
+
+        # 1) During ensure_loaded() (even if fifo were free), live_reqs & status["busy"] are already set atomically.
+        def run_req():
+            for _ in svc.run(ids, False, None, 16, {}, threading.Event()):
+                pass
+
+        t = threading.Thread(target=run_req, daemon=True)
+        t.start()
+        self.assertTrue(entered.wait(5))
+        with svc.status_lock:
+            observed["live"] = len(svc.live_reqs)
+            observed["busy"] = svc.status.get("busy")
+            observed["queued"] = svc.status.get("queued")
+        self.assertEqual(observed, {"live": 1, "busy": True, "queued": 0})
+        self.assertEqual(svc.unload(), "busy")
+        self.assertEqual(svc.sleep(), "busy")
+        with svc.vram_cv:
+            svc.vram_queued = {"reserve_mib": 512}
+        self.assertIsNone(svc._apply_vram(0))
+        with svc.vram_cv:
+            svc.vram_queued = None
+        release.set()
+        t.join(10)
+        self.assertEqual(unloads, [])
+        self.assertEqual(svc.requests_done, 1)
+
+        # 2) If ensure_loaded() fails, live_reqs and busy are cleaned up and no bogus history entry is recorded.
+        eng.up = False
+        fail_load[0] = True
+        entered.clear()
+        release.set()
+        with self.assertRaises(EngineStartError):
+            list(svc.run(ids, False, None, 16, {}, threading.Event()))
+        with svc.status_lock:
+            self.assertEqual(svc.live_reqs, {})
+            self.assertFalse(svc.status.get("busy"))
+            self.assertEqual(svc.status.get("queued"), 0)
+        self.assertEqual(svc.requests_done, 1)
+        self.assertEqual(len(svc.history), 1)
+
+    def test_unload_acquires_ctl_and_checks_live_reqs_in_batch_mode(self):
+        from serve.engine.mock import MockEngine
+
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja")
+        unloads = []
+
+        class BatchEngine(MockEngine):
+            def __init__(self):
+                super().__init__(tok, "ok", max_context=4096, batch=2)
+                self.ctl = threading.Lock()
+                self.up = True
+
+            def alive(self):
+                return self.up
+
+            def unload(self):
+                unloads.append(1)
+                self.up = False
+
+        eng = BatchEngine()
+        svc = Service(eng, tok, tpl)
+        with eng.ctl:
+            self.assertEqual(svc.unload(), "busy")
+        self.assertEqual(unloads, [])
+        with svc.status_lock:
+            svc.live_reqs[1] = ({"busy": True}, [])
+        try:
+            self.assertEqual(svc.unload(), "busy")
+        finally:
+            with svc.status_lock:
+                svc.live_reqs.clear()
+        self.assertEqual(unloads, [])
+        self.assertEqual(svc.unload(), "unloaded")
+        self.assertEqual(unloads, [1])
+
+    def test_pump_pushes_eof_sentinels_on_unexpected_exception(self):
+        import queue
+
+        class ExplodingStdout:
+            def __iter__(self):
+                yield "INFO engine=1\n"
+                raise RuntimeError("unexpected pump failure")
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ended = False
+        e.proc = mock.Mock(stdout=ExplodingStdout())
+        e.lines = queue.Queue()
+        e.prompt_q = queue.Queue()
+        e.slot_q = [queue.Queue(), queue.Queue()]
+        e.log = None
+        with self.assertRaisesRegex(RuntimeError, "unexpected pump failure"):
+            e._pump()
+        self.assertTrue(e.ended)
+        self.assertIsNone(e.lines.get_nowait())
+        self.assertIsNone(e.prompt_q.get_nowait())
+        for q in e.slot_q:
+            self.assertIsNone(q.get_nowait())
+
+    def test_pump_lines_closes_stream_on_eof_and_error(self):
+        import io
+        from serve.engine.process import pump_lines
+
+        s1 = io.StringIO("a\nb\n")
+        seen = []
+        pump_lines(s1, seen.append)
+        self.assertEqual(seen, ["a\n", "b\n"])
+        self.assertTrue(s1.closed)
+
+        class BadStream:
+            closed = False
+
+            def __iter__(self):
+                raise OSError("pipe broken")
+
+            def close(self):
+                self.closed = True
+
+        s2 = BadStream()
+        pump_lines(s2, lambda _: None)
+        self.assertTrue(s2.closed)
+
+    def test_vram_command_retires_engine_on_timeout_and_uses_wlock(self):
+        import queue
+        from types import SimpleNamespace
+        from serve.engine.errors import EngineDied
+
+        stopped = []
+        writes = []
+
+        class TrackingLock:
+            def __init__(self):
+                self.acquired = 0
+
+            def __enter__(self):
+                self.acquired += 1
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ended = False
+        e.lines = queue.Queue()
+        e.wlock = TrackingLock()
+        e.proc = SimpleNamespace(
+            poll=lambda: None,
+            stdin=SimpleNamespace(write=writes.append, flush=lambda: None),
+            kill=lambda: stopped.append("kill"),
+            wait=lambda timeout=None: stopped.append("wait"),
+        )
+        with self.assertRaises(EngineDied):
+            e._vram_command("VRAM 1024", timeout=0.05)
+        self.assertEqual(writes, ["VRAM 1024\n"])
+        self.assertEqual(e.wlock.acquired, 1)
+        self.assertTrue(e.ended)
+        self.assertIn("VRAM command timed out", e.silent_note)
+        self.assertEqual(stopped, ["kill", "wait"])
+
+    def test_bgen_does_not_overflow_when_slot_room_exhausted(self):
+        import queue
+        from serve.engine.process import AdmissionQueue, SLOT_MARGIN
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ctl = threading.Lock()
+        e.slot_cv = threading.Condition()
+        e.admission = AdmissionQueue()
+        e.batch = 2
+        e.max_context = 64
+        e.info = {"slot0_solo": 1}
+        e.gen = 1
+        e.slot_busy = [False, False]
+        e.slot_held = [0, 0]
+        e.slot_epoch = [0, 0]
+        e.slot_used = [0.0, 0.0]
+        e.slot_order = [0, 1]
+        e.slot_owner = {}
+        e.slot_thread = [None, None]
+        e.slot_q = [queue.Queue(), queue.Queue()]
+        e.waiting = 0
+        e.ctl_epoch = 0
+        e._yielded = None
+        sent = []
+        e._send = sent.append
+        e.alive = lambda: True
+        e.eos_ids = lambda: set()
+        e._meet = lambda handle, born: [0, 0]
+
+        def fake_take_control(cancel, prompt_size, after_epoch=None):
+            e.ctl.acquire()
+            if False:
+                yield None
+            return True
+
+        e._take_control = fake_take_control
+        # Prompt leaves 0 tokens of room in the slot: must raise ValueError, NOT send BGEN <slot> 1.
+        prompt_len = e.max_context - SLOT_MARGIN
+        with self.assertRaisesRegex(ValueError, "leaves no room"):
+            list(e._generate_batched(list(range(prompt_len)), {"handle": 1, "gen": 1},
+                                     prompt_len, 4, {}, threading.Event(), None, None, None))
+        self.assertEqual([s for s in sent if s.startswith("BGEN ")], [])
+        self.assertFalse(any(e.slot_busy))
+        self.assertTrue(e.ctl.acquire(blocking=False))
+        e.ctl.release()
+
+    def test_init_failure_and_close_close_all_fds_independently(self):
+        import io
+        from serve.engine.errors import EngineStartError
+
+        class FailingClose:
+            def __init__(self):
+                self.called = False
+
+            def close(self):
+                self.called = True
+                raise OSError("bad fd")
+
+        # 1) close() still closes stderr and log and clears proc even if stdout.close() raises OSError.
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        proc = mock.Mock()
+        proc.stdin = FailingClose()
+        proc.stdout = FailingClose()
+        proc.stderr = io.StringIO()
+        proc.poll.return_value = 0
+        log_fp = io.StringIO()
+        e.proc = proc
+        e.log = log_fp
+        e.close()
+        self.assertTrue(proc.stdin.called)
+        self.assertTrue(proc.stdout.called)
+        self.assertTrue(proc.stderr.closed)
+        self.assertTrue(log_fp.closed)
+        self.assertIsNone(e.proc)
+        self.assertIsNone(e.log)
+
+        # 2) __init__ failure path closes stdin, stdout, stderr, and log even when wait() times out.
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "eng.log"
+            fake_proc = mock.Mock()
+            fake_proc.stdin = FailingClose()
+            fake_proc.stdout = io.StringIO("")  # immediate EOF -> max_context stays 0
+            fake_proc.stderr = io.StringIO()
+            fake_proc.wait.side_effect = subprocess.TimeoutExpired("basalt", 5)
+            with mock.patch("serve.engine.process.lifeline.popen", return_value=fake_proc), \
+                    mock.patch("serve.engine.process.narrate_start", lambda *a, **k: None):
+                with self.assertRaises(EngineStartError):
+                    ProcessEngine("basalt", [], log=str(log_path))
+            self.assertTrue(fake_proc.stdin.called)
+            self.assertTrue(fake_proc.stdout.closed)
+            self.assertTrue(fake_proc.stderr.closed)
+            # On Windows, unlinking log_path also proves the log file handle was closed.
+            log_path.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

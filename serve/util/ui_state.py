@@ -16,7 +16,7 @@ class UIState:
 
     def start(self):
         with self.cv:
-            if self.worker is None:
+            if not self.stop.is_set() and (self.worker is None or not self.worker.is_alive()):
                 self.worker = threading.Thread(target=self._run, daemon=True)
                 self.worker.start()
 
@@ -35,33 +35,43 @@ class UIState:
         return key
 
     def _run(self):
-        previous, deadline = None, 0
+        previous, deadline, last_error = None, 0, None
         while not self.stop.is_set():
-            key = self._key()
-            if key != previous or time.monotonic() >= deadline:
-                data = self.router.metrics(self.router.shown(), include_slots=True)
-                frame = b"event: state\ndata: " + json.dumps(data, ensure_ascii=False).encode() + b"\n\n"
-                with self.cv:
-                    self.frame = frame
-                    self.version += 1
-                    self.cv.notify_all()
-                previous, deadline = key, time.monotonic() + 1
+            try:
+                key = self._key()
+                if key != previous or time.monotonic() >= deadline:
+                    data = self.router.metrics(self.router.shown(), include_slots=True)
+                    frame = b"event: state\ndata: " + json.dumps(data, ensure_ascii=False).encode() + b"\n\n"
+                    with self.cv:
+                        self.frame = frame
+                        self.version += 1
+                        self.cv.notify_all()
+                    previous, deadline = key, time.monotonic() + 1
+                last_error = None
+            except Exception as e:
+                err = (type(e), str(e))
+                if err != last_error:
+                    print(f"[server] warning: UI state update failed ({str(e) or type(e).__name__})", flush=True)
+                    last_error = err
             self.stop.wait(.1)
 
     def close(self):
         self.stop.set()
         with self.cv:
             self.cv.notify_all()
-        if self.worker is not None:
-            self.worker.join(timeout=5)
+            worker = self.worker
+        if worker is not None:
+            worker.join(timeout=5)
 
 
 def stream_state(handler, state):
     if not state.clients.acquire(blocking=False):
         handler._json(503, {"error": {"message": "Too many UI streams (maximum 8)"}})
         return
-    timeout = handler.connection.gettimeout()
+    got_timeout = False
     try:
+        timeout = handler.connection.gettimeout()
+        got_timeout = True
         state.start()
         handler.connection.settimeout(5)
         handler._sse()
@@ -79,5 +89,10 @@ def stream_state(handler, state):
     except OSError:
         pass
     finally:
-        handler.connection.settimeout(timeout)
-        state.clients.release()
+        try:
+            if got_timeout:
+                handler.connection.settimeout(timeout)
+        except OSError:
+            pass
+        finally:
+            state.clients.release()

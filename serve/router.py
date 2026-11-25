@@ -62,6 +62,7 @@ class Router:
         self.queue: collections.deque[Turn] = collections.deque()
         self.running = 0                                # granted requests that have not left
         self.swap = None                                # the swap under way: {"from", "to", "phase", "since"}
+        self._unloading = None                          # active service being unloaded; holds new turns and swaps
         self.swaps = 0                                  # swaps done since start
         self.errors: dict[int, str] = {}                # id(service) -> its last load's failure, until one succeeds
         self.stopping = False
@@ -129,7 +130,7 @@ class Router:
         with self.cv:
             if self.stopping:
                 turn.state, turn.error = FAILED, EngineDied("the server is stopping")
-            elif self.current is svc and not self.swap and not self.queue:
+            elif self.current is svc and not self.swap and not self._unloading and not self.queue:
                 turn.state = GRANTED
                 self.running += 1
             else:
@@ -167,6 +168,7 @@ class Router:
         """Shutdown: the waiting requests get an error and no swap starts."""
         with self.cv:
             self.stopping = True
+            current = self.current
             for turn in self.queue:
                 turn.state, turn.error = FAILED, EngineDied("the server is stopping")
             self.queue.clear()
@@ -174,11 +176,57 @@ class Router:
         for svc in self.services:
             svc.stop()
         if self.cache is not None:                      # the loaded model ends first: a parked one gets its VRAM back to exit
-            for svc in ([self.current] if self.current else []) + self.cache.keys():
+            with self.park_lock:
+                parked = self.cache.keys()
+            for svc in ([current] if current else []) + parked:
                 close = getattr(svc.engine, "close", None)
                 if close is not None:
                     close()
         self.stop_telemetry()
+
+    def unload(self, svc, idle_for: float | None = None) -> str:
+        """Unload `svc`: evict a parked model without waking it; else stop its engine and clear `current`."""
+        if not self.multi:
+            return svc.unload(idle_for=idle_for)
+        if not hasattr(svc.engine, "unload"):
+            return "unsupported"
+        claimed = False
+        with self.cv:
+            if self.swap is not None and (self.swap["svc"] is svc or self.current is svc):
+                return "busy"
+            if self._unloading is svc or any(t.svc is svc for t in self.queue):
+                return "busy"
+            if self.current is svc:
+                if self.running > 0:
+                    return "busy"
+                self._unloading = svc
+                claimed = True
+        if claimed:
+            result = None
+            try:
+                result = svc.unload(idle_for=idle_for)
+                return result
+            finally:
+                with self.cv:
+                    if result in ("unloaded", "not loaded") and self.current is svc:
+                        self.current = None
+                    self._unloading = None
+                    self.cv.notify_all()
+        if self.cache is not None:
+            with self.park_lock:
+                self.prune()
+                if svc in self.cache:
+                    with self.cv:
+                        if (self.swap is not None and self.swap["svc"] is svc) or any(t.svc is svc for t in self.queue):
+                            return "busy"
+                    if idle_for is not None and time.time() - (svc.last_request_at or svc.started_at) < idle_for:
+                        return "busy"
+                    self._evict(svc, "unloaded" if idle_for is None else f"idle {idle_for:.0f} s")
+                    return "unloaded"
+        with self.cv:
+            if (self.swap is not None and self.swap["svc"] is svc) or any(t.svc is svc for t in self.queue):
+                return "busy"
+        return "not loaded"
 
     def vram(self, reserve_mib):
         """POST /v1/vram: the reserve is the machine's, so a model loaded later applies it too."""
@@ -229,9 +277,9 @@ class Router:
                     if self.stopping:
                         return
                     head = self.queue[0].svc if self.queue else None
-                    if head is not None and head is self.current:
+                    if head is not None and head is self.current and not self._unloading:
                         self._grant_batch(head)
-                    elif head is not None and self.running == 0:
+                    elif head is not None and self.running == 0 and not self._unloading:
                         break
                     else:
                         self.cv.wait()
@@ -254,17 +302,18 @@ class Router:
     def _swap(self, old, new, waiting: int) -> Exception | None:
         """End `old` (park it, with a cache), start `new` (wake it, when parked); the failure, or None."""
         t = time.time()
+        waking, parked_mib = False, 0
         if self.cache is not None:
-            self.prune()
-        waking = self.cache is not None and new in self.cache
+            with self.park_lock:
+                self.prune()
+                if new in self.cache:
+                    parked_mib = self.cache.take(new)
+                    waking = True
         new.load_kind, new.loading = "wake" if waking else "weights", True    # the status routes show the load from now on
         if hasattr(new.engine, "load_status"):
             new.engine.load_status = {}
-        print(f"[server] {f'swap {old.model} ->' if old else 'loading'} {new.model} ({waiting} waiting)", flush=True)
         try:
-            if waking:
-                with self.park_lock:
-                    self.cache.take(new)
+            print(f"[server] {f'swap {old.model} ->' if old else 'loading'} {new.model} ({waiting} waiting)", flush=True)
             if old is not None:
                 if self.cache is not None:
                     self._park(old)
@@ -278,7 +327,7 @@ class Router:
             print(f"[server] error: {new.model} did not load: {e}", flush=True)
             if waking and getattr(new.engine, "asleep", False) is True:     # a wake that was refused leaves it parked
                 with self.park_lock:
-                    self.cache.add(new, new.held_mib() or 0)
+                    self.cache.add(new, new.held_mib() or parked_mib)
             return e
         finally:
             new.loading = False
@@ -338,7 +387,7 @@ class Router:
               f"{gib(self.cache.budget_mib)} parked", flush=True)
 
     def prune(self) -> None:
-        """Forget parked models whose engine ended by itself (an idle unload)."""
+        """Forget parked models whose engine ended by itself."""
         with self.park_lock:
             for svc in self.cache.keys():
                 if not svc.engine.alive():

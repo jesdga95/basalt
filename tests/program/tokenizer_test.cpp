@@ -126,6 +126,25 @@ void synthetic() {
     CHECK((ids == std::vector<int32_t>{'x', 261, 'y'}));
     std::string bad;
     CHECK(!t.load("{\"a\":1", "", "[]", bad));
+
+    // qwen35 pre-tokenizer edge cases: contractions, numbers, punctuation + CRLF, whitespace lookahead, Unicode, invalid UTF-8
+    auto pieces = [](std::string_view s) {
+        std::vector<size_t> ends;
+        kQwen35(s.data(), s.size(), ends);
+        std::vector<std::string> out;
+        size_t start = 0;
+        for (size_t e : ends) { out.emplace_back(s.substr(start, e - start)); start = e; }
+        return out;
+    };
+    CHECK((pieces("it's YOU'RE 'll 'VE 'D") == std::vector<std::string>{"it", "'s", " YOU", "'RE", " '", "ll", " '", "VE", " '", "D"}));
+    CHECK((pieces("a   b  ") == std::vector<std::string>{"a", "  ", " b", "  "}));
+    CHECK((pieces(" ") == std::vector<std::string>{" "}));
+    CHECK((pieces(" !!\r\n12") == std::vector<std::string>{" !!\r\n", "1", "2"}));
+    CHECK((pieces(" \t\r\n  x") == std::vector<std::string>{" \t\r\n", " ", " x"}));
+    CHECK((pieces("caf\xC3\xA9 \xE4\xB8\xAD\xE6\x96\x87\xE3\x80\x80\xE3\x80\x80x") ==
+           std::vector<std::string>{"caf\xC3\xA9", " \xE4\xB8\xAD\xE6\x96\x87", "\xE3\x80\x80", "\xE3\x80\x80x"}));
+    CHECK((pieces("\xFF\xFE" "abc") == std::vector<std::string>{"\xFF\xFE", "abc"}));
+    CHECK((pieces("\xFF" "abc") == std::vector<std::string>{"\xFF" "abc"}));
 }
 
 int parity(const std::string& dir, const std::string& golden) {
