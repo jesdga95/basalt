@@ -1980,6 +1980,81 @@ void test_batch_window() {
     failures += !post_same + !moe_same;
 }
 
+
+// Multi-row sliding-window decode across a 64-key chunk boundary at position 2,556..2,563 (where early rows read the tail of
+// chunk 23 while later rows advance p_max into chunk 40): parity with CPU double and bitwise identity with single-row decode.
+void test_attention_window_boundary() {
+    for (const Kv kv : {kF16, kE4M3}) {
+        const int R = 8, p0 = 2556, cap = kExtent + 8;
+        std::vector<int> pos(R);
+        for (int r = 0; r < R; ++r) pos[r] = p0 + r;
+        const size_t rows = (size_t) kKvHeads * cap;
+        std::vector<uint8_t> kb(rows * kv_bytes(kv), 0), vb(rows * kv_bytes(kv), 0);
+        std::vector<double> kd(rows * kHeadDim), vd(rows * kHeadDim);
+        const std::vector<float> ksrc = fixed_values(rows * kHeadDim, 0.6f, 0x31c59a7du);
+        const std::vector<float> vsrc = fixed_values(rows * kHeadDim, 1.0f, 0x58e27b41u);
+        for (size_t i = 0; i < rows; ++i) {
+            put_row(kv, &ksrc[i * kHeadDim], &kb[i * kv_bytes(kv)], &kd[i * kHeadDim]);
+            put_row(kv, &vsrc[i * kHeadDim], &vb[i * kv_bytes(kv)], &vd[i * kHeadDim]);
+        }
+        const std::vector<float> q = fixed_values((size_t) R * kHeads * kHeadDim, 0.8f, 0x62d48f19u);
+        const std::vector<float> rs = fixed_values((size_t) R * kHeads * kRel, 1.0f, 0x19a35c87u);
+        const std::vector<float> sink = fixed_values((size_t) R * kHeads, 2.0f, 0x8b41e623u);
+        const std::vector<float> table = fixed_values((size_t) kRel * kExtent, 0.3f, 0x74f0b2d5u);
+        void *dk = dev(kb), *dv = dev(vb);
+        float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table);
+        float* out = zeros<float>((size_t) R * kHeads * kHeadDim);
+        int* dpos = dev(pos);
+        AttnArgs a;
+        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
+        kv_set(kv, a);
+        a.window = kExtent;
+        void* scr = zeros<uint8_t>(attention_decode_scratch(R, kExtent));
+        attention_decode(a, R, kExtent, scr, out, nullptr);
+        const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
+        std::vector<double> ref(got.size());
+        for (int r = 0; r < R; ++r)
+            for (int h = 0; h < kHeads; ++h) {
+                const int g = h / 3, lo = std::max(0, pos[r] - kExtent + 1);
+                std::vector<double> sc;
+                double m = sink[(size_t) r * kHeads + h];
+                for (int k = lo; k <= pos[r]; ++k) {
+                    double d = 0;
+                    for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kd[((size_t) (k % cap) * kKvHeads + g) * kHeadDim + i];
+                    d *= a.scale;
+                    const int dist = pos[r] - k;
+                    if (dist < kExtent)
+                        for (int i = 0; i < kRel; ++i) d += (double) rs[((size_t) r * kHeads + h) * kRel + i] * table[(size_t) i * kExtent + dist];
+                    sc.push_back(d);
+                    m = std::max(m, d);
+                }
+                double den = std::exp(sink[(size_t) r * kHeads + h] - m);
+                for (double& sv : sc) den += (sv = std::exp(sv - m));
+                for (int i = 0; i < kHeadDim; ++i) {
+                    double acc = 0;
+                    for (int k = lo; k <= pos[r]; ++k) acc += sc[(size_t) (k - lo)] * vd[((size_t) (k % cap) * kKvHeads + g) * kHeadDim + i];
+                    ref[((size_t) r * kHeads + h) * kHeadDim + i] = acc / den;
+                }
+            }
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "attention (window boundary, 8 rows%s)", kv_tag(kv));
+        report(tag, got, ref, 2e-3);
+        float* out1 = zeros<float>((size_t) R * kHeads * kHeadDim);
+        for (int r = 0; r < R; ++r) {
+            AttnArgs one = a;
+            one.q = dq + (size_t) r * kHeads * kHeadDim;
+            one.r = drs + (size_t) r * kHeads * kRel;
+            one.sink = dsink + (size_t) r * kHeads;
+            one.pos = dpos + r;
+            attention_decode(one, 1, kExtent, scr, out1 + (size_t) r * kHeads * kHeadDim, nullptr);
+        }
+        const std::vector<float> solo = host(out1, got.size());
+        same_bits("  8-row batch vs each row alone", solo.data(), got.data(), got.size() * 4);
+        cudaFree(dk); cudaFree(dv); cudaFree(dq); cudaFree(drs); cudaFree(dsink); cudaFree(dt);
+        cudaFree(out); cudaFree(out1); cudaFree(dpos); cudaFree(scr);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2008,6 +2083,7 @@ int main() {
     time_cpu_handoff();
     test_heat_fold();
     test_batch_window();
+    test_attention_window_boundary();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }
