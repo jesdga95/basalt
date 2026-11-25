@@ -43,8 +43,8 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# Two architectures: 120 (the full engine) and 89 (Ada, e.g. -DCMAKE_CUDA_ARCHITECTURES=89), where the kernels that
-# need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers take the
+# Architectures: 120 (the full engine; 121 on Arm64, the GB10/N1X family) and 89 (Ada, e.g. -DCMAKE_CUDA_ARCHITECTURES=89), where the
+# kernels that need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers take the
 # plain kernels instead.
 if(PEER_ADA)
   set(_basalt_has_89 FALSE)
@@ -61,10 +61,10 @@ endif()
 set(_basalt_has_sm90 FALSE)
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT (_base STREQUAL "120" OR _base STREQUAL "89"))
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 and 8.9 only")
+  if(NOT (_base STREQUAL "120" OR _base STREQUAL "121" OR _base STREQUAL "89"))
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0, 12.1 and 8.9 only")
   endif()
-  if(_base STREQUAL "120")
+  if(_base STREQUAL "120" OR _base STREQUAL "121")
     set(_basalt_has_sm90 TRUE)
   endif()
 endforeach()
