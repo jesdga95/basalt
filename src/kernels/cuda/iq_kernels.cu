@@ -3516,7 +3516,7 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
 #undef GU_MIX_CASE
             default: basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d", L.gu_type, L.up_type); std::exit(1);
         }
-    } else if (!v1 && !g_old_kernels && L.gu_type == 40 && cap_entries >= 256 && L.n_embd == 2304 && L.n_ff % 16 == 0) {
+    } else if (!v1 && !g_old_kernels && L.gu_type == 40 && cap_entries >= 160 && L.n_embd == 2304 && L.n_ff % 16 == 0) {
         const dim3 gm((unsigned) (2 * L.n_ff / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
         native_gu_nvfp4_mma_kernel<<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     } else
@@ -3559,7 +3559,7 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     if (g_exp_phase == 1) return;
     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
-    if (!v1 && !g_old_kernels && L.d_type == 40 && cap_entries >= 256 && L.n_ff == 1152 && L.n_embd % 32 == 0) {
+    if (!v1 && !g_old_kernels && L.d_type == 40 && cap_entries >= 160 && L.n_ff == 1152 && L.n_embd % 32 == 0) {
         const dim3 gm((unsigned) (L.n_embd / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
         if (chain) launch_dependent(native_down_nvfp4_mma_kernel<true>, gm, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else native_down_nvfp4_mma_kernel<false><<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);

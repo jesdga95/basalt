@@ -204,12 +204,13 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
 #pragma unroll
             for (int t = 0; t < NT; ++t) acc[mt][t][0] = acc[mt][t][1] = acc[mt][t][2] = acc[mt][t][3] = 0.0f;
 
-        // the activations of chunk i + 1 load while chunk i computes (not at NT 4: no registers to spare)
+        // the activations of chunk i + 1 load while chunk i computes (NT <= 2), per-chunk (NT == 4), or per-subchunk (NT == 8)
         constexpr bool kAhead = NT <= 2;
-        uint4 na[KB][NT], nb[KB][NT];
+        constexpr int kHoldB = NT <= 4 ? KB : 1;
+        uint4 na[kHoldB][NT], nb[kHoldB][NT];
         auto load_x = [&](int i) {
 #pragma unroll
-            for (int b = 0; b < KB; ++b)
+            for (int b = 0; b < kHoldB; ++b)
 #pragma unroll
                 for (int t = 0; t < NT; ++t) {
                     const uint16_t* xp = xcol[t] + k0 + i * CH + b * 64;
@@ -220,15 +221,17 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
         if constexpr (kAhead) load_x(0);
         for (int i = 0; i < n; ++i, ++q) {
             issue_next();
-            if constexpr (!kAhead) load_x(i);
-            uint4 xa[KB][NT], xb[KB][NT];
+            if constexpr (!kAhead && NT <= 4) load_x(i);
+            uint4 xa[kHoldB][NT], xb[kHoldB][NT];
+            if constexpr (NT <= 4) {
 #pragma unroll
-            for (int b = 0; b < KB; ++b)
+                for (int b = 0; b < kHoldB; ++b)
 #pragma unroll
-                for (int t = 0; t < NT; ++t) {
-                    xa[b][t] = na[b][t];
-                    xb[b][t] = nb[b][t];
-                }
+                    for (int t = 0; t < NT; ++t) {
+                        xa[b][t] = na[b][t];
+                        xb[b][t] = nb[b][t];
+                    }
+            }
             if (kAhead && i + 1 < n) load_x(i + 1);
             cp_wait<ST - 1>();
             __syncthreads();
@@ -294,10 +297,19 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                             a3[s] = h1[2 * s + 1];
                         }
                     }
+                    if constexpr (NT > 4) {
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            const uint16_t* xp = xcol[t] + k0 + i * CH + b * 64;
+                            xa[0][t] = live[t] ? ld_nc16(xp) : make_uint4(0, 0, 0, 0);
+                            xb[0][t] = live[t] ? ld_nc16(xp + 8) : make_uint4(0, 0, 0, 0);
+                        }
+                    }
+                    const int bi = NT <= 4 ? b : 0;
 #pragma unroll
                     for (int t = 0; t < NT; ++t) {
-                        const unsigned xw[8] = {xa[b][t].x, xa[b][t].y, xa[b][t].z, xa[b][t].w,
-                                                xb[b][t].x, xb[b][t].y, xb[b][t].z, xb[b][t].w};
+                        const unsigned xw[8] = {xa[bi][t].x, xa[bi][t].y, xa[bi][t].z, xa[bi][t].w,
+                                                xb[bi][t].x, xb[bi][t].y, xb[bi][t].z, xb[bi][t].w};
 #pragma unroll
                         for (int s = 0; s < 4; ++s) mma(acc[mt][t], a0[s], a1[s], a2[s], a3[s], xw[2 * s], xw[2 * s + 1]);
                     }

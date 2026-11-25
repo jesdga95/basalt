@@ -194,7 +194,7 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             return false;
         }
         if (w.solo) {
-            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
+            const double ms = s.window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
             if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
             else bpolicy->observe_window(w.chance, T, a, ms);
         }
@@ -243,7 +243,7 @@ bool Runtime::batch_round() {
     // serves all, the rows going to the drafts likeliest kept.  Drafters that set their own length: each window as it would
     // run alone, shared max-min fairly when they do not fit (a window held to fewer takes its drafts again within its share)
     constexpr int kShortSpecCap = 16;
-    constexpr int kLongSpecCap = 28;
+    constexpr int kLongSpecCap = 35;
     const int n_act = (int) act.size();
     int64_t max_pos = 0;
     for (int i = 0; i < n_act; ++i) max_pos = std::max(max_pos, bs[(size_t) act[(size_t) i]].p);
