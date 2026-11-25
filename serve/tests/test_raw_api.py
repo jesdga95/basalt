@@ -24,13 +24,15 @@ NAMES_DEFAULT_ORDER = ["rep_pen", "top_k", "top_a", "tfs", "typical", "top_p", "
 
 
 class RawApi(unittest.TestCase):
+    FLAGS = {"more_samplers": True, "gbnf_grammar": True}
+
     def setUp(self):
         tok = ByteTokenizer()
         self.tok = tok
         self.engine = ResidentEngine(tok)
         self.engine.reply = MockEngine(tok, SCRIPT, max_context=4096)
         template = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
-        self.svc = Service(self.engine, tok, template, more_samplers=True, gbnf_grammar=True)
+        self.svc = Service(self.engine, tok, template, **self.FLAGS)
         self.httpd = serve(self.svc, port=0)
         self.port = self.httpd.server_address[1]
 
@@ -263,6 +265,91 @@ class KoboldExtras(RawApi):
         status, body = self.get("/api/extra/version")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["result"], "KoboldCpp")
+
+
+class RequestGrammar(RawApi):
+    """A request's own `grammar` / `grammar_schema` on every generation API, behind --gbnf-grammar on."""
+    GBNF = 'root ::= "yes" | "no"'
+    SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+    CHAT = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
+    ENDPOINTS = (
+        ("/v1/completions", {"prompt": "Hi", "max_tokens": 8}),
+        ("/api/v1/generate", {"prompt": "Hi", "max_length": 8}),
+        ("/v1/chat/completions", CHAT),
+        ("/v1/messages", CHAT),
+        ("/v1/responses", {"input": "Hi", "max_output_tokens": 8}),
+    )
+
+    def engine_grammar(self, path, body):
+        del self.engine.reply.requests[:]
+        status, text = self.post(path, body)
+        return status, self.engine.reply.requests[-1][1].get("_grammar") if self.engine.reply.requests else None, text
+
+    def test_a_gbnf_grammar_reaches_the_engine_from_every_endpoint(self):
+        for path, body in self.ENDPOINTS:
+            with self.subTest(endpoint=path):
+                status, grammar, text = self.engine_grammar(path, {**body, "grammar": self.GBNF})
+                self.assertEqual(status, 200, text)
+                self.assertEqual((grammar["kind"], grammar["bnf"]), ("gbnf", self.GBNF))
+
+    def test_a_json_schema_reaches_the_engine_from_every_endpoint(self):
+        for path, body in self.ENDPOINTS:
+            for schema in (self.SCHEMA, json.dumps(self.SCHEMA)):
+                with self.subTest(endpoint=path, schema=type(schema).__name__):
+                    status, grammar, text = self.engine_grammar(path, {**body, "grammar_schema": schema})
+                    self.assertEqual(status, 200, text)
+                    self.assertEqual((grammar["kind"], grammar["schema"]), ("json_schema", self.SCHEMA))
+
+    def test_the_raw_apis_hold_their_grammar_from_the_first_token_and_the_chat_apis_let_the_request_think(self):
+        status, grammar, _ = self.engine_grammar("/v1/completions", {"prompt": "Hi", "max_tokens": 8, "grammar": self.GBNF})
+        self.assertEqual(grammar.get("think"), False)
+        for path, body in self.ENDPOINTS[2:]:
+            status, grammar, _ = self.engine_grammar(path, {**body, "grammar": self.GBNF})
+            self.assertIsNone(grammar.get("think"))            # the chat path decides, from the request's thinking
+
+    def test_on_the_chat_apis_the_grammar_takes_the_place_of_the_response_format(self):
+        body = {**self.CHAT, "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": self.SCHEMA}},
+                "grammar": self.GBNF}
+        status, grammar, text = self.engine_grammar("/v1/chat/completions", body)
+        self.assertEqual((status, grammar["kind"]), (200, "gbnf"))
+
+    def test_a_request_cannot_hold_both_tools_and_a_grammar(self):
+        tools = [{"type": "function", "function": {"name": "look", "description": "d", "parameters": {"type": "object",
+                                                                                                     "properties": {}}}}]
+        status, text = self.post("/v1/chat/completions", {**self.CHAT, "tools": tools, "grammar": self.GBNF})
+        self.assertEqual(status, 400)
+        self.assertIn("both tools and a grammar", text)
+
+    def test_without_tools_the_grammar_of_a_chat_request_needs_no_response_format(self):
+        status, grammar, _ = self.engine_grammar("/v1/chat/completions", {**self.CHAT})
+        self.assertEqual((status, grammar), (200, None))
+
+
+class RequestGrammarFlagOff(RawApi):
+    """The same requests with the flag off: a 400 that names the flag, on every endpoint, never silence."""
+    FLAGS = {"more_samplers": True}
+    GBNF, SCHEMA = RequestGrammar.GBNF, RequestGrammar.SCHEMA
+
+    def test_every_endpoint_refuses_and_names_the_flag(self):
+        for path, body in RequestGrammar.ENDPOINTS:
+            for field in ({"grammar": self.GBNF}, {"grammar_schema": self.SCHEMA}):
+                with self.subTest(endpoint=path, field=list(field)[0]):
+                    status, text = self.post(path, {**body, **field})
+                    self.assertEqual(status, 400)
+                    self.assertIn("--gbnf-grammar on", text)
+
+
+class RequestGrammarNoEngineGrammar(RawApi):
+    """The flag on, but the engine has no --grammar: refused the same way rather than served unconstrained."""
+    FLAGS = {"more_samplers": True, "gbnf_grammar": True, "grammar_engine": False}
+    GBNF = RequestGrammar.GBNF
+
+    def test_every_endpoint_refuses_and_names_the_flag(self):
+        for path, body in RequestGrammar.ENDPOINTS:
+            with self.subTest(endpoint=path):
+                status, text = self.post(path, {**body, "grammar": self.GBNF})
+                self.assertEqual(status, 400)
+                self.assertIn("--gbnf-grammar on", text)
 
 
 if __name__ == "__main__":
