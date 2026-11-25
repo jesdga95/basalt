@@ -84,26 +84,26 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
         : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
 }
-__device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
+[[maybe_unused]] __device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
 }
-__device__ __forceinline__ void mb_wait(unsigned long long* b, unsigned phase) {
+[[maybe_unused]] __device__ __forceinline__ void mb_wait(unsigned long long* b, unsigned phase) {
     asm volatile("{\n.reg .pred d;\nw_%=:\nmbarrier.try_wait.parity.shared::cta.b64 d, [%0], %1, %2;\n@d bra e_%=;\nbra w_%=;\ne_%=:\n}\n"
                  ::"r"(su(b)), "r"(phase), "r"(0x989680u) : "memory");
 }
-__device__ __forceinline__ void mb_arrive(unsigned long long* b) {
+[[maybe_unused]] __device__ __forceinline__ void mb_arrive(unsigned long long* b) {
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(su(b)) : "memory");
 }
-__device__ __forceinline__ void mb_expect(unsigned long long* b, unsigned bytes) {
+[[maybe_unused]] __device__ __forceinline__ void mb_expect(unsigned long long* b, unsigned bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(su(b)), "r"(bytes) : "memory");
 }
-__device__ __forceinline__ void cp_mb_arrive(unsigned long long* b) {
+[[maybe_unused]] __device__ __forceinline__ void cp_mb_arrive(unsigned long long* b) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(su(b)) : "memory");
 }
-__device__ __forceinline__ void cp16(void* dst, const void* src) {
+[[maybe_unused]] __device__ __forceinline__ void cp16(void* dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(su(dst)), "l"(src) : "memory");
 }
-__device__ __forceinline__ void tma2d(void* dst, const TmaDesc* m, int k, int r, unsigned long long* b) {
+[[maybe_unused]] __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* m, int k, int r, unsigned long long* b) {
     asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  ::"r"(su(dst)), "l"(m), "r"(k), "r"(r), "r"(su(b)) : "memory");
 }
@@ -111,12 +111,12 @@ __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^
 
 __global__ __launch_bounds__(160, 2)
 void gemm_64x64_ws_kernel(const __grid_constant__ Args p) {
-    constexpr int BT = 64, BR = 64, WT = 2, WR = 2;
-    constexpr int WTOK = 32, WROW = 32, MT = 2, MR = 4;
-    constexpr int ACT_B = ST * BT * BK, W_B = ST * BR * BK;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     if (threadIdx.x == 0) __trap();   // TMA and mbarrier transaction counts: gemm_ada_kernel runs below compute capability 9.0
 #else
+    constexpr int BT = 64, BR = 64, WT = 2, WR = 2;
+    constexpr int WTOK = 32, WROW = 32, MT = 2, MR = 4;
+    constexpr int ACT_B = ST * BT * BK, W_B = ST * BR * BK;   // tile constants: read only above sm_90
     extern __shared__ __align__(1024) unsigned char raw[];
     unsigned char* act = raw;
     unsigned char* wt = raw + ACT_B;
@@ -472,12 +472,12 @@ bool tma_device() {
 
 __global__ __launch_bounds__(512, 1)
 void gemm_128x128_u16_kernel(const __grid_constant__ Args p) {
-    constexpr int BT = 128, BR = 128, WR = 4;
-    constexpr int WTOK = 32, WROW = 32, MT = 2, MR = 4;
-    constexpr int ACT_B = ST * BT * BK, W_B = ST * BR * BK;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     __trap();   // TMA and mbarrier transaction counts: gemm_ada_kernel runs below compute capability 9.0
 #else
+    constexpr int BT = 128, BR = 128, WR = 4;
+    constexpr int WTOK = 32, WROW = 32, MT = 2, MR = 4;
+    constexpr int ACT_B = ST * BT * BK, W_B = ST * BR * BK;   // tile constants: read only above sm_90
 
     extern __shared__ __align__(1024) unsigned char raw[];
     unsigned char* act = raw;
