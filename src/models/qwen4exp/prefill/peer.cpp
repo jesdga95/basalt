@@ -1,3 +1,4 @@
+#include "basalt/core/gpu_mem_info.hpp"
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
@@ -91,7 +92,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, std::string& err) {
     size_t fb = 0, tb = 0;
     {
         const core::OnDevice od(pp->dev);
-        cudaMemGetInfo(&fb, &tb);
+        basalt::core::gpu_mem_info(&fb, &tb);
     }
     if (!ok) {
         cudaGetLastError();

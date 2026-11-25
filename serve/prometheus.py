@@ -221,9 +221,12 @@ def render_prometheus(entries: list[tuple[dict, dict]]) -> str:
               ml, float(totals.get("prompt_ms") or 0.0) / 1000.0)
         b.add("basalt_decode_seconds_total", "counter", "Total time spent in token generation in seconds.",
               ml, float(totals.get("decode_ms") or 0.0) / 1000.0)
-        if engine.get("spill") is not None:
+        spill = engine.get("spill")
+        if isinstance(spill, dict):
+            spill = spill.get("experts")
+        if spill is not None:
             b.add("basalt_experts_spilled", "gauge", "Number of routed experts spilled to disk.",
-                  ml, int(engine["spill"]))
+                  ml, int(spill))
         if engine.get("expert_total") is not None:
             b.add("basalt_experts", "gauge", "Total number of routed experts.",
                   ml, int(engine["expert_total"]))

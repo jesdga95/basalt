@@ -5,6 +5,7 @@
 // and the decode window's fused kernels against the references and the kernels they replace, their q8_1 blocks against a
 // CPU rounding of their own fp32 rows. Every kernel is checked for a row's bits not depending on the rows beside it, and
 // timed. Exit 77 without a GPU.
+#include "basalt/core/device_copy.hpp"
 #include "../cpu_expert_drain.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -55,12 +56,12 @@ std::vector<float> fixed_values(size_t n, float scale, uint32_t state) {
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
-    cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return p;
 }
 template <class T> std::vector<T> host(const T* d, size_t n) {
     std::vector<T> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 // Device memory of `n` bytes filled with 0xa5: what a kernel leaves unwritten shows.
@@ -396,8 +397,8 @@ void test_prepare() {
         for (const Kv kv : kAllKv) {
             const size_t kvb = (size_t) kKvHeads * cap * kv_bytes(kv);
             uint8_t *kcache = poisoned(kvb), *vcache = poisoned(kvb);
-            cudaMemcpy(dkr, kr.data(), kr.size() * 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(dvr, vr.data(), vr.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(dkr, kr.data(), kr.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(dvr, vr.data(), vr.size() * 4, cudaMemcpyHostToDevice);
             a.k_cache = kcache; a.v_cache = vcache;
             kv_set(kv, a);
             attn_prepare(a, R, nullptr);
@@ -1166,7 +1167,7 @@ void test_expert_prefetch() {
     // experts in RAM (0 in the table, the CPU's) are skipped: some of them, then all
     for (int all : {0, 1}) {
         for (int e = 0; e < NE; ++e) tab[e] = all || e % 2 ? 0ull : (unsigned long long) (blobs + (size_t) e * blob);
-        cudaMemcpy(dtab, tab.data(), NE * sizeof(tab[0]), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(dtab, tab.data(), NE * sizeof(tab[0]), cudaMemcpyHostToDevice);
         expert_prefetch(dids, (int) ids.size(), dtab, blob, sink, nullptr);
         const bool skip_ok = cudaDeviceSynchronize() == cudaSuccess;
         std::printf("%-34s %s\n", all ? "expert_prefetch: every one in RAM" : "expert_prefetch: some in RAM", skip_ok ? "ok" : "FAIL");
@@ -1381,9 +1382,9 @@ void test_cpu_ring() {
                 uint32_t grows = 0;
                 for (int p = 0; p < pairs; ++p)
                     if (!tab[(size_t) gids[(size_t) p]]) grows |= 1u << (p / K);
-                cudaMemcpy(di, gids.data(), gids.size() * 4, cudaMemcpyHostToDevice);
-                cudaMemcpy(dx, gx.data(), gx.size() * 4, cudaMemcpyHostToDevice);
-                cudaMemcpy(dy, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(di, gids.data(), gids.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dx, gx.data(), gx.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dy, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
                 poison();
                 sv.replay.store(replay);
                 cudaGraphLaunch(exec, st);

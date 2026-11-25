@@ -14,6 +14,7 @@
 // The layer split (model.hpp card_of): the second card runs its layers' visits on its own scratch and streams, and a window
 // crosses between the cards where walk.hpp's split_walk says, the row buffers the next card reads going through page-locked
 // RAM (consumer cards have no peer access). The whole window, both cards' launches and the crossings, is one graph.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/elastic_kv.hpp"
@@ -368,7 +369,7 @@ public:
             visit_layer_ = (int32_t*) alloc(g_.visits.size() * 4, ok);
             std::vector<int32_t> layer;
             for (const Visit& v : g_.visits) layer.push_back(v.layer);
-            if (ok && cudaMemcpy(visit_layer_, layer.data(), layer.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+            if (ok && basalt::core::device_copy(visit_layer_, layer.data(), layer.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
         }
         rec_blobs_ = (unsigned long long*) alloc((size_t) g_.visits.size() * kAheadExperts * 8, ok);
         rec_n_ = (int32_t*) alloc((size_t) g_.visits.size() * 4, ok);
@@ -723,7 +724,7 @@ public:
 
     model::Result copy_logits(int row, float* out) override {
         if (row < 0 || row >= head_rows_) return {model::Status::Error, "inkling2: no logits for that row"};
-        if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (basalt::core::device_copy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
             return {model::Status::Error, "inkling2: copying the logits failed"};
         return {};
     }
@@ -920,7 +921,7 @@ public:
             Session& o = *owners[i];
             samples[i].resize((size_t) expert_pairs());
             if (cudaStreamSynchronize(o.stream_) != cudaSuccess ||
-                cudaMemcpy(samples[i].data(), o.heat_tally_, samples[i].size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                basalt::core::device_copy(samples[i].data(), o.heat_tally_, samples[i].size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
                 m_.wedge();   // no ranking from a partial sample
                 basalt::log::error("basalt inkling2", "expert lookup counters could not be read; restart the engine");
                 return false;
@@ -1084,7 +1085,7 @@ public:
             k.v.resize_for_overwrite(run);
             const auto down = [](const void* dev, core::ConversationBuffer& to) {
                 return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                    return basalt::core::device_copy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
                 });
             };
             if (!down(c.k, k.k) || !down(c.v, k.v)) return {model::Status::Error, "inkling2: reading a cache back failed"};
@@ -1108,7 +1109,7 @@ public:
                 return {model::Status::Error, "inkling2: a parked conversation has other caches"};
             const auto up = [&](void* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                    return basalt::core::device_copy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
                 });
             };
             if (!up(c.k, kv[i].k) || !up(c.v, kv[i].v)) return {model::Status::Error, "inkling2: writing a cache back failed"};
@@ -1183,7 +1184,7 @@ private:
         std::vector<uint32_t> c(t.size());
         for (const Lane& k : lane_) {
             if (!k.ex_tally) continue;
-            if (cudaMemcpy(c.data(), k.ex_tally, c.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            if (basalt::core::device_copy(c.data(), k.ex_tally, c.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
             for (size_t i = 0; i < t.size(); ++i) t[i] += c[i];
         }
         return true;

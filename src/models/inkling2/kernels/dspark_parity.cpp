@@ -2,6 +2,7 @@
 // accumulation) at the drafter's geometry: the target features' mixes (and a row's bits alone), the block's inputs, the
 // Markov recurrence, the screened head over the whole vocabulary (against its exact rows, its tie rule), the head folds and
 // the recurrence's split. Each is timed. Exit 77 without a GPU.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -40,13 +41,13 @@ std::vector<float> randn(size_t n, float s = 1.f, float mean = 0.f) {
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
-    cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return p;
 }
 template <class T> std::vector<T> host(const T* d, size_t n) {
     std::vector<T> h(n);
     cudaDeviceSynchronize();
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 template <class T> T* zeros(size_t n) {
@@ -432,9 +433,9 @@ void test_head() {
         std::memcpy(&h2[(size_t) 777 * (E / 32) * 34], &head[(size_t) 150000 * (E / 32) * 34], (size_t) (E / 32) * 34);
         std::memcpy(&f2[(size_t) 777 * (kDsRank / 32) * 34], &fold[(size_t) 150000 * (kDsRank / 32) * 34], (size_t) (kDsRank / 32) * 34);
         fb2[777] = fb[150000];
-        cudaMemcpy(d_head, h2.data(), h2.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fold, f2.data(), f2.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fb, fb2.data(), fb2.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_head, h2.data(), h2.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fold, f2.data(), f2.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fb, fb2.data(), fb2.size() * 4, cudaMemcpyHostToDevice);
         dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
         dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
         dspark_screen_order(d_fb, V, d_fbp, nullptr);
@@ -443,9 +444,9 @@ void test_head() {
         bool ok = differ == 0;
         for (int i = 0; i < R; ++i) ok = ok && ids[i] == 777;
         check("head: a tie takes the lower row", ok);
-        cudaMemcpy(d_head, head.data(), head.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fold, fold.data(), fold.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fb, fb.data(), fb.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_head, head.data(), head.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fold, fold.data(), fold.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fb, fb.data(), fb.size() * 4, cudaMemcpyHostToDevice);
         dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
         dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
         dspark_screen_order(d_fb, V, d_fbp, nullptr);

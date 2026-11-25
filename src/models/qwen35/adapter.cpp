@@ -1,5 +1,6 @@
 // src/models/qwen35/adapter.cpp - the Qwen3.5-family dense hybrid (Qwen3.8-27B): registers the architecture, reads its
 // pack into the shared dense stack and hands out its sessions.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "models/qwen35/adapter.hpp"
 
 #include "basalt/core/diag.hpp"
@@ -109,11 +110,11 @@ model::SplitSpec plan_pack(const GgufFile& gg, const dense::Geometry& g, const d
     size_t main_free = 0, peer_free = 0, total = 0;
     {
         const core::OnDevice on(0);
-        cudaMemGetInfo(&main_free, &total);
+        basalt::core::gpu_mem_info(&main_free, &total);
     }
     {
         const core::OnDevice on(peer);
-        cudaMemGetInfo(&peer_free, &total);
+        basalt::core::gpu_mem_info(&peer_free, &total);
     }
     constexpr uint64_t kMargin = 512ull << 20;
     const uint64_t reserve = ((uint64_t) std::max(reserve_mib, 0) << 20) + kMargin;
@@ -284,7 +285,7 @@ private:
             d.present = true;
         }
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         basalt::log::info("basalt qwen35", "%zu tensors, %.2f GiB on the GPU, %.2f GiB of embedding in page-locked RAM; "
                           "%.2f GiB free", n_tensors_, (double) dev_bytes_ / 1073741824.0, (double) tensor_payload_bytes(*te) / 1073741824.0,
                           (double) free_b / 1073741824.0);

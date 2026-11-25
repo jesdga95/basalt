@@ -207,7 +207,9 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 - **Thinking:** the template writes an effort level into a system message: `reasoning_effort` `none` (0), `minimal` (0.1),
   `low` (0.2), `medium` (0.7), `high` (0.9, the template's default), `xhigh` and `max` (0.99), or a number from 1 to 100 as
   hundredths (at most 0.99). There is no hard switch: at `none` the model still writes a short thinking block (a few hundred
-  tokens), so leave room in `max_tokens`.
+  tokens), so leave room in `max_tokens`. As a practical floor, use 1,024 tokens for short answers and 2,048 when evaluating
+  answer quality; a 512-token cap can end with `length` before the answer is complete. If that happens, raise `max_tokens` or
+  set an explicit `reasoning_budget_tokens` / `answer-room` value; a reserved answer room helps but cannot guarantee a complete answer.
 - **Structured output:** under a JSON schema or `json_object` the model thinks first, as its effort asks, and the grammar
   holds only the answer block; the answer cannot end before its value is whole. At `none` it answers at once.
 - **Tools:** the model writes `<|content_invoke_tool_json|>{"name": ..., "args": {...}}`; several calls per turn are supported.

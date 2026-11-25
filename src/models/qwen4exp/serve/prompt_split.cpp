@@ -1,4 +1,6 @@
 // src/models/qwen4exp/serve/prompt_split.cpp - request prompt_split operations.
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
@@ -303,7 +305,7 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
             float* h = before_last.hand_buffer(aside_buf);
             const int64_t nr = std::min(aside_rows - aside_at, T - r);
             float* dst = h == nullptr ? nullptr : h + (size_t) (chunk + aside_at) * HCN;
-            if (dst == nullptr || cudaMemcpy(dst, R_rows + (size_t) r * HCN, (size_t) nr * HCN * sizeof(float),
+            if (dst == nullptr || basalt::core::device_copy(dst, R_rows + (size_t) r * HCN, (size_t) nr * HCN * sizeof(float),
                                              cudaMemcpyDeviceToHost) != cudaSuccess) {
                 ce = "prompt split: reading the draft layer's rows back failed";
                 return false;
@@ -315,7 +317,7 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
         }
         if (r0 < T && p0 >= in_place_from) {
             float* h = const_cast<float*>(last.sp.hand_in());
-            if (h == nullptr || cudaMemcpy(h + (size_t) r0 * HCN, R_rows + (size_t) r0 * HCN,
+            if (h == nullptr || basalt::core::device_copy(h + (size_t) r0 * HCN, R_rows + (size_t) r0 * HCN,
                                            (size_t) (T - r0) * HCN * sizeof(float),
                                            cudaMemcpyDeviceToHost) != cudaSuccess) {
                 ce = "prompt split: reading the draft layer's rows back failed";
@@ -448,7 +450,7 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
         size_t pfree = 0, ptotal = 0;
         {
             const basalt::core::OnDevice on(st.dev);
-            if (cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) (void) cudaGetLastError();
+            if (basalt::core::gpu_mem_info(&pfree, &ptotal) != cudaSuccess) (void) cudaGetLastError();
         }
         char b[256];
         std::snprintf(b, sizeof b, "%s%lld on CUDA%d, layers %lld-%lld", k ? ", " : "",

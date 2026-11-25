@@ -1,6 +1,7 @@
 // src/models/inkling2/kernels/kv_int8_parity.cu - INT8 KV writer and scalar/MMA reader parity against CPU references.
 // With --bench, also time decode window attention over every cache format at the model's depths. With --reduced, check only
 // a short list of MMA cases and one replayed decode graph (for a race checker).
+#include "basalt/core/device_copy.hpp"
 #include "prep.cuh"
 #include "basalt/kernels/pdl.hpp"
 
@@ -108,7 +109,7 @@ static bool bench_attention() {
                 const int64_t p0 = (window ? 8192 : depth) - rows;
                 std::vector<int32_t> hp(rows);
                 for (int i = 0; i < rows; ++i) hp[i] = (int32_t) (p0 + i);
-                cudaMemcpy(pos, hp.data(), rows * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(pos, hp.data(), rows * 4, cudaMemcpyHostToDevice);
                 ink::AttnPrep pa;
                 pa.yq = y; pa.yk = y + ink::kProjQ; pa.yv = y + ink::kProjQ + ink::kProjKV; pa.ldq = pa.ldk = pa.ldv = ink::kProj;
                 pa.pos = pos; pa.full = !window; pa.k_conv = taps; pa.v_conv = taps; pa.q_scale = qs; pa.r_scale = rs;
@@ -398,14 +399,14 @@ static bool check_attention_mma(bool reduced) {
     };
     const auto upload = [&](float** ptr, const std::vector<float>& v) {
         const size_t bytes = v.size() * sizeof(float);
-        return alloc(ptr, bytes) && check_cuda(cudaMemcpy(*ptr, v.data(), bytes, cudaMemcpyHostToDevice), "attention inputs");
+        return alloc(ptr, bytes) && check_cuda(basalt::core::device_copy(*ptr, v.data(), bytes, cudaMemcpyHostToDevice), "attention inputs");
     };
     const auto upload_cache = [&](uint8_t** ptr, const std::vector<uint8_t>& pattern) {
         std::vector<uint8_t> host((size_t) cap * kCacheCell);
         for (size_t i = 0; i < host.size(); i += pattern.size())
             std::memcpy(host.data() + i, pattern.data(), std::min(pattern.size(), host.size() - i));
         return alloc(ptr, host.size()) &&
-               check_cuda(cudaMemcpy(*ptr, host.data(), host.size(), cudaMemcpyHostToDevice), "attention cache");
+               check_cuda(basalt::core::device_copy(*ptr, host.data(), host.size(), cudaMemcpyHostToDevice), "attention cache");
     };
     bool ok = upload(&dq, q) && upload(&dr, r) && upload(&ds, sink) && upload(&dg, gate) && upload(&dt, table) &&
               upload_cache(&dk, kp) && upload_cache(&dv, vp) && alloc(&dp, rows * sizeof(int32_t)) &&
@@ -428,7 +429,7 @@ static bool check_attention_mma(bool reduced) {
         if (!ok) break;
         int32_t pos[rows];
         for (int j = 0; j < rows; ++j) pos[j] = depth - 4 + j;
-        ok = check_cuda(cudaMemcpy(dp, pos, sizeof(pos), cudaMemcpyHostToDevice), "attention positions");
+        ok = check_cuda(basalt::core::device_copy(dp, pos, sizeof(pos), cudaMemcpyHostToDevice), "attention positions");
         if (!ok) break;
         enum class Reader { Auto, Scalar, Mma };
         const auto run = [&](int first, int width, Reader reader, DecodeResult& dst,
@@ -463,9 +464,9 @@ static bool check_attention_mma(bool reduced) {
                                                         shards, shard_count)) {
                 return false;
             }
-            return check_cuda(cudaMemcpy(dst.fp32.data(), dout, width * kOutput * sizeof(float), cudaMemcpyDeviceToHost),
+            return check_cuda(basalt::core::device_copy(dst.fp32.data(), dout, width * kOutput * sizeof(float), cudaMemcpyDeviceToHost),
                               "attention FP32 output") &&
-                   check_cuda(cudaMemcpy(dst.q8.data(), dq8, width * kOutputQ8, cudaMemcpyDeviceToHost), "attention q8_1 output");
+                   check_cuda(basalt::core::device_copy(dst.q8.data(), dq8, width * kOutputQ8, cudaMemcpyDeviceToHost), "attention q8_1 output");
         };
         const auto matches_plan = [&](int first, int width, ink::Int8MmaPlan plan, int bound, const DecodeResult& expected,
                                       ink::Int8MmaShards shards = ink::Int8MmaShards::Auto, int shard_count = 0) {
@@ -649,14 +650,14 @@ static bool check_decode_graph(bool reduced) {
     };
     const auto upload = [&](float** ptr, const std::vector<float>& v) {
         return alloc(ptr, v.size() * 4) &&
-               check_cuda(cudaMemcpy(*ptr, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "graph inputs");
+               check_cuda(basalt::core::device_copy(*ptr, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "graph inputs");
     };
     const auto upload_cache = [&](uint8_t** ptr, const std::vector<uint8_t>& pattern) {
         std::vector<uint8_t> host((size_t) cap * kCacheCell);
         for (size_t i = 0; i < host.size(); i += pattern.size())
             std::memcpy(host.data() + i, pattern.data(), std::min(pattern.size(), host.size() - i));
         return alloc(ptr, host.size()) &&
-               check_cuda(cudaMemcpy(*ptr, host.data(), host.size(), cudaMemcpyHostToDevice), "graph cache");
+               check_cuda(basalt::core::device_copy(*ptr, host.data(), host.size(), cudaMemcpyHostToDevice), "graph cache");
     };
     bool ok = alloc(&dy, ys[0].size() * 4) && upload(&dtaps, taps) && upload(&dqs, qs) && upload(&drs, rs) &&
               upload(&dkr, ring0) && upload(&dvr, ring0) && upload(&dtable, table) &&
@@ -674,7 +675,7 @@ static bool check_decode_graph(bool reduced) {
         while (bucket < shape.depth) bucket <<= 1;
         const int64_t fewest = shape.tight ? pos0 + 1 : bucket / 2 + 2 - rows;
         const int32_t pos[rows] = {pos0, pos0 + 1};
-        ok = check_cuda(cudaMemcpy(dpos, pos, sizeof(pos), cudaMemcpyHostToDevice), "graph positions");
+        ok = check_cuda(basalt::core::device_copy(dpos, pos, sizeof(pos), cudaMemcpyHostToDevice), "graph positions");
         ink::AttnPrep pa;
         pa.yq = dy; pa.yk = dy + ink::kProjQ; pa.yv = dy + ink::kProjQ + ink::kProjKV; pa.ldq = pa.ldk = pa.ldv = ink::kProj;
         pa.pos = dpos; pa.full = true; pa.k_conv = dtaps; pa.v_conv = dtaps; pa.q_scale = dqs; pa.r_scale = drs;
@@ -697,7 +698,7 @@ static bool check_decode_graph(bool reduced) {
                 ink::attention_decode(aa, rows, bucket, scratch, dout, stream);
             };
             // A shape's first window runs directly, as the session's does, before its graph is captured.
-            ok = ok && check_cuda(cudaMemcpy(dy, ys[replays].data(), ys[replays].size() * 4, cudaMemcpyHostToDevice), "graph y");
+            ok = ok && check_cuda(basalt::core::device_copy(dy, ys[replays].data(), ys[replays].size() * 4, cudaMemcpyHostToDevice), "graph y");
             if (ok) chain();
             ok = ok && check_cuda(cudaStreamSynchronize(stream), "graph direct run");
             cudaGraph_t graph = nullptr;
@@ -708,8 +709,8 @@ static bool check_decode_graph(bool reduced) {
             ok = ok && check_cuda(cudaStreamEndCapture(stream, &graph), "graph capture end") &&
                  check_cuda(cudaGraphInstantiate(&exec, graph, 0), "graph instantiate");
             if (pdl) pdl_launches = basalt::kernels::pdl_count() - before;
-            ok = ok && check_cuda(cudaMemcpy(dkr, ring0.data(), ring0.size() * 4, cudaMemcpyHostToDevice), "graph k ring") &&
-                 check_cuda(cudaMemcpy(dvr, ring0.data(), ring0.size() * 4, cudaMemcpyHostToDevice), "graph v ring");
+            ok = ok && check_cuda(basalt::core::device_copy(dkr, ring0.data(), ring0.size() * 4, cudaMemcpyHostToDevice), "graph k ring") &&
+                 check_cuda(basalt::core::device_copy(dvr, ring0.data(), ring0.size() * 4, cudaMemcpyHostToDevice), "graph v ring");
             fp32[pdl].resize((size_t) replays * rows * kOutput);
             q8[pdl].resize((size_t) replays * rows * kOutputQ8);
             for (int i = 0; i < replays && ok; ++i) {
@@ -768,14 +769,14 @@ int main(int argc, char** argv) {
     uint8_t* dout = nullptr;
     if (!check_cuda(cudaMalloc(&di, input.size() * sizeof(float)), "allocate input") ||
         !check_cuda(cudaMalloc(&dout, (size_t) rows * row_bytes), "allocate rows") ||
-        !check_cuda(cudaMemcpy(di, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "copy input") ||
+        !check_cuda(basalt::core::device_copy(di, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "copy input") ||
         !check_cuda(cudaMemset(dout, 0xa5, (size_t) rows * row_bytes), "poison rows")) return 1;
 
     encode_rows<<<rows, 32>>>(di, dout, rows);
     if (!check_cuda(cudaGetLastError(), "launch") || !check_cuda(cudaDeviceSynchronize(), "synchronize")) return 1;
 
     std::vector<uint8_t> got((size_t) rows * row_bytes);
-    if (!check_cuda(cudaMemcpy(got.data(), dout, got.size(), cudaMemcpyDeviceToHost), "copy rows")) return 1;
+    if (!check_cuda(basalt::core::device_copy(got.data(), dout, got.size(), cudaMemcpyDeviceToHost), "copy rows")) return 1;
 
     double max_abs = 0., max_rel = 0., fp16_max_abs = 0., fp16_max_rel = 0.;
     int mismatches = 0;

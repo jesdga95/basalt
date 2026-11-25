@@ -3,12 +3,14 @@
 #include "basalt/core/card_link.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/multi_gpu.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/program/options.hpp"
 
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <string>
 
 namespace basalt::program::cli {
 
@@ -73,6 +75,31 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
                       basalt::platform::host_os_name().c_str(),
                       drv / 1000, (drv % 1000) / 10, rt / 1000, (rt % 1000) / 10);
     basalt::log::info("basalt", "%s", basalt::model::gpu_start_line(gc).c_str());
+    // An integrated GPU takes its memory from the system's: what the driver reports for it, beside the RAM the host has
+    // and the reserve the planner keeps clear of that report.
+    for (size_t d = 0; d < gc.cards.size(); ++d) {
+        int integrated = 0;
+        if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, (int) d) != cudaSuccess || integrated == 0) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        int prev = 0;
+        (void) cudaGetDevice(&prev);
+        size_t free_b = 0, total_b = 0;
+        const bool read = cudaSetDevice((int) d) == cudaSuccess && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+        const std::string why = read ? "" : cudaGetErrorString(cudaGetLastError());
+        (void) cudaSetDevice(prev);
+        if (!read) {
+            basalt::log::warn("basalt", "gpu %zu is an integrated GPU and its memory is not readable: %s", d,
+                              why.c_str());
+            continue;
+        }
+        basalt::log::info("basalt", "gpu %zu is integrated: cudaMemGetInfo %llu MiB free of %llu MiB; host RAM %llu MiB available "
+                                    "of %llu MiB; --vram-reserve-mib %d",
+                          d, (unsigned long long) (free_b >> 20), (unsigned long long) (total_b >> 20),
+                          (unsigned long long) (basalt::platform::available_memory() >> 20),
+                          (unsigned long long) (basalt::platform::total_physical_memory() >> 20), o.vram_reserve_mib);
+    }
     // a split hands a window's activations from one card to the next and a peer reads its experts device to device: both
     // want peer access, which every pair opts into once per process
     if (gc.cards.size() > 1) {

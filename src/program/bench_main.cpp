@@ -430,7 +430,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
-                        : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -676,7 +676,10 @@ std::string hardware_text(const Hardware& h, const std::vector<std::pair<std::st
     for (const auto& c : cards) {
         const double g = h2d_of(h, c.first);
         const std::string link = pcie_text(c.second);
-        t += "  GPU   " + short_card(c.second.name) + "  PCIe " + (link.empty() ? std::string("unknown") : link) +
+        // an integrated GPU (NVML gives it no memory size) has no PCIe link, whatever NVML answers for one
+        const std::string where = c.second.vram_gib <= 0 ? std::string("integrated")
+                                                         : "PCIe " + (link.empty() ? std::string("unknown") : link);
+        t += "  GPU   " + short_card(c.second.name) + "  " + where +
              (g > 0 ? fmt("  host-to-device %.1f GB/s", g) : std::string("  host-to-device not measured")) + "\n";
     }
     return t;
@@ -1206,7 +1209,10 @@ int main(int argc, char** argv) {
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
-    if (power == "unknown") basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
+    // an integrated GPU has no power limit NVML reads (a GB10's is the system's): no warning, the table says unknown
+    const bool primary_integrated = have_primary && primary.vram_gib <= 0;
+    if (power == "unknown" && !primary_integrated)
+        basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
 
     // one table row per test: values over the repetitions
     struct Row {
@@ -1309,9 +1315,31 @@ int main(int argc, char** argv) {
         }
         std::string gpu_err;
         std::vector<std::pair<std::string, Nvml::Snap>> cards;
+        const uint64_t ram_b = basalt::platform::total_physical_memory();
         for (const std::string& id : basalt::program::split_gpu_ids(info.count("gpus") ? info["gpus"] : "")) {
             Nvml::Snap g;
-            if (!nvml.snap_bus(id, g) || g.name.empty() || g.vram_gib <= 0 || g.power_enforced_w <= 0) {
+            if (!nvml.snap_bus(id, g) || g.name.empty()) {
+                gpu_err = "NVML could not read the GPU at " + id;
+                break;
+            }
+            // NVML gives an integrated GPU (a GB10) no memory size and no power limit: its memory is the machine's, and
+            // its power is the submitter's to state, since the SoC's limit is not the GPU's
+            const bool integrated = g.vram_gib <= 0;
+            if (integrated) {
+                g.vram_gib = (double) ram_b / (double) (1ull << 30);
+                g.power_enforced_w = o.power_label.empty() ? -1 : std::atof(o.power_label.c_str());
+                g.pcie_gen = g.pcie_width = -1;   // no PCIe link: NVML's answer for one is not a link
+                if (g.power_enforced_w <= 0) {
+                    gpu_err = "the GPU at " + id + " is integrated and NVML reads no power limit for it: pass --power-label W "
+                              "with the system's power limit";
+                    break;
+                }
+            }
+            if (!integrated && !o.power_label.empty()) {   // a discrete card's row takes the limit NVML reads, never a label
+                gpu_err = "--power-label is for an integrated GPU; NVML reads the limit of the GPU at " + id;
+                break;
+            }
+            if (g.vram_gib <= 0 || g.power_enforced_w <= 0) {
                 gpu_err = "NVML could not read the GPU at " + id;
                 break;
             }
@@ -1319,7 +1347,6 @@ int main(int argc, char** argv) {
             crow.gpus.push_back({g.name, g.vram_gib, g.power_enforced_w, pcie_text(g), h2d_of(hw, id)});
             cards.emplace_back(id, g);
         }
-        const uint64_t ram_b = basalt::platform::total_physical_memory();
         if (gpu_err.empty() && crow.gpus.empty()) gpu_err = "the engine did not report which GPUs it used";
         if (gpu_err.empty() && (pre_tps[0] <= 0 || pre_tps[1] <= 0 || dec_ms <= 0)) gpu_err = "a request reported no time";
         if (gpu_err.empty() && ram_b == 0) gpu_err = "the system RAM size could not be read";

@@ -1,5 +1,6 @@
 // src/models/hy4flash/model.cpp - loads a Hy4-flash pack: the dense tensors to the main card, the embedding to host memory,
 // the routed experts to RAM.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "models/hy4flash/model.hpp"
 
 #include "basalt/artifact/dequant.hpp"
@@ -205,7 +206,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     // the context: refused when its caches would take more than half of what the weights leave
     {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         int sparse = 0;
         for (int l = 0; l < g.n_layers; ++l) sparse += !g.swa[(size_t) l];
         const ctxp::Plan p = ctxp::plan_context(req.max_context > 0 ? req.max_context : kDefaultContext, g.context_length,

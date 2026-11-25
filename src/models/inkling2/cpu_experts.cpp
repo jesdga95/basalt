@@ -8,10 +8,9 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/compiler.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "models/inkling2/model.hpp"
-
-#include <immintrin.h>
 
 #include <algorithm>
 #include <array>
@@ -179,7 +178,7 @@ struct CpuExperts::Impl {
                 continue;
             }
             if (stop.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+            platform::cpu_relax();
             if ((++spins & 63u) != 0) continue;
             const auto now = std::chrono::steady_clock::now();
             if (const uint32_t wk = wakes.load(std::memory_order_acquire); wk != seen) {

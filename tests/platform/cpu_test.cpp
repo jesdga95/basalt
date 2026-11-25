@@ -18,6 +18,16 @@ void check(bool ok, const std::string& what) {
 
 int main() {
     using namespace basalt::platform;
+    {   // an Arm /proc/cpuinfo has no model name: the core types by implementer and part, the most numerous first
+        std::string gb10;
+        for (int c = 0; c < 20; ++c)
+            gb10 += "processor\t: " + std::to_string(c) + "\nCPU implementer\t: 0x41\nCPU part\t: " +
+                    (c < 10 ? "0xd87" : "0xd85") + "\n\n";
+        check(arm_cpu_name(gb10) == "10x Cortex-A725 + 10x Cortex-X925", "an Arm cpuinfo names its core types");
+        check(arm_cpu_name("processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd99\n") == "1x Arm 0x41:0xd99",
+              "an unknown Arm part is named by its ids");
+        check(arm_cpu_name("processor\t: 0\nmodel name\t: AMD Ryzen 9 9950X\n").empty(), "an x86 cpuinfo gives no Arm name");
+    }
     const CpuTopology all = detect_cpu_topology(false, CpuAffinity::All);
     check(!all.worker_cores.empty(), "at least one worker core is found");
     check(all.host_core == -1, "without skip_first no core is reserved");

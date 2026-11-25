@@ -1,5 +1,7 @@
 // src/kernels/cpu/expert_layout.cpp - the per-layer expert table.  See the header.
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/neon.hpp"
+#include "basalt/platform/cpu.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -99,7 +101,16 @@ bool cpu_avx1_ok() {
     return ok;
 }
 
+bool cpu_neon_ok() {
+    static const bool ok = platform::kArm64 && platform::cpu_has_arm_dotprod();
+    return ok;
+}
+
 std::string cpu_name() {
+    if constexpr (platform::kArm64) {   // no CPUID: the OS's name for the processor
+        const std::string name = platform::cpu_info().name;
+        return name.empty() ? std::string("Arm64") : name;
+    }
     unsigned r[12] = {};
     {
         unsigned x[4];
@@ -120,11 +131,19 @@ std::string cpu_name() {
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
+    if constexpr (platform::kArm64) {
+        q2_0_gguf_rows_multi_neon(w, row_bytes, nblocks, a, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void act_quant_any(const float* x, int n, ActQ& a) {
+    if constexpr (platform::kArm64) {
+        act_quant_q8_1_neon(x, n, a);
+        return;
+    }
     if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
     else act_quant_q8_1_avx2(x, n, a);
 }

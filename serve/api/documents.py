@@ -96,7 +96,8 @@ def _url_name(source: str) -> str:
     path = source
     if re.match(r"[a-zA-Z][a-zA-Z0-9+.-]+://", source):
         try:
-            path = urllib.parse.unquote(urllib.parse.urlsplit(source).path)
+            parts = urllib.parse.urlsplit(source)
+            path = urllib.parse.unquote(parts.path or (parts.netloc if parts.scheme.lower() == "file" else ""))
         except ValueError:
             path = ""
     return re.split(r"[\\/]", path.rstrip("\\/"))[-1] or "document"
