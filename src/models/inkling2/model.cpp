@@ -394,7 +394,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
-        const uint64_t spare = kCardSpare - vision_modules;   // [vision]
+        // the spare the sessions are sized against: the asked reserve (--vram-reserve-mib, the card's own otherwise),
+        // less what the image encoder staged on the card (its kernels' modules, capped at a quarter of the card's spare)
+        const uint64_t spare_base = spare_ ? spare_ : kCardSpare;
+        const uint64_t spare = spare_base > vision_modules ? spare_base - vision_modules : 0;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
@@ -882,6 +885,17 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
     }
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
+    // the asked reserve, after the whole load (the planes converted, the drafter folded, the sessions prepared): a load
+    // that leaves less than the flag asks is refused rather than served at a smaller reserve, so a --vram-reserve-mib
+    // that cannot be met is never silently served
+    if (spare_) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < spare_) {
+            return {model::Status::Error,
+                    "inkling2: --vram-reserve-mib " + std::to_string(spare_ / kMiB) + " MiB cannot be met after loading: only " +
+                        std::to_string(free_b / kMiB) + " MiB free; lower --max-context or --spec, or use a bigger card"};
+        }
+    }
     if (copies()) {   // the sessions' buffers are in place (an elastic spill's caches back only their base): the RAM experts
                       // come back while the card has room beyond its spare
         size_t was_b = 0, free_b = 0, total_b = 0;
