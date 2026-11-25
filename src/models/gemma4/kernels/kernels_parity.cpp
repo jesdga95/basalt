@@ -351,35 +351,45 @@ void batch_check(std::mt19937& rng, const LayerShape& sh, const char* name) {
     expect(std::memcmp(both.data(), solo.data(), both.size() * 4) == 0, name, 0.0);
 }
 
+// The decode attention of one row (the microbench lines): a window layer at a full window, full layers at two lengths.
 void bench(std::mt19937& rng) {
-    // a full layer's decode attention at 4,096 keys, one row (the microbench line)
-    LayerShape sh{16, 2, 512, 64, 0, true};
-    const int P = 4096, hd = sh.hd, kd = sh.n_kv * hd, qd = sh.n_head * hd;
-    std::vector<__half> cache((size_t) P * kd);
-    for (auto& x : cache) x = __float2half_rn(std::normal_distribution<float>()(rng));
-    void* ck = nullptr;
-    cudaMalloc(&ck, cache.size() * 2);
-    cudaMemcpy(ck, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice);
-    auto q = randv(qd, rng), kn = randv(hd, rng);
-    std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, P));
-    rope_tables(hd, 64, 1e6, P, lo.data(), hi.data());
-    std::vector<int32_t> pos{P - 1};
-    float *dq = dev(q), *dkn = dev(kn), *out, *scr;
-    int32_t* dpos = dev(pos);
-    cudaMalloc(&out, (size_t) qd * 4);
-    cudaMalloc(&scr, attn_scratch_floats(1, sh.n_head, hd) * 4);
-    Attn a;
-    a.q = dq, a.pos = dpos, a.k_norm = dkn, a.rope = {dev(lo), dev(hi)}, a.sh = sh, a.max_keys = P, a.scratch = scr, a.out = out;
-    a.kv.c[0] = {ck, nullptr, P};
-    for (int i = 0; i < 20; ++i) attn_decode(a, 1, nullptr);
-    cudaDeviceSynchronize();
-    const int iters = 200;
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < iters; ++i) attn_decode(a, 1, nullptr);
-    cudaDeviceSynchronize();
-    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
-    std::printf("bench attn_decode full layer (16x512, 2 kv heads, one cache) 4096 keys, 1 row: %.1f us, %.0f GB/s\n", us,
-                (double) cache.size() * 2 / us / 1e3);
+    const auto one = [&](const char* name, const LayerShape& sh, int P) {
+        const int hd = sh.hd, kd = sh.n_kv * hd, qd = sh.n_head * hd;
+        const int64_t cap = sh.window > 0 ? sh.window + 2048 : P;
+        std::vector<__half> cache((size_t) cap * kd);
+        for (auto& x : cache) x = __float2half_rn(std::normal_distribution<float>(0.f, 0.3f)(rng));
+        void *ck = nullptr, *cv = nullptr;
+        cudaMalloc(&ck, cache.size() * 2);
+        cudaMalloc(&cv, cache.size() * 2);
+        cudaMemcpy(ck, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(cv, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice);
+        auto q = randv(qd, rng), kn = randv(hd, rng);
+        std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, P));
+        rope_tables(hd, sh.rot, 1e6, P, lo.data(), hi.data());
+        std::vector<int32_t> pos{P - 1};
+        float *dq = dev(q), *dkn = dev(kn), *dlo = dev(lo), *dhi = dev(hi), *out, *scr;
+        int32_t* dpos = dev(pos);
+        cudaMalloc(&out, (size_t) qd * 4);
+        cudaMalloc(&scr, attn_scratch_floats(1, sh.n_head, hd) * 4);
+        Attn a;
+        a.q = dq, a.pos = dpos, a.k_norm = dkn, a.rope = {dlo, dhi}, a.sh = sh, a.scratch = scr, a.out = out;
+        a.max_keys = sh.window > 0 ? sh.window : P;
+        a.kv.c[0] = {ck, sh.one ? nullptr : cv, cap};
+        for (int i = 0; i < 20; ++i) attn_decode(a, 1, nullptr);
+        cudaDeviceSynchronize();
+        const int iters = 200;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) attn_decode(a, 1, nullptr);
+        cudaDeviceSynchronize();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+        const double bytes = (double) (sh.window > 0 ? std::min(P, sh.window) : P) * kd * 2 * (sh.one ? 1 : 2);
+        std::printf("bench attn_decode %s, 1 row: %.1f us, %.0f GB/s\n", name, us, bytes / us / 1e3);
+        for (void* p : {ck, cv, (void*) dq, (void*) dkn, (void*) dlo, (void*) dhi, (void*) dpos, (void*) out, (void*) scr}) cudaFree(p);
+    };
+    one("window layer (16x256, 8 kv, window 1024) at 4096", {16, 8, 256, 128, 1024, false}, 4096);
+    one("full layer (16x512, 2 kv, one cache) 350 keys", {16, 2, 512, 64, 0, true}, 350);
+    one("full layer 4096 keys", {16, 2, 512, 64, 0, true}, 4096);
+    one("full layer 32768 keys", {16, 2, 512, 64, 0, true}, 32768);
 }
 
 // The prompt attention of `C` rows after `past` positions against the decode attention of the same rows over the same
