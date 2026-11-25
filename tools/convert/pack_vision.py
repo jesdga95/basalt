@@ -12,21 +12,28 @@ import struct
 
 GGUF_MAGIC = b"GGUF"
 ALIGNMENT = 32
+_INITIAL_READ = 8 << 20
 # value type id -> fixed size; strings and arrays are walked
 _FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
 
+def _check_bounds(buf: bytes, end: int) -> int:
+    if end > len(buf):
+        raise struct.error("truncated GGUF metadata")
+    return end
+
+
 def _skip_value(buf: bytes, pos: int, vtype: int) -> int:
     if vtype in _FIXED:
-        return pos + _FIXED[vtype]
+        return _check_bounds(buf, pos + _FIXED[vtype])
     if vtype == 8:
         (n,) = struct.unpack_from("<Q", buf, pos)
-        return pos + 8 + n
+        return _check_bounds(buf, pos + 8 + n)
     if vtype == 9:
         etype, count = struct.unpack_from("<IQ", buf, pos)
         pos += 12
         if etype in _FIXED:
-            return pos + _FIXED[etype] * count
+            return _check_bounds(buf, pos + _FIXED[etype] * count)
         for _ in range(count):
             pos = _skip_value(buf, pos, etype)
         return pos
@@ -44,8 +51,9 @@ def _kv_entries(buf: bytes):
     for _ in range(n_kv):
         start = pos
         (klen,) = struct.unpack_from("<Q", buf, pos)
-        key = buf[pos + 8:pos + 8 + klen].decode("utf-8", "replace")
-        pos += 8 + klen
+        key_end = _check_bounds(buf, pos + 8 + klen)
+        key = buf[pos + 8:key_end].decode("utf-8", "replace")
+        pos = key_end
         (vtype,) = struct.unpack_from("<I", buf, pos)
         pos = _skip_value(buf, pos + 4, vtype)
         yield key, buf[start:pos]
@@ -53,7 +61,7 @@ def _kv_entries(buf: bytes):
 
 def _read_header_prefix(path: str) -> bytes:
     """The start of a GGUF up to the end of its metadata; tensor info and data follow and are not read."""
-    size = 8 << 20
+    size = _INITIAL_READ
     with open(path, "rb") as f:
         while True:
             f.seek(0)
@@ -70,9 +78,10 @@ def _read_header_prefix(path: str) -> bytes:
 def vocab_only_gguf(path: str) -> bytes | None:
     """The GGUF at `path` with its metadata only (no tensors, no split.* keys), or None when it has no tokenizer."""
     buf = _read_header_prefix(path)
-    kept = [raw for key, raw in _kv_entries(buf) if not key.startswith("split.")]
-    if not any(k == "tokenizer.ggml.tokens" for k, _ in _kv_entries(buf)):
+    entries = list(_kv_entries(buf))
+    if not any(k == "tokenizer.ggml.tokens" for k, _ in entries):
         return None
+    kept = [raw for key, raw in entries if not key.startswith("split.")]
     head = GGUF_MAGIC + struct.pack("<IQQ", 3, 0, len(kept))
     body = head + b"".join(kept)
     return body + b"\0" * (-len(body) % ALIGNMENT)
