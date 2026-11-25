@@ -39,6 +39,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       native: ${{ steps.files.outputs.native }}
+      models: ${{ steps.files.outputs.models }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -51,17 +52,44 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" != pull_request ]; then echo native=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          all_models='["qwen4exp","deepseek41","qwen35","hy4flash","inkling2"]'
+          if [ "$EVENT" != pull_request ]; then
+            echo "native=true" >> "$GITHUB_OUTPUT"
+            echo "models=$all_models" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           native=false
+          shared_native=false
+          touched_models=""
           while IFS= read -r f; do
             case "$f" in
-              tools/tokenizer.py|tools/check_benchmarks.py|tools/iq_fixture.py) native=true ;;   # CPU tests run these
+              tools/tokenizer.py|tools/check_benchmarks.py|tools/iq_fixture.py)
+                native=true; shared_native=true ;;   # CPU tests run these
               serve/*|tools/*.py|tools/convert/*|tools/migrations/*|requirements*.txt|*.md|docs/*) ;;
-              .github/workflows/review.yml|.github/workflows/community*.yml) ;;
-              *) native=true ;;
+              .github/workflows/review.yml|.github/workflows/community*.yml|.github/workflows/pr-labels.yml) ;;
+              src/models/qwen4exp/*|include/basalt/models/qwen4exp/*|tests/models/qwen4exp/*)
+                native=true; touched_models="$touched_models qwen4exp" ;;
+              src/models/deepseek41/*|include/basalt/models/deepseek41/*|tests/models/deepseek41/*)
+                native=true; touched_models="$touched_models deepseek41" ;;
+              src/models/qwen35/*|include/basalt/models/qwen35/*|tests/models/qwen35/*)
+                native=true; touched_models="$touched_models qwen35" ;;
+              src/models/hy4flash/*|include/basalt/models/hy4flash/*|tests/models/hy4flash/*)
+                native=true; touched_models="$touched_models hy4flash" ;;
+              src/models/inkling2/*|include/basalt/models/inkling2/*|tests/models/inkling2/*)
+                native=true; touched_models="$touched_models inkling2" ;;
+              *)
+                native=true; shared_native=true ;;
             esac
           done < <(git diff --name-only "$BASE...$HEAD")
+          if [ "$native" = false ]; then
+            models='[]'
+          elif [ "$shared_native" = true ] || [ -z "$touched_models" ]; then
+            models="$all_models"
+          else
+            models=$(python3 -c 'import json,sys; print(json.dumps(sorted(set(sys.argv[1:]))))' $touched_models)
+          fi
           echo "native=$native" | tee -a "$GITHUB_OUTPUT"
+          echo "models=$models" | tee -a "$GITHUB_OUTPUT"
 
   lint:
     runs-on: ubuntu-24.04
@@ -177,11 +205,11 @@ jobs:
   # A build of one model compiles and tests none of the others (-DBASALT_MODELS).
   build-single-model:
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.native == 'true' && needs.changes.outputs.models != '[]'
     strategy:
       fail-fast: false
       matrix:
-        model: [qwen4exp, deepseek41, qwen35, hy4flash, inkling2]
+        model: ${{ fromJSON(needs.changes.outputs.models) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
