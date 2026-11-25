@@ -10,10 +10,12 @@
 #include <sys/stat.h>
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -71,6 +73,37 @@ int main() {
     std::vector<uint8_t> back(data.size());
     fd = open_fd_utf8(a);
     check(fd >= 0 && pread_all(fd, back.data(), back.size(), 0) && back == data, "they read back the same");
+    {
+        // concurrent positional reads across threads, EOF short-read, and non-overlapped file_fd(FILE*) fallback
+        std::atomic<bool> ok{true};
+        std::vector<std::thread> ts;
+        for (int t = 0; t < 4; ++t) {
+            ts.emplace_back([&, t] {
+                std::vector<uint8_t> part(2048);
+                for (int r = 0; r < 64; ++r) {
+                    const uint64_t off = (uint64_t) (((t * 13 + r * 37) % 5) * 2048 + (r & 63));
+                    if (!pread_all(fd, part.data(), part.size(), off) ||
+                        std::memcmp(part.data(), data.data() + off, part.size()) != 0) {
+                        ok.store(false);
+                        return;
+                    }
+                }
+            });
+        }
+        for (auto& th : ts) th.join();
+        check(ok.load(), "concurrent positional reads across threads match");
+        uint8_t tail[64] = {};
+        const int64_t eof_got = basalt::platform::pread(fd, tail, sizeof tail, data.size() - 17);
+        check(eof_got == 17 && std::memcmp(tail, data.data() + data.size() - 17, 17) == 0,
+              "positional read crossing EOF returns exact tail");
+        check(basalt::platform::pread(fd, tail, sizeof tail, data.size()) == 0, "positional read at EOF returns 0");
+        std::FILE* fp = open_file_utf8(a, "rb");
+        uint8_t fbuf[64] = {};
+        const bool fp_ok = fp != nullptr && basalt::platform::pread(file_fd(fp), fbuf, sizeof fbuf, 128) == 64 &&
+                           std::memcmp(fbuf, data.data() + 128, 64) == 0;
+        if (fp != nullptr) std::fclose(fp);
+        check(fp_ok, "positional read through FILE* descriptor matches");
+    }
     close_fd(fd);
 
     fd = open_write_utf8(b);
