@@ -391,6 +391,7 @@ class Gemma4(Dialect):
     call_newlines = 0                   # a call follows the thinking's close or the answer directly
     image_pad = IMAGE_PAD
     image_start = IMAGE
+    in_engine_vision = True             # the engine's encoder reads the picture at the size the processor gives it: no sidecar
     # chat_template.jinja: tools and several calls per turn, a thinking switch with no levels, a leading system turn,
     # and `preserve_thinking`
     caps = {"supports_tool_calls": True, "supports_parallel_tool_calls": True, "supports_reasoning_effort": False,

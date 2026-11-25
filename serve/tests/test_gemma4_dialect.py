@@ -350,6 +350,7 @@ class Tokens(unittest.TestCase):
         self.assertEqual(d.stop_texts, (END_TURN, EOS, RESPONSE))
         self.assertEqual(d.reasoning_close, CLOSE)
         self.assertEqual((d.image_start, d.image_pad), (IMAGE, IMAGE_PAD))
+        self.assertTrue(d.in_engine_vision)
         self.assertEqual(d.call_newlines, 0)
         self.assertEqual(d.forced_opening("f"), CALL + "call:f{")
         self.assertEqual(d.forced_opening(None), CALL + "call:")
