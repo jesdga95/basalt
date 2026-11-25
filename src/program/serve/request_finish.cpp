@@ -124,7 +124,9 @@ Flow Request::complete() {
             if (runtime_.slot0_solo() && runtime_.admit_slot == 0) runtime_.live_ok = false;   // the batch windows move the state on
             slot_set_sampling(runtime_.admit_slot);   // the request's own sampling, row by row
             BSlot& sl = runtime_.bs[(size_t) runtime_.admit_slot];
+            auto sfx = std::move(sl.sfx);
             sl = BSlot{};
+            sl.sfx = std::move(sfx);
             sl.active = true;
             sl.pen_n = req_sp.penalty_last_n;
             slot_init(sl);
@@ -157,7 +159,9 @@ Flow Request::complete() {
         slot_state_back(slot_b);
         if (yielded_at < 0) {   // (a read that gave way was parked in the slot already)
             BSlot& sb = runtime_.bs[(size_t) slot_b];
+            auto sfx = std::move(sb.sfx);
             sb = BSlot{};
+            sb.sfx = std::move(sfx);
             sb.ids = runtime_.live;
             sb.cvec = runtime_.cvec_cached;
             sb.imgs = runtime_.live_imgs;
