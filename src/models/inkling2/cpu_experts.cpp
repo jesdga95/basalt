@@ -28,7 +28,7 @@
 namespace basalt::models::inkling2 {
 namespace cpu = kernels::cpu;
 
-static_assert(kDecodeRows * 8 <= 1024, "a window's RAM pairs fit one call");
+static_assert(kBatchRows * 8 <= 1024, "a batch visit's RAM pairs fit one call");
 
 namespace {
 // The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
@@ -72,8 +72,8 @@ struct CpuExperts::Impl {
     int32_t* ids_dev = nullptr;
     float* out = nullptr;
     float* out_dev = nullptr;
-    alignas(64) std::array<std::array<uint8_t, cpu::kNativeActBytes>, kDecodeRows> acts;
-    std::vector<cpu::ExpertJobMulti> jobs;         // [kDecodeRows * k]
+    alignas(64) std::array<std::array<uint8_t, cpu::kNativeActBytes>, kBatchRows> acts;
+    std::vector<cpu::ExpertJobMulti> jobs;         // [kBatchRows * k]
     std::vector<int> job_of;                       // [n_expert]: the expert's job in this call, -1: none
     std::thread server;                            // the doorbell's thread
     std::atomic<bool> stop{false}, napping{false};
@@ -128,7 +128,7 @@ struct CpuExperts::Impl {
     // row of an expert in one job, on the pool; the card's rows land in `out` beside the pool's.
     void run(int layer, int rows) {
         std::fill(job_of.begin(), job_of.end(), -1);
-        bool quant[kDecodeRows] = {};
+        bool quant[kBatchRows] = {};
         int n = 0, on_peer = 0;
         std::string err;
         if (peer) {
@@ -211,7 +211,7 @@ CpuExperts::~CpuExperts() = default;
 std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string& err) {
     if (!m.spill().any()) return nullptr;
     const Geometry& g = m.geo();
-    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kDecodeRows > 1024) {
+    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kBatchRows > 1024) {
         err = "the CPU experts do not fit this geometry";
         return nullptr;
     }
@@ -237,16 +237,16 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
         p.layout.push_back(L);
     }
     p.peer = m.peer_experts();
-    p.kind.assign((size_t) kDecodeRows * g.n_used, 0);
-    p.jobs.resize((size_t) kDecodeRows * g.n_used);
+    p.kind.assign((size_t) kBatchRows * g.n_used, 0);
+    p.jobs.resize((size_t) kBatchRows * g.n_used);
     p.job_of.assign((size_t) g.n_expert, -1);
-    const size_t pairs = (size_t) kDecodeRows * g.n_used;
+    const size_t pairs = (size_t) kBatchRows * g.n_used;
     if (cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&p.ready, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&p.done, cudaEventDisableTiming) != cudaSuccess ||
         cudaHostAlloc((void**) &p.bell, sizeof(CpuBell), cudaHostAllocMapped) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &p.bell_dev, p.bell, 0) != cudaSuccess ||
-        cudaHostAlloc((void**) &p.input, (size_t) kDecodeRows * kWidth * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc((void**) &p.input, (size_t) kBatchRows * kWidth * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &p.input_dev, p.input, 0) != cudaSuccess ||
         cudaHostAlloc((void**) &p.ids, pairs * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &p.ids_dev, p.ids, 0) != cudaSuccess ||

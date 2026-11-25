@@ -1334,6 +1334,44 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
     else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
 }
 
+void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWindowSeg* segs, int n_seg,
+                          float* scratch, int64_t scratch_cells, float* out, void* stream) {
+    if (n_seg < 1 || n_seg > kMaxSegs || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX ||
+        (head_dim != 128 && head_dim != 256)) {
+        basalt::log::error("basalt", "gqa_window_attn_segs: invalid arguments");
+        std::exit(1);
+    }
+    const int n_chunks = (int) ((scratch_cells + CHUNK - 1) / CHUNK) + 1;
+    DecSegs d;
+    d.n = n_seg;
+    for (int k = 0; k < n_seg; ++k) {
+        const GqaWindowSeg& g = segs[k];
+        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.window <= 0 || g.hi < g.pos0 + g.T) {
+            basalt::log::error("basalt", "gqa_window_attn_segs: invalid segment");
+            std::exit(1);
+        }
+        d.row0[k + 1] = d.row0[k] + g.T;
+        d.kc[k] = (const __half*) g.k_cache;
+        d.vc[k] = (const __half*) g.v_cache;
+        Range& r = d.r[k];
+        r.pos0 = g.pos0;
+        r.hi = g.hi;
+        r.window = g.window;
+        r.cap = g.cap;
+        r.causal = 0;
+        r.block = g.block ? 1 : 0;
+        const int64_t lo = std::max<int64_t>(0, g.pos0 - g.window + 1);
+        r.base = (int) (lo / CHUNK);
+        const int used = (int) ((g.hi + CHUNK - 1) / CHUNK) - r.base;
+        if (used > n_chunks) {
+            basalt::log::error("basalt", "gqa_window_attn_segs: the window passes its scratch");
+            std::exit(1);
+        }
+    }
+    if (head_dim == 128) launch_segs<128>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
+    else launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
+}
+
 void gqa_prompt_plan_device(int device) { plan_device.store(device, std::memory_order_relaxed); }
 
 size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits) {

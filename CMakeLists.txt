@@ -274,7 +274,7 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME inkling2_kv_int8_parity COMMAND inkling2_kv_int8_parity)
   add_executable(inkling2_dspark_parity src/models/inkling2/kernels/dspark_parity.cpp)
   target_include_directories(inkling2_dspark_parity PRIVATE ${_gpu_include_directories})
-  target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels ${_gpu_runtime_target})
+  target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2_dspark_parity COMMAND inkling2_dspark_parity)
   add_executable(inkling2_prompt_parity src/models/inkling2/kernels/prompt_parity.cpp)
   target_include_directories(inkling2_prompt_parity PRIVATE ${_gpu_include_directories})
@@ -941,6 +941,16 @@ if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
                    $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_BATCH_ARGS})
   set_property(TEST grammar_batch_test APPEND PROPERTY LABELS gpu)
   set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
+endif()
+
+# speculative multi-slot batch identity (`--serve --batch 2/4/8 --spec 8` vs `--batch 1`, cold + warm replay;
+# configure with -DBASALT_BATCH_IDENTITY_MODEL=/path/to/model.basalt and optional -DBASALT_BATCH_IDENTITY_ARGS=...)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  add_test(NAME batch_spec_identity_test
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_spec_identity_test.py
+                   $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_property(TEST batch_spec_identity_test APPEND PROPERTY LABELS gpu)
+  set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
 endif()
 
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE
