@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -225,7 +226,7 @@ int token_path(Context& context) {
     // plain pageable copy runs on, and such a copy can return before its data lands: each upload waits for its own
     // copy on the current device's legacy stream.
     auto res_put = [&host_res](int32_t* dst) -> cudaError_t {
-        const cudaError_t e = cudaMemcpy(dst, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        const cudaError_t e = basalt::core::device_copy(dst, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         return e != cudaSuccess ? e : cudaStreamSynchronize(cudaStreamLegacy);
     };
     int32_t* d_res = nullptr;

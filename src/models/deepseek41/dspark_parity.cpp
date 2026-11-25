@@ -1,6 +1,7 @@
 // src/models/deepseek41/dspark_parity.cpp - parity of the DSpark drafter's kernels against plain CPU references, at the
 // drafter's geometry (5120 -> 2304 -> 5120 MXFP4 experts, 512-wide latents, a 129280-row rank-256 Markov table), with
 // a microbench line for the expert kernels; and a drafter that keeps some experts computes what the whole one does on them.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/dspark.hpp"
@@ -417,8 +418,8 @@ int main() {
             dspark_kv_rope(kvraw.p, dkvn.p, dpos.p, n, 1e-20f, dfreq.p, nullptr, rows, slots, qs);
         };
         project(dfeat.p, kRows, staged.p, kStage);   // stage 0's rows; the other two stages hold copies of them
-        check(cudaMemcpy(staged.p + (size_t) kStage * kLat, staged.p, (size_t) kStage * kLat * 2, cudaMemcpyDeviceToDevice), "copy");
-        check(cudaMemcpy(staged.p + (size_t) 2 * kStage * kLat, staged.p, (size_t) kStage * kLat * 2, cudaMemcpyDeviceToDevice), "copy");
+        check(basalt::core::device_copy(staged.p + (size_t) kStage * kLat, staged.p, (size_t) kStage * kLat * 2, cudaMemcpyDeviceToDevice), "copy");
+        check(basalt::core::device_copy(staged.p + (size_t) 2 * kStage * kLat, staged.p, (size_t) kStage * kLat * 2, cudaMemcpyDeviceToDevice), "copy");
         bool same = true;
         for (int q = 1; q <= kRows; ++q) {
             check(cudaMemset(ref.p, 0, ref.n * 2), "memset");

@@ -2,6 +2,7 @@
 // from the equations in dfly.hpp: the four kernels, the tap, and the whole block pass with the sequential heads on small
 // random weights (the real width E = 3072, the head screen's, with two layers, eight heads and a 300-token vocabulary) over
 // random "target" caches and selections. Synthetic: no model, no checkpoint.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
@@ -75,13 +76,13 @@ template <class T>
 T* upload(const std::vector<T>& h) {
     T* d = nullptr;
     cudaMalloc(&d, std::max<size_t>(h.size() * sizeof(T), 16));
-    cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return d;
 }
 template <class T>
 std::vector<T> download(const T* d, size_t n) {
     std::vector<T> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 
@@ -386,20 +387,20 @@ void test_block() {
             std::vector<float> v((size_t) s.elems());
             const bool sink = s.name.find("sink") != std::string::npos, gate = s.name.find("gate") != std::string::npos || s.name.find("confidence") != std::string::npos;
             for (float& x : v) x = sink ? gauss(1.f) : gate ? gauss(0.3f) : 1.f + gauss(0.1f);
-            cudaMemcpy(w.slot(s.name), v.data(), v.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(w.slot(s.name), v.data(), v.size() * 4, cudaMemcpyHostToDevice);
             rf[s.name] = v;
         } else {
             Mat mat = rand_mat(s.shape[0], s.shape[1], 1.0f / std::sqrt((float) s.shape[1]));
             if (s.q8) {   // what the loader makes of it (core::Conv::Bf16ToQ8_0)
                 mat.q8.resize(s.bytes());
                 basalt::core::quantize_bf16_q8_0(mat.bits.data(), mat.bits.size(), mat.q8.data());
-                cudaMemcpy(w.slot(s.name), mat.q8.data(), mat.q8.size(), cudaMemcpyHostToDevice);
+                basalt::core::device_copy(w.slot(s.name), mat.q8.data(), mat.q8.size(), cudaMemcpyHostToDevice);
             } else if (s.q4) {   // core::Conv::Bf16ToQ4_0
                 mat.q4.resize(s.bytes());
                 basalt::core::quantize_bf16_q4_0(mat.bits.data(), mat.bits.size(), mat.q4.data());
-                cudaMemcpy(w.slot(s.name), mat.q4.data(), mat.q4.size(), cudaMemcpyHostToDevice);
+                basalt::core::device_copy(w.slot(s.name), mat.q4.data(), mat.q4.size(), cudaMemcpyHostToDevice);
             } else {
-                cudaMemcpy(w.slot(s.name), mat.bits.data(), mat.bits.size() * 2, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(w.slot(s.name), mat.bits.data(), mat.bits.size() * 2, cudaMemcpyHostToDevice);
             }
             rm[s.name] = std::move(mat);
         }

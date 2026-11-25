@@ -1,3 +1,4 @@
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "helpers.hpp"
 
@@ -19,7 +20,7 @@ int fatal_start_error(const std::string& text) {
 std::string vram_free_note() {
     (void) cudaGetLastError();
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+    if (basalt::core::gpu_mem_info(&free_b, &total_b) != cudaSuccess) {
         (void) cudaGetLastError();
         return {};
     }

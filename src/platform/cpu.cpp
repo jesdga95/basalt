@@ -6,9 +6,11 @@
 #include <cstdlib>
 #include <fstream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
@@ -17,9 +19,54 @@
 #include <sched.h>
 #include <unistd.h>
 #include "affinity_linux.hpp"
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#endif
 #endif
 
 namespace basalt::platform {
+
+std::string arm_cpu_name(const std::string& cpuinfo) {
+    struct Part { unsigned impl, part; const char* name; };
+    static const Part kParts[] = {
+        {0x41, 0xd0c, "Neoverse-N1"}, {0x41, 0xd40, "Neoverse-V1"}, {0x41, 0xd49, "Neoverse-N2"}, {0x41, 0xd4f, "Neoverse-V2"},
+        {0x41, 0xd80, "Cortex-A520"}, {0x41, 0xd81, "Cortex-A720"}, {0x41, 0xd82, "Cortex-X4"},   {0x41, 0xd84, "Neoverse-V3"},
+        {0x41, 0xd85, "Cortex-X925"}, {0x41, 0xd87, "Cortex-A725"}, {0x41, 0xd8e, "Neoverse-N3"}, {0x4e, 0x004, "Carmel"},
+        {0x4e, 0x010, "Olympus"},
+    };
+    std::vector<std::pair<std::string, int>> counts;   // in first-seen order, so equal counts keep the OS's order
+    const auto add = [&](long impl, long part) {
+        if (impl < 0 || part < 0) return;
+        std::string name;
+        for (const Part& p : kParts)
+            if (p.impl == (unsigned) impl && p.part == (unsigned) part) name = p.name;
+        if (name.empty()) {
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "Arm 0x%lx:0x%lx", impl, part);
+            name = buf;
+        }
+        for (auto& c : counts)
+            if (c.first == name) { ++c.second; return; }
+        counts.push_back({name, 1});
+    };
+    std::istringstream in(cpuinfo);
+    std::string line;
+    long impl = -1, part = -1;
+    const auto hex = [](const std::string& l) {
+        const size_t c = l.find(':');
+        return c == std::string::npos ? -1L : std::strtol(l.c_str() + c + 1, nullptr, 0);
+    };
+    while (std::getline(in, line)) {
+        if (line.find_first_not_of(" \t\r") == std::string::npos) { add(impl, part); impl = part = -1; }
+        else if (line.rfind("CPU implementer", 0) == 0) impl = hex(line);
+        else if (line.rfind("CPU part", 0) == 0) part = hex(line);
+    }
+    add(impl, part);
+    std::stable_sort(counts.begin(), counts.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string out;
+    for (const auto& [name, n] : counts) out += (out.empty() ? "" : " + ") + std::to_string(n) + "x " + name;
+    return out;
+}
 
 #if defined(_WIN32)
 // --------------------------------------------------------------------------------------------- Windows
@@ -371,6 +418,7 @@ CpuInfo cpu_info() {
     CpuInfo info;
     // /proc/cpuinfo lists every logical CPU; a core is one (physical id, core id) pair
     std::ifstream f("/proc/cpuinfo");
+    std::string text;
     std::set<std::pair<std::string, std::string>> cores;
     std::string line, pkg, core;
     const auto value = [](const std::string& l) {
@@ -385,12 +433,15 @@ CpuInfo cpu_info() {
         core.clear();
     };
     while (std::getline(f, line)) {
+        text += line;
+        text += '\n';
         if (line.empty()) flush();
         else if (line.rfind("model name", 0) == 0 && info.name.empty()) info.name = value(line);
         else if (line.rfind("physical id", 0) == 0) pkg = value(line);
         else if (line.rfind("core id", 0) == 0) core = value(line);
     }
     flush();
+    if (info.name.empty()) info.name = arm_cpu_name(text);   // Arm's /proc/cpuinfo has no model name
     info.physical_cores = (int) cores.size();
     if (info.physical_cores == 0) info.physical_cores = (int) detect_cpu_topology(false).worker_cores.size();
     return info;
@@ -420,6 +471,25 @@ std::vector<std::vector<int>> cpu_l3_groups() {
     return groups;
 }
 
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(_WIN32)
+bool cpu_has_arm_dotprod() { return IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0; }
+bool cpu_has_arm_i8mm() {
+#if defined(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE)
+    return IsProcessorFeaturePresent(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE) != 0;
+#else
+    return false;   // an SDK from before the constant: the baseline kernels run
+#endif
+}
+#else
+bool cpu_has_arm_dotprod() { return (getauxval(AT_HWCAP) & (1ul << 20)) != 0; }    // HWCAP_ASIMDDP
+bool cpu_has_arm_i8mm() { return (getauxval(AT_HWCAP2) & (1ul << 13)) != 0; }      // HWCAP2_I8MM
+#endif
+#else
+bool cpu_has_arm_dotprod() { return false; }
+bool cpu_has_arm_i8mm() { return false; }
 #endif
 
 }  // namespace basalt::platform

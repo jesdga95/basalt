@@ -1,6 +1,7 @@
 // Sparse MQA parity: sparse_mqa against a double-precision CPU reference at the real geometry (64 heads x 512, up to
 // 128 window rows and 512 selected rows, with the sink and the inverse RoPE), the packed cache rows bit for bit against
 // fp32 rows of their values, and the token's independence of the call's width. Prints microbench lines.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "test_util.hpp"
@@ -117,8 +118,8 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
     const auto ref = reference(c, q, win, comp, sel, limit, wstart, sinks, pos, rope);
 
     Dev<uint8_t> wdev(wrows), cdev(crows), wf((size_t) win.size() * 4), cf((size_t) comp.size() * 4);
-    dstest::check(cudaMemcpy(wf.p, win.data(), win.size() * 4, cudaMemcpyHostToDevice), "up");
-    dstest::check(cudaMemcpy(cf.p, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice), "up");
+    dstest::check(basalt::core::device_copy(wf.p, win.data(), win.size() * 4, cudaMemcpyHostToDevice), "up");
+    dstest::check(basalt::core::device_copy(cf.p, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice), "up");
     Dev<float> dq(q), dsink(sinks), dout((size_t) c.T * 64 * 512), dws(sparse_mqa_workspace_floats(c.T, c.n_sel));
     Dev<int32_t> dsel(sel), dlim(limit), dws0(wstart), dwn(wn), dpos(pos);
 

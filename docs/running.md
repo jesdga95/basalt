@@ -48,6 +48,10 @@ Each request ends with one `done` line:
 - `end`: `stop`, `length`, `cancelled`, `disconnect` or `error`.
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
+### Request timing fields
+
+The API's `timings` object and the matching `done`-line values are request-level wall-clock totals, not single-window CUDA timings. `prompt_ms` covers prompt reading; `decode_ms` covers decoding after prompt setup, including host time and gaps between decode windows or engine passes that belong to the request. A request that moves between solo and batch execution accumulates the applicable parts, so compare these fields with other request-level measurements. Use the engine log or `basalt-bench` window metrics when you need a per-window or kernel-oriented rate.
+
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
 taken from the file); `[server] engine log: PATH` names it at start. A log of 10 MiB or more moves to `engine.log.1` at the
 next start. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage

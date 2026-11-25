@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/batch.cpp - the batch slots' rounds on Flash-Next: the shared rounds (batch_round.cpp) over
 // the slots' sessions (slot_session.cpp), with the elastic KV and the adaptive tier between rounds.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
@@ -180,7 +181,7 @@ bool QfnRuntime::slot_windows(QfnSlotSession* const* ss, const basalt::model::De
             }
         }
         const basalt::core::OnDevice on_h(hist_dev);
-        if (cudaMemcpy(d_hist, hist_stage.data(), (size_t) R * (size_t) pen_h * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (basalt::core::device_copy(d_hist, hist_stage.data(), (size_t) R * (size_t) pen_h * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
             e = "batch: the penalty histories could not be staged";
             return false;
         }

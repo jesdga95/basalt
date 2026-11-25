@@ -2,6 +2,7 @@
 // text, the card choice, the model's modes, the roles.
 #include "basalt/program/gpu_select.hpp"
 
+#include "basalt/core/cuda_cc.hpp"
 #include "basalt/platform/process.hpp"
 
 #include <cstdio>
@@ -9,6 +10,10 @@
 #include <string>
 
 using namespace basalt::program;
+
+// the capability this build is for: a "Blackwell" card of the tests is one of it
+static const int kOursMinor = basalt::core::kCudaCCMinor;
+static const std::string kOurs = basalt::core::cuda_cc_name();
 
 static int g_fail = 0;
 #define CHECK(c)                                                              \
@@ -18,7 +23,8 @@ static int g_fail = 0;
 #define CHECK_STR(got, want)                                                                         \
     do {                                                                                             \
         const std::string g_ = (got);                                                                \
-        if (g_ != (want)) { std::printf("FAIL %s:%d: got \"%s\" want \"%s\"\n", __FILE__, __LINE__, g_.c_str(), want); ++g_fail; } \
+        const std::string w_ = (want);                                                               \
+        if (g_ != w_) { std::printf("FAIL %s:%d: got \"%s\" want \"%s\"\n", __FILE__, __LINE__, g_.c_str(), w_.c_str()); ++g_fail; } \
     } while (0)
 
 static constexpr uint64_t G = 1ull << 30;
@@ -84,7 +90,7 @@ int main() {
     }
     // A 5090 and a 5060 Ti, in nvidia-smi order.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 5060 Ti", 12, 0, 448, 16)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, kOursMinor, 1792, 32), card(1, "RTX 5060 Ti", 12, kOursMinor, 448, 16)};
         GpuChoice c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK(c.mode == GpuMode::One && c.shares.empty() && c.error.empty());
@@ -153,7 +159,7 @@ int main() {
     }
     // one visible card: all names one card
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, kOursMinor, 1792, 32)};
         CHECK_STR(cards(pick("all", v)), "0");
         CHECK_STR(pick("all", v, "peer").error, "gpu-mode peer: gpu names one card (gpu \"all\"); a mode needs two or more");
         CHECK_STR(pick("all", v, "", "1,1").error, "gpu-share: gpu names one card (gpu \"all\"); shares need two or more");
@@ -164,9 +170,9 @@ int main() {
     }
     // The model's side: the mode it runs and the cards it takes.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 5060 Ti", 12, 0, 448, 16),
-                                        card(2, "RTX 5060 Ti", 12, 0, 448, 16), card(3, "RTX 5060 Ti", 12, 0, 448, 16),
-                                        card(4, "RTX 5060 Ti", 12, 0, 448, 16)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, kOursMinor, 1792, 32), card(1, "RTX 5060 Ti", 12, kOursMinor, 448, 16),
+                                        card(2, "RTX 5060 Ti", 12, kOursMinor, 448, 16), card(3, "RTX 5060 Ti", 12, kOursMinor, 448, 16),
+                                        card(4, "RTX 5060 Ti", 12, kOursMinor, 448, 16)};
         const GpuModes hy4{4, 0, 0}, dense{2, 2, 0}, flash{4, 8, 0};
         CHECK_STR(check_gpu_modes(pick("0,1", v, "peer"), "Hy4-flash", hy4), "");
         CHECK_STR(check_gpu_modes(pick("0,1,2,3", v, "peer"), "Hy4-flash", hy4), "");
@@ -187,45 +193,45 @@ int main() {
         CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "peer"), "Qwen3.8-Flash-Next", flash),
                   "gpu-mode peer: Qwen3.8-Flash-Next takes at most 4 cards (the main card and 3 peers); gpu names 5");
         // an sm_89 peer, which only a -DPEER_ADA=ON build lists: a model whose peer kernels that build does not compile refuses it
-        const std::vector<GpuCard> ada = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
+        const std::vector<GpuCard> ada = {card(0, "RTX 5090", 12, kOursMinor, 1792, 32), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
         GpuChoice two;
         two.cards = {0, 1};
         two.mode = GpuMode::Peer;
-        CHECK_STR(check_gpu_modes(two, "Hy4-flash", hy4, ada), "gpu-mode peer: GPU 1 (RTX 4060 Ti) is sm_89; Hy4-flash runs peer on sm_120 cards");
+        CHECK_STR(check_gpu_modes(two, "Hy4-flash", hy4, ada), "gpu-mode peer: GPU 1 (RTX 4060 Ti) is sm_89; Hy4-flash runs peer on " + kOurs + " cards");
         CHECK_STR(check_gpu_modes(two, "Qwen3.8-Flash-Next", GpuModes{4, 8, 0, true}, ada), "");
     }
     // The same cards with the slower one first.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5060 Ti", 12, 0, 448, 16), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5060 Ti", 12, kOursMinor, 448, 16), card(1, "RTX 5090", 12, kOursMinor, 1792, 32)};
         CHECK_STR(cards(pick("all", v, "split")), "0,1");   // the order is the user's: GPU 0 is main
         CHECK_STR(cards(pick("1,0", v, "split")), "1,0");
         CHECK_STR(cards(pick("", v)), "0");
     }
     // Four mixed cards, one of them not Blackwell: all takes them all and refuses the one that cannot run.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, 0, 896, 16), card(1, "RTX 3090", 8, 6, 936, 24),
-                                        card(2, "RTX 5090", 12, 0, 1792, 32), card(3, "RTX 5060 Ti", 12, 0, 448, 16)};
-        CHECK_STR(pick("all", v, "peer").error, "gpu-mode peer: GPU 1 (RTX 3090) is sm_86; peer runs on sm_120 cards");
+        const std::vector<GpuCard> v = {card(0, "RTX 5070 Ti", 12, kOursMinor, 896, 16), card(1, "RTX 3090", 8, 6, 936, 24),
+                                        card(2, "RTX 5090", 12, kOursMinor, 1792, 32), card(3, "RTX 5060 Ti", 12, kOursMinor, 448, 16)};
+        CHECK_STR(pick("all", v, "peer").error, "gpu-mode peer: GPU 1 (RTX 3090) is sm_86; peer runs on " + kOurs + " cards");
         CHECK_STR(pick("0,2,3", v, "peer").error, "");
         CHECK_STR(cards(pick("3,2,0", v, "split")), "3,2,0");
-        CHECK_STR(pick("0,1", v, "split").error, "gpu-mode split: GPU 1 (RTX 3090) is sm_86; split and tensor run on sm_120 cards");
-        CHECK_STR(pick("0,1", v, "tensor").error, "gpu-mode tensor: GPU 1 (RTX 3090) is sm_86; split and tensor run on sm_120 cards");
+        CHECK_STR(pick("0,1", v, "split").error, "gpu-mode split: GPU 1 (RTX 3090) is sm_86; split and tensor run on " + kOurs + " cards");
+        CHECK_STR(pick("0,1", v, "tensor").error, "gpu-mode tensor: GPU 1 (RTX 3090) is sm_86; split and tensor run on " + kOurs + " cards");
         GpuChoice c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; to use more cards set gpu (0,1 or all) and gpu-mode");
-        CHECK_STR(pick("1", v).error, "gpu 1: GPU 1 (RTX 3090) is sm_86; the main card must be sm_120");
-        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 3090) is sm_86; the main card must be sm_120");
+        CHECK_STR(pick("1", v).error, "gpu 1: GPU 1 (RTX 3090) is sm_86; the main card must be " + kOurs);
+        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 3090) is sm_86; the main card must be " + kOurs);
     }
     // An Ada (sm_89) card: never the main card; a peer only in a -DPEER_ADA=ON build; never in split or tensor
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5080", 12, 0, 960, 16), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
-        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be sm_120");
-        CHECK_STR(pick("1,0", v, "split").error, "gpu 1,0: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be sm_120");
-        CHECK_STR(pick("1", v).error, "gpu 1: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be sm_120");
+        const std::vector<GpuCard> v = {card(0, "RTX 5080", 12, kOursMinor, 960, 16), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
+        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be " + kOurs);
+        CHECK_STR(pick("1,0", v, "split").error, "gpu 1,0: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be " + kOurs);
+        CHECK_STR(pick("1", v).error, "gpu 1: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be " + kOurs);
         CHECK_STR(pick("0,1", v, "split").error,
-                  "gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on sm_120 cards (peer takes sm_89 in a -DPEER_ADA=ON build)");
+                  "gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on " + kOurs + " cards (peer takes sm_89 in a -DPEER_ADA=ON build)");
         CHECK_STR(pick("all", v, "tensor").error,
-                  "gpu-mode tensor: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on sm_120 cards (peer takes sm_89 in a -DPEER_ADA=ON build)");
+                  "gpu-mode tensor: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on " + kOurs + " cards (peer takes sm_89 in a -DPEER_ADA=ON build)");
 #if defined(BASALT_PEER_ADA)
         CHECK_STR(cards(pick("0,1", v, "peer")), "0,1");
         CHECK_STR(cards(pick("all", v, "peer")), "0,1");
@@ -236,16 +242,16 @@ int main() {
     }
     // A laptop's own card beside a desktop card in an enclosure: the order is the user's, and unset is GPU 0 alone.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 5080 Laptop GPU", 12, 0, 896, 16), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5080 Laptop GPU", 12, kOursMinor, 896, 16), card(1, "RTX 5090", 12, kOursMinor, 1792, 32)};
         CHECK_STR(cards(pick("1,0", v, "peer")), "1,0");
         CHECK_STR(cards(pick("", v)), "0");
         CHECK(!pick("", v).warning.empty());
     }
     // A first card Basalt cannot run: unset is an error.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
-        CHECK_STR(pick("", v).error, "gpu 0: GPU 0 (RTX 4090) is sm_89; the main card must be sm_120");
-        CHECK_STR(pick("all", v, "peer").error, "gpu all: GPU 0 (RTX 4090) is sm_89; the main card must be sm_120");
+        const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, kOursMinor, 1792, 32)};
+        CHECK_STR(pick("", v).error, "gpu 0: GPU 0 (RTX 4090) is sm_89; the main card must be " + kOurs);
+        CHECK_STR(pick("all", v, "peer").error, "gpu all: GPU 0 (RTX 4090) is sm_89; the main card must be " + kOurs);
         CHECK_STR(cards(pick("1", v)), "1");
     }
     // No card list (no management library, no CUDA_VISIBLE_DEVICES): numbers pass, all cannot run.

@@ -7,6 +7,7 @@
 // left behind, and the small picture still reserves. With the room given back (what the expert tier's lend does), the
 // same encoder encodes both pictures bit for bit as the fresh ones did. Exit status 77 without a CUDA device, 1 when a
 // check fails.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 
 #include <cuda_runtime.h>
@@ -149,7 +150,7 @@ struct Fill {
         size_t chunk = (size_t) 256 << 20;
         for (;;) {
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::gpu_mem_info(&free_b, &total_b);
             free_after = free_b;
             if (free_b <= left) break;
             const size_t want = std::min(chunk, free_b - left);

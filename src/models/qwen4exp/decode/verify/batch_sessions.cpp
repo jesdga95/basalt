@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -99,7 +100,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     {   // static per-slot pointers: the PLE histories and, per QSA layer, the slots' caches and indexer state
         std::vector<float*> ph((size_t) S);
         for (int64_t i = 0; i < S; ++i) ph[(size_t) i] = slots[(size_t) i]->ple_hist;
-        cudaMemcpy(d_ple_slots_, ph.data(), (size_t) S * sizeof(float*), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_ple_slots_, ph.data(), (size_t) S * sizeof(float*), cudaMemcpyHostToDevice);
         d_qslots_.assign((size_t) nQ, nullptr);
         QsaSegSlot* dev = (QsaSegSlot*) ((uint8_t*) d + b5);
         for (int64_t l = lb_; l < le_; ++l) {
@@ -117,7 +118,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
                 e.tail_snap = tail_snap_b_ + ((size_t) i * nQ + qi) * TS;
                 e.block_pos = st.idx_block_pos; e.max_cells = (int32_t) st.max_cells;
             }
-            cudaMemcpy(dev, hs.data(), (size_t) S * sizeof(QsaSegSlot), cudaMemcpyHostToDevice);
+            basalt::core::device_copy(dev, hs.data(), (size_t) S * sizeof(QsaSegSlot), cudaMemcpyHostToDevice);
             d_qslots_[(size_t) qi] = dev;
             dev += S;
         }

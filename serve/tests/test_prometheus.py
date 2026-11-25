@@ -214,5 +214,32 @@ class MultiModelAndAuthMetrics(unittest.TestCase):
         self.assertEqual(status, 404)
 
 
+class SpillAndTelemetry(unittest.TestCase):
+    def test_prometheus_renders_dict_spill(self):
+        from serve.prometheus import PromStats, render_prometheus
+        metrics = {
+            "engine": {
+                "model": "TestModel",
+                "max_context": 4096,
+                "spill": {"experts": 34, "total": 3072, "bytes": 193273528},
+                "expert_total": 3072,
+            },
+            "live": {"state": "idle"},
+            "totals": {},
+        }
+        text = render_prometheus([(metrics, PromStats().snapshot())])
+        assert_valid_prometheus(self, text)
+        self.assertIn('basalt_experts_spilled{model_name="TestModel"} 34', text)
+        self.assertIn('basalt_experts{model_name="TestModel"} 3072', text)
+
+    def test_telemetry_disk_handles_none_counters(self):
+        from types import SimpleNamespace
+        from serve.util.telemetry import Telemetry
+        t = Telemetry.__new__(Telemetry)
+        t.ps = SimpleNamespace(disk_io_counters=lambda: None)
+        t._disk_prev = None
+        self.assertIsNone(t._disk())
+
+
 if __name__ == "__main__":
     unittest.main()

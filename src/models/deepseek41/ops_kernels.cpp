@@ -1,5 +1,6 @@
 // src/models/deepseek41/ops_kernels.cpp - the layer ops built from the kernel groups' entry points: attention
 // (window ring, compressor, indexer, query path, sparse MQA, grouped output) with per-layer state owned here.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
@@ -162,11 +163,11 @@ public:
         float tab[kRopePairs];
         rope_freq_table(RopeParams{}, tab);
         if (!alloc((void**) &freq_[0], sizeof(tab))) return oom(err);
-        cudaMemcpy(freq_[0], tab, sizeof(tab), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(freq_[0], tab, sizeof(tab), cudaMemcpyHostToDevice);
         rope_freq_table(RopeParams{g_.comp_rope_base, 1.f / g_.yarn_factor, 1.f, g_.yarn_beta_fast, g_.yarn_beta_slow,
                                    g_.yarn_orig_ctx}, tab);
         if (!alloc((void**) &freq_[1], sizeof(tab))) return oom(err);
-        cudaMemcpy(freq_[1], tab, sizeof(tab), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(freq_[1], tab, sizeof(tab), cudaMemcpyHostToDevice);
         rope_[0] = rope_table_window();
         rope_[1] = rope_table_compressed(g_.comp_rope_base, g_.yarn_factor, g_.yarn_beta_fast, g_.yarn_beta_slow, g_.yarn_orig_ctx);
 
@@ -230,7 +231,7 @@ public:
             k.v.resize_for_overwrite(rows * idx_b_);
             const auto down = [&](const uint8_t* dev, core::ConversationBuffer& to) {
                 return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy(p, dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                    return basalt::core::device_copy(p, dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
                 });
             };
             if (!down(el_kv_[(size_t) il]->data(), k.k) || !down(el_ik_[(size_t) il]->data(), k.v)) {
@@ -253,7 +254,7 @@ public:
             }
             const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                    return basalt::core::device_copy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
                 });
             };
             if (!up(el_kv_[(size_t) il]->data(), kv[i].k) || !up(el_ik_[(size_t) il]->data(), kv[i].v)) {

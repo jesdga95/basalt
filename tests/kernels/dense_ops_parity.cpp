@@ -323,6 +323,65 @@ int main() {
         cudaFree(dout);
         cudaFree(dscr);
     }
+    {   // f32_rows_dot: K % 32 != 0 fallback (K = 48, K % 16 == 0) and T = 1023, 1024, 3072 dispatch boundaries
+        for (const int TR : {65, 1024}) {
+            const int NR = 67, KR = 48;
+            auto x = randn((size_t) TR * KR), w = randn((size_t) NR * KR, 0.2f);
+            float *dx = up(x), *dw = up(w), *dy = nullptr;
+            cudaMalloc(&dy, (size_t) TR * NR * 4);
+            basalt::kernels::f32_rows_dot(dx, dw, dy, TR, NR, KR, S);
+            auto y = down(dy, (size_t) TR * NR);
+            std::vector<double> want(y.size());
+            for (int r = 0; r < TR; ++r)
+                for (int n = 0; n < NR; ++n) {
+                    double acc = 0;
+                    for (int k = 0; k < KR; ++k) acc += (double) x[(size_t) r * KR + k] * w[(size_t) n * KR + k];
+                    want[(size_t) r * NR + n] = acc;
+                }
+            report(TR == 65 ? "f32_rows_dot K=48" : "f32_rows_dot K=48 1K", y, want, 1e-4);
+            cudaFree(dx);
+            cudaFree(dw);
+            cudaFree(dy);
+        }
+        {
+            const int TMAX = 3072, NR = 130, KR = 64;
+            auto x = randn((size_t) TMAX * KR), w = randn((size_t) NR * KR, 0.2f);
+            float *dx = up(x), *dw = up(w), *dy_1023 = nullptr, *dy_1024 = nullptr, *dy_3072 = nullptr;
+            cudaMalloc(&dy_1023, (size_t) 1023 * NR * 4);
+            cudaMalloc(&dy_1024, (size_t) 1024 * NR * 4);
+            cudaMalloc(&dy_3072, (size_t) TMAX * NR * 4);
+            basalt::kernels::f32_rows_dot(dx, dw, dy_1023, 1023, NR, KR, S);
+            basalt::kernels::f32_rows_dot(dx, dw, dy_1024, 1024, NR, KR, S);
+            basalt::kernels::f32_rows_dot(dx, dw, dy_3072, TMAX, NR, KR, S);
+            auto y1023 = down(dy_1023, (size_t) 1023 * NR);
+            auto y1024 = down(dy_1024, (size_t) 1024 * NR);
+            auto y3072 = down(dy_3072, (size_t) TMAX * NR);
+            auto cpu_check = [&](const char* label, const std::vector<float>& yv, const std::vector<int>& rows) {
+                std::vector<double> want;
+                std::vector<float> got;
+                for (const int r : rows)
+                    for (int n = 0; n < NR; ++n) {
+                        double acc = 0;
+                        for (int k = 0; k < KR; ++k) acc += (double) x[(size_t) r * KR + k] * w[(size_t) n * KR + k];
+                        want.push_back(acc);
+                        got.push_back(yv[(size_t) r * NR + n]);
+                    }
+                report(label, got, want, 1e-4);
+            };
+            cpu_check("f32_rows_dot T=1023", y1023, {0, 15, 16, 1008, 1022});
+            cpu_check("f32_rows_dot T=1024", y1024, {0, 31, 32, 992, 1022, 1023});
+            cpu_check("f32_rows_dot T=3072", y3072, {0, 47, 48, 1022, 1023, 1024, 3024, 3071});
+            const bool bit_1023 = std::memcmp(y1023.data(), y3072.data(), y1023.size() * 4) == 0;
+            const bool bit_1024 = std::memcmp(y1024.data(), y3072.data(), y1024.size() * 4) == 0;
+            std::printf("f32_rows_dot tiles    T=1023/1024/3072 %s\n", (bit_1023 && bit_1024) ? "bitwise" : "FAIL");
+            if (!(bit_1023 && bit_1024)) ++fails;
+            cudaFree(dx);
+            cudaFree(dw);
+            cudaFree(dy_1023);
+            cudaFree(dy_1024);
+            cudaFree(dy_3072);
+        }
+    }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

@@ -268,6 +268,8 @@ class Telemetry:
             c = self.ps.disk_io_counters()
         except (OSError, RuntimeError):
             return None
+        if c is None:
+            return None
         t = time.time()
         prev, self._disk_prev = self._disk_prev, (t, c.read_bytes)
         if prev is None or t <= prev[0]:

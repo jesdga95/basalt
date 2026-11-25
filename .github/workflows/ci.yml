@@ -98,7 +98,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022]   # the Arm64 build is the DGX Spark's (12.1, NEON)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     defaults:
@@ -131,7 +131,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DWERROR="$WERROR"
           -DBUILD_TESTING=ON
-          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DCMAKE_CUDA_ARCHITECTURES=${{ runner.arch == 'ARM64' && '121' || '120' }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
@@ -157,6 +157,7 @@ jobs:
           fi
 
       - name: AVX-512 stays inside the dispatched kernels
+        if: runner.arch == 'X64'
         run: python tools/check_isa_isolation.py build
 
       - name: CPU tests

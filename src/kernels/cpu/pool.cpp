@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
+#include "basalt/platform/compiler.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -169,7 +169,7 @@ void ExpertPool::worker(int id) {
         uint32_t spins = 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+            basalt::platform::cpu_relax();
             if ((++spins & 63u) != 0) continue;
             const auto now = std::chrono::steady_clock::now();
             if (now - parked_at < spin_before_sleep_) {
@@ -240,7 +240,7 @@ void ExpertPool::wait_parked(const char* what) {
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     StallClock clock;
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
-        _mm_pause();
+        basalt::platform::cpu_relax();
         if (clock.expired(parked_.load(std::memory_order_relaxed))) {
             basalt::log::error("basalt", "the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again",
@@ -257,7 +257,7 @@ void ExpertPool::wait_done(int n) {
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        _mm_pause();
+        basalt::platform::cpu_relax();
         if (clock.expired(d)) {                                       // progress restarts the clock
             basalt::log::error("basalt", "the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again",
@@ -270,7 +270,7 @@ void ExpertPool::wait_done(int n) {
 void ExpertPool::wait_ready(int e) {
     StallClock clock;
     while (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
-        _mm_pause();
+        basalt::platform::cpu_relax();
         if (clock.expired(done_.load(std::memory_order_relaxed))) {
             basalt::log::error("basalt", "the CPU expert pool stalled: the gate/up rows of expert %d of the batch did not finish "
                                  "(%u of %d tasks done, %u of %d workers parked) - stopping the engine so the server can "
@@ -330,7 +330,7 @@ int ExpertPool::part_row(int part, int parts, int rows) const {
 void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const {
     // into L2 (a part is tens of KB, more than L1 holds), checking every 4 KB whether the wait is already over
     for (size_t o = 0; o < bytes; o += 64) {
-        _mm_prefetch((const char*) p + o, _MM_HINT_T1);
+        basalt::platform::prefetch(p + o, false);
         if ((o & 4095) == 4032 && fused_[(size_t) e].ready.load(std::memory_order_relaxed) != 0) return;
     }
 }

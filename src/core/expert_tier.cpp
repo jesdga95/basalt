@@ -1,4 +1,5 @@
 // src/core/expert_tier.cpp - the routed-expert tiers.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/log.hpp"
 #include "basalt/core/expert_tier.hpp"
 
@@ -1591,7 +1592,7 @@ void ExpertTier::report(const char* tag) const {
         basalt::log::info(s_.area.c_str(), "TIER %s: %lld experts read into the RAM tier (%s)", tag, (long long) read_,
                           reads_.unbuffered() ? "unbuffered" : "through the file cache");
     unsigned long long c[8] = {};
-    if (route_counts_ != nullptr && cudaMemcpy(c, route_counts_, sizeof c, cudaMemcpyDeviceToHost) == cudaSuccess)
+    if (route_counts_ != nullptr && basalt::core::device_copy(c, route_counts_, sizeof c, cudaMemcpyDeviceToHost) == cudaSuccess)
         for (const std::string& line : route_report(c, route_tail_skip_, route_prior_))
             basalt::log::info(s_.area.c_str(), "TIER %s: %s", tag, line.c_str());
     else

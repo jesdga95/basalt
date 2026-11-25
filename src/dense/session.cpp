@@ -1,4 +1,5 @@
 // src/dense/session.cpp - a conversation of the dense stack as a model::ModelSession.
+#include "basalt/core/device_copy.hpp"
 #include "internal.hpp"
 
 #include "basalt/core/conversation_cache.hpp"
@@ -602,8 +603,8 @@ public:
             to.resize_for_overwrite(bytes);
             return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
                 const size_t a = at < split ? std::min(n, split - at) : 0;
-                return (a == 0 || cudaMemcpy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
-                       (a == n || cudaMemcpy(p + a, (const uint8_t*) far_buf + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
+                return (a == 0 || basalt::core::device_copy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
+                       (a == n || basalt::core::device_copy(p + a, (const uint8_t*) far_buf + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv_layers() + (drafter_ ? 1 : 0); ++i) {
@@ -644,8 +645,8 @@ public:
         const auto up = [&](void* dev, void* far_buf, size_t split, const core::ConversationBuffer& from, size_t bytes) {
             return from.size() >= bytes && from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) {
                 const size_t a = at < split ? std::min(n, split - at) : 0;
-                return (a == 0 || cudaMemcpy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
-                       (a == n || cudaMemcpy((uint8_t*) far_buf + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
+                return (a == 0 || basalt::core::device_copy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
+                       (a == n || basalt::core::device_copy((uint8_t*) far_buf + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv.size(); ++i) {
@@ -717,7 +718,7 @@ public:
 
     Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(st_.stream);
-        if (cudaMemcpy(out, st_.logits + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (basalt::core::device_copy(out, st_.logits + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return fail("the logits copy failed");
         return {};
     }
@@ -874,7 +875,7 @@ private:
                 owned_.emplace_back(v);
                 d_hist_ = (int32_t*) v;
             }
-            if (cudaMemcpy(d_hist_, r.history, (size_t) r.n_tokens * r.history_len * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (basalt::core::device_copy(d_hist_, r.history, (size_t) r.n_tokens * r.history_len * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "the penalty history upload failed";
                 return false;
             }
