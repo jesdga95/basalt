@@ -3,15 +3,16 @@ name: pr-labels
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
-  push:
-    branches: [main]
+  # Main moving can make any open PR conflict; a sweep every half hour labels those (GitHub has computed mergeable by then).
+  schedule:
+    - cron: "17,47 * * * *"
   workflow_dispatch:
 
 permissions:
   pull-requests: write
 
 concurrency:
-  group: pr-labels-${{ github.event.pull_request.number || 'main' }}
+  group: pr-labels-${{ github.event.pull_request.number || 'sweep' }}
   cancel-in-progress: true
 
 jobs:
@@ -95,9 +96,8 @@ jobs:
           if pr_num:
               sync_one(fetch_pr(pr_num), 4)
           else:
-              # Push to main or manual dispatch: sweep all open PRs. No polling: right after a push every PR's mergeable is
-              # still being computed, and waiting on each one in turn made the sweep outlast the next push. A PR left
-              # unknown here is labelled by its own next run or the next sweep.
+              # Scheduled or manual sweep of every open PR, without polling: a PR whose mergeable GitHub has not computed yet
+              # (reading it starts the computation) is labelled by the next sweep or its own next run.
               pages = gh_json("api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100")
               for p in (pr for page in pages for pr in page):
                   sync_one(fetch_pr(p["number"]), 0)
