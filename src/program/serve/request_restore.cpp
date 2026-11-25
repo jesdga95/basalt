@@ -1,5 +1,6 @@
 // src/program/serve/request_restore.cpp - request restore operations.
 #include "prefix_anchor.hpp"
+#include "prompt_parts.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -116,8 +117,10 @@ Flow Request::restore() {
         runtime_.live_imgs = std::move(s0.imgs);
         runtime_.live_ok = runtime_.o.prompt_cache > 0;
         runtime_.cvec_cached = s0.cvec;
-        for (ConvCheckpoint& c : s0.checks) runtime_.checks.push_back(std::move(c));
-        s0.checks.clear();
+        merge_slot_checkpoints(s0.checks, runtime_.checks,
+                               [](const int32_t* a, size_t n_ids, const int32_t* b) {
+                                   return basalt::core::conversation_ids_equal(a, n_ids, b);
+                               });
         s0.cached = false;
         if (!slot_draft_in(0)) runtime_.live_ok = false;   // the draft K/V with it
     }
