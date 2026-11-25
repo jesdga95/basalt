@@ -187,26 +187,26 @@ int Guard::scan(const int32_t* out, int rows, int first) {
 }
 
 void Guard::mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias) {
-    st_.fill_mask(*pv_.vocab, mask_, use_cache);
-    if (blocks_) {   // a reply of blocks before or after its answer: the tokens feed() takes there
-        const auto allow = [&](int32_t t) { if (t >= 0 && (size_t) t < mask_.size()) mask_[(size_t) t] = 1; };
-        if (thinking_) {
-            std::fill(mask_.begin(), mask_.end(), (uint8_t) 1);
-            for (int32_t e : pv_.vocab->end_ids())
-                if (is_end(e)) mask_[(size_t) e] = 0;
-        } else if (phase_ == Phase::between) {
-            std::fill(mask_.begin(), mask_.end(), (uint8_t) 0);
-            allow(pv_.block_header);
-        } else if (phase_ == Phase::opened) {   // the grammar's first text, or a block's tag
+    const size_t n = pv_.vocab->size();
+    const auto allow = [&](int32_t t) { if (t >= 0 && (size_t) t < n) mask_[(size_t) t] = 1; };
+    if (blocks_ && thinking_) {
+        mask_.assign(n, (uint8_t) 1);
+        for (int32_t e : pv_.vocab->end_ids())
+            if (is_end(e)) mask_[(size_t) e] = 0;
+    } else if (blocks_ && phase_ == Phase::between) {
+        mask_.assign(n, (uint8_t) 0);
+        allow(pv_.block_header);
+    } else if (blocks_ && phase_ == Phase::done) {
+        mask_.assign(n, (uint8_t) 0);
+        for (int32_t e : pv_.vocab->end_ids())
+            if (is_end(e)) allow(e);
+    } else {
+        st_.fill_mask(*pv_.vocab, mask_, use_cache);
+        if (blocks_ && phase_ == Phase::opened) {   // the grammar's first text, or a block's tag
             allow(pv_.answer_open);
             if (allow_think_) allow(pv_.think_open);
-        } else if (phase_ == Phase::done) {
-            std::fill(mask_.begin(), mask_.end(), (uint8_t) 0);
-            for (int32_t e : pv_.vocab->end_ids())
-                if (is_end(e)) allow(e);
         }
     }
-    const size_t n = mask_.size();
     bias.resize(n);
     const bool u = user_bias.size() == n;
     for (size_t i = 0; i < n; ++i) bias[i] = mask_[i] ? (u ? user_bias[i] : 0.0f) : -INFINITY;
