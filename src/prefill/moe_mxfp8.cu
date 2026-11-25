@@ -80,12 +80,12 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], unsigned a0, unsigned a1,
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 // a UE8M0 byte's power of two (0xFF, NaN in the format, reads as 0 as the block-scaled mma's weights take it)
-__device__ __forceinline__ float ue8m0_f(unsigned u) {
+[[maybe_unused]] __device__ __forceinline__ float ue8m0_f(unsigned u) {
     u &= 255u;
     if (u == 255u) u = 0u;
     return u ? __uint_as_float(u << 23) : __uint_as_float(0x00400000u);
 }
-__device__ __forceinline__ void mma_mxfp8_ada(float* c, const unsigned* a, unsigned b0, unsigned b1, float sa0, float sa1,
+[[maybe_unused]] __device__ __forceinline__ void mma_mxfp8_ada(float* c, const unsigned* a, unsigned b0, unsigned b1, float sa0, float sa1,
                                               float sb0, float sb1) {
     float p[4] = {0.f, 0.f, 0.f, 0.f};
     mma_f16(p, e4m3x2_h2(a[0]), e4m3x2_h2(a[1]), e4m3x2_h2(a[0] >> 16), e4m3x2_h2(a[1] >> 16), e4m3x2_h2(b0),

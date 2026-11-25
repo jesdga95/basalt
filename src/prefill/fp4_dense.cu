@@ -744,7 +744,7 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
 
 // E2M1 to nearest, ties to the even code, saturating: the rounding of cvt.rn.satfinite.e2m1x2.f32, which 8.9 lacks
 // (nvfp4_planes.cu rounds the same way)
-__device__ __forceinline__ unsigned e2m1_rn(float x) {
+[[maybe_unused]] __device__ __forceinline__ unsigned e2m1_rn(float x) {
     const float a = fabsf(x);
     const unsigned c = a <= 0.25f ? 0 : a < 0.75f ? 1 : a <= 1.25f ? 2 : a < 1.75f ? 3 : a <= 2.5f ? 4 : a < 3.5f ? 5 : a <= 5.0f ? 6 : 7;
     return c | (x < 0.0f && c ? 8u : 0u);

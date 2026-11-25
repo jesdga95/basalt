@@ -23,14 +23,14 @@ constexpr int BK = 128, ST = 2;
 // kernel-local copies above the same values, which shadow these inside their bodies
 constexpr int BT = 64, BR = 64;
 constexpr int WT = 2, WR = 2;
-constexpr int NCONS = WT * WR * 32, NT = NCONS + 32;
+[[maybe_unused]] constexpr int NCONS = WT * WR * 32, NT = NCONS + 32;
 constexpr int WTOK = BT / WT, WROW = BR / WR;
-constexpr int MT = WTOK / 16, MR = WROW / 8;
+[[maybe_unused]] constexpr int MT = WTOK / 16, MR = WROW / 8;
 constexpr int ACT_B = ST * BT * BK;                       // 16 KiB
 constexpr int W_B = ST * BR * BK;                         // 16 KiB
 constexpr int ASC_B = ST * 4 * BT * (int) sizeof(float);  // 2 KiB: [ST][4][BT] float
 constexpr int WSC_B = ST * 4 * BR * (int) sizeof(__half); // 1 KiB: [ST][4][BR] half
-constexpr int SMEM = ACT_B + W_B + ASC_B + WSC_B + 3 * ST * 8;
+[[maybe_unused]] constexpr int SMEM = ACT_B + W_B + ASC_B + WSC_B + 3 * ST * 8;
 constexpr int MAX_SEG = 3;
 
 template <int BT, int BR>
@@ -289,10 +289,10 @@ struct ArgsAda {
     int nseg, ntok, tok_tiles, total_tiles, k_tiles, k_blocks, a_sc_ld, epi;
 };
 
-__device__ __forceinline__ void cp16z(void* dst, const void* src, bool ok) {
+[[maybe_unused]] __device__ __forceinline__ void cp16z(void* dst, const void* src, bool ok) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(su(dst)), "l"(src), "r"(ok ? 16 : 0) : "memory");
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+[[maybe_unused]] __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
 
 __global__ __launch_bounds__(NCONS, 2) void gemm_ada_kernel(const __grid_constant__ ArgsAda p) {

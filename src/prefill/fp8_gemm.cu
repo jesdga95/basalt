@@ -388,7 +388,7 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], unsigned a0, unsigned a1,
 #endif
 // byte offset of (row, logical byte) in a stage tile of 64-byte rows: the 16-byte pieces swizzled by (row / 2) % 4, so
 // the eight rows of an ldmatrix matrix fall in eight bank groups
-__device__ __forceinline__ int swa(int row, int byte) {
+[[maybe_unused]] __device__ __forceinline__ int swa(int row, int byte) {
     return row * A_BK + ((((byte >> 4) ^ (row >> 1)) & 3) << 4) + (byte & 15);
 }
 
