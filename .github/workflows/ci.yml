@@ -160,7 +160,8 @@ jobs:
           -DWERROR="$WERROR"
           -DBASALT_MODELS=all
           -DBUILD_TESTING=ON
-          -DCMAKE_CUDA_ARCHITECTURES=${{ runner.arch == 'ARM64' && '121' || '120' }}
+          # 89 as well: the runner has no GPU, so compiling the Ada path is the only proof CI can give of it
+          -DCMAKE_CUDA_ARCHITECTURES=${{ runner.arch == 'ARM64' && '121;89' || '120;89' }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
@@ -235,7 +236,8 @@ jobs:
           -DWERROR=ON
           -DBUILD_TESTING=ON
           -DBASALT_MODELS=${{ matrix.model }}
-          -DCMAKE_CUDA_ARCHITECTURES=120
+          # the Ada path is compiled on every job for the same reason: a runner cannot run the kernels
+          -DCMAKE_CUDA_ARCHITECTURES="120;89"
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
