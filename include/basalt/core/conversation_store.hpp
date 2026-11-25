@@ -115,8 +115,8 @@ public:
     /// The RAM a write() of `tokens` tokens takes beside its source.
     static uint64_t write_bytes(size_t tokens);
     /// Whether a conversation of `bytes` could be written now: what write() and the writer refuse before they begin
-    /// (one larger than the budget, or than the volume's free space past the room it keeps), so a caller can tell
-    /// before it makes room for the write.
+    /// (one larger than the budget, or one fits() finds no room for on the volume), so a caller can tell before it
+    /// makes room for the write.
     bool may_take(uint64_t bytes) const;
 
     /// Whether an image with these live tokens is stored or queued.

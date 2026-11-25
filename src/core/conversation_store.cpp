@@ -1444,7 +1444,7 @@ uint64_t ConversationStore::write_bytes(size_t tokens) {
 }
 
 bool ConversationStore::may_take(uint64_t bytes) const {
-    return open_ && bytes <= budget_ && basalt::platform::disk_free_bytes(dir_) >= bytes + kSpaceFloor;
+    return bytes <= budget_ && fits(bytes);
 }
 
 bool ConversationStore::write(const ConversationSource& src, std::string& error,
