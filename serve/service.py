@@ -1667,8 +1667,9 @@ class Service:
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
-                                    # only at a clean point: no held tag or split character
-                                    if thought >= budget and not parser.buf and not detok.pending():
+                                    # only at a clean point: no held tag or split character; let a budget-capped pass drain its own DONE/BDONE
+                                    if thought >= budget and not parser.buf and not detok.pending() \
+                                            and not (capped and n - n_pass0 >= cap):
                                         wrap = True
                                         break
                                 if live is not None:

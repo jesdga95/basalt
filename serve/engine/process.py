@@ -994,10 +994,11 @@ class ProcessEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: int | None = None, wait_s: float = 0.0):
+    def _release_slot_when_done(self, slot: int, stream: int | None = None, wait_s: float = 0.0, cancel=None):
         """BSTOP a slot whose consumer left and free it at BDONE; `stream` (the tokens of the prompt and the tokens so
-        far) becomes what the slot holds. Waits up to `wait_s` for the BDONE and returns its fields (None when it has not come: the
-        rest is freed in the background)."""
+        far) becomes what the slot holds. Waits up to `wait_s` for the BDONE (or, while `cancel` is unset, until the
+        slot finishes or `cancel` fires) and returns its fields (None when it has not come: the rest is freed in the
+        background)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots
             return None
         try:
@@ -1007,11 +1008,17 @@ class ProcessEngine:
         q, busy = self.slot_q[slot], self.slot_busy     # restart() replaces them
         tail = [stream or 0]                            # the tokens the slot holds so far, one counted past the fed ones
 
-        def drain(end):             # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
+        def drain(end, stop_ev=None):   # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
             while time.monotonic() < end:
+                if stop_ev is not None and stop_ev.is_set():
+                    return "wait", None
+                step = 0.2 if stop_ev is not None else 5.0
                 try:
-                    line = q.get(timeout=max(0.01, min(5.0, end - time.monotonic())))
+                    line = q.get(timeout=max(0.01, min(step, end - time.monotonic())))
                 except queue.Empty:
+                    if stop_ev is not None and not self.alive():
+                        tail[0] = 0
+                        return "gone", None
                     continue
                 if line is None:
                     tail[0] = 0
@@ -1030,7 +1037,10 @@ class ProcessEngine:
                 busy[slot] = False
                 self.slot_cv.notify_all()
 
-        state, fields = drain(time.monotonic() + wait_s) if wait_s > 0 else ("wait", None)
+        if cancel is not None and not cancel.is_set():
+            state, fields = drain(time.monotonic() + 600.0, stop_ev=cancel)
+        else:
+            state, fields = drain(time.monotonic() + wait_s) if wait_s > 0 else ("wait", None)
         if state != "wait":
             free()
             return fields
@@ -1207,15 +1217,16 @@ class ProcessEngine:
         meet, epoch = [], []          # per slot: the tokens of the prompt it covers, and the slot's epoch when it said so
         handle = held["handle"]
 
-        def attach() -> None:       # the control lines are held: the prompt on this engine, and what its slots cover of it
+        def attach(match: bool = True) -> None:       # the control lines are held: the prompt on this engine, and what its slots cover of it
             nonlocal handle, meet, epoch
             if held["gen"] != self.gen:             # the engine restarted while this request waited: hold it again
                 handle, _ = self._hold_prompt(ids, embeddings)
                 held.update(handle=handle, gen=self.gen)
-                meet = []
-            if not meet:
+                meet, epoch = [], []
+            if match and (not meet or epoch != self.slot_epoch):
+                snap = list(self.slot_epoch)
                 meet = self._meet(handle, self.gen)
-                epoch = list(self.slot_epoch)
+                epoch = snap
 
         def gen_keys() -> str:      # a run that continues after tokens were generated tells the grammar where the prompt ends
             return keys + (f" gprompt={n}" if out and " grammar=" in keys and " gprompt=" not in keys else "")
@@ -1329,18 +1340,30 @@ class ProcessEngine:
                             return
                         self._carry_run(carry, first, last0, False)
                         extra = list(out)                   # continues in a batch slot
-                while True:
-                    if slot is None:
-                        # prefer the slot holding this prompt's start, else the longest unused
-                        with self.slot_cv:
-                            ticket = self.admission.join()
-                            try:
+                ticket = None
+                try:
+                    while True:
+                        if slot is None:
+                            # prefer the slot holding this prompt's start, else the longest unused
+                            refresh = False
+                            with self.slot_cv:
+                                if ticket is None:
+                                    ticket = self.admission.join()
                                 while True:
-                                    slot = self.pick_slot(meets(), size(), session)
-                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, meets(), size())):
+                                    if any(not self.slot_busy[b] and self.slot_held[b] > 0
+                                           and (b >= len(epoch) or epoch[b] != self.slot_epoch[b])
+                                           for b in self.slot_order):
+                                        refresh = True
+                                        break
+                                    cur_meets = meets()
+                                    slot = self.pick_slot(cur_meets, size(), session)
+                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size())):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
                                         slot_gen = self.gen
+                                        self.admission.leave(ticket)
+                                        ticket = None
+                                        self.slot_cv.notify_all()
                                         break
                                     slot = None
                                     if holding:
@@ -1352,71 +1375,81 @@ class ProcessEngine:
                                     self.slot_cv.wait(timeout=10.0)
                                     if cancel.is_set():
                                         return
-                            finally:
-                                self.admission.leave(ticket)
-                                self.slot_cv.notify_all()
-                    if not holding:                         # waited for the slot: take the control lines again
-                        ok = yield from self._take_control(cancel, size())
-                        if not ok:
-                            return
-                        holding, born = True, self.gen
-                        attach()
-                        if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
-                            slot, slot_gen = None, None
+                            if refresh:
+                                if not holding:
+                                    ok = yield from self._take_control(cancel, size())
+                                    if not ok:
+                                        return
+                                    holding, born = True, self.gen
+                                attach()
+                                continue
+                        if not holding:                         # waited for the slot: take the control lines again
+                            ok = yield from self._take_control(cancel, size())
+                            if not ok:
+                                return
+                            holding, born = True, self.gen
+                            attach(match=slot_gen != born)
+                            if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                                slot, slot_gen = None, None
+                                self._yielded = None
+                                continue
+                        if self._yielded is not None:           # gave way: waiting requests go first
+                            self._hold(slot, self._yielded[1])
+                            note(slot)
                             self._yielded = None
-                            continue
-                    if self._yielded is not None:           # gave way: waiting requests go first
-                        self._hold(slot, self._yielded[1])
-                        note(slot)
-                        self._yielded = None
-                        yields += 1
-                        self.ctl.release()
-                        holding = False
-                        with self.slot_cv:
-                            ctl_epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, size(), after_epoch=ctl_epoch)
-                        if not ok:
-                            return
-                        holding, born = True, self.gen
-                        attach()
-                        if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
-                            slot, slot_gen = None, None
-                            continue
-                    left = max(1, min(left, self.max_context - size() - SLOT_MARGIN))   # the slot's room
-                    while not self.slot_q[slot].empty():
-                        self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
-                    self._send(f"{head} {ref()}")
-                    self._hold(slot, 0)                     # admission overwrites the slot
-                    phase = "admit"
-                    self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
-                    self._ctl_erred = False
-                    asked = False
+                            yields += 1
+                            self.ctl.release()
+                            holding = False
+                            with self.slot_cv:
+                                ctl_epoch = self.ctl_epoch
+                            ok = yield from self._take_control(cancel, size(), after_epoch=ctl_epoch)
+                            if not ok:
+                                return
+                            holding, born = True, self.gen
+                            attach(match=slot_gen != born)
+                            if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                                slot, slot_gen = None, None
+                                continue
+                        left = max(1, min(left, self.max_context - size() - SLOT_MARGIN))   # the slot's room
+                        while not self.slot_q[slot].empty():
+                            self.slot_q[slot].get_nowait()
+                        head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
+                        self._send(f"{head} {ref()}")
+                        self._hold(slot, 0)                     # admission overwrites the slot
+                        phase = "admit"
+                        self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                        self._ctl_erred = False
+                        asked = False
 
-                    def ask_yield():    # a shorter request waits: the read gives way at its next chunk boundary
-                        nonlocal asked
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(size())):
-                            self._send(f"BYIELD {slot}")
-                            asked = True
-                    for x in self._control(cancel, pending.append, idle=ask_yield):
+                        def ask_yield():    # a shorter request waits: the read gives way at its next chunk boundary
+                            nonlocal asked
+                            if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                                    self._shorter_waiting(size())):
+                                self._send(f"BYIELD {slot}")
+                                asked = True
+                        for x in self._control(cancel, pending.append, idle=ask_yield):
+                            while pending:
+                                t = pending.pop(0)
+                                out.append(t)
+                                yield t
+                            if x is None:
+                                ask_yield()
+                                yield None
+                        self._note_first_reused(first, last0)
+                        cont = bool(self._ctl_result and self._ctl_result[1])
+                        phase = "slot" if cont else "none"
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
                             yield t
-                        if x is None:
-                            ask_yield()
-                            yield None
-                    self._note_first_reused(first, last0)
-                    cont = bool(self._ctl_result and self._ctl_result[1])
-                    phase = "slot" if cont else "none"
-                    while pending:
-                        t = pending.pop(0)
-                        out.append(t)
-                        yield t
-                    if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
-                        continue                            # gave way: retry after the shorter request
-                    break
+                        if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
+                            continue                            # gave way: retry after the shorter request
+                        break
+                finally:
+                    if ticket is not None:
+                        with self.slot_cv:
+                            self.admission.leave(ticket)
+                            self.slot_cv.notify_all()
                 self.ctl.release()
                 holding = False
                 if not cont:
@@ -1515,7 +1548,7 @@ class ProcessEngine:
                 if phase == "slot":
                     self._hold(slot, 0)
                     stream = size() + len(out) - gen0 if gen0 is not None and len(out) > gen0 else None
-                    f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S)
+                    f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S, cancel=cancel)
                     if f is not None:
                         self._bdone_last(f)
                         self._carry_run(carry, first, last0, True)

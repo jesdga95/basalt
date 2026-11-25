@@ -1297,6 +1297,145 @@ class RestartRaces(unittest.TestCase):
         self.assertTrue(e.slot_busy[0])
         self.assertFalse(e.slot_busy[1])
 
+    def test_waiter_refreshes_pmatch_after_busy_slot_finishes(self):
+        """A waiter that ran PMATCH while all slots were busy re-runs PMATCH once a slot finishes with cached state."""
+        import queue
+        from serve.engine.process import AdmissionQueue
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ctl = threading.Lock()
+        e.slot_cv = threading.Condition()
+        e.admission = AdmissionQueue()
+        e.batch = 2
+        e.max_context = 4096
+        e.info = {"slot0_solo": 1}
+        e.gen = 1
+        e.slot_busy = [True, True]
+        e.slot_held = [0, 0]
+        e.slot_epoch = [0, 0]
+        e.slot_used = [1.0, 2.0]   # slot 0 looks older; without refreshed PMATCH slot 0 would be chosen
+        e.slot_order = [0, 1]
+        e.slot_owner = {}
+        e.slot_thread = [None, None]
+        e.slot_q = [queue.Queue(), queue.Queue()]
+        e.slot_live = [None, None]
+        e.waiting = 0
+        e.ctl_epoch = 0
+        e._yielded = None
+
+        sent = []
+        meet_calls = [0]
+        e._send = sent.append
+        e.alive = lambda: True
+        e.eos_ids = lambda: set()
+        e._hold_prompt = lambda ids, emb: (1, len(ids))
+
+        def fake_meet(handle, born):
+            meet_calls[0] += 1
+            return [0, 0] if meet_calls[0] == 1 else [0, 50]
+
+        def fake_take_control(cancel, prompt_size, after_epoch=None):
+            e.ctl.acquire()
+            if False:
+                yield None
+            return True
+
+        def fake_control(cancel, on_tok, **kw):
+            e._ctl_result = ("badm", False, False)
+            if False:
+                yield None
+
+        e._meet = fake_meet
+        e._take_control = fake_take_control
+        e._control = fake_control
+
+        def finish_slots():
+            time.sleep(0.05)
+            # Both slots become idle; slot 1 now holds a matching 50-token prefix
+            e._hold(0, 0)
+            e._hold(1, 50)
+            with e.slot_cv:
+                e.slot_busy[0] = False
+                e.slot_busy[1] = False
+                e.slot_cv.notify_all()
+
+        t = threading.Thread(target=finish_slots)
+        t.start()
+        cancel = threading.Event()
+        list(e._generate_batched(list(range(60)), {"handle": 1, "gen": 1}, 60, 4, {}, cancel, None, None, None))
+        t.join(5)
+        self.assertEqual(meet_calls[0], 2)
+        bgen = [s for s in sent if s.startswith("BGEN ")]
+        self.assertEqual(len(bgen), 1, sent)
+        self.assertTrue(bgen[0].startswith("BGEN 1 "), bgen)
+
+    def test_release_slot_when_done_waits_for_bdone_when_not_cancelled(self):
+        """A non-cancelled early exit waits past BDONE_WAIT_S so the slot is idle and cached before Pass 2 runs PMATCH."""
+        import queue
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.slot_cv = threading.Condition()
+        e.slot_q = [queue.Queue()]
+        e.slot_busy = [True]
+        e.slot_held = [0]
+        e.slot_epoch = [0]
+        e.slot_drafts = [None]
+        e._send = lambda line: None
+        e.alive = lambda: True
+
+        def send_bdone():
+            time.sleep(0.15)
+            e.slot_q[0].put("BDONE 0 10 cancel 1.0")
+
+        t = threading.Thread(target=send_bdone)
+        t.start()
+        cancel = threading.Event()
+        f = e._release_slot_when_done(0, stream=42, wait_s=0.02, cancel=cancel)
+        t.join(5)
+        self.assertIsNotNone(f)
+        self.assertFalse(e.slot_busy[0])
+        self.assertEqual(e.slot_held[0], 41)
+
+    def test_budget_capped_pass_drains_natural_bdone_without_bstop(self):
+        """When a thinking-budget pass is capped at max_new=budget, Service drains natural BDONE instead of sending BSTOP."""
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja")
+        closed_early = []
+        passes = []
+
+        class CapEngine:
+            max_context = 4096
+            last = None
+
+            def generate(self, prompt, max_new, sampling, cancel, session=None, **kw):
+                passes.append(max_new)
+                done = False
+                try:
+                    if len(passes) == 1:
+                        # Emit exactly max_new reasoning tokens (no </think>) and finish cleanly
+                        for b in b"a" * max_new:
+                            yield b
+                        done = True
+                    else:
+                        for b in b"final answer":
+                            yield b
+                        yield 257
+                        done = True
+                finally:
+                    if not done:
+                        closed_early.append(len(passes))
+
+        svc = Service(CapEngine(), tok, tpl)
+        cancel = threading.Event()
+        ids = svc.encode_prompt([{"role": "user", "content": "hi"}], None, {"enable_thinking": True})
+        events = [ev for kind, ev in svc.run(ids, True, None, 64,
+                                             {"temperature": 0.0, "reasoning_budget_tokens": 5},
+                                             cancel) if kind == "event"]
+        self.assertNotIn(1, closed_early, "capped pass 1 should drain natural BDONE without early gen.close()")
+        self.assertEqual(passes[0], 5)
+        self.assertGreaterEqual(len(passes), 2)
+        self.assertIn("final answer", "".join(ev.text for ev in events if ev.kind == "content"))
+
 
 if __name__ == "__main__":
     unittest.main()
