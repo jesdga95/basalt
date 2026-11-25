@@ -66,11 +66,11 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kRowWidth = 576;                 // a cache row: 512 latent values and 64 rotated
-constexpr int kMaxChunk = 16384;               // rows a prompt chunk may carry (the residual streams and the experts' pairs)
+constexpr int kMaxChunk = 32768;               // rows a prompt chunk may carry (the residual streams and the experts' pairs)
 constexpr int kAttRows = 2048;                 // rows of one attention step inside a chunk (the rings are sized for it)
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
 constexpr int kMmqTile = 128;                  // the widest column tile of an MMQ product
-constexpr int kLaunchRows = 16384;              // most (row, expert) pairs of one prompt launch
+constexpr int kLaunchRows = 32768;              // most (row, expert) pairs of one prompt launch
 constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
 constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
@@ -491,8 +491,11 @@ public:
         if (total < kRingRows) {
             want = std::max(kMaxWindow, total);
         } else {
-            while (want < total && want < kMaxChunk) want *= 2;
-            want = std::min(want, kMaxChunk);
+            // 32k chunks at up to 128k tokens; above that the attention inside a chunk is the cost, and above
+            // 262,144 per slot a ~15k-row chunk faults in the NVFP4 moe-down launch (8k there).
+            const int cap = m_.context() > 262144 ? 8192 : (total > 131072 ? 16384 : kMaxChunk);
+            while (want < total && want < cap) want *= 2;
+            want = std::min(want, cap);
         }
         const bool ringed = total >= kRingRows && tier_ && !ring_;
         // a bounded lend: the tier gives up only the slots the chunk's buffers and the ring need, and the rest keep their experts
