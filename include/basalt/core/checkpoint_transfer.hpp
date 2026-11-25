@@ -74,6 +74,7 @@ private:
     uint8_t* spare_ = nullptr;
     uint8_t* bounce_ = nullptr;
     size_t cap_ = 0;
+    int device_ = -1;
     cudaStream_t stream_ = nullptr;
     cudaEvent_t snapshot_ = nullptr, landed_ = nullptr;
     std::vector<Bounced> tail_;

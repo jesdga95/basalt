@@ -5,6 +5,7 @@
 #include "basalt/core/ram_load.hpp"
 
 #include <cstring>
+#include <limits>
 
 namespace basalt::core {
 namespace {
@@ -27,6 +28,20 @@ bool fail(std::string& error, const char* what, cudaError_t status) {
     return false;
 }
 
+template <typename Segment>
+bool validate_segments(const std::vector<Segment>& segments, std::string& error) {
+    for (const Segment& s : segments) {
+        for (const DeviceRegion& r : s.regions) {
+            if (r.bytes == 0) continue;
+            if (!r.dev || !s.host) {
+                error = "checkpoint transfer: a running-state region has no buffer";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 const HostPin kCheckpointPin = {lock_block, unlock_block};
@@ -41,13 +56,17 @@ bool host_range_pinned(const void* p) {
 }
 
 bool checkpoint_copy_out(const std::vector<SaveSegment>& segments, cudaStream_t stream, std::string& error) {
+    if (!validate_segments(segments, error)) return false;
+    bool queued = false;
     for (const SaveSegment& s : segments) {
         size_t at = 0;
         for (const DeviceRegion& r : s.regions) {
             if (r.bytes == 0) continue;
-            if (!r.dev || !s.host) { error = "checkpoint transfer: a running-state region has no buffer"; return false; }
-            if (const cudaError_t e = cudaMemcpyAsync(s.host + at, r.dev, r.bytes, cudaMemcpyDeviceToHost, stream); e != cudaSuccess)
+            if (const cudaError_t e = cudaMemcpyAsync(s.host + at, r.dev, r.bytes, cudaMemcpyDeviceToHost, stream); e != cudaSuccess) {
+                if (queued) (void) cudaStreamSynchronize(stream);
                 return fail(error, "copy out", e);
+            }
+            queued = true;
             at += r.bytes;
         }
     }
@@ -56,13 +75,17 @@ bool checkpoint_copy_out(const std::vector<SaveSegment>& segments, cudaStream_t 
 }
 
 bool checkpoint_copy_in(const std::vector<RestoreSegment>& segments, cudaStream_t stream, std::string& error) {
+    if (!validate_segments(segments, error)) return false;
+    bool queued = false;
     for (const RestoreSegment& s : segments) {
         size_t at = 0;
         for (const DeviceRegion& r : s.regions) {
             if (r.bytes == 0) continue;
-            if (!r.dev || !s.host) { error = "checkpoint transfer: a running-state region has no buffer"; return false; }
-            if (const cudaError_t e = cudaMemcpyAsync(r.dev, s.host + at, r.bytes, cudaMemcpyHostToDevice, stream); e != cudaSuccess)
+            if (const cudaError_t e = cudaMemcpyAsync(r.dev, s.host + at, r.bytes, cudaMemcpyHostToDevice, stream); e != cudaSuccess) {
+                if (queued) (void) cudaStreamSynchronize(stream);
                 return fail(error, "copy in", e);
+            }
+            queued = true;
             at += r.bytes;
         }
     }
@@ -90,7 +113,8 @@ bool running_copy_in(const RunningState& rs, const uint8_t* host, std::string& e
 CheckpointDeferral::~CheckpointDeferral() { release(); }
 
 void CheckpointDeferral::release() {
-    if (landed_) cudaEventSynchronize(landed_);
+    const OnDevice on(device_);
+    if (stream_) (void) cudaStreamSynchronize(stream_);
     if (landed_) cudaEventDestroy(landed_);
     if (snapshot_) cudaEventDestroy(snapshot_);
     if (stream_) cudaStreamDestroy(stream_);
@@ -101,6 +125,7 @@ void CheckpointDeferral::release() {
     stream_ = nullptr;
     snapshot_ = landed_ = nullptr;
     cap_ = 0;
+    device_ = -1;
     dst_ = nullptr;
     tail_.clear();
 }
@@ -109,6 +134,12 @@ bool CheckpointDeferral::reserve(size_t bytes, std::string& error) {
     if (bytes <= cap_ || !bytes) return true;
     if (dst_ && !finish(error)) return false;
     release();
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        dev = -1;
+    }
+    device_ = dev;
     if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&snapshot_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&landed_, cudaEventDisableTiming) != cudaSuccess) {
@@ -129,28 +160,41 @@ bool CheckpointDeferral::reserve(size_t bytes, std::string& error) {
 
 bool CheckpointDeferral::save(const std::vector<SaveSegment>& segments, cudaStream_t stream, const void* key, std::string& error) {
     if (dst_ && !finish(error)) return false;
+    if (!validate_segments(segments, error)) return false;
     size_t total = 0, loose = 0;
+    bool overflow = false;
     for (const SaveSegment& s : segments) {
         const size_t n = s.bytes();
+        if (n > std::numeric_limits<size_t>::max() - total) {
+            overflow = true;
+            break;
+        }
         total += n;
         if (n && !host_range_pinned(s.host)) loose += n;
     }
     // host bytes the driver would stage itself make the copy wait for the host: more than the bounce buffer holds, and
     // the save is made at once instead
-    if (!spare_ || total > cap_ || !total || loose > kBounceBytes) return checkpoint_copy_out(segments, stream, error);
+    if (overflow || !spare_ || total > cap_ || !total || loose > kBounceBytes) return checkpoint_copy_out(segments, stream, error);
+    const OnDevice on(device_);
     // snapshot: every region into the spare, in the stream's order, so work queued after this call cannot change it
     size_t at = 0;
+    bool d2d_queued = false;
     for (const SaveSegment& s : segments)
         for (const DeviceRegion& r : s.regions) {
             if (r.bytes == 0) continue;
-            if (!r.dev || !s.host) { error = "checkpoint transfer: a running-state region has no buffer"; return false; }
-            if (const cudaError_t e = cudaMemcpyAsync(spare_ + at, r.dev, r.bytes, cudaMemcpyDeviceToDevice, stream); e != cudaSuccess)
+            if (const cudaError_t e = cudaMemcpyAsync(spare_ + at, r.dev, r.bytes, cudaMemcpyDeviceToDevice, stream); e != cudaSuccess) {
+                if (d2d_queued) (void) cudaStreamSynchronize(stream);
                 return fail(error, "snapshot", e);
+            }
+            d2d_queued = true;
             at += r.bytes;
         }
     cudaError_t e = cudaEventRecord(snapshot_, stream);
     if (e == cudaSuccess) e = cudaStreamWaitEvent(stream_, snapshot_, 0);
-    if (e != cudaSuccess) return fail(error, "snapshot order", e);
+    if (e != cudaSuccess) {
+        if (d2d_queued) (void) cudaStreamSynchronize(stream);
+        return fail(error, "snapshot order", e);
+    }
     // one host copy per segment; a segment on ordinary memory goes through the bounce buffer and is copied on at finish()
     size_t from = 0, bounced = 0;
     tail_.clear();
@@ -164,12 +208,14 @@ bool CheckpointDeferral::save(const std::vector<SaveSegment>& segments, cudaStre
             bounced += n;
         }
         if (e = cudaMemcpyAsync(to, spare_ + from, n, cudaMemcpyDeviceToHost, stream_); e != cudaSuccess) {
+            (void) cudaStreamSynchronize(stream_);
             tail_.clear();
             return fail(error, "copy out", e);
         }
         from += n;
     }
     if (e = cudaEventRecord(landed_, stream_); e != cudaSuccess) {
+        (void) cudaStreamSynchronize(stream_);
         tail_.clear();
         return fail(error, "copy out", e);
     }
@@ -179,6 +225,7 @@ bool CheckpointDeferral::save(const std::vector<SaveSegment>& segments, cudaStre
 
 bool CheckpointDeferral::finish(std::string& error) {
     if (!dst_) return true;
+    const OnDevice on(device_);
     const cudaError_t c = cudaEventSynchronize(landed_);
     if (c == cudaSuccess)
         for (const Bounced& b : tail_) std::memcpy(b.host, b.bounce, b.bytes);

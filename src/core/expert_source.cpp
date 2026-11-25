@@ -278,6 +278,14 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
 }
 
 void FileExpertSource::close() {
+    {
+        std::unique_ptr<AdviseWorker> worker;
+        {
+            std::lock_guard<std::mutex> g(advise_mu_);
+            worker = std::move(advise_worker_);
+        }
+        // Destroyed outside advise_mu_ so AdviseWorker joins before any source buffers are cleared.
+    }
     repin_join();
     if (complement_arena_ != nullptr) {
         if (complement_allocation_.allocation_pinned()) complement_allocation_.reset();
@@ -1363,7 +1371,7 @@ struct FileExpertSource::AdviseWorker {
             {
                 std::unique_lock<std::mutex> g(mu);
                 cv.wait(g, [this] { return stop || !q.empty(); });
-                if (q.empty()) return;
+                if (stop) return;
                 batch.swap(q);
             }
             (void) src->advise_pairs(batch.data(), (int64_t) batch.size());
@@ -1381,7 +1389,8 @@ struct FileExpertSource::AdviseWorker {
 
 void FileExpertSource::advise_cpu(int64_t layer, const int32_t* ids, int64_t n) const {
     if (base_ == nullptr || ids == nullptr || n <= 0 || !basalt::platform::read_ahead_enabled()) return;
-    std::call_once(advise_once_, [this] { advise_worker_.reset(new AdviseWorker(this)); });
+    std::lock_guard<std::mutex> wg(advise_mu_);
+    if (!advise_worker_) advise_worker_.reset(new AdviseWorker(this));
     AdviseWorker& w = *advise_worker_;
     {
         std::lock_guard<std::mutex> g(w.mu);
@@ -1400,7 +1409,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
         return r >= 0 && homes_[(size_t) r].pinned;
     }
     if (complement_offsets_[index] >= complement_bytes_) return top_pinned_;
-    if (!complement_pinned_ || complement_host_ == nullptr) return false;
+    if (unpinned_ || !complement_pinned_ || complement_host_ == nullptr) return false;
     // a partial pin (CS-T): only the registered prefix
     return !complement_partial_ ||
            complement_offsets_[index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
@@ -1414,11 +1423,16 @@ void FileExpertSource::repin_join() {
 // Each range registered by itself: the whole arena (as loaded), or the ranges of an earlier WAKE.
 void FileExpertSource::unregister_complement() {
     if (complement_allocation_.allocation_pinned()) return;
-    if (unpinned_ || complement_arena_ == nullptr) return;
+    if (complement_arena_ == nullptr) return;
     if (pin_units_.size() >= 2 && pin_state_) {
         for (size_t i = 0; i + 1 < pin_units_.size(); ++i)
-            if (pin_state_[i].load() == 1) (void) cudaHostUnregister((uint8_t*) complement_arena_ + pin_units_[i]);
-    } else if (!complement_slice_at_.empty()) {
+            if (pin_state_[i].load(std::memory_order_acquire) == 1)
+                (void) cudaHostUnregister((uint8_t*) complement_arena_ + pin_units_[i]);
+        (void) cudaGetLastError();
+        return;
+    }
+    if (unpinned_) return;
+    if (!complement_slice_at_.empty()) {
         for (uint64_t off : complement_slice_at_) (void) cudaHostUnregister((uint8_t*) complement_arena_ + off);
     } else {
         (void) cudaHostUnregister(complement_arena_);
@@ -1431,7 +1445,13 @@ bool FileExpertSource::unpin_complement(std::string& err) {
         err = "host VMM keeps the expert RAM pinned";
         return false;
     }
-    if (unpinned_) return true;
+    if (unpinned_) {
+        repin_join();
+        unregister_complement();
+        pin_units_.clear();
+        pin_state_.reset();
+        return true;
+    }
     if (!complement_ready_ || complement_arena_ == nullptr || !complement_partial_ ||
         complement_pin_limit_ != complement_bytes_ || complement_device_ == nullptr ||
         complement_device_ != complement_host_) {
@@ -1452,15 +1472,18 @@ bool FileExpertSource::unpin_complement(std::string& err) {
 }
 
 void FileExpertSource::repin_start(int threads) {
-    if (!unpinned_ || !pin_threads_.empty()) return;
+    if (!unpinned_ || !pin_threads_.empty() || complement_arena_ == nullptr || complement_bytes_ == 0) return;
     if (pin_units_.empty()) {
         // the ranges end where a blob starts on a page boundary, about 1 GiB apart (a blob never spans two ranges,
         // so every copy from one stays a copy from registered memory); the last one ends where the load registered
-        constexpr uint64_t kPage = 4096, kUnit = 1ull << 30, kHuge = 2ull << 20;
-        const uint64_t end = (complement_bytes_ + kHuge - 1) / kHuge * kHuge;
+        const uint64_t page = std::max<uint64_t>(1, platform::system_page_size());
+        constexpr uint64_t kUnit = 1ull << 30, kHuge = 2ull << 20;
+        const uint64_t end_align = std::max<uint64_t>(kHuge, page);
+        if (complement_bytes_ > std::numeric_limits<uint64_t>::max() - (end_align - 1)) return;
+        const uint64_t end = (complement_bytes_ + end_align - 1) / end_align * end_align;
         std::vector<uint64_t> starts;
         for (uint64_t off : complement_offsets_)
-            if (off != kNoComplement && off < complement_bytes_ && off % kPage == 0) starts.push_back(off);
+            if (off != kNoComplement && off < complement_bytes_ && off % page == 0) starts.push_back(off);
         std::sort(starts.begin(), starts.end());
         pin_units_.push_back(0);
         for (uint64_t s : starts)
@@ -1503,12 +1526,23 @@ bool FileExpertSource::repin_wait(const void* p, uint64_t n) const {
 bool FileExpertSource::repin_finish(std::string& err) {
     if (!unpinned_) return true;
     repin_join();
-    if (!pin_state_) { err = "the RAM copy was not registered again"; return false; }
+    if (!pin_state_ || pin_units_.size() < 2) { err = "the RAM copy was not registered again"; return false; }
+    bool all_ok = true;
     for (size_t i = 0; i + 1 < pin_units_.size(); ++i)
-        if (pin_state_[i].load() != 1) {
-            err = "the driver refused to register the RAM copy again";
-            return false;
+        if (pin_state_[i].load(std::memory_order_acquire) != 1) {
+            all_ok = false;
+            break;
         }
+    if (!all_ok) {
+        for (size_t i = 0; i + 1 < pin_units_.size(); ++i)
+            if (pin_state_[i].load(std::memory_order_acquire) == 1)
+                (void) cudaHostUnregister((uint8_t*) complement_arena_ + pin_units_[i]);
+        (void) cudaGetLastError();
+        pin_state_.reset();
+        pin_units_.clear();
+        err = "the driver refused to register the RAM copy again";
+        return false;
+    }
     unpinned_ = false;
     return true;
 }
@@ -1528,7 +1562,7 @@ const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) con
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {
-    if (complement_ready_ && complement_pinned_ && complement_device_ != nullptr)
+    if (complement_ready_ && complement_pinned_ && !unpinned_ && complement_device_ != nullptr)
         return layer >= 0 && layer < n_layers_;
     return device_alias(layer, 0) != nullptr;
 }

@@ -2,6 +2,7 @@
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/cuda_cc.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/platform/dynlib.hpp"
 
 #include <cuda_runtime.h>
@@ -10,6 +11,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace basalt::core {
 
@@ -281,23 +283,32 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     // happens once, here, before anything depends on it.
     check(cudaMalloc(&base_, (size_t) bytes), "cudaMalloc");
     if (poison_) {
-        const int threads = 256;
-        const uint64_t n = bytes / sizeof(float);
-        const uint64_t blocks = (n + threads - 1) / threads;
-        // gridDim.x is 32-bit, so a large region needs a loop.  12 GB of floats is 3e9 elements = 1.2e7
-        // blocks, which fits, but the loop keeps it correct for any size rather than for today's sizes.
-        const uint64_t max_blocks = 0x7FFFFFFFull;
-        for (uint64_t b = 0; b < blocks; b += max_blocks) {
-            const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
-            poison_kernel<<<(unsigned) chunk, threads>>>((float*) base_ + b * threads, n - b * threads);
-            check(cudaGetLastError(), "poison_kernel");
+        try {
+            const int threads = 256;
+            const uint64_t n = bytes / sizeof(float);
+            const uint64_t blocks = (n + threads - 1) / threads;
+            // gridDim.x is 32-bit, so a large region needs a loop.  12 GB of floats is 3e9 elements = 1.2e7
+            // blocks, which fits, but the loop keeps it correct for any size rather than for today's sizes.
+            const uint64_t max_blocks = 0x7FFFFFFFull;
+            for (uint64_t b = 0; b < blocks; b += max_blocks) {
+                const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
+                poison_kernel<<<(unsigned) chunk, threads>>>((float*) base_ + b * threads, n - b * threads);
+                check(cudaGetLastError(), "poison_kernel");
+            }
+            check(cudaDeviceSynchronize(), "poison sync");
+        } catch (...) {
+            (void) cudaDeviceSynchronize();
+            cudaFree(base_);
+            base_ = nullptr;
+            throw;
         }
-        check(cudaDeviceSynchronize(), "poison sync");
     }
 }
 
 DeviceArena::~DeviceArena() {
-    if (base_) cudaFree(base_);          // best effort: a destructor must not throw
+    if (!base_) return;
+    const OnDevice on(ordinal_);
+    cudaFree(base_);          // best effort: a destructor must not throw
 }
 
 void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
@@ -305,14 +316,15 @@ void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     if (align == 0 || (align & (align - 1)) != 0) {
         throw CudaError("DeviceArena::alloc alignment must be a power of two", -1);
     }
-    const uint64_t start = (used_ + align - 1) & ~(align - 1);
-    if (start + bytes > capacity_) {
+    const bool align_overflow = used_ > std::numeric_limits<uint64_t>::max() - (align - 1);
+    const uint64_t start = align_overflow ? 0 : (used_ + align - 1) & ~(align - 1);
+    if (align_overflow || start > capacity_ || bytes > capacity_ - start) {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
                       "DeviceArena out of memory: asked for %llu B at offset %llu (align %llu) in a %llu B "
                       "region - the memory plan did not close",
-                      (unsigned long long) bytes, (unsigned long long) start, (unsigned long long) align,
-                      (unsigned long long) capacity_);
+                      (unsigned long long) bytes, (unsigned long long) (align_overflow ? used_ : start),
+                      (unsigned long long) align, (unsigned long long) capacity_);
         throw CudaError(msg, -1);
     }
     used_ = start + bytes;

@@ -11,23 +11,33 @@ namespace basalt::core {
 StagedCopy::~StagedCopy() { release(); }
 
 void StagedCopy::release() {
+    if (src_dev_ >= 0 && src_stream_ != nullptr) {
+        const OnDevice on(src_dev_);
+        (void) cudaStreamSynchronize(src_stream_);
+    }
+    if (dst_dev_ >= 0 && dst_stream_ != nullptr) {
+        const OnDevice on(dst_dev_);
+        (void) cudaStreamSynchronize(dst_stream_);
+    }
+    if (src_dev_ >= 0) {
+        const OnDevice on(src_dev_);
+        if (src_stream_ != nullptr) cudaStreamDestroy(src_stream_);
+        for (cudaEvent_t& e : d2h_) { if (e != nullptr) cudaEventDestroy(e); e = nullptr; }
+    }
+    if (dst_dev_ >= 0) {
+        const OnDevice on(dst_dev_);
+        if (dst_stream_ != nullptr) cudaStreamDestroy(dst_stream_);
+        for (cudaEvent_t& e : h2d_) { if (e != nullptr) cudaEventDestroy(e); e = nullptr; }
+    }
     for (int b = 0; b < kBufs; ++b) {
         if (buf_[b] != nullptr) cudaFreeHost(buf_[b]);
         buf_[b] = nullptr;
         live_[b] = false;
     }
-    if (src_dev_ >= 0) {
-        const OnDevice on(src_dev_);
-        if (src_stream_ != nullptr) { cudaStreamSynchronize(src_stream_); cudaStreamDestroy(src_stream_); }
-        for (cudaEvent_t& e : d2h_) { if (e != nullptr) cudaEventDestroy(e); e = nullptr; }
-    }
-    if (dst_dev_ >= 0) {
-        const OnDevice on(dst_dev_);
-        if (dst_stream_ != nullptr) { cudaStreamSynchronize(dst_stream_); cudaStreamDestroy(dst_stream_); }
-        for (cudaEvent_t& e : h2d_) { if (e != nullptr) cudaEventDestroy(e); e = nullptr; }
-    }
     src_stream_ = dst_stream_ = nullptr;
     src_dev_ = dst_dev_ = -1;
+    piece_ = 0;
+    next_ = 0;
 }
 
 bool StagedCopy::init(int src_dev, int dst_dev, size_t piece_bytes, std::string& err) {

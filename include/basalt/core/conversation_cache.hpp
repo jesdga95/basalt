@@ -419,6 +419,10 @@ public:
     void put_slot(SavedConversation&& image, size_t keep) {
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         while (slot_count_ > 0 && slot_count_ >= keep && evict_oldest(true)) {}
+        if (keep == 0) {
+            if (spill_) spilled_.push_back(std::move(image));
+            return;
+        }
         image.from_slot = true;
         const size_t n = image.bytes();
         entries_.push_back(std::move(image));

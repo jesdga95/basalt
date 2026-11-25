@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace basalt::core {
@@ -36,6 +37,8 @@ namespace {
 // False when the file system, the platform or the allocation refuses, and the caller takes the ordinary read.
 bool pread_direct(const std::string& path, void* dst, uint64_t n, uint64_t off) {
     constexpr uint64_t kAlign = 4096, kChunk = 16ull << 20;
+    constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
+    if (n > kMaxU64 - off || off + n > kMaxU64 - (kAlign - 1)) return false;
     const int fd = platform::open_unbuffered(path);
     if (fd < 0) return false;
     void* bounce = basalt::platform::alloc_aligned((size_t) (std::min<uint64_t>(n, kChunk) + 2 * kAlign), kAlign);
@@ -63,7 +66,9 @@ bool pread_direct(const std::string& path, void* dst, uint64_t n, uint64_t off) 
 }  // namespace
 
 bool read_range_at(const FileRange& r, uint64_t off, void* dst, uint64_t n, std::string& err) {
+    constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
     if (r.bytes != 0 && (off > r.bytes || n > r.bytes - off)) { err = "read past the end of a section of " + r.path; return false; }
+    if (off > kMaxU64 - r.offset || n > kMaxU64 - (r.offset + off)) { err = "read offset overflows in " + r.path; return false; }
     constexpr uint64_t kDirectMin = 256ull << 10;
     if (n >= kDirectMin && pread_direct(r.path, dst, n, r.offset + off)) return true;
     const int fd = platform::open_fd_utf8(r.path);
@@ -101,7 +106,7 @@ double Json::num() const {
 
 int64_t Json::i64() const {
     if (type == Type::Float) return (int64_t) f;
-    return neg ? -(int64_t) u : (int64_t) u;
+    return neg ? (int64_t) (uint64_t(0) - u) : (int64_t) u;
 }
 
 namespace {
@@ -193,11 +198,26 @@ struct JsonParser {
             while (p < end && *p >= '0' && *p <= '9') ++p;
         }
         const std::string tok(a, (size_t) (p - a));
-        if (!is_float && (size_t) (p - digits) <= 19) {
-            v.type = Json::Type::Int;
-            v.neg = neg;
-            v.u = std::strtoull(std::string(digits, (size_t) (p - digits)).c_str(), nullptr, 10);
-            return true;
+        if (!is_float) {
+            constexpr uint64_t kMaxNeg = uint64_t(1) << 63;
+            constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
+            const uint64_t limit = neg ? kMaxNeg : kMaxU64;
+            uint64_t val = 0;
+            bool fits = true;
+            for (const char* q = digits; q < p; ++q) {
+                const uint64_t d = (uint64_t) (*q - '0');
+                if (val > (limit - d) / 10) {
+                    fits = false;
+                    break;
+                }
+                val = val * 10 + d;
+            }
+            if (fits) {
+                v.type = Json::Type::Int;
+                v.neg = neg && val != 0;
+                v.u = val;
+                return true;
+            }
         }
         v.type = Json::Type::Float;
         v.f = std::strtod(tok.c_str(), nullptr);
@@ -358,7 +378,7 @@ MetaValue meta_value(const Json& j) {
         case Json::Type::Bool: v.type = MetaType::BOOL; v.u = j.b ? 1 : 0; break;
         case Json::Type::Int:
             v.type = j.neg ? MetaType::I64 : MetaType::U64;
-            v.u = j.neg ? (uint64_t) (-(int64_t) j.u) : j.u;
+            v.u = j.neg ? (uint64_t(0) - j.u) : j.u;
             if (j.neg) v.f = -(double) j.u;
             break;
         case Json::Type::Float: v.type = MetaType::F64; v.f = j.f; break;
@@ -386,18 +406,26 @@ bool ModelFile::register_gguf_view(std::string& err) const {
     }
     auto view = std::make_shared<VirtualGguf>();
     for (const auto& [k, v] : kv->members) view->meta.emplace(k, meta_value(v));
+    auto is_nonneg_int = [](const Json* j) { return j != nullptr && j->type == Json::Type::Int && !j->neg; };
     for (const auto& [name, t] : tensors->members) {
         const Json* type_id = t.get("type_id");
         const Json* shape = t.get("shape");
         const Json* off = t.get("offset");
-        if (gg == nullptr || type_id == nullptr || shape == nullptr || !shape->is_array() || off == nullptr ||
+        if (gg == nullptr || !is_nonneg_int(type_id) || type_id->u64() > std::numeric_limits<uint32_t>::max() ||
+            shape == nullptr || !shape->is_array() || !is_nonneg_int(off) ||
             shape->items.empty() || shape->items.size() > 4 || shape->count != shape->items.size()) {
             err = path_ + ": meta.tensors['" + name + "'] is malformed (or there is no gguf section)";
             return false;
         }
         TensorInfo ti;
         ti.name = name;
-        for (const Json& d : shape->items) ti.shape.push_back(d.u64());
+        for (const Json& d : shape->items) {
+            if (!is_nonneg_int(&d)) {
+                err = path_ + ": meta.tensors['" + name + "'] has a non-integer or negative dimension";
+                return false;
+            }
+            ti.shape.push_back(d.u64());
+        }
         ti.type = (uint32_t) type_id->u64();
         // a tensor may name another section (the Engram table); its offset is relative to that section
         const Section* sec = gg;
@@ -408,12 +436,17 @@ bool ModelFile::register_gguf_view(std::string& err) const {
                 return false;
             }
         }
-        ti.offset = sec->offset + off->u64();
-        if (const Json* nb = t.get("bytes"))
-            if (off->u64() > sec->bytes || nb->u64() > sec->bytes - off->u64()) {
+        if (off->u64() > sec->bytes) {
+            err = path_ + ": tensor " + name + " runs past the end of its section";
+            return false;
+        }
+        if (const Json* nb = t.get("bytes")) {
+            if (!is_nonneg_int(nb) || nb->u64() > sec->bytes - off->u64()) {
                 err = path_ + ": tensor " + name + " runs past the end of its section";
                 return false;
             }
+        }
+        ti.offset = sec->offset + off->u64();
         view->tensors.push_back(std::move(ti));
     }
     gguf_register_virtual(path_, std::move(view));
@@ -468,8 +501,17 @@ bool hc8_read(const FileRange& r, std::map<std::string, Hc8Copy>& out, std::stri
         c.rows = e.rows;
         c.cols = e.cols;
         c.srow = e.srow;
-        const uint64_t want = (uint64_t) e.rows * e.cols + (uint64_t) e.rows * e.srow * 2;
-        if (e.bytes != want || e.offset > total || want > total - e.offset || e.cols % 32 != 0 ||
+        const auto mul_u64 = [](uint64_t a, uint64_t b, uint64_t& prod) {
+            if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) return false;
+            prod = a * b;
+            return true;
+        };
+        uint64_t q_bytes = 0, s_elems = 0, s_bytes = 0;
+        const bool ok_size = mul_u64(e.rows, e.cols, q_bytes) && mul_u64(e.rows, e.srow, s_elems) &&
+                             mul_u64(s_elems, 2, s_bytes) &&
+                             q_bytes <= std::numeric_limits<uint64_t>::max() - s_bytes;
+        const uint64_t want = ok_size ? q_bytes + s_bytes : 0;
+        if (!ok_size || e.bytes != want || e.offset > total || want > total - e.offset || e.cols % 32 != 0 ||
             e.srow < e.cols / 32) {
             err = "hc8: entry " + c.name + " is malformed";
             return false;

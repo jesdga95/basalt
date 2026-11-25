@@ -7,10 +7,12 @@
 #include "basalt/core/exact_slots.hpp"
 
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/core/route_report.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
 #include <cstdio>
+#include <limits>
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
@@ -39,6 +41,7 @@ constexpr size_t kEvents = 2 * kMaxPending;      // a window's and the last one'
 ExpertTier::ExpertTier(ExpertTierSpec spec) : s_(std::move(spec)) {}
 
 ExpertTier::~ExpertTier() {
+    const OnDevice on_device(device_);
     std::string read_err;
     await_reads(read_err);   // the reads write into the RAM tier freed below
     report("final");
@@ -50,6 +53,9 @@ ExpertTier::~ExpertTier() {
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (out_stream_) cudaStreamSynchronize(out_stream_);
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
+    pool_.reset();           // join CPU workers before freeing RAM, activation, or mapped file memory
+    shares_.clear();
+    peers_.clear();
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     for (cudaEvent_t e : out_events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
@@ -57,6 +63,8 @@ ExpertTier::~ExpertTier() {
     if (copy_stream_) cudaStreamDestroy(copy_stream_);
     if (out_stream_) cudaStreamDestroy(out_stream_);
     if (fetch_stream_) cudaStreamDestroy(fetch_stream_);
+    ext_.close();
+    cache_.close();
     for (size_t l = 0; l < ram_.size(); ++l) {
         if (ram_[l] == nullptr) continue;
         if (l < ram_pins_.size()) core::unpin_ram(ram_[l], ram_pins_[l]);
@@ -64,7 +72,7 @@ ExpertTier::~ExpertTier() {
     ram_allocations_.clear();
     platform::free_aligned(act_);
     if (held_ev_) {
-        cudaEventSynchronize(held_ev_);
+        if (held_ev_live_) cudaEventSynchronize(held_ev_);
         cudaEventDestroy(held_ev_);
     }
     cudaFree(held_dev_);
@@ -74,12 +82,36 @@ ExpertTier::~ExpertTier() {
 }
 
 bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err) {
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        dev = -1;
+    }
+    device_ = dev;
+    if (s_.n_layers <= 0 || s_.n_expert <= 0 || (int) s_.layers.size() != s_.n_layers) {
+        err = s_.name + ": invalid expert tier geometry";
+        return false;
+    }
     n_layers_ = s_.n_layers;
     n_expert_ = s_.n_expert;
     uint64_t one_each = 0, one_each_ram = 0;   // bytes of one slot in every layer, of one RAM place in every layer
+    constexpr uint64_t kU64Max = std::numeric_limits<uint64_t>::max();
     for (const ExpertTierSpec::Layer& e : s_.layers) {
-        one_each += (e.blob_bytes + 255) / 256 * 256;
+        if (e.blob_bytes == 0 || e.blob_bytes > kU64Max - 255) {
+            err = s_.name + ": invalid expert blob size";
+            return false;
+        }
+        const uint64_t aligned = (e.blob_bytes + 255) / 256 * 256;
+        if (aligned > kU64Max - one_each || e.blob_bytes > kU64Max - one_each_ram) {
+            err = s_.name + ": expert tier byte size overflows";
+            return false;
+        }
+        one_each += aligned;
         one_each_ram += e.blob_bytes;
+    }
+    if (one_each == 0 || one_each_ram == 0) {
+        err = s_.name + ": expert tier has zero-sized blobs";
+        return false;
     }
     uint64_t free_b = 0, total_b = 0;
     std::string why;
@@ -431,6 +463,8 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     ram_.assign((size_t) n_layers_, nullptr);
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
     spare_.assign((size_t) n_layers_, -1);
+    free_ram_.assign((size_t) n_layers_, {});
+    pending_reads_.clear();
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
     std::vector<int32_t> device_home;   // [layer * n_expert + e] the slot of a home on either card, or -1
     if (homes_.main > 0 || homes_.peer > 0) device_home.assign((size_t) n_layers_ * n_expert_, -1);
@@ -563,15 +597,18 @@ bool ExpertTier::open_route(std::string& err) {
         return false;
     }
     held_pub_.assign(n, -1);
+    held_dirty_ = true;
+    held_ev_live_ = false;
     route_tail_skip_ = s_.route_tail_skip;
     route_prior_ = s_.route_prior;
     return true;
 }
 
 void ExpertTier::publish_held(cudaStream_t stream) {
-    if (held_dev_ == nullptr) return;
-    cudaEventSynchronize(held_ev_);   // the last publish's copies have read the staging
+    if (held_dev_ == nullptr || !held_dirty_) return;
+    if (held_ev_live_) cudaEventSynchronize(held_ev_);   // the last publish's copies have read the staging
     const size_t ne = (size_t) n_expert_;
+    bool any = false;
     for (int l = 0; l < n_layers_;) {
         // a run of layers that changed goes out in one copy
         const auto changed = [&](int layer) {
@@ -592,9 +629,14 @@ void ExpertTier::publish_held(cudaStream_t stream) {
         int hi = l + 1;
         while (hi < n_layers_ && changed(hi)) ++hi;
         cudaMemcpyAsync(held_dev_ + (size_t) l * ne, held_pin_ + (size_t) l * ne, (size_t) (hi - l) * ne * 4, cudaMemcpyHostToDevice, stream);
+        any = true;
         l = hi + 1;   // layer hi was checked (and is unchanged, or past the end)
     }
-    cudaEventRecord(held_ev_, stream);
+    if (any) {
+        cudaEventRecord(held_ev_, stream);
+        held_ev_live_ = true;
+    }
+    held_dirty_ = false;
 }
 
 kernels::ResidentTabs ExpertTier::held_tabs(int layer) const {
@@ -659,9 +701,23 @@ bool ExpertTier::load_rank(std::string& err) {
         err = "the expert profile " + path + " does not rank every expert";
         return false;
     }
-    rank_.resize(pairs.size());
+    std::vector<int32_t> rank(pairs.size(), -1);
     std::vector<int32_t> next((size_t) n_layers_, 0);
-    for (const auto& [layer, e] : pairs) rank_[(size_t) layer * n_expert_ + next[(size_t) layer]++] = e;
+    std::vector<uint8_t> seen(pairs.size(), 0);
+    for (const auto& [layer, e] : pairs) {
+        if (layer < 0 || layer >= n_layers_ || e < 0 || e >= n_expert_) {
+            err = "the expert profile " + path + " has an out-of-range pair";
+            return false;
+        }
+        const size_t idx = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+        if (seen[idx] || next[(size_t) layer] >= n_expert_) {
+            err = "the expert profile " + path + " has duplicate or unbalanced layer entries";
+            return false;
+        }
+        seen[idx] = 1;
+        rank[(size_t) layer * (size_t) n_expert_ + (size_t) next[(size_t) layer]++] = e;
+    }
+    rank_ = std::move(rank);
     return true;
 }
 
@@ -713,6 +769,7 @@ const uint8_t* ExpertTier::slot_ptr(int32_t slot) const {
 void ExpertTier::apply(const Pending& p) {
     const size_t in = (size_t) p.layer * n_expert_ + p.expert;
     res_[in] = p.slot;
+    held_dirty_ = true;
     busy_[(size_t) p.slot] = 0;
     free_events_.push_back(p.event);
     if (p.out >= 0) {   // the home that left has its RAM place, and the one that came gives its own up
@@ -727,6 +784,7 @@ void ExpertTier::apply(const PeerMove& m) {
     core::PeerExperts* p = peer_for(m.layer);   // m.slot is that card's local slot
     p->admit(m.layer, m.out, -1);
     p->admit(m.layer, m.in, m.slot);
+    held_dirty_ = true;
     ram_idx_[base + m.out] = m.place;
     spare_[(size_t) m.layer] = ram_idx_[base + m.in];
     ram_idx_[base + m.in] = -1;
@@ -1007,7 +1065,10 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     const int32_t slot = oldest_slot(layer, homes_too, best);
     if (slot < 0 || best == tick_) return -1;   // every slot is in use by this very lookup
     const int32_t o = owner_[(size_t) slot];
-    if (o >= 0) res_[(size_t) layer * n_expert_ + o] = -1;
+    if (o >= 0) {
+        res_[(size_t) layer * n_expert_ + o] = -1;
+        held_dirty_ = true;
+    }
     owner_[(size_t) slot] = e;
     busy_[(size_t) slot] = 1;
     stamp_[(size_t) layer * n_expert_ + e] = tick_;
@@ -1248,7 +1309,10 @@ void ExpertTier::shrink() {
     for (int l = 0; l < n_layers_; ++l) recall(l, nb + (int64_t) l * ext_per_layer_, ext_per_layer_);
     for (int64_t s = nb; s < (int64_t) owner_.size(); ++s) {
         const int32_t o = owner_[(size_t) s];
-        if (o >= 0) res_[(size_t) ((s - nb) / ext_per_layer_) * n_expert_ + o] = -1;
+        if (o >= 0) {
+            res_[(size_t) ((s - nb) / ext_per_layer_) * n_expert_ + o] = -1;
+            held_dirty_ = true;
+        }
     }
     owner_.resize((size_t) nb);
     busy_.resize((size_t) nb);
@@ -1262,6 +1326,7 @@ void ExpertTier::lend_all() {
     settle();
     for (int l = 0; l < n_layers_; ++l) recall(l, base_lo_[(size_t) l], live_n(l));
     std::fill(res_.begin(), res_.end(), -1);
+    held_dirty_ = true;
     owner_.clear();
     busy_.clear();
     lent_per_layer_ = per_layer_;
@@ -1383,12 +1448,16 @@ void ExpertTier::keep_hottest(const std::vector<int64_t>& keep) {
         if (ext_per_layer_) recall(l, nb + (int64_t) l * ext_per_layer_, ext_per_layer_);
         auto drop = [&](int64_t s) {
             const int32_t o = owner_[(size_t) s];
-            if (o >= 0 && res_[base + o] == (int32_t) s) res_[base + o] = -1;
+            if (o >= 0 && res_[base + o] == (int32_t) s) {
+                res_[base + o] = -1;
+                held_dirty_ = true;
+            }
             owner_[(size_t) s] = -1;
         };
         for (int64_t s = lo + kept; s < lo + live_n(l); ++s) drop(s);
         for (int64_t s = nb + (int64_t) l * ext_per_layer_; ext_per_layer_ && s < nb + (int64_t) (l + 1) * ext_per_layer_; ++s) drop(s);
     }
+    held_dirty_ = true;
     if (const cudaError_t ce = cudaStreamSynchronize(copy_stream_); ce != cudaSuccess)
         basalt::log::error(s_.area.c_str(), "tier keep sync: %s", cudaGetErrorString(ce));
 }
@@ -1564,12 +1633,20 @@ bool ExpertTier::read_misses(int layer, const int32_t* ids, int k, bool* reading
             for (int j = 0; j < i; ++j) reading[i] = reading[i] || (reading[j] && ids[j] == e);
             continue;
         }
-        const int v = core::policy::pick_victim(&ram_idx_[base], &stamp_[base], n_expert_, ids, k);
-        if (v < 0) continue;   // every place holds one of `ids`: the CPU reads this one from the mapped file
-        ram_idx_[base + e] = ram_idx_[base + v];
-        ram_idx_[base + v] = -1;
+        int32_t slot = -1;
+        if (!free_ram_[(size_t) layer].empty()) {
+            slot = free_ram_[(size_t) layer].back();
+            free_ram_[(size_t) layer].pop_back();
+        } else {
+            const int v = core::policy::pick_victim(&ram_idx_[base], &stamp_[base], n_expert_, ids, k);
+            if (v < 0) continue;   // every place holds one of `ids`: the CPU reads this one from the mapped file
+            slot = ram_idx_[base + v];
+            ram_idx_[base + v] = -1;
+        }
+        ram_idx_[base + e] = slot;
+        pending_reads_.push_back({layer, e, slot});
         blobs_.push_back({s_.range.offset + el.offset + (uint64_t) e * el.blob_bytes, el.blob_bytes,
-                          ram_[(size_t) layer] + (size_t) ram_idx_[base + e] * el.blob_bytes});
+                          ram_[(size_t) layer] + (size_t) slot * el.blob_bytes});
         reading[i] = true;
     }
     if (blobs_.empty()) return true;
@@ -1578,7 +1655,22 @@ bool ExpertTier::read_misses(int layer, const int32_t* ids, int k, bool* reading
     return true;
 }
 
-bool ExpertTier::await_reads(std::string& err) { return reads_.wait(err); }
+bool ExpertTier::await_reads(std::string& err) {
+    const bool ok = reads_.wait(err);
+    if (ok) {
+        pending_reads_.clear();
+        return true;
+    }
+    for (const PendingRead& pr : pending_reads_) {
+        const size_t idx = (size_t) pr.layer * (size_t) n_expert_ + (size_t) pr.expert;
+        if (idx < ram_idx_.size() && ram_idx_[idx] == pr.slot) {
+            ram_idx_[idx] = -1;
+            if ((size_t) pr.layer < free_ram_.size()) free_ram_[(size_t) pr.layer].push_back(pr.slot);
+        }
+    }
+    pending_reads_.clear();
+    return false;
+}
 
 void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }
 

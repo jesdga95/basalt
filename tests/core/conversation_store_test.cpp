@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -685,6 +686,94 @@ int main() {
         SavedConversation got_e;
         CHECK(me.tokens == 700 && st.load(me, got_e, err) && got_e.live.ids == e);
         remove_dir(dir4);
+    }
+    {
+        // Queue cap & disk fits overflow guards, row_cells == 0 guard, and corrupt shared part cascading drop.
+        const std::string dir5 = dir + "-hardening";
+        std::string err;
+        ConversationStore st;
+        st.set_row_cells(0);   // must clamp to >= 1 instead of dividing by zero
+        CHECK(st.open(dir5, id, 1ull << 30, err));
+        CHECK(!st.fits(std::numeric_limits<uint64_t>::max()));
+
+        auto seq = [](int32_t base, size_t n) {
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = base + (int32_t) i;
+            return v;
+        };
+        const std::vector<int32_t> a = seq(60000, 600);
+        SavedConversation sa = chat(a, {{200, Src::kRoot}, {600, Src::kTurnEnd}});
+        // Keep only non-pooled K/V so row_cells == 0 (clamped to 1) round-trips cleanly without divide-by-zero.
+        sa.kv = {kv_layer((int64_t) a.size(), false)};
+
+        // Image larger than queue_cap must be rejected cleanly without uint64 underflow.
+        CHECK(!st.put(SavedConversation(sa), 16));
+        CHECK(st.queued_bytes() == 0);
+
+        CHECK(st.put(SavedConversation(sa), 1ull << 30));
+        st.flush();
+        CHECK(st.stats().files == 1);
+
+        // Load with row_cells == 0 works cleanly without divide-by-zero.
+        std::vector<int32_t> pa = a;
+        pa.push_back(-1);
+        const auto ma = st.best(pa.data(), pa.size(), {}, true);
+        CHECK(ma.tokens == 600 && st.load_bytes(ma) > 0);
+        SavedConversation got_ok;
+        CHECK(st.load(ma, got_ok, err) && got_ok.live.ids == a);
+        remove_dir(dir5);
+
+        // Corrupt a shared root state file referenced by two chats: loading the first must fail,
+        // delete the corrupt state file, drop BOTH on-disk entries referencing it, and GC their orphaned parts.
+        const std::string dir6 = dir + "-corrupt-shared";
+        ConversationStore st2;
+        st2.set_row_cells(4);
+        CHECK(st2.open(dir6, id, 1ull << 30, err));
+        std::vector<int32_t> lb = a;
+        for (size_t i = 300; i < lb.size(); ++i) lb[i] = 70000 + (int32_t) i;
+        SavedConversation ra = chat(a, {{200, Src::kRoot}, {600, Src::kTurnEnd}});
+        SavedConversation rb = chat(lb, {{200, Src::kRoot}, {600, Src::kTurnEnd}});
+        ra.checkpoints[0].state_a.assign(65536, 0x33);   // distinct small size so the shared root file is uniquely identifiable
+        copy_state_bytes(rb.checkpoints[0], ra.checkpoints[0]);
+        CHECK(st2.put(SavedConversation(ra), 1ull << 30));
+        CHECK(st2.put(SavedConversation(rb), 1ull << 30));
+        st2.flush();
+        CHECK(st2.stats().files == 2 && state_files(dir6) == 3);
+
+        std::vector<basalt::platform::DirFile> files6;
+        CHECK(basalt::platform::list_files(dir6, files6));
+        std::string root_file;
+        uint64_t root_bytes = std::numeric_limits<uint64_t>::max();
+        for (const auto& f : files6) {
+            if (f.name.size() > 18 && f.name[17] == 's' && f.bytes < root_bytes) {
+                root_file = dir6 + "/" + f.name;
+                root_bytes = f.bytes;
+            }
+        }
+        CHECK(!root_file.empty() && root_bytes > 8192 && root_bytes < (1u << 20));
+        {
+            std::FILE* fp = basalt::platform::open_file_utf8(root_file, "r+b");
+            CHECK(fp != nullptr);
+            if (fp) {
+                CHECK(basalt::platform::fseek64(fp, (int64_t) root_bytes - 4096, SEEK_SET) == 0);
+                const int c = std::fgetc(fp);
+                CHECK(c != EOF);
+                CHECK(basalt::platform::fseek64(fp, (int64_t) root_bytes - 4096, SEEK_SET) == 0);
+                CHECK(std::fputc(c ^ 0x5a, fp) != EOF);
+                std::fclose(fp);
+            }
+        }
+        std::vector<int32_t> qa(a.begin(), a.begin() + 250);
+        qa.push_back(-9);
+        const auto mra = st2.best(qa.data(), qa.size(), {}, true);
+        CHECK(mra.tokens == 200);
+        SavedConversation dummy;
+        CHECK(!st2.load(mra, dummy, err));
+        CHECK(st2.stats().files == 0 && state_files(dir6) == 0);
+        std::vector<int32_t> qb(lb.begin(), lb.begin() + 250);
+        qb.push_back(-9);
+        CHECK(st2.best(qb.data(), qb.size(), {}, true).tokens == 0);
+        remove_dir(dir6);
     }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))
