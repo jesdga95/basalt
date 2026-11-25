@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import threading
 import time
 import unittest
@@ -20,6 +21,7 @@ from serve.service import Service
 from serve.util.text import ByteTokenizer
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
+APP_JS = (TEMPLATE.parent / "web" / "app.js").read_text(encoding="utf-8")
 MSGS = [{"role": "user", "content": "hi"}]
 ROUTES = {"/v1/chat/completions": {"messages": MSGS, "max_tokens": 64},
           "/v1/messages": {"messages": MSGS, "max_tokens": 64},
@@ -42,6 +44,7 @@ class SwapEngine(ProcessEngine):
         self.hold_start = False
         self.release = threading.Event()
         self.release.set()
+        self.quit = threading.Event()                   # QUIT at a stop: a held reply ends before its first token
         self.generating = 0
 
     def alive(self):
@@ -68,6 +71,8 @@ class SwapEngine(ProcessEngine):
         self.generating += 1
         try:
             while not self.release.wait(0.02):
+                if self.quit.is_set():
+                    return
                 yield None
             yield from self.reply.generate(*args, **kwargs)
         finally:
@@ -466,8 +471,49 @@ class Turns(Base):
         self.router.stop()
         tb.join(10)
         self.assertEqual(later["B"][0], 503)
+        self.assertIn("the server is stopping", later["B"][1])
+        self.assertNotIn("restarts it", later["B"][1])
         self.engines["A"].release.set()
         t.join(10)
+
+    def test_a_stop_ends_the_running_request_with_the_stopping_error(self):
+        out, t = self.run_with_a_running_request()
+        self.router.stop()
+        self.engines["A"].quit.set()
+        t.join(10)
+        status, body = out["first"]
+        self.assertEqual(status, 503)
+        self.assertIn("the server is stopping", body)
+        self.assertNotIn("restarts it", body)
+
+    def test_a_stop_ends_a_running_stream_with_the_stopping_error(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.engines["A"].release.clear()
+        out = {}
+        body = {**ROUTES["/v1/chat/completions"], "model": "A", "stream": True}
+        t = threading.Thread(target=lambda: out.update(r=self.post("/v1/chat/completions", body)), daemon=True)
+        t.start()
+        self.wait_until(lambda: self.engines["A"].generating == 1)
+        self.router.stop()
+        self.engines["A"].quit.set()
+        t.join(10)
+        text = out["r"][1]
+        self.assertIn("the server is stopping", text)
+        self.assertNotIn('"finish_reason": "length"', text)
+
+    def test_a_reply_that_reaches_its_cap_during_a_stop_keeps_length(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.engines["A"].release.clear()
+        out = {}
+        body = {**ROUTES["/v1/chat/completions"], "model": "A", "max_tokens": 5}
+        t = threading.Thread(target=lambda: out.update(r=self.post("/v1/chat/completions", body)), daemon=True)
+        t.start()
+        self.wait_until(lambda: self.engines["A"].generating == 1)
+        self.svcs["A"].stop()                           # the stop has begun; the engine still answers up to the cap
+        self.engines["A"].release.set()
+        t.join(10)
+        self.assertEqual(out["r"][0], 200)
+        self.assertIn('"finish_reason": "length"', out["r"][1])
 
 
 class FailedLoad(Base):
@@ -566,6 +612,26 @@ class Preload(Base):
         self.assertEqual(self.chat("B")[0], 200)
 
 
+class Page(Base):
+    def status(self, name):
+        """The status value /metrics gives `name`, the one the page reads."""
+        return {m["id"]: m for m in self.get("/metrics")[1]["models"]}[name]["status"]["value"]
+
+    def test_the_page_posts_routes_and_reads_values_the_server_has(self):
+        picker, unload = (APP_JS.split(f"function {f}")[1].split("\n}\n")[0] for f in ("drawModels", "unloadView"))
+        self.assertEqual(set(re.findall(r'control\("([^"]+)"', APP_JS)), {"v1/load", "v1/unload"})
+        self.engines["B"].fail = "boom"
+        self.assertEqual(self.post("/v1/load", {"model": "B"})[0], 503)
+        seen = {self.status("A"), self.status("B")}             # unloaded, failed
+        for path, after in (("/v1/load", "loaded"), ("/v1/unload", "unloaded")):
+            status, body = self.post(path, {"model": "A"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(self.status("A"), after, path)
+            seen.add(after)
+        posts = set(re.findall(r'\bv === "(\w+)"', picker)) | set(re.findall(r'status\.value === "(\w+)"', unload))
+        self.assertEqual(posts, seen)                           # the values a row loads at and the button unloads at
+
+
 class ThirdModel(Base):
     NAMES = ("A", "B", "C")
 
@@ -622,16 +688,18 @@ class Startup(unittest.TestCase):
 
     def test_every_entry_is_checked_with_its_own_words(self):
         code, _, calls = self.run_main({"engine": {"pool-workers": 8},
-                                        "models": [{"model": "a.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144},
-                                                   {"model": "b.basalt", "gpu": "auto", "max-context": 1048576}]})
+                                        "models": [{"model": "a.basalt", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144},
+                                                   {"model": "b.basalt", "gpu": "0,1", "gpu-mode": "split", "gpu-share": "3,1", "max-context": 1048576}]})
         self.assertEqual(code, "past the checks")
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].args[2], "auto")
+        self.assertEqual(calls[0].args[2], "all")
+        self.assertEqual(calls[0].args[4:], ("peer", None))                      # the mode and the shares go with the cards
+        self.assertEqual((calls[1].args[2], calls[1].args[4:]), ("0,1", ("split", "3,1")))
         self.assertEqual(calls[0].args[3], ["--pool-workers", "8", "--kv", "int8", "--max-context", "262144"])
         self.assertEqual(calls[1].args[3], ["--pool-workers", "8", "--max-context", "1048576"])
 
     def test_a_flag_an_entry_refuses_stops_the_start(self):
-        def plan(engine_bin, path, gpu, words):
+        def plan(engine_bin, path, gpu, words, mode=None, share=None):
             if path.endswith("b.basalt"):
                 raise ValueError("unknown argument: --spec")
             return {"devices": "0", "cards": []}
@@ -640,7 +708,7 @@ class Startup(unittest.TestCase):
         self.assertIn("b.basalt: unknown argument: --spec", err)
 
     def test_a_kv_the_entry_cannot_take_stops_the_start_and_a_top_level_one_is_skipped(self):
-        def plan(engine_bin, path, gpu, words):
+        def plan(engine_bin, path, gpu, words, mode=None, share=None):
             if path.endswith("b.basalt") and "--kv" in words:
                 raise ValueError("unknown argument: --kv")
             return {"devices": "0", "cards": []}
@@ -654,7 +722,7 @@ class Startup(unittest.TestCase):
         self.assertEqual(calls[1].args[3], [])
 
     def test_a_context_past_the_maximum_stops_the_start(self):
-        def plan(engine_bin, path, gpu, words):
+        def plan(engine_bin, path, gpu, words, mode=None, share=None):
             raise ValueError("--max-context 2097152 is past the model's maximum context of 1048576 tokens")
         code, err, _ = self.run_main({"models": [{"model": "b.basalt", "max-context": 2097152}]}, plan)
         self.assertEqual(code, 2)

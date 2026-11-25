@@ -402,6 +402,89 @@ __global__ void idx_score_kernel(const float* __restrict__ iq, const float* __re
     }
 }
 
+// idx_score_kernel<true> without a candidate mask, on the tensor cores: the queries (rounded to FP4 with power-of-two
+// scales) and the FP4 key rows are exact in bf16, so every product is exact and only the order of the sums of the
+// 128 dims differs (an FP32 accumulation; within the dynamic range of the scales the sums are exact). The heads' sum
+// runs in idx_score_kernel's order. A block: kTcTok tokens (their 32 heads each) against key tiles of kTcRows rows,
+// a tile apart by gridDim.x.
+constexpr int kTcTok = 2, kTcRows = 64, kTcLd = kIdxDim + 8, kTcCLd = kTcRows + 4, kTcThreads = 128, kTcScoreBlocks = 64;
+constexpr int kTcM = kTcTok * kIdxHeads;
+constexpr size_t kTcSmem = (size_t) kTcM * kTcLd * 2 + (size_t) kTcRows * kTcLd * 2 + (size_t) kTcM * kTcCLd * 4;
+static_assert(kTcM / 16 == kTcThreads / 32, "a warp per 16 query rows");
+static_assert(kTcTok * kTcRows == kTcThreads, "a thread per (token, row) in the epilogue");
+
+__global__ void __launch_bounds__(kTcThreads) idx_score_tc_kernel(const float* __restrict__ iq, const float* __restrict__ iw,
+                                                                   const int32_t* __restrict__ pos, int n_tokens,
+                                                                   const uint8_t* __restrict__ ik, int n_comp, int ratio,
+                                                                   float w_scale, float* __restrict__ scores) {
+    using namespace nvcuda;
+    extern __shared__ __align__(128) unsigned char tc_smem[];
+    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(tc_smem);
+    __nv_bfloat16* Bs = As + (size_t) kTcM * kTcLd;
+    float* Cs = reinterpret_cast<float*>(Bs + (size_t) kTcRows * kTcLd);
+    __shared__ float wsh[kTcTok][kIdxHeads];
+    const int t0 = blockIdx.y * kTcTok, nt = min(kTcTok, n_tokens - t0);
+    const int n_eff = eff_rows(pos, n_tokens, ratio, n_comp);
+    if (blockIdx.x * kTcRows >= n_eff) return;
+    for (int i = threadIdx.x; i < kTcM * kIdxDim; i += kTcThreads) {
+        const int r = i / kIdxDim, d = i % kIdxDim, t = r / kIdxHeads;
+        As[r * kTcLd + d] = __float2bfloat16(t < nt ? iq[(size_t) (t0 + t) * kIdxHeads * kIdxDim + (size_t) (r % kIdxHeads) * kIdxDim + d] : 0.f);
+    }
+    if (threadIdx.x < kTcTok * kIdxHeads) {
+        const int t = threadIdx.x / kIdxHeads, h = threadIdx.x % kIdxHeads;
+        wsh[t][h] = t < nt ? iw[(t0 + t) * kIdxHeads + h] : 0.f;
+    }
+    const int warp = threadIdx.x >> 5;
+    for (int base = blockIdx.x * kTcRows; base < n_eff; base += gridDim.x * kTcRows) {
+        __syncthreads();   // the last tile's epilogue is done with Bs and Cs
+        // decode the tile's key rows: a thread per (row, word of 8 values)
+        for (int i = threadIdx.x; i < kTcRows * (kIdxDim / 8); i += kTcThreads) {
+            const int r = i / (kIdxDim / 8), c = i % (kIdxDim / 8), j = base + r;
+            float k[8];
+            if (j < n_eff) {
+                const uint8_t* row = ik + (size_t) j * kIdxRowBytes;
+                const uint32_t sw = *reinterpret_cast<const uint32_t*>(row + kIdxDim / 2);
+                rows::fp4p_values<8>(reinterpret_cast<const uint32_t*>(row)[c], (sw >> (8 * (c / 4))) & 0xffu, k);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) k[e] = 0.f;
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) Bs[r * kTcLd + c * 8 + e] = __float2bfloat16(k[e]);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kTcRows / 16];
+#pragma unroll
+        for (int n = 0; n < kTcRows / 16; ++n) wmma::fill_fragment(acc[n], 0.f);
+#pragma unroll
+        for (int kk = 0; kk < kIdxDim / 16; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+            wmma::load_matrix_sync(a, As + (size_t) warp * 16 * kTcLd + kk * 16, kTcLd);
+#pragma unroll
+            for (int n = 0; n < kTcRows / 16; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+                wmma::load_matrix_sync(b, Bs + (size_t) n * 16 * kTcLd + kk * 16, kTcLd);
+                wmma::mma_sync(acc[n], a, b, acc[n]);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < kTcRows / 16; ++n)
+            wmma::store_matrix_sync(Cs + (size_t) warp * 16 * kTcCLd + n * 16, acc[n], kTcCLd, wmma::mem_row_major);
+        __syncthreads();
+        const int t = threadIdx.x / kTcRows, jj = threadIdx.x % kTcRows, j = base + jj;
+        if (t < nt && j < n_eff) {
+            const int nv = (pos[t0 + t] + 1) / ratio;
+            float s = -INFINITY;
+            if (j < nv) {
+                s = 0.f;
+#pragma unroll
+                for (int h = 0; h < kIdxHeads; ++h) s += fmaxf(Cs[(size_t) (t * kIdxHeads + h) * kTcCLd + jj], 0.f) * (wsh[t][h] * w_scale);
+            }
+            scores[(size_t) (t0 + t) * n_comp + j] = s;
+        }
+    }
+}
+
 // Best score per block, plus 1e30 on the block holding the newest visible row.
 __global__ void block_max_kernel(const float* __restrict__ scores, const int32_t* __restrict__ pos, int n_comp,
                                  int ratio, int block_size, float* __restrict__ bscore) {
@@ -1381,10 +1464,21 @@ void indexer_select_batch(const IndexerArgs& a, const float* qr, const float* x,
     const float w_scale = 1.0f / sqrtf((float) (kIdxHeads * kIdxDim));
     if (a.mode == IndexMode::Level2) mark_blocks_kernel<<<n_tokens, 256, 0, s>>>(a.cand_ids, a.cand_n, n_blk, pos, a.n_comp, a.ratio,
                                                           a.block_size, w.blk_ok);
-    dim3 grid(std::min((a.n_comp + 127) / 128, kScoreBlocks), n_tokens);
-    (a.format == CacheFormat::Fp8 ? idx_score_kernel<true> : idx_score_kernel<false>)<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, a.comp_ik, a.n_comp, a.ratio,
-                                          a.block_size, a.mode == IndexMode::Level2 ? w.blk_ok : nullptr, n_blk,
-                                          w_scale, w.scores);
+    // the fp16 cache and Level2's candidate mask keep idx_score_kernel
+    if (a.format == CacheFormat::Fp8 && a.mode != IndexMode::Level2) {
+        static bool attr = false;
+        if (!attr) {
+            cudaFuncSetAttribute(idx_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem);
+            attr = true;
+        }
+        dim3 g(std::min((a.n_comp + kTcRows - 1) / kTcRows, kTcScoreBlocks), (n_tokens + kTcTok - 1) / kTcTok);
+        idx_score_tc_kernel<<<g, kTcThreads, kTcSmem, s>>>(w.iq, w.iw, pos, n_tokens, a.comp_ik, a.n_comp, a.ratio, w_scale, w.scores);
+    } else {
+        dim3 grid(std::min((a.n_comp + 127) / 128, kScoreBlocks), n_tokens);
+        (a.format == CacheFormat::Fp8 ? idx_score_kernel<true> : idx_score_kernel<false>)<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, a.comp_ik, a.n_comp, a.ratio,
+                                              a.block_size, a.mode == IndexMode::Level2 ? w.blk_ok : nullptr, n_blk,
+                                              w_scale, w.scores);
+    }
     check_launch("idx_score");
     if (a.mode == IndexMode::Level1) {
         dim3 g((n_blk + 127) / 128, n_tokens);

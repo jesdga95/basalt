@@ -2,6 +2,8 @@
 //
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
@@ -10,6 +12,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/attn_batch.hpp"
@@ -48,7 +51,7 @@ constexpr int kStepTailTokens = 16;     // a tail shorter than this reads one de
 
 constexpr int kMaxWindow = kMaxT;   // rows one decode window verifies
 
-class Session final : public model::ModelSession {
+class Session final : public model::BatchSession {
 public:
     explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
@@ -93,7 +96,7 @@ public:
                 return false;
             }
         const size_t n = (size_t) g_.n_embd;
-        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow, nullptr);   // [T - 1][layer][with previous tail]
+        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow * 2, nullptr);   // [lossy][T - 1][layer][with previous tail]
         tail_g_.assign((size_t) g_.n_layers * kMaxWindow, nullptr);
         constexpr int W = kMaxWindow;
         auto buf = [&](float*& p, size_t floats) {
@@ -201,6 +204,7 @@ public:
 
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
+        holding_ = false;   // drafts a batch left unread are another round's
         std::string err;
         if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::clamp(n, 1, std::min(max_window() - 1, kDsparkBlock)), err))
             return {model::Status::Error, err};
@@ -210,11 +214,31 @@ public:
         return {};
     }
 
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    // The sessions share one drafter, which runs one block at a time: each session's block runs and is read in turn, and
+    // its draft_end takes the drafts it holds.
+    model::Result draft_batch(ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n, int count) override {
+        if (count == 1) return peers[0]->draft_begin(anchors[0], pos[0], n[0]);
+        for (int i = 0; i < count; ++i) {
+            Session* s = dynamic_cast<Session*>(peers[i]);
+            if (s == nullptr) return {model::Status::Error, "deepseek41: a draft batch of sessions of another model"};
+            if (model::Result r = s->draft_begin(anchors[i], pos[i], n[i]); !r.ok()) return r;
+            std::string err;
+            if (!s->drafter_->draft_end(s->held_, err)) return {model::Status::Error, err};
+            s->holding_ = true;
+        }
+        return {};
+    }
+
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
         DsparkDraft d;
-        if (!drafter_->draft_end(d, err)) return {model::Status::Error, err};
+        if (holding_) {
+            d = held_;
+            holding_ = false;
+        } else if (!drafter_->draft_end(d, err)) {
+            return {model::Status::Error, err};
+        }
         n = std::min(max_n, d.n);
         std::copy(d.token, d.token + n, ids);
         std::copy(d.conf, d.conf + n, conf);
@@ -222,6 +246,16 @@ public:
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        // the lossy routing flags apply to decode windows only: prompts route as the model does
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        {
+            std::string e;
+            core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+            lossy_ = t && t->route_lossy() ? t : nullptr;
+        }
         if (r.row_tokens) {
             if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
             std::string err;
@@ -333,7 +367,7 @@ public:
             if (!t->reclaim(e)) return {model::Status::Error, e};
             t->grow();
         }
-        expert_slots = t->slots();
+        expert_slots = t->gpu_slots();
         return {};
     }
 
@@ -344,7 +378,7 @@ public:
         cudaStreamSynchronize(stream_);
         release_short_prompt();
         if (!t->replan(mib, e)) return {model::Status::Error, e};
-        expert_slots = t->slots();
+        expert_slots = t->gpu_slots();
         return {};
     }
 
@@ -366,11 +400,28 @@ public:
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
+    std::vector<CardExperts> experts_by_card() const override {
+        std::string e;
+        const core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        std::vector<CardExperts> out;
+        if (t != nullptr)
+            for (const core::ExpertTier::CardSlots& c : t->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        std::string e;
+        core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        if (t == nullptr) return false;
+        t->expert_map(total, homes, routed);
+        return true;
+    }
+
     std::string info_words() const override {
         std::string e;
         core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
-        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->gpu_slots()) + " expert_slots_primary=" + std::to_string(t->slots()) + " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }
@@ -440,53 +491,63 @@ public:
 
     model::Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(stream_);
-        if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (basalt::core::device_copy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return {model::Status::Error, "the head logits copy failed"};
         return {};
     }
 
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid&) override {
         std::string err;
-        if (!image_) {   // this slot's image buffers, allocated with the tier
+        if (!image_) {   // this slot's image buffers, filled per request
             core::ExpertTier* tier = ops_ ? ops_->expert_tier(err) : nullptr;
             image_ = tier ? m_.prompt_host().take_image() : nullptr;
             if (!image_) return {model::Status::Error, err.empty() ? "deepseek41: no image buffers for this slot" : err};
         }
         vision::Image& img = image_->picture;
         if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
+        // The encoder's weights and this picture's work buffers go above the VRAM reserve: in what the tier's extra copies
+        // leave, else in the room of all its copies; images_done gives it back.
+        std::string te;
+        core::ExpertTier* t = ops_->expert_tier(te);
+        const auto above_floor = [&] {
+            size_t free_b = 0, total_b = 0;
+            return !t || basalt::core::gpu_mem_info(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
+        };
+        const auto lend = [&] {
+            if (!t) return false;
+            cudaStreamSynchronize(stream_);
+            t->lend_all();
+            return true;
+        };
         if (!vis_) {
             release_short_prompt();
-            // the encoder takes the memory of the tier's extra copies, and of all its copies when that is short;
-            // images_done gives it back
-            std::string te;
-            core::ExpertTier* t = ops_->expert_tier(te);
             cudaStreamSynchronize(stream_);
             vis_borrowed_ = true;
             if (t) t->shrink();
             vision::Mmproj mp;
             if (!m_.open_mmproj(mp, err)) { images_done(); return {model::Status::Error, err}; }
-            const VisionPlan pl = plan_image(img.w, img.h, mp.hp().merge, mp.hp().min_pixels);
             vis_ = std::make_unique<VisionEncoder>();
-            const auto above_floor = [&] {
-                size_t free_b = 0, total_b = 0;
-                return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
-            };
-            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err) && above_floor();
-            if (!opened && t) {
+            bool loaded = vis_->init(mp, m_.vision_blas(), err);
+            if (!loaded && lend()) {
                 vis_ = std::make_unique<VisionEncoder>();
-                t->lend_all();
                 err.clear();
-                opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err);
-                if (opened && !above_floor()) {
-                    opened = false;
-                    err = "not enough free device memory for the image encoder above the VRAM reserve";
-                }
+                loaded = vis_->init(mp, m_.vision_blas(), err);
             }
-            if (!opened) { images_done(); return {model::Status::Error, err}; }
+            if (!loaded) { images_done(); return {model::Status::Error, err}; }
             vis_merge_ = mp.hp().merge;
             vis_min_pixels_ = mp.hp().min_pixels;
         }
         const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
+        bool room = vis_->reserve(pl, err) && above_floor();
+        if (!room && lend()) {
+            err.clear();
+            room = vis_->reserve(pl, err) && above_floor();
+        }
+        if (!room) {
+            if (err.empty()) err = "not enough free device memory for the image encoder above the VRAM reserve";
+            images_done();
+            return {model::Status::Error, err};
+        }
         std::vector<float>& patches = image_->patches;
         image_patches(img, pl, patches);
         if (!vis_->encode(patches, pl, rows, err)) { images_done(); return {model::Status::Error, err}; }
@@ -495,6 +556,10 @@ public:
     }
 
     void images_done() override {
+        if (image_) {   // the picture's decode and patch rows leave with the request
+            std::vector<uint8_t>().swap(image_->picture.rgb);
+            std::vector<float>().swap(image_->patches);
+        }
         if (!vis_borrowed_) return;
         vis_borrowed_ = false;
         cudaStreamSynchronize(stream_);
@@ -527,6 +592,99 @@ public:
         return {};
     }
 
+    // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
+    // session's scratch and stream. Each conversation keeps its caches, window ring and compressor state (its layer ops),
+    // its Engram reads and history, its drafter rows, logits and draws; the attention (with the compressor and the
+    // indexer) and the Engram run per segment over its own state, as its solo window of that many rows would, the rest
+    // over every row. The host places the experts layer by layer, so the forward runs directly every window
+    // (batch_captured false). The cap is a decode window's (kMaxT): the experts' window plan and every row buffer.
+    int batch_rows() const override { return kMaxWindow; }
+
+protected:
+    const char* batch_name() const override { return "deepseek41"; }
+    int64_t batch_context() const override { return m_.context(); }
+    model::BatchShared& batch_shared() override { return m_.batch_shared(); }
+    cudaStream_t batch_stream() const override { return stream_; }
+    bool batch_captured() const override { return false; }
+    // a decode window with the lossy routing flags or tensor dumps runs in turn
+    bool batch_ready() const override {
+        std::string e;
+        const core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        return t && !t->route_lossy() && dump_dir_.empty() && ops_->graph_capable();
+    }
+    // What step() does before the layers, on this session's stream: the draw, the drafter's rows of the last window, the
+    // history, the positions staged (the last window's compressor commit), the rows' embeddings and their Engram reads.
+    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        const int T = r.n_tokens;
+        if (T > kMaxWindow || (!r.row_tokens && T > 1)) {
+            err = "a batch window of " + std::to_string(T) + " rows without row picks";
+            return false;
+        }
+        if (!prepare_draw(r, err)) return false;
+        err_.clear();
+        if (!flush_features(r.pos, err_) || !batch_prologue(r.tokens, T, r.pos)) {
+            err = err_.empty() ? "deepseek41: the batch window failed" : err_;
+            return false;
+        }
+        return true;
+    }
+    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key&, std::string& err) override {
+        const size_t row = (size_t) kHcMult * g_.n_embd;
+        for (int i = 0; i < v.n; ++i) {
+            const Session* s = static_cast<const Session*>(v.ss[i]);
+            const model::BatchWindow::Seg& sg = v.w.segs[(size_t) i];
+            if (cudaMemcpyAsync(x_ + (size_t) sg.row0 * row, s->h_emb4_, (size_t) sg.rows * row * sizeof(float), cudaMemcpyHostToDevice,
+                                v.stream) != cudaSuccess) {
+                err = "the embeddings' copy failed";
+                return false;
+            }
+        }
+        return true;
+    }
+    bool batch_forward(const model::BatchView& v, std::string& err) override {
+        err_.clear();
+        if (batch_layers(v)) return true;
+        err = err_.empty() ? "deepseek41: the batch window failed" : err_;
+        return false;
+    }
+    // segment i's head rows into its logits, as its solo window leaves them (every row of a verify window), and its
+    // drafter rows' bookkeeping
+    void batch_take(const model::BatchView& v, int i) override {
+        const model::DecodeRequest& r = v.reqs[i];
+        const model::BatchWindow::Seg& sg = v.w.segs[(size_t) i];
+        const Session* lead = static_cast<const Session*>(v.ss[0]);
+        const int h = v.head[i];
+        const size_t V = (size_t) g_.n_vocab;
+        if (drafter_) {
+            feat_pos0_ = r.pos;
+            feat_n_ = r.n_tokens;
+        }
+        if (h == 0) return;
+        const float* src = lead->logits_ + (size_t) (sg.row0 + sg.rows - h) * V;
+        // the leader's own rows first: its copy lands below every later segment's rows
+        if (src != logits_) cudaMemcpyAsync(logits_, src, (size_t) h * V * 4, cudaMemcpyDeviceToDevice, v.stream);
+        if (r.logits) cudaMemcpyAsync(r.logits, logits_, (size_t) (r.n_tokens > 1 ? h : 1) * V * 4, cudaMemcpyDeviceToHost, v.stream);
+    }
+    // its draws, as step() draws a window's (every row) or one token's
+    const int32_t* batch_draw(const model::BatchView& v, int i, std::string& err) override {
+        const int h = v.head[i];
+        void* st = v.stream;
+        if (h > 1) {
+            if (draw_kernel_) kernels::sample_tokens(logits_, h, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
+            else argmax_rows(logits_, h, g_.n_vocab, am_dev_, am_ws_, st);
+        } else if (draw_kernel_ && !v.reqs[i].logits) {
+            kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
+        } else {
+            argmax_index(logits_, g_.n_vocab, am_dev_, am_ws_, st);
+        }
+        if (cudaMemcpyAsync(h_next_, am_dev_, (size_t) h * sizeof(int32_t), cudaMemcpyDeviceToHost, (cudaStream_t) st) != cudaSuccess) {
+            err = "the picks' copy failed";
+            return nullptr;
+        }
+        return h_next_;
+    }
+
+public:
 private:
     // The prompt path's workspaces and the expert tier share the card. The tier opens first; the workspaces size to
     // the free memory beside it. Once a prompt has run they are released and the tier takes the memory as extra slots,
@@ -556,7 +714,7 @@ private:
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
             const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
-            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
+            if (prefill_ && basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
                 return true;
             }
@@ -684,7 +842,7 @@ private:
                 allocs_.push_back(v);
                 d_hist_ = (int32_t*) v;
             }
-            if (cudaMemcpy(d_hist_, r.history, (size_t) r.n_tokens * history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (basalt::core::device_copy(d_hist_, r.history, (size_t) r.n_tokens * history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "the penalty history upload failed";
                 return false;
             }
@@ -707,7 +865,7 @@ private:
         if (dump_dir_.empty()) return;
         std::vector<char> h(bytes);
         cudaStreamSynchronize(stream_);
-        cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDefault);   // device or mapped host memory
+        basalt::core::device_copy(h.data(), dev, bytes, cudaMemcpyDefault);   // device or mapped host memory
         const std::string path = dump_dir_ + "/" + name + "." + std::to_string(layer) + "." + std::to_string(pos) + ".bin";
         if (FILE* f = std::fopen(path.c_str(), "wb")) {
             std::fwrite(h.data(), 1, bytes, f);
@@ -760,6 +918,26 @@ private:
         std::string e;
         m_.engram_reader().collect(t, e);
         t = {};
+    }
+
+    // Layer k's Engram rows of the window's `T` rows: both reads landed, dequantized into the mapped rows.
+    bool engram_rows_of(size_t k, int T, std::string& err) {
+        const EngramInfo& en = m_.pack().engram;
+        for (ngram::PleReader::Ticket& t : eread_[k]) {
+            if (t.id && !m_.engram_reader().collect(t, err)) return false;
+            t = {};
+        }
+        for (int r = 0; r < en.hash.n_cols() * T; ++r)
+            engram_row_f32(en.type, en.row_values, eraw_[k].data() + (size_t) r * en.row_bytes, erow_h_[k] + (size_t) r * 256);
+        return true;
+    }
+    // Their projection by layer il's Engram matrix into ekv_[k].
+    bool engram_project_of(size_t k, int il, int T, void* s) {
+        const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
+        if (!kvw) return false;
+        const int n_cols = m_.pack().engram.hash.n_cols();
+        dense_f32(*kvw, erow_d_[k], eq8_[k], ekv_[k], n_cols * 256, (int) (5 * g_.n_embd), T, s);
+        return true;
     }
 
     // Row 0 of the window after the drafts is `token` at `pos`: its embedding and its Engram reads are made while the
@@ -830,6 +1008,10 @@ private:
         ra.n_embd = (int) n;
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
+        if (lossy_) {   // a decode window with the lossy routing flags: the experts the GPUs hold
+            ra.held = lossy_->held_tabs(il);
+            ra.prior = lossy_->route_prior();
+        }
 
         // each sublayer's mixes run beside its collapse: only its expansion reads them (captured after the collapse, so a
         // graph launch starts the collapse's branch first)
@@ -869,6 +1051,9 @@ private:
         ops_->stage_rows(T, normed_, row_st_);
         DS_CUDA(cudaEventRecord(row_ev_[1], row_st_));
         router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
+        if (lossy_ && lossy_->route_tail_skip() > 0)
+            kernels::route_tail_skip(ids_, rw_, ra.held, T * g_.n_used, g_.n_used, lossy_->route_tail_skip(), g_.n_expert,
+                                     lossy_->route_counts(), st);
         dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
@@ -919,7 +1104,8 @@ private:
     int graph_row(int T) const { return T - 1; }
 
     bool run_head(int il, int64_t pos, int32_t token, bool with_prev_tail, int T = 1) {
-        return run_graph(head_g_[(((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
+        const size_t lossy = lossy_ ? (size_t) g_.n_layers * 2 * kMaxWindow : 0;
+        return run_graph(head_g_[lossy + (((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
                          [&]() { return enqueue_head(il, pos, token, stream_, with_prev_tail, T); });
     }
     bool run_tail(int il, int64_t pos, int T = 1) {
@@ -949,6 +1135,135 @@ private:
 
 
 
+    // A window's start before its layers, as step_impl's: the history, the positions staged, the rows' embeddings in the four
+    // streams (h_emb4_; row 0's may have been made while the drafter ran) and their Engram reads.
+    bool batch_prologue(const int32_t* tokens, int T, int64_t pos) {
+        const size_t n = (size_t) g_.n_embd;
+        if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return fail(kSkippedRows);
+        if (pos == 0) {
+            hist_.clear();
+            whole_from_ = 0;
+            ops_->reset();
+            if (drafter_) drafter_->reset(dwin_);
+        }
+        if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
+        hist_.resize((size_t) pos);
+        hist_.insert(hist_.end(), tokens, tokens + T);
+        {
+            std::string se;
+            if (!ops_->stage_token(pos, T, stream_, se)) return fail(se);
+        }
+        fused_ = true;
+        staged_ = false;
+        const int from = take_row0(tokens[0], pos) ? 1 : 0;
+        for (int t = from; t < T; ++t) {
+            float* row = h_emb4_ + (size_t) t * kHcMult * n;
+            std::string e;
+            if (!m_.embedding_row(tokens[t], row, e)) return fail(e);
+            for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
+        }
+        if (!m_.pack().engram.layers.empty() && from < T) {
+            engram_issue(tokens + from, T - from, pos + from, from, 1, true);
+            engram_issue(tokens + from, T - from, pos + from, from, 1, false);
+        }
+        return true;
+    }
+
+    // A batch window's layers and head on this session's scratch: every row through the mixes, norms, router, experts and
+    // head; each segment's attention through its own session's layer ops (its caches, ring and compressor state, the same
+    // calls as its solo window of that many rows), its Engram rows and drafter rows into its own buffers.
+    bool batch_layers(const model::BatchView& v) {
+        const size_t n = (size_t) g_.n_embd;
+        const int R = v.w.rows;
+        void* st = stream_;
+        const auto seg = [&](int i) { return static_cast<Session*>(v.ss[i]); };
+        const auto row0 = [&](int i) { return (size_t) v.w.segs[(size_t) i].row0; };
+        const auto rows = [&](int i) { return v.w.segs[(size_t) i].rows; };
+        const EngramInfo& en = m_.pack().engram;
+        HcArgs hca;
+        hca.n_embd = (int) n;
+        hca.rms_eps = 1e-20f;
+        hca.hc_eps = g_.hc_eps;
+        hca.sinkhorn_iters = g_.sinkhorn_iters;
+        RouterArgs ra;
+        ra.n_expert = g_.n_expert;
+        ra.n_embd = (int) n;
+        ra.k = g_.n_used;
+        ra.weight_scale = g_.weight_scale;
+        std::string err;
+        for (int il = 0; il < g_.n_layers; ++il) {
+            if (il > 0) hc_post(ffn_sum_, x2_, coef_f_[(il - 1) & 1], kHcCoef, R, (int) n, x_, st);
+            for (size_t k = 0; k < en.layers.size(); ++k) {
+                if (en.layers[k] != il) continue;
+                const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
+                if (!gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
+                EngramArgs ea;
+                ea.n_embd = (int) n;
+                for (int i = 0; i < v.n; ++i) {
+                    Session* s = seg(i);
+                    if (!s->engram_rows_of(k, rows(i), err)) return fail(err);
+                    if (!s->engram_project_of(k, il, rows(i), st)) return fail("layer " + std::to_string(il) + " has no Engram tensors");
+                    engram_apply(s->ekv_[k], (const float*) gw->ptr, nullptr, rows(i), ea, x_ + row0(i) * kHcMult * n, st);
+                }
+            }
+            if (drafter_) {
+                if (il == feat_first_) drafter_->after_staging(stream_);   // the last staging has read its rows
+                if (const int slot = drafter_->feature_slot(il); slot >= 0)
+                    for (int i = 0; i < v.n; ++i)
+                        dspark_hc_mean(x_ + row0(i) * kHcMult * n, rows(i), (int) n, seg(i)->dfeat_ + (size_t) slot * n, drafter_->feature_floats(), st);
+            }
+            const float* pre_prev = il > 0 ? coef_f_[(il - 1) & 1] : nullptr;
+            float* coef_f = coef_f_[il & 1];
+            DS_CUDA(cudaEventRecord(mix_ev_[0], stream_));
+            if (pre_prev) {
+                hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), R, (int) n, g_.rms_eps, cur_, normed_, st);
+            } else {
+                for (int t = 0; t < R; ++t) copy_rows(x_ + (size_t) t * kHcMult * n, cur_ + (size_t) t * n, (int) n, st);
+                rms_norm(cur_, wf(il, "attn_norm.weight"), R, (int) n, g_.rms_eps, normed_, st);
+            }
+            DS_CUDA(cudaStreamWaitEvent(mix_st_, mix_ev_[0], 0));
+            hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), R, hca, hc_ws_,
+                     coef_a_, mix_st_);
+            DS_CUDA(cudaEventRecord(mix_ev_[1], mix_st_));
+            for (int i = 0; i < v.n; ++i)
+                if (!seg(i)->ops_->attention_window(il, rows(i), normed_ + row0(i) * n, attn_out_ + row0(i) * n, st, err_)) return false;
+            DS_CUDA(cudaStreamWaitEvent(stream_, mix_ev_[1], 0));
+            hc_post(attn_out_, x_, coef_a_, kHcCoef, R, (int) n, x2_, st);
+            DS_CUDA(cudaEventRecord(mix_ev_[2], stream_));
+            DS_CUDA(cudaStreamWaitEvent(mix_st_, mix_ev_[2], 0));
+            hc_mixes(x2_, wf(il, "hc_ffn_fn.weight"), wf(il, "hc_ffn_scale.weight"), wf(il, "hc_ffn_base.weight"), R, hca, hc_ws_, coef_f,
+                     mix_st_);
+            DS_CUDA(cudaEventRecord(mix_ev_[3], mix_st_));
+            hc_pre_rms_norm(x2_, coef_a_, kHcCoef, wf(il, "ffn_norm.weight"), R, (int) n, g_.rms_eps, cur_, normed_, st);
+            DS_CUDA(cudaEventRecord(row_ev_[0], stream_));
+            DS_CUDA(cudaStreamWaitEvent(row_st_, row_ev_[0], 0));
+            ops_->stage_rows(R, normed_, row_st_);
+            DS_CUDA(cudaEventRecord(row_ev_[1], row_st_));
+            router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), R, ra, rlogits_, ids_, rw_, st);
+            DS_CUDA(cudaStreamWaitEvent(stream_, row_ev_[1], 0));
+            ops_->stage_ids(R, ids_, st);
+            DS_CUDA(cudaStreamWaitEvent(stream_, mix_ev_[3], 0));
+            if (!ops_->shared_expert_window(il, R, normed_, sh_out_, st, err_)) return false;
+            if (il == 0) ops_->begin_token(v.reqs[0].pos, R);
+            if (drafter_ && il == feat_last_) {
+                // every target row is in the sessions' feature rows: the drafter stages one session's beside the window (it
+                // holds one staging); the others' go in when they next draft (inject), as a window that could not stage
+                Session* s = seg(v.n - 1);
+                std::string se;
+                DS_CUDA(cudaEventRecord(s->feat_ev_, stream_));
+                s->staged_ = drafter_->stage(s->dwin_, v.reqs[v.n - 1].pos, rows(v.n - 1), s->dfeat_, s->feat_ev_, se);
+                if (!se.empty()) return fail(se);
+            }
+            if (!ops_->routed_shared_window(il, R, rw_, ffn_sum_, sh_out_, st, err_)) return false;
+        }
+        hc_post(ffn_sum_, x2_, coef_f_[(g_.n_layers - 1) & 1], kHcCoef, R, (int) n, x_, st);
+        hc_pre(x_, coef_f_[(g_.n_layers - 1) & 1], kHcCoef, R, (int) n, cur_, st);
+        rms_norm(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, R, (int) n, g_.rms_eps, normed_, st);
+        dense_f32(*m_.tensor("output.weight"), normed_, q8_, logits_, (int) n, g_.n_vocab, R, st);
+        ops_->end_window();
+        return true;
+    }
+
     // `T` rows at pos..; with T > 1 every row's pick lands in next[T] and the rows stay until a later call drops those past it.
     bool step_impl(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out) {
         const size_t n = (size_t) g_.n_embd;
@@ -968,6 +1283,7 @@ private:
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
         }
+        if (lossy_) lossy_->publish_held(stream_);   // ahead of the window's first router
         const bool graphs = dump_dir_.empty() && ops_->graph_capable();
         fused_ = graphs;
 
@@ -999,21 +1315,8 @@ private:
         // A layer's rows are dequantized into mapped memory that its projection reads, so no copy waits behind the
         // expert copies. The projection of an Engram layer past layer 1 runs one layer ahead, behind that layer's head,
         // while its experts run; the Engram layer's head then only adds the result.
-        const auto engram_rows = [&](size_t k) {
-            for (ngram::PleReader::Ticket& t : eread_[k]) {
-                if (t.id && !m_.engram_reader().collect(t, err)) return false;
-                t = {};
-            }
-            for (int r = 0; r < n_cols * T; ++r)
-                engram_row_f32(en.type, en.row_values, eraw_[k].data() + (size_t) r * en.row_bytes, erow_h_[k] + (size_t) r * 256);
-            return true;
-        };
-        const auto engram_project = [&](size_t k, int il, void* s) {
-            const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
-            if (!kvw) return false;
-            dense_f32(*kvw, erow_d_[k], eq8_[k], ekv_[k], n_cols * 256, (int) (5 * n), T, s);
-            return true;
-        };
+        const auto engram_rows = [&](size_t k) { return engram_rows_of(k, T, err); };
+        const auto engram_project = [&](size_t k, int il, void* s) { return engram_project_of(k, il, T, s); };
 
         for (int il = 0; il < g_.n_layers; ++il) {
             // Engram
@@ -1125,6 +1428,7 @@ private:
     DsModel& m_;
     const Geometry& g_;
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     static constexpr int kHistoryCap = 4096;
     kernels::SamplerParams sampling_{};
     bool draw_kernel_ = false, bias_on_ = false;
@@ -1180,7 +1484,9 @@ private:
     // the drafter and the main model's side of its feature hand-off
     std::shared_ptr<DsparkDrafter> drafter_;
     int dwin_ = 0;               // this session's window in the drafter
-    PromptHost::Image* image_ = nullptr;   ///< this slot's image buffers
+    DsparkDraft held_;           // the drafts of a draft_batch, which draft_end returns
+    bool holding_ = false;
+    PromptHost::Image* image_ = nullptr;   ///< this slot's image buffers, filled per request
     float* dfeat_ = nullptr;     // [rows][target layers][n_embd]
     float* h_dfeat_ = nullptr;
     int64_t feat_pos0_ = 0;      // the first position of the rows in dfeat_ that await the drafter, and how many

@@ -1,7 +1,8 @@
-// tests/program/batch_plan_test.cpp - a round's windows over a batch's rows: each slot's share of the cap and the
-// first-fit groups that run as one batch (CPU).
+// tests/program/batch_plan_test.cpp - a round's windows over a batch's rows: each slot's rows of the cap by its drafts'
+// chances or max-min fair over its own window, and the first-fit groups that run as one batch (CPU).
 #include "program/serve/batch_plan.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -32,20 +33,53 @@ bool sound(const std::vector<int>& rows, const Groups& g, int cap) {
 
 int main() {
     using basalt::program::serve::batch_groups;
-    using basalt::program::serve::batch_share;
+    using basalt::program::serve::batch_fair_shares;
+    using basalt::program::serve::batch_shares;
+    using Joint = std::vector<std::vector<double>>;
+    using Rows = std::vector<int>;
 
-    check(batch_share(0, 1, 16) == 16, "one slot takes the whole cap");
-    check(batch_share(0, 2, 16) == 8 && batch_share(1, 2, 16) == 8, "two slots take half each");
-    check(batch_share(0, 3, 16) == 6 && batch_share(1, 3, 16) == 5 && batch_share(2, 3, 16) == 5,
-          "three slots: the first takes the remainder row");
+    check(batch_shares({{0.9, 0.8, 0.7}}, 8) == Rows{8}, "one slot: its drafts' rows, then the rest of the cap");
+    check(batch_shares({{0.9, 0.8, 0.7}, {0.3, 0.1}}, 8) == Rows{5, 3},
+          "the likelier drafts take the rows first, then the leftover rows go round the slots");
+    check(batch_shares({{0.9, 0.2}, {0.5, 0.4, 0.3}}, 5) == Rows{2, 3}, "each row to the slot whose next draft is likeliest kept");
+    check(batch_shares({{}, {}}, 8) == Rows{4, 4}, "without drafts the rows go round in turn");
+    check(batch_shares({{0.5}, {0.5}}, 3) == Rows{2, 1}, "a tie goes to the earlier slot");
     bool whole = true;
     for (int n = 1; n <= 16; ++n) {
+        Joint j((size_t) n);
+        for (int i = 0; i < n; ++i) j[(size_t) i] = {0.9 / (i + 1), 0.5 / (i + 1)};
         int sum = 0;
-        for (int i = 0; i < n; ++i) sum += batch_share(i, n, 16);
+        for (const int r : batch_shares(j, 16)) sum += r;
         whole = whole && sum == 16;
     }
     check(whole, "with no more slots than rows the shares add up to the cap, so one pass serves all");
-    check(batch_share(0, 20, 16) == 16 && batch_share(19, 20, 16) == 16, "more slots than rows: each may take the cap");
+    check(batch_shares(Joint(20), 16) == Rows(20, 16), "more slots than rows: each may take the cap");
+
+    check(batch_fair_shares({3}, 8) == Rows{3}, "one slot keeps its window");
+    check(batch_fair_shares({3, 5}, 8) == Rows{3, 5}, "windows that fit together keep their rows");
+    check(batch_fair_shares({3, 7}, 8) == Rows{3, 5}, "the window wanting less is served in full, the other takes the rest");
+    check(batch_fair_shares({8, 8}, 8) == Rows{4, 4}, "equal wants split evenly");
+    check(batch_fair_shares({8, 8, 8}, 8) == Rows{3, 3, 2}, "a remainder row goes to the earlier slot");
+    check(batch_fair_shares({1, 8, 2, 8}, 8) == Rows{1, 3, 2, 2}, "small windows in full, the rest split what is left");
+    bool filled = true, fair = true;
+    for (int n = 1; n <= 16; ++n) {
+        Rows want((size_t) n);
+        for (int i = 0; i < n; ++i) want[(size_t) i] = 1 + (i * 7) % 16;
+        const Rows r = batch_fair_shares(want, 16);
+        int sum = 0, wsum = 0, lo = 99, hi = 0;
+        for (int i = 0; i < n; ++i) {
+            sum += r[(size_t) i];
+            wsum += want[(size_t) i];
+            if (r[(size_t) i] < want[(size_t) i]) lo = std::min(lo, r[(size_t) i]);
+            hi = std::max(hi, r[(size_t) i]);
+            fair = fair && r[(size_t) i] >= 1 && r[(size_t) i] <= want[(size_t) i];
+        }
+        filled = filled && sum == std::min(16, wsum);
+        fair = fair && (lo == 99 || hi <= lo + 1);   // a window held short is within a row of the largest share
+    }
+    check(filled, "with no more slots than rows the shares fill the pass or every window, so one pass serves all");
+    check(fair, "every share is 1 to the window's rows, a held window within a row of the largest share");
+    check(batch_fair_shares(Rows(20, 3), 16) == Rows(20, 16), "more slots than rows: each may take the cap");
 
     check(batch_groups({8, 8}, 16) == Groups{{0, 1}}, "two halves run as one batch");
     check(batch_groups({6, 5, 5}, 16) == Groups{{0, 1, 2}}, "three shares run as one batch");

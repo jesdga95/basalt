@@ -5,6 +5,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/rope_flags.hpp"
+#include "basalt/model/route_flags.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
@@ -16,12 +17,13 @@
 namespace basalt::models::qwen4exp {
 namespace {
 constexpr float kRelaxedDraftingDefault = 0.5f;
-constexpr int kRouteTailSkipDefault = 9;
-constexpr float kRoutePriorDefault = 0.5f;
+constexpr int kTopK = 10;                // the routed experts per token
+constexpr float kRoutePriorBare = 0.5f;  // --route-prior alone: on the log probability
 }  // namespace
 
 bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& code) {
     if (model::parse_rope_flag(a, args, o.rope)) {}
+    else if (model::parse_route_flag(a, args, o.route, code)) {}
     else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(args.next("--prompt-cache-every")));
     else if (a == "--dump-residual") o.dump_residual = args.next("--dump-residual");
     else if (a == "--dump-mixed") o.dump_mixed = args.next("--dump-mixed");
@@ -34,6 +36,8 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
     else if (a == "--no-capture") o.no_capture = true;
     else if (a == "--no-pool") o.no_pool = true;
+    else if (a == "--diag-main-card-bits") basalt::core::diagnostics().main_card_bits = true;
+    else if (a == "--diag-fixed-experts") o.diag_fixed_experts = true;
     else if (a == "--stage-timing") o.stage_timing = true;
     else if (a == "--graph-only") { o.graph_only = true; o.generates = false; }
     else if (a == "--gpu-only-full") o.gpu_only_full = true;
@@ -67,30 +71,6 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
                 args.take();
                 if (!(v > 0.0f && v <= 1.0f)) { basalt::log::error("basalt", "--relaxed-drafting: P must be in (0, 1]"); { code = 2; return true; } }
                 o.relaxed_drafting = v;
-            }
-        }
-    }
-    else if (a == "--route-tail-skip") {   // the value is optional: an integer 1..9 when one follows
-        o.route_tail_skip = kRouteTailSkipDefault;
-        if (args.peek() != nullptr) {
-            char* e = nullptr;
-            const long v = std::strtol(args.peek(), &e, 10);
-            if (e != args.peek() && *e == '\0') {
-                args.take();
-                if (v < 1 || v > 9) { basalt::log::error("basalt", "--route-tail-skip: R must be 1..9"); { code = 2; return true; } }
-                o.route_tail_skip = (int) v;
-            }
-        }
-    }
-    else if (a == "--route-prior") {   // the value is optional: a number in (0, 16] when one follows
-        o.route_prior = kRoutePriorDefault;
-        if (args.peek() != nullptr) {
-            char* e = nullptr;
-            const float v = std::strtof(args.peek(), &e);
-            if (e != args.peek() && *e == '\0') {
-                args.take();
-                if (!(v > 0.0f && v <= 16.0f)) { basalt::log::error("basalt", "--route-prior: LAMBDA must be in (0, 16]"); { code = 2; return true; } }
-                o.route_prior = v;
             }
         }
     }
@@ -132,7 +112,6 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(args.next("--adapt-swaps"));
     else if (a == "--peer-exclusive") { o.peer_exclusive = true; o.peer_exclusive_given = true; }
     else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(args.next("--peer-adapt-swaps"));
-    else if (a == "--no-peer-prefill") o.no_peer_prefill = true;
     else if (a == "--expert-profile-save") o.expert_profile_save = args.next("--expert-profile-save");
     else if (a == "--expert-profile-save-every")
         o.expert_profile_save_min = std::atof(args.next("--expert-profile-save-every"));
@@ -167,6 +146,11 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
 }
 
 std::optional<int> finish_flags(Options& o) {
+    if (o.diag_gpu_check) {
+        basalt::log::error("basalt generate", "--diag-gpu-check does not run in Qwen3.8-Flash-Next's serving engine; tools/gpu_identity.py compares its greedy tokens");
+        return 2;
+    }
+    if (o.diag_batch_check) o.serve = true;   // the batch slots exist in the serving engine, which runs the check
     if (o.resident_budget_given) {   // the resident mode with a RAM budget
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
         o.resident_headroom = 0;
@@ -176,15 +160,7 @@ std::optional<int> finish_flags(Options& o) {
         std::snprintf(effect, sizeof effect, "--relaxed-drafting %g accepts draft tokens the model would not pick", (double) o.relaxed_drafting);
         o.lossy.push_back({"--relaxed-drafting", effect});
     }
-    if (o.route_prior > 0.0f) {
-        std::snprintf(effect, sizeof effect, "--route-prior %g changes expert routing", (double) o.route_prior);
-        o.lossy.push_back({"--route-prior", effect});
-    }
-    if (o.route_tail_skip > 0) {
-        std::snprintf(effect, sizeof effect, "--route-tail-skip %d drops low-ranked missed experts", o.route_tail_skip);
-        o.lossy.push_back({"--route-tail-skip", effect});
-    }
-    return std::nullopt;
+    return model::finish_route_flags(o, kTopK, kRoutePriorBare, "basalt");
 }
 
 }  // namespace basalt::models::qwen4exp

@@ -181,10 +181,14 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         e.row_bytes = (uint32_t) ej->get("row_bytes")->u64();
         e.row_values = (int) ej->get("row_values")->u64();
         e.type = (int) num_or(ej->get("type_id"), 20);
-        const size_t block = engram_block_bytes(e.type);   // bytes per 32 values
-        if (block == 0 || e.row_values % 32 || e.row_bytes != (uint32_t) ((size_t) e.row_values / 32 * block)) {
+        if (e.row_values != 256) {   // every consumer dequantizes one row into 256 floats
+            err = path + ": the Engram rows hold " + std::to_string(e.row_values) + " values; rows of 256 values are read";
+            return false;
+        }
+        const size_t want = engram_row_bytes(e.type, e.row_values);   // the whole row: blocks of 32 values, or of 256
+        if (want == 0 || e.row_bytes != (uint32_t) want) {
             err = path + ": the Engram rows are type " + std::to_string(e.type) + " of " + std::to_string(e.row_bytes) +
-                  " bytes; IQ4_NL and MXFP4 rows are read";
+                  " bytes; IQ4_NL, Q5_K and MXFP4 rows are read";
             return false;
         }
         for (double d : numbers(ej->get("ple.layers"))) e.layers.push_back((int) d);

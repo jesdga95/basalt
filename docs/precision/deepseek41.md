@@ -17,8 +17,9 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 | Stage | Format | Arithmetic |
 |---|---|---|
 | Routed experts (UD-IQ1_M) | IQ1_S, IQ2_XXS or IQ2_XS gate/up; IQ1_S, IQ2_XXS, IQ2_S or IQ2_XS down | q8_1 activations (GPU), Q8_K (CPU); fp32 scales |
+| Routed experts (UD-Q2_K_XL) | IQ2_XXS, IQ2_XS, IQ2_S or IQ3_XXS gate/up; IQ2_XXS, IQ3_XXS, IQ3_S or MXFP4 down | q8_1 activations (GPU), Q8_K (CPU; MXFP4: Q8_0); fp32 scales |
 | Attention and shared-expert projections | Q6_K, Q5_K or Q8_0 | q8_1 (decode); fp16 block-scaled int8 mma (prompt) |
-| Engram table | IQ4_NL, 256 values per row | dequantized to fp32 on the host |
+| Engram table | IQ4_NL, Q5_K or MXFP4, 256 values per row | dequantized to fp32 on the host |
 | Compressor and indexer projections | BF16 | fp32 activations and accumulation |
 | Norms, router, hyper-connections | F32 | fp32 |
 | Window rows (the latest 128 latents) | E4M3, a power-of-two scale per 32 values (`--kv fp16`: fp16) | decoded exactly; fp32 scores, softmax and accumulation |
@@ -112,15 +113,66 @@ selection overlap 0.998 over a 6,250-token prompt. Greedy decoding reproduces ll
 
 ## Against the BF16 reference
 
-Reference: [quality](quality.md#the-bf16-reference). Two cards, 400 W + 180 W, 25,500 rows each:
+Reference: [quality](quality.md#the-bf16-reference). 25,500 rows each; the published packs on two cards (400 W + 180 W), UD-Q2_K_XL
+on one:
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|
 | UD-IQ1_M (the published pack) | 3.0456 | 0.2779 | 0.0566 | 2.86 | 83.88% |
 | UD-IQ2_XXS (published, fp16 caches) | 3.1074 | 0.2408 | 0.0408 | 2.53 | 85.15% |
 | GSQ-RCO IQ2_XXS (tested, not shipped) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 79.97% |
+| UD-Q2_K_XL (converted, not published) | 2.7356 | 0.1501 | 0.0201 | 1.76 | 88.42% |
+
+The UD-Q2_K_XL row is one RTX PRO 6000 Blackwell Max-Q at 300 W with 121 GiB of RAM (homes main card 153, RAM 159, file 72).
 
 The cache roundings cost nothing measurable: the same run with `--kv fp16` scores PPL 3.0387, KLD 0.2777, top-1 83.97%.
 
+The Engram projection as one MMQ GEMM and the indexer scores on the tensor cores (#573) change the prompt's rounding, not its quality:
+PPL 3.0520 -> 3.0492, KLD 0.2800 -> 0.2791, top-1 83.81% -> 83.87% (the same rows, before and after).
+
 Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 200 tokens after it match `--no-prompt-skip` closely
 (KL mean 6.2e-4 between the two runs).
+
+## Lossy routing flags
+
+What the flags do: [quality](quality.md#lossy-routing-flags). Here k is 6, so `--route-tail-skip` takes R 1 to 5 (bare 5), and
+`--route-prior` adds LAMBDA to `sqrt(softplus(logit)) + bias`, which runs about 0.5 to 3 (bare 0.1).
+
+Two cards (400 W + 180 W), the default placement (RAM tier 308 of 384 experts per layer). Speed: `basalt-bench -t conv,struct,prose
+--seed 1`, one cold run each (off twice, before and after the rest); ms a window is the step time, which drafting luck does not move.
+CPU and bus picks: the run's `TIER final` line. Quality: the gate at 100 chunks against the BF16 base.
+
+| Flags | CPU / bus picks | conv tok/s, ms/w | struct tok/s, ms/w | prose tok/s, ms/w | PPL | KLD | Same top-1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| off | 5.0% / 2.6% | 93.7, 20.80 | 245.5, 23.32 | 97.7, 17.10 | 3.0482 | 0.2803 | 83.84% |
+| `--route-prior 0.1` | 2.8% / 1.1% | 112.2, 17.67 | 274.8, 21.24 | 111.9, 15.33 | 3.0446 | 0.2824 | 83.87% |
+| `--route-tail-skip 5` | 4.0% / 1.9% | 110.6, 19.04 | 260.9, 22.67 | 108.5, 15.64 | 3.0457 | 0.2799 | 83.86% |
+| `--route-tail-skip 3` | 2.5% / 0.8% | 132.5, 16.09 | 283.6, 20.80 | 133.5, 14.09 | 3.0421 | 0.2865 | 83.70% |
+| both (0.1, 5) | 2.7% / 1.1% | 128.3, 18.33 | 274.1, 21.22 | 112.8, 14.77 | 3.0446 | 0.2808 | 83.99% |
+
+On two cards only 7.6% of picks miss both GPUs, so each flag has less to win and less to cost than on one card: `--route-prior 0.1`
+cuts conv's window by 15% for +0.002 KLD, `--route-tail-skip 5` (31% of the misses dropped) by 8% within the gate's noise, and
+`--route-tail-skip 3` (77% dropped) by 23% for +0.006. A KLD step under about 0.002 is placement noise: routing follows the tiers,
+which follow the run's history.
+
+`--route-prior` on DeepSeek was first ported and measured by @giveen (#434), UD-IQ1_M on one 32 GB card with a 123 GiB RAM tier
+at 475 W, 100 chunks against the BF16 base (2.7314 PPL there), `--seed 1`, two runs per row:
+
+| `--route-prior` | Picks in VRAM | PPL | KLD | Same top-1 | tg conv | tg struct | tg prose |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| off | 69.8-70.9% | 3.0507 | 0.2800 | 83.77% | 66 | 108 | 70 |
+| 0.1 | 81.0-81.2% | 3.0595 | 0.2847 | 83.68% | 82 | 216 | 83 |
+| 0.25 | 86.3% | 3.1515 | 0.3082 | 83.24% | 93 | 284 | 96 |
+| 0.5 | 91.2% | 3.4108 | 0.3787 | 81.03% | 125 | 307 | 121 |
+
+0.1 adds 0.0047 KLD (1.7% of the pack's own error) for a quarter more speed on conv and double on struct; 0.25 costs six times
+the error for little more. Prefill does not move: the batched prompt path takes no flag. The gain grows with the window's width,
+since a window of five rows asks the CPU for five rows of every expert it computes. The 20-chunk quick check overstates the low
+boosts by about half (its text is easier: base PPL 2.2717 there against 2.7314 over all 100).
+
+Reproduce (the base is [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases)):
+
+```sh
+basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 --quality 100 --kld-base dsv41-bf16-base.kld -- --route-prior 0.1
+basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 -t conv,struct,prose --seed 1 -- --route-prior 0.1
+```

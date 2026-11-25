@@ -2,6 +2,7 @@
 
 #include "state.hpp"
 #include "layout.hpp"
+#include "stream_copy.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
@@ -22,6 +23,9 @@
 
 namespace basalt::prefill {
 using namespace detail;
+
+/// The two-pass QSA scorer's device counters (--exp qsa_two_pass_check=1), logged and zeroed at a prompt's end.
+void log_two_pass_counts(cudaStream_t cs);
 
 struct Prefill::Run {
     struct Chunk;
@@ -75,6 +79,7 @@ struct Prefill::Run::Chunk {
     bool ple_land();
     bool ple_layer(int64_t l);
     bool start_stream();
+    bool publish_route(int64_t layer);
     bool layer(int64_t l);
     bool gdn(const core::LayerView& v);
     bool qsa(const core::LayerView& v);
@@ -125,12 +130,8 @@ struct Prefill::Run::Chunk {
     // `used` event recorded), so the copy stream never waits on an event that is not queued yet
     const basalt::kernels::cpu::ExpertLayout& lay0 = basalt::kernels::cpu::expert_layout();
     const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
-    // the peer takes the rows of a chunk only up to its buffers' size; a streamed chunk only up
-    // to T_fp4, and then on the FP4 kernels (PeerPrefill::T_fp4)
-    PeerPrefill* const ppc =
-        m.pp && m.peer_share && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
-    const bool peer_fp4 = ppc && stream_all && ppc->T_fp4 > 0;
-    struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; };
+    // the peer takes the rows of a routed-only chunk up to its buffers' size
+    PeerPrefill* const ppc = m.pp && m.peer_share && T <= m.pp->T_max ? m.pp.get() : nullptr;
     std::vector<StreamEntry> seq;
     std::vector<size_t> seq_start;
     size_t consumed = 0;
@@ -145,6 +146,17 @@ struct Prefill::Run::Chunk {
     std::atomic<bool> a_stop{false};
     double iss_ms = 0;
     int64_t iss_streamed = 0, iss_dma = 0;
+    struct RouteSnapshot {
+        uint32_t* counts = nullptr;   // pinned host copy, one immutable row per layer
+        cudaStream_t stream = nullptr;
+        std::vector<cudaEvent_t> ready;
+        std::atomic<int64_t> recorded{-1};
+        ~RouteSnapshot() {
+            if (recorded.load() >= 0) cudaStreamSynchronize(stream);
+            for (cudaEvent_t event : ready) if (event) cudaEventDestroy(event);
+            if (counts) cudaFreeHost(counts);
+        }
+    } route_snapshot;
     std::thread issuer;
     struct IssuerJoin {
         std::atomic<bool>* stop;

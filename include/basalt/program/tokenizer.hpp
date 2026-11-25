@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace basalt::program {
@@ -26,6 +27,9 @@ public:
     /// The rule that splits text into pieces: byte offsets of the pieces' ends. Set before encode().
     using PreTokenize = void (*)(const char* text, size_t size, std::vector<size_t>& ends);
     void set_pretokenize(PreTokenize fn) { pretokenize_ = fn; }
+    /// A piece that is itself a vocabulary entry becomes that token whole, not merged from its bytes (Hugging Face
+    /// BPE's ignore_merges). Set before load().
+    void set_ignore_merges(bool on) { ignore_merges_ = on; }
 
     bool load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json, std::string& err);
     bool loaded() const { return !raw_.empty(); }
@@ -62,6 +66,13 @@ private:
         uint64_t hash = 0;
         uint32_t key_off = 0, key_len = 0, ids_off = 0, ids_len = 0;   // key_len 0: empty slot
     };
+    struct HeapItem {
+        uint32_t rank;
+        uint32_t pos;
+        int32_t left;
+        int32_t right;
+        int32_t result;
+    };
 
     int32_t find_merge(int32_t left, int32_t right, uint32_t& rank) const;
     bool merge_piece(const uint8_t* p, size_t n, std::vector<int32_t>& out, std::string& err);
@@ -81,10 +92,15 @@ private:
     std::vector<int32_t> memo_ids_;
 
     PreTokenize pretokenize_ = nullptr;
+    bool ignore_merges_ = false;
+    std::unordered_map<std::string_view, int32_t> whole_;   // with ignore_merges: a plain entry's bytes (in raw_) -> its id
     // scratch for the pre-tokenizer and the merger, kept between calls
     std::vector<size_t> ends_;
     std::vector<int32_t> sym_;
-    std::vector<uint32_t> rank_;
+    std::vector<int32_t> next_;
+    std::vector<int32_t> prev_;
+    std::vector<uint8_t> dead_;
+    std::vector<HeapItem> heap_;
 };
 
 }  // namespace basalt::program

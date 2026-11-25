@@ -32,6 +32,19 @@ def api_key_of(value) -> str:
     return key.strip()
 
 
+def api_key_from_file(path: str) -> str:
+    """The key in the first line of `path`. A file that cannot be read, or whose first line holds no key, raises
+    ValueError: it never means "no key"."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            line = f.readline()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f"--api-key-file {path}: {e}") from None
+    if not line.strip():
+        raise ValueError(f"--api-key-file {path}: no key in its first line")
+    return line
+
+
 def key_matches(given: str, key: str) -> bool:
     """`given` is a header's value as http.server read it, each byte one character. A key with characters outside
     ASCII arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms.
@@ -148,9 +161,10 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
     or a listed origin. Unlike the Host check no IP passes on trust, and "null" fails (any site can send it);
     non-http(s) schemes pass since no web site can send them."""
     origin = (origin or "").strip().rstrip("/")
-    if origin in origins or "*" in origins:             # "*": every page
+    origin_low = origin.lower()
+    if any(o == "*" or origin_low == o.strip().rstrip("/").lower() for o in origins):             # "*": every page
         return True
-    scheme, sep, rest = origin.lower().partition("://")
+    scheme, sep, rest = origin_low.partition("://")
     if not sep or not scheme:
         return False
     if scheme not in ("http", "https"):
@@ -221,7 +235,8 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
             out.append(x)
             continue
         scheme, sep, rest = x.partition("://")
-        if scheme not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest:
+        if scheme.lower() not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest \
+                or any(ord(c) < 0x20 or ord(c) == 0x7f for c in x):
             raise SystemExit(f"[server] error: {key}: {x!r} is not an origin like https://chat.example.com"
                              + ("" if wildcard else " (no wildcards)"))
         out.append(x)

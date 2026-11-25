@@ -17,6 +17,13 @@ inline uint16_t bf16_of(float v) {
     return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1)) >> 16);                  // round to nearest even
 }
 
+inline float unbf16(uint16_t b) {
+    const uint32_t u = (uint32_t) b << 16;
+    float v;
+    std::memcpy(&v, &u, 4);
+    return v;
+}
+
 /// The merge convolution `mm.0.weight` (F32 [4E out][E in][2][2]) as the bf16 product [4E][4E] over a group's four patch
 /// rows in merge order: column p * E + c takes the weight of channel c at kernel position p = ky * 2 + kx.
 inline bool merge_matrix(const Mmproj& m, int E, uint16_t* dst, std::string& err) {

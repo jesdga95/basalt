@@ -1,5 +1,6 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace cpu = basalt::kernels::cpu;
@@ -26,13 +28,13 @@ const char* mode_name(Mode m) {
 }
 
 void run_mode(Mode m, bool gate, const uint8_t* w, size_t stride, size_t up, int n, const void* const* act, int nt,
-              float* const* out, int r0, int r1, float lim = 0.f) {
+              float* const* out, int r0, int r1, const cpu::SwiGlu& glu = {}) {
     if (gate) {
         switch (m) {
-            case Mode::Avx2Base: cpu::nvfp4_256_gu_rows_base(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
-            case Mode::Avx2Vnni: cpu::nvfp4_256_gu_rows_vnni(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
-            case Mode::Avx2Disp: cpu::nvfp4_256_gu_rows(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
-            case Mode::Avx512: cpu::nvfp4_512_gu_rows(w, stride, up, n, .1f, .1f, lim, act, nt, out, r0, r1); break;
+            case Mode::Avx2Base: cpu::nvfp4_256_gu_rows_base(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
+            case Mode::Avx2Vnni: cpu::nvfp4_256_gu_rows_vnni(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
+            case Mode::Avx2Disp: cpu::nvfp4_256_gu_rows(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
+            case Mode::Avx512: cpu::nvfp4_512_gu_rows(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
         }
     } else {
         switch (m) {
@@ -44,8 +46,15 @@ void run_mode(Mode m, bool gate, const uint8_t* w, size_t stride, size_t up, int
     }
 }
 
-// `limited`: the SwiGLU limit at the median |gate/up| of the reference, so about half the values are capped or clamped
-int check(int n, int rows, bool gate, bool edge_scales, Mode mode, bool limited = false) {
+// The card's softcapped SwiGLU (swiglu_softcap_q8_1_entries_kernel), spelled out here as the reference: the caps on gate
+// and up, the sigmoid on the raw gate.
+constexpr float kCapG = 1.5f, kCapU = 1.f;
+float card_softcap(float g, float u) { return (kCapG * std::tanh(g / kCapG)) * (1.0f / (1.0f + std::exp(-g))) * (kCapU * std::tanh(u / kCapU)); }
+double card_softcap(double g, double u) { return kCapG * std::tanh(g / kCapG) / (1 + std::exp(-g)) * (kCapU * std::tanh(u / kCapU)); }
+
+// `limited`: the SwiGLU limit at the median |gate/up| of the reference, so about half the values are capped or clamped;
+// `softcap`: the softcapped SwiGLU, its caps near the values' spread so that tanh bends them
+int check(int n, int rows, bool gate, bool edge_scales, Mode mode, bool limited = false, bool softcap = false) {
     constexpr int T = 8;
     const bool wide = mode == Mode::Avx512;
     const size_t stride = ggml_row_size(GGML_TYPE_NVFP4, n), up = stride * rows;
@@ -105,7 +114,8 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode, bool limited 
                 a = std::fmin(a, lim);
                 b = std::fmax(std::fmin(b, lim), -lim);
             }
-            ref[t][r] = gate ? (a / (1.f + std::exp(-a))) * b : a;
+            capped += softcap && (std::abs(a) > kCapG || std::abs(b) > kCapU);
+            ref[t][r] = !gate ? a : softcap ? card_softcap(a, b) : (a / (1.f + std::exp(-a))) * b;
             double da = 0, db = 0;
             for (int i = 0; i < n; ++i) {
                 da += (double) w[i] * x[t][i];
@@ -117,12 +127,13 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode, bool limited 
                 da = std::min(da, (double) lim);
                 db = std::max(std::min(db, (double) lim), -(double) lim);
             }
-            expected[t][r] = gate ? da / (1 + std::exp(-da)) * db : da;
+            expected[t][r] = !gate ? da : softcap ? card_softcap(da, db) : da / (1 + std::exp(-da)) * db;
         }
     }
     for (int nt = 1; nt <= T; ++nt) for (int offset = 0; offset + nt <= T; ++offset) {
         auto run = [&](int r0, int r1) {
-            run_mode(mode, gate, weights.data(), stride, up, n, act + offset, nt, out, r0, r1, lim);
+            run_mode(mode, gate, weights.data(), stride, up, n, act + offset, nt, out, r0, r1,
+                     softcap ? cpu::SwiGlu{0.f, kCapG, kCapU} : cpu::SwiGlu{lim});
         };
         run(0, rows);
         for (int t = 0; t < nt; ++t) {
@@ -151,10 +162,10 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode, bool limited 
             r0 = r1;
         }
     }
-    if (limited && capped == 0) ++bad;
+    if ((limited || softcap) && capped == 0) ++bad;
     std::printf("NVFP4 %s %s n=%d rows=%d%s: double reference max_abs=%.3g max_rel=%.3g; "
                 "ggml identity, widths, positions and tails: %s\n", mode_name(mode),
-                gate ? "gate/up" : "down", n, rows, limited ? " limited" : "",
+                gate ? "gate/up" : "down", n, rows, limited ? " limited" : softcap ? " softcapped" : "",
                 max_abs, max_rel, bad ? "FAIL" : "PASS");
     return bad;
 }
@@ -216,6 +227,61 @@ int check_extremes(Mode mode) {
     }
     return bad;
 }
+// The softcapped SwiGLU through native_gu_rows on a type without multi-token rows (the ggml dot) and on NVFP4 (the row
+// kernels, whichever this CPU dispatches): every value the card's formula over the ggml dots.
+int check_native_softcap(int type) {
+    constexpr int n = 256, rows = 64, T = 8;
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(type, type, n, rows, f, err)) {
+        std::printf("native softcap type %d: %s\n", type, err.c_str());
+        return 1;
+    }
+    f.gate_softcap = kCapG;
+    f.up_softcap = kCapU;
+    std::vector<uint8_t> blob(f.bytes);
+    std::mt19937 rng(7 + type);
+    std::normal_distribution<float> nd(0, 1.f);
+    std::vector<float> raw((size_t) n * rows);
+    const auto* wt = ggml_get_type_traits((ggml_type) type);
+    for (size_t off : {size_t(0), f.up_off}) {
+        for (float& v : raw) v = nd(rng) * .05f;
+        wt->from_float_ref(raw.data(), blob.data() + off, (int64_t) raw.size());
+    }
+    const float sc[4] = {1.25f, .75f, 1.f, 0.f};
+    if (f.tail) std::memcpy(blob.data() + f.bytes - f.tail, sc, sizeof(sc));
+    std::vector<std::vector<uint8_t>> packed(T, std::vector<uint8_t>(f.act_bytes));
+    std::vector<std::vector<float>> got(T, std::vector<float>(rows));
+    const void* act[T];
+    float* out[T];
+    std::vector<float> x(n);
+    for (int t = 0; t < T; ++t) {
+        for (float& v : x) v = nd(rng);
+        cpu::native_quant_act(f, x.data(), packed[t].data());
+        act[t] = packed[t].data();
+        out[t] = got[t].data();
+    }
+    cpu::native_gu_rows(f, blob.data(), act, T, out, 0, rows);
+    const auto dot = ggml_get_type_traits_cpu((ggml_type) type)->vec_dot;
+    int bad = 0, bent = 0;
+    for (int t = 0; t < T; ++t)
+        for (int r = 0; r < rows; ++r) {
+            float g = 0, u = 0;
+            dot(n, &g, 0, blob.data() + (size_t) r * f.gu_row, 0, act[t], 0, 1);
+            dot(n, &u, 0, blob.data() + f.up_off + (size_t) r * f.up_row, 0, act[t], 0, 1);
+            if (f.tail) {
+                g *= sc[0];
+                u *= sc[1];
+            }
+            bent += std::abs(g) > kCapG || std::abs(u) > kCapU;
+            const float want = card_softcap(g, u);
+            if (std::memcmp(&want, &got[t][r], sizeof(float))) ++bad;
+        }
+    if (bent == 0) ++bad;
+    std::printf("native %s softcapped gate/up: the card's formula bit for bit: %s\n", ggml_type_name((ggml_type) type),
+                bad ? "FAIL" : "PASS");
+    return bad;
+}
 }  // namespace
 
 int main() {
@@ -232,8 +298,11 @@ int main() {
         bad += check(2560, 640, true, false, m);
         bad += check(640, 2560, false, false, m);
         bad += check(5120, 24, true, false, m, true);   // the DeepSeek geometry with its SwiGLU limit
+        bad += check(2560, 72, true, false, m, false, true);   // the Inkling geometry with its softcapped SwiGLU
         bad += check(2304, 40, false, false, m);
         bad += check_extremes(m);
     }
+    bad += check_native_softcap(GGML_TYPE_Q8_0);
+    bad += check_native_softcap(GGML_TYPE_NVFP4);
     return bad ? 1 : 0;
 }

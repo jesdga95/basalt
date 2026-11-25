@@ -36,6 +36,8 @@ public:
     /// Opens a region for `plan` (and a typical picture or more, so a request's pictures share it); false with `err` when the
     /// card has no room for it, and the session makes room.
     bool reserve(const ImagePlan& plan, std::string& err);
+    /// The device bytes `reserve` takes for `plan`.
+    size_t region_bytes(const ImagePlan& plan) const;
 
     /// A picture's block of rows [n_rows][n_embd] and its grid; reserves the region when needs_region.
     bool encode(const vision::Image& img, const ImagePlan& plan, std::vector<float>& rows, int& n_rows,

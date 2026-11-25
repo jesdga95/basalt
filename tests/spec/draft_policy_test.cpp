@@ -151,6 +151,58 @@ int main() {
         const float sure[7] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
         check(!p.choose_window(sure, 7, 5, 4).lookup, "drafter vs lookup: a failing short copy loses to sure drafts");
     }
+    {   // may_verify: a draft it rules out is in no window of any later chances, and stopping there keeps the window
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        bool sound = true, same = true;
+        int stops = 0, asked = 0;
+        for (int pass = 0; pass < 40; ++pass) {
+            DraftPolicy p(6);
+            const double row = 1.0 + 6.0 * u(rng);   // ms a row on top of a 15 ms round
+            for (int i = 0; i < 30 + pass * 7; ++i) {
+                float ch[5];
+                for (float& c : ch) c = u(rng);
+                const int t = p.window(ch, 5);
+                int a = 0;
+                while (a < t - 1 && u(rng) < ch[a]) ++a;
+                p.observe_window(ch, t, a, 15.0 + row * (t - 1));
+            }
+            for (int k = 0; k < 200; ++k) {
+                float ch[5];
+                for (float& c : ch) c = u(rng) < 0.3f ? 0.99f + 0.01f * u(rng) : u(rng);
+                const int n = 1 + k % 5;
+                for (int j = 0; j < n; ++j) {
+                    ++asked;
+                    if (p.may_verify(ch, j, n)) continue;
+                    ++stops;
+                    const int cut = p.window(ch, j);   // the drafts made before the stop
+                    for (int r = 0; r < 20; ++r) {
+                        float full[5];
+                        std::copy(ch, ch + 5, full);
+                        for (int i = j + 1; i < n; ++i) full[i] = r == 0 ? 1.0f : u(rng);
+                        const int t = p.window(full, n);
+                        sound = sound && t <= j + 1;
+                        same = same && t == cut;
+                    }
+                    break;
+                }
+            }
+        }
+        std::printf("  (may_verify stopped %d of %d asks)\n", stops, asked);
+        check(sound, "may_verify: a draft ruled out is in no window of any later chances");
+        check(same, "may_verify: the window of the drafts made is the full window");
+        check(stops > asked / 10, "may_verify: drafts are ruled out");
+        DraftPolicy p(6);
+        for (int i = 0; i < 100; ++i) {   // prose-like: a first draft at 0.6, a second at 0.45
+            const float ch[5] = {0.6f, 0.45f, 0.45f, 0.45f, 0.45f};
+            const int t = p.window(ch, 2);
+            p.observe_window(ch, t, i % 5 < 3 ? std::min(1, t - 1) : 0, 16.0 + 4.0 * (t - 1));
+        }
+        const float lo[2] = {0.6f, 0.2f};
+        check(p.window(lo, 2) <= 2 && !p.may_verify(lo, 1, 2), "may_verify: a weak second draft is not made");
+        const float none[1] = {0.0f};
+        check(!p.may_verify(none, 0, 0) && !p.may_verify(none, 5, 5), "may_verify: no draft past the drafts or the cap");
+    }
     {   // an untimed policy ignores round times: the same outcomes give the same picks whatever the clock said
         DraftPolicy fast(8, 0.03, false), slow(8, 0.03, false);
         std::mt19937 rng(7);

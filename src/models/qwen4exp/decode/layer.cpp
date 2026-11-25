@@ -1,5 +1,6 @@
 
 // src/models/qwen4exp/decode/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
@@ -655,8 +656,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
             basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
                                               hc.data(), hs.data());
-            cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
         }
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp)
@@ -667,7 +668,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (p.mode == 0) {
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
-        cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
     } else if (p.mode == 1) {
         basalt::kernels::kv_stream_reset(st.map, nullptr);
     } else {

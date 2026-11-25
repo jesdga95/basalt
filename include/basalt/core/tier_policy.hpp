@@ -22,9 +22,27 @@ inline bool count_use(uint16_t& uses, int threshold = kPromoteUses) {
     return true;
 }
 
+/// Whether the tokens from `token` to `token + n` cross a multiple of `period` (0: never).
+inline bool crosses(uint64_t token, uint64_t n, uint64_t period) {
+    return period > 0 && token / period != (token + n) / period;
+}
+
 /// Whether the tokens from `token` to `token + n` cross a kUseHalfLife boundary.
-inline bool use_half_life(uint64_t token, uint64_t n) {
-    return token / kUseHalfLife != (token + n) / kUseHalfLife;
+inline bool use_half_life(uint64_t token, uint64_t n) { return crosses(token, n, kUseHalfLife); }
+
+/// The most lookups a tier that picks its main card victims by use counts for an expert: one that was hot long ago gives way
+/// within a few halvings.
+constexpr uint16_t kLookCap = 15;
+
+/// One more lookup of an expert, for a tier that picks its main card victims by use; the count stops at kLookCap.
+inline void count_look(uint16_t& looks) {
+    if (looks < kLookCap) ++looks;
+}
+
+/// With victims picked by use: whether a slot whose expert has `looks_a` lookups and was last used at `stamp_a` gives way
+/// before one with `looks_b` and `stamp_b`. Fewer lookups first; the one used longest ago among equals.
+inline bool yields_before(uint16_t looks_a, uint64_t stamp_a, uint16_t looks_b, uint64_t stamp_b) {
+    return looks_a != looks_b ? looks_a < looks_b : stamp_a < stamp_b;
 }
 
 /// `last` is the token + 1 of the previous miss of an expert (0 = never); true when it falls within `window` tokens.

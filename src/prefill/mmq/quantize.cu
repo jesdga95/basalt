@@ -3,7 +3,13 @@
 // llama.cpp commit 3cf03257f219afbe7334045ff7c6a06ac68c627d (https://github.com/ggml-org/llama.cpp),
 // ggml/src/ggml-cuda/quantize.cu.  Copyright (c) 2023-2026 The ggml authors.  MIT licence: see THIRD_PARTY_LICENSES.
 #include "quantize.cuh"
+#include "basalt/kernels/q8_1_finite.hpp"
 #include <cstdint>
+
+static __device__ __forceinline__ signed char mmq_q8_clamp(const float v) {
+    const float r = roundf(v);
+    return (signed char) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : isnan(r) ? 0.0f : r);
+}
 
 // One thread quantizes 4 consecutive floats; the 8 threads of a 32-value block share one scale (and, for DS4, the
 // sum of its rounded values times the scale); for D2S6 the 16 threads of 64 values share one scale, and each 16 values
@@ -50,13 +56,22 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    const float d_inv = 127.0f / amax;
-    char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+    float d = 0.0f;
+    char4 q = make_char4(0, 0, 0, 0);
+    if (amax > 0.0f) {
+        float d_inv = 127.0f / amax;
+        d = 1.0f / d_inv;
+        if constexpr (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+            if (d > basalt::kernels::kHalfMax) {
+                d = basalt::kernels::kHalfMax;
+                d_inv = 1.0f / d;
+            }
+        }
+        q.x = mmq_q8_clamp(xi.x * d_inv);
+        q.y = mmq_q8_clamp(xi.y * d_inv);
+        q.z = mmq_q8_clamp(xi.z * d_inv);
+        q.w = mmq_q8_clamp(xi.w * d_inv);
+    }
 
     // DS4: the block's sum of the rounded values times d, so the minimum's term meets the same activations as the codes
     float sum = 0.0f;
@@ -78,14 +93,14 @@ static __global__ void quantize_mmq_q8_1(
 
     if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
         if (iqs % 16 == 0 && iqs < 96) {
-            y[ib].d2s6[2 + iqs/16] = sum;
+            y[ib].d2s6[2 + iqs/16] = __float2half(basalt::kernels::q8_1_finite(sum));
             if (iqs % 64 == 0) {
-                y[ib].d2s6[iqs/64] = d;
+                y[ib].d2s6[iqs/64] = __float2half(basalt::kernels::q8_1_finite(d));
             }
         }
     } else if (iqs % 32 == 0) {
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
-            y[ib].ds4[iqs/32] = make_half2(d, sum);
+            y[ib].ds4[iqs/32] = basalt::kernels::q8_1_ds(d, sum);
         } else {
             y[ib].d4[iqs/32]  = d;
         }

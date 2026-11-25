@@ -35,14 +35,40 @@ std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t 
 
 bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
 
+void Runtime::stats_tick(bool force) {
+    if (!stats.due(Clock::now(), force)) return;
+    std::string out = stats.slot_lines();
+    int64_t total = 0;
+    std::vector<uint8_t> homes;
+    std::vector<uint32_t> routed;
+    if (expert_map(total, homes, routed)) out += ConsoleStats::map_line(total, homes, routed);
+    std::string cards;
+    for (const CardFacts& c : card_facts()) {
+        char bus[32] = {}, gbps[32] = "-";
+        if (cudaDeviceGetPCIBusId(bus, sizeof bus, c.device) != cudaSuccess) continue;
+        if (c.h2d_gbps > 0) std::snprintf(gbps, sizeof gbps, "%.1f", c.h2d_gbps);
+        cards += (cards.empty() ? "" : ";") + std::string(bus) + "/" + std::to_string(c.expert_slots) + "/" + gbps + "/" +
+                 std::to_string(c.expert_bytes >> 20) + "/" + (c.kv_bytes >= 0 ? std::to_string(c.kv_bytes >> 20) : "-");
+    }
+    if (!cards.empty() && cards != cards_sent_) {
+        cards_sent_ = cards;
+        out += "INFO cards=" + cards + "\n";
+    }
+    if (out.empty()) return;
+    std::fputs(out.c_str(), stdout);
+    std::fflush(stdout);
+}
+
 Flow Runtime::dispatch() {
-    if (batch_on() || windows_in_flight()) {
+    if (batch_on()) {
         if (!try_next_line(line)) {
             const BusyClock busy(busy_s, busy_on, busy_from);
+            const size_t active = (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; });
             if (!next_batch_window()) return Flow::error;
+            // a slot that ended its request has its last figures out with its BDONE
+            stats_tick(active != (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; }));
             return Flow::next;
         }
-        if (line.rfind("BSTOP ", 0) != 0 && !drain_windows()) return Flow::error;
     } else {
         kv_ceiling_note();   // between requests too: the free VRAM also moves without the KV
         // idle: once no line has come for a second (a client's next turn usually comes sooner), what a crash would
@@ -69,10 +95,6 @@ Flow Runtime::dispatch() {
         if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
         return Flow::next;
     }
-    if (line.rfind("BSCRIPT ", 0) == 0) {   // BSCRIPT <slot> <seed> <id,id,...>: before the slot's BGEN
-        script_command(line);
-        return Flow::next;
-    }
     if (line.rfind("BYIELD", 0) == 0) return Flow::next;   // for a prompt read that has ended meanwhile
     if (line.rfind("ENC ", 0) == 0 || line.rfind("ENCV ", 0) == 0) {   // the in-engine encoder, between requests and windows
         enc_command(line);
@@ -92,6 +114,7 @@ Flow Runtime::dispatch() {
         else vram_command(line, verr, false);
         if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
         std::fflush(stdout);
+        stats_tick(true);   // the cards' expert slots moved
         return Flow::next;
     }
     // SLEEP / WAKE, between requests: the expert cache gives its VRAM back down to its smallest size (every
@@ -111,6 +134,12 @@ Flow Runtime::dispatch() {
         if (!down) basalt::platform::ram_guard_pause(false);
         if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
         std::fflush(stdout);
+        stats_tick(true);
+        return Flow::next;
+    }
+    if (line == "STATS") {   // the server's console: XSLOT and XMAP lines from now on (console_stats.hpp)
+        stats.on = true;
+        stats_tick(true);
         return Flow::next;
     }
     if (line.rfind("PMATCH ", 0) == 0 || line.rfind("PFREE ", 0) == 0) {   // a prompt held by handle, between requests and windows

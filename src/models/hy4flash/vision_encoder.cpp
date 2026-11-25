@@ -34,10 +34,14 @@ bool ImageEncoder::stage(const core::FileRange& section, int n_embd, std::string
     return ok;
 }
 
+// sized for this picture and no smaller than a typical one, so a few pictures of a request share one region
+static int region_tokens(const ImagePlan& plan) { return std::min(std::max(plan.n_merged(), 1024), vision_geometry().max_tokens); }
+
+size_t ImageEncoder::region_bytes(const ImagePlan& plan) const { return enc_ ? enc_->arena_bytes(region_tokens(plan)) : 0; }
+
 bool ImageEncoder::reserve(const ImagePlan& plan, std::string& err) {
     release();
-    // sized for this picture and no smaller than a typical one, so a few pictures of a request share one region
-    const int tokens = std::min(std::max(plan.n_merged(), 1024), vision_geometry().max_tokens);
+    const int tokens = region_tokens(plan);
     const size_t bytes = enc_->arena_bytes(tokens);
     if (cudaMalloc(&region_, bytes) != cudaSuccess) {
         cudaGetLastError();

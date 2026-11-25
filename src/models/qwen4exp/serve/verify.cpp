@@ -1,4 +1,5 @@
 // src/models/qwen4exp/serve/verify.cpp - verify operations for the persistent engine.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -11,6 +12,25 @@ basalt::core::Verifier & QfnRuntime::stage_ver(int st) {
 }
 
 int QfnRuntime::pcie_num_of(double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); }
+
+// --diag-fixed-experts: a window's residency on `dev` says no expert is in VRAM (the CPU pool computes every row)
+bool QfnRuntime::fixed_experts(basalt::core::VerifyHits& h, int dev) {
+    if (!o.diag_fixed_experts) return true;
+    const size_t le = (size_t) (g.n_layers * g.n_expert);
+    if (fixed_res.empty()) fixed_res.assign(le, -1);
+    h.h_res = fixed_res.data();
+    for (const auto& [d, p] : fixed_res_d)
+        if (d == dev) { h.d_res = p; return true; }
+    const basalt::core::OnDevice on(dev);
+    int32_t* p = nullptr;
+    if (cudaMalloc((void**) &p, le * 4) != cudaSuccess || cudaMemset(p, 0xff, le * 4) != cudaSuccess) {
+        basalt::log::error("basalt serve", "--diag-fixed-experts: the residency table on CUDA%d", dev);
+        return false;
+    }
+    fixed_res_d.emplace_back(dev, p);
+    h.d_res = p;
+    return true;
+}
 
 basalt::core::Verifier & QfnRuntime::stage_verb(int st) { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; }
 
@@ -30,6 +50,7 @@ int QfnRuntime::init_verify() {
     vh.blob = thits.blob;
     vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
     vh.n_slots = xcache.slots();
+    if (!fixed_experts(vh, 0)) return 1;
 
     pair_snap = nullptr;
 
@@ -53,8 +74,8 @@ int QfnRuntime::init_verify() {
         split_drive.base = &drive;
         split_drive.n = n_stages;
         for (int st = 0; st < n_stages; ++st) {
-            stage_ver(st).set_route_tail_skip(o.route_tail_skip);
-            stage_ver(st).set_route_prior(o.route_prior);
+            stage_ver(st).set_route_tail_skip(o.route.tail_skip);
+            stage_ver(st).set_route_prior(o.route.prior);
             stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                     st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
             split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
@@ -76,6 +97,7 @@ int QfnRuntime::init_verify() {
                 vs.blob = thits.blob;
                 vs.slot_off = gs.cache.slot_offsets();
                 vs.n_slots = gs.cache.slots();
+                if (!fixed_experts(vs, gs.dev)) return 1;
                 ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err);
                 split_drive.cache_base[st] = gs.cache.device_slot(0);
                 split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
@@ -98,10 +120,10 @@ int QfnRuntime::init_verify() {
                 return 1;
             }
             std::memset(hb_host, 0, hb);
-            ver_b.set_route_tail_skip(o.route_tail_skip);
-            gs.ver_b.set_route_tail_skip(o.route_tail_skip);
-            ver_b.set_route_prior(o.route_prior);
-            gs.ver_b.set_route_prior(o.route_prior);
+            ver_b.set_route_tail_skip(o.route.tail_skip);
+            gs.ver_b.set_route_tail_skip(o.route.tail_skip);
+            ver_b.set_route_prior(o.route.prior);
+            gs.ver_b.set_route_prior(o.route.prior);
             ver_b.set_stage(0, split_at[0], nullptr, hand_b);
             gs.ver_b.set_stage(split_at[0], -1, hand_b, nullptr);
             ver.set_pipelined(pair_snap);
@@ -114,6 +136,7 @@ int QfnRuntime::init_verify() {
             vs.blob = thits.blob;
             vs.slot_off = gs.cache.slot_offsets();
             vs.n_slots = gs.cache.slots();
+            if (!fixed_experts(vs, gs.dev)) return 1;
             if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
                 basalt::log::error("basalt serve", "pipelined windows, stage 2: %s", err.c_str());
                 return 1;
@@ -128,8 +151,8 @@ int QfnRuntime::init_verify() {
                       " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
         basalt::log::info("basalt serve", "layer split: layers %s, one hand-off per window", plan_s.c_str());
     }
-    ver.set_route_tail_skip(o.route_tail_skip);
-    ver.set_route_prior(o.route_prior);
+    ver.set_route_tail_skip(o.route.tail_skip);
+    ver.set_route_prior(o.route.prior);
     ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
     if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
     for (const auto& xpe : xpeers)
@@ -178,7 +201,7 @@ int QfnRuntime::capture_windows() {
     if (o.serve && slot0_is_solo && o.batch > 1) {
         const auto tw = Clock::now();
         size_t free0 = 0, total0 = 0;
-        cudaMemGetInfo(&free0, &total0);
+        basalt::core::gpu_mem_info(&free0, &total0);
         for (int b = 1; b < o.batch; ++b) {
             make_view(rviews[(size_t) b], b);
             if (!ver.warm_session(&rviews[(size_t) b], err)) {
@@ -187,7 +210,7 @@ int QfnRuntime::capture_windows() {
             }
         }
         size_t free1 = 0;
-        cudaMemGetInfo(&free1, &total0);
+        basalt::core::gpu_mem_info(&free1, &total0);
         basalt::log::info("basalt serve", "solo windows of %d more slot sessions captured in %.0f ms (%.1f MiB of VRAM)",
                      o.batch - 1, std::chrono::duration<double, std::milli>(Clock::now() - tw).count(),
                      (double) ((int64_t) free0 - (int64_t) free1) / 1048576.0);

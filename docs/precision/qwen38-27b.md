@@ -43,8 +43,12 @@ as F8_E4M3 (E4M3 codes, FP32 per matrix), both bit for bit; the rest as above.
   normed rows as two bf16 terms on tensor cores (about fp32's precision), the gates applied in the same kernel.
 - **Attention:** K and V stored fp16, or with `--kv int8` as int8 codes and an fp16 scale per 64 values (amax / 127, codes rounded
   to nearest against the stored scale); with `--kv-resident` the positions in RAM are read where they live, the same bytes in
-  the same order (bitwise the output with every position on the card). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32), in chunks of 64 cells folded in a fixed
-  order.
+  the same order (bitwise the output with every position on the card). With `--kv nvfp4` each 16 values take an E4M3 scale
+  (amax / 6) and E2M1 codes rounded to nearest against it; K, and every query read against it, is first turned by the
+  normalized 256-point Hadamard transform (orthonormal, so the dot products are unchanged before rounding), V is stored as it
+  is. Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32; nvfp4: code x scale exact in fp32,
+  then fp16), in chunks of 64 cells folded in a fixed order. A prompt chunk on an nvfp4 cache first rounds the layer's
+  positions to int8 by the int8 cache's rule into one model-wide copy, and reads that as below.
   Prompt chunks, fp16 cache: QK^T with fp16 q and k on tensor cores, fp32 accumulation; P V with fp16 p and v, each tile of
   32 cells summed in fp16 and added to the fp32 output. int8 cache: q rounded to int8 per 64 values (amax / 127), each
   64-value group's integer sum times both scales in fp32; P V in 8 bits (Infernix's prompt-pv8): per 64-value V group
@@ -67,6 +71,7 @@ Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, on
 |---|---:|---:|---:|---:|---:|
 | QUASAR, every projection NVFP4, the head FP8 rows (the published pack), `--kv fp16` | 6.8388 | 0.0262 | 0.0119 | 0.252 | 92.82% |
 | The same, `--kv int8` | 6.8260 | 0.0259 | 0.0118 | 0.252 | 92.89% |
+| The same, `--kv nvfp4` | 6.8600 | 0.0283 | 0.0134 | 0.267 | 92.69% |
 | QUASAR with the head rounded to NVFP4 (`--head nvfp4`), `--kv fp16` | 6.8622 | 0.0312 | 0.0168 | 0.265 | 91.83% |
 | The same, `--kv int8` | 6.8498 | 0.0308 | 0.0168 | 0.267 | 91.87% |
 | NVIDIA's checkpoint: NVFP4 MLP and head, F8_E4M3 GDN and attention, `--kv fp16` | 6.7843 | 0.0239 | 0.0128 | 0.209 | 92.52% |
@@ -81,6 +86,11 @@ QUASAR's weights take 2.4 GiB less on the card and decode faster ([guide](../mod
 The base scores 6.7411 on the same rows. Each chunk's first half is read as one 257-row prompt and the scored rows are then
 decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote, W4A4 on the NVFP4 matrices at
 any chunk length (as the checkpoints and Infernix do). Decode never uses it.
+
+## Two cards
+
+`gpu-mode peer` and `gpu-mode split` give the tokens of one card, greedy, at 65,536 context on conversation, struct, prose and a
+16,672-token prompt (`tools/gpu_identity.py` against `--gpu 0`): the second card runs the main card's kernels on the same rows.
 
 ## Context past 262,144
 

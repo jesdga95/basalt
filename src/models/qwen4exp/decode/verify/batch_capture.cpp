@@ -14,8 +14,8 @@
 namespace basalt::core {
 using namespace verify_detail;
 
-bool Verifier::capture_batch(int R, int hbase, std::string& err) {
-    const uint64_t key = bkey(R, hbase);
+bool Verifier::capture_batch(int R, std::string& err) {
+    const uint64_t key = bkey(R);
     cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
     const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
@@ -26,7 +26,7 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
         (void) cudaGetLastError();
         pdl_off_ = true;
         ex = nullptr;
-        return capture_batch(R, hbase, err);
+        return capture_batch(R, err);
     };
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
@@ -34,12 +34,10 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
     }
     batch_rec_ = true;
     pdl_rec_ = pdl_try;
-    row_base_ = hbase;
     std::string rerr;
     const bool ok = record_window(R, cs_, rerr);
     batch_rec_ = false;
     pdl_rec_ = false;
-    row_base_ = 0;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok || ce != cudaSuccess) {

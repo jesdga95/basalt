@@ -42,6 +42,10 @@ public:
     virtual void chunk_layers(const std::vector<int>& tokens) = 0;
     /// The shared expert over T tokens.
     virtual bool shared(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
+    /// out[t] = W x[t] for T tokens (x: [T][cols], out: [T][rows] device) through the MMQ tiles, a GEMM per sub-chunk
+    /// instead of a matrix-vector product per 8 tokens. False, with nothing done, when MMQ does not cover W's format.
+    virtual bool dense_rows(const void* w, int type, int rows, int cols, const float* x, int n_tokens, float* out,
+                            void* stream) = 0;
 };
 
 std::unique_ptr<PrefillFfn> make_prefill_ffn(const DsModel& model, LayerOps& ops, int max_tokens, std::string& err);

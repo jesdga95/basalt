@@ -35,10 +35,11 @@ struct Size {
 /// camera's full-resolution photo.
 inline constexpr int64_t kMaxImagePixels = 64ll << 20;
 
-/// JPEG, PNG, BMP or GIF (first frame) from memory, three channels (alpha dropped).  False on a bad image, or on
-/// one whose header claims more than `max_pixels` - checked before any pixel buffer is allocated.
+/// JPEG, PNG, BMP or GIF (first frame) from memory, three channels; the alpha channel is dropped, or, with `alpha`, kept
+/// there (w * h values) when the file has one (cleared when it has none).  False on a bad image, or on one whose header
+/// claims more than `max_pixels` - checked before any pixel buffer is allocated.
 bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err,
-                  int64_t max_pixels = kMaxImagePixels);
+                  int64_t max_pixels = kMaxImagePixels, std::vector<uint8_t>* alpha = nullptr);
 
 /// `src` resampled to w x h (Pillow-style bicubic).
 Image resize_bicubic_to(const Image& src, int w, int h);
@@ -55,5 +56,17 @@ void normalize_planar(const Image& canvas, std::vector<float>& out);
 /// Patch rows [n_patches][3 * patch * patch] (channel, row, column order), the patches in merge order: for each
 /// 2x2 group of patches in raster order, its (dy, dx) patches.  `planar` as from normalize_planar.
 void patchify(const std::vector<float>& planar, Size canvas, const Geometry& g, std::vector<float>& out);
+
+/// The canvas of whole merge groups (patch * merge pixels a side) holding a w x h picture at its top left.
+Size padded_canvas(int w, int h, const Geometry& g);
+
+/// The CLIP normalisation (OpenAI's mean and std, 0-1 scale) a processor applies before the encoder's own.
+inline constexpr float kClipMean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+inline constexpr float kClipStd[3] = {0.26862954f, 0.2613026f, 0.2757771f};
+
+/// Patch rows as `patchify` gives them for the picture at the top left of its padded_canvas, every pixel past the picture
+/// -1 on the 0-255 scale, as the class-token tower's reference makes its bf16 pixels: x = bf16((v / 255 - kClipMean[c]) /
+/// kClipStd[c]), then bf16((x bf16(kClipStd[c]) + bf16(kClipMean[c]) - mean[c]) / std[c]) (mean, std: the encoder's).
+void patchify_padded(const Image& img, const Geometry& g, const float mean[3], const float std[3], std::vector<float>& out);
 
 }  // namespace basalt::vision

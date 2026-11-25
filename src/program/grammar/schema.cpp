@@ -3,6 +3,7 @@
 #include "basalt/program/grammar/schema.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -38,9 +39,19 @@ const JsonValue* deref(const JsonValue* root, const JsonValue* s) {
             std::string part = r->s.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
             if (cur->is(Type::Object)) {
                 cur = cur->get(part);
-            } else if (cur->is(Type::Array) && !part.empty() && part.find_first_not_of("0123456789") == std::string::npos &&
-                       std::stoul(part) < cur->items.size()) {
-                cur = &cur->items[std::stoul(part)];
+            } else if (cur->is(Type::Array)) {
+                const size_t limit = cur->items.size();
+                bool ok_idx = !part.empty() && limit > 0;
+                size_t idx = 0;
+                for (size_t k = 0; ok_idx && k < part.size(); ++k) {
+                    const char ch = part[k];
+                    if (ch < '0' || ch > '9') { ok_idx = false; break; }
+                    const size_t d = (size_t) (ch - '0');
+                    if (idx > ((std::numeric_limits<size_t>::max)() - d) / 10) { ok_idx = false; break; }
+                    idx = idx * 10 + d;
+                    if (idx >= limit) { ok_idx = false; break; }
+                }
+                cur = ok_idx ? &cur->items[idx] : nullptr;
             } else {
                 cur = nullptr;
             }
@@ -48,6 +59,9 @@ const JsonValue* deref(const JsonValue* root, const JsonValue* s) {
             pos = e + 1;
         }
         s = cur;
+    }
+    if (s && s->is(Type::Object)) {
+        if (const JsonValue* r = s->get("$ref"); r && r->is(Type::String)) return nullptr;
     }
     return s;
 }
@@ -304,6 +318,26 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
             for (const JsonValue& n : r->items) if (n.is(Type::String)) required.insert(n.s);
         }
         std::string fn_id = "fn" + std::to_string(ti);
+        if (form.json_args) {   // one JSON object of the parameter schema (any object when the tool declares none)
+            JsonValue any;
+            any.type = Type::Object;
+            any.set("type", json_string("object"));
+            const JsonValue* schema = params && params->is(Type::Object) ? params : &any;
+            std::string args;
+            try {
+                SchemaDocument d = build_schema_document(*schema);
+                args = c.add_schema(fn_id + "-args", *d.root);
+            } catch (const std::exception& e) {
+                err = "tools: " + nm->s + ": " + e.what();
+                return "";
+            }
+            std::string mid = form.fn_mid;
+            const std::string quoted = json_string(nm->s).dump();
+            for (size_t p = mid.find("{name}"); p != std::string::npos; p = mid.find("{name}", p + quoted.size()))
+                mid.replace(p, 6, quoted);
+            fns.push_back(c.add_rule(fn_id, literal(form.fn_open + nm->s + mid) + " " + args + " " + literal(form.fn_close)));
+            continue;
+        }
         std::vector<std::string> req_items, opt_items;
         if (props && props->is(Type::Object)) {
             for (const auto& m : props->members) {
@@ -372,25 +406,26 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
         if (n == 1 || n > opt.max_permute) {
             for (const std::string& it : req_items) body += it + " ";
         } else if (n > 1) {
-            auto rule_of = [&](size_t remaining) { return fn_id + "-req" + std::to_string(remaining); };
+            std::vector<std::string> req_rule((size_t) 1 << n);
             for (size_t remaining = 1; remaining < ((size_t) 1 << n); ++remaining) {
                 std::vector<std::string> alts;
                 for (size_t i = 0; i < n; ++i) {
                     const size_t bit = (size_t) 1 << i;
                     if (!(remaining & bit)) continue;
-                    alts.push_back(req_items[i] + (remaining & ~bit ? " " + rule_of(remaining & ~bit) : ""));
+                    alts.push_back(req_items[i] + (remaining & ~bit ? " " + req_rule[remaining & ~bit] : ""));
                 }
-                c.add_rule(rule_of(remaining), join(alts, " | "));
+                req_rule[remaining] = c.add_rule(fn_id + "-req" + std::to_string(remaining), join(alts, " | "));
             }
-            body = rule_of(((size_t) 1 << n) - 1) + " ";
+            body = req_rule[((size_t) 1 << n) - 1] + " ";
         }
         if (!opt_items.empty()) body += "(" + c.add_rule(fn_id + "-opt", join(opt_items, " | ")) + ")* ";
         fns.push_back(c.add_rule(fn_id, literal(form.fn_open + nm->s + form.fn_mid) + " " + body + literal(form.fn_close)));
     }
     const std::string one = "(" + join(fns, " | ") + ")";
     const bool shared_block = form.calls_share_block && opt.multiple_calls;
-    c.add_rule("call", literal(form.call_open) + " " + (shared_block ? one + " (" + literal("\n") + " " + one + ")*" : one) + " " + literal(form.call_close));
-    std::string root = opt.multiple_calls && !form.calls_share_block ? "call ([ \\t\\n]* call)*" : "call";
+    const std::string call_rule =
+        c.add_rule("call", literal(form.call_open) + " " + (shared_block ? one + " (" + literal("\n") + " " + one + ")*" : one) + " " + literal(form.call_close));
+    std::string root = opt.multiple_calls && !form.calls_share_block ? call_rule + " ([ \\t\\n]* " + call_rule + ")*" : call_rule;
     if (!opt.answer_schema.empty()) {
         JsonValue answer;
         if (!read_json(opt.answer_schema, answer, err)) return "";
@@ -421,6 +456,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
         err = "grammar: missing kind";
         return out;
     }
+    if (const JsonValue* think = req.get("think"); think && think->is(Type::Bool)) out.think = think->b;
     std::string gbnf;
     if (kind->s == "json_object" || kind->s == "json_schema") {
         std::string schema = R"({"type":"object"})";
@@ -468,7 +504,8 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
             }
         }
         gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
-        out.triggers.words = {tool_form().trigger};
+        if (!tool_form().trigger_pattern.empty()) out.triggers.patterns = {tool_form().trigger_pattern};
+        else out.triggers.words = {tool_form().trigger};
     } else {
         err = "grammar: unknown kind '" + kind->s + "'";
         return out;

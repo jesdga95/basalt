@@ -55,6 +55,8 @@ protected:
     bool want_cvec{};
     int slot_b{};
     bool in_slot{};
+    bool slot_swapped{};
+    bool slot_bound{};
     bool solo_req{};
     using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
@@ -126,6 +128,7 @@ protected:
     Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
     virtual Flow decode() = 0;
+    bool leave_in_slot();
     Flow complete();
     template <class B> Flow decode_loop(B& b);
     virtual bool parse_begin() { return true; }

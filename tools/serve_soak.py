@@ -163,7 +163,7 @@ def series(reqs, t0, t1, bin_s):
     return [a / bin_s for a in acc]
 
 
-def run_topics(a):
+def run_topics(a, join_timeout=120):
     names = list(TOPICS)
     reqs, lock, stop = [], threading.Lock(), threading.Event()
     t0 = time.time()
@@ -184,20 +184,26 @@ def run_topics(a):
     stop.set()
     t1 = time.time()
     for t in ths:
-        t.join(120)
+        t.join(join_timeout)
+    hung_threads = sum(1 for t in ths if t.is_alive())
+    with lock:
+        snap = list(reqs)
     # the streams are cut at the deadline: count what they produced
-    for q in reqs:
+    for q in snap:
         if q.cancelled and not q.tokens:
             q.tokens = len(q.chunks)
-    ser = series(reqs, t0, t1, a.bin)
+    ser = series(snap, t0, t1, a.bin)
     print("bins of", a.bin, "s, total tok/s:", [round(x) for x in ser])
     skip = int(60 / a.bin)   # the first minute holds the admissions
     steady = ser[skip:] or ser
     print(f"streams {a.streams}: total tok/s mean {sum(steady) / len(steady):.1f} (after the first minute), "
           f"min {min(steady):.0f} max {max(steady):.0f}")
-    errs = [(q.tag, q.status, q.err) for q in reqs if q.err or (q.status not in (None, 200))]
-    print("requests", len(reqs), "errors", errs[:10])
-    return 0 if not errs else 1
+    errs = [(q.tag, q.status, q.err or ("hung" if not q.done else None))
+            for q in snap if not q.done or q.err or (not q.cancelled and q.status != 200) or (q.status not in (None, 200))]
+    if hung_threads:
+        print(f"hung worker threads: {hung_threads}")
+    print("requests", len(snap), "errors", errs[:10])
+    return 0 if not errs and not hung_threads else 1
 
 
 def count_tokens(base, text):
@@ -238,113 +244,137 @@ def sample_system(pgid):
 
 
 def is_bad(q):
-    """A finished request that did not end as planned (an expected 400 is fine, a cancelled stream is fine)."""
+    """A request that did not end as planned (an expected 400 is fine, a cleanly cancelled stream is fine)."""
+    if not q.done:
+        return True
     if q.cancelled:
-        return False
+        return bool(q.err)
     return q.status != q.expect or (q.status == 200 and bool(q.err))
 
 
-def run_soak(a):
+def run_soak(a, grace_s=300, post_stop_s=2, final_sleep_s=5):
     rnd = random.Random(a.seed)
     allp = [p for v in TOPICS.values() for p in v]
     reqs, lock, stop = [], threading.Lock(), threading.Event()
     t0 = time.time()
     log = open(a.out, "w") if a.out else None
-    st, props = http_json(a.base, "/slots")
-    n_slots = len(props) if isinstance(props, list) else 4
-    slot_ctx = props[0].get("n_ctx") if isinstance(props, list) and props else None
-    print("slots", n_slots, "per-slot context", slot_ctx, flush=True)
-    ctx = slot_ctx or 65536
-    img = png(seed=1)
-    target = [rnd.randint(2, 8)]
+    mon = None
+    try:
+        st, props = http_json(a.base, "/slots")
+        n_slots = len(props) if isinstance(props, list) else 4
+        slot_ctx = props[0].get("n_ctx") if isinstance(props, list) and props else None
+        print("slots", n_slots, "per-slot context", slot_ctx, flush=True)
+        ctx = slot_ctx or 65536
+        img = png(seed=1)
+        target = [rnd.randint(2, 8)]
 
-    def launch(kind_pick):
-        kind = rnd.choice(["openai", "anthropic"])
-        q = Req(kind, kind_pick)
-        text, mt, cancel, image = rnd.choice(allp), rnd.choice([64, 200, 600, 1500]), None, None
-        if kind_pick == "cancel":
-            cancel = rnd.randint(3, 120)
-            mt = 1500
-        elif kind_pick == "near":
-            text = long_text(a.base, ctx - 1800) + "\n\nSummarize the passage above in two sentences."
-            mt = 200
-        elif kind_pick == "over":
-            text = long_text(a.base, ctx + 4000) + "\n\nSummarize."
-            q.expect = 400
-        elif kind_pick == "image":
-            image, text, mt = img, "Describe this image in a few sentences.", 200
-        with lock:
-            reqs.append(q)
-        threading.Thread(target=stream, args=(a.base, q, text, mt, cancel, image, stop), daemon=True).start()
-
-    def pick():
-        r = rnd.random()
-        if r < 0.10: return "cancel"
-        if r < 0.13: return "near"
-        if r < 0.17: return "over"
-        if a.images and r < 0.22: return "image"
-        return "chat"
-
-    def monitor():
-        while not stop.is_set():
-            rec = {"t": round(time.time() - t0)}
-            try:
-                st_, sl = http_json(a.base, "/slots", timeout=20)
-                rec["slots_busy"] = sum(1 for s in sl if s.get("is_processing")) if isinstance(sl, list) else None
-            except Exception as e:  # noqa: BLE001
-                rec["slots_err"] = str(e)[:80]
-            rec.update(sample_system(a.pgid))
+        def launch(kind_pick):
+            kind = rnd.choice(["openai", "anthropic"])
+            q = Req(kind, kind_pick)
+            text, mt, cancel, image = rnd.choice(allp), rnd.choice([64, 200, 600, 1500]), None, None
+            if kind_pick == "cancel":
+                cancel = rnd.randint(3, 120)
+                mt = 1500
+            elif kind_pick == "near":
+                text = long_text(a.base, ctx - 1800) + "\n\nSummarize the passage above in two sentences."
+                mt = 200
+            elif kind_pick == "over":
+                text = long_text(a.base, ctx + 4000) + "\n\nSummarize."
+                q.expect = 400
+            elif kind_pick == "image":
+                image, text, mt = img, "Describe this image in a few sentences.", 200
             with lock:
-                live = [q for q in reqs if not q.done]
-                rec["in_flight"] = len(live)
-                rec["done"] = len(reqs) - len(live)
-                rec["bad"] = sum(1 for q in reqs if q.done and is_bad(q))
-                now = time.time()
-                rec["stuck"] = [q.tag for q in live if now - q.last > a.stuck_s and q.chunks]
-                rec["tokens"] = sum(q.tokens for q in reqs)
-            if log:
-                log.write(json.dumps(rec) + "\n")
-                log.flush()
-            print(json.dumps(rec), flush=True)
-            time.sleep(a.sample_s)
-    threading.Thread(target=monitor, daemon=True).start()
-    nlong = [0, 0]
-    while time.time() - t0 < a.secs:
+                reqs.append(q)
+            threading.Thread(target=stream, args=(a.base, q, text, mt, cancel, image, stop), daemon=True).start()
+
+        def pick():
+            r = rnd.random()
+            if r < 0.10: return "cancel"
+            if r < 0.13: return "near"
+            if r < 0.17: return "over"
+            if a.images and r < 0.22: return "image"
+            return "chat"
+
+        def monitor():
+            while not stop.is_set():
+                rec = {"t": round(time.time() - t0)}
+                try:
+                    st_, sl = http_json(a.base, "/slots", timeout=20)
+                    rec["slots_busy"] = sum(1 for s in sl if s.get("is_processing")) if isinstance(sl, list) else None
+                except Exception as e:  # noqa: BLE001
+                    rec["slots_err"] = str(e)[:80]
+                rec.update(sample_system(a.pgid))
+                with lock:
+                    live = [q for q in reqs if not q.done]
+                    rec["in_flight"] = len(live)
+                    rec["done"] = len(reqs) - len(live)
+                    rec["bad"] = sum(1 for q in reqs if q.done and is_bad(q))
+                    now = time.time()
+                    rec["stuck"] = [q.tag for q in live if now - q.last > a.stuck_s and q.chunks]
+                    rec["tokens"] = sum(q.tokens for q in reqs)
+                if log:
+                    log.write(json.dumps(rec) + "\n")
+                    log.flush()
+                print(json.dumps(rec), flush=True)
+                stop.wait(a.sample_s)
+        mon = threading.Thread(target=monitor, daemon=True)
+        mon.start()
+        nlong = [0, 0]
+        while time.time() - t0 < a.secs:
+            with lock:
+                live = sum(1 for q in reqs if not q.done)
+            if rnd.random() < 0.02:
+                target[0] = rnd.randint(2, 8)
+            if live < target[0]:
+                k = pick()
+                if k in ("near", "over") and nlong[k == "over"] >= (a.secs // 600 + 1) * 2:
+                    k = "chat"
+                if k in ("near", "over"):
+                    nlong[k == "over"] += 1
+                launch(k)
+            time.sleep(rnd.uniform(0.2, 2.0))
+        # drain: no new requests; the rest finish (or are cut after a grace period)
+        grace = time.time() + grace_s
+        while time.time() < grace:
+            with lock:
+                if not any(not q.done for q in reqs):
+                    break
+            time.sleep(min(1.0, max(0.05, grace - time.time())))
         with lock:
-            live = sum(1 for q in reqs if not q.done)
-        if rnd.random() < 0.02:
-            target[0] = rnd.randint(2, 8)
-        if live < target[0]:
-            k = pick()
-            if k in ("near", "over") and nlong[k == "over"] >= (a.secs // 600 + 1) * 2:
-                k = "chat"
-            if k in ("near", "over"):
-                nlong[k == "over"] += 1
-            launch(k)
-        time.sleep(rnd.uniform(0.2, 2.0))
-    # drain: no new requests; the rest finish (or are cut after a grace period)
-    grace = time.time() + 300
-    while time.time() < grace and any(not q.done for q in reqs):
-        time.sleep(1)
-    stop.set()
-    time.sleep(2)
-    t1 = time.time()
-    by = {}
-    for q in reqs:
-        key = (q.tag, q.status if not q.cancelled else "cancel", bool(q.err))
-        by[key] = by.get(key, 0) + 1
-    print("== requests by (kind, status, error):")
-    for k, v in sorted(by.items(), key=str):
-        print("  ", k, v)
-    bad = [(q.tag, q.kind, q.status, q.err) for q in reqs if q.done and is_bad(q)]
-    print("unexpected:", len(bad), bad[:10])
-    ser = series(reqs, t0, t1, 60)
-    print("total tok/s per minute:", [round(x) for x in ser])
-    time.sleep(5)
-    st, sl = http_json(a.base, "/slots")
-    print("final /slots:", json.dumps(sl)[:600])
-    print("final system:", sample_system(a.pgid))
-    return 0 if not bad else 1
+            snap = list(reqs)
+        timed_out = {id(q) for q in snap if not q.done}
+        stop.set()
+        if timed_out and post_stop_s > 0:
+            time.sleep(post_stop_s)
+        t1 = time.time()
+        by = {}
+        for q in snap:
+            state = "timeout" if (not q.done or id(q) in timed_out) else ("cancel" if q.cancelled else q.status)
+            key = (q.tag, state, bool(q.err))
+            by[key] = by.get(key, 0) + 1
+        print("== requests by (kind, status, error):")
+        for k, v in sorted(by.items(), key=str):
+            print("  ", k, v)
+        bad = [(q.tag, q.kind, q.status, q.err or ("timeout" if not q.done or id(q) in timed_out else None))
+               for q in snap if not q.done or id(q) in timed_out or is_bad(q)]
+        print("unexpected:", len(bad), bad[:10])
+        ser = series(snap, t0, t1, 60)
+        print("total tok/s per minute:", [round(x) for x in ser])
+        if final_sleep_s > 0:
+            time.sleep(final_sleep_s)
+        try:
+            st, sl = http_json(a.base, "/slots")
+            print("final /slots:", json.dumps(sl)[:600])
+        except Exception as e:  # noqa: BLE001
+            print("final /slots error:", e)
+        print("final system:", sample_system(a.pgid))
+        return 0 if not bad else 1
+    finally:
+        stop.set()
+        if mon is not None:
+            mon.join(5)
+        if log:
+            log.close()
 
 
 def main():

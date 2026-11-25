@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -14,6 +15,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/route_report.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
@@ -80,7 +82,7 @@ bool Verifier::dm_init(std::string& err) {
     d->vram = -1;
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
-             cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
+             basalt::core::device_copy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
     if (ok)
         ok = cudaMalloc((void**) &d->ptab0, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab0, 0, (size_t) LE * 8) == cudaSuccess;
@@ -128,7 +130,7 @@ bool Verifier::dm_init(std::string& err) {
              cudaMalloc((void**) &d->ptab, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab, 0, (size_t) LE * 8) == cudaSuccess &&
              cudaMalloc((void**) &d->lay, ls.size() * sizeof(NativeExpertLayout)) == cudaSuccess &&
-             cudaMemcpy(d->lay, ls.data(), ls.size() * sizeof(NativeExpertLayout), cudaMemcpyHostToDevice) == cudaSuccess &&
+             basalt::core::device_copy(d->lay, ls.data(), ls.size() * sizeof(NativeExpertLayout), cudaMemcpyHostToDevice) == cudaSuccess &&
              cudaMalloc(&d->pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
@@ -170,7 +172,7 @@ bool Verifier::dm_init(std::string& err) {
                      cudaMalloc((void**) &x.ptab, (size_t) LE * 8) == cudaSuccess &&
                      cudaMemset(x.ptab, 0, (size_t) LE * 8) == cudaSuccess &&
                      cudaMalloc((void**) &x.lay, ls.size() * sizeof(NativeExpertLayout)) == cudaSuccess &&
-                     cudaMemcpy(x.lay, ls.data(), ls.size() * sizeof(NativeExpertLayout), cudaMemcpyHostToDevice) == cudaSuccess &&
+                     basalt::core::device_copy(x.lay, ls.data(), ls.size() * sizeof(NativeExpertLayout), cudaMemcpyHostToDevice) == cudaSuccess &&
                      cudaMalloc(&x.pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
                      cudaMemset(x.pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
                      cudaMalloc((void**) &x.parr, 64) == cudaSuccess;
@@ -223,7 +225,7 @@ bool Verifier::dm_init(std::string& err) {
                    cudaMemset(d->stage_src, 0, (size_t) LE * 8) == cudaSuccess &&
                    cudaMallocHost((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
                    cudaMalloc((void**) &d->stage_k, kt.size() * 4) == cudaSuccess &&
-                   cudaMemcpy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                   basalt::core::device_copy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
                    cudaDeviceGetStreamPriorityRange(&st_least, &st_greatest) == cudaSuccess &&
                    cudaStreamCreateWithPriority(&d->st_s, cudaStreamNonBlocking, st_greatest) == cudaSuccess &&
                    cudaEventCreateWithFlags(&d->st_fork, cudaEventDisableTiming) == cudaSuccess &&
@@ -295,25 +297,11 @@ std::vector<std::string> Verifier::route_report() const {
     if (dm_ == nullptr || dm_->route_counts == nullptr) return {};
     const OnDevice on(device_);
     unsigned long long c[8] = {};
-    if (cudaMemcpy(c, dm_->route_counts, sizeof c, cudaMemcpyDeviceToHost) != cudaSuccess) {
+    if (basalt::core::device_copy(c, dm_->route_counts, sizeof c, cudaMemcpyDeviceToHost) != cudaSuccess) {
         cudaGetLastError();
         return {};
     }
-    std::vector<std::string> out;
-    char b[240];
-    if (route_tail_skip_ > 0 && c[0] > 0) {
-        std::snprintf(b, sizeof b, "route-tail-skip %d: %llu of %llu routed entries no GPU held dropped (%.1f%%); %.1f%% of all %llu entries",
-                      route_tail_skip_, c[2], c[1], c[1] > 0 ? 100.0 * (double) c[2] / (double) c[1] : 0.0,
-                      100.0 * (double) c[2] / (double) c[0], c[0]);
-        out.push_back(b);
-    }
-    if (route_prior_ > 0.0f && c[3] > 0) {
-        std::snprintf(b, sizeof b, "route-prior %g: %.1f%% of %llu routed entries picked because of the bias; %.1f%% of entries held by no GPU",
-                      (double) route_prior_, 100.0 * (double) c[4] / (double) c[3], c[3],
-                      100.0 * (double) c[5] / (double) c[3]);
-        out.push_back(b);
-    }
-    return out;
+    return ::basalt::core::route_report(c, route_tail_skip_, route_prior_);
 }
 
 }  // namespace basalt::core

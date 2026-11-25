@@ -3,19 +3,27 @@
 # `if(BASALT_MODEL_<ARCH>)`. A model left out is not compiled, not linked and not registered.
 
 # Every model that ships: the architecture ids, as `general.architecture` names them.
-set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35 hy4flash)
+set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35 hy4flash inkling2)
 
-set(BASALT_MODELS "${BASALT_BUILTIN_MODELS}" CACHE STRING
-    "Semicolon list of the models to build, from: ${BASALT_BUILTIN_MODELS}")
-
-list(REMOVE_DUPLICATES BASALT_MODELS)
+# BASALT_MODELS is required, with no default: a configure that leaves it out stops and says how to set it. "all" follows
+# BASALT_BUILTIN_MODELS, so a build folder picks up a model added later. The cache keeps the word, not the list: a list
+# would stay in the folder and leave every newer model out. A folder that already holds a value keeps it.
+set(BASALT_MODELS "" CACHE STRING
+    "Models to build (required): all, or a semicolon list from: ${BASALT_BUILTIN_MODELS}")
 string(REPLACE ";" ", " _basalt_valid "${BASALT_BUILTIN_MODELS}")
 if(NOT BASALT_MODELS)
-  message(FATAL_ERROR "BASALT_MODELS is empty: name at least one of ${_basalt_valid}")
+  message(FATAL_ERROR "BASALT_MODELS is not set: pass -DBASALT_MODELS=all to build every model, or a semicolon list "
+                      "from: ${_basalt_valid} (quote the list, as in \"-DBASALT_MODELS=qwen4exp;deepseek41\")")
 endif()
+# The resolved list, as a normal variable over the cache entry for the rest of the configure.
+if(BASALT_MODELS STREQUAL "all")
+  set(BASALT_MODELS ${BASALT_BUILTIN_MODELS})
+endif()
+
+list(REMOVE_DUPLICATES BASALT_MODELS)
 foreach(_m IN LISTS BASALT_MODELS)
   if(NOT _m IN_LIST BASALT_BUILTIN_MODELS)
-    message(FATAL_ERROR "BASALT_MODELS names '${_m}', which is not a Basalt model. Valid: ${_basalt_valid}")
+    message(FATAL_ERROR "BASALT_MODELS names '${_m}', which is not a Basalt model. Valid: all, ${_basalt_valid}")
   endif()
 endforeach()
 
