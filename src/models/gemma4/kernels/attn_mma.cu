@@ -58,8 +58,9 @@ struct Cfg {
     static constexpr int kRows = 16 * RG;            // rows a block
     static constexpr int kLd = HD + 8;               // a tile row in halves, padded: ldmatrix without bank conflicts
     static constexpr int kSLd = kKeys + 4;           // a row of exchanged scores in floats
-    static size_t smem(int raw_stage) {
-        return 2 * (size_t) raw_stage + 2 * (size_t) kKeys * kLd * 2 + (size_t) RG * DS * 16 * kSLd * 4;
+    // DIRECT: two stages of fp16 key and value tiles; else two stages of raw rows and one of converted tiles
+    static size_t smem(int raw_stage, bool direct) {
+        return (direct ? 0 : 2 * (size_t) raw_stage) + (direct ? 4 : 2) * (size_t) kKeys * kLd * 2 + (size_t) RG * DS * 16 * kSLd * 4;
     }
 };
 
@@ -100,7 +101,8 @@ __device__ __forceinline__ float raw_at(const uint8_t* row, int i, bool f8) {
     return f8 ? float(reinterpret_cast<const __nv_fp8_e4m3*>(row)[i]) : __half2float(reinterpret_cast<const __half*>(row)[i]);
 }
 
-template <int HD, int RG, bool DEC>
+// DIRECT (an fp16 cache whose keys are stored): the cache rows go straight into the tiles, no conversion.
+template <int HD, int RG, bool DEC, bool DIRECT>
 __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaArgs a, int rows) {
     using C = Cfg<HD, RG>;
     extern __shared__ __align__(16) uint8_t sm[];
@@ -113,9 +115,9 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
     const int raw_row = HD * eb;                              // bytes of a key's head row
     const int raw_stage = kKeys * raw_row * (one ? 1 : 2);    // a tile's V rows, then its K rows
     uint8_t* raw = sm;
-    __half* Kt = reinterpret_cast<__half*>(sm + 2 * raw_stage);
+    __half* Kt = reinterpret_cast<__half*>(sm + (DIRECT ? 0 : 2 * raw_stage));   // DIRECT: [2] stages, K then V each
     __half* Vt = Kt + kKeys * C::kLd;
-    float* Sx = reinterpret_cast<float*>(Vt + kKeys * C::kLd);   // [RG][DS][16][kSLd]
+    float* Sx = reinterpret_cast<float*>(Kt + (DIRECT ? 4 : 2) * kKeys * C::kLd);   // [RG][DS][16][kSLd]
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int rg = warp / C::DS, ds = warp % C::DS;
@@ -188,6 +190,18 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
             cp16(raw + buf * raw_stage + which * per_mat * 16 + j * raw_row + 16 * c, src, ok);
         }
     };
+    const auto stage_tiles = [&](int tile, int buf) {   // DIRECT
+        constexpr int per_row = HD / 8, n = 2 * kKeys * per_row;
+        __half* kt = reinterpret_cast<__half*>(sm) + buf * 2 * kKeys * C::kLd;
+        for (int i = tid; i < n; i += C::kThreads) {
+            const int isv = i >= kKeys * per_row, rem = isv ? i - kKeys * per_row : i, j = rem / per_row, c = rem - j * per_row;
+            const int key = tile * kKeys + j;
+            const bool ok = key >= kmin && key <= kmax;
+            const __half* src = static_cast<const __half*>(isv ? cache.v : cache.k) +
+                                ((ok ? (int64_t) (key % (int) cache.cap) : 0) * sh.n_kv + h) * HD + 8 * c;
+            cp16(kt + (isv ? kKeys * C::kLd : 0) + j * C::kLd + 8 * c, src, ok);
+        }
+    };
     const auto convert = [&](int tile, int buf) {
         const uint8_t* rv = raw + buf * raw_stage;
         if (one) {   // V as stored; K = rope(V * k_norm): two pairs (i, i + HD / 2) an item
@@ -248,16 +262,24 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
     float* sx_own = Sx + (size_t) (rg * C::DS + ds) * 16 * C::kSLd;
     const float* sx_grp = Sx + (size_t) rg * C::DS * 16 * C::kSLd;
 
-    stage_raw(t0, 0);
+    if constexpr (DIRECT) stage_tiles(t0, 0);
+    else stage_raw(t0, 0);
     cp_commit();
     for (int tile = t0; tile <= t1; ++tile) {
         const int buf = (int) ((tile - t0) & 1);
         cp_wait_all();
-        __syncthreads();   // the tile's raw rows are in; every warp is done with the last tile's K, V and scores
-        convert(tile, buf);
-        if (tile < t1) stage_raw(tile + 1, buf ^ 1);
-        cp_commit();
-        __syncthreads();
+        __syncthreads();   // the tile's rows are in; every warp is done with the last tile's K, V and scores
+        if constexpr (DIRECT) {
+            if (tile < t1) stage_tiles(tile + 1, buf ^ 1);
+            cp_commit();
+            Kt = reinterpret_cast<__half*>(sm) + buf * 2 * kKeys * C::kLd;
+            Vt = Kt + kKeys * C::kLd;
+        } else {
+            convert(tile, buf);
+            if (tile < t1) stage_raw(tile + 1, buf ^ 1);
+            cp_commit();
+            __syncthreads();
+        }
         // this slice's partial scores of the group's 16 rows against the tile's keys
         float s[2][4] = {};
 #pragma unroll
@@ -348,9 +370,14 @@ template <int HD, int RG, bool DEC>
 void launch(const MmaArgs& a, int rows, dim3 grid, cudaStream_t st) {
     using C = Cfg<HD, RG>;
     const int raw_stage = kKeys * HD * kv_elem_bytes(a.kv_type) * (a.sh.one ? 1 : 2);
-    const size_t smem = C::smem(raw_stage);
-    cudaFuncSetAttribute(attn_mma_kernel<HD, RG, DEC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-    bk::launch_pdl(attn_mma_kernel<HD, RG, DEC>, grid, dim3(C::kThreads), smem, st, a, rows);
+    const bool direct = a.kv_type == KvType::F16 && !a.sh.one;
+    const size_t smem = C::smem(raw_stage, direct);
+    const auto run = [&](auto kernel) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        bk::launch_pdl(kernel, grid, dim3(C::kThreads), smem, st, a, rows);
+    };
+    if (direct) run(attn_mma_kernel<HD, RG, DEC, true>);
+    else run(attn_mma_kernel<HD, RG, DEC, false>);
 }
 
 void check_shape(const LayerShape& sh) {
