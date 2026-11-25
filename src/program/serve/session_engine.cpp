@@ -613,7 +613,7 @@ public:
     }
     void observe_policy(bool from_sfx, int T, int a, int sfx_match, Clock::time_point round0) {
         if (ppl != nullptr) return;   // a quality gate's windows are forced, not drafted
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+        const double ms = rt_.session().window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
         if (from_sfx) rt_.policy->observe(true, T, a, sfx_match, ms);
         else rt_.policy->observe_window(window_conf_.data(), T, a, ms);
     }

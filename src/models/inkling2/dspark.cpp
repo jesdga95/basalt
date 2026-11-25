@@ -854,7 +854,7 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     if (!w || max_sessions <= 1) return true;
     const DsparkGeometry& d = w->geo;
     const size_t E = kE, V = (size_t) w->n_vocab, ff = (size_t) d.n_ff;
-    const int S = std::min(max_sessions, bk::kWindowSegsMax);
+    const int S = std::min(max_sessions, kMaxDraftSessions);
     const int CR = std::min(S, kChunkSlots) * kDsBlock;   // <= 32 == wgemm::kRows
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };

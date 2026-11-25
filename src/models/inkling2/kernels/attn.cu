@@ -373,7 +373,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
 // reading K and V once per chunk of 64 cells with coalesced 128-bit loads and pipelined prefetch.
 template <bool FP8, int BM>
 __global__ void __launch_bounds__(128, BM == 16 ? 3 : 2) attn_mma_kernel(AttnArgs a, int total_rows, int tiles_per_seg, int z,
-                                                                         int z_stride, float* __restrict__ part_ml,
+                                                                         int z_stride,
+                                                                         float* __restrict__ part_ml,
                                                                          float* __restrict__ part_acc) {
     constexpr int HD = kHeadDim;
     constexpr int CHUNK = 64;
@@ -458,15 +459,19 @@ __global__ void __launch_bounds__(128, BM == 16 ? 3 : 2) attn_mma_kernel(AttnArg
     uint4 pk[NI], pv[NI];
     unsigned pmask = 0;
 
+    const uint32_t cap32 = (uint32_t) a.cap;
     const auto fetch = [&](int c0) {
         pmask = 0;
+        const uint32_t base_cell = a.window > 0 ? ((uint32_t) c0 % cap32) : (uint32_t) c0;
 #pragma unroll
         for (int j = 0; j < NI; ++j) {
             const int idx = tid + j * 128;
             const int cell = idx / (HD / kElems), d0 = (idx - cell * (HD / kElems)) * kElems;
             const int key = c0 + cell;
             if (key >= lo_min && key <= p_max) {
-                const size_t off = (size_t) (key % a.cap) * kKvHeads * kRowBytes + (size_t) d0 * (FP8 ? 1 : 2);
+                uint32_t rkey = base_cell + (uint32_t) cell;
+                if (a.window > 0 && rkey >= cap32) rkey -= cap32;
+                const size_t off = (size_t) rkey * kKvHeads * kRowBytes + (size_t) d0 * (FP8 ? 1 : 2);
                 pk[j] = *reinterpret_cast<const uint4*>(kbase + off);
                 pv[j] = *reinterpret_cast<const uint4*>(vbase + off);
                 pmask |= 1u << j;
@@ -1007,8 +1012,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_mma_split_kernel(AttnArgs
             attn_mma_slice<1, true>(a, begin, begin + 1, g, lo, hi, s, z, kc, vc, sm, nullptr,
                                     alternate_v, 0, false, part_ml, part_acc, threadIdx.x);
         }
-        return;
-    }
+    } else {
     for (int s = blockIdx.z; s < z; s += gridDim.z) {
         // Partition at a span or a tail tile boundary so a row takes the same steps in every window.
         for (int first = begin; first < end;) {
@@ -1022,7 +1026,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_mma_split_kernel(AttnArgs
             int last = first + 1;
             for (; last < end && (last - first + 1) * kGroup <= MaxSlabs * kMmaRows; ++last) {
                 const int next = a.pos[last] + 1, next_hi = min(next, lo + span);
-                if (next < min_keys || next <= lo || span_of(next) != span || (next_hi + kTile - 1) / kTile != tiles) break;
+                if (next < min_keys || next <= lo || span_of(next) != span || (next_hi + kTile - 1) / kTile != tiles || (last - first + 1) * kGroup > MaxSlabs * kMmaRows) break;
                 hi = max(hi, next_hi);
             }
             const bool primed = primed_tile == lo && hi >= lo + kTile;
@@ -1042,6 +1046,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_mma_split_kernel(AttnArgs
         }
     }
     if (primed_tile >= 0) mma_wait(0);
+    }
 }
 
 // A block per (row, head), a thread a channel: the row's slices merged with the sink, gated, written in fp32 and/or as
@@ -1641,7 +1646,7 @@ template <int Slabs, bool Narrow = false, bool Direct = false>
 void launch_mma(const AttnArgs& a, int rows, int min_keys, int64_t max_keys, int z, float* part_ml,
                 float* part_acc, cudaStream_t stream, const MmaDevice& device, const MmaLaunch* forced,
                 Int8MmaPlanInfo* info, Int8MmaShards shard_rule, int shard_count) {
-    const int segments = a.seg.at.n > 0 ? a.seg.at.n : (a.seg.at_d ? std::min(rows, (int) bk::kWindowSegsMax) : 1);
+    const int segments = a.seg.at.n > 0 ? a.seg.at.n : (a.seg.at_d ? (a.seg.n_segs > 0 ? a.seg.n_segs : std::min(rows, (int) bk::kWindowSegsMax)) : 1);
     const int64_t bytes_per_segment = max_keys * (2 * kKvHeads * kKvInt8RowBytes);
     const auto& plan = forced ? *forced : Direct ? device.singleton :
                        device.plans[Narrow ? 0 : Slabs][bytes_per_segment > device.l2 / segments];
@@ -1700,9 +1705,19 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
     const bool use_mma = !a.int8;
     const int mma_z = a.window > 0 ? kWindowMmaSplits : z;
     if (use_mma) {
-        const int nseg = a.seg.at.n > 0 ? a.seg.at.n : (a.seg.at_d ? std::min(rows, (int) bk::kWindowSegsMax) : 1);
-        const int max_seg_rows = seg_mode ? std::min(rows, kDecodeRows) : rows;
-        const int bm = (seg_mode ? rows > 5 : rows * kGroup > 16) ? 32 : 16;
+        int nseg = 1, max_seg_rows = rows;
+        if (a.seg.at.n > 0) {
+            nseg = a.seg.at.n;
+            max_seg_rows = 1;
+            for (int k = 0; k < nseg; ++k) max_seg_rows = std::max(max_seg_rows, a.seg.at.row0[k + 1] - a.seg.at.row0[k]);
+        } else if (a.seg.at_d != nullptr) {
+            nseg = a.seg.n_segs > 0 ? a.seg.n_segs : std::min(rows, (int) bk::kWindowSegsMax);
+            max_seg_rows = a.seg.max_seg_rows > 0
+                               ? a.seg.max_seg_rows
+                               : (a.seg.n_segs > 0 ? std::min(kDecodeRows, std::max(1, rows - (a.seg.n_segs - 1)))
+                                                   : std::min(rows, kDecodeRows));
+        }
+        const int bm = max_seg_rows * kGroup > 16 ? 32 : 16;
         const int tiles_per_seg = (max_seg_rows * kGroup + bm - 1) / bm;
         const dim3 grid((unsigned) (nseg * tiles_per_seg), kKvHeads, (unsigned) mma_z);
         if (bm == 32) {
