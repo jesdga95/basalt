@@ -335,6 +335,13 @@ public:
         return {};
     }
 
+    // SLEEP / WAKE: every weight stays on the card, so the session has nothing to lend: ok, no slots, SLEEP goes on to the
+    // driver.
+    model::Result set_low_memory(bool, int64_t&) override {
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "gemma4: the session stream failed"};
+        return {};
+    }
+
     model::Result copy_logits(int row, float* out) override {
         if (row < 0 || row >= head_rows_) return {model::Status::Error, "gemma4: no logits for that row"};
         if (core::device_copy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
