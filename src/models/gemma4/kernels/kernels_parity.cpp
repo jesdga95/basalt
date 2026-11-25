@@ -442,7 +442,7 @@ void prompt_case(const char* name, const LayerShape& sh, int past, int C, KvType
     const std::vector<float> r = host(ref, (size_t) C * qd), o = host(got, (size_t) C * qd);
     double err = 0;
     for (size_t i = 0; i < r.size(); ++i) err = std::max(err, (double) std::fabs(r[i] - o[i]));
-    expect(err < 3e-2, name, err);
+    expect(err < 5e-2, name, err);   // the prompt's single fp16 query and key terms against the decode's two (scores spread ~25)
     const int c1 = C / 3 + 5;   // two calls: rows [0, c1) and [c1, C)
     AttnPrompt a1 = ap, a2 = ap;
     a1.out = ref;

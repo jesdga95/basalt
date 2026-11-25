@@ -6,7 +6,8 @@
 // A prompt block takes the query heads of one key/value head over a run of positions: its rows are (head, position)
 // pairs, head-major, in groups of 16. A decode block takes one chunk of one row's keys for the query heads of one key/value
 // head: one group of 16 rows, the heads first (the rest padding), its result the chunk's unnormalized output with its
-// max and sum. A row group's head width is split in slices of 128 dims, a warp a (group, slice): each
+// max and sum. A row group's head width is split in slices (of 128 dims, or the whole 256 for a prompt), a warp a
+// (group, slice): each
 // warp holds its rows' queries and outputs for its slice only, so the scores of a key tile are the sum of the slices'
 // partial products, exchanged through shared memory and added in slice order (every slice of a group gets the same
 // bits). Keys stream in tiles of kKeys on a fixed grid of positions: the raw cache rows of the next tile load while the
@@ -51,16 +52,19 @@ void check(const char* what) {
 constexpr int kKeys = 16;                  // keys a tile
 constexpr float kLog2e = 1.4426950408889634f;
 
-template <int HD, int RG>
+template <int HD, int RG, int NS = HD / 128>
 struct Cfg {
-    static constexpr int DS = HD / 128;              // slices of a head row
+    static constexpr int DS = NS;                    // slices of a head row
+    static constexpr int SW = HD / DS;               // dims a slice
     static constexpr int kThreads = RG * DS * 32;
     static constexpr int kRows = 16 * RG;            // rows a block
     static constexpr int kLd = HD + 8;               // a tile row in halves, padded: ldmatrix without bank conflicts
     static constexpr int kSLd = kKeys + 4;           // a row of exchanged scores in floats
-    // DIRECT: two stages of fp16 key and value tiles; else two stages of raw rows and one of converted tiles
-    static size_t smem(int raw_stage, bool direct) {
-        return (direct ? 0 : 2 * (size_t) raw_stage) + (direct ? 4 : 2) * (size_t) kKeys * kLd * 2 + (size_t) RG * DS * 16 * kSLd * 4;
+    // DIRECT: two stages of fp16 key and value tiles; else two stages of raw rows and one of converted tiles (and, `lo`,
+    // the derived keys' second fp16 term)
+    static size_t smem(int raw_stage, bool direct, bool lo) {
+        return (direct ? 0 : 2 * (size_t) raw_stage) + (direct ? 4 : lo ? 3 : 2) * (size_t) kKeys * kLd * 2 +
+               (size_t) RG * DS * 16 * kSLd * 4;
     }
 };
 
@@ -102,9 +106,10 @@ __device__ __forceinline__ float raw_at(const uint8_t* row, int i, bool f8) {
 }
 
 // DIRECT (an fp16 cache whose keys are stored): the cache rows go straight into the tiles, no conversion.
-template <int HD, int RG, bool DEC, bool DIRECT>
-__global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaArgs a, int rows) {
-    using C = Cfg<HD, RG>;
+template <int HD, int RG, int NS, bool DEC, bool DIRECT>
+__global__ void __launch_bounds__(Cfg<HD, RG, NS>::kThreads, 1) attn_mma_kernel(MmaArgs a, int rows) {
+    using C = Cfg<HD, RG, NS>;
+    constexpr int KS = C::SW / 16, NT = C::SW / 8;   // a slice's 16-dim steps and 8-dim output tiles
     extern __shared__ __align__(16) uint8_t sm[];
     bk::pdl_wait();
     bk::pdl_launch_dependents();
@@ -115,9 +120,12 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
     const int raw_row = HD * eb;                              // bytes of a key's head row
     const int raw_stage = kKeys * raw_row * (one ? 1 : 2);    // a tile's V rows, then its K rows
     uint8_t* raw = sm;
+    // a decode row's derived keys as two fp16 terms (the rounding and what it leaves), so its scores keep fp32 keys
+    const bool klo = DEC && !DIRECT && one;
     __half* Kt = reinterpret_cast<__half*>(sm + (DIRECT ? 0 : 2 * raw_stage));   // DIRECT: [2] stages, K then V each
     __half* Vt = Kt + kKeys * C::kLd;
-    float* Sx = reinterpret_cast<float*>(Kt + (DIRECT ? 4 : 2) * kKeys * C::kLd);   // [RG][DS][16][kSLd]
+    __half* Kl = Vt + kKeys * C::kLd;                                            // klo: the keys' second terms
+    float* Sx = reinterpret_cast<float*>(Kt + (DIRECT ? 4 : klo ? 3 : 2) * kKeys * C::kLd);   // [RG][DS][16][kSLd]
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int rg = warp / C::DS, ds = warp % C::DS;
@@ -170,12 +178,12 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
     const int t0 = kmin / kKeys, t1 = kmax / kKeys;
     // the queries of this warp's slice as A fragments: 8 steps of 16 dims; a decode row's as two fp16 terms (the rounding
     // and what it leaves), so its scores keep the fp32 queries' precision
-    unsigned qf[8][4], ql[DEC ? 8 : 1][4];
+    unsigned qf[KS][4], ql[DEC ? KS : 1][4];
 #pragma unroll
-    for (int ks = 0; ks < 8; ++ks)
+    for (int ks = 0; ks < KS; ++ks)
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            const int e = r & 1, d = ds * 128 + ks * 16 + 2 * t + (r >> 1) * 8;
+            const int e = r & 1, d = ds * C::SW + ks * 16 + 2 * t + (r >> 1) * 8;
             const float2 v = *reinterpret_cast<const float2*>(a.q + ((size_t) rrow[e] * sh.n_head + rhead[e]) * HD + d);
             const __half2 hi = __floats2half2_rn(v.x, v.y);
             qf[ks][r] = rok[e] || !DEC ? *reinterpret_cast<const unsigned*>(&hi) : 0u;
@@ -239,8 +247,14 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
                         y[c] = ky;
                     }
                 }
-                *reinterpret_cast<__half2*>(Kt + j * C::kLd + i) = __floats2half2_rn(x[0], x[1]);
-                *reinterpret_cast<__half2*>(Kt + j * C::kLd + i + H) = __floats2half2_rn(y[0], y[1]);
+                const __half2 kx2 = __floats2half2_rn(x[0], x[1]), ky2 = __floats2half2_rn(y[0], y[1]);
+                *reinterpret_cast<__half2*>(Kt + j * C::kLd + i) = kx2;
+                *reinterpret_cast<__half2*>(Kt + j * C::kLd + i + H) = ky2;
+                if (klo) {
+                    const float2 hx = __half22float2(kx2), hy = __half22float2(ky2);
+                    *reinterpret_cast<__half2*>(Kl + j * C::kLd + i) = __floats2half2_rn(x[0] - hx.x, x[1] - hx.y);
+                    *reinterpret_cast<__half2*>(Kl + j * C::kLd + i + H) = __floats2half2_rn(y[0] - hy.x, y[1] - hy.y);
+                }
             }
         } else {     // V and K as stored, 8 values an item
             const uint8_t* rk = rv + kKeys * raw_row;
@@ -261,9 +275,9 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
         }
     };
 
-    float o[16][4];
+    float o[NT][4];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+    for (int i = 0; i < NT; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
     float* sx_own = Sx + (size_t) (rg * C::DS + ds) * 16 * C::kSLd;
     const float* sx_grp = Sx + (size_t) rg * C::DS * 16 * C::kSLd;
@@ -289,22 +303,29 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
         // this slice's partial scores of the group's 16 rows against the tile's keys
         float s[2][4] = {};
 #pragma unroll
-        for (int ks = 0; ks < 8; ++ks) {
+        for (int ks = 0; ks < KS; ++ks) {
             unsigned b0, b1, b2, b3;
-            ldsm_x4(b0, b1, b2, b3, Kt + ((lane & 7) + ((lane >> 4) << 3)) * C::kLd + ds * 128 + ks * 16 + ((lane >> 3) & 1) * 8);
+            ldsm_x4(b0, b1, b2, b3, Kt + ((lane & 7) + ((lane >> 4) << 3)) * C::kLd + ds * C::SW + ks * 16 + ((lane >> 3) & 1) * 8);
             mma16816(s[0], qf[ks], b0, b1);
             mma16816(s[1], qf[ks], b2, b3);
             if constexpr (DEC) {
                 mma16816(s[0], ql[ks], b0, b1);
                 mma16816(s[1], ql[ks], b2, b3);
+                if (klo) {
+                    ldsm_x4(b0, b1, b2, b3, Kl + ((lane & 7) + ((lane >> 4) << 3)) * C::kLd + ds * C::SW + ks * 16 + ((lane >> 3) & 1) * 8);
+                    mma16816(s[0], qf[ks], b0, b1);
+                    mma16816(s[1], qf[ks], b2, b3);
+                }
             }
         }
+        if constexpr (C::DS > 1) {   // the slices' partial scores to the group
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt) {
-            *reinterpret_cast<float2*>(sx_own + g * C::kSLd + nt * 8 + 2 * t) = make_float2(s[nt][0], s[nt][1]);
-            *reinterpret_cast<float2*>(sx_own + (g + 8) * C::kSLd + nt * 8 + 2 * t) = make_float2(s[nt][2], s[nt][3]);
+            for (int nt = 0; nt < 2; ++nt) {
+                *reinterpret_cast<float2*>(sx_own + g * C::kSLd + nt * 8 + 2 * t) = make_float2(s[nt][0], s[nt][1]);
+                *reinterpret_cast<float2*>(sx_own + (g + 8) * C::kSLd + nt * 8 + 2 * t) = make_float2(s[nt][2], s[nt][3]);
+            }
+            bar_sync(1 + rg, C::DS * 32);
         }
-        bar_sync(1 + rg, C::DS * 32);
         float p[2][2][2];   // [row e][n-tile][key]
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
@@ -313,10 +334,13 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
             for (int nt = 0; nt < 2; ++nt)
 #pragma unroll
                 for (int c = 0; c < 2; ++c) {
-                    const int off = (g + 8 * e) * C::kSLd + nt * 8 + 2 * t + c;
-                    float x = sx_grp[off];
+                    float x = s[nt][2 * e + c];
+                    if constexpr (C::DS > 1) {
+                        const int off = (g + 8 * e) * C::kSLd + nt * 8 + 2 * t + c;
+                        x = sx_grp[off];
 #pragma unroll
-                    for (int d = 1; d < C::DS; ++d) x += sx_grp[d * 16 * C::kSLd + off];
+                        for (int d = 1; d < C::DS; ++d) x += sx_grp[d * 16 * C::kSLd + off];
+                    }
                     const int key = tile * kKeys + nt * 8 + 2 * t + c;
                     const bool ok = key >= rlo[e] && key <= rhi[e];
                     v[nt][c] = ok ? x * kLog2e : -INFINITY;
@@ -336,7 +360,7 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
             l[e] = l[e] * corr + sum;
             m[e] = mn;
 #pragma unroll
-            for (int dt = 0; dt < 16; ++dt) {
+            for (int dt = 0; dt < NT; ++dt) {
                 o[dt][2 * e] *= corr;
                 o[dt][2 * e + 1] *= corr;
             }
@@ -344,9 +368,9 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
         const unsigned pa[4] = {pack_h2(p[0][0][0], p[0][0][1]), pack_h2(p[1][0][0], p[1][0][1]), pack_h2(p[0][1][0], p[0][1][1]),
                                 pack_h2(p[1][1][0], p[1][1][1])};
 #pragma unroll
-        for (int dt = 0; dt < 16; dt += 2) {
+        for (int dt = 0; dt < NT; dt += 2) {
             unsigned b0, b1, b2, b3;
-            ldsm_x4_t(b0, b1, b2, b3, Vt + ((lane & 7) + ((lane >> 3) & 1) * 8) * C::kLd + ds * 128 + dt * 8 + (lane >> 4) * 8);
+            ldsm_x4_t(b0, b1, b2, b3, Vt + ((lane & 7) + ((lane >> 3) & 1) * 8) * C::kLd + ds * C::SW + dt * 8 + (lane >> 4) * 8);
             mma16816(o[dt], pa, b0, b1);
             mma16816(o[dt + 1], pa, b2, b3);
         }
@@ -362,32 +386,32 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
                 out[1] = L;
             }
 #pragma unroll
-            for (int dt = 0; dt < 16; ++dt) {
-                out[2 + ds * 128 + dt * 8 + 2 * t] = o[dt][2 * e];
-                out[3 + ds * 128 + dt * 8 + 2 * t] = o[dt][2 * e + 1];
+            for (int dt = 0; dt < NT; ++dt) {
+                out[2 + ds * C::SW + dt * 8 + 2 * t] = o[dt][2 * e];
+                out[3 + ds * C::SW + dt * 8 + 2 * t] = o[dt][2 * e + 1];
             }
         } else {
             const float inv = 1.f / L;
-            float* out = a.out + ((size_t) rrow[e] * sh.n_head + rhead[e]) * HD + ds * 128 + 2 * t;
+            float* out = a.out + ((size_t) rrow[e] * sh.n_head + rhead[e]) * HD + ds * C::SW + 2 * t;
 #pragma unroll
-            for (int dt = 0; dt < 16; ++dt)
+            for (int dt = 0; dt < NT; ++dt)
                 *reinterpret_cast<float2*>(out + dt * 8) = make_float2(o[dt][2 * e] * inv, o[dt][2 * e + 1] * inv);
         }
     }
 }
 
-template <int HD, int RG, bool DEC>
+template <int HD, int RG, int NS, bool DEC>
 void launch(const MmaArgs& a, int rows, dim3 grid, cudaStream_t st) {
-    using C = Cfg<HD, RG>;
+    using C = Cfg<HD, RG, NS>;
     const int raw_stage = kKeys * HD * kv_elem_bytes(a.kv_type) * (a.sh.one ? 1 : 2);
     const bool direct = a.kv_type == KvType::F16 && !a.sh.one;
-    const size_t smem = C::smem(raw_stage, direct);
+    const size_t smem = C::smem(raw_stage, direct, DEC && !direct && a.sh.one);
     const auto run = [&](auto kernel) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         bk::launch_pdl(kernel, grid, dim3(C::kThreads), smem, st, a, rows);
     };
-    if (direct) run(attn_mma_kernel<HD, RG, DEC, true>);
-    else run(attn_mma_kernel<HD, RG, DEC, false>);
+    if (direct) run(attn_mma_kernel<HD, RG, NS, DEC, true>);
+    else run(attn_mma_kernel<HD, RG, NS, DEC, false>);
 }
 
 void check_shape(const LayerShape& sh) {
@@ -407,8 +431,8 @@ void attn_prompt(const AttnPrompt& p, int rows, void* stream) {
     a.kv.c[0] = p.kv;
     const int G = p.sh.n_head / p.sh.n_kv;
     const auto grid = [&](int block_rows) { return dim3((unsigned) ((rows + block_rows / G - 1) / (block_rows / G)), (unsigned) p.sh.n_kv); };
-    if (p.sh.hd == 256) launch<256, 8, false>(a, rows, grid(Cfg<256, 8>::kRows), (cudaStream_t) stream);
-    else launch<512, 4, false>(a, rows, grid(Cfg<512, 4>::kRows), (cudaStream_t) stream);
+    if (p.sh.hd == 256) launch<256, 8, 1, false>(a, rows, grid(Cfg<256, 8, 1>::kRows), (cudaStream_t) stream);
+    else launch<512, 4, 4, false>(a, rows, grid(Cfg<512, 4, 4>::kRows), (cudaStream_t) stream);
     check("attn_prompt");
 }
 
@@ -419,8 +443,8 @@ void attn_chunks(const Attn& d, int rows, cudaStream_t st) {
     a.out = d.scratch;
     const int64_t keys = d.sh.window > 0 && d.max_keys > d.sh.window ? d.sh.window : d.max_keys;
     const dim3 grid((unsigned) chunk_bound(keys), (unsigned) (rows * d.sh.n_kv));
-    if (d.sh.hd == 256) launch<256, 1, true>(a, rows, grid, st);
-    else launch<512, 1, true>(a, rows, grid, st);
+    if (d.sh.hd == 256) launch<256, 1, 2, true>(a, rows, grid, st);
+    else launch<512, 1, 4, true>(a, rows, grid, st);
     check("attn_chunks");
 }
 
