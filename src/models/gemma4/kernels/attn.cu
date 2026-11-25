@@ -119,27 +119,35 @@ __global__ void __launch_bounds__(128) prep_kernel(Prep p, int rows) {
 
 // ---- decode attention: the chunks on the tensor cores (attn_mma.cu), then their merge
 
-// grid (row * n_head): the row's chunks merged in chunk order.
+// grid (row * n_head): the row's chunks merged in chunk order, each chunk's weight exp(max - M) computed once.
 __global__ void __launch_bounds__(128) attn_merge_kernel(Attn a, int rows) {
     bk::pdl_wait();
     bk::pdl_launch_dependents();
+    __shared__ float wt[kMaxChunks];
+    __shared__ float inv_l;
     const LayerShape& sh = a.sh;
     const int hd = sh.hd;
     const int r = blockIdx.x / sh.n_head, head = blockIdx.x % sh.n_head;
     if (r >= rows) return;
     const Split sp = split_of(a.pos[r], sh.window);
     const float* part = a.scratch + ((size_t) r * sh.n_head + head) * kMaxChunks * (hd + 2);
-    float M = -INFINITY;
-    for (int c = 0; c < sp.chunks; ++c) M = fmaxf(M, part[(size_t) c * (hd + 2)]);
-    float L = 0.f;
-    for (int c = 0; c < sp.chunks; ++c) L += part[(size_t) c * (hd + 2) + 1] * expf(part[(size_t) c * (hd + 2)] - M);
-    const float invL = 1.0f / L;
+    if (threadIdx.x == 0) {
+        float M = -INFINITY;
+        for (int c = 0; c < sp.chunks; ++c) M = fmaxf(M, part[(size_t) c * (hd + 2)]);
+        float L = 0.f;
+        for (int c = 0; c < sp.chunks; ++c) {
+            wt[c] = expf(part[(size_t) c * (hd + 2)] - M);
+            L += part[(size_t) c * (hd + 2) + 1] * wt[c];
+        }
+        inv_l = 1.0f / L;
+    }
+    __syncthreads();
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float A = 0.f;
-        for (int c = 0; c < sp.chunks; ++c) A += part[(size_t) c * (hd + 2) + 2 + d] * expf(part[(size_t) c * (hd + 2)] - M);
+        for (int c = 0; c < sp.chunks; ++c) A += part[(size_t) c * (hd + 2) + 2 + d] * wt[c];
         const size_t at = ((size_t) r * sh.n_head + head) * hd + d;
-        if (a.act) static_cast<uint16_t*>(a.act)[at] = bk::bf16_from_f32(A * invL);
-        else a.out[at] = A * invL;
+        if (a.act) static_cast<uint16_t*>(a.act)[at] = bk::bf16_from_f32(A * inv_l);
+        else a.out[at] = A * inv_l;
     }
 }
 

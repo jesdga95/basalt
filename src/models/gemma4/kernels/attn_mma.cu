@@ -168,15 +168,21 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
         }
     }
     const int t0 = kmin / kKeys, t1 = kmax / kKeys;
-    // the queries of this warp's slice as A fragments: 8 steps of 16 dims
-    unsigned qf[8][4];
+    // the queries of this warp's slice as A fragments: 8 steps of 16 dims; a decode row's as two fp16 terms (the rounding
+    // and what it leaves), so its scores keep the fp32 queries' precision
+    unsigned qf[8][4], ql[DEC ? 8 : 1][4];
 #pragma unroll
     for (int ks = 0; ks < 8; ++ks)
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
             const int e = r & 1, d = ds * 128 + ks * 16 + 2 * t + (r >> 1) * 8;
             const float2 v = *reinterpret_cast<const float2*>(a.q + ((size_t) rrow[e] * sh.n_head + rhead[e]) * HD + d);
-            qf[ks][r] = rok[e] || !DEC ? pack_h2(v.x, v.y) : 0u;
+            const __half2 hi = __floats2half2_rn(v.x, v.y);
+            qf[ks][r] = rok[e] || !DEC ? *reinterpret_cast<const unsigned*>(&hi) : 0u;
+            if constexpr (DEC) {
+                const float2 h = __half22float2(hi);
+                ql[ks][r] = rok[e] ? pack_h2(v.x - h.x, v.y - h.y) : 0u;
+            }
         }
 
     const auto stage_raw = [&](int tile, int buf) {
@@ -288,6 +294,10 @@ __global__ void __launch_bounds__(Cfg<HD, RG>::kThreads, 1) attn_mma_kernel(MmaA
             ldsm_x4(b0, b1, b2, b3, Kt + ((lane & 7) + ((lane >> 4) << 3)) * C::kLd + ds * 128 + ks * 16 + ((lane >> 3) & 1) * 8);
             mma16816(s[0], qf[ks], b0, b1);
             mma16816(s[1], qf[ks], b2, b3);
+            if constexpr (DEC) {
+                mma16816(s[0], ql[ks], b0, b1);
+                mma16816(s[1], ql[ks], b2, b3);
+            }
         }
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
