@@ -15,6 +15,7 @@ Built from Google's BF16 checkpoint (`google/gemma-4-26b-a4b-it`) and, for draft
 - Output head (the tied embedding): FP8 E4M3 rows with an FP32 scale per row. Token embedding BF16, kept in RAM.
 - Router F32 with its input scale folded in; norms and layer scalars F32.
 - The assistant drafter's projections and head FP8 the same way.
+- Vision tower and its projection into the text model's width: BF16 and F32 as stored (`vision/mmproj`, 1.1 GiB).
 
 ## Architecture
 
@@ -35,6 +36,10 @@ The `gemma4` architecture (code in `src/models/gemma4`):
   through its layers, whose queries read the caches of the model's last sliding and last full layer at the anchor's position;
   its head picks the draft and its state goes to the next step. `--spec` caps the window (default: the drafter's own draft
   count plus the anchor).
+- **Vision:** a 27-layer ViT on 16 x 16 patches (column and row position tables, RMS norms around attention and a gated
+  MLP, queries and keys RMS-normed per head with 2D rotary positions); each cell of 3 x 3 patches is pooled to one row,
+  standardised and projected to the text model's width. A picture's rows stand in for its `<|image|>` tokens and are read as
+  one prompt chunk: the window layers let them attend to each other both ways, the full layers keep them causal.
 
 ## Prompt and decode
 
@@ -52,6 +57,8 @@ The `gemma4` architecture (code in `src/models/gemma4`):
 
 Every weight sits on one card; the embedding stays in RAM. The sliding layers' rings are a fixed size; the full layers' cells
 grow with `--max-context`. `--batch N` slots each take their own caches.
+With `--vision dynamic` the image encoder's region (1.28 GiB) stays free beside the caches, so the context is that much
+smaller.
 
 ## Chat
 
@@ -59,3 +66,12 @@ The dialect (`serve/models/gemma4.py`) renders the checkpoint's template: thinki
 turn, the reply's `<|channel>thought ... <channel|>`), off with reasoning effort `none`. Tool calls are
 `<|tool_call>call:NAME{key:value,...}<tool_call|>`, string values between `<|"|>` marks; the parser turns them into JSON
 arguments.
+
+## Images
+
+`--vision dynamic` ([vision](../running.md#vision---vision)). The picture is resized (aspect kept, bicubic) to the largest
+size of whole 48 x 48 cells within 280 cells, up or down, as the checkpoint's processor does; one token per cell, so a
+picture takes up to 280 tokens. Transparent pixels are laid over white. The encoder's weights are staged in page-locked RAM
+(1.1 GiB) and keep no card memory at rest: a request's pictures take a region of the card (1.28 GiB) from the room the model
+keeps free, and it goes back when they are read. On an RTX 5090 a request with one fresh picture gives its first token in 70
+to 120 ms (the region's copy, the encoder and the prompt).

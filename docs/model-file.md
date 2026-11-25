@@ -272,6 +272,9 @@ python3 tools/convert/convert.py --checkpoint gemma4 --drafter gemma4-assistant 
   MLP's inner width zero-padded to a multiple of 128; `token_embd.weight` BF16 as stored; `output.weight` the tied embedding as
   `F8_E4M3` rows with `output.scale` per row; `ffn_gate_inp.weight` the router F32 with its input scale and 1 / sqrt(hidden)
   folded in; norms and `layer_scalar` F32. The drafter's tensors as `assistant.*`, rounded the same way.
+- `vision/mmproj`: the vision tower as llama.cpp's clip GGUF (projector `gemma4v`): the patch embedding as the F32 convolution,
+  the column and row position tables, the norms and the standardisation F32, the products and the embedding projection
+  (`mm.input_projection.weight`) BF16 as stored.
 - `tokenizer/*`: the checkpoint's SentencePiece-style BPE as the engine's tables: a token's bytes are its text with U+2581 as a
   space, spelled in GPT-2's byte alphabet; the byte-fallback tokens keep their `<0xNN>` text and type 6. The engine starts a
   piece from its characters (the fallback bytes for a character the vocabulary lacks) and merges by rank, as the checkpoint's
