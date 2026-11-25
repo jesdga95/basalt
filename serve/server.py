@@ -501,7 +501,7 @@ def main() -> int:
     if router.cache is not None:
         router.start_guard()
     for s, m in zip(services, (x[0] for x in settings)):
-        s.start_idle_unload()
+        s.start_idle_unload(unloader=lambda idle_for=None, s=s: router.unload(s, idle_for=idle_for))
         s.start_idle_sleep(announce=not shared_sleep, name=s.model if multi else None)
         s.on_loaded = announcer(s, m)
 
