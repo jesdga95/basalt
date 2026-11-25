@@ -402,9 +402,9 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 #log u { text-decoration: none; color: var(--fg-3); }
 #log span { white-space: pre-wrap; word-break: break-word; }
 #log .warn span, #log .warn u { color: var(--warn); }
-#log .error span, #log .error u { color: var(--err); }
-#log.warnonly > div:not(.warn):not(.error):not(.empty) { display: none; }
-#log > div:last-child:not(.empty) span { color: var(--fg); }
+#log .err span, #log .err u { color: var(--err); }
+#log.warnonly > div:not(.warn):not(.err):not(.empty) { display: none; }
+#log > div:last-child:not(.warn):not(.err):not(.empty) span { color: var(--fg); }
 #log .empty { display: block; color: var(--fg-3); }
 
 /* ---------- the footer: the newest log line, totals ---------- */
@@ -413,7 +413,7 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .ticker { display: flex; align-items: center; gap: 10px; padding: 0; min-width: 0; flex: 1; text-align: left; color: var(--fg-2); }
 .ticker span { overflow: hidden; text-overflow: ellipsis; white-space: pre; }
 .ticker[data-lvl="warn"] span { color: var(--warn); }
-.ticker[data-lvl="error"] span { color: var(--err); }
+.ticker[data-lvl="err"] span { color: var(--err); }
 .ticker:hover span { color: var(--fg); }
 .tot { flex: none; white-space: nowrap; }
 .tot b { color: var(--fg-2); font-weight: 500; }
