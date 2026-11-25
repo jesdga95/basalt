@@ -115,6 +115,7 @@ private:
     void* dev(size_t bytes, bool& ok);
     void* mapped(size_t bytes, bool& ok);   ///< mapped host memory; the device's pointer to it
     std::vector<void*> allocs_, pinned_;
+    int device_ = -1;
     uint64_t bytes_ = 0;
     bool finished_ = false;
 };
@@ -177,9 +178,10 @@ public:
     void note(int64_t pos0, int rows);
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, void* stream);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed& need, void* stream);
-    /// Conversations: the sliding-window layers' rings are running state, the full layers' cells go with the target's.
+    /// Conversations: the sliding-window layers' rings and the Markov feature ring are running state, the full layers' cells go with the target's.
     size_t running_bytes() const;
     void running_regions(core::RunningState& st) const;
+    void restored(int64_t pos);
     size_t cells_bytes(int64_t positions) const;
     /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
     /// positions and a block past them; trim gives back what lies past them.
@@ -219,6 +221,7 @@ private:
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
+    int device_ = -1;
     std::vector<void*> allocs_, pinned_;
     uint8_t* slab_ptr_ = nullptr;
     size_t slab_rem_ = 0;
@@ -261,6 +264,7 @@ private:
     int pending_ = 0;
     DsparkBatch* batch_owner_ = nullptr;
     int batch_slot_ = -1;
+    void* draft_stream_ = nullptr;
     // --diag-dump
     std::FILE* dump_ = nullptr;
     int dumped_ = 0;
@@ -285,6 +289,7 @@ public:
 private:
     void* dev(size_t bytes, bool& ok);
     const DsparkWeights* w_ = nullptr;
+    int device_ = -1;
     std::vector<void*> allocs_, pinned_;
     int max_sessions_ = 0, max_rows_ = 0, tap_rows_ = 0;
     int64_t att_cells_ = 0;

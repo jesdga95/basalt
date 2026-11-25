@@ -7,6 +7,7 @@
 // (the chunk's keys are staged, then its last positions moved in) and the convolution rings' last kConvRing positions.
 #include "models/inkling2/prompt.hpp"
 
+#include "basalt/core/on_device.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/kernels/dense_ops.hpp"
@@ -155,15 +156,24 @@ struct Lane {
 
 class Prompt final : public PromptRunner {
 public:
-    Prompt(InklingModel& m, cudaStream_t s) : m_(m), g_(m.geo()) { lane_[0].stream = s; }
+    Prompt(InklingModel& m, cudaStream_t s) : m_(m), g_(m.geo()) {
+        lane_[0].device = lane_device(0);
+        lane_[0].stream = s;
+        if (lanes() > 1) lane_[1].device = lane_device(1);
+    }
     ~Prompt() override {   // every read synced its streams before it returned
+        const core::OnDevice on_main(m_.device());
         // the copies decode keeps in the arena go back to RAM; an upload into it that may still run keeps the arena
         if (m_.has_spill() && m_.cards() == 1 && !m_.set_prompt_arena(nullptr, 0)) return;
         for (cudaEvent_t& e : done_)
             if (e) cudaEventDestroy(e);
         for (int i = lanes() - 1; i >= 0; --i) {
             Lane& k = lane_[i];
-            cudaSetDevice(k.device);
+            const core::OnDevice on_lane(k.device);
+            if (!core::gpu_left_running().load()) {
+                if (k.copy) (void) cudaStreamSynchronize(k.copy);
+                if (i > 0 && k.stream) (void) cudaStreamSynchronize(k.stream);
+            }
             if (k.hand) cudaEventDestroy(k.hand);
             if (k.freed) cudaEventDestroy(k.freed);
             if (k.staged) cudaEventDestroy(k.staged);
@@ -185,6 +195,7 @@ public:
     }
 
     bool init(std::string& err) {
+        const core::OnDevice on_main(m_.device());
         if (!walk(g_, walk_, err)) return false;
         {   // the runs of visits on each card (walk.hpp)
             std::vector<int> card_of((size_t) g_.n_layers);
@@ -199,7 +210,7 @@ public:
         for (int i = lanes() - 1; i >= 0; --i) {   // the first card's last: it stays current
             cur_ = i;
             lane_[i].device = lane_device(i);
-            cudaSetDevice(lane_[i].device);
+            const core::OnDevice on_lane(lane_[i].device);
             if (i > 0 && cudaStreamCreateWithFlags(&lane_[i].stream, cudaStreamNonBlocking) != cudaSuccess) {
                 err = "cannot create the prompt path's second stream";
                 return false;
@@ -413,7 +424,10 @@ public:
             const LayerWeights& w = m_.layer(l);
             if (!lane_runs(l)) continue;
             if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) continue;
-            if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
+            if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) {
+                (void) cudaStreamSynchronize(strm());
+                return false;
+            }
         }
         if (cudaStreamSynchronize(strm()) != cudaSuccess) {
             err = "the prompt path's setup failed";
@@ -545,14 +559,14 @@ private:
     // (core::gpu_left_running).
     bool drain() noexcept {
         bool out = true;
-        for (int i = m_.cards() - 1; i >= 0; --i) {
+        for (int i = lanes() - 1; i >= 0; --i) {
             Lane& k = lane_[i];
             if (cudaSetDevice(k.device) != cudaSuccess) {
                 out = false;
                 continue;
             }
             if (k.copy && cudaStreamSynchronize(k.copy) != cudaSuccess) out = false;
-            if (cudaStreamSynchronize(k.stream) != cudaSuccess) out = false;
+            if (k.stream && cudaStreamSynchronize(k.stream) != cudaSuccess) out = false;
         }
         cur_ = 0;
         if (cudaSetDevice(lane_[0].device) != cudaSuccess) out = false;
@@ -750,8 +764,8 @@ private:
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
-        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, chunk_, c.k, c.v, c.cap, pos0, rows, g_.window,
-                                  kv_cache_row_bytes(fp8, int8), strm());
+        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, chunk_, c.k, c.v, c.cap, pos0, rows,
+                                  (int) std::min<int64_t>(c.cap, chunk_), kv_cache_row_bytes(fp8, int8), strm());
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
                  q8::Epilogue::Store, strm());

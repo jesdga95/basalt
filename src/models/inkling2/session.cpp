@@ -19,6 +19,7 @@
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/graph.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -69,6 +70,11 @@ constexpr int kSegWords = (sizeof(bk::WindowSegs) + 15) / 4;   // device WindowS
 int call_rows_of(const InklingModel& m) {
     return m.sessions() > 1 ? std::min(kMaxRows, m.sessions() * kWindowRows) : kWindowRows;
 }
+
+struct RestoreDevice {
+    int dev = 0;
+    ~RestoreDevice() { cudaSetDevice(dev); }
+};
 
 // The forward scratch: the rows of one call through the layers and the head. Every session of the model runs on the same
 // buffers (Shared below), one call at a time: each call syncs its stream before it returns, and a batch window syncs every
@@ -134,9 +140,11 @@ struct Shared {
         max_rows = call_rows_of(m);
         if (!alloc_scratch(m, x, m.device(), true, err)) return false;
         if (m.cards() > 1) {
-            cudaSetDevice(m.card_device(1));
-            const bool ok = alloc_scratch(m, x1, m.card_device(1), false, err);
-            cudaSetDevice(m.device());
+            bool ok = false;
+            {
+                const core::OnDevice on_peer(m.card_device(1));
+                ok = alloc_scratch(m, x1, m.card_device(1), false, err);
+            }
             if (!ok) return false;
             tap_slot0 = max_pulls;
             hand_slots = max_pulls + kDsTargets;
@@ -217,7 +225,7 @@ struct Shared {
 // One card's side of a session's forward: its streams and events and its running counts of the experts' lookups. The first
 // card's are the session's own members (stream_, ...); the layer split's second card has its own.
 struct Lane {
-    int device = 0;
+    int device = -1;
     const Scratch* x = nullptr;
     cudaStream_t stream = nullptr, ra_st = nullptr, pf_st = nullptr;
     cudaEvent_t ra_ev = nullptr, ra_join = nullptr, gs_ev = nullptr, pf_ev = nullptr, pf_join = nullptr;
@@ -233,9 +241,15 @@ class Session final : public model::BatchSession, private Scratch {
 public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        const core::OnDevice on_main(m_.device());
         if (sh_) std::erase(sh_->heat_sessions, this);
-        if (stream_) cudaStreamSynchronize(stream_);
-        if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
+        for (cudaStream_t st : {stream_, ra_st_, pf_st_})
+            if (st) (void) cudaStreamSynchronize(st);
+        if (Lane& k = lane_[1]; k.device >= 0) {
+            const core::OnDevice on_peer(k.device);
+            for (cudaStream_t st : {k.stream, k.ra_st, k.pf_st})
+                if (st) (void) cudaStreamSynchronize(st);
+        }
         if (!m_.wedged() && m_.has_spill() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {
@@ -255,19 +269,24 @@ public:
                                       (unsigned long long) loan);
             }
         }
+        graphs_.clear();
+        elastic_.clear();
+        if (d_hist_) {
+            cudaFree(d_hist_);
+            d_hist_ = nullptr;
+        }
         for (auto [d, p] : bufs_) {
-            cudaSetDevice(d);
+            const core::OnDevice on_d(d);
             cudaFree(p);
         }
         for (void* p : pinned_) cudaFreeHost(p);
-        if (Lane& k = lane_[1]; k.stream) {
-            cudaSetDevice(k.device);
+        if (Lane& k = lane_[1]; k.device >= 0) {
+            const core::OnDevice on_peer(k.device);
             for (cudaEvent_t e : {k.ra_ev, k.ra_join, k.gs_ev, k.pf_ev, k.pf_join, k.hand, io_ev1_})
                 if (e) cudaEventDestroy(e);
             for (cudaStream_t st : {k.ra_st, k.pf_st, k.stream})
                 if (st) cudaStreamDestroy(st);
         }
-        cudaSetDevice(m_.device());
         for (cudaEvent_t e : {hand0_, io_ev0_})
             if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : stage_ev_)
@@ -280,6 +299,8 @@ public:
     }
 
     bool init(std::string& err) {
+        const RestoreDevice restore_dev{m_.device()};
+        lane_[0].device = m_.device();
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&pf_st_, cudaStreamNonBlocking) != cudaSuccess ||
@@ -496,7 +517,7 @@ public:
             logits_ = head > 0 ? blog_ : nullptr;
             if (head > 0) logits_gen_ = ++sh_->logits_gen;
             if (!want) continue;
-            if (!pick(r, t0, head, err)) return {model::Status::Error, "inkling2: " + err};
+            if (!pick(r, r.row_tokens ? t0 : 0, head, err)) return {model::Status::Error, "inkling2: " + err};
             if (r.row_tokens)
                 for (int i = 0; i < n; ++i) r.row_tokens[t0 + i] = picks_[(size_t) i];
             if (last && r.next_token) *r.next_token = picks_[(size_t) head - 1];
@@ -715,6 +736,9 @@ public:
         bk::SamplerParams sp = sampling_;
         sp.logit_bias = d_mask_;
         sp.counter += (uint64_t) row;
+        if (!sp.greedy && sp.temperature > 0.f && bk::sampler_list_len(sp.top_k, g_.n_vocab) > bk::kSamplerNarrowMax &&
+            !bk::sampler_wide_reserve(g_.n_vocab, stream_))
+            return {model::Status::Error, "inkling2: out of device memory for the sampler"};
         bk::sample_tokens(logits_ + (size_t) row * g_.n_vocab, 1, g_.n_vocab,
                           history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr, history_len_, sp, pick_ + 24, stream_);
         int32_t t = 0;
@@ -741,7 +765,7 @@ public:
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
         if (m_.wedged()) return wedged();
         if (!m_.copies()) return {};
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !feed_heat()) return wedged();
+        if (!sync_lanes() || !feed_heat()) return wedged();
         if (low && !recall_loan(-1)) return wedged();
         if (!m_.lend(low))
             return {model::Status::Error, low ? "inkling2: the expert copies could not go back to RAM"
@@ -754,7 +778,7 @@ public:
     // no copies to resize: refused unless it already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
         if (m_.wedged()) return wedged();
-        if (cudaStreamSynchronize(stream_) != cudaSuccess)
+        if (!sync_lanes())
             return {model::Status::Error, "inkling2: the session stream failed before resizing VRAM"};
         if (!feed_heat()) return wedged();
         const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20);
@@ -787,8 +811,19 @@ public:
     model::Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                               int count) override {
         if (m_.wedged()) return wedged();
-        if (!sh_->ds_batch || !sh_->ds_batch->on() || count <= 1 || count > bk::kWindowSegsMax)
+        if (!sh_->ds_batch || !sh_->ds_batch->on() || count <= 1)
             return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        if (count > bk::kWindowSegsMax) {
+            for (int i = 0; i < count; ++i) {
+                Session* s = dynamic_cast<Session*>(peers[i]);
+                if (!s || s->sh_ != sh_) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+            }
+            for (int i = 0; i < count; ++i) {
+                Session* s = static_cast<Session*>(peers[i]);
+                if (model::Result r = s->dspark_.draft_begin(anchors[i], pos[i], n[i], stream_); !r.ok()) return r;
+            }
+            return {};
+        }
         DsparkHook* hooks[bk::kWindowSegsMax] = {};
         for (int i = 0; i < count; ++i) {
             Session* s = dynamic_cast<Session*>(peers[i]);
@@ -1017,10 +1052,7 @@ public:
     bool settle_hits() {
         if (!m_.has_spill() || !ex_tally_) return true;
         std::vector<uint32_t> t;
-        bool ok = true;
-        for (const Lane& k : lane_)
-            if (k.stream && cudaStreamSynchronize(k.stream) != cudaSuccess) ok = false;
-        if (!ok || !read_tally(t)) {
+        if (!sync_lanes() || !read_tally(t)) {
             m_.wedge();
             basalt::log::error("basalt inkling2", "expert lookup counters could not be read; restart the engine");
             return false;
@@ -1095,6 +1127,7 @@ public:
 
     model::Result running_restored(int64_t pos, const uint8_t*) override {
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+        dspark_.restored(pos);
         stale_ = false;   // the rings are the checkpoint's again
         return {};
     }
@@ -1113,11 +1146,14 @@ public:
         if (stale_) return stale();
         if (m_.wedged()) return wedged();
         if (positions < 0 || positions > backed_) return {model::Status::Error, "inkling2: positions past the backed caches"};
-        cudaStreamSynchronize(stream_);
+        const core::OnDevice on_main(m_.device());
+        if (!sync_lanes()) return {model::Status::Error, "inkling2: the session stream failed before saving caches"};
         kv.clear();
         const size_t run = (size_t) positions * cell_bytes();
-        for (const VisitCache& c : vc_) {
+        for (size_t vi = 0; vi < vc_.size(); ++vi) {
+            const VisitCache& c = vc_[vi];
             if (c.ring) continue;
+            const core::OnDevice on_dev(m_.card_device(slot_card_[vi]));
             core::ConversationKv k;
             k.format = cell_format();
             k.page_size = 1;
@@ -1142,14 +1178,17 @@ public:
         if (m_.wedged()) return wedged();
         if (positions < 0 || positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         if (std::string e; !ensure_positions(positions, e)) return grow_failed(e);
-        cudaStreamSynchronize(stream_);
+        const core::OnDevice on_main(m_.device());
+        if (!sync_lanes()) return {model::Status::Error, "inkling2: the session stream failed before restoring caches"};
         const size_t run = (size_t) positions * cell_bytes();
         size_t i = 0;
-        for (const VisitCache& c : vc_) {
+        for (size_t vi = 0; vi < vc_.size(); ++vi) {
+            const VisitCache& c = vc_[vi];
             if (c.ring) continue;
             if (i >= kv.size() || kv[i].format != cell_format() || kv[i].cells != positions || kv[i].heads != kKvHeads ||
                 kv[i].k.size() < run || kv[i].v.size() < run)
                 return {model::Status::Error, "inkling2: a parked conversation has other caches"};
+            const core::OnDevice on_dev(m_.card_device(slot_card_[vi]));
             const auto up = [&](void* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t at) {
                     return basalt::core::device_copy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
@@ -1175,7 +1214,7 @@ public:
     ExpertCounts expert_counts() const override {
         if (!m_.has_spill() || !ex_tally_) return {lookups_, lookups_, 0, 0};
         std::vector<uint32_t> t;
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) return {lookups_, lookups_, 0, 0};
+        if (!sync_lanes() || !read_tally(t)) return {lookups_, lookups_, 0, 0};
         uint64_t loan = 0;
         const CardShare sh = lookup_share(t, loan);
         return {(int64_t) (sh.card + sh.peer), (int64_t) sh.all, 0, 0};
@@ -1194,7 +1233,7 @@ public:
         return out;
     }
     bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(tally_h_)) return false;
+        if (!sync_lanes() || !read_tally(tally_h_)) return false;
         map_.take(tally_h_, total, homes, routed);
         return true;
     }
@@ -1232,12 +1271,26 @@ private:
         return p;
     }
 
+    bool sync_lanes() const {
+        bool ok = true;
+        {
+            const core::OnDevice on_main(m_.device());
+            if (stream_ && cudaStreamSynchronize(stream_) != cudaSuccess) ok = false;
+        }
+        if (lane_[1].stream) {
+            const core::OnDevice on_peer(lane_[1].device);
+            if (cudaStreamSynchronize(lane_[1].stream) != cudaSuccess) ok = false;
+        }
+        return ok;
+    }
+
     // Every card's running counts of the experts' lookups, summed (a card counts its own layers').
     bool read_tally(std::vector<uint32_t>& t) const {
         t.assign((size_t) expert_pairs(), 0u);
         std::vector<uint32_t> c(t.size());
         for (const Lane& k : lane_) {
             if (!k.ex_tally) continue;
+            const core::OnDevice on_lane(k.device);
             if (basalt::core::device_copy(c.data(), k.ex_tally, c.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
             for (size_t i = 0; i < t.size(); ++i) t[i] += c[i];
         }
@@ -1604,6 +1657,7 @@ private:
         try {
             body(rows, head, full_keys);
         } catch (...) {   // the stream leaves the capture before the call's cleanup syncs it
+            cudaSetDevice(m_.device());
             cudaGraph_t dropped = nullptr;
             cudaStreamEndCapture(stream_, &dropped);
             if (dropped) cudaGraphDestroy(dropped);
@@ -1629,6 +1683,7 @@ private:
     // Launches only: the visits, then the head. Each kernel may start while the one before it finishes (it waits for it
     // before reading what it wrote), so a product streams its first weights during the glue before it.
     void body(int rows, int head, int64_t full_keys) {
+        const RestoreDevice restore_dev{m_.device()};
         for (Lane& k : lane_) k.ra_on = k.pf_on = false;
         visits_and_head(rows, head, full_keys);
         join_sides(lane_[0]);
@@ -1770,8 +1825,7 @@ private:
     // Admission to the CPU experts' windows (CpuExperts::enter): held from before a call's first window until the sync
     // that ends them, so an abort waits for the calls in flight, and a call it interrupted discards its results.
     bool admit(std::string& err) {
-        if (!sh_->cpu) return true;
-        if (!sh_->cpu->enter()) {
+        if (sh_->cpu && !sh_->cpu->enter()) {
             err = "the CPU experts were stopped";
             return false;
         }
@@ -1783,21 +1837,30 @@ private:
     bool complete(cudaError_t synced) {
         if (!admitted_) return synced == cudaSuccess;
         admitted_ = false;
-        if (synced == cudaSuccess && lane_[1].stream) synced = cudaStreamSynchronize(lane_[1].stream);
+        if (lane_[1].stream) {
+            const core::OnDevice on_peer(lane_[1].device);
+            const cudaError_t pe = cudaStreamSynchronize(lane_[1].stream);
+            if (synced == cudaSuccess) synced = pe;
+        }
         const bool joined = !fork_open_;
         fork_open_ = false;
+        if (!sh_->cpu) return synced == cudaSuccess && joined;
         return sh_->cpu->leave(synced, joined) && synced == cudaSuccess && joined;
     }
     // An exit before that sync: the window stream is synchronized first.
     void release() {
-        if (admitted_) complete(cudaStreamSynchronize(stream_));
+        if (!admitted_) return;
+        const core::OnDevice on_main(m_.device());
+        complete(cudaStreamSynchronize(stream_));
     }
     // The end of a call that took admission: its closing sync, then the abort's verdict on its results.
     model::Result end_call(const char* failed) {
         const cudaError_t synced = cudaStreamSynchronize(stream_);
         const bool kept = complete(synced);
         if (synced != cudaSuccess) return {model::Status::Error, std::string("inkling2: ") + failed};
-        if (!kept) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
+        if (!kept)
+            return {model::Status::Error,
+                    sh_->cpu ? "inkling2: the CPU experts were stopped" : std::string("inkling2: ") + failed};
         return {};
     }
     // Gives admission up on every return of a call that took it, unless passed on.
@@ -1856,20 +1919,36 @@ private:
         if (!r.sampling) sp.temperature = 0.f;
         sp.counter += (uint64_t) t0;
         sp.logit_bias = bias_on_ ? d_bias_ : nullptr;
-        history_len_ = r.history != nullptr ? r.history_len : 0;
-        if (history_len_ > 0) {   // the penalties' history of each row of the window
-            const size_t n = (size_t) kWindowRows * history_len_;
+        if (!sp.greedy && sp.temperature > 0.f && bk::sampler_list_len(sp.top_k, g_.n_vocab) > bk::kSamplerNarrowMax &&
+            !bk::sampler_wide_reserve(g_.n_vocab, st)) {
+            err = "out of device memory for the sampler";
+            return nullptr;
+        }
+        const int hist_len = r.history != nullptr ? r.history_len : 0;
+        history_len_ = 0;
+        if (hist_len > 0) {   // the penalties' history of each row of the window
+            const size_t n = (size_t) std::max(kWindowRows, rows) * (size_t) hist_len;
             if (d_hist_len_ < n) {
-                bool ok = true;
-                d_hist_ = (int32_t*) alloc(n * 4, ok);
-                if (!ok) {
+                const core::OnDevice on_main(m_.device());
+                int32_t* fresh = nullptr;
+                if (cudaMalloc(&fresh, n * sizeof(int32_t)) != cudaSuccess) {
                     cudaGetLastError();
                     err = "out of device memory for the sampling history";
                     return nullptr;
                 }
+                if (d_hist_) {
+                    (void) cudaStreamSynchronize(st);
+                    cudaFree(d_hist_);
+                }
+                d_hist_ = fresh;
                 d_hist_len_ = n;
             }
-            cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
+            if (cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * hist_len, (size_t) rows * hist_len * 4,
+                                cudaMemcpyHostToDevice, st) != cudaSuccess) {
+                err = "the sampling history upload failed";
+                return nullptr;
+            }
+            history_len_ = hist_len;
         }
         sampling_ = sp;
         bk::sample_tokens(logits_, rows, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);

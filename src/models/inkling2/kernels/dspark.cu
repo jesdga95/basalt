@@ -516,8 +516,12 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     exact_x(xh_g, xl_g, xh, xl, tid, 512);
     const int n = collect_tiles(f, n_tiles, cand, part, prev, conf + i);
     if (n == 0) {   // never: the vocabulary has rows
-        if (tid == 0) ids[i] = *prev;
-        if (warp == 0) reinterpret_cast<uint4*>(w1_row)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) *prev * kDsRank)[lane];
+        if (tid == 0) {
+            *prev = 0;
+            ids[i] = 0;
+            conf[i] = 1.0f;
+        }
+        if (warp == 0) reinterpret_cast<uint4*>(w1_row)[lane] = reinterpret_cast<const uint4*>(w1)[lane];
         return;
     }
     for (int c = warp; c < n; c += 16) {   // by token from here: the pick's tie goes to the lower token
@@ -534,8 +538,15 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     __syncthreads();
     const int pick = *prev;
     if (tid == 0) ids[i] = pick;
-    for (int c = warp; c < n; c += 16)
-        if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_row)[lane] = wr[c][lane];
+    if (warp == 0) {
+        int match = -1;
+        for (int c = lane; c < n; c += 32)
+            if (f.list[c] == pick) match = c;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) match = max(match, __shfl_xor_sync(0xffffffffu, match, o));
+        reinterpret_cast<uint4*>(w1_row)[lane] =
+            match >= 0 ? wr[match][lane] : reinterpret_cast<const uint4*>(w1 + (int64_t) pick * kDsRank)[lane];
+    }
 }
 
 // by_row[r] = by_token[token_of(r)] (0 past the vocabulary).
@@ -996,8 +1007,12 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
     uint16_t* w1_b = w1_row + (size_t) b * kDsRank;
     const int n = collect_tiles(f, n_tiles, cand, part, prev_b, conf_b + step_i);
     if (n == 0) {
-        if (tid == 0) ids_b[step_i] = *prev_b;
-        if (warp == 0) reinterpret_cast<uint4*>(w1_b)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) *prev_b * kDsRank)[lane];
+        if (tid == 0) {
+            *prev_b = 0;
+            ids_b[step_i] = 0;
+            conf_b[step_i] = 1.0f;
+        }
+        if (warp == 0) reinterpret_cast<uint4*>(w1_b)[lane] = reinterpret_cast<const uint4*>(w1)[lane];
         return;
     }
     for (int c = warp; c < n; c += 16) {
@@ -1014,8 +1029,15 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
     __syncthreads();
     const int pick = *prev_b;
     if (tid == 0) ids_b[step_i] = pick;
-    for (int c = warp; c < n; c += 16)
-        if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_b)[lane] = wr[c][lane];
+    if (warp == 0) {
+        int match = -1;
+        for (int c = lane; c < n; c += 32)
+            if (f.list[c] == pick) match = c;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) match = max(match, __shfl_xor_sync(0xffffffffu, match, o));
+        reinterpret_cast<uint4*>(w1_b)[lane] =
+            match >= 0 ? wr[match][lane] : reinterpret_cast<const uint4*>(w1 + (int64_t) pick * kDsRank)[lane];
+    }
 }
 
 }  // namespace
