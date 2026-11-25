@@ -14,10 +14,19 @@ namespace basalt::models::hy4flash {
 inline void engram_ids(const EngramInfo& p, int e, int32_t token, int32_t prev1, int32_t prev2, int64_t pos, bool embedding,
                        uint32_t* ids, float& valid) {
     const int n_gram = p.n_gram, n_head = p.n_head, n_cols = p.n_cols();
-    const uint64_t* mult = p.mult.data() + (size_t) e * n_gram;
-    const uint64_t* primes = p.primes.data() + (size_t) e * n_cols;
-    const uint64_t* offs = p.offsets.data() + (size_t) e * n_cols;
-    const int64_t pad = p.token_map[(size_t) p.pad_token_id];
+    if (n_gram < 2 || n_gram > 3 || n_head <= 0 || e < 0 ||
+        (size_t) (e + 1) * (size_t) n_gram > p.mult.size() ||
+        (size_t) (e + 1) * (size_t) n_cols > p.primes.size() ||
+        (size_t) (e + 1) * (size_t) n_cols > p.offsets.size()) {
+        valid = 0.f;
+        return;
+    }
+    const uint64_t* mult = p.mult.data() + (size_t) e * (size_t) n_gram;
+    const uint64_t* primes = p.primes.data() + (size_t) e * (size_t) n_cols;
+    const uint64_t* offs = p.offsets.data() + (size_t) e * (size_t) n_cols;
+    const int64_t pad = (p.pad_token_id >= 0 && (size_t) p.pad_token_id < p.token_map.size())
+                            ? p.token_map[(size_t) p.pad_token_id]
+                            : 0;
     const auto cid = [&](int32_t t) -> int64_t {
         return t < 0 || (size_t) t >= p.token_map.size() ? -1 : p.token_map[(size_t) t];
     };
@@ -35,7 +44,8 @@ inline void engram_ids(const EngramInfo& p, int e, int32_t token, int32_t prev1,
         rolling ^= toks[o] * mult[o];
         for (int h = 0; h < n_head; ++h) {
             const int col = (o - 1) * n_head + h;
-            ids[col] = (uint32_t) (rolling % primes[col] + offs[col]);
+            const uint64_t prime = primes[col];
+            ids[col] = prime > 0 ? (uint32_t) (rolling % prime + offs[col]) : (uint32_t) offs[col];
         }
     }
     valid = dead ? 0.f : 1.f;

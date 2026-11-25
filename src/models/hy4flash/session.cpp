@@ -15,6 +15,8 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -50,11 +52,11 @@
 #include <cstdio>
 #include <numeric>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <set>
 #include <utility>
 #include <string>
-#include <atomic>
 #include <thread>
 #include <vector>
 #include <condition_variable>
@@ -104,7 +106,8 @@ struct Bufs {
           *qabs = nullptr, *qcur = nullptr, *olat = nullptr, *vout = nullptr, *gate = nullptr, *ik = nullptr, *ikn = nullptr,
           *ivt = nullptr, *igt = nullptr, *iq = nullptr, *iw = nullptr, *gu = nullptr, *h = nullptr, *rlog = nullptr, *rw = nullptr,
           *xlat = nullptr, *lat_out = nullptr, *moe_out = nullptr, *sh = nullptr, *erows = nullptr, *ekv = nullptr, *evalid = nullptr,
-          *pair_rows = nullptr, *h_erows = nullptr, *h_e = nullptr, *h_evalid = nullptr;
+          *pair_rows = nullptr, *h_erows = nullptr, *h_e = nullptr, *h_evalid = nullptr,
+          *d_erows = nullptr, *d_e = nullptr, *d_evalid = nullptr;
     int32_t *icells = nullptr, *meta_d = nullptr, *meta_h = nullptr, *ids = nullptr, *pair_map = nullptr, *pair_ident = nullptr,
             *mmq_ident = nullptr;
     void* mmq_xq = nullptr;
@@ -119,6 +122,7 @@ struct Bufs {
 // buffers of a decode window, the experts' staging and the products' workspaces. The engine runs one call at a time and each call
 // syncs its stream before it returns, so one set serves every session; only a conversation's own state is per session.
 struct Scratch {
+    int device = -1;
     Bufs dec;
     std::vector<void*> dev, pinned;
     float *iscore = nullptr, *ex_rows = nullptr;
@@ -133,6 +137,7 @@ struct Scratch {
     const float** h_rowptr = nullptr;
     void* h_plan = nullptr;
     ~Scratch() {
+        const core::OnDevice on(device);
         dec.release();
         for (void* p : dev) cudaFree(p);
         for (void* p : pinned) cudaFreeHost(p);
@@ -143,15 +148,12 @@ class Session final : public model::BatchSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        const core::OnDevice on(m_.device());
+        ring_join();
         settle_early();
-        big_.release();
-        platform::free_aligned(cpu_act_);
+        drain_prefetch();
         std::string e;
         join_moe(e);
-        for (cudaGraphExec_t g : gx_)
-            if (g) cudaGraphExecDestroy(g);
-        for (cudaGraphExec_t g : gbx_)
-            if (g) cudaGraphExecDestroy(g);
         if (joiner_.joinable()) {
             {
                 std::lock_guard<std::mutex> g(jm_);
@@ -160,17 +162,37 @@ public:
             jcv_.notify_one();
             joiner_.join();
         }
+        if (copy_) cudaStreamSynchronize(copy_);
+        if (stream_) cudaStreamSynchronize(stream_);
         if (ra_st_) cudaStreamSynchronize(ra_st_);
+        ring_close();
+        big_.release();
+        platform::free_aligned(cpu_act_);
+        cpu_act_ = nullptr;
+        for (cudaGraphExec_t g : gx_)
+            if (g) cudaGraphExecDestroy(g);
+        for (cudaGraphExec_t g : gbx_)
+            if (g) cudaGraphExecDestroy(g);
+        for (Stage& b : stage_) {
+            if (b.copied) cudaEventDestroy(b.copied);
+            if (b.done) cudaEventDestroy(b.done);
+        }
+        if (eng_ev_) cudaEventDestroy(eng_ev_);
+        if (ev_) cudaEventDestroy(ev_);
+        if (ra_ev_) cudaEventDestroy(ra_ev_);
+        if (copy_) cudaStreamDestroy(copy_);
+        if (ra_st_) cudaStreamDestroy(ra_st_);
+        if (stream_) cudaStreamDestroy(stream_);
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
-        if (ev_) cudaEventDestroy(ev_);
-        if (ra_ev_) cudaEventDestroy(ra_ev_);
-        if (ra_st_) cudaStreamDestroy(ra_st_);
-        if (stream_) cudaStreamDestroy(stream_);
+        ea_.clear();
+        pea_.clear();
+        sc_.reset();
     }
 
     bool init(std::string& err) {
+        const core::OnDevice on(m_.device());
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess ||
             cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
@@ -203,16 +225,16 @@ public:
         // host writes once the CPU's and the second card's rows landed
         {
             constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
-            if (cudaHostAlloc((void**) &h_ids_, (size_t) kLookupK * 4, kMapped) != cudaSuccess ||
-                cudaHostAlloc((void**) &h_words_, 64, kMapped) != cudaSuccess)
-                ok = false;
+            if (cudaHostAlloc((void**) &h_ids_, (size_t) kLookupK * 4, kMapped) != cudaSuccess) ok = false;
             else {
                 pinned_.push_back(h_ids_);
+                if (cudaHostGetDevicePointer((void**) &d_ids_, h_ids_, 0) != cudaSuccess) ok = false;
+            }
+            if (cudaHostAlloc((void**) &h_words_, 64, kMapped) != cudaSuccess) ok = false;
+            else {
                 pinned_.push_back(h_words_);
                 h_words_[0] = h_words_[1] = 0;
-                if (cudaHostGetDevicePointer((void**) &d_ids_, h_ids_, 0) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &d_words_, h_words_, 0) != cudaSuccess)
-                    ok = false;
+                if (cudaHostGetDevicePointer((void**) &d_words_, h_words_, 0) != cudaSuccess) ok = false;
             }
             if (cudaHostAlloc((void**) &stage_h_, kStageInts * 4, kMapped) != cudaSuccess) ok = false;
             else {
@@ -230,6 +252,7 @@ public:
             std::shared_ptr<void>& slot = m_.forward_scratch();
             if (!slot) {
                 auto sc = std::make_shared<Scratch>();
+                sc->device = m_.device();
                 if (!build_scratch(*sc, err)) return false;
                 slot = sc;
             }
@@ -371,6 +394,28 @@ public:
             b.host.push_back(p);
             return (float*) p;
         };
+        auto map_pin = [&](int64_t n, float*& dev_out) {
+            void* p = nullptr;
+            void* dp = nullptr;
+            if (count) {
+                dev_out = counted;
+                return counted;
+            }
+            constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
+            if (!ok || cudaHostAlloc(&p, std::max<size_t>((size_t) n * 4, 16), kMapped) != cudaSuccess) {
+                ok = false;
+                dev_out = nullptr;
+                return (float*) nullptr;
+            }
+            b.host.push_back(p);
+            if (cudaHostGetDevicePointer(&dp, p, 0) != cudaSuccess) {
+                ok = false;
+                dev_out = nullptr;
+                return (float*) nullptr;
+            }
+            dev_out = (float*) dp;
+            return (float*) p;
+        };
         const int A = std::min(R, kAttRows);
         b.rows = R;
         b.arows = A;
@@ -402,7 +447,9 @@ public:
         b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); // the identity maps are the ids of MMQ products: a tile reads the ids of its 128 columns, past the last row of the product
         b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used + kMmqTile);
         b.mmq_ident = (int32_t*) f(A + kMmqTile);
-        b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
+        b.h_erows = map_pin((int64_t) A * g_.n_embd, b.d_erows);
+        b.h_e = map_pin((int64_t) R * E, b.d_e);
+        b.h_evalid = map_pin(A, b.d_evalid);
         if (count) {
             f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
             b = Bufs();
@@ -442,6 +489,7 @@ public:
         xlat_ = b.xlat; lat_out_ = b.lat_out; moe_out_ = b.moe_out; sh_ = b.sh; erows_ = b.erows; ekv_ = b.ekv; evalid_ = b.evalid;
         pair_rows_ = b.pair_rows; pair_map_ = b.pair_map; pair_ident_ = b.pair_ident; mmq_ident_ = b.mmq_ident; mmq_xq_ = b.mmq_xq;
         h_erows_ = b.h_erows; h_e_ = b.h_e; h_evalid_ = b.h_evalid;
+        d_erows_ = b.d_erows; d_e_ = b.d_e; d_evalid_ = b.d_evalid;
     }
 
     // A prompt of `total` rows and the row buffers of a chunk (up to kMaxChunk rows). A short prompt (below kRingRows: an agent
@@ -559,7 +607,10 @@ public:
         lent_ = false;
     }
 
-    void end_prompt() override { release_prompt(); }
+    void end_prompt() override {
+        const core::OnDevice on(m_.device());
+        release_prompt();
+    }
 
     // The decode tier hits of the turn so far: the first kEarlyTokens tokens after a prompt and the rest, logged when the next
     // prompt starts (a turn that starts cold shows a low first share).
@@ -586,15 +637,18 @@ public:
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        const core::OnDevice on(m_.device());
         const model::Result r = dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
         early_window(anchor, pos);   // while the card runs the block
         return r;
     }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        const core::OnDevice on(m_.device());
         return dfly_.draft_end(ids, conf, max_n, n, stream_, need);
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        const core::OnDevice on(m_.device());
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
@@ -643,6 +697,7 @@ protected:
     bool batch_captured() const override { return false; }
     bool batch_ready() const override { return !rope_on_ && m_.diag_dump().empty(); }   // [vision] a picture's rotary table: in turn
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        const core::OnDevice on(m_.device());
         release_prompt();
         if (r.pos > (int64_t) hist_.size()) {
             err = "position " + std::to_string(r.pos) + " does not follow the state's " + std::to_string(hist_.size());
@@ -659,6 +714,7 @@ protected:
         return true;
     }
     bool batch_forward(const model::BatchView& v, std::string& err) override {
+        const core::OnDevice on(m_.device());
         bsegs_.clear();
         for (int i = 0; i < v.n; ++i) {
             Session* s = static_cast<Session*>(v.ss[i]);
@@ -684,6 +740,7 @@ protected:
         return ok;
     }
     void batch_take(const model::BatchView& v, int i) override {
+        const core::OnDevice on(m_.device());
         const model::DecodeRequest& r = v.reqs[i];
         const model::BatchWindow::Seg& sg = v.w.segs[(size_t) i];
         const Session* lead = static_cast<const Session*>(v.ss[0]);
@@ -698,6 +755,7 @@ protected:
         if (r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (h - 1) * V, V * 4, cudaMemcpyDeviceToHost, v.stream);
     }
     const int32_t* batch_draw(const model::BatchView& v, int i, std::string& err) override {
+        const core::OnDevice on(m_.device());
         if (!draw(v.reqs[i], 0, v.head[i], v.stream, err)) return nullptr;
         cudaMemcpyAsync(pick_h_, pick_, (size_t) v.head[i] * 4, cudaMemcpyDeviceToHost, v.stream);
         return pick_h_;
@@ -706,6 +764,7 @@ protected:
 public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
+        const core::OnDevice on(m_.device());
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
         if (!big_.rows) {   // a prompt starts
@@ -730,10 +789,20 @@ public:
         if (!open_prompt(std::max(r.total_tokens, r.n_tokens), err)) return {model::Status::Error, "hy4flash: " + err};
         if (tier_) { turn_h0_ = tier_->hits(); turn_l0_ = tier_->lookups(); }
         const int chunk = m_.diag_rows() > 0 ? std::min(rows_, m_.diag_rows()) : rows_;
+        struct LiveGuard {
+            const std::function<void(int)>*& live;
+            int& t0;
+            int& n;
+            ~LiveGuard() { live = nullptr; t0 = 0; n = 0; }
+        } live_guard{prefill_live_, prefill_t0_, prefill_n_};
+        prefill_live_ = r.live ? &r.live : nullptr;
         for (int t0 = 0; t0 < r.n_tokens; t0 += chunk) {
             if (r.stop && r.stop()) break;
             const int n = std::min(chunk, r.n_tokens - t0);
+            prefill_t0_ = t0;
+            prefill_n_ = n;
             if (!run_rows(r.tokens + t0, n, r.pos + t0, 0, err)) return {grow_failed_ ? model::Status::Refused : model::Status::Error, "hy4flash: " + err};
+            core::progress_beat();
             if (r.progress) {
                 cudaStreamSynchronize(stream_);
                 r.progress(t0 + n);
@@ -749,6 +818,7 @@ public:
     // contribution is masked (valid 0) and, to the rows after it, it is a padded history entry. The history therefore holds -1 for
     // an image row, which engram_ids reads as "no n-gram" on both counts.
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
+        const core::OnDevice on(m_.device());
         ImageEncoder& enc = m_.encoder();
         if (!enc.staged()) return {model::Status::NotImplemented, "hy4flash: started without --vision"};
         vision::Image img;
@@ -775,6 +845,7 @@ public:
         return {};
     }
     void images_done() override {
+        const core::OnDevice on(m_.device());
         m_.encoder().release();
         if (!vis_shrunk_) return;
         std::string e;
@@ -784,7 +855,10 @@ public:
     }
     // The rows of a picture block (newline rows included) at positions pos..: chunks of the row pass with the rows as the embeddings.
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid grid) override {
-        if (grid.nx <= 0 || (int64_t) grid.nx * grid.ny != n_rows) return {model::Status::Error, "hy4flash: an image block needs its grid"};
+        const core::OnDevice on(m_.device());
+        if (pos < 0 || n_rows <= 0 || rows == nullptr || grid.nx <= 0 || grid.ny <= 0 || (int64_t) grid.nx * grid.ny != n_rows)
+            return {model::Status::Error, "hy4flash: an image block needs its grid"};
+        dfly_.invalidate();   // DFLY HOOK
         sync_rope(pos);
         img_start_ = rope_.next();
         img_nx_ = grid.nx;
@@ -797,6 +871,7 @@ public:
             img_j_ = at;
             const bool ok = run_rows(dead.data(), n, pos + at, 0, err);
             emb_rows_ = nullptr;
+            core::progress_beat();
             if (!ok && grow_failed_) return {model::Status::Refused, "hy4flash: " + err};
             if (!ok) return {model::Status::Error, "hy4flash: " + err};
         }
@@ -805,6 +880,7 @@ public:
     }
 
     model::Result prepare() override {
+        const core::OnDevice on(m_.device());
         std::string e;
         if (!ensure_tier(e)) return {model::Status::Error, "hy4flash: " + e};
         if (elastic())
@@ -877,6 +953,7 @@ public:
     // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
     // return at the wake. The latent caches, the rings and the drafter's rows are conversation state and stay.
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
+        const core::OnDevice on(m_.device());
         std::string e;
         if (!tier_) return {model::Status::Error, "hy4flash: the expert tier is not open"};
         cudaStreamSynchronize(stream_);
@@ -891,6 +968,7 @@ public:
     }
 
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        const core::OnDevice on(m_.device());
         std::string e;
         if (!tier_) return {model::Status::Error, "hy4flash: the expert tier is not open"};
         cudaStreamSynchronize(stream_);
@@ -914,6 +992,7 @@ public:
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
+        if (pos < 0) return {model::Status::Error, "hy4flash: negative checkpoint position"};
         if (save && (int64_t) hist_.size() - pos > kAttRows)
             return {model::Status::Error, "hy4flash: the rings have moved on more than " + std::to_string(kAttRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "hy4flash: a checkpoint past the session's position"};
@@ -930,6 +1009,7 @@ public:
     }
 
     model::Result running_restored(int64_t pos, const uint8_t*) override {
+        if (pos < 0) return {model::Status::Error, "hy4flash: negative restored position"};
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         rope_.rewind(pos);
         rope_on_ = rope_.has_image();
@@ -947,7 +1027,8 @@ public:
     int64_t disk_row_cells() const override { return g_.idx_pool; }
 
     model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
-        if (positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
+        const core::OnDevice on(m_.device());
+        if (positions < 0 || positions > backed_) return {model::Status::Error, "hy4flash: positions that were never run"};
         cudaStreamSynchronize(stream_);
         kv.clear();
         const size_t rb = (size_t) sparse_row_bytes(), pools = (size_t) (positions / g_.idx_pool + 1), pb = (size_t) g_.idx_dim * 2;
@@ -972,20 +1053,25 @@ public:
     }
 
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
+        const core::OnDevice on(m_.device());
+        if (positions < 0 || positions > m_.context()) return {model::Status::Error, "hy4flash: positions past the context"};
         std::string e;
-        if (!ensure_positions(positions, e)) return {model::Status::Error, "hy4flash: " + e};
+        if (!ensure_positions(positions, e)) return {grow_failed_ ? model::Status::Refused : model::Status::Error, "hy4flash: " + e};
         cudaStreamSynchronize(stream_);
         const int64_t pools = positions / g_.idx_pool + 1;
+        const size_t k_bytes = (size_t) positions * (size_t) sparse_row_bytes();
+        const size_t p_bytes = (size_t) pools * (size_t) g_.idx_dim * 2;
         size_t i = 0;
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
             if (i >= kv.size() || kv[i].format != cell_format() || kv[i].page_size != 1 || kv[i].cells != positions ||
-                kv[i].pooled_rows != pools)
+                kv[i].pooled_rows != pools || kv[i].idx_dim != g_.idx_dim ||
+                kv[i].k.size() < k_bytes || kv[i].pooled.size() < p_bytes)
                 return {model::Status::Error, "hy4flash: a parked conversation has other caches"};
-            const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
-                return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) { return basalt::core::device_copy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });
+            const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from, size_t bytes) {
+                return from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) { return basalt::core::device_copy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess; });
             };
-            if (!up(cache_[(size_t) l], kv[i].k) || !up((uint8_t*) ipool_[(size_t) l], kv[i].pooled))
+            if (!up(cache_[(size_t) l], kv[i].k, k_bytes) || !up((uint8_t*) ipool_[(size_t) l], kv[i].pooled, p_bytes))
                 return {model::Status::Error, "hy4flash: writing a cache back failed"};
             ++i;
         }
@@ -998,11 +1084,13 @@ public:
 
     // the tokens below `n` come back with a restored conversation: the Engram's history
     model::Result set_history(const int32_t* tokens, int64_t n) override {
+        if (n < 0 || (n > 0 && tokens == nullptr)) return {model::Status::Error, "hy4flash: invalid history"};
         hist_.assign(tokens, tokens + n);
         return {};
     }
 
     model::Result set_logit_bias(const float* bias) override {
+        const core::OnDevice on(m_.device());
         bias_on_ = bias != nullptr;
         if (!bias_on_) return {};
         std::string e;
@@ -1012,12 +1100,17 @@ public:
 
     // a draw of one row again, with the tokens the mask bans
     model::Result resample_row(int row, const float* bias, int32_t& token) override {
+        const core::OnDevice on(m_.device());
         std::string e;
         if (row < 0 || row >= last_rows_) return {model::Status::Error, "hy4flash: the row is not in the last window"};
         if (!device_bias(d_mask_, bias, e)) return {model::Status::Error, "hy4flash: " + e};
         bk::SamplerParams sp = sampling_;
         sp.logit_bias = d_mask_;
         sp.counter += (uint64_t) row;
+        if (!sp.greedy && sp.temperature > 0.f &&
+            bk::sampler_list_len(sp.top_k, g_.n_vocab) > bk::kSamplerNarrowMax &&
+            !bk::sampler_wide_reserve(g_.n_vocab, stream_))
+            return {model::Status::Error, "hy4flash: out of device memory for the sampler"};
         bk::sample_tokens(logits_ + (size_t) row * g_.n_vocab, 1, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr,
                           history_len_, sp, pick_ + 24, stream_);
         int32_t t = 0;
@@ -1028,12 +1121,14 @@ public:
     }
 
     model::Result copy_logits(int row, float* out) override {
+        const core::OnDevice on(m_.device());
         if (row < 0 || row >= last_rows_) return {model::Status::Error, "hy4flash: the session keeps the last window's logits only"};
         basalt::core::device_copy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
         return {};
     }
 
     model::Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override {
+        const core::OnDevice on(m_.device());
         if (row0 < 0 || n < 1 || row0 + n > last_rows_) return {model::Status::Error, "hy4flash: the session keeps the last window's logits only"};
         float* d_out = lp_ + bk::row_logprobs_scratch_floats(n, (int) g_.n_vocab);
         int32_t* d_pick = pick_ + 16;
@@ -1064,28 +1159,35 @@ private:
     // A prompt chunk's small inputs from the host: staged in mapped memory and copied by a kernel, so they do not wait on a copy
     // engine behind the expert ring's copies (one piece queued there holds every later copy). A window copies as before.
     void put_i32(int32_t* dst, const int32_t* src, size_t n) {
-        if (rows_ <= kMaxWindow || n == 0) {
+        if (n == 0) return;
+        if (rows_ <= kMaxWindow) {
             cudaMemcpyAsync(dst, src, n * 4, cudaMemcpyHostToDevice, stream_);
             return;
         }
-        if (stage_at_ + n > kStageInts) {   // full: wait until the kernels queued so far have read their rows
-            cudaStreamSynchronize(stream_);
-            stage_at_ = 0;
+        size_t off = 0;
+        while (off < n) {
+            const size_t take = std::min(kStageInts, n - off);
+            if (stage_at_ + take > kStageInts) {   // full: wait until the kernels queued so far have read their rows
+                cudaStreamSynchronize(stream_);
+                stage_at_ = 0;
+            }
+            std::memcpy(stage_h_ + stage_at_, src + off, take * 4);
+            bk::copy_i32x3_from_mapped(dst + off, stage_d_ + stage_at_, (int64_t) take, nullptr, nullptr, 0, nullptr, nullptr, 0, stream_);
+            stage_at_ += (take + 3) & ~(size_t) 3;
+            off += take;
         }
-        std::memcpy(stage_h_ + stage_at_, src, n * 4);
-        bk::copy_i32x3_from_mapped(dst, stage_d_ + stage_at_, (int64_t) n, nullptr, nullptr, 0, nullptr, nullptr, 0, stream_);
-        stage_at_ += (n + 3) & ~(size_t) 3;
     }
-    // n floats from pinned host memory the caller keeps until the stream has read it
-    void put_f32(float* dst, const float* src, int64_t n) {
+    // n floats from mapped pinned host memory the caller keeps until the stream has read it
+    void put_f32(float* dst, const float* host_src, const float* dev_src, int64_t n) {
+        if (n <= 0) return;
         if (rows_ <= kMaxWindow) {
-            cudaMemcpyAsync(dst, src, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
+            cudaMemcpyAsync(dst, host_src, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
             return;
         }
-        if (n % 4 || (uintptr_t) src % 16 || (uintptr_t) dst % 16)
-            bk::copy_i32x3_from_mapped((int32_t*) dst, (const int32_t*) src, n, nullptr, nullptr, 0, nullptr, nullptr, 0, stream_);
+        if (n % 4 || (uintptr_t) dev_src % 16 || (uintptr_t) dst % 16)
+            bk::copy_i32x3_from_mapped((int32_t*) dst, (const int32_t*) dev_src, n, nullptr, nullptr, 0, nullptr, nullptr, 0, stream_);
         else
-            bk::copy_from_mapped(dst, src, n, stream_);
+            bk::copy_from_mapped(dst, dev_src, n, stream_);
     }
 
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
@@ -1157,6 +1259,50 @@ private:
     void gemm_n(const DevTensor* w, float* y, int n_out, int R) {
         if (R > kMaxWindow) return gemm(w, xn_, y, g_.n_embd, n_out, R);
         bk::native_mmvq(w->type, w->ptr, xq_n_, y, g_.n_embd, n_out, R, stream_);
+    }
+    // Several products over the same input rows `x`: quantize each tile of `x` once (same kernels and bits as separate gemm calls).
+    void gemm_shared(const DevTensor* const* ws, float* const* ys, const int* n_outs, int count, const float* x, int n_in, int R) {
+        namespace mmq = basalt::prefill::mmq;
+        if (R > kMaxWindow && mmq::built()) {
+            bool all_mmq = true;
+            for (int i = 0; i < count; ++i)
+                if (ws[i]->type != ws[0]->type || !mmq::fits(ws[i]->type, n_outs[i])) all_mmq = false;
+            if (all_mmq) {
+                const int type = ws[0]->type;
+                for (int i = 0; i < count; ++i)
+                    if (loaded_.insert({type, n_outs[i]}).second) mmq::load(type, n_outs[i]);
+                for (int r0 = 0; r0 < R; r0 += arows_) {
+                    const int nb = std::min(arows_, R - r0);
+                    mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, type, n_in, n_in, nb, stream_);
+                    for (int i = 0; i < count; ++i) {
+                        mmq::Product p;
+                        p.w = ws[i]->ptr;
+                        p.type = type;
+                        p.w_rows = n_outs[i];
+                        p.w_cols = n_in;
+                        p.expert_bytes = mmq::matrix_bytes(type, n_outs[i], n_in);
+                        p.n = 1;
+                        p.xq = mmq_xq_;
+                        p.bounds = bounds_tab_ + 2 * nb;
+                        p.ids = mmq_ident_;
+                        p.total_rows = nb;
+                        p.max_rows = nb;
+                        p.dst = ys[i] + (size_t) r0 * n_outs[i];
+                        p.ld_dst = n_outs[i];
+                        mmq_.run(p, stream_);
+                    }
+                }
+                return;
+            }
+            for (int i = 0; i < count; ++i) gemm(ws[i], x, ys[i], n_in, n_outs[i], R);
+            return;
+        }
+        for (int c0 = 0; c0 < R; c0 += kMaxWindow) {
+            const int nc = std::min(kMaxWindow, R - c0);
+            bk::native_quantize_q8_1(x + (size_t) c0 * n_in, q8_, n_in, nc, stream_);
+            for (int i = 0; i < count; ++i)
+                bk::native_mmvq(ws[i]->type, ws[i]->ptr, q8_, ys[i] + (size_t) c0 * n_outs[i], n_in, n_outs[i], nc, stream_);
+        }
     }
     const DevTensor* T(int l, const char* s) const { return m_.tensor(l, s); }
     const float* F(int l, const char* s) const { return (const float*) m_.tensor(l, s)->ptr; }
@@ -1235,18 +1381,24 @@ private:
         const int E = g_.n_embd, rank = g_.kv_lora;
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
         if (phases & kQuery) {
-            quant_n(R);
-            gemm_n(T(l, "attn_q_a.weight"), qa_, g_.q_lora, R);
+            if (R <= kMaxWindow) {
+                quant_n(R);
+                gemm_n(T(l, "attn_q_a.weight"), qa_, g_.q_lora, R);
+                gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
+            } else {
+                const DevTensor* ws[2] = {T(l, "attn_q_a.weight"), T(l, "attn_kv_a_mqa.weight")};
+                float* ys[2] = {qa_, kvraw_};
+                const int n_outs[2] = {g_.q_lora, rank + g_.rope_dim};
+                gemm_shared(ws, ys, n_outs, 2, xn_, E, R);
+            }
             bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
             gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
-            gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
         }
         if (!(phases & (kCells | kOutput | kAttend))) return true;
         // the cells each row attends
         int32_t* meta = meta_h_ + ((size_t) l * steps_ + step) * 4 * arows_;   // firsts, counts, fill, positions
         int32_t *firsts = meta, *counts = meta + arows_, *fill = meta + 2 * arows_, *posv = meta + 3 * arows_;
         bool selecting = false;
-        std::vector<int> pools_of(R, 0);
         const int keep = g_.idx_top_k / g_.idx_pool - (g_.idx_select_tail ? 1 : 0);
         if ((phases & kCells) && (phases & kDevMeta) && swa) {
             swa_meta(pos_d_, R, g_.window, arows_, meta_d_, stream_);
@@ -1260,13 +1412,14 @@ private:
                     fill[t] = 0;
                 }
             } else {
+                if ((int) pools_of_.size() < R) pools_of_.resize((size_t) R);
                 for (int t = 0; t < R; ++t) {
                     const int64_t pos = posv[t];
-                    pools_of[(size_t) t] = (int) (pos / g_.idx_pool);   // complete groups before the row's own
+                    pools_of_[(size_t) t] = (int) (pos / g_.idx_pool);   // complete groups before the row's own
                     firsts[t] = 0;
-                    if (pools_of[(size_t) t] > keep) {
+                    if (pools_of_[(size_t) t] > keep) {
                         selecting = true;
-                        counts[t] = keep * g_.idx_pool + (int32_t) (pos - (int64_t) pools_of[(size_t) t] * g_.idx_pool + 1);
+                        counts[t] = keep * g_.idx_pool + (int32_t) (pos - (int64_t) pools_of_[(size_t) t] * g_.idx_pool + 1);
                         fill[t] = 0;
                     } else {
                         counts[t] = (int32_t) (pos + 1);
@@ -1321,10 +1474,10 @@ private:
             put("q_pe-" + std::to_string(l), qp);
         }
         if (!swa) {
-            indexer(l, pos0, R, selecting, pools_of, err);
+            indexer(l, pos0, R, selecting, pools_of_, err);
             each_seg(pos0, R, [&](const Seg& sg) {   // DFLY HOOK: each row's selection, for its conversation's drafter
                 for (int t = sg.row0; t < sg.row0 + sg.rows; ++t) {
-                    const bool sel = pools_of[(size_t) t] > keep;
+                    const bool sel = pools_of_[(size_t) t] > keep;
                     sg.s->dfly_.selection(l, t - sg.row0, sel ? icells_ + (size_t) t * cells_stride_ : nullptr, sel ? counts[t] : -1, stream_);
                 }
             });
@@ -1377,10 +1530,14 @@ private:
         a.cell_rope = rope_on_ ? rope_dev_ : nullptr;   // [vision]
         a.sec_h = kMropeH;
         a.sec_w = kMropeW;
-        gemm(T(l, "indexer.attn_k.weight"), xn_, ik_, E, D, R);
+        gemm_n(T(l, "indexer.attn_k.weight"), ik_, D, R);
         bk::rms_norm_rows(ik_, F(l, "indexer.k_norm.weight"), ikn_, R, D, g_.rms_eps, stream_);
-        gemm(T(l, "indexer_compressor_value.weight"), ikn_, ivt_, D, D, R);
-        gemm(T(l, "indexer_compressor_gate.weight"), ikn_, igt_, D, D, R);
+        {
+            const DevTensor* ws[2] = {T(l, "indexer_compressor_value.weight"), T(l, "indexer_compressor_gate.weight")};
+            float* ys[2] = {ivt_, igt_};
+            const int n_outs[2] = {D, D};
+            gemm_shared(ws, ys, n_outs, 2, ikn_, D, R);
+        }
         // each segment's rows into its ring of the last positions, at cell pos % kRawRing (one wrap at most), and the pooled keys
         // of the groups whose last position is among them
         each_seg(pos0, R, [&](const Seg& sg) {
@@ -1470,8 +1627,13 @@ private:
     uint8_t* ring_ = nullptr;
     cudaEvent_t ring_copied_[2] = {nullptr, nullptr}, ring_done_[2] = {nullptr, nullptr};
     int ring_layer_[2] = {-1, -1};
-    std::thread ring_thr_[2];
+    bool ring_done_flag_[2] = {true, true};
     bool ring_ok_[2] = {false, false};
+    std::thread ring_thr_;
+    std::mutex ring_m_;
+    std::condition_variable ring_cv_;
+    std::deque<int> ring_q_;
+    bool ring_stop_ = false, ring_busy_ = false;
 
     // The bytes the prompt products read past the last expert of a buffer of blobs: the last row of a matrix whose rows are not a
     // multiple of 256 values is read on to the next multiple (zeros there, as a stray scale could be a NaN)
@@ -1507,23 +1669,66 @@ private:
             }
         }
         ring_layer_[0] = ring_layer_[1] = -1;
+        ring_done_flag_[0] = ring_done_flag_[1] = true;
+        ring_ok_[0] = ring_ok_[1] = false;
+        away_.assign((size_t) (g_.n_layers - g_.n_dense), {});
         return true;
     }
+    void ring_worker(int dev) {
+        cudaSetDevice(dev);
+        for (;;) {
+            int tl = -1;
+            {
+                std::unique_lock<std::mutex> lk(ring_m_);
+                ring_cv_.wait(lk, [this] { return !ring_q_.empty() || ring_stop_; });
+                if (ring_q_.empty() && ring_stop_) return;
+                tl = ring_q_.front();
+                ring_q_.pop_front();
+                ring_busy_ = true;
+            }
+            const int slot = tl & 1;
+            const double t0 = now_ms();
+            const bool ok = ring_copy(tl);
+            t_ring_ms_ += now_ms() - t0;
+            {
+                std::lock_guard<std::mutex> lk(ring_m_);
+                ring_ok_[slot] = ok;
+                ring_done_flag_[slot] = true;
+                ring_busy_ = false;
+            }
+            ring_cv_.notify_all();
+        }
+    }
+    void ring_wait_idle() {
+        if (!ring_thr_.joinable()) return;
+        std::unique_lock<std::mutex> lk(ring_m_);
+        ring_cv_.wait(lk, [this] { return ring_q_.empty() && !ring_busy_; });
+    }
     void ring_join() {
-        for (std::thread& t : ring_thr_)
-            if (t.joinable()) t.join();
+        if (!ring_thr_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lk(ring_m_);
+            ring_stop_ = true;
+        }
+        ring_cv_.notify_all();
+        ring_thr_.join();
+        ring_q_.clear();
+        ring_stop_ = false;
+        ring_busy_ = false;
+        ring_done_flag_[0] = ring_done_flag_[1] = true;
     }
     void ring_close() {
-        if (!ring_) return;
         ring_join();
-        cudaStreamSynchronize(copy_);
-        cudaStreamSynchronize(stream_);
+        if (!ring_) return;
+        if (copy_) cudaStreamSynchronize(copy_);
+        if (stream_) cudaStreamSynchronize(stream_);
         cudaFree(ring_);
         ring_ = nullptr;
         for (int i = 0; i < 2; ++i) {
             if (ring_copied_[i]) cudaEventDestroy(ring_copied_[i]);
             if (ring_done_[i]) cudaEventDestroy(ring_done_[i]);
             ring_copied_[i] = ring_done_[i] = nullptr;
+            ring_layer_[i] = -1;
         }
     }
     // All the experts of tier layer `tl` into its slot, on the copy stream once the layer that used the slot is done.
@@ -1572,26 +1777,34 @@ private:
         cudaEventRecord(ring_copied_[slot], copy_);
         return true;
     }
-    // The copy is issued from a thread of its own: hundreds of copy calls can hold the caller until the bus has taken most of them.
+    // The copy is issued from one worker thread in layer order: hundreds of copy calls can hold the caller until the bus has taken most of them.
     void ring_start(int tl, int R) {
         const int slot = tl & 1;
-        if (ring_thr_[slot].joinable()) ring_thr_[slot].join();
+        if (!ring_thr_.joinable()) {
+            ring_stop_ = false;
+            const int dev = m_.device();
+            ring_thr_ = std::thread([this, dev] { ring_worker(dev); });
+        }
+        {
+            std::unique_lock<std::mutex> lk(ring_m_);
+            ring_cv_.wait(lk, [this, slot] { return ring_done_flag_[slot]; });
+        }
         ring_layer_[slot] = tl;
         prepare_away(tl, R);
-        ring_ok_[slot] = false;
-        const int dev = m_.device();
-        ring_thr_[slot] = std::thread([this, tl, slot, dev] {
-            cudaSetDevice(dev);
-            const double t0 = now_ms();
-            ring_ok_[slot] = ring_copy(tl);
-            t_ring_ms_ += now_ms() - t0;
-        });
+        {
+            std::lock_guard<std::mutex> lk(ring_m_);
+            ring_ok_[slot] = false;
+            ring_done_flag_[slot] = false;
+            ring_q_.push_back(tl);
+        }
+        ring_cv_.notify_all();
     }
-    // Layer `tl`'s experts are in their slot (waits for the thread that issued the copy); false when they could not be.
+    // Layer `tl`'s experts are in their slot (waits for the worker thread that issued the copy); false when they could not be.
     bool ring_ready(int tl, int R) {
         const int slot = tl & 1;
         if (ring_layer_[slot] != tl) ring_start(tl, R);
-        if (ring_thr_[slot].joinable()) ring_thr_[slot].join();
+        std::unique_lock<std::mutex> lk(ring_m_);
+        ring_cv_.wait(lk, [this, slot] { return ring_done_flag_[slot]; });
         return ring_ok_[slot];
     }
     // At the start of layer `l`: the next layer with routed experts starts its copy.
@@ -1628,8 +1841,8 @@ private:
         }
         ~CpuShare() { join(); }
     };
-    float *cpu_rows_ = nullptr, *cpu_x_ = nullptr;   // pinned: the CPU's output rows, a short chunk's latent rows
-    uint8_t* cpu_act_ = nullptr;                     // the latent rows quantised for the CPU's products
+    float *cpu_rows_ = nullptr, *d_cpu_rows_ = nullptr, *cpu_x_ = nullptr;   // mapped/pinned: the CPU's output rows, a short chunk's latent rows
+    uint8_t* cpu_act_ = nullptr;                                             // the latent rows quantised for the CPU's products
     // Takes out of `used` the RAM experts of tier layer tl the CPU computes, fewest rows first, while the bus would still carry as many
     // experts as the CPU has rows, and starts them.
     bool plan_cpu(int tl, int R, const std::vector<std::vector<int32_t>>& by, std::vector<int>& used, CpuShare& s, std::string& err) {
@@ -1642,12 +1855,24 @@ private:
         }
         if (bus == 0) return true;
         if (!cpu_rows_) {
-            if (cudaMallocHost((void**) &cpu_rows_, (size_t) kCpuMaxRows * L * 4) != cudaSuccess ||
-                cudaMallocHost((void**) &cpu_x_, (size_t) kRingRows * L * 4) != cudaSuccess ||
-                !(cpu_act_ = (uint8_t*) platform::alloc_aligned((size_t) kRingRows * kernels::cpu::kNativeActBytes, 64))) {
+            constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
+            float *rows = nullptr, *d_rows = nullptr, *x = nullptr;
+            uint8_t* act = nullptr;
+            if (cudaHostAlloc((void**) &rows, (size_t) kCpuMaxRows * L * 4, kMapped) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &d_rows, rows, 0) != cudaSuccess ||
+                cudaMallocHost((void**) &x, (size_t) kRingRows * L * 4) != cudaSuccess ||
+                !(act = (uint8_t*) platform::alloc_aligned((size_t) kRingRows * kernels::cpu::kNativeActBytes, 64))) {
+                cudaGetLastError();
+                if (rows) cudaFreeHost(rows);
+                if (x) cudaFreeHost(x);
+                if (act) platform::free_aligned(act);
                 err = "cannot allocate the CPU share's rows";
                 return false;
             }
+            cpu_rows_ = rows;
+            d_cpu_rows_ = d_rows;
+            cpu_x_ = x;
+            cpu_act_ = act;
             pinned_.push_back(cpu_rows_);
             pinned_.push_back(cpu_x_);
         }
@@ -1969,8 +2194,8 @@ private:
             }
         }
         if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
-        put_f32(erows_, h_erows_, (int64_t) R * n_cols * W);
-        put_f32(evalid_, h_evalid_, R);
+        put_f32(erows_, h_erows_, d_erows_, (int64_t) R * n_cols * W);
+        put_f32(evalid_, h_evalid_, d_evalid_, R);
         if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
         cudaEventRecord(eng_ev_, stream_);
         gemm(T(l, "engram_kv.weight"), erows_, ekv_, n_cols * W, 5 * g_.n_embd, R);
@@ -1990,8 +2215,10 @@ private:
                 xn_ = xn0 + (size_t) off * E;
                 mlp_ = ml0 + (size_t) off * E;
                 float *gate = gu_, *up = gu_ + (size_t) n * g_.n_ff;
-                gemm(T(l, "ffn_gate.weight"), xn_, gate, E, g_.n_ff, n);
-                gemm(T(l, "ffn_up.weight"), xn_, up, E, g_.n_ff, n);
+                const DevTensor* ws[2] = {T(l, "ffn_gate.weight"), T(l, "ffn_up.weight")};
+                float* ys[2] = {gate, up};
+                const int n_outs[2] = {g_.n_ff, g_.n_ff};
+                gemm_shared(ws, ys, n_outs, 2, xn_, E, n);
                 bk::swiglu_scaled(gate, up, nullptr, nullptr, h_, n, g_.n_ff, g_.n_ff, stream_);
                 gemm(T(l, "ffn_down.weight"), h_, mlp_, g_.n_ff, E, n);
             }
@@ -2009,8 +2236,9 @@ private:
         Hy4Model::SharedTier& shared = m_.shared_tier();
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (!shared.tier) {
-            if (cudaHostAlloc((void**) &shared.h_x, (size_t) kMaxWindow * g_.n_latent * 4, kMapped) != cudaSuccess ||
-                cudaHostAlloc((void**) &shared.h_rows, (size_t) kLookupK * g_.n_latent * 4, kMapped) != cudaSuccess) {
+            if ((!shared.h_x && cudaHostAlloc((void**) &shared.h_x, (size_t) kMaxWindow * g_.n_latent * 4, kMapped) != cudaSuccess) ||
+                (!shared.h_rows && cudaHostAlloc((void**) &shared.h_rows, (size_t) kLookupK * g_.n_latent * 4, kMapped) != cudaSuccess)) {
+                cudaGetLastError();
                 err = "cannot allocate the pinned expert staging";
                 return false;
             }
@@ -2026,6 +2254,15 @@ private:
                 return false;
             }
             if (!t->open(r, shared.h_rows, *reads, err)) return false;
+            if (const program::ExpertSpill sp = t->spill(); sp.experts > 0) {
+                const double gib = (double) sp.bytes / 1073741824.0;
+                char buf[256];
+                std::snprintf(buf, sizeof buf,
+                              "%lld experts (%.1f GiB) do not fit in VRAM + RAM; Hy4-flash requires all routed experts in memory (free %.1f GiB RAM or use a smaller quant)",
+                              (long long) sp.experts, gib, gib);
+                err = buf;
+                return false;
+            }
             shared.tier = std::move(t);
         }
         tier_ = shared.tier;
@@ -2091,12 +2328,19 @@ private:
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
                                     lossy_->route_tail_skip(), g_.n_expert, lossy_->route_counts(), stream_);
-        quant_n(R);
-        gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
-        if (!prompt) publish(0, std::min(kMaxWindow, R));
         float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
-        gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
-        gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
+        if (prompt) {
+            const DevTensor* ws[3] = {T(l, "ffn_routed_down.weight"), T(l, "ffn_gate_shexp.weight"), T(l, "ffn_up_shexp.weight")};
+            float* ys[3] = {xlat_, sg, su};
+            const int n_outs[3] = {L, g_.n_ff_exp, g_.n_ff_exp};
+            gemm_shared(ws, ys, n_outs, 3, xn_, E, R);
+        } else {
+            quant_n(R);
+            gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
+            publish(0, std::min(kMaxWindow, R));
+            gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
+            gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
+        }
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, stream_);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
     }
@@ -2303,6 +2547,19 @@ private:
             for (size_t i = 0; i < cpu.pair.size(); ++i) map_h[(size_t) cpu.pair[i]] = (int32_t) (at + (int64_t) i);
             n_cpu_rows_ += (int64_t) cpu.pair.size();
         }
+        bool peer_running = false;
+        struct PeerGuard {
+            prefill::PeerShare* share;
+            bool& running;
+            cudaStream_t st;
+            ~PeerGuard() {
+                if (running && share) {
+                    std::string ignore;
+                    share->join(st, ignore);
+                    running = false;
+                }
+            }
+        } peer_guard{share, peer_running, st};
         if (!peer.empty()) {   // its rows after the main card's
             int64_t at = 0;
             for (int e : used) at += (int64_t) by[(size_t) e].size();
@@ -2324,6 +2581,7 @@ private:
                 ex.push_back(x1);
             }
             if (!share->run(share_layer(tl), xlat_, R, ex, pair_rows_ + (size_t) at * L, st, err)) return false;
+            peer_running = true;
             n_peer_rows_ += end - at;
         }
         if (ringed && tl + 1 < g_.n_layers - g_.n_dense && ring_layer_[(tl + 1) & 1] == tl + 1) stage_away(tl + 1);
@@ -2402,61 +2660,66 @@ private:
                 b0 = b1;
             }
             cudaEventRecord(ring_done_[slot], st);
-        } else
-        for (size_t b0 = 0; b0 < used.size();) {
-            int nb = 0;
-            int64_t rows = 0, max_rows = 0;
-            while (b0 + (size_t) nb < used.size() && nb < kStageExperts) {
-                const int64_t c = (int64_t) by[(size_t) used[b0 + (size_t) nb]].size();
-                if (nb > 0 && rows + c > kLaunchRows) break;
-                rows += c;
-                max_rows = std::max(max_rows, c);
-                ++nb;
-            }
-            Stage& B = stage_[launch_++ & 1];
-            cudaStreamWaitEvent(copy_, B.done, 0);   // the device buffers of the launch before last are free
-            for (int q = 0; q < nb; ++q) {
-                const int e = used[b0 + (size_t) q];
-                uint8_t* dst = B.blobs + stride_ * (size_t) q;
-                const core::ExpertTier::Source src = tier_->locate(tl, e);
-                if (src.dev) {
-                    cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
-                    ++n_stage_dev_;
-                } else if (src.pinned) {
-                    cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
-                    ++n_stage_bus_;
-                } else if (src.peer) {
-                    ++n_stage_peer_;
-                    core::PeerExperts* pe = tier_->peer_for(tl);
-                    cudaMemcpyPeerAsync(dst, m_.device(), src.peer, pe->device(), el.blob_bytes, copy_);
-                } else {
-                    err = "expert " + std::to_string(e) + " of layer " + std::to_string(l) + " is not in RAM (a pack larger than RAM is not run yet)";
-                    return false;
+        } else {
+            if (ring_) ring_wait_idle();   // ensure the ring worker is not touching copy_ concurrently
+            for (size_t b0 = 0; b0 < used.size();) {
+                int nb = 0;
+                int64_t rows = 0, max_rows = 0;
+                while (b0 + (size_t) nb < used.size() && nb < kStageExperts) {
+                    const int64_t c = (int64_t) by[(size_t) used[b0 + (size_t) nb]].size();
+                    if (nb > 0 && rows + c > kLaunchRows) break;
+                    rows += c;
+                    max_rows = std::max(max_rows, c);
+                    ++nb;
                 }
-            }
-            cudaEventRecord(B.copied, copy_);
-            std::vector<int32_t> tok, bounds{0};
-            for (int q = 0; q < nb; ++q) {
-                for (int32_t p : by[(size_t) used[b0 + (size_t) q]]) {
-                    map_h[(size_t) p] = (int32_t) (pos + (int64_t) tok.size());
-                    tok.push_back(p / K);
+                Stage& B = stage_[launch_++ & 1];
+                cudaStreamWaitEvent(copy_, B.done, 0);   // the device buffers of the launch before last are free
+                for (int q = 0; q < nb; ++q) {
+                    const int e = used[b0 + (size_t) q];
+                    uint8_t* dst = B.blobs + stride_ * (size_t) q;
+                    const core::ExpertTier::Source src = tier_->locate(tl, e);
+                    if (src.dev) {
+                        cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
+                        ++n_stage_dev_;
+                    } else if (src.pinned) {
+                        cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
+                        ++n_stage_bus_;
+                    } else if (src.peer) {
+                        ++n_stage_peer_;
+                        core::PeerExperts* pe = tier_->peer_for(tl);
+                        cudaMemcpyPeerAsync(dst, m_.device(), src.peer, pe->device(), el.blob_bytes, copy_);
+                    } else {
+                        err = "expert " + std::to_string(e) + " of layer " + std::to_string(l) + " is not in RAM (a pack larger than RAM is not run yet)";
+                        return false;
+                    }
                 }
-                bounds.push_back((int32_t) tok.size());
+                cudaEventRecord(B.copied, copy_);
+                std::vector<int32_t> tok, bounds{0};
+                for (int q = 0; q < nb; ++q) {
+                    for (int32_t p : by[(size_t) used[b0 + (size_t) q]]) {
+                        map_h[(size_t) p] = (int32_t) (pos + (int64_t) tok.size());
+                        tok.push_back(p / K);
+                    }
+                    bounds.push_back((int32_t) tok.size());
+                }
+                cudaStreamWaitEvent(st, B.copied, 0);
+                launch(B, B.blobs, nb, rows, max_rows, tok, bounds);
+                b0 += (size_t) nb;
             }
-            cudaStreamWaitEvent(st, B.copied, 0);
-            launch(B, B.blobs, nb, rows, max_rows, tok, bounds);
-            b0 += (size_t) nb;
         }
         const double t3 = now_ms();
         t_issue_ms_ += t3 - t2;
         const double tw0 = now_ms();
-        if (!peer.empty() && !share->join(st, err)) return false;
+        if (peer_running) {
+            peer_running = false;
+            if (!share->join(st, err)) return false;
+        }
         const double tw1 = now_ms();
         t_peer_wait_ms_ += tw1 - tw0;
         if (!cpu.jobs.empty()) {
             cpu.join();
             t_cpu_wait_ms_ += now_ms() - tw1;
-            put_f32(pair_rows_ + (size_t) cpu.at * L, cpu_rows_, (int64_t) cpu.pair.size() * L);
+            put_f32(pair_rows_ + (size_t) cpu.at * L, cpu_rows_, d_cpu_rows_, (int64_t) cpu.pair.size() * L);
         }
         put_i32(pair_map_, map_h.data(), (size_t) R * K);
         weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
@@ -2480,6 +2743,11 @@ private:
     // The published ids have landed (the stream goes on meanwhile); a launch that failed never writes them.
     bool await_ids(std::string& err) {
         const volatile uint32_t* seq = h_words_;
+        if (*seq == seq_want_) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            return true;
+        }
+        (void) cudaStreamQuery(stream_);   // flush the driver queue before spinning
         for (int s = 0; s < (1 << 22); ++s) {
             if (*seq == seq_want_) {
                 std::atomic_thread_fence(std::memory_order_acquire);
@@ -2652,6 +2920,7 @@ private:
                 jwork_ = true;
                 jdone_.store(false, std::memory_order_relaxed);
             }
+            pd.joiner = true;
             jcv_.notify_one();
         }
         return true;
@@ -2677,9 +2946,10 @@ private:
     // never waits for good.
     bool join_moe(std::string& err) {
         if (!pend_.on) return true;
-        if (use_joiner_ && pend_.word && !pend_.reading && joiner_.joinable()) {   // handed to the joiner: its result
+        if (pend_.joiner) {   // handed to the joiner: its result
             while (!jdone_.load(std::memory_order_acquire)) platform::cpu_relax();
             pend_.on = false;
+            pend_.joiner = false;
             if (!jok_ && err.empty()) err = jerr_;
             return jok_;
         }
@@ -2761,16 +3031,21 @@ private:
                 err = "no embedding row";
                 return false;
             }
-        put_f32(e_, h_e_, (int64_t) R * E);
+        put_f32(e_, h_e_, d_e_, (int64_t) R * E);
         if (graphs_) {   // the window's first position, for the graphs' row spans (sliding-window layers)
             *pos_h_ = (int32_t) pos0;
             cudaMemcpyAsync(pos_d_, pos_h_, 4, cudaMemcpyHostToDevice, stream_);
         }
         fill_streams(e_, E, R, X_, stream_);
         if (!m_.diag_dump().empty()) dump("hc_init", X_, (int64_t) R * 4 * E);
-        ring_join();
+        ring_wait_idle();
         ring_layer_[0] = ring_layer_[1] = -1;
+        const bool prefill = big_.rows != 0;
         for (int l = 0; l < g_.n_layers; ++l) {
+            if (prefill) {
+                core::progress_at("hy4flash prefill: layer", l, pos0);
+                core::progress_beat();
+            }
             ring_ahead(l, R);
             if (!engram(l, pos0, R, tokens, err)) return false;
             if (diag(l) && !g_.swa.empty() && l >= 1) dump("engram_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
@@ -2798,6 +3073,8 @@ private:
             bk::hc_post(mlp2_, X_, coef_, bk::kHcCoef, R, E, Xn_, stream_);
             std::swap(X_, Xn_);
             if (!m_.diag_dump().empty()) dump("l_out-" + std::to_string(l), X_, (int64_t) R * 4 * E);
+            if (prefill_live_ && *prefill_live_ && l + 1 < g_.n_layers)
+                (*prefill_live_)(prefill_t0_ + (int) ((int64_t) prefill_n_ * (l + 1) / g_.n_layers));
         }
         if (!join_moe(err)) return false;
         if (tier_) tier_->pump(-1, core::ExpertTier::kAllPieces);
@@ -2832,19 +3109,12 @@ private:
     // tried again, then lends all its slots and takes back what is left once the caches have grown (as DeepSeek's caches do).
     bool grow_failed_ = false;   // the last ensure_positions found no room (a refusal: nothing was run past `backed_`)
     // the exact remaining device bytes the sparse layers' caches will map to reach `target` positions
-    // (ElasticArray::ensure grows each array in steps of 4 granules = 8 MiB on 2 MiB VMM pages)
     uint64_t grow_bytes(int64_t target) const {
-        constexpr uint64_t kStep = 8ull << 20;
-        auto need = [&](const std::unique_ptr<core::ElasticArray>& a, uint64_t bytes) -> uint64_t {
-            if (!a || bytes <= a->backed()) return 0;
-            const uint64_t want = std::min(a->capacity(), (bytes + kStep - 1) / kStep * kStep);
-            return want > a->backed() ? want - a->backed() : 0;
-        };
         uint64_t total = 0;
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
-            total += need(ea_[(size_t) l], (uint64_t) target * sparse_row_bytes());
-            total += need(pea_[(size_t) l], (uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2);
+            if (ea_[(size_t) l]) total += ea_[(size_t) l]->growth((uint64_t) target * sparse_row_bytes());
+            if (pea_[(size_t) l]) total += pea_[(size_t) l]->growth((uint64_t) (target / g_.idx_pool + 1) * g_.idx_dim * 2);
         }
         return total;
     }
@@ -2987,11 +3257,28 @@ private:
         if (history_len_ > 0) {   // the penalties' history of each row of the window
             const size_t n = (size_t) kMaxWindow * history_len_;
             if (d_hist_len_ < n) {
-                if (d_hist_) cudaFree(d_hist_);
-                if (cudaMalloc((void**) &d_hist_, n * 4) != cudaSuccess) { cudaGetLastError(); err = "out of device memory for the sampling history"; return false; }
+                if (d_hist_) {
+                    cudaStreamSynchronize(st);
+                    cudaFree(d_hist_);
+                    d_hist_ = nullptr;
+                    d_hist_len_ = 0;
+                }
+                int* next = nullptr;
+                if (cudaMalloc((void**) &next, n * 4) != cudaSuccess) {
+                    cudaGetLastError();
+                    err = "out of device memory for the sampling history";
+                    return false;
+                }
+                d_hist_ = next;
                 d_hist_len_ = n;
             }
             cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * (size_t) history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
+        }
+        if (!sp.greedy && sp.temperature > 0.f &&
+            bk::sampler_list_len(sp.top_k, g_.n_vocab) > bk::kSamplerNarrowMax &&
+            !bk::sampler_wide_reserve(g_.n_vocab, st)) {
+            err = "out of device memory for the sampler";
+            return false;
         }
         sampling_ = sp;
         bk::sample_tokens(logits_, rows, (int) g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);
@@ -3043,6 +3330,10 @@ private:
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *h_erows_ = nullptr, *h_evalid_ = nullptr;
+    float *d_e_ = nullptr, *d_erows_ = nullptr, *d_evalid_ = nullptr;
+    std::vector<int> pools_of_;
+    const std::function<void(int)>* prefill_live_ = nullptr;
+    int prefill_t0_ = 0, prefill_n_ = 0;
     const float** rowptr_d_ = nullptr;
     const float** h_rowptr_ = nullptr;
     WindowPlan* h_plan_ = nullptr;
@@ -3068,7 +3359,7 @@ private:
     std::string jerr_;
     // the group whose CPU and second-card share is still running (join_moe ends it)
     struct Pending {
-        bool on = false, cpu = false, reading = false, peer_raised = false;
+        bool on = false, cpu = false, reading = false, peer_raised = false, joiner = false;
         int tl = 0;
         uint32_t word = 0;
         core::PeerExperts* peer = nullptr;

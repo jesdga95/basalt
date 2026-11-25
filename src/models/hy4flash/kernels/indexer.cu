@@ -289,12 +289,14 @@ void idx_pool(const float* values, const float* gates, const float* ape, const f
 }
 
 void idx_rope_heads(float* q, const IndexerArgs& a, int pos0, int n_tok, void* stream) {
+    if (a.heads <= 0 || n_tok <= 0) return;
     rope_heads_kernel<<<dim3(a.heads, n_tok), 32, 0, (cudaStream_t) stream>>>(q, a, pos0);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
 void idx_scores(const float* q, const float* w, const uint16_t* pooled, int n_pool, const IndexerArgs& a, float* scores,
                 void* stream) {
+    if (n_pool <= 0) return;
     const size_t smem = ((size_t) a.heads * a.dim + a.heads) * sizeof(float);
     scores_kernel<<<(n_pool + 127) / 128, 128, smem, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), n_pool, a, scores, nullptr, 0);
     if (!stream) cudaStreamSynchronize(nullptr);
@@ -308,6 +310,7 @@ void idx_select(const float* scores, int n_pool, int k, int pool, int tail0, int
 
 void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, const int32_t* meta, int max_pool, int rows, const IndexerArgs& a,
                      float* scores, int stride, void* stream) {
+    if (max_pool <= 0 || rows <= 0) return;
     if (a.heads == 16 && a.dim == 128) {
         scores_mma_kernel<<<dim3((max_pool + 511) / 512, rows), 128, 0, (cudaStream_t) stream>>>(q, w, reinterpret_cast<const __half*>(pooled), meta, stride, scores);
         if (!stream) cudaStreamSynchronize(nullptr);
@@ -320,6 +323,7 @@ void idx_scores_rows(const float* q, const float* w, const uint16_t* pooled, con
 }
 
 void idx_select_rows(const float* scores, int stride, const int32_t* meta, int rows, int k, int pool, int32_t* cells, int cells_stride, void* stream) {
+    if (rows <= 0) return;
     select_kernel<<<rows, kSelThreads, 0, (cudaStream_t) stream>>>(scores, 0, k, pool, 0, 0, cells, meta, stride, cells_stride);
     if (!stream) cudaStreamSynchronize(nullptr);
 }

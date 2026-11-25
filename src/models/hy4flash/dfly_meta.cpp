@@ -128,6 +128,10 @@ bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDim
         err = "dfly: tensors final_norm, 0.mlp.gate_proj, 0.self_attn.q_a_proj, 0.self_attn.linear_gate or hidden_correction.gate_proj are missing";
         return false;
     }
+    if ((*fn)[0] == 0 || (*gp)[0] == 0 || (*qa)[0] == 0 || (*lg)[0] == 0 || (*lg)[0] % 256 != 0 || (*hg)[0] == 0) {
+        err = "dfly: one or more drafter dimensions are zero or not aligned";
+        return false;
+    }
     d.E = (int) (*fn)[0];
     d.ffn = (int) (*gp)[0];
     d.q_lora = (int) (*qa)[0];

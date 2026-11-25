@@ -70,6 +70,7 @@ public:
     int32_t next() const { return cells_.empty() ? 0 : cells_.back().last() + 1; }
     /// Forgets the cells from `pos` on.
     void rewind(int64_t pos) {
+        if (pos < 0) pos = 0;
         if ((size_t) pos < cells_.size()) cells_.resize((size_t) pos);
         if (first_image_ >= 0 && first_image_ >= (int64_t) cells_.size()) first_image_ = -1;
     }
