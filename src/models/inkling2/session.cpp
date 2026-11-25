@@ -1330,15 +1330,21 @@ private:
         // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
         const bool guess = rows <= kGuessRows;
-        if (guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card) {   // its guess was made on this card
+        const bool has_prev_guess = guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card;
+        // On deep full-attention visits (>= 16K keys = 32..535 MB KV), prefetching before attention_window both contends
+        // with attn_mma_kernel on SMs/DRAM and gets evicted from L2 by the KV sweep; deferring past attention_window lands
+        // the guessed experts into L2 during o_proj + post_attn + router right before MoE reads them.
+        const bool defer_guess = full && full_keys >= 16384;
+        const auto launch_guess_prefetch = [&]() {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.pf_ev, k.stream);
             cudaStreamWaitEvent(k.pf_st, k.pf_ev, 0);
             cudaStreamWaitEvent(k.pf_st, k.gs_ev, 0);
-            expert_prefetch(x.gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts / rows * rows, w.blob_table, (uint64_t) Lx.down_off & ~(uint64_t) 15,
-                            x.pf_sink_, k.pf_st);
+            expert_prefetch(x.gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts / rows * rows, w.blob_table,
+                            (uint64_t) Lx.down_off & ~(uint64_t) 15, x.pf_sink_, k.pf_st);
             k.pf_on = true;
-        }
+        };
+        if (has_prev_guess && !defer_guess) launch_guess_prefetch();
         // convolutions, clips, caches (the attention prepares them)
         ap.pos = x.pos_d_;
         ap.full = full;
@@ -1388,6 +1394,7 @@ private:
             aa.min_full_keys = previous + 2 - rows;
         }
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, x.att_scr_, k.stream);
+        if (has_prev_guess && defer_guess) launch_guess_prefetch();
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)

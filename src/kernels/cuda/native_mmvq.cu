@@ -2500,6 +2500,10 @@ void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, in
     const dim3 threads(WARP, WARPS);
     if (n_in >= 1024 && mmvq_mma_sms() != 0 && (ncols > 8 || (n_out >= 65536 && ncols >= 4) || (n_out >= 4096 && ncols >= 7))) {
         const dim3 grid{unsigned((n_out + 15) / 16)};
+        if (ncols > 32 && std::size_t(n_out) * std::size_t(n_in) <= (32u << 20)) {
+            launch_pdl(native_q8p_mma_kernel<4>, dim3(grid.x, unsigned((ncols + 31) / 32)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap);
+            return;
+        }
         switch ((ncols + 7) / 8) {
         case 1: launch_pdl(native_q8p_mma_kernel<1>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
         case 2: launch_pdl(native_q8p_mma_kernel<2>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
@@ -2588,6 +2592,11 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
     }
     const dim3 grid{unsigned(end)}, threads(WARP, WARPS);
     if (mma) {
+        if (ncols > 32 && std::size_t(sum_rows) * std::size_t(n_in) <= (32u << 20)) {
+            launch_pdl(native_q8p_mma_seg_kernel<4>, dim3(grid.x, unsigned((ncols + 31) / 32)), dim3(256), 0, s, w, a, n_in, ncols);
+            launch_check();
+            return;
+        }
         switch ((ncols + 7) / 8) {
         case 1: launch_pdl(native_q8p_mma_seg_kernel<1>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
         case 2: launch_pdl(native_q8p_mma_seg_kernel<2>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
