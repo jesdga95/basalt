@@ -40,13 +40,6 @@ uint64_t layer_cache_bytes(const Geometry& g, int l, int64_t context, KvType kv)
     return cell * (s.window > 0 ? (uint64_t) s.window + kRows : (uint64_t) context);
 }
 
-// The rotary frequencies of a head width: base^(-2i / hd) for the first `rot` pairs, 0 past them (the identity).
-std::vector<float> inv_freq(int hd, int rot, float base) {
-    std::vector<float> f((size_t) hd / 2, 0.f);
-    for (int i = 0; i < rot; ++i) f[(size_t) i] = (float) (1.0 / std::pow((double) base, (double) (2 * i) / (double) hd));
-    return f;
-}
-
 }  // namespace
 
 uint64_t session_bytes(const Geometry& g, int64_t context, KvType kv) {
@@ -170,17 +163,25 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
     }
     if (!f8("output", V, E, reads, file, head_, err, true)) return fail(err);
     if (!(output_norm_ = small("output_norm.weight", (uint64_t) E, reads, file, err))) return fail(err);
-    {   // the router input's unweighted norm, and the rotary frequencies of the two layer kinds
+    {   // the router input's unweighted norm
         std::vector<float> one((size_t) E, 1.f);
-        const LayerShape sw = g.shape((int) (std::find(g.swa.begin(), g.swa.end(), true) - g.swa.begin()) % g.n_layers);
-        const LayerShape fu = g.shape((int) (std::find(g.swa.begin(), g.swa.end(), false) - g.swa.begin()) % g.n_layers);
-        const std::vector<float> fs = inv_freq(sw.hd, sw.rot, g.rope_base_swa), ff = inv_freq(fu.hd, fu.rot, g.rope_base);
-        if (!(ones_ = (float*) device_buf((uint64_t) E * 4)) || !(inv_swa_ = (float*) device_buf(fs.size() * 4)) ||
-            !(inv_full_ = (float*) device_buf(ff.size() * 4)) ||
-            core::device_copy(ones_, one.data(), one.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
-            core::device_copy(inv_swa_, fs.data(), fs.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
-            core::device_copy(inv_full_, ff.data(), ff.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+        if (!(ones_ = (float*) device_buf((uint64_t) E * 4)) ||
+            core::device_copy(ones_, one.data(), one.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
             return fail("out of device memory for the small tables");
+    }
+    // the rotary tables of the two layer kinds, for the longest context the model takes
+    const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
+    for (int kind = 0; kind < 2; ++kind) {
+        const int l = (int) (std::find(g.swa.begin(), g.swa.end(), kind == 0) - g.swa.begin()) % g.n_layers;
+        const LayerShape sh = g.shape(l);
+        std::vector<float> lo(rope_lo_floats(sh.hd)), hi(rope_hi_floats(sh.hd, want));
+        rope_tables(sh.hd, sh.rot, kind == 0 ? g.rope_base_swa : g.rope_base, want, lo.data(), hi.data());
+        float* dl = (float*) device_buf(lo.size() * 4);
+        float* dh = (float*) device_buf(hi.size() * 4);
+        if (!dl || !dh || core::device_copy(dl, lo.data(), lo.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+            core::device_copy(dh, hi.data(), hi.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("out of device memory for the rotary tables");
+        (kind == 0 ? rope_swa_ : rope_full_) = {dl, dh};
     }
     {
         const TensorRef* t = pack_.find("blk.0.ffn_down.weight");
@@ -195,7 +196,7 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         LayerWeights& w = layers_[(size_t) l];
         const std::string b = "blk." + std::to_string(l) + ".";
         w.sh = g.shape(l);
-        w.inv_freq = w.sh.window > 0 ? inv_swa_ : inv_full_;
+        w.rope = w.sh.window > 0 ? rope_swa_ : rope_full_;
         const int64_t qd = (int64_t) w.sh.n_head * w.sh.hd, kd = (int64_t) w.sh.n_kv * w.sh.hd;
         auto S = [&](const char* suffix, uint64_t floats) { return small(b + suffix, floats, reads, file, err); };
         if (!f8(b + "attn_q", qd, E, reads, file, w.q, err) || !f8(b + "attn_k", kd, E, reads, file, w.k, err) ||
@@ -265,7 +266,7 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
             if (w.source < 0) return fail("the drafter reads a kind of layer the model does not have");
             w.sh = g.shape(w.source);
             w.sh.n_head = dg.n_head;
-            w.inv_freq = sw ? inv_swa_ : inv_full_;
+            w.rope = sw ? rope_swa_ : rope_full_;
             const std::string b = "assistant.blk." + std::to_string(l) + ".";
             const int64_t qd = (int64_t) w.sh.n_head * w.sh.hd;
             auto S = [&](const char* suffix, uint64_t floats) { return small(b + suffix, floats, reads, file, err); };
@@ -282,7 +283,6 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
     }
 
     // the context: what the weights leave, less the card's spare
-    const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
     if (want < 1024 || (g.context_length > 0 && want > g.context_length))
         return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
     size_t free_b = 0, total_b = 0;

@@ -27,6 +27,19 @@ struct LayerShape {
     bool one = false;                   ///< keys are the values (k_eq_v): one cache holds V, K is derived from it
 };
 
+/// A layer kind's rotary angles as two tables of (cos, sin) float pairs, [256][hd / 2] for the position's low 8 bits and
+/// [positions / 256][hd / 2] for the rest: the angle of position p and pair i is (p & ~255) f_i + (p & 255) f_i, so its
+/// cos and sin are one product of the two entries (rope_tables).
+struct RopeTab {
+    const float* lo = nullptr;
+    const float* hi = nullptr;
+};
+/// The tables of `positions` positions for head width hd, base `base`, the first `rot` pairs rotated (f_i =
+/// base^(-2i / hd), computed in double; past `rot`, cos 1 and sin 0): host arrays to upload, lo then hi.
+void rope_tables(int hd, int rot, double base, int64_t positions, float* lo, float* hi);
+inline size_t rope_lo_floats(int hd) { return (size_t) 256 * hd; }
+inline size_t rope_hi_floats(int hd, int64_t positions) { return (size_t) ((positions + 255) / 256) * hd; }
+
 /// The cache element type: fp16, or unit-scale E4M3 (keys are normed, so they fit).
 enum class KvType : int { F16 = 0, F8 = 1 };
 constexpr int kv_elem_bytes(KvType t) { return t == KvType::F8 ? 1 : 2; }
@@ -54,7 +67,7 @@ struct Prep {
     const int32_t* pos = nullptr;        ///< each row's position [rows]
     const float* q_norm = nullptr;       ///< [hd]
     const float* k_norm = nullptr;       ///< [hd]
-    const float* inv_freq = nullptr;     ///< [hd / 2] rotary frequencies (pairs past sh.rot unused)
+    RopeTab rope;
     float eps = 1e-6f;
     LayerShape sh;
     KvType kv_type = KvType::F16;
@@ -72,7 +85,7 @@ struct Attn {
     const float* q = nullptr;            ///< [rows][n_head][hd], prepared
     const int32_t* pos = nullptr;
     const float* k_norm = nullptr;       ///< sh.one: K = rope(V * k_norm)
-    const float* inv_freq = nullptr;
+    RopeTab rope;
     LayerShape sh;
     KvType kv_type = KvType::F16;
     KvSegs kv;

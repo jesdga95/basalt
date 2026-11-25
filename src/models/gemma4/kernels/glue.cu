@@ -15,6 +15,7 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kThreads = 256;
+constexpr int kEndThreads = 1024;   // ffn_end: one block per row reads its k experts' rows, so the block is wide
 
 void check(const char* what) {
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
@@ -22,8 +23,9 @@ void check(const char* what) {
 }
 
 // The block's sum of v (every thread gets it), in a fixed order.
+template <int T = kThreads>
 __device__ float block_sum(float v) {
-    __shared__ float part[kThreads / 32];
+    __shared__ float part[T / 32];
     __shared__ float total;
 #pragma unroll
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -31,7 +33,7 @@ __device__ float block_sum(float v) {
     __syncthreads();
     if (threadIdx.x == 0) {
         float s = 0.f;
-        for (int i = 0; i < kThreads / 32; ++i) s += part[i];
+        for (int i = 0; i < T / 32; ++i) s += part[i];
         total = s;
     }
     __syncthreads();
@@ -41,10 +43,11 @@ __device__ float block_sum(float v) {
 }
 
 // 1 / rms of a row of `width` values.
+template <int T = kThreads>
 __device__ float inv_rms(const float* __restrict__ x, int width, float eps) {
     float ss = 0.f;
-    for (int i = threadIdx.x; i < width; i += kThreads) ss += x[i] * x[i];
-    return 1.0f / sqrtf(block_sum(ss) / (float) width + eps);
+    for (int i = threadIdx.x; i < width; i += T) ss += x[i] * x[i];
+    return 1.0f / sqrtf(block_sum<T>(ss) / (float) width + eps);
 }
 
 __global__ void __launch_bounds__(kThreads) embed_kernel(const uint16_t* table, const int32_t* __restrict__ tokens, int width,
@@ -83,7 +86,7 @@ __global__ void __launch_bounds__(kThreads) gelu_mul_kernel(const float* __restr
 
 // One row: the experts' sum (slot order) and the MLP output normed and added, the sum normed, the residual and the scalar.
 // `buf` holds the row's experts' sum while the norms read it.
-__global__ void __launch_bounds__(kThreads) ffn_end_kernel(FfnEnd f, int width) {
+__global__ void __launch_bounds__(kEndThreads) ffn_end_kernel(FfnEnd f, int width) {
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     extern __shared__ float sm[];   // [2][width]: the MLP part, then the experts' sum
@@ -92,23 +95,23 @@ __global__ void __launch_bounds__(kThreads) ffn_end_kernel(FfnEnd f, int width) 
     float* b = sm + width;
     const float* mlp = f.mlp + (size_t) r * width;
     if (f.experts) {
-        for (int i = threadIdx.x; i < width; i += kThreads) {
+        for (int i = threadIdx.x; i < width; i += kEndThreads) {
             float s = 0.f;
             for (int k = 0; k < f.k; ++k) s += f.weights[(size_t) r * f.k + k] * f.experts[((size_t) r * f.k + k) * width + i];
             b[i] = s;
         }
         __syncthreads();
-        const float i1 = inv_rms(mlp, width, f.eps);
-        const float i2 = inv_rms(b, width, f.eps);
-        for (int i = threadIdx.x; i < width; i += kThreads) a[i] = mlp[i] * i1 * f.n1[i] + b[i] * i2 * f.n2[i];
+        const float i1 = inv_rms<kEndThreads>(mlp, width, f.eps);
+        const float i2 = inv_rms<kEndThreads>(b, width, f.eps);
+        for (int i = threadIdx.x; i < width; i += kEndThreads) a[i] = mlp[i] * i1 * f.n1[i] + b[i] * i2 * f.n2[i];
     } else {
-        for (int i = threadIdx.x; i < width; i += kThreads) a[i] = mlp[i];
+        for (int i = threadIdx.x; i < width; i += kEndThreads) a[i] = mlp[i];
     }
     __syncthreads();
-    const float ip = inv_rms(a, width, f.eps);
+    const float ip = inv_rms<kEndThreads>(a, width, f.eps);
     const float sc = f.scalar[0];
     float* x = f.x + (size_t) r * width;
-    for (int i = threadIdx.x; i < width; i += kThreads) x[i] = (x[i] + a[i] * ip * f.n_post[i]) * sc;
+    for (int i = threadIdx.x; i < width; i += kEndThreads) x[i] = (x[i] + a[i] * ip * f.n_post[i]) * sc;
 }
 
 __global__ void softcap_kernel(float* __restrict__ x, int64_t n, float cap) {
@@ -144,7 +147,7 @@ void ffn_end(const FfnEnd& f, int rows, int width, void* stream) {
     if (rows <= 0) return;
     const size_t smem = (size_t) 2 * width * sizeof(float);
     cudaFuncSetAttribute(ffn_end_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-    bk::launch_pdl(ffn_end_kernel, dim3((unsigned) rows), dim3(kThreads), smem, (cudaStream_t) stream, f, width);
+    bk::launch_pdl(ffn_end_kernel, dim3((unsigned) rows), dim3(kEndThreads), smem, (cudaStream_t) stream, f, width);
     check("ffn_end");
 }
 

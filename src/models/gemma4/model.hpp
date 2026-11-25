@@ -26,7 +26,7 @@ struct F8Mat {
 
 struct LayerWeights {
     LayerShape sh;
-    const float* inv_freq = nullptr;      ///< the layer kind's rotary frequencies [hd / 2]
+    RopeTab rope;                         ///< the layer kind's rotary tables
     const float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *post_attn = nullptr;
     const float *ffn_norm = nullptr, *post_ffw = nullptr, *scalar = nullptr;
     F8Mat q, k, v, o, gate, up, down;     ///< v empty on a layer whose keys are its values
@@ -44,7 +44,7 @@ struct LayerWeights {
 struct DrafterLayer {
     LayerShape sh;
     int source = 0;
-    const float* inv_freq = nullptr;
+    RopeTab rope;
     const float *attn_norm = nullptr, *q_norm = nullptr, *post_attn = nullptr, *ffn_norm = nullptr, *post_ffw = nullptr;
     const float* scalar = nullptr;
     F8Mat q, o, gate, up, down;
@@ -103,8 +103,7 @@ private:
     F8Mat head_;
     float* output_norm_ = nullptr;
     float* ones_ = nullptr;
-    float* inv_swa_ = nullptr;
-    float* inv_full_ = nullptr;
+    RopeTab rope_swa_, rope_full_;
     int64_t n_ff_pad_ = 0;
     KvType kv_ = KvType::F16;
     int device_ = 0, fd_ = -1;

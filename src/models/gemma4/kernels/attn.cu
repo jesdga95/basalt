@@ -1,8 +1,7 @@
 // src/models/gemma4/kernels/attn.cu - the attention's preparation and decode attention (basalt/models/gemma4/kernels.hpp).
 //
 // A warp holds one head row: lane L the dims [L * hd / 32, (L + 1) * hd / 32), so dim i and its rotary partner i + hd / 2
-// sit in lanes L and L + 16. Angles are float(pos) * inv_freq in fp32 and their sine and cosine are the accurate ones
-// (this file is built without fast math), as the reference computes them.
+// sit in lanes L and L + 16. A rotation's cos and sin come from the rotary tables (RopeTab).
 #include "basalt/models/gemma4/kernels.hpp"
 
 #include "basalt/kernels/pdl.hpp"
@@ -11,6 +10,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -75,22 +75,23 @@ __device__ __forceinline__ void store_cell(void* base, KvType t, int64_t off, co
 }
 
 // The rotation of a head row held across the warp: lanes 0..15 hold the first half's dims, 16..31 their partners. Dim i
-// (i < rot) becomes x_i cos - x_{i+h} sin, its partner x_{i+h} cos + x_i sin.
+// (i < rot) becomes x_i cos - x_{i+h} sin, its partner x_{i+h} cos + x_i sin, the angle's cos and sin from the tables.
 template <int D>
-__device__ __forceinline__ void rotate(float (&x)[D], int lane, int hd, int rot, float pos, const float* __restrict__ inv_freq) {
+__device__ __forceinline__ void rotate(float (&x)[D], int lane, int hd, int rot, int pos, const RopeTab& t) {
     float other[D];
 #pragma unroll
     for (int i = 0; i < D; ++i) other[i] = __shfl_xor_sync(0xffffffffu, x[i], 16);
     const bool hi = lane >= 16;
+    const float2* lo_row = reinterpret_cast<const float2*>(t.lo) + (size_t) (pos & 255) * (hd / 2);
+    const float2* hi_row = reinterpret_cast<const float2*>(t.hi) + (size_t) (pos >> 8) * (hd / 2);
 #pragma unroll
     for (int i = 0; i < D; ++i) {
         const int d = (lane & 15) * D + i;   // the pair's first dim
         if (d >= rot) continue;
-        float s, c;
-        sincosf(pos * inv_freq[d], &s, &c);
+        const float2 a = hi_row[d], b = lo_row[d];
+        const float c = a.x * b.x - a.y * b.y, s = a.y * b.x + a.x * b.y;
         x[i] = hi ? x[i] * c + other[i] * s : x[i] * c - other[i] * s;
     }
-    (void) hd;
 }
 
 // ---- preparation: one warp per (row, item); items are the q heads, then the k heads, then the v heads
@@ -127,7 +128,7 @@ __global__ void __launch_bounds__(128) prep_kernel(Prep p, int rows) {
     const float inv = 1.0f / sqrtf(warp_sum(ss) / (float) hd + p.eps);
 #pragma unroll
     for (int i = 0; i < D; ++i) x[i] = w ? x[i] * inv * w[lane * D + i] : x[i] * inv;
-    if (kind == 0 || (kind == 1 && !sh.one)) rotate<D>(x, lane, hd, sh.rot, (float) pos, p.inv_freq);
+    if (kind == 0 || (kind == 1 && !sh.one)) rotate<D>(x, lane, hd, sh.rot, pos, p.rope);
     const int64_t off = (cell * sh.n_kv + head) * hd + lane * D;
     if (kind == 0) {
         float* o = p.q_out + ((size_t) r * sh.n_head + head) * hd + lane * D;
@@ -143,7 +144,7 @@ __global__ void __launch_bounds__(128) prep_kernel(Prep p, int rows) {
 // ---- decode attention
 constexpr int kAttnWarps = 4;
 constexpr int kMaxChunks = 64;     // chunks a row's keys split into at most
-constexpr int kMinChunk = 128;     // keys a chunk holds at least
+constexpr int kMinChunk = 16;      // keys a chunk holds at least
 
 // A row's split: its key range [lo, hi], its chunk length and count, from its own position only.
 struct Split {
@@ -205,7 +206,7 @@ __global__ void __launch_bounds__(kAttnWarps * 32) attn_chunk_kernel(Attn a, int
         if (sh.one) {
 #pragma unroll
             for (int i = 0; i < D; ++i) k[i] = v[i] * wk[i];
-            rotate<D>(k, lane, hd, sh.rot, (float) kp, a.inv_freq);
+            rotate<D>(k, lane, hd, sh.rot, (int) kp, a.rope);
         } else {
             load_cell<D>(c.k, a.kv_type, off, k);
         }
@@ -293,6 +294,21 @@ void attn_prep(const Prep& p, int rows, void* stream) {
     if (p.sh.hd == 256) bk::launch_pdl(prep_kernel<8>, grid, dim3(128), 0, (cudaStream_t) stream, p, rows);
     else bk::launch_pdl(prep_kernel<16>, grid, dim3(128), 0, (cudaStream_t) stream, p, rows);
     check("attn_prep");
+}
+
+void rope_tables(int hd, int rot, double base, int64_t positions, float* lo, float* hi) {
+    const int h = hd / 2;
+    for (int i = 0; i < h; ++i) {
+        const double f = i < rot ? std::pow(base, -2.0 * i / hd) : 0.0;
+        for (int b = 0; b < 256; ++b) {
+            lo[((size_t) b * h + i) * 2] = (float) std::cos(b * f);
+            lo[((size_t) b * h + i) * 2 + 1] = (float) std::sin(b * f);
+        }
+        for (int64_t a = 0; a < (positions + 255) / 256; ++a) {
+            hi[((size_t) a * h + i) * 2] = (float) std::cos((double) (a * 256) * f);
+            hi[((size_t) a * h + i) * 2 + 1] = (float) std::sin((double) (a * 256) * f);
+        }
+    }
 }
 
 size_t attn_scratch_floats(int rows, int n_head, int hd) { return (size_t) rows * n_head * kMaxChunks * (hd + 2); }

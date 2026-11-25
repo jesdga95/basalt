@@ -51,7 +51,8 @@ double h2d(float x) { return (double) __half2float(__float2half_rn(x)); }
 // from `past` rows, then attention. Returns out [rows][n_head][hd].
 struct Ref {
     LayerShape sh;
-    std::vector<float> qn, kn, inv;
+    std::vector<float> qn, kn;
+    std::vector<double> finv;
     double eps = 1e-6;
     // normed and rotated head row `x` at `pos` (w null: unweighted, rotate false: as is)
     std::vector<double> prep(const float* x, const float* w, bool rotate, int pos) const {
@@ -64,8 +65,8 @@ struct Ref {
         if (rotate) {
             std::vector<double> z = y;
             for (int i = 0; i < sh.rot; ++i) {
-                const float ang = (float) pos * inv[i];
-                const double c = std::cos((double) ang), s = std::sin((double) ang);
+                const double ang = pos * finv[i];
+                const double c = std::cos(ang), s = std::sin(ang);
                 z[i] = y[i] * c - y[i + hd / 2] * s;
                 z[i + hd / 2] = y[i + hd / 2] * c + y[i] * s;
             }
@@ -95,8 +96,11 @@ std::vector<float> run_case(const Case& cs, std::mt19937& rng, bool check, std::
     for (float& x : ref.qn) x += 1.f;
     ref.kn = randv(hd, rng, 0.3f);
     for (float& x : ref.kn) x += 1.f;
-    ref.inv.assign(hd / 2, 0.f);
-    for (int i = 0; i < sh.rot; ++i) ref.inv[i] = (float) (1.0 / std::pow(sh.window > 0 ? 1e4 : 1e6, 2.0 * i / hd));
+    const double base = sh.window > 0 ? 1e4 : 1e6;
+    ref.finv.assign(hd / 2, 0.0);
+    for (int i = 0; i < sh.rot; ++i) ref.finv[i] = std::pow(base, -2.0 * i / hd);
+    std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, P + kRows));
+    rope_tables(hd, sh.rot, base, P + kRows, lo.data(), hi.data());
     // every position's projections (q, k, v), positions 0..P-1
     std::vector<float> q, k, v;
     if (qkv_in) {
@@ -111,7 +115,7 @@ std::vector<float> run_case(const Case& cs, std::mt19937& rng, bool check, std::
         qkv_out->insert(qkv_out->end(), k.begin(), k.end());
         qkv_out->insert(qkv_out->end(), v.begin(), v.end());
     }
-    float *dq = dev(q), *dk = dev(k), *dv = dev(v), *dqn = dev(ref.qn), *dkn = dev(ref.kn), *dinv = dev(ref.inv);
+    float *dq = dev(q), *dk = dev(k), *dv = dev(v), *dqn = dev(ref.qn), *dkn = dev(ref.kn), *dlo = dev(lo), *dhi = dev(hi);
     void *ck = nullptr, *cv = nullptr;
     cudaMalloc(&ck, (size_t) cap * kd * 2);
     cudaMalloc(&cv, (size_t) cap * kd * 2);
@@ -128,12 +132,12 @@ std::vector<float> run_case(const Case& cs, std::mt19937& rng, bool check, std::
         cudaMemcpy(dpos, pos.data(), n * 4, cudaMemcpyHostToDevice);
         Prep pr;
         pr.q = dq + (size_t) p0 * qd, pr.k = dk + (size_t) p0 * kd, pr.v = dv + (size_t) p0 * kd;
-        pr.ldq = qd, pr.ldk = kd, pr.ldv = kd, pr.pos = dpos, pr.q_norm = dqn, pr.k_norm = dkn, pr.inv_freq = dinv, pr.sh = sh;
+        pr.ldq = qd, pr.ldk = kd, pr.ldv = kd, pr.pos = dpos, pr.q_norm = dqn, pr.k_norm = dkn, pr.rope = {dlo, dhi}, pr.sh = sh;
         pr.q_out = qp;
         pr.kv.c[0] = {ck, cv, cap};
         attn_prep(pr, n, nullptr);
         Attn a;
-        a.q = qp, a.pos = dpos, a.k_norm = dkn, a.inv_freq = dinv, a.sh = sh, a.kv = pr.kv;
+        a.q = qp, a.pos = dpos, a.k_norm = dkn, a.rope = {dlo, dhi}, a.sh = sh, a.kv = pr.kv;
         a.max_keys = sh.window > 0 ? sh.window : P, a.scratch = scr, a.out = out;
         attn_decode(a, n, nullptr);
     }
@@ -159,8 +163,8 @@ std::vector<float> run_case(const Case& cs, std::mt19937& rng, bool check, std::
                     kk.assign(t.begin(), t.end());
                     std::vector<double> z = kk;
                     for (int i = 0; i < sh.rot; ++i) {
-                        const float ang = (float) p * ref.inv[i];
-                        const double c = std::cos((double) ang), s = std::sin((double) ang);
+                        const double ang = p * ref.finv[i];
+                        const double c = std::cos(ang), s = std::sin(ang);
                         z[i] = kk[i] * c - kk[i + hd / 2] * s;
                         z[i + hd / 2] = kk[i + hd / 2] * c + kk[i] * s;
                     }
@@ -196,9 +200,9 @@ std::vector<float> run_case(const Case& cs, std::mt19937& rng, bool check, std::
                 }
             }
         }
-        expect(maxerr < 2e-3, cs.name, maxerr);
+        expect(maxerr < 5e-3, cs.name, maxerr);   // keys rounded to fp16 in the cache
     }
-    for (void* p : {(void*) dq, (void*) dk, (void*) dv, (void*) dqn, (void*) dkn, (void*) dinv, ck, cv, (void*) qp, (void*) out,
+    for (void* p : {(void*) dq, (void*) dk, (void*) dv, (void*) dqn, (void*) dkn, (void*) dlo, (void*) dhi, ck, cv, (void*) qp, (void*) out,
                     (void*) scr, (void*) dpos})
         cudaFree(p);
     return got;
@@ -293,9 +297,10 @@ void batch_check(std::mt19937& rng, const LayerShape& sh, const char* name) {
     const int R[2] = {2, 3};
     const int64_t cap[2] = {sh.window > 0 ? sh.window + kRows : 1024, sh.window > 0 ? sh.window + kRows : 1024};
     auto qn = randv(hd, rng), kn = randv(hd, rng);
-    std::vector<float> inv(hd / 2, 0.f);
-    for (int i = 0; i < sh.rot; ++i) inv[i] = (float) (1.0 / std::pow(1e4, 2.0 * i / hd));
-    float *dqn = dev(qn), *dkn = dev(kn), *dinv = dev(inv);
+    std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, 1024));
+    rope_tables(hd, sh.rot, 1e4, 1024, lo.data(), hi.data());
+    float *dqn = dev(qn), *dkn = dev(kn);
+    const RopeTab rt{dev(lo), dev(hi)};
     void* c[2][2];
     for (int s = 0; s < 2; ++s)
         for (int j = 0; j < 2; ++j) {
@@ -316,11 +321,11 @@ void batch_check(std::mt19937& rng, const LayerShape& sh, const char* name) {
         cudaMemcpy(dpos, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice);
         Prep pr;
         pr.q = dq + (size_t) row0 * qd, pr.k = dk + (size_t) row0 * kd, pr.v = dv + (size_t) row0 * kd;
-        pr.ldq = qd, pr.ldk = kd, pr.ldv = kd, pr.pos = dpos, pr.q_norm = dqn, pr.k_norm = dkn, pr.inv_freq = dinv, pr.sh = sh;
+        pr.ldq = qd, pr.ldk = kd, pr.ldv = kd, pr.pos = dpos, pr.q_norm = dqn, pr.k_norm = dkn, pr.rope = rt, pr.sh = sh;
         pr.q_out = qp, pr.kv = kv;
         attn_prep(pr, n, nullptr);
         Attn a;
-        a.q = qp, a.pos = dpos, a.k_norm = dkn, a.inv_freq = dinv, a.sh = sh, a.kv = kv, a.max_keys = 1024, a.scratch = scr, a.out = out;
+        a.q = qp, a.pos = dpos, a.k_norm = dkn, a.rope = rt, a.sh = sh, a.kv = kv, a.max_keys = 1024, a.scratch = scr, a.out = out;
         attn_decode(a, n, nullptr);
         return host(out, (size_t) n * qd);
     };
@@ -354,15 +359,15 @@ void bench(std::mt19937& rng) {
     cudaMalloc(&ck, cache.size() * 2);
     cudaMemcpy(ck, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice);
     auto q = randv(qd, rng), kn = randv(hd, rng);
-    std::vector<float> inv(hd / 2, 0.f);
-    for (int i = 0; i < 64; ++i) inv[i] = (float) (1.0 / std::pow(1e6, 2.0 * i / hd));
+    std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, P));
+    rope_tables(hd, 64, 1e6, P, lo.data(), hi.data());
     std::vector<int32_t> pos{P - 1};
-    float *dq = dev(q), *dkn = dev(kn), *dinv = dev(inv), *out, *scr;
+    float *dq = dev(q), *dkn = dev(kn), *out, *scr;
     int32_t* dpos = dev(pos);
     cudaMalloc(&out, (size_t) qd * 4);
     cudaMalloc(&scr, attn_scratch_floats(1, sh.n_head, hd) * 4);
     Attn a;
-    a.q = dq, a.pos = dpos, a.k_norm = dkn, a.inv_freq = dinv, a.sh = sh, a.max_keys = P, a.scratch = scr, a.out = out;
+    a.q = dq, a.pos = dpos, a.k_norm = dkn, a.rope = {dev(lo), dev(hi)}, a.sh = sh, a.max_keys = P, a.scratch = scr, a.out = out;
     a.kv.c[0] = {ck, nullptr, P};
     for (int i = 0; i < 20; ++i) attn_decode(a, 1, nullptr);
     cudaDeviceSynchronize();
