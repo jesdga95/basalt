@@ -80,6 +80,7 @@ std::string Ffmpeg::error_text(int code) const {
 
 bool load_ffmpeg(const std::vector<ff::AbiRow>& rows, Ffmpeg& out, std::string& why) {
     std::string tried;
+    std::string last_err;
     for (const ff::AbiRow& row : rows) {
         const std::string fname = DynLib::versioned_name("avformat", row.avformat);
         DynLib f = DynLib::open_app(fname);
@@ -87,35 +88,42 @@ bool load_ffmpeg(const std::vector<ff::AbiRow>& rows, Ffmpeg& out, std::string& 
             tried += (tried.empty() ? "" : ", ") + fname;
             continue;
         }
-        // the rest of the release: libavformat brought its own dependencies, so these find the same files
-        DynLib u = DynLib::open_app(DynLib::versioned_name("avutil", row.avutil));
-        DynLib c = DynLib::open_app(DynLib::versioned_name("avcodec", row.avcodec));
-        DynLib s = DynLib::open_app(DynLib::versioned_name("swscale", row.swscale));
+        // Prefer companion libraries from the directory avformat loaded from before searching other locations.
+        const std::string fpath = f.path();
+        const size_t cut = fpath.find_last_of("\\/");
+        const std::string dir = cut != std::string::npos ? fpath.substr(0, cut) : std::string();
+        DynLib u = DynLib::open_app(DynLib::versioned_name("avutil", row.avutil), dir);
+        DynLib c = DynLib::open_app(DynLib::versioned_name("avcodec", row.avcodec), dir);
+        DynLib s = DynLib::open_app(DynLib::versioned_name("swscale", row.swscale), dir);
         const char* missing = !u ? "avutil" : !c ? "avcodec" : !s ? "swscale" : nullptr;
         if (missing != nullptr) {
             const int major = !u ? row.avutil : !c ? row.avcodec : row.swscale;
-            why = "FFmpeg " + std::string(row.release) + " is incomplete: " + fname + " loaded, " +
-                  DynLib::versioned_name(missing, major) + " did not";
-            return false;
+            last_err = "FFmpeg " + std::string(row.release) + " is incomplete: " + fname + " loaded, " +
+                       DynLib::versioned_name(missing, major) + " did not";
+            continue;
         }
         Ffmpeg got;
-        if (!bind(u, f, c, s, got, why)) return false;
+        std::string bind_err;
+        if (!bind(u, f, c, s, got, bind_err)) {
+            last_err = bind_err;
+            continue;
+        }
         const unsigned vf = got.avformat_version(), vc = got.avcodec_version(), vu = got.avutil_version(),
                        vs = got.swscale_version();
         if ((int) (vf >> 16) != row.avformat || (int) (vc >> 16) != row.avcodec || (int) (vu >> 16) != row.avutil ||
             (int) (vs >> 16) != row.swscale) {
-            why = "FFmpeg's libraries are from different releases (libavformat " + version_text(vf) + ", libavcodec " +
-                  version_text(vc) + ", libavutil " + version_text(vu) + ", libswscale " + version_text(vs) + ")";
-            return false;
+            last_err = "FFmpeg's libraries are from different releases (libavformat " + version_text(vf) + ", libavcodec " +
+                       version_text(vc) + ", libavutil " + version_text(vu) + ", libswscale " + version_text(vs) + ")";
+            continue;
         }
         got.abi = row;
         got.version = "FFmpeg " + std::string(row.release) + " (libavformat " + version_text(vf) + ")";
-        got.path = f.path();
+        got.path = fpath;
         got.av_log_set_level(ff::kLogQuiet);   // failures come back as error codes; the library prints nothing
         out = got;   // a DynLib never closes its library, so the functions stay valid for the life of the process
         return true;
     }
-    why = "no FFmpeg libraries found (tried " + tried + ")";
+    why = !last_err.empty() ? last_err : "no FFmpeg libraries found (tried " + tried + ")";
     return false;
 }
 

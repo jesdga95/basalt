@@ -42,27 +42,31 @@ inline __m256 bf16x8_to_f32x8_avx1(const uint16_t* p) {
 }  // namespace
 
 void bf16_rows_dot_multi_avx1(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out) {
-    // each row is read once for all `nt` (<= 8) tokens, exactly as the AVX2 kernel does
-    for (int r = 0; r < rows; ++r) {
-        const uint16_t* wr = w + (size_t) r * (size_t) cols;
-        __m256 acc[8];
-        for (int t = 0; t < nt; ++t) acc[t] = _mm256_setzero_ps();
-        int c = 0;
-        for (; c + 8 <= cols; c += 8) {
-            const __m256 wf = bf16x8_to_f32x8_avx1(wr + c);
-            for (int t = 0; t < nt; ++t) {
-                const __m256 xv = _mm256_loadu_ps(x + (size_t) t * (size_t) cols + c);
-                acc[t] = _mm256_add_ps(acc[t], _mm256_mul_ps(wf, xv));   // no FMA on AVX1: mul, then add
+    if (rows <= 0 || nt <= 0) return;
+    // each row is read once per chunk of up to 8 tokens, matching the AVX2 kernel
+    for (int t0 = 0; t0 < nt; t0 += 8) {
+        const int m = nt - t0 < 8 ? nt - t0 : 8;
+        for (int r = 0; r < rows; ++r) {
+            const uint16_t* wr = w + (size_t) r * (size_t) cols;
+            __m256 acc[8];
+            for (int t = 0; t < m; ++t) acc[t] = _mm256_setzero_ps();
+            int c = 0;
+            for (; c + 8 <= cols; c += 8) {
+                const __m256 wf = bf16x8_to_f32x8_avx1(wr + c);
+                for (int t = 0; t < m; ++t) {
+                    const __m256 xv = _mm256_loadu_ps(x + (size_t) (t0 + t) * (size_t) cols + c);
+                    acc[t] = _mm256_add_ps(acc[t], _mm256_mul_ps(wf, xv));   // no FMA on AVX1: mul, then add
+                }
             }
-        }
-        for (int t = 0; t < nt; ++t) {
-            float s = hsum_float_8_avx1(acc[t]);
-            for (; c < cols; ++c) {                                      // cols % 8 != 0 tail (cols % 8 == 0 today)
-                const uint32_t bits = (uint32_t) wr[c] << 16;
-                float wf; std::memcpy(&wf, &bits, sizeof wf);
-                s += wf * x[(size_t) t * (size_t) cols + c];
+            for (int t = 0; t < m; ++t) {
+                float s = hsum_float_8_avx1(acc[t]);
+                for (int cc = c; cc < cols; ++cc) {
+                    const uint32_t bits = (uint32_t) wr[cc] << 16;
+                    float wf; std::memcpy(&wf, &bits, sizeof wf);
+                    s += wf * x[(size_t) (t0 + t) * (size_t) cols + cc];
+                }
+                out[(size_t) (t0 + t) * (size_t) rows + r] = s;
             }
-            out[(size_t) t * (size_t) rows + r] = s;
         }
     }
 }

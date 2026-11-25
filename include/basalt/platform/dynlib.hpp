@@ -28,6 +28,9 @@ public:
     /// each tried by full path so the library's own dependencies resolve beside it; never the current directory.
     /// Empty when no such library loads.
     static DynLib open_app(const std::string& file);
+    /// Like `open_app`, trying `prefer_dir` (when non-empty) before the default search locations so companion
+    /// libraries resolve beside a library loaded from `prefer_dir`.
+    static DynLib open_app(const std::string& file, const std::string& prefer_dir);
 
     /// The file name a library built with its major version in the name has here: `libNAME.so.MAJOR` on Linux,
     /// `NAME-MAJOR.dll` on Windows (FFmpeg's names on both).

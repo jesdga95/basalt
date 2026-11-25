@@ -3,6 +3,7 @@
 
 #include "basalt/platform/file.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -356,11 +357,27 @@ struct DirectFile::Impl {
             const Pending p = queue.front();
             queue.pop_front();
             lk.unlock();
-            const ssize_t got = pread(fd, p.buffer, p.length, (off_t) p.offset);
+            uint32_t total = 0;
+            bool ok = true;
+            while (total < p.length) {
+                const ssize_t got = pread(fd, (uint8_t*) p.buffer + total, (size_t) (p.length - total),
+                                          (off_t) (p.offset + total));
+                if (got < 0) {
+                    if (errno == EINTR) continue;
+                    ok = false;
+                    total = 0;
+                    break;
+                }
+                if (got == 0) break;   // EOF
+                total += (uint32_t) got;
+                // O_DIRECT only returns an unaligned count on the partial final block at EOF; issuing another
+                // O_DIRECT pread at an unaligned offset/buffer would fail with EINVAL.
+                if ((size_t) got % DirectFile::alignment() != 0) break;
+            }
             lk.lock();
             // only a waiter that found the list empty is blocked, so only the first completion needs to wake it
             const bool was_empty = done.empty();
-            done.push_back(Completion{p.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
+            done.push_back(Completion{p.tag, total, ok});
             if (was_empty) cv_done.notify_all();
         }
     }

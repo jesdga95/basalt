@@ -202,17 +202,31 @@ void dot_rows(int type, const uint8_t* row, int n, const void* const* act, int n
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 
 void bf16_rows_dot_multi(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out) {
-    // each row is read once for all `nt` (<= 8) tokens: the router (2.6 MB per layer) streams once per prediction
-    for (int r = 0; r < rows; ++r) {
-        const uint16_t* wr = w + (size_t) r * (size_t) cols;
-        __m256 acc[8];
-        for (int t = 0; t < nt; ++t) acc[t] = _mm256_setzero_ps();
-        for (int c = 0; c + 8 <= cols; c += 8) {
-            const __m256 wf = _mm256_castsi256_ps(
-                _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (wr + c))), 16));
-            for (int t = 0; t < nt; ++t) acc[t] = _mm256_fmadd_ps(wf, _mm256_loadu_ps(x + (size_t) t * cols + c), acc[t]);
+    if (rows <= 0 || nt <= 0) return;
+    // each row is read once per chunk of up to MAXT tokens: the router streams once per prediction
+    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+        const int m = nt - t0 < MAXT ? nt - t0 : MAXT;
+        for (int r = 0; r < rows; ++r) {
+            const uint16_t* wr = w + (size_t) r * (size_t) cols;
+            __m256 acc[MAXT];
+            for (int t = 0; t < m; ++t) acc[t] = _mm256_setzero_ps();
+            int c = 0;
+            for (; c + 8 <= cols; c += 8) {
+                const __m256 wf = _mm256_castsi256_ps(
+                    _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (wr + c))), 16));
+                for (int t = 0; t < m; ++t)
+                    acc[t] = _mm256_fmadd_ps(wf, _mm256_loadu_ps(x + (size_t) (t0 + t) * (size_t) cols + c), acc[t]);
+            }
+            for (int t = 0; t < m; ++t) {
+                float s = hsum_float_8(acc[t]);
+                for (int cc = c; cc < cols; ++cc) {
+                    const uint32_t bits = (uint32_t) wr[cc] << 16;
+                    float wf; std::memcpy(&wf, &bits, sizeof wf);
+                    s = std::fma(wf, x[(size_t) (t0 + t) * (size_t) cols + cc], s);
+                }
+                out[(size_t) (t0 + t) * (size_t) rows + r] = s;
+            }
         }
-        for (int t = 0; t < nt; ++t) out[(size_t) t * rows + r] = hsum_float_8(acc[t]);   // cols % 8 == 0 (2560)
     }
 }
 

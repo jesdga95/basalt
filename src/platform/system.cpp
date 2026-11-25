@@ -5,6 +5,7 @@
 #include "basalt/platform/process.hpp"
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,57 +19,134 @@
 #include <io.h>      // _fileno, _setmode
 #include <psapi.h>   // K32GetProcessMemoryInfo
 #else
+#include <fcntl.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
 #include <unistd.h>
+extern "C" { extern char** environ; }
 #endif
 
 namespace basalt::platform {
 
-namespace {
-/// An argument for a shell's command line: wrapped in quotes the shell reads literally.
-std::string shell_quote(const std::string& a) {
-#if defined(_WIN32)
-    return quote_arg(a);
-#else
-    std::string out = "'";
-    for (char c : a) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += '\'';
-    return out;
-#endif
-}
-}  // namespace
-
 std::optional<std::string> capture_output(const std::vector<std::string>& argv, bool include_stderr) {
     if (argv.empty()) return std::nullopt;
+#if defined(_WIN32)
+    // Start the program directly with CreateProcessW rather than cmd.exe (_popen), so UTF-8 paths and shell
+    // metacharacters (&, |, <, >, ^, %) pass literally without shell interpretation.
     std::string cmd;
     for (const std::string& a : argv) {
         if (!cmd.empty()) cmd += ' ';
-        cmd += shell_quote(a);
+        cmd += quote_arg(a);
     }
-#if defined(_WIN32)
-    cmd += include_stderr ? " 2>&1" : " 2>nul";
-    // cmd.exe drops the first and last quote of a command line that holds more than one quoted word or a redirection,
-    // so the whole line is wrapped in one more pair
-    cmd = "\"" + cmd + "\"";
-    std::FILE* pf = _popen(cmd.c_str(), "r");
+    const std::wstring wcmd = to_wide(cmd);
+    std::vector<wchar_t> line(wcmd.begin(), wcmd.end());
+    line.push_back(L'\0');
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof sa;
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return std::nullopt;
+    (void) SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (nul == INVALID_HANDLE_VALUE) {
+        CloseHandle(rd);
+        CloseHandle(wr);
+        return std::nullopt;
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul;
+    si.hStdOutput = wr;
+    si.hStdError = include_stderr ? wr : nul;
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+    CloseHandle(wr);
+    CloseHandle(nul);
+    if (!ok) {
+        CloseHandle(rd);
+        return std::nullopt;
+    }
+    CloseHandle(pi.hThread);
+
+    std::string raw;
+    char buf[4096];
+    for (DWORD got = 0; ReadFile(rd, buf, (DWORD) sizeof buf, &got, nullptr) && got > 0;) raw.append(buf, got);
+    CloseHandle(rd);
+    (void) WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+
+    // Match text-mode line endings (\r\n -> \n) without exposing output to CRT EOF translation.
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\r' && i + 1 < raw.size() && raw[i + 1] == '\n') continue;
+        out.push_back(raw[i]);
+    }
+    return out;
 #else
-    cmd += include_stderr ? " 2>&1" : " 2>/dev/null";
-    std::FILE* pf = popen(cmd.c_str(), "r");
-#endif
-    if (pf == nullptr) return std::nullopt;
+    int pfd[2] = {-1, -1};
+    if (pipe2(pfd, O_CLOEXEC) != 0) return std::nullopt;
+    const int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (devnull < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return std::nullopt;
+    }
+    posix_spawn_file_actions_t fa;
+    if (posix_spawn_file_actions_init(&fa) != 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        close(devnull);
+        return std::nullopt;
+    }
+    if (posix_spawn_file_actions_adddup2(&fa, devnull, STDIN_FILENO) != 0 ||
+        posix_spawn_file_actions_adddup2(&fa, pfd[1], STDOUT_FILENO) != 0 ||
+        posix_spawn_file_actions_adddup2(&fa, include_stderr ? pfd[1] : devnull, STDERR_FILENO) != 0) {
+        (void) posix_spawn_file_actions_destroy(&fa);
+        close(pfd[0]);
+        close(pfd[1]);
+        close(devnull);
+        return std::nullopt;
+    }
+
+    std::vector<std::string> args = argv;
+    std::vector<char*> av;
+    av.reserve(args.size() + 1);
+    for (std::string& s : args) av.push_back(s.data());
+    av.push_back(nullptr);
+
+    pid_t pid = -1;
+    const int err = posix_spawnp(&pid, args[0].c_str(), &fa, nullptr, av.data(), environ);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    close(pfd[1]);
+    close(devnull);
+    if (err != 0) {
+        close(pfd[0]);
+        return std::nullopt;
+    }
+
     std::string out;
     char buf[4096];
-    for (size_t n; (n = std::fread(buf, 1, sizeof buf, pf)) > 0;) out.append(buf, n);
-#if defined(_WIN32)
-    _pclose(pf);
-#else
-    pclose(pf);
-#endif
+    for (;;) {
+        const ssize_t n = ::read(pfd[0], buf, sizeof buf);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        out.append(buf, (size_t) n);
+    }
+    close(pfd[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     return out;
+#endif
 }
 
 #if defined(_WIN32)

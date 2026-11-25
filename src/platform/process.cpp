@@ -5,11 +5,14 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
@@ -116,7 +119,14 @@ bool spawn_piped(const std::vector<std::string>& argv, const std::string& stderr
     sa.nLength = sizeof sa;
     sa.bInheritHandle = TRUE;
     HANDLE rd_in = nullptr, wr_in = nullptr, rd_out = nullptr, wr_out = nullptr;
+    auto close_pipes = [&] {
+        if (rd_in != nullptr) CloseHandle(rd_in);
+        if (wr_in != nullptr) CloseHandle(wr_in);
+        if (rd_out != nullptr) CloseHandle(rd_out);
+        if (wr_out != nullptr) CloseHandle(wr_out);
+    };
     if (!CreatePipe(&rd_in, &wr_in, &sa, 0) || !CreatePipe(&rd_out, &wr_out, &sa, 0)) {
+        close_pipes();
         err = "pipe failed";
         return false;
     }
@@ -126,43 +136,105 @@ bool spawn_piped(const std::vector<std::string>& argv, const std::string& stderr
     (void) SetHandleInformation(rd_out, HANDLE_FLAG_INHERIT, 0);
     // The share mode is what lets the log be read while the run is going on; a share mode of 0 keeps it closed
     // to any other process until the child exits. `sa` (bInheritHandle) is what hands the handle to the child.
-    HANDLE log = CreateFileW(to_wide_path(stderr_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
-                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    const HANDLE std_handles[3] = {rd_in, wr_out, log != INVALID_HANDLE_VALUE ? log : wr_out};
+    HANDLE log = INVALID_HANDLE_VALUE;
+    if (stderr_path.empty()) {
+        log = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+    } else {
+        log = CreateFileW(to_wide_path(stderr_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
+                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    if (log == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        close_pipes();
+        err = "cannot open child error log " + (stderr_path.empty() ? std::string("NUL") : stderr_path) + " (error " +
+              std::to_string(e) + ")";
+        return false;
+    }
+    const HANDLE std_handles[3] = {rd_in, wr_out, log};
     const HANDLE proc = start(argv, std_handles);
     if (proc == nullptr) {
         err = "CreateProcess failed (error " + std::to_string(GetLastError()) + ")";
-        CloseHandle(rd_in); CloseHandle(wr_in); CloseHandle(rd_out); CloseHandle(wr_out);
-        if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+        close_pipes();
+        CloseHandle(log);
+        return false;
+    }
+    CloseHandle(rd_in);              // the child owns the request pipe's read end
+    CloseHandle(wr_out);             // the child owns the reply pipe's write end
+    CloseHandle(log);
+    // The parent's ends become CRT descriptors, so the request and reply loops are the same code either way.
+    const int in_fd = _open_osfhandle((intptr_t) wr_in, _O_BINARY | _O_WRONLY);
+    if (in_fd < 0) {
+        CloseHandle(wr_in);
+        CloseHandle(rd_out);
+        (void) TerminateProcess(proc, 1);
+        (void) WaitForSingleObject(proc, 5000);
+        CloseHandle(proc);
+        err = "cannot wrap child stdin pipe";
+        return false;
+    }
+    const int out_fd = _open_osfhandle((intptr_t) rd_out, _O_BINARY | _O_RDONLY);
+    if (out_fd < 0) {
+        _close(in_fd);
+        CloseHandle(rd_out);
+        (void) TerminateProcess(proc, 1);
+        (void) WaitForSingleObject(proc, 5000);
+        CloseHandle(proc);
+        err = "cannot wrap child stdout pipe";
         return false;
     }
     out.child.handle = proc;
     out.child.id = (int64_t) GetProcessId(proc);
-    // The parent's ends become CRT descriptors, so the request and reply loops are the same code either way.
-    out.in_fd = _open_osfhandle((intptr_t) wr_in, _O_BINARY | _O_WRONLY);
-    out.out_fd = _open_osfhandle((intptr_t) rd_out, _O_BINARY | _O_RDONLY);
-    CloseHandle(rd_in);              // the child owns the request pipe's read end
-    CloseHandle(wr_out);             // the child owns the reply pipe's write end
-    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+    out.in_fd = in_fd;
+    out.out_fd = out_fd;
     return true;
 #else
-    int in[2], outp[2];
-    if (pipe(in) != 0 || pipe(outp) != 0) { err = "pipe failed"; return false; }
+    int in[2] = {-1, -1}, outp[2] = {-1, -1};
+    int lf = -1;
+    auto close_all = [&] {
+        for (int fd : {in[0], in[1], outp[0], outp[1], lf})
+            if (fd >= 0) close(fd);
+    };
+    if (pipe2(in, O_CLOEXEC) != 0 || pipe2(outp, O_CLOEXEC) != 0) {
+        close_all();
+        err = "pipe failed";
+        return false;
+    }
+    if (stderr_path.empty()) {
+        lf = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    } else {
+        lf = open(stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    }
+    if (lf < 0) {
+        const int e = errno;
+        close_all();
+        err = "cannot open child error log " + (stderr_path.empty() ? std::string("/dev/null") : stderr_path) + ": " +
+              std::strerror(e);
+        return false;
+    }
     std::vector<std::string> store = argv;
     std::vector<char*> av = c_argv(store);
     const pid_t pid = fork();
-    if (pid < 0) { err = "fork failed"; return false; }
+    if (pid < 0) {
+        close_all();
+        err = "fork failed";
+        return false;
+    }
     if (pid == 0) {
-        dup2(in[0], 0);
-        dup2(outp[1], 1);
-        const int lf = open(stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (lf >= 0) dup2(lf, 2);
-        close(in[0]); close(in[1]); close(outp[0]); close(outp[1]);
+        auto wire = [](int src, int dst) {
+            if (src == dst) (void) fcntl(dst, F_SETFD, 0);
+            else (void) dup2(src, dst);
+        };
+        wire(in[0], 0);
+        wire(outp[1], 1);
+        wire(lf, 2);
+        // Any remaining pipe/log FDs are marked O_CLOEXEC and closed automatically on execv.
         execv(store[0].c_str(), av.data());
         _exit(127);
     }
     close(in[0]);
     close(outp[1]);
+    close(lf);
     out.in_fd = in[1];
     out.out_fd = outp[0];
     out.child.id = (int64_t) pid;
@@ -171,11 +243,13 @@ bool spawn_piped(const std::vector<std::string>& argv, const std::string& stderr
 }
 
 bool pipe_write_all(int fd, const void* data, size_t n) {
+    if (fd < 0) return false;
     const char* p = (const char*) data;
     size_t off = 0;
     while (off < n) {
 #if defined(_WIN32)
-        const int w = _write(fd, p + off, (unsigned) (n - off));
+        const unsigned chunk = (unsigned) std::min<size_t>(n - off, (size_t) INT_MAX);
+        const int w = _write(fd, p + off, chunk);
 #else
         const ssize_t w = ::write(fd, p + off, n - off);
 #endif
@@ -183,15 +257,19 @@ bool pipe_write_all(int fd, const void* data, size_t n) {
             if (errno == EINTR) continue;
             return false;
         }
+        if (w == 0) return false;
         off += (size_t) w;
     }
     return true;
 }
 
 int64_t pipe_read(int fd, void* dst, size_t n) {
+    if (fd < 0) { errno = EBADF; return -1; }
+    if (n == 0) return 0;
     for (;;) {
 #if defined(_WIN32)
-        const int r = _read(fd, dst, (unsigned) n);
+        const unsigned chunk = (unsigned) std::min<size_t>(n, (size_t) INT_MAX);
+        const int r = _read(fd, dst, chunk);
 #else
         const ssize_t r = ::read(fd, dst, n);
 #endif
@@ -201,14 +279,24 @@ int64_t pipe_read(int fd, void* dst, size_t n) {
 }
 
 bool pipe_wait_readable(int fd, int timeout_ms) {
+    if (fd < 0) return true;
 #if defined(_WIN32)
     const HANDLE h = (HANDLE) _get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_PIPE) return true;
-    for (int waited = 0;; waited += 10) {
+    const bool infinite = timeout_ms < 0;
+    const auto deadline = infinite ? std::chrono::steady_clock::time_point{}
+                                   : std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
         DWORD avail = 0;
         if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) return true;   // data, or the writer is gone
-        if (waited >= timeout_ms) return false;
-        Sleep(10);
+        if (!infinite) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return false;
+            const auto left_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            Sleep((DWORD) (left_ms < 10 ? (left_ms > 0 ? left_ms : 1) : 10));
+        } else {
+            Sleep(10);
+        }
     }
 #else
     pollfd p{fd, POLLIN, 0};
@@ -458,6 +546,17 @@ LONG WINAPI on_win_exception(EXCEPTION_POINTERS* ep) noexcept {
     }
     return EXCEPTION_CONTINUE_SEARCH;   // the system's own crash handling and the exit status stay as they were
 }
+
+void on_win_abort(int) noexcept {
+    if (!g_crash_logged.exchange(true, std::memory_order_relaxed)) {
+        CrashBuf b;
+        b.puts("basalt crash: error: SIGABRT");
+        append_crash_stage(b, true);
+        b.putc('\n');
+        write_crash_line(b);
+        write_crash_backtrace();
+    }
+}
 #else
 const char* posix_signal_name(int sig) noexcept {
     switch (sig) {
@@ -465,6 +564,7 @@ const char* posix_signal_name(int sig) noexcept {
         case SIGBUS: return "SIGBUS";
         case SIGILL: return "SIGILL";
         case SIGFPE: return "SIGFPE";
+        case SIGABRT: return "SIGABRT";
         default: return "signal";
     }
 }
@@ -492,6 +592,7 @@ void install_crash_handler() {
     (void) std::set_terminate(on_terminate);
 #if defined(_WIN32)
     (void) SetUnhandledExceptionFilter(on_win_exception);
+    (void) std::signal(SIGABRT, on_win_abort);
 #else
     // backtrace() loads its unwinder on first use, which allocates: do it now, not in the handler
     void* warm[1];
@@ -506,7 +607,7 @@ void install_crash_handler() {
     sa.sa_sigaction = on_crash_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
-    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) (void) sigaction(sig, &sa, nullptr);
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) (void) sigaction(sig, &sa, nullptr);
 #endif
 }
 

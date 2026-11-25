@@ -87,5 +87,14 @@ int main() {
     const DynLib crt = DynLib::open_app("libc.so.6");
 #endif
     check((bool) crt && !crt.path().empty(), "open_app: the C runtime loads and path() names its file");
+    const std::string crt_path = crt.path();
+    const size_t cut = crt_path.find_last_of("\\/");
+    const std::string crt_dir = cut != std::string::npos ? crt_path.substr(0, cut) : std::string();
+#if defined(_WIN32)
+    const DynLib crt_near = DynLib::open_app("ucrtbase.dll", crt_dir);
+#else
+    const DynLib crt_near = DynLib::open_app("libc.so.6", crt_dir);
+#endif
+    check((bool) crt_near && !crt_near.path().empty(), "open_app with prefer_dir loads companion library");
     return failures ? 1 : 0;
 }

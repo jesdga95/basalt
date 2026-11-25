@@ -8,7 +8,6 @@
 #include <thread>
 #include <vector>
 
-#include "basalt/platform/compiler.hpp"
 #include "gemm_cpu.hpp"
 
 namespace basalt::vision {
@@ -45,9 +44,8 @@ inline void tile4(const uint16_t* x, const uint16_t* w, float* y, int m0, int ro
 
 }  // namespace
 
-bool cpu_has_bf16() { return basalt::platform::cpu_has_avx512_bf16(); }
-
 void gemm_bf16_avx512(const float* X, const uint16_t* W, float* Y, int M, int N, int K, int threads) {
+    if (M <= 0 || N <= 0 || K < 0) return;
     std::vector<uint16_t> xb((size_t) M * K);
     {   // x to bf16, round to nearest even
         const size_t total = xb.size();

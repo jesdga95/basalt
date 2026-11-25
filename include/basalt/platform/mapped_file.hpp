@@ -16,7 +16,7 @@
 namespace basalt::platform {
 
 struct MapOptions {
-    uint64_t offset = 0;   ///< first byte of the file to expose; on Linux it has to be a multiple of the page size
+    uint64_t offset = 0;   ///< first byte of the file to expose; aligned down to the OS page size when mapping
     uint64_t bytes = 0;    ///< bytes to expose; 0 is everything from `offset` to the end of the file
     bool shared = false;   ///< Linux: MAP_SHARED instead of MAP_PRIVATE (read-only either way); no effect on Windows
 };

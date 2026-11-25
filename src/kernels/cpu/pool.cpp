@@ -3,6 +3,7 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/swiglu.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -338,8 +339,10 @@ void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) con
 void ExpertPool::native_gu_range(int e, int r0, int r1) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const ExpertJobMulti& j = mjobs_[e];
-    if (q2_native_kernels(nfmt_->gu_type)) {
-        // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
+    bool have_act = q2_native_kernels(nfmt_->gu_type) && nfmt_->n_embd <= kActMaxWidth && j.nt > 0;
+    for (int t = 0; have_act && t < j.nt; ++t) have_act = j.act[t] != nullptr;
+    if (have_act) {
+        // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then the layer's SwiGLU
         thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
         float* gp[MAXT];
         float* up[MAXT];
@@ -347,9 +350,10 @@ void ExpertPool::native_gu_range(int e, int r0, int r1) {
         const int nbk = (int) (nfmt_->n_embd / 64);
         q2_rows_any(j.blob, nfmt_->gu_row, nbk, j.act, j.nt, gp, r0, r1);
         q2_rows_any(j.blob + nfmt_->up_off, nfmt_->gu_row, nbk, j.act, j.nt, up, r0, r1);
+        const SwiGlu glu{nfmt_->swiglu_limit, nfmt_->gate_softcap, nfmt_->up_softcap};
         for (int t = 0; t < j.nt; ++t)
             for (int r = r0; r < r1; ++r)
-                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+                sb.ff[t][r] = swiglu(glu, gbuf[t][r], ubuf[t][r]);
         return;
     }
     float* ff[MAXT];
@@ -360,7 +364,7 @@ void ExpertPool::native_gu_range(int e, int r0, int r1) {
 void ExpertPool::native_down_range(int e, int r0, int r1) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const ExpertJobMulti& j = mjobs_[e];
-    if (q2_native_kernels(nfmt_->d_type)) {
+    if (q2_native_kernels(nfmt_->d_type) && nfmt_->n_ff <= kActMaxWidth) {
         // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
         const ActQ* a2[MAXT];
         for (int t = 0; t < j.nt; ++t) a2[t] = &sb.a2[t];
@@ -375,7 +379,7 @@ void ExpertPool::native_down_range(int e, int r0, int r1) {
 void ExpertPool::native_quantize(int e) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     for (int t = 0; t < mjobs_[e].nt; ++t)
-        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
+        if (q2_native_kernels(nfmt_->d_type) && nfmt_->n_ff <= kActMaxWidth) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
         else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
 }
 

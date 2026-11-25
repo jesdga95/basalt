@@ -37,6 +37,26 @@ int main() {
     }
     free_region(nullptr, 0);
 
+    // Non-2 MiB-multiple sizes must also allocate and release cleanly (Linux hugetlb requires 2 MiB-aligned munmap).
+    {
+        const uint64_t odd_bytes = (5ull << 20) + 1234;
+        std::string odd_note;
+        void* ob = nullptr;
+        uint64_t on = 0;
+        uint8_t* op = (uint8_t*) alloc_region(odd_bytes, backing, odd_note, "", 0, ob, on);
+        check(op != nullptr && ob != nullptr && on >= odd_bytes, "non-2 MiB-multiple region allocates and tracks mapping bytes");
+        if (op != nullptr) {
+            op[0] = 0x5a;
+            op[odd_bytes - 1] = 0xa5;
+            check(op[0] == 0x5a && op[odd_bytes - 1] == 0xa5, "non-2 MiB-multiple region is writable end to end");
+            free_region(ob, on);
+        }
+        std::string znote;
+        void* zb = (void*) 1;
+        uint64_t zn = 1;
+        check(alloc_region(0, backing, znote, "", 0, zb, zn) == nullptr && zb == nullptr && zn == 0, "empty region is refused");
+    }
+
     // a shared arena file is refused with a note where it cannot be made (no model hash here), and nothing is mapped
     std::string note2;
     void* b2 = (void*) 1;

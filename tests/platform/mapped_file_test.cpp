@@ -59,10 +59,40 @@ int main() {
         moved.prefetch(total - 10, 100);
         const uint64_t released = moved.release(0, total);
         check(released <= total, "release reports at most the range");
+        const uint64_t rel_huge = moved.release(0, UINT64_MAX);
+        check(rel_huge <= total, "release clips huge length to the view");
+        const uint64_t rel_wrap = moved.release(total - 10, UINT64_MAX);
+        check(rel_wrap <= 10, "release clips wrapping off + len to the view");
         check(moved.data()[total - 1] == byte_at(total - 1), "bytes are still readable after release");
         moved.reset();
         check(!moved && moved.data() == nullptr && moved.size() == 0, "reset empties the view");
         moved.reset();
+    }
+    {
+        // Unaligned offsets (4 KiB and arbitrary byte offset) work on both 4 KiB and 64 KiB page systems.
+        for (uint64_t off : {4096ull, 123ull}) {
+            MapOptions o;
+            o.offset = off;
+            o.bytes = 70000;
+            auto m = MappedFile::open_ro(path, &err, o);
+            check(m.has_value() && m->size() == 70000 && m->file_size() == total,
+                  "unaligned offset " + std::to_string(off) + ": size");
+            bool same = m.has_value();
+            for (uint64_t i = 0; same && i < 70000; ++i) same = m->data()[i] == byte_at(off + i);
+            check(same, "unaligned offset " + std::to_string(off) + ": every byte");
+            if (m) {
+                m->prefetch(0, 70000);
+                check(m->release(0, 70000) <= 70000, "unaligned offset " + std::to_string(off) + ": release");
+                check(m->data()[69999] == byte_at(off + 69999), "unaligned offset " + std::to_string(off) + ": readable after release");
+            }
+        }
+    }
+    {
+        err.clear();
+        MapOptions o;
+        o.offset = total;
+        o.bytes = 0;
+        check(!MappedFile::open_ro(path, &err, o).has_value() && !err.empty(), "empty trailing range is refused");
     }
     {
         MapOptions o;

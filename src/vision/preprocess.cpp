@@ -23,11 +23,11 @@ bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err,
     int w = 0, h = 0, c = 0;
     // The header first: a file that claims more pixels than the guard allows is refused before the decode allocates
     // anything.  stb's own size checks still apply afterwards.
-    if (!stbi_info_from_memory(data, n, &w, &h, &c)) {
+    if (!stbi_info_from_memory(data, n, &w, &h, &c) || w <= 0 || h <= 0) {
         err = stbi_failure_reason() ? stbi_failure_reason() : "unreadable image";
         return false;
     }
-    if ((int64_t) w * (int64_t) h > max_pixels) {
+    if (max_pixels <= 0 || (int64_t) w * (int64_t) h > max_pixels) {
         const std::string limit = max_pixels >= (1 << 20) ? std::to_string(max_pixels >> 20) + " megapixels"
                                                           : std::to_string(max_pixels) + " pixels";
         err = "the image is " + std::to_string(w) + "x" + std::to_string(h) + " pixels; the limit is " + limit;
@@ -60,25 +60,46 @@ bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err,
 }
 
 Size fit_size(int w, int h, const Geometry& g) {
-    if (w <= 0 || h <= 0) return {0, 0};
-    const int f = g.patch * g.merge;
-    const int64_t min_px = (int64_t) g.min_tokens * f * f, max_px = (int64_t) g.max_tokens * f * f;
+    if (w <= 0 || h <= 0 || g.patch <= 0 || g.merge <= 0 || g.max_tokens <= 0) return {0, 0};
+    const int64_t f = (int64_t) g.patch * g.merge;
+    const int64_t min_px = (int64_t) std::max(0, g.min_tokens) * f * f, max_px = (int64_t) g.max_tokens * f * f;
     // the reference smart_resize's arithmetic: doubles, and Python round() (nearbyint rounds half to even in the
     // default rounding mode)
-    auto round_f = [f](double x) { return (int) std::nearbyint(x / (double) f) * f; };
-    auto ceil_f = [f](double x) { return (int) std::ceil(x / (double) f) * f; };
-    auto floor_f = [f](double x) { return (int) std::floor(x / (double) f) * f; };
-    int wb = round_f((double) w), hb = round_f((double) h);
-    if ((int64_t) hb * wb > max_px) {
+    auto round_f = [f](double x) { return (int64_t) std::nearbyint(x / (double) f) * f; };
+    auto ceil_f = [f](double x) { return (int64_t) std::ceil(x / (double) f) * f; };
+    auto floor_f = [f](double x) { return (int64_t) std::floor(x / (double) f) * f; };
+    int64_t wb = round_f((double) w), hb = round_f((double) h);
+    if (hb * wb > max_px) {
         const double beta = std::sqrt((double) h * (double) w / (double) max_px);
         hb = std::max(f, floor_f((double) h / beta));
         wb = std::max(f, floor_f((double) w / beta));
-    } else if ((int64_t) hb * wb < min_px) {
+    } else if (hb * wb < min_px) {
         const double beta = std::sqrt((double) min_px / ((double) h * (double) w));
         hb = ceil_f((double) h * beta);
         wb = ceil_f((double) w * beta);
     }
-    return {wb, hb};
+    hb = std::max(f, hb);
+    wb = std::max(f, wb);
+    // Clamping one axis up to `f` (or extreme aspect ratios) can push the product past max_tokens; shrink until it fits.
+    while ((hb / f) * (wb / f) > g.max_tokens) {
+        if (hb == f && wb == f) break;
+        if (hb == f) {
+            wb = std::max(f, (int64_t) g.max_tokens * f);
+        } else if (wb == f) {
+            hb = std::max(f, (int64_t) g.max_tokens * f);
+        } else {
+            const double beta = std::sqrt((double) hb * (double) wb / (double) max_px);
+            const int64_t h2 = std::max(f, floor_f((double) hb / beta));
+            const int64_t w2 = std::max(f, floor_f((double) wb / beta));
+            if (h2 == hb && w2 == wb) {
+                if (hb > wb) hb -= f; else wb -= f;
+            } else {
+                hb = h2;
+                wb = w2;
+            }
+        }
+    }
+    return {(int) wb, (int) hb};
 }
 
 namespace {
