@@ -208,3 +208,9 @@ The previous INT8 row-writer parity matched the CPU reference for 257 rows of wi
 The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output
 with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
 2,405-token prompt checked).
+
+The prompt attention and the FP4 experts round a row the same at any chunk width (the parity test checks both, the experts
+in an 8,192-row chunk against a 256-row one); Q8_0 experts through MMQ do not, since MMQ splits K by the chunk. The
+drafter's context of a chunk's rows comes from MMQ products over the whole chunk, so its last bits follow the chunk's width:
+a read that runs 8,192-row chunks (more than 4,096 tokens, experts in RAM) gives the drafter other bits than 4,096-row
+chunks would, and its drafts can differ (the target still checks every one).

@@ -1,13 +1,14 @@
 // src/models/inkling2/prompt.cpp - the prompt path of an Inkling 2 session. A read of more rows than a decode window runs in
-// chunks of up to kChunk rows, each one forward through the visits of walk.hpp over chunk-wide row buffers: the Q8_0
-// projections and the experts are MMQ products on the int8 tensor cores (the experts grouped by expert and read in place),
-// the router's scores and the loop controllers' products run on the tf32 tensor cores, the attention flash style over the
-// caches (kernels/attn_prompt.cu), the rest are the decode forward's kernels over all the rows. A chunk leaves the caches as
-// the decode forward leaves them: a full visit's cells, a sliding-window visit's ring (the chunk's keys are staged, then
-// its last positions moved in) and the convolution rings' last kConvRing positions.
+// chunks of up to kPromptChunk rows (kWidePromptChunk for a long read with room for it), each one forward through the visits of
+// walk.hpp over chunk-wide row buffers: the Q8_0 projections and the experts are MMQ products on the int8 tensor cores (the
+// experts grouped by expert and read in place), the router's scores and the loop controllers' products run on the tf32 tensor
+// cores, the attention flash style over the caches (kernels/attn_prompt.cu), the rest are the decode forward's kernels over all
+// the rows. A chunk leaves the caches as the decode forward leaves them: a full visit's cells, a sliding-window visit's ring
+// (the chunk's keys are staged, then its last positions moved in) and the convolution rings' last kConvRing positions.
 #include "models/inkling2/prompt.hpp"
 
 #include "basalt/core/progress.hpp"
+#include "basalt/core/vmm.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/router.hpp"
@@ -21,12 +22,14 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "models/inkling2/dspark.hpp"
 #include "models/inkling2/walk.hpp"
+#include "models/inkling2/wide_chunk.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -37,7 +40,6 @@ namespace fp4 = basalt::prefill::fp4;
 namespace mxfp8 = basalt::prefill::mxfp8;
 namespace q8 = basalt::prefill::q8;
 
-constexpr int kChunk = kPromptChunk;       // rows of one chunk forward
 constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
 constexpr int kTypeMxfp8 = 46;
@@ -78,8 +80,8 @@ struct Bufs {
     int32_t *pos = nullptr, *tokd = nullptr, *ident = nullptr, *dbounds = nullptr;
 };
 
-void carve(Carve& c, Bufs& b, const Geometry& g) {
-    const size_t E = (size_t) g.n_embd, R = kChunk, P = R * (size_t) g.n_used;
+void carve(Carve& c, Bufs& b, const Geometry& g, int chunk) {
+    const size_t E = (size_t) g.n_embd, R = (size_t) chunk, P = R * (size_t) g.n_used;
     for (float*& p : b.role) p = c.take<float>(R * E);
     b.resid = c.take<float>(R * E);
     // the attention's buffers
@@ -167,7 +169,13 @@ public:
             if (k.staged) cudaEventDestroy(k.staged);
             if (k.copy) cudaStreamDestroy(k.copy);
             if (i > 0 && k.stream) cudaStreamDestroy(k.stream);
-            if (k.mem) cudaFree(k.mem);
+            if (i == 0 && wide_va_) {
+                if (wide_h_) core::vmm::unmap(wide_va_ + narrow_bytes_, wide_bytes_ - narrow_bytes_, wide_h_);
+                if (narrow_h_) core::vmm::unmap(wide_va_, narrow_bytes_, narrow_h_);
+                core::vmm::release_range(wide_va_, wide_bytes_);
+            } else if (k.mem) {
+                cudaFree(k.mem);
+            }
         }
         if (hand_) cudaFreeHost(hand_);
         for (void* q : {(void*) px_nrm_, (void*) px_ids_, (void*) px_rw_, (void*) px_out_, (void*) px_cnt_})
@@ -203,7 +211,7 @@ public:
             if (!init_lane(err)) return false;
         }
         if (m_.peer_device() >= 0) {   // gpu-mode peer: a layer's rows to the second card and its partial sums back
-            const size_t R = kChunk, E = (size_t) g_.n_embd, P = R * (size_t) g_.n_used;
+            const size_t R = (size_t) chunk_, E = (size_t) g_.n_embd, P = R * (size_t) g_.n_used;
             constexpr unsigned flags = cudaHostAllocPortable | cudaHostAllocMapped;   // the main card's kernels write the rows there
             if (cudaHostAlloc((void**) &px_nrm_, R * E * 4, flags) != cudaSuccess ||
                 cudaHostAlloc((void**) &px_ids_, P * 4, flags) != cudaSuccess ||
@@ -244,7 +252,7 @@ public:
             size_t pulls = 0;
             for (const Segment& sg : segs_) pulls = std::max(pulls, sg.pull.size());
             tap_slot0_ = (int) pulls;
-            const size_t bytes = (pulls + kDsTargets) * (size_t) kChunk * g_.n_embd * 4;
+            const size_t bytes = (pulls + kDsTargets) * (size_t) chunk_ * g_.n_embd * 4;
             if (cudaHostAlloc((void**) &hand_, bytes, cudaHostAllocPortable) != cudaSuccess) {
                 cudaGetLastError();
                 err = "cannot pin " + std::to_string(bytes >> 20) + " MiB for the layer split's prompt hand-offs";
@@ -254,24 +262,139 @@ public:
         return true;
     }
 
+    // A long read's wider chunk: on the first card alone, with the card's copies to make room from.
+    bool wide_possible() const {
+        return m_.copies() && m_.cards() == 1 && m_.peer_device() < 0 && core::vmm::supported();
+    }
+
+    // The current card's buffers carved over its arena at chunk_ rows, and their fixed contents.
+    void carve_lane() {
+        Carve c;
+        c.base = static_cast<uint8_t*>(lane().mem);
+        carve(c, b(), g_, chunk_);
+        mmq::iota(b().ident, (int64_t) chunk_ * g_.n_used, strm());
+        // the sorted entries past the ones a chunk fills (pairs another card computes are left out) read as row 0 of expert 0
+        const size_t pair_bytes = (size_t) chunk_ * g_.n_used * 4;
+        cudaMemsetAsync(b().tok, 0, pair_bytes, strm());
+        cudaMemsetAsync(b().dst, 0, pair_bytes, strm());
+        cudaMemsetAsync(b().exp, 0, pair_bytes, strm());
+    }
+
+    // A read of more than kPromptChunk rows takes kWidePromptChunk-row chunks when the card's copies make room for the rest
+    // of the arena and the drafter's wider tap (the counted room, so the choice follows the requests). Before the first
+    // chunk, after the prompt loan came back; false leaves the read at kPromptChunk rows.
+    struct WideOps {
+        Prompt& p;
+        bool short_ = false;   // the card had less free memory than counted
+        Take take(uint64_t bytes) { return p.m_.take_room(bytes); }
+        bool give(uint64_t bytes) { return p.m_.give_room(bytes); }
+        WideStep map() {
+            bool out_of_memory = false;
+            p.wide_h_ = core::vmm::map(p.wide_va_ + p.narrow_bytes_, p.wide_bytes_ - p.narrow_bytes_, &out_of_memory);
+            if (p.wide_h_) return WideStep::Done;
+            cudaGetLastError();
+            short_ = out_of_memory;
+            return out_of_memory ? WideStep::Short : WideStep::Broken;
+        }
+        bool unmap() {
+            if (!core::vmm::unmap(p.wide_va_ + p.narrow_bytes_, p.wide_bytes_ - p.narrow_bytes_, p.wide_h_)) return false;
+            p.wide_h_ = 0;
+            return true;
+        }
+        WideStep tap_on() {
+            const cudaError_t e = cudaMalloc((void**) &p.wide_tap_, dspark_tap_bytes(kWidePromptChunk));
+            if (e != cudaSuccess) {
+                cudaGetLastError();
+                p.wide_tap_ = nullptr;
+                short_ = e == cudaErrorMemoryAllocation;
+                return short_ ? WideStep::Short : WideStep::Broken;
+            }
+            p.narrow_tap_ = p.ds_->tap_base();
+            p.narrow_tap_rows_ = p.ds_->tap_rows();
+            p.ds_->use_tap(p.wide_tap_, kWidePromptChunk);
+            return WideStep::Done;
+        }
+        bool tap_off() {   // the drafter reads its own tap again; the wide one stays owned when its release fails
+            p.ds_->use_tap(p.narrow_tap_, p.narrow_tap_rows_);
+            if (cudaFree(p.wide_tap_) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            p.wide_tap_ = nullptr;
+            return true;
+        }
+    };
+    WideOpen widen(int n) {
+        if (!wide_va_ || n <= kPromptChunk || chunk_ != kPromptChunk || m_.loaned() > 0) return WideOpen::Narrow;
+        const bool tap = ds_->on();
+        const uint64_t extra = wide_bytes_ - narrow_bytes_ + (tap ? dspark_tap_bytes(kWidePromptChunk) : 0);
+        wide_ops_.short_ = false;
+        const WideOpen w = wide_.open(extra, tap);
+        if (wide_.stuck()) {
+            m_.wedge();
+            basalt::log::error("basalt inkling2", "the wide prompt chunk's memory could not be released; restart the engine");
+        }
+        if (w == WideOpen::Narrow && wide_ops_.short_ && !std::exchange(wide_short_, true))
+            basalt::log::warn("basalt inkling2", "a long prompt read found no memory for its wider chunk: %d rows at a time",
+                              kPromptChunk);
+        if (w != WideOpen::Wide) return w;
+        chunk_ = kWidePromptChunk;
+        carve_lane();
+        return w;
+    }
+
+    // After a wide read: the narrow chunk's buffers again, the extra memory back to the copies. `drained`: the read's
+    // streams are confirmed idle (when not, nothing is released or touched). False when the copies did not all come back
+    // or the memory stays taken. Never throws.
+    bool narrow(bool drained) noexcept {
+        if (!wide_.wide()) return !wide_.stuck();
+        const WideClose c = wide_.close(drained);
+        if (c == WideClose::Stuck) {
+            m_.wedge();
+            quiet_error("the wide prompt chunk's memory could not be released; restart the engine");
+            return false;
+        }
+        chunk_ = kPromptChunk;
+        if (c == WideClose::RestoreFailed) {   // the read fails first; the next read lays the narrow buffers out
+            recarve_ = true;
+            quiet_error("the copies a long prompt read lent did not all come back");
+            return false;
+        }
+        carve_lane();
+        return true;
+    }
+    static void quiet_error(const char* what) noexcept {
+        try {
+            basalt::log::error("basalt inkling2", "%s", what);
+        } catch (...) {
+        }
+    }
+
     // The current card's chunk buffers and products.
     bool init_lane(std::string& err) {
         Carve c;
-        carve(c, b(), g_);
-        if (cudaMalloc(&lane().mem, c.at) != cudaSuccess) {
+        carve(c, b(), g_, chunk_);
+        if (cur_ == 0 && wide_possible()) {
+            // the arena in a range of the wide chunk's size, backed as far as the chunk of kPromptChunk rows needs; a long
+            // read backs the rest while it runs
+            Carve w;
+            Bufs wb;
+            carve(w, wb, g_, kWidePromptChunk);
+            const uint64_t gran = core::vmm::granularity();
+            narrow_bytes_ = (c.at + gran - 1) / gran * gran;
+            wide_bytes_ = (w.at + gran - 1) / gran * gran;
+            if (!(wide_va_ = core::vmm::reserve(wide_bytes_)) || !(narrow_h_ = core::vmm::map(wide_va_, narrow_bytes_))) {
+                cudaGetLastError();
+                err = "out of device memory for the prompt path (" + std::to_string(c.at >> 20) + " MiB)";
+                return false;
+            }
+            lane().mem = wide_va_;
+        } else if (cudaMalloc(&lane().mem, c.at) != cudaSuccess) {
             cudaGetLastError();
             err = "out of device memory for the prompt path (" + std::to_string(c.at >> 20) + " MiB)";
             return false;
         }
-        c = Carve{};
-        c.base = static_cast<uint8_t*>(lane().mem);
-        carve(c, b(), g_);
-        mmq::iota(b().ident, (int64_t) kChunk * g_.n_used, strm());
-        // the sorted entries past the ones a chunk fills (pairs another card computes are left out) read as row 0 of expert 0
-        const size_t pair_bytes = (size_t) kChunk * g_.n_used * 4;
-        cudaMemsetAsync(b().tok, 0, pair_bytes, strm());
-        cudaMemsetAsync(b().dst, 0, pair_bytes, strm());
-        cudaMemsetAsync(b().exp, 0, pair_bytes, strm());
+        carve_lane();
         // the arena before `ident` (the one buffer set once) is scratch outside a prompt: decode may keep expert copies there
         // (InklingModel::set_prompt_arena); not under gpu-mode peer, which reads the zeros above
         if (cur_ == 0 && m_.has_spill() && m_.cards() == 1 && m_.peer_device() < 0)
@@ -341,7 +464,7 @@ private:
     void cross(int from, const Segment& sg, int rows) {
         Lane& a = lane_[from];
         Lane& k = lane_[sg.card];
-        const size_t n = (size_t) rows * g_.n_embd, slot = (size_t) kChunk * g_.n_embd;
+        const size_t n = (size_t) rows * g_.n_embd, slot = (size_t) chunk_ * g_.n_embd;
         cudaSetDevice(a.device);
         for (size_t i = 0; i < sg.pull.size(); ++i)
             cudaMemcpyAsync(hand_ + i * slot, a.b.role[(int) sg.pull[i]], n * 4, cudaMemcpyDeviceToHost, a.stream);
@@ -356,7 +479,7 @@ private:
     void tap_across(int t, const float* rows_dev, int rows) {
         Lane& a = lane_[1];
         const size_t n = (size_t) rows * g_.n_embd;
-        float* slot = hand_ + (size_t) (tap_slot0_ + t) * kChunk * g_.n_embd;
+        float* slot = hand_ + (size_t) (tap_slot0_ + t) * chunk_ * g_.n_embd;
         cudaMemcpyAsync(slot, rows_dev, n * 4, cudaMemcpyDeviceToHost, a.stream);
         cudaEventRecord(a.hand, a.stream);
         cudaSetDevice(lane_[0].device);
@@ -367,25 +490,34 @@ private:
 
     // `n` rows (tokens, or host embedding rows) in chunks of about equal size; one chunk stays queued ahead of the host,
     // which reports a chunk once the card has run it. A read that ends any other way than its final wait (an error, an
-    // exception) runs out its streams first (drain).
+    // exception) runs out its streams first (drain), then a wide read gives its memory back (narrow).
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
                       std::vector<int32_t>& hist, int32_t pad, const Prepare& prepare) {
+        struct Narrow {   // a read that ends any other way: after the drain, and only what the drain confirmed
+            Prompt* p;
+            ~Narrow() { (void) p->narrow(p->drained_); }
+        } narrow_after{this};
         struct Guard {
             Prompt* p;
             bool armed = true;
             ~Guard() {
-                if (armed) p->drain();
+                if (armed) p->drained_ = p->drain();
             }
         } guard{this};
-        const int chunks = (n + kChunk - 1) / kChunk;
-        const int per = (n + chunks - 1) / chunks;
+        drained_ = false;
         std::string err;
         int reported = 0, k = 0;
         prestaged_ = false;
-        for (int t0 = 0; t0 < n; t0 += per, ++k) {
-            if (r.stop && r.stop()) break;
-            if (k == 0 && prepare && (!prepare() || m_.wedged() || m_.loaned() > 0))
-                return {model::Status::Error, "inkling2: the prompt path's memory could not be taken back"};
+        const bool go = !(r.stop && r.stop());
+        if (go && prepare && (!prepare() || m_.wedged() || m_.loaned() > 0))
+            return {model::Status::Error, "inkling2: the prompt path's memory could not be taken back"};
+        if (go && std::exchange(recarve_, false)) carve_lane();
+        if (go && widen(n) == WideOpen::Failed)
+            return {model::Status::Error, "inkling2: the copies a long prompt read borrowed from could not be put back"};
+        const int chunks = (n + chunk_ - 1) / chunk_;
+        const int per = (n + chunks - 1) / chunks;
+        for (int t0 = 0; go && t0 < n; t0 += per, ++k) {
+            if (k > 0 && r.stop && r.stop()) break;
             const int rows = std::min(per, n - t0);
             next_long_ = t0 + per < n && std::min(per, n - t0 - per) > kRoutedRows;
             if (!chunk(tokens ? tokens + t0 : nullptr, emb ? emb + (size_t) t0 * g_.n_embd : nullptr, rows, pos + t0, err))
@@ -403,6 +535,7 @@ private:
         // a stopped read may leave the next chunk's copies queued (staging_read)
         if (lane_[0].copy && cudaStreamSynchronize(lane_[0].copy) != cudaSuccess)
             return {model::Status::Error, "inkling2: the prompt staging failed"};
+        if (!narrow(true)) return {model::Status::Error, "inkling2: a long prompt read's borrowed memory did not all come back"};
         guard.armed = false;
         if (r.progress && reported > 0) r.progress(reported);
         return {};
@@ -410,7 +543,7 @@ private:
     // A failed read: every stream it queued work on runs out before the staging, the chunk buffers or a card copy it reads
     // can be used again. When one cannot, the engine ends without the CUDA teardown, which would wait for that work
     // (core::gpu_left_running).
-    void drain() {
+    bool drain() noexcept {
         bool out = true;
         for (int i = m_.cards() - 1; i >= 0; --i) {
             Lane& k = lane_[i];
@@ -426,8 +559,9 @@ private:
         cudaGetLastError();
         if (!out) {
             basalt::core::gpu_left_running().store(true);
-            basalt::log::error("basalt inkling2", "a failed prompt read's work could not be run out");
+            quiet_error("a failed prompt read's work could not be run out");
         }
+        return out;
     }
     // The first failing call's status of the read (staging_failed), for its error.
     bool ok(cudaError_t e) {
@@ -592,7 +726,7 @@ private:
         ap.v_ring = c.v_ring;
         ap.k_cache = c.ring ? b().k_stage : c.k;
         ap.v_cache = c.ring ? b().v_stage : c.v;
-        ap.cap = c.ring ? kChunk : c.cap;
+        ap.cap = c.ring ? chunk_ : c.cap;
         ap.fp8 = fp8;
         ap.int8 = int8;
         ap.q = b().q;
@@ -616,7 +750,7 @@ private:
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
-        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
+        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, chunk_, c.k, c.v, c.cap, pos0, rows, g_.window,
                                   kv_cache_row_bytes(fp8, int8), strm());
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
@@ -902,6 +1036,18 @@ private:
 
     InklingModel& m_;
     const Geometry& g_;
+    int chunk_ = kPromptChunk;   // rows of one chunk forward
+    // the first card's arena when a long read may widen its chunk: the range, its two backings, the wide read's tap
+    uint8_t* wide_va_ = nullptr;
+    uint64_t narrow_bytes_ = 0, wide_bytes_ = 0;
+    unsigned long long narrow_h_ = 0, wide_h_ = 0;
+    float *wide_tap_ = nullptr, *narrow_tap_ = nullptr;
+    int narrow_tap_rows_ = 0;
+    bool wide_short_ = false;
+    bool drained_ = false;   // the last failed read's streams were run out (drain)
+    bool recarve_ = false;   // a wide read whose copies did not all return left its buffers laid out wide
+    WideOps wide_ops_{*this};
+    WideChunk<WideOps> wide_{wide_ops_};
     const std::vector<VisitCache>* vc_ = nullptr;   // the reading session's caches, drafter and stream
     DsparkHook* ds_ = nullptr;
     Walk walk_;
@@ -935,7 +1081,7 @@ std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, void* stream, std::st
 uint64_t prompt_bytes(const Geometry& g) {
     Carve c;
     Bufs b;
-    carve(c, b, g);
+    carve(c, b, g, kPromptChunk);
     return (uint64_t) c.at + kMmqSpare;
 }
 
