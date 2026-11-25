@@ -943,7 +943,7 @@ if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
   set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
 endif()
 
-# speculative multi-slot batch identity (`--serve --batch 2/4/8 --spec 8` vs `--batch 1`, cold + warm replay;
+# speculative multi-slot batch identity (`--serve --batch 2..64 --spec 8` vs `--batch 1`, cold + warm replay;
 # configure with -DBASALT_BATCH_IDENTITY_MODEL=/path/to/model.basalt and optional -DBASALT_BATCH_IDENTITY_ARGS=...)
 if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
   add_test(NAME batch_spec_identity_test

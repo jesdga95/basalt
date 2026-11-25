@@ -1863,7 +1863,7 @@ bool launch_q80_mma(const void* weights, const void* x_q8_1, float* y, int n_in,
     return true;
 }
 
-constexpr int MAX_PLANES_NCOLS = 32;
+constexpr int MAX_PLANES_NCOLS = 64;
 constexpr int MAX_QUANT_NCOLS = 128;
 
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
@@ -2475,13 +2475,13 @@ __device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restr
 }
 
 template<int CTILES>
-__global__ void __launch_bounds__(256) native_q8p_mma_kernel(Q8Planes w, const Q81Block* __restrict__ x,
-                                                             float* __restrict__ y, int n_in, int n_out, int ncols) {
+__global__ void __launch_bounds__(256, CTILES <= 4 ? 2 : 1) native_q8p_mma_kernel(Q8Planes w, const Q81Block* __restrict__ x,
+                                                                                   float* __restrict__ y, int n_in, int n_out, int ncols) {
     q8p_mma_body<CTILES>(w, x, y, n_in, n_out, ncols, int(blockIdx.x));
 }
 
 template<int CTILES>
-__global__ void __launch_bounds__(256) native_q8p_mma_seg_kernel(Q8Planes w, SegArgs a, int n_in, int ncols) {
+__global__ void __launch_bounds__(256, CTILES <= 4 ? 2 : 1) native_q8p_mma_seg_kernel(Q8Planes w, SegArgs a, int n_in, int ncols) {
     const SegPick p = seg_pick(a);
     q8p_mma_body<CTILES>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, ncols, p.bx);
 }
@@ -2494,7 +2494,11 @@ void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, in
         case 1: launch_pdl(native_q8p_mma_kernel<1>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
         case 2: launch_pdl(native_q8p_mma_kernel<2>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
         case 3: launch_pdl(native_q8p_mma_kernel<3>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
-        default: launch_pdl(native_q8p_mma_kernel<4>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        case 4: launch_pdl(native_q8p_mma_kernel<4>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        case 5: launch_pdl(native_q8p_mma_kernel<5>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        case 6: launch_pdl(native_q8p_mma_kernel<6>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        case 7: launch_pdl(native_q8p_mma_kernel<7>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        default: launch_pdl(native_q8p_mma_kernel<8>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
         }
         return;
     }
@@ -2578,7 +2582,11 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
         case 1: launch_pdl(native_q8p_mma_seg_kernel<1>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
         case 2: launch_pdl(native_q8p_mma_seg_kernel<2>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
         case 3: launch_pdl(native_q8p_mma_seg_kernel<3>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
-        default: launch_pdl(native_q8p_mma_seg_kernel<4>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 4: launch_pdl(native_q8p_mma_seg_kernel<4>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 5: launch_pdl(native_q8p_mma_seg_kernel<5>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 6: launch_pdl(native_q8p_mma_seg_kernel<6>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 7: launch_pdl(native_q8p_mma_seg_kernel<7>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        default: launch_pdl(native_q8p_mma_seg_kernel<8>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
         }
         launch_check();
         return;

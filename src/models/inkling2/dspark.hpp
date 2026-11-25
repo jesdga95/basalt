@@ -271,6 +271,7 @@ private:
     void* c_act_ = nullptr;
     // block chunk scratch [kChunkSlots * kDsBlock <= 32]
     static constexpr int kChunkSlots = 4;
+    static constexpr int kMaxDraftSessions = 16;
     float *x_ = nullptr, *h_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr, *qr_ = nullptr, *attn_ = nullptr;
     float* att_scr_ = nullptr;
     void *act_a_ = nullptr, *act_h_ = nullptr;

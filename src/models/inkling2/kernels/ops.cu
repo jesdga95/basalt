@@ -511,19 +511,20 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
 // One block classifies rows before touching the sequence or mapped memory. A RAM visit reserves a ticket even if
 // aborted, so its merge cannot match an earlier visit's completion.
 constexpr int kRingThreads = 256;
-static_assert(kBatchRows <= 32, "a visit's rows fit one mask word");
+static_assert(kBatchRows <= 64, "a visit's rows fit one mask word");
 __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_t* __restrict__ ids, int rows, int k,
                                                                     const unsigned long long* __restrict__ blobs,
                                                                     const float* __restrict__ x, int layer, float* x_m,
                                                                     int32_t* ids_m, CpuBell* bell, uint32_t* seq) {
-    __shared__ uint32_t ram_rows, stopped;
+    __shared__ unsigned long long ram_rows;
+    __shared__ uint32_t stopped;
     const int n = rows * k;
-    if (threadIdx.x == 0) ram_rows = 0;
+    if (threadIdx.x == 0) ram_rows = 0ull;
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += kRingThreads)
-        if (!blobs[ids[i]]) atomicOr(&ram_rows, 1u << (i / k));
+        if (!blobs[ids[i]]) atomicOr(&ram_rows, 1ull << (i / k));
     __syncthreads();
-    const uint32_t m = ram_rows;
+    const unsigned long long m = ram_rows;
     if (!m) return;
     uint32_t ticket = 0;
     if (threadIdx.x == 0) {
@@ -537,7 +538,7 @@ __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_
     for (int i = threadIdx.x; i < n; i += kRingThreads) ids_m[i] = ids[i];
     constexpr int kVecs = kWidth / 4;
     for (int r = 0; r < rows; ++r)
-        if (m >> r & 1)
+        if ((m >> r) & 1ull)
             for (int c = threadIdx.x; c < kVecs; c += kRingThreads)
                 reinterpret_cast<float4*>(x_m)[(size_t) r * kVecs + c] = reinterpret_cast<const float4*>(x)[(size_t) r * kVecs + c];
     if (threadIdx.x == 0) bk::doorbell_store_relaxed(&bell->ticket, ticket);

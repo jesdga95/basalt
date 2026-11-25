@@ -327,7 +327,7 @@ public:
             slot_card_[(size_t) v.slot] = m_.card_of(v.layer);
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
-            c.cap = c.ring ? (int64_t) g_.window + kWindowRows : ctx;
+            c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
@@ -524,7 +524,10 @@ protected:
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
         if (!drop_stale_read_ahead(err)) return false;
         const bk::WindowSegs wsegs = v.w.device_segs();
+        int max_seg_rows = 1;
+        for (int i = 0; i < wsegs.n; ++i) max_seg_rows = std::max(max_seg_rows, wsegs.row0[i + 1] - wsegs.row0[i]);
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data(), &wsegs));
+        key.push_back((uint64_t) (max_seg_rows * (kHeads / kKvHeads) > 16));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
         if (!check(err)) return false;
@@ -1337,7 +1340,7 @@ private:
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
-        if (!guess) {
+        if (!guess && rows <= kDecodeRows) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.ra_ev, k.stream);
             cudaStreamWaitEvent(k.ra_st, k.ra_ev, 0);
@@ -1446,7 +1449,10 @@ private:
         Segments s;
         if (!view_) return s;
         s.at_d = lane_[card].x->at_d_;
+        s.n_segs = view_->n;
+        s.max_seg_rows = 1;
         for (int i = 0; i < view_->n; ++i) {
+            s.max_seg_rows = std::max(s.max_seg_rows, view_->w.segs[(size_t) i].rows);
             const VisitCache& c = static_cast<const Session*>(view_->ss[i])->vc_[(size_t) slot];
             s.c[i] = {c.k, c.v, c.k_ring, c.v_ring, c.a_ring, c.m_ring};
         }
