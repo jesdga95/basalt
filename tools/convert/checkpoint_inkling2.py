@@ -627,7 +627,7 @@ def build(a, Job, fingerprint, die) -> None:
                 tens[n] = {"type": t_.type_name, "type_id": t_.type_id, "shape": [int(d) for d in t_.ne],
                            "bytes": t_.expected_bytes(), "offset": off}
             lic = kv.get("general.license", "")
-            mx = [l for l, kind, _, _, _ in experts.layers if kind == "q8_0"]
+            mx = [l for l, kind, _, _, _ in experts.layers if kind == "mxfp8"]
             meta = {
                 "format": "basalt", "version": 2, "name": name, "arch": ARCH,
                 "converter": {"tool": "tools/convert/convert.py"},

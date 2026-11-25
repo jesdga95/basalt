@@ -305,6 +305,8 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(len(kv["tokenizer.ggml.tokens"]), len(TOKENS))
         self.assertIn("vision/mmproj", self.mf.names())
         self.assertIn("dspark.markov.w1.weight", self.meta["tensors"])
+        self.assertIn("experts_mxfp8", self.meta["checkpoint"])
+        self.assertIn("layers 2", self.meta["checkpoint"]["experts_mxfp8"])
 
     def test_the_drafter_is_kept(self):
         t, raw = self.tensor("dspark.blk.0.attn_k_ctx.weight")

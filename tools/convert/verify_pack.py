@@ -24,6 +24,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
+import arch as A  # noqa: E402
 import model_sections as S  # noqa: E402
 from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile  # noqa: E402
 
@@ -40,14 +41,15 @@ def sha(view: np.ndarray) -> str:
 
 
 def parse_layout(text: bytes):
-    """-> {layer: (gate_type, down_type, offset, blob)}, n_expert, total"""
+    """-> {layer: (gate_type, up_type, down_type, offset, blob)}, n_expert, total"""
     lines = text.decode("utf-8").splitlines()
     m = re.search(r"\(n_expert (\d+), total (\d+)\)", lines[0])
     layers = {}
     for line in lines[1:]:
         if line.strip() and not line.startswith("#"):
             f = [int(x) for x in line.split()]
-            layers[f[0]] = (f[1], f[2], f[3], f[4])
+            ut = f[5] if len(f) >= 6 else f[1]
+            layers[f[0]] = (f[1], ut, f[2], f[3], f[4])
     return layers, int(m.group(1)), int(m.group(2))
 
 
@@ -62,7 +64,7 @@ def parse_index(text: bytes) -> dict:
     return out
 
 
-def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
+def verify(pack: str, first_gguf, workers: int = 16) -> bool:
     if "quantized_from" in json.loads(ModelFile(pack).read("meta")):
         import hy4flash_bf16
         return hy4flash_bf16.verify(pack, first_gguf, workers)
@@ -75,8 +77,16 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
 
     m = ModelFile(pack)
     meta = json.loads(m.read("meta"))
-    paths = S.expand_shards(Path(first_gguf))
+    if isinstance(first_gguf, (str, Path)):
+        paths = S.expand_shards(Path(first_gguf))
+    else:
+        ggufs = [Path(p) for p in first_gguf]
+        paths = S.expand_shards(ggufs[0]) if len(ggufs) == 1 else ggufs
     src = S.SourceModel(paths, frozenset())
+    arch = A.for_architecture(src.files[0].metadata.get("general.architecture"))
+    conv = meta.get("conversions") or {}
+    compat_bf16 = bool(conv.get("compat_bf16", False))
+    converted = {r["name"]: r for r in conv.get("tensors", []) if isinstance(r, dict) and "name" in r}
     file_map = np.memmap(pack, dtype=np.uint8, mode="r")
     print(f"{pack}: {len(m.names())} sections, {Path(pack).stat().st_size} bytes; source {len(paths)} GGUFs, {len(src.where)} tensors")
 
@@ -115,15 +125,16 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
             layers, n_exp, total = parse_layout(m.read(pre + "experts.layout"))
             if total != m.section(pre + "experts")[1]:
                 bad(f"{pre}experts.layout totals {total} bytes, the section is {m.section(pre + 'experts')[1]}")
-            for l, (gt, dt, off, blob) in layers.items():
+            for l, (gt, ut, dt, off, blob) in layers.items():
                 names = [f"blk.{l}.ffn_{r}_exps.weight" for r in ROLES]
                 if any(n not in src.where for n in names):
                     bad(f"{pre}experts layer {l}: the source lacks {names}")
                     continue
                 ts = [src.where[n][1] for n in names]
                 per = [t.expected_bytes() // n_exp for t in ts]
-                if sum(per) != blob or (ts[0].type_id, ts[2].type_id) != (gt, dt) or off % 1:
-                    bad(f"{pre}experts layer {l}: layout {gt}/{dt}/{blob} does not match the source tensors")
+                if sum(per) != blob or (ts[0].type_id, ts[1].type_id, ts[2].type_id) != (gt, ut, dt) \
+                        or off < 0 or off + blob * n_exp > total:
+                    bad(f"{pre}experts layer {l}: layout {gt}/{ut}/{dt}/{blob} does not match the source tensors")
                 role_off = [0, per[0], per[0] + per[1]]
                 for n, ro, p in zip(names, role_off, per):
                     place(n, (pre + "experts", off, blob, n_exp, ro, p))
@@ -133,7 +144,22 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
                 bad(f"{pre}experts: {len(layers)} layers listed, {n_in} source expert tensors of those layers")
     for pre in ("", "mtp/"):
         if pre + "dense.index" in m.sections:
-            for name, r in parse_index(m.read(pre + "dense.index")).items():
+            raw_idx = m.read(pre + "dense.index")
+            if pre == "mtp/" and not raw_idx.startswith(b"# dense index "):
+                # 6-column external MTP drafter index (`short kind rows cols off len`), not sourced from --gguf
+                sec_size = m.section("mtp/dense")[1] if "mtp/dense" in m.sections else -1
+                for line in raw_idx.decode("utf-8").splitlines():
+                    if not line.strip() or line.startswith("#"):
+                        continue
+                    r = line.split()
+                    if len(r) != 6:
+                        bad(f"mtp/dense.index: malformed row {line!r}")
+                        continue
+                    off, ln = int(r[4]), int(r[5])
+                    if off < 0 or ln < 0 or off + ln > sec_size:
+                        bad(f"mtp/dense.index: {r[0]} ({off}+{ln}) lies outside mtp/dense ({sec_size} bytes)")
+                continue
+            for name, r in parse_index(raw_idx).items():
                 if r[2] == "0" and r[4] == "0":
                     continue           # served from `gguf`; meta.tensors places it
                 place(name, (pre + "dense", int(r[3]), int(r[4]), r[2]))
@@ -151,7 +177,15 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
         nb = t.expected_bytes()
         if loc[0] in ("dense", "mtp/dense"):
             _, off, ln, k = loc
-            if ln != nb or kind.get(k) != t.type_name:
+            if name in converted:
+                rec = converted[name]
+                dst = rec.get("dst_type")
+                exp_k = "3" if (dst == "F16" and t.type_name == "F32") else S.KIND.get(dst)
+                elem_bytes = {"F32": 4, "F16": 2, "BF16": 2}.get(kind.get(exp_k, ""))
+                if rec.get("src_type") not in (None, t.type_name) or k != exp_k \
+                        or elem_bytes is None or ln != t.elements * elem_bytes:
+                    bad(f"{name}: converted dense entry kind {k} of {ln} bytes disagrees with {rec}")
+            elif ln != nb or kind.get(k) != t.type_name:
                 bad(f"{name}: the dense index has kind {k} of {ln} bytes, the source {t.type_name} of {nb}")
         elif loc[0] in ("experts", "mtp/experts"):
             pass
@@ -177,8 +211,25 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
         return sha(sec[off:off + n])
 
     def one(name):
-        a = sha(src.bytes(name))
-        return name, all(a == pack_bytes_hash(name, loc) for loc in where[name])
+        raw = src.bytes(name)
+        a = sha(raw)
+        t = src.where[name][1]
+        conv_res = None
+        for loc in where[name]:
+            if loc[0] in ("dense", "mtp/dense") and name in converted:
+                if conv_res is None:
+                    got = S.convert_tensor(name, t.type_name, raw, compat_bf16, arch)
+                    if isinstance(got, str):
+                        return name, False
+                    conv_res = (got[0], len(got[1]), hashlib.sha256(got[1]).hexdigest())
+                exp_k, exp_len, exp_sha = conv_res
+                src_sha = converted[name].get("source_sha256")
+                if loc[3] != exp_k or loc[2] != exp_len or exp_sha != pack_bytes_hash(name, loc) \
+                        or (src_sha is not None and src_sha != a):
+                    return name, False
+            elif a != pack_bytes_hash(name, loc):
+                return name, False
+        return name, True
 
     todo = [n for n in where if n in src.where]
     done = 0
