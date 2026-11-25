@@ -240,6 +240,21 @@ class VisionCache(unittest.TestCase):
             self.assertEqual(list(v.dir.glob("req-*.sve")), [])
             self.assertEqual(v.pinned, {})
 
+    def test_evict_survives_permission_error_on_locked_sve(self):
+        real_unlink = Path.unlink
+
+        def locked_sve(self, missing_ok=False):
+            if self.suffix == ".sve" and not self.name.startswith("req-"):
+                raise PermissionError(13, "locked by engine", str(self))
+            return real_unlink(self, missing_ok=missing_ok)
+
+        for v in self.each_path():
+            with mock.patch.object(vision, "VISION_CACHE_BYTES", 4 * len(SVE)), \
+                    mock.patch.object(Path, "unlink", locked_sve):
+                self.assertTrue(self.readable(v, [f"i{n}" for n in range(10)]))
+                self.assertLessEqual(len(v.cache), 4)
+                self.assertLessEqual(v.cache_bytes, 4 * len(SVE))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,6 +81,27 @@ class Flags(unittest.TestCase):
             self.skipTest("Windows")
         self.assertFalse(lifeline._contain(mock.Mock()))
 
+    def test_contain_closes_job_handle_when_set_information_fails(self):
+        import ctypes
+        from types import SimpleNamespace
+
+        fake_wintypes = SimpleNamespace(HANDLE=ctypes.c_void_p, LPVOID=ctypes.c_void_p,
+                                        LPCWSTR=ctypes.c_wchar_p, DWORD=ctypes.c_uint32)
+        k32 = mock.Mock()
+        k32.CreateJobObjectW.return_value = 12345
+        k32.SetInformationJobObject.return_value = 0
+        saved_job = lifeline._job
+        lifeline._job = None
+        try:
+            with mock.patch.dict(sys.modules, {"ctypes.wintypes": fake_wintypes}), \
+                    mock.patch.object(ctypes, "wintypes", fake_wintypes, create=True), \
+                    mock.patch.object(ctypes, "WinDLL", return_value=k32, create=True):
+                self.assertFalse(lifeline._contain(mock.Mock(_handle=99)))
+            k32.CloseHandle.assert_called_once_with(12345)
+            self.assertIsNone(lifeline._job)
+        finally:
+            lifeline._job = saved_job
+
 
 @unittest.skipUnless(lifeline.LINUX and lifeline._prctl is not None, "needs PR_SET_PDEATHSIG")
 class ServerKilled(unittest.TestCase):
