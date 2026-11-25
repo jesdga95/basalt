@@ -52,7 +52,11 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          all_models='["qwen4exp","deepseek41","qwen35","hy4flash","inkling2"]'
+          # The models come from cmake/models.cmake, so a new model needs no edit here.
+          builtin=$(sed -n 's/^set(BASALT_BUILTIN_MODELS \(.*\))$/\1/p' cmake/models.cmake)
+          [ -n "$builtin" ] || { echo "no BASALT_BUILTIN_MODELS in cmake/models.cmake" >&2; exit 1; }
+          to_json() { python3 -c 'import json,sys; print(json.dumps(sorted(set(sys.argv[1:]))))' "$@"; }
+          all_models=$(to_json $builtin)
           if [ "$EVENT" != pull_request ]; then
             echo "native=true" >> "$GITHUB_OUTPUT"
             echo "models=$all_models" >> "$GITHUB_OUTPUT"
@@ -64,29 +68,25 @@ jobs:
           while IFS= read -r f; do
             case "$f" in
               tools/tokenizer.py|tools/check_benchmarks.py|tools/iq_fixture.py)
-                native=true; shared_native=true ;;   # CPU tests run these
-              serve/*|tools/*.py|tools/convert/*|tools/migrations/*|requirements*.txt|*.md|docs/*) ;;
-              .github/workflows/review.yml|.github/workflows/community*.yml|.github/workflows/pr-labels.yml) ;;
-              src/models/qwen4exp/*|include/basalt/models/qwen4exp/*|tests/models/qwen4exp/*)
-                native=true; touched_models="$touched_models qwen4exp" ;;
-              src/models/deepseek41/*|include/basalt/models/deepseek41/*|tests/models/deepseek41/*)
-                native=true; touched_models="$touched_models deepseek41" ;;
-              src/models/qwen35/*|include/basalt/models/qwen35/*|tests/models/qwen35/*)
-                native=true; touched_models="$touched_models qwen35" ;;
-              src/models/hy4flash/*|include/basalt/models/hy4flash/*|tests/models/hy4flash/*)
-                native=true; touched_models="$touched_models hy4flash" ;;
-              src/models/inkling2/*|include/basalt/models/inkling2/*|tests/models/inkling2/*)
-                native=true; touched_models="$touched_models inkling2" ;;
-              *)
-                native=true; shared_native=true ;;
+                native=true; shared_native=true; continue ;;   # CPU tests run these
+              serve/*|tools/*.py|tools/convert/*|tools/migrations/*|requirements*.txt|*.md|docs/*) continue ;;
+              .github/workflows/review.yml|.github/workflows/community*.yml|.github/workflows/pr-labels.yml) continue ;;
             esac
+            native=true
+            owner=""
+            for m in $builtin; do
+              case "$f" in
+                src/models/$m/*|include/basalt/models/$m/*|tests/models/$m/*|tests/data/$m/*|data/bench/$m/*) owner=$m ;;
+              esac
+            done
+            if [ -n "$owner" ]; then touched_models="$touched_models $owner"; else shared_native=true; fi
           done < <(git diff --no-renames --name-only "$BASE...$HEAD")
           if [ "$native" = false ]; then
             models='[]'
           elif [ "$shared_native" = true ] || [ -z "$touched_models" ]; then
             models="$all_models"
           else
-            models=$(python3 -c 'import json,sys; print(json.dumps(sorted(set(sys.argv[1:]))))' $touched_models)
+            models=$(to_json $touched_models)
           fi
           echo "native=$native" | tee -a "$GITHUB_OUTPUT"
           echo "models=$models" | tee -a "$GITHUB_OUTPUT"
