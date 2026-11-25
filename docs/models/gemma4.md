@@ -23,9 +23,9 @@ The `gemma4` architecture (code in `src/models/gemma4`):
 - **Layers:** sliding-window layers (a window of 1,024, every rotary pair turning) interleaved with full-attention layers
   (partial "proportional" rotary: the first quarter of the pairs turns, the rest pass through). Queries and keys are RMS-normed
   per head with weights, values without; attention is unscaled.
-- **Caches:** a sliding-window layer keeps a ring of its window and a window's rows (the positions a verify window can add
-  before it is settled), never the whole context. A full layer keeps one cell per position. A full layer whose keys are its
-  values (`attention_k_eq_v`) stores each position once, the normed projection: V is that cell, K is rotated from it times the
+- **Caches:** a sliding-window layer keeps a ring of its window and a prompt chunk's rows (a chunk writes its keys straight
+  to their cells; a checkpoint holds while the session has not read a chunk past it), never the whole context. A full
+  layer keeps one cell per position. A full layer whose keys are its values (`attention_k_eq_v`) stores each position once, the normed projection: V is that cell, K is rotated from it times the
   key norm's weights as the attention reads it. `--kv fp8` stores both as unit-scale E4M3.
 - **Feed-forward:** a dense GELU MLP on every layer; on a layer with experts it runs beside the routed experts (softmax router,
   top-k renormalised), each part post-normed, then the sum normed into the residual and scaled by the layer's scalar.
@@ -34,6 +34,18 @@ The `gemma4` architecture (code in `src/models/gemma4`):
   through its layers, whose queries read the caches of the model's last sliding and last full layer at the anchor's position;
   its head picks the draft and its state goes to the next step. `--spec` caps the window (default: the drafter's own draft
   count plus the anchor).
+
+## Prompt and decode
+
+- **Prompt:** a read longer than a decode window runs in chunks of up to 2,048 rows: the projections and the MLP as W8A8
+  products on the FP8 tensor cores (activations rounded per row), the router over the chunk in fp32, the experts on the FP4
+  tensor cores (two FP4 terms per activation, about 8 bits) with the GELU between the two products, the attention flash
+  style on the fp16 tensor cores. A full layer's keys are rotated from its values once a chunk into an fp16 buffer the
+  attention reads in place.
+- **Decode:** the projections and the head read their FP8 weights once per window of up to 16 rows; the experts run grouped
+  by expert; the attention splits each row's keys in chunks by its own position, each chunk on the fp16 tensor cores (the
+  query as two fp16 terms, so the scores keep its fp32 precision), then merges them, so a row's result does not depend on the rows beside it (batch windows and drafting give plain decoding's
+  tokens).
 
 ## Memory
 
