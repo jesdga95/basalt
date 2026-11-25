@@ -80,7 +80,7 @@ jobs:
               *)
                 native=true; shared_native=true ;;
             esac
-          done < <(git diff --name-only "$BASE...$HEAD")
+          done < <(git diff --no-renames --name-only "$BASE...$HEAD")
           if [ "$native" = false ]; then
             models='[]'
           elif [ "$shared_native" = true ] || [ -z "$touched_models" ]; then
