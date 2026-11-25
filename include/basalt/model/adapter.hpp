@@ -376,6 +376,8 @@ public:
         const char* name = "";
         void (*split)(const char* text, size_t size, std::vector<size_t>& ends) = nullptr;
         bool ignore_merges = false;
+        /// SentencePiece's BPE with byte fallback (program::Tokenizer::set_sentencepiece).
+        bool sentencepiece = false;
     };
     virtual PreTokenizer pretokenizer() const = 0;
     virtual program::grammar::ToolForm tool_form() const = 0;
