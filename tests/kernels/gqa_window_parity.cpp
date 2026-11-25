@@ -7,8 +7,11 @@
 // end, and in a one-row window (another place in another tile); the outputs' bits against a frozen hash (a change that
 // must not move a bit leaves it as it is).  The inputs come from mt19937's raw output alone, so they are the same on
 // every platform.
-// --bench: the full-attention layer's call (a window of 1..32 rows over every cell) at 4K..160K cells, us per call and
-// the K/V bytes read once per call over that time, and the sliding layer's call.  Exit 77 without a GPU.
+// The int8 cache (KvInt8, the drafter's full layer with --kv int8): codes and per-64 scales by the cache's rule; every
+// output's bits against the fp16 path on the cache's decoded values (the same fp16 the kernel decodes to), and against the
+// CPU reference on those values; rows bitwise the same at every width.
+// --bench: the full-attention layer's call (a window of 1..32 rows over every cell) at 4K..160K cells, fp16 and int8, us per
+// call and the K/V bytes read once per call over that time, and the sliding layer's call.  Exit 77 without a GPU.
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 
@@ -21,6 +24,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -56,6 +60,30 @@ struct Cache {
     std::vector<uint16_t> k, v;
     uint16_t *dk = nullptr, *dv = nullptr;
 };
+
+// `c`'s values in the int8 cache (per 64 values of a cell's head: scale amax / 127 rounded to fp16, codes rounded to nearest
+// against it), and `deq` the fp16 cache of the decoded values code x scale, rounded to fp16 as the kernel decodes them
+struct Cache8 {
+    std::vector<int8_t> k, v;
+    std::vector<uint16_t> ks, vs;
+    basalt::kernels::KvInt8 d;
+};
+void quantize(const std::vector<uint16_t>& src, std::vector<int8_t>& codes, std::vector<uint16_t>& scales, std::vector<uint16_t>& deq) {
+    codes.resize(src.size());
+    scales.resize(src.size() / 64);
+    deq.resize(src.size());
+    for (size_t g = 0; g < scales.size(); ++g) {
+        float amax = 0;
+        for (int i = 0; i < 64; ++i) amax = std::max(amax, std::fabs(h2f(src[g * 64 + i])));
+        scales[g] = basalt::kernels::f16_from_f32(amax / 127.0f);
+        const float sc = h2f(scales[g]);
+        for (int i = 0; i < 64; ++i) {
+            const float q = sc > 0 ? std::rint(h2f(src[g * 64 + i]) / sc) : 0.0f;
+            codes[g * 64 + i] = (int8_t) std::max(-127.0f, std::min(127.0f, q));
+            deq[g * 64 + i] = basalt::kernels::f16_from_f32((float) codes[g * 64 + i] * sc);
+        }
+    }
+}
 
 Cache make_cache(int64_t cap, std::mt19937& rng) {
     Cache c;
@@ -195,6 +223,78 @@ int main(int argc, char** argv) {
     const unsigned long long frozen = 0x966f4088b1f5f753ull;   // the one-tile kernel's
     std::printf("gqa_window_attn hash: %016llx (bits against the frozen hash: %s)\n", hash, hash == frozen ? "identical" : "DIFFERENT");
     if (hash != frozen) ++fails;
+
+    // the int8 cache: the same cases on the full and ring caches quantized; each output bitwise the fp16 path's on the
+    // decoded cache, near the CPU reference on it, and the same at every width
+    {
+        int bit_diff = 0, bits_checked = 0, wdiff = 0, wchecked = 0;
+        double worst8 = 0;
+        const auto to_dev = [](const auto& v) {
+            using T = typename std::decay_t<decltype(v)>::value_type;
+            T* p = dev<T>(v.size());
+            ck(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "copy");
+            return p;
+        };
+        Cache8 q8[2];
+        Cache deq[2];
+        for (int i = 0; i < 2; ++i) {
+            const Cache& c = i ? ring : full;
+            quantize(c.k, q8[i].k, q8[i].ks, deq[i].k);
+            quantize(c.v, q8[i].v, q8[i].vs, deq[i].v);
+            deq[i].cap = c.cap;
+            deq[i].dk = to_dev(deq[i].k);
+            deq[i].dv = to_dev(deq[i].v);
+            q8[i].d.k = to_dev(q8[i].k);
+            q8[i].d.v = to_dev(q8[i].v);
+            q8[i].d.ks = to_dev(q8[i].ks);
+            q8[i].d.vs = to_dev(q8[i].vs);
+        }
+        std::vector<float> ref16(hq.size());
+        for (const Case& cs : cases) {
+            const int i = cs.ring ? 1 : 0;
+            const Cache& c = deq[i];
+            const int64_t hi = cs.pos + BW;
+            const int64_t window = cs.window > 0 ? cs.window : cs.pos + BW;
+            const int64_t lo_all = std::max<int64_t>(0, cs.pos - window + 1);
+            const int64_t scells = std::min<int64_t>(c.cap, hi - lo_all + 64);
+            basalt::kernels::gqa_window_attn(dq, c.dk, c.dv, NH, NKV, HD, cs.pos, BW, hi, window, c.cap, dscr, scells, dwide, S, cs.block);
+            ck(cudaStreamSynchronize(S), "window attention");
+            ck(cudaMemcpy(ref16.data(), dwide, ref16.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            basalt::kernels::gqa_window_attn(dq, nullptr, nullptr, NH, NKV, HD, cs.pos, BW, hi, window, c.cap, dscr, scells, dwide, S,
+                                             cs.block, q8[i].d);
+            ck(cudaStreamSynchronize(S), "window attention int8");
+            ck(cudaMemcpy(wide.data(), dwide, wide.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            ++bits_checked;
+            if (std::memcmp(wide.data(), ref16.data(), wide.size() * 4)) ++bit_diff;
+            std::vector<double> want((size_t) NH * HD);
+            for (int t = 0; t < BW; ++t) {
+                const int64_t lo = std::max<int64_t>(0, cs.pos + (cs.block ? 0 : t) - window + 1);
+                ref_row(&hq[(size_t) t * NH * HD], c, lo, hi, want.data());
+                for (int j = 0; j < NH * HD; ++j)
+                    worst8 = std::max(worst8, std::fabs(wide[(size_t) t * NH * HD + j] - want[(size_t) j]));
+            }
+            for (int T : {1, 3, 8, 17, BW}) {
+                basalt::kernels::gqa_window_attn(dq, nullptr, nullptr, NH, NKV, HD, cs.pos, T, hi, window, c.cap, dscr, scells, dout, S,
+                                                 cs.block, q8[i].d);
+                ck(cudaStreamSynchronize(S), "window attention int8");
+                ck(cudaMemcpy(got.data(), dout, (size_t) T * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+                if (std::memcmp(got.data(), wide.data(), (size_t) T * NH * HD * 4)) ++wdiff;
+                ++wchecked;
+            }
+        }
+        std::printf("gqa_window_attn int8: bitwise the fp16 path on the decoded cache: %s (%d of %d windows differ)\n",
+                    bit_diff ? "NO" : "yes", bit_diff, bits_checked);
+        if (bit_diff) ++fails;
+        std::printf("gqa_window_attn int8: max abs %.3g vs double on the decoded cache%s\n", worst8, worst8 > 2e-3 ? "  FAIL" : "");
+        if (worst8 > 2e-3) ++fails;
+        std::printf("gqa_window_attn int8: rows bitwise the same at widths 1, 3, 8, 17, %d: %s (%d of %d differ)\n", BW,
+                    wdiff ? "NO" : "yes", wdiff, wchecked);
+        if (wdiff) ++fails;
+        for (int i = 0; i < 2; ++i) {
+            cudaFree(deq[i].dk); cudaFree(deq[i].dv);
+            cudaFree(q8[i].d.k); cudaFree(q8[i].d.v); cudaFree(q8[i].d.ks); cudaFree(q8[i].d.vs);
+        }
+    }
     cudaFree(full.dk); cudaFree(full.dv); cudaFree(ring.dk); cudaFree(ring.dv); cudaFree(dscr); cudaFree(dwide);
 
     if (bench) {
@@ -205,29 +305,43 @@ int main(int argc, char** argv) {
         uint16_t* bv = dev<uint16_t>((size_t) cap * NKV * HD);
         ck(cudaMemset(bk, 0x2c, (size_t) cap * NKV * HD * 2), "memset");   // finite fp16 (0x2c2c = 0.0659)
         ck(cudaMemset(bv, 0x2c, (size_t) cap * NKV * HD * 2), "memset");
+        basalt::kernels::KvInt8 b8;   // the int8 cache of the same cells: codes 0x2c, scales 0x2c2c
+        b8.k = dev<int8_t>((size_t) cap * NKV * HD);
+        b8.v = dev<int8_t>((size_t) cap * NKV * HD);
+        b8.ks = dev<uint16_t>((size_t) cap * NKV * (HD / 64));
+        b8.vs = dev<uint16_t>((size_t) cap * NKV * (HD / 64));
+        ck(cudaMemset(b8.k, 0x2c, (size_t) cap * NKV * HD), "memset");
+        ck(cudaMemset(b8.v, 0x2c, (size_t) cap * NKV * HD), "memset");
+        ck(cudaMemset(b8.ks, 0x2c, (size_t) cap * NKV * (HD / 64) * 2), "memset");
+        ck(cudaMemset(b8.vs, 0x2c, (size_t) cap * NKV * (HD / 64) * 2), "memset");
         float* bs = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap, BW, NH, HD));
         cudaEvent_t e0, e1;
         cudaEventCreate(&e0);
         cudaEventCreate(&e1);
-        for (int64_t depth : {4096LL, 8192LL, 16384LL, 32768LL, 65536LL, 102400LL, 163840LL - 64}) {
-            for (int T : {1, 5, 8, 16, 32}) {
-                const int64_t pos = depth - T, hi = pos + T, window = pos + T;
-                const int64_t cells = hi + 64;
-                const auto call = [&] {
-                    basalt::kernels::gqa_window_attn(dq, bk, bv, NH, NKV, HD, pos, T, hi, window, cap, bs, cells, dout, S, true);
-                };
-                for (int i = 0; i < 3; ++i) call();
-                const int iters = depth > 65536 ? 20 : 50;
-                cudaEventRecord(e0, S);
-                for (int i = 0; i < iters; ++i) call();
-                cudaEventRecord(e1, S);
-                ck(cudaEventSynchronize(e1), "bench");
-                float ms = 0;
-                cudaEventElapsedTime(&ms, e0, e1);
-                const double us = 1e3 * ms / iters, bytes = (double) hi * NKV * HD * 2 * 2;
-                std::printf("bench: window attention %d rows x %lld cells (%d x 128 heads, %d KV): %.1f us, %.0f GB/s of K/V read once\n",
-                            T, (long long) hi, NH, NKV, us, bytes / us / 1e3);
-            }
+        for (int64_t depth : {4096LL, 8192LL, 16384LL, 32768LL, 65536LL, 102400LL, 131072LL, 163840LL - 64}) {
+            for (int T : {1, 5, 8, 16, 32})
+                for (const bool i8 : {false, true}) {
+                    const int64_t pos = depth - T, hi = pos + T, window = pos + T;
+                    const int64_t cells = hi + 64;
+                    const auto call = [&] {
+                        if (i8) basalt::kernels::gqa_window_attn(dq, nullptr, nullptr, NH, NKV, HD, pos, T, hi, window, cap, bs, cells, dout,
+                                                                 S, true, b8);
+                        else basalt::kernels::gqa_window_attn(dq, bk, bv, NH, NKV, HD, pos, T, hi, window, cap, bs, cells, dout, S, true);
+                    };
+                    for (int i = 0; i < 3; ++i) call();
+                    const int iters = depth > 65536 ? 20 : 50;
+                    cudaEventRecord(e0, S);
+                    for (int i = 0; i < iters; ++i) call();
+                    cudaEventRecord(e1, S);
+                    ck(cudaEventSynchronize(e1), "bench");
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    // fp16: 2 bytes a value; int8: a byte a value and a 2-byte scale per 64
+                    const double row = i8 ? HD + (HD / 64) * 2 : HD * 2;
+                    const double us = 1e3 * ms / iters, bytes = (double) hi * NKV * row * 2;
+                    std::printf("bench: window attention %s %d rows x %lld cells (%d x 128 heads, %d KV): %.1f us, %.0f GB/s of K/V read once\n",
+                                i8 ? "int8" : "fp16", T, (long long) hi, NH, NKV, us, bytes / us / 1e3);
+                }
         }
         // the sliding-window layers' call: the window before the block and the block, in a ring of window + 63 cells
         const int64_t rw = 1025, rcap = 1088;
@@ -246,7 +360,7 @@ int main(int argc, char** argv) {
             std::printf("bench: window attention %d rows x a %lld-position window in a %lld-cell ring: %.1f us\n", T, (long long) rw,
                         (long long) rcap, 1e3 * ms / 200);
         }
-        cudaFree(bk); cudaFree(bv); cudaFree(bs);
+        cudaFree(bk); cudaFree(bv); cudaFree(bs); cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
     }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
