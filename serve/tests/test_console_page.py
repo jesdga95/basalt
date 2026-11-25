@@ -77,7 +77,7 @@ class PendingFields(unittest.TestCase):
 NODE = shutil.which("node")
 # app.js run in node over a stub DOM, returning what its pane builders draw for the inputs on stdin
 HARNESS = r"""
-const fs = require("fs"), vm = require("vm");
+const fs = require("fs"), vm = require("vm"), { TextDecoder } = require("util");
 const el = () => new Proxy(function () {}, {
   get: (t, k) => k === "classList" ? { toggle() {}, add() {}, remove() {} } : ["style", "dataset"].includes(k) ? {}
     : k === "querySelectorAll" ? () => [] : k === "querySelector" ? () => null : typeof k === "symbol" ? undefined : el(),
@@ -85,7 +85,8 @@ const el = () => new Proxy(function () {}, {
 const ctx = { document: { querySelector: () => el(), addEventListener() {}, createElement: () => el(), hidden: false },
   sessionStorage: { getItem: () => null, setItem() {} }, location: { hash: "", host: "" }, fetch: () => new Promise(() => {}),
   ResizeObserver: class { observe() {} }, matchMedia: () => ({ matches: false }), requestAnimationFrame() {}, setTimeout() {},
-  clearTimeout() {}, performance: { now: () => 0 }, devicePixelRatio: 1, console };
+  clearTimeout() {}, performance: { now: () => 0 }, devicePixelRatio: 1, window: { addEventListener() {} }, console,
+  AbortController: class { constructor() { this.signal = { aborted: false }; } abort() { this.signal.aborted = true; } }, TextDecoder };
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8") + `
   globalThis.out = {

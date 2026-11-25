@@ -61,7 +61,15 @@ read the vision projector inside it.
 
 ## The stats page
 
-The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`. The top of the page always shows:
+The server's address serves a page. Its figures arrive as one combined snapshot over `/api/state/stream`, once per
+second and on observed request, queue or model state changes (checked every 100 ms); a shared publisher serves all
+clients without per-client snapshot queues, and reconnecting clients receive its latest snapshot. This is a combined
+view, not a transaction across all engine and router state; `/metrics`, `/slots` and `/api/logs` remain JSON endpoints
+for external clients. Each SSE endpoint permits up to eight concurrent clients. The Logs tab receives live console
+lines from `/api/logs/stream`, reconnects from its last cursor, and reports server restarts or lines lost from the
+bounded buffer. Both log endpoints require the API key when one is configured; the page sends it in the Authorization
+header. The top of the page always shows:
+
 
 - Decode and prefill: the live rate with a 60 s chart; when idle, the last request's decode and the last prompt read of at least 512
   new tokens (a cached follow-up has no meaningful read rate). The decode number's tooltip has the best decode and the conversation

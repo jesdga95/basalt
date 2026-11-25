@@ -21,14 +21,7 @@ const shortCpu = s => String(s || "").replace(/\((R|TM)\)/gi, "").replace(/\s+\d
   .replace(/\s+CPU\s+@.*$/i, "").replace(/\s+Processor$/i, "").replace(/\s+/g, " ").trim();
 
 let apiKey = sessionStorage.getItem("basalt.key") || "";
-let M = null;          // the last /metrics reading, with .slots from /slots
-
-async function get(path) {
-  const r = await fetch(path, { cache: "no-store", headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
-  if (r.status === 401) throw Object.assign(new Error("locked"), { locked: true });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
+let M = null;          // the last combined state snapshot
 
 /* ---- fields the page draws once the server sends them. Each is read only through ahead(); until it arrives, its panel is
    hidden or shows what the server sends now, never a made-up figure. Keyed by where the field lives. ---- */
@@ -322,6 +315,7 @@ const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100
 const kc = n => n >= 1048576 ? `${n / 1048576 >= 10 ? Math.round(n / 1048576) : +(n / 1048576).toFixed(1)}M` : kt(n).replace("k", "K");
 const pctOf = (a, b) => b ? Math.round(a / b * 100) : 0;
 const slotWord = s => !s.is_processing ? "Idle" : s.state === "prefill" ? "Reading" : "Decoding";
+
 const accept = s => s.drafts_offered > 20 ? Math.round(s.drafts_accepted / s.drafts_offered * 100) : null;
 const prefixHit = s => num(s.reused) && s.prompt_tokens > 0 ? Math.round(s.reused / s.prompt_tokens * 100) : null;
 const ACC_NOTE = "Drafts accepted over offered, of the slot's current or last request";
@@ -883,30 +877,68 @@ function clearLog(note) {
   text($("#ticker-t"), "");
 }
 
-/* ---- polling ---- */
-let lastLog = 0;
-async function pollMetrics() {
-  try {
-    const m = await get("metrics");
-    m.slots = await get("slots").catch(() => []);
-    M = m; settle(m.models || [], true); $("#auth").hidden = true; draw(); drawPanes();
-  } catch (e) {
-    $("#auth").hidden = !e.locked; M = null;
-    setState("offline", e.locked ? "Locked" : "Offline");
+/* ---- streamed state and logs ---- */
+function stream(path, receive, status) {
+  let controller = null, retry = null, stopped = false;
+  function cancel() {
+    clearTimeout(retry); retry = null;
+    controller?.abort(); controller = null;
+
   }
-  setTimeout(pollMetrics, 1000);
+  async function connect() {
+    cancel();
+    if (stopped) return;
+    const own = controller = new AbortController();
+    let reader;
+    try {
+      status("connecting");
+      const r = await fetch(path(), { signal: own.signal, cache: "no-store",
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
+      if (own.signal.aborted) return;
+      if (r.status === 401) { status("locked"); return; }
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      reader = r.body.getReader();
+      const decoder = new TextDecoder(), parse = createLogParser(data => { receive(data); status("live"); });
+      while (!own.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("Connection closed");
+        if (!own.signal.aborted) parse(decoder.decode(value, { stream: true }));
+      }
+    } catch (e) {
+      if (own.signal.aborted) return;
+      status("offline"); retry = setTimeout(connect, 2000);
+    } finally {
+      if (reader) { try { await reader.cancel(); } catch (_) {} reader.releaseLock(); }
+    }
+  }
+  window.addEventListener("pagehide", () => { stopped = true; cancel(); });
+  window.addEventListener("pageshow", () => { if (stopped) { stopped = false; connect(); } });
+  return connect;
 }
-async function pollLog() {
-  try {
-    const r = await get(`api/logs?after=${lastLog}`);
-    if (r.last < lastLog) { lastLog = 0; clearLog("The server restarted."); }
-    else if (r.lines.length) { lastLog = r.last; append(r.lines); }
-    else if (!logCount && !logEl.firstChild) clearLog("No log lines yet.");
-  } catch (e) { /* the metrics poll reports the connection */ }
-  setTimeout(pollLog, 1000);
-}
+const connectState = stream(() => "api/state/stream", data => {
+  M = data; settle(M.models || [], true); $("#auth").hidden = true; draw();
+}, state => {
+  if (state === "locked" || state === "offline") {
+    $("#auth").hidden = state !== "locked"; M = null;
+    setState("offline", state === "locked" ? "Locked" : "Offline");
+  }
+});
+let lastLog = null, logInstance = null;
+const connectLogs = stream(() => "api/logs/stream" + (lastLog === null ? "" :
+  `?after=${lastLog}&instance=${encodeURIComponent(logInstance)}`), data => {
+  if (data.reset || (logInstance !== null && logInstance !== data.instance_id)) {
+    clearLog("The server restarted."); lastLog = null;
+  }
+  logInstance = data.instance_id;
+  if (data.dropped) append([{ t: Date.now() / 1000, src: "srv", lvl: "warn", msg: "Some log lines were dropped from the server buffer." }]);
+  append(data.lines.filter(line => lastLog === null || line.id > lastLog));
+  lastLog = data.next;
+  if (!logCount) clearLog("No log lines yet.");
+}, state => text($("#log-status"), { connecting: "Connecting", locked: "API key required",
+  live: "Live", offline: "Disconnected; retrying" }[state]));
 $("#auth").onsubmit = e => {
   e.preventDefault(); apiKey = $("#key").value.trim(); sessionStorage.setItem("basalt.key", apiKey);
+  connectState(); connectLogs();
 };
 
 /* ---- pricing dialog ---- */
@@ -1010,4 +1042,4 @@ async function resetTotals() {
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
-drawPanes(); pollMetrics(); pollLog();
+drawPanes(); connectState(); connectLogs();
