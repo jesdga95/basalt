@@ -11,6 +11,7 @@
 #include <climits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -32,6 +33,12 @@ void check(const char* what) {
 }
 
 __device__ __forceinline__ float bf16f(uint16_t u) { return __uint_as_float((uint32_t) u << 16); }
+
+// Empirical conditional acceptance rate of DSpark's 2-bit screened softmax probability (used solely for GPU-side tail stop).
+__device__ __forceinline__ float ds_step_acc(float p) {
+    return p < 0.30f ? 0.12f : p < 0.50f ? 0.25f : p < 0.70f ? 0.38f : p < 0.80f ? 0.49f
+         : p < 0.90f ? 0.61f : p < 0.95f ? 0.70f : p < 0.985f ? 0.86f : 0.96f;
+}
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -90,7 +97,8 @@ __device__ __forceinline__ void mix_stage(int r, int j, const float* __restrict_
     if (pos3 && j == 0 && threadIdx.x < 3) pos3[r * 3 + threadIdx.x] = p;
 }
 
-__global__ void __launch_bounds__(kThreads) mix_kernel(const float* __restrict__ tap, int64_t tap_stride, DsMixArgs a,
+__global__ void __launch_bounds__(kThreads) mix_kernel(const float* __restrict__ tap, int64_t tap_stride,
+                                                       const __grid_constant__ DsMixArgs a,
                                                        float* __restrict__ out, int64_t out_stride,
                                                        const int32_t* __restrict__ pos, float* __restrict__ fr, int fr_cap,
                                                        int32_t* __restrict__ pos3) {
@@ -108,12 +116,15 @@ __device__ __forceinline__ void block_inputs_stage(int t, const uint16_t* __rest
                                                    float* __restrict__ x, int32_t* __restrict__ pos3, int32_t* __restrict__ prev,
                                                    float* __restrict__ state, const float* __restrict__ fr, int fr_cap,
                                                    float* __restrict__ fr_out, const uint16_t* __restrict__ w1,
-                                                   uint16_t* __restrict__ w1_row, float* red) {
+                                                   uint16_t* __restrict__ w1_row, float* conf, float* red) {
     const int32_t anchor = meta[0], pos0 = meta[1];
     float* row = x + (int64_t) t * kWidth;
     if (pos3 && threadIdx.x < 3) pos3[t * 3 + threadIdx.x] = pos0 + t;
     if (t == 1) {   // the Markov head's start
-        if (threadIdx.x == 0) *prev = anchor;
+        if (threadIdx.x == 0) {
+            *prev = anchor;
+            if (conf) conf[kDsDrafts] = 1.0f;
+        }
         for (int i = threadIdx.x; i < kDsRank; i += kThreads) state[i] = 0.f;
         if (threadIdx.x < kDsRank / 8)
             reinterpret_cast<uint4*>(w1_row)[threadIdx.x] = reinterpret_cast<const uint4*>(w1 + (int64_t) anchor * kDsRank)[threadIdx.x];
@@ -150,9 +161,9 @@ __global__ void __launch_bounds__(kThreads) block_inputs_kernel(const uint16_t* 
                                                                 int32_t* __restrict__ pos3, int32_t* __restrict__ prev,
                                                                 float* __restrict__ state, const float* __restrict__ fr, int fr_cap,
                                                                 float* __restrict__ fr_out, const uint16_t* __restrict__ w1,
-                                                                uint16_t* __restrict__ w1_row) {
+                                                                uint16_t* __restrict__ w1_row, float* __restrict__ conf) {
     __shared__ float red[kThreads / 32];
-    block_inputs_stage((int) blockIdx.x, emb, meta, norm, eps, mask, x, pos3, prev, state, fr, fr_cap, fr_out, w1, w1_row, red);
+    block_inputs_stage((int) blockIdx.x, emb, meta, norm, eps, mask, x, pos3, prev, state, fr, fr_cap, fr_out, w1, w1_row, conf, red);
 }
 
 // ---- the Markov head's recurrence ---------------------------------------------------------------------------------------
@@ -194,7 +205,10 @@ __global__ void __launch_bounds__(kStepWarps * 32) markov_step_kernel(const floa
                                                                       const float* __restrict__ bias, const uint16_t* __restrict__ w_sp,
                                                                       const uint16_t* __restrict__ w1_row,
                                                                       const float* __restrict__ state_in, float* __restrict__ state_out,
-                                                                      float* __restrict__ latent) {
+                                                                      float* __restrict__ latent, const float* __restrict__ cum_conf,
+                                                                      float stop_th) {
+    pdl_wait();
+    if (stop_th > 0.f && cum_conf && *cum_conf < stop_th) return;
     __shared__ float xs[2 * kDsRank];
     markov_step_stage((int) blockIdx.x, ctx_h, ctx_f, bias, w_sp, w1_row, state_in, state_out, latent, xs);
 }
@@ -340,13 +354,14 @@ __device__ __forceinline__ void screen_x(const Q81* __restrict__ x, int nb, int*
 
 // Tile `tile`: approx[r][row] = the head copy's score of q8_1 row r (r < rows) for its 32 copy rows. Four warps split the row
 // length, lane = row; the copy is read once for all the rows.
+template <int RMAX>
 __global__ void __launch_bounds__(128) head_base_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
                                                         const Q81* __restrict__ x, int rows, int64_t n_pad,
                                                         float* __restrict__ approx) {
     constexpr int kNw4 = kWidth / 64, NW = kNw4 / 4;
-    __shared__ __align__(16) int xi[kDsDrafts][kWidth / 4];
-    __shared__ float xs[kDsDrafts][kHeadNb], xdd[kDsDrafts][kHeadNb];
-    __shared__ float red[kDsDrafts][4][32];
+    __shared__ __align__(16) int xi[RMAX][kWidth / 4];
+    __shared__ float xs[RMAX][kHeadNb], xdd[RMAX][kHeadNb];
+    __shared__ float red[RMAX][4][32];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int64_t tile = blockIdx.x;
     const size_t base = ((size_t) tile * kNw4 + warp * NW) * 32 + lane;
@@ -361,12 +376,12 @@ __global__ void __launch_bounds__(128) head_base_kernel(const uint4* __restrict_
     for (int r = 0; r < rows; ++r) screen_x(x + (size_t) r * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < kDsDrafts; ++r)
+    for (int r = 0; r < RMAX; ++r)
         if (r < rows) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
     __syncthreads();
     const int64_t row = tile * 32 + lane;
     for (int r = warp; r < rows; r += 4)
-        approx[r * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+        approx[(size_t) r * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
 }
 
 // A warp per tile of 32 copy rows (lane = row): the fold copy's score of the latent plus the head term and the bias (in
@@ -375,7 +390,13 @@ __global__ void __launch_bounds__(128) head_base_kernel(const uint4* __restrict_
 __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
                                                                         const Q81* __restrict__ lat, const float* __restrict__ approx,
                                                                         const float* __restrict__ fold_bp, float cap, int64_t n_rows,
-                                                                        int n_tiles, float2* __restrict__ cand, float2* __restrict__ part) {
+                                                                        int n_tiles, float2* __restrict__ cand, float2* __restrict__ part,
+                                                                        const float* __restrict__ cum_conf, float stop_th) {
+    if (stop_th > 0.f && cum_conf && __ldcg(cum_conf) < stop_th) {
+        pdl_wait();
+        pdl_launch_dependents();
+        return;
+    }
     constexpr int kNw4 = kDsRank / 64;
     __shared__ __align__(16) int xi[kDsRank / 4];
     __shared__ float xs[kFoldNb], xdd[kFoldNb];
@@ -502,16 +523,25 @@ __device__ __forceinline__ int collect_tiles(px::Final& f, int n_tiles, const fl
 // row of w1: each rescored row's is read (host memory) while the row is scored, the pick's then copied out.
 constexpr int kW1Words = kDsRank * 2 / 16;   // uint4 of a w1 row: a lane each
 static_assert(kW1Words == 32, "a w1 row is a warp's uint4");
-__global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __restrict__ xh_g, const Q81* __restrict__ xl_g,
+__global__ void __launch_bounds__(512) head_final_kernel(const __grid_constant__ DsHead h,
+                                                         const Q81* __restrict__ xh_g, const Q81* __restrict__ xl_g,
                                                          int n_tiles, const float2* __restrict__ cand, const float2* __restrict__ part,
                                                          int32_t* __restrict__ prev, int32_t* __restrict__ ids,
                                                          float* __restrict__ conf, int i, const uint16_t* __restrict__ w1,
-                                                         uint16_t* __restrict__ w1_row) {
+                                                         uint16_t* __restrict__ w1_row, float stop_th) {
     __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
     __shared__ px::Final f;
     __shared__ uint4 wr[px::kMaxCand][kW1Words];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     pdl_wait();
+    pdl_launch_dependents();
+    if (i > 0 && stop_th > 0.f && conf[kDsDrafts] < stop_th) {
+        if (tid == 0) {
+            ids[i] = 0;
+            conf[i] = -1.0f;
+        }
+        return;
+    }
     if (tid == 0) f.cnt = 0;
     exact_x(xh_g, xl_g, xh, xl, tid, 512);
     const int n = collect_tiles(f, n_tiles, cand, part, prev, conf + i);
@@ -533,7 +563,10 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     px::pick_block<false>(f, n, n_tiles, nullptr, part, prev, conf + i);
     __syncthreads();
     const int pick = *prev;
-    if (tid == 0) ids[i] = pick;
+    if (tid == 0) {
+        ids[i] = pick;
+        if (stop_th > 0.f) conf[kDsDrafts] = (i == 0 ? 1.0f : conf[kDsDrafts]) * ds_step_acc(conf[i]);
+    }
     for (int c = warp; c < n; c += 16)
         if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_row)[lane] = wr[c][lane];
 }
@@ -657,17 +690,18 @@ void dspark_mix(const float* tap, int64_t tap_stride, int rows, const DsMixArgs&
 
 void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps, const float* mask,
                          int block, float* x, int32_t* pos3, int32_t* prev, float* state, const float* fr, int fr_cap, float* fr_out,
-                         const uint16_t* w1, uint16_t* w1_row, void* stream) {
+                         const uint16_t* w1, uint16_t* w1_row, void* stream, float* conf) {
     if (block < 3) throw std::runtime_error("inkling2 dspark block inputs: a block of at least three rows");
     block_inputs_kernel<<<(unsigned) block, kThreads, 0, (cudaStream_t) stream>>>(embedding, meta, embed_norm, eps, mask, x, pos3, prev,
-                                                                                    state, fr, fr_cap, fr_out, w1, w1_row);
+                                                                                    state, fr, fr_cap, fr_out, w1, w1_row, conf);
     check("block inputs");
 }
 
 void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1_row,
-                        const float* state_in, float* state_out, float* latent, void* stream) {
-    markov_step_kernel<<<kStepBlocks, kStepWarps * 32, 0, (cudaStream_t) stream>>>(ctx_h, ctx_f, bias, w_sp, w1_row, state_in,
-                                                                                    state_out, latent);
+                        const float* state_in, float* state_out, float* latent, void* stream,
+                        const float* cum_conf, float stop_th) {
+    launch_pdl(markov_step_kernel, dim3(kStepBlocks), dim3(kStepWarps * 32), 0, (cudaStream_t) stream, ctx_h, ctx_f, bias, w_sp,
+               w1_row, state_in, state_out, latent, cum_conf, stop_th);
     check("Markov step");
 }
 
@@ -700,24 +734,31 @@ size_t dspark_head_scratch_bytes(int64_t n_vocab) { return px::scratch_bytes(n_v
 
 void dspark_head_base(const DsHead& h, const void* hq, int rows, float* approx, void* stream) {
     if (rows < 1 || rows > kDsDrafts) throw std::runtime_error("inkling2 dspark head: 1 to 7 rows");
-    launch_pdl(head_base_kernel, dim3((unsigned) px::tiles(h.n_vocab)), dim3(128), 0, (cudaStream_t) stream, (const uint4*) h.head_sc,
-               (const uint32_t*) px::scales(const_cast<void*>(h.head_sc), h.n_vocab, kWidth), (const Q81*) hq, rows,
-               dspark_screen_rows(h.n_vocab), approx);
+    const auto run_hb = [&](auto rmax_tag) {
+        launch_pdl(head_base_kernel<decltype(rmax_tag)::value>, dim3((unsigned) px::tiles(h.n_vocab)), dim3(128), 0,
+                   (cudaStream_t) stream, (const uint4*) h.head_sc,
+                   (const uint32_t*) px::scales(const_cast<void*>(h.head_sc), h.n_vocab, kWidth), (const Q81*) hq, rows,
+                   dspark_screen_rows(h.n_vocab), approx);
+    };
+    if (rows <= 3) run_hb(std::integral_constant<int, 3>{});
+    else if (rows <= 4) run_hb(std::integral_constant<int, 4>{});
+    else run_hb(std::integral_constant<int, kDsDrafts>{});
     check("head base");
 }
 
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
-                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
+                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream, float stop_th) {
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
     float2* cand = (float2*) scratch;
     float2* part = cand + (size_t) tiles * px::kPer;
+    const float* cum = (i > 0 && stop_th > 0.f) ? (conf + kDsDrafts) : nullptr;
     launch_pdl(head_step_kernel, dim3((unsigned) ((tiles + kTilesPerBlock - 1) / kTilesPerBlock)), dim3(32 * kTilesPerBlock), 0, s,
                (const uint4*) h.fold_sc, (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank),
                (const Q81*) latq, approx + (size_t) i * dspark_screen_rows(h.n_vocab), h.fold_bp, h.cap, h.n_vocab, tiles, cand,
-               part);
+               part, cum, i > 0 ? stop_th : 0.f);
     launch_pdl(head_final_kernel, dim3(1), dim3(512), 0, s, h, (const Q81*) hq + (size_t) i * kHeadNb, (const Q81*) latq, tiles,
-               (const float2*) cand, (const float2*) part, prev, ids, conf, i, w1, w1_row);
+               (const float2*) cand, (const float2*) part, prev, ids, conf, i, w1, w1_row, stop_th);
     check("head pick");
 }
 
@@ -803,9 +844,11 @@ __device__ __forceinline__ void store_kv_row(int64_t row, int d, float k, float 
     }
 }
 
-__global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* tap, int64_t tap_stride, DsMixArgs a,
+__global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* tap, int64_t tap_stride,
+                                                             const __grid_constant__ DsMixArgs a,
                                                              float* __restrict__ out, int64_t out_stride,
-                                                             const int32_t* pos, DsCommitSegs segs, int fr_cap) {
+                                                             const int32_t* pos, const __grid_constant__ DsCommitSegs segs,
+                                                             int fr_cap) {
     pdl_wait();
     __shared__ float red[kThreads / 32];
     const int r = (int) blockIdx.x, j = (int) blockIdx.y;
@@ -815,7 +858,9 @@ __global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* tap, i
 
 __global__ void __launch_bounds__(kHeadDim) kv_commit_batch_kernel(const float* kb, const float* vb,
                                                                    const float* __restrict__ k_norm, float eps,
-                                                                   DsRopeFreq rope, const int32_t* pos, DsCommitSegs segs,
+                                                                   const __grid_constant__ DsRopeFreq rope,
+                                                                   const int32_t* pos,
+                                                                   const __grid_constant__ DsCommitSegs segs,
                                                                    int64_t cap) {
     pdl_wait();
     __shared__ float red[kHeadDim / 32];
@@ -843,22 +888,25 @@ __global__ void __launch_bounds__(kThreads) block_inputs_batch_kernel(const uint
                                                                       const float* __restrict__ norm, float eps,
                                                                       const float* __restrict__ mask, int block,
                                                                       float* __restrict__ x, int32_t* __restrict__ prev,
-                                                                      float* __restrict__ state, DsBatchFr frs, int fr_cap,
+                                                                      float* __restrict__ state,
+                                                                      const __grid_constant__ DsBatchFr frs, int fr_cap,
                                                                       float* __restrict__ fr_out,
                                                                       const uint16_t* __restrict__ w1,
-                                                                      uint16_t* __restrict__ w1_row) {
+                                                                      uint16_t* __restrict__ w1_row,
+                                                                      float* __restrict__ conf) {
     __shared__ float red[kThreads / 32];
     const int t = (int) blockIdx.x, b = (int) blockIdx.y;
     block_inputs_stage(t, emb, meta + 2 * b, norm, eps, mask, x + (int64_t) b * block * kWidth, nullptr, prev + b,
                        state + (int64_t) b * 2 * kDsRank, frs.fr[b], fr_cap, fr_out + (int64_t) b * kWidth, w1,
-                       w1_row + (int64_t) b * kDsRank, red);
+                       w1_row + (int64_t) b * kDsRank, conf ? conf + (int64_t) b * kDsBlock : nullptr, red);
 }
 
 __global__ void __launch_bounds__(kHeadDim) block_qk_prep_batch_kernel(const float* q, const float* kb, const float* vb,
                                                                        const float* __restrict__ q_norm,
                                                                        const float* __restrict__ k_norm, float eps,
-                                                                       DsRopeFreq rope, const int32_t* meta,
-                                                                       int block, float* q_out, DsBatchKv kv, int64_t cap) {
+                                                                       const __grid_constant__ DsRopeFreq rope,
+                                                                       const int32_t* meta, int block, float* q_out,
+                                                                       const __grid_constant__ DsBatchKv kv, int64_t cap) {
     pdl_wait();
     __shared__ float red[kHeadDim / 32];
     __shared__ float xs[kHeadDim];
@@ -897,14 +945,15 @@ __global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* h_chu
     for (int j = threadIdx.x; j < kWidth / 4; j += 256) dst[j] = src[j];
 }
 
-// Reads the 2-bit head screen once into registers and scores all `count` sessions' `n_max` draft rows.
+// Reads the 2-bit head screen once into registers and scores all `count * n_max` draft rows in RMAX-row chunks (STACK: 0).
+template <int RMAX, bool SINGLE_CHUNK>
 __global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
-                                                              const Q81* x, int count, int n_max,
+                                                              const Q81* __restrict__ x, int total,
                                                               int64_t n_pad, float* __restrict__ approx) {
     constexpr int kNw4 = kWidth / 64, NW = kNw4 / 4;
-    __shared__ __align__(16) int xi[kDsDrafts][kWidth / 4];
-    __shared__ float xs[kDsDrafts][kHeadNb], xdd[kDsDrafts][kHeadNb];
-    __shared__ float red[kDsDrafts][4][32];
+    __shared__ __align__(16) int xi[RMAX][kWidth / 4];
+    __shared__ float xs[RMAX][kHeadNb], xdd[RMAX][kHeadNb];
+    __shared__ float red[RMAX][4][32];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int64_t tile = blockIdx.x;
     const size_t base = ((size_t) tile * kNw4 + warp * NW) * 32 + lane;
@@ -917,18 +966,29 @@ __global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __res
     }
     pdl_wait();
     const int64_t row = tile * 32 + lane;
-    for (int b = 0; b < count; ++b) {
-        if (b > 0) __syncthreads();
-        const Q81* xb = x + (size_t) b * n_max * kHeadNb;
-        for (int r = 0; r < n_max; ++r) screen_x(xb + (size_t) r * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
+    if constexpr (SINGLE_CHUNK) {
+        for (int r = 0; r < total; ++r) screen_x(x + (size_t) r * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
         __syncthreads();
 #pragma unroll
-        for (int r = 0; r < kDsDrafts; ++r)
-            if (r < n_max) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
+        for (int r = 0; r < RMAX; ++r)
+            if (r < total) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
         __syncthreads();
-        float* apb = approx + (size_t) b * n_max * n_pad;
-        for (int r = warp; r < n_max; r += 4)
-            apb[r * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+        for (int r = warp; r < total; r += 4)
+            approx[(size_t) r * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+    } else {
+#pragma unroll 1
+        for (int r0 = 0; r0 < total; r0 += RMAX) {
+            if (r0 > 0) __syncthreads();
+            const int chunk = total - r0 < RMAX ? total - r0 : RMAX;
+            for (int r = 0; r < chunk; ++r) screen_x(x + (size_t) (r0 + r) * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
+            __syncthreads();
+#pragma unroll
+            for (int r = 0; r < RMAX; ++r)
+                if (r < chunk) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
+            __syncthreads();
+            for (int r = warp; r < chunk; r += 4)
+                approx[(size_t) (r0 + r) * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+        }
     }
 }
 
@@ -938,29 +998,45 @@ __global__ void __launch_bounds__(kStepWarps * 32) markov_step_batch_kernel(cons
                                                                             const uint16_t* __restrict__ w_sp,
                                                                             const uint16_t* w1_row,
                                                                             float* state, int step_i,
-                                                                            int n_max, float* __restrict__ latent) {
+                                                                            int n_max, float* __restrict__ latent,
+                                                                            const float* __restrict__ conf, float stop_th) {
     pdl_wait();
-    __shared__ float xs[2 * kDsRank];
     const int blk = (int) blockIdx.x, b = (int) blockIdx.y;
+    if (step_i > 0 && stop_th > 0.f && conf && conf[(size_t) b * kDsBlock + kDsDrafts] < stop_th) return;
+    __shared__ float xs[2 * kDsRank];
     const float* st_in = state + ((size_t) b * 2 + (step_i & 1)) * kDsRank;
     float* st_out = state + ((size_t) b * 2 + ((step_i + 1) & 1)) * kDsRank;
     markov_step_stage(blk, ctx_h + ((size_t) b * n_max + step_i) * kDsRnn, ctx_f + (size_t) b * kDsRnn, bias, w_sp,
                       w1_row + (size_t) b * kDsRank, st_in, st_out, latent + (size_t) b * kDsRank, xs);
 }
 
-__global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(const uint4* __restrict__ wq,
-                                                                              const uint32_t* __restrict__ sc,
-                                                                              const Q81* lat_step,
-                                                                              const float* approx,
-                                                                              const float* __restrict__ fold_bp, float cap,
-                                                                              int64_t n_rows, int n_tiles, int step_i,
-                                                                              int n_max, int64_t n_pad,
-                                                                              uint8_t* __restrict__ scratch,
-                                                                              size_t scratch_stride) {
+// Single-pass 2-slot fold screen (STACK: 0): reads 15.3 MiB fold_sc + fold_bp once into 21 registers for count <= 2.
+__global__ void __launch_bounds__(32 * kTilesPerBlock, 4) head_step_batch_2_kernel(const uint4* __restrict__ wq,
+                                                                                   const uint32_t* __restrict__ sc,
+                                                                                   const Q81* __restrict__ lat_step,
+                                                                                   const float* __restrict__ approx,
+                                                                                   const float* __restrict__ fold_bp, float cap,
+                                                                                   int64_t n_rows, int n_tiles, int step_i,
+                                                                                   int n_max, int count, int64_t n_pad,
+                                                                                   uint8_t* __restrict__ scratch,
+                                                                                   size_t scratch_stride,
+                                                                                   const float* __restrict__ conf, float stop_th) {
+    uint32_t active_mask = 0u;
+    if (step_i > 0 && stop_th > 0.f && conf) {
+        for (int b = 0; b < count; ++b)
+            if (__ldcg(conf + (size_t) b * kDsBlock + kDsDrafts) >= stop_th) active_mask |= (1u << b);
+        if (active_mask == 0u) {
+            pdl_wait();
+            pdl_launch_dependents();
+            return;
+        }
+    } else {
+        active_mask = (1u << count) - 1u;
+    }
     constexpr int kNw4 = kDsRank / 64;
     __shared__ __align__(16) int xi[kDsRank / 4];
     __shared__ float xs[kFoldNb], xdd[kFoldNb];
-    const int tid = threadIdx.x, lane = tid & 31, b = (int) blockIdx.y;
+    const int tid = threadIdx.x, lane = tid & 31;
     const int tile = (int) blockIdx.x * kTilesPerBlock + (tid >> 5);
     const int64_t row = (int64_t) tile * 32 + lane;
     const bool live = tile < n_tiles, real = live && token_of(row, n_tiles) < n_rows;
@@ -972,6 +1048,80 @@ __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(co
         const size_t at = ((size_t) (live ? tile : 0) * kNw4 + j) * 32 + lane;
         w[j] = __ldcs(wq + at);
         s[j] = __ldcs(sc + at);
+    }
+    if (live) fb = __ldg(fold_bp + row);
+    pdl_wait();
+    pdl_launch_dependents();
+    const float ninf = __int_as_float(0xff800000);
+    bool used_smem = false;
+    for (int b = 0; b < count; ++b) {
+        if ((active_mask & (1u << b)) == 0u) continue;
+        if (used_smem) __syncthreads();
+        used_smem = true;
+        screen_x(lat_step + (size_t) b * kFoldNb, kFoldNb, xi, xs, xdd, tid, 32 * kTilesPerBlock);
+        __syncthreads();
+        if (!live) continue;
+        float2* cand = reinterpret_cast<float2*>(scratch + (size_t) b * scratch_stride);
+        float2* part = cand + (size_t) n_tiles * px::kPer;
+        const float* ap = approx + ((size_t) b * n_max + step_i) * n_pad;
+        float v = ninf;
+        if (real) v = capf(ap[row] + screen_acc<kNw4>(w, s, 0, xi, xs, xdd) + fb, cap);
+        float m = v;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float e = v > ninf ? __expf(v - m) : 0.0f;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
+        if (lane == 0) part[tile] = make_float2(m, e);
+        for (int k = 0; k < px::kPer; ++k) {
+            float bv = v;
+            int bi = lane;
+#pragma unroll
+            for (int o = 16; o; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (lane == 0) cand[tile * px::kPer + k] = make_float2(bv, __int_as_float(tile * 32 + bi));
+            if (lane == bi) v = ninf;
+        }
+    }
+}
+
+// High-occupancy L2-cached batched fold screen for count >= 3 (REG ~50 -> 10 CTAs/SM = 83.3% occupancy, STACK: 0):
+// fold_sc + scales + fold_bp total 15.3 MiB (<< 48-96 MiB Blackwell L2), so __ldg retains fold_sc in L2 across all
+// `b = 0 .. count - 1` CTAs (unlike __ldcs which evicted L2), while stopped sessions return immediately per blockIdx.y.
+__global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(const uint4* __restrict__ wq,
+                                                                              const uint32_t* __restrict__ sc,
+                                                                              const Q81* __restrict__ lat_step,
+                                                                              const float* __restrict__ approx,
+                                                                              const float* __restrict__ fold_bp, float cap,
+                                                                              int64_t n_rows, int n_tiles, int step_i,
+                                                                              int n_max, int64_t n_pad,
+                                                                              uint8_t* __restrict__ scratch,
+                                                                              size_t scratch_stride,
+                                                                              const float* __restrict__ conf, float stop_th) {
+    const int b = (int) blockIdx.y;
+    if (step_i > 0 && stop_th > 0.f && conf && __ldcg(conf + (size_t) b * kDsBlock + kDsDrafts) < stop_th) {
+        pdl_wait();
+        pdl_launch_dependents();
+        return;
+    }
+    constexpr int kNw4 = kDsRank / 64;
+    __shared__ __align__(16) int xi[kDsRank / 4];
+    __shared__ float xs[kFoldNb], xdd[kFoldNb];
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int tile = (int) blockIdx.x * kTilesPerBlock + (tid >> 5);
+    const int64_t row = (int64_t) tile * 32 + lane;
+    const bool live = tile < n_tiles, real = live && token_of(row, n_tiles) < n_rows;
+    uint4 w[kNw4];
+    uint32_t s[kNw4];
+    float fb = 0.f;
+#pragma unroll
+    for (int j = 0; j < kNw4; ++j) {
+        const size_t at = ((size_t) (live ? tile : 0) * kNw4 + j) * 32 + lane;
+        w[j] = __ldg(wq + at);
+        s[j] = __ldg(sc + at);
     }
     if (live) fb = __ldg(fold_bp + row);
     pdl_wait();
@@ -1006,19 +1156,29 @@ __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(co
     }
 }
 
-__global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q81* __restrict__ hq,
+__global__ void __launch_bounds__(512) head_final_batch_kernel(const __grid_constant__ DsHead h,
+                                                               const Q81* __restrict__ hq,
                                                                const Q81* __restrict__ lat_step, int n_tiles, int step_i,
                                                                int n_max, const uint8_t* __restrict__ scratch,
                                                                size_t scratch_stride, int32_t* __restrict__ prev,
                                                                int32_t* __restrict__ ids, float* __restrict__ conf,
                                                                const uint16_t* __restrict__ w1,
-                                                               uint16_t* __restrict__ w1_row) {
+                                                               uint16_t* __restrict__ w1_row, float stop_th) {
     __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
     __shared__ px::Final f;
     __shared__ uint4 wr[px::kMaxCand][kW1Words];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = (int) blockIdx.x;
     pdl_wait();
     pdl_launch_dependents();
+    int32_t* ids_b0 = ids + (size_t) b * kDsBlock;
+    float* conf_b0 = conf + (size_t) b * kDsBlock;
+    if (step_i > 0 && stop_th > 0.f && conf_b0[kDsDrafts] < stop_th) {
+        if (tid == 0) {
+            ids_b0[step_i] = 0;
+            conf_b0[step_i] = -1.0f;
+        }
+        return;
+    }
     if (tid == 0) f.cnt = 0;
     const Q81* xh_g = hq + ((size_t) b * n_max + step_i) * kHeadNb;
     const Q81* xl_g = lat_step + (size_t) b * kFoldNb;
@@ -1048,7 +1208,10 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
     px::pick_block<false>(f, n, n_tiles, nullptr, part, prev_b, conf_b + step_i);
     __syncthreads();
     const int pick = *prev_b;
-    if (tid == 0) ids_b[step_i] = pick;
+    if (tid == 0) {
+        ids_b[step_i] = pick;
+        if (stop_th > 0.f) conf_b[kDsDrafts] = (step_i == 0 ? 1.0f : conf_b[kDsDrafts]) * ds_step_acc(conf_b[step_i]);
+    }
     for (int c = warp; c < n; c += 16)
         if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_b)[lane] = wr[c][lane];
 }
@@ -1074,10 +1237,10 @@ void dspark_kv_commit_batch(const float* kb, const float* vb, const float* k_nor
 void dspark_block_inputs_batch(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps,
                                const float* mask, int block, int count, float* x, int32_t* prev, float* state,
                                const DsBatchFr& frs, int fr_cap, float* fr_out, const uint16_t* w1, uint16_t* w1_row,
-                               void* stream) {
+                               void* stream, float* conf) {
     if (count <= 0) return;
     block_inputs_batch_kernel<<<dim3((unsigned) block, (unsigned) count), kThreads, 0, (cudaStream_t) stream>>>(
-        embedding, meta, embed_norm, eps, mask, block, x, prev, state, frs, fr_cap, fr_out, w1, w1_row);
+        embedding, meta, embed_norm, eps, mask, block, x, prev, state, frs, fr_cap, fr_out, w1, w1_row, conf);
     check("block inputs batch");
 }
 
@@ -1100,34 +1263,52 @@ void dspark_pack_draft_rows(const float* h_chunk, int block, int count_chunk, in
 
 void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, float* approx, void* stream) {
     if (count <= 0 || n_max < 1 || n_max > kDsDrafts) return;
-    launch_pdl(head_base_batch_kernel, dim3((unsigned) px::tiles(h.n_vocab)), dim3(128), 0, (cudaStream_t) stream,
-               (const uint4*) h.head_sc, (const uint32_t*) px::scales(const_cast<void*>(h.head_sc), h.n_vocab, kWidth),
-               (const Q81*) hq, count, n_max, dspark_screen_rows(h.n_vocab), approx);
+    const int total = count * n_max;
+    const uint4* wq = (const uint4*) h.head_sc;
+    const uint32_t* sc = (const uint32_t*) px::scales(const_cast<void*>(h.head_sc), h.n_vocab, kWidth);
+    const int64_t n_pad = dspark_screen_rows(h.n_vocab);
+    const dim3 grid((unsigned) px::tiles(h.n_vocab)), block(128);
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (total <= 4)
+        launch_pdl(head_base_batch_kernel<4, true>, grid, block, 0, s, wq, sc, (const Q81*) hq, total, n_pad, approx);
+    else if (total <= 6)
+        launch_pdl(head_base_batch_kernel<6, true>, grid, block, 0, s, wq, sc, (const Q81*) hq, total, n_pad, approx);
+    else if (total <= 8)
+        launch_pdl(head_base_batch_kernel<8, true>, grid, block, 0, s, wq, sc, (const Q81*) hq, total, n_pad, approx);
+    else
+        launch_pdl(head_base_batch_kernel<6, false>, grid, block, 0, s, wq, sc, (const Q81*) hq, total, n_pad, approx);
     check("head base batch");
 }
 
 void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
                               const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
-                              void* stream) {
+                              void* stream, const float* conf, float stop_th) {
     if (count <= 0) return;
     launch_pdl(markov_step_batch_kernel, dim3(kStepBlocks, (unsigned) count), dim3(kStepWarps * 32), 0, (cudaStream_t) stream,
-               ctx_h, ctx_f, bias, w_sp, w1_row, state, step_i, n_max, latent);
+               ctx_h, ctx_f, bias, w_sp, w1_row, state, step_i, n_max, latent, conf, stop_th);
     check("Markov step batch");
 }
 
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
                             int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
-                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
+                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream, float stop_th) {
     if (count <= 0) return;
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
     const int64_t n_pad = dspark_screen_rows(h.n_vocab);
-    launch_pdl(head_step_batch_kernel, dim3((unsigned) ((tiles + kTilesPerBlock - 1) / kTilesPerBlock), (unsigned) count),
-               dim3(32 * kTilesPerBlock), 0, s, (const uint4*) h.fold_sc,
-               (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank), (const Q81*) latq_step,
-               approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad, (uint8_t*) scratch, scratch_stride);
+    const unsigned gx = (unsigned) ((tiles + kTilesPerBlock - 1) / kTilesPerBlock);
+    const uint4* f_wq = (const uint4*) h.fold_sc;
+    const uint32_t* f_sc = (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank);
+    if (count <= 2)
+        launch_pdl(head_step_batch_2_kernel, dim3(gx), dim3(32 * kTilesPerBlock), 0, s, f_wq, f_sc, (const Q81*) latq_step,
+                   approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, count, n_pad, (uint8_t*) scratch,
+                   scratch_stride, conf, stop_th);
+    else
+        launch_pdl(head_step_batch_kernel, dim3(gx, (unsigned) count), dim3(32 * kTilesPerBlock), 0, s, f_wq, f_sc,
+                   (const Q81*) latq_step, approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad,
+                   (uint8_t*) scratch, scratch_stride, conf, stop_th);
     launch_pdl(head_final_batch_kernel, dim3((unsigned) count), dim3(512), 0, s, h, (const Q81*) hq, (const Q81*) latq_step,
-               tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row);
+               tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row, stop_th);
     check("head pick batch");
 }
 

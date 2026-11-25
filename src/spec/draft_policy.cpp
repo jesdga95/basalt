@@ -125,11 +125,11 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     return lookup_over(t, mtp_tokens(t) / cost_ms(t), lookup_k, match);
 }
 
-DraftPolicy::Pick DraftPolicy::choose_window(const float* chance, int n, int lookup_k, int match) const {
+DraftPolicy::Pick DraftPolicy::choose_window(const float* chance, int n, int lookup_k, int match, bool allow_probe) const {
     Pick p;
-    p.t = window(chance, n);
+    p.t = window(chance, n, allow_probe);
     if (lookup_k <= 0) return p;
-    return lookup_over(p.t, drafter_tokens(chance, p.t) / cost_ms(p.t), lookup_k, match);
+    return lookup_over(p.t, drafter_tokens(chance, p.t) / cost_ms(p.t), lookup_k, match, allow_probe);
 }
 
 double DraftPolicy::drafter_tokens(const float* chance, int t) const {
@@ -142,7 +142,7 @@ double DraftPolicy::drafter_tokens(const float* chance, int t) const {
 }
 
 // `base`: the expected tokens per ms of the window of t the drafter would run
-DraftPolicy::Pick DraftPolicy::lookup_over(int t, double base, int lookup_k, int match) const {
+DraftPolicy::Pick DraftPolicy::lookup_over(int t, double base, int lookup_k, int match, bool allow_probe) const {
     Pick p;
     p.t = t;
     const double q = lookup_rate(match);
@@ -163,14 +163,14 @@ DraftPolicy::Pick DraftPolicy::lookup_over(int t, double base, int lookup_k, int
     // need a size not measured yet (or not for long), it is tried (verification keeps the output; only the one
     // round's speed is at stake)
     const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
-    if (t_full > p.t && unmeasured(t_full) && q >= 0.85) {
+    if (allow_probe && t_full > p.t && unmeasured(t_full) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
     return p;
 }
 
-int DraftPolicy::window(const float* chance, int n) const {
+int DraftPolicy::window(const float* chance, int n, bool allow_probe) const {
     const int most = std::clamp(n + 1, 1, max_t_);
     double e = 1.0, all = 1.0, best = 1.0 / cost_ms(1);
     int best_t = 1;
@@ -182,7 +182,7 @@ int DraftPolicy::window(const float* chance, int n) const {
     }
     // as for lookup windows: a size whose cost is only guessed (or old) is tried a few times when its drafts are
     // likely accepted, so a guessed or stale cost cannot keep the window from ever growing
-    if (best_t < most && unmeasured(best_t + 1)) {
+    if (allow_probe && best_t < most && unmeasured(best_t + 1)) {
         double joint = 1.0;
         for (int i = 0; i < best_t; ++i) joint *= chance_rate(chance[i]);
         if (joint >= kProbeChance) ++best_t;
@@ -214,15 +214,35 @@ bool DraftPolicy::may_verify(const float* chance, int j, int n) const {
 }
 
 void DraftPolicy::observe_window(const float* chance, int t, int accepted, double round_ms) {
-    // drafts 0..accepted-1 were accepted given their prefix and draft `accepted` (if the window had it) was not; the
-    // drafts after it were never tested
+    observe_outcomes(false, chance, t, accepted, 0);
+    observe(false, t, accepted, 0, round_ms);
+}
+
+void DraftPolicy::observe_outcomes(bool lookup, const float* chance, int t, int accepted, int match) {
+    t = std::clamp(t, 1, kMaxT);
+    if (lookup) {
+        const int b = bucket(match);
+        ok_[b] = kDecay * ok_[b] + accepted;
+        bad_[b] = kDecay * bad_[b] + (accepted < t - 1 ? 1.0 : 0.0);
+        return;
+    }
+    if (!chance) return;
     const int tested = std::min(t - 1, accepted + 1);
     for (int i = 0; i < tested; ++i) {
         const int b = chance_bin(chance[i]);
         c_ok_[b] = kChanceDecay * c_ok_[b] + (i < accepted ? 1.0 : 0.0);
         c_n_[b] = kChanceDecay * c_n_[b] + 1.0;
     }
-    observe(false, t, accepted, 0, round_ms);
+}
+
+void DraftPolicy::seed_row_slope(double slope) {
+    scale_ = 1.0;
+    round_ = 1;
+    for (int t = 1; t <= kMaxT; ++t) {
+        base_[t] = 1.0 + slope * (double) (t - 1);
+        base_n_[t] = kBasePrior + kProbes + 1.0;
+        seen_[t] = 1;
+    }
 }
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {

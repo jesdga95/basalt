@@ -680,6 +680,90 @@ void test_head_batch() {
     }
     check("batched Markov + head vs solo (B=2,4,8, plain & PDL)", ok);
 
+    // GPU early-exit parity (stop_th = 0.50f): verify solo and batched early-exit produce identical picks/confidences and
+    // trigger the negative sentinel on low-survival steps across B=2,4,8 (plain & PDL).
+    {
+        constexpr float kTestStop = 0.50f;
+        std::vector<int32_t> stop_ids((size_t) BMax * 8, 0);
+        std::vector<float> stop_conf((size_t) BMax * 8, 0.f);
+        bool saw_stop = false;
+        uint8_t* s_hq = zeros<uint8_t>(R * hrow);
+        uint8_t* s_lq = zeros<uint8_t>(R * lrow);
+        float* s_approx = zeros<float>((size_t) R * dspark_screen_rows(V));
+        float *s_ch = zeros<float>((size_t) R * kDsRnn), *s_cf = zeros<float>(kDsRnn);
+        float *s_st = zeros<float>(2 * kDsRank), *s_lat = zeros<float>(kDsRank);
+        uint16_t* s_w1r = zeros<uint16_t>(kDsRank);
+        void* s_scr = zeros<uint8_t>(scr_stride);
+        int32_t *s_prev = zeros<int32_t>(1), *s_ids = zeros<int32_t>(8);
+        float* s_conf = zeros<float>(8);
+        const float one = 1.0f;
+        for (int b = 0; b < BMax; ++b) {
+            cudaMemsetAsync(s_st, 0, 2 * kDsRank * 4, st);
+            cudaMemsetAsync(s_ids, 0, 8 * 4, st);
+            cudaMemsetAsync(s_conf, 0, 8 * 4, st);
+            cudaMemcpyAsync(s_conf + kDsDrafts, &one, 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(s_prev, &anchors[b], 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(s_w1r, w1.data() + (size_t) anchors[b] * kDsRank, kDsRank * 2, cudaMemcpyHostToDevice, st);
+            basalt::kernels::native_quantize_q8_1(d_hd + (size_t) b * R * E, s_hq, E, R, st);
+            dspark_head_base(h, s_hq, R, s_approx, st);
+            basalt::kernels::bf16_gemv_fp32_mmvf_multi(d_hd + (size_t) b * R * E, E, d_wh, s_ch, kDsRnn, E, kDsRnn, R, st);
+            basalt::kernels::bf16_gemv_fp32_mmvf_multi(d_frc + (size_t) b * E, E, d_wf, s_cf, kDsRnn, E, kDsRnn, 1, st);
+            for (int i = 0; i < R; ++i) {
+                dspark_markov_step(s_ch + (size_t) i * kDsRnn, s_cf, d_rb, d_wsp, s_w1r,
+                                   s_st + (i & 1) * kDsRank, s_st + ((i + 1) & 1) * kDsRank, s_lat, st,
+                                   i > 0 ? s_conf + kDsDrafts : nullptr, i > 0 ? kTestStop : 0.f);
+                basalt::kernels::native_quantize_q8_1(s_lat, s_lq + i * lrow, kDsRank, 1, st);
+                dspark_head_pick(h, s_hq, s_lq + i * lrow, s_approx, i, s_scr, s_prev, s_ids, s_conf, d_w1, s_w1r, st, kTestStop);
+            }
+            cudaStreamSynchronize(st);
+            const auto gi = host(s_ids, R);
+            const auto gc = host(s_conf, R);
+            for (int i = 0; i < R; ++i) saw_stop = saw_stop || (gc[(size_t) i] == -1.0f);
+            std::copy(gi.begin(), gi.end(), stop_ids.begin() + (size_t) b * 8);
+            std::copy(gc.begin(), gc.end(), stop_conf.begin() + (size_t) b * 8);
+        }
+        cudaFree(s_hq); cudaFree(s_lq); cudaFree(s_approx); cudaFree(s_ch); cudaFree(s_cf);
+        cudaFree(s_st); cudaFree(s_lat); cudaFree(s_w1r); cudaFree(s_scr);
+        cudaFree(s_prev); cudaFree(s_ids); cudaFree(s_conf);
+
+        bool stop_ok = saw_stop;
+        for (const bool pdl_on : {false, true}) {
+            for (const int B : {2, 4, 8}) {
+                cudaMemsetAsync(b_st, 0, (size_t) B * 2 * kDsRank * 4, st);
+                cudaMemsetAsync(b_ids, 0, (size_t) B * 8 * 4, st);
+                cudaMemsetAsync(b_conf, 0, (size_t) B * 8 * 4, st);
+                cudaMemcpyAsync(b_prev, anchors.data(), (size_t) B * 4, cudaMemcpyHostToDevice, st);
+                for (int b = 0; b < B; ++b) {
+                    cudaMemcpyAsync(b_conf + (size_t) b * 8 + kDsDrafts, &one, 4, cudaMemcpyHostToDevice, st);
+                    cudaMemcpyAsync(b_w1r + (size_t) b * kDsRank, w1.data() + (size_t) anchors[b] * kDsRank,
+                                    kDsRank * 2, cudaMemcpyHostToDevice, st);
+                }
+                {
+                    basalt::kernels::PdlScope pdl(pdl_on, true);
+                    basalt::kernels::native_quantize_q8_1(d_hd, b_hq, E, B * R, st);
+                    dspark_head_base_batch(h, b_hq, B, R, b_approx, st);
+                    basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_hd, d_wh, b_ch, E, kDsRnn, B * R, st);
+                    basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_frc, d_wf, b_cf, E, kDsRnn, B, st);
+                    for (int i = 0; i < R; ++i) {
+                        dspark_markov_step_batch(b_ch, b_cf, d_rb, d_wsp, b_w1r, b_st, i, R, B, b_lat, st, b_conf, kTestStop);
+                        void* lq_step = b_lq + (size_t) i * B * lrow;
+                        basalt::kernels::native_quantize_q8_1(b_lat, lq_step, kDsRank, B, st);
+                        dspark_head_pick_batch(h, b_hq, lq_step, b_approx, i, R, B, b_scr, scr_stride,
+                                               b_prev, b_ids, b_conf, d_w1, b_w1r, st, kTestStop);
+                    }
+                }
+                cudaStreamSynchronize(st);
+                const auto gi = host(b_ids, (size_t) B * 8);
+                const auto gc = host(b_conf, (size_t) B * 8);
+                for (int b = 0; b < B; ++b) {
+                    stop_ok = stop_ok && std::memcmp(&gi[(size_t) b * 8], &stop_ids[(size_t) b * 8], R * 4) == 0;
+                    stop_ok = stop_ok && std::memcmp(&gc[(size_t) b * 8], &stop_conf[(size_t) b * 8], R * 4) == 0;
+                }
+            }
+        }
+        check("batched early-exit stop_th=0.50 vs solo (B=2,4,8, plain & PDL)", stop_ok);
+    }
+
     cudaStreamDestroy(st);
     cudaFree(b_hq); cudaFree(b_lq); cudaFree(b_approx); cudaFree(b_ch); cudaFree(b_cf);
     cudaFree(b_st); cudaFree(b_lat); cudaFree(b_w1r); cudaFree(b_scr);

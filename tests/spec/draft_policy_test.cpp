@@ -218,6 +218,26 @@ int main() {
         }
         check(same, "untimed: the picks do not depend on the round times");
     }
+    {
+        DraftPolicy p(6);
+        for (int i = 0; i < 10; ++i) p.observe(false, 2, 1, 0, 12.0);
+        p.observe(false, 3, 0, 0, 40.0);
+        const float ch[2] = {0.96f, 0.94f};
+        // One dear sample at size 3 leaves base_n_[3] < kBasePrior + kProbes (unmeasured) with joint=0.9024 >= 0.85.
+        check(p.window(ch, 2, true) == 3 && p.window(ch, 2, false) == 2,
+              "allow_probe=false: skips unmeasured +1 probe while keeping EV-positive prefix");
+        const float hi[4] = {0.95f, 0.92f, 0.42f, 0.40f};
+        const double c4_before = p.cost_ms(4);
+        for (int i = 0; i < 30; ++i) p.observe_outcomes(false, hi, 5, 1, 0);
+        check(p.chance_rate(0.93f) < 0.55 && p.cost_ms(4) == c4_before,
+              "observe_outcomes: calibrates chance bins without altering round size costs");
+        DraftPolicy seeded(6);
+        seeded.seed_row_slope(0.26);
+        const float st[4] = {0.90f, 0.88f, 0.86f, 0.85f};
+        const float pr[4] = {0.52f, 0.50f, 0.48f, 0.45f};
+        check(seeded.window(st, 4, false) == 5 && seeded.window(pr, 4, false) == 2,
+              "seed_row_slope: keeps full struct window while clamping middling prose at T=2");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

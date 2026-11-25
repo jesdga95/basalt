@@ -49,16 +49,20 @@ public:
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
 
     /// A drafter with stated chances: the window (1 + up to `n` drafts) with the most expected tokens per ms.
-    int window(const float* chance, int n) const;
+    int window(const float* chance, int n, bool allow_probe = true) const;
     /// Whether window(chance, n) can hold draft `j` (from 0) when only the chances of drafts 0..j are known: the later
     /// ones are taken at the best rate a stated chance can have. False means every window of those drafts leaves draft j
     /// out, so a drafter that makes its drafts in turn can stop before it.
     bool may_verify(const float* chance, int j, int n) const;
     /// The same drafter's window against a lookup proposal of `lookup_k` tokens behind a match of `match`: the lookup
     /// window when its expected tokens per ms beat the drafter's best by the margin.
-    Pick choose_window(const float* chance, int n, int lookup_k, int match) const;
+    Pick choose_window(const float* chance, int n, int lookup_k, int match, bool allow_probe = true) const;
     /// After such a window: the chances of its t - 1 drafts, the drafts accepted, and the round's time.
     void observe_window(const float* chance, int t, int accepted, double round_ms);
+    /// Record draft/lookup acceptance outcomes from a multi-slot batch window without mixing batch ms into solo size costs.
+    void observe_outcomes(bool lookup, const float* chance, int t, int accepted, int match);
+    /// Seed a fixed linear per-row relative cost `1 + slope * (t - 1)` with all sizes marked measured.
+    void seed_row_slope(double slope);
 
     double lookup_rate(int match) const;   // current q for a match length
     double chance_rate(float chance) const;   // current q for a draft stated at `chance`
@@ -74,7 +78,7 @@ private:
     double base(int t) const;              // a size's cost relative to the scale, measured or inferred
     double base_from(int t, bool lately) const;   // t's base from the other (recent) sizes; < 0 without any
     double mtp_tokens(int t) const;
-    Pick lookup_over(int t, double rate, int lookup_k, int match) const;   // the lookup window, if it beats `rate` at t
+    Pick lookup_over(int t, double rate, int lookup_k, int match, bool allow_probe = true) const;   // the lookup window, if it beats `rate` at t
     double drafter_tokens(const float* chance, int t) const;               // expected tokens of a drafter window of t
 
     int max_t_;

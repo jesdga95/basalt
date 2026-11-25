@@ -40,13 +40,14 @@ void dspark_mix(const float* tap, int64_t tap_stride, int rows, const DsMixArgs&
 /// pos0 - 1, ring row (pos0 - 1) % fr_cap of fr, w1_row = the anchor's row of w1 (BF16 [vocab][kDsRank], device-readable).
 void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps, const float* mask,
                          int block, float* x, int32_t* pos3, int32_t* prev, float* state, const float* fr, int fr_cap, float* fr_out,
-                         const uint16_t* w1, uint16_t* w1_row, void* stream);
+                         const uint16_t* w1, uint16_t* w1_row, void* stream, float* conf = nullptr);
 
 /// One step of the Markov head's recurrence. raw = ctx_h + ctx_f + bias + w_sp [state_in ; w1_row] (w_sp BF16
 /// [kDsRnn][2 kDsRank], w1_row the previous token's row of w1, BF16 [kDsRank] on the device); gate = sigmoid(raw[0:r]); state_out = gate * state_in + (1 - gate) *
 /// tanh(raw[r:2r]); latent = tanh(raw[2r:3r]) into `latent` (fp32 [kDsRank]).
 void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1_row,
-                        const float* state_in, float* state_out, float* latent, void* stream);
+                        const float* state_in, float* state_out, float* latent, void* stream,
+                        const float* cum_conf = nullptr, float stop_th = 0.f);
 
 /// The draft head: draft i's logits l[v] = cap tanh((head_v . h + fold_v . lat + fold_b[v]) / cap) over v < n_vocab, h = block
 /// row i + 1 (q8_1, kWidth) and lat its latent (q8_1, kDsRank). Its argmax is screened (basalt/kernels/head_proxy.cuh) by
@@ -81,7 +82,7 @@ void dspark_head_base(const DsHead& h, const void* hq, int rows, float* approx, 
 /// row on a tie), conf[i] = its softmax probability (the rows not rescored at their approximate logits), w1_row = the pick's
 /// row of w1 (the rescored rows' are read while they are scored, so the next step reads the card, not w1's host memory).
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
-                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
+                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream, float stop_th = 0.f);
 /// The reference: every row's exact logit (the arithmetic the pick rescores with) into logits[n_vocab].
 void dspark_head_exact(const DsHead& h, const void* hq, const void* latq, int i, float* logits, void* stream);
 
@@ -127,7 +128,7 @@ void dspark_kv_commit_batch(const float* kb, const float* vb, const float* k_nor
 void dspark_block_inputs_batch(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps,
                                const float* mask, int block, int count, float* x, int32_t* prev, float* state,
                                const DsBatchFr& frs, int fr_cap, float* fr_out, const uint16_t* w1, uint16_t* w1_row,
-                               void* stream);
+                               void* stream, float* conf = nullptr);
 
 void dspark_block_qk_prep_batch(const float* q, const float* kb, const float* vb, const float* q_norm, const float* k_norm,
                                 float eps, float rope_base, const int32_t* meta, int block, int count, float* q_out,
@@ -140,10 +141,10 @@ void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_ma
 
 void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
                               const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
-                              void* stream);
+                              void* stream, const float* conf = nullptr, float stop_th = 0.f);
 
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
                             int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
-                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
+                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream, float stop_th = 0.f);
 
 }  // namespace basalt::models::inkling2

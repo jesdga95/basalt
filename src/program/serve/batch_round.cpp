@@ -33,22 +33,35 @@ struct SlotWin {
 
 // The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, or as its drafter's
 // own length rule keeps).
-void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
+basalt::spec::DraftPolicy& Runtime::slot_policy(int b) {
+    if (bs.size() <= 1) return *bpolicy;
     BSlot& sl = bs[(size_t) b];
+    if (!sl.policy) {
+        sl.policy.emplace(o.spec, 0.05);
+        const double slope = slot_context(b) >= 16384 ? 0.20 : 0.23;
+        sl.policy->seed_row_slope(slope);
+    }
+    return *sl.policy;
+}
+
+void Runtime::slot_window_begin(int b, SlotWin& w, int limit, bool allow_probe) {
+    BSlot& sl = bs[(size_t) b];
+    basalt::spec::DraftPolicy& pol = allow_probe ? *bpolicy : slot_policy(b);
     basalt::model::ModelSession& s = slot_session(b);
     const int own_limit = s.window_limit(sl.p);
     const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit,
                                               own_limit > 0 ? (int64_t) own_limit : INT64_MAX});
     const int own = s.own_window(sl.dprob, sl.n_dr);
-    w.T = std::max(1, std::min(own > 0 ? own : bpolicy->window(sl.dprob, sl.n_dr), most));
+    w.T = std::max(1, std::min(own > 0 ? own : pol.window(sl.dprob, std::min(sl.n_dr, std::max(0, most - 1)), allow_probe), most));
     w.from_sfx = false;
     w.match = 0;
     if (sl.sfx && most >= 2) {   // a lookup proposal, as in the solo loop
         const int k = sl.sfx->propose(most - 1, sl.sbuf);
         w.match = sl.sfx->last_match();
         if (k > 0 && (sl.n_dr == 0 || sl.sbuf[0] == sl.dr[0])) {
-            const basalt::spec::DraftPolicy::Pick pk = own > 0 ? bpolicy->choose(w.T, k, w.match)
-                                                           : bpolicy->choose_window(sl.dprob, std::min(sl.n_dr, most - 1), k, w.match);
+            const basalt::spec::DraftPolicy::Pick pk =
+                own > 0 ? pol.choose(w.T, k, w.match)
+                        : pol.choose_window(sl.dprob, std::min(sl.n_dr, most - 1), k, w.match, allow_probe);
             if (pk.lookup) {
                 w.T = std::min(pk.t, most);
                 w.from_sfx = true;
@@ -186,9 +199,10 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
     const char* fin = w.fin;
     basalt::protocol::emit_text(w.line + "\n");
     basalt::core::progress_beat();
+    basalt::spec::DraftPolicy& pol = slot_policy(b);
     if (w.drafting) {
         const int max_n = std::min(s.max_window() - 1, (int) std::size(sl.dr));
-        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || bpolicy->may_verify(c, j, m); };
+        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || pol.may_verify(c, j, m); };
         if (const basalt::model::Result r = s.draft_end(sl.dr, sl.dprob, max_n, sl.n_dr, need); !r.ok()) {
             std::printf("ERR %s\n", r.message.c_str());
             return false;
@@ -197,7 +211,12 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             const double ms = s.window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
             if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
             else bpolicy->observe_window(w.chance, T, a, ms);
+            if (bs.size() > 1 && (T > 1 || w.from_sfx)) pol.observe_outcomes(w.from_sfx, w.chance, T, a, w.match);
+        } else if (T > 1 || w.from_sfx) {
+            pol.observe_outcomes(w.from_sfx, w.chance, T, a, w.match);
         }
+    } else if (!w.solo && (T > 1 || w.from_sfx)) {
+        pol.observe_outcomes(w.from_sfx, w.chance, T, a, w.match);
     }
     if (fin != nullptr) end_slot(b, fin);
     std::fflush(stdout);
@@ -276,17 +295,47 @@ bool Runtime::batch_round() {
                 slot_window_begin(act[(size_t) i], wins[(size_t) i], share[(size_t) i]);
                 rows[(size_t) i] = wins[(size_t) i].T;
             }
+    } else if (n_act == 1) {
+        slot_window_begin(act[0], wins[0], per_slot_cap, true);
+        rows[0] = wins[0].T;
+    } else if (n_act >= row_cap) {
+        for (int i = 0; i < n_act; ++i) {
+            slot_window_begin(act[(size_t) i], wins[(size_t) i], 1, false);
+            rows[(size_t) i] = wins[(size_t) i].T;
+        }
     } else {
         std::vector<std::vector<double>> joint(act.size());
         for (int i = 0; i < n_act; ++i) {
-            const BSlot& sl = bs[(size_t) act[(size_t) i]];
+            const int b = act[(size_t) i];
+            BSlot& sl = bs[(size_t) b];
+            basalt::spec::DraftPolicy& pol = slot_policy(b);
+            basalt::model::ModelSession& s = slot_session(b);
+            const int own_lim = s.window_limit(sl.p);
+            const int slot_most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p,
+                                                           (int64_t) std::size(sl.dr) + 1, (int64_t) per_slot_cap,
+                                                           own_lim > 0 ? (int64_t) own_lim : INT64_MAX});
+            const int max_k = std::max(0, slot_most - 1);
+            int sfx_k = 0, sfx_match = 0;
+            if (sl.sfx && max_k >= 1) {
+                const int k = sl.sfx->propose(max_k, sl.sbuf);
+                sfx_match = sl.sfx->last_match();
+                if (k > 0 && (sl.n_dr == 0 || sl.sbuf[0] == sl.dr[0])) sfx_k = k;
+            }
+            const basalt::spec::DraftPolicy::Pick pk =
+                pol.choose_window(sl.dprob, std::min(sl.n_dr, max_k), sfx_k, sfx_match, false);
+            const int pol_t = std::clamp(pk.t, 1, slot_most);
             double all = 1.0;
-            const int max_k = std::min(sl.n_dr, std::max(0, per_slot_cap - 1));
-            for (int k = 0; k < max_k; ++k) joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
+            if (pk.lookup) {
+                const double q = pol.lookup_rate(sfx_match);
+                for (int k = 0; k < pol_t - 1; ++k) joint[(size_t) i].push_back(all *= q);
+            } else {
+                const int dk = std::min(sl.n_dr, pol_t - 1);
+                for (int k = 0; k < dk; ++k) joint[(size_t) i].push_back(all *= pol.chance_rate(sl.dprob[k]));
+            }
         }
-        const std::vector<int> share = batch_shares(joint, row_cap);
+        const std::vector<int> ev_rows = batch_ev_shares(joint, per_slot_cap, row_cap, max_pos);
         for (int i = 0; i < n_act; ++i) {
-            slot_window_begin(act[(size_t) i], wins[(size_t) i], std::min(share[(size_t) i], per_slot_cap));
+            slot_window_begin(act[(size_t) i], wins[(size_t) i], ev_rows[(size_t) i], false);
             rows[(size_t) i] = wins[(size_t) i].T;
         }
     }
@@ -314,7 +363,10 @@ bool Runtime::batch_round() {
             wins[i].solo = group.size() == 1;
             if (!slot_window_accept(act[i], wins[i])) return false;
             kept.push_back(wins[i].kept);
-            // bound drafted tokens to what a slot's share of the batch window can verify next round
+            // bound drafted tokens to what a slot's share of the batch window can verify next round (and cap at 2 on sustained low yield)
+            const BSlot& wsl = bs[(size_t) act[i]];
+            if (group.size() > 1 && wins[i].a == 0 && wsl.drafts_offered >= 8 && wsl.drafts_accepted * 2 < wsl.drafts_offered)
+                wins[i].want = std::min(wins[i].want, 2);
             wins[i].want = std::min(wins[i].want, std::min(per_slot_cap - 1, std::max(0, (spec_cap + n_act - 1) / n_act - 1)));
             if (wins[i].want > 0) {
                 const BSlot& sl = bs[(size_t) act[i]];

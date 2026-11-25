@@ -32,6 +32,8 @@ bool sound(const std::vector<int>& rows, const Groups& g, int cap) {
 }  // namespace
 
 int main() {
+    using basalt::program::serve::BatchRowCost;
+    using basalt::program::serve::batch_ev_shares;
     using basalt::program::serve::batch_groups;
     using basalt::program::serve::batch_fair_shares;
     using basalt::program::serve::batch_shares;
@@ -97,6 +99,24 @@ int main() {
                     all = all && sound(rows, batch_groups(rows, cap), cap);
                 }
     check(all, "every window lands in exactly one group within the cap");
+
+    // Tile-cliff EV budgeting (batch_ev_shares):
+    // 1. 4 weak prose slots (second draft survival 0.32) stop cleanly at M = 8 (CTILES = 1) rather than crossing M = 8 -> 9+.
+    check(batch_ev_shares({{0.62, 0.32}, {0.62, 0.32}, {0.62, 0.32}, {0.62, 0.32}}, 5, 16, 512) == Rows{2, 2, 2, 2},
+          "batch_ev_shares: 4 prose slots clamp at M=8 (CTILES=1) when second drafts cannot pay the M>8 cliff");
+    // 2. 3 confident code/struct slots cross M = 8 -> 12 cleanly when multi-draft survival stays high.
+    check(batch_ev_shares({{0.92, 0.85, 0.78}, {0.92, 0.85, 0.78}, {0.92, 0.85, 0.78}}, 5, 16, 512) == Rows{4, 4, 4},
+          "batch_ev_shares: 3 confident struct slots cross M>8 to full 4-row windows");
+    // 3. When active slots already fill or exceed the cap, every slot gets its 1 anchor row.
+    check(batch_ev_shares(Joint(16, {0.95, 0.90}), 3, 16, 512) == Rows(16, 1),
+          "batch_ev_shares: n >= cap returns 1 anchor row per slot");
+    // 4. Long-context KV amortization (>= 16K) has lower marginal row cost than short context.
+    check(BatchRowCost::cost(8, 32768) < BatchRowCost::cost(8, 512),
+          "BatchRowCost: long context amortizes KV sweep across speculative rows");
+    // 5. Equal-confidence synchronized slots never break symmetry mid-cliff (e.g. 3 slots at M=8 stay {3,3,3} or {2,2,2}, never {3,3,2}).
+    const Rows sym3 = batch_ev_shares({{0.80, 0.55, 0.25}, {0.80, 0.55, 0.25}, {0.80, 0.55, 0.25}}, 5, 16, 512);
+    check(sym3[0] == sym3[1] && sym3[1] == sym3[2],
+          "batch_ev_shares: equal-confidence slots step atomically without desynchronizing");
 
     std::printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;

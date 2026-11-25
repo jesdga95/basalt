@@ -309,6 +309,7 @@ public:
         int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
+        std::optional<basalt::spec::DraftPolicy> policy{};   ///< per-slot isolated 9-bin draft & 4-bucket lookup calibration
     };
     std::vector<BSlot> bs{};
     // ---- --batch: the slots' rounds (batch_round.cpp), the same for every model
@@ -322,7 +323,8 @@ public:
     /// The batch windows' draft policy, which the runtime sets up, and each slot's sampling (slot_set_sampling).
     std::optional<basalt::spec::DraftPolicy> bpolicy{};
     std::vector<basalt::kernels::SamplerParams> slot_sampling{};
-    void slot_window_begin(int b, SlotWin& w, int limit);
+    basalt::spec::DraftPolicy& slot_policy(int b);
+    void slot_window_begin(int b, SlotWin& w, int limit, bool allow_probe = true);
     bool slot_window_finish(int b, SlotWin& w);
     bool slot_window_accept(int b, SlotWin& w);
     bool slot_window_end(int b, SlotWin& w);

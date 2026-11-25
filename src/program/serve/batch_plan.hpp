@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,79 @@ inline int drafts_ahead(int T, int most) { return std::clamp(std::max(T, 2), 1, 
 /// 0..k are all kept. With no more slots than rows, one pass serves them all: each slot takes one row, then each further
 /// row goes to the slot whose next draft is likeliest kept (the earlier slot on a tie), and rows no draft wants go round
 /// the slots in turn (a lookup proposal may still take them). With more slots than rows each may take the cap.
+/// Tile-cliff-aware cost model of a multi-slot decode_batch(M) pass over M total batch rows (1..kMaxM) on sm_120:
+/// - Within M <= 8 (CTILES = 1 Q8 MMA), marginal cost is light since each slot's policy already filtered low-yield drafts.
+/// - Crossing M = 8 -> 9 jumps Q8 projections (w.proj, w.out, lm_head) from CTILES = 1 to CTILES = 2.
+/// - Crossing M = 12 -> 13 switches routed MoE (10 * M >= 128) to grouped MMA.
+struct BatchRowCost {
+    static constexpr int kMaxM = 128;
+
+    static double cost(int m, int64_t max_pos) {
+        m = std::clamp(m, 1, kMaxM);
+        const double slope = max_pos >= 16384 ? 0.060 : max_pos >= 4096 ? 0.070 : 0.080;
+        double c = 1.0 + slope * (double) (m - 1);
+        if (m > 8) c += (max_pos >= 8192 ? 0.06 : 0.13);
+        if (m > 12) c += (max_pos >= 8192 ? 0.04 : 0.06);
+        if (m > 16) c += 0.08;
+        return c;
+    }
+};
+
+/// Global expected-throughput-maximizing row allocation across active batch slots: starts at 1 anchor row per slot
+/// (M = n, E = n) and greedily adds the highest-joint-survival pre-filtered draft across slots up to `per_slot_cap` / `cap`,
+/// picking the prefix M* that maximizes E(M) / BatchRowCost::cost(M, max_pos) (looking across M = 8->12+ tile cliffs when
+/// multiple strong code/struct drafts pay together, while clamping weak prose/mix tails at M <= 8).
+inline std::vector<int> batch_ev_shares(const std::vector<std::vector<double>>& joint, int per_slot_cap, int cap,
+                                        int64_t max_pos = 0) {
+    const size_t n = joint.size();
+    if (n == 0) return {};
+    if ((int) n >= cap) return std::vector<int>(n, 1);
+    std::vector<int> rows(n, 1);
+    int cur_m = (int) n;
+    double cur_e = (double) n;
+    double best_rate = cur_e / BatchRowCost::cost(cur_m, max_pos);
+    std::vector<int> best_rows = rows;
+    while (cur_m < cap) {
+        size_t best_i = n;
+        double best_j = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (rows[i] >= per_slot_cap) continue;
+            const size_t k = (size_t) rows[i] - 1;
+            if (k < joint[i].size() && joint[i][k] > best_j) {
+                best_j = joint[i][k];
+                best_i = i;
+            }
+        }
+        if (best_i == n || best_j <= 0.05) break;
+        // Step near-tied slots (e.g. synchronized multi-sample / shared-prefix slots) together when they fit within `cap`
+        // so breaking a tie mid-cliff never desynchronizes identical trajectories or fragments shared MoE expert coalescing.
+        std::vector<size_t> group;
+        for (size_t i = 0; i < n; ++i) {
+            if (rows[i] >= per_slot_cap) continue;
+            const size_t k = (size_t) rows[i] - 1;
+            if (k < joint[i].size() && best_j - joint[i][k] <= 1e-4) group.push_back(i);
+        }
+        if ((int) group.size() > 1 && cur_m + (int) group.size() <= cap) {
+            for (const size_t i : group) {
+                const size_t k = (size_t) rows[i] - 1;
+                ++rows[i];
+                ++cur_m;
+                cur_e += joint[i][k];
+            }
+        } else {
+            ++rows[best_i];
+            ++cur_m;
+            cur_e += best_j;
+        }
+        const double rate = cur_e / BatchRowCost::cost(cur_m, max_pos);
+        if (rate > best_rate) {
+            best_rate = rate;
+            best_rows = rows;
+        }
+    }
+    return best_rows;
+}
+
 inline std::vector<int> batch_shares(const std::vector<std::vector<double>>& joint, int cap) {
     const size_t n = joint.size();
     if (n == 0) return {};
