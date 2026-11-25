@@ -29,7 +29,8 @@ float bf16_round(float v) {
 }  // namespace
 
 VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens) {
-    const int p = kVisionPatch, r = merge;
+    const int p = kVisionPatch, r = std::max(merge, 1);
+    max_tokens = std::max(max_tokens, 4);
     if (min_pixels > 0 && (int64_t) w * h > 0 && (int64_t) w * h < min_pixels) {
         const double ratio = std::sqrt((double) min_pixels / ((double) w * (double) h));
         w = (int) (w * ratio);
@@ -55,6 +56,8 @@ VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens) {
             bw = (int) std::floor(w * beta / p) * p;
         }
     }
+    bw = std::max(bw, p);
+    bh = std::max(bh, p);
     VisionPlan pl;
     pl.width = bw;
     pl.height = bh;

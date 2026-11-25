@@ -3,6 +3,7 @@
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/core/loader.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -23,6 +24,16 @@
 namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
+    core::OnDevice g(device_);
+    shared_tier_.tier.reset();
+    if (shared_tier_.h_x) {
+        cudaFreeHost(shared_tier_.h_x);
+        shared_tier_.h_x = nullptr;
+    }
+    if (shared_tier_.h_rows) {
+        cudaFreeHost(shared_tier_.h_rows);
+        shared_tier_.h_rows = nullptr;
+    }
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (embd_fd_ >= 0) platform::close_fd(embd_fd_);

@@ -1,6 +1,7 @@
 // src/models/deepseek41/ops_kernels.cpp - the layer ops built from the kernel groups' entry points: attention
 // (window ring, compressor, indexer, query path, sparse MQA, grouped output) with per-layer state owned here.
 #include "basalt/core/device_copy.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
@@ -70,13 +71,19 @@ struct JoinWord {
     }
 };
 
-// Raises an armed second-card share on every way out before its plan, so the card never waits for good (the share
-// then has nothing to do).
-struct PeerArm {
+// Raises an armed second-card share and finishes any running share on every exit path, before JoinWord unblocks the
+// main stream.
+struct PeerGuard {
     core::PeerExperts* peer = nullptr;
-    ~PeerArm() {
+    ~PeerGuard() {
         std::string e;
-        if (peer) peer->raise(0, nullptr, nullptr, e);
+        if (peer) peer->finish(nullptr, e);
+    }
+    bool finish(std::string& err) {
+        if (!peer) return true;
+        core::PeerExperts* p = peer;
+        peer = nullptr;
+        return p->finish(nullptr, err);
     }
 };
 
@@ -112,12 +119,22 @@ public:
         : m_(m), g_(m.geo()), ctx_((int) m.context()), fmt_(m.cache_format()), lat_b_(ctxp::latent_row_bytes(fmt_)),
           idx_b_(ctxp::index_row_bytes(fmt_)) {}
     ~KernelOps() override {
+        core::OnDevice g(m_.device());
+        for (cudaStream_t s : br_)
+            if (s) cudaStreamSynchronize(s);
+        batch_.reset();
         for (cudaGraphExec_t e : share_g_)
             if (e) cudaGraphExecDestroy(e);
         for (cudaEvent_t e : br_ev_)
             if (e) cudaEventDestroy(e);
         for (cudaStream_t s : br_)
             if (s) cudaStreamDestroy(s);
+        if (h_pos_) cudaFreeHost(h_pos_);
+        if (h_plan_) cudaFreeHost(h_plan_);
+        if (h_ids_) cudaFreeHost(h_ids_);
+        if (h_join_) cudaFreeHost(h_join_);
+        el_kv_.clear();
+        el_ik_.clear();
         for (void* p : allocs_) cudaFree(p);
     }
 
@@ -252,6 +269,10 @@ public:
                 err = "deepseek41: a parked conversation has other caches";
                 return false;
             }
+            if (kv[i].k.size() > el_kv_[(size_t) il]->backed() || kv[i].v.size() > el_ik_[(size_t) il]->backed()) {
+                err = "deepseek41: a parked conversation's cache exceeds the backed context";
+                return false;
+            }
             const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) {
                     return basalt::core::device_copy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
@@ -262,6 +283,10 @@ public:
                 return false;
             }
             ++i;
+        }
+        if (i != kv.size()) {
+            err = "deepseek41: a parked conversation has other caches";
+            return false;
         }
         return true;
     }
@@ -610,19 +635,20 @@ public:
         if (tier_) return true;
         constexpr int kRows = kLookupK;   // routed outputs of a window: tokens x slots
         constexpr size_t kPlanBytes = std::max(sizeof(ExpertPlan), sizeof(WindowPlan));
-        share_g_.assign((size_t) g_.n_layers * (kMaxK + 1), nullptr);
-        if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
-            !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp)) ||
-            !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
-            !alloc((void**) &ex_plan_, kPlanBytes) || !alloc((void**) &ex_plan2_, kPlanBytes))
+        if (share_g_.empty()) share_g_.assign((size_t) g_.n_layers * (kMaxK + 1), nullptr);
+        if ((!ex_xq_ && !alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT))) ||
+            (!ex_scr_ && !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp))) ||
+            (!ex_rows_ && !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4)) ||
+            (!ex_plan_ && !alloc((void**) &ex_plan_, kPlanBytes)) ||
+            (!ex_plan2_ && !alloc((void**) &ex_plan2_, kPlanBytes)))
             return oom(err);
         // the hits plan of a token and the CPU's rows are mapped host memory read by kernels (a captured launch reads
         // the plan at replay): no copy-engine job queues behind the promotion copies, and the host sync at the top of
         // each layer orders their reuse; the other plans travel in a kernel's parameters
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
-        if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_join_, 64, kMapped) != cudaSuccess ||
+        if ((!h_plan_ && cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess) ||
+            (!h_ids_ && cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess) ||
+            (!h_join_ && cudaHostAlloc((void**) &h_join_, 64, kMapped) != cudaSuccess) ||
             cudaHostGetDevicePointer((void**) &d_join_, h_join_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_ids_host_, h_ids_, 0) != cudaSuccess) {
@@ -643,10 +669,17 @@ public:
             }
             return true;
         }
-        if (cudaHostAlloc((void**) &h_x_, (size_t) kMaxT * g_.n_embd * 4, kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_rows_, (size_t) kRows * g_.n_embd * 4, kMapped) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d_x_host_, h_x_, 0) != cudaSuccess) {
+        float* hx = nullptr;
+        float* hrows = nullptr;
+        auto free_shared = [&] {
+            if (hx) cudaFreeHost(hx);
+            if (hrows) cudaFreeHost(hrows);
+        };
+        if (cudaHostAlloc((void**) &hx, (size_t) kMaxT * g_.n_embd * 4, kMapped) != cudaSuccess ||
+            cudaHostAlloc((void**) &hrows, (size_t) kRows * g_.n_embd * 4, kMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_rows_, hrows, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_x_host_, hx, 0) != cudaSuccess) {
+            free_shared();
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
@@ -665,12 +698,18 @@ public:
         // the tier is opened once, in the start's plan, which reads its experts in the start's pass
         core::LoadPlan* reads = m_.planning();
         if (reads == nullptr) {
+            free_shared();
             err = "deepseek41: the expert tier opens only while the model starts";
             return false;
         }
-        if (!t->open(r, h_rows_, *reads, err)) return false;
+        if (!t->open(r, hrows, *reads, err)) {
+            free_shared();
+            return false;
+        }
         tier_ = t;
-        shared = {std::move(t), h_x_, h_rows_};
+        h_x_ = hx;
+        h_rows_ = hrows;
+        shared = {std::move(t), hx, hrows};
         return true;
     }
 
@@ -678,8 +717,7 @@ public:
 
     // Kernels write the mapped activation and ids: no copy-engine job queues behind the copies of experts.
     void stage_rows(int T, const float* x, void* stream) override {
-        copy_rows(x, d_x_host_, T * g_.n_embd, stream);
-        kernels::quantize_q8_1_rows(x, T, g_.n_embd, ex_xq_, stream);
+        kernels::quantize_q8_1_rows_copy(x, T, g_.n_embd, ex_xq_, x, d_x_host_, T * g_.n_embd, stream);
     }
 
     void stage_ids(int T, const int32_t* ids, void* stream) override {
@@ -710,6 +748,10 @@ public:
                               std::string& err) override {
         const ExpertLayer& el = m_.pack().experts[(size_t) il];
         const int K = g_.n_used;
+        if (T < 1 || T * K > kLookupK) {
+            err = "deepseek41: decode window exceeds expert lookup capacity";
+            return false;
+        }
         const int n = g_.n_embd;
         const kernels::NativeExpertLayout L = kernels::native_expert_layout(el.gu_type, el.d_type, n, g_.n_ff_exp);
         if (L.bytes != el.blob_bytes) {
@@ -717,9 +759,12 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        // Destruction order on any exit: finish peer GPU and CPU workers before JoinWord unblocks GPU 0.
+        JoinWord jw;
+        CpuJoin join;
+        PeerGuard armed;
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer_for(il);   // the card that holds this layer's second-card homes
-        PeerArm armed;
         if (peer) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
@@ -766,8 +811,6 @@ public:
             reading = reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
-        JoinWord jw;
-        CpuJoin join;
         if (cpu) {
             tier_->start_cpu_window(il, h_x_, lk, use, h_rows_);
             join.tier = tier_.get();
@@ -830,7 +873,7 @@ public:
             join.now();
         }
         if (cpu || reading) tier_->promote(il, lk);
-        if (peer && !peer->finish(nullptr, err)) return false;
+        if (!armed.finish(err)) return false;
         jw.raise();
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = kIdPending;
@@ -872,9 +915,12 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        // Destruction order on any exit: finish peer GPU and CPU workers before JoinWord unblocks GPU 0.
+        JoinWord jw;
+        CpuJoin join;
+        PeerGuard armed;
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer_for(il);   // the card that holds this layer's second-card homes
-        PeerArm armed;
         if (peer) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
@@ -902,8 +948,6 @@ public:
             reading = reading || lk.reading[k];
             on_peer = on_peer || lk.peer[k];
         }
-        JoinWord jw;
-        CpuJoin join;
         if (cpu) {
             tier_->start_cpu(il, h_x_, lk, h_rows_);
             join.tier = tier_.get();
@@ -988,7 +1032,7 @@ public:
             join.now();
         }
         if (cpu || reading) tier_->promote(il, lk);
-        if (peer && !peer->finish(nullptr, err)) return false;
+        if (!armed.finish(err)) return false;
         jw.raise();
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = kIdPending;
