@@ -124,7 +124,7 @@ Result QfnSlotSession::draft_begin(int32_t anchor, int64_t pos, int n) {
 // The next windows' drafts of the slots that go on, one slot at a time on its own draft K/V, beside the last window's
 // commit.  When not every slot can verify drafts (the window holds as many rows as slots), the slots likeliest to use
 // them draft and the others only advance their draft K/V.
-Result QfnSlotSession::draft_batch(basalt::model::ModelSession* const* peers, const int32_t*, const int64_t* pos, const int*, int count) {
+Result QfnSlotSession::draft_batch(basalt::model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int*, int count) {
     constexpr int MR = basalt::kernels::kVerifyMaxT;
     QfnRuntime& rt = rt_;
     if (!rt.batch_spec) return {Status::NotImplemented, "qwen4exp: the slots draft nothing"};
@@ -148,7 +148,9 @@ Result QfnSlotSession::draft_batch(basalt::model::ModelSession* const* peers, co
     for (int ci = 0; ci < count; ++ci) {
         QfnSlotSession& s = *ss[ord[ci]];
         const float* rows = Rw + (size_t) s.r0_ * HCN;
-        const int32_t* picks = rt.win_out + s.r0_;
+        int32_t picks[MR] = {};
+        for (int r = 0; r < s.rows_; ++r) picks[r] = rt.win_out[s.r0_ + r];
+        if (anchors != nullptr && s.kept_ > 0 && s.kept_ <= MR) picks[s.kept_ - 1] = anchors[ord[ci]];
         rt.mtp.set_ple_session(rt.bslot_ss[0][(size_t) s.b_].get());
         s.n_dr_ = 0;
         if (ci < nfull) {
@@ -201,6 +203,7 @@ Result QfnSlotSession::resample_row(int row, const float* bias, int32_t& token) 
     const std::vector<float> b(bias, bias + rt_.n_vocab);
     std::string err;
     if (!rt_.ver.resample_row(r0_ + row, pos0_, b, token, err)) return {Status::Error, err};
+    rt_.win_out[r0_ + row] = token;
     return {};
 }
 

@@ -156,9 +156,17 @@ bool Verifier::run_pair(Verifier& b, int ta, const int32_t* toka, int64_t pa, co
     }
     for (Verifier* v : {a1, b1}) *(volatile uint32_t*) (v->h_flag_ + 12) = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    auto release_pair = [](Verifier* v0, Verifier* v1 = nullptr, Verifier* v2 = nullptr) {
+        for (Verifier* v : {v0, v1, v2})
+            if (v != nullptr) {
+                v->release_gpu_waits(5000);
+                (void) v->peer_released();
+            }
+    };
     progress_at("pipelined windows: launching the window", ta);
-    if (!a0->run_begin(ta, toka, pa, err) || !a1->run_begin(ta, toka, pa, err)) return false;
-    if (!a0->run_serve(pool, usera, err)) return false;
+    if (!a0->run_begin(ta, toka, pa, err)) return false;
+    if (!a1->run_begin(ta, toka, pa, err)) { release_pair(a0); return false; }
+    if (!a0->run_serve(pool, usera, err)) { release_pair(a0, a1); return false; }
     // stage 0's last ring is served; the guess comes from drafts the drafter makes beside the window
     progress_at("pipelined windows: waiting for the drafts of the next window", ta);
     tb = guess(tokb);
@@ -166,25 +174,27 @@ bool Verifier::run_pair(Verifier& b, int ta, const int32_t* toka, int64_t pa, co
         // what the window changes in stage 0's state is saved, A is committed as if every row is kept, and B follows on
         // the same card
         progress_at("pipelined windows: launching the next window", tb);
-        if (!a0->pl_save(err) || !a0->pl_commit_opt(ta, err)) return false;
-        if (!b0->run_begin(tb, tokb, pa + ta, err, a0->ev_opt_)) return false;
+        if (!a0->pl_save(err) || !a0->pl_commit_opt(ta, err)) { release_pair(a0, a1); return false; }
+        if (!b0->run_begin(tb, tokb, pa + ta, err, a0->ev_opt_)) { release_pair(a0, a1); return false; }
     }
     progress_at("pipelined windows: serving the window and the next one", ta);
     void* const user1 = a0->next_user_;
     bool b_done = tb == 0;
     for (;;) {
         const int r = a1->serve_poll(pool, user1, err);
-        if (r < 0) return false;
+        if (r < 0) { release_pair(a1, a0, tb > 0 ? b0 : nullptr); return false; }
         if (r > 0) break;
         if (!b_done) {
             const int rb = b0->serve_poll(pool, userb, err);
-            if (rb < 0) return false;
+            if (rb < 0) { release_pair(b0, a1, a0); return false; }
             b_done = rb > 0;
         }
         basalt::platform::cpu_relax();
     }
     progress_at("pipelined windows: finishing the window", ta);
-    return a1->run_end(outa, err) && a0->run_end(nullptr, err);
+    if (!a1->run_end(outa, err)) { release_pair(a0, tb > 0 ? b0 : nullptr); return false; }
+    if (!a0->run_end(nullptr, err)) { if (tb > 0) release_pair(b0); return false; }
+    return true;
 }
 
 // Stage 1 keeps A whole.

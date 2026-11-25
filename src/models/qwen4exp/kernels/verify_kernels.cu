@@ -656,8 +656,9 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
 }
 
 __global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
-    const int k = threadIdx.x;
-    if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
+    const int count = *n;
+    for (int k = (int) threadIdx.x; k < count; k += (int) blockDim.x)
+        ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
 }
 
 __global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
@@ -687,7 +688,7 @@ __global__ void gather_rows_kernel(const E* __restrict__ src, long long row_e, c
 }
 
 __global__ void map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, int n) {
-    const int i = threadIdx.x;
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) ids[i] = table[ids[i]];
 }
 
@@ -710,7 +711,7 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
 }
 
 __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
-    const int i = threadIdx.x;
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
     const int c = cells[i];
     steps[i * 4 + 0] = c;
@@ -757,7 +758,8 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
 }
 
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream) {
-    map_ids_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(ids, table, n);
+    if (n <= 0) return;
+    map_ids_kernel<<<(unsigned) ((n + 63) / 64), 64, 0, (cudaStream_t) stream>>>(ids, table, n);
     check("map_ids");
 }
 
@@ -920,7 +922,8 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 }
 
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
-    dense_steps_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(cells, n, steps);
+    if (n <= 0) return;
+    dense_steps_kernel<<<(unsigned) ((n + 63) / 64), 64, 0, (cudaStream_t) stream>>>(cells, n, steps);
     check("dense_steps");
 }
 

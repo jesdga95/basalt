@@ -13,7 +13,15 @@ bool Prefill::Run::Chunk::Experts::execute() {
         if (!fused()) return false;
     } else {
         Group group(*this);
-        if (!group.execute()) return false;
+        if (!group.execute()) {
+            if (cpu_fut.valid()) (void) cpu_fut.get();
+            if (peer_now) {
+                std::string jerr;
+                (void) ppc->share->join(m.cs, jerr);
+                peer_now = false;
+            }
+            return false;
+        }
     }
     return finish();
 }

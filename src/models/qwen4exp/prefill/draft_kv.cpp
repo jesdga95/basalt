@@ -13,6 +13,7 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include <algorithm>
 #include <string>
@@ -25,6 +26,7 @@ using namespace detail;
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
     Impl& m = *impl_;
+    const core::OnDevice od(m.device);
     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
     // still reach (r0 below), which the ring holds, so no two of them share a slot..
@@ -114,10 +116,12 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         for (int64_t i = 0; i < nb; ++i) tk[(size_t) i] = next_tokens[b0 + i];
         const int32_t bh[4] = {0, (int32_t) nb, 0, (int32_t) (nb * g.hc)};
         if (q8 && cudaMemcpyAsync(bnd, bh, sizeof bh, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+            cudaStreamSynchronize(m.cs);
             err = "prefill: the draft bounds' upload failed";
             return false;
         }
         if (cudaMemcpyAsync(tok, tk.data(), (size_t) nb * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+            cudaStreamSynchronize(m.cs);
             err = "prefill: the draft tokens' upload failed";
             return false;
         }

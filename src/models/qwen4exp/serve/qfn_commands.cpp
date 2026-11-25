@@ -111,11 +111,11 @@ if (line.rfind("PROBE set ", 0) == 0) {   // PROBE set workers=K share=F: live v
 }
 
 void QfnRuntime::sleep_command(bool down, std::string& verr) {
-    // A peer card's tier goes too.  SLEEP then drops the RAM copy's registration with the driver (a process
+    // Every peer card's tier goes too.  SLEEP then drops the RAM copy's registration with the driver (a process
     // checkpoint would map the copy into every context again on restore); WAKE registers it again while
-    // both caches refill from the ranges already back.  A tier or a registration that cannot come back
+    // all caches refill from the ranges already back.  A tier or a registration that cannot come back
     // fails WAKE: the server then starts the engine again.
-    std::string perr, reply, uerr;
+    std::string reply, uerr;
     const auto tp = Clock::now();
     const bool repin = !down && src.complement_unpinned();
     std::function<bool(const void*, uint64_t)> ready;
@@ -123,7 +123,14 @@ void QfnRuntime::sleep_command(bool down, std::string& verr) {
         src.repin_start(4);
         ready = [this](const void* p, uint64_t n) { return src.repin_wait(p, n); };
     }
-    const bool peer_ok = !peer.valid() || (down ? peer.sleep(perr) : peer.wake(perr, ready));
+    std::vector<basalt::core::PeerExperts*> all_peers;
+    if (peer.valid()) all_peers.push_back(&peer);
+    for (auto& xpe : xpeers)
+        if (xpe && xpe->valid()) all_peers.push_back(xpe.get());
+    std::vector<uint8_t> peer_ok(all_peers.size(), 1);
+    std::vector<std::string> perrs(all_peers.size());
+    for (size_t i = 0; i < all_peers.size(); ++i)
+        peer_ok[i] = (uint8_t) (down ? all_peers[i]->sleep(perrs[i]) : all_peers[i]->wake(perrs[i], ready));
     vram_command(down ? "VRAM " + std::to_string(1ll << 30) : std::string("VRAM"), verr, true, &reply);
     if (repin) {
         if (!src.repin_finish(uerr) && verr.empty()) verr = "WAKE: " + uerr;
@@ -138,15 +145,23 @@ void QfnRuntime::sleep_command(bool down, std::string& verr) {
         else
             basalt::log::info("basalt serve", "SLEEP: the RAM copy stays registered (%s)", uerr.c_str());
     }
-    if (!down && peer.valid() && peer_ok && !peer.wake_wait(perr)) {
-        if (verr.empty()) verr = "WAKE: the peer card's tier could not come back (" + perr + ")";
-    } else if (!down && !peer_ok) {
-        if (verr.empty()) verr = "WAKE: the peer card's tier could not come back (" + perr + ")";
-    } else if (!peer_ok) {
-        basalt::log::warn("basalt serve", "SLEEP: the peer tier stays as it is (%s)", perr.c_str());
-    } else if (peer.valid()) {
-        basalt::log::info("basalt serve", "%s: the peer tier %s; %.0f ms with the main cache",
-                          line.c_str(), down ? "gave its VRAM back" : "is back",
+    bool any_peer_fail = false;
+    for (size_t i = 0; i < all_peers.size(); ++i) {
+        if (!down && peer_ok[i] && !all_peers[i]->wake_wait(perrs[i])) peer_ok[i] = 0;
+        if (!peer_ok[i]) {
+            any_peer_fail = true;
+            if (!down) {
+                if (verr.empty()) verr = "WAKE: the peer card's tier could not come back (" + perrs[i] + ")";
+            } else {
+                basalt::log::warn("basalt serve", "SLEEP: the peer tier on CUDA%d stays as it is (%s)",
+                                  all_peers[i]->device(), perrs[i].c_str());
+            }
+        }
+    }
+    if (!all_peers.empty() && !any_peer_fail) {
+        basalt::log::info("basalt serve", "%s: the peer tier%s %s; %.0f ms with the main cache",
+                          line.c_str(), all_peers.size() > 1 ? "s" : "",
+                          down ? "gave VRAM back" : "is back",
                           std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
     }
     if (verr.empty()) std::fputs(reply.c_str(), stdout);
@@ -234,7 +249,43 @@ int QfnRuntime::init_after_input() {
     return init_batch();
 }
 
+QfnRuntime::~QfnRuntime() {
+    if (ba_job) { ba_thr.join(); ba_job = false; }
+    {
+        const basalt::core::OnDevice on0(0);
+        if (adapt_stream != nullptr) (void) cudaStreamSynchronize(adapt_stream);
+        (void) cudaDeviceSynchronize();
+        if (adapt_ev != nullptr) { cudaEventDestroy(adapt_ev); adapt_ev = nullptr; }
+        if (p2p_ev != nullptr) { cudaEventDestroy(p2p_ev); p2p_ev = nullptr; }
+        if (adapt_stream != nullptr) { cudaStreamDestroy(adapt_stream); adapt_stream = nullptr; }
+        if (xq_pin != nullptr) { cudaFreeHost(xq_pin); xq_pin = nullptr; }
+        if (pair_snap != nullptr) { cudaFree(pair_snap); pair_snap = nullptr; }
+    }
+    for (auto& st : stages) {
+        const basalt::core::OnDevice on(st->dev);
+        (void) cudaDeviceSynchronize();
+    }
+    for (float* hh : hand_hosts)
+        if (hh != nullptr) cudaFreeHost(hh);
+    hand_hosts.clear();
+    if (hb_host != nullptr) { cudaFreeHost(hb_host); hb_host = nullptr; }
+    if (d_hist != nullptr) {
+        const basalt::core::OnDevice on_h(hist_dev >= 0 ? hist_dev : 0);
+        cudaFree(d_hist);
+        d_hist = nullptr;
+    }
+    for (auto& [d, p] : fixed_res_d) {
+        if (p == nullptr) continue;
+        const basalt::core::OnDevice on(d);
+        cudaFree(p);
+    }
+    fixed_res_d.clear();
+}
+
 void QfnRuntime::at_exit() {
+    if (ba_job) { ba_thr.join(); ba_job = false; }
+    apply_pending(true);
+    (void) xq_drain();
     for (int st = 0; st < std::max(n_stages, 1); ++st)
         for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
     save_profile("exit");   // QUIT, or the server closed stdin

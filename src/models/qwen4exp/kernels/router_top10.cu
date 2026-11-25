@@ -39,9 +39,11 @@
 //     produces - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
 //     comparisons and that is the right trade here: n = 512 and every comparison is independent.
 #include "basalt/models/qwen4exp/kernels/router_top10.hpp"
+#include "smem_opt_in.cuh"
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -153,10 +155,17 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
                 const int oi = __shfl_down_sync(0xffffffffu, ix, off);
                 if (ov > v || (ov == v && oi < ix)) { v = ov; ix = oi; }
             }
-            if (tid == 0 && ix < n_expert) {
+            if (tid == 0) {
+                if (ix >= n_expert) {
+                    ix = 0;
+                    v = 0.0f;
+                    for (int e = 0; e < n_expert; ++e) {
+                        if (!s_taken[e]) { ix = e; break; }
+                    }
+                }
                 ids[(size_t) t * k + i] = ix;
                 weights[(size_t) t * k + i] = v;
-                s_taken[ix] = 1;
+                if (ix < n_expert) s_taken[ix] = 1;
             }
         }
         __syncthreads();
@@ -197,6 +206,19 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
     const size_t smem =
         taken_bytes + (size_t) n_expert * sizeof(double) + (size_t) n_expert * sizeof(float);
+    if (smem > 48 * 1024) {
+        static std::atomic<size_t> smem_set[64];
+        const int dev = opt_in_device("router_top10");
+        if (smem > smem_set[dev].load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(opt_in_mutex());
+            if (smem > smem_set[dev].load(std::memory_order_relaxed)) {
+                opt_in_check(cudaFuncSetAttribute(router_top10_kernel,
+                                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem),
+                             "router_top10");
+                smem_set[dev].store(smem, std::memory_order_release);
+            }
+        }
+    }
     router_top10_kernel<<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
         logits, n_tokens, n_expert, k, ids, weights);
     const cudaError_t e = cudaGetLastError();

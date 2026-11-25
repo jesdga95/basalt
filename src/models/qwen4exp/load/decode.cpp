@@ -96,14 +96,19 @@ int decode(Context& context) {
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         cudaStream_t adapt_stream = nullptr;
-        if (!drive.d.usage.empty() && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
-            basalt::log::error("basalt generate", "cannot create the refill stream");
-            return 1;
+        cudaEvent_t adapt_ev = nullptr;
+        if (!drive.d.usage.empty()) {
+            if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
+                if (adapt_ev != nullptr) cudaEventDestroy(adapt_ev);
+                if (adapt_stream != nullptr) cudaStreamDestroy(adapt_stream);
+                basalt::log::error("basalt generate", "cannot create the refill stream");
+                return 1;
+            }
         }
         // swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
-        cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        bool adapt_ev_live = false;
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
@@ -111,6 +116,7 @@ int decode(Context& context) {
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) {
                 return;
             }
+            adapt_ev_live = false;
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
@@ -120,6 +126,20 @@ int decode(Context& context) {
             if (d_res != nullptr)
                 res_put(d_res);
         };
+        auto cleanup_adapt = [&]() {
+            if (adapt_ev_live) {
+                apply_pending(true);
+                adapt_ev_live = false;
+            } else if (adapt_stream != nullptr) {
+                (void) cudaStreamSynchronize(adapt_stream);
+            }
+            if (adapt_ev != nullptr) { cudaEventDestroy(adapt_ev); adapt_ev = nullptr; }
+            if (adapt_stream != nullptr) { cudaStreamDestroy(adapt_stream); adapt_stream = nullptr; }
+        };
+        struct AdaptScopeExit {
+            decltype(cleanup_adapt)& fn;
+            ~AdaptScopeExit() { fn(); }
+        } adapt_guard{cleanup_adapt};
         // The VRAM tier follows the conversation.  Candidates are missing experts routed at least twice (decayed); each
         // is paired with its layer's least-routed resident expert and swapped when it was routed clearly more often.
         // Copies run between rounds, when the GPU is idle.
@@ -171,6 +191,10 @@ int decode(Context& context) {
                 if (slot < 0 || b == nullptr ||
                     cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
+                    if (!pending.empty()) {
+                        cudaEventRecord(adapt_ev, adapt_stream);
+                        adapt_ev_live = true;
+                    }
                     basalt::log::error("basalt generate", "an adaptive refill failed");
                     return false;
                 }
@@ -178,7 +202,10 @@ int decode(Context& context) {
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) {
+                cudaEventRecord(adapt_ev, adapt_stream);
+                adapt_ev_live = true;
+            }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();

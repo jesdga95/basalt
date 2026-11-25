@@ -259,6 +259,7 @@ struct QsaState {
     /// copy and give back the overlap the doorbell protocol exists for.
     int32_t* host_step = nullptr;    ///< (kStepCount,) pinned
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
+    void* host_pinned = nullptr;     ///< pinned backing for `host` pools (kv_mode != 0)
 };
 
 /// The RoPE cos/sin table (max_cells x n_rot/2 x 2 floats) is identical in every QSA layer.  `with_rope = false` sizes a

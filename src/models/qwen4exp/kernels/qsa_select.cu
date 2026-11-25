@@ -5,6 +5,7 @@
 #include "basalt/models/qwen4exp/kernels/qsa_two_pass.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "smem_opt_in.cuh"
 
 #include <cuda_runtime.h>
 
@@ -1015,15 +1016,17 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
     if (nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
-        static int grid_of[64] = {};   // two CTAs per multiprocessor
+        static std::atomic<int> grid_of[64];   // two CTAs per multiprocessor
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); dev = 0; }
-        if (grid_of[dev] == 0) {
+        int gx = grid_of[dev].load(std::memory_order_acquire);
+        if (gx == 0) {
             int sms = 0;
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-            grid_of[dev] = 2 * (sms > 0 ? sms : 64);
+            gx = 2 * (sms > 0 ? sms : 64);
+            grid_of[dev].store(gx, std::memory_order_release);
         }
-        const dim3 g((unsigned) grid_of[dev]);
+        const dim3 g((unsigned) gx);
         if (nq <= 2)
             launch_pdl(block_scores_rg_kernel<2>, g, dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled, dead, q_idx,
                        steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
@@ -1065,27 +1068,30 @@ namespace {
 // This card runs block_scores_tc_kernel: TF32 MMA needs a recent card (an older one keeps the warp kernel), and the
 // kernel's shared memory is opted in per device (a layer split runs it on several).
 bool tc_device_ok() {
-    static int cc_major[64] = {};
+    static std::atomic<int> cc_major[64];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-    if (cc_major[dev] == 0) {
-        int major = 0;
+    int major = cc_major[dev].load(std::memory_order_acquire);
+    if (major == 0) {
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
             cudaGetLastError();
             return false;
         }
-        cc_major[dev] = major;
+        cc_major[dev].store(major, std::memory_order_release);
     }
-    if (cc_major[dev] < 8) return false;
+    if (major < 8) return false;
     static std::atomic<bool> attr[64];
     if (!attr[dev].load(std::memory_order_acquire)) {
-        const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
-        if (cudaFuncSetAttribute(block_scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
-            cudaSuccess) {
-            cudaGetLastError();
-            return false;
+        std::lock_guard<std::mutex> lk(opt_in_mutex());
+        if (!attr[dev].load(std::memory_order_relaxed)) {
+            const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
+            if (cudaFuncSetAttribute(block_scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+                cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            attr[dev].store(true, std::memory_order_release);
         }
-        attr[dev].store(true, std::memory_order_release);
     }
     return true;
 }
@@ -1132,11 +1138,12 @@ bool topk_cluster_launch(const float* scores, const int32_t* steps, int64_t nq, 
     // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not. It needs thread-block clusters (the
     // card's) AND code built for it: a build with only older code JIT-compiles their PTX, whose
     // copy of this kernel is a trap - the function's PTX version says which. `opt`: the dynamic shared memory opted in.
-    static int ok[64] = {};
-    static size_t opt[64] = {};
+    static std::atomic<int> ok[64];
+    static std::atomic<size_t> opt[64];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-    if (ok[dev] == 0) {
+    int okv = ok[dev].load(std::memory_order_acquire);
+    if (okv == 0) {
         int major = 0;
         cudaFuncAttributes fa{};
         const bool code = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
@@ -1144,29 +1151,33 @@ bool topk_cluster_launch(const float* scores, const int32_t* steps, int64_t nq, 
                           cudaFuncGetAttributes(&fa, kern) == cudaSuccess && fa.ptxVersion >= 90 &&
                           fa.binaryVersion >= 90;
         cudaGetLastError();
-        ok[dev] = code ? 1 : 2;
+        okv = code ? 1 : 2;
+        ok[dev].store(okv, std::memory_order_release);
     }
-    if (ok[dev] != 1) return false;
-    if (smem > opt[dev]) {   // a larger capacity: opt in, and check that a cluster of CL_N such CTAs can be resident
-        int clusters = 0;
-        cudaLaunchConfig_t q{};
-        cudaLaunchAttribute qa[1];
-        qa[0].id = cudaLaunchAttributeClusterDimension;
-        qa[0].val.clusterDim.x = CL_N;
-        qa[0].val.clusterDim.y = 1;
-        qa[0].val.clusterDim.z = 1;
-        q.gridDim = dim3(CL_N, 1, 1);
-        q.blockDim = dim3(CL_T, 1, 1);
-        q.dynamicSmemBytes = smem;
-        q.attrs = qa;
-        q.numAttrs = 1;
-        if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) !=
-                cudaSuccess ||
-            cudaOccupancyMaxActiveClusters(&clusters, kern, &q) != cudaSuccess || clusters < 1) {
-            cudaGetLastError();
-            return false;    // this capacity takes the one-CTA kernels; a smaller one may still fit
+    if (okv != 1) return false;
+    if (smem > opt[dev].load(std::memory_order_acquire)) {   // a larger capacity: opt in, and check that a cluster of CL_N such CTAs can be resident
+        std::lock_guard<std::mutex> lk(opt_in_mutex());
+        if (smem > opt[dev].load(std::memory_order_relaxed)) {
+            int clusters = 0;
+            cudaLaunchConfig_t q{};
+            cudaLaunchAttribute qa[1];
+            qa[0].id = cudaLaunchAttributeClusterDimension;
+            qa[0].val.clusterDim.x = CL_N;
+            qa[0].val.clusterDim.y = 1;
+            qa[0].val.clusterDim.z = 1;
+            q.gridDim = dim3(CL_N, 1, 1);
+            q.blockDim = dim3(CL_T, 1, 1);
+            q.dynamicSmemBytes = smem;
+            q.attrs = qa;
+            q.numAttrs = 1;
+            if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) !=
+                    cudaSuccess ||
+                cudaOccupancyMaxActiveClusters(&clusters, kern, &q) != cudaSuccess || clusters < 1) {
+                cudaGetLastError();
+                return false;    // this capacity takes the one-CTA kernels; a smaller one may still fit
+            }
+            opt[dev].store(smem, std::memory_order_release);
         }
-        opt[dev] = smem;
     }
     cudaLaunchConfig_t cfg{};
     cudaLaunchAttribute at[2];
@@ -1874,14 +1885,17 @@ bool tp_device_ok() {
     if (!tc_device_ok()) return false;
     static std::atomic<bool> attr[64];
     int dev = 0;
-    cudaGetDevice(&dev);
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
     if (!attr[dev].load(std::memory_order_acquire)) {
-        const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
-        if (cudaFuncSetAttribute(tp_full_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
+        std::lock_guard<std::mutex> lk(opt_in_mutex());
+        if (!attr[dev].load(std::memory_order_relaxed)) {
+            const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
+            if (cudaFuncSetAttribute(tp_full_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            attr[dev].store(true, std::memory_order_release);
         }
-        attr[dev].store(true, std::memory_order_release);
     }
     return true;
 }

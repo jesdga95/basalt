@@ -145,12 +145,20 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
-    if (dm && !dm_stage_places(err)) return false;
+    if (dm && !dm_stage_places(err)) {
+        release_gpu_waits(5000);
+        (void) peer_released();
+        return false;
+    }
     order_after_commit();
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R)], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    if (le != cudaSuccess) {
+        if (dm) { release_gpu_waits(5000); (void) peer_released(); }
+        err = std::string("verify: batch launch: ") + cudaGetErrorString(le);
+        return false;
+    }
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -171,13 +179,16 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
                 last_flush = now;
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
+                    const bool drained = release_gpu_waits(5000);
                     err = "verify batch: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")" +
+                          released_note(drained) + peer_released();
                     return false;
                 }
             }
             if (now - a > std::chrono::seconds(20)) {
-                err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+                err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000)) +
+                      peer_released();
                 return false;
             }
         }

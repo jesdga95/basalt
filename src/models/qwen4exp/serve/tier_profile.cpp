@@ -174,6 +174,10 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
         size_t at = 0;
         while (at < todo.size()) {
             mv.clear();
+            auto return_spares = [&](size_t from) {
+                for (size_t idx = from; idx < mv.size(); ++idx)
+                    if (mv[idx].xchg) src.spare_return(mv[idx].out / g.n_expert, mv[idx].off);
+            };
             for (; at < todo.size(); ++at) {
                 const auto [slot, in] = todo[at];
                 if (host_res[(size_t) in] >= 0) { later.push_back(todo[at]); continue; }
@@ -191,6 +195,9 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
                     if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(out / g.n_expert),
                                         cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
                         e = std::string("PROBE adapt: an eviction copy failed: ") + cudaGetErrorString(cudaGetLastError());
+                        (void) cudaStreamSynchronize(adapt_stream);
+                        src.spare_return(out / g.n_expert, off);
+                        return_spares(0);
                         return false;
                     }
                 }
@@ -199,12 +206,15 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
             if (mv.empty()) break;
             if (cudaStreamSynchronize(adapt_stream) != cudaSuccess) {
                 e = std::string("PROBE adapt: ") + cudaGetErrorString(cudaGetLastError());
+                return_spares(0);
                 return false;
             }
-            for (const Mv& m : mv) {
+            for (size_t mi = 0; mi < mv.size(); ++mi) {
+                const Mv& m = mv[mi];
                 if (m.out < 0) continue;
                 const int64_t lo = m.out / g.n_expert, eo = m.out % g.n_expert;
                 if (m.xchg && !src.spare_land(lo, eo, m.off)) {
+                    return_spares(mi);
                     e = "PROBE adapt: an evicted expert has no RAM place";
                     return false;
                 }
@@ -217,11 +227,14 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
                 const uint8_t* b = srcp->blob(li, m.in % g.n_expert);
                 if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(m.slot), b, (size_t) lay.blob_bytes(li),
                                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
+                    (void) cudaStreamSynchronize(adapt_stream);
+                    res_upload();
                     e = "PROBE adapt: an expert's copy into its slot failed";
                     return false;
                 }
             }
             if (cudaStreamSynchronize(adapt_stream) != cudaSuccess) {
+                res_upload();
                 e = std::string("PROBE adapt: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }

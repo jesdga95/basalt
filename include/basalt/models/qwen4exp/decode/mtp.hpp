@@ -20,6 +20,7 @@
 
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/kernels/sampler.hpp"
 
@@ -151,7 +152,7 @@ public:
     /// stores, the main sequence in the working state and its pages from the ring over the host copy the snapshot
     /// reads.  A no-op otherwise.
     bool snapshot_main(std::string& err) {
-        return st_.kv_mode != 2 || n_stores_ == 0 || (use_main(err) && ring_to_host(err));
+        return n_stores_ == 0 || (use_main(err) && (st_.kv_mode != 2 || ring_to_host(err)));
     }
     /// `draft` for sequence `id` from the window rows `R_rows` (device, row 0 of the sequence's segment).
     /// Copies a verify window's rows (all slots) out of the buffer the draft graphs also use, so each slot's
@@ -185,6 +186,8 @@ public:
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
     bool idle(std::string& err) {
+        const OnDevice on_device(device_);
+        cs_busy_ = false;
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
         return true;
     }
@@ -228,6 +231,7 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
+    bool cs_busy_ = false;   ///< draft_rows returned early while trailing conditional nodes finish on cs_
     cudaEvent_t ev_done_ = nullptr;
     // the branch stream of the round and chain graphs, its fork / join events, its Q8_1 input;
     // par_ while those graphs are recorded, pre_next_ / have_pre_ for the next step's hidden input computed beside the

@@ -51,6 +51,7 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
                           std::vector<Swap>& swaps, CopyBack&& copy_back, Wait&& wait,
                           std::vector<std::pair<int32_t, int32_t>>& released) {
     if (!src.complement_ready() || swaps.empty()) return true;
+    const size_t rel0 = released.size();
     struct Home { int32_t layer, out; uint64_t off; };
     std::vector<Home> homes;
     std::vector<Swap> kept;
@@ -65,7 +66,10 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
         if (!copy_back(s.layer, slot, dst)) {
             basalt::log::error("basalt serve", "adaptive spare copy failed at layer %d slot %d (%s)",
                                (int) s.layer, (int) slot, cudaGetErrorString(cudaPeekAtLastError()));
+            (void) wait();
             src.spare_return(s.layer, off);
+            for (const Home& h : homes) src.spare_return(h.layer, h.off);
+            released.resize(rel0);
             return false;
         }
         homes.push_back({s.layer, s.out, off});
@@ -76,14 +80,20 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
         if (!wait()) {
             basalt::log::error("basalt serve", "adaptive spare wait failed (%s)",
                                cudaGetErrorString(cudaPeekAtLastError()));
+            for (const Home& h : homes) src.spare_return(h.layer, h.off);
+            released.resize(rel0);
             return false;
         }
-        for (const Home& h : homes)
+        for (size_t hi = 0; hi < homes.size(); ++hi) {
+            const Home& h = homes[hi];
             if (!src.spare_land(h.layer, h.out, h.off)) {
                 basalt::log::error("basalt serve", "adaptive spare land failed at layer %d expert %d",
                                    (int) h.layer, (int) h.out);
+                for (size_t hj = hi; hj < homes.size(); ++hj) src.spare_return(homes[hj].layer, homes[hj].off);
+                released.resize(rel0);
                 return false;
             }
+        }
     }
     swaps.swap(kept);
     return true;
@@ -311,6 +321,15 @@ bool QfnRuntime::adapt() {
                             cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
             basalt::log::error("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                          (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
+            if (main_live || !pending.empty()) {
+                const basalt::core::OnDevice on0(0);
+                cudaEventRecord(adapt_ev, adapt_stream);
+            }
+            for (auto& st : stages)
+                if (st->adapt_live) {
+                    const basalt::core::OnDevice ons(st->dev);
+                    cudaEventRecord(st->adapt_ev, st->adapt_stream);
+                }
             return false;
         }
         if (gs) gs->adapt_live = true;
@@ -346,6 +365,8 @@ bool QfnRuntime::adapt() {
 void QfnRuntime::xq_settle() {
     if (!xq_unsettled) return;
     (void) sync_event(adapt_ev, "adaptive settle sync");
+    for (const auto& [l, e] : xq_spare_released) src.spare_release(l, e);
+    xq_spare_released.clear();
     for (const auto& [l, e] : xq_released) srcp->release(l, e);
     xq_released.clear();
     res_upload();
@@ -401,6 +422,8 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
                                 cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
                 basalt::log::error("basalt serve", "an eviction copy failed (layer %d, slot %d): %s",
                              (int) s.lout, (int) slot, cudaGetErrorString(cudaGetLastError()));
+                (void) cudaStreamSynchronize(adapt_stream);
+                src.spare_return(s.lout, off);
                 return false;
             }
         }
@@ -409,9 +432,16 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
                       peer.valid() && peer.has(s.layer, s.in), p2p});
         return true;
     };
+    auto rollback_xq = [&]() {
+        if (xq.empty()) return;
+        (void) cudaStreamSynchronize(adapt_stream);
+        for (const XSwap& x : xq)
+            if (x.xchg) src.spare_return(x.lout, x.off);
+        xq.clear();
+    };
     const size_t n_base = std::min(swaps.size(), base);
     for (size_t i = 0; i < n_base; ++i)
-        if (!plan(swaps[i])) return false;
+        if (!plan(swaps[i])) { rollback_xq(); return false; }
     for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
     std::vector<size_t> peer_takes;
     if (peer.valid()) {   // the peer tiers take the next most-routed CPU misses (not the ones moving to CUDA0)
@@ -420,6 +450,7 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
         std::string perr;
         if (!adapt_peers(r0, perr)) {
             basalt::log::error("basalt serve", "%s", perr.c_str());
+            rollback_xq();
             return false;
         }
         if (swaps.size() > n_base) {
@@ -433,7 +464,7 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
     for (size_t i = n_base; i < swaps.size(); ++i) {
         if (std::binary_search(peer_takes.begin(), peer_takes.end(),
                                (size_t) swaps[i].layer * g.n_expert + swaps[i].in)) continue;
-        if (!plan(swaps[i])) return false;
+        if (!plan(swaps[i])) { rollback_xq(); return false; }
     }
     xq_swapped += (int64_t) xq.size();
     xq_noplace += (int64_t) n_noplace;
@@ -449,13 +480,19 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
 bool QfnRuntime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
     if (xq_stage == 2) ver.flush_post_launch();
-    const bool nowait = xq_stage == 2 && xq_words && !wait;
+    const bool nowait = xq_stage == 2 && xq_words && !wait && !xq_word_failed;
     if (!nowait && !sync_event(adapt_ev, "adaptive advance sync")) return false;
     if (xq_stage == 1) {
-        for (const XSwap& x : xq) {
+        for (size_t i = 0; i < xq.size(); ++i) {
+            const XSwap& x = xq[i];
             if (x.xchg && !src.spare_land(x.lout, x.out, x.off)) {
                 basalt::log::error("basalt serve", "an evicted expert has no RAM place (layer %d, expert %d)",
                              (int) x.lout, (int) x.out);
+                for (size_t j = i; j < xq.size(); ++j)
+                    if (xq[j].xchg) src.spare_return(xq[j].lout, xq[j].off);
+                res_upload();
+                xq.clear();
+                xq_stage = 0;
                 return false;
             }
             host_res[(size_t) x.lout * g.n_expert + x.out] = basalt::core::kNotResident;
@@ -498,27 +535,35 @@ bool QfnRuntime::xq_advance(bool wait) {
             }
             pw = w;
         }
+        xq_copy_ok.assign(xq.size(), 1);
+        xq_word_failed = false;
         if (deferred) {   // the RAM copies are queued once the next window is launched, and run beside it
-            auto copies = [&, pw] {
+            auto copies = [this, pw] {
                 const auto& lay2 = basalt::kernels::cpu::expert_layout();
                 std::vector<uint32_t> ord;   // layer order: a layer's word goes up right after its own copies
                 for (uint32_t i = 0; i < (uint32_t) xq.size(); ++i)
                     if (!xq[i].p2p) ord.push_back(i);
                 std::stable_sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) { return xq[a].layer < xq[b].layer; });
                 for (size_t k = 0; k < ord.size(); ++k) {
-                    const XSwap& x = xq[ord[k]];
+                    const uint32_t idx = ord[k];
+                    const XSwap& x = xq[idx];
                     const uint8_t* b = srcp->blob(x.layer, x.in);
                     if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
-                                                        cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
+                                                        cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
+                        xq_copy_ok[idx] = 0;
                         basalt::log::warn("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                                      (int) x.layer, (int) x.slot, cudaGetErrorString(cudaGetLastError()));
+                    }
                     if (pw != nullptr && (k + 1 == ord.size() || xq[ord[k + 1]].layer != x.layer) &&
                         cudaMemcpyAsync(ver.landed_words() + x.layer, pw + g.n_layers, 4, cudaMemcpyHostToDevice,
-                                        adapt_stream) != cudaSuccess)
+                                        adapt_stream) != cudaSuccess) {
+                        xq_word_failed = true;
                         basalt::log::warn("basalt serve", "the landed word's copy failed (layer %d): %s", (int) x.layer,
                                      cudaGetErrorString(cudaGetLastError()));
+                    }
                 }
                 cudaEventRecord(adapt_ev, adapt_stream);
+                (void) cudaStreamQuery(adapt_stream);
             };
             // a copy from pageable RAM holds the calling thread until the copy runs, and a window launched ahead of it
             // waits for that thread to serve its rings: such a round's copies are queued here, before the window
@@ -528,6 +573,7 @@ bool QfnRuntime::xq_advance(bool wait) {
                 copies();
         } else {
             cudaEventRecord(adapt_ev, adapt_stream);
+            (void) cudaStreamQuery(adapt_stream);
         }
         xq_stage = 2;
         return true;
@@ -536,9 +582,15 @@ bool QfnRuntime::xq_advance(bool wait) {
     // its gate/up launches wait for them, and what needs them done waits in xq_settle
     if (nowait && std::any_of(xq.begin(), xq.end(), [](const XSwap& x) { return x.p2p; }))
         if (!sync_event(p2p_ev, "adaptive p2p sync")) return false;   // a promotion's peer slot is refilled below
-    for (const XSwap& x : xq) {
+    for (size_t i = 0; i < xq.size(); ++i) {
+        const XSwap& x = xq[i];
+        const bool ok = i >= xq_copy_ok.size() || xq_copy_ok[i] != 0;
+        if (!ok) continue;
         host_res[(size_t) x.layer * g.n_expert + x.in] = x.slot;
-        if (x.xchg && !x.p2p) src.spare_release(x.layer, x.in);
+        if (x.xchg && !x.p2p) {
+            if (nowait) xq_spare_released.emplace_back(x.layer, x.in);
+            else src.spare_release(x.layer, x.in);
+        }
         if (nowait) xq_released.emplace_back(x.layer, x.in);
         else srcp->release(x.layer, x.in);
     }
@@ -552,13 +604,16 @@ bool QfnRuntime::xq_advance(bool wait) {
     } else {
         res_upload();
     }
-    for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up, from any layer
-        if (!x.promo) continue;
+    for (size_t i = 0; i < xq.size(); ++i) {   // a promoted expert's peer slot takes the one CUDA0 gave up, from any layer
+        const XSwap& x = xq[i];
+        if (!x.promo || (i < xq_copy_ok.size() && xq_copy_ok[i] == 0)) continue;
         std::string perr;
         if (!peer.reassign(x.layer, x.in, x.lout, x.out, srcp->blob(x.lout, x.out), perr))
             basalt::log::warn("basalt serve", "%s", perr.c_str());
     }
     xq.clear();
+    xq_copy_ok.clear();
+    xq_word_failed = false;
     xq_stage = 0;
     return true;
 }
@@ -591,7 +646,10 @@ int QfnRuntime::init_tiers() {
     }
 
     adapt_ev = nullptr;
-    cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+    if (cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
+        basalt::log::error("basalt serve", "cannot create the refill event");
+        return 1;
+    }
 
     // the peer's swaps land a window after their copies are queued, so no window waits for a copy
     peer_landing = false;
@@ -641,7 +699,10 @@ int QfnRuntime::init_tiers() {
         xq_pin = nullptr;
     }
     p2p_ev = nullptr;   // the copies out of the peer's slots, which a promotion's reassign refills
-    cudaEventCreateWithFlags(&p2p_ev, cudaEventDisableTiming);
+    if (cudaEventCreateWithFlags(&p2p_ev, cudaEventDisableTiming) != cudaSuccess) {
+        basalt::log::error("basalt serve", "cannot create the peer refill event");
+        return 1;
+    }
     // a round made resident before its copies were done: the bookkeeping that waits for them (the next round or
     // a drain), and the RAM pages of its experts
     xq_unsettled = false;

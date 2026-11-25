@@ -2,6 +2,7 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -22,6 +23,7 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
     if (cpu_maybe) {
         const size_t want = (size_t) T * N;
         if (m.cpu_x_n < want) {
+            if (m.cpu_s != nullptr) cudaStreamSynchronize(m.cpu_s);
             if (m.cpu_x) cudaFreeHost(m.cpu_x);
             m.cpu_x = nullptr;
             m.cpu_x_n = 0;
@@ -32,11 +34,14 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
             m.cpu_x_n = want;
         }
         if (m.cpu_s == nullptr) {
-            cudaStreamCreateWithFlags(&m.cpu_s, cudaStreamNonBlocking);
-            cudaEventCreateWithFlags(&m.cpu_ev_in, cudaEventDisableTiming);
-            cudaEventCreateWithFlags(&m.cpu_ev_x, cudaEventDisableTiming);
-            cudaEventCreate(&m.cpu_gev[0]);
-            cudaEventCreate(&m.cpu_gev[1]);
+            if (cudaStreamCreateWithFlags(&m.cpu_s, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&m.cpu_ev_in, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&m.cpu_ev_x, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreate(&m.cpu_gev[0]) != cudaSuccess ||
+                cudaEventCreate(&m.cpu_gev[1]) != cudaSuccess) {
+                err = "prefill: cannot create the CPU experts' stream or events";
+                return false;
+            }
         }
         cudaEventRecord(m.cpu_ev_in, m.cs);
         cudaStreamWaitEvent(m.cpu_s, m.cpu_ev_in, 0);
@@ -83,6 +88,7 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_start() {
     if (rows_cpu > 0) {
         const size_t want = (size_t) rows_cpu * N;
         if (m.cpu_rows_n < want) {
+            if (m.cs != nullptr) cudaStreamSynchronize(m.cs);
             if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
             m.cpu_rows = nullptr;
             m.cpu_rows_n = 0;
@@ -119,6 +125,7 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_start() {
             m.cpu_jobs.push_back(j);
         }
         cpu_fut = std::async(std::launch::async, [&m = m, &cf, &cpu_ms = cpu_ms, q2, T = T, &owner = owner]() -> bool {
+            const core::OnDevice od(m.device);
             const auto t0 = Clock::now();
             cudaEventSynchronize(m.cpu_ev_x);   // the activations are on the host
             for (int64_t t = 0; t < T; ++t) {

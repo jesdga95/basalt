@@ -31,30 +31,50 @@ void Prefill::reset() {
 
 void Prefill::release() {
     if (!impl_) return;
+    impl_->warm.stop.store(true, std::memory_order_release);
     if (impl_->warm.fut.valid()) impl_->warm.fut.wait();
+    impl_->warm.pending = false;
+    const core::OnDevice od(impl_->device);
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
+    if (impl_->cpu_s) cudaStreamSynchronize(impl_->cpu_s);
+    impl_->peer_stage.release();
+    impl_->stager.reset();
     for (int i = 0; i < RING_MAX; ++i) {
-        if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
-        if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
+        if (impl_->copied[i]) { cudaEventDestroy(impl_->copied[i]); impl_->copied[i] = nullptr; }
+        if (impl_->used[i]) { cudaEventDestroy(impl_->used[i]); impl_->used[i] = nullptr; }
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
-        if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
+        if (impl_->hand[b]) { cudaFreeHost(impl_->hand[b]); impl_->hand[b] = nullptr; }
+        if (impl_->ple_copied[b]) { cudaEventDestroy(impl_->ple_copied[b]); impl_->ple_copied[b] = nullptr; }
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
+        impl_->ple_emb_host[b] = nullptr;
     }
-    if (impl_->copy) cudaStreamDestroy(impl_->copy);
-    if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
-    for (float* p : {impl_->cpu_x, impl_->cpu_rows})
-        if (p) cudaFreeHost(p);
-    if (impl_->cpu_s) cudaStreamDestroy(impl_->cpu_s);
-    for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1], impl_->ahead_ev})
-        if (e) cudaEventDestroy(e);
-    if (impl_->guess_host) cudaFreeHost(impl_->guess_host);
+    if (impl_->copy) { cudaStreamDestroy(impl_->copy); impl_->copy = nullptr; }
+    if (impl_->grp_host) { cudaFreeHost(impl_->grp_host); impl_->grp_host = impl_->grp_dev = nullptr; }
+    if (impl_->cpu_x) { cudaFreeHost(impl_->cpu_x); impl_->cpu_x = nullptr; impl_->cpu_x_n = 0; }
+    if (impl_->cpu_rows) { cudaFreeHost(impl_->cpu_rows); impl_->cpu_rows = nullptr; impl_->cpu_rows_n = 0; }
+    if (impl_->cpu_s) { cudaStreamDestroy(impl_->cpu_s); impl_->cpu_s = nullptr; }
+    for (cudaEvent_t* ep : {&impl_->cpu_ev_in, &impl_->cpu_ev_x, &impl_->cpu_gev[0], &impl_->cpu_gev[1], &impl_->ahead_ev})
+        if (*ep) { cudaEventDestroy(*ep); *ep = nullptr; }
+    if (impl_->guess_host) { cudaFreeHost(impl_->guess_host); impl_->guess_host = impl_->guess_host_dev = nullptr; }
     for (void* p : impl_->owned) cudaFree(p);
+    impl_->owned.clear();
+    impl_->tok_dev = nullptr;
+    impl_->hist = nullptr;
+    impl_->ident_table = nullptr;
+    impl_->guess_ids = nullptr;
+    impl_->guess_w = nullptr;
+    impl_->cs = nullptr;
 }
 
-void Prefill::set_session(core::SessionState& ss) { impl_->ss = &ss; }
+void Prefill::set_session(core::SessionState& ss) {
+    impl_->warm.stop.store(true, std::memory_order_release);
+    if (impl_->warm.fut.valid()) impl_->warm.fut.wait();
+    impl_->warm.stop.store(false, std::memory_order_relaxed);
+    impl_->warm.pending = false;
+    impl_->ss = &ss;
+}
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
@@ -156,11 +176,14 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
-        if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
-            basalt::core::device_copy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+        if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess) {
+            m.ident_table = nullptr;
             ok = false;
-        else
+        } else {
             m.owned.push_back(m.ident_table);
+            if (basalt::core::device_copy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+                ok = false;
+        }
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
     Alloc o;

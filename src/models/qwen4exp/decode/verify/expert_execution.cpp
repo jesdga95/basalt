@@ -66,6 +66,8 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         pa.rq = x.rq; pa.rs = x.rs;
         if (!basalt::kernels::dec_moe_zero_words(x.parr, 16, x.ps) ||
             !basalt::kernels::dec_moe_peer_launch(pa, x.pblocks, x.ps, dm_->pq2)) {
+            release_gpu_waits(5000);
+            (void) peer_released();
             err = "verify: a further peer's window did not launch";
             return false;
         }
