@@ -213,28 +213,35 @@ class Tokens(unittest.TestCase):
     def test_the_markers(self):
         d = Inkling2()
         self.assertEqual(d.reasoning_close, END)
-        self.assertEqual(d.answer_lead, HEADER + TEXT)
+        self.assertEqual(d.answer_lead, HEADER)
+        self.assertEqual(d.reasoning_ban, THINK)
         self.assertEqual((d.image_start, d.image_pad), (IMAGE, IMAGE_PAD))
         self.assertTrue(d.in_engine_vision)
         self.assertEqual(d.forced_opening("f"), HEADER + "f" + TOOL_JSON + '{"name":"f","args":')
         self.assertEqual(d.forced_opening(None), HEADER)
 
-    def test_thinking_budget_wrap_opens_answer_block(self):
-        # Regression for #588: after reasoning_close (<|end_message|>), Inkling 2 opens an answer block
-        # (<|message_model|><|content_text|>) unless a tool call is forced, so it cannot reopen thinking.
+    def test_thinking_budget_wrap_opens_model_turn_and_bans_thinking(self):
+        # Regression for #588: after reasoning_close (<|end_message|>), Inkling 2 opens <|message_model|>
+        # and bans <|content_thinking|> via per-request logit_bias so the model can still pick text or a tool call,
+        # without reopening thinking.
         import threading
+        from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY
         svc = service()
         tok = svc.tok
-        answer_lead_ids = tok.encode(HEADER + TEXT, parse_special=True)
+        lead_ids = tok.encode(HEADER, parse_special=True)
+        think_ids = tok.encode(THINK, parse_special=True)
         thought_ids = tok.encode(HEADER + THINK + "pondering " * 30, parse_special=True)
-        reopen_ids = tok.encode(HEADER + THINK + "still pondering " * 30, parse_special=True)
-        answer_ids = tok.encode("the answer" + END + END_TURN, parse_special=True)
+        reopen_ids = tok.encode(THINK + "still pondering " * 30, parse_special=True)
+        answer_ids = tok.encode(TEXT + "the answer" + END + END_TURN, parse_special=True)
         prompts = []
+        samplings = []
 
         def scripted(ids, max_new, sampling, cancel, embeddings=None, session=None):
             prompts.append(list(ids))
+            samplings.append(dict(sampling))
+            banned = (sampling.get(BIAS_KEY) or {}).get(think_ids[0]) == -100.0
             seq = thought_ids if len(prompts) == 1 else (
-                answer_ids if list(ids)[-len(answer_lead_ids):] == answer_lead_ids else reopen_ids)
+                answer_ids if list(ids)[-len(lead_ids):] == lead_ids and banned else reopen_ids)
             for t in seq[:int(max_new)]:
                 yield t
 
@@ -243,7 +250,9 @@ class Tokens(unittest.TestCase):
         evs = [x for k, x in svc.run(ids, True, None, 200, {"reasoning_budget_tokens": 10}, threading.Event())
                if k == "event"]
         self.assertEqual(len(prompts), 2)
-        self.assertEqual(prompts[1][-len(answer_lead_ids):], answer_lead_ids)
+        self.assertEqual(prompts[1][-len(lead_ids):], lead_ids)
+        self.assertNotIn(BIAS_KEY, samplings[0])
+        self.assertEqual(samplings[1][BIAS_KEY][think_ids[0]], -100.0)
         self.assertIn(("content", "the answer"), merged(evs))
 
     def test_message_text_cannot_write_the_models_tokens(self):

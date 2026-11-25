@@ -15,6 +15,7 @@ from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineSta
 from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
+from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
 from serve.util.logbuf import LogBuffer
@@ -1724,6 +1725,15 @@ class Service:
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
+                        if (ended_thinking or wrap) and self.dialect.reasoning_ban and not getattr(self.engine, "batch", 0):
+                            einfo = getattr(self.engine, "info", None)
+                            if not (isinstance(einfo, dict) and "context" in einfo and not einfo.get("logit_bias")):
+                                ban_ids = self.tok.encode(self.dialect.reasoning_ban, parse_special=True)
+                                if ban_ids:
+                                    bias = dict(sampling.get(BIAS_KEY) or {})
+                                    for tid in ban_ids:
+                                        bias[tid] = -100.0
+                                    sampling = {**sampling, BIAS_KEY: bias}
                         if live is not None:
                             live.state = "thinking" if parser.state == "reasoning" else "answering"
                         if stops is not None and stops.hit is not None:

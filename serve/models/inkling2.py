@@ -505,7 +505,8 @@ class Inkling2(Dialect):
     name = "inkling2"
     stop_texts = (END_TURN,)
     reasoning_close = END               # a thinking block closes with its own end; the model opens the next block
-    answer_lead = HEADER + TEXT         # after a forced close, open the answer block so it cannot reopen thinking (#588)
+    answer_lead = HEADER                # after a forced close, open the model turn; model picks text or tool call (#588)
+    reasoning_ban = THINK               # ban <|content_thinking|> for the rest of the request so it cannot reopen thinking
     call_newlines = 0
     image_pad = IMAGE_PAD
     image_start = IMAGE
