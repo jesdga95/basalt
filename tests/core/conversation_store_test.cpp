@@ -35,17 +35,20 @@
 
 using namespace basalt::core;
 
-// The test's operator new: one allocation of exactly `fail_new_of` bytes fails (0: none).  Its delete frees through a
-// pointer, which the compiler does not pair with a new it sees.
+// The test's operator new: one allocation of `fail_new_of` bytes fails (0: none), or of up to kFailSlack bytes more,
+// which a standard library may add to align a large block.  Its delete frees through a pointer, which the compiler
+// does not pair with a new it sees.
 namespace {
 std::atomic<size_t> fail_new_of{0};
+constexpr size_t kFailSlack = 64;
 void free_new(void* p) { std::free(p); }
 void (*volatile release)(void*) = free_new;
 }  // namespace
 
 void* operator new(std::size_t n) {
-    size_t want = n;
-    if (n != 0 && fail_new_of.compare_exchange_strong(want, 0)) throw std::bad_alloc();
+    size_t want = fail_new_of.load();
+    if (want != 0 && n >= want && n < want + kFailSlack && fail_new_of.compare_exchange_strong(want, 0))
+        throw std::bad_alloc();
     if (void* p = std::malloc(n != 0 ? n : 1)) return p;
     throw std::bad_alloc();
 }
