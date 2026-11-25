@@ -1,6 +1,6 @@
 name: ui-screenshot
 
-# A pull request that changes the UI (anything under serve/web) needs a screenshot in its
+# A pull request that changes the UI (anything under serve/web) is labelled `ui` and needs a screenshot in its
 # description or in one of its author's comments. Without one, the bot comments once; once a screenshot is there, that
 # comment is removed. Only metadata is read through the API; nothing from the pull request is checked out or run.
 on:
@@ -65,6 +65,9 @@ jobs:
           if not any(ui.search(f["filename"]) for page in pages for f in page):
               print("no UI files changed")
               raise SystemExit(0)
+          if "ui" not in {l["name"] for l in info.get("labels", [])}:
+              api("-X", "POST", f"repos/{repo}/issues/{pr}/labels", "-f", "labels[]=ui")
+              print("labelled ui")
 
           author = info["user"]["login"]
           comments = [c for page in api("--paginate", "--slurp", f"repos/{repo}/issues/{pr}/comments?per_page=100")
