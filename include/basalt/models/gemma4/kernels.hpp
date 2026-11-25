@@ -107,10 +107,13 @@ void derive_keys(const SegKv& kv, const float* k_norm, RopeTab rope, const Layer
 /// read from the cache (the rows' own keys written by attn_prep first: a window layer's ring holds the window and the
 /// rows), flash style on the fp16 tensor cores (q, k, v and the probabilities rounded to fp16; fp32 products and
 /// softmax). A full layer whose keys are its values derives each key tile from its values as it stages it. The key
-/// tiles sit on a fixed grid of positions, so a row's result does not depend on the call's other rows.
+/// tiles sit on a fixed grid of positions, so a row's result does not depend on the call's other rows. With `span`, the
+/// call's rows are one picture's, read together: a window layer's row also sees the later rows of the call (the picture
+/// attends to itself both ways); a full layer's row stays causal.
 struct AttnPrompt {
     const float* q = nullptr;            ///< [rows][n_head][hd], prepared
     int64_t pos0 = 0;
+    bool span = false;
     const float* k_norm = nullptr;       ///< sh.one: K = rope(V * k_norm)
     RopeTab rope;
     LayerShape sh;

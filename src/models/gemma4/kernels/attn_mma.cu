@@ -31,11 +31,13 @@ namespace {
 namespace bk = basalt::kernels;
 
 // What a launch reads: the prompt's rows at pos0.. of one conversation (pos null), or the decode rows at their own
-// positions in their segments' caches (`out` then the scratch).
+// positions in their segments' caches (`out` then the scratch). span_end > 0: the prompt's rows are one picture's, and a
+// window layer's row sees every key up to span_end - 1.
 struct MmaArgs {
     const float* q = nullptr;
     const int32_t* pos = nullptr;
     int64_t pos0 = 0;
+    int64_t span_end = 0;
     const float* k_norm = nullptr;
     RopeTab rope;
     LayerShape sh;
@@ -161,7 +163,8 @@ __global__ void __launch_bounds__(Cfg<HD, RG, NS>::kThreads, 1) attn_mma_kernel(
         h = blockIdx.y;
         const int first = (int) (gridDim.x - 1 - blockIdx.x) * P;   // the longest key runs start first
         const int last = min(first + P, rows) - 1;
-        kmax = (int) a.pos0 + last;
+        const bool span = W > 0 && a.span_end > 0;
+        kmax = span ? (int) a.span_end - 1 : (int) a.pos0 + last;
         kmin = W > 0 ? max(0, (int) a.pos0 + first - W + 1) : 0;
         cache = a.kv.c[0];
 #pragma unroll
@@ -171,8 +174,9 @@ __global__ void __launch_bounds__(Cfg<HD, RG, NS>::kThreads, 1) attn_mma_kernel(
             rok[e] = row <= last;
             rrow[e] = rok[e] ? row : last;
             rhead[e] = h * G + rr / P;
-            rhi[e] = (int) a.pos0 + rrow[e];
-            rlo[e] = W > 0 ? rhi[e] - W + 1 : 0;
+            const int p = (int) a.pos0 + rrow[e];
+            rhi[e] = span ? kmax : p;
+            rlo[e] = W > 0 ? p - W + 1 : 0;
         }
     }
     const int t0 = kmin / kKeys, t1 = kmax / kKeys;
@@ -428,6 +432,7 @@ void attn_prompt(const AttnPrompt& p, int rows, void* stream) {
     check_shape(p.sh);
     MmaArgs a;
     a.q = p.q, a.pos0 = p.pos0, a.k_norm = p.k_norm, a.rope = p.rope, a.sh = p.sh, a.kv_type = p.kv_type, a.out = p.out;
+    a.span_end = p.span ? p.pos0 + rows : 0;
     a.kv.c[0] = p.kv;
     const int G = p.sh.n_head / p.sh.n_kv;
     const auto grid = [&](int block_rows) { return dim3((unsigned) ((rows + block_rows / G - 1) / (block_rows / G)), (unsigned) p.sh.n_kv); };

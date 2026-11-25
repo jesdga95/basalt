@@ -1,7 +1,8 @@
 // src/models/gemma4/kernels/kernels_parity.cpp - the Gemma 4 kernels against CPU references in double: the attention's
 // preparation and decode attention (a window layer's ring past its wrap, a full layer whose keys are its values), the glue;
 // a batch window of two conversations bitwise equal to each alone; the prompt attention against the decode attention and
-// split anywhere bitwise equal; the fused glue; and microbench lines of the decode and prompt attention and the glue.
+// split anywhere bitwise equal; a picture's rows read as one span (both ways at the window layers); the fused glue; and
+// microbench lines of the decode and prompt attention and the glue.
 #include "basalt/models/gemma4/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -469,6 +470,85 @@ void prompt_case(const char* name, const LayerShape& sh, int past, int C, KvType
         cudaFree(p);
 }
 
+// A picture's C rows after `past` positions read as one span: a window layer's row against double precision over the
+// cache's keys (p - window, past + C), its own and the picture's later rows among them; a full layer's bitwise as without
+// the span (causal); and the text rows before the picture unchanged by it.
+void span_case(const char* name, const LayerShape& sh, int past, int C, std::mt19937& rng) {
+    const int hd = sh.hd, nq = sh.n_head, nk = sh.n_kv, qd = nq * hd, kd = nk * hd, N = past + C, G = nq / nk;
+    const int64_t cap = sh.window > 0 ? sh.window + std::max(past, C) : N;   // a ring that holds the window and either call
+    auto qn = randv(hd, rng, 0.3f), kn = randv(hd, rng, 0.3f);
+    for (float& x : qn) x += 1.f;
+    for (float& x : kn) x += 1.f;
+    std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, N));
+    rope_tables(hd, sh.rot, sh.window > 0 ? 1e4 : 1e6, N, lo.data(), hi.data());
+    const RopeTab rt{dev(lo), dev(hi)};
+    float *dqn = dev(qn), *dkn = dev(kn);
+    auto q = randv((size_t) N * qd, rng, 2.f), k = randv((size_t) N * kd, rng, 2.f), v = randv((size_t) N * kd, rng, 2.f);
+    float *dq = dev(q), *dk = dev(k), *dv = dev(v), *qp, *got, *plain;
+    void *ck = nullptr, *cv = nullptr;
+    cudaMalloc(&ck, (size_t) cap * kd * 2);
+    cudaMalloc(&cv, (size_t) cap * kd * 2);
+    cudaMalloc(&qp, (size_t) N * qd * 4);
+    cudaMalloc(&got, (size_t) N * qd * 4);
+    cudaMalloc(&plain, (size_t) N * qd * 4);
+    std::vector<int32_t> pos(N);
+    for (int i = 0; i < N; ++i) pos[i] = i;
+    int32_t* dpos = dev(pos);
+    Prep pr;
+    pr.ldq = qd, pr.ldk = kd, pr.ldv = kd, pr.q_norm = dqn, pr.k_norm = dkn, pr.rope = rt, pr.sh = sh;
+    pr.kv.c[0] = {ck, cv, cap};
+    // the text before the picture as one call, then the picture's rows as one (the ring holds the window and the picture)
+    for (const auto [p0, n] : {std::pair<int, int>{0, past}, std::pair<int, int>{past, C}}) {
+        if (n == 0) continue;
+        pr.q = dq + (size_t) p0 * qd, pr.k = dk + (size_t) p0 * kd, pr.v = dv + (size_t) p0 * kd, pr.pos = dpos + p0;
+        pr.q_out = qp + (size_t) p0 * qd;
+        attn_prep(pr, n, nullptr);
+        AttnPrompt ap;
+        ap.q = pr.q_out, ap.pos0 = p0, ap.k_norm = dkn, ap.rope = rt, ap.sh = sh, ap.kv = pr.kv.c[0];
+        ap.out = plain + (size_t) p0 * qd;
+        attn_prompt(ap, n, nullptr);
+        ap.span = p0 == past;
+        ap.out = got + (size_t) p0 * qd;
+        attn_prompt(ap, n, nullptr);
+    }
+    cudaDeviceSynchronize();
+    const std::vector<float> o = host(got, (size_t) N * qd), pl = host(plain, (size_t) N * qd);
+    if (sh.window == 0) {
+        expect(std::memcmp(o.data(), pl.data(), o.size() * 4) == 0, name, 0.0);
+    } else {
+        expect(std::memcmp(o.data(), pl.data(), (size_t) past * qd * 4) == 0, "  the text rows before it: bitwise as without", 0.0);
+        const std::vector<float> qh = host(qp + (size_t) past * qd, (size_t) C * qd);
+        const std::vector<__half> kc = host((const __half*) ck, (size_t) cap * kd), vc = host((const __half*) cv, (size_t) cap * kd);
+        double err = 0;
+        for (int t = 0; t < C; ++t) {
+            const int p = past + t, k0 = std::max(0, p - sh.window + 1), k1 = past + C - 1;
+            for (int hq = 0; hq < nq; ++hq) {
+                const int h = hq / G;
+                std::vector<double> sc;
+                double M = -1e300;
+                for (int j = k0; j <= k1; ++j) {
+                    double d = 0;
+                    for (int i = 0; i < hd; ++i)
+                        d += h2d(qh[((size_t) t * nq + hq) * hd + i]) * __half2float(kc[((size_t) (j % cap) * nk + h) * hd + i]);
+                    sc.push_back(d);
+                    M = std::max(M, d);
+                }
+                double L = 0;
+                for (double& x : sc) L += (x = std::exp(x - M));
+                for (int i = 0; i < hd; ++i) {
+                    double y = 0;
+                    for (int j = k0; j <= k1; ++j) y += sc[(size_t) (j - k0)] * __half2float(vc[((size_t) (j % cap) * nk + h) * hd + i]);
+                    err = std::max(err, std::fabs(y / L - o[((size_t) p * nq + hq) * hd + i]));
+                }
+            }
+        }
+        expect(err < 2e-2, name, err);   // the probabilities rounded to fp16 (scores spread ~25)
+    }
+    for (void* p : {(void*) dq, (void*) dk, (void*) dv, (void*) dqn, (void*) dkn, (void*) rt.lo, (void*) rt.hi, ck, cv, (void*) qp,
+                    (void*) got, (void*) plain, (void*) dpos})
+        cudaFree(p);
+}
+
 // The prompt attention of a chunk of C rows after `past` positions (cache contents random): time and fp16 tensor rate.
 void prompt_bench(const char* name, const LayerShape& sh, int past, int C, std::mt19937& rng) {
     const int hd = sh.hd, kd = sh.n_kv * hd, qd = sh.n_head * hd, N = past + C;
@@ -638,6 +718,10 @@ int main() {
     prompt_case("prompt attention, window layer, fp8 cache, 77 rows", {16, 8, 256, 128, 64, false}, 40, 77, KvType::F8, rng);
     prompt_case("prompt attention, full layer (keys = values), 300 rows", {16, 2, 512, 64, 0, true}, 1500, 300, KvType::F16, rng);
     prompt_case("prompt attention, full layer, fp8 cache, 129 rows", {16, 2, 512, 64, 0, true}, 0, 129, KvType::F8, rng);
+    span_case("picture span, window layer (window 64), 40 rows after 90", {16, 8, 256, 128, 64, false}, 90, 40, rng);
+    span_case("picture span, window layer, 280 rows after 1500", {16, 8, 256, 128, 1024, false}, 1500, 280, rng);
+    span_case("picture span, window layer, 9 rows first", {16, 8, 256, 128, 64, false}, 0, 9, rng);
+    span_case("picture span, full layer: bitwise as causal", {16, 2, 512, 64, 0, true}, 300, 280, rng);
     glue_checks(rng);
     fused_checks(rng);
     bench(rng);
