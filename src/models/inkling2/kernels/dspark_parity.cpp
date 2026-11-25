@@ -232,7 +232,6 @@ void test_markov_step() {
     const auto ch = randn(kDsRnn), cf = randn(kDsRnn), b = randn(kDsRnn, 0.3f);
     uint16_t *d_wsp = dev(wsp), *d_w1 = dev(w1);
     float *d_ch = dev(ch), *d_cf = dev(cf), *d_b = dev(b), *d_state = dev(state);
-    int32_t* d_prev = dev(std::vector<int32_t>{prev});
     float* d_out = zeros<float>(kDsRank);
     float* d_lat = zeros<float>(kDsRank);
     dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1 + (size_t) prev * kDsRank, d_state, d_out, d_lat, nullptr);
