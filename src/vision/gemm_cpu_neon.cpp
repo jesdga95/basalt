@@ -111,7 +111,7 @@ void gemm_bf16w(const float* X, const uint16_t* W, float* Y, int M, int N, int K
         std::vector<float> wf((size_t) 4 * K);
         for (int t = a; t < b; ++t) {
             const int n0 = t * 4, nc = std::min(4, N - n0);
-            const float* wrows[4];
+            const float* wrows[4] = {};
             for (int j = 0; j < nc; ++j) {
                 const uint16_t* w = W + (size_t) (n0 + j) * K;
                 float* dst = wf.data() + (size_t) j * K;
@@ -127,7 +127,8 @@ void gemm_bf16w(const float* X, const uint16_t* W, float* Y, int M, int N, int K
                 }
                 wrows[j] = dst;
             }
-            for (int j = nc; j < 4; ++j) wrows[j] = wrows[nc - 1];
+            const float* last_row = wf.data() + (size_t) (nc - 1) * K;
+            for (int j = nc; j < 4; ++j) wrows[j] = last_row;
             run_col_tile(X, wrows, Y, M, n0, nc, N, K);
         }
     });
