@@ -536,3 +536,5 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .support-alt { padding: 16px 24px 0; font: 400 13px/1.5 var(--font-sans); color: var(--fg-3); }
 .support-alt a { color: var(--fg-2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
 .support-alt a:hover { color: var(--accent); text-decoration-color: var(--accent-line); }
+
+/* test: ui label and screenshot check */
