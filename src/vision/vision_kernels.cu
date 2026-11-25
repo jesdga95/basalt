@@ -434,6 +434,136 @@ __global__ void to_bf16_k(const float* x, __nv_bfloat16* y, size_t count) {
     if (i < count) y[i] = __float2bfloat16_rn(x[i]);
 }
 
+// ---- the pooled tower -------------------------------------------------------------------------------------------------
+constexpr int PPAIRS = 36, PHALF = 18;   // rotated pairs a head, and a half's (one axis)
+
+// pool-order row -> patch row and column (cells of k x k patches)
+__device__ __forceinline__ void pool_pos(int t, int gx, int k, int& py, int& px) {
+    const int kk = k * k, c = t / kk, r = t - c * kk, per = gx / k;
+    py = (c / per) * k + r / k;
+    px = (c % per) * k + r % k;
+}
+
+// one warp: the sum over a row of 1152 held as 36 values a lane
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// one block a patch row: its 3 x 16 x 16 values (channel, row, column), no contracted multiply-add (the reference's roundings)
+__global__ void pool_patch_rows_k(const uint8_t* rgb, int w, int gx, int k, __nv_bfloat16* rows) {
+    constexpr int P = 16, PP = P * P;
+    const int t = blockIdx.x;
+    int py, px;
+    pool_pos(t, gx, k, py, px);
+    __nv_bfloat16* dst = rows + (size_t) t * 3 * PP;
+    for (int j = threadIdx.x; j < 3 * PP; j += blockDim.x) {
+        const int c = j / PP, rem = j % PP, X = px * P + rem % P, Y = py * P + rem / P;
+        const float v = (float) rgb[((size_t) Y * w + X) * 3 + c];
+        dst[j] = __float2bfloat16_rn(__fmul_rn(2.0f, __fsub_rn(__fmul_rn(v, 1.0f / 255.0f), 0.5f)));
+    }
+}
+
+__global__ void pool_embed_k(float* x, const float* tables, int gx, int k, int size) {
+    const int t = blockIdx.x;
+    int py, px;
+    pool_pos(t, gx, k, py, px);
+    const float *cx = tables + (size_t) px * E, *cy = tables + ((size_t) size + py) * E;
+    for (int c = threadIdx.x; c < E; c += blockDim.x) x[(size_t) t * E + c] += cx[c] + cy[c];
+}
+
+__global__ void rope_pool_k(float* tab, int n, int gx, int k, float theta) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    int py, px;
+    pool_pos(t, gx, k, py, px);
+    for (int j = 0; j < PPAIRS; ++j) {
+        const int f = j % PHALF;
+        const float inv = 1.0f / powf(theta, (float) (2 * f) / (float) PPAIRS);
+        const float th = (float) (j < PHALF ? px : py) * inv;
+        float sn, cs;
+        sincosf(th, &sn, &cs);
+        tab[((size_t) t * PPAIRS + j) * 2] = cs;
+        tab[((size_t) t * PPAIRS + j) * 2 + 1] = sn;
+    }
+}
+
+// one block a row, a warp a (part, head) of the 48: the head's RMS over its 72 values, then q and k turned pair by pair
+__global__ void qkv_normed_k(const float* g, const float* qn, const float* kn, const float* rope, __half* q, __half* k, __half* v,
+                             int n, float eps) {
+    __shared__ float hv[8][D];
+    const int t = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float* r = g + (size_t) t * 3 * E;
+    const float* tr = rope + (size_t) t * PPAIRS * 2;
+    for (int item = warp; item < 3 * H; item += blockDim.x >> 5) {
+        const int part = item / H, hd = item % H;
+        const float* src = r + part * E + hd * D;
+        float ss = 0.f;
+        for (int d = lane; d < D; d += 32) ss += src[d] * src[d];
+        const float inv = 1.0f / sqrtf(warp_sum(ss) / D + eps);
+        const float* w = part == 0 ? qn : kn;
+        __half* dst = (part == 0 ? q : part == 1 ? k : v) + ((size_t) hd * n + t) * DP;
+        if (part == 2) {
+            for (int d = lane; d < D; d += 32) dst[d] = __float2half_rn(src[d] * inv);
+            continue;
+        }
+        for (int d = lane; d < D; d += 32) hv[warp][d] = src[d] * inv * w[d];
+        __syncwarp();
+        for (int d = lane; d < D; d += 32) {
+            const int half = d / PPAIRS, i = d % PPAIRS, j = half * PHALF + i % PHALF;   // the pair's table entry
+            const float c = tr[2 * j], s = tr[2 * j + 1];
+            const float a = hv[warp][d], b = hv[warp][i < PHALF ? d + PHALF : d - PHALF];
+            dst[d] = __float2half_rn(i < PHALF ? a * c - b * s : a * c + b * s);
+        }
+        __syncwarp();
+    }
+}
+
+// one warp a row: x += rms(g) * w
+__global__ void norm_residual_k(float* x, const float* g, const float* w, int n, float eps) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const float* gr = g + (size_t) row * E;
+    float v[36], q = 0.f;
+#pragma unroll
+    for (int i = 0; i < 36; ++i) { v[i] = gr[i * 32 + lane]; q += v[i] * v[i]; }
+    const float inv = 1.0f / sqrtf(warp_sum(q) / E + eps);
+    float* xr = x + (size_t) row * E;
+#pragma unroll
+    for (int i = 0; i < 36; ++i) xr[i * 32 + lane] += v[i] * inv * w[i * 32 + lane];
+}
+
+__global__ void gelu_gate_k(const float* g, __nv_bfloat16* y, size_t total, int f) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const size_t t = i / f;
+    const int c = (int) (i - t * f);
+    const float* r = g + t * 2 * f;
+    y[i] = __float2bfloat16_rn(gelu_tanh(r[c]) * r[f + c]);
+}
+
+// one warp a pooled row: the k^2 patch rows summed in order, the mean scaled, standardised and RMS-normed
+__global__ void pool_finish_k(const float* x, const float* bias, const float* scale, __nv_bfloat16* y, int m, int k, float eps) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (row >= m) return;
+    const int kk = k * k;
+    const float* xr = x + (size_t) row * kk * E;
+    const float root = sqrtf((float) E);
+    float v[36], q = 0.f;
+#pragma unroll
+    for (int i = 0; i < 36; ++i) {
+        const int c = i * 32 + lane;
+        float s = 0.f;
+        for (int p = 0; p < kk; ++p) s += xr[(size_t) p * E + c];
+        v[i] = (s / (float) kk * root - bias[c]) * scale[c];
+        q += v[i] * v[i];
+    }
+    const float inv = 1.0f / sqrtf(warp_sum(q) / E + eps);
+#pragma unroll
+    for (int i = 0; i < 36; ++i) y[(size_t) row * E + i * 32 + lane] = __float2bfloat16_rn(v[i] * inv);
+}
+
 inline unsigned blocks(size_t total, int per) { return (unsigned) ((total + per - 1) / per); }
 
 }  // namespace
@@ -510,6 +640,30 @@ void launch_bias_scale_residual(float* x, const float* g, const float* bias, con
 }
 void launch_to_bf16(const float* x, __nv_bfloat16* y, size_t count, cudaStream_t s) {
     if (count > 0) to_bf16_k<<<blocks(count, 256), 256, 0, s>>>(x, y, count);
+}
+
+void launch_pool_patch_rows(const uint8_t* rgb, int w, int gx, int k, __nv_bfloat16* rows, int n, cudaStream_t s) {
+    if (n > 0) pool_patch_rows_k<<<n, 256, 0, s>>>(rgb, w, gx, k, rows);
+}
+void launch_pool_embed(float* x, const float* tables, int n, int gx, int k, int size, cudaStream_t s) {
+    if (n > 0) pool_embed_k<<<n, 128, 0, s>>>(x, tables, gx, k, size);
+}
+void launch_rope_pool(float* tab, int n, int gx, int k, float theta, cudaStream_t s) {
+    if (n > 0) rope_pool_k<<<blocks(n, 128), 128, 0, s>>>(tab, n, gx, k, theta);
+}
+void launch_qkv_normed(const float* g, const float* q_norm, const float* k_norm, const float* rope, __half* q, __half* k,
+                       __half* v, int n, float eps, cudaStream_t s) {
+    if (n > 0) qkv_normed_k<<<n, 256, 0, s>>>(g, q_norm, k_norm, rope, q, k, v, n, eps);
+}
+void launch_norm_residual(float* x, const float* g, const float* w, int n, float eps, cudaStream_t s) {
+    if (n > 0) norm_residual_k<<<blocks(n, 4), 128, 0, s>>>(x, g, w, n, eps);
+}
+void launch_gelu_gate(const float* g, __nv_bfloat16* y, int n, int f, cudaStream_t s) {
+    if (n > 0) gelu_gate_k<<<blocks((size_t) n * f, 256), 256, 0, s>>>(g, y, (size_t) n * f, f);
+}
+void launch_pool_finish(const float* x, const float* bias, const float* scale, __nv_bfloat16* y, int m, int k, float eps,
+                        cudaStream_t s) {
+    if (m > 0) pool_finish_k<<<blocks(m, 4), 128, 0, s>>>(x, bias, scale, y, m, k, eps);
 }
 
 }  // namespace basalt::vision
