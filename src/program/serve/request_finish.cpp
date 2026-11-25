@@ -1,4 +1,5 @@
 // src/program/serve/request_finish.cpp - request complete operations.
+#include "prompt_parts.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -113,15 +114,11 @@ Flow Request::complete() {
                             sl.guard = std::move(gguard);   // the request's grammar, already past the tokens the request decoded here
             // the slot keeps its conversation's longest checkpoint (its next turn) and its shortest (the
             // system prompt, which other requests may share)
-            const ConvCheckpoint *best = nullptr, *root = nullptr;
-            for (const ConvCheckpoint& c : runtime_.checks)
-                if (c.ids.size() < runtime_.live.size() &&
-                    basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), runtime_.live.data())) {
-                    if (best == nullptr || c.ids.size() > best->ids.size()) best = &c;
-                    if (root == nullptr || c.ids.size() < root->ids.size()) root = &c;
-                }
-            if (root != nullptr && root != best) sl.checks.push_back(*root);
-            if (best != nullptr) sl.checks.push_back(*best);
+            select_slot_checkpoints(runtime_.checks, runtime_.live,
+                                    [](const int32_t* a, size_t n_ids, const int32_t* b) {
+                                        return basalt::core::conversation_ids_equal(a, n_ids, b);
+                                    },
+                                    sl.checks);
             basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", runtime_.admit_slot,
                          (long long) runtime_.live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
         }
