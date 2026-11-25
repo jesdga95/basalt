@@ -47,8 +47,8 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 // what the sessions share once (the forward's row buffers and expert scratch, the batch windows' logits), what each one
 // needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
 // driver
-constexpr uint64_t kSharedFixed = 768 * kMiB;
-constexpr uint64_t kSessionFixed = 96 * kMiB;
+constexpr uint64_t kSharedFixed = 896 * kMiB;
+constexpr uint64_t kSessionFixed = 44 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
@@ -102,11 +102,11 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
     uint64_t caches = 0;
     for (const Visit& v : g.visits)
         if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
-    return caches + kSessionFixed + (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
+    return caches + kSessionFixed;
 }
 
 uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
+    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
 }
 
 InklingModel::InklingModel() = default;
