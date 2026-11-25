@@ -594,13 +594,19 @@ bool FileExpertSource::plan_cache_complement(
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
+        // The places have to fit in the RAM the budget may reach: pack the experts to the budget, but never past what
+        // leaves the places room beside it.  A budget with room to spare beside it keeps its experts whole.
+        uint64_t max_spare_blob = 0;
+        for (const auto& [b, n] : spare_sizes) max_spare_blob = std::max(max_spare_blob, b);
+        const uint64_t pack_bytes = ram_tier_pack_bytes(
+            budget_bytes, ram_tier_room(budget_physical, headroom_bytes, pin), spare_bytes, max_spare_blob);
         if (rank != nullptr)
             for (const auto& pr : *rank) {
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) continue;
+                if (b > pack_bytes - at) continue;
                 ranked[i] = at;
                 at += b;
                 ++held;
@@ -659,8 +665,13 @@ bool FileExpertSource::plan_cache_complement(
     }
 
     const uint64_t spare_at = bytes;
-    if (bytes == 0 || bytes + spare_bytes > budget) spare_sizes.clear();   // no room: swaps use exchange buffers
-    else bytes += spare_bytes;
+    if (bytes == 0 || bytes + spare_bytes > budget) {   // no room: an evicted expert has nowhere to go
+        if (spares_want_ > 0 && bytes > 0)
+            basalt::log::warn("basalt", "FileExpertSource: the adaptive swaps have no free place: the %.2f GiB of experts "
+                                        "leave no room in the RAM budget for the %.2f GiB of places",
+                         (double) bytes / 1073741824.0, (double) spare_bytes / 1073741824.0);
+        spare_sizes.clear();
+    } else bytes += spare_bytes;
 
     // The experts the GPU cache was filled from sit in the file cache and the mapping; give them back first, so the
     // arena below does not have to reclaim them while the drive is being read.
