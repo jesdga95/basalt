@@ -372,7 +372,7 @@ class _XmlCalls(frontend.CodeTracker):
         self.buf = ""
         self.pend = False               # buf starts (after whitespace) with an opener that begins a call's text
         self.lead = False               # a call just ended: the whitespace after it is dropped
-        self.fence, self.line, self.ticks = "", "", 0
+        self._reset_track()
 
     def _call(self, name: str, params: list) -> list:
         props = frontend._tool_properties(self.tools.get(name))
@@ -417,10 +417,10 @@ class _XmlCalls(frontend.CodeTracker):
                     self.buf = self.buf[keep:]
                     break
                 i, op = min(found)
-                snap = (self.fence, self.line, self.ticks)
+                snap = self._snap()
                 self._track(self.buf[:i])
                 quoted = self._in_code()
-                self.fence, self.line, self.ticks = snap
+                self._restore(snap)
                 if quoted:                      # an example in code (a fence or backticks) is text
                     content(self.buf[:i + len(op)])
                     self.buf = self.buf[i + len(op):]
@@ -442,7 +442,7 @@ class _XmlCalls(frontend.CodeTracker):
             for name, params in r[1]:
                 out += self._call(name, params)
             self.buf, self.lead = body[r[2]:], True
-            self.fence, self.line, self.ticks = "", "", 0
+            self._reset_track()
         if final and self.buf:
             content(self.buf)
             self.buf, self.pend = "", False
