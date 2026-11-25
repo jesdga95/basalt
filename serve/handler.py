@@ -1093,7 +1093,10 @@ def make_handler(target: Service | Router):
         def _completions(self, req):
             """OpenAI's POST /v1/completions: the raw prompt continues as the model writes it - no chat
             template, no thinking, no tools.  The samplers are the chat path's plus the horde set (--more-samplers
-            on); `grammar` or `grammar_schema` holds the text to a GBNF grammar (--gbnf-grammar on)."""
+            on); `grammar` or `grammar_schema` holds the text to a GBNF grammar (--gbnf-grammar on).
+            `suffix` is the text that follows the completion: the model reads it after the prompt (an infill) and
+            the reply holds the completion alone, or the prompt, the completion and the suffix with `echo`.
+            `stop` strings end the completion and are left out of it."""
             prompt = req.get("prompt")
             if isinstance(prompt, list):
                 if not all(isinstance(x, str) for x in prompt):
@@ -1116,11 +1119,7 @@ def make_handler(target: Service | Router):
                 raise ValueError("stop: a string or a list of strings")
             sampling = self._sampling_from_raw(req, kobold=False)
             self._raw_grammar(req, sampling)
-            if suffix:
-                sampling = dict(sampling)               # stop applies to the pre-suffix completion
-                stop_list = ([stop] if isinstance(stop, str) else list(stop or [])) + [suffix]
-                sampling["stop"] = stop_list
-            elif stop is not None:
+            if stop is not None:
                 sampling["stop"] = stop
             req[BIAS_KEY] = checked_bias(req, self.svc.engine)
             self._open_live("cmpl-" + uuid.uuid4().hex[:24], req)
@@ -1132,7 +1131,8 @@ def make_handler(target: Service | Router):
             unset = max_new <= 0
             if unset:
                 max_new = max(0, ctx - CTX_SLACK) if ctx else 4096
-            prompt_text = PromptText(self.svc.tok, prompt, (), clip=unset or self.svc.fit_max_tokens)
+            prompt_text = PromptText(self.svc.tok, prompt + suffix if suffix else prompt, (), tail=suffix or "",
+                                     clip=unset or self.svc.fit_max_tokens)
             prompt_text.max_new = max_new
             cancel = self._client_cancel()
             stream = bool(req.get("stream"))
@@ -1154,20 +1154,6 @@ def make_handler(target: Service | Router):
                         "model": self.svc.model,
                         "choices": [{"index": 0, "text": text_piece or "", "finish_reason": finish}]}
 
-            def final(finish, text, prompt_tokens, completion_tokens, stop_hit=None):
-                body_text = prompt + text if echo else text
-                if suffix and finish == "stop" and stop_hit == (suffix if isinstance(suffix, str) else None):
-                    body_text += suffix
-                out = {"id": self.live.id, "object": "text_completion", "created": int(time.time()),
-                       "model": self.svc.model,
-                       "choices": [{"index": 0, "text": body_text, "finish_reason": finish,
-                                    "stop_reason": stop_hit}]}
-                if suffix and finish == "stop" and stop_hit:
-                    out["choices"][0]["text"] = body_text + suffix
-                out["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                                "total_tokens": prompt_tokens + completion_tokens}
-                return out
-
             if not stream:
                 text, tail = [], None
                 for piece, done in pieces():
@@ -1177,9 +1163,7 @@ def make_handler(target: Service | Router):
                         tail = done
                 d, full = tail
                 stop_hit = d.get("stop_sequence")
-                body_text = (prompt + full) if echo else full
-                if suffix and d["finish"] == "stop":
-                    body_text += suffix
+                body_text = prompt + full + suffix if echo and suffix else (prompt + full if echo else full)
                 out = {"id": self.live.id, "object": "text_completion", "created": int(time.time()),
                        "model": self.svc.model,
                        "choices": [{"index": 0, "text": body_text, "finish_reason": d["finish"],
@@ -1207,7 +1191,9 @@ def make_handler(target: Service | Router):
         def _kobold_generate(self, req):
             """KoboldCpp's POST /api/v1/generate (sync) and /api/extra/generate/stream (SSE): the horde worker's
             text API.  The prompt continues raw; the samplers are the horde set (rep_pen, top_a, tfs, typical,
-            dynatemp, smoothing, xtc; mirostat is refused)."""
+            dynatemp, smoothing, xtc; mirostat is refused).  `stop_sequence` strings end the generation and are
+            left out of the text, as koboldcpp's `trim_stop` (its default, true) has them; with `trim_stop`
+            false the stop string that ended the generation is the text's end."""
             kobold_stream = self.path.split("?")[0].rstrip("/") == "/api/extra/generate/stream"
             prompt = req.get("prompt")
             if not isinstance(prompt, str):
@@ -1221,6 +1207,8 @@ def make_handler(target: Service | Router):
             if stop:
                 sampling["stop"] = stop
             trim_stop = req.get("trim_stop")
+            if trim_stop is not None and not isinstance(trim_stop, bool):
+                raise ValueError("trim_stop: true or false")
             self._open_live("kcpp-" + uuid.uuid4().hex[:24], req)
             self._take_turn(kobold_stream)
             self.svc.load()
@@ -1233,8 +1221,12 @@ def make_handler(target: Service | Router):
             prompt_text = PromptText(self.svc.tok, prompt, (), clip=unset or self.svc.fit_max_tokens)
             prompt_text.max_new = max_new
             cancel = self._client_cancel()
+
             pieces = []
-            held_tail = ""                      # stop-string holdback released at the end when nothing hit
+
+            def kept_stop(done):
+                """The stop string the text keeps: koboldcpp leaves it in only with trim_stop false."""
+                return (done.get("stop_sequence") or "") if trim_stop is False else ""
 
             def collect():
                 text, done = [], None
@@ -1248,9 +1240,7 @@ def make_handler(target: Service | Router):
 
             if not kobold_stream:
                 text, done = collect()
-                if trim_stop and done.get("stop_sequence"):
-                    text = text.rstrip()
-                return self._json(200, {"results": [{"text": text}]})
+                return self._json(200, {"results": [{"text": text + kept_stop(done)}]})
             self._sse()
             try:
                 for kind, x in self.svc.run_raw(prompt_text, max_new, sampling, cancel,
@@ -1261,9 +1251,7 @@ def make_handler(target: Service | Router):
                     elif kind == "ping":
                         self.wfile.write(b": keep-alive\n\n")
                     elif kind == "done":
-                        text = "".join(pieces)
-                        if trim_stop and x.get("stop_sequence"):
-                            text = text.rstrip()
+                        text = "".join(pieces) + kept_stop(x)
                         self.wfile.write(b"data: " + json.dumps({"text": text, "events": None,
                                                                  "finish_reason": x["finish"]}).encode() + b"\n\n")
                     self.wfile.flush()

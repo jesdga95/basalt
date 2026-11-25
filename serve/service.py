@@ -2150,10 +2150,10 @@ class Service:
                                     last_out = time.monotonic()
                                     yield "ping", None
                                     continue
-                                n += 1
-                                if t in self.stop_ids:
+                                if t in self.stop_ids:                 # the end token is not part of the reply
                                     finish = "stop"
                                     break
+                                n += 1
                                 seg.append(t)
                                 piece = detok.push(t)
                                 if stops is not None:
