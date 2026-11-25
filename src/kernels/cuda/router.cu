@@ -150,7 +150,9 @@ __device__ __forceinline__ float sqrt_softplus(float x) {
     return sqrtf(sp);
 }
 
-__device__ __forceinline__ float score(float x, int gate) { return gate == 0 ? sqrt_softplus(x) : 1.f / (1.f + expf(-x)); }
+__device__ __forceinline__ float score(float x, int gate) {
+    return gate == 0 ? sqrt_softplus(x) : gate == 1 ? 1.f / (1.f + expf(-x)) : x;
+}
 
 // Shared memory of one token's selection.
 struct SelectScratch {
@@ -173,7 +175,7 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
                                     SelectScratch& sh, const ResidentTabs& held, float prior) {
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
     const float s = score(logits[e], gate);
-    float b = s + bias[e];
+    float b = bias ? s + bias[e] : s;
     if (kPrior && held.held(e)) b += prior;
     float m = b;
 #pragma unroll
@@ -212,7 +214,11 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
         }
     }
     __syncthreads();
-    if (e == 0) {
+    if (e == 0 && gate == 2) {   // softmax over the chosen logits, the largest first
+        float sum = 0.f;
+        for (int r = 0; r < k; ++r) sum += expf(sh.sel[r] - sh.sel[0]);
+        for (int r = 0; r < k; ++r) weights[r] = expf(sh.sel[r] - sh.sel[0]) / sum * scale;
+    } else if (e == 0) {
         float sum = 0.f;
         for (int r = 0; r < k; ++r) sum += sh.sel[r];
         const float denom = sum + 1e-20f;
