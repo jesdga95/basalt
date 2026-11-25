@@ -243,13 +243,14 @@ bool Runtime::batch_round() {
     // serves all, the rows going to the drafts likeliest kept.  Drafters that set their own length: each window as it would
     // run alone, shared max-min fairly when they do not fit (a window held to fewer takes its drafts again within its share)
     constexpr int kShortSpecCap = 16;
-    constexpr int kLongSpecCap = 35;
+    constexpr int kLongSpecCap = 96;
     const int n_act = (int) act.size();
     int64_t max_pos = 0;
     for (int i = 0; i < n_act; ++i) max_pos = std::max(max_pos, bs[(size_t) act[(size_t) i]].p);
     const int spec_cap = max_pos >= 4096 ? std::min(cap, kLongSpecCap) : std::min(cap, kShortSpecCap);
     const int row_cap = std::min(cap, std::max(n_act, spec_cap));
-    const int per_slot_cap = n_act >= 2 ? std::min(row_cap, 5) : row_cap;
+    const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : row_cap;
+    const int per_slot_cap = std::min(row_cap, slot_cap_by_n);
     std::vector<SlotWin> wins(act.size());
     std::vector<int> rows(act.size());
     const BSlot& s0 = bs[(size_t) act[0]];

@@ -288,4 +288,147 @@ __device__ __forceinline__ void native_down_nvfp4_mma_stage(dim3 block_idx, dim3
 #endif
 }
 
+
+constexpr int kFastMxfp8Cols = 8;
+
+__device__ __forceinline__ void native_gu_mxfp8_sx8_stage(dim3 block_idx, dim3 grid_dim, int tid,
+                                                          const unsigned long long* __restrict__ grp_ptr,
+                                                          const int32_t* __restrict__ grp_start,
+                                                          const int32_t* __restrict__ n_groups,
+                                                          const int32_t* __restrict__ ent_tok,
+                                                          const block_q8_1* __restrict__ xq,
+                                                          NativeExpertLayout L,
+                                                          float* __restrict__ gate,
+                                                          float* __restrict__ up) {
+    const int ng = *n_groups;
+    if (ng <= (int) grid_dim.y) pdl_launch_dependents();
+    if ((int) block_idx.y >= ng) return;
+    __shared__ __align__(16) uint32_t s_x[kFastMxfp8Cols * kFastGuWords];
+    const block_q8_1* sx = reinterpret_cast<const block_q8_1*>(s_x);
+    const int r_sub_off = tid >> 3, t_sub = tid & 7;
+    const int row0 = (int) block_idx.x * kFastMoeRows;
+    const int row = row0 + r_sub_off;
+    const bool valid = row < 2 * (int) L.n_ff;
+    const bool is_up = row >= (int) L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const size_t w_off = valid ? (is_up ? L.up_off : 0) + (size_t) r * L.gu_row : 0;
+    float* dst = is_up ? up : gate;
+    for (int gi = (int) block_idx.y; gi < ng; gi += (int) grid_dim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[gi] + w_off;
+        const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
+        for (int e = e0; e < e1; e += kFastMxfp8Cols) {
+            const int ne = min(kFastMxfp8Cols, e1 - e);
+            if (ne <= 2) {
+                if (valid) {
+                    if (ne == 1) {
+                        const int off1[1] = { ent_tok[e] * 72 };
+                        float s1[1];
+                        row_dot_sub8<46, 1, true, 288>(wr, xq, off1, 1, 288, t_sub, s1);
+                        if (t_sub == 0) dst[(size_t) e * L.n_ff + r] = s1[0];
+                    } else {
+                        const int off2[2] = { ent_tok[e] * 72, ent_tok[e + 1] * 72 };
+                        float s2[2];
+                        row_dot_sub8<46, 2, true, 288>(wr, xq, off2, 2, 288, t_sub, s2);
+                        if (t_sub < 2) dst[(size_t) (e + t_sub) * L.n_ff + r] = s2[t_sub];
+                    }
+                }
+                continue;
+            }
+            __syncthreads();
+            for (int idx = tid; idx < ne * kFastGuWords; idx += 256) {
+                const int c = idx / kFastGuWords, rem = idx - c * kFastGuWords;
+                s_x[idx] = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + c] * 72)[rem];
+            }
+            __syncthreads();
+            if (valid) {
+                if (ne <= 4) {
+                    int off4[4];
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) off4[c] = min(c, ne - 1) * 72;
+                    float s4[4];
+                    row_dot_sub8<46, 4, false, 288>(wr, sx, off4, ne, 288, t_sub, s4);
+                    if (t_sub < ne) dst[(size_t) (e + t_sub) * L.n_ff + r] = s4[t_sub];
+                } else {
+                    int off8[8];
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) off8[c] = min(c, ne - 1) * 72;
+                    float s8[8];
+                    row_dot_sub8<46, 8, false, 288>(wr, sx, off8, ne, 288, t_sub, s8);
+                    if (t_sub < ne) dst[(size_t) (e + t_sub) * L.n_ff + r] = s8[t_sub];
+                }
+            }
+        }
+    }
+}
+
+template<bool DEP = false>
+__device__ __forceinline__ void native_down_mxfp8_sx8_stage(dim3 block_idx, dim3 grid_dim, int tid,
+                                                            const unsigned long long* __restrict__ grp_ptr,
+                                                            const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups,
+                                                            const int32_t* __restrict__ ent_dst,
+                                                            const block_q8_1* __restrict__ hq,
+                                                            NativeExpertLayout L,
+                                                            float* __restrict__ out) {
+    if constexpr (DEP) {
+        pdl_wait();
+        pdl_launch_dependents();
+    }
+    const int ng = *n_groups;
+    if ((int) block_idx.y >= ng) return;
+    __shared__ __align__(16) uint32_t s_x[kFastMxfp8Cols * kFastDnWords];
+    const block_q8_1* sx = reinterpret_cast<const block_q8_1*>(s_x);
+    const int r_sub_off = tid >> 3, t_sub = tid & 7;
+    const int row0 = (int) block_idx.x * kFastMoeRows;
+    const int row = row0 + r_sub_off;
+    const bool valid = row < (int) L.n_embd;
+    const size_t w_off = valid ? L.down_off + (size_t) row * L.d_row : 0;
+    for (int gi = (int) block_idx.y; gi < ng; gi += (int) grid_dim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[gi] + w_off;
+        const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
+        for (int e = e0; e < e1; e += kFastMxfp8Cols) {
+            const int ne = min(kFastMxfp8Cols, e1 - e);
+            if (ne <= 2) {
+                if (valid) {
+                    if (ne == 1) {
+                        const int off1[1] = { e * 36 };
+                        float s1[1];
+                        row_dot_sub8<46, 1, true, 144>(wr, hq, off1, 1, 144, t_sub, s1);
+                        if (t_sub == 0) out[(size_t) ent_dst[e] * L.n_embd + row] = s1[0];
+                    } else {
+                        const int off2[2] = { e * 36, (e + 1) * 36 };
+                        float s2[2];
+                        row_dot_sub8<46, 2, true, 144>(wr, hq, off2, 2, 144, t_sub, s2);
+                        if (t_sub < 2) out[(size_t) ent_dst[e + t_sub] * L.n_embd + row] = s2[t_sub];
+                    }
+                }
+                continue;
+            }
+            __syncthreads();
+            for (int idx = tid; idx < ne * kFastDnWords; idx += 256) {
+                const int c = idx / kFastDnWords, rem = idx - c * kFastDnWords;
+                s_x[idx] = reinterpret_cast<const uint32_t*>(hq + (size_t) (e + c) * 36)[rem];
+            }
+            __syncthreads();
+            if (valid) {
+                if (ne <= 4) {
+                    int off4[4];
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) off4[c] = min(c, ne - 1) * 36;
+                    float s4[4];
+                    row_dot_sub8<46, 4, false, 144>(wr, sx, off4, ne, 144, t_sub, s4);
+                    if (t_sub < ne) out[(size_t) ent_dst[e + t_sub] * L.n_embd + row] = s4[t_sub];
+                } else {
+                    int off8[8];
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) off8[c] = min(c, ne - 1) * 36;
+                    float s8[8];
+                    row_dot_sub8<46, 8, false, 144>(wr, sx, off8, ne, 144, t_sub, s8);
+                    if (t_sub < ne) out[(size_t) ent_dst[e + t_sub] * L.n_embd + row] = s8[t_sub];
+                }
+            }
+        }
+    }
+}
+
 }  // namespace
