@@ -333,6 +333,7 @@ struct ConversationStore::Job {
 };
 
 struct ConversationStore::Entry {
+    uint64_t id = 0;                          ///< monotonic entry identity (stable across vector erasures)
     std::string name;                         ///< file name in the directory
     uint64_t key = 0, bytes = 0, used = 0;
     bool mine = true;                         ///< written under this identity (others count for the budget only)
@@ -539,6 +540,7 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
             continue;
         }
         auto e = std::make_unique<Entry>();
+        e->id = ++next_id_;
         e->name = f.name;
         e->bytes = f.bytes;
         e->used = ++clock_;
@@ -657,7 +659,7 @@ ConversationStore::Match ConversationStore::best(const int32_t* prompt, size_t n
         };
         auto consider = [&](int64_t len) {
             if (usable(len) && (len > best.tokens || (len == best.tokens && e.used > best_used))) {
-                best = {i, len};
+                best = {i, len, e.id};
                 best_used = e.used;
             }
         };
@@ -709,10 +711,19 @@ uint64_t kv_part_bytes(uint32_t kind, uint64_t stored, int64_t stored_cells, int
 
 }  // namespace
 
+ConversationStore::Entry* ConversationStore::find_entry_locked(const Match& m) const {
+    if (m.entry_id == 0) return nullptr;
+    if (m.index < entries_.size() && entries_[m.index]->id == m.entry_id) return entries_[m.index].get();
+    for (const auto& e : entries_)
+        if (e->id == m.entry_id) return e.get();
+    return nullptr;
+}
+
 uint64_t ConversationStore::load_bytes(const Match& m) const {
     std::lock_guard<std::mutex> lk(mu_);
-    if (m.index >= entries_.size()) return 0;
-    const Entry& e = *entries_[m.index];
+    const Entry* ep = find_entry_locked(m);
+    if (ep == nullptr) return 0;
+    const Entry& e = *ep;
     if (e.job) return e.job->image.bytes();   // an upper bound for a copy out of the queue
     uint64_t n = (uint64_t) m.tokens * 4 * 3, state = 0;
     for (const Section& s : e.table) {
@@ -743,8 +754,9 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     std::vector<uint8_t> kinds;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (m.index >= entries_.size() || m.tokens <= 0) { error = "conversation store: no such entry"; return false; }
-        Entry& e = *entries_[m.index];
+        Entry* ep = m.tokens > 0 ? find_entry_locked(m) : nullptr;
+        if (ep == nullptr) { error = "conversation store: no such entry"; return false; }
+        Entry& e = *ep;
         e.used = ++clock_;
         job = e.job;
         name = e.name;
@@ -1113,6 +1125,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     }
     job->image = std::move(image);
     auto e = std::make_unique<Entry>();
+    e->id = ++next_id_;
     e->name = job->name;
     e->key = job->key;
     e->bytes = bytes;
