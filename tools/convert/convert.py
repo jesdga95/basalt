@@ -66,7 +66,8 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
                      projections keep their codes and scales, FP8 ones their E4M3 codes, NVFP4 GDN a / b become BF16 of
                      their values, a BF16 head becomes FP8 E4M3 rows, the drafter's BF16 projections Q8_0, the vision
                      tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
-  --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
+  --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors;
+                     with a gemma4 checkpoint, Google's assistant drafter (google/gemma-4-*-it-assistant) as assistant.*
   --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
                      to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
 
@@ -869,7 +870,8 @@ def main():
                     help="with --checkpoint and a deepseek41 --sections-from: shards arrive in file order and are deleted once used")
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
-                    "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
+                    "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors; with a gemma4 "
+                    "--checkpoint: Google's assistant drafter added as assistant.* tensors")
     ap.add_argument("--head", choices=("fp8", "nvfp4"),
                     help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
                          "(default) or to NVFP4")
@@ -922,6 +924,12 @@ def main():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
+        if checkpoint_model_type(Path(a.checkpoint)) == "gemma4":
+            if a.head:
+                ap.error("--head goes with a qwen35 checkpoint")
+            import checkpoint_gemma4 as G
+            G.build(a, Job, fingerprint, die)
+            return
         if checkpoint_model_type(Path(a.checkpoint)) == "inkling2_loop":
             if a.drafter or a.head:
                 ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 carries its drafter")
