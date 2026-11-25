@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import io
 import logging
+import posixpath
 import re
 import threading
 import time
@@ -37,6 +38,9 @@ _OFFICE_TYPES = {"application/vnd.openxmlformats-officedocument.wordprocessingml
                  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint (.pptx)",
                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "Excel (.xlsx)"}
 MAX_PART_BYTES = 64 << 20           # one XML part of an Office file, unpacked
+MAX_OFFICE_BYTES = 64 << 20         # all XML parts read from one Office file together, unpacked
+MAX_OFFICE_ENTRIES = 10000          # archive entries allowed in one Office zip file
+MAX_OFFICE_PARTS = 1000             # XML parts read from one Office file (guards repeated refs)
 _TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml", "application/csv",
                "application/javascript", "application/x-sh")
 
@@ -132,7 +136,10 @@ def _anthropic(part: dict) -> tuple:
     context = part.get("context") if isinstance(part.get("context"), str) else None
     kind = src.get("type")
     if kind == "base64":
-        return _read(_b64(src.get("data"), "document source.data"), src.get("media_type") or "", name, context,
+        media = src.get("media_type")
+        if media is not None and not isinstance(media, str):
+            raise ValueError("a document's source.media_type must be a string")
+        return _read(_b64(src.get("data"), "document source.data"), media or "", name, context,
                      part.get("pages"))
     if kind == "text":
         if not isinstance(src.get("data"), str):
@@ -144,11 +151,14 @@ def _anthropic(part: dict) -> tuple:
             return (_text_item(_wrap(name, None, context, body)),)
         if not isinstance(body, list):
             raise ValueError("a content document's source.content must be a string or a list of blocks")
-        head, tail = _wrap(name, None, context, "\0").split("\0")
+        head, tail = _header(name, None, context), "\n</document>"
         items = [_text_item(head)]
         for block in body:
             if isinstance(block, dict) and block.get("type") == "text":
-                items.append(_text_item(block.get("text") or ""))
+                text = block.get("text")
+                if text is not None and not isinstance(text, str):
+                    raise ValueError("a content document's text block must have a string text")
+                items.append(_text_item(text or ""))
             elif isinstance(block, dict) and block.get("type") == "image":
                 items.append(block)
             else:
@@ -170,13 +180,17 @@ def _data_url(value, kind: str) -> tuple[str, bytes]:
     """file_data as (media type, bytes): a data: URL, or bare base64 as some clients send it."""
     if not isinstance(value, str):
         raise ValueError(f"{kind}: file_data must be a string")
-    m = re.match(r"data:([^;,]*)(;[^,]*)?,", value)
+    m = re.match(r"data:([^;,]*)(;[^,]*)?,", value, re.IGNORECASE)
     if not m:
         return "", _b64(value, f"{kind} file_data")
     body = value[m.end():]
-    if ";base64" not in (m.group(2) or ""):
+    params = [p.strip().lower() for p in (m.group(2) or "").split(";") if p.strip()]
+    if "base64" not in params:
         from urllib.parse import unquote_to_bytes
-        return m.group(1), unquote_to_bytes(body)
+        raw = unquote_to_bytes(body)
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            raise ValueError(f"{kind} file_data: a document is limited to {MAX_DOCUMENT_BYTES >> 20} MiB")
+        return m.group(1), raw
     return m.group(1), _b64(body, f"{kind} file_data")
 
 
@@ -194,6 +208,8 @@ def _b64(value, what: str) -> bytes:
 # ------------------------------------------------------------------------------------------------ reading
 def _read(data: bytes, media: str, name: str, context: str | None, want=None) -> tuple:
     """A document's items; `want` (a Basalt extension: "1-5,8") names the PDF pages to read, None all of them."""
+    if not isinstance(media, str):
+        raise ValueError(f"document {name!r}: media_type must be a string")
     media = media.split(";")[0].strip().lower()
     pdf = data[:1024].lstrip().startswith(b"%PDF-")
     if media == "application/pdf" or (pdf and media in ("", "application/octet-stream")):
@@ -352,8 +368,13 @@ def _office_kind(data: bytes) -> str | None:
         return None
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            names = set(z.namelist())
-    except (zipfile.BadZipFile, ValueError):
+            infos = z.infolist()
+            if len(infos) > MAX_OFFICE_ENTRIES:
+                raise ValueError(f"an Office archive has too many entries (more than {MAX_OFFICE_ENTRIES})")
+            names = {i.filename for i in infos}
+    except (zipfile.BadZipFile, ValueError) as e:
+        if isinstance(e, ValueError) and "too many entries" in str(e):
+            raise
         return None
     for part, kind in (("word/document.xml", "docx"), ("ppt/presentation.xml", "pptx"), ("xl/workbook.xml", "xlsx")):
         if part in names:
@@ -365,7 +386,12 @@ def _read_office(data: bytes, name: str, kind: str) -> tuple[str, str]:
     """(text, the frame's count attribute) of a Word, PowerPoint or Excel file."""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            part = lambda path: _xml(z, path)   # noqa: E731
+            infos = z.infolist()
+            if len(infos) > MAX_OFFICE_ENTRIES:
+                raise ValueError(f"document {name!r}: too many entries in the {kind} archive (limit {MAX_OFFICE_ENTRIES})")
+            names = {i.filename for i in infos}
+            state = [0, 0]   # [cumulative unpacked bytes read, XML parts read]
+            part = lambda path: _xml(z, path, state)   # noqa: E731
             if kind == "docx":
                 return _docx(part("word/document.xml")), ""
             if kind == "pptx":
@@ -377,7 +403,7 @@ def _read_office(data: bytes, name: str, kind: str) -> tuple[str, str]:
             sheets = _targets(part, "xl/workbook.xml", "xl/_rels/workbook.xml.rels", "xl/", f"{_PR}Relationship",
                               "sheets")
             shared = [_text_of_node(si, f"{_S}t") for si in part("xl/sharedStrings.xml").iter(f"{_S}si")] \
-                if "xl/sharedStrings.xml" in z.namelist() else []
+                if "xl/sharedStrings.xml" in names else []
             body = "\n\n".join(f"[sheet {title}]\n" + _sheet(part(path), shared) for title, path in sheets)
             return body, f'sheets="{len(sheets)}"'
     except ValueError:
@@ -386,25 +412,50 @@ def _read_office(data: bytes, name: str, kind: str) -> tuple[str, str]:
         raise ValueError(f"document {name!r} could not be read as a {kind} file: {e}") from None
 
 
-def _xml(z: zipfile.ZipFile, path: str):
+def _xml(z: zipfile.ZipFile, path: str, state: list[int] | None = None):
+    if state is not None:
+        state[1] += 1
+        if state[1] > MAX_OFFICE_PARTS:
+            raise ValueError(f"an Office file has more than {MAX_OFFICE_PARTS} XML parts")
     info = z.getinfo(path)
     if info.file_size > MAX_PART_BYTES:
         raise ValueError(f"an Office part is larger than {MAX_PART_BYTES >> 20} MiB unpacked")
+    remaining = MAX_OFFICE_BYTES - state[0] if state is not None else MAX_PART_BYTES
+    if info.file_size > remaining:
+        raise ValueError(f"an Office file is larger than {MAX_OFFICE_BYTES >> 20} MiB unpacked")
+    cap = min(MAX_PART_BYTES, remaining)
     with z.open(info) as f:
-        raw = f.read(MAX_PART_BYTES + 1)
+        raw = f.read(cap + 1)
     if len(raw) > MAX_PART_BYTES:
         raise ValueError(f"an Office part is larger than {MAX_PART_BYTES >> 20} MiB unpacked")
+    if len(raw) > remaining:
+        raise ValueError(f"an Office file is larger than {MAX_OFFICE_BYTES >> 20} MiB unpacked")
+    if state is not None:
+        state[0] += len(raw)
     return ElementTree.fromstring(raw)
+
+
+def _resolve_ooxml_target(base: str, target: str) -> str:
+    """Resolve an OOXML relationship Target against `base` (handling ./, ../, leading /, and backslashes)."""
+    target = target.replace("\\", "/")
+    raw = target.lstrip("/") if target.startswith("/") else base + target
+    norm = posixpath.normpath(raw).lstrip("/")
+    if norm in ("", ".", "..") or norm.startswith("../"):
+        return ""
+    return norm
 
 
 def _targets(part, main: str, rels: str, base: str, rel_tag: str, list_tag: str) -> list[tuple[str, str]]:
     """(name, part path) of the slides or sheets `main` lists, in its order, through its relationships."""
-    links = {r.get("Id"): r.get("Target", "") for r in part(rels).iter(rel_tag)}
+    links = {r.get("Id"): r.get("Target", "") for r in part(rels).iter(rel_tag)
+             if (r.get("TargetMode") or "").lower() != "external"}
     out = []
     for node in next((n for n in part(main).iter() if n.tag.endswith("}" + list_tag)), ElementTree.Element("x")):
         target = links.get(node.get(f"{_R}id"), "")
         if target:
-            out.append((node.get("name") or "", target.lstrip("/") if target.startswith("/") else base + target))
+            resolved = _resolve_ooxml_target(base, target)
+            if resolved:
+                out.append((node.get("name") or "", resolved))
     return out
 
 

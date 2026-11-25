@@ -333,6 +333,48 @@ class OfficeFiles(unittest.TestCase):
                 self.read(office({"word/document.xml": f"<w:document {W}>" + " " * 200 + "</w:document>"}))
             self.assertIn("larger than", str(e.exception))
 
+    def test_relative_ooxml_targets_and_external_links_ignored(self):
+        rel_pptx = office({
+            "ppt/presentation.xml": f'<p:presentation xmlns:p="x" {R}><p:sldIdLst>'
+            '<p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rIdExt"/>'
+            '<p:sldId r:id="rIdEsc"/></p:sldIdLst></p:presentation>',
+            "ppt/_rels/presentation.xml.rels": f'<Relationships {PR}>'
+            '<Relationship Id="rId1" Target="./slides/slide1.xml"/>'
+            '<Relationship Id="rId2" Target="../ppt/slides/slide2.xml"/>'
+            '<Relationship Id="rIdExt" Target="https://example.com/x.xml" TargetMode="External"/>'
+            '<Relationship Id="rIdEsc" Target="../../outside.xml"/></Relationships>',
+            "ppt/slides/slide1.xml": f'<p:sld xmlns:p="x" {A}><a:p><a:r><a:t>One</a:t></a:r></a:p></p:sld>',
+            "ppt/slides/slide2.xml": f'<p:sld xmlns:p="x" {A}><a:p><a:r><a:t>Two</a:t></a:r></a:p></p:sld>',
+        })
+        self.assertEqual(self.read(rel_pptx, name="rel.pptx"),
+                         '<document name="rel.pptx" slides="2">\n[slide 1]\nOne\n\n[slide 2]\nTwo\n</document>')
+
+    def test_zip_bomb_cumulative_bytes_parts_and_entries_caps(self):
+        # Cumulative unpacked bytes across multiple slides (each < MAX_PART_BYTES) exceeds MAX_OFFICE_BYTES
+        slide_xml = f'<p:sld xmlns:p="x" {A}><a:p><a:r><a:t>' + ("A" * 200) + '</a:t></a:r></a:p></p:sld>'
+        multi_slide = office({
+            "ppt/presentation.xml": f'<p:presentation xmlns:p="x" {R}><p:sldIdLst>'
+            + "".join(f'<p:sldId r:id="rId{k}"/>' for k in range(1, 5)) + '</p:sldIdLst></p:presentation>',
+            "ppt/_rels/presentation.xml.rels": f'<Relationships {PR}>'
+            + "".join(f'<Relationship Id="rId{k}" Target="slides/slide{k}.xml"/>' for k in range(1, 5))
+            + '</Relationships>',
+            **{f"ppt/slides/slide{k}.xml": slide_xml for k in range(1, 5)},
+        })
+        with mock.patch.object(documents, "MAX_OFFICE_BYTES", 800):
+            with self.assertRaises(ValueError) as e:
+                self.read(multi_slide, name="bomb.pptx")
+            self.assertIn("larger than", str(e.exception))
+        # Repeated references to the same slide hit MAX_OFFICE_PARTS
+        with mock.patch.object(documents, "MAX_OFFICE_PARTS", 4):
+            with self.assertRaises(ValueError) as e:
+                self.read(multi_slide, name="many.pptx")
+            self.assertIn("more than", str(e.exception))
+        # Archive entry count cap
+        with mock.patch.object(documents, "MAX_OFFICE_ENTRIES", 3):
+            with self.assertRaises(ValueError) as e:
+                self.read(multi_slide, name="entries.pptx")
+            self.assertIn("too many entries", str(e.exception))
+
 
 class Refusals(unittest.TestCase):
     def refused(self, block: dict, words: str):
@@ -377,6 +419,29 @@ class Refusals(unittest.TestCase):
         with mock.patch.object(documents, "MAX_PAGES", 1):
             documents._cache.clear()
             self.refused(anthropic_doc(PAPER), "2 pages; at most 1 are read")
+
+    def test_malformed_types_context_nul_and_case_insensitive_data_url(self):
+        # non-str media_type raises ValueError, not AttributeError
+        self.refused({"type": "document", "source": {"type": "base64", "media_type": 123, "data": b64(b"hi")}},
+                     "media_type must be a string")
+        # non-str text inside content document raises ValueError
+        self.refused({"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": 99}]}},
+                     "string text")
+        # NUL inside context does not crash content document framing
+        msgs, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "document", "title": "deck", "context": "a\0b",
+             "source": {"type": "content", "content": [{"type": "text", "text": "slide 1"}]}}]}]})
+        self.assertIn("<context>a\0b</context>", msgs[0]["content"])
+        self.assertIn("slide 1", msgs[0]["content"])
+        # case-insensitive data: URL scheme and ;BASE64 parameter
+        upper_url = "DATA:TEXT/PLAIN;charset=utf-8;BASE64," + b64(b"hello case")
+        chat, _, _ = openai_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"filename": "a.txt", "file_data": upper_url}}]}]})
+        self.assertEqual(chat[0]["content"], '<document name="a.txt">\nhello case\n</document>')
+        plain_url = "Data:text/plain,hello%20world"
+        chat2, _, _ = openai_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"filename": "b.txt", "file_data": plain_url}}]}]})
+        self.assertEqual(chat2[0]["content"], '<document name="b.txt">\nhello world\n</document>')
 
 
 class ByUrlOrPath(unittest.TestCase):
