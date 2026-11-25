@@ -37,6 +37,8 @@ protected:
     float req_relax{};
     int req_ppl{};
     int req_ppl_t{};
+    long long req_score{};
+    int req_score_top{};
     int req_clip{};
     int req_logprobs{};   // logprobs=K: a P line ahead of every sent pick, with the K likeliest tokens (-1: off)
     std::vector<float> req_bias{};
@@ -134,7 +136,8 @@ protected:
     virtual Flow prepare_image() = 0;
     /// Once the prompt is known and fits the context: the room its slot's KV takes (Flow::next: the request does not run now).
     virtual Flow admit_room() { return Flow::proceed; }
-    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window.
+    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window; `score=N`: the request's
+    /// ids as the stream, its prompt cut to ids[0..N].
     Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
     virtual Flow decode() = 0;
