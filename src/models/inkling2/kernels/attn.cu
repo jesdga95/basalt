@@ -1049,49 +1049,104 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_mma_split_kernel(AttnArgs
     }
 }
 
-// A block per (row, head), a thread a channel: the row's slices merged with the sink, gated, written in fp32 and/or as
-// q8_1 (a warp a block of 32 channels).
-__global__ void __launch_bounds__(kHeadDim) attn_combine_kernel(AttnArgs a, int z, int mma_z, const float* __restrict__ part_ml,
-                                                                const float* __restrict__ part_acc, float* __restrict__ out) {
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
-    const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+// A 32-thread warp block per (row, head, 32-channel Q8_1 block): merges the row's slices with the sink, gates, and
+// writes fp32 and/or q8_1 while keeping 96*rows blocks active across SMs with coalesced part_ml reads and 8-way MLP.
+__global__ void __launch_bounds__(32) attn_combine_kernel(AttnArgs a, int z, int mma_z, const float* __restrict__ part_ml,
+                                                          const float* __restrict__ part_acc, float* __restrict__ out) {
+    __shared__ float sm_f[kMaxSplits], sm_l[kMaxSplits];
+    const int r = blockIdx.x, h = blockIdx.y >> 2, wb = blockIdx.y & 3, lane = threadIdx.x;
+    const int d = wb * 32 + lane;
+    const int c = h * kHeadDim + d;
     int p, lo, n;
     row_keys(a, r, p, lo, n);
+    const float gmul = a.gate ? (1.f / (1.f + expf(-a.gate[(size_t) r * a.gate_ld + c]))) : 1.f;
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
     const size_t base = ((size_t) r * kHeads + h) * z;
     const float t = a.sink[(size_t) r * kHeads + h];
     float mm = t, ll = 0.f, aa = 0.f;
     if (mma_z > 0 && a.window > 0) {
-        const int k0 = lo >> 6, k1 = p >> 6;
-        for (int k = k0; k <= k1; ++k) mm = fmaxf(mm, part_ml[(base + (k & (kWindowMmaSplits - 1))) * 2]);
+        const int k0 = lo >> 6, k1 = p >> 6, cnt = k1 - k0 + 1;
+        float mlane = t;
+        for (int i = lane; i < cnt; i += 32) {
+            const int s = (k0 + i) & (kWindowMmaSplits - 1);
+            const float2 ml = *reinterpret_cast<const float2*>(part_ml + (base + s) * 2);
+            sm_f[i] = ml.x;
+            sm_l[i] = ml.y;
+            mlane = fmaxf(mlane, ml.x);
+        }
+        mm = warp_max(mlane);
+        __syncwarp();
+        for (int i = lane; i < cnt; i += 32) sm_f[i] = expf(sm_f[i] - mm);
+        __syncwarp();
         ll = expf(t - mm);
-        for (int k = k0; k <= k1; ++k) {
-            const int s = k & (kWindowMmaSplits - 1);
-            const float f = expf(part_ml[(base + s) * 2] - mm);
-            ll = fmaf(part_ml[(base + s) * 2 + 1], f, ll);
-            aa = fmaf(part_acc[(base + s) * kHeadDim + d], f, aa);
+        const float* pa = part_acc + base * kHeadDim + d;
+        int i = 0;
+        for (; i + 4 <= cnt; i += 4) {
+            const float a0 = pa[((k0 + i + 0) & (kWindowMmaSplits - 1)) * kHeadDim];
+            const float a1 = pa[((k0 + i + 1) & (kWindowMmaSplits - 1)) * kHeadDim];
+            const float a2 = pa[((k0 + i + 2) & (kWindowMmaSplits - 1)) * kHeadDim];
+            const float a3 = pa[((k0 + i + 3) & (kWindowMmaSplits - 1)) * kHeadDim];
+            ll = fmaf(sm_l[i + 0], sm_f[i + 0], ll); aa = fmaf(a0, sm_f[i + 0], aa);
+            ll = fmaf(sm_l[i + 1], sm_f[i + 1], ll); aa = fmaf(a1, sm_f[i + 1], aa);
+            ll = fmaf(sm_l[i + 2], sm_f[i + 2], ll); aa = fmaf(a2, sm_f[i + 2], aa);
+            ll = fmaf(sm_l[i + 3], sm_f[i + 3], ll); aa = fmaf(a3, sm_f[i + 3], aa);
+        }
+        for (; i < cnt; ++i) {
+            const float a0 = pa[((k0 + i) & (kWindowMmaSplits - 1)) * kHeadDim];
+            ll = fmaf(sm_l[i], sm_f[i], ll);
+            aa = fmaf(a0, sm_f[i], aa);
         }
     } else {
         const int splits = mma_z > 0 ? min(mma_z, (n + 63) / 64) : (n + span_of(n) - 1) / span_of(n);
-        for (int s = 0; s < splits; ++s) mm = fmaxf(mm, part_ml[(base + s) * 2]);
+        float mlane = t;
+        for (int s = lane; s < splits; s += 32) {
+            const float2 ml = *reinterpret_cast<const float2*>(part_ml + (base + s) * 2);
+            sm_f[s] = ml.x;
+            sm_l[s] = ml.y;
+            mlane = fmaxf(mlane, ml.x);
+        }
+        mm = warp_max(mlane);
+        __syncwarp();
+        for (int s = lane; s < splits; s += 32) sm_f[s] = expf(sm_f[s] - mm);
+        __syncwarp();
         ll = expf(t - mm);
-        for (int s = 0; s < splits; ++s) {
-            const float f = expf(part_ml[(base + s) * 2] - mm);
-            ll = fmaf(part_ml[(base + s) * 2 + 1], f, ll);
-            aa = fmaf(part_acc[(base + s) * kHeadDim + d], f, aa);
+        const float* pa = part_acc + base * kHeadDim + d;
+        int s = 0;
+        for (; s + 8 <= splits; s += 8) {
+            const float a0 = pa[(s + 0) * kHeadDim];
+            const float a1 = pa[(s + 1) * kHeadDim];
+            const float a2 = pa[(s + 2) * kHeadDim];
+            const float a3 = pa[(s + 3) * kHeadDim];
+            const float a4 = pa[(s + 4) * kHeadDim];
+            const float a5 = pa[(s + 5) * kHeadDim];
+            const float a6 = pa[(s + 6) * kHeadDim];
+            const float a7 = pa[(s + 7) * kHeadDim];
+            ll = fmaf(sm_l[s + 0], sm_f[s + 0], ll); aa = fmaf(a0, sm_f[s + 0], aa);
+            ll = fmaf(sm_l[s + 1], sm_f[s + 1], ll); aa = fmaf(a1, sm_f[s + 1], aa);
+            ll = fmaf(sm_l[s + 2], sm_f[s + 2], ll); aa = fmaf(a2, sm_f[s + 2], aa);
+            ll = fmaf(sm_l[s + 3], sm_f[s + 3], ll); aa = fmaf(a3, sm_f[s + 3], aa);
+            ll = fmaf(sm_l[s + 4], sm_f[s + 4], ll); aa = fmaf(a4, sm_f[s + 4], aa);
+            ll = fmaf(sm_l[s + 5], sm_f[s + 5], ll); aa = fmaf(a5, sm_f[s + 5], aa);
+            ll = fmaf(sm_l[s + 6], sm_f[s + 6], ll); aa = fmaf(a6, sm_f[s + 6], aa);
+            ll = fmaf(sm_l[s + 7], sm_f[s + 7], ll); aa = fmaf(a7, sm_f[s + 7], aa);
+        }
+        for (; s < splits; ++s) {
+            const float a0 = pa[s * kHeadDim];
+            ll = fmaf(sm_l[s], sm_f[s], ll);
+            aa = fmaf(a0, sm_f[s], aa);
         }
     }
     float o = aa / ll;
-    const int c = h * kHeadDim + d;
-    if (a.gate) o *= 1.f / (1.f + expf(-a.gate[(size_t) r * a.gate_ld + c]));
+    if (a.gate) o *= gmul;
     if (out) out[(size_t) r * kHeads * kHeadDim + c] = o;
     if (a.q8) {
         const float amax = warp_max(fabsf(o));
         const float sum = warp_sum(o);
         const float dq = bk::q8_1_finite(amax / 127.0f);
         Q81& b = reinterpret_cast<Q81*>(a.q8)[(size_t) r * (kHeads * kHeadDim / 32) + c / 32];
-        b.qs[c % 32] = bk::q8_1_quant(o, dq, amax);
-        if ((c & 31) == 0) b.ds = bk::q8_1_ds(dq, sum);
+        b.qs[lane] = bk::q8_1_quant(o, dq, amax);
+        if (lane == 0) b.ds = bk::q8_1_ds(dq, sum);
     }
 }
 
@@ -1758,7 +1813,7 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
         else bk::launch_pdl(attn_split_kernel<false, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     }
     check("attention_decode");
-    bk::launch_pdl(attn_combine_kernel, dim3((unsigned) rows, kHeads), dim3(kHeadDim), 0, s, a, z, use_mma ? mma_z : 0, (const float*) part_ml, (const float*) part_acc, out);
+    bk::launch_pdl(attn_combine_kernel, dim3((unsigned) rows, kHeads * (kHeadDim / 32)), dim3(32), 0, s, a, z, use_mma ? mma_z : 0, (const float*) part_ml, (const float*) part_acc, out);
     check("attention_decode/combine");
     return true;
 }
