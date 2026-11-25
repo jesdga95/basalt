@@ -1,8 +1,9 @@
 // tests/models/qwen4exp/kernels/qsa_dec_attn_parity.cpp - qsa_dec_attn against qsa_decode_attn_batch (+ native_qsa_gate_apply), bitwise,
-// on random INT8 and FP16 pools through a permuted page table with masked pages; then a microbench of both.
+// on random Q4_0, INT8 and FP16 pools through a permuted page table with masked pages.
 //   qsa_dec_attn_parity [iters]
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/native_qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
@@ -72,6 +73,26 @@ int main(int argc, char** argv) {
             up(which ? p.vp : p.kp, hp);
         }
     }
+    const int q4_blocks = D / k::QK4_0;
+    std::mt19937 q4_rng(13);
+    std::vector<k::block_q4_0> q4[2];
+    uint8_t* q4_pool[2];
+    for (int plane = 0; plane < 2; ++plane) {
+        q4[plane].resize(rows * q4_blocks);
+        for (auto& b : q4[plane]) {
+            b.d = f16((q4_rng() & 1 ? 1.0f : -1.0f) * ud(q4_rng));
+            for (auto& code : b.qs) code = (uint8_t) q4_rng();
+        }
+        auto* pool = dalloc<k::block_q4_0>(q4[plane].size());
+        up(pool, q4[plane]);
+        q4_pool[plane] = reinterpret_cast<uint8_t*>(pool);
+    }
+    auto dequant_q4 = [&](int plane, size_t row, int d) {
+        const auto& b = q4[plane][row * q4_blocks + d / k::QK4_0];
+        const int i = d % k::QK4_0;
+        const int code = (b.qs[i % (k::QK4_0 / 2)] >> (i < k::QK4_0 / 2 ? 0 : 4)) & 15;
+        return (double) (code - 8) * __half2float(__ushort_as_half(b.d));
+    };
     std::vector<int32_t> table(pages);
     for (int i = 0; i < pages; ++i) table[i] = i;
     std::shuffle(table.begin(), table.end(), rng);
@@ -101,6 +122,7 @@ int main(int argc, char** argv) {
         k::QsaAttnPools a;
         a.page_table = p.table;
         if (mode == 1) { a.k_q = p.kq; a.v_q = p.vq; a.k_scale = p.ks; a.v_scale = p.vs; }
+        else if (mode == 5) { a.k_q4 = q4_pool[0]; a.v_q4 = q4_pool[1]; }
         else { a.k_pool = p.kp; a.v_pool = p.vp; }
         return a;
     };
@@ -158,13 +180,66 @@ int main(int argc, char** argv) {
         if (bad || gbad) ++g_fail;
         std::printf("%-34s mode %d cap %5d nq %d: %s (attn %zu / gated %zu of %zu differ, max |d| %.3g)\n", label, mode, cap,
                     n_q, bad || gbad ? "FAIL" : "bitwise", bad, gbad, n, maxd);
+        if (mode == 5) {
+            const auto hq = down(q, n);
+            double max_ref = 0.0, max_error = 0.0, rel_l2 = 0.0, ref_l2 = 0.0;
+            size_t batch_diff = 0;
+            for (int i = 0; i < n_q; ++i) {
+                const size_t query = (size_t) i * NH * D;
+                k::qsa_dec_attn(q + query, a, ids + (size_t) i * cap, steps + (size_t) i * k::kStepCount, w[i],
+                                s, scr_new, out_fm, 1, st);
+                ck(cudaStreamSynchronize(st), "single query");
+                const auto single = down(out_fm, (size_t) NH * D);
+                for (size_t j = 0; j < single.size(); ++j)
+                    batch_diff += std::memcmp(&single[j], &x[query + j], sizeof(float)) != 0;
+
+                for (int head = 0; head < NH; ++head) {
+                    const size_t offset = query + (size_t) head * D;
+                    const int kvh = head / (NH / H);
+                    std::vector<double> scores;
+                    std::vector<size_t> selected;
+                    for (int j = 0; j < w[i]; ++j) {
+                        const int cell = hid[(size_t) i * cap + j], page = tb[cell / P];
+                        if (page < 0) continue;
+                        const size_t row = ((size_t) page * H + kvh) * P + cell % P;
+                        double dot = 0.0;
+                        for (int d = 0; d < D; ++d) dot += hq[offset + d] * dequant_q4(0, row, d);
+                        scores.push_back(dot / std::sqrt((double) D));
+                        selected.push_back(row);
+                    }
+                    std::vector<double> acc(D);
+                    double sum = 0.0;
+                    if (!scores.empty()) {
+                        const double max_score = *std::max_element(scores.begin(), scores.end());
+                        for (size_t j = 0; j < scores.size(); ++j) {
+                            const double weight = std::exp(scores[j] - max_score);
+                            sum += weight;
+                            for (int d = 0; d < D; ++d) acc[d] += weight * dequant_q4(1, selected[j], d);
+                        }
+                    }
+                    for (int d = 0; d < D; ++d) {
+                        const double ref = sum > 0.0 ? acc[d] / sum : 0.0;
+                        const double error = ref - x[offset + d];
+                        max_ref = std::max(max_ref, std::fabs(ref));
+                        max_error = std::max(max_error, std::fabs(error));
+                        ref_l2 += ref * ref;
+                        rel_l2 += error * error;
+                    }
+                }
+            }
+            const bool ok = batch_diff == 0 && max_error <= 1e-5 * std::max(max_ref, 1e-6);
+            if (!ok) ++g_fail;
+            std::printf("   Q4_0 CPU: max abs %.3g | relative L2 %.3g | solo vs batched %zu differ | %s\n",
+                        max_error, std::sqrt(rel_l2 / std::max(ref_l2, 1e-30)), batch_diff, ok ? "ok" : "FAIL");
+        }
         if (bench) {
             cudaEvent_t e0, e1;
             cudaEventCreate(&e0);
             cudaEventCreate(&e1);
             double bytes = 0;
             for (int i = 0; i < n_q; ++i)
-                bytes += (double) w[i] * H * (mode == 1 ? (2.0 * D + 2.0 * (D / 64) * 2) : 4.0 * D) + 4.0 * w[i];
+                bytes += (double) w[i] * H * (mode == 1 ? (2.0 * D + 2.0 * (D / 64) * 2) :
+                         mode == 5 ? 2.0 * k::kv_q4_bytes_per_head(D) : 4.0 * D) + 4.0 * w[i];
             float ms_ref = 0, ms_new = 0;
             for (int rep = 0; rep < 2; ++rep) {
                 cudaEventRecord(e0, st);
@@ -209,6 +284,10 @@ int main(int argc, char** argv) {
         run_case(mode, 4096, 1, {4096}, false, true, true, "draft window 4096");
         run_case(mode, 4096, 1, {1250}, false, true, true, "draft window, 1250 cells");
     }
+    run_case(5, cap, 1, {1}, false, true, false, "first cell");
+    run_case(5, cap, 3, {63, 64, 65}, false, true, true, "chunk edges");
+    run_case(5, cap, 5, {cap, 1700, 900, 300, 2000}, true, false, true, "masked pages");
+    run_case(5, cap, 8, {cap, cap, cap, cap, cap, cap, cap, cap}, false, false, true, "T=8 full");
 
     // ---- the draft layer's wide window (qsa_dec_attn takes tensor-core chunks of up to 256 cells there, not bitwise):
     // against the reference batch kernel and a double-precision CPU reference

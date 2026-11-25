@@ -237,7 +237,7 @@ struct Options {
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec;                    // --spec N: the engine argument of the same name
-    std::string gpu;                     // --gpu: the cards (gpu_select.hpp); one after -- wins
+    std::string gpu, gpu_mode, gpu_share;   // --gpu, --gpu-mode, --gpu-share: the cards (gpu_select.hpp); one after -- wins
     std::vector<std::string> decode;     // -t: conv, struct, prose
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
@@ -245,7 +245,7 @@ struct Options {
     bool quality = false, no_windows = false, print_command = false;
     bool community = false, hardware = false;
     std::string submitter;
-    std::string community_file;          // --community-file: the table the row is added to
+    std::string community_dir;           // --community-dir: the community folder the run file is written under
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
@@ -277,24 +277,25 @@ void usage(const std::string& engine) {
         "                     where the model takes it, else the KV format the model's adapter names for community rows, else its own default (the row records the model and the\n"
         "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
-        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it; a row of the same\n"
-        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system) is replaced in place and keeps its notes. prefill_16k_tps and\n"
+        "                     every number is cold. Prints the table, writes the row to its own file, runs/MODEL/ID.json, and prints it; the ID is a hash of the\n"
+        "                     setup (submitter, model, quant, GPUs, CPU, RAM, system), so a run of the same setup overwrites its file and keeps its notes. prefill_16k_tps and\n"
         "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
         "                     PCIe link (maximum generation and width) and the pinned host-to-device copy speed, measured before the engine starts; decode_tps = tokens / decode time\n"
         "                     summed over conv, struct and prose (token-weighted); the per-fixture decode speeds, acceptance and draft length and the engine\n"
         "                     arguments are recorded too. Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
-        "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
+        "                     --model, --submitter, --community-dir, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
         "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
-        "  --community-file PATH  the benchmarks.json the row is added to (default: docs/community/benchmarks.json of the\n"
-        "                     checkout this build came from); when it cannot be written the row is printed instead\n"
+        "  --community-dir DIR  the community folder the run file is written under, DIR/runs/MODEL/ID.json (default: docs/community\n"
+        "                     of the checkout this build came from); when it cannot be written the row is printed instead\n"
         "\n"
         "  --hardware         measure and print this machine's CPU, RAM read speed and, per GPU, PCIe link and\n"
         "                     host-to-device copy speed (the figures --community records), then exit; no model, no engine\n"
         "\n"
         "engine\n"
         "  --model FILE       a .basalt model file\n"
-        "  --gpu A,B,..|auto  the GPUs, as for the server and the engine (default: GPU 0 alone). Every\n"
+        "  --gpu A,B,..|all   the GPUs, as for the server and the engine (default: GPU 0 alone); --gpu-mode MODE and\n"
+        "                     --gpu-share A,B,.. as for the engine (two or more GPUs need a mode; --community takes all three). Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
         "  --engine BIN       engine binary (default: basalt beside this program, else the build's)\n"
@@ -376,9 +377,11 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--community") o.community = true;
         else if (a == "--gpu") o.gpu = next("--gpu");
+        else if (a == "--gpu-mode") o.gpu_mode = next("--gpu-mode");
+        else if (a == "--gpu-share") o.gpu_share = next("--gpu-share");
         else if (a == "--hardware") o.hardware = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
-        else if (a == "--community-file") o.community_file = next("--community-file");
+        else if (a == "--community-dir") o.community_dir = next("--community-dir");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
@@ -427,7 +430,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
-                        : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -437,7 +440,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         // an engine flag is refused first (in main, which asks the engine whether it is lossy): a run with one needs no submitter
         if (o.passthrough.empty() && o.sets.empty() && !community_submitter_error(o, err).empty()) return false;
     }
-    if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
+    if (!o.community_dir.empty() && !o.community) { err = "--community-dir needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
     if (o.format != "md" && o.format != "json") { err = "-o takes md or json"; return false; }
     if (o.quality_chunks < 1 || o.quality_t < 1) { err = "--quality and --quality-t need values >= 1"; return false; }
@@ -673,7 +676,10 @@ std::string hardware_text(const Hardware& h, const std::vector<std::pair<std::st
     for (const auto& c : cards) {
         const double g = h2d_of(h, c.first);
         const std::string link = pcie_text(c.second);
-        t += "  GPU   " + short_card(c.second.name) + "  PCIe " + (link.empty() ? std::string("unknown") : link) +
+        // an integrated GPU (NVML gives it no memory size) has no PCIe link, whatever NVML answers for one
+        const std::string where = c.second.vram_gib <= 0 ? std::string("integrated")
+                                                         : "PCIe " + (link.empty() ? std::string("unknown") : link);
+        t += "  GPU   " + short_card(c.second.name) + "  " + where +
              (g > 0 ? fmt("  host-to-device %.1f GB/s", g) : std::string("  host-to-device not measured")) + "\n";
     }
     return t;
@@ -758,19 +764,30 @@ int main(int argc, char** argv) {
     if (!o.model.empty()) {
         std::string gerr;
         std::vector<basalt::program::GpuCard> used;
-        // a community run uses every visible card; CUDA_VISIBLE_DEVICES picks them
-        const std::string want = o.community ? "auto" : has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
-        if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
+        // a community run takes the user's cards and mode like any other, and its row records them in engine_args
+        const auto given = [&](const char* flag, const std::string& own) { return has_arg(args, flag) ? arg_value(args, flag) : own; };
+        const std::string want = given("--gpu", o.gpu), mode = given("--gpu-mode", o.gpu_mode), share = given("--gpu-share", o.gpu_share);
+        if (!basalt::program::select_gpus(want, mode, share, "basalt-bench", gpu_value, used, gerr)) {
             basalt::log::error("basalt-bench", "%s", gerr.c_str());
             return 2;
         }
         set_arg(args, "--gpu", gpu_value);
+        if (!mode.empty()) set_arg(args, "--gpu-mode", mode);
+        if (!share.empty()) set_arg(args, "--gpu-share", share);
     }
     // the plan probes ask about these cards and not about GPU 0: on a box whose first visible card is not the main
     // card's architecture - a Blackwell card with an older expert-tier peer, where enumeration may name the older
     // one first - a probe at --gpu 0 plans an engine that could never start, and an answer with no plan in it has
     // no model name in it either.  A probe is not a measurement, so a row made this way is the same row.
     const std::string probe_gpu = gpu_value.empty() ? std::string("0") : gpu_value;
+    // the model, then the cards as the run has them (cards, mode, shares), then `tail`: what a plan probe passes the engine
+    const auto probe_args = [&](const std::string& model, const std::vector<std::string>& tail) {
+        std::vector<std::string> v = {"--model", model, "--gpu", probe_gpu};
+        for (const char* flag : {"--gpu-mode", "--gpu-share"})
+            if (has_arg(args, flag)) v.insert(v.end(), {flag, arg_value(args, flag)});
+        v.insert(v.end(), tail.begin(), tail.end());
+        return v;
+    };
     if (o.community && (!o.passthrough.empty() || !o.sets.empty())) {
         // any engine flag is refused; the engine's plan for them says which are lossy, so the refusal can name those
         std::vector<std::string> extra = o.passthrough;
@@ -778,7 +795,7 @@ int main(int argc, char** argv) {
             extra.push_back(kv.first);
             extra.push_back(kv.second);
         }
-        std::vector<std::string> plan_args = {"--model", fs::absolute(o.model).string(), "--gpu", probe_gpu};
+        std::vector<std::string> plan_args = probe_args(fs::absolute(o.model).string(), {});
         merge_args(plan_args, extra);
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
@@ -801,7 +818,7 @@ int main(int argc, char** argv) {
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
         const std::string abs_model = fs::absolute(o.model).string();
-        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu}, plan_log, answer);
+        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, probe_args(abs_model, {}), plan_log, answer);
         if (o.community) {
             community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
             community_arch = basalt::program::plan_field(answer, "arch");
@@ -809,10 +826,10 @@ int main(int argc, char** argv) {
             if (asked != 0) community_plan_err = plan_complaint(plan_log);   // read it before the probes below reuse the log
             // the cache format users run, when the engine accepts one of the flags for this model
             std::string unused;
-            if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", "int8"}, plan_log, unused) == 0) community_kv = "int8";
+            if (engine_plan(engine_bin, probe_args(abs_model, {"--kv", "int8"}), plan_log, unused) == 0) community_kv = "int8";
             // else the format the model's adapter names for community rows; a model that names none runs its default
             else if (!adapter_kv.empty() &&
-                     engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", adapter_kv}, plan_log, unused) == 0) community_kv = adapter_kv;
+                     engine_plan(engine_bin, probe_args(abs_model, {"--kv", adapter_kv}), plan_log, unused) == 0) community_kv = adapter_kv;
         }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
@@ -822,7 +839,7 @@ int main(int argc, char** argv) {
     if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id()) + ".log";
-        const int asked = engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", probe_gpu, "--ppl-base", o.kld_base}, plan_log, answer);
+        const int asked = engine_plan(engine_bin, probe_args(fs::absolute(o.model).string(), {"--ppl-base", o.kld_base}), plan_log, answer);
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
         if (asked != 0) {
@@ -1192,7 +1209,10 @@ int main(int argc, char** argv) {
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
-    if (power == "unknown") basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
+    // an integrated GPU has no power limit NVML reads (a GB10's is the system's): no warning, the table says unknown
+    const bool primary_integrated = have_primary && primary.vram_gib <= 0;
+    if (power == "unknown" && !primary_integrated)
+        basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
 
     // one table row per test: values over the repetitions
     struct Row {
@@ -1295,9 +1315,31 @@ int main(int argc, char** argv) {
         }
         std::string gpu_err;
         std::vector<std::pair<std::string, Nvml::Snap>> cards;
+        const uint64_t ram_b = basalt::platform::total_physical_memory();
         for (const std::string& id : basalt::program::split_gpu_ids(info.count("gpus") ? info["gpus"] : "")) {
             Nvml::Snap g;
-            if (!nvml.snap_bus(id, g) || g.name.empty() || g.vram_gib <= 0 || g.power_enforced_w <= 0) {
+            if (!nvml.snap_bus(id, g) || g.name.empty()) {
+                gpu_err = "NVML could not read the GPU at " + id;
+                break;
+            }
+            // NVML gives an integrated GPU (a GB10) no memory size and no power limit: its memory is the machine's, and
+            // its power is the submitter's to state, since the SoC's limit is not the GPU's
+            const bool integrated = g.vram_gib <= 0;
+            if (integrated) {
+                g.vram_gib = (double) ram_b / (double) (1ull << 30);
+                g.power_enforced_w = o.power_label.empty() ? -1 : std::atof(o.power_label.c_str());
+                g.pcie_gen = g.pcie_width = -1;   // no PCIe link: NVML's answer for one is not a link
+                if (g.power_enforced_w <= 0) {
+                    gpu_err = "the GPU at " + id + " is integrated and NVML reads no power limit for it: pass --power-label W "
+                              "with the system's power limit";
+                    break;
+                }
+            }
+            if (!integrated && !o.power_label.empty()) {   // a discrete card's row takes the limit NVML reads, never a label
+                gpu_err = "--power-label is for an integrated GPU; NVML reads the limit of the GPU at " + id;
+                break;
+            }
+            if (g.vram_gib <= 0 || g.power_enforced_w <= 0) {
                 gpu_err = "NVML could not read the GPU at " + id;
                 break;
             }
@@ -1305,7 +1347,6 @@ int main(int argc, char** argv) {
             crow.gpus.push_back({g.name, g.vram_gib, g.power_enforced_w, pcie_text(g), h2d_of(hw, id)});
             cards.emplace_back(id, g);
         }
-        const uint64_t ram_b = basalt::platform::total_physical_memory();
         if (gpu_err.empty() && crow.gpus.empty()) gpu_err = "the engine did not report which GPUs it used";
         if (gpu_err.empty() && (pre_tps[0] <= 0 || pre_tps[1] <= 0 || dec_ms <= 0)) gpu_err = "a request reported no time";
         if (gpu_err.empty() && ram_b == 0) gpu_err = "the system RAM size could not be read";
@@ -1492,26 +1533,25 @@ int main(int argc, char** argv) {
     }
     std::fputs(rep.c_str(), stdout);
     if (!community_row.empty()) {
-        const std::string path = o.community_file.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community/benchmarks.json"
-                                                          : o.community_file;
+        const std::string dir = o.community_dir.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community" : o.community_dir;
         std::string why;
         basalt::program::CommunityEdit edit;
-        const bool added = basalt::program::community_add_row_file(path, crow, why, &edit);
+        const bool added = basalt::program::community_write_run(dir, crow, why, &edit);
         std::printf("\nCOMMUNITY ROW:\n%s\n", (added ? edit.row_text : community_row).c_str());
         std::fflush(stdout);
         if (added && edit.replaced) {
-            basalt::log::info("basalt-bench", "runs[%zu] of %s has this run's setup (submitter, model, quant, GPUs, CPU, RAM, system): it was updated in "
-                              "place, not added", edit.index, path.c_str());
+            basalt::log::info("basalt-bench", "%s already held a run of this setup (submitter, model, quant, GPUs, CPU, RAM, system): it was overwritten",
+                              edit.path.c_str());
             if (!edit.notes.empty())
                 basalt::log::info("basalt-bench", "its notes were kept: \"%s\". Check they still apply to this run", edit.notes.c_str());
-            basalt::log::info("basalt-bench", "review the row, commit it and open a pull request (docs/community.md)");
+            basalt::log::info("basalt-bench", "review the file, commit it and open a pull request (docs/community.md)");
         } else if (added) {
-            basalt::log::info("basalt-bench", "the row was added to %s; review it, commit it and open a pull request (docs/community.md)",
-                              path.c_str());
+            basalt::log::info("basalt-bench", "the run was written to %s; review it, commit it and open a pull request (docs/community.md)",
+                              edit.path.c_str());
         } else {
-            basalt::log::warn("basalt-bench", "the row was not added to %s (%s); paste it at the end of the runs list of docs/community/benchmarks.json, "
-                              "run python3 tools/check_benchmarks.py --fix on it and open a pull request (docs/community.md)",
-                              path.c_str(), why.c_str());
+            basalt::log::warn("basalt-bench", "the run was not written under %s (%s); save the row above as docs/community/runs/MODEL/ID.json "
+                              "(MODEL: the model name in lower case, ID: see docs/community.md), run python3 tools/check_benchmarks.py --fix on "
+                              "docs/community and open a pull request (docs/community.md)", dir.c_str(), why.c_str());
         }
     }
     return do_quality && !quality.ran ? 1 : 0;

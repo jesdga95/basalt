@@ -8,8 +8,11 @@
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/multi_gpu.hpp"
+#include "basalt/model/peer_hooks.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
+#include "basalt/program/gpu_select.hpp"
 #include "basalt/program/grammar/reply_form.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
@@ -29,7 +32,6 @@ class LoadPlan;
 }
 namespace basalt::program {
 struct CommonOptions;
-struct GpuCard;
 struct ProbeEnv;
 }
 
@@ -82,7 +84,7 @@ struct LoadRequest {
     std::string diag_dump;            ///< diagnostic: directory for per-layer tensor dumps (empty = off)
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
-    std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
+    GpuCards gpus;                    ///< the cards, main first, their mode and shares (multi_gpu.hpp)
     int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
     bool vision = false;              ///< --vision: requests may carry images (each slot keeps buffers for one)
@@ -105,9 +107,7 @@ struct LoadRequest {
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
-    std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
-    int diag_split_at = 0;            ///< diagnostic: a model's layers split at this one across two cards (0: off)
 };
 
 struct DecodeRequest {
@@ -180,6 +180,9 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// The most rows a decode window starting at `pos` may hold, so that it ends at a position where the session changes
+    /// state between windows (0: no limit). Only drafted windows are shortened; a row gives the same bits in any window.
+    virtual int window_limit(int64_t pos) const { (void) pos; return 0; }
     /// For a drafter that sets its windows' length itself (a stop rule in its chain): the rows of the next window over its
     /// drafts `chance[0..n)` (one plus the drafts it keeps); the draft policy then only weighs a lookup proposal against
     /// them. 0: the policy picks the length from the drafts' stated chances.
@@ -238,6 +241,8 @@ public:
     virtual Result probe_env(program::ProbeEnv& env) { (void) env; return {Status::NotImplemented, "this model has no probe"}; }
     /// Conversations shorter than this are cheaper to read again than to keep on disk.
     virtual int64_t disk_min_tokens() const { return 8192; }
+    /// Positions per pooled indexer row in the conversation disk store (1 when the model has no pooled rows).
+    virtual int64_t disk_row_cells() const { return 1; }
     /// The routed experts of decode so far: `lookups` the main card or the CPU served, `hits` the main card's share of
     /// those, `offloaded` what a bus copy or another card served, `files` those of `lookups`
     /// read from the file.
@@ -299,6 +304,11 @@ public:
     /// Once every queued byte has landed: the model connects what the reads filled (prompt stages, copies made from the
     /// weights, checks of what was placed) and makes its sessions if plan() did not; they are then ready to run.
     virtual Result attach(const LoadRequest& req, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+    /// The model's gpu-mode peer (model/peer_hooks.hpp); null for a model that runs no peer.
+    virtual PeerHooks* peer() const { return nullptr; }
+    /// Card `card`'s part of a several-card run once loaded (0 = the main card), for the start line after the load
+    /// (model/multi_gpu.hpp gpu_parts_line): the peer's report when the model has one; empty: nothing to say.
+    virtual std::string gpu_report(int card) const { return peer() ? peer()->peer_report((size_t) card) : std::string(); }
 };
 
 /// A started model and its sessions.
@@ -356,16 +366,8 @@ public:
     virtual const char* community_quant() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
-    /// The cards that may hold experts beside the main one.
-    virtual int max_expert_cards() const = 0;
-    /// A model with no experts to put on a second card reads long prompts there instead (a one-stage prompt split, not an expert tier).
-    virtual bool second_card_reads_prompts() const { return false; }
-    /// Such a model with these flags does not fit its main card and splits its layers across the main card and the second
-    /// (a layer stage), given the two cards' memory bandwidth; asked once the run's cards are visible, before the load.
-    virtual bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const {
-        (void) o; (void) main_gbps; (void) peer_gbps;
-        return false;
-    }
+    /// What the model runs with several cards: the most cards each mode takes, 0 for a mode it does not run.
+    virtual program::GpuModes gpu_modes() const = 0;
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule. `ignore_merges`: a piece that is itself a
     /// vocabulary entry is that token, not merged from its bytes (Hugging Face BPE's ignore_merges; llama.cpp ties it to
@@ -396,8 +398,6 @@ void register_adapter(std::unique_ptr<ModelAdapter> a);
 /// Null when no adapter has that architecture.
 const ModelAdapter* find_adapter(const std::string& arch);
 std::vector<std::string> adapter_names();
-/// The most expert cards any registered model takes: a card plan before a model is known.
-int max_expert_cards();
 /// Why no adapter serves `arch`: a Basalt model this build left out (what the build holds and the option that adds
 /// it), or an architecture Basalt does not have.
 std::string unavailable_architecture(const std::string& arch);

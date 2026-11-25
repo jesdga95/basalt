@@ -33,6 +33,7 @@
 
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
@@ -61,7 +62,8 @@ struct DsparkLayer {
     void *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;            ///< NVFP4 planes (Q8_0 until finish())
     void *gate = nullptr, *up = nullptr, *down = nullptr;                        ///< NVFP4 planes (Q8_0 until finish())
     float* fp4_scale = nullptr;                                                  ///< the planes' FP32 scales [7]: q k v o gate up down
-    void *k_ctx = nullptr, *v_ctx = nullptr;                                     ///< Q8_0
+    void *k_ctx = nullptr, *v_ctx = nullptr;                                     ///< Q8_0 (prompt MMQ)
+    void *k_ctx_p = nullptr, *v_ctx_p = nullptr;                                 ///< Q8 planes (1..32-row decode commit)
     float *attn_norm = nullptr, *post_norm = nullptr, *dflare_norm = nullptr;    ///< [width]
     float *q_norm = nullptr, *k_norm = nullptr, *k_ctx_norm = nullptr;           ///< [head width]
     bool local = false;
@@ -114,6 +116,8 @@ uint64_t dspark_session_bytes(const Pack& pack, int64_t context);
 /// The tap of `tap_rows` rows: the target's features of a call's rows, which every session's commit reads (one shared).
 uint64_t dspark_tap_bytes(int tap_rows);
 
+class DsparkBatch;
+
 /// What a session holds of the drafter: the tap the target fills, the drafter's caches and scratch, and the calls the session
 /// forwards. Without a drafter every call does nothing and draft_begin says the model has none.
 class DsparkHook {
@@ -122,9 +126,12 @@ public:
     /// `w` null: no drafter. `context` the session's positions; `tap_rows` the most rows one forward fills the tap with.
     /// `dump` (--diag-dump's directory, may be empty): every committed run's features and the first blocks' outputs (their
     /// final rows, every draft's logits, the drafts) go to dspark.bin there in order, to replay against a reference.
-    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes).
-    bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump, std::string& err);
+    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). `backed` > 0: the full layers' caches reserve the context and
+    /// back only the cells of the first `backed` positions (and a block past them), growing with the target's (ensure).
+    bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
+              int64_t backed, std::string& err);
     bool on() const { return w_ != nullptr; }
+    bool dumping() const { return dump_ != nullptr; }
     /// The tap slot visit `visit` fills with its input rows, or -1.
     int slot_of_visit(int visit) const;
     /// Slot k's rows (fp32, kWidth each, contiguous): slots 0..2 the visits' inputs, slot 3 the final normed state.
@@ -153,22 +160,48 @@ public:
     size_t running_bytes() const;
     void running_regions(core::RunningState& st) const;
     size_t cells_bytes(int64_t positions) const;
+    /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
+    /// positions and a block past them; trim gives back what lies past them.
+    uint64_t grow_bytes(int64_t positions) const;
+    bool ensure(int64_t positions, std::string& err);
+    void trim(int64_t positions);
+    int64_t backed_cells() const { return backed_cells_; }
+    bool usable() const {
+        for (const auto& a : full_)
+            if (!a->usable()) return false;
+        return true;
+    }
+    /// The last ensure failed only because the device lacked the memory.
+    bool out_of_memory() const {
+        for (const auto& a : full_)
+            if (a->out_of_memory()) return true;
+        return false;
+    }
+    uint64_t backing_bytes() const {
+        uint64_t n = 0;
+        for (const auto& a : full_) n += a->backed();
+        return n;
+    }
     bool save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const;
     /// Restores from kv[at..]; `at` moves past what it read. False when kv holds no drafter cells of that shape.
     bool restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream);
 
 private:
+    friend class DsparkBatch;
     struct Cache {
         uint16_t *k = nullptr, *v = nullptr;   ///< fp16 [cap][kv heads][head width], position p at cell p % cap
         int64_t cap = 0;
         bool ring = false;
     };
     void* dev(size_t bytes, bool& ok);
+    void count_backed();                    ///< backed_cells_ from the elastic caches
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
     std::vector<Cache> cache_;
+    std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V when elastic
+    int64_t backed_cells_ = 0;              ///< cells every full layer's cache backs
     std::vector<int> slot_;                 ///< by visit
     int tap_rows_ = 0;
     int64_t context_ = 0;
@@ -203,6 +236,8 @@ private:
     // the host's record: positions [lo_, hi_) have their context in the caches; a block is in flight
     int64_t lo_ = 0, hi_ = 0;
     int pending_ = 0;
+    DsparkBatch* batch_owner_ = nullptr;
+    int batch_slot_ = -1;
     // --diag-dump
     std::FILE* dump_ = nullptr;
     int dumped_ = 0;
@@ -210,6 +245,45 @@ private:
     int64_t dump_drafts_ = 0, dump_differ_ = 0;   ///< drafts dumped, and those whose pick is not the exact head's
     int64_t block_pos_ = 0;
     int32_t block_anchor_ = 0;
+};
+
+/// Shared multi-session DSpark scratch for batched commit_batch (inside target decode_batch) and draft_batch.
+class DsparkBatch {
+public:
+    ~DsparkBatch();
+    bool init(const DsparkWeights* w, int max_sessions, int max_rows, int tap_rows, float* tap, int64_t context, std::string& err);
+    bool on() const { return w_ != nullptr; }
+    void commit(DsparkHook* const* hooks, int n_seg, const basalt::kernels::WindowSegs* at_d, const int32_t* pos_d, int rows,
+                void* stream);
+    model::Result draft(DsparkHook* const* hooks, const int32_t* anchors, const int64_t* pos, const int* n, int count,
+                        void* stream);
+    model::Result take(int slot, int pending, int32_t* ids, float* conf, int max_n, int& n);
+
+private:
+    void* dev(size_t bytes, bool& ok);
+    const DsparkWeights* w_ = nullptr;
+    std::vector<void*> allocs_, pinned_;
+    int max_sessions_ = 0, max_rows_ = 0, tap_rows_ = 0;
+    int64_t att_cells_ = 0;
+    float* tap_ = nullptr;
+    // commit_batch scratch [max_rows]
+    float *c_mix_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
+    void* c_act_ = nullptr;
+    // block chunk scratch [kChunkSlots * kDsBlock <= 32]
+    static constexpr int kChunkSlots = 4;
+    float *x_ = nullptr, *h_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr, *qr_ = nullptr, *attn_ = nullptr;
+    float* att_scr_ = nullptr;
+    void *act_a_ = nullptr, *act_h_ = nullptr;
+    basalt::kernels::wgemm::Workspace ws_;
+    // head batch scratch [max_sessions]
+    float *hd_ = nullptr, *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
+    float *frc_ = nullptr, *conf_d_ = nullptr, *conf_h_ = nullptr;
+    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
+    size_t head_scr_stride_ = 0;
+    int32_t *prev_ = nullptr, *ids_d_ = nullptr, *ids_h_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
+    uint16_t* w1_row_ = nullptr;
+    void* sync_stream_ = nullptr;
+    bool synced_ = true;
 };
 
 /// The flags an Inkling 2 start takes for speculative decoding: --spec N, --draft-log FILE. False when `a` is neither.

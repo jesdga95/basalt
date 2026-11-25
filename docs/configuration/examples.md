@@ -15,7 +15,7 @@ Start with `bin/basalt serve --config basalt_config.json`. Model paths are relat
 
 ## A GPU and a smaller second card (peer expert tier)
 
-Like the first, with `"gpu": "0,1"` and `"vision": 1`, which runs the image encoder on the second card too.
+Like the first, with `"gpu": "0,1"`, `"gpu-mode": "peer"` and `"vision": 1`, which runs the image encoder on the second card too.
 
 ## Inkling 2 Mini on one card
 

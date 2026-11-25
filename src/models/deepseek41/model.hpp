@@ -40,7 +40,7 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
 
 class DsparkDrafter;
 
-/// The second cards whose expert tiers a start uses; later cards idle.
+/// The most second cards whose expert tiers a start uses (gpu-mode peer takes no more cards than the main card and these).
 constexpr int kMaxSecondCards = 4;
 
 class DsModel final : public model::LoadedModel {
@@ -57,6 +57,8 @@ public:
 
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
+    /// The second cards are the expert tier's (model/peer_hooks.hpp).
+    model::PeerHooks* peer() const override;
     /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Called
     /// once the dense tensors are allocated, before a session is made. False with `err` when the request cannot be honoured.
     bool resolve_context(int64_t requested, std::string& err);
@@ -100,11 +102,6 @@ public:
     /// What the flags ask of the expert tiers.
     const model::LoadRequest& tiers() const { return tiers_; }
     void set_tiers(const model::LoadRequest& req) { tiers_ = req; }
-    /// The CUDA devices of the second cards' expert tiers (each holds a block of layers), in order; empty without any.
-    const std::vector<int>& peer_devices() const { return peer_devices_; }
-    void set_peer_devices(std::vector<int> d) { peer_devices_ = std::move(d); }
-    /// The first second card, or -1.
-    int peer_device() const { return peer_devices_.empty() ? -1 : peer_devices_[0]; }
     /// The CUDA device the dense tensors live on.
     int device() const { return device_; }
     /// The sizes the prompt path's workspaces depend on.
@@ -134,7 +131,7 @@ private:
     std::map<std::string, DevTensor> dev_;
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
-    std::vector<int> peer_devices_;
+    model::GpuCards gpus_;                    ///< the cards the load received
     int device_ = 0;
     model::LoadRequest tiers_;
     mutable PromptHost prompt_host_;   // before the tier: the tier goes first

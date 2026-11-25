@@ -32,8 +32,12 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   (up to 262,144 x F; [configuration](../configuration/index.md#context-and-kv-cache)), which also changes short prompts'
   output, so leave it off below 262,144 ([precision](../precision/qwen38-27b.md#context-past-262144)). The KV cache is allocated at start for every slot:
   `--kv fp16` (default) takes 64 KiB per position over the 16 attention layers, `--kv int8` 33 KiB (int8 codes with an fp16
-  scale per 64 values; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16
-  and the full 262,144 in int8. The start refuses a context that does not fit and names the free memory.
+  scale per 64 values), `--kv nvfp4` 18 KiB (E2M1 codes with an E4M3 scale per 16 values, keys turned by a Hadamard
+  transform; [precision](../precision/qwen38-27b.md)). On a 32 GB card one slot holds about 190K positions in fp16 and the
+  full 262,144 in int8. `--kv nvfp4` adds one int8 copy of a layer's positions that prompt chunks read (2 KiB per position
+  of `--max-context`), runs on one card (a second card in either `gpu-mode` is refused with the reason) and not with
+  `--kv-resident`. The start refuses a context that does not fit and
+  names the free memory.
 - **K/V streaming:** `--kv-resident N` (default 0, off) keeps each attention layer's first N positions on the card and the
   rest in page-locked RAM, so a context or `--parallel` whose cache does not fit the card still starts. Attention reads every
   position for every token, so each decoded token reads all positions past N over the bus: decode slows with every position
@@ -58,10 +62,8 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   131K and 70 to 86 at 250K with `--kv int8`, 107 to 116 at 131K with `--kv fp16`; `--spec 0` at 250K, 44 to 51. The tokens are
   identical.
 - **Slots:** `--parallel N` gives each slot its own cache and recurrent state (157 MiB). Slots share the weights.
-- **Cards:** the main card decodes and holds everything. A second Blackwell card (`gpu "0,1"`, or `"auto"` when two are visible) is the
-  prompt split's one stage: it reads the last layers of long prompts ([below](#long-prompts-on-two-cards)). When the model, the context and the slots do
-  not fit the main card, the second card holds and runs the later layers instead ([below](#two-cards-when-it-does-not-fit-one)). Further
-  cards idle.
+- **Cards:** one card by default; a second Blackwell card is `gpu-mode peer` (it reads long prompts) or `split` (it holds the
+  later layers) ([cards](#cards)).
 
 ## Drafting
 
@@ -75,42 +77,56 @@ A sampled request without a `seed` draws the block drafter's drafts and keeps th
 model's distribution exactly, and more drafts are kept than the drafter's best guesses would give
 ([precision](../precision/qwen38-27b.md#sampling-with-drafts)).
 
-## Long prompts on two cards
+## Cards
 
-With a second Blackwell card (`gpu "0,1"`, [GPUs](../configuration/gpus.md)) that card holds the last 20 layers (4 GiB) and the
-KV cache of their attention layers. A prompt part longer than two chunks (8,192 tokens) is read as a pipeline: the main card
+`gpu` names two cards and `gpu-mode` what they do ([GPUs](../configuration/gpus.md)): `"gpu": "0,1", "gpu-mode": "peer"` or `"split"`.
+The model runs both on two cards and refuses `tensor` and a third card. With `gpu` unset and several cards visible, the model runs on GPU 0 and the start
+warns once.
+
+| Mode | What the second card does | When to use it |
+| --- | --- | --- |
+| `peer` | reads the last layers of long prompts as a pipeline beside the main card; decode stays on the main card | the model, the context and the slots fit the main card |
+| `split` | holds the later layers with their KV cache and recurrent state and runs them in every window and prompt chunk | they do not fit the main card |
+
+Both give the same tokens as one card (greedy, checked at 65,536 context on conversation, struct, prose and a 16,672-token prompt).
+`--kv nvfp4` refuses a second card in either mode, and `--kv-resident` below the context refuses `peer`.
+
+## Peer: long prompts on a second card
+
+With `gpu-mode peer` the second card holds the last layers (the cut comes from the shares, by default the cards' memory bandwidth) and the KV cache of their attention layers. A prompt part longer than two chunks (8,192 tokens) is read as a
+pipeline: the main card
 reads the first layers of a chunk and hands its rows over through page-locked RAM, the second card reads the remaining layers of
 that chunk while the main card reads the next one, and each chunk's KV cells come back as it finishes. The main card reads the
 last one or two chunks whole once the second card's recurrent state is back, so decoding, the conversation cache and later
 requests find the session a read on the main card alone leaves: the output is the same to the bit (the second card runs the
-main card's kernels on the same rows). Each read is priced from both cards' rates, timed at start on random rows and refitted
-from every split read, and is split, at the layer the price picks, only when that is at least 5% faster. Log lines start with
-`prompt split:`. Decoding never uses the second card. Without room on it the start warns and prompts stay on the main card.
+main card's kernels on the same rows). Log lines start with `prompt split:`. Decoding never uses the second card.
+A 64K prefill reads 17% faster than on one card (7,410 against 6,336 tok/s, an RTX 5090 at 400 W with an RTX 5060 Ti at 180 W,
+ABBA); decode is unchanged.
+A prompt read is compute-bound, so a card with less compute than its memory bandwidth suggests reads fewer layers than the bandwidth
+default gives it: on an RTX 5090 with an RTX 5060 Ti, `"gpu-share": "3,1"` (the 5060 Ti reads layers 48 to 63) reads 16K and 64K
+prompts a few percent faster than the default shares (layers 51 to 63).
 
-The start line names it (`gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1) prompt split`), then `prompt split: layers
-44-63 on CUDA1 (4.00 GiB on the card)`, the two cards' timed rates and the page-locked RAM (0.4 GiB). Its layers are read in the
-start's one pass with the rest; timing the cards costs about 4 s before the start is ready, and it takes 0.4 GiB of the main card. The
-second card holds the 4 GiB of layers, their attention layers' cells and a chunk's scratch: 6 to 9 GiB, 8.7 GiB at 262,144 positions
-in `int8`. A context of 8,192 or less holds no prompt the split would read across the cards, and with `--kv-resident` below the
-context (K/V in RAM, [memory](#memory)) it stays off; the start then says why (`prompt split: off (...)`) and nothing goes to the
-second card.
+The start line names it (`gpus: peer; RTX 5090 (nvidia-smi 0) main, share ...; RTX 5060 Ti (nvidia-smi 1) peer, share ...`), then
+`prompt split: CUDA1 reads layers 51-63 of prompts over 8192 tokens; N GiB of page-locked hand-off buffers`. The second card holds
+its layers, their attention layers' cells and a chunk's scratch: 6 to 9 GiB, 8.7 GiB at 262,144 positions in `int8`. A peer that
+would read nothing is refused with the reason, instead of idling: a context of 8,192 or less holds no prompt that a second card
+would read (raise `--max-context`), `--kv-resident` below the context keeps part of the cache in RAM, or the card has no room for its
+layers.
 
 The line works with everything a read on the main card does: `--parallel` slots (a slot's read runs while the others wait, as on one
 card), pictures and video (a picture's rows go through the main card; the text before and after reads across the cards), the conversation cache and
 its checkpoints, the thinking budget. A cancelled request is met within two chunks on either card (0.9 s into a 16K read and 1.4 s into a 40K one, against 0.5 and 0.8 s on one card)
 and the next request finds the state it would find after a cancel on one card.
 
-## Two cards when it does not fit one
+## Split: two cards when it does not fit one
 
-With a second Blackwell card, a start whose weights, KV cache, recurrent state and scratch do not fit the main card splits the layers:
-the main card keeps layers 0 to N-1 with the head, the drafter and the image encoder, the second card layers N to 63 with their own KV
-cache and recurrent state for every slot. The start line calls that card the `layer stage` (`gpus: RTX 5090 (nvidia-smi 0) main,
-RTX 5060 Ti (nvidia-smi 1) layer stage`), then `layer split: layers 0-54 (29.82 GiB) on CUDA0, 55-63 (6.86 GiB) on CUDA1`.
+With `gpu-mode split` the layers are cut by the shares (by default the cards' free VRAM): the main card keeps layers 0 to N-1 with the
+head, the drafter and the image encoder, the second card layers N to 63 with their own KV
+cache and recurrent state for every slot. The start line names the parts, then `layer split: layers 0-N-1 (... GiB) on CUDA0, N-63 (... GiB) on CUDA1`.
 
-- **The cut** is planned at start from the pack's bytes per layer and both cards' free memory. Cards whose memory bandwidth differs
-  by more than 10% keep the most layers that fit on the faster card (the main card, the one `"auto"` picks first); alike cards halve
-  the layers' bytes, so a prompt's chunks take the same time on both. A start that fits one card does not split; one that fits neither
-  one card nor any cut stops and names both cards' free memory.
+- **The cut** divides each layer's weights plus its cells and state at the context and slots by the shares. A part that does not fit
+  its card is refused with its numbers (lower the card's `gpu-share`, `--max-context` or `--parallel`). Nothing is priced: a model
+  that fits one card splits only when you say so.
 - **Decode:** each card runs its layers of every window as its own CUDA graph; the residual crosses through page-locked RAM that both
   graphs read and write with kernels, and the main card reads the block drafter's rows of the later layers back. Every product on the
   second card is planned as on the main card, so the output is the main card's alone to the bit, at every window width, with
@@ -138,9 +154,8 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 
 - `--kv-resident` keeps the MTP drafter's own cache on the card (the block drafter's is a short window).
 - Slots whose windows fit 16 rows together (every slot in plain decoding, two slots of 8-row drafted windows) share one pass through the weights each round, and their block drafters run two blocks a pass; a window that does not fit takes a pass of its own. Prompt reads run per slot.
-- **Idle sleep** (`--idle-sleep`) has no cache to give back first: the driver moves all the GPU state, both cards' on two cards (prompt split or layer split), to RAM (one card: 3.8 s down, 1.7 s back; the layer split: 7.7 s and 3.6 s). The next greedy reply is the same as before the sleep.
-- A second card either reads long prompts or runs the later layers (when the model does not fit one card), never both; no second-card
-  drafting.
+- **Idle sleep** (`--idle-sleep`) has no cache to give back first: the driver moves all the GPU state, both cards' on two cards (peer or split), to RAM (one card: 3.8 s down, 1.7 s back; the split: 7.7 s and 3.6 s). The next greedy reply is the same as before the sleep.
+- A second card either reads long prompts (`peer`) or runs the later layers (`split`), never both; no second-card drafting.
 
 ## Speed
 

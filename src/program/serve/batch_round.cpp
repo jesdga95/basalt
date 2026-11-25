@@ -28,6 +28,7 @@ struct SlotWin {
     const char* fin = nullptr;
     int want = 0;
     bool drafting = false;
+    bool solo = true;
 };
 
 // The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, or as its drafter's
@@ -35,7 +36,9 @@ struct SlotWin {
 void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
     BSlot& sl = bs[(size_t) b];
     basalt::model::ModelSession& s = slot_session(b);
-    const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit});
+    const int own_limit = s.window_limit(sl.p);
+    const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit,
+                                              own_limit > 0 ? (int64_t) own_limit : INT64_MAX});
     const int own = s.own_window(sl.dprob, sl.n_dr);
     w.T = std::max(1, std::min(own > 0 ? own : bpolicy->window(sl.dprob, sl.n_dr), most));
     w.from_sfx = false;
@@ -190,9 +193,11 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             std::printf("ERR %s\n", r.message.c_str());
             return false;
         }
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
-        if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
-        else bpolicy->observe_window(w.chance, T, a, ms);
+        if (w.solo) {
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
+            if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
+            else bpolicy->observe_window(w.chance, T, a, ms);
+        }
     }
     if (fin != nullptr) {
         std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
@@ -286,8 +291,11 @@ bool Runtime::batch_round() {
         std::vector<int> dn;
         for (const size_t i : group) {
             wins[i].round0 = t0;
+            wins[i].solo = group.size() == 1;
             if (!slot_window_accept(act[i], wins[i])) return false;
             kept.push_back(wins[i].kept);
+            // bound drafted tokens to what a slot's share of the batch window can verify next round
+            wins[i].want = std::min(wins[i].want, std::max(0, (cap + n_act - 1) / n_act - 1));
             if (wins[i].want > 0) {
                 const BSlot& sl = bs[(size_t) act[i]];
                 ds.push_back(&slot_session(act[i]));

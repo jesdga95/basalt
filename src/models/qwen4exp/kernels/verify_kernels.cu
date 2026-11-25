@@ -2,6 +2,7 @@
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/kernels/gdn_commit.cuh"
 #include "basalt/kernels/wait_abort.hpp"
@@ -998,7 +999,7 @@ void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, 
 
 bool gdn_commit_lazy_none(CommitCtl* ctl) {
     const uint32_t none = 0x40000000u;
-    return cudaMemcpy(ctl->w + (size_t) kCtlWords * 10, &none, 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    return basalt::core::device_copy(ctl->w + (size_t) kCtlWords * 10, &none, 4, cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
 

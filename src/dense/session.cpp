@@ -1,4 +1,5 @@
 // src/dense/session.cpp - a conversation of the dense stack as a model::ModelSession.
+#include "basalt/core/device_copy.hpp"
 #include "internal.hpp"
 
 #include "basalt/core/conversation_cache.hpp"
@@ -43,7 +44,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         blockbytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
                       (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
     }
-    const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_int8, m.o.kv_resident, m.lb, m.le);
+    const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_format(), m.o.kv_resident, m.lb, m.le);
     if (!st.arena.reserve(dev_bytes + blockbytes)) {
         err = m.o.arch + ": out of device memory for a session of " + std::to_string((long long) m.o.max_context) +
               " cells (" + std::to_string((unsigned long long) (dev_bytes >> 20)) + " MiB); lower --max-context or --parallel";
@@ -66,7 +67,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     const size_t n_near = (size_t) near_cells * g.n_kv * g.head_dim, n_far = cells - n_near;
     uint8_t* host = nullptr;
     if (n_far > 0 && m.n_attn > 0) {
-        const uint64_t hb = session_host_bytes(g, m.o.max_context, m.o.kv_int8, m.o.kv_resident) / (uint64_t) g.attn_layers() * m.n_attn;
+        const uint64_t hb = session_host_bytes(g, m.o.max_context, m.o.kv_format(), m.o.kv_resident) / (uint64_t) g.attn_layers() * m.n_attn;
         if (cudaHostAlloc(&st.far_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             cudaGetLastError();
             st.far_host = nullptr;
@@ -96,10 +97,12 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         st.far_kv.emplace_back();
         if (n_far > 0) far_view(st.far_kv.back());
         if (m.o.kv_int8) {
-            q8.k = st.arena.take<int8_t>(n_near);
-            q8.v = st.arena.take<int8_t>(n_near);
-            q8.ks = st.arena.take<uint16_t>(n_near / 64);
-            q8.vs = st.arena.take<uint16_t>(n_near / 64);
+            const bool f4 = m.o.kv_fp4;
+            q8.fp4 = f4;
+            q8.k = st.arena.take<int8_t>(kernels::kv_code_bytes(n_near, f4));
+            q8.v = st.arena.take<int8_t>(kernels::kv_code_bytes(n_near, f4));
+            q8.ks = st.arena.take<uint16_t>(kernels::kv_scale_bytes(n_near, f4) / 2);
+            q8.vs = st.arena.take<uint16_t>(kernels::kv_scale_bytes(n_near, f4) / 2);
             st.kc.push_back(nullptr);
             st.vc.push_back(nullptr);
             if (!q8.vs) {
@@ -573,6 +576,11 @@ public:
     // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP
     // drafter's own layer is fp16 and comes last
     size_t row_bytes(bool int8) const { return (size_t) g_.n_kv * g_.head_dim * (int8 ? 1 : 2); }
+    // a quantized cache's code bytes per position, and how many code bytes one scale byte covers (int8: 32, NVFP4: 8)
+    size_t q_row() const { return kernels::kv_code_bytes((size_t) g_.n_kv * g_.head_dim, m_.o.kv_fp4); }
+    size_t q_per_scale() const { return m_.o.kv_fp4 ? 8 : 32; }
+    // the format a parked conversation's layer records: fp16 1, int8 2, NVFP4 3
+    int q_format() const { return m_.o.kv_fp4 ? 3 : 2; }
     // the conversation's attention layers: the main card's, then the second card's (a layer split); kv_state maps i to its
     // card's state and its index there
     size_t kv_layers() const { return st_.kc.size() + (st_.peer ? st_.peer->kc.size() : 0); }
@@ -582,7 +590,7 @@ public:
         return *st_.peer;
     }
     size_t cells_bytes(int64_t positions) const override {
-        const size_t main = m_.o.kv_int8 ? 2 * (row_bytes(true) + row_bytes(true) / 32) : 2 * row_bytes(false);
+        const size_t main = m_.o.kv_int8 ? 2 * (q_row() + q_row() / q_per_scale()) : 2 * row_bytes(false);
         return (size_t) positions * (kv_layers() * main + (drafter_ ? 2 * row_bytes(false) : 0));
     }
 
@@ -595,8 +603,8 @@ public:
             to.resize_for_overwrite(bytes);
             return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
                 const size_t a = at < split ? std::min(n, split - at) : 0;
-                return (a == 0 || cudaMemcpy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
-                       (a == n || cudaMemcpy(p + a, (const uint8_t*) far_buf + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
+                return (a == 0 || basalt::core::device_copy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
+                       (a == n || basalt::core::device_copy(p + a, (const uint8_t*) far_buf + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv_layers() + (drafter_ ? 1 : 0); ++i) {
@@ -606,19 +614,20 @@ public:
             const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
             const bool int8 = !mtp && m_.o.kv_int8;
             core::ConversationKv k;
-            k.format = int8 ? 2 : 1;
+            k.format = int8 ? q_format() : 1;
             k.cells = positions;
             k.heads = g_.n_kv;
             k.head_dim = g_.head_dim;
             k.page_size = 1;
-            const size_t rows = (size_t) positions * row_bytes(int8);
+            const size_t rows = (size_t) positions * (int8 ? q_row() : row_bytes(false));
             const kernels::KvFar f = mtp ? kernels::KvFar{} : ls.far_kv[j];
-            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * (int8 ? q_row() : row_bytes(false));
             bool ok;
             if (int8) {
                 const kernels::KvInt8& q = ls.kq[j];
                 ok = down(q.k, f.q8.k, split, k.k, rows) && down(q.v, f.q8.v, split, k.v, rows) &&
-                     down(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && down(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
+                     down(q.ks, f.q8.ks, split / q_per_scale(), k.k_scale, rows / q_per_scale()) &&
+                     down(q.vs, f.q8.vs, split / q_per_scale(), k.v_scale, rows / q_per_scale());
             } else {
                 ok = down(mtp ? st_.mtp_kc : ls.kc[j], f.k, split, k.k, rows) && down(mtp ? st_.mtp_vc : ls.vc[j], f.v, split, k.v, rows);
             }
@@ -636,8 +645,8 @@ public:
         const auto up = [&](void* dev, void* far_buf, size_t split, const core::ConversationBuffer& from, size_t bytes) {
             return from.size() >= bytes && from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) {
                 const size_t a = at < split ? std::min(n, split - at) : 0;
-                return (a == 0 || cudaMemcpy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
-                       (a == n || cudaMemcpy((uint8_t*) far_buf + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
+                return (a == 0 || basalt::core::device_copy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
+                       (a == n || basalt::core::device_copy((uint8_t*) far_buf + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv.size(); ++i) {
@@ -647,16 +656,17 @@ public:
             const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
             const bool int8 = !mtp && m_.o.kv_int8;
             const core::ConversationKv& k = kv[i];
-            if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
+            if (k.format != (int8 ? q_format() : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
                 return fail(m_.o.arch + ": a parked conversation has other caches");
-            const size_t rows = (size_t) positions * row_bytes(int8);
+            const size_t rows = (size_t) positions * (int8 ? q_row() : row_bytes(false));
             const kernels::KvFar f = mtp ? kernels::KvFar{} : ls.far_kv[j];
-            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * (int8 ? q_row() : row_bytes(false));
             bool ok;
             if (int8) {
                 const kernels::KvInt8& q = ls.kq[j];
                 ok = up(q.k, f.q8.k, split, k.k, rows) && up(q.v, f.q8.v, split, k.v, rows) &&
-                     up(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && up(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
+                     up(q.ks, f.q8.ks, split / q_per_scale(), k.k_scale, rows / q_per_scale()) &&
+                     up(q.vs, f.q8.vs, split / q_per_scale(), k.v_scale, rows / q_per_scale());
             } else {
                 ok = up(mtp ? st_.mtp_kc : ls.kc[j], f.k, split, k.k, rows) && up(mtp ? st_.mtp_vc : ls.vc[j], f.v, split, k.v, rows);
             }
@@ -708,13 +718,13 @@ public:
 
     Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(st_.stream);
-        if (cudaMemcpy(out, st_.logits + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (basalt::core::device_copy(out, st_.logits + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return fail("the logits copy failed");
         return {};
     }
 
     std::string info_words() const override {
-        const std::string kv = m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
+        const std::string kv = m_.o.kv_fp4 ? "kv=nvfp4" : m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
         // a dense model has no routed experts, so none can sit on the SSD (the community check reads this)
         // host_weight_bytes: model weights held in host RAM, none for the dense stack (the community check refuses a row if
         // any). gpu_weight_bytes is what the load log calls "GiB on the GPU". The token embedding and the --vision dynamic encoder wait in host RAM by design and are told apart.
@@ -865,7 +875,7 @@ private:
                 owned_.emplace_back(v);
                 d_hist_ = (int32_t*) v;
             }
-            if (cudaMemcpy(d_hist_, r.history, (size_t) r.n_tokens * r.history_len * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (basalt::core::device_copy(d_hist_, r.history, (size_t) r.n_tokens * r.history_len * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "the penalty history upload failed";
                 return false;
             }

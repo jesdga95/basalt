@@ -7,10 +7,12 @@
 // its last positions moved in) and the convolution rings' last kConvRing positions.
 #include "models/inkling2/prompt.hpp"
 
+#include "basalt/core/progress.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
+#include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
@@ -41,6 +43,7 @@ constexpr int kTypeNvfp4 = 40;
 constexpr int kTypeMxfp8 = 46;
 constexpr int kOut = kHeads * kHeadDim;    // the attention output's width
 constexpr uint64_t kMmqSpare = 32ull << 20;   // MMQ's stream-k fixup pool
+constexpr int kRoutedRows = 1024;          // a chunk of at most this many rows stages only the RAM experts it routes to
 
 // One allocation carved into the chunk's buffers; with no base it only counts, so the sizing and the allocation agree.
 struct Carve {
@@ -119,7 +122,9 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
     b.sort_scr = c.take<uint8_t>(moe_sort_scratch((int) P, g.n_expert));
-    const size_t stage = (size_t) kKvHeads * R * kHeadDim * 2;   // fp16 at most
+    const size_t row_bytes = (size_t) std::max(kv_cache_row_bytes(false, false),
+                                               std::max(kv_cache_row_bytes(true, false), kv_cache_row_bytes(false, true)));
+    const size_t stage = (size_t) kKvHeads * R * row_bytes;   // staging must fit the widest cache format
     b.k_stage = c.take<uint8_t>(stage);
     b.v_stage = c.take<uint8_t>(stage);
     b.pos = c.take<int32_t>(R);
@@ -140,22 +145,35 @@ struct Lane {
     mmq::Context mmq;
     cudaStream_t stream = nullptr;
     cudaEvent_t hand = nullptr;   // behind the card's half of a crossing
+    // a spill's card: the staging's copies run on `copy` while the visit before computes; `freed` follows the last spilled
+    // visit's products over the staging, `staged` the next one's copies
+    cudaStream_t copy = nullptr;
+    cudaEvent_t freed = nullptr, staged = nullptr;
 };
 
 class Prompt final : public PromptRunner {
 public:
     Prompt(InklingModel& m, cudaStream_t s) : m_(m), g_(m.geo()) { lane_[0].stream = s; }
     ~Prompt() override {   // every read synced its streams before it returned
+        // the copies decode keeps in the arena go back to RAM; an upload into it that may still run keeps the arena
+        if (m_.has_spill() && m_.cards() == 1 && !m_.set_prompt_arena(nullptr, 0)) return;
         for (cudaEvent_t& e : done_)
             if (e) cudaEventDestroy(e);
-        for (int i = m_.cards() - 1; i >= 0; --i) {
+        for (int i = lanes() - 1; i >= 0; --i) {
             Lane& k = lane_[i];
             cudaSetDevice(k.device);
             if (k.hand) cudaEventDestroy(k.hand);
+            if (k.freed) cudaEventDestroy(k.freed);
+            if (k.staged) cudaEventDestroy(k.staged);
+            if (k.copy) cudaStreamDestroy(k.copy);
             if (i > 0 && k.stream) cudaStreamDestroy(k.stream);
             if (k.mem) cudaFree(k.mem);
         }
         if (hand_) cudaFreeHost(hand_);
+        for (void* q : {(void*) px_nrm_, (void*) px_ids_, (void*) px_rw_, (void*) px_out_, (void*) px_cnt_})
+            if (q) cudaFreeHost(q);
+        if (row_ix_) cudaFree(row_ix_);
+        if (routed_ids_) cudaFreeHost(routed_ids_);
     }
 
     bool init(std::string& err) {
@@ -170,9 +188,9 @@ public:
                 err = "cannot create the prompt path's events";
                 return false;
             }
-        for (int i = m_.cards() - 1; i >= 0; --i) {   // the first card's last: it stays current
+        for (int i = lanes() - 1; i >= 0; --i) {   // the first card's last: it stays current
             cur_ = i;
-            lane_[i].device = m_.card_device(i);
+            lane_[i].device = lane_device(i);
             cudaSetDevice(lane_[i].device);
             if (i > 0 && cudaStreamCreateWithFlags(&lane_[i].stream, cudaStreamNonBlocking) != cudaSuccess) {
                 err = "cannot create the prompt path's second stream";
@@ -183,6 +201,44 @@ public:
                 return false;
             }
             if (!init_lane(err)) return false;
+        }
+        if (m_.peer_device() >= 0) {   // gpu-mode peer: a layer's rows to the second card and its partial sums back
+            const size_t R = kChunk, E = (size_t) g_.n_embd, P = R * (size_t) g_.n_used;
+            constexpr unsigned flags = cudaHostAllocPortable | cudaHostAllocMapped;   // the main card's kernels write the rows there
+            if (cudaHostAlloc((void**) &px_nrm_, R * E * 4, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_ids_, P * 4, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_rw_, P * 4, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_cnt_, 64, flags) != cudaSuccess ||
+                cudaHostAlloc((void**) &px_out_, R * E * 4, cudaHostAllocPortable) != cudaSuccess ||
+                cudaMalloc((void**) &row_ix_, R * 4) != cudaSuccess) {
+                cudaGetLastError();
+                err = "cannot pin the rows the second card's experts take";
+                return false;
+            }
+        }
+        if (m_.spill().any()) {
+            if (cudaHostAlloc((void**) &routed_ids_, (size_t) kRoutedRows * g_.n_used * 4, cudaHostAllocPortable) != cudaSuccess) {
+                cudaGetLastError();
+                err = "cannot pin the prompt path's routed slots";
+                return false;
+            }
+            routed_.assign((size_t) g_.n_expert, 0);
+        }
+        // the next spilled visit after each step (a spill runs on the first card only)
+        next_spill_.assign(walk_.steps.size(), -1);
+        for (int si = (int) walk_.steps.size() - 1; si >= 0; --si) {
+            next_spill_[(size_t) si] = first_spill_;
+            if (m_.layer(g_.visits[(size_t) walk_.steps[(size_t) si].visit].layer).slot_map) first_spill_ = si;
+        }
+        if (first_spill_ >= 0) {
+            Lane& k = lane_[0];
+            if (cudaStreamCreateWithFlags(&k.copy, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&k.freed, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&k.staged, cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                err = "cannot create the prompt staging's stream";
+                return false;
+            }
         }
         if (m_.cards() > 1) {   // the crossings' page-locked slots, then one per drafter tap
             size_t pulls = 0;
@@ -211,6 +267,15 @@ public:
         c.base = static_cast<uint8_t*>(lane().mem);
         carve(c, b(), g_);
         mmq::iota(b().ident, (int64_t) kChunk * g_.n_used, strm());
+        // the sorted entries past the ones a chunk fills (pairs another card computes are left out) read as row 0 of expert 0
+        const size_t pair_bytes = (size_t) kChunk * g_.n_used * 4;
+        cudaMemsetAsync(b().tok, 0, pair_bytes, strm());
+        cudaMemsetAsync(b().dst, 0, pair_bytes, strm());
+        cudaMemsetAsync(b().exp, 0, pair_bytes, strm());
+        // the arena before `ident` (the one buffer set once) is scratch outside a prompt: decode may keep expert copies there
+        // (InklingModel::set_prompt_arena); not under gpu-mode peer, which reads the zeros above
+        if (cur_ == 0 && m_.has_spill() && m_.cards() == 1 && m_.peer_device() < 0)
+            m_.set_prompt_arena(static_cast<uint8_t*>(lane().mem), (uint64_t) (reinterpret_cast<uint8_t*>(b().ident) - static_cast<uint8_t*>(lane().mem)));
         // the products' tiles
         const int E = g_.n_embd, F = g_.n_ff_exp;
         const auto ready = [&](int type, int64_t rows) {
@@ -223,7 +288,7 @@ public:
         };
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerWeights& w = m_.layer(l);
-            if (m_.card_of(l) != cur_) continue;
+            if (!lane_runs(l)) continue;
             if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) continue;
             if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
         }
@@ -235,21 +300,26 @@ public:
     }
 
     model::Result read(const model::PrefillRequest& r, std::vector<int32_t>& hist, const std::vector<VisitCache>& caches,
-                       DsparkHook& dspark, void* stream) override {
+                       DsparkHook& dspark, void* stream, const Prepare& prepare) override {
         bind(caches, dspark, stream);
-        return run(r.tokens, nullptr, r.n_tokens, r.pos, r, hist, 0);
+        return run(r.tokens, nullptr, r.n_tokens, r.pos, r, hist, 0, prepare);
     }
 
     model::Result read_rows(const float* rows, int n, int64_t pos, int32_t pad, std::vector<int32_t>& hist,
-                            const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream) override {
+                            const std::vector<VisitCache>& caches, DsparkHook& dspark, void* stream,
+                            const Prepare& prepare) override {
         bind(caches, dspark, stream);
         model::PrefillRequest r;
         r.n_tokens = n;
         r.pos = pos;
-        return run(nullptr, rows, n, pos, r, hist, pad);
+        return run(nullptr, rows, n, pos, r, hist, pad, prepare);
     }
 
 private:
+    // The second lane: the layer split's card, or gpu-mode peer's, which runs its experts' pairs of every layer that has some.
+    int lanes() const { return m_.cards() > 1 || m_.peer_device() >= 0 ? 2 : 1; }
+    int lane_device(int i) const { return i == 0 ? m_.card_device(0) : m_.cards() > 1 ? m_.card_device(1) : m_.peer_device(); }
+    bool lane_runs(int l) const { return m_.cards() > 1 ? m_.card_of(l) == cur_ : cur_ == 0 || m_.peer_n(l) > 0; }
     Lane& lane() { return lane_[cur_]; }
     Bufs& b() { return lane_[cur_].b; }
     cudaStream_t strm() const { return lane_[cur_].stream; }
@@ -296,31 +366,73 @@ private:
     }
 
     // `n` rows (tokens, or host embedding rows) in chunks of about equal size; one chunk stays queued ahead of the host,
-    // which reports a chunk once the card has run it.
+    // which reports a chunk once the card has run it. A read that ends any other way than its final wait (an error, an
+    // exception) runs out its streams first (drain).
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
-                      std::vector<int32_t>& hist, int32_t pad) {
+                      std::vector<int32_t>& hist, int32_t pad, const Prepare& prepare) {
+        struct Guard {
+            Prompt* p;
+            bool armed = true;
+            ~Guard() {
+                if (armed) p->drain();
+            }
+        } guard{this};
         const int chunks = (n + kChunk - 1) / kChunk;
         const int per = (n + chunks - 1) / chunks;
         std::string err;
         int reported = 0, k = 0;
+        prestaged_ = false;
         for (int t0 = 0; t0 < n; t0 += per, ++k) {
             if (r.stop && r.stop()) break;
+            if (k == 0 && prepare && (!prepare() || m_.wedged() || m_.loaned() > 0))
+                return {model::Status::Error, "inkling2: the prompt path's memory could not be taken back"};
             const int rows = std::min(per, n - t0);
+            next_long_ = t0 + per < n && std::min(per, n - t0 - per) > kRoutedRows;
             if (!chunk(tokens ? tokens + t0 : nullptr, emb ? emb + (size_t) t0 * g_.n_embd : nullptr, rows, pos + t0, err))
                 return {model::Status::Error, "inkling2: " + err};
             ds_->note(pos + t0, rows);
             if (tokens) hist.insert(hist.end(), tokens + t0, tokens + t0 + rows);
             else hist.insert(hist.end(), (size_t) rows, pad);
-            cudaEventRecord(done_[k % 2], strm());
-            if (k > 0) {   // the chunk before this one has run
-                cudaEventSynchronize(done_[(k - 1) % 2]);
-                if (r.progress) r.progress(reported);
-            }
+            if (!ok(cudaEventRecord(done_[k % 2], strm())) || (k > 0 && !ok(cudaEventSynchronize(done_[(k - 1) % 2]))))
+                return {model::Status::Error, std::string("inkling2: a prompt chunk's completion could not be waited for: ") +
+                                                  cudaGetErrorString(fail_)};
+            if (k > 0 && r.progress) r.progress(reported);   // the chunk before this one has run
             reported = t0 + rows;
         }
         if (cudaStreamSynchronize(strm()) != cudaSuccess) return {model::Status::Error, "inkling2: the prompt failed"};
+        // a stopped read may leave the next chunk's copies queued (staging_read)
+        if (lane_[0].copy && cudaStreamSynchronize(lane_[0].copy) != cudaSuccess)
+            return {model::Status::Error, "inkling2: the prompt staging failed"};
+        guard.armed = false;
         if (r.progress && reported > 0) r.progress(reported);
         return {};
+    }
+    // A failed read: every stream it queued work on runs out before the staging, the chunk buffers or a card copy it reads
+    // can be used again. When one cannot, the engine ends without the CUDA teardown, which would wait for that work
+    // (core::gpu_left_running).
+    void drain() {
+        bool out = true;
+        for (int i = m_.cards() - 1; i >= 0; --i) {
+            Lane& k = lane_[i];
+            if (cudaSetDevice(k.device) != cudaSuccess) {
+                out = false;
+                continue;
+            }
+            if (k.copy && cudaStreamSynchronize(k.copy) != cudaSuccess) out = false;
+            if (cudaStreamSynchronize(k.stream) != cudaSuccess) out = false;
+        }
+        cur_ = 0;
+        if (cudaSetDevice(lane_[0].device) != cudaSuccess) out = false;
+        cudaGetLastError();
+        if (!out) {
+            basalt::core::gpu_left_running().store(true);
+            basalt::log::error("basalt inkling2", "a failed prompt read's work could not be run out");
+        }
+    }
+    // The first failing call's status of the read (staging_failed), for its error.
+    bool ok(cudaError_t e) {
+        if (e != cudaSuccess && fail_ == cudaSuccess) fail_ = e;
+        return e == cudaSuccess;
     }
 
     // One chunk of `rows` rows at pos0..: the embedding, the visits, the caches.
@@ -330,6 +442,16 @@ private:
             cur_ = i;
             cudaSetDevice(lane().device);
             prompt_rows(b().pos, pos0, rows, b().dbounds, strm());
+        }
+        // a long chunk stages every RAM expert of a spilled layer: the copies need no routing, so they run ahead on the copy
+        // stream, each layer's once the spilled visit before it has read the staging
+        ahead_ = rows > kRoutedRows && first_spill_ >= 0;
+        fail_ = cudaSuccess;
+        const bool prestaged = prestaged_;
+        prestaged_ = false;
+        if (ahead_ && !prestaged && !stage_ahead(first_spill_)) {
+            err = staging_failed();
+            return false;
         }
         float* x0 = buf(Buf::X0);
         if (emb) {
@@ -348,7 +470,11 @@ private:
                     if (cur_ == 0) cudaMemcpyAsync(ds_->tap(k), buf(s.hid), (size_t) rows * E * 4, cudaMemcpyDeviceToDevice, strm());
                     else tap_across(k, buf(s.hid), rows);
                 }
-                layer(s, rows, pos0);
+                step_ = (int) si;
+                if (!layer(s, rows, pos0)) {
+                    err = staging_failed();
+                    return false;
+                }
             }
         }
         if (ds_->on()) {   // and every row's final normed state, then the rows' context keys and values
@@ -393,7 +519,8 @@ private:
         attnres_mix(st, w.msg_query, 4, rows, 1e-6f, b().msg, (int64_t) rows * g_.n_embd, strm());
     }
 
-    void layer(const Step& s, int rows, int64_t pos0) {
+    // False when the experts' staging failed (nothing of the visit's experts is queued then).
+    bool layer(const Step& s, int rows, int64_t pos0) {
         const Visit& v = g_.visits[(size_t) s.visit];
         const int l = v.layer;
         const LayerWeights& w = m_.layer(l);
@@ -444,6 +571,7 @@ private:
         }
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
         const bool fp8 = m_.cache_fp8();
+        const bool int8 = m_.cache_int8();
         AttnPrep ap;
         ap.yq = b().yq;
         ap.yk = one ? b().yq + kProjQ : b().yk;
@@ -466,6 +594,7 @@ private:
         ap.v_cache = c.ring ? b().v_stage : c.v;
         ap.cap = c.ring ? kChunk : c.cap;
         ap.fp8 = fp8;
+        ap.int8 = int8;
         ap.q = b().q;
         ap.r = b().r;
         ap.sink = b().sink;
@@ -483,10 +612,12 @@ private:
         aa.v_chunk = ap.v_cache;
         aa.chunk_cap = ap.cap;
         aa.fp8 = fp8;
+        aa.int8 = int8;
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
-        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, strm());
+        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
+                                  kv_cache_row_bytes(fp8, int8), strm());
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
                  q8::Epilogue::Store, strm());
@@ -501,14 +632,15 @@ private:
         attnres_mix(st, w.ffn_query, 1, rows, 1e-6f, b().mix, (int64_t) RE, strm());
         if (s.msgs) controller(w, 3, b().mix, b().msg + 3 * RE, rows, b().mix);
         bk::rms_norm_rows(b().mix, w.ffn_norm, rows, E, g_.rms_eps, b().nrm, strm());
-        experts(w, l, rows);
+        if (!experts(w, l, rows)) return false;
         post_conv(b().moe, b().pos, w.ffn_post_conv, c.m_ring, b().resid, rows, out, strm());
+        return true;
     }
 
     // The routed experts of the chunk's normed MLP inputs (nrm) into moe: the router's scores as one product, the pairs
     // sorted by expert, the gate/up and down products per expert in two MMQ launches over the experts in place.
-    void experts(const LayerWeights& w, int l, int rows) {
-        const int E = g_.n_embd, F = g_.n_ff_exp, k = g_.n_used, pairs = rows * k;
+    bool experts(const LayerWeights& w, int l, int rows) {
+        const int E = g_.n_embd, k = g_.n_used, pairs = rows * k;
         bk::f32_rows_dot(b().nrm, w.router, b().rlog, rows, g_.n_expert, E, strm());
         bk::RouterArgs ra;
         ra.n_expert = g_.n_expert;
@@ -517,21 +649,72 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router_select(b().rlog, w.router_bias, rows, ra, b().ids, b().rw, strm());
-        if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot, its RAM experts copied into the staging
-            remap_ids(b().ids, pairs, w.slot_map, strm());
-            const uint64_t kept = (uint64_t) (g_.n_expert - w.n_spill) * w.expert_stride;
-            if (!m_.stage_from_card(l, strm()))   // the elastic spill's card copies when the layer has them all
-                cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) w.n_spill * w.expert_stride, cudaMemcpyHostToDevice, strm());
-            cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm());   // spill.hpp
+        const bool peer = m_.peer_runs(l);
+        const int on_peer = peer ? peer_send(w, l, rows) : 0;   // the second card's rows run beside the main card's
+        if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot (the second card's left out), its RAM experts copied into the staging
+            remap_ids(b().ids, pairs, peer ? w.slot_map : w.slot_full, strm());
+            if (!ahead_) {   // else the copy stream stages it (stage_ahead) and the first product waits (staged_ready)
+                const uint8_t* want = nullptr;
+                if (rows <= kRoutedRows && !(want = routed(pairs))) return false;
+                if (!m_.stage(l, want, strm(), !peer) ||
+                    !ok(cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm())))
+                    return false;   // the guard after the last slot: spill.hpp
+            }
         }
-        moe_sort(b().ids, rows, k, g_.n_expert, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());
+        if (!local_experts(w, g_.n_expert, rows)) return false;
+        if (on_peer > 0) peer_join(on_peer);
+        return true;
+    }
+
+    // The rows with a choice on the second card, their normed rows, choices and weights to it (the main card's kernel writes them
+    // to page-locked memory), which runs its experts' pairs over the same kernels into its own partial sums (the choices it has
+    // no expert for are left out) and sends them back (peer_join). The rows are counted first: the plan is one small launch and
+    // the host waits for it. Returns the rows sent.
+    int peer_send(const LayerWeights& w, int l, int rows) {
+        const int k = g_.n_used;
+        const Lane& m = lane_[0];
+        peer_rows_plan(b().ids, rows, k, w.slot_map, row_ix_, px_cnt_, strm());
+        cudaStreamSynchronize(strm());
+        const int n = *static_cast<volatile int32_t*>(px_cnt_);
+        if (n == 0) return 0;
+        peer_rows_gather(b().nrm, b().ids, b().rw, k, row_ix_, n, px_nrm_, px_ids_, px_rw_, strm());
+        cudaEventRecord(m.hand, strm());
+        const size_t pairs = (size_t) n * k;
+        cur_ = 1;
+        cudaSetDevice(lane().device);
+        cudaStreamWaitEvent(strm(), m.hand, 0);
+        cudaMemcpyAsync(b().nrm, px_nrm_, (size_t) n * g_.n_embd * 4, cudaMemcpyHostToDevice, strm());
+        cudaMemcpyAsync(b().ids, px_ids_, pairs * 4, cudaMemcpyHostToDevice, strm());
+        cudaMemcpyAsync(b().rw, px_rw_, pairs * 4, cudaMemcpyHostToDevice, strm());
+        LayerWeights pw = w;   // the layer's experts on this card: its own run of blobs, no staging
+        pw.experts = m_.peer_base(l);
+        pw.expert_stride = m_.peer_stride(l);
+        pw.slot_map = nullptr;
+        pw.n_spill = 0;
+        remap_ids(b().ids, pairs, m_.peer_map(l), strm());
+        local_experts(pw, m_.peer_n(l), n);   // no staging on this card (slot_map null): always true
+        cudaMemcpyAsync(px_out_, b().moe, (size_t) n * g_.n_embd * 4, cudaMemcpyDeviceToHost, strm());
+        cudaEventRecord(lane().hand, strm());
+        cur_ = 0;
+        cudaSetDevice(lane().device);
+        return n;
+    }
+    void peer_join(int n) {
+        cudaStreamWaitEvent(strm(), lane_[1].hand, 0);
+        cudaMemcpyAsync(b().gu, px_out_, (size_t) n * g_.n_embd * 4, cudaMemcpyHostToDevice, strm());   // gu is spent
+        peer_rows_add(b().gu, row_ix_, n, b().moe, strm());
+    }
+
+    // The pairs of b().ids (expert slots 0..n-1, or -1 for a pair another card computes) over the experts of `w`, combined into moe.
+    // False when the next spilled visit's staging failed (staging_read).
+    bool local_experts(const LayerWeights& w, int n, int rows) {
+        const int E = g_.n_embd, F = g_.n_ff_exp, k = g_.n_used, pairs = rows * k;
+        moe_sort(b().ids, rows, k, n, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());
         if (w.gu_type == kTypeNvfp4 && w.d_type == kTypeNvfp4 && fp4_shape()) {
-            experts_fp4(w, rows);
-            return;
+            return experts_fp4(w, n, rows);
         }
         if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) {
-            experts_mxfp8(w, rows);
-            return;
+            return experts_mxfp8(w, n, rows);
         }
         mmq::quantize(b().nrm, b().tok, b().xq, w.gu_type, E, E, pairs, strm());
         mmq::Product p;
@@ -540,15 +723,16 @@ private:
         p.w_rows = 2 * F;
         p.w_cols = E;
         p.expert_bytes = w.expert_stride;
-        p.n = g_.n_expert;
+        p.n = n;
         p.xq = b().xq;
         p.bounds = b().bounds;
         p.ids = b().ident;
         p.total_rows = pairs;
         p.max_rows = rows;
-        p.opt_rows = (pairs + g_.n_expert - 1) / g_.n_expert;
+        p.opt_rows = (pairs + n - 1) / n;
         p.dst = b().gu;
         p.ld_dst = 2 * F;
+        if (!staged_ready(w)) return false;
         lane().mmq.run(p, strm());
         // an NVFP4 expert's {s_gate, s_up, s_down, 0} tail is read in its blob
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
@@ -570,7 +754,49 @@ private:
         d.dst = b().gu;
         d.ld_dst = E;
         lane().mmq.run(d, strm());
-        moe_combine(b().gu, b().rw, rows, k, b().moe, strm());
+        if (w.slot_map && !staging_read()) return false;
+        moe_combine(b().gu, b().rw, rows, k, b().moe, strm(), b().ids);
+        return true;
+    }
+
+    // Step si's RAM experts into the staging on the copy stream, after the products queued so far on the compute stream:
+    // the copy stream waits for them, `staged` follows the copies and the guard after the layer's last slot (spill.hpp).
+    // False when any of it could not be queued; `staged` then publishes nothing and the chunk fails.
+    bool stage_ahead(int si) {
+        Lane& k = lane();
+        const int l = g_.visits[(size_t) walk_.steps[(size_t) si].visit].layer;
+        const LayerWeights& w = m_.layer(l);
+        return ok(cudaEventRecord(k.freed, k.stream)) && ok(cudaStreamWaitEvent(k.copy, k.freed, 0)) && m_.stage(l, nullptr, k.copy, !m_.peer_runs(l)) &&
+               ok(cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, k.copy)) &&
+               ok(cudaEventRecord(k.staged, k.copy));
+    }
+    // Before a spilled visit's first product over the staging: on the copy stream's chunk, it waits for the copies, so the
+    // sort and the activations' rounding before it run under them.
+    bool staged_ready(const LayerWeights& w) { return !ahead_ || !w.slot_map || ok(cudaStreamWaitEvent(strm(), lane().staged, 0)); }
+    // A spilled visit's products are queued over the staging: the chunk's next spilled visit's copies may start, or after the
+    // chunk's last one, the next chunk's first when that chunk stages ahead too.
+    bool staging_read() {
+        if (!ahead_) return true;
+        if (const int next = next_spill_[(size_t) step_]; next >= 0) return stage_ahead(next);
+        if (!next_long_) return true;
+        prestaged_ = true;
+        return stage_ahead(first_spill_);
+    }
+    std::string staging_failed() {
+        const cudaError_t e = fail_ != cudaSuccess ? fail_ : cudaGetLastError();
+        return std::string("staging a layer's RAM experts failed") + (e != cudaSuccess ? std::string(": ") + cudaGetErrorString(e) : "");
+    }
+
+    // The slots a short chunk's pairs route to, for the staging: the host waits for the router, as a short chunk reads only a
+    // part of a layer's RAM experts. Null when the readback failed.
+    const uint8_t* routed(int pairs) {
+        if (cudaMemcpyAsync(routed_ids_, b().ids, (size_t) pairs * 4, cudaMemcpyDeviceToHost, strm()) != cudaSuccess ||
+            cudaStreamSynchronize(strm()) != cudaSuccess)
+            return nullptr;
+        std::fill(routed_.begin(), routed_.end(), (uint8_t) 0);
+        for (int i = 0; i < pairs; ++i)
+            if (routed_ids_[i] >= 0 && routed_ids_[i] < g_.n_expert) routed_[(size_t) routed_ids_[i]] = 1;
+        return routed_.data();
     }
 
     // The NVFP4 experts on the FP4 block-scaled tensor cores, the weights read once a tile in place: each activation row
@@ -579,8 +805,8 @@ private:
     // planes into H as the softcapped SwiGLU, H rounded per expert tile, then down into the pairs' rows.
     bool fp4_shape() const { return g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024; }
     bool mxfp8_shape() const { return g_.n_embd % 128 == 0 && g_.n_ff_exp % 128 == 0 && g_.n_expert <= 1024; }
-    void experts_mxfp8(const LayerWeights& w, int rows) {
-        const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
+    bool experts_mxfp8(const LayerWeights& w, int n, int rows) {
+        const int E = g_.n_embd, F = g_.n_ff_exp, pairs = rows * g_.n_used;
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
         mxfp8::plan_blocks(b().bounds, n, b().blk_off, strm());
         mxfp8::quantize_tokens(b().nrm, rows, E, E, b().xq, strm());
@@ -603,6 +829,7 @@ private:
         gu.swiglu = true;
         gu.gate_softcap = g_.gate_softcap;
         gu.up_softcap = g_.up_softcap;
+        if (!staged_ready(w)) return false;
         mxfp8::run(gu, strm());
         mxfp8::quantize_f16(h16, pairs, F, F, b().xq, strm());
         mxfp8::Product d = gu;
@@ -619,10 +846,12 @@ private:
         d.dst_ids = b().dst;
         d.ld_dst = E;
         mxfp8::run(d, strm());
-        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm());
+        if (w.slot_map && !staging_read()) return false;
+        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm(), b().ids);
+        return true;
     }
-    void experts_fp4(const LayerWeights& w, int rows) {
-        const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
+    bool experts_fp4(const LayerWeights& w, int n, int rows) {
+        const int E = g_.n_embd, F = g_.n_ff_exp, pairs = rows * g_.n_used;
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
         fp4::plan_blocks(b().bounds, n, b().tile_off, b().blk_off, strm());
         fp4::quantize_tokens(b().nrm, rows, E, E, b().a4x, b().gsx, strm(), true);
@@ -647,6 +876,7 @@ private:
         gu.dst_f16 = h16;
         gu.ld_dst = F;
         gu.two = true;
+        if (!staged_ready(w)) return false;
         fp4::run(gu, strm());
         fp4::quantize_f16(h16, b().bounds, b().tile_off, n, b().a4h, b().gsh, F, F, pairs, strm());
         fp4::Product d = gu;
@@ -665,7 +895,9 @@ private:
         d.two = true;
         d.ld_dst = E;
         fp4::run(d, strm());
-        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm());
+        if (w.slot_map && !staging_read()) return false;
+        moe_combine_f16(gu16, b().rw, rows, g_.n_used, b().moe, strm(), b().ids);
+        return true;
     }
 
     InklingModel& m_;
@@ -676,9 +908,20 @@ private:
     std::vector<Segment> segs_;   // the walk's runs of visits on each card (walk.hpp split_walk)
     Lane lane_[2];                // each card's buffers, products and stream
     int cur_ = 0;                 // the card the launches go to
+    float* px_nrm_ = nullptr, *px_rw_ = nullptr, *px_out_ = nullptr;   // gpu-mode peer: page-locked rows, weights and sums crossing
+    int32_t* px_ids_ = nullptr, *px_cnt_ = nullptr, *row_ix_ = nullptr;   // and the rows sent: their count (page-locked), their rows
     float* hand_ = nullptr;       // the layer split: page-locked slots of a chunk's rows crossing between the cards
     int tap_slot0_ = 0;           // the first drafter tap's slot
     cudaEvent_t done_[2] = {};
+    int32_t* routed_ids_ = nullptr;   // page-locked: a short chunk's pairs by slot (routed)
+    std::vector<uint8_t> routed_;     // [slot] whether a pair of the chunk routes to it
+    std::vector<int> next_spill_;     // [step] the next step whose layer has RAM experts (-1: none)
+    int first_spill_ = -1;            // the first such step
+    int step_ = 0;                    // the step being queued
+    bool ahead_ = false;              // this chunk stages on the copy stream (stage_ahead)
+    bool next_long_ = false;          // the read's next chunk stages on the copy stream too
+    bool prestaged_ = false;          // the chunk before staged this chunk's first spilled visit
+    cudaError_t fail_ = cudaSuccess;  // the read's first failing call (ok)
 };
 
 }  // namespace

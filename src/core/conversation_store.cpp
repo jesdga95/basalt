@@ -699,10 +699,10 @@ Cut plan_cut(const std::vector<int64_t>& checks, int64_t tokens) {
     return c;
 }
 
-// bytes of a K/V buffer for `cells` cells (data and scales scale with the cells; pooled rows with the indexer blocks)
-uint64_t kv_part_bytes(uint32_t kind, uint64_t stored, int64_t stored_cells, int64_t cells, int64_t rows,
-                       int64_t idx_dim) {
-    if (kind == kPooled) return rows > 0 ? (uint64_t) rows * (uint64_t) idx_dim * sizeof(float) : 0;
+// bytes of a K/V buffer for `cells` cells (data and scales scale with the cells; pooled rows with the stored row width)
+uint64_t kv_part_bytes(uint32_t kind, uint64_t stored, int64_t stored_cells, int64_t stored_rows, int64_t cells,
+                       int64_t rows) {
+    if (kind == kPooled) return stored_rows > 0 && rows > 0 ? stored / (uint64_t) stored_rows * (uint64_t) rows : 0;
     if (stored_cells <= 0) return 0;
     return stored / (uint64_t) stored_cells * (uint64_t) cells;
 }
@@ -803,8 +803,8 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             const ConversationBuffer* from[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
             ConversationBuffer* to[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
             for (int b = 0; b < 5; ++b) {
-                const uint64_t n = kv_part_bytes((uint32_t) (kK + b), from[b]->size(), kv.cells, k.cells,
-                                                 k.pooled_rows, kv.idx_dim);
+                const uint64_t n = kv_part_bytes((uint32_t) (kK + b), from[b]->size(), kv.cells, kv.pooled_rows,
+                                                 k.cells, k.pooled_rows);
                 if (n > from[b]->size()) { error = "conversation store: K/V shorter than the match"; return false; }
                 to[b]->resize_for_overwrite(n);
                 to[b]->visit(0, n, [&](uint8_t* p, size_t c, size_t at) { return from[b]->read(p, at, c); });
@@ -1446,6 +1446,19 @@ ConversationStore::Stats ConversationStore::stats() const {
 uint64_t ConversationStore::queued_bytes() const {
     std::lock_guard<std::mutex> lk(mu_);
     return queue_bytes_;
+}
+
+bool ConversationStore::fits(uint64_t bytes) const {
+    if (!open_) return false;
+    const uint64_t queued = queued_bytes(), free_bytes = basalt::platform::disk_free_bytes(dir_);
+    const bool room = free_bytes >= queued + bytes + kSpaceFloor;
+    if (!room && !full_said_.exchange(true))
+        basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, so conversations are not written "
+                          "to disk until it has room (%.0f GiB kept free)", dir_.c_str(), (double) free_bytes / 1073741824.0,
+                          (double) kSpaceFloor / 1073741824.0);
+    else if (room && full_said_.exchange(false))
+        basalt::log::info("basalt serve", "conversation cache: %s has room again", dir_.c_str());
+    return room;
 }
 
 uint64_t conversation_store_hash_file(const std::string& path, uint64_t seed) {

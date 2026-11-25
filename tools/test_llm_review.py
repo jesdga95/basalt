@@ -179,14 +179,20 @@ class CodeReview(unittest.TestCase):
     def test_worst_part_verdict_wins_and_a_failed_part_needs_review(self):
         big = "".join(f"diff --git a/src/f{i}.cpp b/src/f{i}.cpp\n--- a/src/f{i}.cpp\n+++ b/src/f{i}.cpp\n@@ -1,1 +1,1 @@\n" + "+x = 1;\n" * 1500
                       for i in range(6))
-        replies = iter(['{"summary": "A.", "verdict": "merge", "findings": []}', '{"summary": "B.", "verdict": "needs_review", "findings": []}'] * 10)
+        replies = iter(['{"summary": "A.", "verdict": "merge", "findings": []}',
+                        '{"summary": "B.", "verdict": "product_decision", "product_decision": "Turns clamping on by default.", "findings": []}'] * 10)
         with mock.patch.object(cr, "CHUNK_TOKENS", 7000):
             body = cr.review(big, "", "", chat_fn=lambda c, m, max_tokens, effort=None: next(replies), cfg={})
-        self.assertIn("**Verdict: Needs further review**", body)
+        self.assertIn("**Verdict: Product decision**", body)
+        self.assertEqual(body.count("**Product decision:** Turns clamping on by default."), 1)
+        rejects = iter(['{"summary": "A.", "verdict": "product_decision", "findings": []}', '{"summary": "B.", "verdict": "needs_review", "findings": []}'] * 10)
+        with mock.patch.object(cr, "CHUNK_TOKENS", 7000):
+            body = cr.review(big, "", "", chat_fn=lambda c, m, max_tokens, effort=None: next(rejects), cfg={})
+        self.assertIn("**Verdict: Needs additional review**", body)
         fails = iter(['{"summary": "A.", "verdict": "merge", "findings": []}', "oops"] * 10)
         with mock.patch.object(cr, "CHUNK_TOKENS", 7000):
             body = cr.review(big, "", "", chat_fn=lambda c, m, max_tokens, effort=None: next(fails), cfg={})
-        self.assertIn("**Verdict: Needs further review**", body)
+        self.assertIn("**Verdict: Needs additional review**", body)
 
     def test_no_findings_is_one_line_and_focus_is_passed(self):
         sent = []

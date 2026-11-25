@@ -44,7 +44,7 @@ import threading
 import time
 from pathlib import Path
 
-from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
+from serve.api.grammar import GPROMPT_KEY, REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key, gprompt_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
@@ -552,14 +552,21 @@ class ProcessEngine:
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - 4096))
-                tail = f.read().decode("utf-8", "replace")
+                size = f.tell()
+                start = getattr(self, "log_start", None)
+                if isinstance(start, bool) or not isinstance(start, int):
+                    start = max(0, size - 4096)      # no boundary recorded: the bounded tail
+                if 0 <= start <= size:               # a boundary outside the file is not this run's: nothing to attribute
+                    f.seek(max(start, size - 4096))
+                    tail = f.read(4096).decode("utf-8", "replace")
         except (OSError, TypeError):
             pass
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return "the engine's watchdog stopped it: " + line.strip()
         proc = self.proc                                 # None between restart's close and start
+        if proc is None:
+            proc = getattr(self, "_reaped", None)        # a reaped child keeps its exit status
         rc = proc.poll() if proc is not None else None
         status = self._format_exit_status(rc)
         if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
@@ -595,6 +602,30 @@ class ProcessEngine:
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
         self.close()
         self.unloaded = True
+
+    def discard(self):
+        """End the engine without giving a sleeping one its GPU state back: the VRAM it left is in use by another model,
+        so it is killed where it sleeps and its RAM-only conversations are lost."""
+        with self.sleep_lock:
+            if self.asleep and self.proc is not None:
+                self.asleep = False
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=20)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        self.unload()
+
+    def held_mib(self) -> int | None:
+        """The RAM this engine's process holds besides file-backed pages: anonymous and shared memory from
+        /proc/PID/status; None where that is unreadable."""
+        try:
+            with open(f"/proc/{self.proc.pid}/status", encoding="ascii") as f:
+                kb = {k: int(v.split()[0]) for k, _, v in (line.partition(":") for line in f)
+                      if k in ("RssAnon", "RssShmem")}
+        except (OSError, AttributeError, ValueError, IndexError):
+            return None
+        return sum(kb.values()) >> 10 if len(kb) == 2 else None
 
     RESTART_RETRY_S = 15.0   # between restart() tries, for VRAM to be released
 
@@ -755,6 +786,20 @@ class ProcessEngine:
         `OK <groups> <nx> <ny> <ms> <time,...>` line. As encode_images otherwise."""
         return self._encode(f"ENCV {video} {out} {words}".rstrip(), 1, "video", timeout)[0]
 
+    def _retire(self, why: str) -> None:
+        """End the engine after an encode timeout: a late reply leaves the command stream unsafe to
+        reuse, so the next request restarts a fresh one; the child is stopped now, not left holding
+        the VRAM the restart needs."""
+        self.ended = True
+        proc = self.proc
+        if proc is not None and proc.poll() is None and not self.silent_note:   # a live child: retirement is the cause
+            self.silent_note = why + "; the engine was retired"
+            try:
+                proc.kill()
+                proc.wait(timeout=20)                   # restart()/close() handles one still exiting
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
     def _encode(self, command: str, replies: int, what: str, timeout: float | None) -> list[str]:
         if not self.alive():
             raise EngineDied("the engine is not running")
@@ -769,12 +814,13 @@ class ProcessEngine:
                 have_ctl = True
         try:
             self._send(command)
-            deadline = time.time() + timeout
+            deadline = time.monotonic() + timeout
             got: list[str] = []
             while len(got) < replies:
                 try:
-                    line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                    line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
                 except queue.Empty:
+                    self._retire(f"the {what} command timed out")
                     raise EngineDied(f"the engine did not answer the {what} command") from None
                 if line is None:
                     raise EngineDied("the engine ended")
@@ -783,7 +829,8 @@ class ProcessEngine:
                     raise ValueError(f"the {what} could not be read: " + (line[8:].strip() or "the engine refused it"))
                 if line.startswith("ENC OK "):
                     got.append(line[4:])
-                elif time.time() > deadline:
+                elif time.monotonic() > deadline:
+                    self._retire(f"the {what} command timed out")
                     raise EngineDied(f"the engine did not answer the {what} command")
             return got
         finally:
@@ -833,8 +880,10 @@ class ProcessEngine:
             keys += " relax=0"
         elif _number(rd):
             keys += f" relax={float(rd)!r}"
+        gram = grammar_key(sampling.get(GRAMMAR_KEY))
+        gp = gprompt_key(sampling.get(GPROMPT_KEY)) if gram else ""
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + grammar_key(sampling.get(GRAMMAR_KEY)) + logprobs_key(sampling.get(LOGPROBS_KEY))
+            + gram + gp + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1169,7 +1218,7 @@ class ProcessEngine:
                 epoch = list(self.slot_epoch)
 
         def gen_keys() -> str:      # a run that continues after tokens were generated tells the grammar where the prompt ends
-            return keys + (f" gprompt={n}" if out and " grammar=" in keys else "")
+            return keys + (f" gprompt={n}" if out and " grammar=" in keys and " gprompt=" not in keys else "")
 
         def size() -> int:
             return n + len(extra)
@@ -1186,7 +1235,7 @@ class ProcessEngine:
         if not ok:
             return
         holding, born = True, self.gen                  # born: engine generation holding the control lines
-        slot, gen0, reserved = None, None, None
+        slot, slot_gen, gen0, reserved, reserved_gen = None, None, None, None, None
         solo_slot, run0, run_size, ctl_epoch = None, 0, 0, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
@@ -1218,7 +1267,7 @@ class ProcessEngine:
                         else:
                             self.slot_busy[solo_slot] = True
                             self.claim_slot(solo_slot, session)
-                            reserved = solo_slot
+                            reserved, reserved_gen = solo_slot, self.gen
                 if alone and left > 1:
                     if solo_slot is not None:
                         head = f"SGENI {solo_slot} {left}{gen_keys()} {embeddings}" if embeddings else \
@@ -1249,6 +1298,7 @@ class ProcessEngine:
                                         if reserved is not None:
                                             self.slot_busy[reserved] = True
                                             self.claim_slot(reserved, session)
+                                            reserved_gen = self.gen
                                 if reserved is not None:    # (a solo run in a slot parks its read in that slot)
                                     self._send(f"BYIELD {reserved}")
                                     yield_sent = True
@@ -1260,15 +1310,16 @@ class ProcessEngine:
                         out.append(t)
                         yield t
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
-                        slot, reserved = reserved, None     # gave way: the read continues in that slot
+                        slot, slot_gen, reserved, reserved_gen = reserved, reserved_gen, None, None
                     elif reserved is not None:              # did not give way: release the slot
-                        self._solo_kept(solo_slot, run_size, out[run0:])
-                        if solo_slot is not None:
-                            note(solo_slot)
-                        with self.slot_cv:
-                            self.slot_busy[reserved] = False
-                            self.slot_cv.notify_all()
-                        reserved = None
+                        if self.gen == reserved_gen:
+                            self._solo_kept(solo_slot, run_size, out[run0:])
+                            if solo_slot is not None:
+                                note(solo_slot)
+                            with self.slot_cv:
+                                self.slot_busy[reserved] = False
+                                self.slot_cv.notify_all()
+                        reserved, reserved_gen = None, None
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
@@ -1289,6 +1340,7 @@ class ProcessEngine:
                                     if slot is not None and self.admission.may_go(ticket, self._resumes(slot, meets(), size())):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
+                                        slot_gen = self.gen
                                         break
                                     slot = None
                                     if holding:
@@ -1309,6 +1361,10 @@ class ProcessEngine:
                             return
                         holding, born = True, self.gen
                         attach()
+                        if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                            slot, slot_gen = None, None
+                            self._yielded = None
+                            continue
                     if self._yielded is not None:           # gave way: waiting requests go first
                         self._hold(slot, self._yielded[1])
                         note(slot)
@@ -1323,6 +1379,9 @@ class ProcessEngine:
                             return
                         holding, born = True, self.gen
                         attach()
+                        if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                            slot, slot_gen = None, None
+                            continue
                     left = max(1, min(left, self.max_context - size() - SLOT_MARGIN))   # the slot's room
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
@@ -1414,11 +1473,12 @@ class ProcessEngine:
                         self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path
-                            self.slot_used[slot] = time.time()
-                            with self.slot_cv:
-                                self.slot_busy[slot] = False
-                                self.slot_cv.notify_all()
-                            slot, gen0 = None, None
+                            if self.gen == slot_gen:
+                                self.slot_used[slot] = time.time()
+                                with self.slot_cv:
+                                    self.slot_busy[slot] = False
+                                    self.slot_cv.notify_all()
+                            slot, slot_gen, gen0 = None, None, None
                             extra, left = list(out), int(max_new) - len(out)
                             solo_again += 1
                             break
@@ -1444,13 +1504,13 @@ class ProcessEngine:
                 pass
             if holding:
                 self.ctl.release()
-            if reserved is not None:
+            if reserved is not None and self.gen == reserved_gen:
                 if reserved == solo_slot:
                     self._solo_kept(solo_slot, run_size, out[run0:])
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_cv.notify_all()
-            if slot is not None:
+            if slot is not None and self.gen == slot_gen:
                 self.slot_used[slot] = time.time()
                 if phase == "slot":
                     self._hold(slot, 0)
@@ -1492,23 +1552,25 @@ class ProcessEngine:
         The engine answers at once, whatever it is doing. Returns (handle, tokens)."""
         with self.prompt_lock:                  # the answers come in the order the prompts were sent
             try:
-                if isinstance(ids, PromptText):
-                    body = ids.text
-                    spans = ids.byte_spans()
-                    plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
-                    with self.wlock:
+                with self.wlock:
+                    q, gen = self.prompt_q, self.gen
+                    if isinstance(ids, PromptText):
+                        body = ids.text
+                        spans = ids.byte_spans()
+                        plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
                         self.proc.stdin.write(f"PROMPT {len(body.encode('utf-8'))}{plain}\n{body}")
-                        self.proc.stdin.flush()
-                else:
-                    self._send("PROMPTI" + (" img" if embeddings else "") + " " + ",".join(str(int(t)) for t in ids))
+                    else:
+                        self.proc.stdin.write("PROMPTI" + (" img" if embeddings else "") + " " +
+                                              ",".join(str(int(t)) for t in ids) + "\n")
+                    self.proc.stdin.flush()
             except (OSError, AttributeError):
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
             while True:
                 try:
-                    line = self.prompt_q.get(timeout=1.0)
+                    line = q.get(timeout=1.0)
                     break
                 except queue.Empty:
-                    if not self.alive():
+                    if self.gen != gen or not self.alive():
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         if line is None:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -1750,6 +1812,15 @@ class ProcessEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
         return EngineSilent(f"{what}; the server ended the engine")
+
+    def reap(self) -> None:
+        """Close the child of an engine that already ended (a retirement, a stall, a crash): it may still be
+        releasing GPU/RAM, and the load path's free-VRAM check would otherwise blame another program and
+        keep rejecting the restart that cleans it up. The child is kept for death_note: close() clears
+        self.proc, which would turn a crash's exit status into "no exit status"."""
+        if getattr(self, "proc", None) is not None and not self.alive():
+            self._reaped = self.proc                     # its returncode survives the close
+            self.close()   # EngineStuck here means it is genuinely still exiting: the honest answer
 
     def close(self):
         """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""

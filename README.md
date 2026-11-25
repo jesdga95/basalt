@@ -1,8 +1,8 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
 Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Next**, **DeepSeek-V4.1-Flash**, **Qwen3.8-27B**, **Hy4-flash** and **Inkling 2 Mini**. It runs
-on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with what does not fit in VRAM (the experts of a mixture-of-experts model)
-in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
+on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, and on the DGX Spark (GB10, Arm64), with what does not fit in VRAM
+(the experts of a mixture-of-experts model) in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
 
 <p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
 
@@ -16,13 +16,14 @@ in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Ant
 
 ## Requirements
 
-- Linux x86-64 with AVX2, or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
-- An NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
+- Linux x86-64 with AVX2, or Windows 10 1903+ x64, with an NVIDIA Blackwell GPU (compute capability 12.0) ([platforms](docs/platforms.md)).
+- Or a DGX Spark or another GB10 machine: Linux Arm64 with its integrated Blackwell GPU (12.1) ([Arm64](docs/arm64.md)).
+- CUDA 13.
 - CMake 3.24+, GCC 13+ (Linux), Python 3.10+, and enough system RAM for the experts that do not fit in VRAM.
 
 ## Quick start
 
-Prebuilt Linux and Windows archives are attached to each [release](https://github.com/jesdga95/basalt/releases) ([what they need](docs/platforms.md#release-archives)); otherwise build from source:
+Prebuilt Linux (x64 and Arm64) and Windows archives are attached to each [release](https://github.com/jesdga95/basalt/releases) ([what they need](docs/platforms.md#release-archives)); otherwise build from source:
 
 ```sh
 git clone https://github.com/jesdga95/basalt && cd basalt
@@ -39,7 +40,7 @@ Put the settings in `basalt_config.json`:
 ```json
 {
   "version": 2,
-  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "kv": "int8" }],
+  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "gpu-mode": "peer", "kv": "int8" }],
   "engine": { "resident-experts": true },
   "server": { "port": 8080 }
 }

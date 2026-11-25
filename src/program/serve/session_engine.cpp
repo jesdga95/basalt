@@ -1,4 +1,5 @@
 // src/program/serve/session_engine.cpp - the shared server over a model's ModelSession: one token per window.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "session_engine.hpp"
 
 #include "batch_plan.hpp"
@@ -6,6 +7,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -60,6 +62,7 @@ public:
             const uint64_t identity = basalt::core::conversation_store_hash_file(
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;
+            disk.set_row_cells(session().disk_row_cells());
             if (o.prompt_cache <= 0) {
                 basalt::log::warn("basalt serve", "conversation cache on disk off: --prompt-cache 0");
             } else if (!disk.open(o.conversation_cache_dir, identity, (uint64_t) o.conversation_cache_disk_mib << 20, de)) {
@@ -95,7 +98,8 @@ public:
     std::string identity_words() const {
         const basalt::core::Json* nm = model_file.meta().get("name");
         std::string ids;
-        for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices, {})) {
+        for (const basalt::model::GpuCards::Card& c : o.gpus.cards) {
+            const int d = c.device;
             std::string bus;
             if (basalt::core::device_pci_bus_id(d, bus)) ids += (ids.empty() ? "" : ",") + bus;
         }
@@ -150,6 +154,17 @@ public:
         char* end = nullptr;
         const long long reserve = cmd.size() > 4 ? std::strtoll(cmd.c_str() + 4, &end, 10) : -1;
         if (cmd.size() > 4 && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+        if (reserve >= 0) {
+            const int floor = vram_floor_mib();
+            if (reserve < floor) {
+                e = "VRAM reserve is below " + std::to_string(floor) + " MiB";
+                return false;
+            }
+            if ((uint64_t) reserve > (UINT64_MAX >> 20)) {
+                e = "VRAM reserve is too large";
+                return false;
+            }
+        }
         int64_t slots = 0;
         if (const basalt::model::Result r = session().set_vram_reserve(reserve, slots); !r.ok()) {
             e = r.message;
@@ -185,6 +200,7 @@ public:
         const auto spill = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
             if (at_exit) disk.flush();   // one image in RAM at a time
             const int64_t positions = (int64_t) ids.size();
+            if (!disk.fits(session().running_bytes() + session().cells_bytes(positions))) return;   // no copy the writer drops
             if (!capture_admit(session().running_bytes() + session().cells_bytes(positions), floor)) {
                 basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM admission)", ids.size());
                 return;
@@ -257,8 +273,8 @@ public:
         image.cvec = cvec;
         return true;
     }
-    // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
-    // session goes on holding it (`kept`) and only the disk lacks it.
+    // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no RAM tier or
+    // no room in it.
     bool park_current(size_t held, int64_t kept) override {
         ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
@@ -266,12 +282,19 @@ public:
         int64_t deepest = 0;
         for (const ConvCheckpoint& c : checks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
         const bool disk_wants = disk.enabled() && !(kept > 0 && kept >= deepest) && !disk_has(live, live_imgs, checks, cvec_cached);
-        bool to_disk = !conversations->enabled() || kept > 0;
+        bool to_disk = !conversations->enabled();
         if (to_disk && !disk_wants) return true;
+        if (!to_disk)
+            if (const size_t dropped = conversations->drop_superseded(live, live_imgs, checks, cvec_cached))
+                basalt::log::info("basalt serve", "conversation cache: dropped %zu superseded cop%s of this "
+                                  "conversation; parked=%zu", dropped, dropped == 1 ? "y" : "ies", conversations->size());
         const int64_t positions = (int64_t) live.size();
-        const size_t estimate = session().running_bytes() + session().cells_bytes(positions);
+        size_t estimate = session().running_bytes() + session().cells_bytes(positions) +
+                          live.size() * sizeof(int32_t) + live_imgs.size() * sizeof(ImgKey);
+        for (const ConvCheckpoint& c : checks) estimate += c.bytes();
         const bool ram_room = !to_disk && conversations->make_room(estimate, held);
         if (!to_disk && !ram_room && disk_wants) to_disk = true;
+        if (to_disk && !disk.fits(estimate)) return true;   // a full disk: no copy off the card that the writer drops
         if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
         const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk.enabled() ? disk_floor : 0);
         if (!capture_admit(estimate, floor)) {
@@ -385,7 +408,7 @@ public:
 private:
     bool memory_reply(long long reserve, int64_t slots, std::string* reply) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         char line[160];
         char held[48] = "";   // a session with no cache names no slots
         if (slots >= 0) std::snprintf(held, sizeof held, " expert_slots=%lld", (long long) slots);
@@ -420,6 +443,7 @@ public:
     void decode_state_begin() {
         draws_ = 0;
         n_draft_ = 0;
+        hybrid_drafts_ = false;
         drafts_.assign((size_t) max_window(), 0);
         conf_.assign((size_t) max_window(), 0.0f);
         sbuf_.assign((size_t) max_window(), 0);
@@ -439,17 +463,24 @@ public:
     int max_window() const { return rt_.session().max_window(); }
     int draft_window() {
         const int T = rt_.policy->window(conf_.data(), n_draft_);
-        return (int) std::max<int64_t>(1, std::min<int64_t>(T, runtime_.o.max_context - p));
+        return (int) std::max<int64_t>(1, std::min<int64_t>(T, most_rows()));
+    }
+    // the context's end, or a position the session changes state at (window_limit)
+    int64_t most_rows() const {
+        const int limit = rt_.session().window_limit(p);
+        const int64_t room = runtime_.o.max_context - p;
+        return limit > 0 ? std::min<int64_t>(room, limit) : room;
     }
     // a lookup proposal takes the window when its first token is the drafter's (or the drafter has none) and the policy
     // expects more tokens per ms from it
     void lookup_window(int& T, bool& from_sfx, int& sfx_match) {
         if (!rt_.sfx || first_window || ppl != nullptr) return;
-        const int most = (int) std::min<int64_t>(max_window(), runtime_.o.max_context - p);
+        const int most = (int) std::min<int64_t>(max_window(), most_rows());
         if (most < 2) return;
         const int k = rt_.sfx->propose(most - 1, sbuf_.data());
         sfx_match = rt_.sfx->last_match();
-        if (k <= 0 || (n_draft_ > 0 && sbuf_[0] != drafts_[0])) return;
+        const bool allow_override = sfx_match >= basalt::spec::SuffixDrafter::LONG_ORDER && (n_draft_ == 0 || conf_[0] < 0.85f);
+        if (k <= 0 || (n_draft_ > 0 && sbuf_[0] != drafts_[0] && !allow_override)) return;
         const basalt::spec::DraftPolicy::Pick pk = rt_.policy->choose_window(conf_.data(), n_draft_, k, sfx_match);
         if (pk.lookup) {
             T = std::min(pk.t, most);
@@ -458,7 +489,7 @@ public:
     }
     void fill_drafts(int T, bool from_sfx) {
         for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf_[(size_t) i - 1] : drafts_[(size_t) i - 1];
-        own_drafts_ = !from_sfx;
+        own_drafts_ = !from_sfx && !hybrid_drafts_;
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
@@ -479,11 +510,14 @@ public:
         d.history_len = hist_n;
         req_sp.counter = draws_;
         const basalt::model::Result r = rt_.session().decode_window(d);
+        refused_ = r.status == basalt::model::Status::Refused;
+        if (refused_) basalt::log::warn("basalt serve", "%s", r.message.c_str());
         if (!r.ok()) error_ = r.message;
         return r.ok();
     }
     bool take_held(int) { return false; }
     bool window_failed() const { return false; }
+    bool window_refused() const { return refused_; }
     const char* window_error() const { return error_.c_str(); }
     void relax_note_forced(int) {}
     int accept_drafts(int T) {
@@ -510,9 +544,13 @@ public:
     }
     void stamp_before_commit() {}
     // each row's pick is the draw of its own index, whatever the width of the window
-    bool commit(int keep, std::string&, int phase) {
-        if (phase == 2) draws_ += (uint64_t) keep;
-        return true;
+    bool commit(int keep, std::string& e, int phase) {
+        if (phase != 2) return true;
+        draws_ += (uint64_t) keep;
+        basalt::model::ModelSession* s = &rt_.session();
+        const basalt::model::Result r = s->decode_kept(&s, &keep, 1);
+        if (!r.ok()) e = r.message;
+        return r.ok();
     }
     void on_token(int32_t tok) {
         if (rt_.sfx) rt_.sfx->append(tok);
@@ -520,9 +558,20 @@ public:
     void count_round() {}
     // The next window's drafts start before this window's tokens go out, which run in their shadow.
     template <class After>
-    bool draft_next(int T, int a, int, int, bool, bool, bool will_draft, After& after_launch) {
+    bool draft_next(int T, int a, int e0, int, bool, bool, bool will_draft, After& after_launch) {
         n_draft_ = 0;
+        hybrid_drafts_ = false;
         if (!will_draft || max_window() < 2) return true;
+        // Skip launching the GPU drafter when prompt lookup already has a long high-confidence exact match at the new tail.
+        if (rt_.sfx && ppl == nullptr && a >= e0) {
+            int pre_match = 0;
+            const int pre_k = rt_.sfx->propose_after(outv.data() + e0, (size_t) (a - e0 + 1), max_window() - 1, sbuf_.data(), &pre_match);
+            if (pre_match >= 2 * basalt::spec::SuffixDrafter::LONG_ORDER && pre_k >= basalt::spec::SuffixDrafter::LONG_ORDER &&
+                rt_.policy->lookup_rate(pre_match) >= 0.90) {
+                after_launch();
+                return true;
+            }
+        }
         const int n = drafts_ahead(T, max_window());
         if (basalt::model::Result r = rt_.session().draft_begin(outv[(size_t) a], p + a + 1, n); !r.ok()) {
             if (r.status == basalt::model::Status::NotImplemented) return true;
@@ -536,6 +585,23 @@ public:
         if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_, need); !r.ok()) {
             runtime_.err = r.message;
             return false;
+        }
+        // Hybrid drafter -> suffix continuation: when confident drafts re-enter verbatim prompt text after an edit,
+        // extend the window up to max_window() - 1 using the suffix index.
+        if (rt_.sfx && ppl == nullptr && n_draft_ >= 4 && n_draft_ < max_window() - 1) {
+            double joint = 1.0;
+            for (int i = 0; i < n_draft_; ++i) joint *= (double) conf_[(size_t) i];
+            if (joint >= 0.60) {
+                int tail_match = 0;
+                const int ext = rt_.sfx->propose_after(drafts_.data(), (size_t) n_draft_, max_window() - 1 - n_draft_,
+                                                       drafts_.data() + n_draft_, &tail_match);
+                if (ext > 0 && tail_match >= 6) {
+                    const float q = (float) rt_.policy->lookup_rate(tail_match);
+                    for (int j = 0; j < ext; ++j) conf_[(size_t) (n_draft_ + j)] = q;
+                    n_draft_ += ext;
+                    hybrid_drafts_ = true;
+                }
+            }
         }
         return true;
     }
@@ -636,13 +702,15 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
-    bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
+    bool own_drafts_ = false;
+    bool hybrid_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
     FILE* draft_log_ = nullptr;
     basalt::model::ModelSession::ExpertCounts counts0_;
     std::string error_;
+    bool refused_ = false;   // the last window was refused (Status::Refused): the request ends, the engine serves on
     size_t next_block_ = 0;
     double live_ms_ = -1e9;
 };
@@ -825,6 +893,7 @@ int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::m
                 basalt::model::Started& started) {
     std::string err;
     SessionRuntime runtime(o, file, err, started);
+    const basalt::core::GpuLeftRunningExit left_running;
     runtime.pre_ = adapter.pretokenizer();
     return runtime.execute();
 }

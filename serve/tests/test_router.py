@@ -688,16 +688,18 @@ class Startup(unittest.TestCase):
 
     def test_every_entry_is_checked_with_its_own_words(self):
         code, _, calls = self.run_main({"engine": {"pool-workers": 8},
-                                        "models": [{"model": "a.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144},
-                                                   {"model": "b.basalt", "gpu": "auto", "max-context": 1048576}]})
+                                        "models": [{"model": "a.basalt", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144},
+                                                   {"model": "b.basalt", "gpu": "0,1", "gpu-mode": "split", "gpu-share": "3,1", "max-context": 1048576}]})
         self.assertEqual(code, "past the checks")
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].args[2], "auto")
+        self.assertEqual(calls[0].args[2], "all")
+        self.assertEqual(calls[0].args[4:], ("peer", None))                      # the mode and the shares go with the cards
+        self.assertEqual((calls[1].args[2], calls[1].args[4:]), ("0,1", ("split", "3,1")))
         self.assertEqual(calls[0].args[3], ["--pool-workers", "8", "--kv", "int8", "--max-context", "262144"])
         self.assertEqual(calls[1].args[3], ["--pool-workers", "8", "--max-context", "1048576"])
 
     def test_a_flag_an_entry_refuses_stops_the_start(self):
-        def plan(engine_bin, path, gpu, words):
+        def plan(engine_bin, path, gpu, words, mode=None, share=None):
             if path.endswith("b.basalt"):
                 raise ValueError("unknown argument: --spec")
             return {"devices": "0", "cards": []}
@@ -706,7 +708,7 @@ class Startup(unittest.TestCase):
         self.assertIn("b.basalt: unknown argument: --spec", err)
 
     def test_a_kv_the_entry_cannot_take_stops_the_start_and_a_top_level_one_is_skipped(self):
-        def plan(engine_bin, path, gpu, words):
+        def plan(engine_bin, path, gpu, words, mode=None, share=None):
             if path.endswith("b.basalt") and "--kv" in words:
                 raise ValueError("unknown argument: --kv")
             return {"devices": "0", "cards": []}
@@ -720,7 +722,7 @@ class Startup(unittest.TestCase):
         self.assertEqual(calls[1].args[3], [])
 
     def test_a_context_past_the_maximum_stops_the_start(self):
-        def plan(engine_bin, path, gpu, words):
+        def plan(engine_bin, path, gpu, words, mode=None, share=None):
             raise ValueError("--max-context 2097152 is past the model's maximum context of 1048576 tokens")
         code, err, _ = self.run_main({"models": [{"model": "b.basalt", "max-context": 2097152}]}, plan)
         self.assertEqual(code, 2)

@@ -1,4 +1,5 @@
 // src/models/qwen4exp/serve/vision.cpp - vision operations for the persistent engine.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 #include "basalt/vision/video.hpp"
@@ -63,7 +64,7 @@ void QfnRuntime::enc_command(const std::string& cmd) {
         // comes back the same
         const int64_t floor_b = (int64_t) basalt::program::serve::vram_floor_mib() << 20;
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const int64_t need = basalt::vision::video_nvdec_bytes(vpath);
         bool borrowed = false;
         // (only between replies: the cache's segments are shared with the elastic KV, and the engine changes its
@@ -75,7 +76,7 @@ void QfnRuntime::enc_command(const std::string& cmd) {
             borrowed = vram_command("VRAM " + std::to_string((long long) ((need + floor_b) >> 20) + 1), be, true, &quiet);
             borrow_ms = std::chrono::duration<double, std::milli>(Clock::now() - tb).count();
             if (!borrowed) borrow_note = ", no NVDEC room: " + be;
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::gpu_mem_info(&free_b, &total_b);
         } else if (need > 0 && need > (int64_t) free_b - floor_b) {
             borrow_note = batch_on() ? ", a reply is decoding" : !xcache.segmented() ? ", the expert cache cannot lend memory (not segmented)"
                                                                          : ", a prompt's loan is out";

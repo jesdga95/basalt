@@ -1,10 +1,12 @@
 // src/models/inkling2/kernels/prompt_ops.cu - the prompt path's small kernels: the experts' plan as a stable counting sort
 // of a chunk's (row, slot) pairs by expert, and the staged sliding-window keys moved into the window rings.
 #include "basalt/models/inkling2/prompt_kernels.hpp"
+#include "basalt/prefill/q8_gemm.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -28,7 +30,8 @@ __global__ void __launch_bounds__(256) sort_count_kernel(const int32_t* __restri
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) hist[e] = 0;
     __syncthreads();
     const int lo = blockIdx.x * kSortPairs, hi = min(pairs, lo + kSortPairs);
-    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) atomicAdd(&hist[ids[i]], 1);
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x)
+        if (ids[i] >= 0) atomicAdd(&hist[ids[i]], 1);   // a pair another card computes has no expert here
     __syncthreads();
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) counts[(size_t) blockIdx.x * n_expert + e] = hist[e];
 }
@@ -37,6 +40,7 @@ __global__ void __launch_bounds__(256) sort_count_kernel(const int32_t* __restri
 __global__ void __launch_bounds__(kMaxExpert) sort_scan_kernel(int32_t* __restrict__ counts, int n_blocks, int n_expert,
                                                                int pairs, int32_t* __restrict__ bounds) {
     __shared__ int32_t total[kMaxExpert];
+    __shared__ int32_t all;
     const int e = threadIdx.x;
     int run = 0;
     if (e < n_expert)
@@ -54,13 +58,14 @@ __global__ void __launch_bounds__(kMaxExpert) sort_scan_kernel(int32_t* __restri
             total[x] = at;
             at += t;
         }
+        all = at;
     }
     __syncthreads();
     if (e < n_expert) {
         bounds[e] = total[e];
         for (int b = 0; b < n_blocks; ++b) counts[(size_t) b * n_expert + e] += total[e];
     }
-    if (e == 0) bounds[n_expert] = pairs;
+    if (e == 0) bounds[n_expert] = all;
 }
 
 // One warp a counting block: its pairs in order, 32 at a time; a pair's place is its expert's next entry plus the lanes
@@ -149,11 +154,11 @@ void remap_ids(int32_t* ids, int n, const int32_t* map, void* stream) {
 }
 
 void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
-                   int64_t pos0, int rows, int keep, int elem, void* stream) {
+                   int64_t pos0, int rows, int keep, int row_bytes, void* stream) {
     const int64_t end = pos0 + rows, first = end - keep > pos0 ? end - keep : pos0;
     const int n = (int) (end - first);
     if (n <= 0) return;
-    const int pieces = kKvHeads * kHeadDim * elem / 16;
+    const int pieces = kKvHeads * row_bytes / 16;
     stage_to_ring_kernel<<<dim3((unsigned) n, 2), 128, 0, (cudaStream_t) stream>>>(
         static_cast<const uint4*>(k_stage), static_cast<const uint4*>(v_stage), stage_cap, static_cast<uint4*>(k_ring),
         static_cast<uint4*>(v_ring), ring_cap, first, pieces);
@@ -281,43 +286,71 @@ __global__ void __launch_bounds__(32 * kCdW) ctrl_down_prompt_kernel(const float
     }
 }
 
-// 64 rows x 32 channels per block (4 warps, each 16 rows x 32 channels gain+forget).
-constexpr int kCuT = 64, kCuC = 32, kCuK = 64, kCuW = 4;
+// 64 rows x 64 channels per block (8 warps, 35.8 KiB SMEM -> 3 CTAs/SM):
+// stages tanh(g) and 1-tanh(f) through shared memory so each warp reads/writes 1 contiguous row (256B float2x32 coalesced!) at a time.
+constexpr int kCuT = 64, kCuC = 64, kCuK = 64, kCuW = 8;
 constexpr int kCuHS = kCuK + 4, kCuWS = kCuK + 8;
 static_assert(kWidth % kCuC == 0, "kWidth must be a multiple of kCuC");
 
-__global__ void __launch_bounds__(32 * kCuW) ctrl_up_blend_prompt_kernel(const float* __restrict__ dest,
-                                                                         const float* __restrict__ msg,
-                                                                         const float* __restrict__ hid,
-                                                                         const uint16_t* __restrict__ w_gf,
-                                                                         float* __restrict__ out, int rows, int rank) {
-    __shared__ __align__(16) float hs[kCuT][kCuHS];
-    __shared__ __align__(16) uint16_t wg[kCuC][kCuWS];
-    __shared__ __align__(16) uint16_t wf[kCuC][kCuWS];
+__global__ void __launch_bounds__(32 * kCuW, 3)
+ctrl_up_blend_prompt_kernel(const float* __restrict__ dest, const float* __restrict__ msg,
+                            const float* __restrict__ hid, const uint16_t* __restrict__ w_gf,
+                            float* __restrict__ out, int rows, int rank) {
+    union Smem {
+        struct {
+            alignas(16) float hs[kCuT][kCuHS];
+            alignas(16) uint16_t wg[kCuC][kCuWS];
+            alignas(16) uint16_t wf[kCuC][kCuWS];
+        } mma;
+        struct {
+            alignas(16) float sg[kCuT][kCuHS];
+            alignas(16) float sf[kCuT][kCuHS];
+        } epi;
+    };
+    __shared__ __align__(16) Smem sm;
+    auto& hs = sm.mma.hs;
+    auto& wg = sm.mma.wg;
+    auto& wf = sm.mma.wf;
     const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int wtk = wid >> 1, wc = wid & 1;
     const int t0 = (int) blockIdx.x * kCuT, c0 = (int) blockIdx.y * kCuC;
 
     float acc_g[4][4] = {}, acc_f[4][4] = {};
     for (int k0 = 0; k0 < rank; k0 += kCuK) {
         const int kend = min(kCuK, rank - k0);
-        for (int q = tid; q < kCuT * (kCuK / 4); q += 32 * kCuW) {
-            const int r = q / (kCuK / 4), k4 = (q % (kCuK / 4)) * 4;
-            *reinterpret_cast<float4*>(&hs[r][k4]) =
-                k4 < kend ? *reinterpret_cast<const float4*>(hid + (size_t) min(t0 + r, rows - 1) * rank + k0 + k4)
-                          : make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        for (int q = tid; q < kCuC * (kCuK / 8); q += 32 * kCuW) {
-            const int r = q / (kCuK / 8), k8 = (q % (kCuK / 8)) * 8;
-            *reinterpret_cast<uint4*>(&wg[r][k8]) =
-                k8 < kend ? *reinterpret_cast<const uint4*>(w_gf + (size_t) (c0 + r) * rank + k0 + k8)
-                          : make_uint4(0u, 0u, 0u, 0u);
-            *reinterpret_cast<uint4*>(&wf[r][k8]) =
-                k8 < kend ? *reinterpret_cast<const uint4*>(w_gf + (size_t) (kWidth + c0 + r) * rank + k0 + k8)
-                          : make_uint4(0u, 0u, 0u, 0u);
+        if (kend == kCuK) {
+#pragma unroll
+            for (int q = tid; q < kCuT * (kCuK / 4); q += 32 * kCuW) {
+                const int r = q / (kCuK / 4), k4 = (q % (kCuK / 4)) * 4;
+                cp16_cg(&hs[r][k4], hid + (size_t) min(t0 + r, rows - 1) * rank + k0 + k4);
+            }
+#pragma unroll
+            for (int q = tid; q < kCuC * (kCuK / 8); q += 32 * kCuW) {
+                const int r = q / (kCuK / 8), k8 = (q % (kCuK / 8)) * 8;
+                cp16_cg(&wg[r][k8], w_gf + (size_t) (c0 + r) * rank + k0 + k8);
+                cp16_cg(&wf[r][k8], w_gf + (size_t) (kWidth + c0 + r) * rank + k0 + k8);
+            }
+            asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::);
+        } else {
+            for (int q = tid; q < kCuT * (kCuK / 4); q += 32 * kCuW) {
+                const int r = q / (kCuK / 4), k4 = (q % (kCuK / 4)) * 4;
+                *reinterpret_cast<float4*>(&hs[r][k4]) =
+                    k4 < kend ? *reinterpret_cast<const float4*>(hid + (size_t) min(t0 + r, rows - 1) * rank + k0 + k4)
+                              : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+            for (int q = tid; q < kCuC * (kCuK / 8); q += 32 * kCuW) {
+                const int r = q / (kCuK / 8), k8 = (q % (kCuK / 8)) * 8;
+                *reinterpret_cast<uint4*>(&wg[r][k8]) =
+                    k8 < kend ? *reinterpret_cast<const uint4*>(w_gf + (size_t) (c0 + r) * rank + k0 + k8)
+                              : make_uint4(0u, 0u, 0u, 0u);
+                *reinterpret_cast<uint4*>(&wf[r][k8]) =
+                    k8 < kend ? *reinterpret_cast<const uint4*>(w_gf + (size_t) (kWidth + c0 + r) * rank + k0 + k8)
+                              : make_uint4(0u, 0u, 0u, 0u);
+            }
         }
         __syncthreads();
-        const float* ha = &hs[wid * 16 + g][2 * c];
-        const float* hb = &hs[wid * 16 + 8 + g][2 * c];
+        const float* ha = &hs[wtk * 16 + g][2 * c];
+        const float* hb = &hs[wtk * 16 + 8 + g][2 * c];
 #pragma unroll
         for (int k = 0; k < kCuK; k += 8) {
             if (k >= kend) break;
@@ -328,8 +361,8 @@ __global__ void __launch_bounds__(32 * kCuW) ctrl_up_blend_prompt_kernel(const f
             const unsigned l2 = tf32_of(fa.y - __uint_as_float(a2)), l3 = tf32_of(fb.y - __uint_as_float(a3));
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const unsigned vg = *reinterpret_cast<const unsigned*>(&wg[j * 8 + g][k + 2 * c]);
-                const unsigned vf = *reinterpret_cast<const unsigned*>(&wf[j * 8 + g][k + 2 * c]);
+                const unsigned vg = *reinterpret_cast<const unsigned*>(&wg[wc * 32 + j * 8 + g][k + 2 * c]);
+                const unsigned vf = *reinterpret_cast<const unsigned*>(&wf[wc * 32 + j * 8 + g][k + 2 * c]);
                 mma_tf32_2(acc_g[j], a0, a1, a2, a3, l0, l1, l2, l3, vg);
                 mma_tf32_2(acc_f[j], a0, a1, a2, a3, l0, l1, l2, l3, vf);
             }
@@ -337,25 +370,34 @@ __global__ void __launch_bounds__(32 * kCuW) ctrl_up_blend_prompt_kernel(const f
         __syncthreads();
     }
 
-    const int ta = t0 + wid * 16 + g, tb = ta + 8;
+    // Reuse shared memory via Smem::epi to stage sg[64][68] and sf[64][68] for 100% coalesced row-wise HBM access.
+    auto& sg = sm.epi.sg;
+    auto& sf = sm.epi.sf;
+    const int ra = wtk * 16 + g, rb = ra + 8;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int col = c0 + j * 8 + 2 * c;
-        if (ta < rows) {
-            const size_t off = (size_t) ta * kWidth + col;
+        const int lc = wc * 32 + j * 8 + 2 * c;
+        *reinterpret_cast<float2*>(&sg[ra][lc]) = make_float2(tanhf(acc_g[j][0]), tanhf(acc_g[j][1]));
+        *reinterpret_cast<float2*>(&sf[ra][lc]) = make_float2(1.f - tanhf(acc_f[j][0]), 1.f - tanhf(acc_f[j][1]));
+        *reinterpret_cast<float2*>(&sg[rb][lc]) = make_float2(tanhf(acc_g[j][2]), tanhf(acc_g[j][3]));
+        *reinterpret_cast<float2*>(&sf[rb][lc]) = make_float2(1.f - tanhf(acc_f[j][2]), 1.f - tanhf(acc_f[j][3]));
+    }
+    __syncthreads();
+
+    // Now each of the 8 warps processes 8 rows sequentially; within each row, 32 lanes read/write 256 contiguous bytes (float2 per lane)!
+    const int lc2 = 2 * lane;
+    const int col = c0 + lc2;
+#pragma unroll
+    for (int ri = 0; ri < 8; ++ri) {
+        const int r = wid * 8 + ri;
+        const int gr = t0 + r;
+        if (gr < rows) {
+            const size_t off = (size_t) gr * kWidth + col;
             const float2 d = *reinterpret_cast<const float2*>(dest + off);
             const float2 m = *reinterpret_cast<const float2*>(msg + off);
-            *reinterpret_cast<float2*>(out + off) =
-                make_float2((1.f - tanhf(acc_f[j][0])) * d.x + tanhf(acc_g[j][0]) * m.x,
-                            (1.f - tanhf(acc_f[j][1])) * d.y + tanhf(acc_g[j][1]) * m.y);
-        }
-        if (tb < rows) {
-            const size_t off = (size_t) tb * kWidth + col;
-            const float2 d = *reinterpret_cast<const float2*>(dest + off);
-            const float2 m = *reinterpret_cast<const float2*>(msg + off);
-            *reinterpret_cast<float2*>(out + off) =
-                make_float2((1.f - tanhf(acc_f[j][2])) * d.x + tanhf(acc_g[j][2]) * m.x,
-                            (1.f - tanhf(acc_f[j][3])) * d.y + tanhf(acc_g[j][3]) * m.y);
+            const float2 gv = *reinterpret_cast<const float2*>(&sg[r][lc2]);
+            const float2 fv = *reinterpret_cast<const float2*>(&sf[r][lc2]);
+            *reinterpret_cast<float2*>(out + off) = make_float2(fmaf(fv.x, d.x, __fmul_rn(gv.x, m.x)), fmaf(fv.y, d.y, __fmul_rn(gv.y, m.y)));
         }
     }
 }
@@ -383,7 +425,7 @@ namespace {
 
 // Matches block_q8_1_mmq (MMQ_Q8_1_DS_LAYOUT_D4): 4 float scales + 128 int8 codes = 144 bytes per 128 values.
 // Writes 4 floats of a 32-value block (8 consecutive lanes -> 32 values) into prefill::q8 planes:
-// int8 codes [rows][cols] and coalesced fp32 scales [cols / 32][sc_ld] (sc_ld = (rows + 63) & ~63).
+// int8 codes [rows][cols] and coalesced fp32 scales [cols / 32][sc_ld] (sc_ld = act_scale_ld(rows)).
 __device__ __forceinline__ void emit_q8_planes_sub32(float4 v, int col, int r, int cols, int64_t sc_ld,
                                                      int8_t* __restrict__ codes, float* __restrict__ scales) {
     float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
@@ -459,7 +501,7 @@ __global__ void __launch_bounds__(kGateQ8Threads)
 
 void rms_norm_q8_planes_prompt(const float* x, const float* w, int rows, float eps, void* act, void* stream) {
     if (rows <= 0) return;
-    const int64_t sc_ld = ((int64_t) rows + 63) & ~int64_t(63);
+    const int64_t sc_ld = basalt::prefill::q8::act_scale_ld(rows);
     const size_t sc_off = ((size_t) rows * kWidth + 15) & ~size_t(15);
     rms_norm_q8_planes_prompt_kernel<<<(unsigned) rows, kNormQ8Threads, 0, (cudaStream_t) stream>>>(
         x, w, rows, eps, sc_ld, static_cast<int8_t*>(act),
@@ -469,7 +511,7 @@ void rms_norm_q8_planes_prompt(const float* x, const float* w, int rows, float e
 
 void attn_gate_q8_planes_prompt(const float* attn, const float* yq, int64_t yq_ld, int rows, void* act, void* stream) {
     if (rows <= 0) return;
-    const int64_t sc_ld = ((int64_t) rows + 63) & ~int64_t(63);
+    const int64_t sc_ld = basalt::prefill::q8::act_scale_ld(rows);
     const size_t sc_off = ((size_t) rows * (kHeads * kHeadDim) + 15) & ~size_t(15);
     const dim3 grid((unsigned) rows, (unsigned) ((kHeads * kHeadDim) / (4 * kGateQ8Threads)));
     attn_gate_q8_planes_prompt_kernel<<<grid, kGateQ8Threads, 0, (cudaStream_t) stream>>>(
@@ -484,7 +526,8 @@ constexpr int kCombF16Threads = kWidth / 8;   // 288 threads: each owns 8 channe
 static_assert(kWidth % 8 == 0 && kCombF16Threads <= 1024, "kWidth splits into 8-half uint4s");
 
 __global__ void __launch_bounds__(kCombF16Threads)
-    moe_combine_f16_kernel(const uint16_t* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y) {
+    moe_combine_f16_kernel(const uint16_t* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y,
+                           const int32_t* __restrict__ ids) {
     __shared__ float sw[32];
     const int r = (int) blockIdx.x, tid = (int) threadIdx.x;
     if (tid < k) sw[tid] = w[(size_t) r * k + tid];
@@ -492,6 +535,7 @@ __global__ void __launch_bounds__(kCombF16Threads)
     const uint4* out8 = reinterpret_cast<const uint4*>(out);
     float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f), a1 = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int s = 0; s < k; ++s) {
+        if (ids && ids[(size_t) r * k + s] < 0) continue;   // another card's pair: no row here
         const float ws = sw[s];
         const uint4 u = out8[((size_t) r * k + s) * kCombF16Threads + tid];
         const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
@@ -510,11 +554,98 @@ __global__ void __launch_bounds__(kCombF16Threads)
 
 }  // namespace
 
-void moe_combine_f16(const uint16_t* out, const float* w, int rows, int k, float* y, void* stream) {
+void moe_combine_f16(const uint16_t* out, const float* w, int rows, int k, float* y, void* stream, const int32_t* ids) {
     if (rows <= 0) return;
     if (k <= 0 || k > 32) throw std::runtime_error("inkling2 moe_combine_f16: k");
-    moe_combine_f16_kernel<<<(unsigned) rows, kCombF16Threads, 0, (cudaStream_t) stream>>>(out, w, k, y);
+    moe_combine_f16_kernel<<<(unsigned) rows, kCombF16Threads, 0, (cudaStream_t) stream>>>(out, w, k, y, ids);
     check("moe_combine_f16");
+}
+
+namespace {
+__global__ void add_rows_kernel(const float4* __restrict__ x, float4* __restrict__ y, int64_t n4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 a = x[i], b = y[i];
+        y[i] = make_float4(b.x + a.x, b.y + a.y, b.z + a.z, b.w + a.w);
+    }
+}
+}  // namespace
+
+void add_rows(const float* x, float* y, int rows, void* stream) {
+    if (rows <= 0) return;
+    static_assert(kWidth % 4 == 0, "rows are whole float4s");
+    const int64_t n4 = (int64_t) rows * kWidth / 4;
+    add_rows_kernel<<<(unsigned) std::min<int64_t>((n4 + 255) / 256, 4096), 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const float4*>(x), reinterpret_cast<float4*>(y), n4);
+    check("add_rows");
+}
+
+namespace {
+constexpr int kPlanRows = 1024;   // one block scans a thousand rows a step
+
+// The rows with a choice on the second card (slot_map[expert] < 0), in row order.
+__global__ void __launch_bounds__(kPlanRows) peer_rows_plan_kernel(const int32_t* __restrict__ ids, int rows, int k,
+                                                                   const int32_t* __restrict__ slot_map,
+                                                                   int32_t* __restrict__ row_ix, int32_t* __restrict__ count) {
+    __shared__ int wsum[kPlanRows / 32];
+    __shared__ int carry;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    if (tid == 0) carry = 0;
+    __syncthreads();
+    for (int base = 0; base < rows; base += kPlanRows) {
+        const int r = base + tid;
+        int f = 0;
+        if (r < rows)
+            for (int s = 0; s < k; ++s) f |= slot_map[ids[(size_t) r * k + s]] < 0;
+        const unsigned b = __ballot_sync(0xffffffffu, f);
+        if (lane == 0) wsum[w] = __popc(b);
+        __syncthreads();
+        int off = 0, all = 0;
+        for (int i = 0; i < kPlanRows / 32; ++i) {
+            off += i < w ? wsum[i] : 0;
+            all += wsum[i];
+        }
+        if (f) row_ix[carry + off + __popc(b & ((1u << lane) - 1u))] = r;
+        __syncthreads();
+        if (tid == 0) carry += all;
+        __syncthreads();
+    }
+    if (tid == 0) *count = carry;
+}
+
+// Compact row c of the rows, choices and weights is row row_ix[c] of them.
+__global__ void peer_rows_gather_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, const float* __restrict__ w,
+                                        int k, const int32_t* __restrict__ row_ix, float* __restrict__ x_c,
+                                        int32_t* __restrict__ ids_c, float* __restrict__ w_c) {
+    const int c = blockIdx.x, r = row_ix[c];
+    for (int i = threadIdx.x; i < kWidth; i += blockDim.x) x_c[(size_t) c * kWidth + i] = x[(size_t) r * kWidth + i];
+    if (threadIdx.x < k) {
+        ids_c[(size_t) c * k + threadIdx.x] = ids[(size_t) r * k + threadIdx.x];
+        w_c[(size_t) c * k + threadIdx.x] = w[(size_t) r * k + threadIdx.x];
+    }
+}
+
+__global__ void peer_rows_add_kernel(const float* __restrict__ part, const int32_t* __restrict__ row_ix, float* __restrict__ y) {
+    const int c = blockIdx.x, r = row_ix[c];
+    for (int i = threadIdx.x; i < kWidth; i += blockDim.x) y[(size_t) r * kWidth + i] += part[(size_t) c * kWidth + i];
+}
+}  // namespace
+
+void peer_rows_plan(const int32_t* ids, int rows, int k, const int32_t* slot_map, int32_t* row_ix, int32_t* count, void* stream) {
+    peer_rows_plan_kernel<<<1, kPlanRows, 0, (cudaStream_t) stream>>>(ids, rows, k, slot_map, row_ix, count);
+    check("peer_rows_plan");
+}
+
+void peer_rows_gather(const float* x, const int32_t* ids, const float* w, int k, const int32_t* row_ix, int count, float* x_c,
+                      int32_t* ids_c, float* w_c, void* stream) {
+    if (count <= 0) return;
+    peer_rows_gather_kernel<<<(unsigned) count, 256, 0, (cudaStream_t) stream>>>(x, ids, w, k, row_ix, x_c, ids_c, w_c);
+    check("peer_rows_gather");
+}
+
+void peer_rows_add(const float* part, const int32_t* row_ix, int count, float* y, void* stream) {
+    if (count <= 0) return;
+    peer_rows_add_kernel<<<(unsigned) count, 256, 0, (cudaStream_t) stream>>>(part, row_ix, y);
+    check("peer_rows_add");
 }
 
 }  // namespace basalt::models::inkling2

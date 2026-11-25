@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,8 +38,10 @@ struct BatchView {
 /// What every session of one model shares for its batch windows: the graphs by composition. A model keeps one beside its
 /// shared forward scratch; sessions that return the same one batch together.
 struct BatchShared {
-    static constexpr size_t kGraphs = 64;
+    static constexpr size_t kGraphs = 128;
+    static constexpr size_t kSeen = 256;
     GraphLru<core::CapturedGraph> graphs{kGraphs};
+    GraphLru<uint8_t> seen{kSeen};
 };
 
 class BatchSession : public ModelSession {
@@ -77,8 +80,20 @@ public:
         const BatchView v{w, ss.data(), reqs, head.data(), n, st};
         GraphLru<core::CapturedGraph>::Key key;
         if (!batch_stage(v, key, err)) return {Status::Error, who + ": " + err};
-        for (int i = 0; i < n; ++i)
-            key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
+        struct End {   // every exit after the stage ends the window (batch_end): an early one here, the last after its sync
+            BatchSession& s;
+            bool open = true;
+            ~End() {
+                if (open) s.batch_end(std::nullopt);
+            }
+        } end{*this};
+        if (batch_key_per_seg()) {
+            for (int i = 0; i < n; ++i)
+                key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
+        } else {
+            for (int i = 0; i < n; ++i) key.push_back((uint64_t) (uintptr_t) ss[(size_t) i]);
+            key.push_back((uint64_t) w.rows);
+        }
         BatchShared& sh = batch_shared();
         if (!batch_captured()) {
             if (!batch_forward(v, err)) {
@@ -87,17 +102,30 @@ public:
             }
         } else if (core::CapturedGraph* g = sh.graphs.find(key)) {
             if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
+        } else if (!sh.seen.find(key)) {
+            sh.seen.insert(std::move(key), 1u);
+            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
         } else {
             // a composition's first window runs as launched, then is captured for the next ones: the graph is built while
             // the card runs the window
             if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
             core::CapturedGraph fresh;
             if (!fresh.begin(st, err)) return {Status::Error, who + ": " + err};
-            if (!batch_forward(v, err)) {
+            const auto drop = [&] {   // the stream leaves the capture before the window's end syncs it
                 cudaGraph_t dropped = nullptr;
                 cudaStreamEndCapture(st, &dropped);
                 if (dropped) cudaGraphDestroy(dropped);
                 cudaGetLastError();
+            };
+            bool ok = false;
+            try {
+                ok = batch_forward(v, err);
+            } catch (...) {
+                drop();
+                throw;
+            }
+            if (!ok) {
+                drop();
                 return {Status::Error, who + ": " + err};
             }
             if (!fresh.end(st, err)) return {Status::Error, who + ": " + err};
@@ -111,7 +139,10 @@ public:
             if (head[(size_t) i] > 0 && (picks[(size_t) i] = ss[(size_t) i]->batch_draw(v, i, err)) == nullptr)
                 return {Status::Error, who + ": " + err};
         }
-        if (cudaStreamSynchronize(st) != cudaSuccess) return {Status::Error, who + ": the batch window failed"};
+        const cudaError_t synced = cudaStreamSynchronize(st);
+        end.open = false;
+        if (!batch_end(synced) || synced != cudaSuccess)
+            return {Status::Error, who + (synced == cudaSuccess ? ": the window was stopped" : ": the batch window failed")};
         for (int i = 0; i < n; ++i) {
             const DecodeRequest& r = reqs[i];
             const int h = head[(size_t) i];
@@ -150,6 +181,8 @@ protected:
     /// forward (it reads results between launches), so the driver runs it directly every window and the model keeps its
     /// own graphs of the stretches between.
     virtual bool batch_captured() const { return true; }
+    /// False when batch_forward's launches depend only on the total row count (segment boundaries read from device memory).
+    virtual bool batch_key_per_seg() const { return true; }
     /// False while this session holds state its batch path does not cover: the batch's windows run in turn.
     virtual bool batch_ready() const { return true; }
     /// On session i, queued on v.stream: segment i's head rows into its own logits (what row_logprobs, copy_logits and
@@ -158,6 +191,10 @@ protected:
     /// On session i, queued on v.stream: its draws of its head rows with its own sampler; the host array of the picks it
     /// returns is read after the batch's sync (null with `err`: the draw failed).
     virtual const int32_t* batch_draw(const BatchView& v, int i, std::string& err) = 0;
+    /// On the leader, once on every exit after a successful batch_stage: `synced` holds the status of the batch's stream
+    /// sync after every take and draw, and is empty on an earlier exit. False: the window was stopped and nothing of it
+    /// is taken.
+    virtual bool batch_end(std::optional<cudaError_t> synced) { return synced == cudaSuccess; }
 };
 
 }  // namespace basalt::model

@@ -6,6 +6,8 @@
 // rows share its call. `stream` may be null (the call then synchronises).
 #pragma once
 
+#include "basalt/kernels/window_segs.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -59,6 +61,7 @@ struct DsHead {
     const void* fold_sc = nullptr;
     int64_t n_vocab = 0;
     float cap = 30.f;
+    bool head_planes = false;
 };
 
 /// The 2-bit copy of `n_rows` Q8_0 rows of n_in (kWidth or kDsRank) values, packed from the rows. The copy holds the rows
@@ -90,5 +93,51 @@ void dspark_fold(const void* head_q8_0, int64_t n_rows, const uint16_t* w, const
 /// The recurrence's projection (BF16 [kDsRnn][2 kDsRank + 2 kWidth]: state, previous token, hidden, context columns) split
 /// into w_sp [kDsRnn][2 kDsRank], w_h and w_f [kDsRnn][kWidth].
 void dspark_split_rnn(const uint16_t* w, uint16_t* w_sp, uint16_t* w_h, uint16_t* w_f, void* stream);
+
+// ---- batched multi-session commit & draft kernels -----------------------------------------------------------------------
+
+struct DsCommitSegs {
+    const basalt::kernels::WindowSegs* at_d = nullptr;
+    float* fr[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* k[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* v[basalt::kernels::kWindowSegsMax] = {};
+};
+
+struct DsBatchFr {
+    const float* fr[basalt::kernels::kWindowSegsMax] = {};
+};
+
+struct DsBatchKv {
+    uint16_t* k[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* v[basalt::kernels::kWindowSegsMax] = {};
+};
+
+void dspark_mix_batch(const float* tap, int64_t tap_stride, int rows, const DsMixArgs& a, float* out, int64_t out_stride,
+                      const int32_t* pos, const DsCommitSegs& segs, int fr_cap, void* stream);
+
+void dspark_kv_commit_batch(const float* kb, const float* vb, const float* k_norm, float eps, float rope_base,
+                            const int32_t* pos, int rows, const DsCommitSegs& segs, int64_t cap, void* stream);
+
+void dspark_block_inputs_batch(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps,
+                               const float* mask, int block, int count, float* x, int32_t* prev, float* state,
+                               const DsBatchFr& frs, int fr_cap, float* fr_out, const uint16_t* w1, uint16_t* w1_row,
+                               void* stream);
+
+void dspark_block_qk_prep_batch(const float* q, const float* kb, const float* vb, const float* q_norm, const float* k_norm,
+                                float eps, float rope_base, const int32_t* meta, int block, int count, float* q_out,
+                                const DsBatchKv& kv, int64_t cap, void* stream);
+
+void dspark_pack_draft_rows(const float* h_chunk, int block, int count_chunk, int slot0, int n_max, float* hd_all,
+                            void* stream);
+
+void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, float* approx, void* stream);
+
+void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
+                              const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
+                              void* stream);
+
+void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
+                            int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
+                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
 
 }  // namespace basalt::models::inkling2

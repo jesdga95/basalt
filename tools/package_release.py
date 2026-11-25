@@ -56,7 +56,7 @@ def members(root: Path, windows: bool) -> list[tuple[Path, str, bool]]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tag", required=True, help="the release tag, v<major>.<minor>.<patch>")
-    ap.add_argument("--platform", required=True, choices=("linux-x64", "windows-x64"))
+    ap.add_argument("--platform", required=True, choices=("linux-x64", "linux-arm64", "windows-x64"))
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1], help="the built tree")
     ap.add_argument("--out", type=Path, default=Path("dist"))
     a = ap.parse_args()

@@ -10,6 +10,7 @@
 <link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="web/app.css">
+<script defer src="web/logs.js"></script>
 <script defer src="web/app.js"></script>
 </head>
 <body>
@@ -71,15 +72,20 @@
       <section class="pane" id="p-req" role="tabpanel" hidden></section>
       <section class="pane" id="p-slots" role="tabpanel" hidden></section>
       <section class="pane" id="p-hw" role="tabpanel" hidden></section>
-      <section class="pane logs" id="p-logs" role="tabpanel" hidden><div id="log" role="log" aria-live="off" tabindex="0"></div></section>
+      <section class="pane logs" id="p-logs" role="tabpanel" hidden>
+        <div class="lstat" id="log-status">Connecting</div>
+        <div id="log" role="log" aria-live="off" tabindex="0"></div>
+      </section>
     </div>
   </section>
+
 </main>
 
 <!-- always on screen: the newest log line (opens Logs) and the session totals -->
 <footer class="tail">
   <button type="button" class="ticker" id="ticker" title="Open the logs (L)"><span id="ticker-t"></span></button>
-  <span class="tot" id="totals"></span>
+  <button type="button" class="tot" id="totals" title="Pricing and totals"></button>
+  <button type="button" class="heart" id="support" title="Support Basalt" aria-label="Support Basalt"><svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M8 14s-5.5-3.4-5.5-7.4A3 3 0 0 1 8 4.6a3 3 0 0 1 5.5 2c0 4-5.5 7.4-5.5 7.4z" fill="currentColor"/></svg></button>
 </footer>
 
 </body>

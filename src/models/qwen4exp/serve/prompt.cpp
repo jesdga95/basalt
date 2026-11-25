@@ -1,4 +1,5 @@
 // src/models/qwen4exp/serve/prompt.cpp - prompt operations for the persistent engine.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
@@ -128,8 +129,10 @@ bool QfnRequest::refill(std::string& e) {
 // `chunk` > 0: that chunk (a split read's), its first one `head` tokens (0: none)
 bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) {
     // whether the slots decode while this part is read: it decides the layout, and read_part() reads the part alone
-    // when it is false
-    beside_ = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
+    // when it is false.  On a layer split the read is always exclusive so the windows wait and the loan sizes as on
+    // an idle engine.
+    beside_ = runtime_.batch_on() && runtime_.stages.empty() &&
+              (tokens > runtime_.kReadAlone || resumed_chunk > 0);
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
     // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
     // the full depth is restored on the way out for the sizing done elsewhere
@@ -375,7 +378,7 @@ int QfnRuntime::init_prompt() {
                 for (PfPart& p : pf_parts) {
                     const basalt::core::OnDevice on(p.dev);
                     size_t fb = 0, tb = 0;
-                    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                    if (basalt::core::gpu_mem_info(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
                     const uint64_t need = basalt::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
                     if ((uint64_t) fb >= need + (3ull << 29)) {
                         basalt::log::info("basalt serve", "  CUDA%d keeps its own prompt buffers (%.2f GiB of "
@@ -434,7 +437,7 @@ int QfnRuntime::init_prompt() {
                 const int dev = i == 0 ? -1 : stages[i - 1]->dev;
                 const basalt::core::OnDevice on(dev);
                 size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
+                basalt::core::gpu_mem_info(&fb, &tb);
                 const int64_t need = (int64_t) basalt::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
                 if (need + kHeadroom > (int64_t) fb) {
                     dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
@@ -499,8 +502,8 @@ int QfnRuntime::init_prompt() {
         return 1;
     }
     if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
-    if (peer.valid() && !o.no_peer_prefill) {
-        if (!sp.set_peer(&peer, peer_streamed_share, err)) {
+    if (peer.valid()) {
+        if (!sp.set_peer(&peer, err)) {   // the routed-only chunks' rows, up to kPeerSlowRows
             basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
             err.clear();
         }
@@ -536,9 +539,9 @@ int QfnRuntime::init_prompt() {
         PromptStage& st = *pstages[j];
         const basalt::core::OnDevice on(st.dev);
         size_t fb0 = 0, tb0 = 0;
-        cudaMemGetInfo(&fb0, &tb0);
+        basalt::core::gpu_mem_info(&fb0, &tb0);
         uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
-        // (a read of the longest prompt the start priced must fit; a longer one checks its own fit)
+        // (a read of the longest prompt the start sizes the regions for must fit; a longer one checks its own fit)
         bool ok = split_chunk_max >= 1024 &&
                   split_region(st, std::min<int64_t>(o.max_context, kSplitRefCells), split_chunk_max, st.lo, st.hi,
                                w_at, s_at, b_at);
@@ -557,7 +560,7 @@ int QfnRuntime::init_prompt() {
         // beside its stage declines here, before a read could fail on them
         constexpr size_t kStageFreeMin = 256ull << 20;
         size_t fb = 0, tb = 0;
-        if (ok && cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb < kStageFreeMin) {
+        if (ok && basalt::core::gpu_mem_info(&fb, &tb) == cudaSuccess && fb < kStageFreeMin) {
             ok = false;
             err = std::to_string(fb >> 20) + " MiB free beside its stage, a read needs " +
                   std::to_string(kStageFreeMin >> 20) + "; --peer-reserve-mib";

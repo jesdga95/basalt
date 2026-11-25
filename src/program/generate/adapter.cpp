@@ -7,10 +7,12 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/core/progress.hpp"
 #include "basalt/core/shipped_profiles.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/batch_check.hpp"
+#include "basalt/model/gpu_check.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
@@ -139,6 +141,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
                         one.logits = row_logits.data();
                     }
                     r = sess.decode_window(one);
+                    if (!r.ok()) break;
                     if (g_diag_logits) std::fwrite(row_logits.data(), sizeof(float), row_logits.size(), g_diag_logits);
                     std::printf("R %lld %d\n", (long long) (pos + t), row_next);
                 }
@@ -180,7 +183,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         }
         dr.logits = logits;
         r = sess.decode_window(dr);
-        if (g_diag_logits) std::fwrite(logits, sizeof(float), (size_t) g_n_vocab, g_diag_logits);
+        if (r.ok() && g_diag_logits) std::fwrite(logits, sizeof(float), (size_t) g_n_vocab, g_diag_logits);
         ++pos;
     }
     tm.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -361,12 +364,13 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         const basalt::model::ModelDesc desc = adapter->describe(model_gguf);
         g_n_vocab = desc.n_vocab;
         basalt::model::Started started;
+        const basalt::core::GpuLeftRunningExit left_running;
         basalt::model::LoadRequest lreq;
         lreq.paths = o.native_shards;
         lreq.diag_dump = o.diag_dump;
         lreq.diag_tier_ram = o.diag_tier_ram;
         lreq.diag_tier_vram = o.diag_tier_vram;
-        lreq.peer_devices = o.peer_devices;
+        lreq.gpus = o.gpus;
         lreq.max_context = o.max_context;
         lreq.sessions = std::max(o.batch, 1);
         lreq.vision = o.vision;
@@ -403,12 +407,15 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.rope = o.rope;
         lreq.route = o.route;
         lreq.kv_resident = o.kv_resident;
-        lreq.card_gbps.push_back(o.main_gbps);
-        lreq.card_gbps.insert(lreq.card_gbps.end(), o.peer_gbps.begin(), o.peer_gbps.end());
-        lreq.diag_split_at = o.diag_split_at;
         lreq.diag_rows = o.diag_rows;
         const basalt::model::Result r = adapter->start(lreq, started);
         if (!r.ok() || started.sessions.empty()) return fatal_start_error(r.message);
+        if (o.gpus.cards.size() > 1) {   // the start line after the load: each card's part as the model reports it
+            std::vector<std::string> parts;
+            for (size_t c = 0; c < o.gpus.cards.size(); ++c) parts.push_back(started.model->gpu_report((int) c));
+            const std::string line = basalt::model::gpu_parts_line(o.gpus, parts);
+            if (!line.empty()) basalt::log::info("basalt", "%s", line.c_str());
+        }
         std::vector<int64_t> stop;
         if (o.stop_eos) stop = o.eos_ids;
         if (started.model->context() != 0) o.max_context = started.model->context();
@@ -424,6 +431,26 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
             if (!r.ok()) return fatal_start_error(r.message);
             std::printf("batch check: %d windows compared, %d differ: %s\n", bc.compared, bc.differ, bc.differ ? "FAILED" : "PASSED");
             return bc.differ ? 1 : 0;
+        }
+        if (o.diag_gpu_same) return fatal_start_error("--diag-gpu-same: this model does not run a layer split with both stages on one GPU");
+        if (o.diag_gpu_check) {   // the prompt and its greedy steps recorded, and compared with a reference run's trace
+            const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
+            std::string err;
+            basalt::model::GpuTrace ref;   // a comparing run feeds the reference's picks, so each step sees the reference's context
+            if (!o.diag_gpu_ref.empty() && !basalt::model::read_gpu_trace(o.diag_gpu_ref, ref, err)) return fatal_start_error(err);
+            basalt::model::GpuTrace trace;
+            const basalt::model::Result r = basalt::model::record_gpu_trace(*started.sessions.front(), prompt, (int) std::max<int64_t>(o.max_new, 1),
+                                                                            started.model->desc().n_vocab, trace,
+                                                                            o.diag_gpu_ref.empty() ? nullptr : &ref.tokens);
+            if (!r.ok()) return fatal_start_error(r.message);
+            if (!o.diag_gpu_trace.empty() && !basalt::model::write_gpu_trace(o.diag_gpu_trace, trace, err)) return fatal_start_error(err);
+            if (o.diag_gpu_ref.empty()) {
+                std::printf("gpu check: %d steps recorded\n", trace.steps());
+                return 0;
+            }
+            const basalt::model::GpuCompare c = basalt::model::compare_gpu_traces(ref, trace);
+            std::printf("%s\n", basalt::model::gpu_compare_line(c).c_str());
+            return c.same() ? 0 : 1;
         }
         std::vector<int64_t> oracle;
         if (const auto code = cli::load_spec_oracle(o.spec_oracle, oracle)) return *code;

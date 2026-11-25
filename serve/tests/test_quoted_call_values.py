@@ -113,6 +113,24 @@ class QuotedCallValues(unittest.TestCase):
                                                  if e.kind == "tool_args" and e.call.id == call.id)
                                 self.assertEqual(json.loads(pieces), call.arguments)
 
+    def test_malformed_tool_call_falls_back_to_content(self):
+        for stream in (False, True):
+            parser = OutputParser(thinking=False, tools=[SCHEMA], stream_tools=stream)
+            events = parser.feed(f"{CALL_START}\nnot a function call\n{CALL_END} after") + parser.finish()
+            self.assertFalse(any(e.kind == "tool_call" for e in events))
+            content = "".join(e.text for e in events if e.kind == "content")
+            self.assertIn("not a function call", content)
+            self.assertIn("after", content)
+
+    def test_missing_tool_call_closer_preserves_parsed_arguments(self):
+        text = f"{CALL_START}\n{FUNC_START}write_file>\n{PARAM_START}content>\nhello\n{PARAM_END}\n{FUNC_END}"
+        parser = OutputParser(thinking=False, tools=[SCHEMA], stream_tools=True)
+        events = parser.feed(text) + parser.finish()
+        calls = [e.call for e in events if e.kind == "tool_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "write_file")
+        self.assertEqual(calls[0].arguments, {"content": "hello"})
+
 
 if __name__ == "__main__":
     unittest.main()

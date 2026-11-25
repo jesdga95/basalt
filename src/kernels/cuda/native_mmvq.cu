@@ -1863,11 +1863,30 @@ bool launch_q80_mma(const void* weights, const void* x_q8_1, float* y, int n_in,
     return true;
 }
 
+constexpr int MAX_PLANES_NCOLS = 32;
+constexpr int MAX_QUANT_NCOLS = 128;
+
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
     if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
+}
+void validate_planes_shape(int n_in, int ncols, int block_elems = Q8K) {
+    if (n_in <= 0 || n_in % block_elems != 0) {
+        throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
+    }
+    if (ncols < 1 || ncols > MAX_PLANES_NCOLS) {
+        throw std::invalid_argument("native planes MMVQ requires 1 <= ncols <= 32 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
+    }
+}
+void validate_quant_shape(int n_in, int ncols, int block_elems = Q8K) {
+    if (n_in <= 0 || n_in % block_elems != 0) {
+        throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
+    }
+    if (ncols < 1 || ncols > MAX_QUANT_NCOLS) {
+        throw std::invalid_argument("native q8_1 quantize requires 1 <= ncols <= 128 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
+    }
 }
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
@@ -1943,12 +1962,12 @@ bool native_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long native_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
-    validate_shape(n_in, ncols);
+    validate_quant_shape(n_in, ncols);
     return std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
 }
 
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_quant_shape(n_in, ncols);
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_stream(stream);
@@ -1963,7 +1982,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_quant_shape(n_in, ncols);
     validate_pointer(gate);
     validate_pointer(up);
     validate_pointer(x_q8_1);
@@ -2272,118 +2291,100 @@ __host__ __device__ __forceinline__ Q8Planes q8p_offset(Q8Planes p, int row0, in
     return {p.codes + std::size_t(row0) * n_in, p.scales + std::size_t(row0) * (n_in / 32)};
 }
 
-template<bool SmallK, int NCOLS, int NPRE>
-__device__ __forceinline__ void small_q8p_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
-                                               int n_in, int n_out, int bx) {
-    static_assert(NCOLS == 1 || !SmallK, "columns take the one-row layout");
-    constexpr int Qi = 8;
-    constexpr int ROWS = SmallK ? WARPS : 1;
-    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
-    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
-    const int row0 = ROWS * bx;
-    const int blocks_per_row = n_in / 32;
-    const int x_stride = blocks_per_row;
-    const int kbx0 = tid / (Qi / 2);
-    const int kqs = 2 * (tid % (Qi / 2));
-    float tmp[NCOLS][ROWS] = {};
+// 1 warp per row, 4 rows per CTA, 16-byte coalesced int4 (LDG.128) weight loads, zero shared memory & zero __syncthreads.
+// Two lanes cover each 32-value block (lane&1 picks bytes 0..15 or 16..31), so one warp sweeps 16 blocks (512 bytes) per step.
+template<int NCOLS, int NPRE>
+__device__ __forceinline__ void q8p_w1_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                            int n_in, int n_out, int bx) {
+    const int row = bx * WARPS + int(threadIdx.y);
+    if (row >= n_out) {
+        pdl_launch_dependents();
+        pdl_wait();
+        return;
+    }
+    const int lane = int(threadIdx.x);
+    const int nb = n_in / 32;
+    const int b0 = lane >> 1;
+    const int h = lane & 1;   // 0: bytes 0..15, 1: bytes 16..31
+    const int8_t* wc = w.codes + std::size_t(row) * n_in;
+    const half* ws = w.scales + std::size_t(row) * nb;
+    float tmp[NCOLS] = {};
     if constexpr (NPRE > 0) {
-        float d0[ROWS][NPRE];
-        int v0[ROWS][NPRE], v1[ROWS][NPRE];
+        int4 q[NPRE];
+        float d[NPRE];
 #pragma unroll
         for (int p = 0; p < NPRE; ++p) {
-            const int kbx = kbx0 + p * BLOCKS_PER_ITER;
-#pragma unroll
-            for (int i = 0; i < ROWS; ++i) {
-                if (kbx < blocks_per_row && row0 + i < n_out) {
-                    const int2 q2 = __ldg(reinterpret_cast<const int2*>(w.codes + std::size_t(row0 + i) * n_in + kbx * 32) + (kqs >> 1));
-                    v0[i][p] = q2.x;
-                    v1[i][p] = q2.y;
-                    d0[i][p] = __half2float(__ldg(w.scales + std::size_t(row0 + i) * blocks_per_row + kbx));
-                }
+            const int kbx = b0 + p * 16;
+            if (kbx < nb) {
+                q[p] = __ldg(reinterpret_cast<const int4*>(wc + kbx * 32 + h * 16));
+                d[p] = __half2float(__ldg(ws + kbx));
             }
         }
         pdl_launch_dependents();
         pdl_wait();
 #pragma unroll
         for (int p = 0; p < NPRE; ++p) {
-            const int kbx = kbx0 + p * BLOCKS_PER_ITER;
-            if (kbx < blocks_per_row) {
+            const int kbx = b0 + p * 16;
+            if (kbx < nb) {
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j) {
-                    const Q81Block* xj = x + std::size_t(j) * x_stride + kbx;
-                    const int* u = reinterpret_cast<const int*>(xj->qs);
-                    const float d1 = __low2float(xj->ds);
-#pragma unroll
-                    for (int i = 0; i < ROWS; ++i) {
-                        if (row0 + i < n_out) {
-                            int sumi = 0;
-                            sumi = DP4A(v0[i][p], u[kqs], sumi);
-                            sumi = DP4A(v1[i][p], u[kqs + 1], sumi);
-                            tmp[j][i] += d0[i][p] * d1 * float(sumi);
-                        }
-                    }
+                    const Q81Block* xj = x + std::size_t(j) * nb + kbx;
+                    const int* u = reinterpret_cast<const int*>(xj->qs) + h * 4;
+                    int sumi = DP4A(q[p].x, u[0], 0);
+                    sumi = DP4A(q[p].y, u[1], sumi);
+                    sumi = DP4A(q[p].z, u[2], sumi);
+                    sumi = DP4A(q[p].w, u[3], sumi);
+                    tmp[j] = fmaf(__fmul_rn(d[p], __low2float(xj->ds)), float(sumi), tmp[j]);
                 }
             }
         }
     } else {
+        pdl_launch_dependents();
         pdl_wait();
     }
-    for (int kbx = kbx0 + NPRE * BLOCKS_PER_ITER; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+    for (int kbx = b0 + NPRE * 16; kbx < nb; kbx += 16) {
+        const int4 q = __ldg(reinterpret_cast<const int4*>(wc + kbx * 32 + h * 16));
+        const float d = __half2float(__ldg(ws + kbx));
 #pragma unroll
-        for (int i = 0; i < ROWS; ++i) {
-            if (row0 + i < n_out) {
-                const int2 q2 = __ldg(reinterpret_cast<const int2*>(w.codes + std::size_t(row0 + i) * n_in + kbx * 32) + (kqs >> 1));
-                const float d = __half2float(__ldg(w.scales + std::size_t(row0 + i) * blocks_per_row + kbx));
-#pragma unroll
-                for (int j = 0; j < NCOLS; ++j) {
-                    const Q81Block* xj = x + std::size_t(j) * x_stride + kbx;
-                    const int* u = reinterpret_cast<const int*>(xj->qs);
-                    int sumi = 0;
-                    sumi = DP4A(q2.x, u[kqs], sumi);
-                    sumi = DP4A(q2.y, u[kqs + 1], sumi);
-                    tmp[j][i] += d * __low2float(xj->ds) * float(sumi);
-                }
-            }
+        for (int j = 0; j < NCOLS; ++j) {
+            const Q81Block* xj = x + std::size_t(j) * nb + kbx;
+            const int* u = reinterpret_cast<const int*>(xj->qs) + h * 4;
+            int sumi = DP4A(q.x, u[0], 0);
+            sumi = DP4A(q.y, u[1], sumi);
+            sumi = DP4A(q.z, u[2], sumi);
+            sumi = DP4A(q.w, u[3], sumi);
+            tmp[j] = fmaf(__fmul_rn(d, __low2float(xj->ds)), float(sumi), tmp[j]);
         }
     }
-    __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
-    if (threadIdx.y > 0) {
-#pragma unroll
-        for (int j = 0; j < NCOLS; ++j)
-#pragma unroll
-            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
-    }
-    __syncthreads();
-    if (threadIdx.y > 0) return;
 #pragma unroll
     for (int j = 0; j < NCOLS; ++j) {
-#pragma unroll
-        for (int i = 0; i < ROWS; ++i) {
-#pragma unroll
-            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
-            tmp[j][i] = warp_sum(tmp[j][i]);
-            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
-        }
+        tmp[j] = warp_sum(tmp[j]);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = tmp[j];
     }
-}
-
-template<bool SmallK, int NCOLS, int NPRE>
-__launch_bounds__(WARPS * WARP, NCOLS > 1 ? (NPRE > 0 ? 8 : 4) : 1)
-__global__ void native_q8p_kernel(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
-    small_q8p_body<SmallK, NCOLS, NPRE>(w, x, y, n_in, n_out, int(blockIdx.x));
 }
 
 template<int NCOLS, int NPRE>
-__launch_bounds__(WARPS * WARP, NCOLS > 1 ? (NPRE > 0 ? 8 : 4) : 1)
-__global__ void native_q8p_seg_kernel(Q8Planes w, SegArgs a, int n_in) {
-    const SegPick p = seg_pick(a);
-    small_q8p_body<false, NCOLS, NPRE>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, p.bx);
+__launch_bounds__(WARPS * WARP)
+__global__ void native_q8p_w1_kernel(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
+    q8p_w1_body<NCOLS, NPRE>(w, x, y, n_in, n_out, int(blockIdx.x));
 }
 
+template<int NCOLS, int NPRE>
+__launch_bounds__(WARPS * WARP)
+__global__ void native_q8p_w1_seg_kernel(Q8Planes w, SegArgs a, int n_in) {
+    const SegPick p = seg_pick(a);
+    q8p_w1_body<NCOLS, NPRE>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, p.bx);
+}
+
+// Matches q8p_w1_body's reduction order (lane = 2 * b0 + h, 16 blocks per step, two 16-byte halves h = 0, 1 per block, then
+// warp_sum's 16 -> 8 -> 4 -> 2 -> 1 butterfly), using two mma.m16n8k32 s8 instructions per 32-element block and CTILES 8-column
+// tiles sharing one weight stream so every column at 1..32 columns is bitwise identical to a single-column call.
+template<int CTILES>
 __device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
                                              int n_in, int n_out, int ncols, int bx) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __shared__ float s_part[8 * 16 * 33];
+    constexpr int NPRE = CTILES <= 2 ? 3 : 1;
+    __shared__ float s_part[8 * 16 * 17];
     const int wp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int row0 = bx * 16, nb = n_in / 32;
     const int ra = min(row0 + g, n_out - 1), rb = min(row0 + g + 8, n_out - 1);
@@ -2403,115 +2404,115 @@ __device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restr
         r.db = __half2float(__ldg(sb + kbx));
         return r;
     };
-    QmA pre[3];
+    QmA pre[NPRE];
 #pragma unroll
-    for (int j = 0; j < 3; ++j)
-        if (wp + 32 * j < nb) pre[j] = load_a(wp + 32 * j);
+    for (int j = 0; j < NPRE; ++j)
+        if (wp + 16 * j < nb) pre[j] = load_a(wp + 16 * j);
     pdl_launch_dependents();
     pdl_wait();
-    const Q81Block* xg = x + (size_t) min(g, ncols - 1) * nb;
-    const Q81Block* xc0 = x + (size_t) min(2 * t, ncols - 1) * nb;
-    const Q81Block* xc1 = x + (size_t) min(2 * t + 1, ncols - 1) * nb;
-    float v[4][4];
-    const bool lo = t < 2;
-    auto block = [&](const QmA& A, int kbx, float (&acc)[4][4]) {
-        const uint32_t b0 = g < ncols ? (uint32_t) reinterpret_cast<const int*>(xg[kbx].qs)[t] : 0u;
-        const uint32_t b1 = g < ncols ? (uint32_t) reinterpret_cast<const int*>(xg[kbx].qs)[4 + t] : 0u;
-        const float dx0 = __low2float(xc0[kbx].ds), dx1 = __low2float(xc1[kbx].ds);
+    auto block = [&](const QmA& A, int kbx, float (&acc)[CTILES][2][4]) {
 #pragma unroll
-        for (int grp = 0; grp < 4; ++grp) {
-            const bool mine = (grp & 1) ? !lo : lo, hi = grp >= 2;
-            const uint32_t m0 = mine && !hi ? (uint32_t) A.a0 : 0u, m1 = mine && !hi ? (uint32_t) A.a1 : 0u;
-            const uint32_t m2 = mine && hi ? (uint32_t) A.a2 : 0u, m3 = mine && hi ? (uint32_t) A.a3 : 0u;
-            int si[4];
-            qm_mma(si, m0, m1, m2, m3, b0, b1);
-            acc[grp][0] += A.da * dx0 * float(si[0]);
-            acc[grp][1] += A.da * dx1 * float(si[1]);
-            acc[grp][2] += A.db * dx0 * float(si[2]);
-            acc[grp][3] += A.db * dx1 * float(si[3]);
+        for (int ct = 0; ct < CTILES; ++ct) {
+            const int c0 = 8 * ct;
+            const int cg = c0 + g, cc0 = c0 + 2 * t, cc1 = cc0 + 1;
+            const Q81Block* xg = x + (size_t) min(cg, ncols - 1) * nb;
+            const Q81Block* xc0 = x + (size_t) min(cc0, ncols - 1) * nb;
+            const Q81Block* xc1 = x + (size_t) min(cc1, ncols - 1) * nb;
+            const uint32_t b0 = cg < ncols ? (uint32_t) reinterpret_cast<const int*>(xg[kbx].qs)[t] : 0u;
+            const uint32_t b1 = cg < ncols ? (uint32_t) reinterpret_cast<const int*>(xg[kbx].qs)[4 + t] : 0u;
+            const float dx0 = __low2float(xc0[kbx].ds), dx1 = __low2float(xc1[kbx].ds);
+            const float sax0 = __fmul_rn(A.da, dx0), sax1 = __fmul_rn(A.da, dx1);
+            const float sbx0 = __fmul_rn(A.db, dx0), sbx1 = __fmul_rn(A.db, dx1);
+            int si0[4], si1[4];
+            qm_mma(si0, (uint32_t) A.a0, (uint32_t) A.a1, 0u, 0u, b0, 0u);
+            qm_mma(si1, (uint32_t) A.a2, (uint32_t) A.a3, 0u, 0u, b1, 0u);
+            acc[ct][0][0] = fmaf(sax0, float(si0[0]), acc[ct][0][0]);
+            acc[ct][0][1] = fmaf(sax1, float(si0[1]), acc[ct][0][1]);
+            acc[ct][0][2] = fmaf(sbx0, float(si0[2]), acc[ct][0][2]);
+            acc[ct][0][3] = fmaf(sbx1, float(si0[3]), acc[ct][0][3]);
+            acc[ct][1][0] = fmaf(sax0, float(si1[0]), acc[ct][1][0]);
+            acc[ct][1][1] = fmaf(sax1, float(si1[1]), acc[ct][1][1]);
+            acc[ct][1][2] = fmaf(sbx0, float(si1[2]), acc[ct][1][2]);
+            acc[ct][1][3] = fmaf(sbx1, float(si1[3]), acc[ct][1][3]);
         }
     };
+    float acc0[CTILES][2][4] = {}, acc1[CTILES][2][4] = {};
 #pragma unroll
-    for (int yy = 0; yy < 4; ++yy) {
-        float acc[4][4];
+    for (int j = 0; j < NPRE; ++j)
+        if (wp + 16 * j < nb) block(pre[j], wp + 16 * j, acc0);
+    for (int kbx = wp + 16 * NPRE; kbx < nb; kbx += 16) block(load_a(kbx), kbx, acc0);
+    for (int kbx = wp + 8; kbx < nb; kbx += 16) block(load_a(kbx), kbx, acc1);
+    const int tid = wp * 32 + lane;
 #pragma unroll
-        for (int a = 0; a < 4; ++a)
-#pragma unroll
-            for (int q = 0; q < 4; ++q) acc[a][q] = 0.0f;
-        const int c = 8 * yy + wp;
-        if (yy == 0) {
-#pragma unroll
-            for (int j = 0; j < 3; ++j)
-                if (c + 32 * j < nb) block(pre[j], c + 32 * j, acc);
-            for (int kbx = c + 96; kbx < nb; kbx += 32) block(load_a(kbx), kbx, acc);
-        } else {
-            for (int kbx = c; kbx < nb; kbx += 32) block(load_a(kbx), kbx, acc);
+    for (int ct = 0; ct < CTILES; ++ct) {
+        if constexpr (CTILES > 1) {
+            if (ct > 0) __syncthreads();
         }
 #pragma unroll
-        for (int a = 0; a < 4; ++a)
+        for (int q = 0; q < 4; ++q) {
+            const int row = 8 * (q >> 1) + g, col = 2 * t + (q & 1);
+            s_part[(col * 16 + row) * 17 + 2 * wp] = __fadd_rn(acc0[ct][0][q], acc1[ct][0][q]);
+            s_part[(col * 16 + row) * 17 + 2 * wp + 1] = __fadd_rn(acc0[ct][1][q], acc1[ct][1][q]);
+        }
+        __syncthreads();
+        const int ntc = min(8, ncols - 8 * ct);
+        if (tid < ntc * 16) {
+            const int row = tid & 15, col = tid >> 4;
+            const float* p = s_part + (col * 16 + row) * 17;
+            float r8[8];
 #pragma unroll
-            for (int q = 0; q < 4; ++q) v[a][q] = yy == 0 ? acc[a][q] : v[a][q] + acc[a][q];
-    }
+            for (int L = 0; L < 8; ++L) r8[L] = __fadd_rn(p[L], p[L + 8]);
+            float r4[4];
 #pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int row = 8 * (q >> 1) + g, col = 2 * t + (q & 1);
-#pragma unroll
-        for (int a = 0; a < 4; ++a) s_part[(col * 16 + row) * 33 + 4 * wp + a] = v[a][q];
-    }
-    __syncthreads();
-    const int tid = wp * 32 + lane;
-    if (tid < ncols * 16) {
-        const int row = tid & 15, col = tid >> 4;
-        const float* p = s_part + (col * 16 + row) * 33;
-        float r16[16];
-#pragma unroll
-        for (int L = 0; L < 16; ++L) r16[L] = p[L] + p[L + 16];
-        float r8[8];
-#pragma unroll
-        for (int L = 0; L < 8; ++L) r8[L] = r16[L] + r16[L + 8];
-        float r4[4];
-#pragma unroll
-        for (int L = 0; L < 4; ++L) r4[L] = r8[L] + r8[L + 4];
-        const float r2a = r4[0] + r4[2], r2b = r4[1] + r4[3];
-        if (row0 + row < n_out) y[(size_t) col * n_out + row0 + row] = r2a + r2b;
+            for (int L = 0; L < 4; ++L) r4[L] = __fadd_rn(r8[L], r8[L + 4]);
+            const float r2a = __fadd_rn(r4[0], r4[2]), r2b = __fadd_rn(r4[1], r4[3]);
+            if (row0 + row < n_out) y[(size_t) (8 * ct + col) * n_out + row0 + row] = __fadd_rn(r2a, r2b);
+        }
     }
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
 }
 
+template<int CTILES>
 __global__ void __launch_bounds__(256) native_q8p_mma_kernel(Q8Planes w, const Q81Block* __restrict__ x,
                                                              float* __restrict__ y, int n_in, int n_out, int ncols) {
-    q8p_mma_body(w, x, y, n_in, n_out, ncols, int(blockIdx.x));
+    q8p_mma_body<CTILES>(w, x, y, n_in, n_out, ncols, int(blockIdx.x));
 }
 
+template<int CTILES>
 __global__ void __launch_bounds__(256) native_q8p_mma_seg_kernel(Q8Planes w, SegArgs a, int n_in, int ncols) {
     const SegPick p = seg_pick(a);
-    q8p_mma_body(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, ncols, p.bx);
+    q8p_mma_body<CTILES>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, ncols, p.bx);
 }
 
 void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     const dim3 threads(WARP, WARPS);
-    constexpr int BPI = 2 * WARPS * WARP / 8;
-    const bool small_k = (n_in / 32) < BPI;
-    if (ncols == 1) {
-        if (small_k) launch_pdl(native_q8p_kernel<true, 1, 3>, dim3(unsigned((n_out + WARPS - 1) / WARPS)), threads, 0, s, w, x, y, n_in, n_out);
-        else launch_pdl(native_q8p_kernel<false, 1, 3>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out);
+    if (n_in >= 1024 && mmvq_mma_sms() != 0 && (ncols > 8 || (n_out >= 65536 && ncols >= 4) || (n_out >= 4096 && ncols >= 7))) {
+        const dim3 grid{unsigned((n_out + 15) / 16)};
+        switch ((ncols + 7) / 8) {
+        case 1: launch_pdl(native_q8p_mma_kernel<1>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        case 2: launch_pdl(native_q8p_mma_kernel<2>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        case 3: launch_pdl(native_q8p_mma_kernel<3>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        default: launch_pdl(native_q8p_mma_kernel<4>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        }
         return;
     }
-    if (!small_k && mmvq_mma_sms() != 0 && ((n_out >= 65536 && ncols >= 4) || (n_out >= 4096 && ncols >= 7))) {
-        launch_pdl(native_q8p_mma_kernel, dim3(unsigned((n_out + 15) / 16)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols);
+    if (ncols > 8) {
+        for (int c0 = 0; c0 < ncols; c0 += 8)
+            launch_q8p(w, x + std::size_t(c0) * (n_in / 32), y + std::size_t(c0) * n_out, n_in, n_out, std::min(8, ncols - c0), s);
         return;
     }
-    const dim3 grid{unsigned(n_out)};
+    const dim3 grid{unsigned((n_out + WARPS - 1) / WARPS)};
     switch (ncols) {
-    case 2: launch_pdl(native_q8p_kernel<false, 2, 3>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 3: launch_pdl(native_q8p_kernel<false, 3, 3>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 4: launch_pdl(native_q8p_kernel<false, 4, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 5: launch_pdl(native_q8p_kernel<false, 5, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 6: launch_pdl(native_q8p_kernel<false, 6, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 7: launch_pdl(native_q8p_kernel<false, 7, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    default: launch_pdl(native_q8p_kernel<false, 8, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 1: launch_pdl(native_q8p_w1_kernel<1, 2>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 2: launch_pdl(native_q8p_w1_kernel<2, 2>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 3: launch_pdl(native_q8p_w1_kernel<3, 2>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 4: launch_pdl(native_q8p_w1_kernel<4, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 5: launch_pdl(native_q8p_w1_kernel<5, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 6: launch_pdl(native_q8p_w1_kernel<6, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 7: launch_pdl(native_q8p_w1_kernel<7, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    default: launch_pdl(native_q8p_w1_kernel<8, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
     }
 }
 
@@ -2519,7 +2520,7 @@ void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, in
 
 void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                            void* stream) {
-    validate_shape(n_in, ncols, 32);
+    validate_planes_shape(n_in, ncols, 32);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(planes);
     validate_pointer(x_q8_1);
@@ -2535,7 +2536,7 @@ void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int
 void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q80Segments& seg, int n_in, int ncols,
                                     void* stream) {
     if (seg.n < 1 || seg.n > 3) throw std::invalid_argument("native_q8_planes_mmvq_segments takes 1 to 3 segments");
-    validate_shape(n_in, ncols, 32);
+    validate_planes_shape(n_in, ncols, 32);
     validate_pointer(planes);
     validate_stream(stream);
     const auto* codes = static_cast<const int8_t*>(planes);
@@ -2548,17 +2549,18 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
         validate_pointer(seg.y[i]);
         if (seg.n_out[i] <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     }
-    if (n_in / 32 < BPI) {
+    int sum_rows = 0;
+    for (int i = 0; i < seg.n; ++i) sum_rows += seg.n_out[i];
+    const bool mma = n_in >= 1024 && mmvq_mma_sms() != 0 &&
+                     (ncols > 8 || (sum_rows >= 65536 && ncols >= 4) || (sum_rows >= 4096 && ncols >= 7));
+    if (n_in / 32 < BPI || (ncols > 8 && !mma)) {
         for (int j = 0; j < seg.n; ++j)
             launch_q8p(q8p_offset(w, seg.row0[j], n_in), static_cast<const Q81Block*>(seg.x[j]), seg.y[j], n_in,
                        seg.n_out[j], ncols, s);
         launch_check();
         return;
     }
-    int sum_rows = 0;
-    for (int i = 0; i < seg.n; ++i) sum_rows += seg.n_out[i];
-    const bool mma = mmvq_mma_sms() != 0 && ((sum_rows >= 65536 && ncols >= 4) || (sum_rows >= 4096 && ncols >= 7));
-    const int rows_a_block = mma ? 16 : 1;
+    const int rows_a_block = mma ? 16 : WARPS;
     SegArgs a{};
     int end = 0;
     for (int i = 0; i < 3; ++i) {
@@ -2572,19 +2574,24 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
     }
     const dim3 grid{unsigned(end)}, threads(WARP, WARPS);
     if (mma) {
-        launch_pdl(native_q8p_mma_seg_kernel, grid, dim3(256), 0, s, w, a, n_in, ncols);
+        switch ((ncols + 7) / 8) {
+        case 1: launch_pdl(native_q8p_mma_seg_kernel<1>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 2: launch_pdl(native_q8p_mma_seg_kernel<2>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 3: launch_pdl(native_q8p_mma_seg_kernel<3>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        default: launch_pdl(native_q8p_mma_seg_kernel<4>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        }
         launch_check();
         return;
     }
     switch (ncols) {
-    case 1: launch_pdl(native_q8p_seg_kernel<1, 3>, grid, threads, 0, s, w, a, n_in); break;
-    case 2: launch_pdl(native_q8p_seg_kernel<2, 3>, grid, threads, 0, s, w, a, n_in); break;
-    case 3: launch_pdl(native_q8p_seg_kernel<3, 3>, grid, threads, 0, s, w, a, n_in); break;
-    case 4: launch_pdl(native_q8p_seg_kernel<4, 0>, grid, threads, 0, s, w, a, n_in); break;
-    case 5: launch_pdl(native_q8p_seg_kernel<5, 0>, grid, threads, 0, s, w, a, n_in); break;
-    case 6: launch_pdl(native_q8p_seg_kernel<6, 0>, grid, threads, 0, s, w, a, n_in); break;
-    case 7: launch_pdl(native_q8p_seg_kernel<7, 0>, grid, threads, 0, s, w, a, n_in); break;
-    default: launch_pdl(native_q8p_seg_kernel<8, 0>, grid, threads, 0, s, w, a, n_in); break;
+    case 1: launch_pdl(native_q8p_w1_seg_kernel<1, 2>, grid, threads, 0, s, w, a, n_in); break;
+    case 2: launch_pdl(native_q8p_w1_seg_kernel<2, 2>, grid, threads, 0, s, w, a, n_in); break;
+    case 3: launch_pdl(native_q8p_w1_seg_kernel<3, 2>, grid, threads, 0, s, w, a, n_in); break;
+    case 4: launch_pdl(native_q8p_w1_seg_kernel<4, 1>, grid, threads, 0, s, w, a, n_in); break;
+    case 5: launch_pdl(native_q8p_w1_seg_kernel<5, 1>, grid, threads, 0, s, w, a, n_in); break;
+    case 6: launch_pdl(native_q8p_w1_seg_kernel<6, 1>, grid, threads, 0, s, w, a, n_in); break;
+    case 7: launch_pdl(native_q8p_w1_seg_kernel<7, 1>, grid, threads, 0, s, w, a, n_in); break;
+    default: launch_pdl(native_q8p_w1_seg_kernel<8, 0>, grid, threads, 0, s, w, a, n_in); break;
     }
     launch_check();
 }

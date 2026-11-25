@@ -1,3 +1,5 @@
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -57,7 +59,7 @@ int weights(Context& context) {
         // missing is held by something else: say how much was free
         cudaGetLastError();
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         basalt::log::error("basalt generate", "cudaMalloc(%llu) for the weight arena failed (%s): %llu MiB of %llu "
                              "MiB VRAM free on this GPU. The arena is allocated first, before the KV and expert "
                              "caches: another program (or an engine that is still exiting) holds the rest - "
@@ -129,7 +131,7 @@ int weights(Context& context) {
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
         if (cudaMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
-            cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+            basalt::core::device_copy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
             basalt::log::error("basalt generate", "cannot allocate the image position table");
             return 1;

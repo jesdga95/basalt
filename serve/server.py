@@ -27,6 +27,7 @@ from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
                           sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
+from serve.engine import suspend  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
 from serve.engine.flags import flag_value  # noqa: E402
@@ -39,7 +40,7 @@ from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_from_file, api_key_of,  # noqa: E402
                             exposed_without_key, lan_addresses, origins_of)
 from serve.router import Router  # noqa: E402
-from serve.service import Service  # noqa: E402
+from serve.service import Service, meminfo_mib  # noqa: E402
 from serve.engine.progress import load_progress                             # noqa: E402
 from serve.util.logbuf import ColorStream, LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.util.loglevel import ERR, WARN, LevelReader                     # noqa: E402
@@ -128,9 +129,9 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
     cfg = {}                                            # what the model file implies
     lines = cfg["start_lines"] = []                     # printed with the model's other lines once all are checked
     try:
-        check_gpu(a.gpu)
-    except ValueError:
-        fail(f"--gpu {gpu_text(a.gpu)}: expected numbers like 0 or 0,1, or auto")
+        check_gpu(a.gpu, a.gpu_mode, a.gpu_share)
+    except ValueError as e:
+        fail(str(e))
     if not a.mock_engine and not (a.model and a.engine_bin):
         fail("the server needs --model and the engine binary: run it as basalt serve --config FILE (or --mock-engine)")
     if (file_engine or cli_engine) and not a.model:
@@ -157,7 +158,7 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
             # the engine's own choice and its own flag rules, printed once here; the engine then sees only these cards,
             # main first
             try:
-                plan = model_plan(a.engine_bin, a.model, spec.gpu, list(spec.engine_words))
+                plan = model_plan(a.engine_bin, a.model, spec.gpu, list(spec.engine_words), a.gpu_mode, a.gpu_share)
             except ValueError as e:
                 fail(f"{a.model}: {e}")
             card = vision_card(mode)
@@ -178,6 +179,9 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
                 cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
+            for flag, value in (("--gpu-mode", gpu_text(a.gpu_mode)), ("--gpu-share", gpu_text(a.gpu_share))):
+                if value:                                  # the engine checks them again on the cards it was given
+                    cfg["args"] += [flag, value]
     for flag in a.skipped:
         lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
     cfg["items"] = start_items(file_engine, cli_engine,
@@ -329,6 +333,36 @@ def check_models(services: list[Service]) -> None:
             fail(f"--config: {svc.model} and {folders[where]} share the conversation folder {where}: give each its own")
 
 
+RAM_FLOOR_BEAT_MIB = 1024    # kept free above the engines' own RAM reserve while models are parked
+RAM_RESERVE_DEFAULT_MIB = 2048
+
+
+def model_cache_plan(a, services: list[Service]) -> tuple[int, int]:
+    """The model cache's budget and RAM floor in MiB, from the options and the models' own `ram-reserve-mib`; (0, 0) when
+    off. The floor is the highest reserve of any model and a margin, so the cache ends a parked model before the
+    engines' own RAM guard acts. A setting that cannot work stops the start."""
+    if a.model_cache_mib < 0:
+        fail(f"--model-cache-mib {a.model_cache_mib} must be 0 (off) or more")
+    if not a.model_cache_mib:
+        return 0, 0
+    if len(services) < 2:
+        fail("--model-cache-mib parks a model when the router switches to another: it needs two or more models in --config")
+    if a.mock_engine:
+        fail("--model-cache-mib needs the engine, not --mock-engine")
+    if not suspend.available():
+        fail("--model-cache-mib needs the driver's process suspend, which is Linux only: it parks a model as an engine "
+             "asleep in RAM (idle-sleep uses the same)")
+    reserve = max(int(flag_value(getattr(s.engine, "spawn", (None, []))[1], "--ram-reserve-mib") or RAM_RESERVE_DEFAULT_MIB)
+                  for s in services)
+    floor, total = reserve + RAM_FLOOR_BEAT_MIB, meminfo_mib("MemTotal")
+    if total is not None and a.model_cache_mib > total - floor:
+        fail(f"--model-cache-mib {a.model_cache_mib} is more than this machine can park: {total} MiB of RAM, "
+             f"{floor} MiB of it kept free (ram-reserve-mib {reserve})")
+    print(tagged("parking", f"up to {a.model_cache_mib} MiB of switched-away models, least recently used out first; "
+                            f"ends one when RAM available drops under {floor} MiB"), flush=True)
+    return a.model_cache_mib, floor
+
+
 def main() -> int:
     ap = build_parser()
     engine_bin = ap.parse_known_args(sys.argv[1:])[0].engine_bin
@@ -371,7 +405,7 @@ def main() -> int:
         c["shared_items"], c["name_width"] = shared, width
     services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
     check_models(services)
-    router = Router(services)
+    router = Router(services, *model_cache_plan(a, services))
     svc = router.front
     svc.image_sources = image_sources
     if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
@@ -413,6 +447,29 @@ def main() -> int:
         print(tagged("cors", ",".join(svc.cors_origins)), flush=True)
         if "*" in svc.cors_origins and not svc.api_key:
             print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
+    from serve.totals import totals_path_of, totals_path_for_model, totals_reset_file
+    pricing_cli = getattr(a, "pricing_cli", set())
+    for s in services:
+        s.cost_input_per_million = a.cost_in
+        s.cost_output_per_million = a.cost_out
+        s.cost_cache_write_per_million = a.cost_cache_write
+        s.cost_cache_hit_per_million = a.cost_cache_hit
+    totals_owner: dict[str, str] = {}
+    for s in services:
+        tp = totals_path_of(a.totals_file, a.config)
+        if tp and multi:
+            tp = totals_path_for_model(tp, s.model)
+            if tp in totals_owner:
+                raise SystemExit(f"error: models {totals_owner[tp]!r} and {s.model!r} would share the totals file {tp}; "
+                                 "rename one of them")
+            totals_owner[tp] = s.model
+        if tp:
+            if a.totals_reset:
+                prev = totals_reset_file(tp)
+                if prev:
+                    print(tagged("totals", f"reset {s.model}, previous saved to {prev}"), flush=True)
+            s.totals_path = tp
+            s.load_totals(pricing_cli)
     httpd = serve(router, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 
@@ -441,6 +498,8 @@ def main() -> int:
                       flush=True)
         return announce
 
+    if router.cache is not None:
+        router.start_guard()
     for s, m in zip(services, (x[0] for x in settings)):
         s.start_idle_unload()
         s.start_idle_sleep(announce=not shared_sleep, name=s.model if multi else None)

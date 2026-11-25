@@ -22,7 +22,7 @@ class CudaEncoder;
 namespace basalt::dense {
 
 constexpr int kWindow = 16;       // rows one session's decode window holds
-constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
+constexpr int kBatch = 32;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
@@ -133,6 +133,8 @@ public:
     // K/V streaming: the VRAM copy of one attention layer's far cells a prompt chunk reads (at = the resident cells; at
     // INT64_MAX without streaming), filled on stage_side from stage_free (the stage's last reader done) to stage_ready
     kernels::KvFar stage;
+    // an NVFP4 cache: the int8 copy of one attention layer's cells a prompt chunk reads (prompt_cells)
+    kernels::KvInt8 kv8;
     cudaStream_t stage_side = nullptr;
     cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
@@ -275,10 +277,10 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
 void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
 
 /// The stage on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights on `dev`, the other layers empty):
-/// its memory, before the weights land (attach_prompt_split times both cards' rates once they have).
+/// its memory, before the weights land.
 StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, std::string& err);
-/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
-/// true; false with empty `err` when it does not (the caller reads them on the main card).
+/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards, true; false with empty `err` when the
+/// read is too short for it (more than two chunks) or the session cannot take it (the caller reads them on the main card).
 /// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
 /// only, as after a stopped read on the main card), true returned.
 bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,

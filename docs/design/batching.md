@@ -97,7 +97,8 @@ times the slots plus the shared scratch once, so more slots cost only their cach
    composition. A model whose host steers its forward between launches (Hy4 places its experts between per-layer graphs)
    returns false from `batch_captured`: the driver runs its forward directly every window and the model replays its own
    graphs of the stretches between. A session whose state the batch path does not cover yet returns false from
-   `batch_ready`, and the batch's windows run in turn.
+   `batch_ready`, and the batch's windows run in turn. `batch_end` (optional) runs once on every exit after `batch_stage`,
+   with the status of the stream's sync after every draw (none on an earlier exit); false withholds the window's results.
 4. Run the checks: `basalt --model FILE --batch 4 --tokens-file PROMPT --diag-batch-check` (every row of every composition
    bitwise its solo window), then `tools/batch_identity.py ENGINE --model FILE --slots 1,2,4,8` (every slot's tokens, alone
    and together, equal to a one-slot engine's).
@@ -138,7 +139,8 @@ How each model below went onto the driver: its state, the kernels that read it, 
 - **On the driver:** `batch_stage` stages every row's token and position, `batch_forward` runs the visits with each
   segment's caches, then the head over every row into the shared batch logits, and commits each session's drafter context
   from its rows of the shared tap; `batch_take` copies a segment's head rows into its session's logits; `batch_draw` samples
-  with the session's own sampler into its pinned picks.
+  with the session's own sampler into its pinned picks. With experts on the CPU, `batch_stage` takes the CPU experts'
+  admission and `batch_end` gives it up at the driver's sync, withholding a window the CPU experts' abort interrupted.
 - **Shared:** the forward's row buffers and expert scratch, the prompt path (its chunk buffers) and the drafter's tap.
 
 ### Hy4-flash (second)

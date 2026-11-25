@@ -71,8 +71,8 @@ public:
 
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
-    /// Second cards that hold experts, each a contiguous block of layers.
-    int max_expert_cards() const override { return kMaxSecondCards; }
+    /// Peer: the second cards hold experts, each a contiguous block of layers.
+    program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }
 
     const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
     const char* community_kv() const override { return "fp8"; }

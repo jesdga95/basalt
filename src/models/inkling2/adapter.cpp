@@ -45,26 +45,23 @@ public:
         return f;
     }
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
-    int max_expert_cards() const override { return 1; }   // the second card: the layer split (model.hpp card_of)
+    // peer: the second card holds and computes experts the main card cannot (model.hpp peer_held); split: it runs the later layers (card_of)
+    program::GpuModes gpu_modes() const override { return {2, 2, 0}; }
     const char* model_name() const override { return "Inkling-2-Mini"; }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
-    // --kv: the attention caches as fp16 (the default) or fp8; --spec, --draft-log: the drafter's windows
+    // --kv: attention caches as fp16 (default), fp8 or scaled int8; --spec, --draft-log: drafter windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
-            return true;
-        }
-        if (a == "--diag-split-at") {   // diagnostic: the layer split forced, the second card from this layer on
-            o.diag_split_at = std::atoi(args.next("--diag-split-at"));
             return true;
         }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8") {
-            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default) or fp8", o.kv.c_str());
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8") {
+            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8 or int8", o.kv.c_str());
             return 2;
         }
         dspark_finish_flags(o);   // DSPARK HOOK

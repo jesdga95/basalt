@@ -1,0 +1,36 @@
+{
+  "submitter": "sramteare",
+  "date": "2026-11-18",
+  "commit": "63cb68ad47",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "vram_gib": 96,
+      "power_w": 300,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 57.0
+    }
+  ],
+  "ram_gib": 123,
+  "cpu": "AMD Ryzen Threadripper PRO 9955WX, 16 cores",
+  "ram_gbps": 92.6,
+  "os": "Linux",
+  "quant": "Q4_K_XL",
+  "kv": "int8",
+  "prefill_16k_tps": 7476.0,
+  "prefill_64k_tps": 7561.8,
+  "decode_tps": 426.9,
+  "decode_conv_tps": 300.2,
+  "decode_struct_tps": 513.2,
+  "decode_prose_tps": 258.3,
+  "accept_conv_pct": 67.4,
+  "accept_struct_pct": 97.8,
+  "accept_prose_pct": 60.7,
+  "draft_len_conv": 2.5,
+  "draft_len_struct": 7.0,
+  "draft_len_prose": 1.9,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "Official UD-Q4_K_XL pack (jesdga/Qwen3.8-Flash-Next-Basalt). Run assisted by Claude Code."
+}

@@ -33,7 +33,10 @@ def service(script="x"):
     return Service(engine, tok, dialect.template(OFFICIAL), model_name="ink", dialect=dialect)
 
 
-def parse(text, chunk=None, tools=None):
+OFFERED = [{"name": n} for n in ("search", "get_weather", "f")]    # the tools the calls below name
+
+
+def parse(text, chunk=None, tools=OFFERED):
     p = Inkling2Parser(tools=tools)
     events = []
     if chunk is None:
@@ -176,9 +179,48 @@ class Parse(unittest.TestCase):
             self.assertEqual(args.strip(), '{"a": [1, "x\\"y"], "b": {"c": true}}', chunk)
             self.assertEqual([e.call.arguments for e in events if e.kind == "tool_call"], [{"a": [1, 'x"y'], "b": {"c": True}}])
 
+    def test_without_tools_a_call_is_text(self):
+        # nothing offered (tool_choice "none" offers nothing): the call's block is text as written, cut off or whole,
+        # and no call event of any kind is sent
+        call = "get_weather" + TOOL_JSON + '{"name":"get_weather","args":{"city":"Paris"}}'
+        for reply, want in ((HEADER + THINK + "Look it up." + END + HEADER + call + END,
+                             [("reasoning", "Look it up."), ("content", call)]),
+                            (HEADER + TEXT + "On it." + END + HEADER + call + END, [("content", "On it." + call)]),
+                            (HEADER + call[len("get_weather"):] + END, [("content", call[len("get_weather"):])]),
+                            (call[len("get_weather"):], [("content", call[len("get_weather"):])]),
+                            (HEADER + call[:-12], [("content", call[:-12])])):
+            for tools in (None, []):
+                for chunk in (None, 1, 2, 3, 7, 13):
+                    events = parse(reply, chunk, tools)
+                    self.assertEqual(merged(events), want, (reply, chunk))
+                    self.assertFalse([e for e in events if e.kind in ("tool_start", "tool_args", "tool_call")], reply)
+
+    def test_disabled_native_call_preserves_its_payload_and_boundaries(self):
+        # Marker spellings in a JSON string are data until the native block closes.
+        call = "  f  " + TOOL_JSON + '{"name":"f","args":{"example":"' + HEADER + THINK + '"}}'
+        for tail in (END + HEADER + TEXT + "after" + END, "", END[:3]):
+            expected = call + ("after" if tail.startswith(END) else tail)
+            for chunk in (None, 1, 3, 13):
+                events = parse(HEADER + THINK + "before" + END + HEADER + call + tail, chunk, [])
+                self.assertEqual(merged(events), [("reasoning", "before"), ("content", expected)])
+
     def test_the_reply_ends_the_turn(self):
         svc = service(HEADER + TEXT + "done" + END)
         self.assertEqual(svc.dialect.stop_texts, (END_TURN,))
+
+    def test_zero_arg_and_spaced_args_streaming_emit_valid_tool_args(self):
+        for reply, want in (
+            (HEADER + "get_time" + TOOL_JSON + '{"name":"get_time"}' + END, {}),
+            (HEADER + "get_weather" + TOOL_JSON + '{"name":"get_weather","args" : {"city":"NYC"}}' + END,
+             {"city": "NYC"}),
+        ):
+            for chunk in (None, 1, 3, 7):
+                events = parse(reply, chunk)
+                args_text = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(args_text), want, (reply, chunk, events))
+                calls = [e.call for e in events if e.kind == "tool_call"]
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].arguments, want)
 
 
 class Tokens(unittest.TestCase):

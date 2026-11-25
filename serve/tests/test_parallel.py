@@ -25,6 +25,13 @@ from serve.util.text import ByteTokenizer
 # Every reply is the bytes of "ok, done." then <|im_end|> (ByteTokenizer: 257). A request with logprobs=K gets a
 # P line ahead of each T line (BP <slot> ahead of a BT line): the pick at -0.25, then K alternatives.
 FAKE_BATCH = r'''import os, queue, sys, threading, time
+_out_lock = threading.Lock()
+def print(*a, end="\n", sep=" ", flush=False, file=None):
+    out = sys.stdout if file is None else file
+    with _out_lock:
+        out.write(sep.join(str(x) for x in a) + end)
+        if flush:
+            out.flush()
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
@@ -1179,6 +1186,116 @@ class SessionAffinity(PickSlot):
         self.assertEqual(e.slot_owner, {})
         after = [self.pick(e, p, None) for p in ([1, 2, 3, 4, 5, 6], [1, 2, 3, 9], [7, 8], [1, 2, 3])]
         self.assertEqual(before, after)
+
+
+class RestartRaces(unittest.TestCase):
+    """Concurrent engine restarts must neither deadlock _hold_prompt nor reuse a stale-generation slot."""
+
+    def test_hold_prompt_raises_engine_died_when_engine_restarts_mid_wait(self):
+        import io
+        import queue
+        from serve.engine.errors import EngineDied
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.prompt_lock = threading.Lock()
+        e.wlock = threading.Lock()
+        e.gen = 1
+        e.prompt_q = queue.Queue()
+        e.proc = mock.Mock()
+        e.proc.stdin = io.StringIO()
+        e.proc.poll.return_value = None  # engine stays alive as gen 2
+
+        def bump_gen():
+            time.sleep(0.05)
+            # simulate restart() replacing prompt_q and advancing gen while alive() stays True
+            e.prompt_q = queue.Queue()
+            e.gen = 2
+
+        t = threading.Thread(target=bump_gen)
+        t.start()
+        t0 = time.monotonic()
+        with self.assertRaises(EngineDied):
+            e._hold_prompt([1, 2, 3], None)
+        t.join(5)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        # prompt_lock must be released so subsequent callers are not deadlocked
+        acquired = e.prompt_lock.acquire(timeout=1.0)
+        self.assertTrue(acquired)
+        e.prompt_lock.release()
+
+    def test_stale_gen_slot_not_reused_or_cleared_on_restart_during_take_control(self):
+        import queue
+        from serve.engine.process import AdmissionQueue
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ctl = threading.Lock()
+        e.slot_cv = threading.Condition()
+        e.admission = AdmissionQueue()
+        e.batch = 2
+        e.max_context = 4096
+        e.info = {"slot0_solo": 1}
+        e.gen = 1
+        e.slot_busy = [False, False]
+        e.slot_held = [0, 0]
+        e.slot_epoch = [0, 0]
+        e.slot_used = [0.0, 0.0]
+        e.slot_order = [0, 1]
+        e.slot_owner = {}
+        e.slot_thread = [None, None]
+        e.slot_q = [queue.Queue(), queue.Queue()]
+        e.slot_live = [None, None]
+        e.waiting = 0
+        e.ctl_epoch = 0
+
+        sent = []
+        e._send = sent.append
+        e.alive = lambda: True
+        e.eos_ids = lambda: set()
+        e._hold_prompt = lambda ids, emb: (1, len(ids))
+        e._meet = lambda handle, born: [0, 0]
+
+        calls = [0]
+
+        def fake_take_control(cancel, prompt_size, after_epoch=None):
+            calls[0] += 1
+            if calls[0] == 2:
+                # engine restarts to gen 2 while waiting for control; another request claims slot 0 on gen 2
+                e.gen = 2
+                e.slot_busy = [True, False]
+                e.slot_q = [queue.Queue(), queue.Queue()]
+            e.ctl.acquire()
+            if False:
+                yield None
+            return True
+
+        def fake_control(cancel, on_tok, **kw):
+            e._ctl_result = (1, 0)  # finish cleanly after admission
+            if False:
+                yield None
+
+        e._take_control = fake_take_control
+        e._control = fake_control
+
+        # force first pick_slot to wait once (releasing ctl -> holding=False), then pick slot 0 on gen 1
+        picks = [None, 0, 1]
+
+        def fake_pick(meet, size, session=None):
+            if picks:
+                val = picks.pop(0)
+                if val is None:
+                    threading.Timer(0.02, lambda: (e.slot_cv.acquire(), e.slot_cv.notify_all(), e.slot_cv.release())).start()
+                return val
+            return 1
+
+        e.pick_slot = fake_pick
+        cancel = threading.Event()
+        list(e._generate_batched([1, 2, 3], {"handle": 1, "gen": 1}, 3, 4, {}, cancel, None, None, None))
+        # must NOT have sent BGEN 0 (which belongs to another request on gen 2) and must NOT have cleared slot_busy[0]
+        bgen_cmds = [s for s in sent if s.startswith("BGEN ")]
+        self.assertEqual(len(bgen_cmds), 1, sent)
+        self.assertTrue(bgen_cmds[0].startswith("BGEN 1 "), bgen_cmds)
+        self.assertTrue(e.slot_busy[0])
+        self.assertFalse(e.slot_busy[1])
 
 
 if __name__ == "__main__":
