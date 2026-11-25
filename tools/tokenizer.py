@@ -239,13 +239,27 @@ class Tokenizer:
         text; matches inside `plain` spans are left to the text around them."""
         if pat is None:
             return self._encode_plain(text)
+        spans: list[tuple[int, int]] = []
+        if plain:
+            for a, b in sorted((a, b) for a, b in plain if a < b):
+                if spans and a <= spans[-1][1]:
+                    if b > spans[-1][1]:
+                        spans[-1] = (spans[-1][0], b)
+                else:
+                    spans.append((a, b))
+        n_spans = len(spans)
+        j = 0
         out: list[int] = []
         pos = 0
         for m in pat.finditer(text):
-            if plain and any(a <= m.start() < b for a, b in plain):
-                continue
-            if m.start() > pos:
-                out.extend(self._encode_plain(text[pos:m.start()]))
+            start = m.start()
+            if n_spans:
+                while j < n_spans and spans[j][1] <= start:
+                    j += 1
+                if j < n_spans and spans[j][0] <= start:
+                    continue
+            if start > pos:
+                out.extend(self._encode_plain(text[pos:start]))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
         if pos < len(text):
