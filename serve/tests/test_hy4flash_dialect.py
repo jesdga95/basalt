@@ -331,6 +331,36 @@ class Parse(unittest.TestCase):
         got = [e.call for e in ev if e.kind == "tool_call"]
         self.assertEqual([(c.name, c.arguments) for c in got], [("get_weather", {"city": "Oslo"})])
 
+    def test_malformed_call_block_recovers_without_stalling_or_dropping_tail(self):
+        # unexpected prose inside args or after valueless arg_key recovers to content
+        for text in (
+            T.calls + T.call + "get_weather" + T.key + "city" + T.key_end + "oops prose after key",
+            T.calls + T.call + "get_weather" + T.key + "city" + T.key_end + T.value + "Oslo" + T.value_end + "oops prose",
+            T.calls + T.call + "get_weather" + T.calls_end + "After empty calls.",
+            T.calls + T.call + "get_weather" + T.key + "unclosed" + T.calls_end + "After unclosed key.",
+        ):
+            for cuts in ([], [3, 17, 40], list(range(1, len(text)))):
+                _, content, done, _ = parse(text, False, cuts, [WEATHER])
+                self.assertEqual(done, [], (text, cuts))
+                self.assertTrue(content.endswith(("oops prose after key", "oops prose", "After empty calls.",
+                                                  "After unclosed key.")), (text, cuts, content))
+        # prose <tool_calls:...> followed by a real call block in one chunk and split
+        mixed = f"Use {T.calls} to call tools." + calls(call("ping"))
+        for cuts in ([], [10, 35], list(range(1, len(mixed)))):
+            _, content, done, _ = parse(mixed, False, cuts)
+            self.assertEqual(content, f"Use {T.calls} to call tools.", cuts)
+            self.assertEqual([c.name for c in done], ["ping"], cuts)
+        # second non-call <tool_calls:...> at EOF after an earlier call block is not dropped
+        trailing = calls(call("ping")) + f" see {T.calls}partial"
+        _, content, done, _ = parse(trailing, False)
+        self.assertEqual([c.name for c in done], ["ping"])
+        self.assertEqual(content, f" see {T.calls}partial")
+
+    def test_stream_tools_false_drops_cut_call(self):
+        p = Hy4Parser(T, thinking=False, tools=[WEATHER], stream_tools=False)
+        evs = p.feed(T.calls + T.call + "get_weather" + T.key + "city" + T.key_end + T.value + "Par") + p.finish()
+        self.assertEqual([e for e in evs if e.kind in ("tool_start", "tool_args", "tool_call")], [])
+
 
 class Registry(unittest.TestCase):
     def test_both_architecture_names_reach_the_dialect(self):
@@ -451,6 +481,24 @@ class Served(unittest.TestCase):
     def test_props_reports_the_caps(self):
         with urllib.request.urlopen(self.base + "/props", timeout=10) as r:
             self.assertEqual(json.loads(r.read().decode())["chat_template_caps"], Hy4Flash.caps)
+
+    def test_non_streaming_truncated_tool_call_does_not_leak(self):
+        # cut off mid-call: non-streaming OpenAI and Anthropic must not return executable tool calls
+        self.svc.answer_room = 0     # no thinking budget: MockEngine replays from token 0 on a second pass
+        reply = f"why{T.think_end}Looking it up." + calls(call("get_weather", city="Oslo", days="2"))
+        cut = len(self.svc.tok.encode(reply[:reply.index("lo")], parse_special=True))
+        r = self.chat(max_tokens=cut)
+        self.assertEqual(r["choices"][0]["finish_reason"], "length")
+        self.assertNotIn("tool_calls", r["choices"][0]["message"])
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps({
+            "model": "hy", "max_tokens": cut, "stream": False,
+            "tools": [{"name": "get_weather", "input_schema": WEATHER["parameters"]}],
+            "messages": [{"role": "user", "content": "Weather in Oslo?"}]}).encode(),
+            headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            m = json.loads(resp.read().decode())
+        self.assertEqual(m["stop_reason"], "max_tokens")
+        self.assertEqual([b for b in m["content"] if b["type"] == "tool_use"], [])
 
 
 if __name__ == "__main__":
