@@ -252,7 +252,8 @@ endif()
 endif()
 
 if(BASALT_MODEL_GEMMA4)
-add_library(gemma4_kernels STATIC src/models/gemma4/kernels/attn.cu src/models/gemma4/kernels/glue.cu)
+add_library(gemma4_kernels STATIC src/models/gemma4/kernels/attn.cu src/models/gemma4/kernels/attn_mma.cu
+  src/models/gemma4/kernels/glue.cu)
 target_include_directories(gemma4_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(gemma4_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_gemma4 STATIC src/models/gemma4/adapter.cpp src/models/gemma4/pack.cpp src/models/gemma4/model.cpp

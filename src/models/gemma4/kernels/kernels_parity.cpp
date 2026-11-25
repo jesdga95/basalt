@@ -1,11 +1,13 @@
 // src/models/gemma4/kernels/kernels_parity.cpp - the Gemma 4 kernels against CPU references in double: the attention's
 // preparation and decode attention (a window layer's ring past its wrap, a full layer whose keys are its values), the glue;
-// a batch window of two conversations bitwise equal to each alone; and a microbench line of the decode attention.
+// a batch window of two conversations bitwise equal to each alone; the prompt attention against the decode attention and
+// split anywhere bitwise equal; and microbench lines of the decode and prompt attention.
 #include "basalt/models/gemma4/kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -380,6 +382,101 @@ void bench(std::mt19937& rng) {
                 (double) cache.size() * 2 / us / 1e3);
 }
 
+// The prompt attention of `C` rows after `past` positions against the decode attention of the same rows over the same
+// cache (fp16 queries, keys and probabilities: a looser bound), and the rows split in two calls bitwise equal to one.
+void prompt_case(const char* name, const LayerShape& sh, int past, int C, KvType kv, std::mt19937& rng) {
+    const int hd = sh.hd, nq = sh.n_head, nk = sh.n_kv, qd = nq * hd, kd = nk * hd, N = past + C;
+    const int64_t cap = sh.window > 0 ? sh.window + C : N;
+    auto qn = randv(hd, rng, 0.3f), kn = randv(hd, rng, 0.3f);
+    for (float& x : qn) x += 1.f;
+    for (float& x : kn) x += 1.f;
+    std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, N));
+    rope_tables(hd, sh.rot, sh.window > 0 ? 1e4 : 1e6, N, lo.data(), hi.data());
+    const RopeTab rt{dev(lo), dev(hi)};
+    float *dqn = dev(qn), *dkn = dev(kn);
+    auto q = randv((size_t) C * qd, rng, 2.f), k = randv((size_t) C * kd, rng, 2.f), v = randv((size_t) C * kd, rng, 2.f);
+    float *dq = dev(q), *dk = dev(k), *dv = dev(v), *qp, *ref, *got, *scr;
+    void *ck = nullptr, *cv = nullptr;
+    cudaMalloc(&ck, (size_t) cap * kd * kv_elem_bytes(kv));
+    cudaMalloc(&cv, (size_t) cap * kd * kv_elem_bytes(kv));
+    cudaMalloc(&qp, (size_t) C * qd * 4);
+    cudaMalloc(&ref, (size_t) C * qd * 4);
+    cudaMalloc(&got, (size_t) C * qd * 4);
+    cudaMalloc(&scr, attn_scratch_floats(C, nq, hd) * 4);
+    std::vector<int32_t> pos(C);
+    int32_t* dpos;
+    cudaMalloc(&dpos, (size_t) C * 4);
+    Prep pr;
+    pr.q = dq, pr.k = dk, pr.v = dv, pr.ldq = qd, pr.ldk = kd, pr.ldv = kd, pr.pos = dpos, pr.q_norm = dqn, pr.k_norm = dkn;
+    pr.rope = rt, pr.sh = sh, pr.kv_type = kv, pr.q_out = qp;
+    pr.kv.c[0] = {ck, cv, cap};
+    for (int p0 = 0; p0 < N; p0 += C) {   // the earlier positions from the same projections, then the rows
+        const int n = std::min(C, N - p0);
+        for (int i = 0; i < n; ++i) pos[i] = p0 + i;
+        cudaMemcpy(dpos, pos.data(), (size_t) n * 4, cudaMemcpyHostToDevice);
+        attn_prep(pr, n, nullptr);
+    }
+    if (N % C) {   // the rows\x27 own window last
+        for (int i = 0; i < C; ++i) pos[i] = past + i;
+        cudaMemcpy(dpos, pos.data(), (size_t) C * 4, cudaMemcpyHostToDevice);
+        attn_prep(pr, C, nullptr);
+    }
+    Attn a;
+    a.q = qp, a.pos = dpos, a.k_norm = dkn, a.rope = rt, a.sh = sh, a.kv_type = kv, a.kv = pr.kv;
+    a.max_keys = sh.window > 0 ? sh.window : N, a.scratch = scr, a.out = ref;
+    attn_decode(a, C, nullptr);
+    AttnPrompt ap;
+    ap.q = qp, ap.pos0 = past, ap.k_norm = dkn, ap.rope = rt, ap.sh = sh, ap.kv_type = kv, ap.kv = pr.kv.c[0], ap.out = got;
+    attn_prompt(ap, C, nullptr);
+    cudaDeviceSynchronize();
+    const std::vector<float> r = host(ref, (size_t) C * qd), o = host(got, (size_t) C * qd);
+    double err = 0;
+    for (size_t i = 0; i < r.size(); ++i) err = std::max(err, (double) std::fabs(r[i] - o[i]));
+    expect(err < 3e-2, name, err);
+    const int c1 = C / 3 + 5;   // two calls: rows [0, c1) and [c1, C)
+    AttnPrompt a1 = ap, a2 = ap;
+    a1.out = ref;
+    a2.q = qp + (size_t) c1 * qd, a2.pos0 = past + c1, a2.out = ref + (size_t) c1 * qd;
+    attn_prompt(a1, c1, nullptr);
+    attn_prompt(a2, C - c1, nullptr);
+    const std::vector<float> split = host(ref, (size_t) C * qd);
+    expect(std::memcmp(split.data(), o.data(), o.size() * 4) == 0, "  split in two calls: bitwise the same", 0.0);
+    for (void* p : {(void*) dq, (void*) dk, (void*) dv, (void*) dqn, (void*) dkn, (void*) rt.lo, (void*) rt.hi, ck, cv, (void*) qp,
+                    (void*) ref, (void*) got, (void*) scr, (void*) dpos})
+        cudaFree(p);
+}
+
+// The prompt attention of a chunk of C rows after `past` positions (cache contents random): time and fp16 tensor rate.
+void prompt_bench(const char* name, const LayerShape& sh, int past, int C, std::mt19937& rng) {
+    const int hd = sh.hd, kd = sh.n_kv * hd, qd = sh.n_head * hd, N = past + C;
+    const int64_t cap = sh.window > 0 ? sh.window + C : N;
+    std::vector<__half> cache((size_t) cap * kd);
+    for (auto& x : cache) x = __float2half_rn(std::normal_distribution<float>(0.f, 0.3f)(rng));
+    void *ck = nullptr, *cv = nullptr;
+    cudaMalloc(&ck, cache.size() * 2);
+    cudaMalloc(&cv, cache.size() * 2);
+    cudaMemcpy(ck, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(cv, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice);
+    auto q = randv((size_t) C * qd, rng, 0.3f), kn = randv(hd, rng);
+    std::vector<float> lo(rope_lo_floats(hd)), hi(rope_hi_floats(hd, N));
+    rope_tables(hd, sh.rot, 1e6, N, lo.data(), hi.data());
+    float *dq = dev(q), *dkn = dev(kn), *out;
+    cudaMalloc(&out, (size_t) C * qd * 4);
+    AttnPrompt ap;
+    ap.q = dq, ap.pos0 = past, ap.k_norm = dkn, ap.rope = {dev(lo), dev(hi)}, ap.sh = sh, ap.kv = {ck, cv, cap}, ap.out = out;
+    for (int i = 0; i < 3; ++i) attn_prompt(ap, C, nullptr);
+    cudaDeviceSynchronize();
+    const int iters = 10;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) attn_prompt(ap, C, nullptr);
+    cudaDeviceSynchronize();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    double keys = 0;
+    for (int r = 0; r < C; ++r) keys += sh.window > 0 ? std::min(past + r + 1, sh.window) : past + r + 1;
+    std::printf("bench attn_prompt %s: %.0f us, %.0f TFLOPS (fp16)\n", name, us, keys * sh.n_head * hd * 4 / us / 1e6);
+    for (void* p : {(void*) dq, (void*) dkn, (void*) out, ck, cv, (void*) ap.rope.lo, (void*) ap.rope.hi}) cudaFree(p);
+}
+
 }  // namespace
 
 int main() {
@@ -395,8 +492,15 @@ int main() {
     run_case({"full layer, chunked keys (9,000 positions), 1 row", {16, 2, 512, 64, 0, true}, 9000, 16}, rng, true);
     batch_check(rng, {16, 8, 256, 128, 64, false}, "batch of two conversations = each alone (window layer)");
     batch_check(rng, {16, 2, 512, 64, 0, true}, "batch of two conversations = each alone (full layer)");
+    prompt_case("prompt attention, window layer (window 64), ring wrapped, 200 rows", {16, 8, 256, 128, 64, false}, 333, 200,
+                KvType::F16, rng);
+    prompt_case("prompt attention, window layer, fp8 cache, 77 rows", {16, 8, 256, 128, 64, false}, 40, 77, KvType::F8, rng);
+    prompt_case("prompt attention, full layer (keys = values), 300 rows", {16, 2, 512, 64, 0, true}, 1500, 300, KvType::F16, rng);
+    prompt_case("prompt attention, full layer, fp8 cache, 129 rows", {16, 2, 512, 64, 0, true}, 0, 129, KvType::F8, rng);
     glue_checks(rng);
     bench(rng);
+    prompt_bench("window layer (16x256, 8 kv, window 1024) 2048 rows after 8192", {16, 8, 256, 128, 1024, false}, 8192, 2048, rng);
+    prompt_bench("full layer (16x512, 2 kv, one cache) 2048 rows after 8192", {16, 2, 512, 64, 0, true}, 8192, 2048, rng);
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;
 }

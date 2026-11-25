@@ -1,9 +1,11 @@
-// src/models/gemma4/kernels/attn.cu - the attention's preparation and decode attention (basalt/models/gemma4/kernels.hpp).
+// src/models/gemma4/kernels/attn.cu - the attention's preparation, the rotary tables and the decode attention's merge
+// (basalt/models/gemma4/kernels.hpp; the chunks in attn_mma.cu).
 //
 // A warp holds one head row: lane L the dims [L * hd / 32, (L + 1) * hd / 32), so dim i and its rotary partner i + hd / 2
 // sit in lanes L and L + 16. A rotation's cos and sin come from the rotary tables (RopeTab).
 #include "basalt/models/gemma4/kernels.hpp"
 
+#include "attn_split.cuh"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -32,33 +34,6 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 __device__ __forceinline__ const SegKv& seg_kv(const KvSegs& kv, int row) {
     return kv.c[kv.at.n > 0 ? bk::seg_of(kv.at, row) : 0];
-}
-
-template <int D>
-__device__ __forceinline__ void load_cell(const void* base, KvType t, int64_t off, float (&v)[D]) {
-    if (t == KvType::F8) {
-        const auto* p = reinterpret_cast<const __nv_fp8_e4m3*>(base) + off;
-#pragma unroll
-        for (int i = 0; i < D; ++i) v[i] = float(p[i]);
-    } else {
-        const auto* p = reinterpret_cast<const __half*>(base) + off;
-        if constexpr (D % 8 == 0) {
-#pragma unroll
-            for (int i = 0; i < D; i += 8) {
-                const uint4 u = *reinterpret_cast<const uint4*>(p + i);
-                const __half2* h = reinterpret_cast<const __half2*>(&u);
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 f = __half22float2(h[j]);
-                    v[i + 2 * j] = f.x;
-                    v[i + 2 * j + 1] = f.y;
-                }
-            }
-        } else {
-#pragma unroll
-            for (int i = 0; i < D; ++i) v[i] = __half2float(p[i]);
-        }
-    }
 }
 
 template <int D>
@@ -141,120 +116,7 @@ __global__ void __launch_bounds__(128) prep_kernel(Prep p, int rows) {
     }
 }
 
-// ---- decode attention
-constexpr int kAttnWarps = 4;
-constexpr int kMaxChunks = 64;     // chunks a row's keys split into at most
-constexpr int kMinChunk = 16;      // keys a chunk holds at least
-
-// A row's split: its key range [lo, hi], its chunk length and count, from its own position only.
-struct Split {
-    int64_t lo, n;
-    int64_t len;
-    int chunks;
-};
-__device__ __forceinline__ Split split_of(int pos, int window) {
-    Split s;
-    s.lo = window > 0 && pos - window + 1 > 0 ? pos - window + 1 : 0;
-    s.n = pos - s.lo + 1;
-    int64_t len = (s.n + kMaxChunks - 1) / kMaxChunks;
-    len = len < kMinChunk ? kMinChunk : (len + 31) / 32 * 32;
-    s.len = len;
-    s.chunks = (int) ((s.n + len - 1) / len);
-    return s;
-}
-
-// grid (chunk, row * n_kv + kv head): the chunk's keys over the head group's queries; each warp takes every 4th key and
-// keeps a running softmax per query head; the warps merge in order and the chunk's (max, sum, acc) per head go to the
-// scratch: [row][head][chunk][hd + 2].
-template <int D, int G>
-__global__ void __launch_bounds__(kAttnWarps * 32) attn_chunk_kernel(Attn a, int rows) {
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
-    const LayerShape& sh = a.sh;
-    const int hd = sh.hd;
-    const int r = blockIdx.y / sh.n_kv, h = blockIdx.y % sh.n_kv;
-    if (r >= rows) return;
-    const int pos = a.pos[r];
-    const Split sp = split_of(pos, sh.window);
-    const int ch = blockIdx.x;
-    if (ch >= sp.chunks) return;
-    const SegKv& c = seg_kv(a.kv, r);
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    __shared__ float qs[G][32 * D];
-    __shared__ float wm[kAttnWarps][G], wl[kAttnWarps][G];
-    extern __shared__ float wacc[];   // [kAttnWarps][G][hd]
-    for (int i = threadIdx.x; i < G * hd; i += blockDim.x)
-        qs[i / hd][i % hd] = a.q[((size_t) r * sh.n_head + h * G + i / hd) * hd + i % hd];
-    float wk[D];   // k_norm weights of this lane's dims
-#pragma unroll
-    for (int i = 0; i < D; ++i) wk[i] = sh.one ? a.k_norm[lane * D + i] : 1.f;
-    __syncthreads();
-    float m[G], l[G], acc[G][D];
-#pragma unroll
-    for (int g = 0; g < G; ++g) {
-        m[g] = -INFINITY;
-        l[g] = 0.f;
-#pragma unroll
-        for (int i = 0; i < D; ++i) acc[g][i] = 0.f;
-    }
-    const int64_t k0 = sp.lo + (int64_t) ch * sp.len;
-    const int64_t k1 = k0 + sp.len < sp.lo + sp.n ? k0 + sp.len : sp.lo + sp.n;
-    for (int64_t kp = k0 + warp; kp < k1; kp += kAttnWarps) {
-        const int64_t off = (((kp % c.cap) * sh.n_kv) + h) * hd + lane * D;
-        float v[D], k[D];
-        load_cell<D>(sh.one ? c.k : c.v, a.kv_type, off, v);
-        if (sh.one) {
-#pragma unroll
-            for (int i = 0; i < D; ++i) k[i] = v[i] * wk[i];
-            rotate<D>(k, lane, hd, sh.rot, (int) kp, a.rope);
-        } else {
-            load_cell<D>(c.k, a.kv_type, off, k);
-        }
-#pragma unroll
-        for (int g = 0; g < G; ++g) {
-            float s = 0.f;
-#pragma unroll
-            for (int i = 0; i < D; ++i) s += qs[g][lane * D + i] * k[i];
-            s = warp_sum(s);
-            const float mn = fmaxf(m[g], s);
-            const float corr = expf(m[g] - mn), e = expf(s - mn);
-            l[g] = l[g] * corr + e;
-#pragma unroll
-            for (int i = 0; i < D; ++i) acc[g][i] = acc[g][i] * corr + e * v[i];
-            m[g] = mn;
-        }
-    }
-    // the warps' states, merged in warp order
-    if (lane == 0)
-#pragma unroll
-        for (int g = 0; g < G; ++g) {
-            wm[warp][g] = m[g];
-            wl[warp][g] = l[g];
-        }
-#pragma unroll
-    for (int g = 0; g < G; ++g)
-#pragma unroll
-        for (int i = 0; i < D; ++i) wacc[((size_t) warp * G + g) * hd + lane * D + i] = acc[g][i];
-    __syncthreads();
-    float* out = a.scratch;
-    for (int i = threadIdx.x; i < G * hd; i += blockDim.x) {
-        const int g = i / hd, d = i % hd;
-        float M = -INFINITY;
-        for (int w = 0; w < kAttnWarps; ++w) M = fmaxf(M, wm[w][g]);
-        float L = 0.f, A = 0.f;
-        for (int w = 0; w < kAttnWarps; ++w) {
-            const float f = wm[w][g] == -INFINITY ? 0.f : expf(wm[w][g] - M);
-            L += wl[w][g] * f;
-            A += wacc[((size_t) w * G + g) * hd + d] * f;
-        }
-        float* o = out + (((size_t) r * sh.n_head + h * G + g) * kMaxChunks + ch) * (hd + 2);
-        o[2 + d] = A;
-        if (d == 0) {
-            o[0] = M;
-            o[1] = L;
-        }
-    }
-}
+// ---- decode attention: the chunks on the tensor cores (attn_mma.cu), then their merge
 
 // grid (row * n_head): the row's chunks merged in chunk order.
 __global__ void __launch_bounds__(128) attn_merge_kernel(Attn a, int rows) {
@@ -316,30 +178,8 @@ size_t attn_scratch_floats(int rows, int n_head, int hd) { return (size_t) rows 
 void attn_decode(const Attn& a, int rows, void* stream) {
     if (rows <= 0) return;
     check_shape(a.sh);
-    const int64_t keys = a.sh.window > 0 && a.max_keys > a.sh.window ? a.sh.window : a.max_keys;
-    int64_t len = (keys + kMaxChunks - 1) / kMaxChunks;
-    len = len < kMinChunk ? kMinChunk : (len + 31) / 32 * 32;
-    const unsigned chunks = (unsigned) ((keys + len - 1) / len);
-    const int G = a.sh.n_head / a.sh.n_kv;
-    const size_t smem = (size_t) kAttnWarps * G * a.sh.hd * sizeof(float);
-    const dim3 grid(chunks, (unsigned) (rows * a.sh.n_kv));
     cudaStream_t st = (cudaStream_t) stream;
-    const auto run = [&](auto kernel) {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        bk::launch_pdl(kernel, grid, dim3(kAttnWarps * 32), smem, st, a, rows);
-    };
-    switch (a.sh.hd * 100 + G) {
-        case 25601: run(attn_chunk_kernel<8, 1>); break;
-        case 25602: run(attn_chunk_kernel<8, 2>); break;
-        case 25604: run(attn_chunk_kernel<8, 4>); break;
-        case 25608: run(attn_chunk_kernel<8, 8>); break;
-        case 51202: run(attn_chunk_kernel<16, 2>); break;
-        case 51204: run(attn_chunk_kernel<16, 4>); break;
-        case 51208: run(attn_chunk_kernel<16, 8>); break;
-        default: throw std::invalid_argument("gemma4 attention: head width " + std::to_string(a.sh.hd) + " with " +
-                                             std::to_string(G) + " query heads per key head");
-    }
-    check("attn_chunk");
+    attn_chunks(a, rows, st);
     bk::launch_pdl(attn_merge_kernel, dim3((unsigned) (rows * a.sh.n_head)), dim3(128), 0, st, a, rows);
     check("attn_merge");
 }

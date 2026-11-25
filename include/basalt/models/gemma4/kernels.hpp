@@ -96,6 +96,23 @@ struct Attn {
 size_t attn_scratch_floats(int rows, int n_head, int hd);
 void attn_decode(const Attn& a, int rows, void* stream);
 
+/// The prompt attention: `rows` consecutive positions pos0.. of one conversation, each over the keys attn_decode gives it,
+/// read from the cache (the rows' own keys written by attn_prep first: a window layer's ring holds the window and the
+/// rows), flash style on the fp16 tensor cores (q, k, v and the probabilities rounded to fp16; fp32 products and
+/// softmax). A full layer whose keys are its values derives each key tile from its values as it stages it. The key
+/// tiles sit on a fixed grid of positions, so a row's result does not depend on the call's other rows.
+struct AttnPrompt {
+    const float* q = nullptr;            ///< [rows][n_head][hd], prepared
+    int64_t pos0 = 0;
+    const float* k_norm = nullptr;       ///< sh.one: K = rope(V * k_norm)
+    RopeTab rope;
+    LayerShape sh;
+    KvType kv_type = KvType::F16;
+    SegKv kv;
+    float* out = nullptr;                ///< [rows][n_head][hd]
+};
+void attn_prompt(const AttnPrompt& a, int rows, void* stream);
+
 // ---- glue -------------------------------------------------------------------------------------------------------------
 
 /// out[r] = table[tokens[r]] * scale: BF16 rows of `width` (the table may be mapped host memory).
