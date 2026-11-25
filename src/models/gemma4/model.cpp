@@ -55,7 +55,7 @@ uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvTy
     const uint64_t qmax = (uint64_t) g.n_head * std::max(g.hd_swa, g.hd_full);
     const uint64_t rowbuf = R * (4 * E + 3 * qmax + 3 * (uint64_t) n_ff_pad) * 4;
     const uint64_t experts = g.moe() ? R * (uint64_t) g.n_used * (E * 4 + (uint64_t) g.n_ff_exp * 16) + (64ull << 20) : 0;
-    const uint64_t attn = R * (uint64_t) g.n_head * 64 * (std::max(g.hd_swa, g.hd_full) + 2) * 4;
+    const uint64_t attn = attn_scratch_floats(kRows, g.n_head, std::max(g.hd_swa, g.hd_full)) * 4;
     return rowbuf + experts + attn + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB + PromptPath::bytes(g, n_ff_pad, context, kv);
 }
 

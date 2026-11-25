@@ -418,8 +418,7 @@ void attn_chunks(const Attn& d, int rows, cudaStream_t st) {
     a.q = d.q, a.pos = d.pos, a.k_norm = d.k_norm, a.rope = d.rope, a.sh = d.sh, a.kv_type = d.kv_type, a.kv = d.kv;
     a.out = d.scratch;
     const int64_t keys = d.sh.window > 0 && d.max_keys > d.sh.window ? d.sh.window : d.max_keys;
-    const int64_t len = chunk_len(keys);
-    const dim3 grid((unsigned) ((keys + len - 1) / len), (unsigned) (rows * d.sh.n_kv));
+    const dim3 grid((unsigned) chunk_bound(keys), (unsigned) (rows * d.sh.n_kv));
     if (d.sh.hd == 256) launch<256, 1, true>(a, rows, grid, st);
     else launch<512, 1, true>(a, rows, grid, st);
     check("attn_chunks");

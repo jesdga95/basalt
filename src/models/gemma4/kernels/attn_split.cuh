@@ -24,6 +24,11 @@ __host__ __device__ __forceinline__ int64_t chunk_len(int64_t n) {
     const int64_t len = (n + kMaxChunks - 1) / kMaxChunks;
     return len < kMinChunk ? kMinChunk : (len + 31) / 32 * 32;
 }
+// The most chunks any row of at most n keys splits into (a launch's grid; chunk_len is not monotonic in n).
+inline int64_t chunk_bound(int64_t n) {
+    const int64_t b = (n + kMinChunk - 1) / kMinChunk;
+    return b < kMaxChunks ? b : kMaxChunks;
+}
 __device__ __forceinline__ Split split_of(int pos, int window) {
     Split s;
     s.lo = window > 0 && pos - window + 1 > 0 ? pos - window + 1 : 0;
