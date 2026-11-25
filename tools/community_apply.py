@@ -45,6 +45,10 @@ def plan(outcome, mode_value):
         p["comment"] = outcome.get("comment", "")
     if p["comment"] and mode != "live":   # live needs no note; shadow says why nothing merged
         p["comment"] += f"\n\nMode: {shown}."
+    if p["comment"]:
+        by = f"an automated check and an LLM review ({plain(outcome['model'], 60)}); it can be wrong" \
+            if outcome.get("reviewed") else "an automated check"
+        p["comment"] += f"\n\n<sub>This comment was posted by {by}.</sub>"
     return p
 
 

@@ -83,7 +83,8 @@ jobs:
           elif not ours:
               api("-X", "POST", f"repos/{repo}/issues/{pr}/comments", "-f",
                   f"body={marker}\nThis pull request changes the UI. All UI changes require a screenshot: "
-                  "please add one to the description or in a comment.")
+                  "please add one to the description or in a comment.\n\n"
+                  "<sub>This comment was posted by an automated check.</sub>")
               print("asked for a screenshot")
           else:
               print("already asked")

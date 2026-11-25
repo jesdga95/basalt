@@ -171,6 +171,8 @@ def main(argv):
         raise RuntimeError("the model must not be called")
     out = decide(gate, no_call if no_model else (lambda rows, notes: community_review(rows, notes)))
     out["reason"] = plain(out["reason"], 300)
+    if out["reviewed"]:
+        out["model"] = os.environ["LLM_DEFAULT_MODEL"].strip()
     with open(argv[2], "w", encoding="utf-8") as f:
         json.dump(out, f)
     print(out["outcome"], "-", out["reason"][:300])

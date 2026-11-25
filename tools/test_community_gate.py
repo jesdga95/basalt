@@ -280,7 +280,13 @@ class Decide(unittest.TestCase):
 
 
 class Mode(unittest.TestCase):
-    MERGE = {"outcome": "merge", "comment": "", "reason": "", "label": "", "reviewed": True}
+    MERGE = {"outcome": "merge", "comment": "", "reason": "", "label": "", "reviewed": True, "model": "test-model"}
+
+    def test_every_comment_says_it_was_posted_by_an_automated_check(self):
+        p = apply_.plan(self.MERGE, "live")
+        self.assertIn("posted by an automated check and an LLM review (test-model)", p["comment"])
+        p = apply_.plan({"outcome": "gate_fail", "comment": "bad row", "reviewed": False}, "live")
+        self.assertIn("posted by an automated check.</sub>", p["comment"])
 
     def test_only_exact_live_merges(self):
         self.assertTrue(apply_.plan(self.MERGE, "live")["merge"])
