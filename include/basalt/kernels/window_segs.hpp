@@ -13,7 +13,7 @@
 
 namespace basalt::kernels {
 
-constexpr int kWindowSegsMax = 16;   ///< segments one call holds at most
+constexpr int kWindowSegsMax = 64;   ///< segments one call holds at most
 
 /// Segment i is rows row0[i] .. row0[i + 1] - 1 of the call, at consecutive positions of one conversation. n = 0: the call
 /// is one conversation's (row0 unused), as before batching.
@@ -24,9 +24,19 @@ struct WindowSegs {
 
 /// The segment row r is in (0 when n is 0).
 BASALT_SEGS_HD inline int seg_of(const WindowSegs& s, int r) {
-    int k = 0;
-    while (k + 1 < s.n && r >= s.row0[k + 1]) ++k;
-    return k;
+    if (s.n <= 1) return 0;
+    if (s.n <= 8) {
+        int k = 0;
+        while (k + 1 < s.n && r >= s.row0[k + 1]) ++k;
+        return k;
+    }
+    int lo = 0, hi = s.n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (r >= s.row0[mid]) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
 }
 
 /// The first row of row r's segment: the rows before it in the call that its convolutions may read start there (0 when n

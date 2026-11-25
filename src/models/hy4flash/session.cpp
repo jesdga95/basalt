@@ -66,11 +66,11 @@ namespace {
 namespace bk = basalt::kernels;
 
 constexpr int kRowWidth = 576;                 // a cache row: 512 latent values and 64 rotated
-constexpr int kMaxChunk = 16384;               // rows a prompt chunk may carry (the residual streams and the experts' pairs)
+constexpr int kMaxChunk = 32768;               // rows a prompt chunk may carry (the residual streams and the experts' pairs)
 constexpr int kAttRows = 2048;                 // rows of one attention step inside a chunk (the rings are sized for it)
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
 constexpr int kMmqTile = 128;                  // the widest column tile of an MMQ product
-constexpr int kLaunchRows = 16384;              // most (row, expert) pairs of one prompt launch
+constexpr int kLaunchRows = 32768;              // most (row, expert) pairs of one prompt launch
 constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
 constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
@@ -491,8 +491,11 @@ public:
         if (total < kRingRows) {
             want = std::max(kMaxWindow, total);
         } else {
-            while (want < total && want < kMaxChunk) want *= 2;
-            want = std::min(want, kMaxChunk);
+            // 32k chunks at up to 128k tokens; above that the attention inside a chunk is the cost, and above
+            // 262,144 per slot a ~15k-row chunk faults in the NVFP4 moe-down launch (8k there).
+            const int cap = m_.context() > 262144 ? 8192 : (total > 131072 ? 16384 : kMaxChunk);
+            while (want < total && want < cap) want *= 2;
+            want = std::min(want, cap);
         }
         const bool ringed = total >= kRingRows && tier_ && !ring_;
         // a bounded lend: the tier gives up only the slots the chunk's buffers and the ring need, and the rest keep their experts
@@ -928,6 +931,9 @@ public:
 
     model::Result running_restored(int64_t pos, const uint8_t*) override {
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+        rope_.rewind(pos);
+        rope_on_ = rope_.has_image();
+        rope_uploaded_ = rope_on_ ? std::min(rope_uploaded_, pos) : 0;
         dfly_.invalidate();   // DFLY HOOK
         return {};
     }
@@ -983,6 +989,9 @@ public:
                 return {model::Status::Error, "hy4flash: writing a cache back failed"};
             ++i;
         }
+        rope_.clear();
+        rope_on_ = false;
+        rope_uploaded_ = 0;
         dfly_.invalidate();   // DFLY HOOK
         return {};
     }
@@ -2888,6 +2897,12 @@ private:
     // cell on the host and, once a picture is in the session, on the device where the kernels read them (MlaArgs::cell_rope).
     void sync_rope(int64_t pos) {
         rope_.rewind(pos);
+        if (!rope_.has_image()) {
+            rope_on_ = false;
+            rope_uploaded_ = 0;
+        } else if (rope_uploaded_ > pos) {
+            rope_uploaded_ = pos;
+        }
         while (rope_.size() < pos) rope_.push_text();   // cells the session never placed (a restored history) count as text
     }
     // The rotary position a text token at cell `pos` takes, the track left as it is (the drafter's block, before its window).
@@ -2897,17 +2912,18 @@ private:
     }
     void place_rope(int64_t pos0, int R) {
         sync_rope(pos0);
-        const bool was_on = rope_on_;
         for (int t = 0; t < R; ++t) {
             if (emb_rows_) { rope_.push_row(img_start_, img_nx_, img_j_ + t); rope_on_ = true; }
             else rope_.push_text();
         }
         if (!rope_on_) return;
+        const int64_t from = std::min(pos0, rope_uploaded_);
         std::vector<int32_t> tab;
-        const int64_t from = was_on ? pos0 : 0;
+        tab.reserve((size_t) (pos0 + R - from) * 3);
         for (int64_t c = from; c < pos0 + R; ++c) tab.insert(tab.end(), {rope_.at(c).t, rope_.at(c).h, rope_.at(c).w});
         cudaMemcpyAsync(rope_dev_ + from * 3, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice, stream_);
         cudaStreamSynchronize(stream_);   // the host table is a temporary
+        rope_uploaded_ = pos0 + R;
     }
 
     // diagnostic: a layer whose inner tensors are dumped (the first three)
@@ -3080,6 +3096,7 @@ private:
     bool vis_lent_ = false;              // ... and every slot the tier lends
     RopeTrack rope_;
     int32_t* rope_dev_ = nullptr;
+    int64_t rope_uploaded_ = 0;
     bool rope_on_ = false;               // a picture has been fed: the kernels read the rotary table
     const float* emb_rows_ = nullptr;    // the embeddings of the rows being run, in place of the tokens'
     int32_t img_start_ = 0;              // the first position of the block being fed

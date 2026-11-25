@@ -8,10 +8,10 @@ Two workflows (community auto-merge and the `/review` comment) use one cheap Ope
 
 Order, enforced by the workflow and by `llm_review.decide`:
 
-1. **Gate** (`tools/community_gate.py`, no secrets). Any failure stops here: no model call, label `community: needs changes` and a comment with the reasons.
+1. **Gate** (`tools/community_gate.py`, no secrets). Any failure stops here: no model call, label `community-needs-changes` and a comment with the reasons.
    - only files under `docs/community/runs/` changed (`MODEL/ID.json`, one row each), and each was added, modified or deleted. Anything else is a failure with its reason, including `preset.json` and the old `docs/community/benchmarks.json`. A modified or added file must be valid for `check_benchmarks.py`: the house format byte for byte, the folder of the model's slug and the id of its setup as its name, and no other file with the same setup (submitter, model, quant and hardware). At most 12 files are added or modified. The base is the commit the branch started from (the merge base), read from that commit's `docs/community/runs/`. What each change does:
      - an added file is a new row;
-     - a modified file is an updated row, checked like a new one; it can merge automatically only when the pull request author's login is the `submitter` of the row both before and after (case-insensitive), otherwise it goes to a person (`community: needs review`);
+     - a modified file is an updated row, checked like a new one; it can merge automatically only when the pull request author's login is the `submitter` of the row both before and after (case-insensitive), otherwise it goes to a person (`community-needs-review`);
      - a deleted file always goes to a person;
    - `preset` is `community-1` (the `submitter` is a display name and may differ from the PR author; the model review rejects an abusive one);
    - free text (submitter, notes, cpu, quant, GPU names, engine_args) has no link, domain, `@`, markup characters or invisible/direction characters, stays within its length cap, and never says LOSSY;
@@ -21,10 +21,10 @@ Order, enforced by the workflow and by `llm_review.decide`:
 2. **Model review** (only after a pass, `tools/llm_review.py`). It sees the added and modified rows and the check results, temperature 0, with the rows declared untrusted data. It answers `{"verdict": "auto_merge" | "needs_human" | "reject", "reason": "..."}`; anything else, a timeout, an API error or a missing key is `needs_human`. It can only downgrade: the one merge needs a passing gate and `auto_merge`.
 3. **Act** (`community_apply.py`, job `act`).
    - `auto_merge`: squash-merge, pinned to the reviewed head commit (`--match-head-commit`), with the App token.
-   - `needs_human`: label `community: needs review` and a review request to jesdga95.
-   - `reject`: label `community: rejected` and one neutral comment. The pull request is never closed.
+   - `needs_human`: label `community-needs-review` and a review request to jesdga95.
+   - `reject`: label `community-rejected` and one neutral comment. The pull request is never closed.
 
-`COMMUNITY_AUTOMERGE`: only the exact value `live` merges. Unset, `shadow`, `test` or a typo is shadow: labels, review requests and comments only (a row that would merge gets `community: automatic merge` and a comment; in live it gets the same label and is merged). A shadow comment ends with the mode and why nothing merged; a live comment has no mode note.
+`COMMUNITY_AUTOMERGE`: only the exact value `live` merges. Unset, `shadow`, `test` or a typo is shadow: labels, review requests and comments only (a row that would merge gets `community-auto-merge` and a comment; in live it gets the same label and is merged). A shadow comment ends with the mode and why nothing merged; a live comment has no mode note.
 
 Security model: the review runs from base code with secrets only in the one model step; a fork pull request cannot change what runs. Jobs have minimal `permissions` (the deciding job is read-only; the acting job has no `contents: write`); the merge token is a GitHub App token minted only in a merge run; the comments use a second App token scoped to pull requests only. Model output only selects a label. Reasons shown in comments are stripped of links, mentions and markup. Actions are pinned by SHA.
 

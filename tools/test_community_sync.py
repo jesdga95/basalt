@@ -44,7 +44,7 @@ class FakeDB:
         return [self.run(sql, params)]
 
     def batch(self, statements):
-        if statements and statements[0][0].startswith("INSERT INTO runs"):
+        if statements and statements[0][0].startswith("INSERT OR REPLACE INTO runs"):
             self.inserts += 1
             if self.fail_at == self.inserts:
                 raise RuntimeError("boom")
@@ -102,6 +102,12 @@ class Statements(unittest.TestCase):
         for (rel, row), (i, model, data) in zip(runs, out):
             self.assertEqual((i, model, json.loads(data)), (cb.row_id(row), row["model"], row))
             self.assertNotIn("\n", data)
+
+    def test_run_rows_rejects_nonfinite(self):
+        with self.assertRaises(ValueError):
+            cs.run_rows([("runs/m/0123456789ab.json", {"model": "m", "decode_tps": float("inf")})])
+        with self.assertRaises(ValueError):
+            cs.run_rows([("runs/m/0123456789ab.json", {"model": "m", "decode_tps": float("nan")})])
 
 
 class Client(unittest.TestCase):
@@ -181,8 +187,19 @@ class Rebuild(unittest.TestCase):
         cs.sync(db, self.PRESET, rows(70), log=lambda m: None)
         flips = [i for i, s in enumerate(db.log) if s == cs.UPSERT_META]
         self.assertEqual(flips[-1], len(db.log) - 1)
-        self.assertTrue(all(not s.startswith("INSERT INTO runs") for s in db.log[flips[-1]:]))
-        self.assertTrue(all(s.startswith("INSERT INTO runs") or not s.startswith("DELETE") or "gen <>" in s for s in db.log))
+        self.assertTrue(all(not s.startswith("INSERT OR REPLACE INTO runs") for s in db.log[flips[-1]:]))
+        self.assertTrue(all(s.startswith("INSERT OR REPLACE INTO runs") or not s.startswith("DELETE") or "gen <>" in s for s in db.log))
+
+    def test_insert_retry_is_idempotent(self):
+        db = FakeDB()
+        db.batch([(s, []) for s in cs.SCHEMA])
+        data = rows(50)
+        stmts = cs.insert_statements(1, data)
+        db.batch(stmts)
+        # Simulates D1 executing a batch before a transient 502/timeout triggers a retry of the exact same statements.
+        db.batch(stmts)
+        got = db.query("SELECT COUNT(*) AS n FROM runs WHERE gen = 1")[0]["results"][0]["n"]
+        self.assertEqual(got, len(data))
 
     def test_a_failed_rebuild_leaves_the_live_table_untouched(self):
         db = FakeDB()
@@ -205,7 +222,7 @@ class Rebuild(unittest.TestCase):
 
         def lossy(statements):
             out = original(statements)
-            if statements[0][0].startswith("INSERT INTO runs"):
+            if statements[0][0].startswith("INSERT OR REPLACE INTO runs"):
                 db.c.execute("DELETE FROM runs WHERE gen = 2 AND rowid = (SELECT MIN(rowid) FROM runs WHERE gen = 2)")
             return out
         db.batch = lossy

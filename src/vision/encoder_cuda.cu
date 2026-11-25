@@ -1,5 +1,6 @@
 // src/vision/encoder_cuda.cu - see basalt/vision/encoder_cuda.hpp.
 #include "basalt/core/device_copy.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/vision/encoder_cuda.hpp"
 
 #include <cublas_v2.h>
@@ -8,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -48,12 +50,21 @@ bool probe_device(std::string& err) {
 void* current_context() {
     // the runtime makes its context current on first use; the driver's own call through the runtime's entry
     // points, so nothing links the driver library
-    if (cudaFree(nullptr) != cudaSuccess) return nullptr;
+    if (cudaFree(nullptr) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
     void* fn = nullptr;
     cudaDriverEntryPointQueryResult q{};
-    if (cudaGetDriverEntryPointByVersion("cuCtxGetCurrent", &fn, 12000, cudaEnableDefault, &q) != cudaSuccess || fn == nullptr ||
-        q != cudaDriverEntryPointSuccess)
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12050
+    const cudaError_t e = cudaGetDriverEntryPointByVersion("cuCtxGetCurrent", &fn, 12000, cudaEnableDefault, &q);
+#else
+    const cudaError_t e = cudaGetDriverEntryPoint("cuCtxGetCurrent", &fn, cudaEnableDefault, &q);
+#endif
+    if (e != cudaSuccess || fn == nullptr || q != cudaDriverEntryPointSuccess) {
+        (void) cudaGetLastError();
         return nullptr;
+    }
     void* ctx = nullptr;
     return reinterpret_cast<int (*)(void**)>(fn)(&ctx) == 0 ? ctx : nullptr;
 }
@@ -99,6 +110,8 @@ struct CudaEncoder::Impl {
     PixelNorm norm{};
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
+    int device = -1;
+    int image_device = -1;
     std::string err;
     // weight image
     uint8_t* image = nullptr;
@@ -120,17 +133,40 @@ struct CudaEncoder::Impl {
     __nv_bfloat16* act = nullptr;
     __half *qh = nullptr, *kh = nullptr, *vh = nullptr;
 
+    struct StreamSyncOnFail {
+        cudaStream_t s;
+        bool ok = false;
+        ~StreamSyncOnFail() {
+            if (!ok && s) {
+                (void) cudaStreamSynchronize(s);
+                (void) cudaGetLastError();
+            }
+        }
+    };
+
     void fail(const std::string& s) { err = s; }
     ~Impl() {
+        const basalt::core::OnDevice od(device);
+        if (stream) (void) cudaStreamSynchronize(stream);
+        if (own) {
+            cudaFree(own);
+            own = nullptr;
+        }
         release_image();
         if (blas) cublasDestroy(blas);
         if (stream) cudaStreamDestroy(stream);
     }
     void release_image() {
         if (!image) return;
-        if (image_pinned) cudaFreeHost(image);
-        else std::free(image);
+        if (image_pinned) {
+            const basalt::core::OnDevice od(image_device >= 0 ? image_device : device);
+            cudaFreeHost(image);
+        } else {
+            std::free(image);
+        }
         image = nullptr;
+        image_pinned = false;
+        image_device = -1;
     }
 
     // the work buffers' sizes for `patches` patches, in placement order
@@ -166,12 +202,22 @@ struct CudaEncoder::Impl {
     }
 
     bool create(std::string& e) {
-        if (stream) return true;
+        if (stream && blas) return true;
+        int dev = -1;
+        if (cudaGetDevice(&dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            e = "cannot query the encoder's CUDA device";
+            return false;
+        }
         if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess || cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS ||
             cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) {
+            if (blas) { cublasDestroy(blas); blas = nullptr; }
+            if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+            (void) cudaGetLastError();
             e = "cannot create the encoder's stream and product handle";
             return false;
         }
+        device = dev;
         return true;
     }
 
@@ -228,11 +274,21 @@ struct CudaEncoder::Impl {
         wbytes = cur;
         release_image();
         if (pinned) {
-            if (cudaHostAlloc((void**) &image, wbytes, cudaHostAllocDefault) != cudaSuccess) { e = "cannot pin the encoder weights"; return false; }
+            int img_dev = -1;
+            if (cudaGetDevice(&img_dev) == cudaSuccess) image_device = img_dev;
+            else { (void) cudaGetLastError(); image_device = -1; }
+            if (cudaHostAlloc((void**) &image, wbytes, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                image = nullptr;
+                image_device = -1;
+                e = "cannot pin the encoder weights";
+                return false;
+            }
             image_pinned = true;
         } else {
             image = (uint8_t*) std::malloc(wbytes);
             image_pinned = false;
+            image_device = -1;
             if (!image) { e = "out of memory"; return false; }
         }
         std::memset(image, 0, wbytes);
@@ -339,11 +395,21 @@ struct CudaEncoder::Impl {
         wbytes = cur;
         release_image();
         if (pinned) {
-            if (cudaHostAlloc((void**) &image, wbytes, cudaHostAllocDefault) != cudaSuccess) { e = "cannot pin the encoder weights"; return false; }
+            int img_dev = -1;
+            if (cudaGetDevice(&img_dev) == cudaSuccess) image_device = img_dev;
+            else { (void) cudaGetLastError(); image_device = -1; }
+            if (cudaHostAlloc((void**) &image, wbytes, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                image = nullptr;
+                image_device = -1;
+                e = "cannot pin the encoder weights";
+                return false;
+            }
             image_pinned = true;
         } else {
             image = (uint8_t*) std::malloc(wbytes);
             image_pinned = false;
+            image_device = -1;
             if (!image) { e = "out of memory"; return false; }
         }
         std::memset(image, 0, wbytes);   // the merge products' biases stay zero
@@ -393,16 +459,36 @@ struct CudaEncoder::Impl {
         return true;
     }
 
-    size_t arena_bytes(int max_tokens) const { return wbytes + work((size_t) max_tokens * 4).total(); }
+    size_t arena_bytes(int max_tokens) const {
+        return max_tokens > 0 && max_tokens <= INT_MAX / 4 ? wbytes + work((size_t) max_tokens * 4).total() : 0;
+    }
 
     bool attach(void* base, size_t bytes, int max_tokens, std::string& e) {
         if (!image) { e = "the encoder weights are not staged"; return false; }
+        if (max_tokens <= 0 || max_tokens > INT_MAX / 4) { e = "invalid max_tokens"; return false; }
         if (!create(e)) return false;
-        nmax = max_tokens * 4;
-        const Work w = work((size_t) nmax);
+        const int new_nmax = max_tokens * 4;
+        const Work w = work((size_t) new_nmax);
         if (bytes < wbytes + w.total()) { e = "the encoder's device region is too small"; return false; }
+        const basalt::core::OnDevice od(device);
+        struct AttachGuard {
+            Impl* self;
+            bool ok = false;
+            ~AttachGuard() {
+                if (!ok) {
+                    if (self->stream) {
+                        (void) cudaStreamSynchronize(self->stream);
+                        (void) cudaGetLastError();
+                    }
+                    self->arena = nullptr;
+                    self->arena_size = 0;
+                    self->nmax = 0;
+                }
+            }
+        } guard{this};
         arena = (uint8_t*) base;
         arena_size = bytes;
+        nmax = new_nmax;
         auto at = [&](size_t off) { return arena + off; };
         wpatch = (float*) at(o_wpatch); wpatch2 = (float*) at(o_wpatch2); bpatch = (float*) at(o_bpatch); pos = (float*) at(o_pos);
         postw = (float*) at(o_postw); postb = (float*) at(o_postb); newline = (float*) at(o_newline); bm0 = (float*) at(o_bm0); bm2 = (float*) at(o_bm2);
@@ -434,10 +520,12 @@ struct CudaEncoder::Impl {
             CK(cudaMemsetAsync(vh, 0, (size_t) H * nmax * DP * sizeof(__half), stream));
         }
         CK(cudaStreamSynchronize(stream));
+        guard.ok = true;
         return true;
     }
 
     void detach() {
+        const basalt::core::OnDevice od(device);
         if (stream) cudaStreamSynchronize(stream);
         arena = nullptr;
         arena_size = 0;
@@ -445,12 +533,31 @@ struct CudaEncoder::Impl {
     }
 
     bool init(const Mmproj& m, int max_tokens, std::string& e) {
+        if (max_tokens <= 0 || max_tokens > INT_MAX / 4) { e = "invalid max_tokens"; return false; }
+        if (own) {
+            const basalt::core::OnDevice od(device);
+            detach();
+            cudaFree(own);
+            own = nullptr;
+        }
         if (!stage(m, false, e)) return false;
+        if (!create(e)) { release_image(); return false; }
+        const basalt::core::OnDevice od(device);
         void* base = nullptr;
         const size_t bytes = arena_bytes(max_tokens);
-        if (cudaMalloc(&base, bytes) != cudaSuccess) { e = "out of device memory"; return false; }
+        if (cudaMalloc(&base, bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            release_image();
+            e = "out of device memory";
+            return false;
+        }
+        if (!attach(base, bytes, max_tokens, e)) {
+            cudaFree(base);
+            release_image();
+            if (e.empty()) e = err;
+            return false;
+        }
         own = base;
-        if (!attach(base, bytes, max_tokens, e)) { if (e.empty()) e = err; return false; }
         release_image();   // the weights are on the device
         return true;
     }
@@ -458,13 +565,25 @@ struct CudaEncoder::Impl {
 
     bool run(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap) {
         if (cls) { fail("this projector reads a picture, not patch rows"); return false; }
-        const int gx = canvas.w / 16, gy = canvas.h / 16, n = gx * gy, m = n / 4;
-        const bool pair = !hy4 && (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
-        const int ow = gx / 2, out_rows = hy4 ? m + m / std::max(ow, 1) : m;
-        if (n % 4 != 0 || n > nmax || (!pair && (int) patches.size() != n * 768) || (hy4 && (gx % 2 || out_rows > nmax / 4 + (int) kNewlineRows))) {
+        if (!arena || nmax <= 0 || canvas.w <= 0 || canvas.h <= 0) {
             fail("image outside the sized range");
             return false;
         }
+        const int gx = canvas.w / 16, gy = canvas.h / 16;
+        const int64_t n64 = (int64_t) gx * (int64_t) gy;
+        if (gx <= 0 || gy <= 0 || (gx & 1) != 0 || (gy & 1) != 0 || n64 > nmax) {
+            fail("image outside the sized range");
+            return false;
+        }
+        const int n = (int) n64, m = n / 4, ow = gx / 2;
+        const bool pair = !hy4 && (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
+        const int out_rows = hy4 ? m + m / ow : m;
+        if ((!pair && (int64_t) patches.size() != (int64_t) n * 768) || (hy4 && out_rows > nmax / 4 + (int) kNewlineRows)) {
+            fail("image outside the sized range");
+            return false;
+        }
+        const basalt::core::OnDevice od(device);
+        StreamSyncOnFail guard{stream};
         auto host_tap = [&](const std::string& name, const void* dev, size_t count, bool bf) -> bool {
             if (!tap) return true;
             CK(cudaStreamSynchronize(stream));
@@ -517,18 +636,30 @@ struct CudaEncoder::Impl {
         CK(cudaMemcpyAsync(out.data(), d_out, out.size() * 4, cudaMemcpyDeviceToHost, stream));
         CK(cudaStreamSynchronize(stream));
         CK(cudaGetLastError());
+        guard.ok = true;
         if (tap) tap("out", out.data(), out.size());
         return true;
     }
     // The class-token tower on a picture at its own size: its bytes go to the device, which cuts them into normalised bf16
     // patch rows; the sequence is the class token and the patches in merge order; every product runs a chunk of rows.
     bool run_cls(const Image& img, std::vector<float>& out, const TapFn& tap) {
-        const int cell = 2 * patch, cols = (img.w + cell - 1) / cell, rows = (img.h + cell - 1) / cell;
-        const int gx = 2 * cols, gy = 2 * rows, n = gx * gy, T = n + 1, m = cols * rows;
-        if (img.w <= 0 || img.h <= 0 || img.rgb.size() != (size_t) img.w * img.h * 3 || n > nmax) {
+        if (!arena || nmax <= 0 || img.w <= 0 || img.h <= 0 ||
+            img.rgb.size() != (size_t) img.w * (size_t) img.h * 3) {
             fail("image outside the sized range");
             return false;
         }
+        const int cell = 2 * patch;
+        const int64_t cols64 = ((int64_t) img.w + cell - 1) / cell;
+        const int64_t rows64 = ((int64_t) img.h + cell - 1) / cell;
+        const int64_t n64 = (2 * cols64) * (2 * rows64);
+        if (n64 <= 0 || n64 > nmax) {
+            fail("image outside the sized range");
+            return false;
+        }
+        const int cols = (int) cols64, rows = (int) rows64;
+        const int gx = 2 * cols, gy = 2 * rows, n = (int) n64, T = n + 1, m = cols * rows;
+        const basalt::core::OnDevice od(device);
+        StreamSyncOnFail guard{stream};
         auto host_tap = [&](const std::string& name, const float* dev, size_t count) -> bool {
             if (!tap) return true;
             CK(cudaStreamSynchronize(stream));
@@ -584,15 +715,14 @@ struct CudaEncoder::Impl {
         CK(cudaMemcpyAsync(out.data(), d_out, out.size() * 4, cudaMemcpyDeviceToHost, stream));
         CK(cudaStreamSynchronize(stream));
         CK(cudaGetLastError());
+        guard.ok = true;
         if (tap) tap("out", out.data(), out.size());
         return true;
     }
 };
 
 CudaEncoder::CudaEncoder() : impl_(new Impl) {}
-CudaEncoder::~CudaEncoder() {
-    if (impl_->own) { impl_->detach(); cudaFree(impl_->own); }
-}
+CudaEncoder::~CudaEncoder() = default;
 
 bool CudaEncoder::init(const Mmproj& mp, int max_tokens, std::string& err) {
     if (impl_->init(mp, max_tokens, err)) return true;

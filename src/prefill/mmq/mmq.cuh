@@ -518,7 +518,9 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                if (jt*J + j < col_diff) {
+                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                }
             }
             __syncthreads();
         }
@@ -598,7 +600,9 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                if (jt*J + j < col_diff) {
+                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                }
             }
             __syncthreads();
         }
@@ -805,7 +809,9 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+        if (jt*J + j < col_diff) {
+            ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+        }
     }
     __syncthreads();
 

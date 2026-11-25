@@ -341,7 +341,7 @@ public:
             slot_card_[(size_t) v.slot] = m_.card_of(v.layer);
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
-            c.cap = c.ring ? (int64_t) g_.window + kWindowRows : ctx;
+            c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
@@ -539,7 +539,10 @@ protected:
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
         if (!drop_stale_read_ahead(err)) return false;
         const bk::WindowSegs wsegs = v.w.device_segs();
+        int max_seg_rows = 1;
+        for (int i = 0; i < wsegs.n; ++i) max_seg_rows = std::max(max_seg_rows, wsegs.row0[i + 1] - wsegs.row0[i]);
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data(), &wsegs));
+        key.push_back((uint64_t) (max_seg_rows * (kHeads / kKvHeads) > 16));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
         if (!check(err)) return false;
@@ -751,6 +754,7 @@ public:
 
     // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
     int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kWindowRows) : 1; }
+    bool window_cold() const override { return window_cold_; }
     bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (m_.wedged()) return wedged();
@@ -1352,7 +1356,7 @@ private:
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
-        if (!guess && k.side_reads) {
+        if (!guess && k.side_reads && rows <= kDecodeRows) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.ra_ev, k.stream);
             cudaStreamWaitEvent(k.ra_st, k.ra_ev, 0);
@@ -1403,7 +1407,7 @@ private:
         if (guess_next) cudaEventRecord(k.ra_ev, k.stream);   // the MLP input is in
         // the routed ids: a visit's own slot when the session ranks its copies by kept rows (decode_kept), else the scratch
         int32_t* const ids = k.win_ids ? k.win_ids + (size_t) vi * sh_->max_rows * g_.n_used : x.ids_;
-        if (g_.n_expert == 128 && rows == 1) {
+        if (g_.n_expert == 128 && rows <= kBatchRows) {
             bk::router_logits(nrm, w.router, rows, ra, x.rlog_, k.stream);
         } else {
             bk::router(nrm, w.router, w.router_bias, rows, ra, x.rlog_, ids, x.rw_, k.stream);
@@ -1417,7 +1421,7 @@ private:
             cudaEventRecord(k.gs_ev, k.ra_st);
             k.ra_on = true;
         }
-        if (g_.n_expert == 128 && rows == 1) {
+        if (g_.n_expert == 128 && rows <= kBatchRows) {
             router_select_plan(x.rlog_, w.router_bias, rows, g_.n_used, g_.n_expert, g_.expert_scale, ids, x.rw_,
                                w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                                k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
@@ -1461,7 +1465,10 @@ private:
         Segments s;
         if (!view_) return s;
         s.at_d = lane_[card].x->at_d_;
+        s.n_segs = view_->n;
+        s.max_seg_rows = 1;
         for (int i = 0; i < view_->n; ++i) {
+            s.max_seg_rows = std::max(s.max_seg_rows, view_->w.segs[(size_t) i].rows);
             const VisitCache& c = static_cast<const Session*>(view_->ss[i])->vc_[(size_t) slot];
             s.c[i] = {c.k, c.v, c.k_ring, c.v_ring, c.a_ring, c.m_ring};
         }
@@ -1541,7 +1548,11 @@ private:
         if (!drop_stale_read_ahead(err)) return false;
         const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
-        if (it != graphs_.end()) return it->second.launch(stream_, err);
+        if (it != graphs_.end()) {
+            window_cold_ = false;
+            return it->second.launch(stream_, err);
+        }
+        window_cold_ = true;
         if (direct_.insert(key).second || graphless_.count(key)) {
             body(rows, head, full_keys);
             return true;
@@ -1684,16 +1695,26 @@ private:
         hn.norm_out = tapped ? dspark_.tap(kDsTargets - 1) : fin_;
         hn.eps = g_.rms_eps;
         mix_norm(hn, 1, n_fin, stream_);
-        if (tapped && !view_) dspark_.commit(pos_d_, rows, stream_);   // DSPARK HOOK: the rows' context for the drafter
-        if (tapped && view_) {   // a batch window's: all conversations' rows committed in one pass (device segment table)
-            if (view_->n > 1 && sh_->ds_batch && sh_->ds_batch->on()) {
+        if (tapped) {   // DSPARK HOOK: fork onto the side stream when the LM head also runs, overlapping both inside the graph
+            cudaStream_t cst = stream_;
+            if (head > 0) {
+                Lane& k0 = lane_[0];
+                join_sides(k0);
+                cudaEventRecord(k0.ra_ev, stream_);
+                cudaStreamWaitEvent(k0.ra_st, k0.ra_ev, 0);
+                k0.ra_on = true;
+                cst = k0.ra_st;
+            }
+            if (!view_) {
+                dspark_.commit(pos_d_, rows, cst);
+            } else if (view_->n > 1 && sh_->ds_batch && sh_->ds_batch->on()) {
                 DsparkHook* hooks[bk::kWindowSegsMax] = {};
                 for (int i = 0; i < view_->n; ++i) hooks[i] = &static_cast<Session*>(view_->ss[i])->dspark_;
-                sh_->ds_batch->commit(hooks, view_->n, at_d_, pos_d_, rows, stream_);
+                sh_->ds_batch->commit(hooks, view_->n, at_d_, pos_d_, rows, cst);
             } else {
                 for (int i = 0; i < view_->n; ++i) {
                     const model::BatchWindow::Seg& sg = view_->w.segs[(size_t) i];
-                    static_cast<Session*>(view_->ss[i])->dspark_.commit(pos_d_ + sg.row0, sg.rows, stream_, sg.row0);
+                    static_cast<Session*>(view_->ss[i])->dspark_.commit(pos_d_ + sg.row0, sg.rows, cst, sg.row0);
                 }
             }
         }
@@ -1701,8 +1722,7 @@ private:
         const size_t q8_row = (size_t) E / 32 * 36;   // the head's rows' q8_1 blocks follow the rows before them
         float* lg = view_ ? blog_ : logits_;          // a batch window's rows go to each session in batch_take
         bk::native_q8_planes_mmvq(m_.head(), (const uint8_t*) xq_[0] + (size_t) (rows - head - first) * q8_row, lg, E, g_.n_vocab, head,
-                             stream_);
-        softcap(lg, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
+                             stream_, g_.logit_softcap);
     }
 
     // Admission to the CPU experts' windows (CpuExperts::enter): held from before a call's first window until the sync
@@ -1837,7 +1857,8 @@ private:
     std::set<Shape> direct_;                           // the shapes whose first window has run
     std::set<Shape> graphless_;                        // the shapes whose graph found no device memory: always direct
     uint64_t cpu_ = 0;                                 // the window in flight's layers with experts on the CPU
-    bool admitted_ = false;                            // holds admission to the CPU experts' windows (admit)
+    bool admitted_ = false;
+    bool window_cold_ = false;                            // holds admission to the CPU experts' windows (admit)
     bool fork_open_ = false;                           // a start whose finish has not queued its join
     const model::BatchView* view_ = nullptr;           // the batch window in flight, while batch_forward runs it
     float* logits_ = nullptr;                // the last window's head rows (row_logprobs, copy_logits, resample_row)

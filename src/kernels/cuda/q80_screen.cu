@@ -139,7 +139,10 @@ __global__ void __launch_bounds__(512) q80_screen_final_kernel(const Q80B* __res
         xe[i] = make_int4(__ldg(q8), __ldg(q8 + 1), __float_as_int(__low2float(*reinterpret_cast<const half2*>(&dsb))), 0);
     }
     const int n = px::collect<false, false>(f, n_tiles, nullptr, cand, out_id, nullptr);
-    if (n == 0) return;
+    if (n == 0) {
+        if (out_logit && tid == 0) *out_logit = __int_as_float(0xff800000);
+        return;
+    }
     Q80Row<NB> cur, nxt;
     if (warp < n) q80_row_load<NB>(head + (size_t) f.list[warp] * NB, lane, cur);
     for (int c = warp; c < n; c += 16) {
@@ -151,9 +154,13 @@ __global__ void __launch_bounds__(512) q80_screen_final_kernel(const Q80B* __res
     __syncthreads();
     if (warp != 0) return;
     px::pick<false, false>(f, n, n_tiles, nullptr, nullptr, out_id, nullptr);
-    if (out_logit && lane == 0)
+    if (out_logit && lane == 0) {
+        float best = __int_as_float(0xff800000);
+        const int32_t picked = *out_id;
         for (int c = 0; c < n; ++c)
-            if (f.list[c] == *out_id) *out_logit = f.ex[c];
+            if (f.list[c] == picked) { best = f.ex[c]; break; }
+        *out_logit = best;
+    }
 }
 
 void check(const char* what) {

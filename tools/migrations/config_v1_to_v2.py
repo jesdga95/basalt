@@ -15,10 +15,11 @@ from pathlib import Path
 
 VERSION = 2
 # stays with the model: its identity, what it costs and how it answers
-ENTRY_KEYS = {"model", "alias", "gpu", "vision", "parallel", "slot-full-context", "max-context", "kv",
-              "temperature", "top-p", "top-k", "min-p", "presence-penalty", "frequency-penalty", "repetition-penalty",
-              "penalty-last-n", "seed", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "grammar",
-              "fit-max-tokens"}
+ENTRY_KEYS = {"model", "alias", "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "slot-full-context",
+              "max-context", "kv", "temperature", "top-p", "top-k", "min-p", "presence-penalty",
+              "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "reasoning-effort",
+              "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "grammar", "fit-max-tokens",
+              "video-max-tokens"}
 # server options that apply per model and leave "server"
 MODEL_OPTIONS = ENTRY_KEYS | {"idle-sleep", "idle-unload", "min-free-vram-mib"}
 
@@ -35,6 +36,9 @@ def migrated(old) -> dict:
     extra = set(old) - {"v", "version", "server", "engine"}
     if extra:
         raise ValueError(f"not a v1 config: unexpected key {sorted(extra)[0]!r}")
+    for sec in ("server", "engine"):
+        if sec in old and not isinstance(old[sec], dict):
+            raise ValueError(f'not a v1 config: "{sec}" must be a JSON object')
     server, engine, entry, shared = {}, {}, {}, {}
     for key, value in old.get("server", {}).items():
         name = name_of(key)

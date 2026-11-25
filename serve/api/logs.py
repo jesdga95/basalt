@@ -17,8 +17,10 @@ def stream_logs(handler, logs):
     if not logs.clients.acquire(blocking=False):
         handler._json(503, {"error": {"message": "Too many log streams (maximum 8)"}})
         return
-    timeout = handler.connection.gettimeout()
+    got_timeout = False
     try:
+        timeout = handler.connection.gettimeout()
+        got_timeout = True
         handler.connection.settimeout(5)
         handler._sse()
         handler.close_connection = True
@@ -39,5 +41,10 @@ def stream_logs(handler, logs):
     except OSError:
         pass
     finally:
-        handler.connection.settimeout(timeout)
-        logs.clients.release()
+        try:
+            if got_timeout:
+                handler.connection.settimeout(timeout)
+        except OSError:
+            pass
+        finally:
+            logs.clients.release()
