@@ -11,12 +11,14 @@ from pathlib import Path
 from serve.engine.mock import MockEngine
 from serve.frontend import ChatTemplate
 from serve.service import Service
+from serve.util.loglevel import ERR, WARN
 from serve.util.telemetry import GPU_KEYS, Telemetry
 from serve.util.text import ByteTokenizer
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "serve" / "chat_template.jinja"
 APP_JS = (ROOT / "serve" / "web" / "app.js").read_text(encoding="utf-8")
+APP_CSS = (ROOT / "serve" / "web" / "app.css").read_text(encoding="utf-8")
 
 
 class PageContract(unittest.TestCase):
@@ -233,3 +235,317 @@ class LoadControls(unittest.TestCase):
         self.assertEqual(o["loadPending"], "v1/load")
         self.assertTrue(o["loadCleared"])                                # loading: the load bar takes over
         self.assertEqual(o["posts"], ["v1/unload", "v1/unload", "v1/load"])
+
+    def test_asleep_and_parked_models(self):
+        script = r"""
+const fs = require("fs"), vm = require("vm"), { TextDecoder } = require("util");
+function makeEl(tag = "div") {
+  const classes = new Set(), attrs = {};
+  const node = {
+    tagName: tag.toUpperCase(), children: [], dataset: {}, style: {}, textContent: "", innerHTML: "", title: "", hidden: false, disabled: false,
+    get className() { return [...classes].join(" "); },
+    set className(v) { classes.clear(); String(v || "").split(/\s+/).filter(Boolean).forEach(c => classes.add(c)); },
+    classList: {
+      add: (...cs) => cs.forEach(c => classes.add(c)),
+      remove: (...cs) => cs.forEach(c => classes.delete(c)),
+      contains: c => classes.has(c),
+      toggle: (c, f) => { const on = f === undefined ? !classes.has(c) : !!f; on ? classes.add(c) : classes.delete(c); return on; },
+    },
+    get firstElementChild() { return this.children[0] || null; },
+    get lastElementChild() { return this.children[this.children.length - 1] || null; },
+    get childElementCount() { return this.children.length; },
+    get firstChild() { return this.children[0] || null; },
+    append(...xs) { xs.forEach(x => { x.parentElement = this; this.children.push(x); }); },
+    replaceChildren(...xs) { this.children = []; this.append(...xs); },
+    remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(x => x !== this); },
+    setAttribute(k, v) { attrs[k] = String(v); },
+    getAttribute(k) { return attrs[k] ?? null; },
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k); },
+    removeAttribute(k) { delete attrs[k]; },
+    contains(x) { return x === this || this.children.some(c => c.contains(x)); },
+    closest(sel) {
+      if (sel.startsWith(".") && classes.has(sel.slice(1))) return this;
+      return this.parentElement ? this.parentElement.closest(sel) : null;
+    },
+    querySelector(sel) {
+      for (const c of this.children) {
+        if ((sel.startsWith(".") && c.classList.contains(sel.slice(1))) || (sel.startsWith("#") && c.id === sel.slice(1))) return c;
+        const hit = c.querySelector(sel);
+        if (hit) return hit;
+      }
+      return null;
+    },
+    querySelectorAll() { return []; },
+    addEventListener() {}, focus() {}, getBoundingClientRect: () => ({ width: 0, height: 0 }),
+    getContext: () => ({ setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, closePath() {}, fill() {} }),
+  };
+  return node;
+}
+const els = new Map();
+const getEl = sel => {
+  if (!els.has(sel)) {
+    const n = makeEl();
+    if (sel.startsWith("#")) n.id = sel.slice(1);
+    if (sel === "#pbar") n.append(makeEl("i"));
+    if (sel === "#tabs") n.append(makeEl("button"));
+    els.set(sel, n);
+  }
+  return els.get(sel);
+};
+const posts = [];
+const ctx = {
+  document: { querySelector: getEl, addEventListener() {}, createElement: makeEl, hidden: false, activeElement: null },
+  sessionStorage: { getItem: () => null, setItem() {} }, location: { hash: "", host: "localhost" },
+  fetch: (path, opts) => {
+    if (!opts || opts.method !== "POST") return new Promise(() => {});
+    posts.push({ path, body: JSON.parse(opts.body) });
+    return new Promise(() => {});
+  },
+  ResizeObserver: class { observe() {} }, matchMedia: () => ({ matches: true }), requestAnimationFrame() {},
+  setTimeout() { return 1; }, clearTimeout() {}, performance: { now: () => 0 }, devicePixelRatio: 1,
+  window: { addEventListener() {} }, console,
+  AbortController: class { constructor() { this.signal = { aborted: false }; } abort() { this.signal.aborted = true; } },
+  TextDecoder,
+};
+vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8") + "\n" + fs.readFileSync(process.argv[3], "utf8") + `
+  const idle = { state: "idle", queued: 0 }, loading = { state: "loading", queued: 0 }, asleep = { state: "asleep", queued: 0 };
+  const parkedAndActive = [
+    { id: "A", status: { value: "loaded" }, asleep: true, parked_mib: 3000 },
+    { id: "B", status: { value: "loaded" }, asleep: false, parked_mib: null },
+  ];
+  const out = {};
+  out.unloadActive = unloadView(parkedAndActive, idle);
+  out.unloadDuringSwap = unloadView(parkedAndActive, loading);
+  drawModels(parkedAndActive, "B");
+  const pop = $("#models").querySelector(".pop");
+  out.rows = pop.children.map(b => ({ id: b.dataset.v, cls: b.className, checked: b.getAttribute("aria-checked"), word: b.children[1].textContent }));
+  pop.onclick({ target: pop.children[1] });                    // active B: not clickable
+  out.postsAfterActiveClick = posts.length;
+  pop.onclick({ target: pop.children[0] });                    // parked A: wakes via v1/load
+  out.postsAfterParkedClick = posts.slice();
+  settle(parkedAndActive, true);                               // still asleep: stays pending
+  out.pendingWhileAsleep = !!pending;
+  settle([
+    { id: "A", status: { value: "loading" }, asleep: true, parked_mib: null },
+    { id: "B", status: { value: "loaded" }, asleep: true, parked_mib: 3000 },
+  ], true);
+  out.clearedOnLoading = !pending;
+  control("v1/load", "A");
+  settle([
+    { id: "A", status: { value: "loaded" }, asleep: false, parked_mib: null },
+    { id: "B", status: { value: "loaded" }, asleep: true, parked_mib: 3000 },
+  ], true);
+  out.clearedOnWake = !pending;
+  const onlyParked = [
+    { id: "A", status: { value: "loaded" }, asleep: true, parked_mib: 3000 },
+    { id: "B", status: { value: "unloaded" }, asleep: false, parked_mib: null },
+  ];
+  out.unloadOnlyParked = unloadView(onlyParked, idle);
+  M = { live: { state: "asleep", queued: 0, slots: { total: 1, active: 0 } }, engine: { model: "A" }, models: onlyParked };
+  draw();
+  out.onlyParkedHeroEmpty = $(".hero").classList.contains("empty");
+  out.onlyParkedState = $("#state").textContent;
+  const idleAsleep = [
+    { id: "A", status: { value: "loaded" }, asleep: true },
+    { id: "B", status: { value: "unloaded" }, asleep: false },
+  ];
+  out.unloadIdleAsleep = unloadView(idleAsleep, asleep);
+  drawModels(idleAsleep, "A");
+  out.idleAsleepRowCls = $("#models").querySelector(".pop").children[0].className;
+  globalThis.out = out;`, Object.assign(ctx, { posts }));
+process.stdout.write(JSON.stringify(ctx.out));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(script)
+        self.addCleanup(os.unlink, f.name)
+        r = subprocess.run([NODE, f.name, str(ROOT / "serve" / "web" / "logs.js"), str(ROOT / "serve" / "web" / "app.js")],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        o = json.loads(r.stdout)
+        self.assertEqual((o["unloadActive"]["hidden"], o["unloadActive"]["id"], o["unloadActive"]["disabled"]), (False, "B", False))
+        self.assertTrue(o["unloadDuringSwap"]["hidden"])
+        self.assertEqual(o["rows"], [
+            {"id": "A", "cls": "opt go", "checked": "false", "word": "Asleep"},
+            {"id": "B", "cls": "opt", "checked": "true", "word": "Loaded"},
+        ])
+        self.assertEqual(o["postsAfterActiveClick"], 0)
+        self.assertEqual(o["postsAfterParkedClick"], [{"path": "v1/load", "body": {"model": "A"}}])
+        self.assertTrue(o["pendingWhileAsleep"])
+        self.assertTrue(o["clearedOnLoading"])
+        self.assertTrue(o["clearedOnWake"])
+        self.assertTrue(o["unloadOnlyParked"]["hidden"])
+        self.assertTrue(o["onlyParkedHeroEmpty"])
+        self.assertEqual(o["onlyParkedState"], "No model")
+        self.assertEqual((o["unloadIdleAsleep"]["hidden"], o["unloadIdleAsleep"]["id"], o["unloadIdleAsleep"]["disabled"]),
+                         (False, "A", False))
+        self.assertEqual(o["idleAsleepRowCls"], "opt go")
+
+
+class LogStreamAndLevels(unittest.TestCase):
+    """Log SSE empty frames do not trigger reconnect loops, and server 'err' levels style, count and filter."""
+
+    def test_css_matches_server_log_levels(self):
+        self.assertIn(f"#log .{ERR} span, #log .{ERR} u", APP_CSS)
+        self.assertIn(f"#log.warnonly > div:not(.{WARN}):not(.{ERR}):not(.empty)", APP_CSS)
+        self.assertIn(f"#log > div:last-child:not(.{WARN}):not(.{ERR}):not(.empty) span", APP_CSS)
+        self.assertIn(f'.ticker[data-lvl="{ERR}"] span', APP_CSS)
+        self.assertNotIn("#log .error", APP_CSS)
+        self.assertNotIn(":not(.error)", APP_CSS)
+        self.assertNotIn('.ticker[data-lvl="error"]', APP_CSS)
+
+    @unittest.skipUnless(NODE, "needs node")
+    def test_empty_log_frames_and_err_level_handling(self):
+        script = r"""
+const fs = require("fs"), vm = require("vm"), { TextDecoder, TextEncoder } = require("util");
+function makeEl(tag = "div") {
+  const classes = new Set();
+  const node = {
+    tagName: tag.toUpperCase(), children: [], dataset: {}, style: {}, textContent: "", innerHTML: "", title: "", hidden: false,
+    scrollTop: 0, scrollHeight: 0, clientHeight: 0,
+    get className() { return [...classes].join(" "); },
+    set className(v) { classes.clear(); String(v || "").split(/\s+/).filter(Boolean).forEach(c => classes.add(c)); },
+    classList: {
+      add: (...cs) => cs.forEach(c => classes.add(c)),
+      remove: (...cs) => cs.forEach(c => classes.delete(c)),
+      contains: c => classes.has(c),
+      toggle: (c, f) => { const on = f === undefined ? !classes.has(c) : !!f; on ? classes.add(c) : classes.delete(c); return on; },
+    },
+    get childElementCount() { return this.children.length; },
+    get firstChild() { return this.children[0] || null; },
+    get firstElementChild() { return this.children[0] || null; },
+    get lastElementChild() { return this.children[this.children.length - 1] || null; },
+    append(...xs) { xs.forEach(x => { x.parentElement = this; this.children.push(x); }); },
+    replaceChildren(...xs) { this.children = []; this.append(...xs); },
+    remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(x => x !== this); },
+    querySelector(sel) {
+      for (const c of this.children) {
+        if (sel.startsWith(".") && c.classList.contains(sel.slice(1))) return c;
+        const hit = c.querySelector(sel);
+        if (hit) return hit;
+      }
+      return null;
+    },
+    querySelectorAll() { return []; },
+    addEventListener() {}, setAttribute() {}, removeAttribute() {}, hasAttribute: () => false,
+  };
+  return node;
+}
+const els = new Map();
+const getEl = sel => { if (!els.has(sel)) els.set(sel, makeEl()); return els.get(sel); };
+const enc = new TextEncoder();
+const streams = [], logPaths = [], timers = [];
+function makeStream() {
+  const q = []; let waiter = null, closed = false;
+  const push = s => {
+    const item = { value: enc.encode(s), done: false };
+    if (waiter) { const w = waiter; waiter = null; w(item); } else q.push(item);
+  };
+  const close = () => {
+    closed = true;
+    if (waiter) { const w = waiter; waiter = null; w({ value: undefined, done: true }); }
+  };
+  const reader = {
+    read() {
+      if (q.length) return Promise.resolve(q.shift());
+      if (closed) return Promise.resolve({ value: undefined, done: true });
+      return new Promise(res => { waiter = res; });
+    },
+    cancel: () => Promise.resolve(),
+    releaseLock() {},
+  };
+  return { push, close, response: { ok: true, status: 200, body: { getReader: () => reader } } };
+}
+const ctx = {
+  document: { querySelector: getEl, addEventListener() {}, createElement: makeEl, hidden: false },
+  sessionStorage: { getItem: () => null, setItem() {} }, location: { hash: "", host: "localhost" },
+  fetch: path => {
+    if (path.startsWith("api/logs/stream")) {
+      logPaths.push(path);
+      const st = makeStream();
+      streams.push(st);
+      return Promise.resolve(st.response);
+    }
+    return new Promise(() => {});
+  },
+  ResizeObserver: class { observe() {} }, matchMedia: () => ({ matches: true }), requestAnimationFrame() {},
+  setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+  clearTimeout() {}, performance: { now: () => 0 }, devicePixelRatio: 1,
+  window: { addEventListener() {} }, console,
+  AbortController: class { constructor() { this.signal = { aborted: false }; } abort() { this.signal.aborted = true; } },
+  TextDecoder,
+};
+vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8") + "\n" + fs.readFileSync(process.argv[3], "utf8") + `
+  const flush = async () => { for (let i = 0; i < 20; i++) await null; };
+  globalThis.run = async () => {
+    const out = {};
+    await flush();
+    streams[0].push('event: logs\\ndata: {"lines":[],"next":0,"instance_id":"s1","reset":false,"dropped":false}\\n\\n');
+    await flush();
+    out.emptyInitial = {
+      status: $("#log-status").textContent, retries: timers.length, lastLog, logInstance,
+      placeholder: $("#log").children.map(c => c.textContent),
+    };
+    streams[0].push('event: logs\\ndata: ' + JSON.stringify({
+      lines: [
+        { id: 1, t: 1, src: "srv", lvl: "info", msg: "ready" },
+        { id: 2, t: 2, src: "eng", lvl: "warn", msg: "low vram" },
+        { id: 3, t: 3, src: "eng", lvl: "err", msg: "boom" },
+      ],
+      next: 3, instance_id: "s1", reset: false, dropped: false,
+    }) + '\\n\\n');
+    await flush();
+    out.afterLines = {
+      status: $("#log-status").textContent, retries: timers.length, logCount, warnCount,
+      classes: $("#log").children.map(c => c.className),
+      tickerLvl: $("#ticker").dataset.lvl,
+      tickerHasBoom: $("#ticker-t").textContent.includes("boom"),
+    };
+    // Simulate disconnect + scheduled reconnect receiving an empty frame (no new lines)
+    streams[0].close();
+    await flush();
+    out.afterClose = { status: $("#log-status").textContent, retries: timers.length };
+    timers[timers.length - 1].fn();
+    await flush();
+    streams[1].push('event: logs\\ndata: {"lines":[],"next":3,"instance_id":"s1","reset":false,"dropped":false}\\n\\n');
+    await flush();
+    out.afterEmptyReconnect = {
+      path: logPaths[1], status: $("#log-status").textContent, retries: timers.length,
+      logCount, warnCount, tickerLvl: $("#ticker").dataset.lvl, lineCount: $("#log").children.length,
+    };
+    // Server restart with empty buffer
+    streams[1].push('event: logs\\ndata: {"lines":[],"next":0,"instance_id":"s2","reset":true,"dropped":false}\\n\\n');
+    await flush();
+    out.afterEmptyReset = {
+      status: $("#log-status").textContent, retries: timers.length, logCount, warnCount,
+      lastLog, logInstance, tickerText: $("#ticker-t").textContent, tickerLvl: $("#ticker").dataset.lvl,
+      placeholder: $("#log").children.map(c => c.textContent),
+    };
+    return out;
+  };`, Object.assign(ctx, { streams, logPaths, timers }));
+ctx.run().then(o => process.stdout.write(JSON.stringify(o)));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(script)
+        self.addCleanup(os.unlink, f.name)
+        r = subprocess.run([NODE, f.name, str(ROOT / "serve" / "web" / "logs.js"), str(ROOT / "serve" / "web" / "app.js")],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        o = json.loads(r.stdout)
+        self.assertEqual(o["emptyInitial"], {
+            "status": "Live", "retries": 0, "lastLog": 0, "logInstance": "s1",
+            "placeholder": ["No log lines yet."],
+        })
+        self.assertEqual(o["afterLines"], {
+            "status": "Live", "retries": 0, "logCount": 3, "warnCount": 2,
+            "classes": ["", "warn", "err"], "tickerLvl": "err", "tickerHasBoom": True,
+        })
+        self.assertEqual(o["afterClose"], {"status": "Disconnected; retrying", "retries": 1})
+        self.assertEqual(o["afterEmptyReconnect"], {
+            "path": "api/logs/stream?after=3&instance=s1", "status": "Live", "retries": 1,
+            "logCount": 3, "warnCount": 2, "tickerLvl": "err", "lineCount": 3,
+        })
+        self.assertEqual(o["afterEmptyReset"], {
+            "status": "Live", "retries": 1, "logCount": 0, "warnCount": 0,
+            "lastLog": 0, "logInstance": "s2", "tickerText": "", "tickerLvl": "",
+            "placeholder": ["No log lines yet."],
+        })
