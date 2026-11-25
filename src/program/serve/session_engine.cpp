@@ -491,7 +491,7 @@ public:
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
-        history_.resize((size_t) max_window() * hist_n);
+        history_.resize((size_t) std::max<int64_t>({(int64_t) max_window(), (int64_t) rt_.session().prompt_fold_window(), n - fold_p0}) * hist_n);
         return history_.data();
     }
     void upload_history(int) {}
@@ -501,10 +501,12 @@ public:
         d.tokens = window.data();
         d.n_tokens = T;
         d.pos = p;
+        const bool tail_only = e0 == T - 1 && T > 1 && req_logprobs < 0 && (gguard == nullptr || !gguard->on()) && ppl == nullptr;
         d.drawn_drafts = own_drafts_ && e0 == 0 && ppl == nullptr && T > 1;
-        (T > 1 ? d.row_tokens : d.next_token) = outv.data();
+        if (tail_only) d.next_token = &outv[(size_t) e0];
+        else (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
-        d.history = hist_n > 0 ? history_.data() : nullptr;
+        d.history = hist_n > 0 ? history_.data() + (tail_only ? (size_t) e0 * hist_n : 0) : nullptr;
         d.history_len = hist_n;
         req_sp.counter = draws_;
         const basalt::model::Result r = rt_.session().decode_window(d);
@@ -763,7 +765,14 @@ Flow SessionRequest::prepare_image() {
 Flow SessionRequest::read_to(int64_t to) {
     if (at == read_from)
         for (next_block_ = 0; next_block_ < blocks_.size() && blocks_[next_block_].at < at;) ++next_block_;
-    while (at < to) {
+    int64_t fold_tail = 0;
+    const int fw = rt_.session().prompt_fold_window();
+    if (fw > 1 && to == n - 1 && !part_checkpoint(to) && next_block_ >= blocks_.size() && (!in_slot || solo_req) &&
+        ppl == nullptr && to > at && to - at < fw) {
+        fold_tail = to - at;
+    }
+    const int64_t pre_to = to - fold_tail;
+    while (at < pre_to) {
         const bool image = next_block_ < blocks_.size() && blocks_[next_block_].at == at;
         basalt::model::Result r;
         if (image) {
@@ -771,7 +780,7 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
-            const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
+            const int64_t end = next_block_ < blocks_.size() ? std::min(pre_to, blocks_[next_block_].at) : pre_to;
             basalt::model::PrefillRequest pr;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
@@ -810,6 +819,10 @@ Flow SessionRequest::read_to(int64_t to) {
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
         runtime_.pp_reached = std::max(runtime_.pp_reached, at);
         progress_line("PP", at);
+    }
+    if (fold_tail > 0) {
+        fold_p0 = pre_to;
+        at = to;
     }
     if (part_checkpoint(to) &&
         !rt_.checkpoint_at(to, to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd, ids)) {
