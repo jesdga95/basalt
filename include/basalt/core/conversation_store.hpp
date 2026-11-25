@@ -192,7 +192,7 @@ struct ConversationsToStore {
 
 /// Conversations parked in `cache` leave for `store`, the longest parked first, until `admitted()` holds or none is
 /// left to go.  One that `stored` says the store holds already only leaves the cache; the others are written first
-/// (write(), with `waiting` as its progress): an image's RAM is free once it is written.  One shorter than `shortest`
+/// (write(), with `waiting` as its progress), one of them at most per call: an image's RAM is free once it is written.  One shorter than `shortest`
 /// tokens, larger than the store's budget or with a layer split's stage images (the store takes none) stays parked;
 /// one the store does not hold after its write goes back to the cache as its most recent entry, and no more are given
 /// up after it.

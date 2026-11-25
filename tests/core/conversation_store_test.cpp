@@ -891,10 +891,22 @@ void ram_tier_to_store(const std::string& dir, uint64_t id) {
     CHECK(cache.size() == 3 && cache.bytes() == parked_bytes && parked(d_ids) && parked(e_ids));
     CHECK(st.stats().written == 2 && !st.holds(d_ids, {}, true));
     basalt::platform::remove_file(blocker);
-    // nothing in the way: e and d go, the short one stays whatever the condition
+    // nothing in the way: one write per call, e first (the longest parked), then d; the short one stays whatever the
+    // condition
     moved = conversation_cache_to_store(cache, st, 4096, stored, [] { return false; });
-    CHECK(!moved.admitted && moved.left == 2 && moved.written == 2 && cache.size() == 1 && parked(s_ids));
-    CHECK(st.holds(e_ids, {}, true) && st.holds(d_ids, {}, true) && st.stats().written == 4);
+    CHECK(!moved.admitted && moved.left == 1 && moved.written == 1 && cache.size() == 2 && parked(d_ids));
+    CHECK(st.holds(e_ids, {}, true) && !st.holds(d_ids, {}, true) && st.stats().written == 3);
+    moved = conversation_cache_to_store(cache, st, 4096, stored, [] { return false; });
+    CHECK(!moved.admitted && moved.left == 1 && moved.written == 1 && cache.size() == 1 && parked(s_ids));
+    CHECK(st.holds(d_ids, {}, true) && st.stats().written == 4);
+    // after its one write a call still gives up what the store holds already: f is written, e leaves without a write
+    const std::vector<int32_t> f_ids = ids_of(9001, 6);
+    {
+        ConversationCache order(1ull << 30, 8);
+        CHECK(order.put(image(f_ids, {1000})) && order.put(image(e_ids, {1000})));
+        moved = conversation_cache_to_store(order, st, 4096, stored, [] { return false; });
+        CHECK(moved.left == 2 && moved.written == 1 && order.size() == 0 && st.holds(f_ids, {}, true));
+    }
     // an idle slot's conversation whose write fails goes back as an idle slot's
     {
         Store other;

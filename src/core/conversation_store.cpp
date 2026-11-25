@@ -1995,8 +1995,10 @@ ConversationsToStore conversation_cache_to_store(ConversationCache& cache, Conve
     ConversationsToStore r;
     r.admitted = admitted();
     while (!r.admitted) {
+        // one write at most: what the store holds already leaves without one, the rest waits for a later step
         auto image = cache.take_oldest([&](const SavedConversation& c) {
-            return (int64_t) c.live.ids.size() >= shortest && c.bytes() <= store.budget() && c.stage_images.empty();
+            return (int64_t) c.live.ids.size() >= shortest && c.bytes() <= store.budget() && c.stage_images.empty() &&
+                   (r.written == 0 || stored(c));
         });
         if (!image) break;
         if (!stored(*image)) {
