@@ -1039,35 +1039,93 @@ class JsonPrefix:
 
 
 class CodeTracker:
-    """What the answer text that has gone out leaves open: a code fence, the current line, the backticks of the current
-    paragraph. A tag opening inside code is a quoted example, text."""
+    """What the answer text that has gone out leaves open: a code fence, the current line, the backtick runs of the
+    current paragraph, and whether the current line is inside an indented code block. A tag opening inside code is a
+    quoted example, text."""
 
-    fence, line, ticks = "", "", 0
+    fence, line, par_runs, par_open = "", "", 0, False
+    _prev_blank, _indented = False, False
+
+    def _reset_track(self) -> None:
+        self.fence, self.line, self.par_runs, self.par_open = "", "", 0, False
+        self._prev_blank, self._indented = False, False
+
+    def _snap(self) -> tuple:
+        return (self.fence, self.line, self.par_runs, self.par_open, self._prev_blank, self._indented)
+
+    def _restore(self, snap: tuple) -> None:
+        self.fence, self.line, self.par_runs, self.par_open, self._prev_blank, self._indented = snap
 
     def _track(self, text: str) -> str:
-        """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, and the
-        backticks of the current paragraph. Returns the text."""
+        """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, the runs of
+        backticks the current paragraph holds, and whether the run that opened the last one ended its line.
+        Returns the text."""
         parts = text.split("\n")
         for k, part in enumerate(parts):
             if k < len(parts) - 1:
                 line, self.line = self.line + part, ""
                 s = line.lstrip()
+                was_fenced = bool(self.fence)
                 if self.fence:
-                    if s.startswith(self.fence * 3):
+                    # CommonMark: a fence closes only against a line of at least as many of the same character as
+                    # opened it, with no trailing non-whitespace text (so ``` inside ```` or ```python cannot close it).
+                    run = len(s) - len(s.lstrip(self.fence[0]))
+                    if run >= len(self.fence) and not s[run:].strip():
                         self.fence = ""
-                elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
-                    self.fence = s[0]
+                elif s[:3] in ("```", "~~~"):
+                    run = len(s) - len(s.lstrip(s[0]))
+                    if (s[0] * 3) not in s[run:]:
+                        self.fence = s[0] * run
                 elif not s:
-                    self.ticks = 0
+                    self.par_runs, self.par_open = 0, False   # a paragraph ends here
                 else:
-                    self.ticks += line.count("`")
+                    # The runs of backticks pair up across the paragraph, and a span stays open only while the run that
+                    # opened it ENDED its line ("wrapped `example"). A run with text after it is a stray character:
+                    # counting every backtick of the paragraph read each later line as inline code and hid a real call.
+                    runs = self._backtick_runs(line)
+                    self.par_runs += runs
+                    if runs:                                  # a line without backticks does not move the last run
+                        self.par_open = line.endswith("`")
+                # An indented (four spaces or a tab) code block starts after a blank line and runs until a line that is
+                # not indented; a call written in one is an example, not a call.
+                if was_fenced or self.fence:
+                    self._prev_blank = self._indented = False
+                elif not s:
+                    self._prev_blank = True
+                elif line.startswith(("    ", "\t")):
+                    self._indented = self._prev_blank or self._indented
+                    self._prev_blank = False
+                else:
+                    self._prev_blank = self._indented = False
             else:
                 self.line += part
         return text
 
+    @staticmethod
+    def _backtick_runs(line: str) -> int:
+        """How many runs of backticks the line holds: "a `b` c" has two, "``x``" has two, "``x" has one."""
+        runs, in_run = 0, False
+        for ch in line:
+            if ch == "`":
+                if not in_run:
+                    runs += 1
+                    in_run = True
+            else:
+                in_run = False
+        return runs
+
+    def _in_indented_block(self) -> bool:
+        """The current line is part of an indented code block: four spaces or a tab, after a blank line or another such line."""
+        return (self._prev_blank or self._indented) and self.line.startswith(("    ", "\t"))
+
     def _in_code(self) -> bool:
-        """The text so far leaves the next character inside a code fence or inline code."""
-        return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+        """The text so far leaves the next character inside a code fence, an indented code block, or inline code."""
+        if self.fence or self._in_indented_block():
+            return True
+        line_runs = self._backtick_runs(self.line)
+        if self.par_runs % 2 == 1 and self.par_open:
+            return line_runs % 2 == 0
+        return line_runs % 2 == 1
 
 
 class OutputParser(CodeTracker):
@@ -1081,7 +1139,7 @@ class OutputParser(CodeTracker):
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
-        self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
+        self._reset_track()          # code fence, current line, backtick runs and indented-block state
         self._reset_scan()
 
     def _reset_scan(self):
@@ -1255,7 +1313,7 @@ class OutputParser(CodeTracker):
                     out.append(self._reasoning(self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
-                self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
+                self._reset_track()                               # the answer's own text starts here
             elif self.state == "content":
                 if self.lead:                                   # newlines after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -1274,10 +1332,10 @@ class OutputParser(CodeTracker):
                         self.buf = self.buf[j:]
                     return out
                 # an opener inside a code fence or inline code is a quoted example: text, decided by the text before it
-                snap = (self.fence, self.line, self.ticks)
+                snap = self._snap()
                 self._track(self.buf[:i])
                 in_code = self._in_code()
-                self.fence, self.line, self.ticks = snap
+                self._restore(snap)
                 if in_code:
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
