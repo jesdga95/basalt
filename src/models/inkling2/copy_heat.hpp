@@ -17,8 +17,9 @@ public:
     /// Kept rows after which a lookup counts half: a stale genre's counts give way within a few hundred tokens, while a
     /// genre's own hot set stays stable over many more.
     static constexpr double kHalfLifeRows = 320.0;
-    /// The profile's order as a tie-break below one lookup per visit: pair order[i] outranks order[i + 1] while both are unseen.
-    static constexpr float kPriorStep = 1e-4f;
+    /// The profile's order as a tie-break: pair order[i] outranks order[i + 1] while both are unseen, and every tie-break
+    /// value stays below this share of the smallest weight, so one looked-up pair outranks any unseen one.
+    static constexpr float kPriorShare = 0.5f;
     /// A layer run v times a token weighs its counts by v^-kVisitPower: below 1, so a looped layer keeps part of the
     /// credit for serving every one of its visits (deep caches leave few copies, and its visits wait for the CPU too).
     static constexpr double kVisitPower = 0.75;
@@ -39,8 +40,13 @@ public:
                 least = std::min(least, per_visit_[i]);
             }
         }
-        for (size_t i = 0; i < order.size(); ++i)
-            prior_[(size_t) order[i].first * (size_t) n_expert + (size_t) order[i].second] = kPriorStep * (float) (order.size() - i) * least;
+        const size_t n = order.size();
+        rank_.assign(pairs, n);
+        for (size_t i = 0; i < n; ++i) {
+            const size_t pair = (size_t) order[i].first * (size_t) n_expert + (size_t) order[i].second;
+            prior_[pair] = kPriorShare * least * (float) (n - i) / (float) n;
+            rank_[pair] = i;
+        }
     }
     bool started() const { return !heat_.empty(); }
 
@@ -51,14 +57,21 @@ public:
         for (size_t i = 0; i < heat_.size(); ++i) heat_[i] = heat_[i] * keep + (float) lookups[i];
     }
     float score(size_t pair) const { return heat_[pair] * per_visit_[pair] + prior_[pair]; }
+    /// The pair's place in the profile's order (pairs outside it after every pair in it).
+    size_t rank(size_t pair) const { return rank_[pair]; }
 
 private:
     std::vector<float> heat_, prior_, per_visit_;
+    std::vector<size_t> rank_;
 };
 
-/// `pairs` ordered by score, highest first (equal scores keep their order).
+/// `pairs` ordered by score, highest first; equal scores by the profile's order, then by pair, whatever the input order.
 inline std::vector<size_t> by_score_desc(const CopyHeat& h, std::vector<size_t> pairs) {
-    std::stable_sort(pairs.begin(), pairs.end(), [&](size_t a, size_t b) { return h.score(a) > h.score(b); });
+    std::stable_sort(pairs.begin(), pairs.end(), [&](size_t a, size_t b) {
+        const float sa = h.score(a), sb = h.score(b);
+        if (sa != sb) return sa > sb;
+        return h.rank(a) != h.rank(b) ? h.rank(a) < h.rank(b) : a < b;
+    });
     return pairs;
 }
 

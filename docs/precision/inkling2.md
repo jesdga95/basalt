@@ -120,8 +120,9 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | MX8 pack, 100 chunks, the sm_120 prompt and decode kernels (#579's build; 0.00442, 97.17%, 7.0704 before it) | 0.00441 | 97.22% | 7.0647 |
 
 Which RAM experts have a card copy changes their arithmetic (the card's q8_1 activations against the CPU's Q8_0), so
-placement is part of the result. With `--vram-reserve-mib 300` at `--max-context 8192` (1,049 experts planned into RAM,
-250 copied back to the card, 90.17% of decode lookups on the card), 100 chunks against the base build (no copy-back):
+placement is part of the result. Measured when copies were ranked by lookups per token (the earlier ranking): with
+`--vram-reserve-mib 300` at `--max-context 8192` (1,049 experts planned into RAM, 250 copied back to the card, 90.17% of
+decode lookups on the card), 100 chunks against the base build (no copy-back):
 PPL 7.0708 to 7.0725, paired NLL difference +0.00025 +- 0.00042, top-1 98.22% of rows the same (RTX 5080 at 360 W).
 The copies then follow the session's own lookups and the prompt loan adds more while decode runs, so which pairs the card
 computes depends on the conversation; it changes only at positions the requests fix, so a greedy request's placement, and

@@ -116,9 +116,52 @@ int main() {
     expect(by_score_desc(u, std::vector<size_t>(ram.rbegin(), ram.rend())) == ram, "unseen, looped: the spill order");
     std::vector<uint32_t> one(pairs, 0u);
     const size_t last_looped = ram[ram.size() - 2];   // layer 1, near the end of the profile's order
-    one[last_looped] = 3;                              // one lookup per visit
+    one[last_looped] = 1;                              // one lookup, at the smallest weight
     u.learn(one, 0);
-    expect(last_looped / n_expert == 1 && by_score_desc(u, ram)[0] == last_looped, "one lookup per visit outranks every unseen pair");
+    expect(last_looped / n_expert == 1 && by_score_desc(u, ram)[0] == last_looped, "one lookup outranks every unseen pair");
+    {   // the largest order the loader admits (24 layers x 512 experts, the looped layers at weight 3^-0.75): one lookup at
+        // the profile's last place still outranks its unseen first place
+        const int L = 24, E = 512;
+        std::vector<int> vis(L, 1);
+        for (int l = 6; l < 18; ++l) vis[(size_t) l] = 3;
+        std::vector<std::pair<int32_t, int32_t>> big;
+        for (int e = 0; e < E; ++e)
+            for (int l = 0; l < L; ++l) big.emplace_back(l, e);
+        CopyHeat b;
+        b.start((size_t) L * E, E, big, vis);
+        const size_t first = (size_t) big.front().first * E + big.front().second;
+        const auto [ll, le] = big[big.size() - 7];    // a looped layer's pair near the end
+        const size_t late = (size_t) ll * E + le;
+        std::vector<uint32_t> once((size_t) L * E, 0u);
+        once[late] = 1;
+        b.learn(once, 0);
+        expect(ll >= 6 && ll < 18 && by_score_desc(b, {first, late})[0] == late, "12,288 pairs: one lookup outranks the unseen first");
+        expect(by_score_desc(b, {first, (size_t) big[1].first * E + big[1].second})[0] == first, "12,288 pairs: unseen keep the order");
+    }
+    {   // swaps across weights: a copy at a single-visit layer against a RAM expert of a looped one, and back
+        const size_t edge = 0 * n_expert + 2, loop = 1 * n_expert + 2;
+        auto heat = [&](uint32_t e, uint32_t l) {
+            CopyHeat x;
+            x.start(pairs, n_expert, order, looped);
+            std::vector<uint32_t> c(pairs, 0u);
+            c[edge] = e;
+            c[loop] = l;
+            x.learn(c, 0);
+            return x;
+        };
+        auto swaps = [&](const CopyHeat& x, size_t copy, size_t ram_pair) {
+            return plan_swaps(x, {copy}, {ram_pair}, [](size_t) { return 0; }, 8).size();
+        };
+        expect(swaps(heat(40, 160), edge, loop) == 1, "160 over three visits (about 70) takes a copy of 40: past the margin and 16");
+        expect(swaps(heat(40, 120), edge, loop) == 0, "120 over three visits (about 53) is under 16 more than 40");
+        expect(swaps(heat(60, 100), loop, edge) == 1, "60 takes a looped copy of 100 (about 44): 16 more");
+        expect(swaps(heat(58, 100), loop, edge) == 0, "58 is under 16 more than about 44");
+    }
+    {   // equal scores: the profile's order, then the pair, whatever order the candidates come in
+        CopyHeat t;
+        t.start(pairs, n_expert, {}, looped);           // no profile: every prior and rank equal
+        expect(by_score_desc(t, {5, 3, 9}) == std::vector<size_t>({3, 5, 9}), "full ties: by pair");
+    }
     if (failures == 0) std::printf("inkling2_copy_heat_test: ok\n");
     return failures == 0 ? 0 : 1;
 }
