@@ -390,8 +390,11 @@ __device__ int drawn_pick(const int* ids, Prob prob, int n, const SamplerParams&
 // tails and all narrow variants agree bitwise.  The semantics are koboldcpp's (gpttype_adapter.cpp):
 // top_a keeps p >= top_a * p_max^2 (sample_top_a); tfs cuts where the normalized second-derivative mass
 // exceeds z - koboldcpp compares against z, llama.cpp against 1 - z (sample_tail_free); typical re-orders by
-// |shifted score| and keeps the smallest set holding typical_p of the original mass (sampler_typical).
-__device__ __forceinline__ int tail_list_filters(float* x, int k, int n_keep, const SamplerParams& p, double* scr) {
+// |shifted score| and keeps the smallest set holding typical_p of the original mass (sampler_typical): that set
+// is not a prefix of the list, so its tokens are moved to the front of x / ids, in their list order.
+// xtc is not here: koboldcpp runs it after the temperature step, on that step's probabilities.
+__device__ __forceinline__ int tail_list_filters(float* x, int* ids, int k, int n_keep, const SamplerParams& p,
+                                                 double* scr) {
     const int lane = (int) (threadIdx.x & 31);
     auto softmax_into = [&](int n) {
         float mx = x[0];
@@ -455,8 +458,12 @@ __device__ __forceinline__ int tail_list_filters(float* x, int k, int n_keep, co
                 cum += (float) scr[idx[i]];
                 if (cum > p.typical_p && (p.min_keep == 0 || i >= p.min_keep - 1)) { last = i + 1; break; }
             }
-            n_keep = last;
-            if (n_keep < p.min_keep) n_keep = p.min_keep < n_keep ? p.min_keep : n_keep;
+            bool kept[64] = {};
+            for (int i = 0; i < last; ++i) kept[idx[i]] = true;
+            int j = 0;                                     // the kept tokens, in their list order, to the front
+            for (int i = 0; i < n_keep; ++i)
+                if (kept[i]) { x[j] = x[i]; ids[j] = ids[i]; ++j; }
+            n_keep = j;
         }
         n_keep = __shfl_sync(kFullMask, n_keep, 0);
     }
@@ -552,7 +559,7 @@ __device__ void sampled_tail_warp(int* sel_ids, float* sel_logit, int k, const S
                                   int* __restrict__ out, double* ex, float* prob_out = nullptr,
                                   const int* query = nullptr, int nq = 0, float* qprob = nullptr) {
     const int lane = (int) (threadIdx.x & 31);
-    int n_keep = tail_list_filters(sel_logit, k, k, p, ex);
+    int n_keep = tail_list_filters(sel_logit, sel_ids, k, k, p, ex);
     if (p.top_p < 1.0f) {
         float mx = sel_logit[0];
         for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, sel_logit[i]);
@@ -584,10 +591,10 @@ __device__ void sampled_tail_warp(int* sel_ids, float* sel_logit, int k, const S
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    tail_temp_stage(sel_logit, n_keep, p, ex);          // koboldcpp's xtc reads the temperatures' probabilities
     n_keep = tail_xtc(sel_logit, sel_ids, n_keep, p, t, ex);
     if (p.top_ids != nullptr)
         for (int i = lane; i < p.n_top; i += 32) p.top_ids[(size_t) t * p.n_top + i] = i < n_keep ? sel_ids[i] : -1;
-    tail_temp_stage(sel_logit, n_keep, p, ex);
     // one Philox draw over the transformed survivors
     float smx = sel_logit[0];
     for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i]);
@@ -1150,7 +1157,7 @@ __device__ __forceinline__ void ordered_scan(const double* a, int n, At&& at) {
 /// `sampled_tail_warp` reads them), and warps 0 and 1 of the block call this.  The arithmetic is
 /// `sampled_tail_warp`'s, value for value: the same list filters, the same `exp` arguments, every ordered sum and
 /// cumulative scan in the same order (on lane 0 of warp 0), the same correctly rounded quotients.  Only where the
-/// work waits changes: warp 0 alone runs the list filters, top_p, min_p, xtc and the temperature stage (the
+/// work waits changes: warp 0 alone runs the list filters, top_p, min_p, the temperature stage and xtc (the
 /// transformed survivors land in ts.x), publishes n_keep in ts.nk, and warp 1 then runs the temperature pass's
 /// `exp`s and its ordered prefix sums over the survivors before the pick.
 __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p, int t, int* __restrict__ out,
@@ -1170,7 +1177,7 @@ __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p,
         tail_pair_sync();
         return;
     }
-    int n_keep = tail_list_filters(ts.x, k, k, p, ts.e1);
+    int n_keep = tail_list_filters(ts.x, ts.id, k, k, p, ts.e1);
     if (p.top_p < 1.0f) {
         float mx = ts.x[0];
         for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, ts.x[i]);
@@ -1197,10 +1204,10 @@ __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p,
         const int first = below ? __ffs(below) - 1 : k;
         if (first < n_keep) n_keep = first;
     }
+    tail_temp_stage(ts.x, n_keep, p, ts.e1);            // koboldcpp's xtc reads the temperature's probabilities
     n_keep = tail_xtc(ts.x, ts.id, n_keep, p, t, ts.e1);
     if (p.top_ids != nullptr)
         for (int i = lane; i < p.n_top; i += 32) p.top_ids[(size_t) t * p.n_top + i] = i < n_keep ? ts.id[i] : -1;
-    tail_temp_stage(ts.x, n_keep, p, ts.e1);
     ts.nk = n_keep;
     tail_pair_sync();                        // release warp 1: it computes e2/pre2 over the transformed survivors
     tail_pair_sync();                        // and re-joins us when they are written (both warps arrive twice)

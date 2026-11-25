@@ -1,14 +1,15 @@
 // include/basalt/kernels/sampler.hpp - the sampler chain, host-callable.
 //
-//     penalties -> top_k -> tfs -> typical -> top_a -> top_p -> min_p -> xtc -> temperature -> pick
+//     penalties -> top_k -> top_a -> tfs -> typical -> top_p -> min_p -> temperature -> xtc -> pick
 //
-// llama.cpp's default chain: ONE penalties stage, first, and temperature AFTER the truncation filters;
-// top_p cuts before min_p.  tfs, typical, top_a and xtc run where llama.cpp's do (after top_k, before the
-// temperature stage); xtc keeps the TAIL of the list (it drops top tokens, llama_sample_xtc_apply).  The
-// temperature stage is temperature, or koboldcpp's dynatemp + smoothing when their keys are set (the
-// temperature-0 greedy path never reaches the tail).  tfs/typical/top_a/xtc are list-scoped like
-// koboldcpp's: they run on the top_k survivors, so they need top_k <= 64 (the narrow path) and are
-// refused wider.  `src/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
+// koboldcpp's default chain (SampleLogits): ONE penalties stage, first; top_a, tfs and typical over the
+// top_k survivors; top_p cuts before min_p; the temperature stage; xtc last, reading that stage's
+// probabilities (llama_sample_xtc_apply: it drops the tokens at or above the threshold but the least likely
+// of them).  The temperature stage is temperature, or koboldcpp's dynatemp + smoothing when their keys are
+// set (the temperature-0 greedy path never reaches the tail).  tfs/typical/top_a/xtc are list-scoped
+// like koboldcpp's: they run on the top_k survivors, so they need top_k <= 64 (the narrow path) and are
+// refused wider.  `src/kernels/cuda/sampler.cu` has the details; `sampler_parity` pins the chain and
+// `tools/koboldcpp_sampler_reference.py` measures its distributions against koboldcpp's definitions.
 #pragma once
 
 #include <algorithm>
@@ -29,10 +30,12 @@ struct SamplerParams {
     float temperature = 1.0f;    // <= 0 means greedy
     int min_keep = 1;            // top_p keeps at least this many
     // The horde/koboldcpp truncation filters, list-scoped (the top_k survivors, in selection order).  All off
-    // at 0 (or typical at >= 1, tfs at >= 1).  xtc keeps the tail below xtc_thresh with chance xtc_prob
-    // (llama_sample_xtc_apply), its draw from a Philox stream tagged apart from the pick's.  typical needs
-    // the narrow path (k <= 64): it re-orders by |entropy-shifted score|, which the wide path does not do.
-    float tfs_z = 0.0f;          // tail-free sampling's z: cut where the normalized second-derivative mass passes 1-z
+    // at 0 (or typical at >= 1, tfs at >= 1).  xtc runs after the temperature stage, as in koboldcpp: with
+    // chance xtc_prob it drops the tokens whose probability is at least xtc_thresh but the least likely of
+    // them (llama_sample_xtc_apply), its draw from a Philox stream tagged apart from the pick's.  typical
+    // keeps the tokens nearest the list's entropy; they need the narrow path (k <= 64).
+    float tfs_z = 0.0f;          // tail-free sampling's z: cut where the normalized second-derivative mass passes z
+                                // (koboldcpp's default 1 is off; 0 too)
     float typical_p = 0.0f;      // locally typical: keep the smallest shifted-score set holding this much mass
     float top_a = 0.0f;          // keep p >= top_a * p_max^2
     float xtc_prob = 0.0f;       // chance of dropping the top tokens at/above xtc_thresh (0..0.5)
