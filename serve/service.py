@@ -27,6 +27,7 @@ from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQ
 from serve.api.grammar import grammar_spec, unenforced
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobChannels, entry as logprob_entry
 from serve.config import GRAMMAR_DEFAULT
+from serve.monitor import Monitor
 
 
 def meminfo_mib(field: str) -> int | None:
@@ -158,6 +159,7 @@ class Service:
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self.monitor = Monitor(self)
         self.live_lock = threading.Lock()               # one combined live line per LIVE_EVERY_S, whichever request is first
         self.live_at = 0.0
         # GPU sharing, all off by default: idle unload seconds, min free VRAM to load, a command run before loading

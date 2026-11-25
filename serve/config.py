@@ -638,6 +638,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="log one line per request and the raw model text after each reply")
     ap.add_argument("--request-lines", action="store_true",
                     help="echo the engine's per-request summary on stdout, for a supervisor that only sees this output")
+    ap.add_argument("--api-monitor", action="store_true",
+                    help="keep the last 100 requests' prompts, answers and CoT in memory for /api-monitor")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded; load on first request; a sidecar image encoder is dropped, --vision dynamic stays")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")
