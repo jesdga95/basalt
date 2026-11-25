@@ -87,6 +87,7 @@ Flow Request::restore() {
         slot_draft_out();
         solo_book = {std::move(runtime_.live), std::move(runtime_.live_imgs), runtime_.live_ok, runtime_.cvec_cached, std::move(runtime_.checks)};
         runtime_.solo_out = &solo_book;   // idle while this request works in its slot
+        slot_swapped = true;
         BSlot& sb = runtime_.bs[(size_t) slot_b];
         runtime_.live.clear();
         runtime_.live_imgs.clear();
@@ -107,6 +108,7 @@ Flow Request::restore() {
         sb.partial = false;
         sb.checks.clear();
         if (const Flow flow = slot_bind(); flow != Flow::proceed) return flow;
+        slot_bound = true;
     }
     if (!in_slot) runtime_.solo_draft_back(true);   // when a request in another slot ended before it gave them back
     runtime_.solo_busy = !in_slot;
