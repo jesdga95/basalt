@@ -568,6 +568,59 @@ void test_engram() {
         }
     }
     report("engram_apply (rows, one masked)", got, ref, 2e-6);
+    // GPU engram_norm_e4m3 vs host E4M3 LUT + sequential RMSNorm (bit-exact check).
+    {
+        const int RT = 67, NC = 16, W = 96;
+        std::vector<uint8_t> raw((size_t) RT * NC * W);
+        for (size_t i = 0; i < raw.size(); ++i) {
+            uint8_t b = (uint8_t) ((i * 73u + 19u) & 0xffu);
+            if ((b & 0x7fu) == 0x7fu) b = 0x7eu;   // avoid NaN codes
+            raw[i] = b;
+        }
+        std::vector<float> nrm = randn((size_t) NC * W, 0.7f), vld(RT, 1.f);
+        vld[0] = 0.f;
+        vld[17] = 0.f;
+        uint8_t* draw = nullptr;
+        cudaMalloc(&draw, raw.size());
+        cudaMemcpy(draw, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+        float *dnrm = dev(nrm), *dvld = dev(vld), *dout = devf((size_t) RT * NC * W);
+        engram_norm_e4m3(draw, dnrm, dvld, RT, NC, W, dout, nullptr);
+        const std::vector<float> gpu = host(dout, (size_t) RT * NC * W);
+        auto e4m3 = [](uint8_t b) -> float {
+            const int e = (b >> 3) & 15, m = b & 7;
+            if (e == 15 && m == 7) return NAN;
+            const float v = e ? std::ldexp(1.f + (float) m / 8.f, e - 7) : std::ldexp((float) m, -9);
+            return (b & 0x80) ? -v : v;
+        };
+        std::vector<float> cpu((size_t) RT * NC * W);
+        std::vector<double> cpu_d((size_t) RT * NC * W);
+        for (int t = 0; t < RT; ++t) {
+            for (int c = 0; c < NC; ++c) {
+                float ss = 0.f;
+                const size_t base = ((size_t) t * NC + c) * W;
+                for (int d = 0; d < W; ++d) {
+                    const float v = e4m3(raw[base + d]);
+                    cpu[base + d] = v;
+                    ss += v * v;
+                }
+                const float r = 1.0f / std::sqrt(ss / (float) W + 1.1920929e-07f);
+                for (int d = 0; d < W; ++d) {
+                    cpu[base + d] = cpu[base + d] * r * nrm[(size_t) c * W + d] * vld[t];
+                    cpu_d[base + d] = cpu[base + d];
+                }
+            }
+        }
+        int diff_bits = 0;
+        for (size_t i = 0; i < gpu.size(); ++i) {
+            uint32_t a_b = 0, b_b = 0;
+            std::memcpy(&a_b, &gpu[i], 4);
+            std::memcpy(&b_b, &cpu[i], 4);
+            if (a_b != b_b) ++diff_bits;
+        }
+        report("engram_norm_e4m3 vs host", gpu, cpu_d, 1e-6);
+        std::printf("%-30s %d diff bits (%s)\n", "engram_norm_e4m3 exact", diff_bits, diff_bits == 0 ? "bit-exact" : "within tol");
+        cudaFree(draw); cudaFree(dnrm); cudaFree(dvld); cudaFree(dout);
+    }
 }
 
 void test_indexer() {

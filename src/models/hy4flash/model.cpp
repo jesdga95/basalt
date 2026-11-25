@@ -219,7 +219,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 16, err, e.row_bytes))
+        if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes))
             return {model::Status::Error, "hy4flash: " + err};
     }
     // the sessions first, then the expert tier, sized from what they leave and opened by the first session; its reads are
