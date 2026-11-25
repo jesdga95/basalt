@@ -1020,7 +1020,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_mma_split_kernel(AttnArgs
             int hi = min(n, lo + span);
             const int tiles = (hi + kTile - 1) / kTile;
             int last = first + 1;
-            for (; last < end; ++last) {
+            for (; last < end && (last - first + 1) * kGroup <= MaxSlabs * kMmaRows; ++last) {
                 const int next = a.pos[last] + 1, next_hi = min(next, lo + span);
                 if (next < min_keys || next <= lo || span_of(next) != span || (next_hi + kTile - 1) / kTile != tiles) break;
                 hi = max(hi, next_hi);
