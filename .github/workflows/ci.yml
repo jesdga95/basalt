@@ -130,6 +130,7 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DWERROR="$WERROR"
+          -DBASALT_MODELS=all
           -DBUILD_TESTING=ON
           -DCMAKE_CUDA_ARCHITECTURES=${{ runner.arch == 'ARM64' && '121' || '120' }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache

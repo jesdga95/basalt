@@ -81,7 +81,7 @@ endif()
 # The `warnings` and `platform` targets, one file shared with the standalone `tools/vision` configuration.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/platform.cmake)
 
-# BASALT_MODELS: which models this build contains (all of them by default).
+# BASALT_MODELS: which models this build contains (required).
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/models.cmake)
 
 # The application manifest, for every program that names a file path in its command line. Windows decodes argv and
