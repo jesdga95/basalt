@@ -676,9 +676,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="on: a request may set tfs, typical, top_a, xtc, dynatemp and smoothing (they need top_k 1..64); "
                          "off (the default) such a request gets a 400. Command line only")
     ap.add_argument("--gbnf-grammar", choices=("on", "off"), default=None,
-                    help="on: /v1/completions and the KoboldCpp API enforce a request's `grammar` (GBNF text) or "
+                    help="on: a request on any generation API may hold its text to its own `grammar` (GBNF text) or "
                          "`grammar_schema` (a JSON schema); off (the default) such a request gets a 400. The chat APIs' "
-                         "grammar is --grammar's. Command line only")
+                         "grammar for tools and response formats is --grammar's either way. Command line only")
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "
                          "not allowed in a --config file")

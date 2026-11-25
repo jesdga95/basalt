@@ -115,7 +115,8 @@ class Service:
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.more_samplers = more_samplers            # --more-samplers on: requests may set the MORE_SAMPLERS keys
-        self.gbnf_grammar = gbnf_grammar              # --gbnf-grammar on and the engine has --grammar: raw grammars
+        # a request's own grammar needs --gbnf-grammar on and an engine started with --grammar
+        self.gbnf_grammar = bool(gbnf_grammar and grammar_engine)
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
         self.vram_cv = threading.Condition()            # guards the queued resize; new requests wait while one is queued

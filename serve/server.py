@@ -324,7 +324,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens,
-                  more_samplers=more_samplers, gbnf_grammar=gbnf_grammar and (a.mock_engine or has_grammar))
+                  more_samplers=more_samplers, gbnf_grammar=gbnf_grammar)
     svc.logs = logs
     svc.idle_unload_s = a.idle_unload or 0
     svc.idle_sleep_s = a.idle_sleep or 0

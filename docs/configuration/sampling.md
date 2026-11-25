@@ -118,10 +118,14 @@ while video is on) that this model takes video parts now (image input on, a mode
 `--more-samplers on`: without it, a request on any API that switches one on gets a 400 naming the flag. The values
 that switch nothing (`tfs` 1, `top_a` 0, `smoothing_factor` 0, `dynatemp_min` = `dynatemp_max`...) pass either way.
 
+With `--gbnf-grammar on` a request on any generation API may hold its text to a grammar of its own: `grammar` is
+GBNF (llama.cpp's syntax), `grammar_schema` a JSON schema. It takes the place of what the request's response format
+asks for, and a request cannot hold both tools and a grammar. Without the flag such a request gets a 400. The grammar
+of tool calls and of `response_format` on the chat APIs is `--grammar`'s.
+
 `POST /v1/completions` and the KoboldCpp API (`POST /api/v1/generate`, `POST /api/extra/generate/stream`) continue the
-prompt as plain text: no chat template, no thinking, no tool parsing. With `--gbnf-grammar on` a request there may
-hold its text to a grammar: `grammar` is GBNF (llama.cpp's syntax), `grammar_schema` a JSON schema; both are enforced
-from the first generated token. Without the flag such a request gets a 400. The chat APIs' grammar is `--grammar`'s.
+prompt as plain text: no chat template, no thinking, no tool parsing, so a grammar there is held from the first
+generated token.
 
 ## Thinking loops
 

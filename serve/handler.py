@@ -844,8 +844,8 @@ def make_handler(target: Service | Router):
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             req[BIAS_KEY] = checked_bias(req, self.svc.engine)     # a bad logit_bias is a 400 before streaming
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               req.get("response_format"))
+            req[GRAMMAR_KEY] = self._explicit_grammar(req, self.svc.grammar_for(
+                tools, req.get("tool_choice"), req.get("tools"), req.get("response_format")))
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
@@ -982,8 +982,11 @@ def make_handler(target: Service | Router):
                 self.svc.require_grammar(responses_api.text_format(req))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               responses_api.text_format(req))
+            try:
+                req[GRAMMAR_KEY] = self._explicit_grammar(req, self.svc.grammar_for(
+                    tools, req.get("tool_choice"), req.get("tools"), responses_api.text_format(req)))
+            except ValueError as e:
+                raise ResponsesError(str(e), "grammar") from None
             noted = self.svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool (bounded)
             fresh = sorted(set(skipped) - noted)
             if fresh:
@@ -1028,28 +1031,38 @@ def make_handler(target: Service | Router):
                                           "reasoning.encrypted_content" in include, rid=self.live.id)
             return ids, thinking, tools, max_new, asm, req, force
 
-        def _raw_grammar(self, req, sampling: dict) -> None:
-            """The raw APIs' `grammar` (GBNF text) or `grammar_schema` (a JSON schema) into the engine key of
-            `sampling`; nothing when the request has neither."""
+        def _request_grammar(self, req) -> dict | None:
+            """The request's own `grammar` (GBNF text) or `grammar_schema` (a JSON schema) as the engine's grammar
+            request, its `think` left to the caller; None when the request has neither. Every generation API takes
+            the two fields, with --gbnf-grammar on."""
             text, schema = req.get("grammar"), req.get("grammar_schema")
             if text is None and schema is None:
-                return
+                return None
             if not self.svc.gbnf_grammar:
                 raise ValueError("grammar, grammar_schema: start the server with --gbnf-grammar on")
             if text is not None:
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError("grammar: a GBNF string")
-                spec = {"kind": "gbnf", "bnf": text}
-            else:
-                if isinstance(schema, str):
-                    try:
-                        schema = json.loads(schema)
-                    except ValueError:
-                        raise ValueError("grammar_schema: a JSON object, or a string holding one") from None
-                if not isinstance(schema, dict):
-                    raise ValueError("grammar_schema: a JSON object, or a string holding one")
-                spec = {"kind": "json_schema", "schema": schema}
-            sampling[GRAMMAR_KEY] = dict(spec, think=False)      # held from the first generated token
+                return {"kind": "gbnf", "bnf": text}
+            if isinstance(schema, str):
+                try:
+                    schema = json.loads(schema)
+                except ValueError:
+                    raise ValueError("grammar_schema: a JSON object, or a string holding one") from None
+            if not isinstance(schema, dict):
+                raise ValueError("grammar_schema: a JSON object, or a string holding one")
+            return {"kind": "json_schema", "schema": schema}
+
+        def _explicit_grammar(self, req, own: dict | None) -> dict | None:
+            """A chat request's grammar for the engine: its own `grammar` / `grammar_schema` when it has one, in
+            place of what its response format asks for; else `own`, the grammar its tools and response format
+            ask for (Service.grammar_for). A request cannot hold tools and a grammar of its own."""
+            explicit = self._request_grammar(req)
+            if explicit is None:
+                return own
+            if isinstance(own, dict) and own.get("kind") == "tools":
+                raise ValueError("grammar, grammar_schema: a request cannot hold both tools and a grammar")
+            return explicit
 
         def _sampling_from_raw(self, req, kobold: bool) -> dict:
             """The raw APIs' sampling fields into the engine's sampling dict; checked_sampling validates it.
@@ -1118,7 +1131,9 @@ def make_handler(target: Service | Router):
             if stop is not None and not isinstance(stop, (str, list)):
                 raise ValueError("stop: a string or a list of strings")
             sampling = self._sampling_from_raw(req, kobold=False)
-            self._raw_grammar(req, sampling)
+            spec = self._request_grammar(req)
+            if spec is not None:
+                sampling[GRAMMAR_KEY] = dict(spec, think=False)      # held from the first generated token
             if stop is not None:
                 sampling["stop"] = stop
             req[BIAS_KEY] = checked_bias(req, self.svc.engine)
@@ -1200,7 +1215,9 @@ def make_handler(target: Service | Router):
                 raise ValueError("prompt: a string")
             max_new = int(req.get("max_length") or 0)
             sampling = self._sampling_from_raw(req, kobold=True)
-            self._raw_grammar(req, sampling)
+            spec = self._request_grammar(req)
+            if spec is not None:
+                sampling[GRAMMAR_KEY] = dict(spec, think=False)      # held from the first generated token
             stop = req.get("stop_sequence")
             if stop is not None and not isinstance(stop, list):
                 raise ValueError("stop_sequence: a list of strings")
@@ -1295,7 +1312,8 @@ def make_handler(target: Service | Router):
                 self.svc.require_grammar(response_format)
             except ValueError as e:
                 raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
+            req[GRAMMAR_KEY] = self._explicit_grammar(req, self.svc.grammar_for(
+                tools, req.get("tool_choice"), req.get("tools"), response_format))
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
             self.svc.require_more_samplers(req)              # likewise a sampler the server was not started for
