@@ -652,7 +652,8 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     const int up_rows = std::min(rows, kDecodeRows);
     // 3-4 rows read their inputs once for 4 outputs (they are 8 rows x 18 KB), 5+ rows once for 2 (twice the blocks, half
     // the dots and sums on each one's chain), a lone row keeps rank blocks
-    if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams, z), dim3(kDownWarps * 32), 0, s, a, rows);
+    if (rows >= 9) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams, z), dim3(kDownWarps * 32), 0, s, a, rows);
+    else if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<2, 8>, dim3((unsigned) a.rank / 2, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");

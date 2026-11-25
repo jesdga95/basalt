@@ -20,7 +20,7 @@ namespace basalt::spec {
 
 class SuffixDrafter {
 public:
-    static constexpr int WAYS = 4;
+    static constexpr int WAYS = 8;
     static constexpr int LONG_ORDER = 8;
 
     explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19);
@@ -32,6 +32,8 @@ public:
 
     /// Write up to `max_k` proposed next tokens to `out`; returns how many (0 = no match of at least min_match).
     int propose(int max_k, int32_t* out);
+    /// Propose next tokens as if `extra[0..extra_n)` were appended to the history, without mutating the index.
+    int propose_after(const int32_t* extra, size_t extra_n, int max_k, int32_t* out, int* match_out = nullptr) const;
 
     /// Length of the match behind the last proposal (0 if none).
     int last_match() const { return last_match_; }
@@ -44,6 +46,7 @@ private:
         uint8_t n = 0;
     };
     Slot* find_slot(std::vector<Slot>& table, uint64_t key, bool insert);
+    const Slot* find_slot_ro(const std::vector<Slot>& table, uint64_t key) const;
     static void push(Slot* s, size_t end);
     uint64_t key_at(size_t end) const;
     uint64_t long_key_at(size_t end) const;
