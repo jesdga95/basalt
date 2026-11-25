@@ -53,7 +53,7 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     float values[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
-    __syncthreads();
+    __syncwarp();
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
