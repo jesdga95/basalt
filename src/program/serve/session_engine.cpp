@@ -781,7 +781,11 @@ Flow SessionRequest::read_to(int64_t to) {
             pr.rows_after = to - end;
             pr.more = end < n - 1;
             const int64_t base = at;
-            pr.progress = [this, base](int k) { progress_line("PP", base + k); basalt::core::progress_beat(); };
+            pr.progress = [this, base](int k) {
+                runtime_.pp_reached = std::max(runtime_.pp_reached, base + k);
+                progress_line("PP", base + k);
+                basalt::core::progress_beat();
+            };
             pr.live = [this, base](int k) {
                 basalt::core::progress_beat();
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -791,7 +795,7 @@ Flow SessionRequest::read_to(int64_t to) {
             };
             pr.stop = [this] { return runtime_.halted(); };
             r = rt_.session().prefill_chunk(pr);
-            at = end;
+            if (!runtime_.halted()) at = end;
         }
         if (r.status == basalt::model::Status::Refused) {   // no room for this prompt: the engine serves on
             basalt::log::warn("basalt serve", "%s", r.message.c_str());
@@ -805,6 +809,7 @@ Flow SessionRequest::read_to(int64_t to) {
             return Flow::error;
         }
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
+        runtime_.pp_reached = std::max(runtime_.pp_reached, at);
         progress_line("PP", at);
     }
     if (part_checkpoint(to) &&

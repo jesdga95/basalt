@@ -17,6 +17,32 @@ void Request::report_expert_counts(const DoneCounts& dc) const {
                       100.0 * (double) dc.hits / (double) dc.lookups, (long long) dc.hits, (long long) dc.lookups, off);
 }
 
+bool Request::leave_in_slot() {
+    if (!slot_swapped && !slot_bound) return true;
+    bool ok = true;
+    if (slot_bound) {
+        slot_bound = false;
+        ok = slot_leave();
+    }
+    if (slot_swapped) {
+        slot_swapped = false;
+        runtime_.solo_out = nullptr;
+        runtime_.live = std::move(solo_book.live);
+        runtime_.live_imgs = std::move(solo_book.live_imgs);
+        runtime_.live_ok = solo_book.live_ok;
+        runtime_.cvec_cached = solo_book.cvec;
+        runtime_.checks = std::move(solo_book.checks);
+        if (solo_moved) {   // its cells went to this request (hold_slot)
+            runtime_.live.clear();
+            runtime_.live_imgs.clear();
+            runtime_.live_ok = false;
+            runtime_.checks.clear();
+        }
+        runtime_.solo_draft_back(!solo_moved);
+    }
+    return ok;
+}
+
 Flow Request::complete() {
     decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
     if (const Flow flow = complete_begin(); flow != Flow::proceed) return flow;
@@ -148,23 +174,10 @@ Flow Request::complete() {
         }
     }
     if (in_slot) {   // the solo session and its bookkeeping again
-        if (!slot_leave()) {
+        if (!leave_in_slot()) {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        runtime_.solo_out = nullptr;
-        runtime_.live = std::move(solo_book.live);
-        runtime_.live_imgs = std::move(solo_book.live_imgs);
-        runtime_.live_ok = solo_book.live_ok;
-        runtime_.cvec_cached = solo_book.cvec;
-        runtime_.checks = std::move(solo_book.checks);
-        if (solo_moved) {   // its cells went to this request (hold_slot)
-            runtime_.live.clear();
-            runtime_.live_imgs.clear();
-            runtime_.live_ok = false;
-            runtime_.checks.clear();
-        }
-        runtime_.solo_draft_back(!solo_moved);
     } else {
         runtime_.solo_idle_busy = runtime_.busy_now();
     }
