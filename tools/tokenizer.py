@@ -354,8 +354,9 @@ def extract_metadata(md: dict, out_dir) -> dict:
     }
     if tk.pre in PRE_PATTERNS:
         cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
-        cfg["pre_pattern_source"] = ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order"
-                                     % PRE_SOURCES[tk.pre])
+        cfg["pre_pattern_source"] = ("the checkpoint's tokenizer.json: SentencePiece-style BPE, a span between special tokens one piece"
+                                     if tk.pre in SENTENCEPIECE else
+                                     "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order" % PRE_SOURCES[tk.pre])
     else:
         cfg["pre_pattern"] = QWEN35_PATTERN
         cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
