@@ -10,7 +10,7 @@ namespace basalt::models::qwen4exp::cli {
 inline std::string kv_batch_refusal(const std::string& kv, int batch) {
     if (batch < 2 || kv == "int8" || kv == "fp16") return "";
     return "--kv " + kv + " does not run with " + std::to_string(batch) +
-           " slots (--batch, the server's parallel): batch windows need --kv int8, or use one slot";
+           " slots (--batch, the server's parallel): batch windows need --kv int8 or a resident --kv fp16, or use one slot";
 }
 
 }  // namespace basalt::models::qwen4exp::cli
