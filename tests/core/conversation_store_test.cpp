@@ -611,6 +611,81 @@ int main() {
             for (const auto& f : pool_left) basalt::platform::remove_file(dir3 + "/" + f.name);
         basalt::platform::remove_file(dir3);
     }
+    {
+        // Stale Match::index TOCTOU: erasing an earlier entry shifts indices in entries_.
+        // 1) A match on a surviving entry must still resolve to that entry (not its shifted neighbor).
+        // 2) A match on a dropped/superseded entry must miss cleanly without loading or deleting its shifted neighbor.
+        const std::string dir4 = dir + "-toctou";
+        std::string err;
+        ConversationStore st;
+        st.set_row_cells(4);
+        CHECK(st.open(dir4, id, 1ull << 30, err));
+        auto seq = [](int32_t base, size_t n) {
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = base + (int32_t) i;
+            return v;
+        };
+        const std::vector<int32_t> a = seq(10000, 500), b = seq(20000, 500), c = seq(30000, 500);
+        const SavedConversation sa = chat(a, {{200, Src::kRoot}, {500, Src::kTurnEnd}}),
+                                sb = chat(b, {{200, Src::kRoot}, {500, Src::kTurnEnd}}),
+                                sc = chat(c, {{200, Src::kRoot}, {500, Src::kTurnEnd}});
+        CHECK(st.put(SavedConversation(sa), 1ull << 30));
+        CHECK(st.put(SavedConversation(sb), 1ull << 30));
+        CHECK(st.put(SavedConversation(sc), 1ull << 30));
+        st.flush();
+
+        std::vector<int32_t> pa = a, pb = b;
+        pa.push_back(-1);
+        pb.push_back(-1);
+        const auto ma = st.best(pa.data(), pa.size(), {}, true);
+        const auto mb = st.best(pb.data(), pb.size(), {}, true);
+        CHECK(ma.tokens == 500 && mb.tokens == 500);
+
+        // Supersede A (drops entry 0, shifting B and C down by 1).
+        std::vector<int32_t> a2 = a;
+        for (int i = 0; i < 100; ++i) a2.push_back(90000 + i);
+        SavedConversation sa2 = chat(a2, {{200, Src::kRoot}, {500, Src::kTurnEnd}, {600, Src::kTurnEnd}});
+        CHECK(st.put(std::move(sa2), 1ull << 30));
+        st.flush();
+
+        // Surviving match B must load B (not C, which now sits at B's old index).
+        SavedConversation got_b;
+        CHECK(st.load_bytes(mb) > 0);
+        CHECK(st.load(mb, got_b, err));
+        CHECK(got_b.live.ids == b && same_state(got_b.live, sb.checkpoints[1]));
+
+        // Stale match A (superseded) must return false without loading B or deleting B from disk.
+        const size_t dropped_before = st.stats().dropped;
+        SavedConversation got_a;
+        CHECK(st.load_bytes(ma) == 0);
+        CHECK(!st.load(ma, got_a, err));
+        CHECK(st.stats().dropped == dropped_before);
+
+        // Also test mismatched-length neighbor: previously load() hit "no state at the match" and deleted neighbor.
+        const std::vector<int32_t> d = seq(40000, 520), e = seq(50000, 700);
+        const SavedConversation sd = chat(d, {{200, Src::kRoot}, {520, Src::kTurnEnd}}),
+                                se = chat(e, {{300, Src::kRoot}, {700, Src::kTurnEnd}});
+        CHECK(st.put(SavedConversation(sd), 1ull << 30));
+        CHECK(st.put(SavedConversation(se), 1ull << 30));
+        st.flush();
+        std::vector<int32_t> pd = d, pe = e;
+        pd.push_back(-1);
+        pe.push_back(-1);
+        const auto md = st.best(pd.data(), pd.size(), {}, true);
+        CHECK(md.tokens == 520);
+        std::vector<int32_t> d2 = d;
+        for (int i = 0; i < 80; ++i) d2.push_back(95000 + i);
+        CHECK(st.put(chat(d2, {{200, Src::kRoot}, {520, Src::kTurnEnd}, {600, Src::kTurnEnd}}), 1ull << 30));
+        st.flush();
+        const size_t dropped_before2 = st.stats().dropped;
+        SavedConversation got_d;
+        CHECK(!st.load(md, got_d, err));
+        CHECK(st.stats().dropped == dropped_before2);
+        const auto me = st.best(pe.data(), pe.size(), {}, true);
+        SavedConversation got_e;
+        CHECK(me.tokens == 700 && st.load(me, got_e, err) && got_e.live.ids == e);
+        remove_dir(dir4);
+    }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))
         for (const auto& f : left) basalt::platform::remove_file(dir + "/" + f.name);
