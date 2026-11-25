@@ -600,8 +600,8 @@ def make_handler(target: Service | Router):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 requested = req.get("model")
-                # llama.cpp's tokenizer routes name no model: the shown one's tokenizer, as /props describes it
-                self.svc = router.shown() if requested is None and path in ("/tokenize", "/detokenize") else \
+                # llama.cpp's tokenizer and template routes name no model: the shown one, as /props describes it
+                self.svc = router.shown() if requested is None and path in ("/tokenize", "/detokenize", "/apply-template") else \
                     router.service_for(requested)
                 if self.svc is None:
                     self._unknown_model(path, requested)
@@ -622,6 +622,8 @@ def make_handler(target: Service | Router):
                         self._tokenize(req)
                     elif path == "/detokenize":
                         self._detokenize(req)
+                    elif path == "/apply-template":
+                        self._apply_template(req)
                     else:
                         self._json(404, {"error": {"message": "not found"}})
             except EngineError as e:                         # the engine failed: not the request's fault
@@ -987,6 +989,14 @@ def make_handler(target: Service | Router):
             except (IndexError, KeyError):
                 raise ValueError("tokens: an id outside the model's vocabulary") from None
             self._json(200, {"content": text})
+
+        def _apply_template(self, req):
+            """llama.cpp's /apply-template: render the chat template for `messages` (and optional `tools`,
+            `reasoning_effort`, `chat_template_kwargs`, etc.) without generating or taking a slot."""
+            messages, tools, kw = openai_to_messages(req)
+            tools, _ = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)
+            prompt, _ = self.svc.render_text(messages, tools, self.svc.thinking_kwargs(kw))
+            self._json(200, {"prompt": prompt})
 
         def _count_tokens(self, req):
             """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
