@@ -71,6 +71,9 @@ public:
 
     size_t nodes() const { return nodes_; }
     bool valid() const { return exec_ != nullptr; }
+    /// The CUDA status of the call `begin`/`end` last failed in (cudaSuccess when none did); a failed `end` has released its
+    /// partial graph, so what it held is free again.
+    cudaError_t status() const { return status_; }
 
 private:
     void reset();
@@ -78,6 +81,7 @@ private:
     cudaGraphExec_t exec_ = nullptr;
     cudaEvent_t done_ = nullptr;
     size_t nodes_ = 0;
+    cudaError_t status_ = cudaSuccess;
 };
 
 /// Capture-once, replay-many, keyed by `(layer_type, n_tokens)`.

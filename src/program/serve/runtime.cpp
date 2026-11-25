@@ -121,6 +121,11 @@ bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey
 }
 
 int Runtime::shutdown() {
+    if (basalt::core::gpu_left_running().load()) {   // the teardown would wait for unconfirmed GPU work forever
+        basalt::log::error("basalt serve", "the GPU did not confirm earlier work: ending without the CUDA teardown");
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
     // the conversations this process holds go to the disk tier before it ends
     if (disk.enabled()) {
         const auto t0 = Clock::now();

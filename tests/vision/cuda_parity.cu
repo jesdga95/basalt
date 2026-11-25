@@ -36,7 +36,7 @@ using namespace basalt::vision;
 
 namespace {
 
-constexpr int E = 1152, H = 16, D = 72, DP = 80;
+constexpr int E = 1152, H = 16, D = 72, DP = 80;   // the 1152-wide towers
 int g_fail = 0;
 std::mt19937 rng(7);
 
@@ -102,65 +102,76 @@ double time_ms(F fn, int iters = 20) {
 __half to_half(float f) { return __float2half_rn(f); }
 
 void test_attention() {
-    std::printf("attention (fp16 q,k,v, 16 heads x 72, full, bf16 out)\n");
-    const float scale_log2 = (1.0f / std::sqrt((float) D)) * 1.4426950408889634f;
-    for (int n : {1, 5, 64, 100, 1000, 4096}) {
-        std::vector<__half> q((size_t) H * n * DP, to_half(0)), k = q, v = q;
-        std::vector<double> qd((size_t) H * n * D), kd = qd, vd = qd;
-        const std::vector<float> r = randn(3 * (size_t) H * n * D, 1.5f);
-        for (int h = 0; h < H; ++h)
-            for (int t = 0; t < n; ++t)
-                for (int d = 0; d < D; ++d) {
-                    const size_t s = ((size_t) h * n + t) * D + d, p = ((size_t) h * n + t) * DP + d;
-                    q[p] = to_half(r[s]); k[p] = to_half(r[(size_t) H * n * D + s]); v[p] = to_half(r[2 * (size_t) H * n * D + s]);
-                    qd[s] = __half2float(q[p]); kd[s] = __half2float(k[p]); vd[s] = __half2float(v[p]);
-                }
-        __half *dq = dev(q), *dk = dev(k), *dv = dev(v);
-        __nv_bfloat16* dout = dev_empty<__nv_bfloat16>((size_t) n * E);
-        launch_attention(dq, dk, dv, dout, n, scale_log2, 0);
-        CHECK(cudaDeviceSynchronize());
-        const auto o1 = host(dout, (size_t) n * E);
-        launch_attention(dq, dk, dv, dout, n, scale_log2, 0);
-        CHECK(cudaDeviceSynchronize());
-        const bool same = std::memcmp(o1.data(), host(dout, (size_t) n * E).data(), o1.size() * 2) == 0;
-        // host reference on a sample of rows (all rows up to 64, else 64 spread rows)
-        std::vector<double> got, ref;
-        const int rows = std::min(n, 64);
-        for (int ri = 0; ri < rows; ++ri) {
-            const int t = n <= 64 ? ri : (int) ((int64_t) ri * (n - 1) / (rows - 1));
-            for (int h = 0; h < H; ++h) {
-                std::vector<double> sc(n);
-                double mx = -1e300;
-                for (int u = 0; u < n; ++u) {
-                    double s = 0;
-                    for (int d = 0; d < D; ++d) s += qd[((size_t) h * n + t) * D + d] * kd[((size_t) h * n + u) * D + d];
-                    sc[u] = s / std::sqrt((double) D);
-                    mx = std::max(mx, sc[u]);
-                }
-                double sum = 0;
-                for (int u = 0; u < n; ++u) { sc[u] = std::exp(sc[u] - mx); sum += sc[u]; }
-                for (int d = 0; d < D; ++d) {
-                    double a = 0;
-                    for (int u = 0; u < n; ++u) a += sc[u] * vd[((size_t) h * n + u) * D + d];
-                    ref.push_back(a / sum);
-                    got.push_back(__bfloat162float(o1[(size_t) t * E + h * D + d]));
+    for (const int Dh : {72, 64}) {   // the 1152-wide towers' heads (padded to 80) and the class-token tower's
+        const int DPh = Dh == 72 ? 80 : 64, W = H * Dh;
+        std::printf("attention (fp16 q,k,v, 16 heads x %d, full, bf16 out)\n", Dh);
+        const float scale_log2 = (1.0f / std::sqrt((float) Dh)) * 1.4426950408889634f;
+        for (int n : {1, 5, 64, 100, 1000, 4096}) {
+            std::vector<__half> q((size_t) H * n * DPh, to_half(0)), k = q, v = q;
+            std::vector<double> qd((size_t) H * n * Dh), kd = qd, vd = qd;
+            const std::vector<float> r = randn(3 * (size_t) H * n * Dh, 1.5f);
+            for (int h = 0; h < H; ++h)
+                for (int t = 0; t < n; ++t)
+                    for (int d = 0; d < Dh; ++d) {
+                        const size_t s = ((size_t) h * n + t) * Dh + d, p = ((size_t) h * n + t) * DPh + d;
+                        q[p] = to_half(r[s]); k[p] = to_half(r[(size_t) H * n * Dh + s]); v[p] = to_half(r[2 * (size_t) H * n * Dh + s]);
+                        qd[s] = __half2float(q[p]); kd[s] = __half2float(k[p]); vd[s] = __half2float(v[p]);
+                    }
+            __half *dq = dev(q), *dk = dev(k), *dv = dev(v);
+            __nv_bfloat16* dout = dev_empty<__nv_bfloat16>((size_t) n * W);
+            launch_attention(dq, dk, dv, dout, n, 0, n, Dh, scale_log2, 0);
+            CHECK(cudaDeviceSynchronize());
+            const auto o1 = host(dout, (size_t) n * W);
+            launch_attention(dq, dk, dv, dout, n, 0, n, Dh, scale_log2, 0);
+            CHECK(cudaDeviceSynchronize());
+            bool same = std::memcmp(o1.data(), host(dout, (size_t) n * W).data(), o1.size() * 2) == 0;
+            // a range of the queries gives the rows the whole run gives
+            if (n >= 100) {
+                const int a = 37, b = n - 5;
+                launch_attention(dq, dk, dv, dout, n, a, b, Dh, scale_log2, 0);
+                CHECK(cudaDeviceSynchronize());
+                same = same && std::memcmp(&o1[(size_t) a * W], host(dout, (size_t) (b - a) * W).data(), (size_t) (b - a) * W * 2) == 0;
+            }
+            // host reference on a sample of rows (all rows up to 64, else 64 spread rows)
+            std::vector<double> got, ref;
+            const int rows = std::min(n, 64);
+            for (int ri = 0; ri < rows; ++ri) {
+                const int t = n <= 64 ? ri : (int) ((int64_t) ri * (n - 1) / (rows - 1));
+                for (int h = 0; h < H; ++h) {
+                    std::vector<double> sc(n);
+                    double mx = -1e300;
+                    for (int u = 0; u < n; ++u) {
+                        double s = 0;
+                        for (int d = 0; d < Dh; ++d) s += qd[((size_t) h * n + t) * Dh + d] * kd[((size_t) h * n + u) * Dh + d];
+                        sc[u] = s / std::sqrt((double) Dh);
+                        mx = std::max(mx, sc[u]);
+                    }
+                    double sum = 0;
+                    for (int u = 0; u < n; ++u) { sc[u] = std::exp(sc[u] - mx); sum += sc[u]; }
+                    for (int d = 0; d < Dh; ++d) {
+                        double acc = 0;
+                        for (int u = 0; u < n; ++u) acc += sc[u] * vd[((size_t) h * n + u) * Dh + d];
+                        ref.push_back(acc / sum);
+                        got.push_back(__bfloat162float(o1[(size_t) t * W + h * Dh + d]));
+                    }
                 }
             }
+            char name[64];
+            std::snprintf(name, sizeof name, "n=%d%s", n, same ? "" : " (not repeatable)");
+            verdict(name, rel_l2(got, ref), 4e-3);
+            if (!same) ++g_fail;
+            cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
         }
-        char name[64];
-        std::snprintf(name, sizeof name, "n=%d%s", n, same ? "" : " (not repeatable)");
-        verdict(name, rel_l2(got, ref), 4e-3);
-        if (!same) ++g_fail;
-        cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
-    }
-    for (int n : {1024, 4096, 16384}) {
-        std::vector<__half> z((size_t) H * n * DP, to_half(0.5f));
-        __half *dq = dev(z), *dk = dev(z), *dv = dev(z);
-        __nv_bfloat16* dout = dev_empty<__nv_bfloat16>((size_t) n * E);
-        const double ms = time_ms([&] { launch_attention(dq, dk, dv, dout, n, scale_log2, 0); }, 5);
-        const double flops = 4.0 * n * (double) n * D * H;
-        std::printf("  bench attention n=%-6d %9.1f us/call  %6.1f TFLOP/s (16 heads x 72)\n", n, ms * 1e3, flops / (ms * 1e-3) / 1e12);
-        cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
+        for (int n : {1024, 4096, 16384}) {
+            std::vector<__half> z((size_t) H * n * DPh, to_half(0.5f));
+            __half *dq = dev(z), *dk = dev(z), *dv = dev(z);
+            __nv_bfloat16* dout = dev_empty<__nv_bfloat16>((size_t) n * W);
+            const double ms = time_ms([&] { launch_attention(dq, dk, dv, dout, n, 0, n, Dh, scale_log2, 0); }, 5);
+            const double flops = 4.0 * n * (double) n * Dh * H;
+            std::printf("  bench attention n=%-6d %9.1f us/call  %6.1f TFLOP/s (16 heads x %d)\n", n, ms * 1e3,
+                        flops / (ms * 1e-3) / 1e12, Dh);
+            cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
+        }
     }
 }
 
@@ -171,7 +182,7 @@ void test_layernorm() {
     for (auto& v : w) v += 1.f;
     float *dx = dev(x), *dw = dev(w), *db = dev(b);
     __nv_bfloat16* dy = dev_empty<__nv_bfloat16>((size_t) n * E);
-    launch_layernorm(dx, dw, db, dy, n, 1e-6f, 0);
+    launch_layernorm(dx, dw, db, dy, n, E, 1e-6f, 0);
     CHECK(cudaDeviceSynchronize());
     const auto y = host(dy, (size_t) n * E);
     std::vector<double> got, ref;
@@ -189,7 +200,7 @@ void test_layernorm() {
     verdict("37 rows", rel_l2(got, ref), 4e-3);
     // a row alone gives the same bits as inside the batch
     __nv_bfloat16* d1 = dev_empty<__nv_bfloat16>(E);
-    launch_layernorm(dx + (size_t) 20 * E, dw, db, d1, 1, 1e-6f, 0);
+    launch_layernorm(dx + (size_t) 20 * E, dw, db, d1, 1, E, 1e-6f, 0);
     CHECK(cudaDeviceSynchronize());
     const bool same = std::memcmp(host(d1, E).data(), &y[(size_t) 20 * E], E * 2) == 0;
     std::printf("  row 20 alone equals row 20 in the batch: %s\n", same ? "yes" : "NO");
@@ -198,7 +209,7 @@ void test_layernorm() {
     std::vector<float> xb((size_t) big * E, 1.f);
     float* dxb = dev(xb);
     __nv_bfloat16* dyb = dev_empty<__nv_bfloat16>((size_t) big * E);
-    const double ms = time_ms([&] { launch_layernorm(dxb, dw, db, dyb, big, 1e-6f, 0); });
+    const double ms = time_ms([&] { launch_layernorm(dxb, dw, db, dyb, big, E, 1e-6f, 0); });
     const double gb = (double) big * E * (4 + 2) / 1e9;
     std::printf("  bench layernorm n=%d %9.1f us/call  %6.0f GB/s\n", big, ms * 1e3, gb / (ms * 1e-3));
     cudaFree(dxb); cudaFree(dyb); cudaFree(d1); cudaFree(dy); cudaFree(dx); cudaFree(dw); cudaFree(db);

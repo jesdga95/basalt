@@ -49,11 +49,17 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     // one launch, the same bits
     const bool fused_pre = st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
                            qsa_dec_fused_supported(s);
+    // --kv q4_0 in the same prelude: the rotation and the Q4_0 pack live in that launch, so the layer stops paying
+    // the per-token norm/rope, two FWHT launches, T appends and T indexer appends. Mode 0 only; a streamed q4_0
+    // cache keeps the per-token path, which writes the host copy.
+    const bool fused_q4 = !fused_pre && st.kv_q4 && st.kv_rot && st.kv_mode == 0 && st.host.k_q4 == nullptr &&
+                          qsa_dec_fused_supported(s);
     auto kv_post_args = [&] {
         QsaDecKvPost kp;
         kp.kcur = v_.kcur_; kp.vcur = v_.vcur_; kp.pos_k = pos_k;
         kp.k_norm = (const float*) wkn->data; kp.steps = v_.step_;
         kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
+        if (st.kv_q4) { kp.k_q4 = st.k_q4; kp.v_q4 = st.v_q4; }
         kp.page_table = st.page_table; kp.host = st.host;
         kp.idx_raw = idx_raw; kp.idx_k_norm = (const float*) wikn->data;
         kp.tail = st.idx_tail; kp.dead = st.idx_dead; kp.pooled = st.idx_pooled; kp.block_pos = st.idx_block_pos;
@@ -72,11 +78,12 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         qp.q_full = v_.qfull_; qp.qcur = v_.qcur_; qp.pos_q = v_.pos_;
         qp.q_norm = (const float*) wqn->data; qp.q_idx = v_.qidx_; qp.pos_i = pos_i;
         qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
+        qp.rot = fused_q4;   // q4_0 stores rotated keys, so the query rotates with them
         return qp;
     };
     // K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
     // multi-row GEMV is the one-row one)
-    const bool qsaf_wide = fused_pre && (qb || n == 1) && v_.qs_[0] != nullptr;
+    const bool qsaf_wide = ((fused_pre && (qb || n == 1)) || fused_q4) && v_.qs_[0] != nullptr;
     // the query projection's query rows first; its gate rows, which only the merge reads, beside the selection and the
     // attention chunks
     const bool qhalf = qsaf_wide && !v_.batch_rec_ && N == 2560 &&
@@ -159,9 +166,10 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         dense_proj(32, wk->native_type, wk->native_data, v_.xq_, v_.kcur_, (int) N, (int) (NKV * HD), n, cs);
         dense_proj(32, wv->native_type, wv->native_data, v_.xq_, v_.vcur_, (int) N, (int) (NKV * HD), n, cs);
     }
-    if (fused_pre) {
+    if (fused_pre || fused_q4) {
         kv_post(kv_post_args(), cs);
         stamp(l, 8);
+        stamp(l, 9);
     } else {
         if (qb) norm_rope(v_.kcur_, wkn, (int) (n * NKV), (int) HD, pos_k);
         else for (int t = 0; t < T; ++t) norm_rope(v_.kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, v_.pos_ + t * NH);
@@ -202,12 +210,12 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         PdlScope pq(pdl2 && fused_pre && qb);   // PDL2: after the K/V post kernel
         dense_proj(8, wq->native_type, wq->native_data, v_.xq_, v_.qfull_, (int) N,
                    (int) (NH * 2 * HD), n, cs);
-        if (fused_pre && qb)
+        if ((fused_pre || fused_q4) && (qb || fused_q4))
             bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) wiq->data, v_.qidx_,
                                       IQ * ID, N, IQ * ID, n, cs);
     }
-    if (fused_pre) {   // the query split, norms and RoPEs in one launch
-        if (qb) {}   // the indexer query projection ran above
+    if (fused_pre || fused_q4) {   // the query split, norms, RoPEs (and the rotation, for q4_0) in one launch
+        if (qb || fused_q4) {}   // the indexer query projection ran above
         else for (int t = 0; t < T; ++t)
             bf16_gemv_fp32_mmvf(v_.mixed_ + t * N, (const uint16_t*) wiq->data, v_.qidx_ + t * IQ * ID, (int) N,
                                 (int) (IQ * ID), cs);
@@ -242,7 +250,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     }
     }
     stamp(l, 10);
-    bool fused_gate = false;
+    bool gated_merge = false;   // the fused chunks and their merge both run, and the merge applies the gate
+    bool chunk_attn = false;    // the fused chunks run (the gate, if any, is the caller's)
     bool attn_q8 = false;   // the merge wrote the q8_1 rows
     if (v_.batch_rec_) {   // each row selects and attends over its own slot's K/V, from the layer's table
         qsa_block_scores_seg(seg_tab, v_.qidx_, v_.step_, n, v_.max_blocks_, s, v_.scores_, cs, true);
@@ -251,7 +260,6 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         // KV streaming: each streamed slot's selections resident in its own pool (device-side, in the graph)
         if (v_.batch_stream_) kv_stream_resolve_seg(seg_tab, v_.sel_, v_.step_, v_.cap_, s, cs);
         stamp(l, 12);
-        fused_gate = true;
         attn_q8 = true;
         qsa_dec_attn_seg(v_.qcur_, seg_tab, true, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs, v_.qfull_,
                          v_.attn32_, v_.xq_);
@@ -271,23 +279,26 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     qsa_kv_resolve(st, *v_.g_, v_.sel_, v_.step_, n, v_.cap_, cs);
     stamp(l, 12);
     const QsaAttnPools pools = qsa_attn_pools(st);
-    // staged chunks and the gate in the merge, the same bits
-    fused_gate = !st.kv_rot && !st.kv_hybrid &&
-                 qsa_dec_attn_supported(pools, s);
-    attn_q8 = fused_gate && !st.kv_rot && !st.kv_hybrid;
+    // staged chunks and the gate in the merge, the same bits. A `--kv q4_0` cache has rotated keys, so its merge
+    // cannot gate: the merge reads the attention output in the rotated domain, and the gate is a function of the
+    // un-rotated one. It takes the same chunks and the caller gates after the rotation.
+    gated_merge = !st.kv_rot && !st.kv_hybrid && qsa_dec_attn_supported(pools, s);
+    chunk_attn = gated_merge || (fused_q4 && qsa_dec_attn_supported(pools, s));
+    attn_q8 = gated_merge;
     PdlScope pa(pdl);   // the chunks after the top-k, the merge after them
-    if (fused_gate)
+    if (chunk_attn)
         qsa_dec_attn(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_, s,
                      v_.attn_scratch_, v_.attn_, n, cs,
-                     v_.qfull_, v_.attn32_, attn_q8 ? v_.xq_ : nullptr, qhalf ? (void*) v_.qev_[1] : nullptr);
+                     gated_merge ? v_.qfull_ : nullptr, gated_merge ? v_.attn32_ : nullptr,
+                     attn_q8 ? v_.xq_ : nullptr, qhalf ? (void*) v_.qev_[1] : nullptr);
     else
     qsa_decode_attn_batch(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_,
                           s, v_.attn_scratch_, v_.attn_, n, cs);
     }
     stamp(l, 13);
     if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(v_.attn_, (int64_t) n * NH, cs);   // back: H^-1 = H
-    if (qhalf && !fused_gate) cudaStreamWaitEvent(cs, v_.qev_[1], 0);
-    if (fused_gate) {}   // the merge wrote attn32_
+    if (qhalf && !chunk_attn) cudaStreamWaitEvent(cs, v_.qev_[1], 0);
+    if (gated_merge) {}   // the merge wrote attn32_
     else if (qb) native_qsa_gate_apply(v_.attn_, v_.qfull_, v_.attn32_,
                                   (int) (n * NH), (int) HD, cs);
     else

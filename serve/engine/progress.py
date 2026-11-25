@@ -1,6 +1,7 @@
 """Engine start narration from its log: load bars, warnings, errors and start-failure hints."""
 from __future__ import annotations
 
+import math
 import os
 import re
 import sys
@@ -56,9 +57,13 @@ def start_last_line(log: str | None, offset: int) -> str:
 
 class LoadBars:
     """The load's progress bar: one row, "loading model weights", over every byte the engine placed (a card, a second
-    card, RAM) against the total it announced; the n-gram table lock is its own row, outside the total. finish()
-    collapses the bars into one result line. Off a terminal the rows print as text once per heartbeat, only while
-    their bytes move.
+    card, RAM) against the total it announced, labelled on a terminal with where the engine places now and that
+    destination's own part so far: each card's share in turn ("loading model weights: cuda0 3.1/12.5", then "cuda1"
+    ...), then "ram", the label padded to the longest so the bar stays put; the n-gram table lock is its own row,
+    outside the total. finish() collapses the bars into one result line that splits the total by destination, as the
+    engine's plan does (`basalt load: share`). Off a terminal the rows print as text once per heartbeat, only while
+    their bytes move, without a destination: a sample of the whole load is not any destination's part. Each
+    destination instead prints one line when its last byte lands, with its exact total.
 
     A row's MB/s comes from the times its byte counts were read: over the latest window while it moves, over its
     whole stretch of movement once it is complete, and none while it stands still unfinished. A row stands still only
@@ -82,6 +87,9 @@ class LoadBars:
         self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number
         self.tty = self.out.isatty()
         self.total = 0                                 # announced total bytes (0: none)
+        self.into = ""                                 # where the engine places now: `cuda<N>`, `ram` or none
+        self.into_pad = 0                              # the longest stage: the label's width
+        self.shares: dict[str, dict] = {}              # destination -> {done, total, reported}: the plan's split
         self.rows: dict[str, dict] = {}                # target -> {have, plan, start, moves, phase, moved, cadence}
         self._beat_seen: dict[str, int] = {}           # bytes each row showed at the previous busy heartbeat
         self._beat_t: float | None = None              # when the previous busy heartbeat fired
@@ -96,6 +104,72 @@ class LoadBars:
         if target.startswith("cuda") and target[4:].isdigit() and int(target[4:]) < len(self.gpus):
             return f"cuda{self.gpus[int(target[4:])]}"
         return target
+
+    @staticmethod
+    def _part(done: int, total: int) -> str:
+        return f"{done / 2**30:.1f}/{total / 2**30:.1f}"
+
+    def label(self, target: str, staged: bool = True) -> str:
+        """A row's name: the weights' row says where the engine places now and that destination's own part so far
+        (`staged`, on a terminal), as v0.4.1's stages read."""
+        name = self.LABELS.get(target, target)
+        if target != self.WEIGHTS or not self.into or not staged:
+            return name
+        head = f"{name}: {self.key(self.into).ljust(self.into_pad)}"
+        if not self.shares:
+            return head
+        width = max(len(self._part(sh["total"], sh["total"])) for sh in self.shares.values())
+        sh = self.shares.get(self.into)
+        return f"{head} {(self._part(sh['done'], sh['total']) if sh else '').rjust(width)}"
+
+    def set_share(self, target: str, done: int, total: int) -> None:
+        """`done` of `total` bytes of the engine's plan land in `target` (`basalt load: share`): the label's part on a
+        terminal; off one, a line once its last byte lands."""
+        with self.lock:
+            if self.t0 is None:
+                self.t0 = time.time()
+            sh = self.shares.setdefault(target, {"done": 0, "total": total, "reported": False})
+            sh["total"] = total
+            sh["done"] = min(done, total)
+            self.into_pad = max(self.into_pad, len(self.key(target)))
+            if total > 0 and sh["done"] >= total and not sh["reported"]:
+                sh["reported"] = True
+                if not self.tty:
+                    self.say(tagged("placed", f"{self.key(target)} {total / 2**30:.1f}GiB {time.time() - self.t0:.1f}s"))
+            if self.tty and self.drawn and target == self.into:
+                self._erase()
+                self._draw()
+
+    def split(self, done: int) -> str:
+        """The plan's split of `done` bytes by destination: `cuda0=12.5GiB ram=64.3GiB`, each part rounded to a
+        tenth so the parts add up to the total as printed; "" when the engine announced none."""
+        parts = [(t, sh["total"]) for t, sh in self.shares.items()]
+        if not parts:
+            return ""
+        tenths = [b / 2**30 * 10 for _, b in parts]
+        units = [math.floor(x) for x in tenths]
+        if sum(b for _, b in parts) == done:          # largest remainders take the tenths the floors left
+            left = round(done / 2**30 * 10) - sum(units)
+            for i in sorted(range(len(parts)), key=lambda i: units[i] - tenths[i])[:max(0, left)]:
+                units[i] += 1
+        else:                                          # a miscounted start: each part as it is
+            units = [round(x) for x in tenths]
+        return " ".join(f"{self.key(t)}={u / 10:.1f}GiB" for (t, _), u in zip(parts, units))
+
+    def set_stages(self, targets: list[str]) -> None:
+        """Where the engine will place, in order (`basalt load: stages <target>...`): the label is as wide as the longest."""
+        with self.lock:
+            self.into_pad = max([self.into_pad] + [len(self.key(t)) for t in targets])
+
+    def set_into(self, target: str) -> None:
+        """The engine places into `target` from now on (`basalt load: into <target>`): the weights' row takes it as its
+        label on a terminal. Off one nothing prints: the destination's own line comes when its last byte lands."""
+        with self.lock:
+            self.into = target
+            self.into_pad = max(self.into_pad, len(self.key(target)))
+            if self.tty and self.drawn:
+                self._erase()
+                self._draw()
 
     def _row(self, target: str) -> dict:
         # moves: (time, bytes) read while moving, the window the rate covers; phase: where the row's current stretch
@@ -187,7 +261,7 @@ class LoadBars:
             rate = self._rate(t, now)
             if not rate and beat is not None:
                 rate = self._beat_rate(have, now, (beat[0], beat[1].get(target, have)))
-            rows.append((target, f"[server] {self.LABELS.get(target, target)}", have, plan, rate))
+            rows.append((target, f"[server] {self.label(target, self.tty)}", have, plan, rate))
         pad = max((len(r[1]) for r in rows), default=0)
         out = []
         for target, label, have, plan, rate in rows:
@@ -315,6 +389,8 @@ class LoadBars:
             if target == self.WEIGHTS:
                 self.total = total                    # the engine's latest announcement
             self._sample(t, before, time.monotonic())
+            if target == self.TABLE and not self.tty and total > 0 and done >= total and before < total:
+                self.say(tagged("placed", f"n-gram table {total / 2**30:.1f}GiB {time.time() - self.t0:.1f}s"))
             self._erase()
             self._draw()
 
@@ -325,11 +401,14 @@ class LoadBars:
             done = self.done()
             want = self.total or self.rows.get(self.WEIGHTS, {}).get("plan", 0)
             if done > 0 and done >= want:                  # a failed start is reported elsewhere
-                self.out.write(tagged("loaded", f"{done / 2**30:.1f}GiB {time.time() - self.t0:.1f}s") + "\n")
+                split = self.split(done)
+                self.out.write(tagged("loaded", f"{done / 2**30:.1f}GiB {time.time() - self.t0:.1f}s"
+                                                + (f"  {split}" if split else "")) + "\n")
             for line in self.kv_lines():
                 self.out.write(line + "\n")
             self.kv.clear()
             self.rows.clear()
+            self.shares.clear()
             self.out.flush()
 
 
@@ -373,6 +452,34 @@ def load_kv(line: str):
 def load_planning(line: str) -> bool:
     """Whether an engine line is `basalt load: planning`: the start is deciding where everything goes."""
     return line.split() == ["basalt", "load:", "planning"]
+
+
+_STAGE = re.compile(r"ram|cuda\d+")
+
+
+def load_stages(line: str):
+    """The targets of an engine `basalt load: stages <target>...` line, in order, else None."""
+    parts = line.split()
+    if len(parts) >= 4 and parts[:3] == ["basalt", "load:", "stages"] and all(_STAGE.fullmatch(t) for t in parts[3:]):
+        return parts[3:]
+    return None
+
+
+def load_share(line: str):
+    """(target, done, total) from an engine `basalt load: share <target> <done> <total>` line, else None."""
+    parts = line.split()
+    if (len(parts) == 6 and parts[:3] == ["basalt", "load:", "share"] and _STAGE.fullmatch(parts[3])
+            and parts[4].isdigit() and parts[5].isdigit()):
+        return parts[3], int(parts[4]), int(parts[5])
+    return None
+
+
+def load_into(line: str):
+    """Where the engine places now from a `basalt load: into <target>` line (`cuda<N>` or `ram`), else None."""
+    parts = line.split()
+    if len(parts) == 4 and parts[:3] == ["basalt", "load:", "into"] and _STAGE.fullmatch(parts[3]):
+        return parts[3]
+    return None
 
 
 def load_total(line: str):
@@ -440,6 +547,12 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                 if load_planning(line):
                     bars.say("[server] planning weight allocation")
                     last = time.time()
+                elif (stages := load_stages(line)) is not None:
+                    bars.set_stages(stages)
+                elif (into := load_into(line)) is not None:
+                    bars.set_into(into)
+                elif (share := load_share(line)) is not None:
+                    bars.set_share(*share)
                 elif (n := load_total(line)) is not None:
                     bars.set_total(n)
                     last = time.time()

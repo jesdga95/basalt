@@ -628,22 +628,183 @@ Vocab::Vocab(std::vector<std::string> bytes, std::vector<int32_t> end_ids)
 
 // --------------------------------------------------------------------------------------------- state
 
+// Static upper bound on the byte length of any match of an unanchored ECMAScript regex.
+// Returns 0 (unbounded) for anchors, word boundaries, lookarounds, backreferences, open-ended quantifiers, or
+// anything exceeding kMaxBound, so the caller falls back to scanning the full tail.
+static size_t pattern_max_match_bytes(std::string_view p) {
+    constexpr size_t kMaxBound = 4096;
+    struct Parser {
+        std::string_view s;
+        size_t i = 0;
+
+        bool disj(size_t& out) {
+            size_t best = 0;
+            for (;;) {
+                size_t cur = 0;
+                if (!alt(cur)) return false;
+                best = (std::max)(best, cur);
+                if (i < s.size() && s[i] == '|') { ++i; continue; }
+                break;
+            }
+            out = best;
+            return true;
+        }
+
+        bool alt(size_t& out) {
+            size_t total = 0;
+            while (i < s.size() && s[i] != '|' && s[i] != ')') {
+                size_t atom_len = 0;
+                if (!atom(atom_len)) return false;
+                if (!quant(atom_len)) return false;
+                if (atom_len > kMaxBound - total) return false;
+                total += atom_len;
+            }
+            out = total;
+            return true;
+        }
+
+        bool atom(size_t& out) {
+            const char c = s[i++];
+            if (c == '^' || c == '$' || c == '*' || c == '+' || c == '?' || c == '{') return false;
+            if (c == '.') { out = 1; return true; }
+            if (c == '\\') {
+                if (i >= s.size()) return false;
+                const char e = s[i++];
+                if (e == 'b' || e == 'B' || e == 'k' || (e >= '1' && e <= '9')) return false;
+                if (e == '0') {
+                    if (i < s.size() && s[i] >= '0' && s[i] <= '9') return false;
+                    out = 1;
+                    return true;
+                }
+                if (e == 'x') {
+                    if (i + 2 > s.size()) return false;
+                    for (int k = 0; k < 2; ++k) {
+                        const char h = s[i++];
+                        const bool hex = (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
+                        if (!hex) return false;
+                    }
+                    out = 1;
+                    return true;
+                }
+                if (e == 'u') {
+                    if (i + 4 > s.size()) return false;
+                    for (int k = 0; k < 4; ++k) {
+                        const char h = s[i++];
+                        const bool hex = (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
+                        if (!hex) return false;
+                    }
+                    out = 1;
+                    return true;
+                }
+                if (e == 'c') {
+                    if (i >= s.size()) return false;
+                    const char ch = s[i++];
+                    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) return false;
+                    out = 1;
+                    return true;
+                }
+                out = 1;
+                return true;
+            }
+            if (c == '[') {
+                if (i < s.size() && s[i] == '^') ++i;
+                while (i < s.size() && s[i] != ']') {
+                    if (s[i] == '\\') {
+                        if (i + 1 >= s.size()) return false;
+                        i += 2;
+                        continue;
+                    }
+                    if (s[i] == '[' && i + 1 < s.size() && (s[i + 1] == ':' || s[i + 1] == '.' || s[i + 1] == '='))
+                        return false;
+                    ++i;
+                }
+                if (i >= s.size()) return false;
+                ++i;
+                out = 1;
+                return true;
+            }
+            if (c == '(') {
+                if (i < s.size() && s[i] == '?') {
+                    if (i + 1 >= s.size() || s[i + 1] != ':') return false;
+                    i += 2;
+                }
+                if (!disj(out)) return false;
+                if (i >= s.size() || s[i] != ')') return false;
+                ++i;
+                return true;
+            }
+            out = 1;
+            return true;
+        }
+
+        bool parse_uint(size_t& v) {
+            if (i >= s.size() || s[i] < '0' || s[i] > '9') return false;
+            size_t n = 0;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+                const size_t d = (size_t) (s[i++] - '0');
+                if (n > (kMaxBound - d) / 10) return false;
+                n = n * 10 + d;
+            }
+            v = n;
+            return true;
+        }
+
+        bool quant(size_t& len) {
+            if (i >= s.size()) return true;
+            const char q = s[i];
+            if (q == '*' || q == '+') return false;
+            if (q == '?') {
+                ++i;
+                if (i < s.size() && s[i] == '?') ++i;
+            } else if (q == '{') {
+                ++i;
+                size_t lo = 0, hi = 0;
+                if (!parse_uint(lo)) return false;
+                hi = lo;
+                if (i < s.size() && s[i] == ',') {
+                    ++i;
+                    if (i >= s.size() || s[i] == '}') return false;
+                    if (!parse_uint(hi) || hi < lo) return false;
+                }
+                if (i >= s.size() || s[i] != '}') return false;
+                ++i;
+                if (i < s.size() && s[i] == '?') ++i;
+                if (hi > 0 && len > kMaxBound / hi) return false;
+                len *= hi;
+            } else {
+                return true;
+            }
+            if (i < s.size() && (s[i] == '*' || s[i] == '+' || s[i] == '?' || s[i] == '{')) return false;
+            return true;
+        }
+    };
+    Parser parser{p, 0};
+    size_t bound = 0;
+    if (!parser.disj(bound) || parser.i != p.size()) return 0;
+    return bound;
+}
+
 struct GrammarState::PatternSet {
     std::vector<std::regex> re;
     std::vector<std::string> src;
+    std::vector<size_t> max_bytes;   ///< 0: unbounded; else any match has length <= max_bytes[i]
+    bool all_bounded = true;
+    size_t max_keep = 0;             ///< max(max_bytes[i] - 1) across bounded patterns
 
     // Where the grammar starts in `input` for pattern i: the first non-empty capture group, else the match itself.
-    size_t find(size_t i, const std::string& input) const {
-        auto start_of = [](const std::smatch& m) {
+    size_t find(size_t i, const std::string& input, size_t lo) const {
+        auto start_of = [lo](const std::smatch& m) {
             for (size_t g = 1; g < m.size(); ++g) {
-                if (m.length(g) > 0) return (size_t) m.position(g);
+                if (m.length(g) > 0) return lo + (size_t) m.position(g);
             }
-            return (size_t) m.position(0);
+            return lo + (size_t) m.position(0);
         };
         const std::string& p = src[i];
         std::smatch m;
-        if (!p.empty() && p.front() == '^' && p.back() == '$' && std::regex_match(input, m, re[i])) return start_of(m);
-        if (std::regex_search(input, m, re[i])) return start_of(m);
+        if (lo == 0 && !p.empty() && p.front() == '^' && p.back() == '$' && std::regex_match(input, m, re[i]))
+            return start_of(m);
+        if (std::regex_search(input.cbegin() + (std::ptrdiff_t) lo, input.cend(), m, re[i]))
+            return start_of(m);
         return std::string::npos;
     }
 };
@@ -672,10 +833,31 @@ GrammarState::GrammarState(std::shared_ptr<const Grammar> g, Triggers triggers)
         for (const std::string& p : triggers_.patterns) {
             set->re.emplace_back(p);
             set->src.push_back(p);
+            const size_t mb = pattern_max_match_bytes(p);
+            set->max_bytes.push_back(mb);
+            if (mb == 0) set->all_bounded = false;
+            else set->max_keep = (std::max)(set->max_keep, mb - 1);
         }
         patterns_ = std::move(set);
     }
     reset();
+}
+
+std::vector<uint32_t> GrammarState::root_stacks() const {
+    std::vector<uint32_t> out;
+    Arena& a = *arena_;
+    uint32_t sub = g_->rule_start(g_->root());
+    for (;;) {
+        uint32_t s = end_of_seq(a.el(sub)) ? 0 : a.push(0, sub);
+        const std::vector<uint32_t>& c = a.closure(s);
+        out.insert(out.end(), c.begin(), c.end());
+        while (!end_of_seq(a.el(sub))) ++sub;
+        if (a.el(sub).type == ElemType::Alt) ++sub;
+        else break;
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 void GrammarState::reset() {
@@ -683,20 +865,7 @@ void GrammarState::reset() {
     utf8_ = Utf8{};
     tail_.clear();
     pieces_.clear();
-    stacks_.clear();
-    // enter the root rule: one stack per alternative
-    Arena& a = *arena_;
-    uint32_t sub = g_->rule_start(g_->root());
-    for (;;) {
-        uint32_t s = end_of_seq(a.el(sub)) ? 0 : a.push(0, sub);
-        const std::vector<uint32_t>& c = a.closure(s);
-        stacks_.insert(stacks_.end(), c.begin(), c.end());
-        while (!end_of_seq(a.el(sub))) ++sub;
-        if (a.el(sub).type == ElemType::Alt) ++sub;
-        else break;
-    }
-    std::sort(stacks_.begin(), stacks_.end());
-    stacks_.erase(std::unique(stacks_.begin(), stacks_.end()), stacks_.end());
+    stacks_ = root_stacks();
 }
 
 bool GrammarState::accepting() const {
@@ -782,9 +951,7 @@ bool GrammarState::advance(std::vector<uint32_t>& stacks, Utf8& u, std::string_v
 // Starts the grammar from the root and feeds it the output from `from` on (the replay of the buffered tokens when
 // patterns are in use); on failure the state is unchanged.
 bool GrammarState::fire(size_t from, bool by_token, int32_t token_id, std::string_view bytes) {
-    GrammarState fresh = *this;
-    fresh.reset();
-    std::vector<uint32_t> st = fresh.stacks_;
+    std::vector<uint32_t> st = root_stacks();
     Utf8 u;
     if (by_token) {
         if (!advance(st, u, bytes, token_id)) return false;
@@ -821,21 +988,22 @@ bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
         if (t == token_id) return fire(0, true, token_id, bytes);
     }
     // text trigger: look for a word or a pattern in the output so far plus this token
-    std::string buf = tail_;
-    buf.append(bytes.data(), bytes.size());
+    const size_t prev_tail = tail_.size();
+    const size_t prev_pieces = pieces_.size();
+    tail_.append(bytes.data(), bytes.size());
     size_t from = std::string::npos;
     for (const std::string& w : triggers_.words) {
         if (w.empty()) continue;
-        size_t lo = tail_.size() >= w.size() ? tail_.size() - w.size() + 1 : 0;
-        size_t p = buf.find(w, lo);
+        size_t lo = prev_tail >= w.size() ? prev_tail - w.size() + 1 : 0;
+        size_t p = tail_.find(w, lo);
         if (p != std::string::npos) from = (std::min)(from, p);
     }
-    std::vector<Piece> pieces;
     if (patterns_) {
-        pieces = pieces_;
-        pieces.push_back({token_id, tail_.size(), buf.size()});
+        pieces_.push_back({token_id, prev_tail, tail_.size()});
         for (size_t i = 0; i < patterns_->src.size(); ++i) {
-            size_t p = patterns_->find(i, buf);
+            const size_t mb = patterns_->max_bytes[i];
+            const size_t lo = mb > 0 && prev_tail >= mb - 1 ? prev_tail - (mb - 1) : 0;
+            size_t p = patterns_->find(i, tail_, lo);
             if (p != std::string::npos) {
                 from = (std::min)(from, p);
                 break;
@@ -843,19 +1011,27 @@ bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
         }
     }
     if (from == std::string::npos) {
-        if (patterns_) {
-            tail_ = std::move(buf);
-            pieces_ = std::move(pieces);
-        } else {
-            tail_ = buf.size() > tail_keep_ ? buf.substr(buf.size() - tail_keep_) : buf;
+        if (!patterns_) {
+            if (tail_.size() > tail_keep_) tail_.erase(0, tail_.size() - tail_keep_);
+        } else if (patterns_->all_bounded) {
+            const size_t keep = (std::max)(tail_keep_, patterns_->max_keep);
+            if (tail_.size() > keep * 2 + 256) {
+                const size_t drop = tail_.size() - keep;
+                tail_.erase(0, drop);
+                size_t first = 0;
+                while (first < pieces_.size() && pieces_[first].end <= drop) ++first;
+                if (first > 0) pieces_.erase(pieces_.begin(), pieces_.begin() + (std::ptrdiff_t) first);
+                for (Piece& pc : pieces_) {
+                    pc.begin = pc.begin > drop ? pc.begin - drop : 0;
+                    pc.end -= drop;
+                }
+            }
         }
         return true;
     }
-    GrammarState keep = *this;
-    tail_ = std::move(buf);
-    pieces_ = std::move(pieces);
     if (fire(from, false, token_id, bytes)) return true;
-    *this = std::move(keep);
+    tail_.resize(prev_tail);
+    if (patterns_) pieces_.resize(prev_pieces);
     return false;
 }
 

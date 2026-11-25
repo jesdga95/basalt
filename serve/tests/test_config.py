@@ -17,11 +17,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.config import (  # noqa: E402
     CONFIG_VERSION,
+    ENGINE_VALUE_FORMS,
     ENTRY_OPTIONS,
     MODEL_OPTIONS,
     SAMPLING_KEYS,
     budget_count,
     build_parser,
+    cost_rate,
     check_engine_flags,
     engine_flags_of,
     load_config_file,
@@ -109,16 +111,16 @@ class ConfigFile(unittest.TestCase):
 
     def test_the_exact_shape(self):
         p = conf({"engine": {"conversation-cache-disk-mib": 32768, "idle-sleep": 300, "pool-workers": 8, "vram-reserve-mib": 500},
-                  "models": [{"alias": "Qwen 3.8 FN", "gpu": "auto", "kv": "int8", "max-context": 262144,
+                  "models": [{"alias": "Qwen 3.8 FN", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144,
                               "model": "a.basalt", "parallel": 4, "slot-full-context": True, "vision": "dynamic"},
-                             {"alias": "DeepSeek V4.1 Flash", "gpu": "auto", "max-context": 1048576,
+                             {"alias": "DeepSeek V4.1 Flash", "gpu": [0, 1], "gpu-mode": "peer", "gpu-share": [3, 1], "max-context": 1048576,
                               "model": "b.basalt", "vision": "dynamic"}],
                   "server": {"host": "0.0.0.0", "port": 8080}})
         (qwen, _, qfile, _), (ds, _, dfile, _) = model_settings(build_parser(), ["--config", p])
-        self.assertEqual((qwen.alias, qwen.parallel, qwen.gpu, qwen.vision, qwen.idle_sleep, qwen.host, qwen.port),
-                         ("Qwen 3.8 FN", 4, "auto", "dynamic", 300, "0.0.0.0", 8080))
-        self.assertEqual((ds.alias, ds.parallel, ds.gpu, ds.vision, ds.idle_sleep, ds.host, ds.port),
-                         ("DeepSeek V4.1 Flash", None, "auto", "dynamic", 300, "0.0.0.0", 8080))
+        self.assertEqual((qwen.alias, qwen.parallel, qwen.gpu, qwen.gpu_mode, qwen.gpu_share, qwen.vision, qwen.idle_sleep, qwen.host, qwen.port),
+                         ("Qwen 3.8 FN", 4, "all", "peer", None, "dynamic", 300, "0.0.0.0", 8080))
+        self.assertEqual((ds.alias, ds.parallel, ds.gpu, ds.gpu_mode, ds.gpu_share, ds.vision, ds.idle_sleep, ds.host, ds.port),
+                         ("DeepSeek V4.1 Flash", None, "0,1", "peer", "3,1", "dynamic", 300, "0.0.0.0", 8080))
         for words in (qfile, dfile):
             self.assertEqual(flag_value(words, "--pool-workers"), "8")
             self.assertEqual(flag_value(words, "--vram-reserve-mib"), "500")
@@ -210,7 +212,12 @@ class ConfigFile(unittest.TestCase):
                          ({"models": [entry], "engine": {"model": "x"}}, "in a model entry"),
                          ({"models": [entry], "engine": {"spec": None}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"spec": ""}}, "expected a string or number"),
-                         ({"models": [entry], "engine": {"control-vector-layer-range": []}}, "empty list"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": []}}, "must be a list \\[start, end\\], got \\[\\]"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": "4 44"}},
+                          'control-vector-layer-range must be a list \\[start, end\\], got "4 44"'),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": [4]}}, "must be a list"),
+                         ({"models": [entry], "engine": {"kv": ["int8", "x"]}}, 'kv takes one value, got \\["int8", "x"\\]'),
+                         ({"models": [entry, {"model": "b", "control-vector-layer-range": 4}]}, "must be a list"),
                          ({"models": [entry], "engine": {"control-vector-layer-range": [4, [44]]}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"control-vector-layer-range": [4, True]}}, "expected a string or number"),
                          ({"models": [entry], "engine": {"kv": {"a": 1}}}, "expected a string or number"),
@@ -236,10 +243,9 @@ class ConfigFile(unittest.TestCase):
 
     def test_list_values_become_words(self):
         engine = load_config_file(conf({"models": [{"model": "m"}], "engine": {
-            "control-vector-layer-range": [4, 44], "kv": "int8", "resident_experts": True, "no-x": False, "rate": 0.5,
-            "offset": ["-1", -2]}}), build_parser()).models[0].shared_words
+            "control-vector-layer-range": [4, 44], "kv": "int8", "resident_experts": True, "no-x": False, "rate": 0.5}}), build_parser()).models[0].shared_words
         self.assertEqual(engine, ["--control-vector-layer-range", "4", "44", "--kv", "int8", "--resident-experts",
-                                  "--rate", "0.5", "--offset", "-1", "-2"])
+                                  "--rate", "0.5"])
 
 
 class Precedence(unittest.TestCase):
@@ -276,11 +282,6 @@ class Precedence(unittest.TestCase):
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
 
-    def test_no_peer_prefill_config_words(self):
-        for value, words in ((True, ["--no-peer-prefill"]), (False, [])):
-            _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
-            self.assertEqual(file_words, words)
-
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
         self.assertEqual(file_words, ["--route-prior", "1.5"])
@@ -315,6 +316,9 @@ class Precedence(unittest.TestCase):
             check_engine_flags(["--peer-device", "1"], {"--gpu"}, "cli")
         with self.assertRaisesRegex(ValueError, "gpu is a server setting"):
             check_engine_flags(["--gpu", "0,1"], {"--gpu"}, "--config c.json")
+        for flag in ("--gpu-mode", "--gpu-share"):
+            with self.assertRaisesRegex(ValueError, f"{flag[2:]} is a server setting"):
+                check_engine_flags([flag, "peer"], {flag}, "--config c.json")
 
     def test_extras(self):
         self.assertEqual(split_engine_extras(["--kv", "int8", "--resident-experts", "--seed=3", "--x", "-1"]),
@@ -446,6 +450,13 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(slot_share(8192, 4), 2048)
         self.assertEqual(slot_share(512, 4), 256)                                     # never under the least slot
 
+    def test_the_slot_line_shows_each_slots_context(self):
+        from serve.config import slots_text
+        a, *_ = parse(["--parallel", "8", "--max-context", "262144"])
+        self.assertEqual(slots_text(8, 32768, a.shared_context), "slots 8 \u00d7 32768 ctx (slot-full-context: 262144 each)")
+        a, *_ = parse(["--parallel", "8", "--max-context", "262144", "--slot-full-context"])
+        self.assertEqual(slots_text(8, 262144, getattr(a, "shared_context", None)), "slots 8 \u00d7 262144 ctx")
+
     def test_parallel_conflicts_with_batch_and_slots(self):
         for flag in ("--batch", "--slots"):
             with self.assertRaisesRegex(ValueError, f"parallel and engine {flag} both set"):
@@ -503,7 +514,7 @@ class EveryOption(unittest.TestCase):
             return "1"
         if act.type is video_tokens:
             return 1024
-        if act.type is float:
+        if act.type is float or act.type is cost_rate:   # --cost-*: a price per million tokens
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
             return 0.5 if SAMPLING_KEYS[act.dest][0] is float else 7
@@ -515,7 +526,7 @@ class EveryOption(unittest.TestCase):
         ap = build_parser()
         for name, act in server_options(ap).items():
             # grammar is on by default: its no- form differs (test_grammar)
-            if name in ("api-key", "engine-bin", "grammar"):
+            if name in ("api-key", "api-key-file", "engine-bin", "grammar"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
@@ -545,6 +556,8 @@ class EveryOption(unittest.TestCase):
             if flag[2:] in server:                         # the server's own: --model, --vision, ...
                 with self.assertRaises(ValueError, msg=flag):
                     load_config_file(conf({"engine": {flag: 1}}), build_parser())
+                continue
+            if flag[2:] in ENGINE_VALUE_FORMS:             # the flags that take several values
                 continue
             cli = [flag, "5"] if takes_value else [flag]
             cfgv = 5 if takes_value else True
@@ -609,13 +622,28 @@ class Startup(unittest.TestCase):
         code, err = self.run_server({"models": [entry]})
         self.assertIn("the server needs --model and the engine binary", err)
         code, err = self.run_server({"models": [{**entry, "gpu": "a,b"}], "server": {"mock-engine": True}})
-        self.assertIn("--gpu a,b: expected numbers", err)
+        self.assertIn('gpu "a,b": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md', err)
+        code, err = self.run_server({"models": [{**entry, "gpu": "0,1"}], "server": {"mock-engine": True}})
+        self.assertIn("gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md", err)
+        code, err = self.run_server({"models": [{**entry, "gpu": 0, "gpu-mode": "peer"}], "server": {"mock-engine": True}})
+        self.assertIn('gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more', err)
         code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key", "")
         self.assertEqual(code, 2)
         self.assertIn("--api-key is empty", err)
         code, err = self.run_server({"models": [entry], "server": {"api-key": "k"}})
         self.assertEqual(code, 2)
         self.assertIn("api-key can't be set in a config file", err)
+        code, err = self.run_server({"models": [entry], "server": {"api-key-file": "k.txt"}})
+        self.assertEqual(code, 2)
+        self.assertIn("api-key can't be set in a config file", err)
+        key_file = Path(TMP.name) / "key.txt"
+        key_file.write_text("s3cret\n", encoding="utf-8")
+        code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key", "k", "--api-key-file", str(key_file))
+        self.assertEqual(code, 2)
+        self.assertIn("give --api-key or --api-key-file, not both", err)
+        code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key-file", str(key_file) + ".missing")
+        self.assertEqual(code, 2)
+        self.assertIn("--api-key-file", err)
         code, err = self.run_server({"models": [entry], "server": {"nope": 1}})
         self.assertIn("not a server option", err)
         code, err = self.run_server({"models": [entry], "server": {"port": "abc"}})

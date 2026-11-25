@@ -13,32 +13,51 @@ namespace {
 
 constexpr int kMaxRows = 8;
 
-__device__ __forceinline__ float bf16f(uint16_t v) { return __uint_as_float((uint32_t) v << 16); }
-
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
     return v;
 }
 
-// Block (h, part): 128 latent columns of one head; a thread per column walks the head's 192 key rows, so a warp reads a
-// contiguous run of every row.
-__global__ void absorb_k_kernel(const uint16_t* __restrict__ kvb, const float* __restrict__ q, int q_stride, int q_head, int rows,
-                                float* __restrict__ q_abs, int heads) {
-    const int h = blockIdx.x, c = blockIdx.y * 128 + threadIdx.x;
-    float acc[kMaxRows];
+// Block (h, part): 128 latent columns of one head. A thread takes a column pair (a warp reads 128 contiguous bytes of a key
+// row) over one of kAbsorbSlices runs of the head's 192 key rows, so the block keeps that many loads in flight; the runs'
+// partial sums are added in shared memory in run order (the same bits on every call).
+constexpr int kAbsorbSlices = 8;
+__global__ void __launch_bounds__(64 * kAbsorbSlices) absorb_k_kernel(const uint16_t* __restrict__ kvb, const float* __restrict__ q,
+                                                                     int q_stride, int q_head, int rows, float* __restrict__ q_abs, int heads) {
+    __shared__ float part[kAbsorbSlices][kMaxRows][128];
+    const int h = blockIdx.x, x = threadIdx.x, y = threadIdx.y;
+    const int c0 = blockIdx.y * 128;
+    float a0[kMaxRows], a1[kMaxRows];
 #pragma unroll
-    for (int r = 0; r < kMaxRows; ++r) acc[r] = 0.f;
-    const uint16_t* w = kvb + (size_t) h * kDflyKvbHead * kDflyRank + c;
-    for (int d = 0; d < kDflyNope; ++d) {
-        const float wv = bf16f(w[(size_t) d * kDflyRank]);
+    for (int r = 0; r < kMaxRows; ++r) a0[r] = a1[r] = 0.f;
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(kvb + (size_t) h * kDflyKvbHead * kDflyRank + c0) + x;
+    constexpr int kRun = kDflyNope / kAbsorbSlices;
+    for (int d = y * kRun; d < (y + 1) * kRun; ++d) {
+        const uint32_t pair = w[(size_t) d * (kDflyRank / 2)];
+        const float w0 = __uint_as_float(pair << 16), w1 = __uint_as_float(pair & 0xffff0000u);
 #pragma unroll
         for (int r = 0; r < kMaxRows; ++r)
-            if (r < rows) acc[r] = fmaf(q[(size_t) r * q_stride + (size_t) h * q_head + d], wv, acc[r]);
+            if (r < rows) {
+                const float qv = q[(size_t) r * q_stride + (size_t) h * q_head + d];
+                a0[r] = fmaf(qv, w0, a0[r]);
+                a1[r] = fmaf(qv, w1, a1[r]);
+            }
     }
 #pragma unroll
     for (int r = 0; r < kMaxRows; ++r)
-        if (r < rows) q_abs[((size_t) r * heads + h) * kDflyRank + c] = acc[r];
+        if (r < rows) {
+            part[y][r][2 * x] = a0[r];
+            part[y][r][2 * x + 1] = a1[r];
+        }
+    __syncthreads();
+    for (int i = y * 64 + x; i < rows * 128; i += 64 * kAbsorbSlices) {
+        const int r = i / 128, c = i % 128;
+        float t = 0.f;
+#pragma unroll
+        for (int k = 0; k < kAbsorbSlices; ++k) t += part[k][r][c];
+        q_abs[((size_t) r * heads + h) * kDflyRank + c0 + c] = t;
+    }
 }
 
 // Block (h, part): 8 value rows of one head, a warp each; the rows' latents sit in shared memory.
@@ -105,7 +124,7 @@ __global__ void gate_add_kernel(const float* __restrict__ base, const float* __r
 
 void dfly_absorb_k(const uint16_t* kvb, const float* q, int q_stride, int q_head, int rows, int heads, float* q_abs, void* stream) {
     if (rows < 1 || rows > kMaxRows) throw std::invalid_argument("dfly_absorb_k: rows");
-    absorb_k_kernel<<<dim3(heads, kDflyRank / 128), 128, 0, (cudaStream_t) stream>>>(kvb, q, q_stride, q_head, rows, q_abs, heads);
+    absorb_k_kernel<<<dim3(heads, kDflyRank / 128), dim3(64, kAbsorbSlices), 0, (cudaStream_t) stream>>>(kvb, q, q_stride, q_head, rows, q_abs, heads);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

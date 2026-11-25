@@ -39,12 +39,14 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
 struct RequestGrammar {
     std::shared_ptr<const Grammar> grammar;   ///< null: nothing to enforce
     Triggers triggers;                        ///< empty: enforce from the first answer token
+    bool think = true;                        ///< "think": false, the request's thinking is off (a reply of blocks)
 };
 
 /// Builds the grammar from the request's "grammar" JSON object:
 ///   {"kind":"tools","tools":[<OpenAI tool objects>],"tool_choice":<as received>}   lazy, trigger "<tool_call>"
 ///   {"kind":"json_schema","schema":{...}}                                          from the first answer token
 ///   {"kind":"json_object"}                                                         any JSON object
+/// Any of them may say "think": false (the request's thinking is off).
 /// A json_schema or json_object request may carry "tools" too: from the first answer token, either tool calls or the
 /// JSON value. tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is
 /// not an error; an unusable request sets `err`.

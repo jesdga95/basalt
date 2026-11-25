@@ -1,12 +1,13 @@
 // src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
+#include "basalt/platform/compiler.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,31 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
     return detect_cpu_topology(skip_first, affinity).worker_cores;
+}
+
+int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, double cpu_quota, PoolAffinity affinity) {
+    int n = worker_cores;
+    if (hybrid && affinity != PoolAffinity::All) {
+        // The P-cores but the host's.  The auto affinity adds half the E-cores: they run the expert kernels slower, but a
+        // layer's CPU share is split into many small tasks, so each one still shortens it.
+        n = std::max(1, p_cores - 1);
+        if (affinity == PoolAffinity::Auto) n += e_cores / 2;
+    }
+    // A CPU quota throttles the whole group once spent: the workers and the host thread together must fit it.
+    if (cpu_quota > 0) {
+        const int fit = std::max(1, (int) cpu_quota - 1);
+        if (fit < n) n = fit;
+    }
+    return std::max(1, n);
+}
+
+int start_pool_workers(int given, bool affinity_given, PoolAffinity affinity) {
+    if (given > 0) return given;
+    const CpuTopology topo = detect_cpu_topology(true);
+    const PoolAffinity pick = !affinity_given || affinity == PoolAffinity::Auto ? PoolAffinity::Auto
+                              : affinity == PoolAffinity::PCores               ? PoolAffinity::PCores
+                                                                               : PoolAffinity::All;
+    return auto_pool_workers((int) topo.worker_cores.size(), topo.p_cores, topo.e_cores, topo.is_hybrid, cgroup_cpu_quota(), pick);
 }
 
 namespace {
@@ -143,7 +169,7 @@ void ExpertPool::worker(int id) {
         uint32_t spins = 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+            basalt::platform::cpu_relax();
             if ((++spins & 63u) != 0) continue;
             const auto now = std::chrono::steady_clock::now();
             if (now - parked_at < spin_before_sleep_) {
@@ -214,7 +240,7 @@ void ExpertPool::wait_parked(const char* what) {
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     StallClock clock;
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
-        _mm_pause();
+        basalt::platform::cpu_relax();
         if (clock.expired(parked_.load(std::memory_order_relaxed))) {
             basalt::log::error("basalt", "the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again",
@@ -231,7 +257,7 @@ void ExpertPool::wait_done(int n) {
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        _mm_pause();
+        basalt::platform::cpu_relax();
         if (clock.expired(d)) {                                       // progress restarts the clock
             basalt::log::error("basalt", "the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again",
@@ -244,7 +270,7 @@ void ExpertPool::wait_done(int n) {
 void ExpertPool::wait_ready(int e) {
     StallClock clock;
     while (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
-        _mm_pause();
+        basalt::platform::cpu_relax();
         if (clock.expired(done_.load(std::memory_order_relaxed))) {
             basalt::log::error("basalt", "the CPU expert pool stalled: the gate/up rows of expert %d of the batch did not finish "
                                  "(%u of %d tasks done, %u of %d workers parked) - stopping the engine so the server can "
@@ -304,7 +330,7 @@ int ExpertPool::part_row(int part, int parts, int rows) const {
 void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const {
     // into L2 (a part is tens of KB, more than L1 holds), checking every 4 KB whether the wait is already over
     for (size_t o = 0; o < bytes; o += 64) {
-        _mm_prefetch((const char*) p + o, _MM_HINT_T1);
+        basalt::platform::prefetch(p + o, false);
         if ((o & 4095) == 4032 && fused_[(size_t) e].ready.load(std::memory_order_relaxed) != 0) return;
     }
 }

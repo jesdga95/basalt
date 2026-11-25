@@ -249,6 +249,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
+            d.map.note((int) d.layers, (int) e);
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else ++d.offload_entries;   // PCIe or another GPU

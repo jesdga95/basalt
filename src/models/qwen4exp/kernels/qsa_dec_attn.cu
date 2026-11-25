@@ -1,6 +1,7 @@
 // src/models/qwen4exp/kernels/qsa_dec_attn.cu - see include/basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp.
 #include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -87,13 +88,15 @@ __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
 }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::); }
 
-// shared memory of one chunk block; KV_MODE 0: fp16 rows, 1: int8 rows + fp16 scales
+// Shared chunk rows hold the pool's fp16, int8 or packed Q4_0 data. Only int8 stages separate scales.
 template <int KV_MODE> struct ChunkSmem {
-    static constexpr int ROW = KV_MODE == 0 ? HD * 2 : HD;   // bytes of one cell's K (or V) row
+    static constexpr int Q4_ROW = (HD / QK4_0) * sizeof(block_q4_0);
+    static constexpr int ROW = KV_MODE == 0 ? HD * 2 : KV_MODE == 5 ? Q4_ROW : HD;
+    static constexpr int NS = KV_MODE == 5 ? 1 : NSC;
     alignas(16) unsigned char k[CHUNK][ROW];
     alignas(16) unsigned char v[CHUNK][ROW];
-    alignas(16) uint16_t ks[CHUNK][NSC];
-    alignas(16) uint16_t vs[CHUNK][NSC];
+    alignas(16) uint16_t ks[CHUNK][NS];
+    alignas(16) uint16_t vs[CHUNK][NS];
     float sp[G][CHUNK];        // scores
     alignas(16) float spt[CHUNK][G];   // probabilities, cell-major
     long long row[CHUNK];      // pool row of each cell, -1 masked or past the width
@@ -128,20 +131,23 @@ __device__ __forceinline__ void k8_from(const ChunkSmem<KV_MODE>& sm, int c, int
             out[2 * j] = f.x;
             out[2 * j + 1] = f.y;
         }
+    } else if constexpr (KV_MODE == 5) {
+        const auto* block = sm.k[c] + (d0 / QK4_0) * sizeof(block_q4_0);
+        const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(block)));
+        const auto* code = reinterpret_cast<const uint16_t*>(block + sizeof(uint16_t) + (d0 & 15));
+        const int shift = d0 & (QK4_0 / 2) ? 4 : 0;
+        const uint32_t lo = ((uint32_t) code[0] | ((uint32_t) code[1] << 16)) >> shift;
+        const uint32_t hi = ((uint32_t) code[2] | ((uint32_t) code[3] << 16)) >> shift;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int nibble = ((j < 4 ? lo : hi) >> (8 * (j & 3))) & 15;
+            out[j] = (float) (nibble - 8) * sc;
+        }
     } else {
         const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / KV_Q8_GROUP]));
         const uint2 raw = *reinterpret_cast<const uint2*>(&sm.k[c][d0]);
 #pragma unroll
         for (int j = 0; j < 8; ++j) out[j] = (float) packed_s8(j < 4 ? raw.x : raw.y, j & 3) * sc;
-    }
-}
-template <int KV_MODE>
-__device__ __forceinline__ float v1_from(const ChunkSmem<KV_MODE>& sm, int c, int d) {
-    if constexpr (KV_MODE == 0) {
-        return __half2float(*reinterpret_cast<const __half*>(&sm.v[c][d * 2]));
-    } else {
-        const float sc = __half2float(__ushort_as_half(sm.vs[c][d / KV_Q8_GROUP]));
-        return (float) (int8_t) sm.v[c][d] * sc;
     }
 }
 
@@ -184,8 +190,12 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     }
     __syncthreads();
     {
-        const unsigned char* kb = KV_MODE == 0 ? (const unsigned char*) pools.k_pool : (const unsigned char*) pools.k_q;
-        const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) pools.v_pool : (const unsigned char*) pools.v_q;
+        const unsigned char* kb = KV_MODE == 0 ? (const unsigned char*) pools.k_pool
+                               : KV_MODE == 5 ? (const unsigned char*) pools.k_q4
+                                              : (const unsigned char*) pools.k_q;
+        const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) pools.v_pool
+                               : KV_MODE == 5 ? (const unsigned char*) pools.v_q4
+                                              : (const unsigned char*) pools.v_q;
         for (int i = t; i < CHUNK * PER; i += THREADS) {
             const int c = i / PER, j = i % PER;
             const long long r = sm.row[c];
@@ -278,9 +288,11 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         }
     }
     __syncthreads();
-    // values: thread t < 128 owns dimensions 2t, 2t+1 of all 12 heads; cells folded in ascending order.  A masked or
-    // missing cell has weight 0 and value 0, which leaves every accumulator unchanged (none is ever -0).
+    // Each thread owns two dimensions of all heads and folds cells in ascending order.
+    // A Q4_0 thread reads both nibbles of the same byte.
     if (t >= HD / 2) return;
+    constexpr int Q4_BYTES = QK4_0 / 2;
+    const int d = KV_MODE == 5 ? (t / Q4_BYTES) * QK4_0 + t % Q4_BYTES : 2 * t;
     float acc[G][2];
 #pragma unroll
     for (int i = 0; i < G; ++i) acc[i][0] = acc[i][1] = 0.0f;
@@ -290,6 +302,12 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         if constexpr (KV_MODE == 0) {
             const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&sm.v[c][t * 4]));
             v0 = f.x; v1 = f.y;
+        } else if constexpr (KV_MODE == 5) {
+            const auto* block = sm.v[c] + (t / Q4_BYTES) * sizeof(block_q4_0);
+            const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(block)));
+            const uint8_t bits = block[sizeof(uint16_t) + t % Q4_BYTES];
+            v0 = (float) ((int) (bits & 15) - 8) * sc;
+            v1 = (float) ((int) (bits >> 4) - 8) * sc;
         } else {
             const float sc = __half2float(__ushort_as_half(sm.vs[c][t / (KV_Q8_GROUP / 2)]));
             const ushort raw = *reinterpret_cast<const ushort*>(&sm.v[c][t * 2]);
@@ -307,8 +325,15 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         }
     }
 #pragma unroll
-    for (int i = 0; i < G; ++i)
-        *reinterpret_cast<float2*>(&part_acc[((size_t) slot * G + i) * HD + 2 * t]) = make_float2(acc[i][0], acc[i][1]);
+    for (int i = 0; i < G; ++i) {
+        float* out = &part_acc[((size_t) slot * G + i) * HD + d];
+        if constexpr (KV_MODE == 5) {
+            out[0] = acc[i][0];
+            out[Q4_BYTES] = acc[i][1];
+        } else {
+            *reinterpret_cast<float2*>(out) = make_float2(acc[i][0], acc[i][1]);
+        }
+    }
 }
 
 // sigmoid gate with the fast-math sequence native_qsa_gate_apply compiles to
@@ -696,7 +721,9 @@ __global__ void __launch_bounds__(THREADS) attn_merge_v2(AttnArgs a) {
 
 bool a16(const void* p) { return ((uintptr_t) p & 15) == 0; }
 int kv_mode_of(const QsaAttnPools& p) {
-    if (p.k_q4 != nullptr || p.v_q4 != nullptr) return -1;
+    if (p.k_q4 != nullptr || p.v_q4 != nullptr)   // --kv q4_0: packed blocks, staged into the int8 rows (mode 5)
+        return (p.k_q4 != nullptr && p.v_q4 != nullptr && a16(p.k_q4) && a16(p.v_q4) &&
+                ((uintptr_t) p.k_q4 & 7) == 0) ? 5 : -1;
     if (p.k_q != nullptr)
         return (p.v_q != nullptr && p.k_scale != nullptr && p.v_scale != nullptr && a16(p.k_q) && a16(p.v_q) &&
                 ((uintptr_t) p.k_scale & 7) == 0 && ((uintptr_t) p.v_scale & 7) == 0) ? 1 : -1;
@@ -741,7 +768,11 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     cudaStream_t st = (cudaStream_t) stream;
     a.xq = a.attn_gated != nullptr ? xq : nullptr;
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    if (mode == 1 && n_q == 1 && cap >= 8192) {   // the draft layer's wide window (verify's cap is a few thousand cells)
+    if (mode == 5) {   // Q4_0 stores rotated keys, so the unrotated draft path never uses it.
+        constexpr size_t bytes = sizeof(ChunkSmem<5>);
+        opt_in<5>(attn_chunk_v2<5, false>, bytes);
+        launch_pdl(attn_chunk_v2<5, false>, grid, dim3(THREADS), bytes, st, a);
+    } else if (mode == 1 && n_q == 1 && cap >= 8192) {   // the draft layer's wide window (verify's cap is a few thousand cells)
         a.chunk = 0;
         constexpr size_t bytes = sizeof(DSmem);
         static std::atomic<bool> done[64];

@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
@@ -156,7 +157,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
         if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
-            cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+            basalt::core::device_copy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
             ok = false;
         else
             m.owned.push_back(m.ident_table);

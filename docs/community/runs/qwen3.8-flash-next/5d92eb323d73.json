@@ -1,0 +1,25 @@
+{
+  "submitter": "tselle",
+  "date": "2026-11-07",
+  "commit": "6e67f90cd3",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 575,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 55.6
+    }
+  ],
+  "ram_gib": 90,
+  "cpu": "AMD Ryzen 9 9950X, 16 cores",
+  "ram_gbps": 66.6,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 10520.5,
+  "prefill_64k_tps": 11095.8,
+  "decode_tps": 391.5
+}

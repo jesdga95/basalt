@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / "basalt"))
 BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / "basalt-bench"))
 # bench's own options that share an engine flag's name
-BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed", "--gpu"}
+BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed", "--gpu", "--gpu-mode", "--gpu-share"}
 
 
 def engine_flags() -> list[str]:
@@ -45,12 +45,13 @@ class BenchFlags(unittest.TestCase):
         # Every flag the help lists is one the engine parser accepts; an empty or cut-short list would make the
         # per-flag test vacuous.
         flags = engine_flags()
-        sources = [ROOT / "src/program/cli/arguments.cpp", *sorted((ROOT / "src/models").glob("*/flags.cpp")),
+        sources = [ROOT / "src/program/cli/arguments.cpp", ROOT / "src/model/rope_flags.cpp", ROOT / "src/model/route_flags.cpp",
+                   *sorted((ROOT / "src/models").glob("*/flags.cpp")),
                    *sorted((ROOT / "src/models").glob("*/adapter.cpp"))]
         parsed = {f for s in sources for f in re.findall(r'a == "(--[a-z0-9-]+)"', s.read_text())}
         self.assertTrue(parsed)
         self.assertEqual(sorted(set(flags) - parsed), [])
-        for known in ("--spec", "--kv", "--max-context", "--gpu"):
+        for known in ("--spec", "--kv", "--max-context", "--gpu", "--gpu-mode", "--gpu-share"):
             self.assertIn(known, flags)
 
     def test_every_engine_flag_reaches_the_engine(self):
@@ -66,6 +67,12 @@ class BenchFlags(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--max-context") + 1], "999999")
         self.assertEqual(cmd[cmd.index("--kv") + 1], "int8")
         self.assertEqual(cmd.count("--max-context"), 1)
+
+    def test_a_flag_the_engine_keeps_every_value_of_is_passed_each_time(self):
+        cmd = self.command("--exp", "a=1", "--exp", "b=2", "--kv", "int8", "--kv", "f16")
+        self.assertEqual([cmd[i + 1] for i, w in enumerate(cmd) if w == "--exp"], ["a=1", "b=2"])
+        self.assertEqual(cmd.count("--kv"), 1)
+        self.assertEqual(cmd[cmd.index("--kv") + 1], "f16")
 
     def test_a_switch_does_not_take_the_next_option(self):
         cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--vram-reserve-mib", "-1")
@@ -117,14 +124,25 @@ class BenchFlags(unittest.TestCase):
                 self.assertEqual(r.returncode, 2)
                 self.assertIn("--submitter", r.stderr)
 
-    def test_community_uses_every_visible_card_and_refuses_gpu(self):
-        cmd = self.command_community()
-        plan = subprocess.run([str(ENGINE), "--gpu-plan", "--gpu", "auto"], capture_output=True, text=True)
-        self.assertEqual(plan.returncode, 0, plan.stderr)
-        self.assertEqual(cmd[cmd.index("--gpu") + 1], json.loads(plan.stdout)["devices"])   # every visible card
-        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", "--gpu", "0"], capture_output=True, text=True)
+    def test_community_takes_the_users_cards_and_mode(self):
+        base = [str(BENCH), "--model", "m.basalt", "--fixtures", str(self.fixtures), "--print-command", "--community", "--submitter", "test"]
+        r = subprocess.run([*base, "--gpu", "0"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cmd = r.stdout.split()
+        self.assertEqual(cmd[cmd.index("--gpu") + 1], "0")
+        self.assertNotIn("--gpu-mode", cmd)
+        # the engine's plan is asked for the cards as the run has them: a mode with one card is refused the engine's way
+        r = subprocess.run([*base, "--gpu", "0", "--gpu-mode", "peer"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
-        self.assertIn("incomparable", r.stderr)
+        self.assertIn('gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more', r.stderr)
+        r = subprocess.run([*base, "--gpu", "auto"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('gpu "auto": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md', r.stderr)
+
+    def test_a_card_list_needs_a_mode(self):
+        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--print-command", "--gpu", "0,1"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md" if "names 2" in r.stderr else "gpu 1: ", r.stderr)
 
     def test_help_lists_the_engine_flags(self):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)

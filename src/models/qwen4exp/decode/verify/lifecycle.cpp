@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "diagnostics.hpp"
@@ -368,7 +369,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
         if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
             ok2 = cudaMalloc((void**) &slot_off_d_, (size_t) hits.n_slots * sizeof(unsigned long long)) == cudaSuccess &&
-                  cudaMemcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
+                  basalt::core::device_copy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }

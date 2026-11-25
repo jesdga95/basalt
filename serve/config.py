@@ -23,7 +23,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
-    "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
+    "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -68,19 +68,28 @@ def split_engine_extras(extras: list[str]) -> list[str]:
     return out
 
 
+# engine flags that take several values, with their form; every other engine flag takes one
+ENGINE_VALUE_FORMS = {"control-vector-layer-range": ["start", "end"]}
+
+
 def engine_words(key: str, value) -> list[str]:
     """The engine words for one config entry: a switch is true (the flag) or false (nothing), a string or number is
-    one value, and a list gives one word per item (a flag that takes several values). ValueError otherwise."""
-    flag = "--" + str(key).strip().lower().replace("_", "-").removeprefix("--")
+    one value, and a flag that takes several values (`ENGINE_VALUE_FORMS`) is a list of exactly that many. ValueError
+    otherwise."""
+    name = str(key).strip().lower().replace("_", "-").removeprefix("--")
+    flag = "--" + name
     if isinstance(value, bool):
         return [flag] if value else []
+    form = ENGINE_VALUE_FORMS.get(name)
+    if form:
+        if not isinstance(value, list) or len(value) != len(form):
+            raise ValueError(f"{name} must be a list [{', '.join(form)}], got {json.dumps(value)}")
+    elif isinstance(value, list):
+        raise ValueError(f"{name} takes one value, got {json.dumps(value)}")
     items = value if isinstance(value, list) else [value]
     for item in items:
         if isinstance(item, bool) or not isinstance(item, (str, int, float)) or str(item).strip() == "":
-            raise ValueError(f"engine.{key}: expected a string or number, a list of them for several values, "
-                             f"or true/false for a switch, not {value!r}")
-    if not items:
-        raise ValueError(f"engine.{key}: an empty list gives the flag no value")
+            raise ValueError(f"engine.{key}: expected a string or number, or true/false for a switch, not {value!r}")
     return [flag, *(str(item) for item in items)]
 
 
@@ -116,6 +125,10 @@ def option_words(where: str, key, value, act, here: Path) -> list[str]:
             return [flag, str(answer_room(str(value)))]
         except argparse.ArgumentTypeError as e:
             raise ValueError(f"{where}.{key}: {e}") from None
+    if name in ("gpu", "gpu-share") and isinstance(value, list):     # the cards, or their shares, as a list of numbers
+        if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value):
+            raise ValueError(f"{where}.{key}: a number, a list of numbers or a string")
+        return [flag, ",".join(str(x) for x in value)]
     if act.nargs == 0:                                 # a switch
         if not isinstance(value, bool):
             raise ValueError(f"{where}.{key}: true or false")
@@ -260,6 +273,11 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
     a.skipped = []
     a.sampling_launch = {k: getattr(a, k) for k in SAMPLING_KEYS if getattr(a, k) is not None}
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
+    a.pricing_cli = set()
+    for flag, attr in (("--cost-in", "cost_in"), ("--cost-out", "cost_out"),
+                       ("--cost-cache-write", "cost_cache_write"), ("--cost-cache-hit", "cost_cache_hit")):
+        if any(w == flag or w.startswith(flag + "=") for w in cli):
+            a.pricing_cli.add(attr)
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
@@ -291,8 +309,8 @@ def check_engine_flags(words: list[str], known: set[str] | None, where: str) -> 
     """ValueError naming the first flag (a word starting with `--`) the engine rejects; value words are not names
     (unchecked when the binary is unreadable)."""
     for word in words:
-        if word == "--gpu":
-            raise ValueError(f"{where}: gpu is a server setting (--gpu, or \"gpu\" in the server section)")
+        if word in ("--gpu", "--gpu-mode", "--gpu-share"):
+            raise ValueError(f"{where}: {word[2:]} is a server setting ({word}, or \"{word[2:]}\" in a model entry)")
         if known is not None and word.startswith("--") and word not in known:
             raise ValueError(f"{where}: {word} is not an engine flag")
 
@@ -345,6 +363,13 @@ def start_items(file_words: list[str], cli_words: list[str], shared: tuple[int, 
 def slot_share(total: int, parallel: int) -> int:
     """Each of `parallel` slots' part of a shared --max-context."""
     return max(MIN_SLOT_CONTEXT, total // parallel)
+
+
+def slots_text(parallel: int, per_slot: int, shared: int | None) -> str:
+    """The startup slot line: the slots and the context each really gets; a shared --max-context also names the
+    whole-context option."""
+    text = f"slots {parallel} \u00d7 {per_slot} ctx"
+    return text + (f" (slot-full-context: {shared} each)" if shared else "")
 
 
 def with_spec(items: list[str], spec) -> list[str]:
@@ -505,6 +530,17 @@ def answer_room(text: str) -> str | int:
     return n
 
 
+def cost_rate(text: str) -> float:
+    """argparse type: a per-million-token price in USD, a finite number >= 0."""
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, not {text!r}") from None
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, not {text!r}")
+    return v
+
+
 def video_tokens(text: str) -> int:
     """argparse type: a video's token budget, a whole number from 64 to 65536."""
     try:
@@ -559,9 +595,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8080, help="the TCP port to listen on (default 8080)")
-    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: exactly these, the first is the main "
-                                  "card and the engine gives the rest their roles (\"0,1\"); auto = every Blackwell "
-                                  "card, the fastest as main (default: GPU 0 alone)")
+    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: a number (0), a list whose first is the main "
+                                  "card (0,1), or all (default: GPU 0 alone)")
+    ap.add_argument("--gpu-mode", help="what the GPUs do together, required with two or more: peer (the main card runs every "
+                                       "layer, the others help), split (the layers are divided) or tensor")
+    ap.add_argument("--gpu-share", help="the cards' relative shares, one positive number per card in the order of --gpu "
+                                        "(3,1); default: by the mode")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="tokenizer directory for the mock engine (a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
@@ -573,6 +612,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "
                          "not allowed in a --config file")
+    ap.add_argument("--api-key-file", default="", metavar="FILE",
+                    help="read that key from the first line of FILE, which keeps it out of the process list; command "
+                         "line only")
     ap.add_argument("--allowed-host", action="append", default=[], metavar="NAME",
                     help="also answer to this Host name (repeatable; \"*\" turns the check off)")
     ap.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
@@ -586,6 +628,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded; load on first request; a sidecar image encoder is dropped, --vision dynamic stays")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")
+    ap.add_argument("--model-cache-mib", type=int, default=0, metavar="MIB",
+                    help="park a model the router switches away from in RAM, up to this many MiB across all parked "
+                         "models (least recently used out first), so switching back is a RAM copy and not a load from the "
+                         "SSD; 0 = off (Linux; the driver suspends the engine's GPU state)")
     ap.add_argument("--idle-sleep", type=float, default=None, metavar="SECONDS",
                     help="put the model to sleep after this many seconds without requests: its VRAM is freed, its RAM "
                          "copy, conversations and learned expert placement stay, and the next request wakes it in a few "
@@ -622,4 +668,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output tokens kept for closing the thinking and the answer: auto (a quarter of the cap, at "
                          "least 512, at most half) or a whole number of tokens (0 = none); an explicit request budget "
                          "of 0 opts out")
+    ap.add_argument("--totals-file", default="", metavar="PATH",
+                    help="file for persistent token counts (default: <config>.totals.json next to the config, and with several "
+                         "models <config>.totals.<model>.json, the name lowercased with spaces dropped; "
+                         "'none' disables)")
+    ap.add_argument("--totals-reset", action="store_true",
+                    help="reset the persistent counters: move the current file to .prev.json and start fresh")
+    ap.add_argument("--cost-in", type=cost_rate, default=0, metavar="USD",
+                    help="price per million input tokens in US dollars (default 0)")
+    ap.add_argument("--cost-out", type=cost_rate, default=0, metavar="USD",
+                    help="price per million output tokens in US dollars (default 0)")
+    ap.add_argument("--cost-cache-write", type=cost_rate, default=None, metavar="USD",
+                    help="price per million new (cache-write) input tokens (default: same as --cost-in)")
+    ap.add_argument("--cost-cache-hit", type=cost_rate, default=None, metavar="USD",
+                    help="price per million reused (cache-hit) input tokens (default: same as --cost-in)")
     return ap

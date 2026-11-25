@@ -163,18 +163,31 @@ void test_draft_loop() {
     std::vector<int32_t> seen;
     int32_t ids[5];
     float conf[5];
+    int made = -1;
     CHECK(dfly_draft_loop(
         5, 7,
-        [&](int j, int32_t prev, int32_t& tok, float& c) {
+        [&](int j, int32_t prev, int32_t& tok, float& c, bool&) {
             seen.push_back(prev);
             tok = 10 * (j + 1) + (int32_t) seen.size();
             c = 0.5f + 0.1f * (float) j;
             return true;
         },
-        ids, conf));
-    CHECK(seen == (std::vector<int32_t>{7, 11, 22, 33, 44}));
+        ids, conf, made));
+    CHECK(seen == (std::vector<int32_t>{7, 11, 22, 33, 44}) && made == 5);
     CHECK(ids[4] == 55 && std::fabs(conf[3] - 0.8f) < 1e-6f);
-    CHECK(!dfly_draft_loop(3, 0, [](int j, int32_t, int32_t&, float&) { return j < 1; }, ids, conf));
+    CHECK(!dfly_draft_loop(3, 0, [](int j, int32_t, int32_t&, float&, bool&) { return j < 1; }, ids, conf, made));
+    // a step that ends the block: the drafts before it are kept, no step runs after it
+    seen.clear();
+    CHECK(dfly_draft_loop(
+        5, 7,
+        [&](int j, int32_t prev, int32_t& tok, float&, bool& go) {
+            seen.push_back(prev);
+            if (j == 2) go = false;
+            else tok = 100 + j;
+            return true;
+        },
+        ids, conf, made));
+    CHECK(made == 2 && ids[1] == 101 && seen == (std::vector<int32_t>{7, 100, 101}));
 }
 
 void test_flags() {
@@ -269,9 +282,10 @@ std::vector<int32_t> drafted(const FakeTarget& t, std::vector<int32_t> prompt, i
         std::vector<int32_t> truth_hist = hist;
         truth_hist.push_back(next);
         std::vector<int32_t> ids((size_t) block);
+        int made = 0;
         dfly_draft_loop(
             nd, next,
-            [&](int j, int32_t prev, int32_t& tok, float& chance) {
+            [&](int j, int32_t prev, int32_t& tok, float& chance, bool&) {
                 (void) prev;
                 const int64_t at = (int64_t) out.size() + j;
                 const int32_t truth = t.pick(truth_hist, at);   // what plain decoding picks next
@@ -280,7 +294,7 @@ std::vector<int32_t> drafted(const FakeTarget& t, std::vector<int32_t> prompt, i
                 chance = 0.5f;
                 return true;
             },
-            ids.data(), c.data());
+            ids.data(), c.data(), made);
         std::vector<int32_t> window = {next};
         window.insert(window.end(), ids.begin(), ids.begin() + nd);
         // row i: the pick after hist + window[0..i], drawn at the output index of the token it picks

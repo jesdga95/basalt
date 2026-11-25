@@ -1,6 +1,7 @@
 // DeepSeek-V4.1 vision encoder on one CUDA device. Weights stay bf16 as stored; the residual stream, attention scores
 // and aligner output are fp32; the inputs of the products are bf16. Attention runs one head at a time as two products
 // around a row softmax. The graph follows llama.cpp's mtmd deepseek4v encoder (MIT).
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 
 #include <cublas_v2.h>
@@ -170,18 +171,25 @@ struct VisionEncoder::Impl {
         for (void* p : work) cudaFree(p);
     }
 
+    // A failed cudaMalloc stays the thread's last error, which the next launch check would read as its own: it is cleared.
     template <class T>
     T* upload(const basalt::vision::TensorRef* t) {
         void* p = nullptr;
-        if (cudaMalloc(&p, t->bytes) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&p, t->bytes) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
         owned.push_back(p);
-        if (cudaMemcpy(p, t->data, t->bytes, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
+        if (basalt::core::device_copy(p, t->data, t->bytes, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
         return (T*) p;
     }
     template <class T>
     T* alloc(T*& slot, size_t count) {
         void* p = nullptr;
-        if (cudaMalloc(&p, count * sizeof(T)) != cudaSuccess) return nullptr;
+        if (cudaMalloc(&p, count * sizeof(T)) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
         work.push_back(p);
         return slot = (T*) p;
     }
@@ -243,18 +251,42 @@ struct VisionEncoder::Impl {
         return true;
     }
 
-    bool ensure(int n, int ng, int ntok) {
-        if (n <= cap && ng <= ng_cap && ntok <= tok_cap) return true;
+    void drop_work() {
         for (void* p : work) cudaFree(p);
         work.clear();
-        cap = std::max(n, cap);
-        ng_cap = std::max(ng, ng_cap);
-        tok_cap = std::max(ntok, tok_cap);
-        const size_t N = cap;
-        return alloc(d_rows, N * kVisionPatchValues) && alloc(x, N * E) && alloc(g, N * QKV) && alloc(g2, N * F) && alloc(q, N * E) &&
-               alloc(k, N * E) && alloc(v, N * E) && alloc(ao, N * E) && alloc(S, N * N) && alloc(y, N * E) &&
-               alloc(act, N * F) && alloc(aout, (size_t) ng_cap * proj) && alloc(mrg, (size_t) ng_cap * MERGED) &&
-               alloc(h1, (size_t) ng_cap * proj) && alloc(dout, (size_t) tok_cap * proj);
+        d_rows = x = g = g2 = q = k = v = ao = S = y = aout = dout = nullptr;
+        act = mrg = h1 = nullptr;
+        cap = ng_cap = tok_cap = 0;
+    }
+
+    // Grows the work buffers to hold n patches, ng merged cells and ntok block rows; on failure none are held, so a retry
+    // after the caller made room allocates them all again.
+    bool ensure(int n, int ng, int ntok) {
+        if (n <= cap && ng <= ng_cap && ntok <= tok_cap) return true;
+        const int want = std::max(n, cap), want_ng = std::max(ng, ng_cap), want_tok = std::max(ntok, tok_cap);
+        drop_work();
+        const size_t N = want;
+        const bool ok = alloc(d_rows, N * kVisionPatchValues) && alloc(x, N * E) && alloc(g, N * QKV) && alloc(g2, N * F) &&
+                        alloc(q, N * E) && alloc(k, N * E) && alloc(v, N * E) && alloc(ao, N * E) && alloc(S, N * N) &&
+                        alloc(y, N * E) && alloc(act, N * F) && alloc(aout, (size_t) want_ng * proj) &&
+                        alloc(mrg, (size_t) want_ng * MERGED) && alloc(h1, (size_t) want_ng * proj) &&
+                        alloc(dout, (size_t) want_tok * proj);
+        if (!ok) {
+            drop_work();
+            return false;
+        }
+        cap = want;
+        ng_cap = want_ng;
+        tok_cap = want_tok;
+        return true;
+    }
+
+    // The bytes ensure(n, ng, ntok) holds.
+    size_t work_bytes(int n, int ng, int ntok) const {
+        const size_t N = n;
+        return N * kVisionPatchValues * sizeof(float) + N * (6 * E + QKV + F + N) * sizeof(float) + N * F * sizeof(__nv_bfloat16) +
+               (size_t) ng * proj * sizeof(float) + (size_t) ng * (MERGED + proj) * sizeof(__nv_bfloat16) +
+               (size_t) ntok * proj * sizeof(float);
     }
 };
 
@@ -304,8 +336,7 @@ bool VisionBlas::open(std::string& err) {
     return ok;
 }
 
-bool VisionEncoder::init(const basalt::vision::Mmproj& mp, int max_patches, VisionBlas& blas, std::string& err) {
-    (void) max_patches;
+bool VisionEncoder::init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std::string& err) {
     if (!blas.open(err)) return false;
     impl_->blas = blas.impl_->blas;
     if (!impl_->load(mp, err)) {
@@ -313,6 +344,14 @@ bool VisionEncoder::init(const basalt::vision::Mmproj& mp, int max_patches, Visi
         return false;
     }
     return true;
+}
+
+bool VisionEncoder::reserve(const VisionPlan& pl, std::string& err) {
+    Impl& s = *impl_;
+    const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();
+    if (s.ensure(n, ng, ntok)) return true;
+    err = "no device memory for the image encoder's work buffers (" + std::to_string(s.work_bytes(n, ng, ntok) >> 20) + " MiB)";
+    return false;
 }
 
 static int blocks(size_t n) { return (int) ((n + 255) / 256); }
@@ -324,11 +363,8 @@ bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl,
         err = "patch rows do not match the plan";
         return false;
     }
-    if (!s.ensure(n, ng, ntok)) {
-        err = "cannot allocate the encoder's work buffers";
-        return false;
-    }
-    cudaMemcpy(s.d_rows, rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice);
+    if (!reserve(pl, err)) return false;
+    basalt::core::device_copy(s.d_rows, rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice);
     // patch embedding (fp32 product) + bias
     s.gemm(CUDA_R_32F, s.d_rows, kVisionPatchValues, s.wpatch, kVisionPatchValues, s.x, E, n, E, kVisionPatchValues);
     k_bias_add<<<blocks((size_t) n * E), 256>>>(s.x, s.bpatch, (size_t) n * E, E);
@@ -369,7 +405,7 @@ bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl,
     k_bias_add<<<blocks((size_t) ng * s.proj), 256>>>(s.aout, s.b2, (size_t) ng * s.proj, s.proj);
     k_assemble<<<ntok, 256>>>(s.aout, s.start, s.endv, s.nl, s.dout, pl.lw, pl.lh, s.proj);
     out.resize((size_t) ntok * s.proj);
-    const cudaError_t ce = cudaMemcpy(out.data(), s.dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    const cudaError_t ce = basalt::core::device_copy(out.data(), s.dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
     if (!ok || ce != cudaSuccess) {
         err = ok ? std::string("encode failed: ") + cudaGetErrorString(ce) : "a product failed";
         return false;

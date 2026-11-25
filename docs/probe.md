@@ -11,7 +11,8 @@ basalt-probe --model PACK.basalt -- ENGINE FLAGS...
 |---|---|
 | `--model FILE` | the model file |
 | `--engine BIN`, `--fixtures DIR`, `--logs DIR` | as for `basalt-bench` |
-| `--gpu A,B` or `auto` | the cards, as for the server; default GPU 0 |
+| `--gpu A,B` or `all` | the cards, as for the server; default GPU 0 |
+| `--gpu-mode MODE`, `--gpu-share A,B` | what two or more cards do together (`peer`, `split`) and their shares, as for the server ([GPUs](configuration/gpus.md)) |
 | `-- ARGS` | engine flags, as for `basalt-bench`; the report prints the flags it used. `--expert-profile-save FILE` is compared, never written |
 
 ## What it does

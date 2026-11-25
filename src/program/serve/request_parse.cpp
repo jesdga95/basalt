@@ -1,7 +1,10 @@
 // src/program/serve/request_parse.cpp - request parse operations.
 #include "request.hpp"
+#include "basalt/core/progress.hpp"
 #include "../cli/tokens.hpp"
 #include "logprobs.hpp"
+
+#include <algorithm>
 
 namespace basalt::program::serve {
 
@@ -87,10 +90,6 @@ Flow Request::parse() {
         bad = "penalty_freq, penalty_present: numbers";
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
     else if (req_logprobs < -1 || req_logprobs > kMaxTopLogprobs) bad = "logprobs: 0 to 20 alternatives";
-    else if (req_logprobs >= 0 && runtime_.o.batch > 0 && runtime_.pipelined()) bad = "logprobs: pipelined batch groups are not supported";
-    if (bad == nullptr && runtime_.o.batch > 0 && runtime_.pipelined() && req_penalty_last_n > 0 &&
-        (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
-        bad = "penalties: pipelined batch groups are not supported";
     if (bad != nullptr) {
         std::printf("ERR sampling %s\n", bad);
         return Flow::next;
@@ -147,20 +146,27 @@ Flow Request::parse() {
 
     if (!req_grammar_text.empty() && runtime_.grammar_vocab) {
         std::string gerr;
-        if (runtime_.o.batch > 0 && runtime_.pipelined()) gerr = "pipelined batch groups are not supported";
-        else {
-            gguard = std::make_unique<basalt::program::grammar::Guard>(*runtime_.grammar_vocab);
-            const size_t gp = req_gprompt > 0 && (size_t) req_gprompt < ids.size() ? (size_t) req_gprompt : ids.size();
-            if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
-            else if (gp < ids.size() && gguard->on()) {
-                const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
-                if (gguard->scan(done.data(), (int) done.size(), 0) >= 0) {
-                    gerr = "the tokens already generated do not satisfy the grammar";
-                    gguard.reset();
+        gguard = std::make_unique<basalt::program::grammar::Guard>(*runtime_.grammar_vocab);
+        const size_t gp = req_gprompt > 0 && (size_t) req_gprompt < ids.size() ? (size_t) req_gprompt : ids.size();
+        if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
+        else if (gp < ids.size() && gguard->on()) {
+            const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
+            constexpr int kScanChunk = 4096;
+            bool bad = false;
+            for (int off = 0; off < (int) done.size(); off += kScanChunk) {
+                const int n_chunk = (std::min)(kScanChunk, (int) done.size() - off);
+                if (gguard->scan(done.data() + off, n_chunk, 0) >= 0) {
+                    bad = true;
+                    break;
                 }
+                basalt::core::progress_beat();
             }
-            else if (!gguard->on()) gguard.reset();
+            if (bad) {
+                gerr = "the tokens already generated do not satisfy the grammar";
+                gguard.reset();
+            }
         }
+        else if (!gguard->on()) gguard.reset();
         if (!gerr.empty()) { std::printf("ERR grammar: %s\n", gerr.c_str()); return Flow::next; }
     } else if (!req_grammar_text.empty()) {
         basalt::log::warn("basalt grammar", "the request has a grammar but this engine runs with --grammar off; ignored");

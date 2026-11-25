@@ -16,18 +16,23 @@
 #include <vector>
 
 #include "basalt/program/grammar/grammar.hpp"
+#include "basalt/program/grammar/reply_form.hpp"
 
 namespace basalt::program::grammar {
 
 struct PackVocab {
     std::shared_ptr<const Vocab> vocab;
     int32_t think_open = -1;    ///< the token that opens a thinking block, or -1
-    int32_t think_close = -1;   ///< the token that closes it, or -1
+    int32_t think_close = -1;   ///< the token that closes it (a reply of blocks: that ends any block), or -1
+    int32_t block_header = -1;  ///< a reply of blocks: the token that opens a block, else -1
+    int32_t answer_open = -1;   ///< a reply of blocks: the tag of the answer block, or -1
 };
 
 /// `vocab_json` is tokenizer/vocab.json ({"token text": id}, byte-level BPE spelling), `types_json` is
 /// tokenizer/token_type.json (one type per id: 3 control, 4 user-defined added token, 5 unused, 6 byte). Ids from
-/// 0 to n_vocab - 1; an id without an entry has no text. `end_ids` are the tokens that finish generation.
+/// 0 to n_vocab - 1; an id without an entry has no text. `end_ids` are the tokens that finish generation. The thinking
+/// tokens are reply_form()'s: the default form's are added tokens, a reply of blocks' may be control tokens, and its
+/// block end joins the end tokens (the answer block ends only where the grammar can).
 bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, size_t n_vocab,
                      const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err);
 
@@ -50,7 +55,9 @@ public:
 
     /// Starts a request. `grammar_json` is the request's "grammar" object. `prompt` ends where generation starts: an
     /// open thinking block there defers the grammar until the block is closed. False with `err` on an unusable grammar.
-    /// A request whose grammar is null (tool_choice "none") leaves the guard off.
+    /// A request whose grammar is null (tool_choice "none") leaves the guard off. With a reply of blocks and a grammar
+    /// from the first answer token, the reply's thinking blocks pass (unless the request says "think": false) and the
+    /// grammar holds the answer block.
     bool begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err);
     bool on() const { return on_; }
 
@@ -75,11 +82,18 @@ private:
     void mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias);
     std::string describe() const;
 
+    // a reply of blocks, outside a thinking block: where it is before (and after) the answer
+    enum class Phase { answer, between, opened, done };   // in the answer; a block may open; after a header; answered
+    bool is_end(int32_t token) const;   // a token that ends the reply (not the block end)
+
     PackVocab pv_;
     GrammarState st_;
     std::vector<uint8_t> mask_;
     bool on_ = false;
     bool thinking_ = false;
+    bool blocks_ = false;        // this request's reply is read as blocks
+    bool allow_think_ = true;    // a reply of blocks may think
+    Phase phase_ = Phase::answer;
     int64_t windows_ = 0, misses_ = 0, fallbacks_ = 0, ns_ = 0;
 };
 
