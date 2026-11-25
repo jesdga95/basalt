@@ -209,8 +209,7 @@ void test_case(std::mt19937& rng, int64_t ntok, int64_t rows, int64_t cols, bool
                     int32_t dot = 0;
                     for (int i = 0; i < 32; ++i)
                         dot += (int32_t) ac[t * cols + b * 32 + i] * (int32_t) wc[(size_t) (r * cols + b * 32 + i)];
-                    __half hd;
-                    std::memcpy(&hd, &wsc[(size_t) (b * w_ld + r)], sizeof hd);
+                    const __half hd(__half_raw{wsc[(size_t) (b * w_ld + r)]});   // gcc's -Wclass-memaccess dislikes a memcpy into __half
                     a = std::fmaf((float) dot, asc[b * a_ld + t] * __half2float(hd), a);
                 }
                 const float want = add ? y_init[(size_t) (t * ld + r)] + a : a;
