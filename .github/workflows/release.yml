@@ -30,15 +30,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # this fork targets Ada (compute capability 8.9): every archive is built for it
           - os: ubuntu-24.04
             platform: linux-x64
-            cuda_arch: 120
-          - os: ubuntu-24.04-arm   # the DGX Spark's build: Arm64 with the integrated GB10 (12.1)
+            cuda_arch: 89
+          - os: ubuntu-24.04-arm
             platform: linux-arm64
-            cuda_arch: 121
+            cuda_arch: 89
           - os: windows-2022
             platform: windows-x64
-            cuda_arch: 120
+            cuda_arch: 89
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     defaults:
