@@ -804,7 +804,7 @@ void test_experts(int type) {
         void* dscr = zeros<uint8_t>(bk::native_expert_scratch_bytes(WP, F));
         float *rows = zeros<float>((size_t) WP * E), *yd = zeros<float>((size_t) R * E);
         for (int r0 = 0; r0 < R; r0 += W) {
-            moe_plan(dids + (size_t) r0 * K, W, K, NE, dtable, ptr, start, ng, ddst, dtok, S);
+            basalt::kernels::moe_plan(dids + (size_t) r0 * K, W, K, NE, dtable, ptr, start, ng, ddst, dtok, S);
             bk::native_quantize_q8_1(dx + (size_t) r0 * E, dxq, E, W, S);
             bk::native_expert_grouped(ex.L, ptr, start, ng, ddst, dtok, std::min(WP, NE), WP, dxq, dscr, rows, S);
             moe_combine(rows, dw + (size_t) r0 * K, W, K, yd + (size_t) r0 * E, S);

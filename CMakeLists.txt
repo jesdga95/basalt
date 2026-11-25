@@ -562,6 +562,7 @@ endif()
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
 add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
+                        src/kernels/cuda/expert_plan.cu
                         src/kernels/cuda/sampler.cu
                         src/kernels/cuda/logprobs.cu
                         src/kernels/cuda/elementwise.cu

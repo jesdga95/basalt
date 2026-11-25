@@ -648,7 +648,7 @@ void test_experts() {
     void* scr = zeros<uint8_t>(bk::native_expert_scratch_bytes(R * K, FF));
     cudaStream_t st;
     cudaStreamCreate(&st);
-    moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx, xq, H, R, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, NE, R * K, xq, scr, rows, st);
     moe_combine(rows, dw, R, K, y, st);
@@ -675,7 +675,7 @@ void test_experts() {
         }
     report("experts (NVFP4, softcapped SwiGLU)", got, ref, 2e-2);   // q8_1 activations
     // the plan of row 1 alone gives that row's bits
-    moe_plan(dids + K, 1, K, NE, dtable, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids + K, 1, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx + H, xq, H, 1, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, K, K, xq, scr, rows, st);
     float* y1 = zeros<float>(H);
@@ -687,7 +687,7 @@ void test_experts() {
     std::vector<unsigned long long> off = table;
     off[2] = 0;
     unsigned long long* doff = dev(off);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st);
     cudaStreamSynchronize(st);
     const int n_g = host(ng, 1)[0];
     const std::vector<int32_t> hs = host(start, (size_t) R * K + 2), hd = host(dst, (size_t) R * K);
@@ -701,8 +701,8 @@ void test_experts() {
     failures += !plan_ok;
     // the console's tally: two plans add each expert's pairs on the card to its entry, the expert off it stays at zero
     uint32_t* tally = zeros<uint32_t>(NE);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
     cudaStreamSynchronize(st);
     const std::vector<uint32_t> ht = host(tally, NE);
     bool tally_ok = true;
