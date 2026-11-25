@@ -172,9 +172,10 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
                                     int k, float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights,
                                     SelectScratch& sh, const ResidentTabs& held, float prior) {
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
-    const float s = score(logits[e], gate);
+    float s = score(logits[e], gate);
     float b = s + bias[e];
     if (kPrior && held.held(e)) b += prior;
+    if (isnan(b)) { b = -INFINITY; s = 0.f; }
     float m = b;
 #pragma unroll
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
@@ -215,8 +216,22 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
     if (e == 0) {
         float sum = 0.f;
         for (int r = 0; r < k; ++r) sum += sh.sel[r];
-        const float denom = sum + 1e-20f;
-        for (int r = 0; r < k; ++r) weights[r] = sh.sel[r] / denom * scale;
+        if (isfinite(sum)) {
+            const float denom = sum + 1e-20f;
+            for (int r = 0; r < k; ++r) weights[r] = sh.sel[r] / denom * scale;
+        } else {
+            int n_inf = 0;
+            for (int r = 0; r < k; ++r) n_inf += isinf(sh.sel[r]);
+            if (n_inf > 0) {
+                const float w_inf = scale / (float) n_inf;
+                for (int r = 0; r < k; ++r) weights[r] = isinf(sh.sel[r]) ? w_inf : 0.f;
+            } else {
+                double dsum = 0.0;
+                for (int r = 0; r < k; ++r) dsum += (double) sh.sel[r];
+                const double denom = dsum + 1e-20;
+                for (int r = 0; r < k; ++r) weights[r] = (float) ((double) sh.sel[r] / denom) * scale;
+            }
+        }
     }
 }
 
@@ -358,6 +373,7 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
 }
 
 void router_logits(const float* x, const float* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
+    if (n_tokens <= 0) return;
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 16 || a.k > a.n_expert)
         throw std::invalid_argument("router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
@@ -397,6 +413,7 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
 
 void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,
                    void* stream) {
+    if (n_tokens <= 0) return;
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.k < 1 || a.k > 16 || a.k > a.n_expert)
         throw std::invalid_argument("router_select: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
