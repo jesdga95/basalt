@@ -125,7 +125,9 @@ placement is part of the result. With `--vram-reserve-mib 300` at `--max-context
 PPL 7.0708 to 7.0725, paired NLL difference +0.00025 +- 0.00042, top-1 98.22% of rows the same (RTX 5080 at 360 W).
 The copies then follow the session's own lookups and the prompt loan adds more while decode runs, so which pairs the card
 computes depends on the conversation; it changes only at positions the requests fix, so a greedy request's placement, and
-its tokens, are the same on every run.
+its tokens, are the same on every run. The ranking that picks those pairs (lookups discounted by the visits of each expert's
+layer, [placement](../models/inkling2.md)) changes which pairs the card computes, not how: at equal placement the
+arithmetic is the same.
 
 The final rebased quality rows above use the DQ8 pack `/mnt/storage/Projects/basalt/models/Inkling-2-Mini-NVFP4-q8.basalt` and the BF16-derived reference `/mnt/storage/kld/inkling2-q6cr-eval/inkling2-bf16-base.kld`, with the same 100 wikitext-2 chunks (25,500 scored rows), T=3, and RTX 5090 power limit 475 W. The scored-row base PPL was 7.0644 for each run. Earlier quality rows and 256K VRAM readings were measured at 400 W unless noted. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512).
 

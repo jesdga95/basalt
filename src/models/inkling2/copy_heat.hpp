@@ -1,6 +1,6 @@
 // src/models/inkling2/copy_heat.hpp - which RAM experts earn a card copy: each (layer, expert) pair's recent lookups by the rows
-// a conversation keeps, decayed with those rows, ranked in place of the static spill order. With no lookups seen the rank
-// is the spill order itself.
+// a conversation keeps, decayed with those rows, per visit of its layer, ranked in place of the static spill order. With no
+// lookups seen the rank is the spill order itself.
 #pragma once
 
 #include <algorithm>
@@ -17,15 +17,30 @@ public:
     /// Kept rows after which a lookup counts half: a stale genre's counts give way within a few hundred tokens, while a
     /// genre's own hot set stays stable over many more.
     static constexpr double kHalfLifeRows = 320.0;
-    /// The profile's order as a tie-break below one lookup: pair order[i] outranks order[i + 1] while both are unseen.
+    /// The profile's order as a tie-break below one lookup per visit: pair order[i] outranks order[i + 1] while both are unseen.
     static constexpr float kPriorStep = 1e-4f;
+    /// A layer run v times a token weighs its counts by v^-kVisitPower: below 1, so a looped layer keeps part of the
+    /// credit for serving every one of its visits (deep caches leave few copies, and its visits wait for the CPU too).
+    static constexpr double kVisitPower = 0.75;
 
-    /// `order`: the RAM experts, the most routed first, as (layer, expert); `pairs` = layers * n_expert.
-    void start(size_t pairs, int n_expert, const std::vector<std::pair<int32_t, int32_t>>& order) {
+    /// `order`: the RAM experts, the most routed first, as (layer, expert); `pairs` = layers * n_expert; `visits`: [layer]
+    /// how many times a token runs it. A visit waits for its RAM experts only while their CPU work outlasts the card's, so
+    /// a copy is worth about its lookups per visit: a layer that runs several times a token counts each of them, and its
+    /// counts are discounted by its visits (kVisitPower).
+    void start(size_t pairs, int n_expert, const std::vector<std::pair<int32_t, int32_t>>& order, const std::vector<int>& visits) {
         heat_.assign(pairs, 0.0f);
         prior_.assign(pairs, 0.0f);
+        per_visit_.assign(pairs, 1.0f);
+        float least = 1.0f;
+        for (size_t i = 0; i < pairs; ++i) {
+            const size_t l = i / (size_t) n_expert;
+            if (l < visits.size() && visits[l] > 1) {
+                per_visit_[i] = (float) std::pow((double) visits[l], -kVisitPower);
+                least = std::min(least, per_visit_[i]);
+            }
+        }
         for (size_t i = 0; i < order.size(); ++i)
-            prior_[(size_t) order[i].first * (size_t) n_expert + (size_t) order[i].second] = kPriorStep * (float) (order.size() - i);
+            prior_[(size_t) order[i].first * (size_t) n_expert + (size_t) order[i].second] = kPriorStep * (float) (order.size() - i) * least;
     }
     bool started() const { return !heat_.empty(); }
 
@@ -35,10 +50,10 @@ public:
         const float keep = (float) std::exp2(-(double) std::max<int64_t>(rows, 0) / kHalfLifeRows);
         for (size_t i = 0; i < heat_.size(); ++i) heat_[i] = heat_[i] * keep + (float) lookups[i];
     }
-    float score(size_t pair) const { return heat_[pair] + prior_[pair]; }
+    float score(size_t pair) const { return heat_[pair] * per_visit_[pair] + prior_[pair]; }
 
 private:
-    std::vector<float> heat_, prior_;
+    std::vector<float> heat_, prior_, per_visit_;
 };
 
 /// `pairs` ordered by score, highest first (equal scores keep their order).
@@ -52,7 +67,7 @@ struct CopySwap {
 };
 
 /// Swaps that move a card copy from a colder pair to a hotter RAM one of the same size, at most `max_swaps`, the largest
-/// gains first. A pair must beat the copy by a quarter and by `min_gain` lookups, so noise does not churn the card.
+/// gains first. A pair must beat the copy by a quarter and by `min_gain` lookups per visit, so noise does not churn the card.
 /// `copies`: pairs with a copy; `ram`: RAM pairs without; `size_class(pair)`: equal for pairs whose copies can swap storage.
 template <class SizeClass>
 std::vector<CopySwap> plan_swaps(const CopyHeat& h, const std::vector<size_t>& copies, const std::vector<size_t>& ram, SizeClass size_class,

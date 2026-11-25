@@ -78,7 +78,9 @@ the text model.
   CUDA failure) stops the engine: every later request is refused. With one session, a refused decode window ends its
   request with an error and the engine serves the next. Nothing changes when everything fits.
 - **Which experts get a copy:** the profile's order until the session has looked experts up, then the lookups of the rows its
-  windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
+  windows keep (rejected drafts do not count), decayed over 320 kept rows, discounted by the visits of the expert's layer: a
+  visit waits for its RAM experts only while the CPU's share outlasts the card's, so a looped layer's counts are divided by
+  its three visits to the power 0.75. The least looked up give way first when the caches
   grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies
   move to clearly hotter RAM experts of the same size.
 - **Prompt loan:** with an elastic spill, one session and one card, the prompt path's device memory that decode leaves idle (the
