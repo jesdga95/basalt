@@ -60,7 +60,11 @@ the text model.
   from the start and the RAM experts are copied back while the card has room. Either way the copies leave the card's spare
   free: 1 GiB at the start and 512 MiB after a cache grow, or `--vram-reserve-mib N` for both (at least 128, 256 where the
   driver pages GPU memory); with the flag they also leave 256 MiB for what loads after them (kernels at their first launch,
-  the windows' graphs). The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
+  the windows' graphs). The flag is a load-time promise, not just a runtime floor: the load sizes the sessions and the
+  spill so the card holds the asked reserve after loading — the fit check refuses a `--max-context` that cannot leave it
+  room, and a load that still leaves less than the asked reserve is refused with an error naming the knobs (lower
+  `--max-context` or `--spec`, or use a bigger card) — so a reserve that cannot be met is never silently served at a
+  smaller one. The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
   another program, can take it. Placement counts the card's free memory itself: it reads it when the copies are first
   placed, at a VRAM resize and at a wake, and counts every map and release of the copies and the caches after that (what
   loads later comes out of the spare and the 256 MiB). A grow or a copy that cannot map what was counted (another
