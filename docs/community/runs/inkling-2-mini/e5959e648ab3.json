@@ -1,0 +1,35 @@
+{
+  "submitter": "giveen",
+  "date": "2026-11-25",
+  "commit": "f790236b9a",
+  "preset": "community-1",
+  "model": "Inkling-2-Mini",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 475,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 48.7
+    }
+  ],
+  "ram_gib": 247,
+  "cpu": "Intel Core Ultra 9 285K, 24 cores",
+  "ram_gbps": 71.9,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 19876.8,
+  "prefill_64k_tps": 15939.5,
+  "decode_tps": 603.7,
+  "decode_conv_tps": 384.0,
+  "decode_struct_tps": 717.4,
+  "decode_prose_tps": 332.5,
+  "accept_conv_pct": 65.9,
+  "accept_struct_pct": 91.5,
+  "accept_prose_pct": 50.1,
+  "draft_len_conv": 1.8,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.2,
+  "engine_args": "--gpu 0 --max-context 63233 --kv int8"
+}
