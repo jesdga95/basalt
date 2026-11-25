@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <memory>
+#include <optional>
 #include <string>
 #include "basalt/log.hpp"
 
@@ -44,29 +47,36 @@ int main(int argc, char** argv) {
         }
     }
     if (path.empty()) { basalt::log::error("basalt", "--file is required"); return 2; }
+    if (layers == 0) { basalt::log::error("basalt", "--layers must be >= 1"); return 2; }
+    if (threads < 1) { basalt::log::error("basalt", "--threads must be >= 1"); return 2; }
 
-    const uint64_t bytes = layers * blobs_per_layer * blob_bytes;
+    const uint64_t layer_bytes = blobs_per_layer * blob_bytes;
+    if (layers > (std::numeric_limits<uint64_t>::max)() / layer_bytes) {
+        basalt::log::error("basalt", "--layers overflows arena byte size");
+        return 2;
+    }
+    const uint64_t bytes = layers * layer_bytes;
     std::printf("expert arena: %llu layers x %llu blobs x %llu B = %.3f GiB\n", (unsigned long long) layers,
                 (unsigned long long) blobs_per_layer, (unsigned long long) blob_bytes,
                 (double) bytes / (1024.0 * 1024 * 1024));
 
-    basalt::core::PinnedArena arena;
+    std::optional<basalt::core::PinnedArena> arena;
+    std::unique_ptr<uint8_t, decltype(&std::free)> raw(nullptr, &std::free);
     uint8_t* dst = nullptr;
     if (pin) {
-        // constructed in place so the note from the constructor can be printed before the load
-        new (&arena) basalt::core::PinnedArena(bytes);
-        std::printf("backing: %s\n", arena.note.c_str());
-        if (!arena.valid()) { basalt::log::error("basalt", "arena allocation failed"); return 1; }
-        dst = arena.data();
+        arena.emplace(bytes);
+        std::printf("backing: %s\n", arena->note.c_str());
+        if (!arena->valid()) { basalt::log::error("basalt", "arena allocation failed"); return 1; }
+        dst = arena->data();
     } else {
-        dst = (uint8_t*) std::malloc((size_t) bytes);
-        if (!dst) { basalt::log::error("basalt", "malloc failed"); return 1; }
+        raw.reset((uint8_t*) std::malloc((size_t) bytes));
+        if (!raw) { basalt::log::error("basalt", "malloc failed"); return 1; }
+        dst = raw.get();
         std::printf("backing: malloc, NOT pinned (--no-pin)\n");
     }
 
     basalt::core::LoadPlan plan;
     const int file = plan.file(path);
-    const uint64_t layer_bytes = blobs_per_layer * blob_bytes;
     for (uint64_t l = 0; l < layers; ++l) {
         basalt::core::LoadItem it;
         it.file = file;
@@ -104,7 +114,7 @@ int main(int argc, char** argv) {
         const char* names[] = {"1 blob", "16 blobs", "1 layer", "whole arena"};
         for (int i = 0; i < 4; ++i) {
             const uint64_t g = granularities[i];
-            if (g > bytes) continue;
+            if (g == 0 || g > bytes) continue;
             const int iters = (int) (g >= bytes ? 3 : (bytes / g >= 8 ? 8 : 3));
             const basalt::core::StreamStats ss =
                 basalt::core::stream_bandwidth(dst, (bytes / g) * g, g, iters);
@@ -119,10 +129,15 @@ int main(int argc, char** argv) {
         std::printf("\nper-token expert stream at E = 663.6 MB and hit rate h (VRAM-resident fraction):\n");
         std::printf("  %-8s %-14s %-14s %s\n", "h", "miss MB/token", "ms at 1 blob", "tok/s ceiling");
         const basalt::core::StreamStats one = basalt::core::stream_bandwidth(dst, blob_bytes, blob_bytes, 64);
-        for (double h : {0.0, 0.5, 0.833, 0.9, 0.95}) {
-            const double miss_mb = (1.0 - h) * 663.6;
-            const double ms = miss_mb / 1000.0 / (one.gib_per_second() * 1.073741824) * 1000.0;
-            std::printf("  %-8.3f %-14.1f %-14.2f %.1f\n", h, miss_mb, ms, ms > 0 ? 1000.0 / ms : 0.0);
+        const double one_gbps = one.gib_per_second() * 1.073741824;
+        if (one.seconds <= 0.0 || one_gbps <= 0.0) {
+            basalt::log::warn("basalt", "1-blob stream measurement failed; skipping projection table");
+        } else {
+            for (double h : {0.0, 0.5, 0.833, 0.9, 0.95}) {
+                const double miss_mb = (1.0 - h) * 663.6;
+                const double ms = miss_mb / 1000.0 / one_gbps * 1000.0;
+                std::printf("  %-8.3f %-14.1f %-14.2f %.1f\n", h, miss_mb, ms, ms > 0 ? 1000.0 / ms : 0.0);
+            }
         }
         std::printf("  E is the FULL expert set per token, so which fraction is cached is the question the\n"
                     "  number hinges on.\n");

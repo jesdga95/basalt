@@ -113,10 +113,20 @@ bool Runtime::slot_window_accept(int b, SlotWin& w) {
     std::vector<int32_t>& out_ = w.out;
     int a = 0;
     while (a < T - 1 && win_[(size_t) a + 1] == out_[(size_t) a]) ++a;
+    const int64_t ctx = slot_context(b);
+    int emit_a = a;   // last row whose pick is emitted (-1 if grammar hits a dead end on row 0)
     if (sl.guard != nullptr && sl.guard->on()) {
+        // Only scan picks this window would actually emit (stop at EOS, cancel, max_new, or context limit).
+        int scan_rows = 0;
+        for (int i = 0; i <= a; ++i) {
+            ++scan_rows;
+            const int32_t y = out_[(size_t) i];
+            const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+            if (eos || sl.stop || sl.produced + scan_rows >= sl.max_new || sl.p + scan_rows + 2 > ctx) break;
+        }
         // the first pick the grammar refuses is drawn again under its mask, and the window ends there; with no token
-        // allowed at all the slot ends after it, as an error
-        const int miss = sl.guard->scan(out_.data(), a + 1, 0);
+        // allowed at all the slot ends after the valid picks before it, as an error
+        const int miss = sl.guard->scan(out_.data(), scan_rows, 0);
         if (miss >= 0) {
             int32_t y = -1;
             std::string why;
@@ -135,24 +145,28 @@ bool Runtime::slot_window_accept(int b, SlotWin& w) {
                 },
                 y);
             if (verdict == basalt::program::grammar::Redraw::failed) return failed(why.empty() ? "the masked draw failed" : why);
-            if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
-            else out_[(size_t) miss] = y;
-            a = miss;
+            if (verdict == basalt::program::grammar::Redraw::dead) {
+                grammar_dead = true;
+                emit_a = miss - 1;
+                a = std::max(0, miss - 1);
+            } else {
+                out_[(size_t) miss] = y;
+                emit_a = a = miss;
+            }
         }
     }
     sl.drafts_offered += T - 1;
-    sl.drafts_accepted += a;
+    sl.drafts_accepted += std::max(0, emit_a);
     ++sl.windows;
-    std::string line = "BT " + std::to_string(b);
+    std::string line = emit_a >= 0 ? ("BT " + std::to_string(b)) : std::string();
     const char* fin = nullptr;
     const int64_t sent0 = sl.produced;
-    if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
-        lp_rows.resize((size_t) (a + 1) * basalt::kernels::kLogprobStride);
-        if (const basalt::model::Result r = s.row_logprobs(0, a + 1, out_.data(), sl.lp_top, lp_rows.data()); !r.ok())
+    if (sl.lp_top >= 0 && emit_a >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
+        lp_rows.resize((size_t) (emit_a + 1) * basalt::kernels::kLogprobStride);
+        if (const basalt::model::Result r = s.row_logprobs(0, emit_a + 1, out_.data(), sl.lp_top, lp_rows.data()); !r.ok())
             return failed(r.message);
     }
-    const int64_t ctx = slot_context(b);
-    for (int i = 0; i <= a && fin == nullptr; ++i) {
+    for (int i = 0; i <= emit_a && fin == nullptr; ++i) {
         const int32_t y = out_[(size_t) i];
         if (sl.lp_top >= 0)   // ahead of the BT line
             basalt::protocol::emit_text("BP " + std::to_string(b) +
@@ -166,9 +180,16 @@ bool Runtime::slot_window_accept(int b, SlotWin& w) {
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > ctx ? "length" : nullptr;
     }
-    if (grammar_dead) fin = "error";
-    w.kept = (int) (sl.produced - sent0);
-    stats_window(b, T - 1, a, w.kept);
+    if (grammar_dead && fin == nullptr) fin = "error";
+    const int emitted = (int) (sl.produced - sent0);
+    w.kept = emitted;
+    if (w.kept == 0) {
+        // Grammar dead-ended on row 0: commit row 0 (the previously emitted token) without emitting the forbidden pick.
+        sl.ids.push_back(win_[0]);
+        ++sl.p;
+        w.kept = 1;
+    }
+    stats_window(b, T - 1, std::max(0, emit_a), emitted);
     sl.n_dr = 0;
     w.a = a;
     w.line = line;
@@ -184,7 +205,7 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
     basalt::model::ModelSession& s = slot_session(b);
     const int T = w.T, a = w.a;
     const char* fin = w.fin;
-    basalt::protocol::emit_text(w.line + "\n");
+    if (!w.line.empty()) basalt::protocol::emit_text(w.line + "\n");
     basalt::core::progress_beat();
     if (w.drafting) {
         const int max_n = std::min(s.max_window() - 1, (int) std::size(sl.dr));

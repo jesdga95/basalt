@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 
@@ -51,10 +53,38 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--image-at") o.image_at.push_back(std::atoll(next("--image-at")));
         else if (a == "--image-pad-id") { o.image_pad_id = std::atoll(next("--image-pad-id")); o.image_pad_given = true; }
         else if (a == "--greedy") o.greedy = true;
-        else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
+        else if (a == "--seed") {
+            const std::string value = next("--seed");
+            uint64_t s = 0;
+            const auto res = std::from_chars(value.data(), value.data() + value.size(), s);
+            if (res.ec != std::errc{} || res.ptr != value.data() + value.size()) {
+                basalt::log::error("basalt", "--seed needs an unsigned 64-bit integer");
+                return 2;
+            }
+            o.seed = s;
+            o.greedy = false;
+        }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
-        else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
-        else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
+        else if (a == "--top-p") {
+            const char* raw = next("--top-p");
+            char* end = nullptr;
+            const float v = std::strtof(raw, &end);
+            if (end == raw || *end != '\0' || !std::isfinite(v) || !(v > 0.0f && v <= 1.0f)) {
+                basalt::log::error("basalt", "--top-p needs a finite number in (0, 1]");
+                return 2;
+            }
+            o.top_p = v;
+        }
+        else if (a == "--temperature") {
+            const char* raw = next("--temperature");
+            char* end = nullptr;
+            const float v = std::strtof(raw, &end);
+            if (end == raw || *end != '\0' || !std::isfinite(v) || v < 0.0f) {
+                basalt::log::error("basalt", "--temperature needs a finite number >= 0");
+                return 2;
+            }
+            o.temperature = v;
+        }
         else if (a == "--pool-workers") { o.pool_workers = std::atoi(next("--pool-workers")); o.pool_workers_given = true; }
         else if (a == "--pool-affinity") {
             const std::string v = next("--pool-affinity");
@@ -125,8 +155,13 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { basalt::log::error("basalt generate", "--resident-budget-gib needs N > 0"); return 2; }
+            const char* raw = next("--resident-budget-gib");
+            char* end = nullptr;
+            const double gib = std::strtod(raw, &end);
+            if (end == raw || *end != '\0' || !std::isfinite(gib) || !(gib > 0.0) || gib > (double) (UINT64_MAX >> 30)) {
+                basalt::log::error("basalt generate", "--resident-budget-gib needs a finite number > 0");
+                return 2;
+            }
             o.resident_budget = (uint64_t) (gib * 1073741824.0);
             o.resident_budget_given = true;
         }

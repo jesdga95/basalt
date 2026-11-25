@@ -14,6 +14,8 @@
 int main(int argc, char** argv) {
     uint64_t ctx = 20480;
     uint64_t free_vram = 12ull * 1000 * 1000 * 1000; // a small card; overridden by --vram
+    uint64_t pool_override = 0;
+    bool pool_given = false;
     basalt::plan::Costs costs;
     bool state_given = false;
     for (int i = 1; i < argc; ++i) {
@@ -39,9 +41,8 @@ int main(int argc, char** argv) {
             next(costs.state_bytes);
             state_given = true;
         } else if (a == "--pool") {
-            uint64_t v = 0;
-            next(v);
-            free_vram = v;
+            next(pool_override);
+            pool_given = true;
         } else if (a == "--help" || a == "-h") {
             std::printf("usage: basalt-plan [--max-context N] [--vram BYTES] [--dense B] [--embd B]\n"
                         "                   [--workspace B] [--state B] [--pool B]\n"
@@ -57,14 +58,12 @@ int main(int argc, char** argv) {
     // DEFAULT THE STATE FROM THE GEOMETRY.  A `--state` that defaults to 0 and is never passed is not a
     // default, it is an omission - and this one was worth 85 cache slots of overcommit.
     if (!state_given) costs.state_bytes = basalt::plan::state_bytes(basalt::plan::Geometry{});
-    // The pool is what the KV cache and the expert cache share.  Derived from the card's free VRAM less the
-    // resident dense weights; `--pool` overrides it for reproducing the standard-tier numbers exactly.
-    const uint64_t pool = free_vram > costs.dense_bytes + costs.embd_bytes
-                              ? free_vram - costs.dense_bytes - costs.embd_bytes
-                              : 0;
+    // make_plan() deducts fixed costs (dense, embd, mtp, workspace, state) from the budget once; `--pool` sets the
+    // budget directly (reproducing the standard-tier numbers), and insufficient VRAM throws DoesNotClose instead of
+    // silently substituting vram_pool_bytes().
+    const uint64_t budget = pool_given ? pool_override : free_vram;
     try {
-        const basalt::plan::Plan p = basalt::plan::make_plan(ctx, basalt::plan::Geometry{}, costs,
-                                                             pool ? pool : basalt::plan::vram_pool_bytes());
+        const basalt::plan::Plan p = basalt::plan::make_plan(ctx, basalt::plan::Geometry{}, costs, budget);
         std::printf("%s", basalt::plan::to_string(p).c_str());
         return 0;
     } catch (const basalt::plan::DoesNotClose& e) {

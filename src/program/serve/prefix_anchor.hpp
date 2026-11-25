@@ -55,7 +55,9 @@ HeldMeet meet_held(const int32_t* prompt, int64_t n, const int32_t* held, int64_
 
 /// Whether a prompt that grows from `n` to `grown` tokens still leaves `want` tokens of answer in a context of `ctx`
 /// (the engine keeps 8 free). A prompt that does not grow always fits: the request was admitted with it.
-inline bool respell_fits(int64_t grown, int64_t n, int64_t want, int64_t ctx) { return grown <= n || grown + want + 8 <= ctx; }
+inline bool respell_fits(int64_t grown, int64_t n, int64_t want, int64_t ctx) {
+    return grown <= n || (ctx >= 8 && grown <= ctx - 8 && want <= ctx - 8 - grown);
+}
 
 /// The ids two sequences share from the start.
 inline int64_t shared_start(const int32_t* a, int64_t an, const int32_t* b, int64_t bn) {

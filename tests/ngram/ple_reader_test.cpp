@@ -130,6 +130,25 @@ int selftest(const std::string& dir, uint32_t rb) {
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
         }
     }
+    // uint64 wraparound bounds checks in open() and straddle-tail page deduplication
+    {
+        ng::PleReader rd;
+        std::string err;
+        const uint64_t wrap_rows = (~0ull / (uint64_t) rb) + 2;
+        CHECK(!rd.open(path, HEADER, wrap_rows, 8, 0, err, rb), "open() must reject n_rows * row_bytes uint64 wrap");
+        CHECK(!rd.open(path, ~0ull - 16, 1, 8, 0, err, rb), "open() must reject table_offset + bytes uint64 wrap");
+        CHECK(rd.open(path, HEADER, N, 8, 0, err, rb), "open for straddle dedup: %s", err.c_str());
+        uint32_t strad_r = 0;
+        for (uint32_t r = 0; r + 1 < N; ++r) {
+            const uint64_t a = HEADER + (uint64_t) r * rb;
+            if (a / 4096 != (a + rb - 1) / 4096) { strad_r = r; break; }
+        }
+        // strad_r straddles pages P and P+1; strad_r+1 starts on page P+1 -> only 2 unique pages must be read, not 3.
+        rd.reset_stats();
+        check_rows(rd, {strad_r, strad_r + 1}, N, rb, "straddle+next dedup");
+        CHECK(rd.stats().reads == 2, "straddling row + next-page row issued %llu reads (expected 2)",
+              (unsigned long long) rd.stats().reads);
+    }
     // fault injection: a 3 ms delay must be observed, and must not change the bytes
     {
         ng::PleReader rd;

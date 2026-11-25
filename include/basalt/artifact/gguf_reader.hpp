@@ -86,6 +86,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "IQ4_XS";
     case 24:
         return "I8";
+    case 29:
+        return "IQ1_M";
     case 30:
         return "BF16";
     case 34:
@@ -167,6 +169,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 210;
         return true;
+    case 15:   // Q8_K
+        elems = 256;
+        bytes = 292;
+        return true;
     case 16:
         elems = 256;
         bytes = 66;
@@ -178,6 +184,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 18:
         elems = 256;
         bytes = 98;
+        return true;
+    case 19:   // IQ1_S
+        elems = 256;
+        bytes = 50;
         return true;
     case 20:
         elems = 32;
@@ -202,6 +212,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 24:   // I8: raw bytes
         elems = 1;
         bytes = 1;
+        return true;
+    case 39:   // MXFP4: 1 E8M0 scale + 16 packed E2M1 bytes per 32 values
+        elems = 32;
+        bytes = 17;
         return true;
     case 40:   // NVFP4
         elems = 64;
@@ -247,7 +261,11 @@ class Cursor {
 public:
     Cursor(const uint8_t* base, size_t size) : base_(base), size_(size) {}
     void need(size_t n) const {
-        if (pos_ + n > size_) throw std::runtime_error("GGUF: unexpected end of file in header");
+        if (n > size_ - pos_) throw std::runtime_error("GGUF: unexpected end of file in header");
+    }
+    void skip(uint64_t n) {
+        if (n > (uint64_t) (size_ - pos_)) throw std::runtime_error("GGUF: unexpected end of file in header");
+        pos_ += (size_t) n;
     }
     template <class T> T read() {
         need(sizeof(T));
@@ -258,9 +276,9 @@ public:
     }
     std::string str() {
         const uint64_t n = read<uint64_t>();
-        need((size_t)n);
-        std::string s(reinterpret_cast<const char*>(base_ + pos_), (size_t)n);
-        pos_ += (size_t)n;
+        if (n > (uint64_t) (size_ - pos_)) throw std::runtime_error("GGUF: unexpected end of file in header");
+        std::string s(reinterpret_cast<const char*>(base_ + pos_), (size_t) n);
+        pos_ += (size_t) n;
         return s;
     }
     size_t pos() const { return pos_; }
@@ -282,8 +300,50 @@ struct MetaValue {
     uint64_t count = 0;
     std::vector<MetaValue> items;
     bool is_num() const { return type != MetaType::STRING && type != MetaType::ARRAY; }
-    double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
+    double num() const {
+        if (type == MetaType::F32 || type == MetaType::F64) return f;
+        if (type == MetaType::I8 || type == MetaType::I16 || type == MetaType::I32 || type == MetaType::I64)
+            return (double) (int64_t) u;
+        return (double) u;
+    }
 };
+
+inline void skip_value(Cursor& c, MetaType t, int depth = 0) {
+    if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
+    switch (t) {
+    case MetaType::U8:
+    case MetaType::I8:
+    case MetaType::BOOL:
+        c.skip(1);
+        break;
+    case MetaType::U16:
+    case MetaType::I16:
+        c.skip(2);
+        break;
+    case MetaType::U32:
+    case MetaType::I32:
+    case MetaType::F32:
+        c.skip(4);
+        break;
+    case MetaType::U64:
+    case MetaType::I64:
+    case MetaType::F64:
+        c.skip(8);
+        break;
+    case MetaType::STRING:
+        c.skip(c.read<uint64_t>());
+        break;
+    case MetaType::ARRAY: {
+        const MetaType elem = (MetaType) c.read<uint32_t>();
+        const uint64_t count = c.read<uint64_t>();
+        if (count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
+        for (uint64_t i = 0; i < count; ++i) skip_value(c, elem, depth + 1);
+        break;
+    }
+    default:
+        throw std::runtime_error("GGUF: unknown metadata value type");
+    }
+}
 
 inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
@@ -335,8 +395,8 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
         v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
         for (uint64_t i = 0; i < v.count; ++i) {
-            MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (i < 64) v.items.push_back(read_value(c, v.elem, depth + 1)); // keep a sample; the count is what matters
+            else skip_value(c, v.elem, depth + 1);
         }
         break;
     }
@@ -449,12 +509,16 @@ private:
             throw std::runtime_error("GGUF v" + std::to_string(version_) + ", this reader handles v3");
         const uint64_t n_tensors = c.read<uint64_t>();
         const uint64_t n_kv = c.read<uint64_t>();
+        if (n_kv > (size_ - c.pos()) / 13)
+            throw std::runtime_error("GGUF: unexpected end of file in metadata");
 
         for (uint64_t i = 0; i < n_kv; ++i) {
             std::string key = c.str();
             MetaType t = (MetaType)c.read<uint32_t>();
             meta_.emplace(std::move(key), read_value(c, t));
         }
+        if (n_tensors > (size_ - c.pos()) / 32)
+            throw std::runtime_error("GGUF: unexpected end of file in tensor directory");
         tensors_.reserve((size_t)n_tensors);
         // GGUF has no index to arbitrate between two tensors of one name: find() is first-match, so a
         // duplicate would silently win by position.  Refuse the file at open instead, naming both.
@@ -473,10 +537,18 @@ private:
             tensors_.push_back(std::move(t));
         }
         uint64_t align = 32;
-        if (const MetaValue* a = get("general.alignment"))
+        if (const MetaValue* a = get("general.alignment")) {
+            if (a->type == MetaType::I8 || a->type == MetaType::I16 || a->type == MetaType::I32 || a->type == MetaType::I64) {
+                if ((int64_t) a->u <= 0) throw std::runtime_error("GGUF: invalid general.alignment");
+            }
             if (a->u) align = a->u;
+        }
         alignment_ = align;
-        data_start_ = (c.pos() + align - 1) / align * align;
+        const uint64_t pos = c.pos();
+        const uint64_t rem = pos % align;
+        if (rem != 0 && align - rem > size_ - pos)
+            throw std::runtime_error("GGUF: data section starts past EOF");
+        data_start_ = rem == 0 ? pos : pos + (align - rem);
         if (data_start_ > size_) throw std::runtime_error("GGUF: data section starts past EOF");
     }
 

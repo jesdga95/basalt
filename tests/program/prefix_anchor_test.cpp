@@ -2,6 +2,7 @@
 // the bytes the prompt spells (header-only, CPU).
 #include "program/serve/prefix_anchor.hpp"
 
+#include <climits>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -102,5 +103,7 @@ int main() {
     check(respell_fits(7, 6, 16, 8 + 7 + 16), "a longer prompt that leaves max_new room is taken");
     check(!respell_fits(7, 6, 16, 8 + 6 + 16), "a longer prompt that leaves no max_new room is not");
     check(respell_fits(6, 6, 16, 8 + 6 + 16 - 100), "a prompt that does not grow always fits");
+    check(!respell_fits(7, 6, LLONG_MAX, 1024), "respell_fits does not overflow on LLONG_MAX want");
+    check(!respell_fits(7, 6, 1, 4), "respell_fits refuses contexts smaller than the 8-token guard");
     return failures == 0 ? 0 : 1;
 }

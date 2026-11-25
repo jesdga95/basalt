@@ -90,10 +90,12 @@ Flow Request::decode_loop(B& b) {
         } else if constexpr (kSpec) {
             a = b.accept_drafts(T);
         }
-        if (gguard != nullptr && gguard->on()) {
-            // the first generated token the grammar refuses is drawn again under the grammar's mask, and the window
-            // ends there; with no token allowed at all the reply ends after this window, as an error
-            const int miss = gguard->scan(outv.data(), a + 1, e0);
+        int emit_a = a;   // last row whose pick is emitted (< e0 if grammar hits a dead end on row e0)
+        if (gguard != nullptr && gguard->on() && ppl == nullptr) {
+            // Only scan picks this window would actually emit (stopping at max_new or the first EOS).
+            const ReplyRows pre = reply_rows(outv.data(), e0, a, produced_n, max_new, eos_ids, false);
+            const int scan_rows = e0 + pre.emit;
+            const int miss = gguard->scan(outv.data(), scan_rows, e0);
             if (miss >= 0) {
                 int32_t gtok = 0;
                 const basalt::program::grammar::Redraw verdict = gguard->redraw(
@@ -108,25 +110,30 @@ Flow Request::decode_loop(B& b) {
                     std::printf("ERR %s\n", runtime_.err.empty() ? "the masked draw failed" : runtime_.err.c_str());
                     return Flow::error;
                 }
-                if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
-                else outv[(size_t) miss] = gtok;
-                a = miss;
+                if (verdict == basalt::program::grammar::Redraw::dead) {
+                    grammar_dead = true;
+                    emit_a = miss - 1;
+                    a = std::max(e0, miss - 1);
+                } else {
+                    outv[(size_t) miss] = gtok;
+                    emit_a = a = miss;
+                }
                 ++grammar_resamples;
             }
         }
-        if (req_logprobs >= 0 && ppl == nullptr) {   // the picks are final: read their rows before the commit
+        if (req_logprobs >= 0 && ppl == nullptr && emit_a >= e0) {   // the picks are final: read their rows before the commit
             constexpr int S = basalt::kernels::kLogprobStride;
-            lp_rows.resize((size_t) (a + 1 - e0) * S);
-            lp_fields.assign((size_t) a + 1, std::string());
-            if (!b.row_logprobs(e0, a + 1 - e0, outv.data() + e0, req_logprobs, lp_rows.data())) {
+            lp_rows.resize((size_t) (emit_a + 1 - e0) * S);
+            lp_fields.assign((size_t) emit_a + 1, std::string());
+            if (!b.row_logprobs(e0, emit_a + 1 - e0, outv.data() + e0, req_logprobs, lp_rows.data())) {
                 std::printf("ERR logprobs: the head logits read failed\n");
                 return Flow::error;
             }
-            for (int i = e0; i <= a; ++i)
+            for (int i = e0; i <= emit_a; ++i)
                 lp_fields[(size_t) i] = logprob_fields(lp_rows.data() + (size_t) (i - e0) * S, outv[(size_t) i], req_logprobs);
         }
         if (ppl != nullptr) {   // every row scored and committed
-            a = T - 1;
+            emit_a = a = T - 1;
             for (int t = 0; t < T; ++t) {
                 std::vector<float> lg((size_t) runtime_.n_vocab);
                 if (!b.copy_logits(t, lg.data()) || !ppl->score(p + t, std::move(lg), runtime_.err)) {
@@ -146,10 +153,10 @@ Flow Request::decode_loop(B& b) {
         const Clock::time_point tw1 = Clock::now();
         // the picks this window sends and the rows it keeps: a window that ends the reply keeps no row past its
         // last pick, and that pick is the next token, as at any window's end
-        const ReplyRows rr = reply_rows(outv.data(), e0, a, produced_n, max_new, eos_ids, ppl != nullptr);
-        const int keep = rr.keep;
+        const ReplyRows rr = reply_rows(outv.data(), e0, emit_a, produced_n, max_new, eos_ids, ppl != nullptr);
+        const int keep = grammar_dead ? std::max(e0 + 1, rr.keep) : rr.keep;
         // the draft launches first; the commit, the adaptive round and the output go in its shadow
-        const bool will_draft = !rr.ends && produced_n + rr.emit < max_new;
+        const bool will_draft = !grammar_dead && !rr.ends && produced_n + rr.emit < max_new;
         if constexpr (kSpec) b.note_draft_probs(from_sfx);
         b.stamp_before_commit();
         if (!hold && !b.commit(keep, runtime_.err, 2)) {
@@ -158,7 +165,7 @@ Flow Request::decode_loop(B& b) {
         }
         for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
-        draft_accepted += a - e0;
+        draft_accepted += std::max(0, emit_a - e0);
         ++windows;
         first_window = false;
         bool commit_ok = true, after_ran = false, eos = false;
@@ -167,7 +174,7 @@ Flow Request::decode_loop(B& b) {
             after_ran = true;
             commit_ok = hold ? true : b.commit(keep, cerr, 1);
             if (!hold) tier.after_commit();
-            for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
+            for (int i = e0; i <= emit_a && produced_n < max_new && !eos; ++i) {
                 if (req_logprobs >= 0 && ppl == nullptr) std::printf("P%s\n", lp_fields[(size_t) i].c_str());
                 std::printf("T %d\n", (int) outv[(size_t) i]);
                 basalt::core::progress_beat();
@@ -189,7 +196,7 @@ Flow Request::decode_loop(B& b) {
         if (!after_ran) after_launch();
         b.window_timing(T, a, from_sfx, round0, tw0, tw1, tw2);
         tier.finish();
-        runtime_.stats_window(slot_b, T - 1 - e0, a - e0, (int) (produced_n - sent0));
+        runtime_.stats_window(slot_b, T - 1 - e0, std::max(0, emit_a - e0), (int) (produced_n - sent0));
         runtime_.stats_lookups_end();
         runtime_.stats_tick();
         b.mark_after_window();
@@ -206,7 +213,7 @@ Flow Request::decode_loop(B& b) {
             return Flow::error;
         }
         if constexpr (kSpec) {
-            if (timed_round && !eos) b.observe_policy(from_sfx, T, a, sfx_match, round0);
+            if (timed_round && !eos && !grammar_dead) b.observe_policy(from_sfx, T, a, sfx_match, round0);
         }
         b.mark_loop_end();
         if (eos) { finish = "stop"; break; }

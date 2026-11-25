@@ -21,7 +21,7 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
 // reading the reply again from a checkpoint (and leaving a copy of the conversation behind in another slot).
 // Not with pictures, when a token has no bytes, or when the longer prompt would leave no room for max_new.
 void Request::respell_prompt() {
-    if (geni || !runtime_.req_imgs.empty() || !runtime_.text_tokenizer_note.empty()) return;
+    if (geni || ppl != nullptr || !runtime_.req_imgs.empty() || !runtime_.text_tokenizer_note.empty()) return;
     const auto bytes = [this](int32_t id) { return runtime_.token_bytes(id); };
     const std::vector<int32_t>* best = nullptr;
     HeldMeet meet;

@@ -272,7 +272,7 @@ void step_host_mem(Probe& P) {
             while (rd.done.load() < pool.active_workers()) {}
             const double us = us_since(t0);
             pool.idle_stop();
-            best = std::max(best, (double) rd.n * (double) rd.bytes / (us * 1e3));
+            if (us > 0.0) best = std::max(best, (double) rd.n * (double) rd.bytes / (us * 1e3));
         }
         rank.push_back({best, k});
         P.line("host_mem", "workers=%d gbps=%.1f bytes_mib=%zu", k, best, (rd.n * rd.bytes) >> 20);
@@ -318,7 +318,7 @@ void step_cpu_expert(Probe& P, int original_workers) {
             }
             const double m = median(us);
             P.line("cpu_expert", "workers=%d entries=%d median_us=%.1f per_entry_us=%.1f gbps=%.1f", k, n, m, m / n,
-                   (double) n * (double) f.bytes / (m * 1e3));
+                   m > 0.0 ? (double) n * (double) f.bytes / (m * 1e3) : 0.0);
         }
     }
 }
@@ -353,11 +353,12 @@ void step_peer_and_copies(Probe& P) {
             P.line("peer", "entries=%d rt_median_us=%.1f", n, m);
             sx += n; sy += m; sxx += (double) n * n; sxy += n * m; ++cnt;
         }
-        if (peer_ok) {
-            const double b = (cnt * sxy - sx * sy) / (cnt * sxx - sx * sx);
+        if (peer_ok && cnt > 0) {
+            const double denom = cnt * sxx - sx * sx;
+            const double b = denom > 0.0 ? (cnt * sxy - sx * sy) / denom : 0.0;
             P.line("peer", "fit base_us=%.1f per_entry_us=%.2f peer_blocks=%d", (sy - b * sx) / cnt, b, pr->blocks());
         } else {
-            P.line("peer", "rt_us=n/a reason=%s", err.c_str());
+            P.line("peer", "rt_us=n/a reason=%s", err.empty() ? "no_entries" : err.c_str());
         }
     }
 
@@ -386,7 +387,8 @@ void step_peer_and_copies(Probe& P) {
             if (i >= 2 && cudaEventElapsedTime(&ms, e0.e, e1.e) == cudaSuccess) us.push_back(ms * 1e3);
         }
         const double m = median(us);
-        P.line("copy", "dev=%d blob_bytes=%zu median_us=%.1f gbps=%.1f", d, bytes, m, (double) bytes / (m * 1e3));
+        P.line("copy", "dev=%d blob_bytes=%zu median_us=%.1f gbps=%.1f", d, bytes, m,
+               m > 0.0 ? (double) bytes / (m * 1e3) : 0.0);
     }
 
     // the peer's rings with one such copy running into the peer beside them

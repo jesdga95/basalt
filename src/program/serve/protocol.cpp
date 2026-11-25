@@ -173,6 +173,7 @@ int Runtime::init_protocol() {
         auto read_exact = [&](size_t n, std::string& out) -> bool {
             while (buf.size() < n) {
                 const std::ptrdiff_t got = read_some();
+                if (got == -2) return false;
                 if (got < 0 && errno == EINTR) continue;
                 if (got <= 0) return false;
                 buf.append(chunk, (size_t) got);
@@ -200,7 +201,12 @@ int Runtime::init_protocol() {
                 if (i < lead) head += " " + tk[i];
                 else if (tk[i].rfind("plain=", 0) == 0) plain_text = tk[i].substr(6);
                 else if (tk[i].find('=') != std::string::npos) head += " " + tk[i];
-                else if (nbytes < 0) nbytes = std::atoll(tk[i].c_str());
+                else if (nbytes < 0) {
+                    char* nb_end = nullptr;
+                    errno = 0;
+                    const long long parsed = std::strtoll(tk[i].c_str(), &nb_end, 10);
+                    if (nb_end != tk[i].c_str() && *nb_end == '\0' && errno == 0) nbytes = parsed;
+                }
             }
             if (tk.size() < lead || nbytes < 0 || nbytes > (1LL << 31)) {
                 line_out = "ERR_GENT bad header: GENT <max_new> [k=v ...] <nbytes> [plain=a:b,...]";
@@ -223,6 +229,7 @@ int Runtime::init_protocol() {
             std::vector<int32_t> tids;
             std::string terr;
             if (!text_tokenizer.encode(payload, true, spans, tids, terr)) { line_out = "ERR_GENT tokenizer: " + terr; return true; }
+            if (tids.empty()) { line_out = "ERR_GENT empty prompt"; return true; }
             if (tk[0] == "PROMPT") {
                 const size_t n = tids.size();
                 const uint64_t handle = hold_prompt({std::move(tids), false});
@@ -234,7 +241,8 @@ int Runtime::init_protocol() {
             std::lock_guard<std::mutex> lk(gent_mu);
             const uint64_t seq = ++gent_seq;
             gent_ids[seq] = std::move(tids);
-            while (gent_ids.size() > 8) gent_ids.erase(gent_ids.begin());   // a request that never claimed its ids
+            constexpr size_t kGentIdsMax = 256;
+            while (gent_ids.size() > kGentIdsMax) gent_ids.erase(gent_ids.begin());   // cap unclaimed requests
             line_out = head + " @" + std::to_string(seq);
             return true;
         };

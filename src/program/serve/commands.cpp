@@ -19,6 +19,32 @@ struct BusyClock {
         on = false;
     }
 };
+
+// arms the stall watchdog over a request, batch window, or heavy idle GPU/disk command
+struct BusyScope {
+    bool prev;
+    explicit BusyScope(const char* where = "request") : prev(basalt::core::progress().busy.load()) {
+        basalt::core::progress_beat();
+        basalt::core::progress_at(where);
+        basalt::core::progress().busy.store(true);
+    }
+    ~BusyScope() {
+        basalt::core::progress().busy.store(prev);
+        if (!prev) basalt::core::progress_at("idle");
+    }
+};
+
+// if a rejected SGEN/BGEN line carried a GENT `@<seq>` token handle, drop it so gent_ids never leaks
+void drop_gent_ref(Runtime& rt, const char* tail) {
+    if (tail == nullptr) return;
+    const char* at = std::strrchr(tail, '@');
+    if (at == nullptr) return;
+    char* end = nullptr;
+    const unsigned long long seq = std::strtoull(at + 1, &end, 10);
+    if (end == at + 1) return;
+    std::lock_guard<std::mutex> lk(rt.gent_mu);
+    rt.gent_ids.erase((uint64_t) seq);
+}
 }  // namespace
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h) {
@@ -62,6 +88,8 @@ void Runtime::stats_tick(bool force) {
 Flow Runtime::dispatch() {
     if (batch_on()) {
         if (!try_next_line(line)) {
+            if (stdin_lost.load()) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
+            const BusyScope busy_scope("batch window");
             const BusyClock busy(busy_s, busy_on, busy_from);
             const size_t active = (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; });
             if (!next_batch_window()) return Flow::error;
@@ -80,9 +108,15 @@ Flow Runtime::dispatch() {
             const int r = next_line_within(line, 1000);
             if (r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
             got = r == 1;
-            while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
+            while (!got && !(got = try_next_line(line)) && disk.enabled()) {
+                const BusyScope busy_scope("spill to disk");
+                if (spill_to_disk(false, 1) == 0) break;
+            }
             if (got) break;
-            parking = parking && park_idle_engine(pe);
+            if (parking) {
+                const BusyScope busy_scope("park idle");
+                parking = park_idle_engine(pe);
+            }
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
         }
@@ -111,7 +145,10 @@ Flow Runtime::dispatch() {
     if (line.rfind("VRAM", 0) == 0) {   // between requests, not a request
         std::string verr;
         if (batch_on()) verr = "VRAM: not while batch slots are decoding";
-        else vram_command(line, verr, false);
+        else {
+            const BusyScope busy_scope("vram");
+            vram_command(line, verr, false);
+        }
         if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
         std::fflush(stdout);
         stats_tick(true);   // the cards' expert slots moved
@@ -126,6 +163,7 @@ Flow Runtime::dispatch() {
         if (batch_on()) {
             verr = line + ": not while batch slots are decoding";
         } else {
+            const BusyScope busy_scope(down ? "sleep" : "wake");
             sleep_command(down, verr);
         }
         // asleep, the driver holds the engine's GPU state in RAM until the wake: the RAM guard judges no reading
@@ -159,6 +197,7 @@ Flow Runtime::dispatch() {
         char* e1 = nullptr;
         const long b = std::strtol(line.c_str() + (simg ? 6 : 5), &e1, 10);
         if (!slot0_solo() || bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || e1 == line.c_str() + (simg ? 6 : 5)) {
+            drop_gent_ref(*this, e1);
             std::printf("ERR SGEN: no such free slot or slot 0 is not the solo session\n");
             std::fflush(stdout);
             return Flow::next;
@@ -173,6 +212,7 @@ Flow Runtime::dispatch() {
         char* e2 = nullptr;
         const long long mn = std::strtoll(e1, &e2, 10);
         if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1) {
+            drop_gent_ref(*this, e2);
             std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", o.batch);
             std::fflush(stdout);
             return Flow::next;
@@ -184,10 +224,7 @@ Flow Runtime::dispatch() {
     between_requests(line);
     if (line == "QUIT") return Flow::quit;
     // the watchdog watches a request from here until this iteration ends, whichever way it ends
-    struct BusyScope {
-        BusyScope() { basalt::core::progress().busy.store(true); basalt::core::progress_at("request"); }
-        ~BusyScope() { basalt::core::progress().busy.store(false); basalt::core::progress_at("idle"); }
-    } busy_scope;
+    const BusyScope busy_scope("request");
     const BusyClock busy(busy_s, busy_on, busy_from);
     return run_request();
 }

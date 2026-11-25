@@ -224,7 +224,31 @@ int main(int argc, char** argv) {
     }
 
     std::vector<std::string> args = {"--model", fs::absolute(o.model).string()};
-    // what this model takes, asked of the engine; only its own tests and suggestions run
+    merge_args(args, o.passthrough);
+    // the adaptive tier: a saved profile is compared, never written (the engine starts on the model's own); the RAM
+    // copy's free places are sized at start for the largest swap count tried
+    std::string saved_profile;
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == "--expert-profile-save") {
+            saved_profile = args[i + 1];
+            args.erase(args.begin() + (std::ptrdiff_t) i, args.begin() + (std::ptrdiff_t) i + 2);
+            break;
+        }
+    // what the user gave, for the report; the probe adds its own settings below for its measurements
+    const std::vector<std::string> user_args = args;
+    // the GPUs, chosen here once as the server chooses them: apply_gpus narrows CUDA_VISIBLE_DEVICES so visible
+    // device 0 is always the selected main card for both the plan probes below and the engine run that follows
+    std::string gpu_given = arg_value(args, "--gpu");
+    {
+        std::string gpu_value;
+        std::vector<GpuCard> used;
+        if (!select_gpus(gpu_given, arg_value(args, "--gpu-mode"), arg_value(args, "--gpu-share"), "basalt-probe", gpu_value, used, err)) {
+            basalt::log::error("basalt-probe", "%s", err.c_str());
+            return 2;
+        }
+        set_arg(args, "--gpu", gpu_value);
+    }
+    // what this model takes, asked of the engine on the selected main GPU (visible 0); only its own tests and suggestions run
     const std::string plan_log = basalt::platform::temp_dir() + "/basalt-probe-plan-" + std::to_string((long long) basalt::platform::process_id());
     const auto model_takes = [&](const char* flag, const char* value) {
         std::string answer;
@@ -240,18 +264,6 @@ int main(int argc, char** argv) {
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
     }
-    merge_args(args, o.passthrough);
-    // the adaptive tier: a saved profile is compared, never written (the engine starts on the model's own); the RAM
-    // copy's free places are sized at start for the largest swap count tried
-    std::string saved_profile;
-    for (size_t i = 0; i + 1 < args.size(); ++i)
-        if (args[i] == "--expert-profile-save") {
-            saved_profile = args[i + 1];
-            args.erase(args.begin() + (std::ptrdiff_t) i, args.begin() + (std::ptrdiff_t) i + 2);
-            break;
-        }
-    // what the user gave, for the report; the probe adds its own settings below for its measurements
-    const std::vector<std::string> user_args = args;
     {
         uint64_t bytes = 0;
         if (!saved_profile.empty() && !(basalt::platform::file_size(saved_profile, bytes) && bytes > 0)) saved_profile.clear();
@@ -264,17 +276,6 @@ int main(int argc, char** argv) {
         int most = base_swaps;
         for (const auto& t : kAdaptTried) most = std::max(most, t.swaps);
         set_arg(args, "--adapt-swaps", std::to_string(most));
-    }
-    // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
-    std::string gpu_given = arg_value(args, "--gpu");
-    {
-        std::string gpu_value;
-        std::vector<GpuCard> used;
-        if (!select_gpus(gpu_given, arg_value(args, "--gpu-mode"), arg_value(args, "--gpu-share"), "basalt-probe", gpu_value, used, err)) {
-            basalt::log::error("basalt-probe", "%s", err.c_str());
-            return 2;
-        }
-        set_arg(args, "--gpu", gpu_value);
     }
 
     // fixtures

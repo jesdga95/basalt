@@ -87,6 +87,110 @@ int main() {
         check(err.find(path.filename().string()) != std::string::npos, "  the error names the file");
         if (!err.empty()) std::printf("  (%s)\n", err.c_str());
     }
+    {
+        // Type names & block geometry: MXFP4 (39), IQ1_M (29), IQ1_S (19), Q8_K (15)
+        int be = 0, bb = 0;
+        check(std::strcmp(basalt::ggml_type_name(29), "IQ1_M") == 0, "ggml_type_name(29) is IQ1_M");
+        check(std::strcmp(basalt::ggml_type_name(39), "MXFP4") == 0, "ggml_type_name(39) is MXFP4");
+        check(basalt::block_geometry(39, be, bb) && be == 32 && bb == 17, "block_geometry(MXFP4) is 32 elems / 17 bytes");
+        check(basalt::block_geometry(19, be, bb) && be == 256 && bb == 50, "block_geometry(IQ1_S) is 256 elems / 50 bytes");
+        check(basalt::block_geometry(15, be, bb) && be == 256 && bb == 292, "block_geometry(Q8_K) is 256 elems / 292 bytes");
+        basalt::TensorInfo mx;
+        mx.name = "blk.0.ffn_gate.weight";
+        mx.shape = {64, 4};
+        mx.type = 39;
+        mx.offset = 0;
+        check(basalt::tensor_payload_bytes(mx) == 8 * 17, "tensor_payload_bytes computes MXFP4 byte size");
+    }
+    {
+        // Signed MetaValue::num() and large string array (>64 entries skipped without allocating)
+        std::vector<uint8_t> b;
+        put<uint32_t>(b, 0x46554747u);
+        put<uint32_t>(b, 3);
+        put<uint64_t>(b, 1);  // n_tensors
+        put<uint64_t>(b, 5);  // n_kv
+        put_str(b, "s.i8");  put<uint32_t>(b, (uint32_t) basalt::MetaType::I8);  put<int8_t>(b, -1);
+        put_str(b, "s.i16"); put<uint32_t>(b, (uint32_t) basalt::MetaType::I16); put<int16_t>(b, -2);
+        put_str(b, "s.i32"); put<uint32_t>(b, (uint32_t) basalt::MetaType::I32); put<int32_t>(b, -3);
+        put_str(b, "s.i64"); put<uint32_t>(b, (uint32_t) basalt::MetaType::I64); put<int64_t>(b, -4);
+        put_str(b, "s.arr"); put<uint32_t>(b, (uint32_t) basalt::MetaType::ARRAY);
+        put<uint32_t>(b, (uint32_t) basalt::MetaType::STRING);
+        put<uint64_t>(b, 100);
+        for (int i = 0; i < 100; ++i) put_str(b, "tok_" + std::to_string(i));
+        // 1 MXFP4 tensor [32, 2] = 34 bytes
+        put_str(b, "blk.0.mx.weight");
+        put<uint32_t>(b, 2);
+        put<uint64_t>(b, 32);
+        put<uint64_t>(b, 2);
+        put<uint32_t>(b, 39);
+        put<uint64_t>(b, 0);
+        b.resize((b.size() + 31) / 32 * 32 + 34, 0);
+        const auto path = std::filesystem::temp_directory_path() / "gguf_reader_meta_test.gguf";
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize) b.size());
+        bool ok = false;
+        try {
+            basalt::GgufModel gm({path.string()});
+            const basalt::GgufFile& g = gm.meta();
+            const basalt::TensorInfo* t = gm.find("blk.0.mx.weight");
+            ok = g.get("s.i8")->num() == -1.0 && g.get("s.i16")->num() == -2.0 &&
+                 g.get("s.i32")->num() == -3.0 && g.get("s.i64")->num() == -4.0 &&
+                 g.get("s.arr")->count == 100 && g.get("s.arr")->items.size() == 64 &&
+                 g.get("s.arr")->items[63].s == "tok_63" && t != nullptr && gm.in_bounds(*t, 0);
+        } catch (...) {
+            ok = false;
+        }
+        std::filesystem::remove(path);
+        check(ok, "signed MetaValue::num(), >64 string array skip, and MXFP4 in_bounds");
+    }
+    {
+        // Overflow/corruption guards: Cursor::str wraparound, huge n_tensors, huge/negative alignment
+        auto expect_reject = [&](const std::vector<uint8_t>& raw, const char* label) {
+            const auto path = std::filesystem::temp_directory_path() / "gguf_reader_bad_test.gguf";
+            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(raw.data()), (std::streamsize) raw.size());
+            bool rejected = false;
+            try {
+                basalt::GgufFile g(path.string());
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            std::filesystem::remove(path);
+            check(rejected, label);
+        };
+        {   // Cursor::str() 64-bit wraparound (length = UINT64_MAX)
+            std::vector<uint8_t> b;
+            put<uint32_t>(b, 0x46554747u); put<uint32_t>(b, 3);
+            put<uint64_t>(b, 0); put<uint64_t>(b, 1);
+            put<uint64_t>(b, ~0ull);
+            b.resize(64, 0);
+            expect_reject(b, "Cursor::str rejects UINT64_MAX wraparound length");
+        }
+        {   // Implausible n_tensors rejected before reserve()
+            std::vector<uint8_t> b;
+            put<uint32_t>(b, 0x46554747u); put<uint32_t>(b, 3);
+            put<uint64_t>(b, 1ull << 50); put<uint64_t>(b, 0);
+            expect_reject(b, "implausible n_tensors rejected before reserve()");
+        }
+        {   // general.alignment = UINT64_MAX wraparound
+            std::vector<uint8_t> b;
+            put<uint32_t>(b, 0x46554747u); put<uint32_t>(b, 3);
+            put<uint64_t>(b, 0); put<uint64_t>(b, 1);
+            put_str(b, "general.alignment");
+            put<uint32_t>(b, (uint32_t) basalt::MetaType::U64);
+            put<uint64_t>(b, ~0ull);
+            b.resize(128, 0);
+            expect_reject(b, "general.alignment = UINT64_MAX wraparound rejected");
+        }
+        {   // Negative signed general.alignment rejected
+            std::vector<uint8_t> b;
+            put<uint32_t>(b, 0x46554747u); put<uint32_t>(b, 3);
+            put<uint64_t>(b, 0); put<uint64_t>(b, 1);
+            put_str(b, "general.alignment");
+            put<uint32_t>(b, (uint32_t) basalt::MetaType::I32);
+            put<int32_t>(b, -32);
+            b.resize(128, 0);
+            expect_reject(b, "negative signed general.alignment rejected");
+        }
+    }
     std::printf(g_fail ? "gguf_reader_test: %d FAILED\n" : "gguf_reader_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

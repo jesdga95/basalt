@@ -109,6 +109,8 @@ void synthetic() {
     CHECK((ids == std::vector<int32_t>{'x', 261, 'y', 262}));
     CHECK(t.encode("x<|ctl|>y", true, {{1, 8}}, ids, err));
     CHECK(std::find(ids.begin(), ids.end(), 261) == ids.end());
+    CHECK(t.is_special(261) && t.is_special(262));
+    CHECK(!t.is_special('a') && !t.is_special(256) && !t.is_special(-1) && !t.is_special(99999));
     CHECK(t.encode("", true, {}, ids, err) && ids.empty());
     // the same piece twice: the memo returns the same ids
     CHECK(t.encode("abcabc abcabc", false, {}, ids, err));
