@@ -12,6 +12,10 @@ routed experts) straight from the official BF16 checkpoint, for tools/convert/co
                         output head (the tied embedding) F8_E4M3 rows with an FP32 scale per row (`output.scale`); the
                         router F32 with its input scale and 1 / sqrt(hidden) folded into the columns; norms and layer
                         scalars F32 (exact). The assistant drafter's tensors (`--drafter DIR`) as `assistant.*`.
+  vision/mmproj       the vision tower as llama.cpp's clip GGUF (projector gemma4v): the patch embedding as the F32
+                        convolution [out][channel][row][column], the column and row position tables F32, the products
+                        BF16 as stored, the norms and the standardisation F32, the embedding projection as
+                        mm.input_projection.weight
   tokenizer/*, meta   the vocabulary respelled for the engine's BPE (the SentencePiece space mark as a space, the byte
                         fallback tokens as type 6), the chat template and the geometry from config.json
 
@@ -37,6 +41,7 @@ import model_sections as S
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 
 ARCH = "gemma4"
@@ -526,6 +531,92 @@ def _bf16_value(v: float) -> float:
     return float(np.array([int(b) << 16], np.uint32).view(np.float32)[0])
 
 
+# ------------------------------------------------------------------ the vision tower
+VISION = "model.vision_tower."
+# checkpoint tensor after `model.vision_tower.encoder.layers.N.` -> (GGUF name after `v.blk.N.`, form)
+VISION_BLOCK = {
+    "input_layernorm.weight": ("ln1.weight", "F32"),
+    "post_attention_layernorm.weight": ("attn_post_norm.weight", "F32"),
+    "pre_feedforward_layernorm.weight": ("ln2.weight", "F32"),
+    "post_feedforward_layernorm.weight": ("ffn_post_norm.weight", "F32"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "F32"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "F32"),
+    "self_attn.q_proj.linear.weight": ("attn_q.weight", "BF16"),
+    "self_attn.k_proj.linear.weight": ("attn_k.weight", "BF16"),
+    "self_attn.v_proj.linear.weight": ("attn_v.weight", "BF16"),
+    "self_attn.o_proj.linear.weight": ("attn_out.weight", "BF16"),
+    "mlp.gate_proj.linear.weight": ("ffn_gate.weight", "BF16"),
+    "mlp.up_proj.linear.weight": ("ffn_up.weight", "BF16"),
+    "mlp.down_proj.linear.weight": ("ffn_down.weight", "BF16"),
+}
+VISION_GLOBAL = {
+    VISION + "patch_embedder.position_embedding_table": ("v.position_embd.weight", "F32"),   # [2][size][hidden]: columns, then rows
+    VISION + "std_bias": ("v.std_bias", "F32"),
+    VISION + "std_scale": ("v.std_scale", "F32"),
+    "model.embed_vision.embedding_projection.weight": ("mm.input_projection.weight", "BF16"),
+}
+
+
+def has_vision(ck: C.Checkpoint) -> bool:
+    return bool(ck.config.get("vision_config")) and VISION + "patch_embedder.input_proj.weight" in ck.t
+
+
+def mmproj(ck: C.Checkpoint, out: pathlib.Path, name: str) -> None:
+    """The vision tower as the clip GGUF the engine's encoder reads (llama.cpp's gemma4v layout)."""
+    vc = ck.config["vision_config"]
+    pp = json.loads((ck.dir / "processor_config.json").read_text(encoding="utf-8")).get("image_processor", {})
+    for k, want in (("model_type", "gemma4_vision"), ("hidden_activation", "gelu_pytorch_tanh"), ("attention_bias", False),
+                    ("use_clipped_linears", False), ("standardize", True)):
+        if vc.get(k) != want:
+            raise S.ConvertError(f"config.json: vision_config.{k} = {vc.get(k)!r}; the engine runs {want!r}")
+    h, patch, pool = int(vc["hidden_size"]), int(vc["patch_size"]), int(vc["pooling_kernel_size"])
+    if int(pp.get("patch_size", patch)) != patch or int(pp.get("pooling_kernel_size", pool)) != pool or pp.get("do_normalize"):
+        raise S.ConvertError("processor_config.json: an image processor other than the tower's (patch, pooling, no normalisation)")
+    if int(vc["num_attention_heads"]) * int(vc["head_dim"]) != h or vc.get("rope_parameters", {}).get("rope_type") != "default":
+        raise S.ConvertError("config.json: a vision tower whose heads do not tile its width, or a rope other than the default")
+    w = GGUFWriter()
+    for k, v, t in (("general.architecture", "clip", "string"), ("general.type", "mmproj", "string"),
+                    ("general.name", name + " (mmproj)", "string"), ("clip.has_vision_encoder", True, "bool"),
+                    ("clip.vision.projector_type", "gemma4v", "string"),
+                    ("clip.vision.projection_dim", int(ck.text["hidden_size"]), "u32"),
+                    ("clip.vision.image_size", 224, "u32"),   # unused, as llama.cpp's converter writes it
+                    ("clip.vision.patch_size", patch, "u32"),
+                    ("clip.vision.embedding_length", h, "u32"),
+                    ("clip.vision.feed_forward_length", int(vc["intermediate_size"]), "u32"),
+                    ("clip.vision.block_count", int(vc["num_hidden_layers"]), "u32"),
+                    ("clip.vision.attention.head_count", int(vc["num_attention_heads"]), "u32"),
+                    ("clip.vision.attention.layer_norm_epsilon", C.f32(vc["rms_norm_eps"]), "f32"),
+                    ("clip.vision.projector.scale_factor", pool, "u32"),
+                    ("clip.vision.rope.freq_base", C.f32(vc["rope_parameters"]["rope_theta"]), "f32")):
+        w.add(k, v, t)
+    w.add("clip.vision.image_mean", [float(x) for x in pp.get("image_mean", [0.0] * 3)], "array:f32")
+    w.add("clip.vision.image_std", [float(x) for x in pp.get("image_std", [1.0] * 3)], "array:f32")
+
+    def put(gname, x, ty):
+        if ty == "BF16":
+            u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32) >> 16
+            w.add_raw(gname, list(reversed(x.shape)), "BF16", u.astype("<u2").tobytes())
+        else:
+            a = np.ascontiguousarray(x, dtype="<f4")
+            w.add_raw(gname, list(reversed(a.shape)), "F32", a.tobytes())
+
+    used = {VISION + "patch_embedder.input_proj.weight", *VISION_GLOBAL}
+    used |= {f"{VISION}encoder.layers.{l}.{k}" for l in range(int(vc["num_hidden_layers"])) for k in VISION_BLOCK}
+    left = [k for k in ck.t if k.startswith((VISION, "model.embed_vision.")) and k not in used]
+    if left:
+        raise S.ConvertError("vision tensors with no pack counterpart: " + ", ".join(left[:8]))
+    pw = ck.values(VISION + "patch_embedder.input_proj.weight")   # [out, (row, column, channel)]
+    if pw.shape != (h, 3 * patch * patch):
+        raise S.ConvertError(f"the patch embedding has shape {list(pw.shape)}")
+    put("v.patch_embd.weight", pw.reshape(h, patch, patch, 3).transpose(0, 3, 1, 2), "F32")
+    for k, (g, ty) in VISION_GLOBAL.items():
+        put(g, ck.values(k), ty)
+    for l in range(int(vc["num_hidden_layers"])):
+        for k, (g, ty) in VISION_BLOCK.items():
+            put(f"v.blk.{l}.{g}", ck.values(f"{VISION}encoder.layers.{l}.{k}"), ty)
+    w.write(out)
+
+
 # ------------------------------------------------------------------ the pack
 LICENSE = {"apache-2.0": "Apache License 2.0", "gemma": "Gemma Terms of Use"}
 
@@ -544,6 +635,7 @@ def build(a, Job, fingerprint, die) -> None:
         experts = Experts(ck) if plan.moe else None
         name = a.name or "Gemma 4"
         kv = model_kv(ck, dr, name)
+        vision = has_vision(ck)
     except S.ConvertError as e:
         die(str(e))
     partial.unlink(missing_ok=True)
@@ -569,6 +661,10 @@ def build(a, Job, fingerprint, die) -> None:
                 names.append(n)
             offs = w.add_parts("gguf", parts, TENSOR_ALIGN)
             job._report("gguf", w.entries[-1][2], time.time() - t)
+            if vision:
+                mp = pathlib.Path(tmp) / "mmproj.gguf"
+                mmproj(ck, mp, name)
+                job.file("vision/mmproj", mp)
             tens = {}
             for n, off in zip(names, offs):
                 t_ = plan.tensors[n]
@@ -586,6 +682,7 @@ def build(a, Job, fingerprint, die) -> None:
                 "license": {"name": LICENSE.get(lic, lic)},
                 "hf_config": ck.config,
                 "assistant": {"source": dr.dir.name, "config": dr.config} if dr else None,
+                "vision": {"projector": "gemma4v", "source": "the checkpoint's BF16 vision tower"} if vision else None,
                 "checkpoint": {
                     "dir": pathlib.Path(a.checkpoint).name,
                     "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
