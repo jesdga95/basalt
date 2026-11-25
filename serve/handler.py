@@ -501,7 +501,7 @@ def make_handler(target: Service | Router):
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
                     return
-                if path in ("/v1/load", "/v1/unload"):
+                if path in ("/v1/load", "/v1/unload", "/models/load", "/models/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
                     target = router.shown() if req.get("model") is None else router.service_for(req["model"])
@@ -509,7 +509,7 @@ def make_handler(target: Service | Router):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     self.svc = target
-                    if path == "/v1/unload":
+                    if path in ("/v1/unload", "/models/unload"):
                         result = target.unload()
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
