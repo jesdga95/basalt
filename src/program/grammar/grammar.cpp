@@ -25,41 +25,122 @@ using Rule = std::vector<Element>;
 
 // --------------------------------------------------------------------------------------------- parser
 
-// A rule that can reach itself as its leftmost symbol would never leave the closure.
-bool left_recursive(const std::vector<Rule>& rules, size_t idx, std::vector<bool>& visited,
-                    std::vector<bool>& in_progress, std::vector<bool>& may_be_empty) {
-    if (in_progress[idx]) return true;
-    in_progress[idx] = true;
-    const Rule& rule = rules[idx];
-    bool at_start = true;
-    for (const Element& e : rule) {
-        if (end_of_seq(e)) {
-            if (at_start) {
-                may_be_empty[idx] = true;
-                break;
+// Computes which rules can derive the empty string (transitively) in O(V + E).
+std::vector<bool> compute_nullable(const std::vector<Rule>& rules) {
+    const size_t n = rules.size();
+    std::vector<bool> nullable(n, false);
+    struct AltInfo {
+        size_t owner;
+        size_t remaining;
+    };
+    std::vector<AltInfo> alts;
+    std::vector<std::vector<size_t>> ref_to_alts(n);
+    std::vector<size_t> queue;
+
+    for (size_t r = 0; r < n; ++r) {
+        const Rule& rule = rules[r];
+        size_t i = 0;
+        while (i < rule.size()) {
+            bool has_terminal = false;
+            std::vector<uint32_t> refs;
+            while (i < rule.size() && !end_of_seq(rule[i])) {
+                if (rule[i].type == ElemType::RuleRef) {
+                    refs.push_back(rule[i].value);
+                } else {
+                    has_terminal = true;
+                }
+                ++i;
             }
-            at_start = true;
-        } else {
-            at_start = false;
+            if (!has_terminal) {
+                std::sort(refs.begin(), refs.end());
+                refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+                if (refs.empty()) {
+                    if (!nullable[r]) {
+                        nullable[r] = true;
+                        queue.push_back(r);
+                    }
+                } else {
+                    const size_t alt_id = alts.size();
+                    alts.push_back({r, refs.size()});
+                    for (uint32_t target : refs) ref_to_alts[target].push_back(alt_id);
+                }
+            }
+            if (i < rule.size() && rule[i].type == ElemType::Alt) ++i;
+            else break;
         }
     }
-    bool descend = true;
-    for (const Element& e : rule) {
-        if (e.type == ElemType::RuleRef && descend) {
-            if (left_recursive(rules, e.value, visited, in_progress, may_be_empty)) return true;
-            if (!may_be_empty[e.value]) descend = false;
-        } else if (end_of_seq(e)) {
-            descend = true;
-        } else {
-            descend = false;
+
+    for (size_t head = 0; head < queue.size(); ++head) {
+        const size_t r = queue[head];
+        for (size_t alt_id : ref_to_alts[r]) {
+            AltInfo& info = alts[alt_id];
+            if (info.remaining > 0 && --info.remaining == 0 && !nullable[info.owner]) {
+                nullable[info.owner] = true;
+                queue.push_back(info.owner);
+            }
         }
     }
-    in_progress[idx] = false;
-    visited[idx] = true;
-    return false;
+    return nullable;
+}
+
+// Iterative Tarjan strongly connected components in O(V + E).
+std::vector<uint32_t> compute_sccs(size_t n, const std::vector<std::vector<uint32_t>>& adj) {
+    std::vector<uint32_t> index(n, UINT32_MAX), low(n, 0), scc(n, UINT32_MAX);
+    std::vector<uint8_t> on_stack(n, 0);
+    std::vector<uint32_t> tarjan_stk;
+    struct Frame {
+        uint32_t u;
+        size_t edge;
+    };
+    std::vector<Frame> call_stk;
+    uint32_t next_idx = 0, next_scc = 0;
+
+    for (uint32_t start = 0; start < (uint32_t) n; ++start) {
+        if (index[start] != UINT32_MAX) continue;
+        index[start] = low[start] = next_idx++;
+        tarjan_stk.push_back(start);
+        on_stack[start] = 1;
+        call_stk.push_back({start, 0});
+
+        while (!call_stk.empty()) {
+            Frame& f = call_stk.back();
+            const uint32_t u = f.u;
+            if (f.edge < adj[u].size()) {
+                const uint32_t v = adj[u][f.edge++];
+                if (index[v] == UINT32_MAX) {
+                    index[v] = low[v] = next_idx++;
+                    tarjan_stk.push_back(v);
+                    on_stack[v] = 1;
+                    call_stk.push_back({v, 0});
+                } else if (on_stack[v]) {
+                    if (index[v] < low[u]) low[u] = index[v];
+                }
+            } else {
+                call_stk.pop_back();
+                if (!call_stk.empty()) {
+                    const uint32_t p = call_stk.back().u;
+                    if (low[u] < low[p]) low[p] = low[u];
+                }
+                if (low[u] == index[u]) {
+                    for (;;) {
+                        const uint32_t w = tarjan_stk.back();
+                        tarjan_stk.pop_back();
+                        on_stack[w] = 0;
+                        scc[w] = next_scc;
+                        if (w == u) break;
+                    }
+                    ++next_scc;
+                }
+            }
+        }
+    }
+    return scc;
 }
 
 // Throws if a rule refers to a rule that is not defined or if any rule is left-recursive.
+// A left-call cycle that pushes a return frame would grow Arena::closure() stacks without bound; direct leftmost
+// cycles (every edge at index 0) are rejected as well. Pure tail recursion after a nullable prefix (as in `([x]*)*`)
+// does not push a return frame and terminates cleanly via closure deduplication.
 void check_rules(const std::vector<Rule>& rules, const std::function<std::string(uint32_t)>& name_of) {
     for (const Rule& r : rules) {
         if (r.empty() || r.back().type != ElemType::End) throw std::runtime_error("undefined rule");
@@ -70,10 +151,48 @@ void check_rules(const std::vector<Rule>& rules, const std::function<std::string
                 throw std::runtime_error("undefined rule identifier '" + name_of(e.value) + "'");
         }
     }
-    std::vector<bool> visited(rules.size()), in_progress(rules.size()), may_be_empty(rules.size());
-    for (size_t i = 0; i < rules.size(); ++i) {
-        if (!visited[i] && left_recursive(rules, i, visited, in_progress, may_be_empty))
-            throw std::runtime_error("left recursion in rule '" + name_of((uint32_t) i) + "'");
+    const std::vector<bool> may_be_empty = compute_nullable(rules);
+    std::vector<std::vector<uint32_t>> left_adj(rules.size());
+    std::vector<std::vector<uint32_t>> start_adj(rules.size());
+    std::vector<std::pair<uint32_t, uint32_t>> push_edges;
+
+    for (size_t r = 0; r < rules.size(); ++r) {
+        const Rule& rule = rules[r];
+        bool descend = true;
+        bool at_start = true;
+        for (size_t k = 0; k < rule.size(); ++k) {
+            const Element& e = rule[k];
+            if (e.type == ElemType::RuleRef && descend) {
+                left_adj[r].push_back(e.value);
+                if (at_start) start_adj[r].push_back(e.value);
+                if (k + 1 < rule.size() && !end_of_seq(rule[k + 1])) {
+                    push_edges.emplace_back((uint32_t) r, e.value);
+                }
+                at_start = false;
+                if (!may_be_empty[e.value]) descend = false;
+            } else if (end_of_seq(e)) {
+                descend = true;
+                at_start = true;
+            } else {
+                descend = false;
+                at_start = false;
+            }
+        }
+    }
+
+    const std::vector<uint32_t> left_scc = compute_sccs(rules.size(), left_adj);
+    for (const auto& edge : push_edges) {
+        if (left_scc[edge.first] == left_scc[edge.second]) {
+            throw std::runtime_error("left recursion in rule '" + name_of(edge.first) + "'");
+        }
+    }
+    const std::vector<uint32_t> start_scc = compute_sccs(rules.size(), start_adj);
+    for (size_t u = 0; u < rules.size(); ++u) {
+        for (uint32_t v : start_adj[u]) {
+            if (start_scc[u] == start_scc[v]) {
+                throw std::runtime_error("left recursion in rule '" + name_of((uint32_t) u) + "'");
+            }
+        }
     }
 }
 
@@ -185,6 +304,8 @@ private:
             if (((unsigned char) p[i] & 0xC0) != 0x80) throw fail("invalid UTF-8", p);
             v = (v << 6) | ((unsigned char) p[i] & 0x3F);
         }
+        static constexpr uint32_t kMinCp[5] = {0, 0, 0x80, 0x800, 0x10000};
+        if (v < kMinCp[len] || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) throw fail("invalid UTF-8", p);
         return {v, p + len};
     }
 
@@ -249,12 +370,14 @@ private:
         // S{m,n} becomes m copies of S followed by a chain of n-m optional S rules; S* and S+ use one recursive rule.
         auto repeat = [&](uint64_t min_t, uint64_t max_t) {
             bool no_max = max_t == UINT64_MAX;
+            if (!no_max && max_t < min_t) throw std::runtime_error("repetition minimum exceeds maximum");
             if (last_start == rule.size()) throw fail("expecting an item before a repetition", pos);
             Rule prev(rule.begin() + (std::ptrdiff_t) last_start, rule.end());
             uint64_t total = 1;
             if (!no_max && max_t > 0) total = max_t;
             else if (min_t > 0) total = min_t;
-            if (n_prev * total > kMaxRepetition) throw std::runtime_error("repetition is too large");
+            if (total > kMaxRepetition / (std::max<uint64_t>)(1, n_prev))
+                throw std::runtime_error("repetition is too large");
             if (min_t == 0) {
                 rule.resize(last_start);
             } else {
@@ -374,6 +497,7 @@ private:
                 } else {
                     throw fail("expecting ','", pos);
                 }
+                if (max_t < min_t) throw std::runtime_error("repetition minimum exceeds maximum");
                 if (min_t > kMaxRepetition) throw std::runtime_error("repetition is too large");
                 if (max_t != UINT64_MAX && max_t > kMaxRepetition) max_t = UINT64_MAX;
                 repeat(min_t, max_t);
@@ -1129,6 +1253,8 @@ bool GrammarState::feed(const std::string_view& bytes, int32_t& set_id, Utf8& u)
             }
         } else {
             if ((b & 0xC0) != 0x80) return false;
+            if (u.n_remain == 2 && ((u.value == 0 && b < 0xA0) || (u.value == 0x0D && b >= 0xA0))) return false;
+            if (u.n_remain == 3 && ((u.value == 0 && b < 0x90) || (u.value == 4 && b >= 0x90))) return false;
             u.value = (u.value << 6) | (b & 0x3F);
             if (--u.n_remain > 0) continue;
             cp = u.value;
