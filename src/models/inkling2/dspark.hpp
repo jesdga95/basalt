@@ -136,6 +136,14 @@ public:
     int slot_of_visit(int visit) const;
     /// Slot k's rows (fp32, kWidth each, contiguous): slots 0..2 the visits' inputs, slot 3 the final normed state.
     float* tap(int slot) const { return tap_ + (size_t) slot * tap_rows_ * kWidth; }
+    /// The tap's base and rows. A prompt read with a wider chunk points the drafter at a tap of its own while it runs, then
+    /// back.
+    float* tap_base() const { return tap_; }
+    int tap_rows() const { return tap_rows_; }
+    void use_tap(float* tap, int rows) {
+        tap_ = tap;
+        tap_rows_ = rows;
+    }
     /// Caller-owned chunk buffers reused by commit_prompt() (no extra device allocation).
     struct PromptScratch {
         float* mix = nullptr;         ///< [3][rows][kWidth]

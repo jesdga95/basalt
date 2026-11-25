@@ -18,6 +18,9 @@ class DsparkHook;
 
 /// The most rows one prompt chunk runs (the drafter's tap holds as many).
 constexpr int kPromptChunk = 4096;
+/// A read of more rows, with experts in RAM, runs chunks of up to this many while the card's copies leave room for their
+/// buffers: every chunk of more than a thousand rows stages the spilled layers' experts again, so fewer chunks stage less.
+constexpr int kWidePromptChunk = 8192;
 
 class PromptRunner {
 public:
