@@ -21,6 +21,7 @@
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/models/gemma4/kernels.hpp"
 #include "models/gemma4/model.hpp"
+#include "models/gemma4/prompt.hpp"
 
 #include <cuda_runtime.h>
 
@@ -59,6 +60,7 @@ struct Shared {
     float* blog = nullptr;                                                              // a batch's logits [R][V]
     int32_t* io = nullptr;                                                              // tokens [R], positions [R]
     model::BatchShared batch;
+    PromptPath prompt;
     std::vector<void*> bufs;
     ~Shared() {
         for (void* p : bufs) cudaFree(p);
@@ -108,7 +110,7 @@ struct Shared {
             err = "out of device memory for the forward's scratch";
             return false;
         }
-        return true;
+        return prompt.init(m, err);
     }
     template <class F>
     void g_alloc(F& f, int64_t R, int64_t FF) {
@@ -155,7 +157,7 @@ public:
         for (int l = 0; l < g_.n_layers; ++l) {
             const LayerShape s = g_.shape(l);
             SegKv& c = caches_[(size_t) l];
-            c.cap = s.window > 0 ? (int64_t) s.window + kRows : m_.context();
+            c.cap = s.window > 0 ? (int64_t) s.window + kChunk : m_.context();
             const size_t bytes = (size_t) c.cap * s.n_kv * s.hd * eb;
             c.k = alloc(bytes, ok);
             if (!s.one) c.v = alloc(bytes, ok);
@@ -282,6 +284,28 @@ public:
         hist_.resize((size_t) std::min<int64_t>(r.pos, (int64_t) hist_.size()));
         stale_ = true;   // until the rows are in (an error or an exception leaves it set)
         std::string err;
+        if (r.n_tokens > kRows) {   // the prompt path, chunk by chunk
+            try {
+                for (int t0 = 0; t0 < r.n_tokens; t0 += kChunk) {
+                    if (r.stop && r.stop()) break;
+                    const int n = std::min(kChunk, r.n_tokens - t0);
+                    sh_->prompt.chunk(r.tokens + t0, n, r.pos + t0, caches_, stream_);
+                    if (!check(err)) return {model::Status::Error, "gemma4: " + err};
+                    hist_.insert(hist_.end(), r.tokens + t0, r.tokens + t0 + n);
+                    if (r.progress) {
+                        cudaStreamSynchronize(stream_);
+                        r.progress(t0 + n);
+                    }
+                }
+            } catch (const std::exception& e) {
+                return {model::Status::Error, std::string("gemma4: the prompt: ") + e.what()};
+            }
+            win_rows_ = 0;     // no drafter state and no logits for these rows
+            head_rows_ = 0;
+            if (cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "gemma4: the prompt failed"};
+            stale_ = false;
+            return {};
+        }
         for (int t0 = 0; t0 < r.n_tokens; t0 += kRows) {
             if (r.stop && r.stop()) break;
             const int n = std::min(kRows, r.n_tokens - t0);
@@ -406,8 +430,8 @@ public:
     }
 
     // ---- conversations: the full layers' cells by position (save_cells / restore_cells), the window rings by checkpoint
-    // (running_state). A ring holds the window and a window's rows, so a checkpoint at `pos` is intact while the session
-    // has not run more than kRows rows past it.
+    // (running_state). A ring holds the window and a chunk's rows, so a checkpoint at `pos` is intact while the session
+    // has not run more than kChunk rows past it.
     size_t ring_bytes(int l) const {
         const LayerShape s = g_.shape(l);
         return (size_t) caches_[(size_t) l].cap * s.n_kv * s.hd * kv_elem_bytes(m_.kv_type());
@@ -420,8 +444,8 @@ public:
     }
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
         if (save && stale_) return stale();
-        if (save && (int64_t) hist_.size() - pos > kRows)
-            return {model::Status::Error, "gemma4: the rings have moved on more than " + std::to_string(kRows) + " positions past the checkpoint"};
+        if (save && (int64_t) hist_.size() - pos > kChunk)
+            return {model::Status::Error, "gemma4: the rings have moved on more than " + std::to_string(kChunk) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "gemma4: a checkpoint past the session's position"};
         for (int l = 0; l < g_.n_layers; ++l)
             if (g_.swa[(size_t) l]) {

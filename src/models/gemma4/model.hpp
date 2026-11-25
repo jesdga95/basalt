@@ -16,6 +16,8 @@
 namespace basalt::models::gemma4 {
 
 constexpr int64_t kDefaultContext = 8192;
+/// Rows of a prompt chunk (prompt.hpp): a window layer's ring holds its window and a chunk.
+constexpr int kChunk = 2048;
 
 /// An FP8 E4M3 matrix [rows][K] and its device FP32 scale (per matrix, or per row for the head).
 struct F8Mat {
@@ -116,9 +118,9 @@ private:
 std::unique_ptr<model::ModelSession> make_session(Gemma4Model& model, std::string& err);
 
 /// The device bytes a session takes for `context` positions: its caches (a window layer's ring of the window and a
-/// window's rows, a full layer's cells), its logits and graphs.
+/// chunk's rows, a full layer's cells), its logits and graphs.
 uint64_t session_bytes(const Geometry& g, int64_t context, KvType kv);
-/// The device bytes every session shares once on the card: the forward's scratch.
+/// The device bytes every session shares once on the card: the forward's scratch and the prompt path's.
 uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad);
 
 }  // namespace basalt::models::gemma4

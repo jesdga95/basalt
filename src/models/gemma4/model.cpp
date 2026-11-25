@@ -2,6 +2,8 @@
 // then the context sized from what the weights leave.
 #include "models/gemma4/model.hpp"
 
+#include "models/gemma4/prompt.hpp"
+
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/loader.hpp"
@@ -37,7 +39,7 @@ uint64_t expert_stride(uint64_t blob) {
 uint64_t layer_cache_bytes(const Geometry& g, int l, int64_t context, KvType kv) {
     const LayerShape s = g.shape(l);
     const uint64_t cell = (uint64_t) s.n_kv * s.hd * kv_elem_bytes(kv) * (s.one ? 1 : 2);
-    return cell * (s.window > 0 ? (uint64_t) s.window + kRows : (uint64_t) context);
+    return cell * (s.window > 0 ? (uint64_t) s.window + kChunk : (uint64_t) context);
 }
 
 }  // namespace
@@ -54,7 +56,7 @@ uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad) {
     const uint64_t rowbuf = R * (4 * E + 3 * qmax + 3 * (uint64_t) n_ff_pad) * 4;
     const uint64_t experts = g.moe() ? R * (uint64_t) g.n_used * (E * 4 + (uint64_t) g.n_ff_exp * 16) + (64ull << 20) : 0;
     const uint64_t attn = R * (uint64_t) g.n_head * 64 * (std::max(g.hd_swa, g.hd_full) + 2) * 4;
-    return rowbuf + experts + attn + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB;
+    return rowbuf + experts + attn + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB + PromptPath::bytes(g, n_ff_pad);
 }
 
 Gemma4Model::Gemma4Model() = default;
