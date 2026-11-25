@@ -69,21 +69,30 @@ public:
     /// The next text token's position: one past the largest position of the cell before it.
     int32_t next() const { return cells_.empty() ? 0 : cells_.back().last() + 1; }
     /// Forgets the cells from `pos` on.
-    void rewind(int64_t pos) { if ((size_t) pos < cells_.size()) cells_.resize((size_t) pos); }
+    void rewind(int64_t pos) {
+        if ((size_t) pos < cells_.size()) cells_.resize((size_t) pos);
+        if (first_image_ >= 0 && first_image_ >= (int64_t) cells_.size()) first_image_ = -1;
+    }
     int64_t size() const { return (int64_t) cells_.size(); }
+    bool has_image() const { return first_image_ >= 0; }
     const RopePos& at(int64_t cell) const { return cells_[(size_t) cell]; }
     /// Places a text token at the next cell.
     RopePos push_text() { const int32_t p = next(); cells_.push_back({p, p, p}); return cells_.back(); }
     /// Places row `j` of a picture block of `nx` columns (the newline column included) starting at position `start` at the
     /// next cell.
     RopePos push_row(int32_t start, int nx, int j) {
+        if (first_image_ < 0) first_image_ = (int64_t) cells_.size();
         cells_.push_back({start, start + j / nx, start + j % nx});
         return cells_.back();
     }
-    void clear() { cells_.clear(); }
+    void clear() {
+        cells_.clear();
+        first_image_ = -1;
+    }
 
 private:
     std::vector<RopePos> cells_;
+    int64_t first_image_ = -1;
 };
 
 /// The tokens of the pack's vocabulary the layout uses (the pack's meta.hf_config).
