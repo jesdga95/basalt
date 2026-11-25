@@ -65,7 +65,12 @@ def migrate(src: Path, out: Path) -> None:
     try:
         with open(src, "rb") as f:
             def read(name, off, size):
-                f.seek(old.section(name)[0] + off)
+                if name not in old.sections:
+                    raise H.Hc8Error(f"missing section {name}")
+                sec_off, sec_size = old.section(name)
+                if off < 0 or size < 0 or off + size > sec_size:
+                    raise H.Hc8Error(f"section {name}: range {off}+{size} exceeds {sec_size} bytes")
+                f.seek(sec_off + off)
                 return f.read(size)
             for name in old.names():
                 if name in DROPPED:
@@ -76,12 +81,17 @@ def migrate(src: Path, out: Path) -> None:
                     die(f"section {name}: its bytes do not match the SHA-256 in {src}'s table")
                 print(f"  {name:<44} {size / (1 << 30):9.3f} GiB", flush=True)
             whole = lambda n: read(n, 0, old.section(n)[1]) if n in old.sections else None
-            try:
-                table = H.section(read, whole("dense.index"), whole("mtp/dense.index"))
-            except H.Hc8Error as e:
-                die(f"hc8: {e}")
-        w.add_bytes("hc8", table)
-        print(f"  {'hc8':<44} {len(table) / (1 << 30):9.3f} GiB", flush=True)
+            dense_index = whole("dense.index")
+            mtp_index = whole("mtp/dense.index")
+            table = None
+            if dense_index is not None or mtp_index is not None:
+                try:
+                    table = H.section(read, dense_index or b"", mtp_index)
+                except H.Hc8Error as e:
+                    die(f"hc8: {e}")
+        if table is not None and H.HEADER.unpack_from(table, 0)[2] > 0:
+            w.add_bytes("hc8", table)
+            print(f"  {'hc8':<44} {len(table) / (1 << 30):9.3f} GiB", flush=True)
         w.add_bytes("meta", json.dumps(new_meta(meta), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
         ok = True

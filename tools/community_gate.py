@@ -105,7 +105,9 @@ def check_engine_args(row, label, gate):
 def plausible(row, earlier, label, gate):
     for key in ("decode_tps", "prefill_16k_tps", "prefill_64k_tps"):
         v = row.get(key)
-        if cb.is_pos(v) and v > (CAP_DECODE if key == "decode_tps" else CAP_PREFILL):
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and not cb.is_pos(v):
+            gate.fail(f"{label}: {key} {v} must be a finite number > 0")
+        elif cb.is_pos(v) and v > (CAP_DECODE if key == "decode_tps" else CAP_PREFILL):
             gate.fail(f"{label}: {key} {v} is above the ceiling of any card")
     a, b = row.get("prefill_16k_tps"), row.get("prefill_64k_tps")
     if cb.is_pos(a) and cb.is_pos(b) and not RATIO_LOW <= b / a <= RATIO_HIGH:
@@ -137,7 +139,7 @@ def plausible(row, earlier, label, gate):
 def parse_run(text):
     """The row of a run file's text, or None when it is not a JSON object."""
     try:
-        row = json.loads(text)
+        row = cb.loads_strict(text)
     except ValueError:
         return None
     return row if isinstance(row, dict) else None
@@ -208,7 +210,8 @@ def run_gate(base_files, head_files, author, changed, known_commit):
         old = base_rows.get(path, {})
         human(g, f"{path} ({old.get('submitter')}, {old.get('model')}) was deleted; only a person can approve a deletion")
     g.new_rows = [head_rows[p] for p in added + modified]
-    earlier = [r for p, r in base_rows.items() if p not in head_rows and p not in removed]
+    # Judge every PR row only against trusted base rows (never against other untrusted rows in the same PR).
+    earlier = [r for p, r in base_rows.items() if p not in removed]
     for i, path in enumerate(added + modified):
         r = head_rows[path]
         is_update = path in modified
@@ -226,7 +229,7 @@ def run_gate(base_files, head_files, author, changed, known_commit):
             elif owners != {author.lower()}:
                 human(g, f"{label}: modifies the run of '{before.get('submitter')}', which is not the pull request author "
                          f"'{author}'; only a person can approve changing someone else's numbers")
-        plausible(r, earlier + ([before] if before else []) + [head_rows[p] for p in (added + modified)[:i]], label, g)
+        plausible(r, earlier, label, g)
     return g
 
 
@@ -270,7 +273,7 @@ def main(argv):
         if status in ("added", "modified") and PATH_RE.fullmatch(name) and f.is_file():
             head_files[name] = f.read_text(encoding="utf-8")
     g = run_gate(read_tree(base, RUNS_PREFIX.rstrip("/")), head_files, author, changed, git_known_commit())
-    Path(out).write_text(json.dumps(g.to_json()))
+    Path(out).write_text(json.dumps(g.to_json(), allow_nan=False))
     print(g.status)
     for r in g.reasons:
         print(" -", r)
