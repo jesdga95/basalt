@@ -2575,7 +2575,7 @@ private:
             }
         core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
-        const int n_fetched = tier_->fetch(tl, lk);
+        const int n_fetched = tier_->fetch(tl, lk, use);
         // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land
         if (peer) {
             int32_t kind[kLookupK] = {};
