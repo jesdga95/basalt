@@ -251,6 +251,22 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_GEMMA4)
+add_library(gemma4_kernels STATIC src/models/gemma4/kernels/attn.cu src/models/gemma4/kernels/glue.cu)
+target_include_directories(gemma4_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gemma4_kernels PUBLIC ${_gpu_runtime_target})
+add_library(model_gemma4 STATIC src/models/gemma4/adapter.cpp src/models/gemma4/pack.cpp src/models/gemma4/model.cpp
+  src/models/gemma4/session.cpp)
+target_include_directories(model_gemma4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
+target_link_libraries(model_gemma4 PUBLIC model engine_session gemma4_kernels kernels window_gemm core ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  add_executable(gemma4_kernels_parity src/models/gemma4/kernels/kernels_parity.cpp)
+  target_include_directories(gemma4_kernels_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(gemma4_kernels_parity PRIVATE gemma4_kernels kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME gemma4_kernels_parity COMMAND gemma4_kernels_parity)
+endif()
+endif()
+
 if(BASALT_MODEL_INKLING2)
 add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu
   src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/attn_prompt.cu
