@@ -60,6 +60,8 @@ struct NativeExpertLayout {
     /// > 0: the softcapped SwiGLU instead, h = gate_softcap tanh(g / gate_softcap) sigmoid(g) up_softcap tanh(u / up_softcap)
     /// (the sigmoid sees the raw gate; the caps bound its linear factor and up). Both set together.
     float gate_softcap = 0.0f, up_softcap = 0.0f;
+    /// The gated activation is GELU in its tanh form, h = gelu_tanh(g) up, instead of SiLU (not with the limit or the caps).
+    bool gelu = false;
 };
 /// `swiglu_limit` rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
 /// the peer card, the remote tier) applies it without a signature change.
