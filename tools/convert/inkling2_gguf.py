@@ -438,7 +438,18 @@ def build(a, Job, source_paths, export_tokenizer, fingerprint, die) -> None:
                 job.file("vision/mmproj", mmproj)
                 vision_meta = {"projector": "inkling2v", "source": mmproj.name}
             elif base and "vision/mmproj" in base.sections:
-                job.copy_section("vision/mmproj", base)
+                off, sz = base.sections["vision/mmproj"][:2]
+                def _copy_mmproj():
+                    with open(base.path, "rb") as bf:
+                        bf.seek(off)
+                        rem = sz
+                        while rem > 0:
+                            chunk = bf.read(min(rem, 64 << 20))
+                            if not chunk:
+                                break
+                            rem -= len(chunk)
+                            yield chunk
+                job.chunks("vision/mmproj", _copy_mmproj(), sz)
                 bmeta = json.loads(base.read("meta"))
                 vision_meta = bmeta.get("vision")
 
