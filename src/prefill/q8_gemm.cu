@@ -118,6 +118,7 @@ void gemm_64x64_ws_kernel(const __grid_constant__ Args p) {
             mb_init(full_sc + s, 32);
             mb_init(empty + s, WT * WR);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
 
@@ -280,6 +281,7 @@ void gemm_128x128_u16_kernel(const __grid_constant__ Args p) {
             mb_init(full + s, 1);
             mb_init(full_sc + s, 64);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
 
@@ -420,9 +422,10 @@ __global__ void quantize_q8_planes_vec4_kernel(const float* __restrict__ x, int6
     if (b >= rows * nb) return;
     const int64_t r = b / nb, k = b - r * nb;
     const float4 v = *reinterpret_cast<const float4*>(x + r * ld + (k << 5) + idx);
+    const unsigned mask = 0xffu << (sub * 8);
     float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
 #pragma unroll
-    for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(mask, amax, o));
     const float d = amax * (1.0f / 127.0f), id = amax > 0.0f ? (127.0f / amax) : 0.0f;
     char4 q{(signed char) __float2int_rn(v.x * id), (signed char) __float2int_rn(v.y * id),
             (signed char) __float2int_rn(v.z * id), (signed char) __float2int_rn(v.w * id)};

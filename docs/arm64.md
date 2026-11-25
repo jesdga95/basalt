@@ -12,12 +12,12 @@ Needs CUDA 13, GCC 13+ and CMake 3.24+, as on x86.
 
 ```sh
 export CUDACXX=/usr/local/cuda/bin/nvcc
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=121
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=121 -DBASALT_MODELS=all
 cmake --build build -j
 ctest --test-dir build -L cpu -LE avx512 -j 8 --output-on-failure
 ```
 
-`-DBASALT_MODELS="inkling2;qwen4exp"` builds only the models named, which is much quicker for a first build.
+`-DBASALT_MODELS="inkling2;qwen4exp"` builds only the models named, which is much quicker for a first build; `all` builds every model.
 
 `CUDACXX` names the toolkit's own `nvcc`: the `nvcc` of a distribution's CUDA package can stop on an SVE declaration in
 `math-vector.h` from the system's glibc. CMake picks Arm64 from the machine and defaults the architecture to 121 there, so

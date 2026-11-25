@@ -14,10 +14,17 @@ import sys
 
 # Objects built with AVX-512 flags on purpose; their kernels are reached through a run-time CPU check.
 AVX512_OBJECTS = ("iq_avx512", "nvfp4_avx512", "ggml_dots_avx512", "gemm_cpu_avx512", "src/kernels/cpu/expert.cpp")
+# Multi-config MSVC generators place src/kernels/cpu/expert.cpp at kernels_cpu.dir/<Config>/expert.obj.
+MSVC_EXPERT_OBJ = re.compile(r"(?:^|/)kernels_cpu\.dir/(?:[^/]+/)?expert\.obj$")
 # EVEX-encoded instructions start with byte 0x62 in 64-bit mode, whatever registers they name.
 # A long instruction wraps onto continuation lines that carry no mnemonic, so the mnemonic is required.
 EVEX = re.compile(r"^\s*[0-9a-f]+:[\t ]+62 [0-9a-f ]*\t\s*[a-z]")
 STATIC_INIT = re.compile(r"^\?\?__E|^_GLOBAL__sub_I_|^__cxx_global_var_init|^_GLOBAL__I_")
+
+
+def is_dedicated_avx512(obj):
+    posix = obj.as_posix()
+    return any(k in posix for k in AVX512_OBJECTS) or bool(MSVC_EXPERT_OBJ.search(posix))
 
 
 def disassembler():
@@ -30,7 +37,11 @@ def disassembler():
 
 
 def scan(tool, obj):
-    out = subprocess.run([tool, "-d", "-r", str(obj)], capture_output=True, text=True, check=False).stdout
+    res = subprocess.run([tool, "-d", "-r", str(obj)], capture_output=True, encoding="utf-8", errors="replace", check=False)
+    if res.returncode != 0:
+        msg = res.stderr.strip() or f"exit status {res.returncode}"
+        raise RuntimeError(f"{tool} failed on {obj}: {msg}")
+    out = res.stdout
     sym = None
     found = {}
     guarded = set()
@@ -45,14 +56,30 @@ def scan(tool, obj):
     return {k: v for k, v in found.items() if k not in guarded}
 
 
-def main():
-    build = pathlib.Path(sys.argv[1])
-    listing = "--list" in sys.argv
+def main(argv=None):
+    argv = sys.argv if argv is None else argv
+    if len(argv) < 2:
+        print("usage: check_isa_isolation.py BUILD_DIR [--list]", file=sys.stderr)
+        return 2
+    build = pathlib.Path(argv[1])
+    listing = "--list" in argv[2:]
+    if not build.is_dir():
+        print(f"build directory not found: {build}", file=sys.stderr)
+        return 1
+    objs = sorted(list(build.rglob("*.o")) + list(build.rglob("*.obj")))
+    if not objs:
+        print(f"no object files found under {build}", file=sys.stderr)
+        return 1
     tool = disassembler()
     bad = 0
-    for obj in sorted(list(build.rglob("*.o")) + list(build.rglob("*.obj"))):
-        dedicated = any(k in obj.as_posix() for k in AVX512_OBJECTS)
-        for sym, (n, first) in scan(tool, obj).items():
+    for obj in objs:
+        dedicated = is_dedicated_avx512(obj)
+        try:
+            hits = scan(tool, obj)
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        for sym, (n, first) in hits.items():
             wrong = not dedicated or bool(STATIC_INIT.match(sym))
             if wrong or listing:
                 print(f"{'WRONG' if wrong else 'kernel'} {obj.name} {sym} ({n}) e.g. {first}")

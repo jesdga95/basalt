@@ -1,0 +1,35 @@
+{
+  "submitter": "giveen",
+  "date": "2026-11-25",
+  "commit": "f790236b9a",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 475,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 47.8
+    }
+  ],
+  "ram_gib": 247,
+  "cpu": "Intel Core Ultra 9 285K, 24 cores",
+  "ram_gbps": 76.0,
+  "os": "Linux",
+  "quant": "NVFP4-QAD",
+  "kv": "int8",
+  "prefill_16k_tps": 9897.9,
+  "prefill_64k_tps": 10680.4,
+  "decode_tps": 383.6,
+  "decode_conv_tps": 230.6,
+  "decode_struct_tps": 469.6,
+  "decode_prose_tps": 244.9,
+  "accept_conv_pct": 73.8,
+  "accept_struct_pct": 98.2,
+  "accept_prose_pct": 68.7,
+  "draft_len_conv": 2.3,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.9,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

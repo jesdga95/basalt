@@ -168,6 +168,17 @@ void test_complement_plan() {
     require(!make_cache_complement_plan(2, 3, {3, 5}, {{2, 0}}, {}, offsets, bytes, error),
             "out-of-range pair accepted");
     require(!make_cache_complement_plan(2, 3, {0, 5}, {}, {}, offsets, bytes, error), "zero-size layer accepted");
+
+    // An odd-sized layer must not take the following page-sized experts off the page grid.
+    constexpr uint64_t page = 4096;
+    require(make_cache_complement_plan(3, 3, {page, cache_complement_stride(page + 64, page), page},
+                                        {{1, 0}, {1, 2}}, {}, offsets, bytes, error), error);
+    std::vector<uint64_t> starts;
+    for (uint64_t off : offsets)
+        if (off != kNoCacheComplement) starts.push_back(off);
+    const auto cuts = basalt::core::ram_pin_slices(starts, bytes, page, 2 * page);
+    require(cuts == std::vector<uint64_t>({0, 2 * page, 5 * page, 7 * page, 8 * page}),
+            "mixed expert sizes removed registration cuts");
 }
 
 void test_resident_lend_region() {

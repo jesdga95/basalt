@@ -20,6 +20,7 @@
 #include "models/inkling2/loan_layout.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
+#include "models/inkling2/wide_chunk.hpp"
 
 #include <cuda_runtime.h>
 
@@ -46,12 +47,21 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 // what the sessions share once (the forward's row buffers and expert scratch, the batch windows' logits), what each one
 // needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
 // driver
-constexpr uint64_t kSharedFixed = 768 * kMiB;
-constexpr uint64_t kSessionFixed = 96 * kMiB;
+constexpr uint64_t kSharedFixed = 896 * kMiB;
+constexpr uint64_t kSessionFixed = 44 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
 constexpr uint64_t kLateRoom = 256 * kMiB;
+
+// A log line that cannot be written (out of host memory) is left out: the placement step it reports stands.
+template <class F>
+void quiet(F&& f) noexcept {
+    try {
+        f();
+    } catch (...) {
+    }
+}
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
 struct ProjPart {
@@ -92,11 +102,11 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
     uint64_t caches = 0;
     for (const Visit& v : g.visits)
         if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
-    return caches + kSessionFixed + (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
+    return caches + kSessionFixed;
 }
 
 uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
+    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
 }
 
 InklingModel::InklingModel() = default;
@@ -468,7 +478,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                             for (int e = 0; e < g.n_expert; ++e)
                                 if (!on_card(l, e)) spill_order_.emplace_back(l, e);
                     elastic_ = keep < 0 && want > core::kElasticKvBase;
-                    heat_.start((size_t) g.n_layers * g.n_expert, g.n_expert, spill_order_);
+                    std::vector<int> visits((size_t) g.n_layers, 0);
+                    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
+                    heat_.start((size_t) g.n_layers * g.n_expert, g.n_expert, spill_order_, visits);
                     uint64_t ram = 0;
                     for (int l = 0; l < g.n_layers; ++l) ram += (uint64_t) spill_.n_spill[(size_t) l] * stride[(size_t) l];
                     basalt::log::info("basalt inkling2",
@@ -1006,6 +1018,11 @@ bool InklingModel::publish_copy(size_t pair, const void* ptr) {
 
 uint64_t InklingModel::promote(uint64_t keep_free) {
     if (copies_retired_ || wedged() || (size_t) promoted() == spill_order_.size()) return 0;
+    return promote_pairs(by_score_desc(heat_, copy_candidates()), keep_free + late_room());
+}
+
+uint64_t InklingModel::promote_pairs(const std::vector<size_t>& pairs, uint64_t keep_free) {
+    if (copies_retired_ || wedged() || pairs.empty()) return 0;
     if (!copy_range()) {   // no address range for the copies (with virtual memory management): placement leaves its rule
         map_short_ = copy_lay_.gran != 0;
         return 0;
@@ -1014,8 +1031,7 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
     const size_t ne = geo().n_expert;
     const uint64_t gran = copy_lay_.gran;
     uint64_t moved = 0;
-    keep_free += late_room();
-    for (const size_t pair : by_score_desc(heat_, copy_candidates())) {
+    for (const size_t pair : pairs) {
         const uint64_t stride = copy_stride(pair);
         const uint64_t start = copy_lay_.end.empty() ? 0 : CopyLayout::aligned(copy_lay_.end.back());
         const uint64_t mapped = (uint64_t) copy_maps_.size() * gran, end = start + stride;
@@ -1476,6 +1492,47 @@ bool InklingModel::recall_loan(void* stream, const std::string& event) {
     }
     log_copy_change(event.c_str(), before);
     return true;
+}
+
+Take InklingModel::take_room(uint64_t bytes) {
+    wide_out_.clear();
+    if (!copies() || lent_ || wedged() || loaned() > 0) return Take::Refused;
+    const uint64_t paid = (uint64_t) copy_maps_.size() * copy_lay_.gran;
+    if (paid < bytes) return Take::Refused;
+    // the bookkeeping first, in rank order (the order the copies come back in): nothing allocates once a copy moves
+    const std::vector<size_t> held = by_score_desc(heat_, copy_slots_);
+    std::vector<uint8_t> kept(copy_.size(), 0);
+    wide_out_.reserve(held.size());
+    const int64_t before = card_copies();
+    const uint64_t room0 = room();
+    uint64_t freed = 0;
+    if (!demote(bytes, freed)) return Take::Failed;
+    left_out(held, copy_slots_, kept, wide_out_);
+    quiet([&] { log_copy_change("prompt wide chunk", before, bytes); });
+    if (room() < room0 + bytes)   // short of the count: the copies come back as they were
+        return give_room(0) ? Take::Refused : Take::Failed;
+    room_ -= (int64_t) bytes;
+    return Take::Taken;
+}
+
+bool InklingModel::give_room(uint64_t bytes) noexcept {
+    room_ += (int64_t) bytes;
+    if (wedged()) return false;
+    if (wide_out_.empty()) return true;
+    const int64_t before = card_copies();
+    bool back = false;
+    try {   // the copies' vectors keep the capacity the copies had, so their return allocates nothing
+        promote_pairs(wide_out_, 0);
+        back = restored(wide_out_, [&](size_t pair) { return copy_[pair] != nullptr; }, !wedged());
+    } catch (...) {
+        back = false;
+    }
+    wide_out_.clear();
+    quiet([&] {
+        note_shortage("prompt wide chunk back");
+        log_copy_change("prompt wide chunk back", before, 0, false, !back);
+    });
+    return back;
 }
 
 // [vision] ENC runs between requests and windows: once every stream is idle, nothing reads the experts until refill.

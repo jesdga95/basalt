@@ -27,10 +27,10 @@ Prebuilt Linux (x64 and Arm64) and Windows archives are attached to each [releas
 
 ```sh
 git clone https://github.com/jesdga95/basalt && cd basalt
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASALT_MODELS=all
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
                                         # Windows: add -G Ninja to the first line, from an x64 VS 2022 prompt ([platforms](docs/platforms.md#building-on-windows))
-                                        # one model only: -DBASALT_MODELS=qwen4exp, deepseek41, qwen35, hy4flash or inkling2 ([building](docs/building.md#building-only-some-models))
+                                        # -DBASALT_MODELS is required: all, or the ids of the models you want, such as -DBASALT_MODELS=qwen4exp ([building](docs/building.md#building-only-some-models))
 pip install -r requirements.txt
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4-DQ6_K.basalt --local-dir models
 ```

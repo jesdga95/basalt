@@ -1066,8 +1066,9 @@ class ClientShapes(unittest.TestCase):
         v = Vision.__new__(Vision)
         v.dir, v.lock, v.cache, v.cache_bytes, v.pinned = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}, 0, {}
         v.proc = mock.Mock(stdin=Gone())
-        with self.assertRaises(BrokenPipeError):
+        with self.assertRaisesRegex(ValueError, "the vision encoder stopped"):
             v.encode([b"png"])
+        self.assertTrue(v.stopped)
         self.assertEqual(list(v.dir.iterdir()), [])
         v.dir.rmdir()
 
@@ -3898,6 +3899,20 @@ class TemplateAndCollectEdgeCases(unittest.TestCase):
             msg = anthropic_collect(events)
             self.assertEqual(msg["stop_reason"], "end_turn")
             self.assertEqual(msg["content"], [])
+
+
+class UrlHostFormatting(unittest.TestCase):
+    def test_url_host_formats_ipv6_and_wildcards(self):
+        from serve.server import url_host
+
+        self.assertEqual(url_host("0.0.0.0"), "127.0.0.1")
+        self.assertEqual(url_host(""), "127.0.0.1")
+        self.assertEqual(url_host("::"), "127.0.0.1")
+        self.assertEqual(url_host("::1"), "[::1]")
+        self.assertEqual(url_host("[::1]"), "[::1]")
+        self.assertEqual(url_host("fe80::1"), "[fe80::1]")
+        self.assertEqual(url_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(url_host("localhost"), "localhost")
 
 
 if __name__ == "__main__":

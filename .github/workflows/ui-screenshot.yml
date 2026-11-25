@@ -1,0 +1,91 @@
+name: ui-screenshot
+
+# A pull request that changes the UI (anything under serve/web) is labelled `ui` and needs a screenshot in its
+# description or in one of its author's comments. Without one, the bot comments once; once a screenshot is there, that
+# comment is removed. Only metadata is read through the API; nothing from the pull request is checked out or run.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+    paths:
+      - "serve/web/**"
+  issue_comment:
+    types: [created, edited]
+
+permissions: {}
+
+jobs:
+  check:
+    # A comment counts only on a pull request, and only from its author (a screenshot posted after the fact).
+    if: >-
+      github.event_name == 'pull_request_target'
+      || (github.event.issue.pull_request && github.event.comment.user.login == github.event.issue.user.login)
+    # At the job, so a skipped run (someone else's comment) does not cancel a check in progress.
+    concurrency:
+      group: ui-screenshot-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      # Comments are posted as the GitHub App (basalt-code-review-bot), as review.yml does.
+      - name: Bot token
+        id: bot
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.BASALT_REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BASALT_REVIEW_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+
+      - name: Screenshot check
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          python3 - << 'EOF'
+          import json, os, re, subprocess
+
+          repo, pr = os.environ["REPO"], os.environ["PR"]
+          marker = "<!-- basalt-ui-screenshot -->"
+          ui = re.compile(r"^serve/web/")
+          # A Markdown or HTML image, or a file GitHub hosts for an upload (images and videos both land there).
+          shot = re.compile(r"!\[[^\]]*\]\([^)]+\)|<img\s|<video\s|github\.com/user-attachments/assets/|"
+                            r"user-images\.githubusercontent\.com/|private-user-images\.githubusercontent\.com/", re.I)
+
+          def api(*args):
+              out = subprocess.check_output(["gh", "api", *args], text=True)
+              return json.loads(out) if out.strip() else None
+
+          info = api(f"repos/{repo}/pulls/{pr}")
+          if info["state"] != "open":
+              raise SystemExit(0)
+          # The comment trigger has no path filter, so the files are checked here for both triggers.
+          pages = api("--paginate", "--slurp", f"repos/{repo}/pulls/{pr}/files?per_page=100")
+          if not any(ui.search(f["filename"]) for page in pages for f in page):
+              print("no UI files changed")
+              raise SystemExit(0)
+          if "ui" not in {l["name"] for l in info.get("labels", [])}:
+              api("-X", "POST", f"repos/{repo}/issues/{pr}/labels", "-f", "labels[]=ui")
+              print("labelled ui")
+
+          author = info["user"]["login"]
+          comments = [c for page in api("--paginate", "--slurp", f"repos/{repo}/issues/{pr}/comments?per_page=100")
+                      for c in page]
+          texts = [info.get("body") or ""] + [c["body"] or "" for c in comments if c["user"]["login"] == author]
+          has_shot = any(shot.search(t) for t in texts)
+          ours = [c for c in comments if marker in (c["body"] or "")]
+
+          if has_shot:
+              for c in ours:
+                  api("-X", "DELETE", f"repos/{repo}/issues/comments/{c['id']}")
+              print("screenshot found")
+          elif not ours:
+              api("-X", "POST", f"repos/{repo}/issues/{pr}/comments", "-f",
+                  f"body={marker}\nThis pull request changes the UI. All UI changes require a screenshot: "
+                  "please add one to the description or in a comment.\n\n"
+                  "<sub>This comment was posted by an automated check.</sub>")
+              print("asked for a screenshot")
+          else:
+              print("already asked")
+          EOF

@@ -97,7 +97,20 @@ public:
     const uint16_t* embedding = nullptr; ///< the target's BF16 embedding rows
     const float* embed_norm = nullptr;
 
+    struct SharedScratch {
+        int64_t att_cells = 0;
+        float *mix = nullptr, *kb = nullptr, *vb = nullptr;
+        int32_t *pos3 = nullptr, *ring_bounds = nullptr, *pos3b = nullptr;
+        void *act = nullptr, *act_a = nullptr, *act_h = nullptr;
+        float *x = nullptr, *q = nullptr, *qr = nullptr, *attn = nullptr, *h = nullptr, *att_scr = nullptr;
+        basalt::kernels::wgemm::Workspace ws;
+        float *approx = nullptr, *ctx_h = nullptr, *ctx_f = nullptr;
+        void *hq = nullptr, *lat_q = nullptr, *head_scr = nullptr;
+    };
+    const SharedScratch* ensure_shared_scratch(int64_t context, std::string& err) const;
+
 private:
+    mutable SharedScratch shared_scr_;
     friend model::Result dspark_plan(const Pack&, core::LoadPlan&, int, int, std::unique_ptr<DsparkWeights>&);
     void* dev(size_t bytes, bool& ok);
     void* mapped(size_t bytes, bool& ok);   ///< mapped host memory; the device's pointer to it
@@ -136,6 +149,14 @@ public:
     int slot_of_visit(int visit) const;
     /// Slot k's rows (fp32, kWidth each, contiguous): slots 0..2 the visits' inputs, slot 3 the final normed state.
     float* tap(int slot) const { return tap_ + (size_t) slot * tap_rows_ * kWidth; }
+    /// The tap's base and rows. A prompt read with a wider chunk points the drafter at a tap of its own while it runs, then
+    /// back.
+    float* tap_base() const { return tap_; }
+    int tap_rows() const { return tap_rows_; }
+    void use_tap(float* tap, int rows) {
+        tap_ = tap;
+        tap_rows_ = rows;
+    }
     /// Caller-owned chunk buffers reused by commit_prompt() (no extra device allocation).
     struct PromptScratch {
         float* mix = nullptr;         ///< [3][rows][kWidth]
@@ -199,6 +220,8 @@ private:
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
+    uint8_t* slab_ptr_ = nullptr;
+    size_t slab_rem_ = 0;
     std::vector<Cache> cache_;
     std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V when elastic
     int64_t backed_cells_ = 0;              ///< cells every full layer's cache backs
@@ -270,7 +293,8 @@ private:
     float *c_mix_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
     void* c_act_ = nullptr;
     // block chunk scratch [kChunkSlots * kDsBlock <= 32]
-    static constexpr int kChunkSlots = 4;
+    static constexpr int kChunkSlots = 8;
+    static constexpr int kMaxDraftSessions = 16;
     float *x_ = nullptr, *h_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr, *qr_ = nullptr, *attn_ = nullptr;
     float* att_scr_ = nullptr;
     void *act_a_ = nullptr, *act_h_ = nullptr;

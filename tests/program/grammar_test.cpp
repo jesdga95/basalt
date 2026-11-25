@@ -61,6 +61,83 @@ static void test_parse() {
     CHECK(Grammar::parse("# comment\nroot ::= \"a\" # tail\n", err));
 }
 
+static void test_left_recursion_and_utf8() {
+    std::string err;
+    // Diamond DAG of 34 levels must be checked in linear time (not 2^34 DFS)
+    {
+        std::string gbnf = "root ::= r0\n";
+        for (int i = 0; i < 34; ++i) {
+            gbnf += "r" + std::to_string(i) + " ::= r" + std::to_string(i + 1) + " | r" + std::to_string(i + 1) + "\n";
+        }
+        gbnf += "r34 ::= \"a\"\n";
+        auto g = Grammar::parse(gbnf, err);
+        CHECK(g && full(g, "a") && !full(g, "b"));
+    }
+    // Transitive nullability indirect left recursion must be rejected
+    CHECK(!Grammar::parse("root ::= a\na ::= b a \"d\" | \"x\"\nb ::= c\nc ::= | \"y\"\n", err) &&
+          err.find("left recursion") != std::string::npos);
+    CHECK(!Grammar::parse("root ::= a\na ::= b c a \"d\" | \"x\"\nb ::= \"1\"?\nc ::= \"2\"?\n", err) &&
+          err.find("left recursion") != std::string::npos);
+    // Direct unguarded cycles must be rejected
+    CHECK(!Grammar::parse("root ::= root\n", err) && err.find("left recursion") != std::string::npos);
+    CHECK(!Grammar::parse("root ::= a\na ::= b\nb ::= a\n", err) && err.find("left recursion") != std::string::npos);
+    // Tail-recursive nullable loops (([x]*)* and ("" | "a")*) still parse and match
+    {
+        auto g1 = parse("root ::= ([x]*)*");
+        CHECK(g1 && full(g1, "") && full(g1, "x") && full(g1, "xx") && !full(g1, "y"));
+        auto g2 = parse("root ::= (\"\" | \"a\")*");
+        CHECK(g2 && full(g2, "") && full(g2, "a") && full(g2, "aa") && !full(g2, "b"));
+    }
+    // Inverted repetition bounds must be rejected without underflow/OOM
+    CHECK(!Grammar::parse("root ::= \"a\"{5,2}", err) && err.find("minimum") != std::string::npos);
+    CHECK(!Grammar::parse("root ::= [0-9]{16,15}", err));
+
+    // Overlong, surrogate, and >U+10FFFF UTF-8 must be rejected in Grammar::parse literals & classes
+    for (const char* bad : {"\xC0\xAF", "\xC1\xBF", "\xE0\x80\xAF", "\xE0\x9F\xBF", "\xED\xA0\x80", "\xED\xBF\xBF",
+                            "\xF0\x80\x80\xAF", "\xF0\x8F\xBF\xBF", "\xF4\x90\x80\x80"}) {
+        CHECK(!Grammar::parse(std::string("root ::= \"") + bad + "\"", err));
+        CHECK(!Grammar::parse(std::string("root ::= [") + bad + "]", err));
+    }
+    // Valid UTF-8 boundary sequences must parse and match
+    for (const char* good : {"\xC2\x80", "\xE0\xA0\x80", "\xED\x9F\xBF", "\xEE\x80\x80", "\xF0\x90\x80\x80", "\xF4\x8F\xBF\xBF"}) {
+        auto g = parse(std::string("root ::= \"") + good + "\"");
+        CHECK(g && full(g, good));
+    }
+    // Overlong UTF-8 sequences must be rejected by GrammarState::feed() (both whole and byte-by-byte)
+    auto any = parse("root ::= .+");
+    CHECK(any);
+    if (any) {
+        for (const char* bad : {"\xC0\xAF", "\xC1\xBF", "\xE0\x80\xAF", "\xE0\x9F\xBF", "\xED\xA0\x80", "\xED\xBF\xBF",
+                                "\xF0\x80\x80\xAF", "\xF0\x8F\xBF\xBF", "\xF4\x90\x80\x80"}) {
+            GrammarState s(any);
+            CHECK(!s.allows(bad));
+            CHECK(!full(any, bad));
+        }
+        // Partial overlong/surrogate/>U+10FFFF prefixes must fail immediately on the 2nd byte
+        {
+            GrammarState s(any);
+            CHECK(s.accept("\xE0") && !s.allows("\x80") && !s.allows("\x9F") && s.accept("\xA0") && s.accept("\x80") && s.accepting());
+        }
+        {
+            GrammarState s(any);
+            CHECK(s.accept("\xED") && !s.allows("\xA0") && !s.allows("\xBF") && s.accept("\x9F") && s.accept("\xBF") && s.accepting());
+        }
+        {
+            GrammarState s(any);
+            CHECK(s.accept("\xF0") && !s.allows("\x80") && !s.allows("\x8F") && s.accept("\x90") && s.accept("\x80") &&
+                  s.accept("\x80") && s.accepting());
+        }
+        {
+            GrammarState s(any);
+            CHECK(s.accept("\xF4") && !s.allows("\x90") && !s.allows("\xBF") && s.accept("\x8F") && s.accept("\xBF") &&
+                  s.accept("\xBF") && s.accepting());
+        }
+        for (const char* good : {"\xC2\x80", "\xE0\xA0\x80", "\xED\x9F\xBF", "\xEE\x80\x80", "\xF0\x90\x80\x80", "\xF4\x8F\xBF\xBF"}) {
+            CHECK(full(any, good));
+        }
+    }
+}
+
 static void test_basic() {
     auto g = parse("root ::= \"ab\" [0-9]+ (\"x\" | \"yz\")? \"!\"");
     CHECK(g);
@@ -383,6 +460,27 @@ static void test_partial_utf8() {
     // a continuation byte after a finished character, or a bad lead, is refused
     GrammarState u(any);
     CHECK(!u.accept("\x80") && !u.accept("\xC0\x80") && !u.accept("\xFF"));
+    // partial UTF-8 prefixes whose only completions are surrogates (0xED 0xA0..0xBF) or > U+10FFFF (0xF4 0x90..0xBF)
+    // must be rejected before the dead continuation byte so masked sampling cannot deadlock
+    CHECK(!u.allows("\xED\xA0") && !u.allows("\xED\xBF") && u.allows("\xED\x9F"));
+    CHECK(!u.allows("\xF4\x90") && !u.allows("\xF4\xBF") && u.allows("\xF4\x8F"));
+    // negated character class excluding a single non-ASCII code point (or a sub-range): lead bytes that still have
+    // valid unexcluded completions must be allowed across token boundaries and in fill_mask()
+    auto not_e = parse("root ::= [^\\u00e9]");
+    GrammarState ne(not_e);
+    CHECK(ne.allows("\xC3\xA0") && !ne.allows("\xC3\xA9"));
+    CHECK(ne.allows("\xC3"));
+    ne.fill_mask(voc, mask);
+    CHECK(mask[0xC3] && !mask[256]);
+    CHECK(ne.accept("\xC3") && !ne.allows("\xA9") && ne.accept("\xA0") && ne.accepting());
+    // negated class excluding C1 controls (0x80..0x9F): lead byte 0xC2 still allows 0xA0..0xBF
+    auto not_c1 = parse("root ::= [^\\x7f-\\u009f]");
+    GrammarState nc1(not_c1);
+    CHECK(nc1.allows("\xC2") && nc1.accept("\xC2") && !nc1.allows("\x80") && nc1.accept("\xA0") && nc1.accepting());
+    // negated class covering the entire range of lead byte 0xC3 (U+00C0..U+00FF) across two adjacent ranges must reject 0xC3
+    auto not_c3 = parse("root ::= [^\\u00c0-\\u00df\\u00e0-\\u00ff]");
+    GrammarState nc3(not_c3);
+    CHECK(!nc3.allows("\xC3") && nc3.allows("\xC2"));
 }
 
 static double now_us() {
@@ -491,6 +589,7 @@ static void bench() {
 int main() {
     set_test_tool_form();
     test_parse();
+    test_left_recursion_and_utf8();
     test_basic();
     test_json();
     test_utf8_tokens();

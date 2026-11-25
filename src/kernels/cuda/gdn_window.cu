@@ -76,18 +76,30 @@ __device__ __forceinline__ void stamp(const DecRecArgs& a, int i) {
 // the rows a kernel of MAXT rows keeps in shared memory: 8 up to 8 rows (one layout for every narrow window), else MAXT
 __host__ __device__ constexpr int rec_rows(int maxt) { return maxt <= 8 ? 8 : maxt; }
 
-// NJ: uint4 of bf16 per lane in an alpha/beta row (its width / 256); M: rows (rec_rows)
-template<int NJ, int M = 8>
-struct RecSmem {
+template<int M>
+struct RecSmemCore {
     float qn[M][S], kn[M][S];
     float v[M][32];
-    float oc[M][32];
     float red_kv[RG][32], red_o[RG][32];
     float part[2][M][RG];   // the q/k L2 partials
     float g[M], b[M];
+};
+
+// NJ: uint4 of bf16 per lane in an alpha/beta row (its width / 256); M: rows (rec_rows)
+template<int NJ, int M = 8, bool SPLIT = false, bool GIN = false>
+struct RecSmem : RecSmemCore<M> {
+    float oc[M][32];
     float wsum[M][4];       // every rank's sum of squares per token, pushed by the ranks
     uint4 wab[2][32 * NJ];         // the head's alpha and beta rows
 };
+
+template<int NJ, int M>
+struct RecSmem<NJ, M, true, false> : RecSmemCore<M> {
+    uint4 wab[2][32 * NJ];         // the head's alpha and beta rows
+};
+
+template<int NJ, int M>
+struct RecSmem<NJ, M, true, true> : RecSmemCore<M> {};
 
 // alpha and beta of `head` for token t: gdn_ab_multi_unrolled_kernel's two sums, one warp, side by side over one read
 // of the token's activations (80 per lane).  The rows' weights are in shared memory.
@@ -186,8 +198,9 @@ using DmRecClusterPtr = cg::cluster_group*;
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.  GIN (with SPLIT): the gates come computed, alpha of token t at
 // gin_a[t * h_v + gh] and beta at gin_b[t * h_v + gh] (dec_gdn_gates).
-template<int MAXT, int NJ, bool SPLIT, bool SUB = false, bool GIN = false>
-__device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem<NJ, rec_rows(MAXT)>& sm,
+template<int MAXT, int NJ, bool SPLIT, bool SUB = false, bool GIN = false,
+         class Smem = RecSmem<NJ, rec_rows(MAXT), SPLIT, GIN>>
+__device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, Smem& sm,
                                           DmRecClusterPtr cluster, const float* gin_a = nullptr,
                                           const float* gin_b = nullptr) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
@@ -212,42 +225,45 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     for (int j = 0; j < 4; ++j) { wq[j] = a.conv_w[cq * 4 + j]; wk[j] = a.conv_w[ck * 4 + j]; wv[j] = a.conv_w[cv * 4 + j]; }
 #pragma unroll
     for (int j = 0; j < 3; ++j) { hq[j] = hist[cq * 3 + j]; hk[j] = hist[ck * 3 + j]; hv[j] = hist[cv * 3 + j]; }
-    for (int i = tid; !GIN && i < 2 * 32 * NJ; i += S) {   // the alpha/beta rows into shared memory
-        const int r = i / (32 * NJ), k = i % (32 * NJ);
-        const uint4* src = reinterpret_cast<const uint4*>((r ? a.w_beta : a.w_alpha) + (size_t) gh * a.n_embd) + k;
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t) __cvta_generic_to_shared(&sm.wab[r][k])),
-                     "l"(src) : "memory");
+    if constexpr (!GIN) {
+        for (int i = tid; i < 2 * 32 * NJ; i += S) {   // the alpha/beta rows into shared memory
+            const int r = i / (32 * NJ), k = i % (32 * NJ);
+            const uint4* src = reinterpret_cast<const uint4*>((r ? a.w_beta : a.w_alpha) + (size_t) gh * a.n_embd) + k;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t) __cvta_generic_to_shared(&sm.wab[r][k])),
+                         "l"(src) : "memory");
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
     }
-    asm volatile("cp.async.commit_group;" ::: "memory");
-    const float dt = a.dt[gh], sa = a.ssm_a[gh];
     [[maybe_unused]] const float gam = a.gamma[col];   // read by the norm, which a build below sm_90 does not compile
     stamp(a, 1);
     if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights (a no-op below sm_90)
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
-    asm volatile("cp.async.wait_all;" ::: "memory");
-    rec_sync<SUB>();
-    if constexpr (GIN) {
-    } else if constexpr (SPLIT) {   // a token per warp
-        for (int t = rg; t < T; t += RG) {
-            float al, be;
-            ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
-            if (lane == 0) { sm.g[t] = al; sm.b[t] = be; }
-        }
-#if !DM_REC_NO_CLUSTERS
-    } else {   // a token per warp of the cluster, written into every rank's shared memory once all four have started
-        asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
-        for (int t = rank * RG + rg; t < T; t += 4 * RG) {
-            float al, be;
-            ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
-            if (lane < 4) {
-                *cluster->map_shared_rank(&sm.g[t], lane) = al;
-                *cluster->map_shared_rank(&sm.b[t], lane) = be;
+    if constexpr (!GIN) {
+        const float dt = a.dt[gh], sa = a.ssm_a[gh];
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        rec_sync<SUB>();
+        if constexpr (SPLIT) {   // a token per warp
+            for (int t = rg; t < T; t += RG) {
+                float al, be;
+                ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
+                if (lane == 0) { sm.g[t] = al; sm.b[t] = be; }
             }
-        }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");   // waited on before the gates are read
+#if !DM_REC_NO_CLUSTERS
+        } else {   // a token per warp of the cluster, written into every rank's shared memory once all four have started
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+            asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+            for (int t = rank * RG + rg; t < T; t += 4 * RG) {
+                float al, be;
+                ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
+                if (lane < 4) {
+                    *cluster->map_shared_rank(&sm.g[t], lane) = al;
+                    *cluster->map_shared_rank(&sm.b[t], lane) = be;
+                }
+            }
+            asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");   // waited on before the gates are read
 #endif
+        }
     }
     pdl_wait();
 #if !DM_REC_NO_CLUSTERS
@@ -259,13 +275,14 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     stamp(a, 2);
 
     // ---- every load of the previous kernels' outputs, issued together
-    float xq[MAXT], xk[MAXT], xv[MAXT], zz[MAXT];
+    float xq[MAXT], xk[MAXT], xv[MAXT];
+    [[maybe_unused]] float zz[MAXT];
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
         xq[t] = t < T ? a.qkv[(size_t) t * CL + lcq] : 0.0f;
         xk[t] = t < T ? a.qkv[(size_t) t * CL + lck] : 0.0f;
         xv[t] = t < T && rg == 1 ? a.qkv[(size_t) t * CL + lcv] : 0.0f;
-        zz[t] = t < T && rg == 0 && !SPLIT ? a.z[(size_t) t * value_dim + head * S + col] : 0.0f;
+        if constexpr (!SPLIT) zz[t] = t < T && rg == 0 ? a.z[(size_t) t * value_dim + head * S + col] : 0.0f;
     }
     stamp(a, 3);
     if (a.qkv_out != nullptr) {   // the raw channels at the full layout, for the commit
@@ -322,7 +339,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     stamp(a, 5);
 
     // ---- the recurrence: gdn_step_norm_multi_kernel's sums
-    float wsum_t = 0.0f;   // lane t of warp 0: this rank's sum of squares of token t
+    [[maybe_unused]] float wsum_t = 0.0f;   // lane t of warp 0: this rank's sum of squares of token t
     for (int t = 0; t < T; ++t) {
         const float g = __expf(sm.g[t]);
         float kv = 0.0f;
@@ -343,7 +360,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         if (rg == 0) {
             const float oc = (sm.red_o[0][lane] + sm.red_o[1][lane] + sm.red_o[2][lane] + sm.red_o[3][lane]) *
                              rsqrtf((float) S);
-            if (SPLIT) {
+            if constexpr (SPLIT) {
                 a.o[(size_t) t * value_dim + head * S + col] = oc;
             } else {
                 const float sq_part = sq32(oc);
@@ -353,55 +370,56 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     stamp(a, 6);
-    if (!SPLIT && a.state_out != nullptr) {   // every row kept: the commit's state and conv history, from registers
-        float* ob = a.state_out + ((size_t) (rg * RPG) * a.h_v + gh) * S + col;
+    if constexpr (!SPLIT) {
+        if (a.state_out != nullptr) {   // every row kept: the commit's state and conv history, from registers
+            float* ob = a.state_out + ((size_t) (rg * RPG) * a.h_v + gh) * S + col;
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) ob[r * row_stride] = s[r];
-        float* oh = a.state_out + (size_t) S * a.h_v * S;
-        const auto last3 = [&](const float (&h)[3], const float (&x)[MAXT], int j) {   // of [h | x_0 .. x_{T-1}]
-            const int src = T + j;
-            float v = src < 3 ? h[src < 3 ? src : 0] : 0.0f;
+            for (int r = 0; r < RPG; ++r) ob[r * row_stride] = s[r];
+            float* oh = a.state_out + (size_t) S * a.h_v * S;
+            const auto last3 = [&](const float (&h)[3], const float (&x)[MAXT], int j) {   // of [h | x_0 .. x_{T-1}]
+                const int src = T + j;
+                float v = src < 3 ? h[src < 3 ? src : 0] : 0.0f;
 #pragma unroll
-            for (int t = 0; t < MAXT; ++t)
-                if (src >= 3 && t == src - 3) v = x[t];
-            return v;
-        };
+                for (int t = 0; t < MAXT; ++t)
+                    if (src >= 3 && t == src - 3) v = x[t];
+                return v;
+            };
 #pragma unroll
-        for (int j = 0; j < 3; ++j) {
-            if (rank == 0 && head < hm.nkl) {
-                oh[cq * 3 + j] = last3(hq, xq, j);
-                oh[ck * 3 + j] = last3(hk, xk, j);
+            for (int j = 0; j < 3; ++j) {
+                if (rank == 0 && head < hm.nkl) {
+                    oh[cq * 3 + j] = last3(hq, xq, j);
+                    oh[ck * 3 + j] = last3(hk, xk, j);
+                }
+                if (rg == 1) oh[cv * 3 + j] = last3(hv, xv, j);
             }
-            if (rg == 1) oh[cv * 3 + j] = last3(hv, xv, j);
         }
-    }
-    if (SPLIT) return;
 #if !DM_REC_NO_CLUSTERS
-    // every rank's sums of squares, pushed into every rank's shared memory (every rank has started: the gates' barrier)
-    // before one cluster barrier
-    if (rg == 0) {
+        // every rank's sums of squares, pushed into every rank's shared memory (every rank has started: the gates' barrier)
+        // before one cluster barrier
+        if (rg == 0) {
 #pragma unroll
-        for (int t0 = 0; t0 < MAXT; t0 += 8) {   // eight tokens a pass: lane 4 i + r sends token t0 + i to rank r
-            const int t = t0 + lane / 4, r = lane % 4;
-            const float v = __shfl_sync(0xffffffffu, wsum_t, t & 31);
-            if (t < T) *cluster->map_shared_rank(&sm.wsum[t][rank], r) = v;
+            for (int t0 = 0; t0 < MAXT; t0 += 8) {   // eight tokens a pass: lane 4 i + r sends token t0 + i to rank r
+                const int t = t0 + lane / 4, r = lane % 4;
+                const float v = __shfl_sync(0xffffffffu, wsum_t, t & 31);
+                if (t < T) *cluster->map_shared_rank(&sm.wsum[t][rank], r) = v;
+            }
         }
-    }
-    cluster->sync();
-    stamp(a, 7);
+        cluster->sync();
+        stamp(a, 7);
 
-    // ---- the gated RMS norm and the q8_1 of the output: one warp, one q8_1 block per token
-    if (rg == 0) {
+        // ---- the gated RMS norm and the q8_1 of the output: one warp, one q8_1 block per token
+        if (rg == 0) {
 #pragma unroll
-        for (int t = 0; t < MAXT; ++t) {
-            if (t >= T) break;
-            const float ss = sm.wsum[t][0] + sm.wsum[t][1] + sm.wsum[t][2] + sm.wsum[t][3];
-            norm_q8(a, t, head, hm.nvl, rank, lane, sm.oc[t][lane], ss, gam, zz[t]);
+            for (int t = 0; t < MAXT; ++t) {
+                if (t >= T) break;
+                const float ss = sm.wsum[t][0] + sm.wsum[t][1] + sm.wsum[t][2] + sm.wsum[t][3];
+                norm_q8(a, t, head, hm.nvl, rank, lane, sm.oc[t][lane], ss, gam, zz[t]);
+            }
         }
-    }
-    stamp(a, 8);
-    stamp(a, 9);
+        stamp(a, 8);
+        stamp(a, 9);
 #endif  // !DM_REC_NO_CLUSTERS
+    }
 }
 
 #if !DM_REC_NO_CLUSTERS
@@ -415,7 +433,7 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const 
 
 template<int MAXT, int NJ>
 __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T) {
-    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
+    __shared__ RecSmem<NJ, rec_rows(MAXT), true, false> sm;
     rec_block<MAXT, NJ, true>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr);
 }
 
@@ -466,7 +484,7 @@ __global__ void __launch_bounds__(S) rec_split_seg_kernel(const DecRecArgs a0, c
                                                           int n_tok) {
     const SegRow r = rows[blockIdx.y];
     if (r.j != 0) return;
-    __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
+    __shared__ RecSmem<NJ, rec_rows(MAXT), true, true> sm;
     const DecRecArgs a = seg_args(a0, r, state_off, dst, off_c, off_hv);
     const float* ga = gates + (size_t) r.row0 * a.h_v;   // dec_gdn_gates' rows: alpha [n_tok][h_v], then beta
     rec_block<MAXT, NJ, true, false, true>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr, ga, ga + (size_t) n_tok * a.h_v);

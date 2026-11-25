@@ -180,6 +180,9 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// True when the last decode_window ran uncaptured or instantiated a new CUDA graph.
+    virtual bool window_cold() const { return false; }
+    virtual int prompt_fold_window() const { return 1; }
     /// The most rows a decode window starting at `pos` may hold, so that it ends at a position where the session changes
     /// state between windows (0: no limit). Only drafted windows are shortened; a row gives the same bits in any window.
     virtual int window_limit(int64_t pos) const { (void) pos; return 0; }
