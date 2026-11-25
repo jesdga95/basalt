@@ -126,9 +126,6 @@ void attn_prompt(const AttnPrompt& a, int rows, void* stream);
 void embed_rows(const uint16_t* table, const int32_t* tokens, int rows, int width, float scale, float* out, void* stream);
 /// x[r] += rms(y[r]) * w (the post-sublayer norm and the residual).
 void add_norm(float* x, const float* y, const float* w, float eps, int rows, int width, void* stream);
-/// add_norm, then the next product's input: act[r] = bf16(rms(x[r]) * w2), the bf16 rows of window_gemm.hpp.
-void add_norm_pack(float* x, const float* y, const float* w, const float* w2, float eps, int rows, int width, void* act,
-                   void* stream);
 /// out[r][i] = gelu_tanh(g[r][i]) * u[r][i] for i < n, 0 for n <= i < ld (the padding the next product reads).
 void gelu_mul(const float* g, const float* u, int rows, int n, int64_t ld_gu, int64_t ld, float* out, void* stream);
 /// gelu_mul into the next product's bf16 rows (window_gemm.hpp) [rows][ld].

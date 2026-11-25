@@ -76,45 +76,21 @@ __global__ void __launch_bounds__(kThreads) add_norm_kernel(float* __restrict__ 
     for (int i = threadIdx.x; i < width; i += kThreads) x[(size_t) r * width + i] += yr[i] * inv * w[i];
 }
 
-constexpr int kHeld = 16;   // values a thread keeps of a row (width <= kHeld * kThreads)
-
-__global__ void __launch_bounds__(kThreads) add_norm_pack_kernel(float* __restrict__ x, const float* __restrict__ y,
-                                                                  const float* __restrict__ w, const float* __restrict__ w2,
-                                                                  float eps, int width, uint16_t* __restrict__ act) {
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
-    const int r = blockIdx.x;
-    const float* yr = y + (size_t) r * width;
-    float* xr = x + (size_t) r * width;
-    const float inv = inv_rms(yr, width, eps);
-    float v[kHeld], ss = 0.f;
-#pragma unroll
-    for (int j = 0; j < kHeld; ++j) {
-        const int i = threadIdx.x + j * kThreads;
-        v[j] = i < width ? xr[i] + yr[i] * inv * w[i] : 0.f;
-        if (i < width) xr[i] = v[j];
-        ss += v[j] * v[j];
-    }
-    const float inv2 = 1.0f / sqrtf(block_sum(ss) / (float) width + eps);
-#pragma unroll
-    for (int j = 0; j < kHeld; ++j) {
-        const int i = threadIdx.x + j * kThreads;
-        if (i < width) act[(size_t) r * width + i] = bk::bf16_from_f32(v[j] * inv2 * w2[i]);
-    }
-}
-
-// A block a row: its 1 / rms once, xr the unweighted norm, then a warp a q8_1 block of the weighted one.
+// grid (slice, row): each block the row's 1 / rms (the whole row: x is only read), then its slice of xr and of the q8_1
+// blocks, a warp a block.
 __global__ void __launch_bounds__(kThreads) moe_inputs_kernel(const float* __restrict__ x, const float* __restrict__ w, float eps,
                                                               int width, float* __restrict__ xr, bk::Q81Fm* __restrict__ xq) {
     bk::pdl_wait();
     bk::pdl_launch_dependents();
-    const int r = blockIdx.x;
+    const int r = blockIdx.y;
     const float* row = x + (size_t) r * width;
     const float inv = inv_rms(row, width, eps);
-    for (int i = threadIdx.x; i < width; i += kThreads) xr[(size_t) r * width + i] = row[i] * inv;
     const int lane = threadIdx.x & 31, nb = width / 32;
-    for (int b = threadIdx.x >> 5; b < nb; b += kThreads / 32)
-        bk::q8_1_store_fm(row[b * 32 + lane] * inv * w[b * 32 + lane], xq, (size_t) r * nb + b, lane);
+    const int b = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    if (b >= nb) return;
+    const float v = row[b * 32 + lane] * inv;
+    xr[(size_t) r * width + b * 32 + lane] = v;
+    bk::q8_1_store_fm(v * w[b * 32 + lane], xq, (size_t) r * nb + b, lane);
 }
 
 __global__ void __launch_bounds__(kThreads) gelu_pack_kernel(const float* __restrict__ g, const float* __restrict__ u, int n,
@@ -202,20 +178,12 @@ void add_norm(float* x, const float* y, const float* w, float eps, int rows, int
     check("add_norm");
 }
 
-void add_norm_pack(float* x, const float* y, const float* w, const float* w2, float eps, int rows, int width, void* act,
-                   void* stream) {
-    if (rows <= 0) return;
-    if (width > kHeld * kThreads) throw std::invalid_argument("gemma4 add_norm_pack: a row wider than the block holds");
-    bk::launch_pdl(add_norm_pack_kernel, dim3((unsigned) rows), dim3(kThreads), 0, (cudaStream_t) stream, x, y, w, w2, eps, width,
-                   (uint16_t*) act);
-    check("add_norm_pack");
-}
-
 void moe_inputs(const float* x, const float* w, float eps, int rows, int width, float* xr, void* xq, void* stream) {
     if (rows <= 0) return;
     if (width % 32) throw std::invalid_argument("gemma4 moe_inputs: a width not a multiple of 32");
-    bk::launch_pdl(moe_inputs_kernel, dim3((unsigned) rows), dim3(kThreads), 0, (cudaStream_t) stream, x, w, eps, width, xr,
-                   (bk::Q81Fm*) xq);
+    const int slices = (width / 32 + kThreads / 32 - 1) / (kThreads / 32);
+    bk::launch_pdl(moe_inputs_kernel, dim3((unsigned) slices, (unsigned) rows), dim3(kThreads), 0, (cudaStream_t) stream, x, w, eps,
+                   width, xr, (bk::Q81Fm*) xq);
     check("moe_inputs");
 }
 

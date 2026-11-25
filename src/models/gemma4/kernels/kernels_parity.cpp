@@ -524,7 +524,7 @@ double bf(uint16_t b) {
     return f;
 }
 
-// The fused glue against the same references: add_norm_pack, gelu_pack, moe_inputs, ffn_end with the next input; then
+// The fused glue against the same references: gelu_pack, moe_inputs, ffn_end with the next input; then
 // their microbench line (one row each).
 void fused_checks(std::mt19937& rng) {
     const int R = 3, E = 2816, F = 2112, FP = 2176, K = 8;
@@ -534,30 +534,15 @@ void fused_checks(std::mt19937& rng) {
         for (int i = 0; i < n; ++i) ss += v[i] * v[i];
         return 1 / std::sqrt(ss / n + eps);
     };
-    auto x = randv((size_t) R * E, rng), y = randv((size_t) R * E, rng, 3.f), w = randv(E, rng, 0.2f), w2 = randv(E, rng, 0.2f);
-    float *dx = dev(x), *dy = dev(y), *dw = dev(w), *dw2 = dev(w2);
+    auto x = randv((size_t) R * E, rng), w = randv(E, rng, 0.2f), w2 = randv(E, rng, 0.2f);
+    float *dx = dev(x), *dw = dev(w), *dw2 = dev(w2);
     uint16_t* act = nullptr;
     cudaMalloc(&act, (size_t) R * 8192 * 2);
-    add_norm_pack(dx, dy, dw, dw2, (float) eps, R, E, act, nullptr);
-    std::vector<float> gx = host(dx, x.size());
-    std::vector<uint16_t> ga = host(act, (size_t) R * E);
-    double ex = 0, ea = 0;
-    for (int r = 0; r < R; ++r) {
-        std::vector<double> yy(y.begin() + r * E, y.begin() + (r + 1) * E), xx(E);
-        const double iy = rms_inv(yy.data(), E);
-        for (int i = 0; i < E; ++i) xx[i] = x[r * E + i] + yy[i] * iy * w[i];
-        const double ix = rms_inv(xx.data(), E);
-        for (int i = 0; i < E; ++i) {
-            ex = std::max(ex, std::fabs(xx[i] - gx[r * E + i]));
-            const double want = xx[i] * ix * w2[i];
-            ea = std::max(ea, std::fabs(want - bf(ga[r * E + i])) / (std::fabs(want) + 1e-3));
-        }
-    }
-    expect(ex < 1e-4 && ea < 8e-3, "add_norm_pack (residual, then the next input as bf16)", std::max(ex, ea));
+    const std::vector<float>& gx = x;
     auto g = randv((size_t) R * FP, rng, 2.f), u = randv((size_t) R * FP, rng);
     float *dg = dev(g), *du = dev(u);
     gelu_pack(dg, du, R, F, FP, FP, act, nullptr);
-    ga = host(act, (size_t) R * FP);
+    std::vector<uint16_t> ga = host(act, (size_t) R * FP);
     double eg = 0;
     for (int r = 0; r < R; ++r)
         for (int i = 0; i < FP; ++i) {
@@ -624,13 +609,11 @@ void fused_checks(std::mt19937& rng) {
         cudaDeviceSynchronize();
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 200;
     };
-    const double t1 = time([&] { add_norm_pack(dx, dy, dw, dw2, (float) eps, 1, E, act, nullptr); });
     const double t2 = time([&] { gelu_pack(dg, du, 1, F, FP, FP, act, nullptr); });
     const double t3 = time([&] { moe_inputs(dx, dw, (float) eps, 1, E, xr, xq, nullptr); });
     const double t4 = time([&] { ffn_end(fe, 1, E, nullptr); });
-    std::printf("bench 1 row: add_norm_pack %.1f us, gelu_pack %.1f us, moe_inputs %.1f us, ffn_end with the next input %.1f us\n",
-                t1, t2, t3, t4);
-    for (void* q : {(void*) dx, (void*) dy, (void*) dw, (void*) dw2, (void*) act, (void*) dg, (void*) du, (void*) xr, xq, (void*) dm,
+    std::printf("bench 1 row: gelu_pack %.1f us, moe_inputs %.1f us, ffn_end with the next input %.1f us\n", t2, t3, t4);
+    for (void* q : {(void*) dx, (void*) dw, (void*) dw2, (void*) act, (void*) dg, (void*) du, (void*) xr, xq, (void*) dm,
                     (void*) de, (void*) dwt, (void*) dn1, (void*) dn2, (void*) dnp, (void*) dsc, (void*) xa, (void*) xb, (void*) xn})
         cudaFree(q);
 }

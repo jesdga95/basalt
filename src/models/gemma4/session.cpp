@@ -669,7 +669,8 @@ private:
             attn_decode(a, rows, stream_);
             product(w.o, x.tmp, E, rows);
             // the MLP
-            add_norm_pack(x.x, x.tmp, w.post_attn, w.ffn_norm, g_.rms_eps, rows, E, x.act, stream_);
+            add_norm(x.x, x.tmp, w.post_attn, g_.rms_eps, rows, E, stream_);
+            wg::norm_pack(x.x, w.ffn_norm, g_.rms_eps, E, rows, x.act, nullptr, stream_);
             {
                 wg::Call c;
                 c.fmt = wg::Format::F8;
