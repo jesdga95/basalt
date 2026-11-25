@@ -1,7 +1,7 @@
 // src/models/gemma4/kernels/kernels_parity.cpp - the Gemma 4 kernels against CPU references in double: the attention's
 // preparation and decode attention (a window layer's ring past its wrap, a full layer whose keys are its values), the glue;
 // a batch window of two conversations bitwise equal to each alone; the prompt attention against the decode attention and
-// split anywhere bitwise equal; and microbench lines of the decode and prompt attention.
+// split anywhere bitwise equal; the fused glue; and microbench lines of the decode and prompt attention and the glue.
 #include "basalt/models/gemma4/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -477,6 +477,124 @@ void prompt_bench(const char* name, const LayerShape& sh, int past, int C, std::
     for (void* p : {(void*) dq, (void*) dkn, (void*) out, ck, cv, (void*) ap.rope.lo, (void*) ap.rope.hi}) cudaFree(p);
 }
 
+double bf(uint16_t b) {
+    const uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+// The fused glue against the same references: add_norm_pack, gelu_pack, moe_inputs, ffn_end with the next input; then
+// their microbench line (one row each).
+void fused_checks(std::mt19937& rng) {
+    const int R = 3, E = 2816, F = 2112, FP = 2176, K = 8;
+    const double eps = 1e-6;
+    auto rms_inv = [&](const double* v, int n) {
+        double ss = 0;
+        for (int i = 0; i < n; ++i) ss += v[i] * v[i];
+        return 1 / std::sqrt(ss / n + eps);
+    };
+    auto x = randv((size_t) R * E, rng), y = randv((size_t) R * E, rng, 3.f), w = randv(E, rng, 0.2f), w2 = randv(E, rng, 0.2f);
+    float *dx = dev(x), *dy = dev(y), *dw = dev(w), *dw2 = dev(w2);
+    uint16_t* act = nullptr;
+    cudaMalloc(&act, (size_t) R * 8192 * 2);
+    add_norm_pack(dx, dy, dw, dw2, (float) eps, R, E, act, nullptr);
+    std::vector<float> gx = host(dx, x.size());
+    std::vector<uint16_t> ga = host(act, (size_t) R * E);
+    double ex = 0, ea = 0;
+    for (int r = 0; r < R; ++r) {
+        std::vector<double> yy(y.begin() + r * E, y.begin() + (r + 1) * E), xx(E);
+        const double iy = rms_inv(yy.data(), E);
+        for (int i = 0; i < E; ++i) xx[i] = x[r * E + i] + yy[i] * iy * w[i];
+        const double ix = rms_inv(xx.data(), E);
+        for (int i = 0; i < E; ++i) {
+            ex = std::max(ex, std::fabs(xx[i] - gx[r * E + i]));
+            const double want = xx[i] * ix * w2[i];
+            ea = std::max(ea, std::fabs(want - bf(ga[r * E + i])) / (std::fabs(want) + 1e-3));
+        }
+    }
+    expect(ex < 1e-4 && ea < 8e-3, "add_norm_pack (residual, then the next input as bf16)", std::max(ex, ea));
+    auto g = randv((size_t) R * FP, rng, 2.f), u = randv((size_t) R * FP, rng);
+    float *dg = dev(g), *du = dev(u);
+    gelu_pack(dg, du, R, F, FP, FP, act, nullptr);
+    ga = host(act, (size_t) R * FP);
+    double eg = 0;
+    for (int r = 0; r < R; ++r)
+        for (int i = 0; i < FP; ++i) {
+            const double a = g[r * FP + i];
+            const double want = i < F ? 0.5 * a * (1 + std::tanh(0.7978845608028654 * (a + 0.044715 * a * a * a))) * u[r * FP + i] : 0;
+            eg = std::max(eg, std::fabs(want - bf(ga[r * FP + i])) / (std::fabs(want) + 1e-3));
+        }
+    expect(eg < 8e-3, "gelu_pack (bf16, zero padding)", eg);
+    float* xr = nullptr;
+    void* xq = nullptr;
+    cudaMalloc(&xr, (size_t) R * E * 4);
+    cudaMalloc(&xq, (size_t) R * (E / 32) * 36);
+    moe_inputs(dx, dw, (float) eps, R, E, xr, xq, nullptr);
+    std::vector<float> gxr = host(xr, (size_t) R * E);
+    std::vector<uint8_t> gq = host((uint8_t*) xq, (size_t) R * (E / 32) * 36);
+    double er = 0, eq = 0;
+    for (int r = 0; r < R; ++r) {
+        std::vector<double> xx(gx.begin() + r * E, gx.begin() + (r + 1) * E);
+        const double ix = rms_inv(xx.data(), E);
+        for (int b = 0; b < E / 32; ++b) {
+            const uint8_t* blk = gq.data() + ((size_t) r * (E / 32) + b) * 36;
+            __half d;
+            std::memcpy(&d, blk, 2);
+            double amax = 0;
+            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(xx[b * 32 + j] * ix * w[b * 32 + j]));
+            for (int j = 0; j < 32; ++j) {
+                const int i = b * 32 + j;
+                er = std::max(er, std::fabs(xx[i] * ix - gxr[r * E + i]));
+                eq = std::max(eq, std::fabs(xx[i] * ix * w[i] - (double) __half2float(d) * (int8_t) blk[4 + j]) / (amax + 1e-9));
+            }
+        }
+    }
+    expect(er < 1e-5 && eq < 6e-3, "moe_inputs (the router\x27s norm, the experts\x27 q8_1 blocks)", std::max(er, eq));
+    // ffn_end with experts and the next input, against ffn_end alone and the reference norm of its result
+    auto mlp = randv((size_t) R * E, rng), exs = randv((size_t) R * K * E, rng), wt = randv((size_t) R * K, rng, 0.3f);
+    auto n1 = randv(E, rng, 0.2f), n2 = randv(E, rng, 0.2f), np = randv(E, rng, 0.2f);
+    std::vector<float> sc{0.75f};
+    float *dm = dev(mlp), *de = dev(exs), *dwt = dev(wt), *dn1 = dev(n1), *dn2 = dev(n2), *dnp = dev(np), *dsc = dev(sc);
+    float *xa = dev(x), *xb = dev(x), *xn = nullptr;
+    cudaMalloc(&xn, (size_t) R * E * 4);
+    FfnEnd fe;
+    fe.x = xa, fe.mlp = dm, fe.experts = de, fe.weights = dwt, fe.k = K, fe.n1 = dn1, fe.n2 = dn2, fe.n_post = dnp, fe.scalar = dsc;
+    ffn_end(fe, R, E, nullptr);
+    fe.x = xb, fe.next_w = dw2, fe.act = act, fe.xn = xn;
+    ffn_end(fe, R, E, nullptr);
+    const std::vector<float> ra = host(xa, x.size()), rb = host(xb, x.size()), rn = host(xn, x.size());
+    ga = host(act, (size_t) R * E);
+    double en = 0;
+    for (int r = 0; r < R; ++r) {
+        std::vector<double> xx(ra.begin() + r * E, ra.begin() + (r + 1) * E);
+        const double ix = rms_inv(xx.data(), E);
+        for (int i = 0; i < E; ++i) {
+            const double want = xx[i] * ix * w2[i];
+            en = std::max(en, std::fabs(want - rn[r * E + i]) + std::fabs(want - bf(ga[r * E + i])) / (std::fabs(want) + 1e-3) * 1e-3);
+        }
+    }
+    expect(std::memcmp(ra.data(), rb.data(), ra.size() * 4) == 0 && en < 1e-4, "ffn_end with the next input (residual bitwise the same)", en);
+    // microbench: one row each
+    const auto time = [&](auto&& f) {
+        for (int i = 0; i < 20; ++i) f();
+        cudaDeviceSynchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 200; ++i) f();
+        cudaDeviceSynchronize();
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 200;
+    };
+    const double t1 = time([&] { add_norm_pack(dx, dy, dw, dw2, (float) eps, 1, E, act, nullptr); });
+    const double t2 = time([&] { gelu_pack(dg, du, 1, F, FP, FP, act, nullptr); });
+    const double t3 = time([&] { moe_inputs(dx, dw, (float) eps, 1, E, xr, xq, nullptr); });
+    const double t4 = time([&] { ffn_end(fe, 1, E, nullptr); });
+    std::printf("bench 1 row: add_norm_pack %.1f us, gelu_pack %.1f us, moe_inputs %.1f us, ffn_end with the next input %.1f us\n",
+                t1, t2, t3, t4);
+    for (void* q : {(void*) dx, (void*) dy, (void*) dw, (void*) dw2, (void*) act, (void*) dg, (void*) du, (void*) xr, xq, (void*) dm,
+                    (void*) de, (void*) dwt, (void*) dn1, (void*) dn2, (void*) dnp, (void*) dsc, (void*) xa, (void*) xb, (void*) xn})
+        cudaFree(q);
+}
+
 }  // namespace
 
 int main() {
@@ -498,6 +616,7 @@ int main() {
     prompt_case("prompt attention, full layer (keys = values), 300 rows", {16, 2, 512, 64, 0, true}, 1500, 300, KvType::F16, rng);
     prompt_case("prompt attention, full layer, fp8 cache, 129 rows", {16, 2, 512, 64, 0, true}, 0, 129, KvType::F8, rng);
     glue_checks(rng);
+    fused_checks(rng);
     bench(rng);
     prompt_bench("window layer (16x256, 8 kv, window 1024) 2048 rows after 8192", {16, 8, 256, 128, 1024, false}, 8192, 2048, rng);
     prompt_bench("full layer (16x512, 2 kv, one cache) 2048 rows after 8192", {16, 2, 512, 64, 0, true}, 8192, 2048, rng);

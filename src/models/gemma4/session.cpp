@@ -45,9 +45,9 @@ constexpr int kStage = 4;   // pinned staging slots for a call's tokens and posi
 // The forward scratch every session of the model shares (one call at a time: each call syncs its stream before it
 // returns, and a batch window syncs every session's stream before it starts), and the batch windows' graphs.
 struct Shared {
-    float *x = nullptr, *tmp = nullptr, *mlp = nullptr, *xe = nullptr, *xr = nullptr, *xn = nullptr;   // [R][E]
-    float *q = nullptr, *k = nullptr, *v = nullptr, *qp = nullptr, *att = nullptr;      // [R][qmax] / [R][kmax]
-    float *g = nullptr, *u = nullptr, *h = nullptr;                                     // [R][n_ff_pad]
+    float *x = nullptr, *tmp = nullptr, *mlp = nullptr, *xr = nullptr, *xn = nullptr;   // [R][E]
+    float *q = nullptr, *k = nullptr, *v = nullptr, *qp = nullptr;                      // [R][qmax] / [R][kmax]
+    float *g = nullptr, *u = nullptr;                                                   // [R][n_ff_pad]
     void* act = nullptr;                                                                // wgemm activations
     float *rlog = nullptr, *rw = nullptr;
     int32_t* ids = nullptr;
@@ -85,8 +85,8 @@ struct Shared {
             return p;
         };
         auto f = [&](int64_t n) { return (float*) a((size_t) n * 4); };
-        x = f(R * E), tmp = f(R * E), mlp = f(R * E), xe = f(R * E), xr = f(R * E), xn = f(R * E);
-        q = f(R * qmax), k = f(R * kmax), v = f(R * kmax), qp = f(R * qmax), att = f(R * qmax);
+        x = f(R * E), tmp = f(R * E), mlp = f(R * E), xr = f(R * E), xn = f(R * E);
+        q = f(R * qmax), k = f(R * kmax), v = f(R * kmax), qp = f(R * qmax);
         g_alloc(f, R, F);
         act = a(wg::act_bytes(std::max({E, qmax, F})));
         attn_scr = f((int64_t) attn_scratch_floats(kRows, g.n_head, std::max(g.hd_swa, g.hd_full)));
@@ -114,7 +114,7 @@ struct Shared {
     }
     template <class F>
     void g_alloc(F& f, int64_t R, int64_t FF) {
-        g = f(R * FF), u = f(R * FF), h = f(R * FF);
+        g = f(R * FF), u = f(R * FF);
     }
 };
 
@@ -633,12 +633,11 @@ private:
         const int32_t* pos = x.io + kRows;
         bk::PdlScope pdl(true, true);
         embed_rows(m_.embedding(), tok, rows, E, g_.embed_scale, x.x, stream_);
-        for (int l = 0; l < g_.n_layers; ++l) {
+        wg::norm_pack(x.x, m_.layer(0).attn_norm, g_.rms_eps, E, rows, x.act, nullptr, stream_);
+        for (int l = 0; l < g_.n_layers; ++l) {   // a layer starts with its attention's input in x.act
             const LayerWeights& w = m_.layer(l);
             const LayerShape& s = w.sh;
             const int64_t qd = (int64_t) s.n_head * s.hd, kd = (int64_t) s.n_kv * s.hd;
-            // attention
-            wg::norm_pack(x.x, w.attn_norm, g_.rms_eps, E, rows, x.act, nullptr, stream_);
             {
                 wg::Call c;
                 c.fmt = wg::Format::F8;
@@ -666,13 +665,11 @@ private:
             a.kv = p.kv;
             a.max_keys = s.window > 0 ? s.window : full_keys;
             a.scratch = x.attn_scr;
-            a.out = x.att;
+            a.act = x.act;
             attn_decode(a, rows, stream_);
-            wg::pack(x.att, qd, qd, rows, x.act, stream_);
             product(w.o, x.tmp, E, rows);
-            add_norm(x.x, x.tmp, w.post_attn, g_.rms_eps, rows, E, stream_);
             // the MLP
-            wg::norm_pack(x.x, w.ffn_norm, g_.rms_eps, E, rows, x.act, nullptr, stream_);
+            add_norm_pack(x.x, x.tmp, w.post_attn, w.ffn_norm, g_.rms_eps, rows, E, x.act, stream_);
             {
                 wg::Call c;
                 c.fmt = wg::Format::F8;
@@ -682,18 +679,15 @@ private:
                 c.n = 2;
                 wg::gemm(c, x.act, rows, ws_, stream_);
             }
-            gelu_mul(x.g, x.u, rows, g_.n_ff, F, F, x.h, stream_);
-            wg::pack(x.h, F, F, rows, x.act, stream_);
+            gelu_pack(x.g, x.u, rows, g_.n_ff, F, F, x.act, stream_);
             product(w.down, x.mlp, E, rows);
             FfnEnd fe;
             fe.x = x.x, fe.mlp = x.mlp, fe.n_post = w.post_ffw, fe.scalar = w.scalar, fe.eps = g_.rms_eps;
             if (g_.moe()) {   // the router reads the residual unweighted-normed; the experts its pre_ffw2 norm
-                bk::rms_norm_rows(x.x, m_.ones(), rows, E, g_.rms_eps, x.xr, stream_);
+                moe_inputs(x.x, w.pre_ffw2, g_.rms_eps, rows, E, x.xr, x.xq, stream_);
                 bk::RouterArgs ra;
                 ra.n_expert = g_.n_expert, ra.n_embd = E, ra.k = g_.n_used, ra.weight_scale = 1.f, ra.gate = bk::RouterGate::Softmax;
                 bk::router(x.xr, w.router, nullptr, rows, ra, x.rlog, x.ids, x.rw, stream_);
-                bk::rms_norm_rows(x.x, w.pre_ffw2, rows, E, g_.rms_eps, x.xe, stream_);
-                bk::quantize_q8_1_rows(x.xe, rows, E, x.xq, stream_);
                 bk::moe_plan(x.ids, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr, x.ex_start, x.ex_ng, x.ex_dst, x.ex_tok, stream_);
                 bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
                 L.gelu = true;
@@ -702,9 +696,13 @@ private:
                                           x.xq, x.ex_scr, x.ex_rows, stream_);
                 fe.experts = x.ex_rows, fe.weights = x.rw, fe.k = g_.n_used, fe.n1 = w.post_ffw1, fe.n2 = w.post_ffw2;
             }
+            if (l + 1 < g_.n_layers) {   // the next layer's attention input, or the final norm
+                fe.next_w = m_.layer(l + 1).attn_norm, fe.act = x.act;
+            } else {
+                fe.next_w = m_.output_norm(), fe.xn = x.xn;
+            }
             ffn_end(fe, rows, E, stream_);
         }
-        bk::rms_norm_rows(x.x, m_.output_norm(), rows, E, g_.rms_eps, x.xn, stream_);
         if (tap) cudaMemcpyAsync(tap, x.xn, (size_t) rows * E * 4, cudaMemcpyDeviceToDevice, stream_);
         if (head <= 0) return;
         wg::pack(x.xn + (size_t) (rows - head) * E, E, E, head, x.act, stream_);

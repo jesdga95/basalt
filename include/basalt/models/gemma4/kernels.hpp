@@ -92,6 +92,7 @@ struct Attn {
     int64_t max_keys = 0;
     float* scratch = nullptr;            ///< attn_scratch_floats
     float* out = nullptr;                ///< [rows][n_head][hd]
+    void* act = nullptr;                 ///< set: the output as the next product's bf16 rows (window_gemm.hpp) in place of out
 };
 size_t attn_scratch_floats(int rows, int n_head, int hd);
 void attn_decode(const Attn& a, int rows, void* stream);
@@ -119,10 +120,19 @@ void attn_prompt(const AttnPrompt& a, int rows, void* stream);
 void embed_rows(const uint16_t* table, const int32_t* tokens, int rows, int width, float scale, float* out, void* stream);
 /// x[r] += rms(y[r]) * w (the post-sublayer norm and the residual).
 void add_norm(float* x, const float* y, const float* w, float eps, int rows, int width, void* stream);
+/// add_norm, then the next product's input: act[r] = bf16(rms(x[r]) * w2), the bf16 rows of window_gemm.hpp.
+void add_norm_pack(float* x, const float* y, const float* w, const float* w2, float eps, int rows, int width, void* act,
+                   void* stream);
 /// out[r][i] = gelu_tanh(g[r][i]) * u[r][i] for i < n, 0 for n <= i < ld (the padding the next product reads).
 void gelu_mul(const float* g, const float* u, int rows, int n, int64_t ld_gu, int64_t ld, float* out, void* stream);
+/// gelu_mul into the next product's bf16 rows (window_gemm.hpp) [rows][ld].
+void gelu_pack(const float* g, const float* u, int rows, int n, int64_t ld_gu, int64_t ld, void* act, void* stream);
+/// The experts' inputs: xr[r] = rms(x[r]) (unweighted: the router's), xq the q8_1 blocks (36 bytes, 32 values each) of
+/// rms(x[r]) * w (width a multiple of 32).
+void moe_inputs(const float* x, const float* w, float eps, int rows, int width, float* xr, void* xq, void* stream);
 /// The feed-forward's end: mlp = rms(mlp_out) * n1 when the layer has experts (then + rms(sum_s w[r][s] e[r * k + s]) * n2,
-/// in slot order), or mlp_out alone; x = (x + rms(mlp) * n_post) * scalar[0].
+/// in slot order), or mlp_out alone; x = (x + rms(mlp) * n_post) * scalar[0]. With `next_w`, then the next step's input
+/// rms(x) * next_w: as bf16 rows of window_gemm.hpp into `act`, or as fp32 rows into `xn`.
 struct FfnEnd {
     float* x = nullptr;
     const float* mlp = nullptr;
@@ -132,6 +142,9 @@ struct FfnEnd {
     const float* n1 = nullptr, *n2 = nullptr, *n_post = nullptr;
     const float* scalar = nullptr;       ///< device [1]
     float eps = 1e-6f;
+    const float* next_w = nullptr;
+    void* act = nullptr;
+    float* xn = nullptr;
 };
 void ffn_end(const FfnEnd& f, int rows, int width, void* stream);
 /// x = cap * tanh(x / cap), n values.

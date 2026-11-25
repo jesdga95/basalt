@@ -6,6 +6,7 @@
 #include "basalt/models/gemma4/kernels.hpp"
 
 #include "attn_split.cuh"
+#include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -136,7 +137,9 @@ __global__ void __launch_bounds__(128) attn_merge_kernel(Attn a, int rows) {
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float A = 0.f;
         for (int c = 0; c < sp.chunks; ++c) A += part[(size_t) c * (hd + 2) + 2 + d] * expf(part[(size_t) c * (hd + 2)] - M);
-        a.out[((size_t) r * sh.n_head + head) * hd + d] = A * invL;
+        const size_t at = ((size_t) r * sh.n_head + head) * hd + d;
+        if (a.act) static_cast<uint16_t*>(a.act)[at] = bk::bf16_from_f32(A * invL);
+        else a.out[at] = A * invL;
     }
 }
 
