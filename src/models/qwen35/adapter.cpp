@@ -29,7 +29,7 @@ namespace basalt::models::qwen35 {
 namespace {
 
 // the pack's DFlash 2 block drafter's shape (qwen35.dflash.* metadata)
-bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
+bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, int n_layers, std::string& err) {
     const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };
     const auto f = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (float) v->num() : 0.0f; };
     d.block = u("block_size");
@@ -43,14 +43,21 @@ bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& 
     d.head_dim = u("attention.key_length");
     d.theta = f("rope.freq_base");
     d.eps = f("attention.layer_norm_rms_epsilon");
+    const int n_blocks = u("block_count");
+    d.target_layers.clear();
     if (const MetaValue* t = gg.get("qwen35.dflash.target_layers"))
         for (const MetaValue& x : t->items) d.target_layers.push_back((int) x.u);
-    if (d.block < 2 || d.block > 8 || d.target_layers.empty() || u("conv_kernel") != 2 || d.n_kv <= 0 ||
-        (d.head_dim != 128 && d.head_dim != 256) || d.top_k > 20 || H % d.conv_group) {
+    bool targets_ok = !d.target_layers.empty();
+    for (int tl : d.target_layers) targets_ok = targets_ok && tl >= 0 && tl < n_layers;
+    if (d.block < 2 || d.block > 8 || !targets_ok || u("conv_kernel") != 2 || n_blocks <= 0 ||
+        d.n_kv <= 0 || d.n_head <= 0 || d.n_head % d.n_kv != 0 || d.n_head / d.n_kv > 8 ||
+        (d.head_dim != 128 && d.head_dim != 256) || d.top_k <= 0 || d.top_k > 20 || d.rank <= 0 ||
+        d.window <= 0 || d.conv_group <= 0 || H % d.conv_group != 0) {
         err = "qwen35: the pack's block drafter has a shape the engine does not run";
         return false;
     }
-    for (int l = 0; l < u("block_count"); ++l) d.layers.emplace_back();
+    d.layers.clear();
+    for (int l = 0; l < n_blocks; ++l) d.layers.emplace_back();
     d.present = true;
     return true;
 }
@@ -127,7 +134,10 @@ class Loaded final : public model::LoadedModel, private model::PeerHooks, privat
 public:
     ~Loaded() override {
         model_.reset();
-        for (auto& [dev, b] : blocks_) cudaFree(b.base);
+        for (auto& [dev, b] : blocks_) {
+            const core::OnDevice on(dev);
+            cudaFree(b.base);
+        }
         if (embd_) cudaFreeHost(embd_);
     }
 
@@ -196,7 +206,7 @@ private:
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
-        if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
+        if (want_block && !block_meta(gg, bd_meta, g.n_embd, g.n_layers, err)) return false;
         if (req.gpus.cards.size() > 1 && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
         plan_file_ = plan_.file(path);
         stage_file_ = stage_plan_.file(path);
@@ -228,7 +238,11 @@ private:
             plan_.add(it);   // (the token embedding is host memory: never the stage's)
         }
         void* dev_embd = nullptr;
-        cudaHostGetDevicePointer(&dev_embd, embd_, 0);
+        if (cudaHostGetDevicePointer(&dev_embd, embd_, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "cannot map page-locked memory for the token embedding";
+            return false;
+        }
         w.embd = (const uint16_t*) dev_embd;
         w.out_norm = floats(gg, "output_norm.weight", H, err);
         if (!w.out_norm || !linear(gg, "output", g.n_vocab, H, w.head, err)) return false;
@@ -264,7 +278,7 @@ private:
             queue_to_ = &plan_;
             dev_bytes_ = before;
         }
-        if (want_block && !block_drafter(gg, w.dflash, H, err)) return false;
+        if (want_block && !block_drafter(gg, w.dflash, H, g.n_layers, err)) return false;
         if (want_mtp) {   // the pack's drafter layer, for --spec
             dense::Mtp& d = w.mtp;
             dense::Layer& L = d.layer;
@@ -462,12 +476,16 @@ private:
     }
 
     // the pack's DFlash 2 block drafter (dflash.* tensors, qwen35.dflash.* metadata)
-    bool block_drafter(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
-        if (!block_meta(gg, d, H, err)) return false;
+    bool block_drafter(const GgufFile& gg, dense::BlockDrafter& d, int H, int n_layers, std::string& err) {
+        if (!block_meta(gg, d, H, n_layers, err)) return false;
         d.layers.clear();
         d.present = false;
         const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };
         const int layers = u("block_count"), ff = u("feed_forward_length");
+        if (ff <= 0) {
+            err = "qwen35: the pack's block drafter has an invalid feed_forward_length";
+            return false;
+        }
         const int AQ = d.n_head * d.head_dim, KV = d.n_kv * d.head_dim, conv = 2 * 2 * (H / d.conv_group);
         for (size_t j = 0; j < d.target_layers.size(); ++j) {
             d.fc.emplace_back();
