@@ -140,11 +140,11 @@ def decide(gate, review_fn):
     """The outcome of a gate result. review_fn(rows, notes) -> verdict dict is called only when the gate passed:
     a fail or a human result never reaches the model. Returns {outcome, reason, label, comment, reviewed}."""
     if gate["status"] == "fail":
-        return {"outcome": "gate_fail", "reviewed": False, "label": "community: needs changes", "reason": "; ".join(gate["reasons"]),
+        return {"outcome": "gate_fail", "reviewed": False, "label": "community-needs-changes", "reason": "; ".join(gate["reasons"]),
                 "comment": "The automatic checks found problems with this benchmark row:\n\n"
                            + "\n".join("- " + plain(r) for r in gate["reasons"]) + "\n\nA maintainer will look once they are fixed."}
     if gate["status"] != "pass":
-        return {"outcome": "needs_human", "reviewed": False, "label": "community: needs review",
+        return {"outcome": "needs_human", "reviewed": False, "label": "community-needs-review",
                 "reason": "; ".join(gate["reasons"]),
                 "comment": "The automatic checks passed, but this row needs a maintainer's look:\n\n"
                            + "\n".join("- " + plain(r) for r in gate["reasons"]) + "\n\nA maintainer will review it."}
@@ -152,9 +152,9 @@ def decide(gate, review_fn):
     if v["verdict"] == "auto_merge":
         return {"outcome": "merge", "reviewed": True, "label": "", "reason": v["reason"], "comment": ""}
     if v["verdict"] == "reject":
-        return {"outcome": "reject", "reviewed": True, "label": "community: rejected", "reason": v["reason"],
+        return {"outcome": "reject", "reviewed": True, "label": "community-rejected", "reason": v["reason"],
                 "comment": "This benchmark row was flagged by the automatic review and needs changes before it can be listed. A maintainer will follow up."}
-    return {"outcome": "needs_human", "reviewed": True, "label": "community: needs review", "reason": v["reason"],
+    return {"outcome": "needs_human", "reviewed": True, "label": "community-needs-review", "reason": v["reason"],
             "comment": "The automatic checks passed and the automatic review asked for a maintainer's look:\n\n- "
                        + plain(v["reason"]) + "\n\nA maintainer will review it."}
 

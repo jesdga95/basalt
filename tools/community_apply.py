@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llm_review import plain  # noqa: E402
 
-LABELS = ("community: needs review", "community: rejected", "community: needs changes", "community: automatic merge")
+LABELS = ("community-needs-review", "community-rejected", "community-needs-changes", "community-auto-merge")
 OWNER = "jesdga95"
 
 
@@ -27,20 +27,20 @@ def plan(outcome, mode_value):
     p = {"mode": mode, "merge": False, "labels": [], "request_review": False, "comment": ""}
     o = outcome["outcome"]
     if o == "merge":
-        p["labels"] = ["community: automatic merge"]
+        p["labels"] = ["community-auto-merge"]
         if mode == "live":
             p["merge"] = True
             p["comment"] = "Automatic review: this row passed every check and is merged automatically."
         else:
             p["comment"] = "Automatic review: this row passed every check and would be merged."
     elif o == "reject":
-        p["labels"] = ["community: rejected"]
+        p["labels"] = ["community-rejected"]
         p["comment"] = outcome["comment"]
     elif o == "gate_fail":
-        p["labels"] = ["community: needs changes"]
+        p["labels"] = ["community-needs-changes"]
         p["comment"] = outcome["comment"]
     else:
-        p["labels"] = ["community: needs review"]
+        p["labels"] = ["community-needs-review"]
         p["request_review"] = True
         p["comment"] = outcome.get("comment", "")
     if p["comment"] and mode != "live":   # live needs no note; shadow says why nothing merged

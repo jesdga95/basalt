@@ -297,7 +297,7 @@ class Mode(unittest.TestCase):
         self.assertIn("'test'", p["comment"])
         p = apply_.plan({"outcome": "reject", "comment": "needs changes"}, "live")
         self.assertNotIn("Mode:", p["comment"])   # live comments carry no mode note
-        self.assertEqual(p["labels"], ["community: rejected"])
+        self.assertEqual(p["labels"], ["community-rejected"])
 
     def test_needs_human_comments_with_the_reasons(self):
         r = good_row()
@@ -307,11 +307,11 @@ class Mode(unittest.TestCase):
         self.assertIn("no earlier row", o["comment"])
         p = apply_.plan(o, "live")
         self.assertIn("needs a maintainer's look", p["comment"])
-        self.assertEqual(p["labels"], ["community: needs review"])
+        self.assertEqual(p["labels"], ["community-needs-review"])
 
     def test_needs_human_labels_and_requests_review(self):
         p = apply_.plan({"outcome": "needs_human", "comment": ""}, "live")
-        self.assertEqual((p["labels"], p["request_review"], p["merge"]), (["community: needs review"], True, False))
+        self.assertEqual((p["labels"], p["request_review"], p["merge"]), (["community-needs-review"], True, False))
 
 
 class Workflows(unittest.TestCase):
