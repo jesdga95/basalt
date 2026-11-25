@@ -139,6 +139,22 @@ void unit_tests() {
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
     }
+    {   // propose_after queries speculative suffix continuations without mutating the history
+        SuffixDrafter d;
+        std::vector<int32_t> doc;
+        for (int i = 0; i < 32; ++i) doc.push_back(700 + i);
+        d.append(doc.data(), doc.size());
+        const size_t before = d.size();
+        const int32_t extra[] = {705, 706, 707, 708, 709, 710, 711, 712};
+        int32_t out_a[8] = {}, out_b[8] = {};
+        int match_len = 0;
+        const int na = d.propose_after(extra, 8, 8, out_a, &match_len);
+        check(d.size() == before, "propose_after leaves indexed history untouched");
+        check(na == 8 && match_len == 8 && out_a[0] == 713 && out_a[7] == 720, "propose_after returns exact continuation");
+        d.append(extra, 8);
+        const int nb = d.propose(8, out_b);
+        check(na == nb && std::memcmp(out_a, out_b, 8 * sizeof(int32_t)) == 0, "propose_after matches append + propose");
+    }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }
 }  // namespace

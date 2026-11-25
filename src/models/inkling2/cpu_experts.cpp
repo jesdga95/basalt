@@ -28,7 +28,7 @@
 namespace basalt::models::inkling2 {
 namespace cpu = kernels::cpu;
 
-static_assert(kDecodeRows <= cpu::MAXT, "a RAM expert takes every row of a window in one job");
+static_assert(kDecodeRows * 8 <= 1024, "a window's RAM pairs fit one call");
 
 namespace {
 // The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
@@ -147,7 +147,7 @@ struct CpuExperts::Impl {
             const uint8_t* blob = e >= 0 && e < n_expert ? model->ram_blob(layer, e) : nullptr;
             if (!blob) continue;   // on the card
             int& j = job_of[(size_t) e];
-            if (j < 0) {
+            if (j < 0 || jobs[(size_t) j].nt == cpu::MAXT) {
                 j = n++;
                 jobs[(size_t) j] = cpu::ExpertJobMulti{};
                 jobs[(size_t) j].blob = blob;

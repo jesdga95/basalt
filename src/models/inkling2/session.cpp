@@ -59,7 +59,7 @@ constexpr int kMaxRows = kDecodeRows;    // rows of one forward call (a decode w
 constexpr int kChunkRead = 16;          // a longer read runs on the prompt path, a shorter one as decode windows
 // with experts in RAM, a read of up to this many tokens runs as decode windows: the prompt path's fixed cost (staging the
 // spilled layers' experts on the card) is more than eight of them
-constexpr int kSpillWindowRead = 8 * kMaxRows;
+constexpr int kSpillWindowRead = 64;
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
 constexpr int kStage = 64;               // windows whose tokens and positions are in flight from the pinned ring at once
@@ -484,7 +484,7 @@ public:
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
     // session's scratch and stream. Each conversation keeps its caches and rings (the kernels take them per segment), its
     // drafter's context, its logits and its draws; a row gives the bits it gives in its own window.
-    int batch_rows() const override { return kMaxRows; }
+    int batch_rows() const override { return kDsBlock; }
 
 protected:
     // the hooks of the shared driver (model/batch_driver.hpp)
