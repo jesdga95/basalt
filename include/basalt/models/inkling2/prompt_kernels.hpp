@@ -37,15 +37,6 @@ struct AttnPromptArgs {
 /// (q, the relative states and the bias table rounded to fp16 for the products, fp32 accumulation and softmax).
 void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* stream);
 
-/// Bytes of scratch moe_sort needs for `pairs` (row, slot) pairs.
-size_t moe_sort_scratch(int pairs, int n_expert);
-/// The pairs of `rows` rows' top-k choices ids [rows][k] sorted by expert, in pair order within an expert (a negative id
-/// is a pair another card computes: it is left out, and bounds[n_expert] counts the rest): bounds
-/// [n_expert + 1] (device), and for sorted entry i its token row tok[i], its pair dst[i] = row * k + slot and its expert
-/// exp[i]. The same order at any launch shape.
-void moe_sort(const int32_t* ids, int rows, int k, int n_expert, void* scratch, int32_t* bounds, int32_t* tok, int32_t* dst,
-              int32_t* exp, void* stream);
-
 /// ids[i] = map[ids[i]] for `n` entries: a spilled layer's experts by their slot (spill.hpp).
 void remap_ids(int32_t* ids, int n, const int32_t* map, void* stream);
 
