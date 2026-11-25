@@ -9,6 +9,7 @@ figure: what an API would have charged for the same work.
 """
 from __future__ import annotations
 import json
+import math
 import os
 import tempfile
 import time
@@ -51,16 +52,21 @@ def totals_load_file(path: str | Path) -> dict:
     return data
 
 
+def _finite_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def totals_add_saved(totals: dict, saved: dict) -> dict:
-    """Add a saved file's counts into the live totals dict. Only numbers are added; a file another
+    """Add a saved file's counts into the live totals dict. Only finite numbers are added; a file another
     version wrote or a hand-edit cannot spoil a start. The 'since' timestamp moves back to the
     saved one so the printed window covers every start the file remembers."""
     for key in TOTALS_KEYS:
         v = saved.get(key)
-        if isinstance(v, (int, float)):
+        if _finite_number(v):
             totals[key] = totals.get(key, 0) + v
-    if isinstance(saved.get("since"), (int, float)) and saved["since"] < totals.get("since", float("inf")):
-        totals["since"] = saved["since"]
+    since = saved.get("since")
+    if _finite_number(since) and since < totals.get("since", float("inf")):
+        totals["since"] = since
     return totals
 
 

@@ -206,33 +206,38 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> ConfigFile:
         if name not in known:
             raise ValueError(f'server.{key}: not a server option (engine flags go under "engine")')
         server_argv += option_words("server", key, value, known[name], here)
-    shared_argv: list[str] = []
-    shared_words: list[str] = []
+    shared_model: dict[str, list[str]] = {}
+    shared_engine: dict[str, list[str]] = {}
     for key, value in shared.items():
         name = config_name(key)
         if name in ENTRY_OPTIONS:
             raise ValueError(f"engine.{key}: set it in a model entry")
         if name in MODEL_OPTIONS:
-            shared_argv += option_words("engine", key, value, known[name], here)
+            shared_model[name] = option_words("engine", key, value, known[name], here)
         elif name in known:
             raise ValueError(f'engine.{key}: a server option, set it under "server"')
         else:
-            shared_words += engine_words(key, value)
+            shared_engine[name] = engine_words(key, value)
     models: list[ModelEntry] = []
     for i, entry in enumerate(entries):
         where = f"models[{i}]"
         if not isinstance(entry.get("model"), str) or not entry["model"].strip():
             raise ValueError(f'{where}: "model" names the model file')
-        out = ModelEntry(str(here / os.path.expanduser(entry["model"])), list(shared_argv), list(shared_words))
+        entry_model: dict[str, list[str]] = {}
+        entry_engine: dict[str, list[str]] = {}
         for key, value in entry.items():
             name = config_name(key)
             if name in ENTRY_OPTIONS or name in MODEL_OPTIONS:
-                out.argv += option_words(where, key, value, known[name], here)
+                entry_model[name] = option_words(where, key, value, known[name], here)
             elif name in known:
                 raise ValueError(f'{where}.{key}: a server option, set it under "server"')
             else:
-                out.own_words += engine_words(key, value)
-        models.append(out)
+                entry_engine[name] = engine_words(key, value)
+        argv = [w for k, words in shared_model.items() if k not in entry_model for w in words]
+        argv += [w for words in entry_model.values() for w in words]
+        s_words = [w for k, words in shared_engine.items() if k not in entry_engine for w in words]
+        own_words = [w for words in entry_engine.values() for w in words]
+        models.append(ModelEntry(str(here / os.path.expanduser(entry["model"])), argv, s_words, own_words))
     return ConfigFile(server_argv, models)
 
 
@@ -391,11 +396,19 @@ def model_line(name: str, width: int, items: list[str]) -> str:
 
 
 def _num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    return isinstance(v, float) and math.isfinite(v)
 
 
 def _whole(v):
-    return _num(v) and v == int(v)
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    return isinstance(v, float) and math.isfinite(v) and v.is_integer()
 
 
 # the engine's penalty window holds at most this many tokens (src/program/serve/state.hpp, kPenaltyWindowCap)
@@ -458,7 +471,7 @@ def sampling_option(key: str):
 
     def parse(text: str):
         try:
-            value = float(text)
+            value = int(text) if convert is int else float(text)
         except ValueError:
             raise argparse.ArgumentTypeError(f"expected {expected}, not {text!r}") from None
         if not ok(value):
