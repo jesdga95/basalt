@@ -70,7 +70,7 @@ jobs:
               tools/tokenizer.py|tools/check_benchmarks.py|tools/iq_fixture.py)
                 native=true; shared_native=true; continue ;;   # CPU tests run these
               serve/*|tools/*.py|tools/convert/*|tools/migrations/*|requirements*.txt|*.md|docs/*) continue ;;
-              .github/workflows/review.yml|.github/workflows/community*.yml|.github/workflows/pr-labels.yml) continue ;;
+              .github/workflows/review.yml|.github/workflows/community*.yml|.github/workflows/pr-labels.yml|.github/workflows/ui-screenshot.yml) continue ;;
             esac
             native=true
             owner=""
