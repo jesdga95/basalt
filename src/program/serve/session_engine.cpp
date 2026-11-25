@@ -447,10 +447,8 @@ public:
         drafts_.assign((size_t) max_window(), 0);
         conf_.assign((size_t) max_window(), 0.0f);
         sbuf_.assign((size_t) max_window(), 0);
-        if (rt_.sfx) {
-            rt_.sfx->reset();
-            for (int64_t t : ids) rt_.sfx->append((int32_t) t);
-        }
+        if (rt_.sfx && (!in_slot || solo_req))
+            rt_.sfx->sync(ids32.data(), ids32.size());
     }
     void decode_stats_begin() {
         counts0_ = rt_.session().expert_counts();
@@ -648,9 +646,10 @@ private:
     // a slot's prompt lookup history: the conversation, then the token its first window feeds
     void slot_init(BSlot& sl) override {
         if (!rt_.lookup_on()) return;
-        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
-                                                               (size_t) runtime_.o.max_context + 4096);
-        for (int32_t t : runtime_.live) sl.sfx->append(t);
+        if (!sl.sfx)
+            sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
+                                                                   (size_t) runtime_.o.max_context + 4096);
+        sl.sfx->sync(runtime_.live.data(), runtime_.live.size());
         sl.sfx->append(x);
     }
     Flow restore_image() override {

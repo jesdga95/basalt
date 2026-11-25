@@ -2,6 +2,7 @@
 #include "basalt/spec/suffix_drafter.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 namespace basalt::spec {
 
@@ -16,7 +17,7 @@ uint64_t mix(uint64_t x) {
 }  // namespace
 
 SuffixDrafter::SuffixDrafter(int min_match, int max_match, size_t capacity_tokens)
-    : min_match_(std::max(3, min_match)), max_match_(std::max(min_match, max_match)) {
+    : min_match_(std::max(3, min_match)), max_match_(std::max(min_match_, max_match)) {
     size_t cap = 1;
     while (cap < capacity_tokens * 2) cap <<= 1;          // load factor <= 0.5 at the nominal capacity
     table_.assign(cap, Slot{});
@@ -30,6 +31,17 @@ void SuffixDrafter::reset() {
     for (const uint32_t d : dirty_) (d & kLongBit ? long_ : table_)[d & ~kLongBit] = Slot{};   // only what was filled
     dirty_.clear();
     last_match_ = 0;
+}
+
+void SuffixDrafter::sync(const int32_t* tokens, size_t n) {
+    last_match_ = 0;
+    const size_t h = hist_.size();
+    if (h <= n && (h == 0 || std::memcmp(hist_.data(), tokens, h * sizeof(int32_t)) == 0)) {
+        if (n > h) append(tokens + h, n - h);
+        return;
+    }
+    reset();
+    if (n > 0) append(tokens, n);
 }
 
 uint64_t SuffixDrafter::key_at(size_t end) const {
