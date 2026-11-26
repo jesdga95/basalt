@@ -71,6 +71,8 @@ public:
     std::shared_ptr<void>& forward_scratch() const { return scratch_; }
     const model::LoadRequest& flags() const { return flags_; }
     const std::string& path() const { return path_; }
+    /// The pack, opened read-only through the file cache.
+    int fd() const { return fd_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     int device() const { return device_; }
     /// --kv fp8: the sparse layers' latent rows as FP8 (default fp16).
