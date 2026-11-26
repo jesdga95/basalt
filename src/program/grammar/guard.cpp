@@ -107,12 +107,24 @@ bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t
     windows_ = misses_ = fallbacks_ = ns_ = 0;
     RequestGrammar rg = grammar_from_request(grammar_json, err);
     if (!err.empty()) return false;
-    if (!rg.grammar) return true;
+    // A reply of blocks that may not think, outside a grammar that holds the block structure: the guard only keeps the
+    // thinking block from opening.
+    ban_think_ = pv_.block_header >= 0 && !rg.think;
+    after_header_ = n_prompt > 0 && prompt[n_prompt - 1] == pv_.block_header;
+    has_grammar_ = (bool) rg.grammar;
+    if (!rg.grammar) {
+        if (!ban_think_) return true;
+        blocks_ = thinking_ = false;
+        phase_ = Phase::answer;
+        on_ = true;
+        return true;
+    }
     st_ = GrammarState(rg.grammar, rg.triggers);
     // A reply of blocks under a grammar from the first answer token: thinking blocks, then the answer block. A lazy
     // grammar (tool calls) finds its own start.
     blocks_ = pv_.block_header >= 0 && !rg.triggers.lazy();
     allow_think_ = rg.think;
+    ban_think_ = ban_think_ && !blocks_;   // a grammar of blocks bans thinking through its phases
     phase_ = blocks_ ? Phase::between : Phase::answer;
     // generation starts inside a thinking block when the prompt's last think tag opens one (a reply of blocks: after
     // the prompt's last block marker)
@@ -134,6 +146,11 @@ bool Guard::is_end(int32_t token) const {
 }
 
 bool Guard::feed(int32_t token) {
+    if (ban_think_) {
+        if (after_header_ && token == pv_.think_open) return false;
+        after_header_ = token == pv_.block_header;
+        if (!has_grammar_) return true;
+    }
     if (thinking_) {
         if (token == pv_.think_close) {
             thinking_ = false;
@@ -189,7 +206,11 @@ int Guard::scan(const int32_t* out, int rows, int first) {
 void Guard::mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias) {
     const size_t n = pv_.vocab->size();
     const auto allow = [&](int32_t t) { if (t >= 0 && (size_t) t < n) mask_[(size_t) t] = 1; };
-    if (blocks_ && thinking_) {
+    if (ban_think_) {
+        if (has_grammar_) st_.fill_mask(*pv_.vocab, mask_, use_cache);
+        else mask_.assign(n, (uint8_t) 1);
+        if (after_header_ && pv_.think_open >= 0 && (size_t) pv_.think_open < n) mask_[(size_t) pv_.think_open] = 0;
+    } else if (blocks_ && thinking_) {
         mask_.assign(n, (uint8_t) 1);
         for (int32_t e : pv_.vocab->end_ids())
             if (is_end(e)) mask_[(size_t) e] = 0;

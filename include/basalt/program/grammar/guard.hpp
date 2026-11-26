@@ -92,6 +92,9 @@ private:
     bool on_ = false;
     bool thinking_ = false;
     bool blocks_ = false;        // this request's reply is read as blocks
+    bool ban_think_ = false;     // a reply of blocks that may not think, outside a grammar of blocks: no thinking block opens
+    bool after_header_ = false;  // the last token opened a block
+    bool has_grammar_ = false;
     bool allow_think_ = true;    // a reply of blocks may think
     Phase phase_ = Phase::answer;
     int64_t windows_ = 0, misses_ = 0, fallbacks_ = 0, ns_ = 0;

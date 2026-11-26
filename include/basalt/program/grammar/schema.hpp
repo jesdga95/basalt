@@ -46,6 +46,7 @@ struct RequestGrammar {
 ///   {"kind":"tools","tools":[<OpenAI tool objects>],"tool_choice":<as received>}   lazy, trigger "<tool_call>"
 ///   {"kind":"json_schema","schema":{...}}                                          from the first answer token
 ///   {"kind":"json_object"}                                                         any JSON object
+///   {"kind":"text"}                                                                no grammar, only "think" counts
 /// Any of them may say "think": false (the request's thinking is off).
 /// A json_schema or json_object request may carry "tools" too: from the first answer token, either tool calls or the
 /// JSON value. tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is

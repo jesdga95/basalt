@@ -1448,9 +1448,12 @@ class Service:
         (serve/api/logprobs.py)."""
         if live is not None:
             live.thinking = bool(thinking)
-        if not thinking and self.dialect.thinks_in_blocks and isinstance((sampling or {}).get(GRAMMAR_KEY), dict):
-            # the grammar guard lets a reply of blocks think only when the request does
-            sampling = {**sampling, GRAMMAR_KEY: dict(sampling[GRAMMAR_KEY], think=False)}
+        if not thinking and self.dialect.thinks_in_blocks and self.grammar_engine:
+            # the grammar guard lets a reply of blocks think only when the request does: a request without a grammar
+            # gets the one that only forbids thinking
+            spec = (sampling or {}).get(GRAMMAR_KEY)
+            sampling = {**(sampling or {}), GRAMMAR_KEY: dict(spec if isinstance(spec, dict) else {"kind": "text"},
+                                                              think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
         budget_req = sampling
         budget_ready = False

@@ -458,6 +458,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
     }
     if (const JsonValue* think = req.get("think"); think && think->is(Type::Bool)) out.think = think->b;
     std::string gbnf;
+    if (kind->s == "text") return out;   // no grammar: only "think" counts
     if (kind->s == "json_object" || kind->s == "json_schema") {
         std::string schema = R"({"type":"object"})";
         if (kind->s == "json_schema") {
