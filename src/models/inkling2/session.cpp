@@ -91,6 +91,7 @@ struct Scratch {
     int32_t* gs_ids_ = nullptr;                 // [visit][kGuessExperts] the guessed experts
     float *gs_log_ = nullptr, *gs_w_ = nullptr; // the guess's router scratch
     uint32_t* pf_sink_ = nullptr;               // the prefetch's keep-alive word
+    uint32_t* fl_sink_ = nullptr;               // the projection fill's keep-alive word
     float* lp_ = nullptr;                       // the log probabilities' scratch
     float* blog_ = nullptr;                     // a batch window's logits, every row, before each session takes its own
     int32_t *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr;   // a call's tokens, positions, and segment table
@@ -198,6 +199,7 @@ struct Shared {
         x.gs_log_ = f((int64_t) Scratch::kGuessRows * g.n_expert);
         x.gs_w_ = f(Scratch::kGuessExperts);
         x.pf_sink_ = (uint32_t*) alloc(4);
+        x.fl_sink_ = (uint32_t*) alloc(4);
         x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(max_rows, g.n_vocab) + R * (bk::kLogprobStride + 1));
         x.blog_ = f(R * (int64_t) g.n_vocab);
         x.io_d_ = (int32_t*) alloc((size_t) (2 * R + kSegWords) * 4);
@@ -227,6 +229,12 @@ struct Lane {
     int32_t* rec_n = nullptr;                   // [visit] how many
     bool ra_on = false, pf_on = false;
     int32_t* win_ids = nullptr;                 // [visit][kMaxRows][n_used] the last window's routed ids (with copies)
+    // the next visit's input projection into L2 while a visit's merge waits on the CPU pool: its stream, fork and join
+    // events, and its grid (0: the card's L2 cannot hold it beside the guessed experts)
+    cudaStream_t fl_st = nullptr;
+    cudaEvent_t fl_ev = nullptr, fl_join = nullptr;
+    bool fl_on = false;
+    int fl_blocks = 0;
 };
 
 class Session final : public model::BatchSession, private Scratch {
@@ -262,9 +270,9 @@ public:
         for (void* p : pinned_) cudaFreeHost(p);
         if (Lane& k = lane_[1]; k.stream) {
             cudaSetDevice(k.device);
-            for (cudaEvent_t e : {k.ra_ev, k.ra_join, k.gs_ev, k.pf_ev, k.pf_join, k.hand, io_ev1_})
+            for (cudaEvent_t e : {k.ra_ev, k.ra_join, k.gs_ev, k.pf_ev, k.pf_join, k.fl_ev, k.fl_join, k.hand, io_ev1_})
                 if (e) cudaEventDestroy(e);
-            for (cudaStream_t st : {k.ra_st, k.pf_st, k.stream})
+            for (cudaStream_t st : {k.ra_st, k.pf_st, k.fl_st, k.stream})
                 if (st) cudaStreamDestroy(st);
         }
         cudaSetDevice(m_.device());
@@ -272,10 +280,11 @@ public:
             if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : stage_ev_)
             if (e) cudaEventDestroy(e);
-        for (cudaEvent_t e : {ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_})
+        for (cudaEvent_t e : {ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_, fl_ev_, fl_join_})
             if (e) cudaEventDestroy(e);
         if (ra_st_) cudaStreamDestroy(ra_st_);
         if (pf_st_) cudaStreamDestroy(pf_st_);
+        if (fl_st_) cudaStreamDestroy(fl_st_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
@@ -283,11 +292,14 @@ public:
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&pf_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&fl_st_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&ra_ev_, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&ra_join_, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&gs_ev_, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&pf_ev_, cudaEventDisableTiming) != cudaSuccess ||
-            cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&fl_ev_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&fl_join_, cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create a stream";
             return false;
         }
@@ -303,8 +315,9 @@ public:
             cudaSetDevice(k.device);
             bool sok = cudaStreamCreateWithFlags(&k.stream, cudaStreamNonBlocking) == cudaSuccess &&
                        cudaStreamCreateWithFlags(&k.ra_st, cudaStreamNonBlocking) == cudaSuccess &&
-                       cudaStreamCreateWithFlags(&k.pf_st, cudaStreamNonBlocking) == cudaSuccess;
-            for (cudaEvent_t* e : {&k.ra_ev, &k.ra_join, &k.gs_ev, &k.pf_ev, &k.pf_join, &k.hand, &io_ev1_})
+                       cudaStreamCreateWithFlags(&k.pf_st, cudaStreamNonBlocking) == cudaSuccess &&
+                       cudaStreamCreateWithFlags(&k.fl_st, cudaStreamNonBlocking) == cudaSuccess;
+            for (cudaEvent_t* e : {&k.ra_ev, &k.ra_join, &k.gs_ev, &k.pf_ev, &k.pf_join, &k.fl_ev, &k.fl_join, &k.hand, &io_ev1_})
                 sok = sok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
             cudaSetDevice(m_.device());
             for (cudaEvent_t* e : {&hand0_, &io_ev0_}) sok = sok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
@@ -421,6 +434,7 @@ public:
         }
         // the scratch every session of the model shares: the first session makes it
         sh_ = std::static_pointer_cast<Shared>(m_.shared().lock());
+        const bool first = !sh_;
         if (!sh_) {
             size_t pulls = 0;   // the most row buffers one crossing takes
             for (const Segment& sg : segs_) pulls = std::max(pulls, sg.pull.size());
@@ -432,6 +446,11 @@ public:
         lane_[0] = Lane{m_.device(), &sh_->x, stream_, ra_st_, pf_st_, ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_, hand0_, ex_tally_,
                         rec_blobs_, rec_n_};
         lane_[0].win_ids = win_ids_;
+        lane_[0].fl_st = fl_st_;
+        lane_[0].fl_ev = fl_ev_;
+        lane_[0].fl_join = fl_join_;
+        for (int c = 0; c < m_.cards(); ++c) lane_[c].fl_blocks = fill_blocks(m_.card_device(c));
+        if (first) basalt::log::info("basalt inkling2", "projection fill: %d blocks", lane_[0].fl_blocks);
         lane_[1].x = &sh_->x1;
         for (const VisitCache& c : vc_) {
             if (slot_card_[(size_t) (&c - vc_.data())] != 0) continue;
@@ -1483,6 +1502,14 @@ private:
         bk::native_expert_grouped(L, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, std::min(pairs, g_.n_expert), pairs, x.xq_[0], x.ex_scr_,
                                   x.ex_rows_, k.stream);
         if (on_cpu) {
+            // the next visit's input projection into L2 on its own side stream, from when the card's experts are done
+            // through the merge's wait on the CPU pool; it only reads, and joins with the other side streams
+            if (k.fl_blocks > 0 && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card) {
+                cudaEventRecord(k.fl_ev, k.stream);
+                cudaStreamWaitEvent(k.fl_st, k.fl_ev, 0);
+                l2_fill(m_.layer(g_.visits[(size_t) vi + 1].layer).proj, proj_bytes(), k.fl_blocks, x.fl_sink_, k.fl_st);
+                k.fl_on = true;
+            }
             sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
             fork_open_ = false;
         }
@@ -1629,9 +1656,28 @@ private:
     // Launches only: the visits, then the head. Each kernel may start while the one before it finishes (it waits for it
     // before reading what it wrote), so a product streams its first weights during the glue before it.
     void body(int rows, int head, int64_t full_keys) {
-        for (Lane& k : lane_) k.ra_on = k.pf_on = false;
+        for (Lane& k : lane_) k.ra_on = k.pf_on = k.fl_on = false;
         visits_and_head(rows, head, full_keys);
         join_sides(lane_[0]);
+    }
+
+    // The bytes of a layer's input projection planes (codes, then scales).
+    size_t proj_bytes() const { return (size_t) kProj * (size_t) (g_.n_embd / 32 * 34); }
+
+    // The projection fill's grid on `device`: two blocks a multiprocessor, or 0 when its L2 cannot hold a projection beside
+    // the most a visit's guess or read-ahead requests (that many experts' gate and up parts, any layer).
+    int fill_blocks(int device) const {
+        int sms = 0, l2 = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) != cudaSuccess)
+            return 0;
+        size_t guess = 0;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            const LayerWeights& w = m_.layer(l);
+            const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, g_.n_embd, g_.n_ff_exp);
+            guess = std::max(guess, (size_t) std::max(Scratch::kGuessExperts, kAheadExperts) * (size_t) Lx.down_off);
+        }
+        return proj_bytes() + guess <= (size_t) l2 ? 2 * sms : 0;
     }
 
     // A card's side streams join its window stream.
@@ -1644,7 +1690,11 @@ private:
             cudaEventRecord(k.pf_join, k.pf_st);
             cudaStreamWaitEvent(k.stream, k.pf_join, 0);
         }
-        k.ra_on = k.pf_on = false;
+        if (k.fl_on) {
+            cudaEventRecord(k.fl_join, k.fl_st);
+            cudaStreamWaitEvent(k.stream, k.fl_join, 0);
+        }
+        k.ra_on = k.pf_on = k.fl_on = false;
     }
 
     // The layer split: the window crosses from card `from` to segment `sg`'s card, which waits for it and takes the row
@@ -1916,6 +1966,8 @@ private:
     cudaEvent_t ra_ev_ = nullptr, ra_join_ = nullptr, gs_ev_ = nullptr;   // gs_ev_: a guess is in
     cudaStream_t pf_st_ = nullptr;              // the guesses' prefetch stream, its fork and join events
     cudaEvent_t pf_ev_ = nullptr, pf_join_ = nullptr;
+    cudaStream_t fl_st_ = nullptr;              // the projection fill's stream, its fork and join events
+    cudaEvent_t fl_ev_ = nullptr, fl_join_ = nullptr;
     std::vector<uint32_t> tally_h_;
     // the copies' ranking (with copies): the kept rows' lookups, the last window's routed ids by visit and its rows not
     // folded yet (from window position win_pos_ + win_off_), the counts and rows the model has not learned yet
