@@ -22,4 +22,37 @@ void project_attention_kv(const float* x, int wkv_type, const void* wkv, const f
 /// Writes prepared `[T][512]` rows to the sliding cache slot `position % 128`; ring slots must be unique within the call.
 void cache_attention_window(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream);
 
+struct AttentionStepWeights {
+    kernels::SparseMqaQWeights q;
+    int kv_type = -1;
+    const void* kv = nullptr;
+    const float* kv_norm = nullptr;
+    const float* sinks = nullptr;
+    int output_a_type = -1;
+    const void* output_a = nullptr;
+    int output_b_type = -1;
+    const void* output_b = nullptr;
+};
+
+struct AttentionStepScratch {
+    void* input_q8 = nullptr;
+    float* q_latent = nullptr;
+    void* q_latent_q8 = nullptr;
+    float* q_heads = nullptr;
+    float* kv_projected = nullptr;
+    float* kv_row = nullptr;
+    float* mqa_output = nullptr;
+    float* mqa_workspace = nullptr;
+    void* output_q8 = nullptr;
+    float* output_latent = nullptr;
+    float* output = nullptr;
+};
+
+/// One token's attention projection, sliding cache update, sparse MQA and grouped output projection. `selection` supplies
+/// device positions, window bounds and optional preselected compressed rows for the same token; its other inputs are set
+/// from `weights`, `window_ring` and `rope`. Caller owns all device storage.
+void attention_step(const float* x, const AttentionStepWeights& weights, const kernels::MqaRopeTable& rope,
+                   float* window_ring, kernels::SparseMqaArgs selection, const AttentionStepScratch& scratch,
+                   void* stream);
+
 }  // namespace basalt::models::deepseek4
