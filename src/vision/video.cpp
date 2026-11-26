@@ -386,7 +386,8 @@ private:
         if (pf == ff::kPixFmtNv12 || pf == A.pix_fmt_p010) {
             const bool ten = pf != ff::kPixFmtNv12;
             const int cw = (w + 1) / 2, ch = (h + 1) / 2, bytes = ten ? 2 : 1;
-            planes.resize((size_t) w * h * bytes + (size_t) 2 * cw * ch * bytes);
+            // swscale reads whole blocks of 16 pixels, past the end of the last chroma row
+            planes.resize((size_t) w * h * bytes + (size_t) 2 * cw * ch * bytes + 16);
             uint8_t* y = planes.data();
             uint8_t* u = y + (size_t) w * h * bytes;
             uint8_t* v = u + (size_t) cw * ch * bytes;
@@ -444,10 +445,17 @@ private:
         Image img;
         img.w = w;
         img.h = h;
-        img.rgb.resize((size_t) w * h * 3);
+        // swscale writes whole blocks of 16 pixels: when the width is not a multiple of 16, rows of w * 3 bytes either
+        // lose their last pixels or overrun the buffer, so it writes rows that hold whole blocks and they are packed after
+        const int stride = ((w + 15) & ~15) * 3;
+        img.rgb.resize((size_t) stride * h);
         uint8_t* dst[4] = {img.rgb.data(), nullptr, nullptr, nullptr};
-        const int dst_stride[4] = {w * 3, 0, 0, 0};
+        const int dst_stride[4] = {stride, 0, 0, 0};
         F.sws_scale(sws, data, linesize, 0, h, dst, dst_stride);
+        if (stride != w * 3)
+            for (int r = 1; r < h; ++r)   // row 0 is in place; a row's source and destination can overlap
+                std::memmove(img.rgb.data() + (size_t) r * w * 3, img.rgb.data() + (size_t) r * stride, (size_t) w * 3);
+        img.rgb.resize((size_t) w * h * 3);
         const Image c = video_frame_to_canvas(img, V.canvas);
         std::memcpy(&V.frames[j.slot * c.rgb.size()], c.rgb.data(), c.rgb.size());
         return "";
