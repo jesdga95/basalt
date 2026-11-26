@@ -230,20 +230,38 @@ __device__ __forceinline__ void item_loop(uint8_t* smem, const uint8_t* const* r
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, c = lane & 3;
     const int ra = GU ? 8 * w + g : 16 * w + 2 * g;
     const int rb = GU ? C::ROWS / 2 + 8 * w + g : 16 * w + 2 * g + 1;
+    // a thread's copies of every chunk, worked out once: weight piece id = tid + NT k (row id / WP, piece id % WP) at its
+    // row's offset from the first row's 8-aligned start, activation piece id = tid + NT k (entry id / 16, piece id % 16)
+    constexpr int WS = (C::ROWS * C::WP + C::NT - 1) / C::NT, AS = (C::TT * 16 + C::NT - 1) / C::NT;
+    const uint8_t* const wbase =
+        reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(rowp[0]) & ~(uintptr_t) 7);
+    uint32_t woff[WS], wdst[WS];
+#pragma unroll
+    for (int k = 0; k < WS; ++k) {
+        const int id = tid + C::NT * k, r = id / C::WP, p = id - r * C::WP;
+        woff[k] = id < C::ROWS * C::WP ? (uint32_t) (rowp[r] - wbase) : 0u;
+        wdst[k] = (uint32_t) (r * C::WSZ + 8 * p) | (uint32_t) (8 * p) << 16;
+    }
+    uint32_t aoff[AS];
+#pragma unroll
+    for (int k = 0; k < AS; ++k) {
+        const int id = tid + C::NT * k, t = id >> 4, p = id & 15;
+        aoff[k] = id < C::TT * 16 && t < n ? (uint32_t) (s_arow[t] * K + 8 * p) : ~0u;
+    }
     const auto load_w = [&](int q, int s) {
         uint8_t* ws = smem + s * C::SLOT;
-        for (int id = tid; id < C::ROWS * C::WP; id += C::NT) {
-            const int r = id / C::WP, p = id - r * C::WP;
-            const uint8_t* a = rowp[r] + q * C::CB;
-            const uint8_t* a8 = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(a) & ~(uintptr_t) 7);
-            cp_async8(ws + r * C::WSZ + 8 * p, a8 + 8 * p, pol);
+#pragma unroll
+        for (int k = 0; k < WS; ++k) {
+            if (C::ROWS * C::WP % C::NT == 0 || tid + C::NT * k < C::ROWS * C::WP)
+                cp_async8(ws + (wdst[k] & 0xffffu), wbase + ((woff[k] + (uint32_t) (q * C::CB)) & ~7u) + (wdst[k] >> 16), pol);
         }
     };
     const auto load_a = [&](int q, int s) {
         uint8_t* as = smem + s * C::SLOT + C::W_SLOT;
-        for (int id = tid; id < C::TT * 16; id += C::NT) {
-            const int t = id >> 4, p = id & 15;
-            if (t < n) cp_async16(as + t * C::AST + 16 * p, X + (size_t) s_arow[t] * K + q * kChunk + 8 * p);
+#pragma unroll
+        for (int k = 0; k < AS; ++k) {
+            const int id = tid + C::NT * k;
+            if (aoff[k] != ~0u) cp_async16(as + (id >> 4) * C::AST + 16 * (id & 15), X + aoff[k] + q * kChunk);
         }
     };
     // the first NS - 1 chunks: the weights may have been issued before the caller's wait (one commit group with chunk 0's
