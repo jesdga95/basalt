@@ -7,7 +7,17 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 project(basalt VERSION 0.5.7 LANGUAGES C CXX CUDA)
 include(cmake/target_arch.cmake)
-add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
+# What the binaries report in their logs and bench JSON: this line's own version ("<upstream base>-rtx40.<n>"
+# from version-rtx40.txt) so a build identifies the fork, falling back to upstream's number on a tree without
+# the file. project() VERSION above stays upstream's, so merges never fight over it.
+set(BASALT_REPORTED_VERSION "${PROJECT_VERSION}")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/version-rtx40.txt")
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/version-rtx40.txt" _rtx40_version LIMIT_COUNT 1)
+  if(_rtx40_version)
+    string(STRIP "${_rtx40_version}" BASALT_REPORTED_VERSION)
+  endif()
+endif()
+add_compile_definitions(BASALT_VERSION="${BASALT_REPORTED_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

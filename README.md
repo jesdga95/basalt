@@ -35,6 +35,10 @@ on an NVIDIA Blackwell GPU (sm_120) - or, in this fork, an Ada GPU (sm_89, RTX 4
 
 This fork builds from source; its [releases](https://github.com/FahadAlAlawi/basalt-RTX40/releases) carry prebuilt Linux x64, Linux Arm64 and Windows x64 archives built for the 40-series alongside Blackwell (upstream's [releases](https://github.com/jesdga95/basalt/releases), [what they need](docs/platforms.md#release-archives), target Blackwell only):
 
+Releases are versioned `<upstream base>-rtx40.<n>`, for example `v0.5.7-rtx40.0.2`: the first two numbers are the
+upstream release this tree syncs, `rtx40` is this line, and the last counts this line's releases on that base.
+Each release body names the upstream commit it synced, and `version-rtx40.txt` is what the binaries report.
+
 ```sh
 git clone https://github.com/FahadAlAlawi/basalt-RTX40 && cd basalt-RTX40
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DBASALT_MODELS=all
