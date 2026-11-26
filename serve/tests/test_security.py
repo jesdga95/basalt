@@ -5,6 +5,7 @@ import contextlib
 import http.client
 import io
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -15,7 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
-from serve.handler import serve  # noqa: E402
+from serve.handler import CONTROL_BODY_MAX, HOSTED_TOOLS_NOTED_MAX, Server, make_handler, serve  # noqa: E402
 from serve.security import (allowed_hosts_of, api_key_from_file, api_key_of, host_allowed, host_name,  # noqa: E402
                             host_names_for, key_matches, origin_allowed)
 from serve.service import Service  # noqa: E402
@@ -275,6 +276,177 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.req("POST", "/unload", {}, {"Content-Type": "application/json"})[0], 200)
         self.assertEqual(self.req("POST", "/load", {}, {"Content-Type": "application/json",
                                                         "Origin": f"http://127.0.0.1:{self.port}"})[0], 200)
+
+    def test_tokenize_and_detokenize_refuse_foreign_pages_and_non_json(self):
+        self.start()
+        for path, body in (("/tokenize", {"content": "hi"}), ("/detokenize", {"tokens": [65]})):
+            self.assertEqual(self.req("POST", path, body,
+                                      {"Content-Type": "application/json", "Origin": "http://evil.example.com"})[0], 403, path)
+            self.assertEqual(self.req("POST", path, body,
+                                      {"Content-Type": "text/plain", "Origin": f"http://127.0.0.1:{self.port}"})[0], 415, path)
+            self.assertEqual(self.req("POST", path, body,
+                                      {"Content-Type": "Application/JSON; charset=utf-8",
+                                       "Origin": f"http://127.0.0.1:{self.port}"})[0], 200, path)
+
+    def test_own_page_case_insensitive_and_scheme_checked(self):
+        self.start(trusted_origins=["https://trusted.example.com"])
+        # uppercase Content-Type and case-insensitive Host/Origin match
+        self.assertEqual(self.req("POST", "/api/pricing", {},
+                                  {"Content-Type": "APPLICATION/JSON; charset=utf-8",
+                                   "Origin": f"HTTP://LOCALHOST:{self.port}"},
+                                  host=f"localhost:{self.port}")[0], 200)
+        self.assertEqual(self.req("POST", "/api/pricing", {},
+                                  {"Content-Type": "Application/Json",
+                                   "Origin": "HTTPS://TRUSTED.EXAMPLE.COM"})[0], 200)
+        # non-http(s) schemes or schemeless Origin matching Host must be refused
+        for bad_origin in (f"ftp://127.0.0.1:{self.port}", f"javascript://127.0.0.1:{self.port}",
+                           f"127.0.0.1:{self.port}", "null"):
+            self.assertEqual(self.req("POST", "/api/pricing", {},
+                                      {"Content-Type": "application/json", "Origin": bad_origin},
+                                      host=f"127.0.0.1:{self.port}")[0], 403, bad_origin)
+
+    def test_control_routes_check_csrf_before_reading_body_and_cap_size(self):
+        self.start()
+        for path in ("/v1/load", "/v1/unload", "/models/load", "/models/unload",
+                     "/api/pricing", "/api/totals-reset", "/v1/vram"):
+            # non-JSON form POST must get 415 (not 400 from JSON parse)
+            self.assertEqual(self.req("POST", path, b"a=1",
+                                      {"Content-Type": "application/x-www-form-urlencoded"})[0], 415, path)
+            # foreign Origin with huge Content-Length is rejected before reading the body
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall((f"POST {path} HTTP/1.0\r\nHost: 127.0.0.1:{self.port}\r\n"
+                           f"Content-Type: application/json\r\nOrigin: http://evil.example.com\r\n"
+                           f"Content-Length: 100000000\r\n\r\n").encode())
+                head = s.recv(4096)
+            self.assertTrue(head.startswith(b"HTTP/1.0 403"), (path, head[:80]))
+            # oversized control body gets 413
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall((f"POST {path} HTTP/1.0\r\nHost: 127.0.0.1:{self.port}\r\n"
+                           f"Content-Type: application/json\r\n"
+                           f"Content-Length: {CONTROL_BODY_MAX + 1}\r\n\r\n").encode())
+                head = s.recv(4096)
+            self.assertTrue(head.startswith(b"HTTP/1.0 413"), (path, head[:80]))
+
+    def test_cors_rejects_control_chars_in_requested_headers(self):
+        self.start(cors_origins=["https://chat.example.com"])
+        for bad in (b"X-Foo\x00Bar", b"X-Foo\x0bBar", b"X-Foo\x7fBar", b"X-Foo\r\n X-Bar"):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall((f"OPTIONS /v1/chat/completions HTTP/1.0\r\nHost: 127.0.0.1:{self.port}\r\n"
+                           f"Origin: https://chat.example.com\r\n"
+                           f"Access-Control-Request-Headers: ").encode() + bad + b"\r\n\r\n")
+                raw = b""
+                while chunk := s.recv(4096):
+                    raw += chunk
+            text = raw.decode("latin-1")
+            self.assertIn("Access-Control-Allow-Headers: Authorization, Content-Type", text, bad)
+            self.assertNotIn("X-Foo", text, bad)
+        # Direct _cors() check for raw CR/LF in Access-Control-Request-Headers
+        cls = make_handler(self.svc)
+        h = cls.__new__(cls)
+        h.path = "/v1/chat/completions"
+        h.headers = {"Origin": "https://chat.example.com",
+                     "Access-Control-Request-Headers": "X-Foo\r\nX-Injected: 1"}
+        sent = []
+        h.send_header = lambda k, v: sent.append((k, v))
+        h._cors()
+        allow_hdrs = dict(sent).get("Access-Control-Allow-Headers", "")
+        self.assertTrue(allow_hdrs.startswith("Authorization, Content-Type"), allow_hdrs)
+        self.assertNotIn("\r", allow_hdrs)
+        self.assertNotIn("\n", allow_hdrs)
+        self.assertNotIn("X-Injected", allow_hdrs)
+        # Valid requested headers are still echoed
+        h.headers = {"Origin": "https://chat.example.com",
+                     "Access-Control-Request-Headers": "Authorization, X-Custom-Header"}
+        sent.clear()
+        h._cors()
+        self.assertEqual(dict(sent).get("Access-Control-Allow-Headers"), "Authorization, X-Custom-Header")
+
+    def test_api_pricing_is_atomic_on_validation_error(self):
+        self.start()
+        self.svc.cost_input_per_million = 1.25
+        self.svc.cost_output_per_million = 2.5
+        code, body, _ = self.req("POST", "/api/pricing",
+                                 {"cost_input_per_million": 9.5, "cost_output_per_million": -1},
+                                 {"Content-Type": "application/json"})
+        self.assertEqual(code, 400, body)
+        self.assertEqual(self.svc.cost_input_per_million, 1.25)
+        self.assertEqual(self.svc.cost_output_per_million, 2.5)
+
+    def test_api_totals_reset_locks_around_file_rename(self):
+        self.start()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.totals.json"
+            p.write_text('{"requests": 2}', encoding="utf-8")
+            self.svc.totals_path = str(p)
+            locked_during_reset = []
+            from serve import totals as totals_mod
+            real_reset = totals_mod.totals_reset_file
+
+            def spy_reset(path):
+                locked_during_reset.append(self.svc.status_lock.locked())
+                return real_reset(path)
+
+            with mock.patch.object(totals_mod, "totals_reset_file", side_effect=spy_reset):
+                code, body, _ = self.req("POST", "/api/totals-reset", {}, {"Content-Type": "application/json"})
+            self.assertEqual(code, 200, body)
+            self.assertEqual(locked_during_reset, [True])
+
+    def test_malformed_max_tokens_returns_400(self):
+        self.start()
+        for bad in ({"a": 1}, [1], True, False, 1.5, "50", -2):
+            for field in ("max_tokens", "max_completion_tokens"):
+                code, _, _ = self.req("POST", "/v1/chat/completions",
+                                      {"model": "basalt", "messages": [{"role": "user", "content": "hi"}], field: bad},
+                                      {"Content-Type": "application/json"})
+                self.assertEqual(code, 400, (field, bad))
+            code, _, _ = self.req("POST", "/v1/messages",
+                                  {"model": "basalt", "messages": [{"role": "user", "content": "hi"}], "max_tokens": bad},
+                                  {"Content-Type": "application/json"})
+            self.assertEqual(code, 400, ("anthropic", bad))
+
+    def test_hosted_tools_noted_is_bounded_and_sanitized(self):
+        self.start()
+        code, _, log = self.req("POST", "/v1/responses",
+                                {"model": "basalt", "input": "hi",
+                                 "tools": [{"type": "evil\r\n[server] forged"}]},
+                                {"Content-Type": "application/json"})
+        self.assertEqual(code, 200)
+        lines = [l for l in log.splitlines() if "ignores hosted tools" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("\n[server] forged", log)
+        # flooding distinct unknown tool names never grows hosted_tools_noted unboundedly
+        extra = [{"type": f"custom_unknown_{i}"} for i in range(HOSTED_TOOLS_NOTED_MAX + 20)]
+        code, _, _ = self.req("POST", "/v1/responses", {"model": "basalt", "input": "hi", "tools": extra},
+                              {"Content-Type": "application/json"})
+        self.assertEqual(code, 200)
+        self.assertLessEqual(len(self.svc.hosted_tools_noted), HOSTED_TOOLS_NOTED_MAX)
+        # known hosted tools are still logged even after unknown cap is reached
+        code, _, log = self.req("POST", "/v1/responses",
+                                {"model": "basalt", "input": "hi", "tools": [{"type": "web_search"}]},
+                                {"Content-Type": "application/json"})
+        self.assertEqual(code, 200)
+        self.assertIn("web_search", log)
+
+
+class ServerBind(unittest.TestCase):
+    def test_duplicate_bind_fails_and_rebind_after_close_succeeds(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok,
+                      ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        self.assertEqual(Server.allow_reuse_address, os.name != "nt")
+        first = Server(("127.0.0.1", 0), make_handler(svc))
+        port = first.server_address[1]
+        try:
+            with self.assertRaises(OSError):
+                second = Server(("127.0.0.1", port), make_handler(svc))
+                second.server_close()
+        finally:
+            first.server_close()
+        rebound = Server(("127.0.0.1", port), make_handler(svc))
+        try:
+            self.assertEqual(rebound.server_address[1], port)
+        finally:
+            rebound.server_close()
 
 
 class ApiKeyForms(unittest.TestCase):

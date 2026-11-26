@@ -90,6 +90,49 @@ class Migrate(unittest.TestCase):
             self.assertEqual(struct.unpack_from("<I", f.read(12), 8)[0], 1)
         self.assertFalse((self.t / "again.basalt.partial").exists())
 
+    def _write_v1(self, path: Path, sections: list[tuple[str, bytes]]) -> None:
+        saved, model_file.VERSION = model_file.VERSION, 1
+        try:
+            w = ModelWriter(str(path))
+            for n, b in sections:
+                w.add_bytes(n, b)
+            w.add_bytes("meta", json.dumps(self.meta).encode())
+            w.close()
+        finally:
+            model_file.VERSION = saved
+
+    def test_migrate_without_dense_index(self):
+        src = self.t / "no_dense.basalt"
+        out = self.t / "no_dense_v2.basalt"
+        self._write_v1(src, [("tokenizer/vocab.json", b'{"a":0}'), ("gguf", b"G" * 64), ("profile", b"P" * 8)])
+        M.migrate(src, out)
+        m = ModelFile(str(out))
+        self.assertEqual(m.version, 2)
+        self.assertNotIn("hc8", m.names())
+        self.assertEqual(m.names(), ["tokenizer/vocab.json", "gguf", "meta"])
+
+    def test_migrate_omits_empty_hc8(self):
+        src = self.t / "no_hc.basalt"
+        out = self.t / "no_hc_v2.basalt"
+        index = ("# dense index v3\n# align 64 pool 64 tensors 1\n"
+                 "blk.0.attn_q.weight 0 2 0 64 0 64 16 1 0 0 1 0 0 0 0 0 0 0\n").encode()
+        self._write_v1(src, [("dense", b"\1" * 64), ("dense.index", index)])
+        M.migrate(src, out)
+        m = ModelFile(str(out))
+        self.assertEqual(m.version, 2)
+        self.assertNotIn("hc8", m.names())
+
+    def test_migrate_mtp_only_hc8(self):
+        src = self.t / "mtp_only.basalt"
+        out = self.t / "mtp_only_v2.basalt"
+        mtp_index = f"attn_hyper_connection.input_mix_weight_down.weight bf16 1 32 0 {self.mw.nbytes}\n".encode()
+        self._write_v1(src, [("mtp/dense", self.mw.tobytes()), ("mtp/dense.index", mtp_index)])
+        M.migrate(src, out)
+        m = ModelFile(str(out))
+        self.assertIn("hc8", m.names())
+        t = H.read_table(m.read("hc8"))
+        self.assertEqual(list(t), ["mtp.attn_hyper_connection.input_mix_weight_down.weight"])
+
 
 if __name__ == "__main__":
     unittest.main()

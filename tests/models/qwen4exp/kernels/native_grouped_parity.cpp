@@ -74,10 +74,11 @@ const char* name_of(int t) {
         case 6: return "Q5_0";
         case 8: return "Q8_0";
         case 40: return "NVFP4";
+        case 46: return "MXFP8";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 6 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 6 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : t == 46 ? 128 : 256; }
 // NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales in 0.5 .. 2
 void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
     std::uniform_real_distribution<float> u(0.5f, 2.0f);
@@ -97,6 +98,10 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
         if (t == 40) {
             // NVFP4: four UE4M3 sub-block scales, exponent 1..4: 2^-7 .. 2^-4 as ggml decodes them
             for (int j = 0; j < 4; ++j) w[o + j] = (uint8_t) (((1 + byte(rng) % 4) << 3) | (byte(rng) & 7));
+        } else if (t == 46) {
+            for (int j = 0; j < 4; ++j) w[o + j] = (uint8_t) (115 + byte(rng) % 6);
+            for (int j = 0; j < 128; ++j)
+                if ((w[o + 4 + j] & 0x7Fu) == 0x7Fu) w[o + 4 + j] ^= 0x01u;
         } else if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of its four scale words (bytes 48..55), the sign and the
             // exponent's top bits in the last: 0x1 / 0x2 there (0x9 / 0xA negative) keeps it in 2^-11 .. 2^-3
@@ -596,6 +601,8 @@ int main(int argc, char** argv) {
     check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);
+    check(40, 40, 2304, 1152, s, rng, 64);
+    check(46, 46, 2304, 1152, s, rng, 64);
     check(21, 23, 2560, 768, s, rng);
     check(18, 20, 2560, 640, s, rng);
     check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries

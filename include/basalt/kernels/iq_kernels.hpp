@@ -57,6 +57,9 @@ struct NativeExpertLayout {
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
     float swiglu_limit = 0.0f;          // > 0: native_expert_grouped limits the SwiGLU (gate capped, up clamped to +-limit)
+    /// > 0: the softcapped SwiGLU instead, h = gate_softcap tanh(g / gate_softcap) sigmoid(g) up_softcap tanh(u / up_softcap)
+    /// (the sigmoid sees the raw gate; the caps bound its linear factor and up). Both set together.
+    float gate_softcap = 0.0f, up_softcap = 0.0f;
 };
 /// `swiglu_limit` rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
 /// the peer card, the remote tier) applies it without a signature change.

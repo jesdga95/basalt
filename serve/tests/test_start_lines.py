@@ -23,7 +23,7 @@ class StartLines(unittest.TestCase):
         from serve.router import Router
         new = SimpleNamespace(model="DeepSeek V4.1 Flash", engine=SimpleNamespace(), load=lambda: None)
         old = SimpleNamespace(model="Qwen 3.8 FN", swap_out=lambda: None)
-        r = SimpleNamespace(cv=contextlib.nullcontext(), swap={}, current=None)
+        r = SimpleNamespace(cv=contextlib.nullcontext(), swap={}, current=None, cache=None)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             Router._swap(r, None, new, 1)

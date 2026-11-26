@@ -1,0 +1,52 @@
+{
+  "submitter": "neuromaniacmd",
+  "date": "2026-11-24",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "DeepSeek-V4.1-Flash",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 400,
+      "pcie": "4.0 x16"
+    },
+    {
+      "name": "RTX PRO 5000 Blackwell",
+      "vram_gib": 48,
+      "power_w": 250,
+      "pcie": "4.0 x16"
+    },
+    {
+      "name": "RTX PRO 4500 Blackwell",
+      "vram_gib": 32,
+      "power_w": 150,
+      "pcie": "4.0 x16"
+    },
+    {
+      "name": "RTX PRO 4000 Blackwell",
+      "vram_gib": 24,
+      "power_w": 145,
+      "pcie": "4.0 x16"
+    }
+  ],
+  "ram_gib": 252,
+  "cpu": "AMD EPYC 7443, 24 cores",
+  "ram_gbps": 112.4,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "fp8+fp4",
+  "prefill_16k_tps": 1678.5,
+  "prefill_64k_tps": 2104.9,
+  "decode_tps": 131.9,
+  "decode_conv_tps": 81.7,
+  "decode_struct_tps": 166.5,
+  "decode_prose_tps": 80.2,
+  "accept_conv_pct": 82.2,
+  "accept_struct_pct": 98.7,
+  "accept_prose_pct": 65.1,
+  "draft_len_conv": 1.2,
+  "draft_len_struct": 4.9,
+  "draft_len_prose": 0.9,
+  "engine_args": "--gpu 0,1,2,3 --gpu-mode peer --max-context 61709 --kv fp8"
+}

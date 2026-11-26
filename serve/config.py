@@ -23,7 +23,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
-    "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
+    "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -125,6 +125,10 @@ def option_words(where: str, key, value, act, here: Path) -> list[str]:
             return [flag, str(answer_room(str(value)))]
         except argparse.ArgumentTypeError as e:
             raise ValueError(f"{where}.{key}: {e}") from None
+    if name in ("gpu", "gpu-share") and isinstance(value, list):     # the cards, or their shares, as a list of numbers
+        if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value):
+            raise ValueError(f"{where}.{key}: a number, a list of numbers or a string")
+        return [flag, ",".join(str(x) for x in value)]
     if act.nargs == 0:                                 # a switch
         if not isinstance(value, bool):
             raise ValueError(f"{where}.{key}: true or false")
@@ -202,33 +206,38 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> ConfigFile:
         if name not in known:
             raise ValueError(f'server.{key}: not a server option (engine flags go under "engine")')
         server_argv += option_words("server", key, value, known[name], here)
-    shared_argv: list[str] = []
-    shared_words: list[str] = []
+    shared_model: dict[str, list[str]] = {}
+    shared_engine: dict[str, list[str]] = {}
     for key, value in shared.items():
         name = config_name(key)
         if name in ENTRY_OPTIONS:
             raise ValueError(f"engine.{key}: set it in a model entry")
         if name in MODEL_OPTIONS:
-            shared_argv += option_words("engine", key, value, known[name], here)
+            shared_model[name] = option_words("engine", key, value, known[name], here)
         elif name in known:
             raise ValueError(f'engine.{key}: a server option, set it under "server"')
         else:
-            shared_words += engine_words(key, value)
+            shared_engine[name] = engine_words(key, value)
     models: list[ModelEntry] = []
     for i, entry in enumerate(entries):
         where = f"models[{i}]"
         if not isinstance(entry.get("model"), str) or not entry["model"].strip():
             raise ValueError(f'{where}: "model" names the model file')
-        out = ModelEntry(str(here / os.path.expanduser(entry["model"])), list(shared_argv), list(shared_words))
+        entry_model: dict[str, list[str]] = {}
+        entry_engine: dict[str, list[str]] = {}
         for key, value in entry.items():
             name = config_name(key)
             if name in ENTRY_OPTIONS or name in MODEL_OPTIONS:
-                out.argv += option_words(where, key, value, known[name], here)
+                entry_model[name] = option_words(where, key, value, known[name], here)
             elif name in known:
                 raise ValueError(f'{where}.{key}: a server option, set it under "server"')
             else:
-                out.own_words += engine_words(key, value)
-        models.append(out)
+                entry_engine[name] = engine_words(key, value)
+        argv = [w for k, words in shared_model.items() if k not in entry_model for w in words]
+        argv += [w for words in entry_model.values() for w in words]
+        s_words = [w for k, words in shared_engine.items() if k not in entry_engine for w in words]
+        own_words = [w for words in entry_engine.values() for w in words]
+        models.append(ModelEntry(str(here / os.path.expanduser(entry["model"])), argv, s_words, own_words))
     return ConfigFile(server_argv, models)
 
 
@@ -269,6 +278,11 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
     a.skipped = []
     a.sampling_launch = {k: getattr(a, k) for k in SAMPLING_KEYS if getattr(a, k) is not None}
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
+    a.pricing_cli = set()
+    for flag, attr in (("--cost-in", "cost_in"), ("--cost-out", "cost_out"),
+                       ("--cost-cache-write", "cost_cache_write"), ("--cost-cache-hit", "cost_cache_hit")):
+        if any(w == flag or w.startswith(flag + "=") for w in cli):
+            a.pricing_cli.add(attr)
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
@@ -300,8 +314,8 @@ def check_engine_flags(words: list[str], known: set[str] | None, where: str) -> 
     """ValueError naming the first flag (a word starting with `--`) the engine rejects; value words are not names
     (unchecked when the binary is unreadable)."""
     for word in words:
-        if word == "--gpu":
-            raise ValueError(f"{where}: gpu is a server setting (--gpu, or \"gpu\" in the server section)")
+        if word in ("--gpu", "--gpu-mode", "--gpu-share"):
+            raise ValueError(f"{where}: {word[2:]} is a server setting ({word}, or \"{word[2:]}\" in a model entry)")
         if known is not None and word.startswith("--") and word not in known:
             raise ValueError(f"{where}: {word} is not an engine flag")
 
@@ -382,11 +396,19 @@ def model_line(name: str, width: int, items: list[str]) -> str:
 
 
 def _num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    return isinstance(v, float) and math.isfinite(v)
 
 
 def _whole(v):
-    return _num(v) and v == int(v)
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    return isinstance(v, float) and math.isfinite(v) and v.is_integer()
 
 
 # the engine's penalty window holds at most this many tokens (src/program/serve/state.hpp, kPenaltyWindowCap)
@@ -449,7 +471,7 @@ def sampling_option(key: str):
 
     def parse(text: str):
         try:
-            value = float(text)
+            value = int(text) if convert is int else float(text)
         except ValueError:
             raise argparse.ArgumentTypeError(f"expected {expected}, not {text!r}") from None
         if not ok(value):
@@ -521,6 +543,17 @@ def answer_room(text: str) -> str | int:
     return n
 
 
+def cost_rate(text: str) -> float:
+    """argparse type: a per-million-token price in USD, a finite number >= 0."""
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, not {text!r}") from None
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, not {text!r}")
+    return v
+
+
 def video_tokens(text: str) -> int:
     """argparse type: a video's token budget, a whole number from 64 to 65536."""
     try:
@@ -575,9 +608,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8080, help="the TCP port to listen on (default 8080)")
-    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: exactly these, the first is the main "
-                                  "card and the engine gives the rest their roles (\"0,1\"); auto = every Blackwell "
-                                  "card, the fastest as main (default: GPU 0 alone)")
+    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: a number (0), a list whose first is the main "
+                                  "card (0,1), or all (default: GPU 0 alone)")
+    ap.add_argument("--gpu-mode", help="what the GPUs do together, required with two or more: peer (the main card runs every "
+                                       "layer, the others help), split (the layers are divided) or tensor")
+    ap.add_argument("--gpu-share", help="the cards' relative shares, one positive number per card in the order of --gpu "
+                                        "(3,1); default: by the mode")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="tokenizer directory for the mock engine (a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
@@ -605,6 +641,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded; load on first request; a sidecar image encoder is dropped, --vision dynamic stays")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")
+    ap.add_argument("--model-cache-mib", type=int, default=0, metavar="MIB",
+                    help="park a model the router switches away from in RAM, up to this many MiB across all parked "
+                         "models (least recently used out first), so switching back is a RAM copy and not a load from the "
+                         "SSD; 0 = off (Linux; the driver suspends the engine's GPU state)")
     ap.add_argument("--idle-sleep", type=float, default=None, metavar="SECONDS",
                     help="put the model to sleep after this many seconds without requests: its VRAM is freed, its RAM "
                          "copy, conversations and learned expert placement stay, and the next request wakes it in a few "
@@ -641,4 +681,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output tokens kept for closing the thinking and the answer: auto (a quarter of the cap, at "
                          "least 512, at most half) or a whole number of tokens (0 = none); an explicit request budget "
                          "of 0 opts out")
+    ap.add_argument("--totals-file", default="", metavar="PATH",
+                    help="file for persistent token counts (default: <config>.totals.json next to the config, and with several "
+                         "models <config>.totals.<model>.json, the name lowercased with spaces dropped; "
+                         "'none' disables)")
+    ap.add_argument("--totals-reset", action="store_true",
+                    help="reset the persistent counters: move the current file to .prev.json and start fresh")
+    ap.add_argument("--cost-in", type=cost_rate, default=0, metavar="USD",
+                    help="price per million input tokens in US dollars (default 0)")
+    ap.add_argument("--cost-out", type=cost_rate, default=0, metavar="USD",
+                    help="price per million output tokens in US dollars (default 0)")
+    ap.add_argument("--cost-cache-write", type=cost_rate, default=None, metavar="USD",
+                    help="price per million new (cache-write) input tokens (default: same as --cost-in)")
+    ap.add_argument("--cost-cache-hit", type=cost_rate, default=None, metavar="USD",
+                    help="price per million reused (cache-hit) input tokens (default: same as --cost-in)")
     return ap

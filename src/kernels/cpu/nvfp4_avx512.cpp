@@ -6,6 +6,7 @@
 // int32 sums per 4 bytes (dpbusd equals maddubs + madd at these magnitudes), the same per-lane fp32 products
 // d_y * scale, the same fused accumulation across blocks and the same final reduction, so results are bitwise equal.
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
+#include "basalt/kernels/cpu/swiglu.hpp"
 #include "basalt/platform/compiler.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -123,7 +124,7 @@ inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* cons
 }
 
 template <int NT>
-void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, float limit,
+void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, const SwiGlu& glu,
              const void* const* act, float* const* ff, int r0, int r1) {
     const block_q8_0* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_0*) act[t];
@@ -136,12 +137,7 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg,
                                    (const block_nvfp4*) (blob + up_off + (size_t) r * gu_row)};
         rows_dot<2, NT>(w, nb, y, dv, res);
         for (int t = 0; t < NT; ++t) {
-            float g = res[0][t] * sg, u = res[1][t] * su;
-            if (limit > 0.f) {
-                g = std::fmin(g, limit);
-                u = std::fmax(std::fmin(u, limit), -limit);
-            }
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            ff[t][r] = swiglu(glu, res[0][t] * sg, res[1][t] * su);
         }
     }
 }
@@ -178,21 +174,21 @@ bool nvfp4_512_fits(int n_embd, int n_ff) noexcept {
     return n_embd % QK_NVFP4 == 0 && n_ff % QK_NVFP4 == 0 && n_embd <= kMaxN && n_ff <= kMaxN;
 }
 
-void nvfp4_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, float limit,
+void nvfp4_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, const SwiGlu& glu,
                        const void* const* act, int nt, float* const* ff, int r0, int r1) {
     for (int t0 = 0; t0 < nt; t0 += kMaxT) {
         const int k = nt - t0 < kMaxT ? nt - t0 : kMaxT;
         const void* const* a = act + t0;
         float* const* o = ff + t0;
         switch (k) {
-            case 1: gu_rows<1>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 2: gu_rows<2>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 3: gu_rows<3>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 4: gu_rows<4>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 5: gu_rows<5>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 6: gu_rows<6>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 7: gu_rows<7>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            default: gu_rows<8>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
+            case 1: gu_rows<1>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 2: gu_rows<2>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 3: gu_rows<3>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 4: gu_rows<4>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 5: gu_rows<5>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 6: gu_rows<6>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 7: gu_rows<7>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            default: gu_rows<8>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
         }
     }
 }

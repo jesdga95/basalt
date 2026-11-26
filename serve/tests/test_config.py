@@ -23,6 +23,7 @@ from serve.config import (  # noqa: E402
     SAMPLING_KEYS,
     budget_count,
     build_parser,
+    cost_rate,
     check_engine_flags,
     engine_flags_of,
     load_config_file,
@@ -110,16 +111,16 @@ class ConfigFile(unittest.TestCase):
 
     def test_the_exact_shape(self):
         p = conf({"engine": {"conversation-cache-disk-mib": 32768, "idle-sleep": 300, "pool-workers": 8, "vram-reserve-mib": 500},
-                  "models": [{"alias": "Qwen 3.8 FN", "gpu": "auto", "kv": "int8", "max-context": 262144,
+                  "models": [{"alias": "Qwen 3.8 FN", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144,
                               "model": "a.basalt", "parallel": 4, "slot-full-context": True, "vision": "dynamic"},
-                             {"alias": "DeepSeek V4.1 Flash", "gpu": "auto", "max-context": 1048576,
+                             {"alias": "DeepSeek V4.1 Flash", "gpu": [0, 1], "gpu-mode": "peer", "gpu-share": [3, 1], "max-context": 1048576,
                               "model": "b.basalt", "vision": "dynamic"}],
                   "server": {"host": "0.0.0.0", "port": 8080}})
         (qwen, _, qfile, _), (ds, _, dfile, _) = model_settings(build_parser(), ["--config", p])
-        self.assertEqual((qwen.alias, qwen.parallel, qwen.gpu, qwen.vision, qwen.idle_sleep, qwen.host, qwen.port),
-                         ("Qwen 3.8 FN", 4, "auto", "dynamic", 300, "0.0.0.0", 8080))
-        self.assertEqual((ds.alias, ds.parallel, ds.gpu, ds.vision, ds.idle_sleep, ds.host, ds.port),
-                         ("DeepSeek V4.1 Flash", None, "auto", "dynamic", 300, "0.0.0.0", 8080))
+        self.assertEqual((qwen.alias, qwen.parallel, qwen.gpu, qwen.gpu_mode, qwen.gpu_share, qwen.vision, qwen.idle_sleep, qwen.host, qwen.port),
+                         ("Qwen 3.8 FN", 4, "all", "peer", None, "dynamic", 300, "0.0.0.0", 8080))
+        self.assertEqual((ds.alias, ds.parallel, ds.gpu, ds.gpu_mode, ds.gpu_share, ds.vision, ds.idle_sleep, ds.host, ds.port),
+                         ("DeepSeek V4.1 Flash", None, "0,1", "peer", "3,1", "dynamic", 300, "0.0.0.0", 8080))
         for words in (qfile, dfile):
             self.assertEqual(flag_value(words, "--pool-workers"), "8")
             self.assertEqual(flag_value(words, "--vram-reserve-mib"), "500")
@@ -129,6 +130,33 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--batch"), "4")
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
+
+    def test_model_entry_boolean_false_overrides_engine_true(self):
+        p = conf({
+            "version": 2,
+            "engine": {
+                "fit-max-tokens": True,
+                "slot-full-context": True,
+                "grammar": True,
+                "resident-experts": True,
+                "route-tail-skip": 7,
+            },
+            "models": [
+                {"model": "a.basalt", "parallel": 2, "max-context": 8192},
+                {"model": "b.basalt", "parallel": 2, "max-context": 8192,
+                 "fit-max-tokens": False, "slot-full-context": False, "grammar": False,
+                 "resident-experts": False, "route-tail-skip": False},
+            ],
+        })
+        (a, _, afile, _), (b, _, bfile, _) = model_settings(build_parser(), ["--config", p])
+        self.assertTrue((a.fit_max_tokens, a.slot_full_context, a.grammar) == (True, True, True))
+        self.assertEqual(flag_value(afile, "--max-context"), "8192")
+        self.assertIn("--resident-experts", afile)
+        self.assertEqual(flag_value(afile, "--route-tail-skip"), "7")
+        self.assertEqual((b.fit_max_tokens, b.slot_full_context, b.grammar), (False, False, False))
+        self.assertEqual(flag_value(bfile, "--max-context"), "4096")
+        self.assertNotIn("--resident-experts", bfile)
+        self.assertNotIn("--route-tail-skip", bfile)
 
     def test_the_ram_reserve(self):
         p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
@@ -281,11 +309,6 @@ class Precedence(unittest.TestCase):
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
 
-    def test_no_peer_prefill_config_words(self):
-        for value, words in ((True, ["--no-peer-prefill"]), (False, [])):
-            _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
-            self.assertEqual(file_words, words)
-
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
         self.assertEqual(file_words, ["--route-prior", "1.5"])
@@ -320,6 +343,9 @@ class Precedence(unittest.TestCase):
             check_engine_flags(["--peer-device", "1"], {"--gpu"}, "cli")
         with self.assertRaisesRegex(ValueError, "gpu is a server setting"):
             check_engine_flags(["--gpu", "0,1"], {"--gpu"}, "--config c.json")
+        for flag in ("--gpu-mode", "--gpu-share"):
+            with self.assertRaisesRegex(ValueError, f"{flag[2:]} is a server setting"):
+                check_engine_flags([flag, "peer"], {flag}, "--config c.json")
 
     def test_extras(self):
         self.assertEqual(split_engine_extras(["--kv", "int8", "--resident-experts", "--seed=3", "--x", "-1"]),
@@ -399,6 +425,19 @@ class SamplingOptions(unittest.TestCase):
         a = parse(["--top-k", "0", "--seed", "0", "--presence-penalty", "-0.5", "--penalty-last-n", "4096"])[0]
         self.assertEqual(a.sampling_launch, {"top_k": 0, "seed": 0, "presence_penalty": -0.5, "penalty_last_n": 4096})
         self.assertEqual(parse(["--top-k", "1000"])[0].sampling_launch, {"top_k": 1000})
+
+    def test_seed_keeps_full_64bit_precision(self):
+        from serve.config import checked_sampling
+        for exact in (2 ** 53 + 1, 2 ** 64 - 1, -(2 ** 63)):
+            a = parse(["--seed", str(exact)])[0]
+            self.assertEqual(a.seed, exact)
+            self.assertIsInstance(a.seed, int)
+            checked_sampling({"seed": exact})
+        for huge in (2 ** 64, -(2 ** 63) - 1, 10 ** 400):
+            with self.assertRaises(SystemExit, msg=str(huge)):
+                parse(["--seed", str(huge)])
+            with self.assertRaises(ValueError, msg=str(huge)):
+                checked_sampling({"seed": huge})
 
     def test_the_model_file_check_is_the_same(self):
         with self.assertRaisesRegex(SystemExit, "sampling.top_k=-5"):
@@ -515,7 +554,7 @@ class EveryOption(unittest.TestCase):
             return "1"
         if act.type is video_tokens:
             return 1024
-        if act.type is float:
+        if act.type is float or act.type is cost_rate:   # --cost-*: a price per million tokens
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
             return 0.5 if SAMPLING_KEYS[act.dest][0] is float else 7
@@ -623,7 +662,11 @@ class Startup(unittest.TestCase):
         code, err = self.run_server({"models": [entry]})
         self.assertIn("the server needs --model and the engine binary", err)
         code, err = self.run_server({"models": [{**entry, "gpu": "a,b"}], "server": {"mock-engine": True}})
-        self.assertIn("--gpu a,b: expected numbers", err)
+        self.assertIn('gpu "a,b": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md', err)
+        code, err = self.run_server({"models": [{**entry, "gpu": "0,1"}], "server": {"mock-engine": True}})
+        self.assertIn("gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md", err)
+        code, err = self.run_server({"models": [{**entry, "gpu": 0, "gpu-mode": "peer"}], "server": {"mock-engine": True}})
+        self.assertIn('gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more', err)
         code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key", "")
         self.assertEqual(code, 2)
         self.assertIn("--api-key is empty", err)

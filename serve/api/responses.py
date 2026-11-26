@@ -65,9 +65,15 @@ def _content(content, param):
             raise ResponsesError("expected a content part object", f"{param}[{j}]")
         kind = part.get("type")
         if kind in ("input_text", "output_text", "text", "summary_text", "reasoning_text"):
-            parts.append({"type": "text", "text": part.get("text") or ""})
+            text = part.get("text")
+            if text is not None and not isinstance(text, str):
+                raise ResponsesError("text must be a string", f"{param}[{j}].text")
+            parts.append({"type": "text", "text": text or ""})
         elif kind == "refusal":
-            parts.append({"type": "text", "text": part.get("refusal") or ""})
+            refusal = part.get("refusal")
+            if refusal is not None and not isinstance(refusal, str):
+                raise ResponsesError("refusal must be a string", f"{param}[{j}].refusal")
+            parts.append({"type": "text", "text": refusal or ""})
         elif kind == "input_file":
             if not (part.get("file_data") or part.get("file_url")):
                 field = "file_id" if part.get("file_id") else "file_data"
@@ -76,11 +82,14 @@ def _content(content, param):
                                      "unsupported_parameter")
             parts.append(part)
         elif kind in IMAGE_PARTS:
-            if not part.get("image_url"):
+            img = part.get("image_url")
+            ok = (isinstance(img, str) and bool(img)) or (
+                isinstance(img, dict) and isinstance(img.get("url"), str) and bool(img["url"]))
+            if not ok:
                 print("[server] error: an image part has no image_url", flush=True)
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
-            parts.append({"type": "input_image", "image_url": part["image_url"]})
+            parts.append({"type": "input_image", "image_url": img})
         elif kind in VIDEO_PARTS:
             if not isinstance(part.get("video_url"), str) or not part["video_url"]:
                 raise ResponsesError("only videos given as video_url (a data: or http(s) URL) are supported; "
@@ -95,14 +104,25 @@ def _content(content, param):
 
 def _reasoning_text(item, param) -> str:
     """The thinking of a reasoning item: reasoning_text content, else our own encrypted_content."""
-    texts = [p.get("text") or "" for p in item.get("content") or [] if isinstance(p, dict)
-             and p.get("type") in ("reasoning_text", "text")]
+    content = item.get("content")
+    if content is not None and not isinstance(content, list):
+        raise ResponsesError("reasoning content must be an array", param + ".content")
+    texts = []
+    for j, p in enumerate(content or []):
+        if isinstance(p, dict) and p.get("type") in ("reasoning_text", "text"):
+            text = p.get("text")
+            if text is not None and not isinstance(text, str):
+                raise ResponsesError("reasoning text must be a string", f"{param}.content[{j}].text")
+            texts.append(text or "")
     if texts:
         return "".join(texts)
     enc = item.get("encrypted_content")
     if isinstance(enc, str) and enc.startswith(ENCRYPTED_PREFIX):
         try:
-            return json.loads(base64.b64decode(enc[len(ENCRYPTED_PREFIX):], validate=True).decode("utf-8"))["text"]
+            payload = json.loads(base64.b64decode(enc[len(ENCRYPTED_PREFIX):], validate=True).decode("utf-8"))
+            if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+                raise ValueError("not a reasoning payload")
+            return payload["text"]
         except (ValueError, KeyError, TypeError, UnicodeError):
             raise ResponsesError("this reasoning item's encrypted_content is damaged", param + ".encrypted_content",
                                  "invalid_encrypted_content") from None
@@ -185,17 +205,26 @@ def input_messages(req: dict) -> list[dict]:
             name = item.get("name")
             if not isinstance(name, str) or not name:
                 raise ResponsesError("a function_call needs a name", param + ".name")
-            if item.get("namespace"):
-                name = f"{item['namespace']}.{name}"
+            ns = item.get("namespace")
+            if ns is not None and not isinstance(ns, str):
+                raise ResponsesError("namespace must be a string", param + ".namespace")
+            if ns:
+                name = f"{ns}.{name}"
+            call_id = item.get("call_id")
+            if call_id is not None and not isinstance(call_id, str):
+                raise ResponsesError("call_id must be a string", param + ".call_id")
             if kind == "function_call":
                 args = _arguments(item.get("arguments"), param + ".arguments")
             else:
                 args = {"input": item.get("input") if isinstance(item.get("input"), str) else ""}
             target = open_turn if open_turn is not None and not thinking else turn()
             target.setdefault("tool_calls", []).append({"function": {"name": name, "arguments": args},
-                                                        "_call_id": item.get("call_id")})
+                                                        "_call_id": call_id})
         elif kind in ("function_call_output", "custom_tool_call_output"):
-            messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
+            call_id = item.get("call_id")
+            if call_id is not None and not isinstance(call_id, str):
+                raise ResponsesError("call_id must be a string", param + ".call_id")
+            messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": call_id})
             open_turn = None
             thinking.clear()
         elif kind == "item_reference":
@@ -226,8 +255,11 @@ def _order_tool_results(messages):
             j += 1
         prev = messages[i - 1] if i else {}
         order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
-        rank = {cid: k for k, cid in enumerate(order) if cid}
-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        rank = {cid: k for k, cid in enumerate(order) if isinstance(cid, str) and cid}
+        messages[i:j] = sorted(
+            messages[i:j],
+            key=lambda m: rank.get(m.get("_call_id"), len(order)) if isinstance(m.get("_call_id"), str) else len(order),
+        )
         i = j
     for m in messages:
         m.pop("_call_id", None)
@@ -248,7 +280,10 @@ def request_tools(req: dict):
         if not isinstance(name, str) or not name:
             raise ResponsesError("a tool needs a name", param + ".name")
         flat = f"{namespace}.{name}" if namespace else name
-        description = tool.get("description") or ""
+        description = tool.get("description")
+        if description is not None and not isinstance(description, str):
+            raise ResponsesError("tool description must be a string", param + ".description")
+        description = description or ""
         if ns_description:
             description = ns_description + ("\n\n" + description if description else "")
         if kind == "function":
@@ -260,7 +295,11 @@ def request_tools(req: dict):
         else:                                        # custom: free-form text, maybe in a grammar the model reads
             fmt = tool.get("format") or {}
             if isinstance(fmt, dict) and fmt.get("type") == "grammar" and fmt.get("definition"):
-                description += f"\n\nThe input must follow this {fmt.get('syntax', '')} grammar:\n{fmt['definition']}"
+                syntax = fmt.get("syntax", "")
+                defn = fmt["definition"]
+                if not isinstance(defn, str) or (syntax is not None and not isinstance(syntax, str)):
+                    raise ResponsesError("custom tool grammar definition and syntax must be strings", param + ".format")
+                description += f"\n\nThe input must follow this {syntax or ''} grammar:\n{defn}"
             params = {"type": "object", "properties": {"input": {"type": "string", "description": "the raw input"}},
                       "required": ["input"]}
         tools.append({"name": flat, "description": description, "parameters": params})
@@ -274,11 +313,19 @@ def request_tools(req: dict):
         if kind in ("function", "custom"):
             add(tool, param)
         elif kind == "namespace":
-            for j, member in enumerate(tool.get("tools") or []):
+            ns_name = tool.get("name")
+            if not isinstance(ns_name, str) or not ns_name:
+                raise ResponsesError("a namespace needs a name", param + ".name")
+            ns_desc = tool.get("description")
+            if ns_desc is not None and not isinstance(ns_desc, str):
+                raise ResponsesError("namespace description must be a string", param + ".description")
+            ns_tools = tool.get("tools")
+            if ns_tools is not None and not isinstance(ns_tools, list):
+                raise ResponsesError("namespace tools must be an array", param + ".tools")
+            for j, member in enumerate(ns_tools or []):
                 if not isinstance(member, dict) or member.get("type", "function") not in ("function", "custom"):
                     raise ResponsesError("a namespace holds function tools", f"{param}.tools[{j}]")
-                add({"type": "function", **member}, f"{param}.tools[{j}]", tool.get("name"),
-                    tool.get("description") or "")
+                add({"type": "function", **member}, f"{param}.tools[{j}]", ns_name, ns_desc or "")
         elif kind in HOSTED_TOOLS or isinstance(kind, str):
             skipped.append(kind)                     # the model cannot run OpenAI's hosted tools: left out
         else:
@@ -427,11 +474,21 @@ class Assembler:
             item["logprobs"] += self.lps_tools.pop(self.calls.index(item), [])
         if item["type"] == "message":
             part = item["content"][0]
+            if self.lps:
+                part["logprobs"] += self.lps
+                out.append(self.event("response.output_text.delta", item_id=item["id"], output_index=at,
+                                      content_index=0, delta="", logprobs=self.lps))
+                self.lps = []
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
                                text=part["text"], logprobs=copy.deepcopy(part["logprobs"])),
                     self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
                                part=copy.deepcopy(part))]
         elif item["type"] == "reasoning":
+            if self.want_lp and self.lps_reasoning:
+                item["logprobs"] += self.lps_reasoning
+                out.append(self.event("response.reasoning_text.delta", item_id=item["id"], output_index=at,
+                                      content_index=0, delta="", logprobs=self.lps_reasoning))
+                self.lps_reasoning = []
             text = item["content"][0]["text"]
             out.append(self.event("response.reasoning_text.done", item_id=item["id"], output_index=at,
                                   content_index=0, text=text))
@@ -538,6 +595,17 @@ class Assembler:
         # an open call was cut off: incomplete whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
         out = self.close("incomplete" if length or unfinished else "completed")
+        if self.lps:                                         # held-back answer tokens after the message item closed
+            msg = next((o for o in reversed(self.response["output"]) if o["type"] == "message"), None)
+            if msg is not None:
+                msg["content"][0]["logprobs"] += self.lps
+            self.lps = []
+        if self.lps_reasoning:                               # held-back reasoning tokens after the reasoning item closed
+            if self.want_lp:
+                rs = next((o for o in reversed(self.response["output"]) if o["type"] == "reasoning"), None)
+                if rs is not None:
+                    rs["logprobs"] += self.lps_reasoning
+            self.lps_reasoning = []
         for k, entries in sorted(self.lps_tools.items()):    # a call's closing markup, after its item closed
             if k < len(self.calls):
                 self.calls[k]["logprobs"] += entries

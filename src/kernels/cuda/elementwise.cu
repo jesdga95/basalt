@@ -1,6 +1,7 @@
 // src/kernels/cuda/elementwise.cu - the glue kernels.  See the header for why each exists.
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/doorbell.cuh"
 
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -39,13 +40,11 @@ __global__ void embedding_gather_kernel(const uint8_t* __restrict__ codes,
 __device__ __forceinline__ float softplus_dev(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
 __global__ void gdn_gate_kernel(const float* __restrict__ alpha, const float* __restrict__ dt,
-                                const float* __restrict__ ssm_a, float* __restrict__ gate, int64_t h_v) {
+                                const float* __restrict__ ssm_a, float* __restrict__ gate, int64_t n, int64_t h_v) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= h_v) return;
-    const int64_t t = i / h_v;      // `n_tokens` is the leading dim; the real call has one token
+    if (i >= n) return;
     const int64_t h = i % h_v;
     gate[i] = softplus_dev(alpha[i] + dt[h]) * ssm_a[h];
-    (void) t;
 }
 
 __global__ void scale_kernel(float* __restrict__ x, int64_t n, float s) {
@@ -144,7 +143,7 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
               int64_t h_v, void* stream) {
     if (n_tokens <= 0 || h_v <= 0) return;
     const int64_t n = n_tokens * h_v;
-    gdn_gate_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(alpha, dt, ssm_a, gate, h_v);
+    gdn_gate_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(alpha, dt, ssm_a, gate, n, h_v);
     check_launch("gdn_gate");
     sync_if_needed(stream, "gdn_gate");
 }
@@ -193,6 +192,16 @@ __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volati
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) {
     if (d_flag == nullptr || d_seq == nullptr) return;
     doorbell_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, d_seq);
+    check_launch("doorbell_wait");
+}
+
+__global__ void doorbell_abort_wait_kernel(const uint32_t* flag, const uint32_t* seq, const uint32_t* abort) {
+    doorbell_spin(flag, *seq, abort, 1);
+}
+
+void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, const uint32_t* d_abort, void* stream) {
+    if (d_flag == nullptr || d_seq == nullptr) return;
+    doorbell_abort_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, d_seq, d_abort);
     check_launch("doorbell_wait");
 }
 

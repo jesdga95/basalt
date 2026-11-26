@@ -71,14 +71,9 @@ bool PromptHost::open(const DsModel& m, int pieces, int slots, bool vision, std:
         engram_layer = (size_t) prefillp::kMaxChunk * cols * en.row_bytes;
         for (std::vector<uint8_t>& r : engram_raw) take(r, engram_layer * en.layers.size());
     }
-    if (vision) {
-        images_.resize((size_t) slots);
-        for (Image& im : images_) {
-            take(im.picture.rgb, (size_t) vision::kMaxImagePixels * 3);
-            const size_t merge = (size_t) VisionPlan{}.merge;
-            take(im.patches, (size_t) kVisionMaxTokens * merge * merge * kVisionPatchValues);
-        }
-    }
+    // a picture's decode and patch rows grow in its slot's vectors while it is read and are freed with images_done: standing
+    // buffers sized for the largest picture would take RAM from the experts' homes at rest
+    if (vision) images_.resize((size_t) slots);
     return true;
 }
 

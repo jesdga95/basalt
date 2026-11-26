@@ -3,6 +3,7 @@
 // This prints the memory plan against the actual cudaMemGetInfo, on its own so it can run
 // without the model.  It is also the run-time half of the architecture policy: CMake refuses to COMPILE for another
 // architecture, and this refuses to RUN on one.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/models/qwen4exp/plan/plan.hpp"
 

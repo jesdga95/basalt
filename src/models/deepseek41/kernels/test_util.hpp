@@ -1,6 +1,7 @@
 // Shared helpers of the DeepSeek-V4.1 kernel parity tests: error statistics, raw dumps, timing.
 #pragma once
 
+#include "basalt/core/device_copy.hpp"
 #include "basalt/log.hpp"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -37,10 +38,10 @@ struct Dev {
     Dev(const Dev&) = delete;
     Dev& operator=(const Dev&) = delete;
     ~Dev() { cudaFree(p); }
-    void up(const std::vector<T>& h) { check(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up"); }
+    void up(const std::vector<T>& h) { check(basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up"); }
     std::vector<T> down() const {
         std::vector<T> h(n);
-        check(cudaMemcpy(h.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost), "down");
+        check(basalt::core::device_copy(h.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost), "down");
         return h;
     }
 };

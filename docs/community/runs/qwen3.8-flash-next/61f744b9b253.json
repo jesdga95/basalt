@@ -1,0 +1,36 @@
+{
+  "submitter": "pro4000-rig",
+  "date": "2026-11-21",
+  "commit": "a388da2431",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 4000 Blackwell",
+      "vram_gib": 24,
+      "power_w": 145,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 38.7
+    }
+  ],
+  "ram_gib": 125,
+  "cpu": "AMD Ryzen Threadripper 7970X s, 32 cores",
+  "ram_gbps": 113.3,
+  "os": "Linux",
+  "quant": "Q8_0",
+  "kv": "int8",
+  "prefill_16k_tps": 727.9,
+  "prefill_64k_tps": 971.7,
+  "decode_tps": 121.7,
+  "decode_conv_tps": 83.4,
+  "decode_struct_tps": 143.9,
+  "decode_prose_tps": 79.9,
+  "accept_conv_pct": 74.7,
+  "accept_struct_pct": 98.2,
+  "accept_prose_pct": 72.4,
+  "draft_len_conv": 1.8,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.3,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "official HF pack (Qwen3.8-FN-Q8_0), single RTX PRO 4000; other services stopped to fit. Decode all VRAM+RAM; prefill re-reads lent expert slots from NVMe (low prefill)"
+}

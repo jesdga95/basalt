@@ -57,6 +57,55 @@ HeldMeet meet_held(const int32_t* prompt, int64_t n, const int32_t* held, int64_
 /// (the engine keeps 8 free). A prompt that does not grow always fits: the request was admitted with it.
 inline bool respell_fits(int64_t grown, int64_t n, int64_t want, int64_t ctx) { return grown <= n || grown + want + 8 <= ctx; }
 
+/// The ids two sequences share from the start.
+inline int64_t shared_start(const int32_t* a, int64_t an, const int32_t* b, int64_t bn) {
+    const int64_t lim = std::min(an, bn);
+    return lim > 0 ? std::mismatch(a, a + lim, b).first - a : 0;
+}
+
+/// Whether the held ids from `k` on spell the bytes of the prompt's tokens from `k` on: the model wrote the start of
+/// the prompt in other pieces than the tokenizer cuts it into (a reply the client sends back), so the ids part where
+/// the bytes agree.  The prompt may end inside the held ids' last token, or run on past them into the next message.
+template <class Bytes>
+bool spells_the_prompt(const int32_t* prompt, int64_t n, const int32_t* held, int64_t h, int64_t k, Bytes bytes) {
+    int64_t hi = k;
+    size_t hoff = 0;
+    for (int64_t j = k; j < n; ++j) {
+        const std::string_view pb = bytes(prompt[j]);
+        if (pb.empty()) return false;
+        size_t po = 0;
+        while (po < pb.size()) {
+            if (hi == h) return true;                       // the held ids end inside this prompt token
+            const std::string_view hb = bytes(held[hi]);
+            if (hb.empty()) return false;
+            const size_t take = std::min(hb.size() - hoff, pb.size() - po);
+            if (hb.compare(hoff, take, pb.data() + po, take) != 0) return false;
+            po += take;
+            hoff += take;
+            if (hoff == hb.size()) {
+                hoff = 0;
+                ++hi;
+            }
+        }
+    }
+    return true;                                            // the prompt ends inside (or at) the held ids: they spell it
+}
+
+/// The prompt tokens a slot's held conversation continues: the ids the two share from the start when the slot's
+/// conversation goes on as this prompt (its reply the client sent back, cut into other pieces - `meet_held`, or the
+/// bytes of its tail spelling the prompt's; `shared` is the ids the two share), else 0 - two conversations that share
+/// a system prompt continue nothing of each other.  Never the prompt's last token, which starts the first window.
+template <class Bytes>
+int64_t slot_cover(const int32_t* prompt, int64_t n, const int32_t* held, int64_t h, int64_t shared, bool respell,
+                   Bytes bytes) {
+    if (n <= 0 || h <= 0) return 0;
+    const HeldMeet m = meet_held(prompt, n, held, h, respell, bytes);
+    if (m.held > 0) return std::min(m.held, n - 1);
+    if (shared >= n) return n - 1;                          // the prompt is the start of the slot's conversation
+    if (respell && shared > 0 && spells_the_prompt(prompt, n, held, h, shared, bytes)) return std::min(shared, n - 1);
+    return 0;
+}
+
 /// The prompt with the held ids standing for the tokens they spell: the held sequence, then the prompt from `m.resume`.
 template <class Out>
 void splice_held(const int32_t* held, const HeldMeet& m, const int32_t* prompt, int64_t n, std::vector<Out>& out) {

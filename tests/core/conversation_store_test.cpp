@@ -229,6 +229,79 @@ void compressed_rows(const std::string& dir) {
     check_at(got2, 5000, src.checkpoints[1]);
 }
 
+// Cell-major KV with fp16 pooled indexer rows (page_size = 1, row_cells = 4): both the queued-RAM load and a
+// restart disk load cut cleanly at positions that are not multiples of row_cells.
+void fp16_pooled_rows(const std::string& dir) {
+    constexpr int64_t kRowBytes = 656, kPool = 4, kPoolDim = 64, kPoolRowBytes = kPoolDim * 2;
+    std::vector<int32_t> ids(9001);
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (i * 11 + 3);
+    auto running = [&](size_t len) {
+        ConversationCheckpoint c;
+        c.ids.assign(ids.begin(), ids.begin() + (std::ptrdiff_t) len);
+        fill(c.state_a, 1u << 20);
+        return c;
+    };
+    SavedConversation src;
+    src.live = running(ids.size());
+    src.checkpoints.push_back(running(4097));
+    src.checkpoints.back().source = ConversationCheckpoint::kRoot;
+    src.checkpoints.push_back(running(5003));
+    for (int l = 0; l < 2; ++l) {
+        ConversationKv k;
+        k.format = 1;
+        k.page_size = 1;
+        k.cells = (int64_t) ids.size();
+        k.pooled_rows = (int64_t) ids.size() / kPool + 1;
+        k.idx_dim = kPoolDim;
+        fill(k.k, (size_t) k.cells * kRowBytes);
+        fill(k.pooled, (size_t) k.pooled_rows * kPoolRowBytes);
+        src.kv.push_back(std::move(k));
+    }
+    const auto check_at = [&](const SavedConversation& got, int64_t at, const ConversationCheckpoint& c) {
+        CHECK((int64_t) got.live.ids.size() == at);
+        CHECK(got.live.state_a == c.state_a);
+        CHECK(got.kv.size() == src.kv.size());
+        const int64_t want_rows = at / kPool + 1;
+        for (size_t i = 0; i < got.kv.size() && i < src.kv.size(); ++i) {
+            CHECK(got.kv[i].page_size == 1);
+            CHECK(got.kv[i].cells == at);
+            CHECK(got.kv[i].pooled_rows == want_rows);
+            CHECK(got.kv[i].k.size() == (size_t) at * kRowBytes && prefix_of(got.kv[i].k, src.kv[i].k));
+            CHECK(got.kv[i].pooled.size() == (size_t) want_rows * kPoolRowBytes &&
+                  prefix_of(got.kv[i].pooled, src.kv[i].pooled));
+        }
+    };
+    std::string err;
+    {
+        ConversationStore st;
+        st.set_row_cells(kPool);
+        CHECK(st.open(dir, 88, 1ull << 30, err));
+        SavedConversation copy = src;
+        CHECK(st.put(std::move(copy), 1ull << 30));
+        // read from the write queue before flush (exercises kv_part_bytes on fp16 pooled rows)
+        std::vector<int32_t> q(ids.begin(), ids.begin() + 4500);
+        q.push_back(-5);
+        auto mq = st.best(q.data(), q.size(), {}, true);
+        CHECK(mq.tokens == 4097);
+        SavedConversation gotq;
+        CHECK(st.load(mq, gotq, err));
+        check_at(gotq, 4097, src.checkpoints[0]);
+        st.flush();
+        CHECK(st.stats().written == 1);
+    }
+    ConversationStore st;   // fresh store from disk
+    st.set_row_cells(kPool);
+    CHECK(st.open(dir, 88, 1ull << 30, err));
+    std::vector<int32_t> p(ids.begin(), ids.begin() + 6000);
+    p.push_back(-5);
+    auto m = st.best(p.data(), p.size(), {}, true);
+    CHECK(m.tokens == 5003);
+    SavedConversation got;
+    CHECK(st.load(m, got, err));
+    check_at(got, 5003, src.checkpoints[1]);
+    CHECK(st.stats().files == 1);
+}
+
 int main() {
     const std::string dir = basalt::platform::temp_dir() + "/basalt-store-test-" +
                             std::to_string((long long) basalt::platform::process_id());
@@ -529,6 +602,89 @@ int main() {
         if (basalt::platform::list_files(dir2, rows_left))
             for (const auto& f : rows_left) basalt::platform::remove_file(dir2 + "/" + f.name);
         basalt::platform::remove_file(dir2);
+    }
+    {
+        const std::string dir3 = dir + "-fp16pool";
+        fp16_pooled_rows(dir3);
+        std::vector<basalt::platform::DirFile> pool_left;
+        if (basalt::platform::list_files(dir3, pool_left))
+            for (const auto& f : pool_left) basalt::platform::remove_file(dir3 + "/" + f.name);
+        basalt::platform::remove_file(dir3);
+    }
+    {
+        // Stale Match::index TOCTOU: erasing an earlier entry shifts indices in entries_.
+        // 1) A match on a surviving entry must still resolve to that entry (not its shifted neighbor).
+        // 2) A match on a dropped/superseded entry must miss cleanly without loading or deleting its shifted neighbor.
+        const std::string dir4 = dir + "-toctou";
+        std::string err;
+        ConversationStore st;
+        st.set_row_cells(4);
+        CHECK(st.open(dir4, id, 1ull << 30, err));
+        auto seq = [](int32_t base, size_t n) {
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = base + (int32_t) i;
+            return v;
+        };
+        const std::vector<int32_t> a = seq(10000, 500), b = seq(20000, 500), c = seq(30000, 500);
+        const SavedConversation sa = chat(a, {{200, Src::kRoot}, {500, Src::kTurnEnd}}),
+                                sb = chat(b, {{200, Src::kRoot}, {500, Src::kTurnEnd}}),
+                                sc = chat(c, {{200, Src::kRoot}, {500, Src::kTurnEnd}});
+        CHECK(st.put(SavedConversation(sa), 1ull << 30));
+        CHECK(st.put(SavedConversation(sb), 1ull << 30));
+        CHECK(st.put(SavedConversation(sc), 1ull << 30));
+        st.flush();
+
+        std::vector<int32_t> pa = a, pb = b;
+        pa.push_back(-1);
+        pb.push_back(-1);
+        const auto ma = st.best(pa.data(), pa.size(), {}, true);
+        const auto mb = st.best(pb.data(), pb.size(), {}, true);
+        CHECK(ma.tokens == 500 && mb.tokens == 500);
+
+        // Supersede A (drops entry 0, shifting B and C down by 1).
+        std::vector<int32_t> a2 = a;
+        for (int i = 0; i < 100; ++i) a2.push_back(90000 + i);
+        SavedConversation sa2 = chat(a2, {{200, Src::kRoot}, {500, Src::kTurnEnd}, {600, Src::kTurnEnd}});
+        CHECK(st.put(std::move(sa2), 1ull << 30));
+        st.flush();
+
+        // Surviving match B must load B (not C, which now sits at B's old index).
+        SavedConversation got_b;
+        CHECK(st.load_bytes(mb) > 0);
+        CHECK(st.load(mb, got_b, err));
+        CHECK(got_b.live.ids == b && same_state(got_b.live, sb.checkpoints[1]));
+
+        // Stale match A (superseded) must return false without loading B or deleting B from disk.
+        const size_t dropped_before = st.stats().dropped;
+        SavedConversation got_a;
+        CHECK(st.load_bytes(ma) == 0);
+        CHECK(!st.load(ma, got_a, err));
+        CHECK(st.stats().dropped == dropped_before);
+
+        // Also test mismatched-length neighbor: previously load() hit "no state at the match" and deleted neighbor.
+        const std::vector<int32_t> d = seq(40000, 520), e = seq(50000, 700);
+        const SavedConversation sd = chat(d, {{200, Src::kRoot}, {520, Src::kTurnEnd}}),
+                                se = chat(e, {{300, Src::kRoot}, {700, Src::kTurnEnd}});
+        CHECK(st.put(SavedConversation(sd), 1ull << 30));
+        CHECK(st.put(SavedConversation(se), 1ull << 30));
+        st.flush();
+        std::vector<int32_t> pd = d, pe = e;
+        pd.push_back(-1);
+        pe.push_back(-1);
+        const auto md = st.best(pd.data(), pd.size(), {}, true);
+        CHECK(md.tokens == 520);
+        std::vector<int32_t> d2 = d;
+        for (int i = 0; i < 80; ++i) d2.push_back(95000 + i);
+        CHECK(st.put(chat(d2, {{200, Src::kRoot}, {520, Src::kTurnEnd}, {600, Src::kTurnEnd}}), 1ull << 30));
+        st.flush();
+        const size_t dropped_before2 = st.stats().dropped;
+        SavedConversation got_d;
+        CHECK(!st.load(md, got_d, err));
+        CHECK(st.stats().dropped == dropped_before2);
+        const auto me = st.best(pe.data(), pe.size(), {}, true);
+        SavedConversation got_e;
+        CHECK(me.tokens == 700 && st.load(me, got_e, err) && got_e.live.ids == e);
+        remove_dir(dir4);
     }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))

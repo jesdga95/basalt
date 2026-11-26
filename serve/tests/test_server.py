@@ -900,6 +900,24 @@ class ClientShapes(unittest.TestCase):
         status, _ = self.post("/v1/nothing?beta=true", body)
         self.assertEqual(status, 404)
 
+    def test_a_base_url_that_ends_in_v1(self):
+        # an Anthropic client adds /v1/messages to its base URL itself: given ".../v1" it posts /v1/v1/messages
+        body = {"model": "basalt", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+        status, b = self.post("/v1/v1/messages?beta=true", body)
+        self.assertEqual((status, b.get("type")), (200, "message"), b)
+        status, b = self.post("/v1/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200, b)
+        self.assertGreater(b["input_tokens"], 0)
+        req = urllib.request.Request(self.base + "/v1/v1/messages", data=json.dumps({**body, "stream": True}).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            events = r.read().decode()
+        self.assertIn("event: message_start", events)
+        self.assertIn("event: message_stop", events)
+        for path in ("/v1/v1/chat/completions", "/v1/v1/responses"):   # only the two Anthropic paths are aliased
+            status, _ = self.post(path, body)
+            self.assertEqual(status, 404, path)
+
     def test_anthropic_mid_conversation_system(self):
         status, b = self.post("/v1/messages?beta=true", {
             "model": "basalt", "max_tokens": 50,
@@ -1019,8 +1037,9 @@ class ClientShapes(unittest.TestCase):
         v = Vision.__new__(Vision)
         v.dir, v.lock, v.cache, v.cache_bytes, v.pinned = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}, 0, {}
         v.proc = mock.Mock(stdin=Gone())
-        with self.assertRaises(BrokenPipeError):
+        with self.assertRaisesRegex(ValueError, "the vision encoder stopped"):
             v.encode([b"png"])
+        self.assertTrue(v.stopped)
         self.assertEqual(list(v.dir.iterdir()), [])
         v.dir.rmdir()
 
@@ -1227,16 +1246,36 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(gpu_text([0, 1]), "0,1")
         self.assertEqual(gpu_text(1), "1")
         self.assertEqual(gpu_text(None), "")
-        for good in (None, "", "auto", "0", "1,0", [0, 1]):
-            check_gpu(good)
-        for bad in ("a,b", "0,0", "-1", "0,"):
-            with self.assertRaises(ValueError):
-                check_gpu(bad)
+        for good in ((None,), ("",), ("0",), ("1,0", "peer"), ([0, 1], "split"), ("all", "tensor"), ("all",), (0,), ("0,1", "peer", "3,1"),
+                     ([0, 1], "split", [3, 1]), ("all", "peer", "1,1,1")):
+            check_gpu(*good)
+        texts = {("auto",): 'gpu "auto": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("a,b",): 'gpu "a,b": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("0,0",): 'gpu "0,0": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("-1",): 'gpu "-1": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("0,",): 'gpu "0,": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md',
+                 ("0,1",): "gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md",
+                 ("0,1,2", None, "1,1,1"): "gpu 0,1,2 names 3 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md",
+                 ("0,1", "auto"): 'gpu-mode "auto": expected peer, split or tensor; see docs/configuration/gpus.md',
+                 ("0", "peer"): 'gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more',
+                 (None, "split"): 'gpu-mode split: gpu names one card (gpu "0"); a mode needs two or more',
+                 ("0", None, "1"): 'gpu-share: gpu names one card (gpu "0"); shares need two or more',
+                 ("0,1", "peer", "3"): 'gpu-share "3": expected one positive number per card of gpu (2 cards), like 3,1',
+                 ("0,1", "peer", "0,1"): 'gpu-share "0,1": expected one positive number per card of gpu (2 cards), like 3,1',
+                 ("0,1", "peer", "a,b"): 'gpu-share "a,b": expected one positive number per card of gpu (2 cards), like 3,1',
+                 ("all", "peer", "-1,1"): 'gpu-share "-1,1": expected one positive number per card of gpu, like 3,1'}
+        for args, text in texts.items():
+            with self.assertRaises(ValueError, msg=args) as e:
+                check_gpu(*args)
+            self.assertEqual(str(e.exception), text)
         ok = mock.Mock(returncode=0, stderr="",
                        stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
         with mock.patch("subprocess.run", return_value=ok) as run:
             self.assertEqual(model_plan("/x/basalt", "/m.basalt", "1,0", ["--kv", "int8"])["devices"], "1,0")
             self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--kv", "int8", "--gpu-plan", "--gpu", "1,0"])
+            model_plan("/x/basalt", "/m.basalt", [1, 0], [], "peer", [3, 1])
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--gpu-plan", "--gpu", "1,0", "--gpu-mode", "peer",
+                                                     "--gpu-share", "3,1"])
             model_plan("/x/basalt", "/m.basalt", None, [])
             self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--gpu-plan"])
         bad = mock.Mock(returncode=2, stderr="", stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')
@@ -2482,7 +2521,11 @@ class WebApp(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
         self.assertIn(b"\"web/app.js\"", body)   # relative (works behind a path-prefixed proxy)
+        for icon in (b'"web/favicon.svg"', b'"web/favicon-32.png"', b'"web/apple-touch-icon.png"'):
+            self.assertIn(icon, body)
         for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/mark.svg", "image/svg+xml"),
+                           ("/web/favicon.svg", "image/svg+xml"), ("/web/favicon-32.png", "image/png"),
+                           ("/web/apple-touch-icon.png", "image/png"),
                            ("/fonts/geist-latin-wght.woff2", "font/woff2"),
                            ("/fonts/geist-mono-latin-wght.woff2", "font/woff2")):
             with self.subTest(path=path):
@@ -2491,7 +2534,7 @@ class WebApp(unittest.TestCase):
                 self.assertIn(want, ctype)
 
     def test_only_the_app_files_are_served(self):
-        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
+        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/web/missing.png", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 404)
@@ -3229,6 +3272,74 @@ class ThinkingBudget(unittest.TestCase):
                          self.engine.THOUGHT[:200] + REASONING_CLOSE.split("</think>")[0])
         self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
 
+    def _pt_engine(self):
+        """A text-prompt engine as the real one answers at PT: the cap it was sent, cut to the context room."""
+        from serve.prompt import PromptText
+        self.engine.takes_text = True
+        original = self.engine.generate
+
+        def pt(ids, max_new, sampling, cancel, embeddings=None, session=None):
+            if isinstance(ids, PromptText):
+                yield None
+                n = len(ids.ids())
+                max_new = min(max_new, self.engine.max_context - n - 16)
+                ids.set_counted(n, max_new)
+                yield None
+                ids = ids.ids()
+            yield from original(ids, max_new, sampling, cancel, embeddings)
+
+        self.engine.generate = pt
+
+    def test_thinking_budget_caps_the_thinking_not_the_reply_on_the_text_path(self):
+        # issue #512: the engine answers PT with the pass's cap (the budget); that must not become the total cap
+        self.engine.max_context = 16384
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40           # far longer than any budget below
+        self._pt_engine()
+        for field in ({"thinking_budget_tokens": 800}, {"reasoning_budget": 800},
+                      {"thinking": {"type": "enabled", "budget_tokens": 800}}):
+            with self.subTest(field=field):
+                code, b = self.openai(max_tokens=3000, **field)
+                self.assertEqual(code, 200, b)
+                msg = b["choices"][0]["message"]
+                self.assertTrue(790 <= len(msg["reasoning_content"]) <= 802, len(msg["reasoning_content"]))   # stopped at the budget
+                self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+                self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+                self.assertGreater(b["usage"]["completion_tokens"], 800)
+                self.assertLessEqual(b["usage"]["completion_tokens"], 3000)
+        code, b = self.openai(max_tokens=16384, thinking_budget_tokens=4096)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertGreater(b["usage"]["completion_tokens"], 4096)
+
+    def test_thinking_budget_over_max_tokens_is_still_capped_by_max_tokens(self):
+        self.engine.max_context = 16384
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40
+        self._pt_engine()
+        code, b = self.openai(max_tokens=1000, thinking_budget_tokens=5000)
+        self.assertEqual(code, 200, b)
+        self.assertLessEqual(b["usage"]["completion_tokens"], 1000)
+
+    def test_thinking_budget_on_the_anthropic_route_keeps_max_tokens(self):
+        self.engine.max_context = 16384
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40
+        self._pt_engine()
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                code, b = self.post("/v1/messages", {"model": self.svc.model, "max_tokens": 3000, "stream": stream,
+                                                     "thinking": {"type": "enabled", "budget_tokens": 800},
+                                                     "messages": [{"role": "user", "content": "2+2?"}]})
+                self.assertEqual(code, 200, b)
+                if stream:
+                    events = [json.loads(l[6:]) for l in b.splitlines() if l.startswith("data: {")]
+                    text = "".join(e["delta"].get("text", "") for e in events if e["type"] == "content_block_delta")
+                    self.assertIn(ThinkingEngine.ANSWER, text)
+                    out = [e for e in events if e["type"] == "message_delta"][-1]
+                    self.assertEqual(out["delta"]["stop_reason"], "end_turn")
+                    self.assertGreater(out["usage"]["output_tokens"], 800)
+                else:
+                    self.assertEqual(b["stop_reason"], "end_turn")
+                    self.assertGreater(b["usage"]["output_tokens"], 800)
+
     def test_answer_room_reserves_a_quarter_of_an_8192_token_cap(self):
         from serve.service import REASONING_CLOSE
         self.engine.max_context = 16384
@@ -3723,6 +3834,20 @@ class LostStep(unittest.TestCase):
 
     def test_stop_never_acknowledged(self):
         self.run_mode("stop", stream=False)
+
+
+class UrlHostFormatting(unittest.TestCase):
+    def test_url_host_formats_ipv6_and_wildcards(self):
+        from serve.server import url_host
+
+        self.assertEqual(url_host("0.0.0.0"), "127.0.0.1")
+        self.assertEqual(url_host(""), "127.0.0.1")
+        self.assertEqual(url_host("::"), "127.0.0.1")
+        self.assertEqual(url_host("::1"), "[::1]")
+        self.assertEqual(url_host("[::1]"), "[::1]")
+        self.assertEqual(url_host("fe80::1"), "[fe80::1]")
+        self.assertEqual(url_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(url_host("localhost"), "localhost")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1]))
 import config_v1_to_v2 as migrate  # noqa: E402
-from serve.config import build_parser, load_config_file  # noqa: E402
+from serve.config import ENTRY_OPTIONS, MODEL_OPTIONS, build_parser, load_config_file  # noqa: E402
 
 OLD = {"server": {"model": "m.basalt", "alias": "Name", "gpu": "auto", "vision": "dynamic", "host": "0.0.0.0", "port": 8080,
                   "parallel": 4, "slot-full-context": True, "idle-sleep": 300},
@@ -91,6 +91,43 @@ class Migration(unittest.TestCase):
             bad.write_text("{")
             self.assertEqual(self.run_it(str(bad))[0], 2)
             self.assertEqual(self.run_it(str(Path(d) / "none.json"))[0], 2)
+
+    def test_entry_keys_cover_all_serve_model_options(self):
+        missing = (ENTRY_OPTIONS | MODEL_OPTIONS) - migrate.MODEL_OPTIONS
+        self.assertEqual(missing, set())
+
+    def test_migrates_gpu_reasoning_and_video_keys(self):
+        old = {
+            "server": {
+                "model": "m.basalt",
+                "host": "127.0.0.1",
+                "gpu": "0,1",
+                "gpu-mode": "peer",
+                "gpu-share": "3,1",
+                "reasoning-effort": "high",
+                "video-max-tokens": 4096,
+            },
+            "engine": {"max-context": 8192},
+        }
+        new = migrate.migrated(old)
+        self.assertEqual(new["server"], {"host": "127.0.0.1"})
+        entry = new["models"][0]
+        for k, v in (("gpu-mode", "peer"), ("gpu-share", "3,1"), ("reasoning-effort", "high"), ("video-max-tokens", 4096)):
+            self.assertEqual(entry[k], v)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "v2.json"
+            out.write_text(json.dumps(new))
+            cfg = load_config_file(str(out), build_parser())
+            self.assertEqual(len(cfg.models), 1)
+            self.assertIn("--gpu-mode", cfg.models[0].argv)
+            self.assertIn("--gpu-share", cfg.models[0].argv)
+            self.assertIn("--reasoning-effort", cfg.models[0].argv)
+            self.assertIn("--video-max-tokens", cfg.models[0].argv)
+
+    def test_refuses_non_object_sections(self):
+        for bad in ({"server": None}, {"server": {"model": "m"}, "engine": []}):
+            with self.assertRaises(ValueError):
+                migrate.migrated(bad)
 
 
 if __name__ == "__main__":

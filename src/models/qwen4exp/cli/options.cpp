@@ -117,16 +117,11 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
         return 2;
     }
     if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts || !o.serve)) {
-        basalt::log::error("basalt generate", "--peer-exclusive needs a second GPU (--gpu 0,1), --resident-experts and --serve");
+        basalt::log::error("basalt generate", "--peer-exclusive needs a second GPU (--gpu 0,1 --gpu-mode peer), --resident-experts and --serve");
         return 2;
     }
     if (o.peer_exclusive && o.peer_devices.size() > 1) {
-        basalt::log::error("basalt generate", "--peer-exclusive runs with one expert tier card (--gpu 0,1)");
-        return 2;
-    }
-    // the peer tier is the second card's only user: a layer split would put a second engine part on it
-    if (o.peer_device >= 1 && !o.layer_split.empty()) {
-        basalt::log::error("basalt generate", "--peer-device cannot be combined with --layer-split (use one or the other)");
+        basalt::log::error("basalt generate", "--peer-exclusive runs with one peer card (--gpu 0,1 --gpu-mode peer)");
         return 2;
     }
 
