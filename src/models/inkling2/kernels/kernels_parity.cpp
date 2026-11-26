@@ -2041,7 +2041,7 @@ void test_attention_window_boundary() {
 }
 
 void test_router_select_plan() {
-    std::printf("router_select_plan (rows = 1..64)\n");
+    std::printf("router_select_plan (rows = 1..%d)\n", kBatchRows);
     constexpr int H = kWidth, NE = 128, K = 8, RMAX = kBatchRows;
     const std::vector<float> x = randn((size_t) RMAX * H, 0.5f), gate = randn((size_t) NE * H, 0.05f), bias = randn(NE, 0.1f);
     std::vector<unsigned long long> table(NE);
@@ -2065,7 +2065,7 @@ void test_router_select_plan() {
     for (int r = 0; r < RMAX; ++r) bk::router_logits(dx + (size_t) r * H, dg, 1, ra, dlog1 + (size_t) r * NE, nullptr);
     const std::vector<float> ref_log = host(dlog1, RMAX * NE);
     bool ok = true;
-    for (int R : {1, 2, 7, 16, 35, 64}) {
+    for (int R : {1, 2, 7, 16, 35, 64, kBatchRows}) {
         bk::router_logits(dx, dg, R, ra, dlog, nullptr);
         const std::vector<float> got_log = host(dlog, R * NE);
         ok = ok && std::memcmp(ref_log.data(), got_log.data(), (size_t) R * NE * 4) == 0;
@@ -2089,7 +2089,7 @@ void test_router_select_plan() {
              host(rb_ref, kAheadExperts) == host(rb_got, kAheadExperts) &&
              host(rn_ref, 1) == host(rn_got, 1);
     }
-    std::printf("%-34s %s\n", "  logits + select + plan (1..64)", ok ? "bitwise" : "FAIL");
+    std::printf("%-34s %s\n", "  logits + select + plan (1..320)", ok ? "bitwise" : "FAIL");
     failures += !ok;
     cudaFree(dx); cudaFree(dg); cudaFree(db); cudaFree(dlog); cudaFree(dlog1);
     cudaFree(dw_ref); cudaFree(dw_got); cudaFree(di_ref); cudaFree(di_got);
