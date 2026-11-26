@@ -54,7 +54,7 @@ constexpr uint64_t kSessionFixed = 44 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 // a batch window's graph on the main card (its kernel nodes): a batch of slots keeps up to BatchShared::kGraphs of them,
 // instantiated as compositions come, so the plan holds them beside the KV pool
-constexpr uint64_t kBatchGraphBytes = 5 * kMiB;
+constexpr uint64_t kBatchGraphBytes = 3 * kMiB;
 uint64_t batch_graphs_bytes(int n_sess) { return n_sess > 1 ? kBatchGraphBytes * model::BatchShared::kGraphs : 0; }
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
@@ -429,13 +429,14 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t gran = core::vmm::granularity();
         // DSPARK HOOK: a session's drafter beside its own buffers, its full layers' cells in the main card's pool
         const auto own_on = [&](int c) { return session_bytes(g, want, fp8_, int8_, cut_, c) + (c == 0 && dspark_ ? dspark_session_bytes(pack_) : 0); };
-        // the least pool: one session at the whole context, and every session at once at its first granule
+        // a pool of `positions` positions of one session (its granules rounded as `round` says)
         const auto one_on = [&](int c, int64_t positions, uint64_t round) {
             return pool_bytes(g, positions, fp8_, int8_, round, cut_, c) + (c == 0 && dspark_ ? dspark_pool_bytes(pack_, positions, round) : 0);
         };
-        // with --kv-pool off every session holds the whole context: the pool is all of them at once, each backed at start
+        // the least pool: every session at its first granule (the pool takes what is left after the experts; a conversation
+        // that outgrows it waits for room or is refused); with --kv-pool off every session holds the whole context
         const auto pool_on = [&](int c) {
-            return req.kv_pool ? std::max(one_on(c, want, gran), (uint64_t) n_sess * one_on(c, 1, gran)) : (uint64_t) n_sess * one_on(c, want, gran);
+            return req.kv_pool ? (uint64_t) n_sess * one_on(c, 1, gran) : (uint64_t) n_sess * one_on(c, want, gran);
         };
         // a position's bytes in card c's pool, granules aside
         const auto per_on = [&](int c) { return one_on(c, 2, 1) - one_on(c, 1, 1); };
@@ -475,8 +476,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             cudaSetDevice(device_);
             ctx_ = want;
         } else {
-        // the experts: all on the card when they fit beside the asked context; else the least routed go to RAM, just enough
-        // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
+        // the experts: all on the card when they fit beside the slots' own buffers and the least pool; else the least routed
+        // go to RAM, just enough (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
         {
             size_t free_b = 0, total_b = 0;
             basalt::core::gpu_mem_info(&free_b, &total_b);
@@ -554,10 +555,15 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                                   cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "", n_sess, n_sess == 1 ? "" : "s",
                                   (long long) want);
             else
-                basalt::log::info("basalt inkling2", "KV pool%s: %.0f MiB, about %lld positions across the %d slot%s (one slot can reach %lld)",
+            {
+                const long long positions = (long long) (kv_pool_[c].budget() / std::max<uint64_t>(per_on(c), 1));
+                basalt::log::info("basalt inkling2",
+                                  "KV pool%s: %.0f MiB, about %lld positions across the %d slot%s (%lld a slot when all are full; one slot "
+                                  "can reach %lld)",
                                   cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "",
-                                  (double) kv_pool_[c].budget() / (double) kMiB, (long long) (kv_pool_[c].budget() / std::max<uint64_t>(per_on(c), 1)), n_sess,
-                                  n_sess == 1 ? "" : "s", (long long) want);
+                                  (double) kv_pool_[c].budget() / (double) kMiB, positions, n_sess, n_sess == 1 ? "" : "s",
+                                  positions / n_sess, std::min<long long>(positions, (long long) want));
+            }
     }
     basalt::log::info("basalt inkling2", "weights on the GPU: dense %.2f GiB, experts %.2f GiB; the embedding in host memory (%.2f GiB)",
                       (double) dense / (double) kGiB, (double) experts / (double) kGiB,
