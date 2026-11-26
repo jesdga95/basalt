@@ -107,6 +107,13 @@ struct Options : CommonOptions {
     /// The most experts one adaptive round swaps into the main card's tier; a saturated pipeline (see `kSatBoost`) may
     /// swap `kSatBoost` times as many.
     int adapt_swaps = 96;
+    /// True when the main card and every configured peer keep their expert tiers fixed.
+    bool fixed_expert_tiers() const {
+        if (adapt_every <= 0) return true;
+        const bool has_peer = peer_device >= 0 || !peer_devices.empty();
+        const int peer_swaps = peer_adapt_swaps >= 0 ? peer_adapt_swaps : adapt_swaps;
+        return adapt_swaps <= 0 && (!has_peer || peer_swaps <= 0);
+    }
     /// --serve: a text part of the prompt of at most N tokens (a chat message, the assistant header, a short tool
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)

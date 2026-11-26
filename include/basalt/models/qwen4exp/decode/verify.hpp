@@ -148,8 +148,9 @@ public:
     bool release_gpu_waits(int timeout_ms);
 
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
+    /// `fixed_tiers` enables the peer/mixed-size staging extension when adaptation is off.
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-              const NativeHead* head, int max_t, std::string& err);
+              const NativeHead* head, int max_t, bool fixed_tiers, std::string& err);
     /// The window capacity in rows given to init.  A batch planner must never build a window with more rows than this;
     /// kVerifyMaxT only bounds the graphs, not this verifier.
     int max_t() const { return max_t_; }
@@ -383,6 +384,7 @@ public:
 private:
     struct WindowRecorder;
     bool main_high_ = false;
+    bool fixed_tiers_ = false;
     PeerExperts* peer_ = nullptr;
     std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;

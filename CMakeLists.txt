@@ -199,6 +199,11 @@ if(BUILD_TESTING)
   target_include_directories(qwen4exp_kv_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(qwen4exp_kv_batch_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen4exp_kv_batch_test COMMAND qwen4exp_kv_batch_test)
+  # the peer/mixed-size staging extension runs with fixed main and peer tiers
+  add_executable(fixed_expert_tiers_test tests/models/qwen4exp/fixed_expert_tiers_test.cpp)
+  target_include_directories(fixed_expert_tiers_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fixed_expert_tiers_test PRIVATE warnings)
+  basalt_cpu_test(NAME fixed_expert_tiers_test COMMAND fixed_expert_tiers_test)
 endif()
 endif()
 

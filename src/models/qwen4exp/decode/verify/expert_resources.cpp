@@ -213,6 +213,8 @@ bool Verifier::dm_init(std::string& err) {
         stage_single = stage_single || bytes != lay.fmt[0].bytes;
         blob = std::max<int64_t>(blob, (int64_t) bytes);
     }
+    // Adaptive configurations retain their original path; the peer and mixed-size extension requires fixed tiers.
+    stage_single = stage_single && fixed_tiers_;
     const int64_t stride = dec_moe_stage_stride(blob);
     const int stage_slots =
         (int) std::min<int64_t>(kDmStageMax, (int64_t) (kStagingBlobs * (int64_t) lay.max_blob) / stride);
