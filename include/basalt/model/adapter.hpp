@@ -139,9 +139,6 @@ struct PrefillRequest {
     std::function<bool()> stop;          ///< optional: true ends the read at a chunk's end; nothing can continue from there
     int total_tokens = 0;                ///< what the whole prompt still has to read, this part included: sizes the workspaces
     bool more = false;                   ///< another part follows: the workspaces stay until end_prompt()
-    /// The tokens are a reply's own (decoded before, here read again): a model whose prompt path and decode path differ in bits
-    /// runs them as decode windows, so a reply's cells carry the bits its decode wrote whichever run reads them.
-    bool reply = false;
 };
 
 /// The merged tokens of an encoded picture or video group: `nx` across, `ny` down (0: placed as a sequence).

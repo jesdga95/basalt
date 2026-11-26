@@ -611,7 +611,7 @@ public:
         if (stale_ && r.pos > 0) return stale();
         if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
-        const bool staged = sh_->prompt && !r.reply && r.n_tokens > (m_.has_spill() ? kSpillWindowRead : kChunkRead);
+        const bool staged = sh_->prompt && r.n_tokens > (m_.has_spill() ? kSpillWindowRead : kChunkRead);
         if (heat_tally_) settle_window(r.pos);
         if (!restart_positions(r.pos == 0 ? r.n_tokens : r.pos + std::max(r.n_tokens, r.total_tokens), r.pos)) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return grow_failed(e);

@@ -772,9 +772,6 @@ Flow SessionRequest::read_to(int64_t to) {
         fold_tail = to - at;
     }
     const int64_t pre_to = to - fold_tail;
-    // The last prompt token and the ids past it (`reply=N`) were decoded by an earlier run of this request: read again,
-    // their rows stay what that decode wrote.
-    const int64_t reply_from = req_reply > 0 && req_reply < n ? req_reply - 1 : n;
     while (at < pre_to) {
         const bool image = next_block_ < blocks_.size() && blocks_[next_block_].at == at;
         basalt::model::Result r;
@@ -783,10 +780,8 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
-            int64_t end = next_block_ < blocks_.size() ? std::min(pre_to, blocks_[next_block_].at) : pre_to;
-            if (at < reply_from && end > reply_from) end = reply_from;
+            const int64_t end = next_block_ < blocks_.size() ? std::min(pre_to, blocks_[next_block_].at) : pre_to;
             basalt::model::PrefillRequest pr;
-            pr.reply = at >= reply_from;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
             pr.pos = at;
