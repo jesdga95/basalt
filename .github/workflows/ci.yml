@@ -161,7 +161,7 @@ jobs:
           -DWERROR="$WERROR"
           -DBASALT_MODELS=all
           -DBUILD_TESTING=ON
-          -DCMAKE_CUDA_ARCHITECTURES=${{ runner.arch == 'ARM64' && '121;89' || '120;89' }}
+          -DCMAKE_CUDA_ARCHITECTURES="${{ runner.arch == 'ARM64' && '121;89' || '120;89' }}"
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
