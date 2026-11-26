@@ -6,6 +6,16 @@ Implement V4 as its own registered Basalt model (`deepseek4`) with a dedicated p
 
 The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted from its source GGUF/safetensors into a Basalt pack. Its 12 sections and all 1,371 source tensors were verified against the source GGUF; every section hash and tensor hash matched. It has the 43 trunk layers, token-to-expert tensors for the first three layers, and an embedded `deepseek4v` projector. Its manifest has no MTP tensors or drafter section, so an MTP drafter is not available in this artifact. Preserving the source tensors and projector does not constitute runtime support.
 
+## Runtime layout
+
+- `Pack` owns the validated V4 geometry, named dense tensor references, per-layer expert ranges, and the embedded projector file range. `plan` places the dense working set on the primary GPU and queues the source ranges once through `LoadPlan`; the token embedding stays file-backed for row reads, and routed experts stay in the `ExpertTier` file/RAM/VRAM placement rather than being duplicated.
+- A V4 `BatchSession` owns per-slot attention state. Its `ElasticArray` cache rows retain their source position and layer schedule: sliding rows, ratio-4 CSA rows, ratio-128 HCA rows, and separate indexer rows. Chunk continuation, rewind, save/restore, and batch slots must preserve those identities. The cache builder and selected-position attention stay V4-specific; mHC mixing and compatible router/expert primitives are shared.
+- A text step expands the mHC stream, applies the layer's attention and cache update, runs V4's token/hash routing plus shared expert, then collapses the stream. Prompt chunks initially use the same single-token path for identity; a batched prefill path is admitted only after matching it. Peer mode distributes expert tiers only, with one-card identity as the reference.
+- Vision follows the V4.1 loan lifecycle but uses V4 preprocessing and N-layout. At rest, the session owns no image bytes, patch buffers, or encoder weights. On an image request it borrows expert-tier room, decodes and grows per-slot buffers, loads the embedded `deepseek4v` tower, encodes and assembles rows, then releases buffers and encoder weights in `images_done` before the tier regrows. The image token positions must reach V4's positional path; text-only hash lookup must not treat image rows as text IDs.
+- The existing `serve/models/deepseek4.py` uses the DeepSeek message encoder and shared incremental DSML parser with V4's tool-tag spelling, EOS, reasoning marker, and image placeholder. Keep that dialect model-local; C++ metadata supplies EOS, image, and pad token IDs and the joyai-llm pre-tokenizer.
+
+The staged path is registration/adapter and one-card serial decode, then token identity and KLD, then chunked prefill and persistent state, then expert-tier and peer/batch behavior, and finally request-level Vision and zero-idle-memory checks. Do not register an adapter that cannot execute the selected pack.
+
 ## Model path
 
 1. Validate and describe `general.architecture=deepseek4` metadata, including geometry, compression schedule, MoE routing, tokenizer, context and multimodal fields.
