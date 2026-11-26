@@ -132,6 +132,10 @@ Flow Request::complete() {
             slot_init(sl);
             sl.x = x;
             sl.p = p;
+            if (defer_read >= 0) {   // the slot reads the rest of the prompt in its windows, then takes the turn checkpoint
+                sl.pend.assign(ids32.begin() + defer_read + 1, ids32.begin() + n);
+                sl.pend_check = part_checkpoint(n - 1);
+            }
             sl.produced = in_slot ? 0 : 1;
             sl.max_new = runtime_.admit_max_new;
             sl.t0 = Clock::now();

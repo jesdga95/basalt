@@ -317,27 +317,9 @@ public:
         if (o.prompt_cache <= 0 || to < 1) return true;
         ckd_finish();   // the save before this one lands first; one that failed has left the chain
         if (touch_check(to, source)) return true;
+        const std::vector<int32_t> ids(prompt.begin(), prompt.begin() + to);
         ConvCheckpoint c;
-        c.source = source;
-        c.ids.assign(prompt.begin(), prompt.begin() + to);
-        c.imgs = imgs_below(req_imgs, to);
-        basalt::core::RunningState rs;
-        if (const basalt::model::Result r = session().running_state(to, true, rs); !r.ok()) {
-            err = r.message;
-            return false;
-        }
-        c.state_a.resize(rs.bytes());
-        std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
-        // the state is snapshotted on the device now and moves to the host while the request goes on (each card's part on
-        // its own device)
-        const std::vector<basalt::core::SaveSegment> seg{{c.state_a.data() + rs.head.size(), rs.regions}};
-        if (!ckd.save(seg, (cudaStream_t) rs.stream, c.state_a.data(), err)) return false;
-        if (!rs.peer_regions.empty()) {
-            const basalt::core::OnDevice on(rs.peer_device);
-            ckd_peer_dev = rs.peer_device;
-            const std::vector<basalt::core::SaveSegment> ps{{c.state_a.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
-            if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, c.state_a.data(), err)) return false;
-        }
+        if (!capture_check(session(), to, source, ids.data(), imgs_below(req_imgs, to), c)) return false;
         keep_check(std::move(c));
         return true;
     }
@@ -761,6 +743,7 @@ private:
         return Flow::proceed;
     }
     Flow read_to(int64_t to) override;
+    Flow read_windows(int64_t to, int fw);
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
     // a slot's prompt lookup history: the conversation, then the token its first window feeds
     void slot_init(BSlot& sl) override {
@@ -949,18 +932,22 @@ Flow SessionRequest::prepare_image() {
     return Flow::proceed;
 }
 
-// Positions at..to: text through the model's prompt path, pictures as rows, then the checkpoint of a turn or root part.
+// Positions at..to: text through the model's prompt path, or a short part before the last token as decode windows,
+// pictures as rows, then the checkpoint of a turn or root part.
 Flow SessionRequest::read_to(int64_t to) {
     if (at == read_from)
         for (next_block_ = 0; next_block_ < blocks_.size() && blocks_[next_block_].at < at;) ++next_block_;
-    int64_t fold_tail = 0;
     const int fw = rt_.session().prompt_fold_window();
-    if (fw > 1 && to == n - 1 && !part_checkpoint(to) && next_block_ >= blocks_.size() && (!in_slot || solo_req) &&
-        ppl == nullptr && to > at && to - at < fw) {
-        fold_tail = to - at;
+    if (fw > 1 && to == n - 1 && to > at && to - at <= kWindowReadMax && next_block_ >= blocks_.size() && ppl == nullptr) {
+        if (in_slot && !solo_req) {   // the slot reads it in the batch windows, its turn checkpoint after them
+            defer_read = at;
+            fold_p0 = at;
+            at = to;
+            return Flow::proceed;
+        }
+        if (const Flow flow = read_windows(to, fw); flow != Flow::proceed) return flow;
     }
-    const int64_t pre_to = to - fold_tail;
-    while (at < pre_to) {
+    while (at < to) {
         const bool image = next_block_ < blocks_.size() && blocks_[next_block_].at == at;
         basalt::model::Result r;
         if (image) {
@@ -968,7 +955,7 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
-            const int64_t end = next_block_ < blocks_.size() ? std::min(pre_to, blocks_[next_block_].at) : pre_to;
+            const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
             basalt::model::PrefillRequest pr;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
@@ -1008,14 +995,37 @@ Flow SessionRequest::read_to(int64_t to) {
         runtime_.pp_reached = std::max(runtime_.pp_reached, at);
         progress_line("PP", at);
     }
-    if (fold_tail > 0) {
-        fold_p0 = pre_to;
-        at = to;
-    }
     if (part_checkpoint(to) &&
         !rt_.checkpoint_at(to, to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd, ids)) {
         std::printf("ERR saving a conversation checkpoint failed: %s\n", runtime_.err.c_str());
         return Flow::error;
+    }
+    return Flow::proceed;
+}
+
+// Positions at..to as decode windows of up to `fw` rows, every row a prompt token: the rows a batch slot reads for the
+// same prompt (BSlot::pend), so the cells are the same either way.
+Flow SessionRequest::read_windows(int64_t to, int fw) {
+    int32_t pick = 0;
+    basalt::model::ModelSession* s = &rt_.session();
+    while (at < to) {
+        int keep = (int) std::min<int64_t>(fw, to - at);
+        basalt::model::DecodeRequest d;
+        d.tokens = ids32.data() + at;
+        d.n_tokens = keep;
+        d.pos = at;
+        d.next_token = &pick;
+        basalt::model::Result r = s->decode_window(d);
+        if (r.ok()) r = s->decode_kept(&s, &keep, 1);
+        if (!r.ok()) {
+            basalt::log::error("basalt serve", "%s", r.message.c_str());
+            std::printf("ERR %s\n", r.message.c_str());
+            return Flow::error;
+        }
+        at += keep;
+        runtime_.pp_reached = std::max(runtime_.pp_reached, at);
+        progress_line("PP", at);
+        if (runtime_.halted()) { cancelled = true; return Flow::quit; }
     }
     return Flow::proceed;
 }

@@ -117,6 +117,12 @@ protected:
     bool part_checkpoint(int64_t to) const { return to == turn_at || to == root_at || to == media_at; }
     int64_t at{};
     int64_t fold_p0{};
+    /// A batch admission's short prompt part that its slot reads in the batch windows (BSlot::pend): its first position,
+    /// or -1 (read here)
+    int64_t defer_read{-1};
+    /// A text part this short before the prompt's last token is read as decode windows (both the solo request and a batch
+    /// slot, so their replies are the same): many slots' prompts then share one pass over the weights.
+    static constexpr int64_t kWindowReadMax = 64;
     double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
     /// The prompt, with the ids a held conversation wrote standing for the tokens that spell the same bytes.

@@ -203,6 +203,12 @@ public:
     /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache, and past the pool
     /// (check_pool) the least recently used one of every chain.
     void keep_check(ConvCheckpoint&& c);
+    /// Session `s`'s running state at `to` (the conversation `ids[0..to)`, its pictures `imgs`) into `c`: snapshotted on
+    /// the device now, it moves to the host while the work goes on (ckd).
+    bool capture_check(basalt::model::ModelSession& s, int64_t to, ConvCheckpoint::Source source, const int32_t* ids,
+                       std::vector<ImgKey> imgs, ConvCheckpoint& c);
+    /// Past the pool (check_pool), the least recently used checkpoint of every chain goes.
+    void trim_check_pool();
     /// The checkpoints every chain holds together: the pool --checkpoint-pool-mib fits (conv_cache::pool_checkpoints),
     /// set by the runtime once it knows a checkpoint's bytes.
     size_t check_pool{};
@@ -314,11 +320,18 @@ public:
         int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
+        // a short prompt the slot reads in its windows (Request::defer_read): the prompt tokens after `x`, fed as forced
+        // rows, then the turn checkpoint at the prompt's last token when `pend_check`
+        std::vector<int32_t> pend;
+        bool pend_check = false;
     };
     std::vector<BSlot> bs{};
     // ---- --batch: the slots' rounds (batch_round.cpp), the same for every model
     /// The session slot `b` decodes in.
     virtual basalt::model::ModelSession& slot_session(int b) = 0;
+    /// Slot `b`'s running state at its position, as its conversation's turn checkpoint (a prompt it read in its windows):
+    /// the slot keeps it and its shortest one, as an admission leaves it (select_slot_checkpoints).
+    bool slot_turn_checkpoint(int b);
     /// False while active slot `b` sits out the next round (its model cannot run its window yet); it keeps its place.
     virtual bool slot_ready(int b) { (void) b; return true; }
     /// One window of every ready active slot: the windows share batch_rows() rows, each group runs as one batch

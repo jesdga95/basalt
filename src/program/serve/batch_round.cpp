@@ -29,6 +29,7 @@ struct SlotWin {
     int want = 0;
     bool drafting = false;
     bool solo = true;
+    bool reading = false;    // the rows are prompt tokens the slot reads (BSlot::pend)
 };
 
 // The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, or as its drafter's
@@ -36,6 +37,23 @@ struct SlotWin {
 void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
     BSlot& sl = bs[(size_t) b];
     basalt::model::ModelSession& s = slot_session(b);
+    w.reading = !sl.pend.empty();
+    if (w.reading) {   // forced rows as the solo request reads them (SessionRequest::read_windows): the anchor and the next ones
+        w.T = (int) std::min<int64_t>((int64_t) s.max_window(), (int64_t) sl.pend.size());
+        w.from_sfx = false;
+        w.match = 0;
+        w.win.assign((size_t) w.T, 0);
+        w.out.assign((size_t) w.T, -1);
+        w.win[0] = sl.x;
+        std::copy(sl.pend.begin(), sl.pend.begin() + (w.T - 1), w.win.begin() + 1);
+        w.history.clear();
+        w.d = {};
+        w.d.tokens = w.win.data();
+        w.d.n_tokens = w.T;
+        w.d.pos = sl.p;
+        w.d.next_token = &w.out[(size_t) w.T - 1];
+        return;
+    }
     const int own_limit = s.window_limit(sl.p);
     const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit,
                                               own_limit > 0 ? (int64_t) own_limit : INT64_MAX});
@@ -100,6 +118,23 @@ bool Runtime::slot_window_finish(int b, SlotWin& w) {
 
 // The window's accepted drafts, grammar, logprobs and tokens; the rows it keeps (w.kept); whether drafts follow (w.want).
 bool Runtime::slot_window_accept(int b, SlotWin& w) {
+    if (w.reading) {   // every row stays; the slot's next token is the prompt's next one
+        BSlot& sl = bs[(size_t) b];
+        const int T = w.T;
+        sl.ids.insert(sl.ids.end(), w.win.begin(), w.win.end());
+        if (sl.sfx)
+            for (int i = 0; i < T; ++i) sl.sfx->append(sl.pend[(size_t) i]);
+        sl.p += T;
+        sl.x = sl.pend[(size_t) T - 1];
+        sl.pend.erase(sl.pend.begin(), sl.pend.begin() + T);
+        w.kept = T;
+        w.a = 0;
+        w.line.clear();
+        w.fin = nullptr;
+        w.want = 0;
+        w.drafting = false;
+        return true;
+    }
     std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
     bool grammar_dead = false;    // the grammar allowed no token: the slot ends as an error after this window
     const auto failed = [&](const std::string& m) {
@@ -184,6 +219,13 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
     basalt::model::ModelSession& s = slot_session(b);
     const int T = w.T, a = w.a;
     const char* fin = w.fin;
+    if (w.reading) {   // the prompt read: its turn checkpoint, as the solo request takes it
+        if (sl.pend.empty() && sl.pend_check && !slot_turn_checkpoint(b)) {
+            std::printf("ERR saving a conversation checkpoint failed: %s\n", err.c_str());
+            return false;
+        }
+        return true;
+    }
     basalt::protocol::emit_text(w.line + "\n");
     basalt::core::progress_beat();
     if (w.drafting) {

@@ -59,6 +59,11 @@ With more slots than rows each may take the cap and the windows are packed first
 one for batch windows, whose rounds cost differently. A runtime may hold a slot out of a round (`slot_ready`, Flash-Next's
 elastic KV beside a prompt read); it keeps its place.
 
+A short text part before a prompt's last token (`Request::kWindowReadMax`, a model with `prompt_fold_window` above 1) is
+read as decode windows of forced rows: a batch admission leaves it to its slot (`BSlot::pend`), whose windows run in the
+rounds beside the other slots' (many prompts share one pass over the weights) and take the turn checkpoint after the last
+one; a solo request reads the same windows itself (`read_windows`), so its cells and reply are the same.
+
 ## Shared code and what a model provides
 
 Shared code never names a model (`tools/check_model_layering.sh`).
@@ -284,7 +289,7 @@ rows.
   prompts: `--parallel 1` is unchanged.
 - **Serve identity** (`tools/batch_identity.py`): each prompt first in a one-slot engine (`--batch 1`), then in an engine
   with `--batch N` alone in slot 0 and all together, one per slot; every slot's tokens must equal the one-slot run's, greedy,
-  at 2, 4 and 8 slots.
+  at 2, 4 and 8 slots; `--prompt-tokens N` cuts the prompts short, so they take the windowed read.
 - **Throughput:** the same tool's aggregate tokens per second (every slot's tokens over the wall time from the first slot's
   start to the last one's end) at 1, 2, 4 and 8 slots, drafting on and with `--spec 1`, main against the branch, the bench
   fixtures (conv, struct, prose). Labelled with the cards and power (400 W RTX 5090, 180 W RTX 5060 Ti). Main's numbers are
