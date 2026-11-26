@@ -42,6 +42,10 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
   experts by the shipped routing profile `data/profiles/hy4flash-42x512.prof`, so the first request after a start finds the
   most routed ones resident. The early layers route more widely and get more of the main card's copies (layers 0 to 3 about
   1.4 times the mean, the quietest 0.73), the same total.
+- **Experts beyond RAM:** when RAM cannot take every expert (the start warns `N experts on SSD`), the least routed stay in the
+  pack. Decode reads the ones a token routes to into the RAM tier and the CPU computes them there; a prompt chunk reads its
+  file experts through two pinned buffers of 16 blobs straight to the card, one buffer filling while the other's copies run.
+  A long prompt rereads them every chunk, so it reads slower than with every expert in RAM.
 - **Copies give way by use:** an expert that earns a main card slot takes the one whose expert was looked up least lately (every
   lookup counts, up to 15; the counts halve every 256 tokens and start again with each prompt), the one used longest ago among
   equals. An expert that recurs every few tokens keeps its copy through runs of experts that come once, and the experts of an
