@@ -3245,17 +3245,36 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 #include "nvfp4_grouped_mma.cuh"
 
 namespace {
-__global__ void __launch_bounds__(256, 1) native_gu_nvfp4_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                                     const int32_t* __restrict__ grp_start,
-                                                                     const int32_t* __restrict__ n_groups,
-                                                                     const int32_t* __restrict__ ent_tok,
-                                                                     const block_q8_1* __restrict__ xq,
-                                                                     NativeExpertLayout L,
-                                                                     float* __restrict__ gate,
-                                                                     float* __restrict__ up) {
+// The NVFP4 and MXFP8 grouped experts at 2304 x 1152 on persistent grids. CT 2 (chunks of 16 entries): gate/up a block an
+// SM (each holds the whole register file), down two. CT 1 (chunks of 8, half the activation registers), for calls of
+// fewer than kStreamWide entries: gate/up two blocks an SM as well. An entry's arithmetic is the same in both. NVFP4 runs
+// CT 2 from kStreamWide entries (the per-tile kernels are as fast below, with the same bits); MXFP8 at every row count.
+constexpr int64_t kStreamWide = 160;
+template<int TY, int CT>
+__global__ void __launch_bounds__(256, CT == 1 ? 2 : 1) native_gu_stream_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                                const int32_t* __restrict__ grp_start,
+                                                                                const int32_t* __restrict__ n_groups,
+                                                                                const int32_t* __restrict__ ent_tok,
+                                                                                const block_q8_1* __restrict__ xq,
+                                                                                NativeExpertLayout L,
+                                                                                float* __restrict__ gate,
+                                                                                float* __restrict__ up) {
     extern __shared__ __align__(128) uint8_t gu_smem[];
-    expert_stream_stage<40, 2304, true, false>((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, gu_smem, grp_ptr, grp_start,
-                                               n_groups, ent_tok, xq, L, gate, up);
+    expert_stream_stage<TY, 2304, true, false, CT>((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, gu_smem, grp_ptr,
+                                                   grp_start, n_groups, ent_tok, xq, L, gate, up);
+}
+
+template<int TY, bool DEP, int CT>
+__global__ void __launch_bounds__(256, 2) native_down_stream_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                    const int32_t* __restrict__ grp_start,
+                                                                    const int32_t* __restrict__ n_groups,
+                                                                    const int32_t* __restrict__ ent_dst,
+                                                                    const block_q8_1* __restrict__ hq,
+                                                                    NativeExpertLayout L,
+                                                                    float* __restrict__ out) {
+    extern __shared__ __align__(128) uint8_t dn_smem[];
+    expert_stream_stage<TY, 1152, false, DEP, CT>((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, dn_smem, grp_ptr,
+                                                  grp_start, n_groups, ent_dst, hq, L, out, nullptr);
 }
 
 // The SMs of the current device: the persistent grids take as many blocks as fit on every one.
@@ -3267,68 +3286,53 @@ int sm_count() {
     return sms[dev];
 }
 
-// The persistent gate/up grid: a block an SM (each holds the whole register file).
-int gu_nvfp4_mma_blocks() {
-    static bool set[64] = {};
-    int dev = 0;
-    cudaGetDevice(&dev);
-    if (!set[dev]) set[dev] = cudaFuncSetAttribute(native_gu_nvfp4_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                   (int) kGuSmemBytes) == cudaSuccess;
-    return sm_count();
+// The shared memory the stream grids take beyond 48 KB, set once a device for every instantiation.
+template<int TY, int CT>
+bool stream_smem_one() {
+    return cudaFuncSetAttribute(native_gu_stream_kernel<TY, CT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) kNvSmemBytes<TY, 2304, true, CT>) == cudaSuccess &&
+           cudaFuncSetAttribute(native_down_stream_kernel<TY, true, CT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) kNvSmemBytes<TY, 1152, false, CT>) == cudaSuccess &&
+           cudaFuncSetAttribute(native_down_stream_kernel<TY, false, CT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) kNvSmemBytes<TY, 1152, false, CT>) == cudaSuccess;
 }
-
-template<bool DEP = false>
-__global__ void __launch_bounds__(256, 2) native_down_nvfp4_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                                       const int32_t* __restrict__ grp_start,
-                                                                       const int32_t* __restrict__ n_groups,
-                                                                       const int32_t* __restrict__ ent_dst,
-                                                                       const block_q8_1* __restrict__ hq,
-                                                                       NativeExpertLayout L,
-                                                                       float* __restrict__ out) {
-    extern __shared__ __align__(128) uint8_t dn_smem[];
-    expert_stream_stage<40, 1152, false, DEP>((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, dn_smem, grp_ptr, grp_start,
-                                              n_groups, ent_dst, hq, L, out, nullptr);
-}
-
-// The persistent down grid: two blocks an SM (each holds half the register file).
-int down_nvfp4_mma_blocks() { return 2 * sm_count(); }
-
-// MXFP8 experts on the same persistent grids: gate/up a block an SM, down two.
-__global__ void __launch_bounds__(256, 1) native_gu_mxfp8_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                                     const int32_t* __restrict__ grp_start,
-                                                                     const int32_t* __restrict__ n_groups,
-                                                                     const int32_t* __restrict__ ent_tok,
-                                                                     const block_q8_1* __restrict__ xq,
-                                                                     NativeExpertLayout L,
-                                                                     float* __restrict__ gate,
-                                                                     float* __restrict__ up) {
-    extern __shared__ __align__(128) uint8_t gu_smem[];
-    expert_stream_stage<46, 2304, true, false>((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, gu_smem, grp_ptr, grp_start,
-                                               n_groups, ent_tok, xq, L, gate, up);
-}
-
-template<bool DEP = false>
-__global__ void __launch_bounds__(256, 2) native_down_mxfp8_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                                       const int32_t* __restrict__ grp_start,
-                                                                       const int32_t* __restrict__ n_groups,
-                                                                       const int32_t* __restrict__ ent_dst,
-                                                                       const block_q8_1* __restrict__ hq,
-                                                                       NativeExpertLayout L,
-                                                                       float* __restrict__ out) {
-    extern __shared__ __align__(128) uint8_t dn_smem[];
-    expert_stream_stage<46, 1152, false, DEP>((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, dn_smem, grp_ptr, grp_start,
-                                              n_groups, ent_dst, hq, L, out, nullptr);
-}
-
-// The shared memory the MXFP8 grids take beyond 48 KB, set once a device.
-void mxfp8_mma_smem() {
+void stream_smem() {
     static bool set[64] = {};
     int dev = 0;
     cudaGetDevice(&dev);
     if (set[dev]) return;
-    set[dev] = cudaFuncSetAttribute(native_gu_mxfp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMxGuSmemBytes) == cudaSuccess &&
-               cudaFuncSetAttribute(native_down_mxfp8_mma_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMxDnSmemBytes) == cudaSuccess &&
-               cudaFuncSetAttribute(native_down_mxfp8_mma_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMxDnSmemBytes) == cudaSuccess;
+    set[dev] = stream_smem_one<40, 2>() && stream_smem_one<46, 1>() && stream_smem_one<46, 2>();
+}
+
+template<int TY, int CT>
+void launch_gu_stream(cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                      const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L, float* gate, float* up) {
+    stream_smem();
+    native_gu_stream_kernel<TY, CT><<<(CT == 1 ? 2 : 1) * sm_count(), 256, kNvSmemBytes<TY, 2304, true, CT>, s>>>(
+        grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+}
+template<int TY, int CT>
+void launch_down_stream(cudaStream_t s, bool chain, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                        const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
+                        float* out) {
+    stream_smem();
+    const dim3 gm((unsigned) (2 * sm_count()));
+    constexpr size_t smem = kNvSmemBytes<TY, 1152, false, CT>;
+    if (chain) launch_dependent_smem(native_down_stream_kernel<TY, true, CT>, gm, smem, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else native_down_stream_kernel<TY, false, CT><<<gm, 256, smem, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+}
+template<int TY>
+void gu_stream(int64_t cap_entries, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+               const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L, float* gate,
+               float* up) {
+    if (cap_entries < kStreamWide) launch_gu_stream<TY, 1>(s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    else launch_gu_stream<TY, 2>(s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+}
+template<int TY>
+void down_stream(int64_t cap_entries, cudaStream_t s, bool chain, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                 const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
+    if (cap_entries < kStreamWide) launch_down_stream<TY, 1>(s, chain, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else launch_down_stream<TY, 2>(s, chain, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
 }  // namespace
 
@@ -3579,13 +3583,11 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
 #undef GU_MIX_CASE
             default: basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d", L.gu_type, L.up_type); std::exit(1);
         }
-    } else if (!v1 && !g_old_kernels && L.gu_type == 40 && cap_entries >= 160 && cap_groups <= kNvMaxGroups && L.n_embd == 2304 &&
-               L.n_ff % 16 == 0) {
-        native_gu_nvfp4_mma_kernel<<<gu_nvfp4_mma_blocks(), 256, kGuSmemBytes, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L,
-                                                                                   gate, up);
+    } else if (!v1 && !g_old_kernels && L.gu_type == 40 && cap_entries >= kStreamWide && cap_groups <= kNvMaxGroups &&
+               L.n_embd == 2304 && L.n_ff % 16 == 0) {
+        launch_gu_stream<40, 2>(s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     } else if (!v1 && !g_old_kernels && L.gu_type == 46 && cap_groups <= kNvMaxGroups && L.n_embd == 2304 && L.n_ff % 16 == 0) {
-        mxfp8_mma_smem();   // every row count: the MXFP8 bits are this kernel's
-        native_gu_mxfp8_mma_kernel<<<sm_count(), 256, kMxGuSmemBytes, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        gu_stream<46>(cap_entries, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);   // every row count: its bits
     } else
     switch (L.gu_type) {
 #define GU_CASE(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1); break;
@@ -3626,16 +3628,11 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     if (g_exp_phase == 1) return;
     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
-    if (!v1 && !g_old_kernels && L.d_type == 40 && cap_entries >= 160 && cap_groups <= kNvMaxGroups && L.n_ff == 1152 &&
+    if (!v1 && !g_old_kernels && L.d_type == 40 && cap_entries >= kStreamWide && cap_groups <= kNvMaxGroups && L.n_ff == 1152 &&
         L.n_embd % 32 == 0) {
-        const dim3 gm((unsigned) down_nvfp4_mma_blocks());
-        if (chain) launch_dependent_smem(native_down_nvfp4_mma_kernel<true>, gm, kDnSmemBytes, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        else native_down_nvfp4_mma_kernel<false><<<gm, 256, kDnSmemBytes, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        launch_down_stream<40, 2>(s, chain, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else if (!v1 && !g_old_kernels && L.d_type == 46 && cap_groups <= kNvMaxGroups && L.n_ff == 1152 && L.n_embd % 16 == 0) {
-        mxfp8_mma_smem();
-        const dim3 gm((unsigned) (2 * sm_count()));
-        if (chain) launch_dependent_smem(native_down_mxfp8_mma_kernel<true>, gm, kMxDnSmemBytes, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        else native_down_mxfp8_mma_kernel<false><<<gm, 256, kMxDnSmemBytes, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        down_stream<46>(cap_entries, s, chain, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);   // every row count: its bits
     } else switch (L.d_type) {
 #define DOWN_CASE(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, chain); break;
         D_FMTS(DOWN_CASE)

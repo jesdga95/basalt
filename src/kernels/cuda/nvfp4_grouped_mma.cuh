@@ -7,8 +7,7 @@
 
 namespace {
 
-constexpr int kFastMoeCols = 16;
-constexpr int kFastMoeCTiles = kFastMoeCols / 8;
+// CT: the column tiles of 8 entries a thread holds activations for (a chunk of a group's entries is 8 CT of them)
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ uint32_t nvfp4_frag_s8(const block_nvfp4* b, int iqs, int t) {
@@ -30,7 +29,7 @@ __device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1
 // The stages stream the experts' weights: the work is (group, 16-row tile of its gate and up rows, or of its down
 // rows), group-major, and a block takes one contiguous run of it (the runs split it evenly), so it reads its weights as one
 // stream. The tiles come into shared memory as bulk copies, NS in flight, the next one past them requested into L2. A
-// thread holds the activation words and scales its k steps meet, for up to 16 of a group's entries, in registers: read once
+// thread holds the activation words and scales its k steps meet, for up to 8 CT of a group's entries, in registers: read once
 // for all the group's tiles of the run. Each warp multiplies the tile's 16 rows against them over its share of K on
 // mma.m16n8k16, and the block adds the warps' sums in row_dot_sub8's tree order: the arithmetic and its order are the
 // per-tile stage's, on the same bytes, so every NVFP4 entry's bits are v1's at any row count. MXFP8 runs the same frame
@@ -43,11 +42,8 @@ template<int TY, int K> constexpr int kNvTileBytes = kNvSubRows * kNvRowBytes<TY
 template<bool GU> constexpr int kNvStages = GU ? 2 : 3;
 template<int K> constexpr int kNvSteps = K / 128;
 template<int K> constexpr int kMxSteps = (K / 32 + 7) / 8;
-template<int TY, int K, bool GU> constexpr size_t kNvSmemBytes = (size_t) kNvStages<GU> * kNvTileBytes<TY, K> + (size_t) kFastMoeCols * kNvSubRows * 9 * 4;
-constexpr size_t kGuSmemBytes = kNvSmemBytes<40, 2304, true>;
-constexpr size_t kDnSmemBytes = kNvSmemBytes<40, 1152, false>;
-constexpr size_t kMxGuSmemBytes = kNvSmemBytes<46, 2304, true>;
-constexpr size_t kMxDnSmemBytes = kNvSmemBytes<46, 1152, false>;
+template<int TY, int K, bool GU, int CT>
+constexpr size_t kNvSmemBytes = (size_t) kNvStages<GU> * kNvTileBytes<TY, K> + (size_t) 8 * CT * kNvSubRows * 9 * 4;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 __device__ __forceinline__ unsigned gu_su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
@@ -67,21 +63,21 @@ __device__ __forceinline__ void tile_prefetch(const uint8_t* src, unsigned bytes
 }
 #endif
 
-// A thread's activations for a chunk of up to 16 entries: per column tile ct and step j, the word of entry 8 ct + g it
+// A thread's activations for a chunk of up to 8 CT entries: per column tile ct and step j, the word of entry 8 ct + g it
 // gives the B fragment and the scales of entries 8 ct + 2 t and + 1 (0 past the chunk).
-template<int K>
+template<int K, int CT>
 struct NvCols {
-    uint32_t b[kFastMoeCTiles][kNvSteps<K>];
-    float d0[kFastMoeCTiles][kNvSteps<K>], d1[kFastMoeCTiles][kNvSteps<K>];
+    uint32_t b[CT][kNvSteps<K>];
+    float d0[CT][kNvSteps<K>], d1[CT][kNvSteps<K>];
 };
-template<int K, bool GU>
-__device__ __forceinline__ void nv_cols_load(NvCols<K>& x, const block_q8_1* __restrict__ xq, const int32_t* __restrict__ ent, int e,
+template<int K, bool GU, int CT>
+__device__ __forceinline__ void nv_cols_load(NvCols<K, CT>& x, const block_q8_1* __restrict__ xq, const int32_t* __restrict__ ent, int e,
                                              int ne, int wp, int g, int t) {
     const auto entry = [&](int c) {
         return reinterpret_cast<const uint32_t*>(xq + (GU ? (size_t) ent[e + c] : (size_t) (e + c)) * (K / 32));
     };
 #pragma unroll
-    for (int ct = 0; ct < kFastMoeCTiles; ++ct) {
+    for (int ct = 0; ct < CT; ++ct) {
         const int cg = 8 * ct + g, c0 = 8 * ct + 2 * t, c1 = c0 + 1;
         const uint32_t* xg = cg < ne ? entry(cg) : nullptr;
         const uint32_t* x0 = c0 < ne ? entry(c0) : nullptr;
@@ -96,11 +92,11 @@ __device__ __forceinline__ void nv_cols_load(NvCols<K>& x, const block_q8_1* __r
     }
 }
 
-// A warp's sums of a tile's rows g and g + 8 (wra, wrb) against CT column tiles of x: step j is k = wp + 8 j, summed in
+// A warp's sums of a tile's rows g and g + 8 (wra, wrb) against the first CU column tiles of x: step j is k = wp + 8 j, summed in
 // acc[.][j % 4] (the per-tile stage's k = wp + 8 s + 32 m).
-template<int K, int CT>
-__device__ __forceinline__ void nv_tile_mma(const uint8_t* wra, const uint8_t* wrb, const NvCols<K>& x, int wp, int t,
-                                            float (&acc)[kFastMoeCTiles][4][4]) {
+template<int K, int CU, int CT>
+__device__ __forceinline__ void nv_tile_mma(const uint8_t* wra, const uint8_t* wrb, const NvCols<K, CT>& x, int wp, int t,
+                                            float (&acc)[CT][4][4]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll
     for (int j = 0; j < kNvSteps<K>; ++j) {
@@ -111,7 +107,7 @@ __device__ __forceinline__ void nv_tile_mma(const uint8_t* wra, const uint8_t* w
         const uint32_t a0 = nvfp4_frag_s8(ba, iqs, t), a1 = nvfp4_frag_s8(bb, iqs, t);
         const float d4a = nvfp4_scale_dev(ba->d[iqs]), d4b = nvfp4_scale_dev(bb->d[iqs]);
 #pragma unroll
-        for (int ct = 0; ct < CT; ++ct) {
+        for (int ct = 0; ct < CU; ++ct) {
             const float d8_0 = x.d0[ct][j], d8_1 = x.d1[ct][j];
             int si[4];
             mma_s8_k16(si, a0, a1, x.b[ct][j]);
@@ -126,27 +122,27 @@ __device__ __forceinline__ void nv_tile_mma(const uint8_t* wra, const uint8_t* w
 #endif
 }
 
-// MXFP8: a thread's activations for a chunk of up to 16 entries, as f16 (an int8 is exact in f16). In block u = wp + 8 j
+// MXFP8: a thread's activations for a chunk of up to 8 CT entries, as f16 (an int8 is exact in f16). In block u = wp + 8 j
 // the thread's k positions are 4 t .. 4 t + 3 (the first k16 MMA) and 16 + 4 t .. 16 + 4 t + 3 (the second), a permutation
 // of each MMA's k that the weights share: b[ct][j] holds entry 8 ct + g's {4 t, 4 t + 1}, {4 t + 2, 4 t + 3}, then the same
 // 16 on, and d0 / d1 the scales of entries 8 ct + 2 t and + 1 (0 past the chunk or past K).
-template<int K>
+template<int K, int CT>
 struct MxCols {
-    uint32_t b[kFastMoeCTiles][kMxSteps<K>][4];
-    float d0[kFastMoeCTiles][kMxSteps<K>], d1[kFastMoeCTiles][kMxSteps<K>];
+    uint32_t b[CT][kMxSteps<K>][4];
+    float d0[CT][kMxSteps<K>], d1[CT][kMxSteps<K>];
 };
 __device__ __forceinline__ uint32_t s8x2_half2(uint32_t w) {
     const __half2 h = __halves2half2(__short2half_rn((short) (int8_t) (w & 0xFFu)), __short2half_rn((short) (int8_t) (w >> 8)));
     return *reinterpret_cast<const uint32_t*>(&h);
 }
-template<int K, bool GU>
-__device__ __forceinline__ void mx_cols_load(MxCols<K>& x, const block_q8_1* __restrict__ xq, const int32_t* __restrict__ ent, int e,
+template<int K, bool GU, int CT>
+__device__ __forceinline__ void mx_cols_load(MxCols<K, CT>& x, const block_q8_1* __restrict__ xq, const int32_t* __restrict__ ent, int e,
                                              int ne, int wp, int g, int t) {
     const auto entry = [&](int c) {
         return reinterpret_cast<const uint32_t*>(xq + (GU ? (size_t) ent[e + c] : (size_t) (e + c)) * (K / 32));
     };
 #pragma unroll
-    for (int ct = 0; ct < kFastMoeCTiles; ++ct) {
+    for (int ct = 0; ct < CT; ++ct) {
         const int cg = 8 * ct + g, c0 = 8 * ct + 2 * t, c1 = c0 + 1;
         const uint32_t* xg = cg < ne ? entry(cg) : nullptr;
         const uint32_t* x0 = c0 < ne ? entry(c0) : nullptr;
@@ -179,11 +175,11 @@ __device__ __forceinline__ uint32_t e4m3x2_half2(uint32_t w) {
 }
 #endif
 
-// A warp's sums of a tile's rows g and g + 8 (wra, wrb: MXFP8 rows) against CT column tiles of x: block u = wp + 8 j is two
+// A warp's sums of a tile's rows g and g + 8 (wra, wrb: MXFP8 rows) against the first CU column tiles of x: block u = wp + 8 j is two
 // k16 MMAs from zero (its E4M3 x int8 products), then acc[.][j % 4] += (d_x * d_w) * that, d_w the block's UE8M0 scale.
-template<int K, int CT>
-__device__ __forceinline__ void mx_tile_mma(const uint8_t* wra, const uint8_t* wrb, const MxCols<K>& x, int wp, int t,
-                                            float (&acc)[kFastMoeCTiles][4][4]) {
+template<int K, int CU, int CT>
+__device__ __forceinline__ void mx_tile_mma(const uint8_t* wra, const uint8_t* wrb, const MxCols<K, CT>& x, int wp, int t,
+                                            float (&acc)[CT][4][4]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll
     for (int j = 0; j < kMxSteps<K>; ++j) {
@@ -201,7 +197,7 @@ __device__ __forceinline__ void mx_tile_mma(const uint8_t* wra, const uint8_t* w
         const float dwa = ue8m0_scale_dev(ba[u & 3]), dwb = ue8m0_scale_dev(bb[u & 3]);
         constexpr float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-        for (int ct = 0; ct < CT; ++ct) {
+        for (int ct = 0; ct < CU; ++ct) {
             float c[4];
             mma_f16_k16(c, a0, x.b[ct][j][0], x.b[ct][j][1], kZero);
             mma_f16_k16(c, a1, x.b[ct][j][2], x.b[ct][j][3], c);
@@ -221,10 +217,10 @@ constexpr int kNvMaxGroups = 256;
 
 // TY: 40 NVFP4 or 46 MXFP8. GU: gate/up (K = n_embd 2304, rows 2 n_ff, entries' tokens `ent`, out0 gate and out1 up [entry][n_ff]); else down (K =
 // n_ff 1152, rows n_embd, entries' destinations `ent`, out0 [dest][n_embd]). DEP: a programmatic dependent, its weights
-// requested before the wait (they and the plan are ready before the kernel before it starts). A group of more than 16
-// entries runs as one per 16 of them (chunk-major), each streaming the group's weights again, so a thread's activations
+// requested before the wait (they and the plan are ready before the kernel before it starts). A group of more than 8 CT
+// entries runs as one per 8 CT of them (chunk-major), each streaming the group's weights again, so a thread's activations
 // change only when its run reaches another chunk.
-template<int TY, int K, bool GU, bool DEP>
+template<int TY, int K, bool GU, bool DEP, int CT>
 __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int tid, uint8_t* smem,
                                                    const unsigned long long* __restrict__ grp_ptr,
                                                    const int32_t* __restrict__ grp_start,
@@ -237,14 +233,15 @@ __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int t
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     constexpr int RB = kNvRowBytes<TY, K>, TB = kNvTileBytes<TY, K>, NS = kNvStages<GU>;
     if constexpr (!DEP) pdl_launch_dependents();
-    __shared__ int s_pre[kNvMaxGroups + 1];   // the work items before each group: nx a chunk of 16 entries
+    constexpr int C = 8 * CT;
+    __shared__ int s_pre[kNvMaxGroups + 1];   // the work items before each group: nx a chunk of C entries
     __shared__ int s_wsum[8];
     __shared__ __align__(8) unsigned long long bar[NS];
     const int ng = *n_groups;
     const int nx = (GU ? 2 * (int) L.n_ff : (int) L.n_embd) / kNvSubRows;
     const int wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     {   // the exclusive prefix of the groups' items, one group a thread
-        int v = tid < ng ? (grp_start[tid + 1] - grp_start[tid] + kFastMoeCols - 1) / kFastMoeCols * nx : 0;
+        int v = tid < ng ? (grp_start[tid + 1] - grp_start[tid] + C - 1) / C * nx : 0;
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
             const int u = __shfl_up_sync(0xffffffffu, v, o);
@@ -266,7 +263,7 @@ __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int t
     const auto locate = [&](int i, int& gi, int& e, int& row0) {
         while (i >= s_pre[gi + 1]) ++gi;
         const int u = i - s_pre[gi], c = u / nx;
-        e = grp_start[gi] + c * kFastMoeCols;
+        e = grp_start[gi] + c * C;
         row0 = (u - c * nx) * kNvSubRows;
     };
     const auto src = [&](int gi, int row0) {
@@ -300,7 +297,7 @@ __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int t
     }
     if (i0 >= i1) return;
     __syncthreads();   // the barriers' init seen
-    std::conditional_t<TY == 40, NvCols<K>, MxCols<K>> x;
+    std::conditional_t<TY == 40, NvCols<K, CT>, MxCols<K, CT>> x;
     int held_e = -1, gi = 0;
     for (int i = i0, k = 0; i < i1; ++i, ++k) {
         int e, row0;
@@ -309,26 +306,26 @@ __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int t
         const int r0 = is_up ? row0 - (int) L.n_ff : row0;
         float* dst = is_up ? out1 : out0;
         const float sc = TY == 40 ? nvfp4_tail((const void*) grp_ptr[gi], L)[GU ? (is_up ? 1 : 0) : 2] : 1.0f;
-        const int ne = min(kFastMoeCols, grp_start[gi + 1] - e);
+        const int ne = min(C, grp_start[gi + 1] - e);
         if (held_e != e) {   // entries are each one group's, so the first entry names the chunk
-            if constexpr (TY == 40) nv_cols_load<K, GU>(x, xq, ent, e, ne, wp, g, t);
-            else mx_cols_load<K, GU>(x, xq, ent, e, ne, wp, g, t);
+            if constexpr (TY == 40) nv_cols_load<K, GU, CT>(x, xq, ent, e, ne, wp, g, t);
+            else mx_cols_load<K, GU, CT>(x, xq, ent, e, ne, wp, g, t);
             held_e = e;
         }
         uint8_t* tile = smem + (k % NS) * TB;
         const uint8_t* wra = tile + (size_t) g * RB;
         const uint8_t* wrb = wra + 8 * RB;
         gu_mb_wait(&bar[k % NS], (unsigned) (k / NS) & 1u);
-        float acc[kFastMoeCTiles][4][4] = {};
+        float acc[CT][4][4] = {};
         if constexpr (TY == 40) {
-            if (ne <= 8) nv_tile_mma<K, 1>(wra, wrb, x, wp, t, acc);
-            else nv_tile_mma<K, 2>(wra, wrb, x, wp, t, acc);
+            if (CT == 1 || ne <= 8) nv_tile_mma<K, 1, CT>(wra, wrb, x, wp, t, acc);
+            else nv_tile_mma<K, CT, CT>(wra, wrb, x, wp, t, acc);
         } else {
-            if (ne <= 8) mx_tile_mma<K, 1>(wra, wrb, x, wp, t, acc);
-            else mx_tile_mma<K, 2>(wra, wrb, x, wp, t, acc);
+            if (CT == 1 || ne <= 8) mx_tile_mma<K, 1, CT>(wra, wrb, x, wp, t, acc);
+            else mx_tile_mma<K, CT, CT>(wra, wrb, x, wp, t, acc);
         }
 #pragma unroll
-        for (int ct = 0; ct < kFastMoeCTiles; ++ct) {
+        for (int ct = 0; ct < CT; ++ct) {
             if (8 * ct >= ne) break;
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
