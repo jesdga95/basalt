@@ -2,6 +2,7 @@
 #include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -91,8 +92,8 @@ __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.com
 // Shared chunk rows hold the pool's fp16, int8 or packed Q4_0 data. Only int8 stages separate scales.
 template <int KV_MODE> struct ChunkSmem {
     static constexpr int Q4_ROW = (HD / QK4_0) * sizeof(block_q4_0);
-    static constexpr int ROW = KV_MODE == 0 ? HD * 2 : KV_MODE == 5 ? Q4_ROW : HD;
-    static constexpr int NS = KV_MODE == 5 ? 1 : NSC;
+    static constexpr int ROW = KV_MODE == 0 ? HD * 2 : (KV_MODE == 5 || KV_MODE == 6) ? Q4_ROW : HD;
+    static constexpr int NS = (KV_MODE == 5 || KV_MODE == 6) ? 1 : NSC;
     alignas(16) unsigned char k[CHUNK][ROW];
     alignas(16) unsigned char v[CHUNK][ROW];
     alignas(16) uint16_t ks[CHUNK][NS];
@@ -131,17 +132,27 @@ __device__ __forceinline__ void k8_from(const ChunkSmem<KV_MODE>& sm, int c, int
             out[2 * j] = f.x;
             out[2 * j + 1] = f.y;
         }
-    } else if constexpr (KV_MODE == 5) {
+    } else if constexpr (KV_MODE == 5 || KV_MODE == 6) {
         const auto* block = sm.k[c] + (d0 / QK4_0) * sizeof(block_q4_0);
-        const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(block)));
+        const uint16_t d_bits = *reinterpret_cast<const uint16_t*>(block);
         const auto* code = reinterpret_cast<const uint16_t*>(block + sizeof(uint16_t) + (d0 & 15));
         const int shift = d0 & (QK4_0 / 2) ? 4 : 0;
         const uint32_t lo = ((uint32_t) code[0] | ((uint32_t) code[1] << 16)) >> shift;
         const uint32_t hi = ((uint32_t) code[2] | ((uint32_t) code[3] << 16)) >> shift;
+        if constexpr (KV_MODE == 6) {
+            const float sc = kv4_e4m3_value(shift ? (d_bits >> 8) : (d_bits & 0xffu)) * 16384.0f;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int nibble = ((j < 4 ? lo : hi) >> (8 * (j & 3))) & 15;
-            out[j] = (float) (nibble - 8) * sc;
+            for (int j = 0; j < 8; ++j) {
+                const uint32_t nibble = ((j < 4 ? lo : hi) >> (8 * (j & 3))) & 15u;
+                out[j] = kv4_e2m1_value14(nibble) * sc;
+            }
+        } else {
+            const float sc = __half2float(__ushort_as_half(d_bits));
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int nibble = ((j < 4 ? lo : hi) >> (8 * (j & 3))) & 15;
+                out[j] = (float) (nibble - 8) * sc;
+            }
         }
     } else {
         const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / KV_Q8_GROUP]));
@@ -191,11 +202,11 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     __syncthreads();
     {
         const unsigned char* kb = KV_MODE == 0 ? (const unsigned char*) pools.k_pool
-                               : KV_MODE == 5 ? (const unsigned char*) pools.k_q4
-                                              : (const unsigned char*) pools.k_q;
+                               : (KV_MODE == 5 || KV_MODE == 6) ? (const unsigned char*) pools.k_q4
+                                                                : (const unsigned char*) pools.k_q;
         const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) pools.v_pool
-                               : KV_MODE == 5 ? (const unsigned char*) pools.v_q4
-                                              : (const unsigned char*) pools.v_q;
+                               : (KV_MODE == 5 || KV_MODE == 6) ? (const unsigned char*) pools.v_q4
+                                                                : (const unsigned char*) pools.v_q;
         for (int i = t; i < CHUNK * PER; i += THREADS) {
             const int c = i / PER, j = i % PER;
             const long long r = sm.row[c];
@@ -292,7 +303,7 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     // A Q4_0 thread reads both nibbles of the same byte.
     if (t >= HD / 2) return;
     constexpr int Q4_BYTES = QK4_0 / 2;
-    const int d = KV_MODE == 5 ? (t / Q4_BYTES) * QK4_0 + t % Q4_BYTES : 2 * t;
+    const int d = (KV_MODE == 5 || KV_MODE == 6) ? (t / Q4_BYTES) * QK4_0 + t % Q4_BYTES : 2 * t;
     float acc[G][2];
 #pragma unroll
     for (int i = 0; i < G; ++i) acc[i][0] = acc[i][1] = 0.0f;
@@ -302,12 +313,20 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         if constexpr (KV_MODE == 0) {
             const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&sm.v[c][t * 4]));
             v0 = f.x; v1 = f.y;
-        } else if constexpr (KV_MODE == 5) {
+        } else if constexpr (KV_MODE == 5 || KV_MODE == 6) {
             const auto* block = sm.v[c] + (t / Q4_BYTES) * sizeof(block_q4_0);
-            const float sc = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(block)));
+            const uint16_t d_bits = *reinterpret_cast<const uint16_t*>(block);
             const uint8_t bits = block[sizeof(uint16_t) + t % Q4_BYTES];
-            v0 = (float) ((int) (bits & 15) - 8) * sc;
-            v1 = (float) ((int) (bits >> 4) - 8) * sc;
+            if constexpr (KV_MODE == 6) {
+                const float sc0 = kv4_e4m3_value(d_bits & 0xffu) * 16384.0f;
+                const float sc1 = kv4_e4m3_value(d_bits >> 8) * 16384.0f;
+                v0 = kv4_e2m1_value14(bits & 15u) * sc0;
+                v1 = kv4_e2m1_value14(bits >> 4) * sc1;
+            } else {
+                const float sc = __half2float(__ushort_as_half(d_bits));
+                v0 = (float) ((int) (bits & 15) - 8) * sc;
+                v1 = (float) ((int) (bits >> 4) - 8) * sc;
+            }
         } else {
             const float sc = __half2float(__ushort_as_half(sm.vs[c][t / (KV_Q8_GROUP / 2)]));
             const ushort raw = *reinterpret_cast<const ushort*>(&sm.v[c][t * 2]);
@@ -327,7 +346,7 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
 #pragma unroll
     for (int i = 0; i < G; ++i) {
         float* out = &part_acc[((size_t) slot * G + i) * HD + d];
-        if constexpr (KV_MODE == 5) {
+        if constexpr (KV_MODE == 5 || KV_MODE == 6) {
             out[0] = acc[i][0];
             out[Q4_BYTES] = acc[i][1];
         } else {
@@ -721,9 +740,9 @@ __global__ void __launch_bounds__(THREADS) attn_merge_v2(AttnArgs a) {
 
 bool a16(const void* p) { return ((uintptr_t) p & 15) == 0; }
 int kv_mode_of(const QsaAttnPools& p) {
-    if (p.k_q4 != nullptr || p.v_q4 != nullptr)   // --kv q4_0: packed blocks, staged into the int8 rows (mode 5)
+    if (p.k_q4 != nullptr || p.v_q4 != nullptr)   // --kv q4_0 / nvfp4: packed blocks, staged into the int8 rows (mode 5/6)
         return (p.k_q4 != nullptr && p.v_q4 != nullptr && a16(p.k_q4) && a16(p.v_q4) &&
-                ((uintptr_t) p.k_q4 & 7) == 0) ? 5 : -1;
+                ((uintptr_t) p.k_q4 & 7) == 0) ? (p.kv_fp4 ? 6 : 5) : -1;
     if (p.k_q != nullptr)
         return (p.v_q != nullptr && p.k_scale != nullptr && p.v_scale != nullptr && a16(p.k_q) && a16(p.v_q) &&
                 ((uintptr_t) p.k_scale & 7) == 0 && ((uintptr_t) p.v_scale & 7) == 0) ? 1 : -1;
@@ -768,7 +787,11 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     cudaStream_t st = (cudaStream_t) stream;
     a.xq = a.attn_gated != nullptr ? xq : nullptr;
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    if (mode == 5) {   // Q4_0 stores rotated keys, so the unrotated draft path never uses it.
+    if (mode == 6) {   // NVFP4 stores rotated keys, so the unrotated draft path never uses it.
+        constexpr size_t bytes = sizeof(ChunkSmem<6>);
+        opt_in<6>(attn_chunk_v2<6, false>, bytes);
+        launch_pdl(attn_chunk_v2<6, false>, grid, dim3(THREADS), bytes, st, a);
+    } else if (mode == 5) {   // Q4_0 stores rotated keys, so the unrotated draft path never uses it.
         constexpr size_t bytes = sizeof(ChunkSmem<5>);
         opt_in<5>(attn_chunk_v2<5, false>, bytes);
         launch_pdl(attn_chunk_v2<5, false>, grid, dim3(THREADS), bytes, st, a);

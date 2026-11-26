@@ -44,17 +44,17 @@ inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fw
 /// and to VRAM only if its block is resident.
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host = nullptr);
+                       const KvHostPools* host = nullptr, bool fp4 = false);
 
 /// The prompt path: T consecutive (rotated) cells from pos0, K/V [T, n_head_kv, 256]; also into `stage` (identity
 /// layout, the one-layer staging pool of a streamed session) when given.
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
                   const float* V, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr,
-                  const KvHostPools* stage = nullptr);
+                  const KvHostPools* stage = nullptr, bool fp4 = false);
 
 /// Gather step[kStepWidth] cells named by `ids` into FP16 scratch [id][kv_head][head_dim] (still rotated).
 void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* page_table, const int32_t* ids,
                        const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,
-                       uint16_t* v_scratch, void* stream);
+                       uint16_t* v_scratch, void* stream, bool fp4 = false);
 
 }  // namespace basalt::kernels

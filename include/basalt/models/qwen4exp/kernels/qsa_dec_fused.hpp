@@ -29,6 +29,7 @@ struct QsaDecKvPost {
     /// q4_0 K/V (`--kv q4_0`): non-null switches the append from INT8 to packed Q4_0 after the rotation, in the
     /// same launch. Mode 0 only (the streaming copy keeps the per-token path).
     uint8_t *k_q4 = nullptr, *v_q4 = nullptr;
+    bool kv_fp4 = false;                ///< when k_q4/v_q4 are non-null: NVFP4 (E2M1 + E4M3/16) instead of Q4_0
     const int32_t* page_table = nullptr;
     KvHostPools host;                   ///< the host copy, when the cache streams
     const float* idx_raw = nullptr;     ///< [n][idx_dim] raw indexer keys; null: no indexer (a dense layer)

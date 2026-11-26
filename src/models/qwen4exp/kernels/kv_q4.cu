@@ -2,6 +2,7 @@
 // (with KV-streaming integration and a deterministic group maximum).
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
 
 #include <cuda_fp16.h>
@@ -91,6 +92,20 @@ __device__ __forceinline__ uint16_t q4_group(float x, int lane, uint8_t& byte) {
     return f16_from_f32(d);
 }
 
+// Two 16-value NVFP4 groups packed into one 18-byte block_q4_0 slot: d = d0 | (d1 << 8) (E4M3 scale bytes),
+// qs[j] = code(j) | (code(j + 16) << 4) (E2M1 nibbles).
+__device__ __forceinline__ uint16_t fp4_group(float x, int lane, uint8_t& byte) {
+    const float amax = kv4_amax16(x);
+    const uint32_t sc_byte = kv4_group_scale(amax);
+    const float s = kv4_e4m3_value(sc_byte);
+    const uint32_t qc = kv4_group_code(x, s);
+    const uint32_t qhi = __shfl_down_sync(0xffffffffu, qc, 16);
+    byte = (uint8_t) (qc | (qhi << 4));
+    const uint32_t d1 = __shfl_down_sync(0xffffffffu, sc_byte, 16);
+    (void) lane;
+    return (uint16_t) (sc_byte | (d1 << 8));
+}
+
 __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, int lane, uint16_t d, uint8_t byte) {
     block_q4_0* blk = reinterpret_cast<block_q4_0*>(pool + row * (long long) sizeof(block_q4_0) * 8) + b;
     if (lane == 0) blk->d = d;
@@ -99,6 +114,7 @@ __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, in
 
 // One block = one 32-value group of one KV head of K (blockIdx.z = 0) or V (1); 32 threads. KV streaming: the VRAM
 // page only if the block is resident (table >= 0), the host copy always (identity layout) when there is one.
+template <bool FP4>
 __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                     const float* __restrict__ kcur, const float* __restrict__ vcur,
@@ -108,7 +124,7 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
     const bool is_v = blockIdx.z == 1;
     const float x = (is_v ? vcur : kcur)[h * head_dim + b * QK4_0 + t];
     uint8_t byte;
-    const uint16_t d = q4_group(x, t, byte);
+    const uint16_t d = FP4 ? fp4_group(x, t, byte) : q4_group(x, t, byte);
     const long long page = (long long) table[pos / page_size];
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, t, d, byte);
     if (host.k_q4 != nullptr)
@@ -117,6 +133,7 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
 }
 
 // The prompt path: grid (T, kv_heads, groups), K then V; also into the staging pool (identity layout) when given.
+template <bool FP4>
 __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
                                           const int32_t* __restrict__ table, int64_t pos0,
                                           const float* __restrict__ K, const float* __restrict__ V,
@@ -128,7 +145,7 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
     const bool is_v = is_v_grid != 0;
     const float x = (is_v ? V : K)[t * (kv_heads * head_dim) + h * head_dim + b * QK4_0 + th];
     uint8_t byte;
-    const uint16_t d = q4_group(x, th, byte);
+    const uint16_t d = FP4 ? fp4_group(x, th, byte) : q4_group(x, th, byte);
     const long long page = (long long) table[pos / page_size];
     const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, th, d, byte);
@@ -137,6 +154,7 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
 }
 
 // Gather step[kStepWidth] cells into FP16 scratch (the non-fused attention paths)
+template <bool FP4>
 __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint8_t* __restrict__ v_q4,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
                                     const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
@@ -161,16 +179,25 @@ __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint
 
     const block_q4_0* k_blk = reinterpret_cast<const block_q4_0*>(k_q4 + row * bytes_per_head) + b;
     const block_q4_0* v_blk = reinterpret_cast<const block_q4_0*>(v_q4 + row * bytes_per_head) + b;
-    const float kd = f32_from_f16(k_blk->d);
-    const float vd = f32_from_f16(v_blk->d);
     const int j = t < 16 ? t : (t - 16);
     const uint8_t k_byte = k_blk->qs[j];
     const uint8_t v_byte = v_blk->qs[j];
-    const int kq = (t < 16) ? ((k_byte & 0x0F) - 8) : ((k_byte >> 4) - 8);
-    const int vq = (t < 16) ? ((v_byte & 0x0F) - 8) : ((v_byte >> 4) - 8);
     const long long dst_offset = ((id * kv_heads + h) * head_dim) + (b * QK4_0 + t);
-    k_scratch[dst_offset] = f16_from_f32((float) kq * kd);
-    v_scratch[dst_offset] = f16_from_f32((float) vq * vd);
+    if constexpr (FP4) {
+        const float kd = kv4_e4m3_value(t < 16 ? (k_blk->d & 0xffu) : (k_blk->d >> 8)) * 16384.0f;
+        const float vd = kv4_e4m3_value(t < 16 ? (v_blk->d & 0xffu) : (v_blk->d >> 8)) * 16384.0f;
+        const uint32_t kq = t < 16 ? (k_byte & 0x0Fu) : (k_byte >> 4);
+        const uint32_t vq = t < 16 ? (v_byte & 0x0Fu) : (v_byte >> 4);
+        k_scratch[dst_offset] = f16_from_f32(kv4_e2m1_value14(kq) * kd);
+        v_scratch[dst_offset] = f16_from_f32(kv4_e2m1_value14(vq) * vd);
+    } else {
+        const float kd = f32_from_f16(k_blk->d);
+        const float vd = f32_from_f16(v_blk->d);
+        const int kq = (t < 16) ? ((k_byte & 0x0F) - 8) : ((k_byte >> 4) - 8);
+        const int vq = (t < 16) ? ((v_byte & 0x0F) - 8) : ((v_byte >> 4) - 8);
+        k_scratch[dst_offset] = f16_from_f32((float) kq * kd);
+        v_scratch[dst_offset] = f16_from_f32((float) vq * vd);
+    }
 }
 
 void need_256(const QsaShapes& s, const char* what) {
@@ -193,39 +220,54 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
 
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host) {
+                       const KvHostPools* host, bool fp4) {
     need_256(s, "kv_append_q4");
     const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0), 2);
-    kv_append_q4_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
-        k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
-        host ? *host : KvHostPools{});
+    const KvHostPools h = host ? *host : KvHostPools{};
+    if (fp4)
+        kv_append_q4_kernel<true><<<grid, 32, 0, (cudaStream_t) stream>>>(
+            k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, h);
+    else
+        kv_append_q4_kernel<false><<<grid, 32, 0, (cudaStream_t) stream>>>(
+            k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, h);
     check("kv_append_q4 launch");
 }
 
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
-                  const float* V, const QsaShapes& s, void* stream, const KvHostPools* host, const KvHostPools* stage) {
+                  const float* V, const QsaShapes& s, void* stream, const KvHostPools* host, const KvHostPools* stage,
+                  bool fp4) {
     if (T <= 0) return;
     need_256(s, "kv_append_q4");
     const dim3 grid((unsigned) T, (unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0));
     cudaStream_t cs = (cudaStream_t) stream;
     const KvHostPools h = host ? *host : KvHostPools{}, st = stage ? *stage : KvHostPools{};
-    for (int is_v = 0; is_v < 2; ++is_v)
-        kv_append_q4_batch_kernel<<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, pos0, K, V, (int) s.n_head_kv,
-                                                       (int) s.head_dim, (int) s.page_size, is_v, h, st);
+    for (int is_v = 0; is_v < 2; ++is_v) {
+        if (fp4)
+            kv_append_q4_batch_kernel<true><<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, pos0, K, V, (int) s.n_head_kv,
+                                                                 (int) s.head_dim, (int) s.page_size, is_v, h, st);
+        else
+            kv_append_q4_batch_kernel<false><<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, pos0, K, V, (int) s.n_head_kv,
+                                                                  (int) s.head_dim, (int) s.page_size, is_v, h, st);
+    }
     check("kv_append_q4 batch launch");
 }
 
 void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* page_table, const int32_t* ids,
                        const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,
-                       uint16_t* v_scratch, void* stream) {
+                       uint16_t* v_scratch, void* stream, bool fp4) {
     if (max_ids <= 0) return;
     const int blocks_per_head = (int) (s.head_dim / QK4_0);
     const int64_t total_blocks = max_ids * s.n_head_kv * blocks_per_head;
     const int rows_per_block = 4;
     const unsigned num_blocks = (unsigned) ((total_blocks + rows_per_block - 1) / rows_per_block);
-    kv_gather_q4_kernel<<<dim3(num_blocks), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
-        k_q4, v_q4, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, k_scratch,
-        v_scratch);
+    if (fp4)
+        kv_gather_q4_kernel<true><<<dim3(num_blocks), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
+            k_q4, v_q4, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, k_scratch,
+            v_scratch);
+    else
+        kv_gather_q4_kernel<false><<<dim3(num_blocks), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
+            k_q4, v_q4, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, k_scratch,
+            v_scratch);
     check("kv_gather_q4 launch");
 }
 

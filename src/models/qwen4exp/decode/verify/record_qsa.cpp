@@ -59,7 +59,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         kp.kcur = v_.kcur_; kp.vcur = v_.vcur_; kp.pos_k = pos_k;
         kp.k_norm = (const float*) wkn->data; kp.steps = v_.step_;
         kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
-        if (st.kv_q4) { kp.k_q4 = st.k_q4; kp.v_q4 = st.v_q4; }
+        if (st.kv_q4) { kp.k_q4 = st.k_q4; kp.v_q4 = st.v_q4; kp.kv_fp4 = st.kv_fp4; }
         kp.page_table = st.page_table; kp.host = st.host;
         kp.idx_raw = idx_raw; kp.idx_k_norm = (const float*) wikn->data;
         kp.tail = st.idx_tail; kp.dead = st.idx_dead; kp.pooled = st.idx_pooled; kp.block_pos = st.idx_block_pos;
@@ -190,7 +190,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
                                   v_.vcur_ + t * NKV * HD, s, cs, nullptr);
             } else if (st.kv_q4)
                 kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
-                                  v_.vcur_ + t * NKV * HD, s, cs, &st.host);
+                                  v_.vcur_ + t * NKV * HD, s, cs, &st.host, st.kv_fp4);
             else if (st.kv_int8)
                 kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
                                   v_.kcur_ + t * NKV * HD, v_.vcur_ + t * NKV * HD, s, cs, &st.host);
