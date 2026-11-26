@@ -53,6 +53,7 @@ public:
     }
 
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
+    int max_slots() const override { return kMaxWindow; }   // one row each of a window
     program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }   // peer: experts by layer block
     const char* model_name() const override { return "Hy4-flash"; }
 

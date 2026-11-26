@@ -369,6 +369,9 @@ public:
     virtual const char* community_quant() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
+    /// The most parallel slots (--batch) the model batches: each slot's window takes at least one row of a batch window. A
+    /// start asking for more is refused.
+    virtual int max_slots() const = 0;
     /// What the model runs with several cards: the most cards each mode takes, 0 for a mode it does not run.
     virtual program::GpuModes gpu_modes() const = 0;
     virtual TokenNames token_names() const = 0;

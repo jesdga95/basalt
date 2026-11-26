@@ -150,6 +150,10 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         basalt::log::warn("basalt", "RAM guard off (--ram-reserve-mib 0): low RAM can stop the engine or the machine");
     if (adapter != nullptr)
         if (const std::optional<int> code = adapter->finish_flags(o)) return code;
+    if (adapter != nullptr && o.batch > adapter->max_slots()) {
+        basalt::log::error("basalt", "--batch %d: %s batches at most %d slots", o.batch, adapter->arch(), adapter->max_slots());
+        return 2;
+    }
     if (!o.lossy.empty()) {
         basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
         for (const auto& f : o.lossy) basalt::log::warn("basalt", "%s", f.effect.c_str());

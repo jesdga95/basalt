@@ -26,6 +26,7 @@ struct DevTensor {
 
 /// The most second cards whose expert tiers a start uses (gpu-mode peer takes no more cards than the main card and these).
 constexpr int kMaxSecondCards = 3;
+constexpr int kMaxWindow = 8;   // rows of a decode window, and of one expert group
 constexpr int64_t kDefaultContext = 8192;
 constexpr uint64_t kExpertLendSegment = 256ull << 20;
 
