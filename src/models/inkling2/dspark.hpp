@@ -56,6 +56,10 @@ class Context;
 
 namespace basalt::models::inkling2 {
 
+class Dflash2Weights;
+class Dflash2Hook;
+class Dflash2Batch;
+
 constexpr int kDsMaxLayers = 4;
 
 struct DsparkLayer {
@@ -72,6 +76,7 @@ struct DsparkLayer {
 /// The drafter's weights on the main card, and what it shares with the target.
 class DsparkWeights {
 public:
+    DsparkWeights();
     ~DsparkWeights();
     /// After the start's reads have landed: the recurrence's projection split, the head folds made from the target's
     /// Q8_0 head (`head`, n_vocab rows), and the target's embedding (BF16 rows, device-readable) and embedding norm noted.
@@ -82,6 +87,8 @@ public:
     DsparkGeometry geo;
     int n_vocab = 0;
     float logit_softcap = 30.f;
+    float target_eps = 1e-6f;
+    std::unique_ptr<Dflash2Weights> df2;
     std::vector<DsparkLayer> layer;
     float *norm = nullptr, *mask = nullptr, *markov_norm = nullptr, *rnn_b = nullptr, *out_b = nullptr;
     float* alpha = nullptr;              ///< softmax(fuse_weight) [kDsMixes][kDsTargets]
@@ -135,6 +142,7 @@ class DsparkBatch;
 /// forwards. Without a drafter every call does nothing and draft_begin says the model has none.
 class DsparkHook {
 public:
+    DsparkHook();
     ~DsparkHook();
     /// `w` null: no drafter. `context` the session's positions; `tap_rows` the most rows one forward fills the tap with.
     /// `dump` (--diag-dump's directory, may be empty): every committed run's features and the first blocks' outputs (their
@@ -143,7 +151,7 @@ public:
     /// back only the cells of the first `backed` positions (and a block past them), growing with the target's (ensure).
     bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
               int64_t backed, std::string& err);
-    bool on() const { return w_ != nullptr; }
+    bool on() const { return w_ != nullptr || df2_ != nullptr; }
     bool dumping() const { return dump_ != nullptr; }
     /// The tap slot visit `visit` fills with its input rows, or -1.
     int slot_of_visit(int visit) const;
@@ -153,10 +161,7 @@ public:
     /// back.
     float* tap_base() const { return tap_; }
     int tap_rows() const { return tap_rows_; }
-    void use_tap(float* tap, int rows) {
-        tap_ = tap;
-        tap_rows_ = rows;
-    }
+    void use_tap(float* tap, int rows);
     /// Caller-owned chunk buffers reused by commit_prompt() (no extra device allocation).
     struct PromptScratch {
         float* mix = nullptr;         ///< [3][rows][kWidth]
@@ -179,14 +184,15 @@ public:
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed& need, void* stream);
     /// Conversations: the sliding-window layers' rings are running state, the full layers' cells go with the target's.
     size_t running_bytes() const;
-    void running_regions(core::RunningState& st) const;
+    void running_state(int64_t pos, bool save, core::RunningState& st) const;
+    bool running_restored(int64_t pos, const uint8_t* head);
     size_t cells_bytes(int64_t positions) const;
     /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
     /// positions and a block past them; trim gives back what lies past them.
     uint64_t grow_bytes(int64_t positions) const;
     bool ensure(int64_t positions, std::string& err);
     void trim(int64_t positions);
-    int64_t backed_cells() const { return backed_cells_; }
+    int64_t backed_cells() const;
     bool usable() const {
         for (const auto& a : full_)
             if (!a->usable()) return false;
@@ -219,6 +225,7 @@ private:
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
+    std::unique_ptr<Dflash2Hook> df2_;
     std::vector<void*> allocs_, pinned_;
     uint8_t* slab_ptr_ = nullptr;
     size_t slab_rem_ = 0;
@@ -273,9 +280,10 @@ private:
 /// Shared multi-session DSpark scratch for batched commit_batch (inside target decode_batch) and draft_batch.
 class DsparkBatch {
 public:
+    DsparkBatch();
     ~DsparkBatch();
     bool init(const DsparkWeights* w, int max_sessions, int max_rows, int tap_rows, float* tap, int64_t context, std::string& err);
-    bool on() const { return w_ != nullptr; }
+    bool on() const { return w_ != nullptr || df2_ != nullptr; }
     void commit(DsparkHook* const* hooks, int n_seg, const basalt::kernels::WindowSegs* at_d, const int32_t* pos_d, int rows,
                 void* stream);
     model::Result draft(DsparkHook* const* hooks, const int32_t* anchors, const int64_t* pos, const int* n, int count,
@@ -285,6 +293,7 @@ public:
 private:
     void* dev(size_t bytes, bool& ok);
     const DsparkWeights* w_ = nullptr;
+    std::unique_ptr<Dflash2Batch> df2_;
     std::vector<void*> allocs_, pinned_;
     int max_sessions_ = 0, max_rows_ = 0, tap_rows_ = 0;
     int64_t att_cells_ = 0;

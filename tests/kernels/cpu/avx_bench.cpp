@@ -165,9 +165,13 @@ int main(int argc, char** argv) {
         ops.push_back({"NVFP4 gate/up", "avx512", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_512_gu_rows(b, row, up, NH, 1.f, 1.f, {}, p0, NT, ff, r0, r1); }, bytes});
         ops.push_back({"NVFP4 gate/up", "avx2", bytes, NFF, tr(ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)), bytes});
         ops.push_back({"NVFP4 gate/up", "avx2 mt", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_256_gu_rows_base(b, row, up, NH, 1.f, 1.f, {}, p0, NT, ff, r0, r1); }, bytes});
+        if (cpu::cpu_avxvnni_ok())
+            ops.push_back({"NVFP4 gate/up", "vnni mt", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_256_gu_rows_dpbusd(b, row, up, NH, 1.f, 1.f, {}, p0, NT, ff, r0, r1); }, bytes});
         if (cpu::cpu_avxvnni_int8_ok())
             ops.push_back({"NVFP4 gate/up", "vnni8 mt", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_256_gu_rows_vnni(b, row, up, NH, 1.f, 1.f, {}, p0, NT, ff, r0, r1); }, bytes});
         ops.push_back({"NVFP4 down", "avx2 mt", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_256_down_rows_base(b, drow, NFF, 1.f, ph0, NT, out, r0, r1); }, dbytes});
+        if (cpu::cpu_avxvnni_ok())
+            ops.push_back({"NVFP4 down", "vnni mt", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_256_down_rows_dpbusd(b, drow, NFF, 1.f, ph0, NT, out, r0, r1); }, dbytes});
         if (cpu::cpu_avxvnni_int8_ok())
             ops.push_back({"NVFP4 down", "vnni8 mt", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_256_down_rows_vnni(b, drow, NFF, 1.f, ph0, NT, out, r0, r1); }, dbytes});
         ops.push_back({"NVFP4 down", "avx512", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_512_down_rows(b, drow, NFF, 1.f, ph0, NT, out, r0, r1); }, dbytes});

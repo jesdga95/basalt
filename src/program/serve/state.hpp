@@ -315,6 +315,8 @@ public:
     bool slot_window_finish(int b, SlotWin& w);
     bool slot_window_accept(int b, SlotWin& w);
     bool slot_window_end(int b, SlotWin& w);
+    /// Active slot `b`'s request ends with finish `fin` (BDONE); the slot keeps its conversation for the next turn.
+    void end_slot(int b, const char* fin);
     // ---- idle conversations out of VRAM.  An idle conversation (a cached batch slot's, or the solo session's while
     // no request works there) keeps its KV in VRAM until the work beside it has run kParkAfterBusy seconds: the
     // expert-cache slots its cells hold have then cost that work about what moving it out and back costs, both

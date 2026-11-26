@@ -1,5 +1,6 @@
 // src/kernels/cpu/nvfp4_avx2_vnni.cpp - nvfp4_avx2_rows.inc built for AVX-VNNI-INT8: the same rows, the signed int8
-// products summed directly into int32 by `vpdpbssd`.  Only called behind cpu_avxvnni_int8_ok().
+// products summed directly into int32 by `vpdpbssd`.  Only called behind cpu_avxvnni_int8_ok(); a CPU with AVX-VNNI
+// only gets nvfp4_avx2_dpbusd.cpp's build.
 
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 
@@ -14,6 +15,6 @@
 #include <cstring>
 
 #define BASALT_NVFP4_VNNI_INT8 1
+#define BASALT_NVFP4_VNNI 0
 #define BASALT_NVFP4_EXPORT(name) name##_vnni
 #include "nvfp4_avx2_rows.inc"
-

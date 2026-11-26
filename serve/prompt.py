@@ -10,6 +10,7 @@ from serve.engine.errors import split_err
 
 
 CTX_SLACK = 8               # the engine rejects prompt + max_new + 8 > context
+REPLY_KEY = "_reply"        # sampling key: the prompt's token count where the reply this request continues begins
 
 
 def room_error(n: int, ctx: int) -> ValueError:
