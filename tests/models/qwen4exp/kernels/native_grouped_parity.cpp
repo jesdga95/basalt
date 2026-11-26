@@ -228,8 +228,8 @@ struct Setup {
         ck(cudaMemcpy(tok, tk_v.data(), tk_v.size() * 4, cudaMemcpyHostToDevice), "tok");
         return ng;
     }
-    void call(int64_t grid_groups, cudaStream_t s) {
-        k::native_expert_grouped(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s, grid_groups);
+    void call(int64_t grid_groups, cudaStream_t s) {   // the groups at most as the engines bound them: the entries, or the experts
+        k::native_expert_grouped(L, ptr, start, n, dst, tok, std::min(cap, n_blobs), cap, xq, scr, out, s, grid_groups);
     }
     // `out` after one call from the NaN pattern, the scratch holding `junk` (what earlier calls left there)
     std::vector<uint32_t> result(bool v1, int64_t grid_groups, int junk, cudaStream_t s) {
@@ -415,7 +415,7 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
 // experts each, so about 128 * (1 - (120/128)^R) groups a call. 12 layers' own copies of the experts (the calls cycle
 // through them, so the weights stream from DRAM), the call's output checked bitwise against v1, then the 48 calls
 // timed against v1 in a graph, alternating as in --bench. Prints the weight bytes a call reads and the rate.
-void bench_wide(cudaStream_t s, std::mt19937& rng, int R, int type) {
+void bench_wide(cudaStream_t s, std::mt19937& rng, int R, int type, int phase) {
     constexpr int kExperts = 128, kTop = 8, kLayers = 12;
     Setup S(type, type, 2304, 1152, R, kTop, kExperts, rng, s);
     std::vector<int> ids((size_t) R * kTop), ord(kExperts);
@@ -463,7 +463,7 @@ void bench_wide(cudaStream_t s, std::mt19937& rng, int R, int type) {
         cudaGraphExec_t ge;
         ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
         for (int c = 0; c < 48; ++c)
-            k::native_expert_grouped(S.L, lptr[(size_t) (c % kLayers)], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr,
+            k::native_expert_grouped(S.L, lptr[(size_t) (c % kLayers)], S.start, S.n, S.dst, S.tok, std::min(S.cap, S.n_blobs), S.cap, S.xq, S.scr,
                                      S.out, s);
         ck(cudaStreamEndCapture(s, &g), "capture");
         ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
@@ -471,7 +471,9 @@ void bench_wide(cudaStream_t s, std::mt19937& rng, int R, int type) {
         k::native_grouped_set_v1(false);
         return ge;
     };
+    k::native_expert_set_mode(-1, phase);   // 1: gate/up + SwiGLU only, 2: down only
     cudaGraphExec_t ga = graph(true), gb = graph(false);
+    k::native_expert_set_mode(-1, 0);
     cudaEvent_t e0, e1;
     ck(cudaEventCreate(&e0), "event");
     ck(cudaEventCreate(&e1), "event");
@@ -628,7 +630,7 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
 
 int main(int argc, char** argv) {
     bool do_bench = false, gu2 = false, do_glue = false, glue_one = false;
-    int glue_t = 3, glue_pool = 22, wide = 0, wide_type = 40;
+    int glue_t = 3, glue_pool = 22, wide = 0, wide_type = 40, wide_phase = 0;
     BenchOptions bo;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--glue") { bo.down = 20; bo.ff = 640; }   // the shape the glue launches cover
@@ -638,6 +640,7 @@ int main(int argc, char** argv) {
         if (a == "--bench") do_bench = true;
         else if (a == "--wide") num(wide);
         else if (a == "--wide-type") num(wide_type);   // 40 NVFP4, 46 MXFP8
+        else if (a == "--wide-phase") num(wide_phase);   // 1 gate/up + SwiGLU, 2 down
         else if (a == "--glue") do_glue = true;
         else if (a == "--glue-t") { num(glue_t); glue_one = true; }
         else if (a == "--glue-pool") num(glue_pool);
@@ -656,7 +659,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench-sizes" && i + 1 < argc) bo.sizes = argv[++i];
         else if (a == "--bench-ab" && i + 1 < argc) bo.ab = argv[++i];
         else {
-            std::printf("usage: native_grouped_parity [--wide ROWS [--wide-type 40|46]] [--gu2] [--glue [--glue-t N] [--glue-pool N]] [--bench [--bench-gu N] "
+            std::printf("usage: native_grouped_parity [--wide ROWS [--wide-type 40|46] [--wide-phase 1|2]] [--gu2] [--glue [--glue-t N] [--glue-pool N]] [--bench [--bench-gu N] "
                         "[--bench-down N] [--bench-ff N] [--bench-t N] [--bench-gy N] [--bench-phase N] [--bench-sizes LIST] [--bench-ab gu2]]\n");
             return 2;
         }
@@ -665,7 +668,7 @@ int main(int argc, char** argv) {
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
     if (wide > 0) {   // only the wide batch call: its bits against v1 and its timing
-        bench_wide(s, rng, wide, wide_type);
+        bench_wide(s, rng, wide, wide_type, wide_phase);
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;
     }
