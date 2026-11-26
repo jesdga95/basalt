@@ -9,9 +9,14 @@ show the load: `load.percent` and `load.gib`, the GiB placed so far in one figur
 
 ## Concurrent requests: `--parallel N`
 
-`--parallel N` (1 to 64) serves N requests at once in batch slots. Further requests wait in arrival order. `--max-context` is shared:
-each slot holds `max-context / N` tokens (`--parallel 4 --max-context 262144` gives four slots of 65,536). A request longer than its slot
-is refused with a 400 that names the length; the start log's `slots` line shows the context each slot gets. `--slot-full-context` gives every slot the whole `--max-context`, at N times the KV cache.
+`--parallel N` (1 to 64) serves N requests at once in batch slots. Further requests wait in arrival order. Every slot can reach the
+whole `--max-context`; a request longer than that is refused with a 400 that names the length. A model with a KV pool (Inkling 2 Mini)
+backs every slot's cells from one pool as its conversation grows, so one long agent session can hold most of it while short requests run
+beside it; the start log's `KV pool` line states its size and the positions it holds. When the pool runs short, idle conversations
+move to the conversation cache first (the longest idle first), then a new request waits for a running one to end, and a running slot
+that cannot grow sits out until there is room; only when every running slot waits does the newest one end with an error that says so
+(its conversation stays, so asking again continues it). Any other model gives each slot the whole context's cache, so N slots take N
+times its KV; lower `--max-context` when they do not fit.
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 
