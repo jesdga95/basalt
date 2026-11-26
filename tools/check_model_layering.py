@@ -6,8 +6,8 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MODELS = ("qwen4exp", "deepseek41", "qwen35", "hy4flash", "inkling2")
-NAMES = re.compile(r"qwen4exp|deepseek41|hy4flash|inkling2|Inkling|Hy4-flash|Flash-Next|DeepSeek|Qwen3\.8|\b(248044|248045|248046|248056|248058|248059|248320)\b")
+MODELS = ("qwen4exp", "deepseek41", "qwen35", "hy4flash", "inkling2", "glm5next")
+NAMES = re.compile(r"qwen4exp|deepseek41|hy4flash|inkling2|glm5next|Inkling|Hy4-flash|Flash-Next|DeepSeek|Qwen3\.8|\b(248044|248045|248046|248056|248058|248059|248320)\b")
 status = 0
 
 
@@ -105,7 +105,7 @@ for f in py:
     if not f.endswith(".py") or f.startswith(("serve/models/", "serve/tests/")):
         continue
     for n, line in enumerate((ROOT / f).read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-        if re.search(r"qwen4exp|deepseek41|\b24804[456]\b", line):
+        if re.search(r"qwen4exp|deepseek41|glm5next|\b24804[456]\b", line):
             hits.append(f"{f}:{n}: {line.strip()[:100]}")
 fail("the server names a model outside serve/models", hits)
 sys.exit(status)

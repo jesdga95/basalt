@@ -4,6 +4,7 @@
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
@@ -1009,7 +1010,7 @@ public:
         kernels::native_quantize_q8_1(x, sh_q1_, kAttnEmbd, T, stream);
         kernels::native_mmvq(gt->type, gt->ptr, sh_q1_, sh_g_, kAttnEmbd, nf, T, stream);
         kernels::native_mmvq(up->type, up->ptr, sh_q1_, sh_u_, kAttnEmbd, nf, T, stream);
-        swiglu_clamped(sh_g_, sh_u_, nf * T, g_.clamp_shexp[(size_t) il], sh_h_, stream);
+        kernels::swiglu_clamped(sh_g_, sh_u_, g_.clamp_shexp[(size_t) il], sh_h_, 1, nf * T, nf * T, stream);
         kernels::native_quantize_q8_1(sh_h_, sh_q2_, nf, T, stream);
         kernels::native_mmvq(dn->type, dn->ptr, sh_q2_, out, nf, kAttnEmbd, T, stream);
         return true;

@@ -15,6 +15,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -316,7 +317,7 @@ public:
             dense(gt, nf, n, xq1_, nc, sg, stream);
             if (up->type != gt->type) mmq::quantize(x + (size_t) t0 * n, nullptr, xq1_, up->type, n, n, nc, stream);
             dense(up, nf, n, xq1_, nc, su, stream);
-            swiglu_clamped(sg, su, nf * nc, g_.clamp_shexp[(size_t) il], h_, stream);
+            kernels::swiglu_clamped(sg, su, g_.clamp_shexp[(size_t) il], h_, 1, nf * nc, nf * nc, stream);
             mmq::quantize(h_, nullptr, xq2_, dn->type, nf, nf, nc, stream);
             dense(dn, n, nf, xq2_, nc, out + (size_t) t0 * n, stream);
         }

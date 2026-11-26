@@ -424,7 +424,9 @@ def convert(a) -> None:
         mtp_gguf = None
         if mtp_ids:
             # the drafter's layers come from the GGUF itself: its own dense pool and experts, the main sections without them
-            tensors = [x for x in tensors if not in_mtp(x[0])]
+            # the drafter's float tensors move to mtp/dense; its quantized ones stay where every other quantized
+            # tensor is served from, the `gguf` section, and are listed as kind-0 rows of mtp/dense.index
+            tensors = [x for x in tensors if not in_mtp(x[0]) or x[4].type_name not in S.FLOAT]
             dense = S.Dense(model, a.compat_bf16, arch, only=lambda n: not in_mtp(n))
             experts = S.Experts(model, [l for l in range(min(mtp_ids)) if f"blk.{l}.ffn_gate_exps.weight" in model.where])
             mtp_gguf = (S.Dense(model, a.compat_bf16, arch, only=in_mtp), S.Experts(model, mtp_ids))

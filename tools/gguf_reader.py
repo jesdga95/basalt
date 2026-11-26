@@ -76,6 +76,7 @@ class GGUFFile:
     def __init__(self, path: pathlib.Path):
         self.path = pathlib.Path(path)
         self.metadata: dict[str, Any] = {}
+        self.meta_types: dict[str, str] = {}
         self.tensors: list[TensorInfo] = []
         self.version = 0
         self.alignment = 32
@@ -93,7 +94,7 @@ class GGUFFile:
             raise ValueError(f"{self.path.name}: GGUF v{self.version}, this reader handles v3")
         for _ in range(n_kv):
             key = self._str(fh)
-            self.metadata[key] = self._value(fh)
+            self.metadata[key], self.meta_types[key] = self._value(fh)
         for _ in range(n_tensors):
             name = self._str(fh)
             (n_dims,) = struct.unpack("<I", fh.read(4))
@@ -112,23 +113,26 @@ class GGUFFile:
         return fh.read(n).decode("utf-8", "replace")
 
     def _value(self, fh):
+        """The next metadata value, with the type the file declares it as. A reader that keeps only the value
+        loses that: `gguf_writer.GGUFWriter.add` then infers i64 for every int, which Basalt's loader accepts and
+        llama.cpp's does not (`key general.file_type has wrong type i64 but expected type u32`)."""
         (t,) = struct.unpack("<I", fh.read(4))
         name, size = GGUF_META[t]
         if name == "string":
-            return self._str(fh)
+            return self._str(fh), name
         if name == "array":
             (et,) = struct.unpack("<I", fh.read(4))
             (count,) = struct.unpack("<Q", fh.read(8))
             ename, esize = GGUF_META[et]
             if ename == "string":
-                return [self._str(fh) for _ in range(count)]
+                return [self._str(fh) for _ in range(count)], "array:string"
             fmt = {"u8": "B", "i8": "b", "u16": "H", "i16": "h", "u32": "I", "i32": "i",
                    "f32": "f", "bool": "?", "u64": "Q", "i64": "q", "f64": "d"}[ename]
             raw = fh.read(esize * count)
-            return list(struct.unpack(f"<{count}{fmt}", raw))
+            return list(struct.unpack(f"<{count}{fmt}", raw)), "array:" + ename
         fmt = {"u8": "B", "i8": "b", "u16": "H", "i16": "h", "u32": "I", "i32": "i",
                "f32": "f", "bool": "?", "u64": "Q", "i64": "q", "f64": "d"}[name]
-        return struct.unpack(f"<{fmt}", fh.read(size))[0]
+        return struct.unpack(f"<{fmt}", fh.read(size))[0], name
 
     # ------------------------------------------------------------------ helpers
     def by_type(self) -> dict[str, int]:

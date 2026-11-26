@@ -4,6 +4,7 @@
 
 #include "basalt/model/adapter.hpp"
 #include "models/deepseek41/meta.hpp"
+#include "models/glm5next/meta.hpp"
 #include "models/qwen4exp/meta.hpp"
 
 #include <memory>
@@ -36,6 +37,13 @@ inline void register_meta_adapters() {
         model::register_adapter(std::make_unique<MetaAdapter>("qwen4exp", models::qwen4exp::validate_meta, models::qwen4exp::describe_meta));
     if (model::find_adapter("deepseek41") == nullptr)
         model::register_adapter(std::make_unique<MetaAdapter>("deepseek41", models::deepseek41::validate_meta, models::deepseek41::describe_meta));
+    // A GLM pack's gguf_kv keeps the source GGUF's architecture, which is what the registry looks an adapter up by; the
+    // same rules answer to both names, as they do for hy4flash.
+    if (model::find_adapter(models::glm5next::kGgufArch) == nullptr)
+        model::register_adapter(std::make_unique<MetaAdapter>(models::glm5next::kGgufArch, models::glm5next::validate_meta,
+                                                             models::glm5next::describe_meta));
+    if (model::find_adapter("glm5next") == nullptr)
+        model::register_adapter(std::make_unique<MetaAdapter>("glm5next", models::glm5next::validate_meta, models::glm5next::describe_meta));
 }
 
 }  // namespace basalt::test

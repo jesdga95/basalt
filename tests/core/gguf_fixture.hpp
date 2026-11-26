@@ -18,14 +18,16 @@ namespace fixture {
 
 struct Kv {
     std::string key;
-    uint32_t type = 8;         ///< GGUF value type: 8 string, 2 u16, 4 u32, 5 i32
+    uint32_t type = 8;         ///< GGUF value type: 8 string, 2 u16, 4 u32, 5 i32, 9 array of u32
     std::string s;
     uint64_t u = 0;
+    std::vector<uint64_t> arr; ///< the elements of a type-9 array
 };
-inline Kv str(const std::string& k, const std::string& v) { return Kv{k, 8, v, 0}; }
-inline Kv u16(const std::string& k, uint64_t v) { return Kv{k, 2, {}, v}; }
-inline Kv i32(const std::string& k, uint64_t v) { return Kv{k, 5, {}, v}; }
-inline Kv u32(const std::string& k, uint64_t v) { return Kv{k, 4, {}, v}; }
+inline Kv str(const std::string& k, const std::string& v) { return Kv{k, 8, v, 0, {}}; }
+inline Kv u16(const std::string& k, uint64_t v) { return Kv{k, 2, {}, v, {}}; }
+inline Kv i32(const std::string& k, uint64_t v) { return Kv{k, 5, {}, v, {}}; }
+inline Kv u32(const std::string& k, uint64_t v) { return Kv{k, 4, {}, v, {}}; }
+inline Kv u32arr(const std::string& k, std::vector<uint64_t> v) { return Kv{k, 9, {}, 0, std::move(v)}; }
 
 struct Tensor {
     std::string name;
@@ -65,6 +67,11 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
         if (k.type == 8) puts(k.s);
         else if (k.type == 2) { const uint16_t v = (uint16_t) k.u; put(&v, 2); }
         else if (k.type == 4 || k.type == 5) { const uint32_t v = (uint32_t) k.u; put(&v, 4); }
+        else if (k.type == 9) {
+            put32(4);   // u32 elements
+            put64(k.arr.size());
+            for (const uint64_t v : k.arr) { const uint32_t e = (uint32_t) v; put(&e, 4); }
+        }
         else throw std::runtime_error("fixture: unsupported metadata type");
     }
     Written w;

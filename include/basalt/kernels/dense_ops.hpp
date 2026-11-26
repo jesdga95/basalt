@@ -28,6 +28,11 @@ void scale_values(float* y, const float* scale, int64_t n, void* stream);
 /// h[i] = silu(g[i] * sg) * (u[i] * su)  (n values; g, u and h may each have their own row stride: rows x width).
 void swiglu_scaled(const float* g, const float* u, const float* sg, const float* su, float* h, int64_t rows,
                    int64_t width, int64_t ld_gu, void* stream);
+/// The SwiGLU of the packs that carry a clamp: h[i] = silu(min(g, limit)) * clamp(u, -limit, limit) (rows x width of g and
+/// u at the row stride ld_gu, h packed). A pack with no clamp for a layer leaves the model on swiglu_scaled; the clamp
+/// follows the same side of each factor as the checkpoint's own gate (the gate above, the rest below).
+void swiglu_clamped(const float* g, const float* u, float limit, float* h, int64_t rows, int64_t width, int64_t ld_gu,
+                    void* stream);
 /// y[t][n] = x[t] . w[n]  for BF16 rows w [N][K]: the small BF16 projections of a prompt chunk. Few outputs over a long K
 /// run as 8-output tiles a warp (the same bits); `tiles` false keeps the one-warp form (the parity's reference).
 void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream, bool tiles = true);

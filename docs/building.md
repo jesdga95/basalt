@@ -28,6 +28,7 @@ all: its C++ and CUDA sources, its kernels and its tests are skipped, which is m
 | Qwen3.8-27B | `qwen35` |
 | Hy4-flash | `hy4flash` |
 | Inkling 2 Mini | `inkling2` |
+| GLM-5.3-Flash | `glm5next` |
 
 ```sh
 cmake -S . -B build -DBASALT_MODELS=qwen4exp                  # Flash-Next only

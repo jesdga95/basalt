@@ -61,6 +61,14 @@ int main() {
 #else
     expect("inkling2", false);
 #endif
+#ifdef BASALT_MODEL_GLM5NEXT
+    expect("glm5next", true);
+    // and under the architecture a pack converted from the release's GGUF keeps in its gguf_kv
+    check(model::find_adapter("glm5-next") != nullptr, "glm5next also answers to glm5-next");
+    ++built;
+#else
+    expect("glm5next", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         model::Started started;

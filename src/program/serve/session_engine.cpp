@@ -313,7 +313,10 @@ public:
 
     /// The running state at `to`, kept in the chain; the oldest goes first past --prompt-cache.
     bool checkpoint_at(int64_t to, ConvCheckpoint::Source source, const std::vector<int64_t>& prompt) {
-        if (o.prompt_cache <= 0 || to < 1) return true;
+        // a session with no running state (running_bytes() == 0, adapter.hpp) has nothing to checkpoint;
+        // skip it the way reserve_checkpoints() already does, instead of failing the request with the
+        // adapter's "this model keeps no checkpoint"
+        if (o.prompt_cache <= 0 || to < 1 || session().running_bytes() == 0) return true;
         ckd_finish();   // the save before this one lands first; one that failed has left the chain
         if (touch_check(to, source)) return true;
         ConvCheckpoint c;

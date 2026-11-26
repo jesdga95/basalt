@@ -11,6 +11,7 @@
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
@@ -538,7 +539,7 @@ struct DsparkDrafter::Impl {
             dspark_moe_down(s.down_exps.p, kFF, kN, moe_hq, ids, kT, kUsed, live, moe_d, st);
             kernels::native_mmvq(s.sh_gate.type, s.sh_gate.p, sh_q1, sh_g, kN, kFF, kT, st);
             kernels::native_mmvq(s.sh_up.type, s.sh_up.p, sh_q1, sh_u, kN, kFF, kT, st);
-            swiglu_clamped(sh_g, sh_u, kT * kFF, 10.f, sh_h, st);
+            kernels::swiglu_clamped(sh_g, sh_u, 10.f, sh_h, 1, kT * kFF, kT * kFF, st);
             kernels::native_quantize_q8_1(sh_h, sh_q2, kFF, kT, st);
             kernels::native_mmvq(s.sh_down.type, s.sh_down.p, sh_q2, sh_out, kFF, kN, kT, st);
             dspark_moe_combine(moe_d, rw, sh_out, kT, kUsed, kN, ffn_sum, st);

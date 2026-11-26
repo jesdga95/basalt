@@ -52,27 +52,33 @@ LAYOUT = {   # equals ggufq's GGML_QUANT_SIZES and the kernels' sizes
 HALF_ONE = struct.pack("<e", 1.0)      # fp16 1.0 = 0x3c00
 
 
-def repair_scales(name: str, raw: np.ndarray) -> None:
-    """Overwrite every block's fp16 scale with a sane value, in place. IQ*_X* and IQ4_* keep it at offset 0; Q3_K
+def repair_scales(name: str, raw: np.ndarray, one: bytes = HALF_ONE) -> None:
+    """Overwrite every block's fp16 scale with `one`, in place. IQ*_X* and IQ4_* keep it at offset 0; Q3_K
     after the 32-byte hmask, 64-byte qs and 12 scale bytes; IQ1_M splits it over the high nibbles of the four
     little-endian uint16s at bytes 48..56 (1.0 = 0x3C00 is nibbles 0, 0, C, 3 on odd bytes 49, 51, 53, 55)."""
     if name == "Q3_K":
-        raw[:, 108:110] = np.frombuffer(HALF_ONE, dtype=np.uint8)
+        raw[:, 108:110] = np.frombuffer(one, dtype=np.uint8)
         return
     if name == "IQ1_M":
         raw[:, 49:56:2] &= np.uint8(0x0F)          # clear the four scale nibbles while keeping even-byte sub-scales
         for byte, nib in ((49, 0x00), (51, 0x00), (53, 0xC0), (55, 0x30)):
             raw[:, byte] |= np.uint8(nib)
         return
-    raw[:, 0:2] = np.frombuffer(HALF_ONE, dtype=np.uint8)
+    raw[:, 0:2] = np.frombuffer(one, dtype=np.uint8)
 # name -> kernel type id for the .bin header (equal to the ggufq enum id)
 KERNEL_IDS = {"IQ2_XXS": 16, "IQ2_XS": 17, "IQ2_S": 22, "IQ3_XXS": 18, "IQ3_S": 21,
               "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11}
 
 
-def build(name: str, rows: int, cols: int, seed: int):
-    """The .bin body (header + raw blocks) and the .f32 reference for one type."""
-    kernel_type = KERNEL_IDS[name]
+def blocks(name: str, rows: int, cols: int, seed: int, scale: float = 1.0):
+    """The raw quantization blocks for a (rows, cols) tensor of `name`, and their dequantized reference. The blocks
+    are row-major: `rows * cols // block_values` of them, in row order, which is how a GGUF tensor's bytes runs.
+
+    `scale` is the fp16 block scale that `repair_scales` pins in. 1.0 is what the dequantization fixtures want,
+    but it is not a sane *weight*: the sub-scales and indices stay random, so a repaired block dequantizes to an
+    RMS of tens (IQ2_XXS 53, IQ3_XXS 137, IQ4_XS 1258 measured). A caller that writes these into a model it will
+    run has to scale them down with it - the expert tensors in the glm5next fixture do, or every block's FFN sums
+    them out of any useful range."""
     n = rows * cols
     rng = np.random.RandomState((seed, hash(name) & 0xFFFF) if False else (seed, KERNEL_IDS[name]))
     if name == "Q2_0":                                 # ggufq has no type 42
@@ -82,15 +88,23 @@ def build(name: str, rows: int, cols: int, seed: int):
         flat = raw
     else:
         block_values, block_bytes = LAYOUT[name]
-        blocks = n // block_values
-        raw = rng.randint(0, 256, (blocks, block_bytes), dtype=np.uint8)
-        repair_scales(name, raw)                       # sane scales; indices stay random
+        blocks_ = n // block_values
+        raw = rng.randint(0, 256, (blocks_, block_bytes), dtype=np.uint8)
+        if scale != 1.0 and name == "IQ1_M":
+            raise ValueError("iq_fixture: IQ1_M keeps its fp16 scale in four nibbles; only scale=1.0 is encoded")
+        repair_scales(name, raw, HALF_ONE if scale == 1.0 else struct.pack("<e", np.float32(scale)))
         flat = raw.reshape(-1)
         ref = np.asarray(gguf_dequantize(flat, getattr(QT, name)), dtype=np.float32)
     if not np.isfinite(ref).all() or float(np.abs(ref).max()) > 1e4:
         raise RuntimeError(f"{name}: the dequantized reference is not finite/tame - the layout table "
                            f"(block bytes, scale offsets) does not match ggufq's dequantizer")
-    header = struct.pack("<3i", kernel_type, rows, cols)
+    return flat, ref
+
+
+def build(name: str, rows: int, cols: int, seed: int, scale: float = 1.0):
+    """The .bin body (header + raw blocks) and the .f32 reference for one type."""
+    flat, ref = blocks(name, rows, cols, seed, scale)
+    header = struct.pack("<3i", KERNEL_IDS[name], rows, cols)
     return header + flat.tobytes(), ref
 
 

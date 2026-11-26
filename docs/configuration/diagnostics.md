@@ -47,7 +47,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--diag-main-card-bits` | CLI, serve | Flash-Next: the other cards' stages run the main card's cuBLAS algorithms and plan by its SM count, so a peer's prompt stages and a split are bitwise against the main card (and `--diag-gpu-same`). A normal run lets each card use its own, which costs nothing and keeps the BF16 KLD level; the flag costs about 0.6% of a 64K prefill. |
 | `--diag-fixed-experts` | CLI, serve | Flash-Next: a prompt's experts all run on the GPU and a window's verifiers see none in VRAM, so the CPU pool computes every window row; two placements of the same experts (a split and its `--diag-gpu-same` reference) then compute the same rows. |
 | `--diag-teacher` | CLI | DeepSeek with `--spec-oracle`: teacher-forces the file's tokens and counts differing picks. |
-| `--diag-tier-frozen` | CLI, serve | DeepSeek: fixed placement (no copies or promotion). |
+| `--diag-tier-frozen` | CLI, serve | Expert tier: no bus fetches and no promotions, so which experts run on the card never changes after load. A repeatability knob for reproducing or bisecting a run, not a way to fit more or go faster. One flag for every model. |
 | `--diag-drafter-gpu DEV` | CLI, serve | DeepSeek: the card the drafter runs on. |
 | `--force-zero-doorbell` | serve | Scheduling test on a card that cannot hold every expert. The output is wrong by design. |
 

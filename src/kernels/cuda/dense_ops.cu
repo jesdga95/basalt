@@ -109,6 +109,17 @@ __global__ void swiglu_scaled_kernel(const float* g, const float* u, const float
     h[i] = gv / (1.0f + expf(-gv)) * uv;
 }
 
+__global__ void swiglu_clamped_kernel(const float* g, const float* u, float limit, float* h, int64_t rows,
+                                      int64_t width, int64_t ld) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * width) return;
+    const int64_t r = i / width, c = i % width;
+    const float gv = fminf(g[r * ld + c], limit), uv = fminf(fmaxf(u[r * ld + c], -limit), limit);
+    h[i] = gv / (1.0f + expf(-gv)) * uv;
+}
+
 // y[t][n] = sum_k x[t][k] w[n][k], x fp32, w BF16, on tf32 tensor cores (mma m16n8k8): a warp per 16 rows x 48 outputs.
 // x is split into two tf32 terms (hi + lo: about fp32's precision; BF16 weights are exact in tf32), fp32 accumulation.  In each 8-value step thread c's k-slots c and
 // c + 4 take values 2c and 2c + 1, so its loads are contiguous pairs (the sum is the same dot product).
@@ -818,6 +829,14 @@ void swiglu_scaled(const float* g, const float* u, const float* sg, const float*
     launch_pdl(swiglu_scaled_kernel, blocks_for(rows * width), dim3(256), 0, (cudaStream_t) stream, g, u, sg, su, h, rows, width,
                ld_gu);
     check("swiglu_scaled");
+}
+
+void swiglu_clamped(const float* g, const float* u, float limit, float* h, int64_t rows, int64_t width, int64_t ld_gu,
+                    void* stream) {
+    if (rows <= 0) return;
+    launch_pdl(swiglu_clamped_kernel, blocks_for(rows * width), dim3(256), 0, (cudaStream_t) stream, g, u, limit, h, rows,
+               width, ld_gu);
+    check("swiglu_clamped");
 }
 
 void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream, bool tiles) {

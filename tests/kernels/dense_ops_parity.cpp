@@ -105,6 +105,59 @@ int main() {
         }
         report("swiglu_scaled", h, want, 1e-4);
     }
+    {   // swiglu_clamped: the gate's upper clamp, the up stream's two-sided clamp, and the row stride.
+        // The spread is wider than the limit on purpose - a fixture that never reaches the limit would test
+        // swiglu and call it swiglu_clamped. ld_gu wider than width is what a caller with the two streams
+        // interleaved passes, and a kernel that read them contiguously would pass the flat case alone.
+        const float limit = 2.5f;
+        const int W = FF / 2;
+        std::mt19937 local(4242);   // its own stream: the cases after this one must see the numbers they saw before
+        std::normal_distribution<float> nrm(0.f, 3.f);
+        std::vector<float> g((size_t) T * FF), u((size_t) T * FF);
+        for (auto& v : g) v = nrm(local);
+        for (auto& v : u) v = nrm(local);
+        size_t clamped_g = 0, clamped_u = 0;
+        for (size_t i = 0; i < g.size(); ++i) {
+            if (g[i] > limit) ++clamped_g;
+            if (u[i] > limit || u[i] < -limit) ++clamped_u;
+        }
+        float *dg = up(g), *du = up(u), *dh = nullptr;
+        cudaMalloc(&dh, (size_t) T * FF * 4);
+        basalt::kernels::swiglu_clamped(dg, du, limit, dh, T, FF, FF, S);
+        auto h = down(dh, (size_t) T * FF);
+        std::vector<double> want(h.size());
+        for (size_t i = 0; i < h.size(); ++i) {
+            const double a = std::min((double) g[i], (double) limit);
+            const double b = std::min(std::max((double) u[i], -(double) limit), (double) limit);
+            want[i] = a / (1 + std::exp(-a)) * b;
+        }
+        report("swiglu_clamped", h, want, 1e-4);
+        std::printf("                      (%zu of %zu gates above the limit, %zu up-stream values clamped)\n",
+                    clamped_g, g.size(), clamped_u);
+
+        std::vector<float> gs((size_t) T * FF), us((size_t) T * FF);
+        for (int r = 0; r < T; ++r)
+            for (int c = 0; c < W; ++c) {
+                gs[(size_t) r * FF + c] = g[(size_t) r * FF + 2 * c];        // two streams living in wider rows
+                us[(size_t) r * FF + c] = u[(size_t) r * FF + 2 * c + 1];
+            }
+        float* dgs = up(gs);
+        float* dus = up(us);
+        cudaMemset(dh, 0, (size_t) T * FF * 4);
+        basalt::kernels::swiglu_clamped(dgs, dus, limit, dh, T, W, FF, S);
+        auto hs = down(dh, (size_t) T * FF);
+        std::vector<float> got;
+        std::vector<double> want_s;
+        for (int r = 0; r < T; ++r)
+            for (int c = 0; c < W; ++c) {
+                got.push_back(hs[(size_t) r * W + c]);  // the output is packed: width per row, whatever ld_gu was
+                const double a = std::min((double) gs[(size_t) r * FF + c], (double) limit);
+                const double b = std::min(std::max((double) us[(size_t) r * FF + c], -(double) limit), (double) limit);
+                want_s.push_back(a / (1 + std::exp(-a)) * b);
+            }
+        report("swiglu_clamped strided", got, want_s, 1e-4);
+        cudaFree(dg); cudaFree(du); cudaFree(dgs); cudaFree(dus); cudaFree(dh);
+    }
     {   // bf16_rows_dot (the GDN gates' and the selector's projections)
         const int N = 96;
         auto x = randn((size_t) T * H);
