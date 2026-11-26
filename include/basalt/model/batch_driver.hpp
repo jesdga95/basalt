@@ -8,6 +8,7 @@
 #pragma once
 
 #include "basalt/core/graph.hpp"
+#include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/batch_window.hpp"
 
@@ -41,7 +42,10 @@ struct BatchShared {
     static constexpr size_t kGraphs = 128;
     static constexpr size_t kSeen = 256;
     GraphLru<core::CapturedGraph> graphs{kGraphs};
+    /// `seen` values: a composition's windows so far ran direct once; or its graph found no device memory.
+    static constexpr uint8_t kSeenOnce = 1, kGraphless = 2;
     GraphLru<uint8_t> seen{kSeen};
+    bool graph_short_noted = false;
 };
 
 class BatchSession : public ModelSession {
@@ -102,8 +106,10 @@ public:
             }
         } else if (core::CapturedGraph* g = sh.graphs.find(key)) {
             if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
-        } else if (!sh.seen.find(key)) {
-            sh.seen.insert(std::move(key), 1u);
+        } else if (uint8_t* seen = sh.seen.find(key); seen == nullptr) {
+            sh.seen.insert(std::move(key), uint8_t(BatchShared::kSeenOnce));
+            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
+        } else if (*seen == BatchShared::kGraphless) {
             if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
         } else {
             // a composition's first window runs as launched, then is captured for the next ones: the graph is built while
@@ -128,8 +134,21 @@ public:
                 drop();
                 return {Status::Error, who + ": " + err};
             }
-            if (!fresh.end(st, err)) return {Status::Error, who + ": " + err};
-            sh.graphs.insert(std::move(key), std::move(fresh));
+            if (!fresh.end(st, err)) {
+                // the graph's own device memory is what the card is short of: this window ran direct above and the
+                // composition keeps running without a graph; any other failure fails the window
+                if (fresh.status() != cudaErrorMemoryAllocation) return {Status::Error, who + ": " + err};
+                (void) cudaGetLastError();
+                err.clear();
+                if (!sh.graph_short_noted) {
+                    sh.graph_short_noted = true;
+                    basalt::log::warn("basalt batch", "%s: a window's graph found no device memory: windows of its composition run without one",
+                                      who.c_str());
+                }
+                *seen = BatchShared::kGraphless;
+            } else {
+                sh.graphs.insert(std::move(key), std::move(fresh));
+            }
         }
         if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) return {Status::Error, who + ": CUDA: " + cudaGetErrorString(e)};
         // each session its rows back, then its draws, all queued; one sync, then the picks
