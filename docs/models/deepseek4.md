@@ -17,8 +17,10 @@ cache state bitwise. Do not describe this pack as runnable until text decode, im
 
 ## Architecture and ownership
 
-- `tools/convert/arch/deepseek4.py` maps checkpoint/GGUF metadata and tensors into the Basalt pack. The vision sidecar
-  stores the projector section separately and validates its projector type; the engine pack reader checks section bounds.
+- `tools/convert/arch/deepseek4.py` maps GGUF metadata and tensors into the Basalt pack; conversion also takes the matching
+  Hugging Face checkpoint through `--hf-dir` to preserve the final `hc_head_*` weights, which the source GGUF omits. The
+  vision sidecar stores the projector section separately and validates its projector type; the engine pack reader checks
+  section bounds.
 - `src/models/deepseek4/pack.*` owns V4 geometry and tensor validation. The future adapter and model/session stay under
   `src/models/deepseek4/` and `include/basalt/models/deepseek4/`; shared code must not name this architecture.
 - Text execution owns V4-specific hyper-connections, hash routing, indexer/compression scheduling, attention and cache
@@ -27,6 +29,9 @@ cache state bitwise. Do not describe this pack as runnable until text decode, im
 - `src/models/deepseek4/vision/` owns V4 image-grid planning and patch ordering. Shared `src/vision/` owns image decode
   and reusable preprocessing primitives. Model-specific CUDA tower/projector operations belong under
   `src/models/deepseek4/` unless another model can use the exact same tensor contract.
+- `src/models/deepseek4/tokenizer/pretok_deepseek4.cpp` implements the checkpoint tokenizer's numeric, CJK, and text
+  boundaries in a model-local target; `ds4_tokenizer_test` covers those boundaries. The adapter still needs to connect it to
+  the pack tokenizer metadata.
 - `serve/models/deepseek4.py` owns prompt rendering, image placeholders, stop/reasoning/tool parsing. Shared `serve/`
   code remains architecture-agnostic.
 
