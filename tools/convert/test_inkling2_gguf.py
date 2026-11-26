@@ -290,6 +290,23 @@ class Inkling2GgufTest(unittest.TestCase):
             self.assertIn("blk.0.ffn_gate_up_exps.weight is Q4_K", r.stderr)
             self.assertIn("supports BF16, F16 (rounded to NVFP4) and IQ1_M, IQ1_S", r.stderr)
 
+    def test_q2_0_gate_up_refused(self):
+        """Q2_0 gate/up has no softcapped SwiGLU on the CPU: refused, naming the layer."""
+        with tempfile.TemporaryDirectory() as d:
+            td = pathlib.Path(d)
+            src = td / "tiny-q2gu.gguf"
+            out = td / "tiny-q2gu.basalt"
+            saved = list(MIXED_EXPERTS)
+            MIXED_EXPERTS[1] = ("Q2_0", "Q2_0")
+            try:
+                _write_synthetic_inkling2_gguf(src, "MIXED")
+            finally:
+                MIXED_EXPERTS[:] = saved
+            r = self._run_convert(src, out)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("layer 1 gate_up experts are Q2_0", r.stderr)
+            self.assertFalse(out.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

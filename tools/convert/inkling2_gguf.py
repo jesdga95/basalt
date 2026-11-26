@@ -5,7 +5,7 @@ tools/convert/convert.py.
   experts             routed experts per layer, [gate | up | down] (llama.cpp's fused gate_up is gate rows, then up rows):
                         BF16/F16 source:   NVFP4 (type 40) blocks + FP32 scale tail {s_gate, s_up, s_down, 0}
                         quantized source:  the GGUF's blocks as stored, each layer in its own gate_up and down types
-                                           (STORED_EXPERT_TYPES), no scale tail
+                                           (STORED_GATE_UP_TYPES / STORED_DOWN_TYPES), no scale tail
   experts.layout      one `layer gu_type d_type offset blob_bytes` line per layer
   gguf                all other tensors in Basalt's inkling2 names:
                         attention projections -> Q8_0 (passthrough if Q8_0, else ggml reference rounding of the
@@ -48,10 +48,10 @@ NVFP4 = 40
 EXPERTS_PER_JOB = 16
 FLOAT_TYPES = ("F32", "BF16", "F16")
 # Expert encodings copied as stored: the engine's native expert kernels (CUDA kernels::native_expert_layout and the CPU
-# cpu::native_fmt) read them in place, gate/up and down each in its own type.
-STORED_EXPERT_TYPES = frozenset({
-    "Q8_0", "Q2_0", "IQ4_NL", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S",
-})
+# cpu::native_fmt) read them in place, gate/up and down each in its own type. Not Q2_0 gate/up: the CPU's Q2_0 gate/up
+# rows (kernels/cpu/pool.cpp native_gu_range) have no softcapped SwiGLU. Down rows are 1152 wide: 32- or 64-value blocks.
+STORED_GATE_UP_TYPES = frozenset({"Q8_0", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S"})
+STORED_DOWN_TYPES = frozenset({"Q8_0", "Q2_0", "IQ4_NL"})
 # Quantized types tools/ggufq.py dequantizes (dense tensors are rounded from their values to the engine's types).
 DEQUANT_TYPES = frozenset(t.name for t in ggufq.GGMLQuantizationType if t.name not in FLOAT_TYPES)
 
@@ -324,9 +324,9 @@ def build(a, Job, source_paths, export_tokenizer, fingerprint, die) -> None:
         die(f"expected {n_layers} expert layers, found {len(experts_gu)} gate_up and {len(experts_dn)} down")
     sample_type = experts_gu[0][1].type_name
     nvfp4 = sample_type in ("BF16", "F16")
-    if not nvfp4 and sample_type not in STORED_EXPERT_TYPES:
+    if not nvfp4 and sample_type not in STORED_GATE_UP_TYPES:
         die(f"blk.0.ffn_gate_up_exps.weight is {sample_type}; inkling2 GGUF conversion supports BF16, F16 "
-            f"(rounded to NVFP4) and {', '.join(sorted(STORED_EXPERT_TYPES))} (as stored)")
+            f"(rounded to NVFP4) and {', '.join(sorted(STORED_GATE_UP_TYPES))} (as stored)")
 
     # per layer: (gate_up type name, down type name, per-expert gate_up bytes, per-expert down bytes)
     layer_types: list[tuple[str, str, int, int]] = []
@@ -338,10 +338,10 @@ def build(a, Job, source_paths, export_tokenizer, fingerprint, die) -> None:
                     die(f"layer {l} {kind} experts are {t}; a {sample_type} source must be {sample_type} throughout")
             layer_types.append((gt, dt, 0, 0))
             continue
-        for kind, t in (("gate_up", gt), ("down", dt)):
-            if t not in STORED_EXPERT_TYPES:
-                die(f"layer {l} {kind} experts are {t}; quantized inkling2 experts must be one of "
-                    f"{', '.join(sorted(STORED_EXPERT_TYPES))}")
+        for kind, t, allowed in (("gate_up", gt, STORED_GATE_UP_TYPES), ("down", dt, STORED_DOWN_TYPES)):
+            if t not in allowed:
+                die(f"layer {l} {kind} experts are {t}; quantized inkling2 {kind} experts must be one of "
+                    f"{', '.join(sorted(allowed))}")
         try:
             gu_eb, dn_eb = 2 * inter * _row_bytes(gt, hidden), hidden * _row_bytes(dt, inter)
         except S.ConvertError as e:

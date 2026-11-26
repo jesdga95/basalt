@@ -2143,6 +2143,12 @@ if(BUILD_TESTING)
   add_executable(pool_native_test tests/kernels/cpu/pool_native_test.cpp)
   target_link_libraries(pool_native_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME pool_native_test COMMAND pool_native_test)
+  # Inkling 2's GSQ-RCO expert types (IQ gate/up over Q2_0 / IQ4_NL down, softcapped SwiGLU) on the pool against a double
+  # reference of the dequantized blob, and batch independence
+  add_executable(inkling2_native_expert_cpu_parity tests/models/inkling2/native_expert_cpu_parity.cpp)
+  target_link_libraries(inkling2_native_expert_cpu_parity PRIVATE kernels_cpu platform)
+  basalt_cpu_test(NAME inkling2_native_expert_cpu_parity COMMAND inkling2_native_expert_cpu_parity)
+  set_tests_properties(inkling2_native_expert_cpu_parity PROPERTIES SKIP_RETURN_CODE 77)
   # the AVX2 i-quant rows: the madd build against the AVX-VNNI build (bitwise) and a double reference
   add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
   target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
