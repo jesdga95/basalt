@@ -23,6 +23,15 @@ struct AttentionLayerScratch {
     AttentionStepScratch attention;
 };
 
+/// Computes the attention mHC coefficients and normalized collapsed input. The session may run the V4 indexer and
+/// compression projections from `scratch.normalized` before calling attention_step().
+void prepare_attention_layer(const float* streams, int n_tokens, const AttentionLayerWeights& weights,
+                             const AttentionLayerScratch& scratch, void* stream);
+
+/// Expands `attention_output` through the prepared attention mHC coefficients into the next stream state.
+void finish_attention_layer(const float* streams, const float* coefficients, const float* attention_output,
+                            int n_tokens, int n_embd, float* next_streams, void* stream);
+
 /// Runs a V4 attention sublayer for a 1..8 row window. `streams` and `next_streams` are [T][4][n_embd].
 /// `selection.n_tokens` is T. The output does not alias the input; all scratch and cache storage belongs to the caller.
 void attention_layer_step(const float* streams, const AttentionLayerWeights& weights, const kernels::MqaRopeTable& rope,

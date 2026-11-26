@@ -240,10 +240,59 @@ int main(int argc, char** argv) {
     bool window_equal = true;
     for (size_t i = 0; i < (size_t) T * Embd; ++i) window_equal &= window_output[i] == sequential_output[i];
     const bool window_ring_equal = window_ring == sequential_ring;
+
+    // The session needs the mHC-normalized input between attention preparation and sparse attention for V4's
+    // indexer/compressors. This two-row composition guards the layer's post-mix row count.
+    const auto layer_input = randn((size_t) T * 4 * Embd, 0x4154533e, 0.08f);
+    Dev<float> layer_streams((size_t) T * 4 * Embd), layer_actual((size_t) T * 4 * Embd),
+               layer_expected((size_t) T * 4 * Embd);
+    Dev<float> layer_ws(hc_mixes_workspace_floats(T)), layer_coef((size_t) T * kHcCoef),
+               layer_collapsed((size_t) T * Embd), layer_normalized((size_t) T * Embd);
+    Dev<float> ref_ws(hc_mixes_workspace_floats(T)), ref_coef((size_t) T * kHcCoef),
+               ref_collapsed((size_t) T * Embd), ref_normalized((size_t) T * Embd);
+    layer_streams.up(layer_input);
+    AttentionLayerWeights window_weights;
+    window_weights.hc = {Embd, 1e-20f, 1e-6f, 20};
+    window_weights.hc_fn = hc_fn.p;
+    window_weights.hc_scale = hc_scale.p;
+    window_weights.hc_base = hc_base.p;
+    window_weights.norm = attn_norm.p;
+    window_weights.attention = weights;
+    window_weights.attention.q.q_norm = window.q_norm.p;
+    window_weights.attention.kv_norm = window.kv_norm.p;
+    window_weights.attention.sinks = window.sinks.p;
+    AttentionStepScratch layer_attention_scratch{window.input_q8.p, window.q_latent.p, window.q_latent_q8.p,
+        window.q_heads.p, window.kv_projected.p, window.kv_row.p, window.mqa_output.p,
+        window.mqa_workspace.p, window.output_q8.p, window.output_latent.p, window.output.p};
+    AttentionLayerScratch layer_scratch_window{layer_ws.p, layer_coef.p, layer_collapsed.p, layer_normalized.p,
+                                               layer_attention_scratch};
+    attention_layer_step(layer_streams.p, window_weights, rope, window.ring.p, window_selection,
+                         layer_scratch_window, layer_actual.p, stream);
+
+    hc_mixes(layer_streams.p, hc_fn.p, hc_scale.p, hc_base.p, T, window_weights.hc,
+             ref_ws.p, ref_coef.p, stream);
+    hc_pre_rms_norm(layer_streams.p, ref_coef.p, kHcCoef, attn_norm.p, T, Embd,
+                    window_weights.hc.rms_eps, ref_collapsed.p, ref_normalized.p, stream);
+    AttentionStepScratch reference_attention_scratch{sequential.input_q8.p, sequential.q_latent.p,
+        sequential.q_latent_q8.p, sequential.q_heads.p, sequential.kv_projected.p, sequential.kv_row.p,
+        sequential.mqa_output.p, sequential.mqa_workspace.p, sequential.output_q8.p,
+        sequential.output_latent.p, sequential.output.p};
+    AttentionStepWeights reference_attention_weights = window_weights.attention;
+    reference_attention_weights.q.q_norm = sequential.q_norm.p;
+    reference_attention_weights.kv_norm = sequential.kv_norm.p;
+    reference_attention_weights.sinks = sequential.sinks.p;
+    attention_step(ref_normalized.p, reference_attention_weights, rope, sequential.ring.p,
+                   window_selection, reference_attention_scratch, stream);
+    hc_post(sequential.output.p, layer_streams.p, ref_coef.p, kHcCoef, T, Embd, layer_expected.p, stream);
+    check(cudaStreamSynchronize(stream), "synchronize two-row attention-layer parity");
+    const bool layer_window_equal = layer_actual.down() == layer_expected.down();
+
     std::printf("DeepSeek4 attention sublayer composition: streams %s; cache %s; mHC and attention primitives composed\n",
                 layer_output_equal ? "bitwise" : "DIFFERS", layer_ring_equal ? "bitwise" : "DIFFERS");
     std::printf("DeepSeek4 attention decode window T=2 vs sequential T=1: output %s; ring state %s\n",
                 window_equal ? "bitwise" : "DIFFERS", window_ring_equal ? "bitwise" : "DIFFERS");
+    std::printf("DeepSeek4 attention layer mHC composition T=2: output %s\n",
+                layer_window_equal ? "bitwise" : "DIFFERS");
     std::printf("DeepSeek4 one-token attention step: output %s; ring state %s; Q8_0 checkpoint geometry %d/%d/%d\n",
                 output_equal ? "bitwise" : "DIFFERS", ring_equal ? "bitwise" : "DIFFERS", Embd, Rank, HeadsDim);
     if (argc > 1 && std::string(argv[1]) == "--bench") {
@@ -270,5 +319,6 @@ int main(int argc, char** argv) {
                    projection_bytes + attention_bytes);
     }
     cudaStreamDestroy(stream);
-    return output_equal && ring_equal && layer_output_equal && layer_ring_equal && window_equal && window_ring_equal ? 0 : 1;
+    return output_equal && ring_equal && layer_output_equal && layer_ring_equal && window_equal && window_ring_equal &&
+                   layer_window_equal ? 0 : 1;
 }
