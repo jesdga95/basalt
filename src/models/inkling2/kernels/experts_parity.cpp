@@ -434,15 +434,27 @@ void test_format(int type) {
     cudaStreamDestroy(st);
 }
 
-void bench(int type) {
+// `same`: every row routes the same 8 experts (a batch of one conversation repeated: few groups, many entries each)
+void bench(int type, bool same) {
     const bool bf = type == 46;
     const Experts X = make_experts(type);
     cudaStream_t st;
     cudaStreamCreate(&st);
     for (const int R : {1, 4, 8, 64, 256, 320}) {
         Call c = make_call(R, bf, 100);
+        if (same) {
+            for (int r = 0; r < R; ++r)
+                for (int q = 0; q < K; ++q) c.ids[(size_t) r * K + q] = 3 + 7 * q;
+            basalt::core::device_copy(c.d_ids, c.ids.data(), c.ids.size() * 4, cudaMemcpyHostToDevice);
+        }
         float* ring = zeros<float>((size_t) kConvRing * E);
         MoeFinish f = finish_of(c, ring);
+        if (R > kDecodeRows) {   // a batch window: conversations of 5 rows (the last one the rest)
+            f.seg.at.n = (R + 4) / 5;
+            for (int sg = 0; sg <= f.seg.at.n; ++sg) f.seg.at.row0[sg] = std::min(R, 5 * sg);
+            f.seg.n_segs = f.seg.at.n;
+            for (int sg = 0; sg < f.seg.at.n; ++sg) f.seg.c[sg].m_ring = zeros<float>((size_t) kConvRing * E);
+        }
         std::set<int> distinct(c.ids.begin(), c.ids.end());
         const double bytes = (double) distinct.size() * (double) X.L.bytes;
         moe_plan(c.d_ids, c.rows, K, NE, X.dtable, c.ptr, c.start, c.ng, c.dst, c.tok, st);
@@ -453,21 +465,28 @@ void bench(int type) {
         }
         cudaStreamSynchronize(st);
         const int n = 50;
-        cudaEvent_t a, b;
+        cudaEvent_t a, b, m;
         cudaEventCreate(&a);
         cudaEventCreate(&b);
-        cudaEventRecord(a, st);
+        cudaEventCreate(&m);
+        float gu = 0.f, dn = 0.f;
         for (int i = 0; i < n; ++i) {
+            float t0 = 0.f, t1 = 0.f;
+            cudaEventRecord(a, st);
             experts_gate_up(e, st);
+            cudaEventRecord(m, st);
             experts_down(e, f, R, st);
+            cudaEventRecord(b, st);
+            cudaEventSynchronize(b);
+            cudaEventElapsedTime(&t0, a, m);
+            cudaEventElapsedTime(&t1, m, b);
+            gu += t0;
+            dn += t1;
         }
-        cudaEventRecord(b, st);
-        cudaEventSynchronize(b);
-        float ms = 0.f;
-        cudaEventElapsedTime(&ms, a, b);
-        const double us = 1e3 * ms / n;
-        std::printf("bench experts %s %3d rows: %8.1f us a call (gate/up + down + finish), %3zu experts, %6.0f GB/s\n",
-                    type == 40 ? "NVFP4" : "MXFP8", R, us, distinct.size(), bytes / (us * 1e3));
+        const double ug = 1e3 * gu / n, ud = 1e3 * dn / n, flop = 2.0 * R * K * 3.0 * E * FF;
+        std::printf("bench experts %s%s %3d rows: gate/up %7.1f us, down + finish %7.1f us, %3zu experts, %6.0f GB/s, %5.1f TFLOP/s\n",
+                    type == 40 ? "NVFP4" : "MXFP8", same ? " (one routing)" : "", R, ug, ud, distinct.size(), bytes / ((ug + ud) * 1e3),
+                    flop / ((ug + ud) * 1e6));
     }
     cudaStreamDestroy(st);
 }
@@ -482,8 +501,10 @@ int main(int argc, char** argv) {
     }
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
     if (do_bench) {
-        bench(40);
-        bench(46);
+        bench(40, false);
+        bench(40, true);
+        bench(46, false);
+        bench(46, true);
         return 0;
     }
     test_format(40);
