@@ -1,5 +1,7 @@
 #pragma once
 
+#include "basalt/kernels/router.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -13,6 +15,28 @@ struct RouteRows {
     std::vector<uint8_t> fixed_mask;
     std::vector<uint8_t> alternate_mask;
 };
+
+/// V4's scored and hash-selected rows share the generic router's mixed selector. Keep the checkpoint's
+/// top-6, SqrtSoftplus, and 1.5 weight scale in one model-owned constructor so sessions cannot drift
+/// from the pack contract. All pointers are device pointers; row buffers are produced from build_route_rows.
+inline kernels::RouterMixedArgs router_mixed_args(int n_expert, int token_vocab, const int32_t* fixed_table,
+                                                  const int32_t* fixed_rows, const uint8_t* fixed_mask,
+                                                  const uint8_t* alternate_mask, const float* bias,
+                                                  const float* alternate_bias) {
+    kernels::RouterMixedArgs args;
+    args.n_expert = n_expert;
+    args.k = 6;
+    args.weight_scale = 1.5f;
+    args.gate = kernels::RouterGate::SqrtSoftplus;
+    args.fixed_table = fixed_table;
+    args.fixed_rows = fixed_rows;
+    args.fixed_table_rows = token_vocab;
+    args.fixed_mask = fixed_mask;
+    args.alternate_mask = alternate_mask;
+    args.bias = bias;
+    args.alternate_bias = alternate_bias;
+    return args;
+}
 
 /// Builds the host-side selector inputs from token IDs. Text rows in hash-routed layers index `tid2eid`; image IDs use
 /// score selection with `bias_vl` in every layer.
