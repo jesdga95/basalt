@@ -314,7 +314,7 @@ private:
     // head batch scratch [max_sessions]
     float *hd_ = nullptr, *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
     float *frc_ = nullptr, *conf_d_ = nullptr, *conf_h_ = nullptr;
-    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
+    void *hq_ = nullptr, *head_cols_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
     size_t head_scr_stride_ = 0;
     int32_t *prev_ = nullptr, *ids_d_ = nullptr, *ids_h_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     uint16_t* w1_row_ = nullptr;

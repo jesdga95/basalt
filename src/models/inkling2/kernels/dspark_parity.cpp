@@ -638,6 +638,7 @@ void test_head_batch() {
     uint8_t* b_hq = zeros<uint8_t>((size_t) BMax * R * hrow);
     uint8_t* b_lq = zeros<uint8_t>((size_t) BMax * R * lrow);
     float* b_approx = zeros<float>((size_t) BMax * R * dspark_screen_rows(V));
+    void* b_cols = zeros<uint8_t>(dspark_head_base_cols_bytes(BMax * R));
     float *b_ch = zeros<float>((size_t) BMax * R * kDsRnn), *b_cf = zeros<float>((size_t) BMax * kDsRnn);
     float *b_st = zeros<float>((size_t) BMax * 2 * kDsRank), *b_lat = zeros<float>((size_t) BMax * kDsRank);
     uint16_t* b_w1r = zeros<uint16_t>((size_t) BMax * kDsRank);
@@ -657,7 +658,7 @@ void test_head_batch() {
             {
                 basalt::kernels::PdlScope pdl(pdl_on, true);
                 basalt::kernels::native_quantize_q8_1(d_hd, b_hq, E, B * R, st);
-                dspark_head_base_batch(h, b_hq, B, R, b_approx, st);
+                dspark_head_base_batch(h, b_hq, B, R, b_cols, b_approx, st);
                 basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_hd, d_wh, b_ch, E, kDsRnn, B * R, st);
                 basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_frc, d_wf, b_cf, E, kDsRnn, B, st);
                 for (int i = 0; i < R; ++i) {
@@ -680,12 +681,62 @@ void test_head_batch() {
     check("batched Markov + head vs solo (B=2,4,8, plain & PDL)", ok);
 
     cudaStreamDestroy(st);
+    cudaFree(b_cols);
     cudaFree(b_hq); cudaFree(b_lq); cudaFree(b_approx); cudaFree(b_ch); cudaFree(b_cf);
     cudaFree(b_st); cudaFree(b_lat); cudaFree(b_w1r); cudaFree(b_scr);
     cudaFree(b_prev); cudaFree(b_ids); cudaFree(b_conf);
     cudaFree(d_head); cudaFree(d_fold); cudaFree(d_fb); cudaFree(d_hsc); cudaFree(d_fsc); cudaFree(d_fbp);
     cudaFree(d_wsp); cudaFree(d_wh); cudaFree(d_wf); cudaFree(d_w1); cudaFree(d_rb);
     cudaFree(d_hd); cudaFree(d_frc);
+}
+
+
+// The batched head screen (int8 tensor cores) against dspark_head_base, bit for bit, for every row of count x n_max columns
+// (n_max 1..7, up to 64 sessions x 4 = 256 columns, column counts that are not a multiple of 8), and its time at 8, 128 and
+// 256 columns.
+void test_head_base_batch() {
+    const int64_t V = kVocab;
+    const int CMax = 256;
+    cudaStream_t st = nullptr;
+    cudaStreamCreate(&st);
+    const auto head = q8_0_rows(V, E, 1.5e-4f, 2718u);
+    uint8_t* d_head = dev(head);
+    void* d_hsc = zeros<uint8_t>(dspark_screen_bytes(E, V));
+    dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
+    DsHead h{};
+    h.head = d_head; h.head_sc = d_hsc; h.n_vocab = V;
+    const int64_t n_pad = dspark_screen_rows(V);
+    const size_t hrow = basalt::kernels::native_q8_1_bytes(E, 1);
+    const auto hd = randn((size_t) CMax * E, 2.5f);
+    float* d_hd = dev(hd);
+    uint8_t* d_hq = zeros<uint8_t>((size_t) CMax * hrow);
+    for (int c0 = 0; c0 < CMax; c0 += 128)
+        basalt::kernels::native_quantize_q8_1(d_hd + (size_t) c0 * E, d_hq + (size_t) c0 * hrow, E, 128, st);
+    float* ref = zeros<float>((size_t) CMax * n_pad);
+    for (int r0 = 0; r0 < CMax; r0 += kDsDrafts) {
+        const int rows = std::min(kDsDrafts, CMax - r0);
+        dspark_head_base(h, d_hq + (size_t) r0 * hrow, rows, ref + (size_t) r0 * n_pad, st);
+    }
+    const auto want = host(ref, (size_t) CMax * n_pad);
+    float* got = zeros<float>((size_t) CMax * n_pad);
+    void* cols = zeros<uint8_t>(dspark_head_base_cols_bytes(CMax));
+    bool ok = true;
+    const int shapes[][2] = {{1, 1}, {1, 7}, {3, 5}, {16, 7}, {33, 3}, {64, 2}, {64, 4}, {36, 7}};
+    for (const auto& sh : shapes) {
+        const int count = sh[0], n_max = sh[1], c = count * n_max;
+        cudaMemset(got, 0x7f, (size_t) c * n_pad * 4);
+        dspark_head_base_batch(h, d_hq, count, n_max, cols, got, st);
+        const auto g = host(got, (size_t) c * n_pad);
+        const bool same = std::memcmp(g.data(), want.data(), (size_t) c * n_pad * 4) == 0;
+        if (!same) std::printf("  head base batch %d x %d differs\n", count, n_max);
+        ok = ok && same;
+    }
+    check("head base batch == head base (bits)", ok);
+    for (const int c : {8, 128, 256})
+        std::printf("  head base batch %3d columns: %8.1f us\n", c,
+                    time_us([&] { dspark_head_base_batch(h, d_hq, c / 4 ? c / 4 : 1, c >= 4 ? 4 : c, cols, got, st); }));
+    cudaFree(d_head); cudaFree(d_hsc); cudaFree(d_hd); cudaFree(d_hq); cudaFree(ref); cudaFree(got); cudaFree(cols);
+    cudaStreamDestroy(st);
 }
 
 }  // namespace
@@ -703,6 +754,7 @@ int main() {
     test_fold();
     test_split();
     test_head_batch();
+    test_head_base_batch();
     std::printf("inkling2_dspark_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

@@ -130,7 +130,11 @@ void dspark_block_qk_prep_batch(const float* q, const float* kb, const float* vb
 void dspark_pack_draft_rows(const float* h_chunk, int block, int count_chunk, int slot0, int n_max, float* hd_all,
                             void* stream);
 
-void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, float* approx, void* stream);
+/// dspark_head_base for `count` sessions' n_max rows each (hq: count x n_max q8_1 rows; approx: the same rows of
+/// dspark_screen_rows floats), bit for bit, on int8 tensor cores; cols_scratch holds dspark_head_base_cols_bytes(count x n_max).
+size_t dspark_head_base_cols_bytes(int cols);
+void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, void* cols_scratch, float* approx,
+                            void* stream);
 
 void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
                               const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,

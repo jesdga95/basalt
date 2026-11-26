@@ -1041,6 +1041,7 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     // head batch scratch: per-draft-row buffers hold max(16*7, 64*2)=128 rows; per-slot state holds S_all<=64 slots
     hd_ = f((size_t) max_dr_rows * E);
     hq_ = dev(bk::native_q8_1_bytes(kE, max_dr_rows), ok);
+    head_cols_ = dev(dspark_head_base_cols_bytes(max_dr_rows), ok);
     approx_ = f((size_t) max_dr_rows * dspark_screen_rows((int64_t) V));
     ctx_h_ = f((size_t) max_dr_rows * kDsRnn);
     ctx_f_ = f((size_t) S_all * kDsRnn);
@@ -1243,7 +1244,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
             const size_t lq_row_b = bk::native_q8_1_bytes(kDsRank, 1);
             const int64_t n_pad = dspark_screen_rows((int64_t) w.n_vocab);
             bk::native_quantize_q8_1(hd_, hq_, kE, cb * sub_nmax, st);
-            dspark_head_base_batch(head, hq_, cb, sub_nmax, approx_, st);
+            dspark_head_base_batch(head, hq_, cb, sub_nmax, head_cols_, approx_, st);
             bk::bf16_gemv_fp32_mmvf_cols(hd_, w.w_h, ctx_h_, kE, kDsRnn, cb * sub_nmax, st);
             bk::bf16_gemv_fp32_mmvf_cols(frc_ + (size_t) b0 * kE, w.w_f, ctx_f_ + (size_t) b0 * kDsRnn, kE, kDsRnn, cb, st);
             for (int i = 0; i < sub_nmax; ++i) {

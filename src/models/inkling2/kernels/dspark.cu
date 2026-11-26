@@ -860,38 +860,182 @@ __global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* h_chu
     for (int j = threadIdx.x; j < kWidth / 4; j += 256) dst[j] = src[j];
 }
 
-// Reads the 2-bit head screen once into registers and scores all `count` sessions' `n_max` draft rows.
-__global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
-                                                              const Q81* x, int count, int n_max,
-                                                              int64_t n_pad, float* __restrict__ approx) {
-    constexpr int kNw4 = kWidth / 64, NW = kNw4 / 4;
-    __shared__ __align__(16) int xi[kDsDrafts][kWidth / 4];
-    __shared__ float xs[kDsDrafts][kHeadNb], xdd[kDsDrafts][kHeadNb];
-    __shared__ float red[kDsDrafts][4][32];
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int64_t tile = blockIdx.x;
-    const size_t base = ((size_t) tile * kNw4 + warp * NW) * 32 + lane;
-    uint4 w[NW];
-    uint32_t s[NW];
-#pragma unroll
-    for (int j = 0; j < NW; ++j) {
-        w[j] = __ldcs(wq + base + (size_t) j * 32);
-        s[j] = __ldcs(sc + base + (size_t) j * 32);
-    }
+// The screen's columns (count x n_max q8_1 rows of hq) in the layout head_base_mma_kernel reads: for group g and column c,
+// the eight code words in the order a B fragment's thread t takes them (words t and 4 + t), and for a column pair the scales
+// {d, d', 1.5 s, 1.5 s'} (s = d times the code sum, screen_x's terms). Columns past `cols` up to the next kMmaCols are zeros.
+__global__ void __launch_bounds__(256) screen_cols_kernel(const Q81* __restrict__ x, int cols, int cols_pad,
+                                                          int* __restrict__ xq, float* __restrict__ xm) {
     pdl_wait();
-    const int64_t row = tile * 32 + lane;
-    for (int b = 0; b < count; ++b) {
-        if (b > 0) __syncthreads();
-        const Q81* xb = x + (size_t) b * n_max * kHeadNb;
-        for (int r = 0; r < n_max; ++r) screen_x(xb + (size_t) r * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
-        __syncthreads();
+    const int i = (int) blockIdx.x * 256 + threadIdx.x;
+    if (i >= kHeadNb * cols_pad) return;
+    const int g = i / cols_pad, c = i - g * cols_pad;
+    int q[8] = {};
+    float d = 0.f, s15 = 0.f;
+    if (c < cols) {
+        const Q81& b = x[(size_t) c * kHeadNb + g];
+        const int* qs = reinterpret_cast<const int*>(b.qs);
+        int sum = 0;
 #pragma unroll
-        for (int r = 0; r < kDsDrafts; ++r)
-            if (r < n_max) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
+        for (int k = 0; k < 8; ++k) {
+            q[k] = qs[k];
+            sum = __dp4a(0x01010101, q[k], sum);
+        }
+        d = __low2float(b.ds);
+        s15 = __fmul_rn(__fmul_rn(d, (float) sum), 1.5f);
+    }
+    int4* dq = reinterpret_cast<int4*>(xq + (size_t) i * 8);
+    dq[0] = make_int4(q[0], q[4], q[1], q[5]);
+    dq[1] = make_int4(q[2], q[6], q[3], q[7]);
+    float* dm = xm + ((size_t) g * (cols_pad / 2) + c / 2) * 4 + (c & 1);
+    dm[0] = d;
+    dm[2] = s15;
+}
+
+__device__ __forceinline__ void screen_mma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+
+__device__ __forceinline__ void cp16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src)
+                 : "memory");
+}
+
+// head_base_kernel's scores for any number of columns on int8 tensor cores, bit for bit: a group's integer dot (its 32 2-bit levels times the
+// column's codes) is exact in int32 whichever instruction computes it, so mma.sync m16n8k32 takes it for 16 copy rows x 8
+// columns. A word's levels at shift 2 t are a B fragment thread t's codes (screen_acc pairs them so), so lane t's A
+// registers are the words shifted by 2 t. The float terms follow screen_acc's order: each quarter of the row (18 groups,
+// one reference warp's) is summed from zero in group order as fma(scale, fma(d, P, -1.5 s), acc), and the quarters are
+// added in warp order. A block takes four tiles (128 copy rows, a warp 16 of them) against every column, kMmaCols columns
+// at a time; a step is one word of the rows (two groups): the rows' words and scales and the columns' codes and scales
+// for it are copied into a ring of shared memory kMmaStages - 1 steps ahead.
+constexpr int kMmaTiles = 4;
+constexpr int kMmaThreads = 32 * 2 * kMmaTiles;
+constexpr int kMmaCols = 32;
+constexpr int kMmaStages = 4;
+struct MmaStage {
+    uint4 w[kMmaTiles][32];             // the rows' word of the step
+    uint32_t s[kMmaTiles][32];          // their two groups' scales
+    int q[2][kMmaCols * 8];             // the columns' codes (screen_cols_kernel's order), a group each
+    float4 m[2][kMmaCols / 2];          // the columns' scales
+};
+constexpr int kMmaPieces = (int) sizeof(MmaStage) / 16;
+constexpr int kMmaCopies = (kMmaPieces + kMmaThreads - 1) / kMmaThreads;   // a thread's 16-byte copies of a stage
+
+__global__ void __launch_bounds__(kMmaThreads, 2) head_base_mma_kernel(const uint4* __restrict__ wq,
+                                                                       const uint32_t* __restrict__ sc,
+                                                                       const int* __restrict__ xq,
+                                                                       const float4* __restrict__ xm, int cols,
+                                                                       int cols_pad, int64_t n_tiles, int64_t n_pad,
+                                                                       float* __restrict__ approx) {
+    constexpr int kNw4 = kWidth / 64, kQuarter = kNw4 / 4;
+    constexpr int kW = kMmaTiles * 32, kS = kMmaTiles * 8, kQ = 2 * kMmaCols * 2;   // pieces: words, scales, codes
+    __shared__ MmaStage ring[kMmaStages];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const int64_t tile0 = (int64_t) blockIdx.x * kMmaTiles;
+    const int n_here = (int) (n_tiles - tile0 < kMmaTiles ? n_tiles - tile0 : kMmaTiles);
+    const int steps = cols_pad / kMmaCols * kNw4;
+    // this thread's pieces of a stage (16-byte copies): its k-th piece of step s (word w4 of chunk c) is copied from
+    // src[k] + w4 * w_step[k] + c * c_step[k] (the rows' parts are constant data, the columns' are not)
+    const char* src[kMmaCopies];
+    int w_step[kMmaCopies], c_step[kMmaCopies];
+#pragma unroll
+    for (int k = 0; k < kMmaCopies; ++k) {
+        const int p = tid + k * kMmaThreads;
+        if (p < kW) {
+            const int t = min(p >> 5, n_here - 1);
+            src[k] = reinterpret_cast<const char*>(wq + (size_t) (tile0 + t) * kNw4 * 32 + (p & 31));
+            w_step[k] = 32 * 16, c_step[k] = 0;
+        } else if (p < kW + kS) {
+            const int i = p - kW, t = min(i >> 3, n_here - 1);
+            src[k] = reinterpret_cast<const char*>(sc + (size_t) (tile0 + t) * kNw4 * 32 + (i & 7) * 4);
+            w_step[k] = 32 * 4, c_step[k] = 0;
+        } else if (p < kW + kS + kQ) {
+            const int i = p - kW - kS, h = i / (kQ / 2), j = i - h * (kQ / 2);
+            src[k] = reinterpret_cast<const char*>(xq + (size_t) h * cols_pad * 8 + j * 4);
+            w_step[k] = 2 * cols_pad * 32, c_step[k] = kMmaCols * 32;
+        } else {
+            const int i = p - kW - kS - kQ, h = i / (kMmaCols / 2), j = i - h * (kMmaCols / 2);
+            src[k] = reinterpret_cast<const char*>(xm + (size_t) h * (cols_pad / 2) + (p < kMmaPieces ? j : 0));
+            w_step[k] = cols_pad * 16, c_step[k] = kMmaCols * 8;
+        }
+    }
+    auto stage = [&](int s) {
+        if (s < steps) {
+            char* dst = reinterpret_cast<char*>(&ring[s % kMmaStages]);
+            const int w4 = s % kNw4, c = s / kNw4;
+#pragma unroll
+            for (int k = 0; k < kMmaCopies; ++k)
+                if (tid + k * kMmaThreads < kMmaPieces)
+                    cp16(dst + (tid + k * kMmaThreads) * 16, src[k] + w4 * w_step[k] + c * c_step[k]);
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    };
+    pdl_wait();
+#pragma unroll
+    for (int s = 0; s < kMmaStages - 1; ++s) stage(s);
+    const int tl = warp >> 1, l0 = (warp & 1) * 16 + gid, sh = 2 * tig;
+    const int64_t row0 = (tile0 + tl) * 32 + l0;
+    const bool live = tl < n_here;
+    float acc[kMmaCols / 8][4], tot[kMmaCols / 8][4];
+    for (int s = 0; s < steps; ++s) {
+        const int w4 = s % kNw4;
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kMmaStages - 2) : "memory");
         __syncthreads();
-        float* apb = approx + (size_t) b * n_max * n_pad;
-        for (int r = warp; r < n_max; r += 4)
-            apb[r * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+        stage(s + kMmaStages - 1);
+        if (w4 == 0) {
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[t][e] = 0.f, tot[t][e] = 0.f;
+        }
+        const MmaStage& st = ring[s % kMmaStages];
+        const uint4 wa = st.w[tl][l0], wb = st.w[tl][l0 + 8];
+        const uint32_t sa = st.s[tl][l0], sb = st.s[tl][l0 + 8];
+        const uint32_t va[4] = {wa.x, wa.y, wa.z, wa.w}, vb[4] = {wb.x, wb.y, wb.z, wb.w};
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const uint32_t a[4] = {(va[2 * hh] >> sh) & 0x03030303u, (vb[2 * hh] >> sh) & 0x03030303u,
+                                   (va[2 * hh + 1] >> sh) & 0x03030303u, (vb[2 * hh + 1] >> sh) & 0x03030303u};
+            const float sga = __half2float(__ushort_as_half((unsigned short) (hh ? (sa >> 16) : (sa & 0xffff))));
+            const float sgb = __half2float(__ushort_as_half((unsigned short) (hh ? (sb >> 16) : (sb & 0xffff))));
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t) {
+                const int2 bq = *reinterpret_cast<const int2*>(&st.q[hh][(t * 8 + gid) * 8 + 2 * tig]);
+                const float4 m = st.m[hh][t * 4 + tig];
+                int p[4];
+                screen_mma(p, a, (uint32_t) bq.x, (uint32_t) bq.y);
+                acc[t][0] = __fmaf_rn(sga, __fmaf_rn(m.x, (float) p[0], -m.z), acc[t][0]);
+                acc[t][1] = __fmaf_rn(sga, __fmaf_rn(m.y, (float) p[1], -m.w), acc[t][1]);
+                acc[t][2] = __fmaf_rn(sgb, __fmaf_rn(m.x, (float) p[2], -m.z), acc[t][2]);
+                acc[t][3] = __fmaf_rn(sgb, __fmaf_rn(m.y, (float) p[3], -m.w), acc[t][3]);
+            }
+        }
+        if (w4 % kQuarter == kQuarter - 1) {
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    tot[t][e] = w4 < kQuarter ? acc[t][e] : __fadd_rn(tot[t][e], acc[t][e]);
+                    acc[t][e] = 0.f;
+                }
+        }
+        if (w4 == kNw4 - 1 && live) {
+            const int c0 = s / kNw4 * kMmaCols;
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t) {
+                const int c = c0 + t * 8 + 2 * tig;
+                if (c < cols) {
+                    approx[(size_t) c * n_pad + row0] = tot[t][0];
+                    approx[(size_t) c * n_pad + row0 + 8] = tot[t][2];
+                }
+                if (c + 1 < cols) {
+                    approx[(size_t) (c + 1) * n_pad + row0] = tot[t][1];
+                    approx[(size_t) (c + 1) * n_pad + row0 + 8] = tot[t][3];
+                }
+            }
+        }
     }
 }
 
@@ -1061,11 +1205,24 @@ void dspark_pack_draft_rows(const float* h_chunk, int block, int count_chunk, in
     check("pack draft rows");
 }
 
-void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, float* approx, void* stream) {
+size_t dspark_head_base_cols_bytes(int cols) {
+    const size_t cols_pad = (size_t) (cols + kMmaCols - 1) / kMmaCols * kMmaCols;
+    return cols_pad * kHeadNb * (8 * sizeof(int) + 2 * sizeof(float));
+}
+
+void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, void* cols_scratch, float* approx,
+                            void* stream) {
     if (count <= 0 || n_max < 1 || n_max > kDsDrafts) return;
-    launch_pdl(head_base_batch_kernel, dim3((unsigned) px::tiles(h.n_vocab)), dim3(128), 0, (cudaStream_t) stream,
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int cols = count * n_max, cols_pad = (cols + kMmaCols - 1) / kMmaCols * kMmaCols;
+    int* xq = (int*) cols_scratch;
+    float* xm = (float*) (xq + (size_t) cols_pad * kHeadNb * 8);
+    launch_pdl(screen_cols_kernel, dim3((unsigned) ((kHeadNb * cols_pad + 255) / 256)), dim3(256), 0, s, (const Q81*) hq, cols,
+               cols_pad, xq, xm);
+    const int64_t n_tiles = px::tiles(h.n_vocab);
+    launch_pdl(head_base_mma_kernel, dim3((unsigned) ((n_tiles + kMmaTiles - 1) / kMmaTiles)), dim3(kMmaThreads), 0, s,
                (const uint4*) h.head_sc, (const uint32_t*) px::scales(const_cast<void*>(h.head_sc), h.n_vocab, kWidth),
-               (const Q81*) hq, count, n_max, dspark_screen_rows(h.n_vocab), approx);
+               (const int*) xq, (const float4*) xm, cols, cols_pad, n_tiles, dspark_screen_rows(h.n_vocab), approx);
     check("head base batch");
 }
 
