@@ -7,15 +7,84 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/route_flags.hpp"
+#include "basalt/program/json_scan.hpp"
 #include "basalt/program/options.hpp"
 #include "models/hy4flash/dfly.hpp"   // DFLY HOOK
 #include "models/hy4flash/meta.hpp"
 #include "models/hy4flash/model.hpp"
 
+#include <string_view>
+
 namespace basalt::models::hy4flash {
 namespace {
 
 constexpr float kRoutePriorBare = 0.01f;   // --route-prior alone: on the biased score (a sigmoid plus its bias)
+constexpr const char* kDefaultHytkSuffix = ":opensource";
+
+// Resolves the pack's HYTK tag suffix (e.g. ":opensource" or ":6124c78e") from tokenizer/vocab.json.
+std::string hytk_suffix_from_vocab(std::string_view vocab_json) {
+    program::json::Scan sc{vocab_json};
+    if (!sc.eat('{')) return kDefaultHytkSuffix;
+    std::string key;
+    std::string think_suf;
+    std::string end_suf;
+    static constexpr std::string_view kCallsPre = "<tool_calls:";
+    static constexpr std::string_view kThinkPre = "<think:";
+    static constexpr std::string_view kEndPre = "<\xef\xbd\x9c" "hy_end:";
+    static constexpr std::string_view kEndTail = "\xef\xbd\x9c>";
+    if (!sc.eat('}')) {
+        do {
+            int64_t id = 0;
+            if (!sc.str(key) || !sc.eat(':') || !sc.integer(id)) break;
+            if (key.size() > kCallsPre.size() + 1 && key.compare(0, kCallsPre.size(), kCallsPre) == 0 && key.back() == '>') {
+                return key.substr(kCallsPre.size() - 1, key.size() - kCallsPre.size());
+            }
+            if (think_suf.empty() && key.size() > kThinkPre.size() + 1 &&
+                key.compare(0, kThinkPre.size(), kThinkPre) == 0 && key.back() == '>') {
+                think_suf = key.substr(kThinkPre.size() - 1, key.size() - kThinkPre.size());
+            }
+            if (end_suf.empty() && key.size() > kEndPre.size() + kEndTail.size() &&
+                key.compare(0, kEndPre.size(), kEndPre) == 0 &&
+                key.compare(key.size() - kEndTail.size(), kEndTail.size(), kEndTail) == 0) {
+                end_suf = key.substr(kEndPre.size() - 1, key.size() - kEndPre.size() - kEndTail.size() + 1);
+            }
+        } while (sc.eat(','));
+    }
+    if (!think_suf.empty()) return think_suf;
+    if (!end_suf.empty()) return end_suf;
+    return kDefaultHytkSuffix;
+}
+
+std::string hytk_suffix(const core::ModelFile& file) {
+    std::vector<uint8_t> text;
+    std::string err;
+    if (!core::read_range(file.range("tokenizer/vocab.json"), text, err)) return kDefaultHytkSuffix;
+    return hytk_suffix_from_vocab(std::string_view((const char*) text.data(), text.size()));
+}
+
+program::grammar::ToolForm make_tool_form(const std::string& suf) {
+    program::grammar::ToolForm f;
+    f.call_open = "<tool_calls" + suf + ">";
+    f.call_close = "</tool_calls" + suf + ">";
+    f.fn_open = "<tool_call" + suf + ">";
+    f.fn_mid = "";
+    f.fn_close = "</tool_call" + suf + ">";
+    f.param_open = "<arg_key" + suf + ">";
+    f.param_mid_text = "</arg_key" + suf + "><arg_value" + suf + ">";
+    f.param_mid_value = "</arg_key" + suf + "><arg_value" + suf + ">";
+    f.param_close = "</arg_value" + suf + ">";
+    f.text_end = "</arg_value" + suf + ">";
+    f.calls_share_block = true;
+    f.trigger = "<tool_calls" + suf + ">";
+    return f;
+}
+
+program::grammar::ReplyForm make_reply_form(const std::string& suf) {
+    program::grammar::ReplyForm f;
+    f.think_open = "<think" + suf + ">";
+    f.think_close = "</think" + suf + ">";
+    return f;
+}
 
 class Adapter final : public model::ModelAdapter {
 public:
@@ -37,19 +106,14 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "hy_v4"}; }
 
-    // <tool_calls><tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call></tool_calls>
-    program::grammar::ToolForm tool_form() const override {
-        program::grammar::ToolForm f;
-        f.call_open = "<tool_calls><tool_call>";
-        f.call_close = "</tool_call></tool_calls>";
-        f.fn_mid = "";
-        f.param_open = "<arg_key>";
-        f.param_mid_text = "</arg_key><arg_value>";
-        f.param_mid_value = "</arg_key><arg_value>";
-        f.param_close = "</arg_value>";
-        f.text_end = "</arg_value>";
-        f.trigger = "<tool_calls>";
-        return f;
+    // <tool_calls:suf><tool_call:suf>NAME<arg_key:suf>K</arg_key:suf><arg_value:suf>V</arg_value:suf></tool_call:suf></tool_calls:suf>
+    program::grammar::ToolForm tool_form() const override { return make_tool_form(kDefaultHytkSuffix); }
+    program::grammar::ToolForm tool_form(const core::ModelFile& file) const override {
+        return make_tool_form(hytk_suffix(file));
+    }
+    program::grammar::ReplyForm reply_form() const override { return make_reply_form(kDefaultHytkSuffix); }
+    program::grammar::ReplyForm reply_form(const core::ModelFile& file) const override {
+        return make_reply_form(hytk_suffix(file));
     }
 
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }

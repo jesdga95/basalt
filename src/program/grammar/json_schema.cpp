@@ -1,6 +1,7 @@
 // src/program/grammar/json_schema.cpp - JSON schema -> SchemaNode tree. See schema_internal.hpp.
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -40,17 +41,30 @@ class Builder {
     static int get_count(const JsonValue& schema, const std::string& key, const std::string& path, int def) {
         const JsonValue* value = schema.get(key);
         if (!value) return def;
-        if (!value->is_integer() || (int) value->as_int() < 0) fail(path, key + " must be a non-negative integer");
-        return (int) value->as_int();
+        int64_t v = 0;
+        if (!value->parse_int64(v) || v < 0 || v > (std::numeric_limits<int>::max)()) {
+            fail(path, key + " must be a non-negative integer");
+        }
+        return (int) v;
     }
 
     // a fractional bound is rounded inwards, towards the integers it still admits
     static int64_t get_bound(const JsonValue& schema, const std::string& key, const std::string& path, bool round_up) {
         const JsonValue& value = *schema.get(key);
-        if (value.is_integer()) return value.as_int();
+        if (value.is_integer()) {
+            int64_t v = 0;
+            if (!value.parse_int64(v)) fail(path, key + " is out of 64-bit integer range");
+            return v;
+        }
         if (value.type != Type::Number) fail(path, key + " must be a number");
-        double d = value.as_double();
-        return (int64_t) (round_up ? std::ceil(d) : std::floor(d));
+        const double d = value.as_double();
+        const double r = round_up ? std::ceil(d) : std::floor(d);
+        constexpr double kMinI64 = -9223372036854775808.0;     // -2^63, exact in IEEE-754 double
+        constexpr double kMaxI64Plus1 = 9223372036854775808.0; // +2^63, exact in IEEE-754 double
+        if (!std::isfinite(r) || r < kMinI64 || r >= kMaxI64Plus1) {
+            fail(path, key + " is out of 64-bit integer range");
+        }
+        return (int64_t) r;
     }
 
     static SchemaNode::Format get_format(const JsonValue& schema, const std::string& path) {
@@ -71,17 +85,15 @@ class Builder {
         const JsonValue* target = &root_;
         auto tokens = split(ref.substr(1), "/");
         for (size_t i = 1; i < tokens.size(); i++) {
-            const std::string& sel = tokens[i];
+            std::string sel;
+            if (!json_pointer_unescape(tokens[i], sel)) {
+                fail(path, "cannot resolve $ref " + ref + ", invalid escape in " + tokens[i]);
+            }
             if (target->type == Type::Object && target->contains(sel)) {
                 target = target->get(sel);
             } else if (target->type == Type::Array) {
-                size_t idx;
-                try {
-                    idx = (size_t) std::stoull(sel);
-                } catch (const std::logic_error&) {
-                    idx = target->items.size();
-                }
-                if (idx >= target->items.size()) {
+                size_t idx = 0;
+                if (!json_pointer_index(sel, target->items.size(), idx)) {
                     fail(path, "cannot resolve $ref " + ref + ", " + sel + " is out of range");
                 }
                 target = &target->items[idx];
@@ -239,13 +251,33 @@ class Builder {
         node->kind = SchemaNode::Integer;
         if (schema.contains("minimum")) {
             node->minimum = get_bound(schema, "minimum", path, /* round_up */ true);
-        } else if (schema.contains("exclusiveMinimum")) {
-            node->minimum = get_bound(schema, "exclusiveMinimum", path, /* round_up */ false) + 1;
+            node->has_minimum = true;
+        }
+        if (schema.contains("exclusiveMinimum")) {
+            const int64_t b = get_bound(schema, "exclusiveMinimum", path, /* round_up */ false);
+            if (b == (std::numeric_limits<int64_t>::max)()) {
+                fail(path, "exclusiveMinimum is out of 64-bit integer range");
+            }
+            const int64_t ex_min = b + 1;
+            if (!node->has_minimum || ex_min > node->minimum) {
+                node->minimum = ex_min;
+                node->has_minimum = true;
+            }
         }
         if (schema.contains("maximum")) {
             node->maximum = get_bound(schema, "maximum", path, /* round_up */ false);
-        } else if (schema.contains("exclusiveMaximum")) {
-            node->maximum = get_bound(schema, "exclusiveMaximum", path, /* round_up */ true) - 1;
+            node->has_maximum = true;
+        }
+        if (schema.contains("exclusiveMaximum")) {
+            const int64_t b = get_bound(schema, "exclusiveMaximum", path, /* round_up */ true);
+            if (b == (std::numeric_limits<int64_t>::min)()) {
+                fail(path, "exclusiveMaximum is out of 64-bit integer range");
+            }
+            const int64_t ex_max = b - 1;
+            if (!node->has_maximum || ex_max < node->maximum) {
+                node->maximum = ex_max;
+                node->has_maximum = true;
+            }
         }
         return node;
     }
@@ -269,19 +301,23 @@ class Builder {
             return build_alternatives(SchemaNode::AnyOf, *schema.get(key), path + "/" + key);
         }
 
-        JsonValue type;
-        if (const JsonValue* t = schema.get("type")) type = *t;
-        if (type.type == Type::Array) {
+        const JsonValue* type = schema.get("type");
+        if (type && type->type == Type::Array) {
             // {"type": ["a", "b"], ...} is {"anyOf": [{"type": "a", ...}, {"type": "b", ...}]}
-            if (type.items.empty()) fail(path, "type must not be empty");
+            if (type->items.empty()) fail(path, "type must not be empty");
             auto node = simple(SchemaNode::AnyOf);
             size_t i = 0;
-            for (const auto& t : type.items) {
+            for (const auto& t : type->items) {
+                const std::string item_path = path + "/type/" + std::to_string(i++);
+                if (t.type != Type::String) fail(item_path, "type array elements must be strings");
                 JsonValue alt = schema;
                 alt.set("type", t);
-                node->children.push_back(build_node(alt, path + "/type/" + std::to_string(i++)));
+                node->children.push_back(build_node(alt, item_path));
             }
             return node;
+        }
+        if (type && type->type != Type::String) {
+            fail(path, "type must be a string or an array of strings");
         }
         if (const JsonValue* c = schema.get("const")) {
             auto node = simple(SchemaNode::Const);
@@ -294,15 +330,11 @@ class Builder {
             for (const auto& value : values->items) node->values.push_back(value);
             return node;
         }
-        if (type.type != Type::Null && type.type != Type::String) {
-            fail(path, "type must be a string or an array of strings");
-        }
 
-        const std::string type_name = type.type == Type::String ? type.s : "";
         const JsonValue* addl = schema.get("additionalProperties");
         const bool has_properties = schema.contains("properties") || (addl && !addl->is_true());
 
-        if (type_name.empty()) {
+        if (!type) {
             // without a type the structural keywords decide, in the same order as the converter
             if (has_properties) return build_object(schema, path);
             if (schema.contains("allOf")) return build_alternatives(SchemaNode::AllOf, *schema.get("allOf"), path + "/allOf");
@@ -313,6 +345,7 @@ class Builder {
             }
             return simple(SchemaNode::Any);
         }
+        const std::string& type_name = type->s;
         if (type_name == "object") {
             if (!has_properties && schema.contains("allOf")) {
                 return build_alternatives(SchemaNode::AllOf, *schema.get("allOf"), path + "/allOf");

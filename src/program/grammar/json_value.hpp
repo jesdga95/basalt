@@ -39,6 +39,17 @@ struct JsonValue {
     bool is_integer() const {
         return type == Type::Number && s.find_first_of(".eE") == std::string::npos;
     }
+    /// Strict 64-bit signed integer parse: checks errno == 0 and full string consumption.
+    bool parse_int64(int64_t& out) const {
+        if (!is_integer() || s.empty()) return false;
+        if (s[0] != '-' && (s[0] < '0' || s[0] > '9')) return false;
+        errno = 0;
+        char* end = nullptr;
+        const long long v = std::strtoll(s.c_str(), &end, 10);
+        if (errno != 0 || end != s.c_str() + s.size()) return false;
+        out = (int64_t) v;
+        return true;
+    }
     int64_t as_int() const { return (int64_t) std::strtoll(s.c_str(), nullptr, 10); }
     double as_double() const { return std::strtod(s.c_str(), nullptr); }
     bool is_true() const { return type == Type::Bool && b; }
