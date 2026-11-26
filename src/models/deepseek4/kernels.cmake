@@ -1,5 +1,6 @@
 # DeepSeek-V4 kernels and their parity programs. Included only when the deepseek4 model is selected.
 add_library(deepseek4_kernels STATIC
+  src/models/deepseek4/attention.cpp
   src/models/deepseek4/attention.cu
   src/models/deepseek4/compress.cu
   src/models/deepseek4/indexer_compress.cu
@@ -40,6 +41,13 @@ if(BUILD_TESTING)
   target_link_libraries(ds4_attention_kv_parity PRIVATE deepseek4_kernels core ${_gpu_runtime_target})
   basalt_gpu_test(NAME ds4_attention_kv_parity COMMAND ds4_attention_kv_parity)
   basalt_gpu_test(NAME ds4_attention_kv_bench COMMAND ds4_attention_kv_parity --bench)
+
+  add_executable(ds4_attention_project_parity src/models/deepseek4/attention_project_parity.cpp)
+  target_include_directories(ds4_attention_project_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                                   ${_gpu_include_directories})
+  target_link_libraries(ds4_attention_project_parity PRIVATE deepseek4_kernels core ${_gpu_runtime_target})
+  basalt_gpu_test(NAME ds4_attention_project_parity COMMAND ds4_attention_project_parity)
+  basalt_gpu_test(NAME ds4_attention_project_bench COMMAND ds4_attention_project_parity --bench)
 
   add_executable(ds4_vision_plan_test src/models/deepseek4/vision/plan_test.cpp)
   target_link_libraries(ds4_vision_plan_test PRIVATE deepseek4_vision_plan warnings)
