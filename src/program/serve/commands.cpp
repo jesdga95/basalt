@@ -61,7 +61,10 @@ void Runtime::stats_tick(bool force) {
 
 Flow Runtime::dispatch() {
     if (batch_on()) {
-        if (!try_next_line(line)) {
+        // another admission is on its way: its lines come before the next round (bounded, should the request go away)
+        const bool held = admit_hold && next_line_within(line, kAdmitHoldMs) == 1;
+        admit_hold = admit_hold && held;
+        if (!held && !try_next_line(line)) {
             const BusyClock busy(busy_s, busy_on, busy_from);
             const size_t active = (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; });
             if (!next_batch_window()) return Flow::error;
@@ -179,7 +182,11 @@ Flow Runtime::dispatch() {
         }
         admit_slot = (int) b;
         admit_max_new = mn;
-        line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+        std::string rest(e2);
+        const size_t more = rest.find(" more=1");
+        admit_hold = more != std::string::npos;
+        if (admit_hold) rest.erase(more, 7);
+        line = std::string(bimg ? "GENI 1" : "GEN 1") + rest;
     }
     between_requests(line);
     if (line == "QUIT") return Flow::quit;

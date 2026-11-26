@@ -363,6 +363,10 @@ public:
     int admit_slot{};
     int solo_slot{};
     long long admit_max_new{};
+    // BGEN ... more=1: the server has another request waiting for admission, so the next round waits for its lines
+    // (up to kAdmitHoldMs) instead of running between the two admissions
+    bool admit_hold{};
+    static constexpr int kAdmitHoldMs = 20;
     // a slot's conversation held in RAM (`hold_slot`) while its KV cells back the request that continues it, when the
     // two do not fit side by side; copy_from_slot restores from it
     struct SlotHeld {

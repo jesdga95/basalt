@@ -21,7 +21,8 @@ Protocol (one line each):
     engine runs adds after it); `PFREE <handle>` drops it.
   * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`; with
     `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
-    `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
+    `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`);
+    `more=1` on a BGEN: another request waits to be admitted, so the engine waits briefly for its lines before its next round.
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
@@ -1464,7 +1465,10 @@ class ProcessEngine:
                         left = min(left, room)                  # the slot's room
                         while not self.slot_q[slot].empty():
                             self.slot_q[slot].get_nowait()
-                        head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
+                        with self.slot_cv:              # another request waits to be admitted: the engine waits for it
+                            more = " more=1" if self.waiting > 0 else ""   # before its next round (BGEN more=1)
+                        head = (f"BGENI {slot} {left}{gen_keys()}{more} {embeddings}" if embeddings
+                                else f"BGEN {slot} {left}{gen_keys()}{more}")
                         self._send(f"{head} {ref()}")
                         self._hold(slot, 0)                     # admission overwrites the slot
                         phase = "admit"
