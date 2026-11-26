@@ -70,9 +70,10 @@ as fast as through MMQ.
   reader, which shallower rows and the sliding-window layers keep.
 - **Slices:** both INT8 readers split a full-cache row's keys into slices of whole 128-key passes, sized by the row's own
   key count, and merge them in fp32 in slice order. The most slices an INT8 row takes follows the card's multiprocessor
-  count (the count whose launches end in whole waves, 63 on an 84-SM card, logged at load as `attention slices`), so rows
-  deep enough to reach it (over 128 keys a slice) round differently in their last bits on cards of different models; on
-  one card, a row's bits do not depend on its window. FP16 and FP8 caches take at most 64 slices on every card.
+  count (the count whose launches end in whole waves, 63 on an 84-SM card, logged at load as `attention slices`). A row
+  that would take more slices than that takes fewer, larger ones, so it can round differently in its last bits from a
+  card with another count; the other rows slice the same on every card. On one card, a row's bits do not depend on its
+  window. FP16 and FP8 caches take at most 64 slices on every card.
 
 ### Cost of the tensor-core INT8 reader
 
