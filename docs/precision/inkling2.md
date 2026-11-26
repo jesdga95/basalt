@@ -79,7 +79,7 @@ as fast as through MMQ.
 
 ### Cost of the tensor-core INT8 reader
 
-The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16`, `--kv fp8` and shallower INT8 rows run the scalar reader unchanged.
+The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16` and `--kv fp8` keep their own tensor-core reader and shallower INT8 rows the scalar reader, unchanged.
 
 Two measurements against the scalar INT8 reader of the same build, with the same weights and forced tokens (and the same expert placement, except where a row says otherwise).
 
