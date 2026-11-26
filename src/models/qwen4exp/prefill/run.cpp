@@ -27,6 +27,19 @@ bool Prefill::Run::execute() {
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
     if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    // Synchronize all prefill streams on any exit that skipped finish() (cancellation, chunk error, or exception)
+    // before the caller's refill overwrites borrowed cache slots, while Run::on_device is still active.
+    bool finished = false;
+    struct StreamDrain {
+        Impl& m;
+        bool& finished;
+        ~StreamDrain() {
+            if (finished) return;
+            if (m.cs) (void) cudaStreamSynchronize(m.cs);
+            if (m.copy) (void) cudaStreamSynchronize(m.copy);
+            if (m.cpu_s) (void) cudaStreamSynchronize(m.cpu_s);
+        }
+    } stream_drain{m, finished};
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -38,7 +51,9 @@ bool Prefill::Run::execute() {
         if (flow < 0) return false;
         if (flow > 0) break;
     }
-    return finish();
+    const bool ok = finish();
+    finished = ok;
+    return ok;
 }
 
 bool Prefill::Run::finish() {

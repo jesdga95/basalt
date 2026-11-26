@@ -85,6 +85,7 @@ bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& 
             cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
             if (t.from_ram) {
                 if ((from = srcp->blob(l, t.hot)) == nullptr) {
+                    if (moved > 0) (void) cudaStreamSynchronize(adapt_stream);
                     e = "moving an expert out of the cache's tail: its RAM copy is gone";
                     return false;
                 }
@@ -94,6 +95,7 @@ bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& 
             if (cudaMemcpyAsync(xcache.device_slot(t.to), from, (size_t) lay.blob_bytes(l), kind, adapt_stream) !=
                 cudaSuccess) {
                 e = std::string("moving an expert out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError());
+                if (moved > 0) (void) cudaStreamSynchronize(adapt_stream);
                 return false;
             }
             r[t.hot] = t.to;
@@ -138,11 +140,14 @@ bool QfnRuntime::cache_regrow(std::string& e) {
     std::string gerr;
     (void) xcache.grow(xcache.mapped_bytes() + room, gerr);   // what it could not map stays with the driver
     const int64_t live = xcache.slots();
+    std::vector<uint8_t> claimed(host_res.size(), 0);
     auto usable = [&](int64_t j) {
         const int64_t l = j / g.n_expert, ex = j % g.n_expert;
-        return host_res[(size_t) j] < 0 && (!src.complement_ready() || src.has_resident(l, ex)) &&
+        return host_res[(size_t) j] < 0 && !claimed[(size_t) j] && (!src.complement_ready() || src.has_resident(l, ex)) &&
                !(peer.valid() && peer.has(l, ex));
     };
+    struct Fill { int32_t pick; int32_t slot; const uint8_t* b; int64_t bytes; };
+    std::vector<Fill> fills;
     std::vector<std::pair<int32_t, int32_t>> keep_out;
     std::string ferr;
     for (const auto& [i, slot] : vram_evicted) {
@@ -160,17 +165,40 @@ bool QfnRuntime::cache_regrow(std::string& e) {
         }
         if (pick < 0) continue;
         const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
-        if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer))) {
+        if (b == nullptr) {
+            e = "elastic KV: refilling the cache failed: an expert has no RAM copy";
+            return false;
+        }
+        claimed[(size_t) pick] = 1;
+        fills.push_back({(int32_t) pick, slot, b, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer)});
+    }
+    bool queued = false;
+    for (const Fill& f : fills) {
+        if (!xcache.fill_slot_queued(f.slot, f.b, ferr, f.bytes)) {
+            if (queued) { std::string se; (void) xcache.sync_queued(se); }
             e = "elastic KV: refilling the cache failed: " + ferr;
             return false;
         }
-        host_res[(size_t) pick] = slot;
+        queued = true;
     }
+    if (queued && !xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
+    for (const Fill& f : fills) host_res[(size_t) f.pick] = f.slot;
     vram_evicted.swap(keep_out);
-    if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
     res_upload();
     relend();
+    if (src.complement_ready() && src.homes_bytes() > 0) {
+        const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+        size_t released = 0;
+        for (size_t j = 0; j < host_res.size(); ++j)
+            if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                ++released;
+        if (released > 0) {
+            const uint64_t freed = src.homes_reclaim() + src.homes_compact();
+            basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept",
+                              released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
+        }
+    }
     return true;
 }
 
@@ -333,8 +361,19 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
         // whole tail segments: everything from the first one at or past `keep` goes
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
-        if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
-        if (!xcache.shrink(keep, e)) return false;
+        const int64_t keep_slots = xcache.slots_after_shrink(keep);
+        if (kv_keep_routed && !move_routed_below(keep_slots, "elastic KV", e)) {
+            res_upload();
+            return false;
+        }
+        std::string herr;
+        if (!home_given_up(keep_slots, herr))
+            basalt::log::warn("basalt serve", "elastic KV: could not move evicted experts to RAM (%s); falling back to file reads",
+                              herr.c_str());
+        if (!xcache.shrink(keep, e)) {
+            if (kv_keep_routed) res_upload();
+            return false;
+        }
         const int64_t live = xcache.slots();
         std::vector<int32_t> off;
         for (size_t i = 0; i < host_res.size(); ++i)

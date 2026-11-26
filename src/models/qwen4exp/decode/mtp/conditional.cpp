@@ -28,8 +28,10 @@ bool MtpDrafter::capture_cond(int T, int steps) {
     cudaGraphExec_t& exec = cond_exec_[tier_][T];
     if (exec && cond_steps_[tier_][T] == steps) return true;
     if (exec) {
+        if (cs_) (void) cudaStreamSynchronize(cs_);
         cudaGraphExecDestroy(exec);
         exec = nullptr;
+        cond_steps_[tier_][T] = 0;
     }
     using namespace basalt::kernels;
     std::string err;

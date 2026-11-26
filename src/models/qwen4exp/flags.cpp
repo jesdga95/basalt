@@ -9,6 +9,7 @@
 #include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -86,7 +87,8 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
             const size_t colon = item.rfind(':');
             char* end = nullptr;
             const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
-            if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
+            if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0' ||
+                !std::isfinite(sc)) {
                 basalt::log::error("basalt", "--control-vector-scaled: expected FILE:SCALE, got '%s'", item.c_str());
                 { code = 2; return true; }
             }

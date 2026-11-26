@@ -143,18 +143,18 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
         const int64_t live = xcache.slots();
         std::string ferr;
         std::vector<std::pair<int32_t, int32_t>> keep_out;
-        struct Fill { int32_t slot; const uint8_t* b; int64_t bytes; };
+        struct Fill { int32_t pick; int32_t slot; const uint8_t* b; int64_t bytes; };
         std::vector<Fill> fills;
+        std::vector<uint8_t> claimed(host_res.size(), 0);
         for (const auto& [i, slot] : vram_evicted) {
             if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
             const int64_t layer = i / g.n_expert;
-            int64_t pick = i;
-            if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
-                pick = -1;
+            int64_t pick = (host_res[(size_t) i] < 0 && !claimed[(size_t) i]) ? i : -1;
+            if (pick < 0) {   // back already (the adaptive tier): the layer's most-routed miss
                 float best = -1.0f;
                 for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                     const size_t j = (size_t) (layer * g.n_expert + ex);
-                    if (host_res[j] >= 0 || (src.complement_ready() && !src.has_resident(layer, ex))) continue;
+                    if (host_res[j] >= 0 || claimed[j] || (src.complement_ready() && !src.has_resident(layer, ex))) continue;
                     const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
                     if (u > best) { best = u; pick = (int64_t) j; }
                 }
@@ -165,26 +165,31 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
                 e = "VRAM: refilling the cache failed: an expert has no RAM copy";
                 return false;
             }
-            fills.push_back({slot, b, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer)});
-            host_res[(size_t) pick] = slot;
+            claimed[(size_t) pick] = 1;
+            fills.push_back({(int32_t) pick, slot, b, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer)});
         }
         // after a SLEEP the RAM copy is registered again in address order (WAKE): the copies follow it
         const bool repinning = src.complement_unpinned();
         if (repinning)
             std::sort(fills.begin(), fills.end(),
                       [](const Fill& x, const Fill& y) { return std::less<const uint8_t*>()(x.b, y.b); });
+        bool queued = false;
         for (const Fill& f : fills) {
             if (repinning && !src.repin_wait(f.b, (uint64_t) f.bytes)) {
+                if (queued) { std::string se; (void) xcache.sync_queued(se); }
                 e = "VRAM: the RAM copy could not be registered again";
                 return false;
             }
             if (!xcache.fill_slot_queued(f.slot, f.b, ferr, f.bytes)) {
+                if (queued) { std::string se; (void) xcache.sync_queued(se); }
                 e = "VRAM: refilling the cache failed: " + ferr;
                 return false;
             }
+            queued = true;
         }
+        if (queued && !xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
+        for (const Fill& f : fills) host_res[(size_t) f.pick] = f.slot;
         vram_evicted.swap(keep_out);
-        if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
         res_upload();
         relend();
         // the slots hold the experts again: every expert in a slot below the loan has its RAM home freed (the

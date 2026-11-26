@@ -48,6 +48,7 @@ private:
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
+    int device_ = -1;
     bool planes_ = false;
 };
 
@@ -78,6 +79,7 @@ public:
 private:
     void* host_ = nullptr;
     const void* dev_ = nullptr;
+    int dev_device_ = -1;   ///< the device that holds dev_ when VRAM fallback is used (host_ == nullptr)
     void* hot_ = nullptr;
     int hot_device_ = -1;   ///< the device that holds hot_; the other devices read every row from the mapped table
     int64_t n_hot_ = 0;

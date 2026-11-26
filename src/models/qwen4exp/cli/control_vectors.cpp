@@ -8,8 +8,11 @@
 #include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <vector>
 
 namespace basalt::models::qwen4exp::cli {
@@ -19,9 +22,19 @@ namespace basalt::models::qwen4exp::cli {
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
 bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g, std::string& summary, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
+    if (L <= 0 || N <= 0) {
+        err = "control vector: invalid model geometry";
+        return false;
+    }
     std::vector<float> data((size_t) (L * N), 0.0f);
+    std::vector<float> vec((size_t) N);
     std::vector<bool> have((size_t) L, false);
+    const uint64_t need_bytes = (uint64_t) N * sizeof(float);
     for (const auto& [path, scale] : o.cvec_files) {
+        if (!std::isfinite(scale)) {
+            err = path + ": non-finite control vector scale";
+            return false;
+        }
         try {
             basalt::GgufFile f(path);
             const basalt::MetaValue* arch = f.get("general.architecture");
@@ -32,17 +45,36 @@ bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g
             const basalt::MetaValue* hint = f.get("controlvector.model_hint");
             if (hint != nullptr && hint->s != "qwen4exp")
                 basalt::log::warn("basalt generate", "%s was made for '%s', not qwen4exp", path.c_str(), hint->s.c_str());
+            const uint64_t payload = f.file_size() >= f.data_start() ? f.file_size() - f.data_start() : 0;
             int found = 0;
             for (const basalt::TensorInfo& t : f.tensors()) {
                 if (t.name.rfind("direction.", 0) != 0) continue;
-                const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
+                const char* start = t.name.c_str() + 10;
+                if (*start < '0' || *start > '9') continue;
+                char* end = nullptr;
+                errno = 0;
+                const long l = std::strtol(start, &end, 10);
+                if (errno != 0 || end == start || *end != '\0') continue;
                 if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
-                if (t.type != 0 || t.elements() != (uint64_t) N) {
+                uint64_t elems = 1;
+                bool shape_ok = !t.shape.empty();
+                for (uint64_t dim : t.shape) {
+                    if (dim == 0 || elems > (std::numeric_limits<uint64_t>::max)() / dim) {
+                        shape_ok = false;
+                        break;
+                    }
+                    elems *= dim;
+                }
+                if (t.type != 0 || !shape_ok || elems != (uint64_t) N) {
                     err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
                     return false;
                 }
-                const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
-                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
+                if (t.offset > payload || need_bytes > payload - t.offset) {
+                    err = path + ": " + t.name + " payload is truncated";
+                    return false;
+                }
+                std::memcpy(vec.data(), f.tensor_data(t), (size_t) need_bytes);
+                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * vec[(size_t) j];
                 have[(size_t) l] = true;
                 ++found;
             }
@@ -69,10 +101,14 @@ bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g
             double nrm = 0.0;
             for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
             nrm = std::sqrt(nrm);
-            if (nrm <= 0.0) continue;
+            if (!std::isfinite(nrm) || nrm <= 0.0 || !std::isfinite((float) nrm)) continue;
             s[(size_t) l] = (float) nrm;
             for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
         } else {
+            bool finite = true;
+            for (int64_t j = 0; j < N; ++j)
+                if (!std::isfinite(d[j])) { finite = false; break; }
+            if (!finite) continue;
             s[(size_t) l] = 1.0f;
             std::copy(d, d + N, dir.begin() + (size_t) (l * N));
         }

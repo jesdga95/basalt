@@ -55,13 +55,36 @@ int QfnRuntime::init_prompt_paths() {   // 0: ready; 1: failed (err set); 2: fai
 bool QfnRuntime::split_region(PromptStage& st, int64_t cells, int64_t chunk, int64_t l0, int64_t l1, uint8_t*& w_at, uint8_t*& s_at, uint8_t*& b_at) {
     const basalt::core::ExpertCache& pc = st.tier->cache();
     uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
-    auto down = [](uint8_t* p) { return (uint8_t*) ((uintptr_t) p & ~(uintptr_t) 255); };
-    w_at = down(base + pc.bytes() - st.image_bytes);
-    s_at = down(w_at - basalt::core::prompt_session_bytes(g, cells, l0, l1));
-    basalt::core::prompt_session_carve(g, cells, K, s_at, st.ss, l0, l1);
-    b_at = down(s_at - basalt::prefill::Prefill::bytes_needed(g, st.ss, chunk));
+    const uint64_t cap = (uint64_t) std::max<int64_t>(pc.bytes(), 0);
+    if (base == nullptr || cap == 0) return false;
+    const uintptr_t base_addr = (uintptr_t) base;
+    auto align_down_off = [base_addr](uint64_t off, uint64_t& out) -> bool {
+        const uint64_t rem = (uint64_t) ((base_addr + (uintptr_t) off) & (uintptr_t) 255);
+        if (off < rem) return false;
+        out = off - rem;
+        return true;
+    };
+    const uint64_t img_bytes = st.image_bytes;
+    uint64_t w_off = 0, s_off = 0, b_off = 0;
+    if (img_bytes > cap || !align_down_off(cap - img_bytes, w_off)) return false;
+    const uint64_t sess_bytes = basalt::core::prompt_session_bytes(g, cells, l0, l1);
+    if (sess_bytes > w_off || !align_down_off(w_off - sess_bytes, s_off)) return false;
+    // Price the prompt buffers with a stack probe matching prompt_session_carve's max_cells / kv_mode == 0 so a
+    // failed fit test never mutates st.ss or wraps pointer arithmetic below base.
+    basalt::core::QsaState qprobe{};
+    qprobe.max_cells = cells;
+    basalt::core::SessionState sprobe{};
+    sprobe.qsa_states = &qprobe;
+    sprobe.qsa_ord0 = 0;
+    const uint64_t buf_bytes = basalt::prefill::Prefill::bytes_needed(g, sprobe, chunk);
+    if (buf_bytes > s_off || !align_down_off(s_off - buf_bytes, b_off)) return false;
     // the loan leaves the tier a tenth of its slots, as the main card's
-    return b_at >= base + pc.bytes() / 10;
+    if (b_off < cap / 10) return false;
+    w_at = base + w_off;
+    s_at = base + s_off;
+    b_at = base + b_off;
+    basalt::core::prompt_session_carve(g, cells, K, s_at, st.ss, l0, l1);
+    return true;
 }
 
 // the batched path's slots are lent just before its first run and given back (refilled) before a window
@@ -72,13 +95,18 @@ bool QfnRuntime::split_region(PromptStage& st, int64_t cells, int64_t chunk, int
 // holding an expert it does not own, which is silent and produces plausible tokens.
 // (split in two halves so a layer split can queue every stage's copies before it waits for any)
 bool QfnRequest::refill_issue(PfPart& p, std::string& e, bool assign) {
+    (void) assign;   // host_res is committed only after sync_queued succeeds
     const basalt::core::OnDevice on(p.dev);
+    bool queued = false;
     for (const auto& [i, slot] : p.lent) {   // queued, one wait
         const uint8_t* b = runtime_.srcp->blob(i / runtime_.g.n_expert, i % runtime_.g.n_expert);
         const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / runtime_.g.n_expert);
-        if (b == nullptr || !(p.cache->fill_slot_queued(slot, b, e, nb)))
+        if (b == nullptr || !(p.cache->fill_slot_queued(slot, b, e, nb))) {
+            if (b == nullptr && e.empty()) e = "an expert has no RAM copy";
+            if (queued) { std::string se; (void) p.cache->sync_queued(se); }
             return false;
-        if (assign) runtime_.host_res[(size_t) i] = slot;
+        }
+        queued = true;
     }
     return true;
 }
@@ -86,6 +114,7 @@ bool QfnRequest::refill_issue(PfPart& p, std::string& e, bool assign) {
 bool QfnRequest::refill_wait(PfPart& p, std::string& e) {
     const basalt::core::OnDevice on(p.dev);
     if (!p.cache->sync_queued(e)) return false;
+    for (const auto& [i, slot] : p.lent) runtime_.host_res[(size_t) i] = slot;
     p.lent.clear();
     p.lent_chunk = 0;
     return true;
@@ -100,20 +129,41 @@ bool QfnRequest::refill_one(PfPart& p, std::string& e) {
         ov_copied = false;
         return true;
     }
-    return refill_issue(p, e) && refill_wait(p, e);
+    return refill_issue(p, e, false) && refill_wait(p, e);
 }
 
 // with several stages every stage's copies go out first (each card on its own link), then each is waited
 // for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
 bool QfnRequest::refill(std::string& e) {
-    int64_t n_lent = 0, n_parts = 0;
+    int64_t n_parts = 0;
     for (PfPart& p : runtime_.pf_parts)
-        if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+        if (!p.lent.empty()) ++n_parts;
     if (n_parts > 1) {
-        for (PfPart& p : runtime_.pf_parts)
-            if (!p.lent.empty() && !refill_issue(p, e)) return false;
-        for (PfPart& p : runtime_.pf_parts)
-            if (!p.lent.empty() && !refill_wait(p, e)) return false;
+        std::vector<PfPart*> issued;
+        bool ok = true;
+        for (PfPart& part : runtime_.pf_parts) {
+            if (part.lent.empty()) continue;
+            if (refill_issue(part, e, false)) {
+                issued.push_back(&part);
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        for (PfPart* part : issued) {
+            const basalt::core::OnDevice on(part->dev);
+            std::string we;
+            if (!part->cache->sync_queued(we)) {
+                if (ok) e = we;
+                ok = false;
+            }
+        }
+        if (!ok) return false;
+        for (PfPart* part : issued) {
+            for (const auto& [i, slot] : part->lent) runtime_.host_res[(size_t) i] = slot;
+            part->lent.clear();
+            part->lent_chunk = 0;
+        }
     } else {
         for (PfPart& p : runtime_.pf_parts)
             if (!p.lent.empty() && !refill_one(p, e)) return false;
@@ -210,7 +260,13 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
             // only this participant's loan goes back: `refill` would return the other participants'
             // loans too, and their buffers are still laid out in their caches - marking those slots
             // resident again would hand the next window a prompt buffer in place of an expert
-            if (!refill_one(p, e)) return false;
+            if (!refill_one(p, e)) {
+                for (const auto& [i, slot] : again) {
+                    runtime_.host_res[(size_t) i] = basalt::core::kNotResident;
+                    p.lent.emplace_back(i, slot);
+                }
+                return false;
+            }
         }
         const basalt::core::OnDevice on(p.dev);
         if (beside_ && &p == &runtime_.pf_parts[0] && p.lent.empty()) {

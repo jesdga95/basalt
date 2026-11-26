@@ -201,6 +201,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
         }
     }
+    bool peer_launched = false;
+    int touched_n = 0;
+    int32_t touched[kMaxWindowEntries];
+    struct Cleanup {
+        ExpertDispatch& d;
+        float* out;
+        bool& peer_launched;
+        int& touched_n;
+        const int32_t* touched;
+        ~Cleanup() {
+            for (int q = 0; q < touched_n; ++q) d.job_of[(size_t) touched[q]] = -1;
+            if (peer_launched) {
+                std::string perr;
+                (void) d.peer->finish(out, perr);
+                peer_launched = false;
+            }
+        }
+    } cleanup{d, out, peer_launched, touched_n, touched};
     if (d.peer != nullptr && !ext) {         // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
         if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
@@ -210,6 +228,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             d.fail_layer = d.layers;
             return;
         }
+        peer_launched = true;
     }
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap);
@@ -275,11 +294,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     return;
                 }
                 jo = (int16_t) njobs++;
+                touched[touched_n++] = (int32_t) e;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            if (jb.nt >= MAXT) {
+                d.failed = true;
+                d.fail = "a routed expert appears more times than the multi-token kernel holds";
+                d.fail_layer = d.layers;
+                d.fail_expert = e;
+                return;
+            }
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;
@@ -290,7 +317,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (njobs > 0) {
         d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     }
-    if (d.peer != nullptr && !ext) {         // multi-GPU: the second GPU's rows, into the same mapped rows
+    if (peer_launched) {         // multi-GPU: the second GPU's rows, into the same mapped rows
+        peer_launched = false;
         std::string perr;
         if (!d.peer->finish(out, perr)) {
             basalt::log::error("basalt", "%s (layer %lld)", perr.c_str(), (long long) d.layers);
@@ -306,10 +334,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
-    for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
-        if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
-    }
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;

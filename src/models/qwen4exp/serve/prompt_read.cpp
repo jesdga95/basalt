@@ -27,19 +27,43 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
             std::mutex mu;
             std::condition_variable cv;
             std::function<void()> job;
-            bool job_done = false, fin = false;
+            bool job_done = false, fin = false, aborted = false;
         } mail;
         std::atomic<bool> abort_read{false};
         bool ok = false;
+        bool terr_oom = false;
         std::string terr;
         int yield_req = -1;                 // a BYIELD <slot> not acted on yet
         int64_t yield_q = -1;               // the chunk boundary the read stopped at, to give way
         int yield_slot = -1;
         auto orig_chunk = runtime_.sp.on_chunk;
         auto orig_stop = runtime_.sp.should_stop;
+        std::thread th;
+        bool ov_closed = false;
+        auto close_overlap = [&] {
+            if (ov_closed) return;
+            ov_closed = true;
+            abort_read.store(true);
+            {
+                std::lock_guard<std::mutex> lk(mail.mu);
+                mail.aborted = true;
+                mail.job = nullptr;
+                mail.job_done = true;
+                mail.cv.notify_all();
+            }
+            if (th.joinable()) th.join();
+            runtime_.ov_active = false;
+            runtime_.sp.on_chunk = std::move(orig_chunk);
+            runtime_.sp.should_stop = std::move(orig_stop);
+        };
+        struct OverlapGuard {
+            decltype(close_overlap)& fn;
+            ~OverlapGuard() { fn(); }
+        } overlap_guard{close_overlap};
         runtime_.sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ce) -> bool {
             bool r = false;
             std::unique_lock<std::mutex> lk(mail.mu);
+            if (mail.aborted) return false;
             mail.job = [&] {
                 r = orig_chunk ? orig_chunk(R_rows, T, p0, ce) : true;
                 if (!r || yield_req < 0) return;
@@ -57,22 +81,35 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
                 }
             };
             mail.job_done = false;
-            mail.cv.wait(lk, [&] { return mail.job_done; });
-            return r;
+            mail.cv.wait(lk, [&] { return mail.job_done || mail.aborted; });
+            return r && !mail.aborted;
         };
         runtime_.sp.should_stop = [&] { return abort_read.load() || (orig_stop && orig_stop()); };
         runtime_.ov_active = true;
-        std::thread th([&] {
-            const basalt::core::OnDevice on(0);
-            ok = runtime_.sp.run(ids.data() + a0, b0 - a0, a0, terr);
-            if (ok && runtime_.ov_post) {   // (the checkpoint's copy to the host beside the windows)
-                ok = runtime_.ov_post();
-                runtime_.ov_post_done = ok;
-                if (!ok) terr = "saving a conversation checkpoint failed" + runtime_.ckpt_why;
+        th = std::thread([&] {
+            struct SignalFin {
+                Mail& m;
+                ~SignalFin() noexcept {
+                    std::lock_guard<std::mutex> lk(m.mu);
+                    m.fin = true;
+                    m.cv.notify_all();
+                }
+            } signal_fin{mail};
+            try {
+                const basalt::core::OnDevice on(0);
+                ok = runtime_.sp.run(ids.data() + a0, b0 - a0, a0, terr);
+                if (ok && runtime_.ov_post) {   // (the checkpoint's copy to the host beside the windows)
+                    ok = runtime_.ov_post();
+                    runtime_.ov_post_done = ok;
+                    if (!ok) terr = "saving a conversation checkpoint failed" + runtime_.ckpt_why;
+                }
+            } catch (const std::exception& ex) {
+                ok = false;
+                try { terr = ex.what(); } catch (...) { terr_oom = true; }
+            } catch (...) {
+                ok = false;
+                try { terr = "overlapped prompt read failed"; } catch (...) { terr_oom = true; }
             }
-            std::lock_guard<std::mutex> lk(mail.mu);
-            mail.fin = true;
-            mail.cv.notify_all();
         });
         bool fatal = false;
         int64_t ov_jobs = 0, ov_wins = 0;
@@ -120,14 +157,11 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
                 mail.cv.wait_for(lk, std::chrono::milliseconds(2), [&] { return mail.fin || (mail.job && !mail.job_done); });
             }
         }
-        th.join();
-        runtime_.ov_active = false;
+        close_overlap();
         basalt::log::info("basalt batch", "overlapped prompt read: %lld windows (%.1f ms avg, %.0f ms max) beside "
                              "%lld chunk jobs run between windows (%.1f ms avg, %.0f ms max)",
                      (long long) ov_wins, ov_wins ? ov_win_ms / (double) ov_wins : 0.0, ov_win_max,
                      (long long) ov_jobs, ov_jobs ? ov_job_ms / (double) ov_jobs : 0.0, ov_job_max);
-        runtime_.sp.on_chunk = std::move(orig_chunk);
-        runtime_.sp.should_stop = std::move(orig_stop);
         if (yield_q >= 0 && !fatal) {   // the read stopped at a chunk boundary to give way (BYIELD)
             std::string ye;
             const auto ty = Clock::now();
@@ -146,7 +180,7 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
             return false;
         }
         if (fatal) { batch_fatal = true; e = "a batch window failed"; return false; }
-        if (!ok) e = terr;
+        if (!ok) e = terr.empty() && terr_oom ? std::string("overlapped prompt read ran out of memory") : terr;
         return ok;
     }
     const int64_t C = std::max<int64_t>(runtime_.sp.chunk(), 1);

@@ -1,6 +1,7 @@
 #include "basalt/models/qwen4exp/decode/native_dense.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/core/loader.hpp"
+#include "basalt/core/on_device.hpp"
 #include <cstdlib>
 #include "basalt/core/weights.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
@@ -130,6 +131,7 @@ bool NativeDense::keep_unquantized_ple_key(const PackFiles& pack, std::set<std::
 }
 
 NativeDense::~NativeDense() {
+    const OnDevice on_device(device_);
     if (scratch_) cudaFree(scratch_);
     for (void* p : allocs_) cudaFree(p);
 }
@@ -311,6 +313,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (slab) allocs_.push_back(slab.release());
         scratch_ = scratch.release();
         bytes_ = total;
+        device_ = load_dev;
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();
