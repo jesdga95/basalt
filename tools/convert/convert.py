@@ -47,7 +47,8 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
                      experts) likewise to Q6_K or Q8_0, and BF16 where the checkpoint has BF16. Each form goes to Q6_K
                      where rows are whole 256-value blocks, Q8_0 elsewhere and for the output head and token embedding;
                      the other tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8
-                     code x scale as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+                     code x scale as Q8_0, or as IQ4_NL with --ple-q. The GGUF metadata and the tokenizer come from the
+                     checkpoint's files.
                      Model Optimizer's FP4-Local layout is read too: the shards in tensors/, expert scales as CSF stream
                      pairs (decoded bit for bit), MXFP8 projections, F32 norm weights, and an NVFP4 n-gram table (E2M1
                      code x UE4M3 block scale x weight_scale_2 as Q8_0)
@@ -637,7 +638,7 @@ def from_checkpoint(a) -> None:
         ck = C.Checkpoint(a.checkpoint)
         experts = C.CheckpointExperts(ck)
         dense_src = C.CheckpointDense(ck, q6k)
-        ple = C.ple_table(ck)
+        ple = C.ple_table(ck, quant=a.ple_q)
         kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
         dense = S.Dense(dense_src, False)
     except S.ConvertError as e:
@@ -702,7 +703,7 @@ def from_checkpoint(a) -> None:
                     die(f"section {name}: the copy's SHA-256 differs from {src}'s")
             tens = {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.ne],
                         "bytes": t.expected_bytes(), "offset": tensor_offsets[n]} for n, t in dense_src.tensors.items()}
-            tens["per_layer_token_embd.weight"] = {"type": "Q8_0", "type_id": 8, "shape": [S.PLE_DIM, ple.rows],
+            tens["per_layer_token_embd.weight"] = {"type": ple.type_name, "type_id": ple.type_id, "shape": [S.PLE_DIM, ple.rows],
                                                   "bytes": ple.nbytes, "offset": tensor_offsets["per_layer_token_embd.weight"]}
             ck_files = sorted(set(ck.shards) | set(ple.paths))
             meta = {
@@ -865,6 +866,9 @@ def main():
     ap.add_argument("--compat-bf16", action="store_true",
                     help="convert small projections stored in another form to BF16 (rounds)")
     ap.add_argument("--no-vision", action="store_true")
+    ap.add_argument("--ple-q", choices=("iq4_nl", "q8_0"), default="q8_0",
+                    help="the PLE n-gram table's rows: iq4_nl (90 B/row, what the engine calls the model's own format "
+                         "and 24 GiB smaller) or q8_0 (170 B/row, the default; the FP8 source is re-rounded either way)")
     ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
     ap.add_argument("--checkpoint", metavar="DIR",

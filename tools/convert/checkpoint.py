@@ -748,7 +748,7 @@ def model_kv(ck: Checkpoint, ple_dim: int, file_type: int, name: str | None) -> 
     return kv
 
 
-def ple_table(ck: Checkpoint):
+def ple_table(ck: Checkpoint, quant: str = "q8_0"):
     """The n-gram table's reader: NVFP4 shards with one FP32 weight_scale_2 (PleNvfp4), or FP8 shards with one BF16
     weight_scale (model_sections.PleFp8, given the files that hold them; a release that consolidated its files may
     spread them over several)."""
@@ -760,7 +760,7 @@ def ple_table(ck: Checkpoint):
         raise S.ConvertError(f"{ck.dir}: no ngram_embedding.weight_scale")
     if not hits:
         raise S.ConvertError(f"{ck.dir}: no ngram_embedding shards")
-    return S.PleFp8([str(p) for p in hits])
+    return S.PleFp8([str(p) for p in hits], quant=quant)
 
 
 class PleNvfp4:
