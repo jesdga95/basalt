@@ -28,7 +28,7 @@ converter.
 | Norms, attention-residual queries, router, biases, convolution taps, relative tables, clip scales | F32 | as stored |
 | Loop controllers | BF16 | as stored |
 | Vision encoder and projector | BF16 | as stored |
-| DSpark drafter | BF16 in the file; projections rounded to Q8_0 as they load | drafting only: cannot change output |
+| DSpark drafter | BF16 in the file; projections rounded to Q8_0 as they load; its full layer's K/V fp16, int8 with `--kv int8` (the target's int8 cache rule), its window layers' rings fp16 | drafting only: cannot change output |
 
 The release marks NVFP4 activation quantization as required (its own serving runs W4A4); transformers and llama.cpp run
 dequantized weights, and so does the reference.
@@ -208,8 +208,9 @@ The previous INT8 row-writer parity matched the CPU reference for 257 rows of wi
 
 ## Drafting
 
-The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output
-with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
+The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. With
+`--kv int8` the drafter's full layer keeps its K/V in int8 too, which can change which tokens it drafts, not the output. Greedy
+output with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
 2,405-token prompt checked).
 
 The prompt attention and the FP4 experts round a row the same at any chunk width (the parity test checks both, the experts

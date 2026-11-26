@@ -766,6 +766,43 @@ __device__ __forceinline__ float block_sum_128(float v, float* red) {
     return s;
 }
 
+// Thread d of a kHeadDim-thread block writes dim d of a cell's K and V row of one head: fp16, or with `ks` set the int8
+// cache's rule (attn_qk_prepare's: per 64 values, scale amax / 127 stored fp16, codes rounded to nearest against the stored
+// scale; a group is two warps). Every thread of the block calls it.
+__device__ __forceinline__ void store_kv_row(int64_t row, int d, float k, float v, uint16_t* kc, uint16_t* vc, uint16_t* ks,
+                                             uint16_t* vs) {
+    const int64_t at = row * kHeadDim + d;
+    if (!ks) {
+        reinterpret_cast<__half*>(kc)[at] = __float2half_rn(k);
+        reinterpret_cast<__half*>(vc)[at] = __float2half_rn(v);
+        return;
+    }
+    __shared__ float mk[kHeadDim / 32], mv[kHeadDim / 32];
+    float ak = fabsf(k), av = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        ak = fmaxf(ak, __shfl_xor_sync(0xffffffffu, ak, o));
+        av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, o));
+    }
+    if ((d & 31) == 0) {
+        mk[d >> 5] = ak;
+        mv[d >> 5] = av;
+    }
+    __syncthreads();
+    const int w0 = (d >> 5) & ~1;
+    ak = fmaxf(mk[w0], mk[w0 + 1]);
+    av = fmaxf(mv[w0], mv[w0 + 1]);
+    const __half hk = __float2half_rn(ak / 127.0f), hv = __float2half_rn(av / 127.0f);
+    const float sk = __half2float(hk), sv = __half2float(hv);
+    const float qk = sk > 0.0f ? rintf(k / sk) : 0.0f, qv = sv > 0.0f ? rintf(v / sv) : 0.0f;
+    reinterpret_cast<int8_t*>(kc)[at] = (int8_t) fmaxf(-127.0f, fminf(127.0f, qk));
+    reinterpret_cast<int8_t*>(vc)[at] = (int8_t) fmaxf(-127.0f, fminf(127.0f, qv));
+    if ((d & 63) == 0) {
+        ks[row * (kHeadDim / 64) + d / 64] = __half_as_ushort(hk);
+        vs[row * (kHeadDim / 64) + d / 64] = __half_as_ushort(hv);
+    }
+}
+
 __global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* tap, int64_t tap_stride, DsMixArgs a,
                                                              float* __restrict__ out, int64_t out_stride,
                                                              const int32_t* pos, DsCommitSegs segs, int fr_cap) {
@@ -797,9 +834,8 @@ __global__ void __launch_bounds__(kHeadDim) kv_commit_batch_kernel(const float* 
     y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     const int sk = segs.at_d ? basalt::kernels::seg_of(*segs.at_d, t) : 0;
     const int64_t cell = cap > 0 ? (int64_t) p % cap : (int64_t) p;
-    const int64_t at = (cell * kKvHeads + head) * kHeadDim + d;
-    reinterpret_cast<__half*>(segs.k[sk])[at] = __float2half_rn(y);
-    reinterpret_cast<__half*>(segs.v[sk])[at] = __float2half_rn(vb[((int64_t) t * kKvHeads + head) * kHeadDim + d]);
+    store_kv_row(cell * kKvHeads + head, d, y, vb[((int64_t) t * kKvHeads + head) * kHeadDim + d], segs.k[sk], segs.v[sk],
+                 segs.ks[sk], segs.vs[sk]);
 }
 
 __global__ void __launch_bounds__(kThreads) block_inputs_batch_kernel(const uint16_t* __restrict__ emb,
@@ -847,9 +883,8 @@ __global__ void __launch_bounds__(kHeadDim) block_qk_prep_batch_kernel(const flo
         return;
     }
     const int64_t cell = cap > 0 ? (int64_t) p % cap : (int64_t) p;
-    const int64_t at = (cell * kKvHeads + head) * kHeadDim + d;
-    reinterpret_cast<__half*>(kv.k[b])[at] = __float2half_rn(y);
-    reinterpret_cast<__half*>(kv.v[b])[at] = __float2half_rn(vb[((int64_t) row * kKvHeads + head) * kHeadDim + d]);
+    store_kv_row(cell * kKvHeads + head, d, y, vb[((int64_t) row * kKvHeads + head) * kHeadDim + d], kv.k[b], kv.v[b], kv.ks[b],
+                 kv.vs[b]);
 }
 
 __global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* h_chunk, int block, int slot0,
