@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pack_vision  # noqa: E402
 from gguf_reader import GGUFFile  # noqa: E402
-from pack_vision import vision_sections, vocab_only_gguf  # noqa: E402
+from pack_vision import require_projector, vision_sections, vocab_only_gguf  # noqa: E402
 
 
 def s(x: bytes) -> bytes:
@@ -60,6 +60,26 @@ class Pack(unittest.TestCase):
                 f.write(gguf(ENTRIES[:1]))
             with self.assertRaises(ValueError):
                 vision_sections(mm, [shard])
+
+    def test_projector_type_is_exact_metadata_and_bounds_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "projector.gguf"
+            expected = kv("clip.projector_type", 8, s(b"deepseek4v"))
+            path.write_bytes(gguf([kv("general.name", 8, s(b"deepseek4v")), expected]))
+            require_projector(str(path), "deepseek4v")
+
+            path.write_bytes(gguf([kv("general.name", 8, s(b"deepseek4v")),
+                                   kv("clip.projector_type", 8, s(b"another-projector"))]))
+            with self.assertRaisesRegex(ValueError, "not a deepseek4v projector"):
+                require_projector(str(path), "deepseek4v")
+
+            path.write_bytes(gguf([expected])[:-1])
+            with self.assertRaisesRegex(ValueError, "invalid projector metadata"):
+                require_projector(str(path), "deepseek4v")
+
+            path.write_bytes(gguf([kv("general.name", 8, s(b"deepseek4v"))]))
+            with self.assertRaisesRegex(ValueError, "missing clip.projector_type"):
+                require_projector(str(path), "deepseek4v")
 
     def _assert_roundtrip(self, entries, initial_read):
         with tempfile.TemporaryDirectory() as d:

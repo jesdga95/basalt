@@ -205,8 +205,9 @@ class DeepSeek41Test(unittest.TestCase):
             convert.convert(self.args(draft_vocab=str(self.gguf)))
 
     def test_mmproj_becomes_the_vision_section(self):
-        proj = self.t / "mmproj.gguf"
-        proj.write_bytes(b"GGUF" + b"\0" * 16 + b"deepseek41v" + b"\1\2\3" * 100)
+        writer = GGUFWriter()
+        writer.add("clip.projector_type", "deepseek41v")
+        proj = writer.write(self.t / "mmproj.gguf")
         convert.convert(self.args(mmproj=str(proj)))
         m = ModelFile(str(self.t / "out.basalt"))
         self.assertIn("vision/mmproj", m.names())

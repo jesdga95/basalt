@@ -75,6 +75,31 @@ def _read_header_prefix(path: str) -> bytes:
                 size *= 4
 
 
+def require_projector(path: str, expected_type: str) -> None:
+    """Refuse a GGUF whose clip.projector_type metadata is absent or names another projector."""
+    try:
+        buf = _read_header_prefix(path)
+        raw = next((entry for key, entry in _kv_entries(buf) if key == "clip.projector_type"), None)
+        if raw is None:
+            raise ValueError("missing clip.projector_type")
+        (key_size,) = struct.unpack_from("<Q", raw, 0)
+        pos = 8 + key_size
+        (vtype,) = struct.unpack_from("<I", raw, pos)
+        pos += 4
+        if vtype != 8:
+            raise ValueError("clip.projector_type is not a string")
+        (n,) = struct.unpack_from("<Q", raw, pos)
+        pos += 8
+        end = _check_bounds(raw, pos + n)
+        if end != len(raw):
+            raise ValueError("invalid clip.projector_type entry length")
+        projector_type = raw[pos:end].decode("utf-8")
+    except (OSError, struct.error, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"{path} has invalid projector metadata: {exc}") from exc
+    if projector_type != expected_type:
+        raise ValueError(f"{path} is not a {expected_type} projector GGUF (found {projector_type!r})")
+
+
 def vocab_only_gguf(path: str) -> bytes | None:
     """The GGUF at `path` with its metadata only (no tensors, no split.* keys), or None when it has no tokenizer."""
     buf = _read_header_prefix(path)

@@ -129,6 +129,7 @@ import arch as A  # noqa: E402
 import hc8 as H  # noqa: E402
 import model_sections as S  # noqa: E402
 from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile, ModelWriter, Stream, append_section, undo_append  # noqa: E402
+from pack_vision import require_projector  # noqa: E402
 
 FINGERPRINT_BYTES = 64 << 20
 
@@ -393,10 +394,10 @@ def convert(a) -> None:
     vision = arch.side_sections and not a.no_vision
     if arch.mmproj_only and a.mmproj and not a.no_vision:
         vision = True
-        with open(a.mmproj, "rb") as f:
-            head = f.read(1 << 20)
-        if head[:4] != b"GGUF" or arch.projector_type.encode() not in head:
-            die(f"{a.mmproj} is not a {arch.projector_type} projector GGUF")
+        try:
+            require_projector(str(a.mmproj), arch.projector_type)
+        except ValueError as e:
+            die(str(e))
     if a.sections_from:
         base = ModelFile(a.sections_from) if Path(a.sections_from).is_file() else die(f"missing input: {a.sections_from}")
         if a.mtp_source or a.mtp_dense or a.draft_vocab or a.mmproj or a.no_vision or getattr(a, "dspark", None):
