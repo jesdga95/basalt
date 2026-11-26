@@ -1,6 +1,8 @@
 // Shared 64-head sparse MQA with an attention sink and inverse RoPE.
 #include "basalt/kernels/sparse_mqa.hpp"
 #include "basalt/kernels/mqa_chunk.cuh"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/q8_1_fm.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -78,6 +80,49 @@ __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float pos, flo
     const float b = x0 * s + x1 * c;
     x0 = a;
     x1 = b;
+}
+
+__global__ void __launch_bounds__(256) q_rms_norm_kernel(float* x, const float* w, int n, float eps,
+                                                          Q81Fm* xq) {
+    float* row = x + (size_t) blockIdx.x * n;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += 256) ss = fmaf(row[i], row[i], ss);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    __shared__ float part[8];
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    float tot = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) tot += part[i];
+    const float scale = rsqrtf(tot / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += 256) {
+        const float y = row[i] * scale * w[i];
+        row[i] = y;
+        q8_1_store_fm(y, xq, ((size_t) blockIdx.x * n + i) / 32, threadIdx.x & 31);
+    }
+}
+
+__global__ void q_rope_rows_kernel(float* rows, int n_rows, int stride, int rows_per_pos, const int32_t* pos,
+                                   MqaRopeTable rope, bool inverse) {
+    const int row_id = blockIdx.x;
+    const int pair = threadIdx.x;
+    const int first = stride - kSparseMqaRopeDim;
+    if (row_id >= n_rows || pair >= kSparseMqaRopeDim / 2) return;
+    float a = rows[(size_t) row_id * stride + first + pair * 2];
+    float b = rows[(size_t) row_id * stride + first + pair * 2 + 1];
+    if (inverse) rotate_pair(a, b, (float) pos[row_id / rows_per_pos], rope.step[pair], rope.mscale);
+    else {
+        float s, c;
+        sincosf((float) pos[row_id / rows_per_pos] * rope.step[pair], &s, &c);
+        c *= rope.mscale;
+        s *= rope.mscale;
+        const float x = a * c - b * s;
+        b = a * s + b * c;
+        a = x;
+    }
+    rows[(size_t) row_id * stride + first + pair * 2] = a;
+    rows[(size_t) row_id * stride + first + pair * 2 + 1] = b;
 }
 
 template <class W, class C, int HB>
@@ -197,6 +242,87 @@ void launch(const SparseMqaArgs& a, int n_win, int n_chunks, float* o_part, floa
 }
 
 }  // namespace
+
+size_t sparse_mqa_q_scratch_bytes(int n_tokens, int q_rank) {
+    if (n_tokens < 1 || n_tokens > kSparseMqaMaxTokens || q_rank < 32 || q_rank % 32 != 0)
+        throw std::invalid_argument("sparse_mqa_q_scratch_bytes: bounds");
+    return native_q8_1_bytes(q_rank, n_tokens);
+}
+
+void sparse_mqa_q_latent(const void* x_q8_1, const SparseMqaQWeights& w, int n_tokens, float* qr,
+                         void* qr_q8_1, void* stream) {
+    sparse_mqa_q_scratch_bytes(n_tokens, w.q_rank);
+    if (!x_q8_1 || !w.wq_a || !w.q_norm || !qr || !qr_q8_1 || !stream || w.n_embd < 32 || w.n_embd % 32 != 0 ||
+        w.wq_a_type < 0 || !(w.rms_eps > 0.f) || !std::isfinite(w.rms_eps))
+        throw std::invalid_argument("sparse_mqa_q_latent: invalid input");
+    native_mmvq(w.wq_a_type, w.wq_a, x_q8_1, qr, w.n_embd, w.q_rank, n_tokens, stream);
+    q_rms_norm_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(qr, w.q_norm, w.q_rank, w.rms_eps,
+                                                                   static_cast<Q81Fm*>(qr_q8_1));
+    check_launch("sparse_mqa_q_latent norm");
+}
+
+void sparse_mqa_q_heads(const SparseMqaQWeights& w, int n_tokens, const int32_t* pos, const MqaRopeTable& rope,
+                        const void* qr_q8_1, float* q, void* stream) {
+    sparse_mqa_q_scratch_bytes(n_tokens, w.q_rank);
+    if (!w.wq_b || !pos || !qr_q8_1 || !q || !stream || w.wq_b_type < 0 || !std::isfinite(rope.mscale))
+        throw std::invalid_argument("sparse_mqa_q_heads: invalid input");
+    native_mmvq(w.wq_b_type, w.wq_b, qr_q8_1, q, w.q_rank, kSparseMqaHeads * kSparseMqaDim, n_tokens, stream);
+    q_rope_rows_kernel<<<n_tokens * kSparseMqaHeads, kSparseMqaRopeDim / 2, 0, (cudaStream_t) stream>>>(
+        q, n_tokens * kSparseMqaHeads, kSparseMqaDim, kSparseMqaHeads, pos, rope, false);
+    check_launch("sparse_mqa_q_heads rope");
+}
+
+void sparse_mqa_rope_rows(float* rows, int n_rows, int row_stride, int rows_per_pos, const int32_t* pos,
+                          const MqaRopeTable& rope, bool inverse, void* stream) {
+    if (!rows || n_rows < 1 || row_stride < kSparseMqaRopeDim || rows_per_pos < 1 || !pos || !stream ||
+        !std::isfinite(rope.mscale))
+        throw std::invalid_argument("sparse_mqa_rope_rows: invalid input");
+    q_rope_rows_kernel<<<n_rows, kSparseMqaRopeDim / 2, 0, (cudaStream_t) stream>>>(
+        rows, n_rows, row_stride, rows_per_pos, pos, rope, inverse);
+    check_launch("sparse_mqa_rope_rows");
+}
+
+size_t sparse_mqa_output_scratch_bytes(int n_tokens) {
+    if (n_tokens < 1 || n_tokens > kSparseMqaMaxTokens) throw std::invalid_argument("sparse_mqa_output_scratch_bytes: bounds");
+    return native_q8_1_bytes(kSparseMqaHeads * kSparseMqaDim, n_tokens);
+}
+
+size_t sparse_mqa_output_workspace_floats(int n_tokens) {
+    if (n_tokens < 1 || n_tokens > kSparseMqaMaxTokens)
+        throw std::invalid_argument("sparse_mqa_output_workspace_floats: bounds");
+    return (size_t) n_tokens * kSparseMqaOutputGroups * kSparseMqaOutputRank;
+}
+
+void sparse_mqa_output(const float* attn, int wo_a_type, const void* wo_a, int wo_b_type, const void* wo_b,
+                       int n_embd, int n_tokens, void* q8_scratch, float* latent, float* out, void* stream) {
+    sparse_mqa_output_scratch_bytes(n_tokens);
+    sparse_mqa_output_workspace_floats(n_tokens);
+    if (!attn || !q8_scratch || !stream) throw std::invalid_argument("sparse_mqa_output: invalid input");
+    native_quantize_q8_1(attn, q8_scratch, kSparseMqaHeads * kSparseMqaDim, n_tokens, stream);
+    sparse_mqa_output_q8(wo_a_type, wo_a, wo_b_type, wo_b, n_embd, n_tokens, q8_scratch, latent, out, stream);
+}
+
+void sparse_mqa_output_q8(int wo_a_type, const void* wo_a, int wo_b_type, const void* wo_b, int n_embd,
+                          int n_tokens, void* q8_scratch, float* latent, float* out, void* stream) {
+    sparse_mqa_output_scratch_bytes(n_tokens);
+    sparse_mqa_output_workspace_floats(n_tokens);
+    if (!wo_a || !wo_b || !q8_scratch || !latent || !out || !stream || wo_a_type < 0 || wo_b_type < 0 ||
+        n_embd < 32 || n_embd % 32 != 0)
+        throw std::invalid_argument("sparse_mqa_output: invalid input");
+    constexpr int output_width = kSparseMqaOutputGroups * kSparseMqaOutputRank;
+    const size_t per_group_x = native_q8_1_bytes(kSparseMqaGroupInput, 1);
+    const size_t per_group_w = native_mmvq_weight_bytes(wo_a_type, kSparseMqaGroupInput, kSparseMqaOutputRank);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int g = 0; g < kSparseMqaOutputGroups; ++g) {
+            const auto* wx = static_cast<const uint8_t*>(q8_scratch) + (size_t) (t * kSparseMqaOutputGroups + g) * per_group_x;
+            const auto* ww = static_cast<const uint8_t*>(wo_a) + (size_t) g * per_group_w;
+            native_mmvq(wo_a_type, ww, wx, latent + (size_t) t * output_width + (size_t) g * kSparseMqaOutputRank,
+                        kSparseMqaGroupInput, kSparseMqaOutputRank, 1, stream);
+        }
+    }
+    native_quantize_q8_1(latent, q8_scratch, output_width, n_tokens, stream);
+    native_mmvq(wo_b_type, wo_b, q8_scratch, out, output_width, n_embd, n_tokens, stream);
+}
 
 size_t sparse_mqa_workspace_floats(int n_tokens, int n_sel) {
     if (n_tokens < 1 || n_tokens > kSparseMqaMaxTokens || n_sel < 0 || n_sel > kSparseMqaTopK)
