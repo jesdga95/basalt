@@ -4,8 +4,8 @@
 //     bf16), double sums, the down's input rounded as the gate/up writes it; and against the kernels they replace
 //     (q8_1 activations, native_expert_grouped, moe_combine and post_conv); max abs and rel error of both;
 //   - bits: each conversation's rows alone (a single window, the small tile shape) against the same rows in a batch window
-//     of 64 segments (the wide shape) and of 8 (the middle one); a call with experts off the card (their rows written
-//     before the down) against the same call with every expert on it;
+//     of 64 segments (the wide shape) and of 8 (the middle one); a call with experts off the card (the down writes the
+//     card's rows, the others come in, then the finish) against the same call with every expert on it;
 //   - --bench: us a call (gate/up + down) and GB/s of the experts' weights the call reads, at 1, 4, 8, 64, 256 and 320 rows.
 #include "basalt/core/device_copy.hpp"
 #include "basalt/ggml/ggml.h"
@@ -405,13 +405,12 @@ void test_format(int type) {
         moe_plan(c2.d_ids, c2.rows, K, NE, doff, c2.ptr, c2.start, c2.ng, c2.dst, c2.tok, st);
         ExpertCall e = expert_call(X, c2, doff);
         experts_gate_up(e, st);
-        e.ids = c2.d_ids;
-        e.blobs = doff;
-        experts_down(e, finish_of(c2, ring2), c2.rows, st);
+        experts_down_rows(e, finish_of(c2, ring2), c2.rows, st);
+        experts_finish(e, finish_of(c2, ring2), c2.rows, st);
         cudaStreamSynchronize(st);
         std::snprintf(name, sizeof name, "experts %s: a third off the card = all on it", tag);
         same_bits(name, host(c2.out, (size_t) c.rows * E).data(), all_on.data(), (size_t) c.rows * E * 4);
-        // and every expert of a row off the card: only the extra block finishes that segment
+        // and every expert off the card: the down writes nothing, the finish reads the rows given
         std::vector<unsigned long long> none(NE, 0ull);
         unsigned long long* dnone = dev(none);
         Call c3 = c;
@@ -422,9 +421,8 @@ void test_format(int type) {
         moe_plan(c3.d_ids, c3.rows, K, NE, dnone, c3.ptr, c3.start, c3.ng, c3.dst, c3.tok, st);
         ExpertCall e3 = expert_call(X, c3, dnone);
         experts_gate_up(e3, st);
-        e3.ids = c3.d_ids;
-        e3.blobs = dnone;
-        experts_down(e3, finish_of(c3, ring3), c3.rows, st);
+        experts_down_rows(e3, finish_of(c3, ring3), c3.rows, st);
+        experts_finish(e3, finish_of(c3, ring3), c3.rows, st);
         cudaStreamSynchronize(st);
         std::snprintf(name, sizeof name, "experts %s: every expert off the card", tag);
         same_bits(name, host(c3.out, (size_t) c.rows * E).data(), all_on.data(), (size_t) c.rows * E * 4);

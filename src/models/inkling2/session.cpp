@@ -1608,12 +1608,6 @@ private:
         ec.h = x.ex_h_;
         ec.tickets = x.ex_tk_;
         experts_gate_up(ec, k.stream);
-        if (on_cpu) {   // the RAM experts' rows before the down, whose blocks finish the rows as they complete
-            sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
-            fork_open_ = false;
-            ec.ids = ids;
-            ec.blobs = w.blob_table;
-        }
         MoeFinish mf;
         mf.rows = x.ex_rows_;
         mf.w = x.rw_;
@@ -1625,7 +1619,14 @@ private:
         mf.resid = x.resid_;
         mf.out = out;
         mf.tap = tap;
-        experts_down(ec, mf, rows, k.stream);
+        if (on_cpu) {   // the card's rows, the RAM experts' rows beside them, then the finish
+            experts_down_rows(ec, mf, rows, k.stream);
+            sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
+            fork_open_ = false;
+            experts_finish(ec, mf, rows, k.stream);
+        } else {
+            experts_down(ec, mf, rows, k.stream);
+        }
     }
 
     float* buf(Buf b) const { return role_[(int) b]; }

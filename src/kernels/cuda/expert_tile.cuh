@@ -63,8 +63,10 @@ __device__ __forceinline__ uint64_t evict_first_policy() {
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
     return p;
 }
+// (the 8-byte copy takes no L2 cache hint: the hinted form traps on sm_120)
 __device__ __forceinline__ void cp_async8(void* dst, const void* src, uint64_t pol) {
-    asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], 8, %2;" ::"r"(smem_u32(dst)), "l"(src), "l"(pol) : "memory");
+    (void) pol;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(smem_u32(dst)), "l"(src) : "memory");
 }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)), "l"(src) : "memory");
@@ -359,9 +361,7 @@ __global__ void __launch_bounds__(C::NT, 2) gate_up_kernel(Plan P, NativeExpertL
 
 /// What down_kernel's finish reads beside the plan. F provides, on the device:
 ///   int seg(int row) const;              the segment (rows finished together) of a row
-///   int n_segs() const;
 ///   int target(int seg) const;           the pairs a segment's ticket counts: its rows x k
-///   int off_card(int seg) const;         its pairs whose expert is not on the card (their rows written before the call)
 ///   void finish(int seg, int c0, int tid, int nt) const;   its channels c0 .. c0 + kTicketCh - 1, every pair's row in
 ///   int* tickets;                        [segments][n_embd / kTicketCh], zero between calls
 /// A ticket counts a segment's pairs done for kTicketCh channels; the block that completes it runs the finish, reading
@@ -373,45 +373,31 @@ __device__ __forceinline__ void run_finishes(const F& f, const int* s_fin, int n
     for (int i = 0; i < nfin; ++i) f.finish(s_fin[i] >> 8, (s_fin[i] & 255) * kTicketCh, tid, nt);
 }
 
-/// Down: work item blockIdx.x = tile * (n_embd / ROWS) + row block writes rows dst[e] [n_embd] (fp32) of its entries,
-/// then counts them on its segments' tickets and runs the finishes it completes. `off`: one more block (the last) adds
-/// the pairs not on the card. A programmatic dependent of gate/up: the plan and the first weights before its wait.
+/// The finish alone, block (segment, kTicketCh channels): for a call whose rows are not all written by its down (some
+/// came from elsewhere after it). Blocks past the segments exit.
+template<class F>
+__global__ void __launch_bounds__(256) finish_kernel(F f, int n_segs) {
+    pdl_wait();
+    pdl_launch_dependents();
+    if ((int) blockIdx.x >= n_segs) return;
+    f.finish((int) blockIdx.x, (int) blockIdx.y * kTicketCh, (int) threadIdx.x, 256);
+}
+
+/// Down: work item blockIdx.x = tile * (n_embd / ROWS) + row block writes rows dst[e] [n_embd] (fp32) of its entries;
+/// with `fin`, then counts them on its segments' tickets and runs the finishes it completes. A programmatic dependent of
+/// gate/up: the plan and the first weights before its wait.
 template<int TY, int K, class C, class F>
 __global__ void __launch_bounds__(C::NT, 2) down_kernel(Plan P, NativeExpertLayout L, const uint16_t* __restrict__ H,
-                                                        float* __restrict__ out, F f, bool off) {
+                                                        float* __restrict__ out, F f, bool fin) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
     __shared__ int s_t[3];
     __shared__ int s_arow[C::TT];
     __shared__ const uint8_t* s_rowp[C::ROWS];
-    constexpr int kFinMax = 2 * C::TT > 64 ? 2 * C::TT : 64;   // an item's runs x its tickets; a segment's tickets
-    __shared__ int s_fin[kFinMax];
+    __shared__ int s_fin[2 * C::TT];   // an item's runs x its tickets
     __shared__ int s_nfin;
     const int ncb = (int) L.n_embd / kTicketCh;
     const int tid = threadIdx.x;
-    if (off && blockIdx.x == gridDim.x - 1) {   // the pairs whose rows came from elsewhere, a segment at a time
-        pdl_wait();
-        pdl_launch_dependents();
-        for (int s = 0; s < f.n_segs(); ++s) {
-            if (tid == 0) {
-                s_nfin = 0;
-                const int m = f.off_card(s), tgt = f.target(s);
-                for (int cb = 0; m > 0 && cb < ncb; ++cb) {
-                    const int old = atomicAdd(&f.tickets[s * ncb + cb], m);
-                    if (old + m == tgt) {
-                        f.tickets[s * ncb + cb] = 0;
-                        s_fin[s_nfin++] = s << 8 | cb;
-                    }
-                }
-                if (s_nfin) __threadfence();
-            }
-            __syncthreads();
-            const int nf = s_nfin;
-            run_finishes(f, s_fin, nf, tid, C::NT);
-            __syncthreads();
-        }
-        return;
-    }
     const int nblk = (int) L.n_embd / C::ROWS;
     const int tile = (int) blockIdx.x / nblk, rblk = (int) blockIdx.x - tile * nblk;
     if (tid < 32) find_tile<C::TT>(P, tile, s_t);   // the plan came before gate/up
@@ -459,6 +445,7 @@ __global__ void __launch_bounds__(C::NT, 2) down_kernel(Plan P, NativeExpertLayo
         case 3: if constexpr (C::TT >= 24) run(std::integral_constant<int, 3>{}); break;
         default: if constexpr (C::TT >= 32) run(std::integral_constant<int, 4>{}); break;
     }
+    if (!fin) return;
     // the tickets: the item's entries are in row order, so its segments come as runs
     __threadfence();
     __syncthreads();
@@ -484,7 +471,7 @@ __global__ void __launch_bounds__(C::NT, 2) down_kernel(Plan P, NativeExpertLayo
     const int nf = s_nfin;
     if (nf) run_finishes(f, s_fin, nf, tid, C::NT);
 #else
-    (void) P; (void) L; (void) H; (void) out; (void) f; (void) off;
+    (void) P; (void) L; (void) H; (void) out; (void) f; (void) fin;
     __trap();
 #endif
 }

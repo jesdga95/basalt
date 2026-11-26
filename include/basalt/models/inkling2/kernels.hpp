@@ -375,13 +375,14 @@ struct ExpertCall {
     const void* x = nullptr;                 ///< [rows][kWidth] expert_input rows
     void* h = nullptr;                       ///< scratch, expert_h_bytes
     int32_t* tickets = nullptr;              ///< expert_tickets ints
-    /// set when some of the visit's experts are not on the card: the choices and the blob table (their pairs' rows are
-    /// in MoeFinish::rows before experts_down)
-    const int32_t* ids = nullptr;
-    const unsigned long long* blobs = nullptr;
 };
 void experts_gate_up(const ExpertCall& e, void* stream);
+/// The down and the finish, every pair's expert on the card.
 void experts_down(const ExpertCall& e, const MoeFinish& f, int rows, void* stream);
+/// A visit with experts off the card: the down writes the card's pairs' rows only; the other rows come in (the CPU's
+/// merge), then experts_finish runs the finish.
+void experts_down_rows(const ExpertCall& e, const MoeFinish& f, int rows, void* stream);
+void experts_finish(const ExpertCall& e, const MoeFinish& f, int rows, void* stream);
 
 // ---- head --------------------------------------------------------------------------------------------------------------
 

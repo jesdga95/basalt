@@ -27,8 +27,6 @@ void check(const char* what) {
 struct Finish {
     MoeFinish a;
     int rows = 0;
-    const int32_t* ids = nullptr;
-    const unsigned long long* blobs = nullptr;
     int* tickets = nullptr;
 
     __device__ void span(int s, int& r0, int& r1) const {
@@ -36,22 +34,11 @@ struct Finish {
         r0 = at.n > 0 ? at.row0[s] : 0;
         r1 = at.n > 0 ? at.row0[s + 1] : rows;
     }
-    __device__ int n_segs() const {
-        const bk::WindowSegs& at = seg_table(a.seg);
-        return at.n > 0 ? at.n : 1;
-    }
     __device__ int seg(int r) const { return bk::seg_of(seg_table(a.seg), r); }
     __device__ int target(int s) const {
         int r0, r1;
         span(s, r0, r1);
         return (r1 - r0) * a.k;
-    }
-    __device__ int off_card(int s) const {
-        int r0, r1;
-        span(s, r0, r1);
-        int m = 0;
-        for (int i = r0 * a.k; i < r1 * a.k; ++i) m += blobs[ids[i]] ? 0 : 1;
-        return m;
     }
     // rows r0 .. r1 - 1 of segment s, channels c0 .. c0 + kTicketCh - 1, each row's slots as one fma chain in slot
     // order: the rows' pairs were written by other blocks of the call (or before it), so they are read through L2
@@ -122,7 +109,7 @@ void gate_up_one(const ExpertCall& e, cudaStream_t s) {
 }
 
 template<int TY, class C>
-void down_one(const ExpertCall& e, const Finish& f, cudaStream_t s) {
+void down_one(const ExpertCall& e, const Finish& f, bool fin, cudaStream_t s) {
     auto* kern = xt::down_kernel<TY, kFf, C, Finish>;
     static thread_local int set_dev = -1;
     int dev = 0;
@@ -131,11 +118,10 @@ void down_one(const ExpertCall& e, const Finish& f, cudaStream_t s) {
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
         set_dev = dev;
     }
-    const bool off = e.ids != nullptr;
     const int tiles = xt::max_tiles(e.pairs, e.n_expert, C::TT);
-    const dim3 grid((unsigned) (tiles * (kWidth / C::ROWS) + (off ? 1 : 0)));
+    const dim3 grid((unsigned) (tiles * (kWidth / C::ROWS)));
     bk::launch_pdl(kern, grid, dim3(C::NT), (size_t) C::SMEM, s, plan_of(e), e.L, static_cast<const uint16_t*>(e.h),
-                   const_cast<float*>(f.a.rows), f, off);
+                   const_cast<float*>(f.a.rows), f, fin);
 }
 
 void check_call(const ExpertCall& e, const char* what) {
@@ -168,28 +154,47 @@ void experts_gate_up(const ExpertCall& e, void* stream) {
     check("experts_gate_up");
 }
 
-void experts_down(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) {
-    check_call(e, "experts_down");
-    if (rows <= 0 || rows > kBatchRows || mf.k * rows != e.pairs) throw std::runtime_error("inkling2 experts_down: rows");
-    cudaStream_t s = (cudaStream_t) stream;
+namespace {
+Finish finish_of(const ExpertCall& e, const MoeFinish& mf, int rows) {
     Finish f;
     f.a = mf;
     f.rows = rows;
-    f.ids = e.ids;
-    f.blobs = e.blobs;
     f.tickets = e.tickets;
+    return f;
+}
+
+}  // namespace
+
+void experts_finish(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) {
+    if (rows <= 0 || rows > kBatchRows || mf.k * rows != e.pairs) throw std::runtime_error("inkling2 experts_finish: rows");
+    const int n_segs = mf.seg.at.n > 0 ? mf.seg.at.n : mf.seg.n_segs > 0 ? mf.seg.n_segs : 1;
+    bk::launch_pdl(xt::finish_kernel<Finish>, dim3((unsigned) n_segs, kWidth / xt::kTicketCh), dim3(256), 0,
+                   (cudaStream_t) stream, finish_of(e, mf, rows), n_segs);
+    check("experts_finish");
+}
+
+namespace {
+void down_any(const ExpertCall& e, const MoeFinish& mf, int rows, bool fin, void* stream) {
+    check_call(e, "experts_down");
+    if (rows <= 0 || rows > kBatchRows || mf.k * rows != e.pairs) throw std::runtime_error("inkling2 experts_down: rows");
+    cudaStream_t s = (cudaStream_t) stream;
+    const Finish f = finish_of(e, mf, rows);
     const bool mx = e.L.gu_type == xt::kMxfp8;
     if (e.pairs < kSmallPairs) {
-        if (mx) down_one<xt::kMxfp8, Small<xt::kMxfp8, kFf>>(e, f, s);
-        else down_one<xt::kNvfp4, Small<xt::kNvfp4, kFf>>(e, f, s);
+        if (mx) down_one<xt::kMxfp8, Small<xt::kMxfp8, kFf>>(e, f, fin, s);
+        else down_one<xt::kNvfp4, Small<xt::kNvfp4, kFf>>(e, f, fin, s);
     } else if (e.pairs < kWidePairs) {
-        if (mx) down_one<xt::kMxfp8, Mid<xt::kMxfp8, kFf>>(e, f, s);
-        else down_one<xt::kNvfp4, Mid<xt::kNvfp4, kFf>>(e, f, s);
+        if (mx) down_one<xt::kMxfp8, Mid<xt::kMxfp8, kFf>>(e, f, fin, s);
+        else down_one<xt::kNvfp4, Mid<xt::kNvfp4, kFf>>(e, f, fin, s);
     } else {
-        if (mx) down_one<xt::kMxfp8, Wide<xt::kMxfp8, kFf>>(e, f, s);
-        else down_one<xt::kNvfp4, Wide<xt::kNvfp4, kFf>>(e, f, s);
+        if (mx) down_one<xt::kMxfp8, Wide<xt::kMxfp8, kFf>>(e, f, fin, s);
+        else down_one<xt::kNvfp4, Wide<xt::kNvfp4, kFf>>(e, f, fin, s);
     }
     check("experts_down");
 }
+}  // namespace
+
+void experts_down(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) { down_any(e, mf, rows, true, stream); }
+void experts_down_rows(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) { down_any(e, mf, rows, false, stream); }
 
 }  // namespace basalt::models::inkling2

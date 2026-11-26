@@ -56,8 +56,9 @@ public:
     void* fc_p = nullptr;                ///< [2304][9216] Q8 planes (Tensor Core wgemm decode/batch commit)
     float *hidden_norm = nullptr, *norm = nullptr, *mask = nullptr;
     uint16_t *sel_h = nullptr, *pred = nullptr, *succ = nullptr;
-    void* head_fp4 = nullptr;            ///< NVFP4 planes [n_vocab][2304] (when n_vocab % 128 == 0; else Q8 head wgemm)
+    void* head_fp4 = nullptr;            ///< the batched drafter's NVFP4 planes [head_rows][2304], rows past n_vocab zero
     float* head_fp4_scale = nullptr;
+    int64_t head_rows = 0;               ///< n_vocab rounded up to whole 128-row tiles
     const void* head = nullptr;          ///< target's Q8 head (q8_planes at runtime after InklingModel::finish)
     const uint16_t* embedding = nullptr; ///< target's BF16 embedding rows (mapped host memory)
     const float* embed_norm = nullptr;   ///< target's F32 embedding RMSNorm weights

@@ -77,9 +77,10 @@ size_t dflash2_top16_scratch_bytes(int max_rows, int n_vocab);
 
 /// Extracts the sorted Top-16 (token id, raw logit) pairs per draft row into `cand_out` ([rows][32]: 16 ids then 16 raw
 /// logit bit patterns, ties broken to lower token id) and writes each row's softcapped tail log-sum-exp `(m_tail, l_tail)`
-/// over the remaining `n_vocab - 16` tokens into `tail_lse_out` ([rows * 2] floats, optional).
+/// over the remaining `n_vocab - 16` tokens into `tail_lse_out` ([rows * 2] floats, optional). Row r's logits at
+/// logits + r * ld.
 void dflash2_top16(const float* logits, const void* head_q8, bool head_planes, const void* hq, int rows, int n_vocab,
-                   float cap, void* scratch, int32_t* cand_out, float* tail_lse_out, void* stream);
+                   int64_t ld, float cap, void* scratch, int32_t* cand_out, float* tail_lse_out, void* stream);
 
 /// Walks the bilinear candidate selector across `n_drafts` steps for `count` slots using 16 warps (one warp per candidate,
 /// 128-bit uint4 codebook loads). Applies after-correction softcapping `cap * tanh(raw_sc / cap)`; when `tail_lse` is

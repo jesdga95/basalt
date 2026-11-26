@@ -42,7 +42,7 @@ uint64_t q8_bytes(uint64_t rows, uint64_t n_in) { return rows * (n_in / 32) * 34
 
 int64_t ring_cells(const Dflash2Geometry& d) { return (int64_t) d.window + kRingExtra; }
 
-void ws_need(const Dflash2Geometry& d, int n_vocab, bool head_fp4, size_t& partial, size_t& tickets) {
+void ws_need(const Dflash2Geometry& d, int n_vocab, size_t& partial, size_t& tickets) {
     namespace wg = bk::wgemm;
     partial = tickets = 0;
     const auto need = [&](wg::Format fmt, int64_t K, std::initializer_list<int64_t> rows, wg::Epilogue epi) {
@@ -64,7 +64,7 @@ void ws_need(const Dflash2Geometry& d, int n_vocab, bool head_fp4, size_t& parti
     need(wg::Format::Nvfp4, kDf2Q, {kE}, wg::Epilogue::Store);
     need(wg::Format::Nvfp4, kE, {d.n_ff, d.n_ff}, wg::Epilogue::SwiGLU);
     need(wg::Format::Nvfp4, d.n_ff, {kE}, wg::Epilogue::Store);
-    need(head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8, kE, {n_vocab}, wg::Epilogue::Store);
+    need(wg::Format::Q8, kE, {n_vocab}, wg::Epilogue::Store);
     need(wg::Format::Bf16, kE, {kDf2Rank}, wg::Epilogue::Store);
 }
 
@@ -187,10 +187,9 @@ model::Result dflash2_plan(const Pack& pack, core::LoadPlan& reads, int file, in
         L.fp4_scale = (float*) w->dev(kFp4Mats * 4, ok);
     }
 
-    if (bk::nvfp4p::fits(g.n_vocab, kE)) {
-        w->head_fp4 = w->dev(bk::nvfp4p::bytes(g.n_vocab, kE), ok);
-        w->head_fp4_scale = (float*) w->dev(4, ok);
-    }
+    w->head_rows = ((int64_t) g.n_vocab + 127) / 128 * 128;
+    w->head_fp4 = w->dev(bk::nvfp4p::bytes(w->head_rows, kE), ok);
+    w->head_fp4_scale = (float*) w->dev(4, ok);
     if (!ok) return fail(err.empty() ? "out of device memory" : err);
 
     basalt::log::info("basalt inkling2",
@@ -224,7 +223,17 @@ model::Result Dflash2Weights::finish(const void* head_q8, const uint16_t* emb, c
         cudaMemcpyAsync(tmp, fc_q8, q8_bytes(kE, (uint64_t) kDf2Targets * kE), cudaMemcpyDeviceToDevice, s);
         dflash2_split_fc_q8(tmp, fc_q8, s);
 
-        if (head_fp4) bk::nvfp4p::from_q8(head_q8, n_vocab, kE, head_fp4, head_fp4_scale, s);
+        {   // the head's planes from a copy padded with zero rows to whole tiles
+            const size_t rb = q8_bytes(1, kE);
+            void* padded = nullptr;
+            if (cudaMalloc(&padded, rb * (size_t) head_rows) != cudaSuccess)
+                throw std::runtime_error("out of device memory converting the DFlash 2 head");
+            cudaMemsetAsync(padded, 0, rb * (size_t) head_rows, s);
+            cudaMemcpyAsync(padded, head_q8, rb * (size_t) n_vocab, cudaMemcpyDeviceToDevice, s);
+            bk::nvfp4p::from_q8(padded, head_rows, kE, head_fp4, head_fp4_scale, s);
+            cudaStreamSynchronize(s);
+            cudaFree(padded);
+        }
 
         for (Dflash2Layer& L : layer) {
             bk::nvfp4p::from_q8(L.wk_q8, kDf2KV, kE, L.wk, L.fp4_scale + 1, s);
@@ -299,7 +308,7 @@ const Dflash2Weights::SharedScratch* Dflash2Weights::ensure_shared_scratch(std::
     s.act_h = alloc_z(bk::wgemm::act_bytes((int64_t) ff));
     {
         size_t pf = 0, tk = 0;
-        ws_need(geo, n_vocab, head_fp4 != nullptr, pf, tk);
+        ws_need(geo, n_vocab, pf, tk);
         s.ws.partial = f(std::max<size_t>(pf, 1));
         s.ws.tickets = (int32_t*) alloc_z(std::max<size_t>(tk, 1) * 4);
         s.ws.partial_floats = pf;
@@ -589,9 +598,9 @@ void Dflash2Hook::stage(int k, int n, void* stream) {
 
     dflash2_norm_draft_pack(s.x, w.norm, d.rms_eps, kDf2Block, 1, n, s.act_a, s.hq, nullptr, stream);
     wg::Call hc;
-    hc.fmt = w.head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8;
+    hc.fmt = wg::Format::Q8;
     hc.K = kE;
-    hc.m[0] = mat(w.head_fp4 ? w.head_fp4 : w.head, w.n_vocab, w.head_fp4_scale, s.logits, w.n_vocab);
+    hc.m[0] = mat(w.head, w.n_vocab, nullptr, s.logits, w.n_vocab);
     wg::gemm(hc, s.act_a, n, s.ws, stream);
 
     wg::Call sc_call;
@@ -600,7 +609,7 @@ void Dflash2Hook::stage(int k, int n, void* stream) {
     sc_call.m[0] = mat(w.sel_h, kDf2Rank, nullptr, s.g, kDf2Rank);
     wg::gemm(sc_call, s.act_a, n, s.ws, stream);
 
-    dflash2_top16(s.logits, w.head, true, s.hq, n, w.n_vocab, d.logit_softcap, s.top_scr, s.cand, s.tail_lse, stream);
+    dflash2_top16(s.logits, w.head, true, s.hq, n, w.n_vocab, w.n_vocab, d.logit_softcap, s.top_scr, s.cand, s.tail_lse, stream);
     dflash2_select(meta_d_, 2, s.cand, s.tail_lse, s.g, w.pred, w.succ, 1, n, d.logit_softcap, ids_d_, kDf2Block,
                    conf_d_, kDf2Block, stream);
     cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
@@ -816,7 +825,7 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     act_h_ = dev((size_t) CR * ff * sizeof(uint16_t), ok);
     {
         size_t pf = 0, tk = 0;
-        ws_need(d, w->n_vocab, w->head_fp4 != nullptr, pf, tk);
+        ws_need(d, w->n_vocab, pf, tk);
         pf *= (size_t) CG;
         tk *= (size_t) CG;
         ws_.partial = f(std::max<size_t>(pf, 1));
@@ -827,11 +836,7 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     att_cells_ = ring_cells(d);
     att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, CR, kDf2Heads, kDf2HeadDim));
 
-    if (!w->head_fp4) {
-        err = "the batched DFlash 2 drafter needs the head as NVFP4 planes (a vocabulary of whole 128-row tiles)";
-        return false;
-    }
-    logits_ = f((size_t) CD * (size_t) w->n_vocab);
+    logits_ = f((size_t) CD * (size_t) w->head_rows);
     hd_ = f((size_t) CD * E);
     head_gs_ = f((size_t) CD);
     head_act_ = dev(bp::fp4_dense::act_bytes(CD, kE), ok);
@@ -1040,8 +1045,8 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
             // the 200K-row screen on the FP4 block-scaled tensor cores (the rows as NVFP4 with a scale a row); the top
             // candidates are rescored on the Q8 head by dflash2_top16
             bp::fp4_dense::quantize(hd_, D_rows, kE, kE, head_act_, head_gs_, st);
-            bp::fp4_dense::product(w.head_fp4, w.head_fp4_scale, w.n_vocab, kE, head_act_, head_gs_, D_rows, logits_, w.n_vocab,
-                                   false, st);
+            bp::fp4_dense::product(w.head_fp4, w.head_fp4_scale, w.head_rows, kE, head_act_, head_gs_, D_rows, logits_,
+                                   w.head_rows, false, st);
 
             wg::Call sc_call;
             sc_call.fmt = wg::Format::Bf16;
@@ -1049,7 +1054,7 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
             sc_call.m[0] = mat(w.sel_h, kDf2Rank, nullptr, g_, kDf2Rank);
             wg::gemm(sc_call, act_a_, D_rows, ws_, st);
 
-            dflash2_top16(logits_, w.head, true, hq_, D_rows, w.n_vocab, d.logit_softcap, top_scr_, cand_, tail_lse_, st);
+            dflash2_top16(logits_, w.head, true, hq_, D_rows, w.n_vocab, w.head_rows, d.logit_softcap, top_scr_, cand_, tail_lse_, st);
             dflash2_select(meta_d_ + 2 * s0, 2, cand_, tail_lse_, g_, w.pred, w.succ, cn, n_max, d.logit_softcap,
                            ids_d_ + (size_t) s0 * kDf2Block, kDf2Block, conf_d_ + (size_t) s0 * kDf2Block, kDf2Block, st);
         }

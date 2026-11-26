@@ -281,7 +281,7 @@ void test_top16_and_selector() {
     uint8_t* scr_d = zeros<uint8_t>(dflash2_top16_scratch_bytes(rows, kVocab));
     int32_t* cand_d = zeros<int32_t>((size_t) rows * 2 * kDf2TopK);
     float* tail_lse_d = zeros<float>((size_t) rows * 2);
-    dflash2_top16(logits_d, nullptr, false, nullptr, rows, kVocab, cap, scr_d, cand_d, tail_lse_d, nullptr);
+    dflash2_top16(logits_d, nullptr, false, nullptr, rows, kVocab, kVocab, cap, scr_d, cand_d, tail_lse_d, nullptr);
     const auto cand_h = host(cand_d, (size_t) rows * 2 * kDf2TopK);
     const auto tail_h = host(tail_lse_d, (size_t) rows * 2);
 
