@@ -31,10 +31,13 @@ struct RouterMixedArgs {
     int k = 6;                        ///< at most 16
     float weight_scale = 1.5f;
     RouterGate gate = RouterGate::SqrtSoftplus;
-    const int32_t* fixed_ids = nullptr;       ///< device [T][k]; required when fixed_mask is set
-    const uint8_t* fixed_mask = nullptr;      ///< device [T]; nonzero rows use fixed_ids and ignore biases
+    const int32_t* fixed_ids = nullptr;       ///< device [T][k]; direct fixed rows
+    const int32_t* fixed_table = nullptr;     ///< device [rows][k]; alternative source for fixed rows
+    const int32_t* fixed_rows = nullptr;      ///< device [T]; row indices into fixed_table when fixed_mask is set
+    int fixed_table_rows = 0;                 ///< bounds for fixed_rows; validated by the caller
+    const uint8_t* fixed_mask = nullptr;      ///< device [T]; nonzero rows use fixed_ids or fixed_table and ignore biases
     const uint8_t* alternate_mask = nullptr;  ///< device [T]; nonzero dynamic rows use alternate_bias
-    const float* bias = nullptr;              ///< device [n_expert]; selection bias for ordinary dynamic rows
+    const float* bias = nullptr;              ///< device [n_expert]; null means zero bias for ordinary dynamic rows
     const float* alternate_bias = nullptr;    ///< device [n_expert]; optional selection bias for alternate rows
 };
 
@@ -56,10 +59,11 @@ void router_bf16(const float* x, const uint16_t* gate, const float* bias, int n_
 void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,
                    void* stream);
 
-/// Fixed rows copy their prescribed [T][k] expert ids and weight them from the unbiased gate scores. Other rows choose top-k
-/// from scores plus `bias`, or `alternate_bias` when `alternate_mask[t]` is nonzero. Both paths normalize the selected
-/// unbiased scores and multiply by weight_scale. Fixed ids must be in range and unique; the model validates the table once
-/// before dispatch. `logits` is [T][n_expert]; masks and ids are device pointers.
+/// Fixed rows copy prescribed [T][k] expert ids or gather a [fixed_table_rows][k] row selected by fixed_rows[t], then weight
+/// them from unbiased gate scores. Other rows choose top-k from scores plus `bias`, or `alternate_bias` when
+/// alternate_mask[t] is nonzero. A null `bias` means zero ordinary bias. Both paths normalize selected unbiased scores and
+/// multiply by weight_scale. Fixed ids must be in range and unique; the model validates table contents and row indices before
+/// dispatch. `logits` is [T][n_expert]; masks, indices, and ids are device pointers.
 void router_select_mixed(const float* logits, int n_tokens, const RouterMixedArgs& a, int32_t* ids, float* weights,
                          void* stream);
 

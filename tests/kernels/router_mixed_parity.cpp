@@ -29,13 +29,13 @@ template <typename T>
 struct Device {
     T* p = nullptr;
     explicit Device(size_t n) {
-        check(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T)), "cudaMalloc");
+        check(cudaMalloc(reinterpret_cast<void**>(&p), std::max<size_t>(1, n) * sizeof(T)), "cudaMalloc");
     }
     ~Device() {
         if (p) cudaFree(p);
     }
     void upload(const std::vector<T>& h) {
-        check(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "cudaMemcpy H2D");
+        if (!h.empty()) check(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "cudaMemcpy H2D");
     }
     std::vector<T> download(size_t n) const {
         std::vector<T> h(n);
@@ -82,6 +82,33 @@ Output run(const std::vector<float>& logits, const std::vector<int32_t>& fixed_i
     check(cudaDeviceSynchronize(), "router_select_mixed");
     out.ids = di.download(out.ids.size());
     out.weights = dw.download(out.weights.size());
+    return out;
+}
+
+Output run_table(const std::vector<float>& logits, const std::vector<int32_t>& fixed_table,
+                 const std::vector<int32_t>& fixed_rows, const std::vector<uint8_t>& fixed_mask,
+                 const std::vector<uint8_t>& alternate_mask, const std::vector<float>& bias,
+                 const std::vector<float>& alternate_bias) {
+    const int n = (int) fixed_mask.size();
+    Device<float> dl(logits.size()), db(bias.size()), da(alternate_bias.size());
+    Device<int32_t> dt(fixed_table.size()), dr(fixed_rows.size()), di((size_t) n * kRoutes);
+    Device<uint8_t> dm(fixed_mask.size()), dx(alternate_mask.size());
+    dl.upload(logits); db.upload(bias); da.upload(alternate_bias); dt.upload(fixed_table); dr.upload(fixed_rows);
+    dm.upload(fixed_mask); dx.upload(alternate_mask);
+
+    basalt::kernels::RouterMixedArgs args;
+    args.n_expert = kExperts; args.k = kRoutes; args.weight_scale = kScale;
+    args.gate = basalt::kernels::RouterGate::SqrtSoftplus;
+    args.fixed_table = dt.p; args.fixed_rows = dr.p; args.fixed_table_rows = (int) (fixed_table.size() / kRoutes);
+    args.fixed_mask = dm.p; args.alternate_mask = dx.p; args.bias = bias.empty() ? nullptr : db.p;
+    args.alternate_bias = alternate_bias.empty() ? nullptr : da.p;
+
+    Output out;
+    out.ids.resize((size_t) n * kRoutes); out.weights.resize((size_t) n * kRoutes);
+    Device<float> dw(out.weights.size());
+    basalt::kernels::router_select_mixed(dl.p, n, args, di.p, dw.p, nullptr);
+    check(cudaDeviceSynchronize(), "router_select_mixed table");
+    out.ids = di.download(out.ids.size()); out.weights = dw.download(out.weights.size());
     return out;
 }
 
@@ -174,6 +201,29 @@ int main() {
         if (id_errors || max_abs > 2e-6 || max_rel > 2e-5 || got.ids[(size_t) 7 * kRoutes] != 3 ||
             got.ids[(size_t) 7 * kRoutes + 1] != 17) return 1;
 
+        std::vector<int32_t> table_rows(kTokens), fixed_table(fixed_ids.size());
+        std::vector<uint8_t> image_mask(kTokens);
+        for (int t = 0; t < kTokens; ++t) {
+            table_rows[(size_t) t] = kTokens - 1 - t;
+            image_mask[(size_t) t] = !fixed_mask[(size_t) t];
+            std::copy_n(fixed_ids.data() + (size_t) t * kRoutes, kRoutes,
+                        fixed_table.data() + (size_t) table_rows[(size_t) t] * kRoutes);
+        }
+        const Output table_got = run_table(logits, fixed_table, table_rows, fixed_mask, image_mask, {}, alternate_bias);
+        const Output table_ref = reference(logits, fixed_ids, fixed_mask, image_mask,
+                                           std::vector<float>(kExperts, 0.f), alternate_bias);
+        int table_id_errors = 0;
+        double table_max_abs = 0.0, table_max_rel = 0.0;
+        for (size_t i = 0; i < table_got.ids.size(); ++i) {
+            table_id_errors += table_got.ids[i] != table_ref.ids[i];
+            const double d = std::fabs((double) table_got.weights[i] - table_ref.weights[i]);
+            table_max_abs = std::max(table_max_abs, d);
+            table_max_rel = std::max(table_max_rel, d / std::max(std::fabs((double) table_ref.weights[i]), 1e-20));
+        }
+        std::printf("router fixed-table/null-bias parity: ids %d differ, weights max abs %.3g rel %.3g\n",
+                    table_id_errors, table_max_abs, table_max_rel);
+        if (table_id_errors || table_max_abs > 2e-6 || table_max_rel > 2e-5) return 1;
+
         bool independent = true;
         for (const auto [start, count] : {std::pair{0, 1}, {1, 3}, {4, 2}, {6, 2}}) {
             const size_t l0 = (size_t) start * kExperts, l1 = (size_t) (start + count) * kExperts;
@@ -197,21 +247,24 @@ int main() {
         }
         if (!refused) return 1;
 
-        const size_t logical_bytes = ((size_t) 4 * kExperts + (size_t) 4 * kRoutes) * sizeof(float) +
-                                     (size_t) 4 * kExperts * sizeof(float) +
-                                     (size_t) 4 * kRoutes * sizeof(int32_t) +
-                                     (size_t) kTokens * kRoutes * (sizeof(int32_t) + sizeof(float)) +
-                                     (size_t) kTokens * 2;
-        Device<float> dl(logits.size()), dw(got.weights.size());
-        Device<int32_t> df(fixed_ids.size()), di(got.ids.size());
-        Device<uint8_t> dm(fixed_mask.size()), dx(alternate_mask.size());
-        Device<float> db(bias.size()), da(alternate_bias.size());
-        dl.upload(logits); df.upload(fixed_ids); dm.upload(fixed_mask); dx.upload(alternate_mask);
-        db.upload(bias); da.upload(alternate_bias);
+        const size_t fixed_tokens = (size_t) std::count(fixed_mask.begin(), fixed_mask.end(), uint8_t{1});
+        const size_t dynamic_tokens = kTokens - fixed_tokens;
+        const size_t alternate_tokens = (size_t) std::count(image_mask.begin(), image_mask.end(), uint8_t{1});
+        const size_t logical_bytes =
+            dynamic_tokens * kExperts * sizeof(float) + alternate_tokens * kExperts * sizeof(float) +
+            fixed_tokens * kRoutes * sizeof(float) + fixed_tokens * kRoutes * sizeof(int32_t) +
+            fixed_tokens * sizeof(int32_t) + (size_t) kTokens * 2 +
+            (size_t) kTokens * kRoutes * (sizeof(int32_t) + sizeof(float));
+        Device<float> dl(logits.size()), dw(got.weights.size()), da(alternate_bias.size());
+        Device<int32_t> dt(fixed_table.size()), dr(table_rows.size()), di(got.ids.size());
+        Device<uint8_t> dm(fixed_mask.size()), dx(image_mask.size());
+        dl.upload(logits); dt.upload(fixed_table); dr.upload(table_rows); dm.upload(fixed_mask); dx.upload(image_mask);
+        da.upload(alternate_bias);
         basalt::kernels::RouterMixedArgs args;
         args.n_expert = kExperts; args.k = kRoutes; args.weight_scale = kScale;
-        args.fixed_ids = df.p; args.fixed_mask = dm.p; args.alternate_mask = dx.p;
-        args.bias = db.p; args.alternate_bias = da.p;
+        args.fixed_table = dt.p; args.fixed_rows = dr.p; args.fixed_table_rows = kTokens;
+        args.fixed_mask = dm.p; args.alternate_mask = dx.p;
+        args.bias = nullptr; args.alternate_bias = da.p;
         cudaEvent_t begin{}, end{};
         check(cudaEventCreate(&begin), "cudaEventCreate");
         check(cudaEventCreate(&end), "cudaEventCreate");
@@ -225,7 +278,7 @@ int main() {
         check(cudaEventElapsedTime(&ms, begin, end), "cudaEventElapsedTime");
         const double us = (double) ms * 1000.0 / iterations;
         const double gbps = logical_bytes / (us * 1000.0);
-        std::printf("router mixed microbench: %.3f us/call, %.2f GB/s logical traffic (%zu bytes/call)\n",
+        std::printf("router fixed-table microbench: %.3f us/call, %.2f GB/s logical traffic (%zu bytes/call)\n",
                     us, gbps, logical_bytes);
         cudaEventDestroy(begin);
         cudaEventDestroy(end);

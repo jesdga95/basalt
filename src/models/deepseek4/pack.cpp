@@ -70,7 +70,7 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
         return false;
     }
     if (g.n_used > g.n_expert || g.n_layers > 64 || g.hash_layers < 0 || g.hash_layers > g.n_layers ||
-        g.compress_ratio.size() < (size_t) g.n_layers) {
+        g.compress_ratio.size() != (size_t) g.n_layers + 3) {
         err = "meta.geometry has an invalid expert count, layer count, or compression schedule";
         return false;
     }
