@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <sstream>
 
@@ -381,6 +382,44 @@ bool open_pack(const std::string& path, Pack& pack, std::string& err) {
         err = path + ": vision/mmproj section is missing";
         return false;
     }
+    return true;
+}
+
+bool read_embedding_row(const Pack& pack, int32_t token, std::vector<float>& row, std::string& err) {
+    const Geometry& g = pack.geo;
+    const TensorRef* tensor = pack.find("token_embd.weight");
+    const core::FileRange gguf = pack.file.range("gguf");
+    if (!tensor || tensor->type != 30 || tensor->shape != std::vector<uint64_t>{(uint64_t) g.n_embd, (uint64_t) g.n_vocab} ||
+        g.n_embd <= 0 || g.n_vocab <= 0 || token < 0 || token >= g.n_vocab || gguf.empty()) {
+        err = "deepseek4 token embedding: invalid tensor, token id, or GGUF section";
+        return false;
+    }
+    const uint64_t n_embd = (uint64_t) g.n_embd;
+    if (n_embd > std::numeric_limits<uint64_t>::max() / (uint64_t) g.n_vocab / 2) {
+        err = "deepseek4 token embedding: tensor size overflows";
+        return false;
+    }
+    const uint64_t row_bytes = n_embd * sizeof(uint16_t);
+    const uint64_t tensor_bytes = row_bytes * (uint64_t) g.n_vocab;
+    if (tensor->bytes != tensor_bytes || tensor->offset < gguf.offset ||
+        tensor->offset - gguf.offset > gguf.bytes || tensor_bytes > gguf.bytes - (tensor->offset - gguf.offset) ||
+        (uint64_t) token > std::numeric_limits<uint64_t>::max() / row_bytes) {
+        err = "deepseek4 token embedding: invalid tensor bounds";
+        return false;
+    }
+    std::vector<uint8_t> bytes((size_t) row_bytes);
+    if (!core::read_range_at(gguf, tensor->offset - gguf.offset + (uint64_t) token * row_bytes,
+                             bytes.data(), row_bytes, err)) {
+        err = "deepseek4 token embedding: " + err;
+        return false;
+    }
+    std::vector<float> decoded((size_t) n_embd);
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        const uint32_t bits = ((uint32_t) bytes[2 * i] | ((uint32_t) bytes[2 * i + 1] << 8)) << 16;
+        std::memcpy(&decoded[i], &bits, sizeof(bits));
+    }
+    row = std::move(decoded);
+    err.clear();
     return true;
 }
 

@@ -56,6 +56,8 @@ struct Pack {
 /// Opens and validates a `deepseek4` Basalt pack, including the per-layer routed-expert layout.
 bool open_pack(const std::string& path, Pack& pack, std::string& err);
 bool validate_supported_geometry(const Geometry& geometry, std::string& err);
+/// Read one BF16 token embedding row, converted to FP32, from the pack's GGUF section.
+bool read_embedding_row(const Pack& pack, int32_t token, std::vector<float>& row, std::string& err);
 /// Read one validated six-expert token-to-expert table into host memory for the model session.
 bool load_hash_route_table(const Pack& pack, int layer, std::vector<int32_t>& ids, std::string& err);
 

@@ -6,7 +6,8 @@ The target pack is the DeepSeek-V4-Flash-Vision-Exp checkpoint derived from V4-F
 `deepseek4` and a `deepseek4v` vision projector GGUF. Its text reference is checkpoint-specific: the converted source
 uses MXFP4 routed experts and Q8_0 for source FP8 linears, so it is not a BF16 0731 reference.
 
-The converter, pack validation, serving dialect, and model-local CUDA primitives exist. The engine does not yet register
+The converter, pack validation, serving dialect, and model-local CUDA primitives exist. The pack reader can fetch validated
+BF16 token-embedding rows from the GGUF section on demand. The engine does not yet register
 `deepseek4` as a loadable model: there is no `ModelAdapter`, `LoadedModel`, `ModelSession`, or full transformer forward.
 The CPU image planner and patch formatter exist, but the vision transformer/projector execution is not integrated into a
 Basalt session. The attention stage now accepts decode windows of up to eight rows and matches sequential one-row output and

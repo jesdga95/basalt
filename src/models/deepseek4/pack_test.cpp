@@ -7,7 +7,9 @@
 #include "basalt/vision/mmproj.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 
 int main(int argc, char** argv) {
     if (argc != 2) {
@@ -41,6 +43,38 @@ int main(int argc, char** argv) {
         return 1;
     }
     const auto& g = pack.geo;
+    std::vector<float> embedding;
+    for (const int token : {0, 1, g.n_vocab - 1}) {
+        if (!basalt::models::deepseek4::read_embedding_row(pack, token, embedding, err) ||
+            embedding.size() != (size_t) g.n_embd ||
+            !std::all_of(embedding.begin(), embedding.end(), [](float value) { return std::isfinite(value); })) {
+            basalt::log::error("deepseek4 pack test", "token embedding row %d: %s", token,
+                               err.empty() ? "invalid decoded row" : err.c_str());
+            return 1;
+        }
+        const auto* tensor = pack.find("token_embd.weight");
+        const auto gguf_range = pack.file.range("gguf");
+        std::vector<uint8_t> raw((size_t) g.n_embd * 2);
+        const uint64_t offset = tensor->offset - gguf_range.offset + (uint64_t) token * raw.size();
+        if (!basalt::core::read_range_at(gguf_range, offset, raw.data(), raw.size(), err)) {
+            basalt::log::error("deepseek4 pack test", "raw token embedding row %d: %s", token, err.c_str());
+            return 1;
+        }
+        for (int i = 0; i < g.n_embd; ++i) {
+            uint32_t bits = ((uint32_t) raw[(size_t) i * 2] | ((uint32_t) raw[(size_t) i * 2 + 1] << 8)) << 16;
+            float expected = 0.f;
+            std::memcpy(&expected, &bits, sizeof(expected));
+            if (embedding[(size_t) i] != expected) {
+                basalt::log::error("deepseek4 pack test", "token embedding row %d differs from raw BF16 at column %d", token, i);
+                return 1;
+            }
+        }
+    }
+    const std::vector<float> before_invalid = embedding;
+    if (basalt::models::deepseek4::read_embedding_row(pack, g.n_vocab, embedding, err) || embedding != before_invalid) {
+        basalt::log::error("deepseek4 pack test", "out-of-range embedding id was accepted or modified output");
+        return 1;
+    }
     const auto& v = mmproj.hp();
     const auto cache_plan = basalt::models::deepseek4::ctxp::plan_context(
         g.context_length, g.context_length, UINT64_MAX, g.compress_ratio);
