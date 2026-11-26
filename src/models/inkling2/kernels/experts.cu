@@ -194,7 +194,16 @@ void down_any(const ExpertCall& e, const MoeFinish& mf, int rows, bool fin, void
 }
 }  // namespace
 
-void experts_down(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) { down_any(e, mf, rows, true, stream); }
+// A call of few pairs runs the finish in the down's blocks; a wider one in its own kernel after them (the blocks that
+// complete the tickets come last and run the finishes at the down's occupancy: the tail would cost more than a launch)
+void experts_down(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) {
+    if (e.pairs < kSmallPairs) {
+        down_any(e, mf, rows, true, stream);
+        return;
+    }
+    down_any(e, mf, rows, false, stream);
+    experts_finish(e, mf, rows, stream);
+}
 void experts_down_rows(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) { down_any(e, mf, rows, false, stream); }
 
 }  // namespace basalt::models::inkling2
