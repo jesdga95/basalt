@@ -168,6 +168,46 @@ int main() {
         const SplitCut cut = split_cut(two(GpuMode::Split), s);
         CHECK(cut.error.empty() && cut.first[1] > 12 && cut.first[1] < 23);
     }
+    {
+        // automatic two-card split shifts to the nearest fitting boundary when the share-nearest cut overflows a card
+        SplitSpec s;
+        s.layer.assign(10, 2 * GiB);
+        s.fixed = {4 * GiB, 0};
+        // equal free VRAM shares 0.5/0.5 target 12 GiB per card (b = 4: need 12 / 12 GiB), but card 1 holds only 10 GiB
+        s.room = {15 * GiB, 10 * GiB};
+        const SplitCut cut = split_cut(two(GpuMode::Split, 16 * GiB, 16 * GiB), s);
+        CHECK(cut.error.empty() && cut.first[1] == 5);
+        CHECK(cut.need[0] == 14 * GiB && cut.need[1] == 10 * GiB);
+    }
+    {
+        // automatic two-card split shifts down when card 0 overflows at the share-nearest cut
+        SplitSpec s;
+        s.layer.assign(10, 2 * GiB);
+        s.fixed = {4 * GiB, 0};
+        s.room = {10 * GiB, 15 * GiB};
+        const SplitCut cut = split_cut(two(GpuMode::Split, 16 * GiB, 16 * GiB), s);
+        CHECK(cut.error.empty() && cut.first[1] == 3);
+        CHECK(cut.need[0] == 10 * GiB && cut.need[1] == 14 * GiB);
+    }
+    {
+        // automatic two-card split recovers when fixed bytes exceed card 0's nominal share (nearest boundary b = 0)
+        SplitSpec s;
+        s.layer.assign(8, GiB / 2);
+        s.fixed = {10 * GiB, 1 * GiB};
+        s.room = {15 * GiB, 15 * GiB};
+        const SplitCut cut = split_cut(two(GpuMode::Split, 16 * GiB, 16 * GiB), s);
+        CHECK(cut.error.empty() && cut.first[1] == 1);
+        CHECK(cut.need[0] == 10 * GiB + GiB / 2 && cut.need[1] == 4 * GiB + GiB / 2);
+    }
+    {
+        // automatic two-card split still refuses when no boundary fits both cards
+        SplitSpec s;
+        s.layer.assign(10, 2 * GiB);
+        s.fixed = {4 * GiB, 0};
+        s.room = {11 * GiB, 11 * GiB};
+        const SplitCut cut = split_cut(two(GpuMode::Split, 16 * GiB, 16 * GiB), s);
+        CHECK(!cut.error.empty() && cut.error.rfind("gpu-mode split: GPU ", 0) == 0);
+    }
 
     // ---- peer: the expert deal by share
     {

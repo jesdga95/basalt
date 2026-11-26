@@ -6,6 +6,7 @@
 #include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda.h>
 
 #include <algorithm>
 #include <atomic>
@@ -17,43 +18,114 @@
 
 namespace basalt::core {
 
-bool host_pin_budget(uint64_t& limit, std::string& why) {
-    if constexpr (!platform::kBoundHostRegistration) return platform::pin_budget(limit, why);
-    limit = 0;
-    why.clear();
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-    std::vector<cudaDeviceProp> props((size_t) count);
-    std::vector<bool> valid((size_t) count, false);
-    for (int d = 0; d < count; ++d) {
-        if (cudaGetDeviceProperties(&props[(size_t) d], d) != cudaSuccess) { (void) cudaGetLastError(); continue; }
-        uint64_t unused = 0;
-        std::string note;
-        const auto& prop = props[(size_t) d];
-        if (!platform::pin_budget(unused, note, prop.luid, prop.luidDeviceNodeMask)) continue;
-        valid[(size_t) d] = true;
-        // Create mapping consumers before registering portable pages, without changing the caller's device.
-        const cudaError_t initialized = cudaInitDevice(d, 0, 0);
-        if (initialized != cudaSuccess) {
-            why = "CUDA" + std::to_string(d) + " context initialization refused: " + cudaGetErrorString(initialized);
+namespace {
+
+struct PrimaryCtxFns {
+    CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
+    CUresult (CUDAAPI* primary_ctx_state)(CUdevice, unsigned int*, int*) = nullptr;
+    bool ok = false;
+};
+
+template <class F> bool driver_entry(const char* name, F& f) {
+    void* p = nullptr;
+    cudaDriverEntryPointQueryResult q{};
+#if CUDART_VERSION >= 12050
+    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
+#else
+    const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
+#endif
+    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || p == nullptr) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    f = reinterpret_cast<F>(p);
+    return true;
+}
+
+[[maybe_unused]] const PrimaryCtxFns& primary_ctx_fns() {
+    static const PrimaryCtxFns f = [] {
+        PrimaryCtxFns x;
+        x.ok = driver_entry("cuDeviceGet", x.device_get) &&
+               driver_entry("cuDevicePrimaryCtxGetState", x.primary_ctx_state);
+        return x;
+    }();
+    return f;
+}
+
+[[maybe_unused]] bool device_ctx_active(int ordinal) {
+    const PrimaryCtxFns& f = primary_ctx_fns();
+    if (!f.ok) return false;
+    CUdevice cu = 0;
+    unsigned int flags = 0;
+    int active = 0;
+    return f.device_get(&cu, ordinal) == CUDA_SUCCESS &&
+           f.primary_ctx_state(cu, &flags, &active) == CUDA_SUCCESS && active != 0;
+}
+
+bool query_host_pin_budget(uint64_t& limit, std::string& why, bool current_only) {
+    if constexpr (!platform::kBoundHostRegistration) {
+        (void) current_only;
+        return platform::pin_budget(limit, why);
+    } else {
+        limit = 0;
+        why.clear();
+        int count = 0;
+        if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) { (void) cudaGetLastError(); return false; }
+        int current = -1;
+        if (cudaGetDevice(&current) != cudaSuccess || current < 0 || current >= count) {
             (void) cudaGetLastError();
-            return true;
+            current = -1;
         }
-    }
-    bool known = false;
-    for (int d = 0; d < count; ++d) {
-        if (!valid[(size_t) d]) continue;
-        const auto& prop = props[(size_t) d];
-        uint64_t allowance = 0;
-        std::string note;
-        if (!platform::pin_budget(allowance, note, prop.luid, prop.luidDeviceNodeMask, count > 1)) continue;
-        if (!known || allowance < limit) {
-            limit = allowance;
-            why = "CUDA" + std::to_string(d) + " " + note;
+        std::vector<int> devices;
+        if (current_only) {
+            devices.push_back(current >= 0 ? current : 0);
+        } else {
+            for (int d = 0; d < count; ++d)
+                if (d == current || device_ctx_active(d)) devices.push_back(d);
+            if (devices.empty()) devices.push_back(0);
         }
-        known = true;
+        std::vector<cudaDeviceProp> props(devices.size());
+        std::vector<bool> valid(devices.size(), false);
+        for (size_t i = 0; i < devices.size(); ++i) {
+            const int d = devices[i];
+            if (cudaGetDeviceProperties(&props[i], d) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+            uint64_t unused = 0;
+            std::string note;
+            const auto& prop = props[i];
+            if (!platform::pin_budget(unused, note, prop.luid, prop.luidDeviceNodeMask)) continue;
+            valid[i] = true;
+            // Create mapping consumers only on active or selected devices before registering portable pages,
+            // without changing the caller's current device.
+            const cudaError_t initialized = cudaInitDevice(d, 0, 0);
+            if (initialized != cudaSuccess) {
+                why = "CUDA" + std::to_string(d) + " context initialization refused: " + cudaGetErrorString(initialized);
+                (void) cudaGetLastError();
+                return true;
+            }
+        }
+        const bool shared_mapping = !current_only && devices.size() > 1;
+        bool known = false;
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (!valid[i]) continue;
+            const int d = devices[i];
+            const auto& prop = props[i];
+            uint64_t allowance = 0;
+            std::string note;
+            if (!platform::pin_budget(allowance, note, prop.luid, prop.luidDeviceNodeMask, shared_mapping)) continue;
+            if (!known || allowance < limit) {
+                limit = allowance;
+                why = "CUDA" + std::to_string(d) + " " + note;
+            }
+            known = true;
+        }
+        return known;
     }
-    return known;
+}
+
+}  // namespace
+
+bool host_pin_budget(uint64_t& limit, std::string& why) {
+    return query_host_pin_budget(limit, why, /*current_only=*/false);
 }
 
 std::vector<uint64_t> ram_pin_slices(std::vector<uint64_t> starts, uint64_t end, uint64_t page, uint64_t target) {
@@ -134,10 +206,16 @@ RamPin pin_ram_bounded(void* base, uint64_t bytes, uint64_t lock_bytes, const st
     }
     if (!bytes) p.refused = "over the pin budget";
     if (p.registered_bytes < lock_bytes) {
-        p.lock_off = p.registered_bytes;
-        const auto lr = platform::lock_resident((uint8_t*) base + p.lock_off, lock_bytes - p.lock_off);
-        p.locked_bytes = lr.locked_bytes;
-        p.lock_note = lr.note;
+        if constexpr (platform::kBoundHostRegistration) {
+            // Leave the unregistered tail pageable when host registration is bounded by an adapter budget,
+            // so working-set locks do not compete for the same physical memory pool.
+            p.lock_note = "none (kept pageable)";
+        } else {
+            p.lock_off = p.registered_bytes;
+            const auto lr = platform::lock_resident((uint8_t*) base + p.lock_off, lock_bytes - p.lock_off);
+            p.locked_bytes = lr.locked_bytes;
+            p.lock_note = lr.note;
+        }
     }
     return p;
 }
@@ -219,7 +297,14 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     if (!bytes) return true;
     if (bytes > SIZE_MAX - ((2ull << 20) - 1)) return false;
     if constexpr (platform::kPreferHostVmm) {
-        if (pin) data_ = vmm::alloc_host(bytes, capacity_);
+        if (pin) {
+            uint64_t budget = 0;
+            std::string why;
+            // Skip host VMM upfront when the span exceeds the current adapter's non-local budget,
+            // falling straight through to ordinary memory and bounded registration.
+            if (!query_host_pin_budget(budget, why, /*current_only=*/true) || bytes <= budget)
+                data_ = vmm::alloc_host(bytes, capacity_);
+        }
         allocation_pinned_ = data_ != nullptr;
     }
     if (!data_) {
@@ -269,25 +354,33 @@ std::vector<RamPin> pin_ram_spans(const std::vector<RamAllocation>& allocations,
 }
 
 std::vector<RamPin> pin_ram_spans(const std::vector<uint8_t*>& spans, const std::vector<uint64_t>& bytes, bool mapped) {
-    uint64_t budget = 0, total = 0;
+    uint64_t budget = 0;
     std::string why;
-    for (uint64_t b : bytes) total += ram_padded(b);
-    const bool limited = (platform::kBoundHostRegistration ? host_pin_budget(budget, why) : platform::pin_budget(budget, why))
-                         && budget < total;
+    const size_t n = std::min(spans.size(), bytes.size());
+    const bool known = platform::kBoundHostRegistration ? host_pin_budget(budget, why) : platform::pin_budget(budget, why);
     std::vector<RamPin> pins(spans.size());
     uint64_t pinned = 0;
-    for (size_t i = 0; i < spans.size(); ++i) {
-        if (spans[i] == nullptr) continue;
-        const uint64_t padded = ram_padded(bytes[i]);
-        const bool room = !limited || (pinned <= budget && padded <= budget - pinned);
-        if constexpr (platform::kBoundHostRegistration) {
-            // DXGI usage can lag registration. Also charge each span against the initial allowance.
-            const uint64_t remaining = limited ? (budget > pinned ? budget - pinned : 0) : ~uint64_t(0);
+    if constexpr (platform::kBoundHostRegistration) {
+        for (size_t i = 0; i < n; ++i) {
+            if (spans[i] == nullptr) continue;
+            const uint64_t padded = ram_padded(bytes[i]);
+            // Adapter usage can lag registration; also charge each span against the initial allowance.
+            const uint64_t remaining = known ? (budget > pinned ? budget - pinned : 0) : ~uint64_t(0);
             pins[i] = pin_ram_bounded(spans[i], padded, bytes[i], {}, mapped, nullptr, remaining);
-        } else {
-            pins[i] = pin_ram(spans[i], room ? padded : 0, bytes[i], {}, mapped);
+            pinned += pins[i].registered_bytes;
         }
-        pinned += pins[i].registered_bytes;
+    } else {
+        uint64_t total = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (spans[i] != nullptr) total += ram_padded(bytes[i]);
+        const bool limited = known && budget < total;
+        for (size_t i = 0; i < n; ++i) {
+            if (spans[i] == nullptr) continue;
+            const uint64_t padded = ram_padded(bytes[i]);
+            const bool room = !limited || (pinned <= budget && padded <= budget - pinned);
+            pins[i] = pin_ram(spans[i], room ? padded : 0, bytes[i], {}, mapped);
+            pinned += pins[i].registered_bytes;
+        }
     }
     return pins;
 }
