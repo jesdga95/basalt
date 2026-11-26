@@ -958,6 +958,22 @@ void test_controllers() {
     three.norm_out = zeros<float>((size_t) 3 * E);
     controllers(three, S, 3, nullptr);
     same_bits("  three rows", host(three.norm_out, (size_t) 3 * E).data(), got.data(), (size_t) 3 * E * 4);
+    {   // a batch window of 320 rows: its first rows against the 8-row launch
+        const int W = 320;
+        CtrlArgs wide = a;
+        for (int s = 0; s < S; ++s) {
+            std::vector<float> d = randn((size_t) W * E, 1.f), m = randn((size_t) W * E, 1.f);
+            std::copy(dest[s].begin(), dest[s].end(), d.begin());
+            std::copy(msg[s].begin(), msg[s].end(), m.begin());
+            wide.dest[s] = dev(d);
+            wide.msg[s] = dev(m);
+            wide.q8[s] = zeros<uint8_t>((size_t) W * E / 32 * 36);
+        }
+        wide.norm_out = zeros<float>((size_t) W * E);
+        controllers(wide, S, W, nullptr);
+        same_bits("  320 rows", host(wide.norm_out, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
+        std::printf("  %.1f us a call (320 rows, 3 streams)\n", time_us([&] { controllers(wide, S, W, nullptr); }));
+    }
     std::printf("  %.1f us a call (1 row, 3 streams)\n", time_us([&] { controllers(one, S, 1, nullptr); }));
     std::printf("  %.1f us a call (%d rows, 3 streams)\n", time_us([&] { controllers(a, S, R, nullptr); }), R);
 }

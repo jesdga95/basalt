@@ -401,6 +401,90 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
     }
 }
 
+// ctrl_down_kernel's sums for a wide window: block (o0 / O, s, r0 / RMAX) holds its O outputs' weights in shared memory, so
+// a window's inputs are read once for O outputs instead of 2 (the inputs, not the dots, bound the wide windows). Each lane,
+// warp and output adds the same products in the same order as ctrl_down_kernel: the same bits.
+template<int O, int RMAX>
+__global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_wide_kernel(CtrlArgs a, int rows_all) {
+    extern __shared__ uint32_t sw[];   // [O][kWidth]: output o0 + j's 2 kWidth bf16
+    __shared__ float part[kDownWarps][O][RMAX][2];
+    const int r0 = (int) blockIdx.z * RMAX;
+    const int rows = min(RMAX, rows_all - r0);
+    const int o0 = blockIdx.x * O, s = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bool second = w >= kDownWarps / 2;
+    const int c0 = (w % (kDownWarps / 2)) * kSlice;
+    {   // the weights, before pdl_wait (constant)
+        const uint4* src = reinterpret_cast<const uint4*>(a.down[s] + (size_t) o0 * 2 * kWidth);
+        uint4* dst = reinterpret_cast<uint4*>(sw);
+        for (int i = threadIdx.x; i < O * kWidth / 4; i += kDownWarps * 32) dst[i] = src[i];
+    }
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    __syncthreads();
+    const float* in = (second ? a.msg[s] : a.dest[s]) + (size_t) r0 * kWidth;
+    const uint32_t* wr = sw + ((second ? kWidth : 0) + c0) / 2;
+    constexpr int kIn = 9;
+    constexpr int kPass = RMAX < 4 ? RMAX : 4;
+    static_assert(kSlice / 2 == 32 * kIn, "a lane's pairs are one batch");
+    float dot[O][RMAX], sq[RMAX];
+#pragma unroll
+    for (int t = 0; t < RMAX; ++t) {
+        sq[t] = 0.f;
+#pragma unroll
+        for (int j = 0; j < O; ++j) dot[j][t] = 0.f;
+    }
+#pragma unroll
+    for (int h = 0; h < RMAX; h += kPass) {
+        float2 x[kIn][kPass];
+#pragma unroll
+        for (int b = 0; b < kIn; ++b)
+#pragma unroll
+            for (int t = 0; t < kPass; ++t)
+                if (h + t < rows) x[b][t] = reinterpret_cast<const float2*>(in + (size_t) (h + t) * kWidth + c0)[lane + 32 * b];
+#pragma unroll
+        for (int b = 0; b < kIn; ++b) {
+#pragma unroll
+            for (int t = 0; t < kPass; ++t)
+                if (h + t < rows) sq[h + t] = fmaf(x[b][t].y, x[b][t].y, fmaf(x[b][t].x, x[b][t].x, sq[h + t]));
+#pragma unroll
+            for (int j = 0; j < O; ++j) {
+                const uint32_t u = wr[(size_t) j * kWidth + lane + 32 * b];
+                const float w0 = __uint_as_float(u << 16), w1 = __uint_as_float(u & 0xffff0000u);
+#pragma unroll
+                for (int t = 0; t < kPass; ++t)
+                    if (h + t < rows) dot[j][h + t] = fmaf(w1, x[b][t].y, fmaf(w0, x[b][t].x, dot[j][h + t]));
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < RMAX; ++t) {
+        if (t >= rows) break;
+        const float q = warp_sum(sq[t]);
+#pragma unroll
+        for (int j = 0; j < O; ++j) {
+            const float d = warp_sum(dot[j][t]);
+            if (lane == 0) {
+                part[w][j][t][0] = d;
+                part[w][j][t][1] = q;
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < rows * O; i += kDownWarps * 32) {
+        const int t = i % rows, j = i / rows;
+        float dd = 0.f, sd = 0.f, dm = 0.f, sm = 0.f;
+#pragma unroll
+        for (int k = 0; k < kDownWarps / 2; ++k) {
+            dd += part[k][j][t][0];
+            sd += part[k][j][t][1];
+            dm += part[kDownWarps / 2 + k][j][t][0];
+            sm += part[kDownWarps / 2 + k][j][t][1];
+        }
+        a.scratch[((size_t) s * kBatchRows + r0 + t) * a.rank + o0 + j] =
+            dd * rsqrtf(sd / (float) kWidth + 1e-6f) + dm * rsqrtf(sm / (float) kWidth + 1e-6f);
+    }
+}
+
 // gf[s][r][i] = up_s[i] . hid[s][r] for the 2 kWidth rows of up_s: eight lanes a row (rank / 8 values each), 32 rows a
 // block.
 constexpr int kUpWords = 8;   // a lane's first weight words, read before pdl_wait (all of them up to rank 128)
@@ -631,7 +715,20 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     const int up_rows = std::min(rows, kDecodeRows);
     // 3-4 rows read their inputs once for 4 outputs (they are 8 rows x 18 KB), 5+ rows once for 2 (twice the blocks, half
     // the dots and sums on each one's chain), a lone row keeps rank blocks
-    if (rows >= 9) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams, z), dim3(kDownWarps * 32), 0, s, a, rows);
+    if (rows > kDecodeRows) {   // a batch window
+        constexpr int O = 8, RM = kDecodeRows;   // 8 outputs' weights are 72 KB of shared memory
+        auto* k = ctrl_down_wide_kernel<O, RM>;
+        const size_t sm = (size_t) O * kWidth * 4;
+        static thread_local int set_dev = -1;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (set_dev != dev) {
+            cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+            set_dev = dev;
+        }
+        if (a.rank % O) throw std::runtime_error("inkling2 controllers: rank");
+        bk::launch_pdl(k, dim3((unsigned) (a.rank / O), (unsigned) streams, (unsigned) ((rows + RM - 1) / RM)), dim3(kDownWarps * 32), sm, s, a, rows);
+    } else if (rows >= 9) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams, z), dim3(kDownWarps * 32), 0, s, a, rows);
     else if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<2, 8>, dim3((unsigned) a.rank / 2, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
