@@ -447,6 +447,16 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
     return c.format_grammar();
 }
 
+namespace {
+void collect_names(const JsonValue& tools, std::vector<std::string>& names) {
+    for (const JsonValue& t : tools.items) {
+        const JsonValue* f = t.is(Type::Object) && t.get("function") ? t.get("function") : &t;
+        const JsonValue* nm = f->is(Type::Object) ? f->get("name") : nullptr;
+        if (nm && nm->is(Type::String)) names.push_back(nm->s);
+    }
+}
+}  // namespace
+
 RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err) {
     RequestGrammar out;
     JsonValue req;
@@ -458,6 +468,10 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
     }
     if (const JsonValue* think = req.get("think"); think && think->is(Type::Bool)) out.think = think->b;
     std::string gbnf;
+    if (kind->s == "text") {   // no grammar
+        if (const JsonValue* calls = req.get("calls"); calls && calls->is(Type::Bool)) out.calls = calls->b;
+        return out;
+    }
     if (kind->s == "json_object" || kind->s == "json_schema") {
         std::string schema = R"({"type":"object"})";
         if (kind->s == "json_schema") {
@@ -473,6 +487,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
                 err = "grammar: tools needs an array";
                 return out;
             }
+            collect_names(*tools, out.call_names);
             ToolGrammarOptions opt;
             opt.answer_schema = schema;
             gbnf = tool_call_gbnf(tools->dump(), opt, err);
@@ -488,6 +503,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
         std::string only;   // a named choice
         if (const JsonValue* tc = req.get("tool_choice")) {
             if (tc->is(Type::String) && tc->s == "none") return out;
+            if (tc->is(Type::String) && tc->s == "required") out.must_call = true;
             if (tc->is(Type::Object)) {
                 const JsonValue* fn = tc->get("function");
                 const JsonValue* nm = fn && fn->is(Type::Object) ? fn->get("name") : tc->get("name");
@@ -503,6 +519,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
                 if (nm && nm->is(Type::String) && nm->s == only) list.items.push_back(t);
             }
         }
+        collect_names(list, out.call_names);
         gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
         if (!tool_form().trigger_pattern.empty()) out.triggers.patterns = {tool_form().trigger_pattern};
         else out.triggers.words = {tool_form().trigger};

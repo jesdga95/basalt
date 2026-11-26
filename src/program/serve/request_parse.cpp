@@ -34,6 +34,7 @@ Flow Request::parse() {
     req_penalty_present = 0.0f;
     req_penalty_last_n = 0;
     req_bias_present = false;
+    req_reply = -1;         // reply=N: the ids past the first N are the reply this request continues, the server's close tokens included
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
     req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
     req_relax = default_relax();   // relax=P: this request's --relaxed-drafting (0 = exact)
@@ -57,6 +58,7 @@ Flow Request::parse() {
             const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
             if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
             else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
+            else if (key == "reply") req_reply = std::atoll(tok.c_str() + eq + 1);
             else if (key == "gprompt") req_gprompt = std::atoll(tok.c_str() + eq + 1);
             else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
             else if (key == "temperature") req_temperature = fv;
@@ -132,6 +134,7 @@ Flow Request::parse() {
                 ids.assign(it->second.ids.begin(), it->second.ids.end());
                 std::vector<int64_t> more;
                 ids_ok = *after != '+' || cli::parse_i64_list(after + 1, more, pe);
+                if (!more.empty()) req_reply = (int64_t) it->second.ids.size();   // what follows the held prompt is the reply so far
                 ids.insert(ids.end(), more.begin(), more.end());
             }
         } else {

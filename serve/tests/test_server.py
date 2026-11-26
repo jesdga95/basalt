@@ -620,6 +620,35 @@ class StopStrings(unittest.TestCase):
         self.assertEqual(m.hit, "</s>")
         self.assertEqual(m.push("more"), "")
 
+    def test_stop_sequence_hit_during_parser_finish_updates_finish_reason(self):
+        # OutputParser holds trailing newlines in buf as a potential gap before <tool_call>;
+        # if max_tokens cuts right after them and stop=["\n\n"], finish() hits the stop string -> "stop", not "length".
+        tok = ByteTokenizer()
+        script = "abc\n\nxyz"
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, body in (
+                ("/v1/chat/completions", {"model": "basalt", "max_tokens": 5, "reasoning_effort": "none",
+                                          "stop": ["\n\n"], "messages": [{"role": "user", "content": "hi"}]}),
+                ("/v1/messages", {"model": "basalt", "max_tokens": 5, "thinking": {"type": "disabled"},
+                                  "stop_sequences": ["\n\n"], "messages": [{"role": "user", "content": "hi"}]}),
+            ):
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
+                    "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    res = json.loads(r.read())
+                if path == "/v1/chat/completions":
+                    self.assertEqual(res["choices"][0]["finish_reason"], "stop")
+                    self.assertEqual(res["choices"][0]["message"]["content"], "abc")
+                else:
+                    self.assertEqual((res["stop_reason"], res["stop_sequence"]), ("stop_sequence", "\n\n"))
+                    self.assertEqual("".join(b["text"] for b in res["content"] if b["type"] == "text"), "abc")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 class EffortAtTheEnd(unittest.TestCase):
     """A non-default effort goes in a system turn before the answer so the cached conversation is kept."""
@@ -3245,6 +3274,7 @@ class ThinkingBudget(unittest.TestCase):
         from serve.service import REASONING_CLOSE
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
         self.engine.takes_text = True
+        self.svc.fit_max_tokens = True      # the engine cuts the cap of a prompt that asks it to (clip=1) and refuses others
         original = self.engine.generate
 
         effective_cap = 1024
@@ -3306,7 +3336,7 @@ class ThinkingBudget(unittest.TestCase):
                 self.assertEqual(b["choices"][0]["finish_reason"], "stop")
                 self.assertGreater(b["usage"]["completion_tokens"], 800)
                 self.assertLessEqual(b["usage"]["completion_tokens"], 3000)
-        code, b = self.openai(max_tokens=16384, thinking_budget_tokens=4096)
+        code, b = self.openai(max_tokens=16000, thinking_budget_tokens=4096)   # a cap that fits beside the prompt
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         self.assertGreater(b["usage"]["completion_tokens"], 4096)
@@ -3834,6 +3864,42 @@ class LostStep(unittest.TestCase):
 
     def test_stop_never_acknowledged(self):
         self.run_mode("stop", stream=False)
+
+
+class TemplateAndCollectEdgeCases(unittest.TestCase):
+    def test_chat_template_leading_tool_message_opens_user_turn(self):
+        tpl = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
+        single = tpl.render([{"role": "tool", "content": "r1"}], enable_thinking=False)
+        self.assertIn("<|im_start|>user\n<tool_response>\nr1\n</tool_response><|im_end|>\n", single)
+        self.assertEqual(single.count("<|im_start|>"), single.count("<|im_end|>") + 1)  # +1 for open assistant turn
+        pair = tpl.render([{"role": "tool", "content": "r1"}, {"role": "tool", "content": "r2"}], enable_thinking=False)
+        self.assertIn("<|im_start|>user\n<tool_response>\nr1\n</tool_response>\n<tool_response>\nr2\n</tool_response><|im_end|>\n", pair)
+
+    def test_collect_handles_early_cancel_before_done(self):
+        from serve.api.anthropic import anthropic_collect
+        from serve.api.openai import openai_collect
+
+        # OpenAI: empty stream, heartbeats only, or role chunk without usage/finish_reason
+        for chunks in ([], [None], [{"id": "c1", "created": 1, "model": "m",
+                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"},
+                                                  "finish_reason": None}]}]):
+            out = openai_collect(chunks)
+            self.assertEqual(out["choices"][0]["finish_reason"], "stop")
+            self.assertIn("usage", out)
+
+        # Anthropic: empty stream, heartbeats only, or stream cancelled mid-tool_use before stop/delta
+        for events in ([], [None], [
+            ("message_start", {"type": "message_start", "message": {
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "m", "content": [],
+                "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 5, "output_tokens": 0}}}),
+            ("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "tool_use", "id": "t1", "name": "f", "input": {}}}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "input_json_delta", "partial_json": '{"x":'}}),
+        ]):
+            msg = anthropic_collect(events)
+            self.assertEqual(msg["stop_reason"], "end_turn")
+            self.assertEqual(msg["content"], [])
 
 
 class UrlHostFormatting(unittest.TestCase):

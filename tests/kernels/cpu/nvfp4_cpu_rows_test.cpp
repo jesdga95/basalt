@@ -15,11 +15,12 @@
 namespace cpu = basalt::kernels::cpu;
 
 namespace {
-enum class Mode { Avx2Base, Avx2Vnni, Avx2Disp, Avx512 };
+enum class Mode { Avx2Base, Avx2Dpbusd, Avx2Vnni, Avx2Disp, Avx512 };
 
 const char* mode_name(Mode m) {
     switch (m) {
         case Mode::Avx2Base: return "AVX2-base";
+        case Mode::Avx2Dpbusd: return "AVX2-vnni";
         case Mode::Avx2Vnni: return "AVX2-vnni8";
         case Mode::Avx2Disp: return "AVX2";
         case Mode::Avx512: return "AVX512";
@@ -32,6 +33,7 @@ void run_mode(Mode m, bool gate, const uint8_t* w, size_t stride, size_t up, int
     if (gate) {
         switch (m) {
             case Mode::Avx2Base: cpu::nvfp4_256_gu_rows_base(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
+            case Mode::Avx2Dpbusd: cpu::nvfp4_256_gu_rows_dpbusd(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
             case Mode::Avx2Vnni: cpu::nvfp4_256_gu_rows_vnni(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
             case Mode::Avx2Disp: cpu::nvfp4_256_gu_rows(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
             case Mode::Avx512: cpu::nvfp4_512_gu_rows(w, stride, up, n, .1f, .1f, glu, act, nt, out, r0, r1); break;
@@ -39,6 +41,7 @@ void run_mode(Mode m, bool gate, const uint8_t* w, size_t stride, size_t up, int
     } else {
         switch (m) {
             case Mode::Avx2Base: cpu::nvfp4_256_down_rows_base(w, stride, n, .1f, act, nt, out, r0, r1); break;
+            case Mode::Avx2Dpbusd: cpu::nvfp4_256_down_rows_dpbusd(w, stride, n, .1f, act, nt, out, r0, r1); break;
             case Mode::Avx2Vnni: cpu::nvfp4_256_down_rows_vnni(w, stride, n, .1f, act, nt, out, r0, r1); break;
             case Mode::Avx2Disp: cpu::nvfp4_256_down_rows(w, stride, n, .1f, act, nt, out, r0, r1); break;
             case Mode::Avx512: cpu::nvfp4_512_down_rows(w, stride, n, .1f, act, nt, out, r0, r1); break;
@@ -287,6 +290,7 @@ int check_native_softcap(int type) {
 int main() {
     if (!cpu::cpu_avx2_ok()) return 77;
     std::vector<Mode> modes = {Mode::Avx2Base, Mode::Avx2Disp};
+    if (cpu::cpu_avxvnni_ok()) modes.push_back(Mode::Avx2Dpbusd);
     if (cpu::cpu_avxvnni_int8_ok()) modes.push_back(Mode::Avx2Vnni);
     if (cpu::cpu_avx512_ok()) modes.push_back(Mode::Avx512);
     int bad = 0;
