@@ -1,18 +1,20 @@
 // src/models/inkling2/kernels/glue.cu - Inkling 2's fused glue for a decode window: the block-residual mixes with the norm
 // and the q8_1 rounding of the products' inputs, the loop controllers (down, up, blend, norm and rounding), the attention
-// preparation a key/value head a block, the attention output's convolution with the residual and the MLP's mix, and the
-// experts' sum with its convolution and the residual.
+// preparation a key/value head a block, and the attention output's convolution with the residual and the MLP's mix
+// (into the experts' activation rows).
 //
 // A block takes one row (or one row and head, or one stream and row), and no row's arithmetic reads another row's partial
 // sums, so a row's bits do not depend on the rows beside it. A window's convolutions read the rows before them in the
 // window and the ring for the positions before the window, and each row writes its own ring slot: a window of at most
 // kDecodeRows rows touches distinct slots, and none of the kConv - 1 its rows read before it (kDecodeRows + kConv - 1 <=
 // kConvRing).
+#include "basalt/kernels/expert_rows.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "prep.cuh"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -174,10 +176,11 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p, float (&x)
     for (int j = 0; j < kPer; ++j) x[j] = p[threadIdx.x + j * kThreads];
 }
 
-// RMS norm of the thread-held row x with the thread-held weights w, into q8_1 (and fp32 when `f32` is set): the sum of
-// squares each warp's, then the warps' in warp order. The kernel's last use of `red` (kWarpsB + 1 floats).
-__device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float (&w)[kPer], float eps, void* q8, float* f32,
-                                        int r, float* red) {
+// RMS norm of the thread-held row x with the thread-held weights w, into q8_1, or the experts' activation rows when `xh`
+// is set (f16, or bf16 with `bf16`, at xh_pos), and fp32 when `f32` is set: the sum of squares each warp's, then the
+// warps' in warp order. The kernel's last use of `red` (kWarpsB + 1 floats).
+__device__ __forceinline__ void norm_out(const float (&x)[kPer], const float (&w)[kPer], float eps, void* q8, void* xh, bool bf16,
+                                         float* f32, int r, float* red) {
     float ss = 0.f;
 #pragma unroll
     for (int j = 0; j < kPer; ++j) ss = fmaf(x[j], x[j], ss);
@@ -193,14 +196,22 @@ __device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float (&w)
     }
     __syncthreads();
     const float inv = rsqrtf(red[kWarpsB] / (float) kWidth + eps);
-    Q81* row = reinterpret_cast<Q81*>(q8) + (size_t) r * (kWidth / 32);
     float y[kPer];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         y[j] = x[j] * inv * w[j];
         if (f32) f32[(size_t) r * kWidth + threadIdx.x + j * kThreads] = y[j];
     }
-    q8_store3(y, row, wp, lane);
+    if (xh) {
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            const size_t at = (size_t) r * kWidth + bk::xt::xh_pos(threadIdx.x + j * kThreads);
+            if (bf16) static_cast<uint16_t*>(xh)[at] = __bfloat16_as_ushort(__float2bfloat16_rn(y[j]));
+            else static_cast<uint16_t*>(xh)[at] = __half_as_ushort(__float2half_rn(y[j]));
+        }
+        return;
+    }
+    q8_store3(y, reinterpret_cast<Q81*>(q8) + (size_t) r * (kWidth / 32), wp, lane);
 }
 
 using prep::conv_in;
@@ -283,7 +294,7 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
             a.mix_out[(size_t) q * a.out_stride + (size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[j];
         return;
     }
-    norm_q8(mixed, nw, a.eps, a.q8[q], q == 0 ? a.norm_out : nullptr, r, red);
+    norm_out(mixed, nw, a.eps, a.q8[q], nullptr, false, q == 0 ? a.norm_out : nullptr, r, red);
 }
 
 // ---- loop controllers --------------------------------------------------------------------------------------------------
@@ -471,7 +482,7 @@ __global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows_all) 
     }
 }
 
-// The norm into q8_1 of stream s and row r's blended controller state.
+// The norm into q8_1 (stream 0: or the experts' rows) of stream s and row r's blended controller state.
 __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const int r = blockIdx.x, s = blockIdx.y;
     float nw[kPer];
@@ -482,7 +493,7 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank + ((size_t) s * kBatchRows + r) * kWidth;
     float y[kPer];
     load_row(yb, y);
-    norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
+    norm_out(y, nw, a.eps, a.q8[s], s == 0 ? a.xh : nullptr, a.xh_bf16, s == 0 ? a.norm_out : nullptr, r, red);
 }
 
 // ---- attention preparation ---------------------------------------------------------------------------------------------
@@ -588,53 +599,7 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
         for (int j = 0; j < kPer; ++j) a.mix_out[(size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[j];
         return;
     }
-    norm_q8(mixed, nw, a.eps, a.q8, a.norm_out, r, red);
-}
-
-// ---- experts -----------------------------------------------------------------------------------------------------------
-
-// Block (row, 256 channels), a thread a channel: the experts' weighted sums of this row and the rows before it in the
-// window that its convolution reads, the ring for the positions before the window, plus the residual; the ring takes this
-// row's sum.
-__global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
-    const int r = blockIdx.x;
-    const int c = blockIdx.y * 256 + threadIdx.x;
-    // a batch window's row: its conversation's ring, and its rows of the window from its segment's first
-    const bk::WindowSegs& at = seg_table(a.seg);
-    const int sk = bk::seg_of(at, r), first = at.n > 0 ? at.row0[sk] : 0;
-    float* const ring = at.n > 0 ? a.seg.c[sk].m_ring : a.ring;
-    float taps[kConv];   // read while the kernel before finishes
-#pragma unroll
-    for (int j = 0; j < kConv; ++j) taps[j] = a.taps[c * kConv + (kConv - 1 - j)];
-    if (threadIdx.x < kConv - 1) {   // the block's ring entries of the three positions before this row into L2
-        const int pj = a.pos[r] - 1 - (int) threadIdx.x;
-        if (pj >= 0)
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ring + (size_t) (pj % kConvRing) * kWidth + blockIdx.y * 256),
-                         "r"(256u * 4u) : "memory");
-    }
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
-    {
-        float acc = 0.f, x0 = 0.f;
-#pragma unroll
-        for (int j = 0; j < kConv; ++j) {
-            float x;
-            if (r - j >= first) {
-                x = 0.f;
-                for (int s = 0; s < a.k; ++s) x = fmaf(a.w[(r - j) * a.k + s], a.rows[((size_t) (r - j) * a.k + s) * kWidth + c], x);
-            } else {
-                const int p = a.pos[r] - j;
-                x = p < 0 ? 0.f : ring[(size_t) (p % kConvRing) * kWidth + c];
-            }
-            if (j == 0) x0 = x;
-            acc = fmaf(taps[j], x, acc);
-        }
-        const size_t i = (size_t) r * kWidth + c;
-        const float y = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];
-        a.out[i] = y;
-        if (a.tap) a.tap[i] = y;
-        ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;
-    }
+    norm_out(mixed, nw, a.eps, nullptr, a.xh, a.xh_bf16, a.norm_out, r, red);
 }
 
 void check_rows(int rows, const char* what) {
@@ -690,13 +655,6 @@ void post_attn(const PostAttn& a, int rows, void* stream) {
     if (a.n_blocks + (a.boundary ? 1 : 0) + 1 > kMaxMix) throw std::runtime_error("inkling2 post_attn: blocks");
     bk::launch_pdl(post_attn_kernel, dim3((unsigned) rows), dim3(kThreads), 0, (cudaStream_t) stream, a);
     check("post_attn");
-}
-
-void moe_finish(const MoeFinish& a, int rows, void* stream) {
-    if (rows <= 0) return;
-    check_rows(rows, "moe_finish");
-    bk::launch_pdl(moe_finish_kernel, dim3((unsigned) rows, kWidth / 256), dim3(256), 0, (cudaStream_t) stream, a);
-    check("moe_finish");
 }
 
 }  // namespace basalt::models::inkling2

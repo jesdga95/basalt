@@ -8,6 +8,7 @@
 #include "basalt/core/device_copy.hpp"
 #include "../cpu_expert_drain.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/expert_rows.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/router.hpp"
@@ -226,6 +227,17 @@ std::vector<double> norm_ref(const std::vector<double>& x, const std::vector<flo
 
 // The q8_1 blocks of `rows` rows of `width` against a CPU rounding of the kernel's own fp32 rows `x`: the int8 values and
 // the scale exactly, the sum to its fp16 rounding.
+// The experts' f16 activation rows (xh_pos layout) of `rows` rows of `width` against the f16 rounding of the kernel's
+// own fp32 rows `x`, exactly.
+void check_xh(const char* what, const void* dxh, const std::vector<float>& x, int rows, int width) {
+    const std::vector<uint16_t> h = host(static_cast<const uint16_t*>(dxh), (size_t) rows * width);
+    bool ok = true;
+    for (int r = 0; r < rows && ok; ++r)
+        for (int i = 0; i < width && ok; ++i) ok = h[(size_t) r * width + basalt::kernels::xt::xh_pos(i)] == f2h(x[(size_t) r * width + i]);
+    std::printf("%-34s %s\n", what, ok ? "exact" : "FAIL");
+    failures += !ok;
+}
+
 void check_q8(const char* what, const void* dq8, const std::vector<float>& x, int rows, int width) {
     const size_t nb = (size_t) rows * width / 32;
     std::vector<uint8_t> q = host(static_cast<const uint8_t*>(dq8), nb * 36);
@@ -1102,7 +1114,7 @@ void test_post_attn() {
             }
             a.o = dev(o); a.pos = dev(pos); a.taps = dev(taps); a.ring = dev(ring); a.hid = dev(hid); a.boundary = boundary;
             a.resid = zeros<float>((size_t) R * E); a.query = dev(q); a.norm = dev(w);
-            a.q8 = zeros<uint8_t>((size_t) R * E / 32 * 36); a.norm_out = zeros<float>((size_t) R * E);
+            a.xh = zeros<uint16_t>((size_t) R * E); a.norm_out = zeros<float>((size_t) R * E);
             if (mix_only) a.mix_out = zeros<float>((size_t) R * E);
             post_attn(a, R, nullptr);
             const std::vector<float> res = host(a.resid, (size_t) R * E);
@@ -1128,7 +1140,7 @@ void test_post_attn() {
             }
             const std::vector<float> got = host(mix_only ? a.mix_out : a.norm_out, (size_t) R * E);
             report(mix_only ? "  the MLP's mix" : "  the MLP's normed input", got, ref, 4e-6);
-            if (!mix_only) check_q8("  its q8_1 blocks", a.q8, got, R, E);
+            if (!mix_only) check_xh("  its f16 expert rows", a.xh, got, R, E);
             const std::vector<float> nr = host(a.ring, (size_t) kConvRing * E);
             bool ring_ok = true;
             for (int r = 0; r < R; ++r) ring_ok = ring_ok && !std::memcmp(&nr[(size_t) (pos[r] % kConvRing) * E], &o[(size_t) r * E], E * 4);
@@ -1140,7 +1152,7 @@ void test_post_attn() {
                 PostAttn one = a;
                 one.o = a.o + 2 * E; one.pos = a.pos + 2; one.ring = dev(ring2); one.hid = a.hid + 2 * E;
                 for (int i = 0; i < nb; ++i) one.blocks[i] = a.blocks[i] + 2 * E;
-                one.resid = zeros<float>(E); one.norm_out = zeros<float>(E); one.q8 = zeros<uint8_t>(E / 32 * 36);
+                one.resid = zeros<float>(E); one.norm_out = zeros<float>(E); one.xh = zeros<uint16_t>(E);
                 post_attn(one, 1, nullptr);
                 same_bits("  a row alone", host(one.norm_out, E).data(), &got[(size_t) 2 * E], (size_t) E * 4);
                 std::printf("  %.1f us a call (1 row, %d blocks)\n", time_us([&] { post_attn(one, 1, nullptr); }), nb);
@@ -1174,34 +1186,6 @@ void test_expert_prefetch() {
         std::printf("%-34s %s\n", all ? "expert_prefetch: every one in RAM" : "expert_prefetch: some in RAM", skip_ok ? "ok" : "FAIL");
         failures += !skip_ok;
     }
-}
-
-void test_moe_finish() {
-    const int R = 4, K = 8;
-    std::vector<int> pos = {130, 131, 132, 133};
-    const std::vector<float> rows = randn((size_t) R * K * E, 0.3f), w = randn((size_t) R * K, 0.3f, 1.f), taps = randn((size_t) E * kConv, 0.3f),
-                             ring = randn((size_t) kConvRing * E, 0.4f), resid = randn((size_t) R * E, 1.0f);
-    MoeFinish a;
-    a.rows = dev(rows); a.w = dev(w); a.k = K; a.pos = dev(pos); a.taps = dev(taps); a.ring = dev(ring); a.resid = dev(resid);
-    a.out = zeros<float>((size_t) R * E);
-    moe_finish(a, R, nullptr);
-    // the kernels it replaces: moe_combine, then post_conv with the residual
-    float *y = zeros<float>((size_t) R * E), *out2 = zeros<float>((size_t) R * E), *ring2 = dev(ring);
-    moe_combine(a.rows, a.w, R, K, y, nullptr);
-    post_conv(y, a.pos, a.taps, ring2, a.resid, R, out2, nullptr);
-    const std::vector<float> got = host(a.out, (size_t) R * E);
-    same_bits("moe_finish = moe_combine + post_conv", got.data(), host(out2, (size_t) R * E).data(), (size_t) R * E * 4);
-    same_bits("  the ring", host(a.ring, (size_t) kConvRing * E).data(), host(ring2, (size_t) kConvRing * E).data(), (size_t) kConvRing * E * 4);
-    MoeFinish t = a;   // with the drafter's tap: the same rows in both outputs
-    t.ring = dev(ring);
-    t.out = zeros<float>((size_t) R * E);
-    t.tap = zeros<float>((size_t) R * E);
-    moe_finish(t, R, nullptr);
-    same_bits("  with a tap: the output", host(t.out, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
-    same_bits("  with a tap: the tap", host(t.tap, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
-    MoeFinish one = a;
-    one.rows = a.rows + (size_t) 3 * K * E; one.w = a.w + 3 * K; one.pos = a.pos + 3; one.resid = a.resid + 3 * E; one.out = zeros<float>(E);
-    std::printf("  %.1f us a call (1 row)\n", time_us([&] { moe_finish(one, 1, nullptr); }));
 }
 
 // The CPU experts' rows into the experts' output (moe_cpu_merge): from mapped host memory a host function filled, in a
@@ -1821,7 +1805,7 @@ void time_cpu_handoff() {
 }
 
 // A batch window (several conversations' rows in one call, docs/design/batching.md) against each conversation's own call:
-// the attention's q8_1 output, caches and rings, post_attn's and moe_finish's outputs and rings, bitwise. Three segments
+// the attention's q8_1 output, caches and rings, post_attn's outputs and rings, bitwise. Three segments
 // of 3, 1 and 2 rows (one at position 1, one past the window ring's wrap), over a window ring and a full cache, fp16 and E4M3.
 void test_batch_window() {
     struct Seg { int p0, T; };
@@ -1913,18 +1897,16 @@ void test_batch_window() {
             failures += !same;
             print_hash("q8_1 output", q8b);
         }
-    // post_attn and moe_finish: each conversation's ring and its own rows before it
-    const int nb = 2, K = 8;
+    // post_attn: each conversation's ring and its own rows before it
+    const int nb = 2;
     const std::vector<float> o = randn((size_t) R * E, 0.4f), taps = randn((size_t) E * kConv, 0.3f), hid = randn((size_t) R * E, 1.0f),
-                             q = randn(E, 0.05f), w = randn(E, 0.1f, 1.f), xr = randn((size_t) R * K * E, 0.3f), xw = randn((size_t) R * K, 0.3f, 1.f),
-                             mt = randn((size_t) E * kConv, 0.3f), mres = randn((size_t) R * E, 1.0f);
-    std::vector<std::vector<float>> blocks(nb), ar(S), mr(S);
+                             q = randn(E, 0.05f), w = randn(E, 0.1f, 1.f);
+    std::vector<std::vector<float>> blocks(nb), ar(S);
     for (int i = 0; i < nb; ++i) blocks[i] = randn((size_t) R * E, 0.7f + 0.5f * i);
     for (int i = 0; i < S; ++i) {
         ar[i] = randn((size_t) kConvRing * E, 0.4f);
-        mr[i] = randn((size_t) kConvRing * E, 0.4f);
     }
-    float *d_o = dev(o), *d_hid = dev(hid), *d_xr = dev(xr), *d_xw = dev(xw), *d_mres = dev(mres);
+    float *d_o = dev(o), *d_hid = dev(hid);
     std::vector<float*> d_blocks;
     for (auto& b : blocks) d_blocks.push_back(dev(b));
     const auto post_of = [&](int r0, int rows) {
@@ -1932,53 +1914,34 @@ void test_batch_window() {
         for (int i = 0; i < nb; ++i) a.blocks[a.n_blocks++] = d_blocks[i] + (size_t) r0 * E;
         a.o = d_o + (size_t) r0 * E; a.pos = dpos + r0; a.taps = dev(taps); a.hid = d_hid + (size_t) r0 * E;
         a.resid = zeros<float>((size_t) rows * E); a.query = dev(q); a.norm = dev(w);
-        a.q8 = zeros<uint8_t>((size_t) rows * E / 32 * 36); a.norm_out = zeros<float>((size_t) rows * E);
-        return a;
-    };
-    const auto moe_of = [&](int r0, int rows) {
-        MoeFinish a;
-        a.rows = d_xr + (size_t) r0 * K * E; a.w = d_xw + (size_t) r0 * K; a.k = K; a.pos = dpos + r0; a.taps = dev(mt);
-        a.resid = d_mres + (size_t) r0 * E; a.out = zeros<float>((size_t) rows * E);
+        a.xh = zeros<uint16_t>((size_t) rows * E); a.norm_out = zeros<float>((size_t) rows * E);
         return a;
     };
     std::vector<PostAttn> pa(S);
-    std::vector<MoeFinish> ma(S);
     for (int i = 0; i < S; ++i) {
         pa[i] = post_of(row0[i], segs[i].T);
         pa[i].ring = dev(ar[i]);
         post_attn(pa[i], segs[i].T, nullptr);
-        ma[i] = moe_of(row0[i], segs[i].T);
-        ma[i].ring = dev(mr[i]);
-        moe_finish(ma[i], segs[i].T, nullptr);
     }
     PostAttn pb = post_of(0, R);
-    MoeFinish mb = moe_of(0, R);
-    pb.seg = mb.seg = sg;
-    for (int i = 0; i < S; ++i) {
-        pb.seg.c[i].a_ring = dev(ar[i]);
-        mb.seg.c[i].m_ring = dev(mr[i]);
-    }
+    pb.seg = sg;
+    for (int i = 0; i < S; ++i) pb.seg.c[i].a_ring = dev(ar[i]);
     pb.ring = pb.seg.c[0].a_ring;
-    mb.ring = mb.seg.c[0].m_ring;
     post_attn(pb, R, nullptr);
-    moe_finish(mb, R, nullptr);
     cudaDeviceSynchronize();
-    bool post_same = true, moe_same = true;
+    bool post_same = true;
     const size_t ring_e = (size_t) kConvRing * E;
-    const std::vector<float> nb_all = host(pb.norm_out, (size_t) R * E), res_all = host(pb.resid, (size_t) R * E), out_all = host(mb.out, (size_t) R * E);
-    const std::vector<uint8_t> q8_all = host((uint8_t*) pb.q8, (size_t) R * E / 32 * 36);
+    const std::vector<float> nb_all = host(pb.norm_out, (size_t) R * E), res_all = host(pb.resid, (size_t) R * E);
+    const std::vector<uint16_t> xh_all = host((uint16_t*) pb.xh, (size_t) R * E);
     for (int i = 0; i < S; ++i) {
         const size_t n = (size_t) segs[i].T * E, at = (size_t) row0[i] * E;
         post_same = post_same && !std::memcmp(host(pa[i].norm_out, n).data(), nb_all.data() + at, n * 4) &&
                     !std::memcmp(host(pa[i].resid, n).data(), res_all.data() + at, n * 4) &&
-                    !std::memcmp(host((uint8_t*) pa[i].q8, n / 32 * 36).data(), q8_all.data() + at / 32 * 36, n / 32 * 36) &&
+                    !std::memcmp(host((uint16_t*) pa[i].xh, n).data(), xh_all.data() + at, n * 2) &&
                     host(pa[i].ring, ring_e) == host(pb.seg.c[i].a_ring, ring_e);
-        moe_same = moe_same && !std::memcmp(host(ma[i].out, n).data(), out_all.data() + at, n * 4) &&
-                   host(ma[i].ring, ring_e) == host(mb.seg.c[i].m_ring, ring_e);
     }
     std::printf("%-46s %s\n", "batch window: post_attn", post_same ? "bitwise = each conversation alone" : "FAIL");
-    std::printf("%-46s %s\n", "batch window: moe_finish", moe_same ? "bitwise = each conversation alone" : "FAIL");
-    failures += !post_same + !moe_same;
+    failures += !post_same;
 }
 
 
@@ -2136,7 +2099,6 @@ int main() {
     test_attention_window();
     test_post_attn();
     test_expert_prefetch();
-    test_moe_finish();
     test_cpu_merge();
     test_cpu_ring();
     test_cpu_abort();

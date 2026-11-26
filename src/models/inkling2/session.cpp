@@ -82,12 +82,14 @@ struct Scratch {
     float *q_ = nullptr, *r_ = nullptr, *sink_ = nullptr, *o_ = nullptr, *resid_ = nullptr, *fin_ = nullptr;
     void* att_scr_ = nullptr;
     void* xq_[3] = {};                       // the products' q8_1 inputs of the hidden width
+    void* xh_ = nullptr;                     // the MLP input as the experts' activation rows
     void* xo_ = nullptr;                     // the output projection's
     float *rlog_ = nullptr, *rw_ = nullptr;
     int32_t* ids_ = nullptr;
     unsigned long long* ex_ptr_ = nullptr;
     int32_t *ex_start_ = nullptr, *ex_ng_ = nullptr, *ex_dst_ = nullptr, *ex_tok_ = nullptr;
-    void* ex_scr_ = nullptr;
+    void* ex_h_ = nullptr;                   // the down's input rows
+    int32_t* ex_tk_ = nullptr;               // the experts' finish tickets
     float* ex_rows_ = nullptr;
     float* nrm1_ = nullptr;                     // [visit][kGuessRows][E] a guessed window's MLP inputs, a visit each
     int32_t* gs_ids_ = nullptr;                 // [visit][kGuessExperts] the guessed experts
@@ -185,6 +187,7 @@ struct Shared {
         x.o_ = f(R * E); x.resid_ = f(R * E); x.fin_ = f(R * E);
         x.att_scr_ = alloc(attention_decode_scratch(max_rows, std::max<int64_t>(ctx, g.window)));
         for (void*& q : x.xq_) q = alloc(bk::native_q8_1_bytes((int) E, max_rows));
+        x.xh_ = alloc((size_t) R * E * 2);
         x.xo_ = alloc(bk::native_q8_1_bytes(kOutRows, max_rows));
         x.rlog_ = f(R * g.n_expert); x.rw_ = f(R * g.n_used); x.ids_ = (int32_t*) alloc((size_t) R * g.n_used * 4);
         const int64_t pairs = R * g.n_used;
@@ -193,7 +196,9 @@ struct Shared {
         x.ex_ng_ = (int32_t*) alloc(16);
         x.ex_dst_ = (int32_t*) alloc((size_t) pairs * 4);
         x.ex_tok_ = (int32_t*) alloc((size_t) pairs * 4);
-        x.ex_scr_ = alloc(bk::native_expert_scratch_bytes(pairs, g.n_ff_exp));
+        x.ex_h_ = alloc(expert_h_bytes((int) pairs, g.n_ff_exp));
+        x.ex_tk_ = (int32_t*) alloc(expert_tickets() * 4);
+        if (ok && cudaMemset(x.ex_tk_, 0, expert_tickets() * 4) != cudaSuccess) ok = false;
         x.ex_rows_ = f(pairs * E);
         x.nrm1_ = f((int64_t) g.visits.size() * Scratch::kGuessRows * E);
         x.gs_ids_ = (int32_t*) alloc((size_t) g.visits.size() * Scratch::kGuessExperts * 4);
@@ -1493,7 +1498,8 @@ private:
         pa.query = w.ffn_query;
         pa.norm = w.ffn_norm;
         pa.eps = g_.rms_eps;
-        pa.q8 = x.xq_[0];
+        pa.xh = x.xh_;
+        pa.xh_bf16 = expert_input_bf16(w.gu_type);
         float* nrm = guess ? x.nrm1_ + (size_t) vi * kGuessRows * E : x.nrm_;   // a visit's own rows: the next visit's guess reads them later
         pa.norm_out = nrm;
         if (msgs) pa.mix_out = x.mix_;
@@ -1505,7 +1511,8 @@ private:
             ca.down[0] = w.ctrl_down[3];
             ca.up[0] = w.ctrl_gf[3];
             ca.norm[0] = w.ffn_norm;
-            ca.q8[0] = x.xq_[0];
+            ca.xh = x.xh_;
+            ca.xh_bf16 = expert_input_bf16(w.gu_type);
             ca.norm_out = nrm;
             ca.scratch = x.ctrl_scr_;
             ca.rank = g_.gate_rank;
@@ -1550,15 +1557,26 @@ private:
             fork_open_ = true;
             sh_->cpu->start(l, rows, nrm, ids, k.stream);
         }
-        bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
-        L.gate_softcap = g_.gate_softcap;
-        L.up_softcap = g_.up_softcap;
-        const int pairs = rows * g_.n_used;
-        bk::native_expert_grouped(L, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, std::min(pairs, g_.n_expert), pairs, x.xq_[0], x.ex_scr_,
-                                  x.ex_rows_, k.stream);
-        if (on_cpu) {
+        ExpertCall ec;
+        ec.L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
+        ec.L.gate_softcap = g_.gate_softcap;
+        ec.L.up_softcap = g_.up_softcap;
+        ec.ptr = x.ex_ptr_;
+        ec.start = x.ex_start_;
+        ec.n_groups = x.ex_ng_;
+        ec.dst = x.ex_dst_;
+        ec.tok = x.ex_tok_;
+        ec.pairs = rows * g_.n_used;
+        ec.n_expert = g_.n_expert;
+        ec.x = x.xh_;
+        ec.h = x.ex_h_;
+        ec.tickets = x.ex_tk_;
+        experts_gate_up(ec, k.stream);
+        if (on_cpu) {   // the RAM experts' rows before the down, whose blocks finish the rows as they complete
             sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
             fork_open_ = false;
+            ec.ids = ids;
+            ec.blobs = w.blob_table;
         }
         MoeFinish mf;
         mf.rows = x.ex_rows_;
@@ -1571,7 +1589,7 @@ private:
         mf.resid = x.resid_;
         mf.out = out;
         mf.tap = tap;
-        moe_finish(mf, rows, k.stream);
+        experts_down(ec, mf, rows, k.stream);
     }
 
     float* buf(Buf b) const { return role_[(int) b]; }

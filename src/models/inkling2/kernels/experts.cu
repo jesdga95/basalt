@@ -1,0 +1,195 @@
+// src/models/inkling2/kernels/experts.cu - Inkling 2's routed experts on tensor cores (the tile kernels of
+// kernels/cuda/expert_tile.cuh) with the experts' finish in the down's blocks: each segment's experts' sum, its
+// convolution over the rows before it in the window (the ring before the window) and the residual, run by the down block
+// that completes the segment's ticket for a range of channels: the same arithmetic whichever block runs it.
+#include "basalt/kernels/pdl.hpp"
+#include "basalt/models/inkling2/kernels.hpp"
+#include "kernels/cuda/expert_tile.cuh"
+
+#include <cuda_runtime.h>
+
+#include <stdexcept>
+#include <string>
+
+namespace basalt::models::inkling2 {
+namespace {
+
+namespace bk = basalt::kernels;
+namespace xt = basalt::kernels::xt;
+
+constexpr int kFf = 1152;   // the experts' width the kernels are built for
+
+void check(const char* what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("inkling2 ") + what + ": " + cudaGetErrorString(e));
+}
+
+struct Finish {
+    MoeFinish a;
+    int rows = 0;
+    const int32_t* ids = nullptr;
+    const unsigned long long* blobs = nullptr;
+    int* tickets = nullptr;
+
+    __device__ void span(int s, int& r0, int& r1) const {
+        const bk::WindowSegs& at = seg_table(a.seg);
+        r0 = at.n > 0 ? at.row0[s] : 0;
+        r1 = at.n > 0 ? at.row0[s + 1] : rows;
+    }
+    __device__ int n_segs() const {
+        const bk::WindowSegs& at = seg_table(a.seg);
+        return at.n > 0 ? at.n : 1;
+    }
+    __device__ int seg(int r) const { return bk::seg_of(seg_table(a.seg), r); }
+    __device__ int target(int s) const {
+        int r0, r1;
+        span(s, r0, r1);
+        return (r1 - r0) * a.k;
+    }
+    __device__ int off_card(int s) const {
+        int r0, r1;
+        span(s, r0, r1);
+        int m = 0;
+        for (int i = r0 * a.k; i < r1 * a.k; ++i) m += blobs[ids[i]] ? 0 : 1;
+        return m;
+    }
+    // rows r0 .. r1 - 1 of segment s, channels c0 .. c0 + kTicketCh - 1, each row's slots as one fma chain in slot
+    // order: the rows' pairs were written by other blocks of the call (or before it), so they are read through L2
+    __device__ void finish(int s, int c0, int tid, int nt) const {
+        int r0, r1;
+        span(s, r0, r1);
+        const bk::WindowSegs& at = seg_table(a.seg);
+        float* const ring = at.n > 0 ? a.seg.c[s].m_ring : a.ring;
+        for (int idx = tid; idx < (r1 - r0) * xt::kTicketCh; idx += nt) {
+            const int r = r0 + idx / xt::kTicketCh, c = c0 + idx % xt::kTicketCh;
+            float acc = 0.f, x0 = 0.f;
+#pragma unroll
+            for (int j = 0; j < kConv; ++j) {
+                const float tap = a.taps[c * kConv + (kConv - 1 - j)];
+                float x;
+                if (r - j >= r0) {
+                    x = 0.f;
+                    for (int q = 0; q < a.k; ++q)
+                        x = fmaf(a.w[(r - j) * a.k + q], __ldcg(a.rows + ((size_t) (r - j) * a.k + q) * kWidth + c), x);
+                } else {
+                    const int p = a.pos[r] - j;
+                    x = p < 0 ? 0.f : ring[(size_t) (p % kConvRing) * kWidth + c];
+                }
+                if (j == 0) x0 = x;
+                acc = fmaf(tap, x, acc);
+            }
+            const size_t i = (size_t) r * kWidth + c;
+            const float y = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];
+            a.out[i] = y;
+            if (a.tap) a.tap[i] = y;
+            ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;   // a window's slots: none its rows read before it
+        }
+    }
+};
+
+// The tile shapes by the call's pairs: few pairs (a single conversation's window) take 8-entry tiles of 64 rows and
+// three stages; more take 16-entry tiles of 128 rows; a wide batch 32-entry tiles of 64 rows. Every shape gives an
+// entry the same bits. MXFP8 rows are twice the bytes: two stages for the wider tiles.
+constexpr int kSmallPairs = 128, kWidePairs = 1024;
+template<int TY, int K> using Small = xt::Cfg<TY, K, 8, 64, 3>;
+template<int TY, int K> using Mid = xt::Cfg<TY, K, 16, 128, TY == xt::kNvfp4 ? 3 : 2>;
+template<int TY, int K> using Wide = xt::Cfg<TY, K, 32, 64, TY == xt::kNvfp4 ? 3 : 2>;
+
+xt::Plan plan_of(const ExpertCall& e) {
+    xt::Plan p;
+    p.ptr = e.ptr;
+    p.start = e.start;
+    p.n_groups = e.n_groups;
+    p.dst = e.dst;
+    p.tok = e.tok;
+    return p;
+}
+
+template<int TY, class C>
+void gate_up_one(const ExpertCall& e, cudaStream_t s) {
+    auto* kern = xt::gate_up_kernel<TY, kWidth, C>;
+    static thread_local int set_dev = -1;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (set_dev != dev) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
+        set_dev = dev;
+    }
+    const int tiles = xt::max_tiles(e.pairs, e.n_expert, C::TT);
+    const dim3 grid((unsigned) (tiles * (2 * kFf / C::ROWS)));
+    bk::launch_pdl(kern, grid, dim3(C::NT), (size_t) C::SMEM, s, plan_of(e), e.L, static_cast<const uint16_t*>(e.x),
+                   static_cast<uint16_t*>(e.h));
+}
+
+template<int TY, class C>
+void down_one(const ExpertCall& e, const Finish& f, cudaStream_t s) {
+    auto* kern = xt::down_kernel<TY, kFf, C, Finish>;
+    static thread_local int set_dev = -1;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (set_dev != dev) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
+        set_dev = dev;
+    }
+    const bool off = e.ids != nullptr;
+    const int tiles = xt::max_tiles(e.pairs, e.n_expert, C::TT);
+    const dim3 grid((unsigned) (tiles * (kWidth / C::ROWS) + (off ? 1 : 0)));
+    bk::launch_pdl(kern, grid, dim3(C::NT), (size_t) C::SMEM, s, plan_of(e), e.L, static_cast<const uint16_t*>(e.h),
+                   const_cast<float*>(f.a.rows), f, off);
+}
+
+void check_call(const ExpertCall& e, const char* what) {
+    const bk::NativeExpertLayout& L = e.L;
+    const bool fmt = (L.gu_type == xt::kNvfp4 || L.gu_type == xt::kMxfp8) && L.d_type == L.gu_type && L.up_type == L.gu_type;
+    if (!fmt || L.n_embd != kWidth || L.n_ff != kFf || e.n_expert > xt::kMaxGroups || e.pairs <= 0 || e.pairs > kMaxPairs)
+        throw std::runtime_error(std::string("inkling2 ") + what + ": the experts' formats or shape");
+}
+
+}  // namespace
+
+size_t expert_h_bytes(int pairs, int64_t n_ff) { return (size_t) pairs * (size_t) n_ff * 2; }
+
+size_t expert_tickets() { return (size_t) bk::kWindowSegsMax * (kWidth / xt::kTicketCh); }
+
+void experts_gate_up(const ExpertCall& e, void* stream) {
+    check_call(e, "experts_gate_up");
+    cudaStream_t s = (cudaStream_t) stream;
+    const bool mx = e.L.gu_type == xt::kMxfp8;
+    if (e.pairs < kSmallPairs) {
+        if (mx) gate_up_one<xt::kMxfp8, Small<xt::kMxfp8, kWidth>>(e, s);
+        else gate_up_one<xt::kNvfp4, Small<xt::kNvfp4, kWidth>>(e, s);
+    } else if (e.pairs < kWidePairs) {
+        if (mx) gate_up_one<xt::kMxfp8, Mid<xt::kMxfp8, kWidth>>(e, s);
+        else gate_up_one<xt::kNvfp4, Mid<xt::kNvfp4, kWidth>>(e, s);
+    } else {
+        if (mx) gate_up_one<xt::kMxfp8, Wide<xt::kMxfp8, kWidth>>(e, s);
+        else gate_up_one<xt::kNvfp4, Wide<xt::kNvfp4, kWidth>>(e, s);
+    }
+    check("experts_gate_up");
+}
+
+void experts_down(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) {
+    check_call(e, "experts_down");
+    if (rows <= 0 || rows > kBatchRows || mf.k * rows != e.pairs) throw std::runtime_error("inkling2 experts_down: rows");
+    cudaStream_t s = (cudaStream_t) stream;
+    Finish f;
+    f.a = mf;
+    f.rows = rows;
+    f.ids = e.ids;
+    f.blobs = e.blobs;
+    f.tickets = e.tickets;
+    const bool mx = e.L.gu_type == xt::kMxfp8;
+    if (e.pairs < kSmallPairs) {
+        if (mx) down_one<xt::kMxfp8, Small<xt::kMxfp8, kFf>>(e, f, s);
+        else down_one<xt::kNvfp4, Small<xt::kNvfp4, kFf>>(e, f, s);
+    } else if (e.pairs < kWidePairs) {
+        if (mx) down_one<xt::kMxfp8, Mid<xt::kMxfp8, kFf>>(e, f, s);
+        else down_one<xt::kNvfp4, Mid<xt::kNvfp4, kFf>>(e, f, s);
+    } else {
+        if (mx) down_one<xt::kMxfp8, Wide<xt::kMxfp8, kFf>>(e, f, s);
+        else down_one<xt::kNvfp4, Wide<xt::kNvfp4, kFf>>(e, f, s);
+    }
+    check("experts_down");
+}
+
+}  // namespace basalt::models::inkling2

@@ -7,6 +7,7 @@
 // depends on how many rows share its call or where it sits among them. `stream` may be null (the call then synchronises).
 #pragma once
 
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/window_segs.hpp"
 
 #include <cstddef>
@@ -289,6 +290,8 @@ struct CtrlArgs {
     const uint16_t* up[kMaxStreams] = {};
     const float* norm[kMaxStreams] = {};
     void* q8[kMaxStreams] = {};
+    void* xh = nullptr;                ///< set: stream 0's normed rows go here in the experts' layout instead of q8[0]
+    bool xh_bf16 = false;
     float* norm_out = nullptr;
     float* scratch = nullptr;
     int rank = 0;
@@ -323,15 +326,16 @@ struct PostAttn {
     const float* query = nullptr;
     const float* norm = nullptr;
     float eps = 1e-6f;
-    void* q8 = nullptr;
+    void* xh = nullptr;
+    bool xh_bf16 = false;              ///< expert_input's type for the layer
     float* norm_out = nullptr;
     float* mix_out = nullptr;
     Segments seg;                      ///< a batch window's: each segment's ring (a_ring)
 };
 void post_attn(const PostAttn& a, int rows, void* stream);
 
-/// The experts' sum of each row (w[r][slot] * rows[r * k + slot], slot order), its convolution (the ring for the positions
-/// before the window) plus `resid` into `out`.
+/// The experts' sum of each row (w[r][slot] * rows[r * k + slot], an fma chain in slot order), its convolution (the ring
+/// for the positions before the window) plus `resid` into `out`: the finish experts_down runs as its rows come in.
 struct MoeFinish {
     const float* rows = nullptr;       ///< [rows][k][kWidth]
     const float* w = nullptr;          ///< [rows][k]
@@ -344,7 +348,40 @@ struct MoeFinish {
     float* tap = nullptr;              ///< set: the output rows also here (the drafter's copy of the next visit's input)
     Segments seg;                      ///< a batch window's: each segment's ring (m_ring)
 };
-void moe_finish(const MoeFinish& a, int rows, void* stream);
+
+// ---- experts (kernels/experts.cu) ----------------------------------------------------------------------------------------
+//
+// A visit's routed experts on tensor cores: gate/up with the SwiGLU, then down, whose blocks also run the finish
+// (MoeFinish) of each segment once its rows are all in. The MLP input comes as expert_input rows: f16 when the layer's
+// experts are NVFP4, bf16 when MXFP8, each 16-value group stored as the pairs (v_j, v_{j+8}). An entry's bits are the
+// same whatever else shares the call (basalt/kernels expert_tile.cuh).
+
+/// The activation rows' element type of a layer whose experts are `type`: true for bf16.
+constexpr bool expert_input_bf16(int type) { return type == 46; }
+/// Bytes of the experts' scratch for `pairs` (row, slot) pairs: the down's input rows.
+size_t expert_h_bytes(int pairs, int64_t n_ff);
+/// Ints of the finish tickets (zeroed once; each call leaves them zero).
+size_t expert_tickets();
+
+struct ExpertCall {
+    basalt::kernels::NativeExpertLayout L;   ///< NVFP4 (40) or MXFP8 (46), gate, up and down alike, kWidth x 1152
+    const unsigned long long* ptr = nullptr; ///< moe_plan's groups and entries
+    const int32_t* start = nullptr;
+    const int32_t* n_groups = nullptr;
+    const int32_t* dst = nullptr;
+    const int32_t* tok = nullptr;
+    int pairs = 0;                           ///< rows x k
+    int n_expert = 0;
+    const void* x = nullptr;                 ///< [rows][kWidth] expert_input rows
+    void* h = nullptr;                       ///< scratch, expert_h_bytes
+    int32_t* tickets = nullptr;              ///< expert_tickets ints
+    /// set when some of the visit's experts are not on the card: the choices and the blob table (their pairs' rows are
+    /// in MoeFinish::rows before experts_down)
+    const int32_t* ids = nullptr;
+    const unsigned long long* blobs = nullptr;
+};
+void experts_gate_up(const ExpertCall& e, void* stream);
+void experts_down(const ExpertCall& e, const MoeFinish& f, int rows, void* stream);
 
 // ---- head --------------------------------------------------------------------------------------------------------------
 

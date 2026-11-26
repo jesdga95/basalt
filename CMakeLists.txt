@@ -255,7 +255,12 @@ add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/model
   src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/dflash2.cu
   src/models/inkling2/kernels/attn_prompt.cu src/models/inkling2/kernels/prompt_ops.cu)
 target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
+# the routed experts on tensor cores (the E2M1 codes convert with sm_120a instructions)
+add_library(inkling2_experts STATIC src/models/inkling2/kernels/experts.cu)
+set_target_properties(inkling2_experts PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
+target_include_directories(inkling2_experts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(inkling2_experts PUBLIC ${_gpu_runtime_target})
+target_link_libraries(inkling2_kernels PUBLIC inkling2_experts ${_gpu_runtime_target})
 add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
   src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
   src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp
