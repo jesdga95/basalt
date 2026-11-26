@@ -1,7 +1,9 @@
 #include "models/deepseek4/pack.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 
 namespace basalt::models::deepseek4 {
@@ -12,11 +14,16 @@ using core::Json;
 const Json* member(const Json& object, const char* name) { return object.get(name); }
 
 double number(const Json* value, double fallback = 0.0) {
-    return value && value->is_number() ? value->num() : fallback;
+    if (!value || !value->is_number()) return fallback;
+    const double result = value->num();
+    return std::isfinite(result) ? result : fallback;
 }
 
 int integer(const Json* value, int fallback = 0) {
-    return (int) number(value, fallback);
+    const double result = number(value, std::numeric_limits<double>::quiet_NaN());
+    if (!std::isfinite(result) || std::trunc(result) != result || result < std::numeric_limits<int>::min() ||
+        result > std::numeric_limits<int>::max()) return fallback;
+    return (int) result;
 }
 
 bool read_geometry(const Json& json, Geometry& g, std::string& err) {
@@ -55,8 +62,16 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
     g.yarn_beta_slow = (float) number(member(json, "rope.scaling.yarn_beta_slow"));
 
     const Json* ratios = member(json, "attention.compress_ratios");
-    if (ratios && ratios->is_array())
-        for (const Json& value : ratios->items) g.compress_ratio.push_back((int) value.num());
+    if (ratios && ratios->is_array()) {
+        for (const Json& value : ratios->items) {
+            const int ratio = integer(&value, -1);
+            if (ratio < 0) {
+                err = "meta.geometry has a non-integer compression ratio";
+                return false;
+            }
+            g.compress_ratio.push_back(ratio);
+        }
+    }
 
     if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv != 1 || g.head_dim <= 0 ||
         g.rope_dim <= 0 || g.q_lora <= 0 || g.o_groups <= 0 || g.o_lora <= 0 || g.n_expert <= 0 ||
