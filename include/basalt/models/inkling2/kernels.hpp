@@ -155,7 +155,8 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 /// Initialize the INT8 MMA plans for the current device during model load.
 void attention_decode_int8_init();
 
-enum class Int8MmaPlan { Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct };
+/// RegisterRing, RegisterPingPong: a window's tiles staged through registers (parity and bench only).
+enum class Int8MmaPlan { Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct, RegisterRing, RegisterPingPong };
 /// Auto: the shard model; Previous: the halving rule the model falls back to.
 enum class Int8MmaShards { Auto, Previous };
 struct Int8MmaPlanInfo {
