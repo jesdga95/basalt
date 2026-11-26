@@ -936,14 +936,19 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
 
     try {
         bk::PdlScope pdl(true);
-        for (int s0 = 0; s0 < B; s0 += kChunkSlots) {
-            const int cn = std::min(kChunkSlots, B - s0);
-            const int R = cn * kDf2Block;
-            int sub_nmax = 1;
-            for (int c = 0; c < cn; ++c) sub_nmax = std::max(sub_nmax, act_n[s0 + c]);
+        // a block of the anchor and as many masks as drafts are wanted: its attention sees only these rows (the drafts then
+        // differ from a whole block's), and a chunk holds as many blocks as its rows take
+        int n_max = 1;
+        for (int b = 0; b < B; ++b) n_max = std::max(n_max, act_n[b]);
+        const int blk = n_max + 1;
+        const int chunk_slots = kChunkSlots * kDf2Block / blk;
+        for (int s0 = 0; s0 < B; s0 += chunk_slots) {
+            const int cn = std::min(chunk_slots, B - s0);
+            const int R = cn * blk;
+            const int sub_nmax = n_max;
             const int D_rows = cn * sub_nmax;
 
-            dflash2_block_inputs_batch(w.embedding, meta_d_ + 2 * s0, w.embed_norm, w.target_eps, w.mask, kDf2Block, cn,
+            dflash2_block_inputs_batch(w.embedding, meta_d_ + 2 * s0, w.embed_norm, w.target_eps, w.mask, blk, cn,
                                        x_, st);
             wg::norm_pack(x_, w.layer[0].attn_norm, d.rms_eps, kE, R, act_a_, xn_, st);
             for (int l = 0; l < d.n_layers; ++l) {
@@ -954,7 +959,7 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                 ca.K = kE;
                 ca.m[0] = mat(L.conv_a, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
                 wg::gemm(ca, act_a_, R, ws_, st);
-                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, kDf2Block, cn, act_a_, nullptr, st);
+                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, blk, cn, act_a_, nullptr, st);
 
                 wg::Call qkv;
                 qkv.fmt = wg::Format::Nvfp4;
@@ -977,12 +982,12 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                     int64_t win = d.window;
                     bool block_win = false;
                     window_range(d, p0, act[s0 + c]->lo_, win, block_win);
-                    const int64_t cells = p0 + kDf2Block - std::max<int64_t>(0, p0 - win + 1) + 64;
+                    const int64_t cells = p0 + blk - std::max<int64_t>(0, p0 - win + 1) + 64;
                     max_cells = std::max(max_cells, std::min(att_cells_, cells));
-                    gsegs[c] = {cc.k, cc.v, p0, kDf2Block, p0 + kDf2Block, win, cc.cap, block_win};
+                    gsegs[c] = {cc.k, cc.v, p0, blk, p0 + blk, win, cc.cap, block_win};
                 }
                 dflash2_block_qk_prep_batch(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, d.rope_base, meta_d_ + 2 * s0,
-                                            kDf2Block, cn, qr_, kv, cap, st);
+                                            blk, cn, qr_, kv, cap, st);
                 bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, cn, att_scr_, max_cells, attn_, st);
 
                 wg::pack(attn_, kDf2Q, kDf2Q, R, act_q_, st);
@@ -991,7 +996,7 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                 o.K = kDf2Q;
                 o.m[0] = mat(L.wo, kE, sc + 3, z_, kE);
                 wg::gemm(o, act_q_, R, ws_, st);
-                dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_a, kDf2Block, cn, x_, L.post_norm, d.rms_eps,
+                dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_a, blk, cn, x_, L.post_norm, d.rms_eps,
                                             act_a_, xn_, st);
 
                 wg::Call cf;
@@ -999,7 +1004,7 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                 cf.K = kE;
                 cf.m[0] = mat(L.conv_f, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
                 wg::gemm(cf, act_a_, R, ws_, st);
-                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, kDf2Block, cn, act_a_, nullptr, st);
+                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, blk, cn, act_a_, nullptr, st);
 
                 wg::Call gu;
                 gu.fmt = wg::Format::Nvfp4;
@@ -1017,14 +1022,14 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                 dn.m[0] = mat(L.down, kE, sc + 6, z_, kE);
                 wg::gemm(dn, act_h_, R, ws_, st);
                 if (l + 1 < d.n_layers) {
-                    dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_f, kDf2Block, cn, x_,
+                    dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_f, blk, cn, x_,
                                                 w.layer[(size_t) l + 1].attn_norm, d.rms_eps, act_a_, xn_, st);
                 } else {
-                    dflash2_conv2_add(z_, dyn_, kDf2Dyn, L.base_f, kDf2Block, cn, x_, st);
+                    dflash2_conv2_add(z_, dyn_, kDf2Dyn, L.base_f, blk, cn, x_, st);
                 }
             }
 
-            dflash2_norm_draft_pack(x_, w.norm, d.rms_eps, kDf2Block, cn, sub_nmax, act_a_, hq_, nullptr, st);
+            dflash2_norm_draft_pack(x_, w.norm, d.rms_eps, blk, cn, sub_nmax, act_a_, hq_, nullptr, st);
             wg::Call hc;
             hc.fmt = w.head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8;
             hc.K = kE;
