@@ -4,6 +4,7 @@
 #include "basalt/model/adapter.hpp"
 
 #include <cmath>
+#include <limits>
 #include <string>
 
 namespace basalt::models::deepseek4 {
@@ -44,12 +45,35 @@ inline std::string validate_meta(const GgufFile& file) {
 
     for (const char* key : {"block_count", "context_length", "embedding_length", "attention.head_count",
                             "attention.head_count_kv", "attention.key_length", "attention.q_lora_rank",
-                            "attention.output_group_count", "attention.output_lora_rank", "rope.dimension_count",
-                            "expert_count", "expert_used_count", "expert_feed_forward_length", "expert_shared_count",
-                            "attention.indexer.head_count", "attention.indexer.key_length", "attention.indexer.top_k",
-                            "hyper_connection.count", "hash_layer_count"}) {
-        if (key_num(file, key) <= 0.0) return std::string("missing or zero deepseek4.") + key;
+                            "attention.sliding_window", "attention.output_group_count", "attention.output_lora_rank",
+                            "attention.layer_norm_rms_epsilon", "attention.compress_rope_freq_base",
+                            "rope.dimension_count", "rope.freq_base", "rope.scaling.factor",
+                            "rope.scaling.original_context_length", "rope.scaling.yarn_beta_fast",
+                            "rope.scaling.yarn_beta_slow", "expert_count", "expert_used_count", "expert_shared_count",
+                            "expert_feed_forward_length", "expert_gating_func", "expert_weights_scale",
+                            "hyper_connection.count", "hyper_connection.sinkhorn_iterations", "hyper_connection.epsilon",
+                            "embedding_length_out", "hash_layer_count", "attention.indexer.head_count",
+                            "attention.indexer.key_length", "attention.indexer.top_k"}) {
+        const MetaValue* value = file.get(std::string("deepseek4.") + key);
+        if (!value || !value->is_num() || value->type == MetaType::BOOL || !std::isfinite(value->num()))
+            return std::string("missing or invalid numeric deepseek4.") + key;
     }
+    for (const char* key : {"block_count", "context_length", "embedding_length", "attention.head_count",
+                            "attention.head_count_kv", "attention.key_length", "attention.q_lora_rank",
+                            "attention.sliding_window", "attention.output_group_count", "attention.output_lora_rank",
+                            "rope.dimension_count", "rope.scaling.original_context_length", "expert_count",
+                            "expert_used_count", "expert_shared_count", "expert_feed_forward_length", "expert_gating_func",
+                            "hyper_connection.count", "hyper_connection.sinkhorn_iterations", "embedding_length_out",
+                            "hash_layer_count", "attention.indexer.head_count", "attention.indexer.key_length",
+                            "attention.indexer.top_k"}) {
+        const MetaValue* value = file.get(std::string("deepseek4.") + key);
+        if (!integer_meta_type(value->type) || value->num() <= 0.0 || value->num() > std::numeric_limits<int>::max())
+            return std::string("deepseek4.") + key + " must be a positive bounded integer";
+    }
+    for (const char* key : {"attention.layer_norm_rms_epsilon", "attention.compress_rope_freq_base", "rope.freq_base",
+                            "rope.scaling.factor", "rope.scaling.yarn_beta_fast", "rope.scaling.yarn_beta_slow",
+                            "expert_weights_scale", "hyper_connection.epsilon"})
+        if (key_num(file, key) <= 0.0) return std::string("deepseek4.") + key + " must be positive";
     const MetaValue* norm = file.get("deepseek4.expert_weights_norm");
     if (!norm || norm->type != MetaType::BOOL || norm->u != 1 ||
         key_num(file, "expert_used_count") != 6 || key_num(file, "hash_layer_count") != 3 ||
