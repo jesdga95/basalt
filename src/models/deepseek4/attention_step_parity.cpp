@@ -1,5 +1,7 @@
 #include "basalt/models/deepseek4/attention.hpp"
+#include "basalt/models/deepseek4/layer.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/row_norm.hpp"
 #include "parity_util.hpp"
 
 #include <cuda_fp16.h>
@@ -135,8 +137,52 @@ int main() {
     const auto direct_ring = direct.ring.down();
     const bool output_equal = actual_out == direct_out;
     const bool ring_equal = actual_ring == direct_ring;
+
+    const auto streams_host = randn((size_t) 4 * Embd, 0x41545338, 0.2f);
+    const auto hc_fn_host = randn((size_t) kHcCoef * 4 * Embd, 0x41545339, 0.0002f);
+    const std::vector<float> hc_scale_host = {0.7f, 0.9f, 0.6f};
+    const auto hc_base_host = randn(kHcCoef, 0x4154533a, 0.15f);
+    const std::vector<float> attn_norm_host(Embd, 1.f);
+    Dev<float> streams((size_t) 4 * Embd), next_streams((size_t) 4 * Embd), expected_streams((size_t) 4 * Embd);
+    Dev<float> hc_fn(hc_fn_host), hc_scale(hc_scale_host), hc_base(hc_base_host), attn_norm(attn_norm_host);
+    Dev<float> hc_workspace(hc_mixes_workspace_floats(1)), hc_coefficients(kHcCoef), hc_collapsed(Embd), hc_normalized(Embd);
+    streams.up(streams_host);
+    set_ring(actual, ring, 130, 3, 128);
+    set_ring(direct, ring, 130, 3, 128);
+
+    AttentionLayerWeights layer_weights;
+    layer_weights.hc = {Embd, 1e-20f, 1e-6f, 20};
+    layer_weights.hc_fn = hc_fn.p;
+    layer_weights.hc_scale = hc_scale.p;
+    layer_weights.hc_base = hc_base.p;
+    layer_weights.norm = attn_norm.p;
+    layer_weights.attention = weights;
+    AttentionLayerScratch layer_scratch{hc_workspace.p, hc_coefficients.p, hc_collapsed.p, hc_normalized.p, scratch};
+    attention_layer_step(streams.p, layer_weights, rope, actual.ring.p, selection, layer_scratch, next_streams.p, stream);
+
+    HcArgs hc_args = layer_weights.hc;
+    Dev<float> direct_hc_workspace(hc_mixes_workspace_floats(1)), direct_hc_coefficients(kHcCoef);
+    Dev<float> direct_collapsed(Embd), direct_normalized(Embd);
+    hc_mixes(streams.p, hc_fn.p, hc_scale.p, hc_base.p, 1, hc_args, direct_hc_workspace.p,
+             direct_hc_coefficients.p, stream);
+    hc_pre_rms_norm(streams.p, direct_hc_coefficients.p, kHcCoef, attn_norm.p, 1, Embd, hc_args.rms_eps,
+                    direct_collapsed.p, direct_normalized.p, stream);
+    SparseMqaArgs direct_selection = selection;
+    direct_selection.pos = direct.pos.p;
+    direct_selection.win_start = direct.win_start.p;
+    direct_selection.win_n = direct.win_n.p;
+    AttentionStepScratch direct_scratch{direct.input_q8.p, direct.q_latent.p, direct.q_latent_q8.p, direct.q_heads.p,
+                                        direct.kv_projected.p, direct.kv_row.p, direct.mqa_output.p,
+                                        direct.mqa_workspace.p, direct.output_q8.p, direct.output_latent.p, direct.output.p};
+    attention_step(direct_normalized.p, weights, rope, direct.ring.p, direct_selection, direct_scratch, stream);
+    hc_post(direct.output.p, streams.p, direct_hc_coefficients.p, kHcCoef, 1, Embd, expected_streams.p, stream);
+    check(cudaStreamSynchronize(stream), "synchronize attention-layer composition");
+    const bool layer_output_equal = next_streams.down() == expected_streams.down();
+    const bool layer_ring_equal = actual.ring.down() == direct.ring.down();
+    std::printf("DeepSeek4 attention sublayer composition: streams %s; cache %s; mHC and attention primitives composed\n",
+                layer_output_equal ? "bitwise" : "DIFFERS", layer_ring_equal ? "bitwise" : "DIFFERS");
     std::printf("DeepSeek4 one-token attention step: output %s; ring state %s; Q8_0 checkpoint geometry %d/%d/%d\n",
                 output_equal ? "bitwise" : "DIFFERS", ring_equal ? "bitwise" : "DIFFERS", Embd, Rank, HeadsDim);
     cudaStreamDestroy(stream);
-    return output_equal && ring_equal ? 0 : 1;
+    return output_equal && ring_equal && layer_output_equal && layer_ring_equal ? 0 : 1;
 }

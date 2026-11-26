@@ -1,6 +1,7 @@
 # DeepSeek-V4 kernels and their parity programs. Included only when the deepseek4 model is selected.
 add_library(deepseek4_kernels STATIC
   src/models/deepseek4/attention.cpp
+  src/models/deepseek4/layer.cpp
   src/models/deepseek4/attention.cu
   src/models/deepseek4/compress.cu
   src/models/deepseek4/indexer_compress.cu
