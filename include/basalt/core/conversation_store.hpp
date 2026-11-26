@@ -17,6 +17,7 @@
 
 #include "basalt/core/conversation_cache.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -43,6 +44,7 @@ public:
     struct Match {
         size_t index = 0;
         int64_t tokens = 0;
+        uint64_t entry_id = 0;
     };
     struct Stats {
         size_t files = 0, written = 0, restored = 0, evicted = 0, dropped = 0;
@@ -84,6 +86,9 @@ public:
 
     Stats stats() const;
     uint64_t queued_bytes() const;
+    /// Whether an image of `bytes` would be written: the volume keeps its floor free after the queue and the image. A
+    /// caller asks before it copies a conversation off the card, so a full disk costs no copy the writer then drops.
+    bool fits(uint64_t bytes) const;
 
 private:
     struct Entry;
@@ -95,12 +100,14 @@ private:
     };
     void writer();
     bool write_job(Job& job, uint64_t& wrote, uint64_t& whole, std::string& error);
+    Entry* find_entry_locked(const Match& m) const;
     void evict_locked();
     void drop_locked(size_t index);
     void release_locked(const std::vector<std::string>& refs);
     void gc_locked(int64_t min_age);         ///< removes unused block and state files at least `min_age` s old
 
     std::string dir_;
+    mutable std::atomic<bool> full_said_{false};   ///< fits() said the volume is full, once until it has room again
     uint64_t identity_ = 0, budget_ = 0;
     bool open_ = false;
     mutable std::mutex mu_;
@@ -108,7 +115,7 @@ private:
     std::vector<std::unique_ptr<Entry>> entries_;
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
-    uint64_t queue_bytes_ = 0, clock_ = 0;
+    uint64_t queue_bytes_ = 0, clock_ = 0, next_id_ = 0;
     bool stop_ = false, busy_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept

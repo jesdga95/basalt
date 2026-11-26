@@ -97,13 +97,6 @@ bool Prefill::Run::Chunk::start_stream() {
                     if (a_stop.load(std::memory_order_acquire)) return;
                     std::this_thread::yield();
                 }
-                // with the peer's share, only a few copies queue on the link at a time: the peer's result rows
-                // then wait behind a few blobs, not behind the whole run-ahead into the next layers
-                if (peer_fp4 && idx >= (size_t) kPeerInFlight)
-                    while (cudaEventQuery(m.copied[(idx - kPeerInFlight) % (size_t) m.ring]) == cudaErrorNotReady) {
-                        if (a_stop.load(std::memory_order_acquire)) return;
-                        std::this_thread::yield();
-                    }
                 const StreamEntry& en = seq[idx];
                 const int sl = (int) (idx % (size_t) m.ring);
                 const auto th = Clock::now();

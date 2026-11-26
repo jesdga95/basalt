@@ -174,14 +174,18 @@ void release_range(uint8_t* va, uint64_t bytes) {
     if (v.ok && va != nullptr && bytes > 0) v.address_free(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);
 }
 
-unsigned long long map(uint8_t* va, uint64_t bytes) {
+unsigned long long map(uint8_t* va, uint64_t bytes, bool* out_of_memory) {
+    if (out_of_memory) *out_of_memory = false;
     const Fns& v = fns();
     if (!v.ok) return 0;
     const int dev = current_device();
     const CUmemAllocationProp prop = device_prop(dev);
     const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
     CUmemGenericAllocationHandle h = 0;
-    if (v.create(&h, (size_t) bytes, &prop, 0) != CUDA_SUCCESS) return 0;
+    if (const CUresult r = v.create(&h, (size_t) bytes, &prop, 0); r != CUDA_SUCCESS) {
+        if (out_of_memory) *out_of_memory = r == CUDA_ERROR_OUT_OF_MEMORY;
+        return 0;
+    }
     if (v.map(p, (size_t) bytes, 0, h, 0) != CUDA_SUCCESS) {
         v.release(h);
         return 0;

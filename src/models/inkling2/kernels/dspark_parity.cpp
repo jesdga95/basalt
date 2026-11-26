@@ -2,7 +2,11 @@
 // accumulation) at the drafter's geometry: the target features' mixes (and a row's bits alone), the block's inputs, the
 // Markov recurrence, the screened head over the whole vocabulary (against its exact rows, its tie rule), the head folds and
 // the recurrence's split. Each is timed. Exit 77 without a GPU.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -37,13 +41,13 @@ std::vector<float> randn(size_t n, float s = 1.f, float mean = 0.f) {
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
-    cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return p;
 }
 template <class T> std::vector<T> host(const T* d, size_t n) {
     std::vector<T> h(n);
     cudaDeviceSynchronize();
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 template <class T> T* zeros(size_t n) {
@@ -229,7 +233,6 @@ void test_markov_step() {
     const auto ch = randn(kDsRnn), cf = randn(kDsRnn), b = randn(kDsRnn, 0.3f);
     uint16_t *d_wsp = dev(wsp), *d_w1 = dev(w1);
     float *d_ch = dev(ch), *d_cf = dev(cf), *d_b = dev(b), *d_state = dev(state);
-    int32_t* d_prev = dev(std::vector<int32_t>{prev});
     float* d_out = zeros<float>(kDsRank);
     float* d_lat = zeros<float>(kDsRank);
     dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1 + (size_t) prev * kDsRank, d_state, d_out, d_lat, nullptr);
@@ -430,9 +433,9 @@ void test_head() {
         std::memcpy(&h2[(size_t) 777 * (E / 32) * 34], &head[(size_t) 150000 * (E / 32) * 34], (size_t) (E / 32) * 34);
         std::memcpy(&f2[(size_t) 777 * (kDsRank / 32) * 34], &fold[(size_t) 150000 * (kDsRank / 32) * 34], (size_t) (kDsRank / 32) * 34);
         fb2[777] = fb[150000];
-        cudaMemcpy(d_head, h2.data(), h2.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fold, f2.data(), f2.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fb, fb2.data(), fb2.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_head, h2.data(), h2.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fold, f2.data(), f2.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fb, fb2.data(), fb2.size() * 4, cudaMemcpyHostToDevice);
         dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
         dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
         dspark_screen_order(d_fb, V, d_fbp, nullptr);
@@ -441,9 +444,9 @@ void test_head() {
         bool ok = differ == 0;
         for (int i = 0; i < R; ++i) ok = ok && ids[i] == 777;
         check("head: a tie takes the lower row", ok);
-        cudaMemcpy(d_head, head.data(), head.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fold, fold.data(), fold.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_fb, fb.data(), fb.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_head, head.data(), head.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fold, fold.data(), fold.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_fb, fb.data(), fb.size() * 4, cudaMemcpyHostToDevice);
         dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
         dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
         dspark_screen_order(d_fb, V, d_fbp, nullptr);
@@ -551,6 +554,140 @@ void test_split() {
     check("recurrence split", ok);
 }
 
+
+// Multi-session batched Markov recurrence + screened head (B = 2, 4, 8), both plain and inside a PdlScope (where four short
+// recurrence/quantize launches sit between dspark_head_base_batch and dspark_head_pick_batch): every slot's draft ids and
+// confidences must match running that slot's solo recurrence + dspark_head_base + dspark_head_pick path bit for bit.
+void test_head_batch() {
+    const int64_t V = kVocab;
+    const int R = kDsDrafts, BMax = 8;
+    const auto head = q8_0_rows(V, E, 1.5e-4f, 913u), fold = q8_0_rows(V, kDsRank, 2e-3f, 5151u);
+    const auto fb = randn((size_t) V, 0.5f);
+    uint8_t *d_head = dev(head), *d_fold = dev(fold);
+    float* d_fb = dev(fb);
+    void* d_hsc = zeros<uint8_t>(dspark_screen_bytes(E, V));
+    void* d_fsc = zeros<uint8_t>(dspark_screen_bytes(kDsRank, V));
+    dspark_screen_pack(d_head, E, V, d_hsc, nullptr);
+    dspark_screen_pack(d_fold, kDsRank, V, d_fsc, nullptr);
+    float* d_fbp = zeros<float>((size_t) dspark_screen_rows(V));
+    dspark_screen_order(d_fb, V, d_fbp, nullptr);
+    DsHead h{};
+    h.head = d_head; h.fold = d_fold; h.fold_b = d_fb;
+    h.head_sc = d_hsc; h.fold_sc = d_fsc; h.fold_bp = d_fbp;
+    h.n_vocab = V; h.cap = 30.f;
+
+    const auto wsp = bf16s(randn((size_t) kDsRnn * 2 * kDsRank, 0.05f));
+    const auto wh = bf16s(randn((size_t) kDsRnn * E, 0.03f));
+    const auto wf = bf16s(randn((size_t) kDsRnn * E, 0.03f));
+    const auto rb = randn(kDsRnn, 0.2f);
+    std::vector<uint16_t> w1((size_t) V * kDsRank);
+    for (size_t k = 0; k < w1.size(); ++k) w1[k] = (uint16_t) (((k / kDsRank) * 131 + k % kDsRank) & 0x3fffu);
+    uint16_t *d_wsp = dev(wsp), *d_wh = dev(wh), *d_wf = dev(wf), *d_w1 = dev(w1);
+    float* d_rb = dev(rb);
+
+    const auto hd = randn((size_t) BMax * R * E, 2.5f);
+    const auto frc = randn((size_t) BMax * E, 1.5f);
+    std::vector<int32_t> anchors(BMax);
+    for (int b = 0; b < BMax; ++b) anchors[b] = 17 + b * 101;
+    float *d_hd = dev(hd), *d_frc = dev(frc);
+
+    const size_t hrow = basalt::kernels::native_q8_1_bytes(E, 1);
+    const size_t lrow = basalt::kernels::native_q8_1_bytes(kDsRank, 1);
+    const size_t scr_stride = (dspark_head_scratch_bytes(V) + 255) & ~(size_t) 255;
+
+    cudaStream_t st = nullptr;
+    cudaStreamCreate(&st);
+
+    std::vector<int32_t> ref_ids((size_t) BMax * 8, 0);
+    std::vector<float> ref_conf((size_t) BMax * 8, 0.f);
+    {
+        uint8_t* s_hq = zeros<uint8_t>(R * hrow);
+        uint8_t* s_lq = zeros<uint8_t>(R * lrow);
+        float* s_approx = zeros<float>((size_t) R * dspark_screen_rows(V));
+        float *s_ch = zeros<float>((size_t) R * kDsRnn), *s_cf = zeros<float>(kDsRnn);
+        float *s_st = zeros<float>(2 * kDsRank), *s_lat = zeros<float>(kDsRank);
+        uint16_t* s_w1r = zeros<uint16_t>(kDsRank);
+        void* s_scr = zeros<uint8_t>(scr_stride);
+        int32_t *s_prev = zeros<int32_t>(1), *s_ids = zeros<int32_t>(8);
+        float* s_conf = zeros<float>(8);
+        for (int b = 0; b < BMax; ++b) {
+            cudaMemsetAsync(s_st, 0, 2 * kDsRank * 4, st);
+            cudaMemcpyAsync(s_prev, &anchors[b], 4, cudaMemcpyHostToDevice, st);
+            cudaMemcpyAsync(s_w1r, w1.data() + (size_t) anchors[b] * kDsRank, kDsRank * 2, cudaMemcpyHostToDevice, st);
+            basalt::kernels::native_quantize_q8_1(d_hd + (size_t) b * R * E, s_hq, E, R, st);
+            dspark_head_base(h, s_hq, R, s_approx, st);
+            basalt::kernels::bf16_gemv_fp32_mmvf_multi(d_hd + (size_t) b * R * E, E, d_wh, s_ch, kDsRnn, E, kDsRnn, R, st);
+            basalt::kernels::bf16_gemv_fp32_mmvf_multi(d_frc + (size_t) b * E, E, d_wf, s_cf, kDsRnn, E, kDsRnn, 1, st);
+            for (int i = 0; i < R; ++i) {
+                dspark_markov_step(s_ch + (size_t) i * kDsRnn, s_cf, d_rb, d_wsp, s_w1r,
+                                   s_st + (i & 1) * kDsRank, s_st + ((i + 1) & 1) * kDsRank, s_lat, st);
+                basalt::kernels::native_quantize_q8_1(s_lat, s_lq + i * lrow, kDsRank, 1, st);
+                dspark_head_pick(h, s_hq, s_lq + i * lrow, s_approx, i, s_scr, s_prev, s_ids, s_conf, d_w1, s_w1r, st);
+            }
+            cudaStreamSynchronize(st);
+            const auto gi = host(s_ids, R);
+            const auto gc = host(s_conf, R);
+            std::copy(gi.begin(), gi.end(), ref_ids.begin() + (size_t) b * 8);
+            std::copy(gc.begin(), gc.end(), ref_conf.begin() + (size_t) b * 8);
+        }
+        cudaFree(s_hq); cudaFree(s_lq); cudaFree(s_approx); cudaFree(s_ch); cudaFree(s_cf);
+        cudaFree(s_st); cudaFree(s_lat); cudaFree(s_w1r); cudaFree(s_scr);
+        cudaFree(s_prev); cudaFree(s_ids); cudaFree(s_conf);
+    }
+
+    uint8_t* b_hq = zeros<uint8_t>((size_t) BMax * R * hrow);
+    uint8_t* b_lq = zeros<uint8_t>((size_t) BMax * R * lrow);
+    float* b_approx = zeros<float>((size_t) BMax * R * dspark_screen_rows(V));
+    float *b_ch = zeros<float>((size_t) BMax * R * kDsRnn), *b_cf = zeros<float>((size_t) BMax * kDsRnn);
+    float *b_st = zeros<float>((size_t) BMax * 2 * kDsRank), *b_lat = zeros<float>((size_t) BMax * kDsRank);
+    uint16_t* b_w1r = zeros<uint16_t>((size_t) BMax * kDsRank);
+    void* b_scr = zeros<uint8_t>((size_t) BMax * scr_stride);
+    int32_t *b_prev = zeros<int32_t>(BMax), *b_ids = zeros<int32_t>((size_t) BMax * 8);
+    float* b_conf = zeros<float>((size_t) BMax * 8);
+
+    bool ok = true;
+    for (const bool pdl_on : {false, true}) {
+        for (const int B : {2, 4, 8}) {
+            cudaMemsetAsync(b_st, 0, (size_t) B * 2 * kDsRank * 4, st);
+            cudaMemsetAsync(b_approx, 0x7f, (size_t) B * R * dspark_screen_rows(V) * 4, st);
+            cudaMemcpyAsync(b_prev, anchors.data(), (size_t) B * 4, cudaMemcpyHostToDevice, st);
+            for (int b = 0; b < B; ++b)
+                cudaMemcpyAsync(b_w1r + (size_t) b * kDsRank, w1.data() + (size_t) anchors[b] * kDsRank,
+                                kDsRank * 2, cudaMemcpyHostToDevice, st);
+            {
+                basalt::kernels::PdlScope pdl(pdl_on, true);
+                basalt::kernels::native_quantize_q8_1(d_hd, b_hq, E, B * R, st);
+                dspark_head_base_batch(h, b_hq, B, R, b_approx, st);
+                basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_hd, d_wh, b_ch, E, kDsRnn, B * R, st);
+                basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_frc, d_wf, b_cf, E, kDsRnn, B, st);
+                for (int i = 0; i < R; ++i) {
+                    dspark_markov_step_batch(b_ch, b_cf, d_rb, d_wsp, b_w1r, b_st, i, R, B, b_lat, st);
+                    void* lq_step = b_lq + (size_t) i * B * lrow;
+                    basalt::kernels::native_quantize_q8_1(b_lat, lq_step, kDsRank, B, st);
+                    dspark_head_pick_batch(h, b_hq, lq_step, b_approx, i, R, B, b_scr, scr_stride,
+                                           b_prev, b_ids, b_conf, d_w1, b_w1r, st);
+                }
+            }
+            cudaStreamSynchronize(st);
+            const auto gi = host(b_ids, (size_t) B * 8);
+            const auto gc = host(b_conf, (size_t) B * 8);
+            for (int b = 0; b < B; ++b) {
+                ok = ok && std::memcmp(&gi[(size_t) b * 8], &ref_ids[(size_t) b * 8], R * 4) == 0;
+                ok = ok && std::memcmp(&gc[(size_t) b * 8], &ref_conf[(size_t) b * 8], R * 4) == 0;
+            }
+        }
+    }
+    check("batched Markov + head vs solo (B=2,4,8, plain & PDL)", ok);
+
+    cudaStreamDestroy(st);
+    cudaFree(b_hq); cudaFree(b_lq); cudaFree(b_approx); cudaFree(b_ch); cudaFree(b_cf);
+    cudaFree(b_st); cudaFree(b_lat); cudaFree(b_w1r); cudaFree(b_scr);
+    cudaFree(b_prev); cudaFree(b_ids); cudaFree(b_conf);
+    cudaFree(d_head); cudaFree(d_fold); cudaFree(d_fb); cudaFree(d_hsc); cudaFree(d_fsc); cudaFree(d_fbp);
+    cudaFree(d_wsp); cudaFree(d_wh); cudaFree(d_wf); cudaFree(d_w1); cudaFree(d_rb);
+    cudaFree(d_hd); cudaFree(d_frc);
+}
+
 }  // namespace
 
 int main() {
@@ -565,6 +702,7 @@ int main() {
     test_head();
     test_fold();
     test_split();
+    test_head_batch();
     std::printf("inkling2_dspark_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

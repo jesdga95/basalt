@@ -1,9 +1,11 @@
 // include/basalt/program/gpu_select.hpp - which GPUs a run uses and what each one does.
 //
-// The `gpu` setting means the same in the server, the engine, basalt-bench and basalt-probe:
-//   unset       the first visible card alone (one warning names the others when there are any);
-//   A,B,...     exactly these cards, in this order: the first is the main card;
-//   auto        every visible Blackwell card, the fastest (memory bandwidth, then VRAM) as the main card.
+// Three settings mean the same in the server, the engine, basalt-bench and basalt-probe:
+//   gpu         unset: the first visible card alone (one warning names the others when there are any);
+//               A,B,...: exactly these cards, in this order, the first is the main card; all: every visible card, in order;
+//   gpu-mode    peer, split or tensor: what the cards do together. Required with two or more cards, refused with one;
+//   gpu-share   one positive number per card, in the order of gpu: their relative shares. Refused with one card.
+// Nothing is picked for the user: a setting the run cannot honour is refused with the reason (design/multi-gpu.md).
 // Cards are numbered as nvidia-smi numbers them; under CUDA_VISIBLE_DEVICES the numbers count within that list. The
 // choice is made before any CUDA call and narrows CUDA_VISIBLE_DEVICES to the chosen cards, main first, so the engine
 // always runs on device 0 with the rest after it. The decisions are pure functions over a card table.
@@ -25,15 +27,24 @@ struct GpuCard {
     uint64_t vram = 0;              ///< bytes; 0 when unknown
 };
 
+/// What the cards do together: One is a single card (no gpu-mode).
+enum class GpuMode { One, Peer, Split, Tensor };
+/// "" for One, else "peer", "split" or "tensor".
+const char* gpu_mode_name(GpuMode m);
+
 /// The `gpu` setting as written.
 struct GpuSpec {
-    enum class Kind { Unset, List, Auto };
+    enum class Kind { Unset, List, All };
     Kind kind = Kind::Unset;
     std::vector<int> list;          ///< visible numbers, main first (List)
+    std::string text;               ///< the setting as the errors name it: "", "all" or "A,B,..."
 };
 
-/// Parses "", "auto" or "A,B,..."; false with `err` naming what is wrong.
+/// Parses "", "all" or "A,B,..."; false with `err` naming what is wrong.
 bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err);
+
+/// Parses "" (One) or "peer", "split" or "tensor"; false with `err` for anything else.
+bool parse_gpu_mode(const std::string& text, GpuMode& out, std::string& err);
 
 /// Whether the card can be the main card: compute capability 12.0, or unknown (nothing to check against).
 bool gpu_main_supported(const GpuCard& c);
@@ -46,50 +57,29 @@ std::string gpu_label(const std::vector<GpuCard>& visible, int index);
 /// The cards a run uses, as indices into the visible table, main first, and the lines to print once.
 struct GpuChoice {
     std::vector<int> cards;
-    std::vector<std::string> notes; ///< info lines: the cards `auto` skipped
+    GpuMode mode = GpuMode::One;
+    std::vector<double> shares;     ///< gpu-share normalized to sum 1, one per card; empty when none was given
+    std::vector<std::string> notes; ///< info lines
     std::string warning;            ///< unset with more cards visible
     std::string error;              ///< non-empty: no run
 };
 
-/// The choice for `spec` over the visible cards. `known` is false when the visible cards could not be listed (no
-/// management library and no CUDA_VISIBLE_DEVICES): numbers are then taken as given and `auto` is an error.
-GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known = true);
+/// The choice for the three settings over the visible cards (`mode` One and `share_text` "" when unset). `known` is false
+/// when the visible cards could not be listed (no management library and no CUDA_VISIBLE_DEVICES): numbers are then taken
+/// as given and `all` is an error.
+GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& share_text, const std::vector<GpuCard>& visible,
+                      bool known = true);
 
-/// A run whose flags keep it on its main card (`why` says which): `auto` keeps only the main card it picked, with a
-/// note naming the cards left idle; a list of several is an error; unset drops the warning about unused cards.
-void keep_main_card(const GpuSpec& spec, const std::vector<GpuCard>& visible, const std::string& why, GpuChoice& c);
-
-/// What a chosen card does.
-enum class GpuRole { Main, ExpertTier, PromptSplit, LayerStage, Idle };
-const char* gpu_role_name(GpuRole r);
-
-/// The inputs of the role decision: the chosen cards, main first, and what this platform and engine can run.
-struct RoleInputs {
-    std::vector<GpuCard> cards;
-    int max_expert_tiers = 1;       ///< how many cards the engine can run as expert tiers
-    bool prompt_split = false;       ///< the model puts its one helper card on long prompts (a dense model), not on experts
-    bool layer_stage = false;       ///< such a model does not fit its main card: the helper card runs its later layers
+/// What a model runs: the most cards each mode takes, 0 = the model does not run it.
+struct GpuModes {
+    int peer = 0, split = 0, tensor = 0;
+    bool peer_ada = false;          ///< its peers' kernels are among those a -DPEER_ADA=ON build compiles for sm_89
 };
 
-/// The role of each card, in order: the cards after the main one are expert tiers, as many as the engine runs, and idle
-/// otherwise (PromptSplit in place of ExpertTier when `prompt_split`, LayerStage when `layer_stage` too). How a model with
-/// experts spreads over its tier cards (expert tier or layer split) is priced at its load (multi_gpu_plan.hpp).
-std::vector<GpuRole> choose_roles(const RoleInputs& in);
-
-/// One expert tier's room for experts (bytes) and its card's memory bandwidth (0: unknown, counted as equal).
-struct TierRoom {
-    uint64_t bytes = 0;
-    double gbps = 0;
-};
-
-/// Deals ranked experts (their slot bytes, hottest first) to the expert tiers: each goes to the tier that has taken the
-/// fewest so far for its bandwidth among those it still fits, so the hot experts split by bandwidth and every tier
-/// fills. A tier closes at the first expert that no longer fits it. Returns each expert's tier, -1 when none takes it.
-std::vector<int> spread_experts(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
-
-/// The tiers, ascending, that spread_experts gives at least one expert. A tier left out has nothing to hold (no expert
-/// outside the main card, or no room for one) and takes no part in the expert tier.
-std::vector<size_t> tiers_holding(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers);
+/// Empty when `model` runs the choice's mode on that many cards of `visible`; else the refusal naming the model and the
+/// modes it runs, or the peer card its peer kernels are not built for.
+std::string check_gpu_modes(const GpuChoice& choice, const std::string& model, const GpuModes& modes,
+                            const std::vector<GpuCard>& visible = {});
 
 /// The visible cards: CUDA_VISIBLE_DEVICES when set (integers read as nvidia-smi numbers), else every card the NVIDIA
 /// management library lists, with what that library says about each. `known` false: neither was available.
@@ -101,7 +91,7 @@ void apply_gpus(const std::vector<GpuCard>& visible, const std::vector<int>& car
 /// The `gpu` value that means "every visible card, in order": what a launcher passes the engine once it narrowed the view.
 std::string gpu_identity(size_t n);
 
-/// The choice as one JSON line (the engine's --gpu-plan answer, read by the server).
+/// The choice as one JSON line (the engine's --gpu-plan answer, read by the server), with its "mode" and "shares".
 /// `arch`: the model's architecture when one was given; `spec` the verify window and `max_context` the context the start
 /// would run (0: no model given); `lossy` the flags given that change the model's output, comma separated.
 std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c, const std::string& arch = {},
@@ -109,10 +99,10 @@ std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& 
                           const std::string& model_name = {}, const std::string& lossy = {},
                           const std::string& community_kv = {});
 
-/// For a launcher (basalt-bench, basalt-probe): resolves `text` ("" = unset), prints its lines under `label`, narrows
-/// the environment the engine inherits, and returns the engine's `gpu` value in `engine_value` and the chosen cards in
-/// `used`. False with `err` set when the setting cannot run.
-bool select_gpus(const std::string& text, const char* label, std::string& engine_value, std::vector<GpuCard>& used,
-                 std::string& err);
+/// For a launcher (basalt-bench, basalt-probe): resolves the three settings ("" = unset), prints its lines under `label`,
+/// narrows the environment the engine inherits, and returns the engine's `gpu` value in `engine_value` and the chosen cards
+/// in `used`. False with `err` set when the settings cannot run. The model's own limits are the engine's to check.
+bool select_gpus(const std::string& text, const std::string& mode_text, const std::string& share_text, const char* label,
+                 std::string& engine_value, std::vector<GpuCard>& used, std::string& err);
 
 }  // namespace basalt::program

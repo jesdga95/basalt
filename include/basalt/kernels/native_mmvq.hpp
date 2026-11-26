@@ -68,7 +68,7 @@ void native_q8_0_mmvq_segments(const void* weights, const Q80Segments& seg, int 
 // Bitwise-identical Q8_0 MMVQ over plane-separated weights (wgemm::q8_planes: int8 codes [total_rows][n_in], then
 // fp16 scales [total_rows][n_in / 32]). Aligned code loads; shares the code plane zero-copy with prefill::q8.
 void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-                           void* stream);
+                           void* stream, float softcap = 0.0f);
 void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q80Segments& seg, int n_in, int ncols,
                                     void* stream);
 

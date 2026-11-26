@@ -511,20 +511,25 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
 // One block classifies rows before touching the sequence or mapped memory. A RAM visit reserves a ticket even if
 // aborted, so its merge cannot match an earlier visit's completion.
 constexpr int kRingThreads = 256;
-static_assert(kDecodeRows <= 32, "a visit's rows fit one mask word");
+constexpr int kRingWords = (kBatchRows + 63) / 64;
+static_assert(kBatchRows <= 128, "a visit's rows fit two mask words");
 __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_t* __restrict__ ids, int rows, int k,
                                                                     const unsigned long long* __restrict__ blobs,
                                                                     const float* __restrict__ x, int layer, float* x_m,
                                                                     int32_t* ids_m, CpuBell* bell, uint32_t* seq) {
-    __shared__ uint32_t ram_rows, stopped;
+    __shared__ unsigned long long ram_rows[kRingWords];
+    __shared__ uint32_t stopped;
     const int n = rows * k;
-    if (threadIdx.x == 0) ram_rows = 0;
+    if (threadIdx.x < kRingWords) ram_rows[threadIdx.x] = 0ull;
     __syncthreads();
-    for (int i = threadIdx.x; i < n; i += kRingThreads)
-        if (!blobs[ids[i]]) atomicOr(&ram_rows, 1u << (i / k));
+    for (int i = threadIdx.x; i < n; i += kRingThreads) {
+        if (!blobs[ids[i]]) {
+            const int r = i / k;
+            atomicOr(&ram_rows[r >> 6], 1ull << (r & 63));
+        }
+    }
     __syncthreads();
-    const uint32_t m = ram_rows;
-    if (!m) return;
+    if (!(ram_rows[0] | (kRingWords > 1 ? ram_rows[1] : 0ull))) return;
     uint32_t ticket = 0;
     if (threadIdx.x == 0) {
         ticket = *seq + 1;
@@ -537,7 +542,7 @@ __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_
     for (int i = threadIdx.x; i < n; i += kRingThreads) ids_m[i] = ids[i];
     constexpr int kVecs = kWidth / 4;
     for (int r = 0; r < rows; ++r)
-        if (m >> r & 1)
+        if ((ram_rows[r >> 6] >> (r & 63)) & 1ull)
             for (int c = threadIdx.x; c < kVecs; c += kRingThreads)
                 reinterpret_cast<float4*>(x_m)[(size_t) r * kVecs + c] = reinterpret_cast<const float4*>(x)[(size_t) r * kVecs + c];
     if (threadIdx.x == 0) bk::doorbell_store_relaxed(&bell->ticket, ticket);
@@ -625,11 +630,13 @@ __global__ void __launch_bounds__(kPrefetchThreads) expert_prefetch_kernel(const
     if (acc == 0x9e3779b9u) *sink = acc;   // so the loads are not dropped as unused
 }
 
-__global__ void moe_combine_kernel(const float* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y) {
+__global__ void moe_combine_kernel(const float* __restrict__ out, const float* __restrict__ w, int k, float* __restrict__ y,
+                                   const int32_t* __restrict__ ids) {
     const int r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= kWidth) return;
     float acc = 0.f;
-    for (int s = 0; s < k; ++s) acc = fmaf(w[r * k + s], out[((size_t) r * k + s) * kWidth + c], acc);
+    for (int s = 0; s < k; ++s)
+        if (!ids || ids[r * k + s] >= 0) acc = fmaf(w[r * k + s], out[((size_t) r * k + s) * kWidth + c], acc);
     y[(size_t) r * kWidth + c] = acc;
 }
 
@@ -701,10 +708,25 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
     check("post_conv/ring");
 }
 
+__global__ void heat_fold_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ layer, int row_stride, int rows,
+                                 int k, int n_expert, uint32_t* __restrict__ tally) {
+    const int v = blockIdx.x;
+    const int32_t* vid = ids + (size_t) v * row_stride * k;
+    uint32_t* t = tally + (size_t) layer[v] * n_expert;
+    for (int i = threadIdx.x; i < rows * k; i += blockDim.x) atomicAdd(t + vid[i], 1u);
+}
+
+void heat_fold(const int32_t* ids, const int32_t* layer, int visits, int row_stride, int rows, int k, int n_expert,
+               uint32_t* tally, void* stream) {
+    if (visits <= 0 || rows <= 0) return;
+    heat_fold_kernel<<<visits, 64, 0, (cudaStream_t) stream>>>(ids, layer, row_stride, rows, k, n_expert, tally);
+    check("heat_fold");
+}
+
 void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
                   int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream) {
     if (rows <= 0) return;
-    if (rows > kDecodeRows || rows * k > 1024 || layer < 0 || layer > 0xff)
+    if (rows > kBatchRows || rows * k > 1024 || layer < 0 || layer > 0xff)
         throw std::runtime_error("inkling2 moe_cpu_ring: rows, pairs or layer");
     moe_cpu_ring_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(ids, rows, k, blobs, x, layer, x_m, ids_m, bell, seq);
     check("moe_cpu_ring");
@@ -730,6 +752,270 @@ void expert_prefetch(const int32_t* ids, int n, const unsigned long long* blobs,
     check("expert_prefetch");
 }
 
+// Fused sigmoid router_select + moe_plan for single-token decode (rows == 1, n_expert == 128) in one 128-thread block.
+// Eliminates router_select launch, 128-way shared atomicAdd, count atomicAdd, and ids HBM round-trip (bitwise match).
+__global__ void __launch_bounds__(128)
+router_select_plan_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int k,
+                          float weight_scale, int32_t* __restrict__ ids, float* __restrict__ weights,
+                          const unsigned long long* __restrict__ blobs, unsigned long long* __restrict__ ptr,
+                          int32_t* __restrict__ start, int32_t* __restrict__ n_groups, int32_t* __restrict__ dst,
+                          int32_t* __restrict__ tok, uint32_t* __restrict__ tally,
+                          unsigned long long* __restrict__ rec_blobs, int32_t* __restrict__ rec_n) {
+    constexpr int NE = 128;
+    __shared__ unsigned long long blob[NE];
+    __shared__ unsigned long long gblob[NE];
+    __shared__ float sb[NE];
+    __shared__ float sel[16];
+    __shared__ int32_t first[NE];
+    __shared__ int32_t sid[16];
+    __shared__ int wsum[4][2];
+    __shared__ int groups;
+    const int e = threadIdx.x, w = e >> 5, lane = e & 31;
+    const unsigned long long my_blob = blobs[e];
+    blob[e] = my_blob;
+    const float my_bias = bias[e];
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+
+    const float sc = 1.f / (1.f + expf(-logits[e]));
+    const float b = sc + my_bias;
+    sb[e] = b;
+    __syncthreads();
+
+    int rank = 0;
+#pragma unroll 8
+    for (int j = 0; j < NE; ++j) {
+        const float bj = sb[j];
+        rank += (bj > b) | ((bj == b) & (j < e));
+    }
+    int c = 0;
+    if (rank < k) {
+        sel[rank] = sc;
+        ids[rank] = e;
+        sid[rank] = e;
+        if (my_blob) c = 1;
+    }
+    __syncthreads();
+
+    if (e == 0) {
+        float sum = 0.f;
+        for (int r = 0; r < k; ++r) sum += sel[r];
+        const float denom = sum + 1e-20f;
+        for (int r = 0; r < k; ++r) weights[r] = sel[r] / denom * weight_scale;
+    }
+
+    int sv = c;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int tv = __shfl_up_sync(0xffffffffu, sv, o);
+        if (lane >= o) sv += tv;
+    }
+    if (lane == 31) wsum[w][0] = sv;
+    __syncthreads();
+
+    int at = 0;
+    for (int j = 0; j < w; ++j) at += wsum[j][0];
+    first[e] = at + sv - c;
+    if (c > 0) {
+        gblob[at + sv - 1] = my_blob;
+        ptr[at + sv - 1] = my_blob;
+        start[at + sv - 1] = at + sv - 1;
+    }
+    if (e == NE - 1) {
+        start[at + sv] = at + sv;
+        start[at + sv + 1] = at + sv;
+        *n_groups = at + sv;
+        groups = at + sv;
+    }
+    __syncthreads();
+
+    if (rec_blobs && e < kAheadExperts) {
+        const int ng = groups;
+        rec_blobs[e] = e < ng ? gblob[e] : 0ull;
+        if (e == 0) *rec_n = ng < kAheadExperts ? ng : kAheadExperts;
+    }
+    if (tally && c) atomicAdd(&tally[e], 1u);
+    if (e < k) {
+        const int x = sid[e];
+        if (blob[x]) {
+            const int pos = first[x];
+            dst[pos] = e;
+            tok[pos] = 0;
+        }
+    }
+}
+
+// Fused sigmoid router_select + moe_plan for multi-row windows (rows = 2..kBatchRows, n_expert == 128, k <= 16).
+// Eight warps select Top-k per row in registers (zero per-row barriers), then build the exact moe_plan group tables.
+__global__ void __launch_bounds__(256)
+router_select_plan_multi_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int rows, int k,
+                                float weight_scale, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                const unsigned long long* __restrict__ blobs, unsigned long long* __restrict__ ptr,
+                                int32_t* __restrict__ start, int32_t* __restrict__ n_groups, int32_t* __restrict__ dst,
+                                int32_t* __restrict__ tok, uint32_t* __restrict__ tally,
+                                unsigned long long* __restrict__ rec_blobs, int32_t* __restrict__ rec_n) {
+    constexpr int NE = 128;
+    __shared__ unsigned long long blob[NE];
+    __shared__ unsigned long long gblob[NE];
+    __shared__ float sbias[NE];
+    __shared__ int32_t count[NE];
+    __shared__ int32_t first[NE];
+    __shared__ int32_t sid[1024];
+    __shared__ int wsum[4][2];
+    __shared__ int groups;
+
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    if (tid < NE) {
+        blob[tid] = blobs[tid];
+        sbias[tid] = bias[tid];
+        count[tid] = 0;
+    }
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    __syncthreads();
+
+    float bias_reg[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) bias_reg[j] = sbias[lane + 32 * j];
+
+    for (int r = w; r < rows; r += 8) {
+        const float* rl = logits + (size_t) r * NE;
+        float sc[4], b[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float lg = rl[lane + 32 * j];
+            sc[j] = 1.f / (1.f + expf(-lg));
+            b[j] = sc[j] + bias_reg[j];
+        }
+        int sel_id = 0;
+        float sel_s = 0.f;
+        for (int rank = 0; rank < k; ++rank) {
+            float bv = b[0], bs = sc[0];
+            int bi = lane;
+#pragma unroll
+            for (int j = 1; j < 4; ++j) {
+                const int idx = lane + 32 * j;
+                if (b[j] > bv || (b[j] == bv && idx < bi)) {
+                    bv = b[j];
+                    bi = idx;
+                    bs = sc[j];
+                }
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                const float os = __shfl_xor_sync(0xffffffffu, bs, o);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bi = oi;
+                    bs = os;
+                }
+            }
+            if (lane == rank) {
+                sel_id = bi;
+                sel_s = bs;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                if (bi == lane + 32 * j) b[j] = -INFINITY;
+        }
+        float sum = 0.f;
+        for (int rank = 0; rank < k; ++rank) sum += __shfl_sync(0xffffffffu, sel_s, rank);
+        if (lane < k) {
+            const int i = r * k + lane;
+            ids[i] = sel_id;
+            sid[i] = sel_id;
+            weights[i] = sel_s / (sum + 1e-20f) * weight_scale;
+            if (blob[sel_id]) atomicAdd(&count[sel_id], 1);
+        }
+    }
+    __syncthreads();
+
+    if (tid < NE) {
+        const int c = count[tid];
+        int s = c, used = c > 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int t = __shfl_up_sync(0xffffffffu, s, o), u = __shfl_up_sync(0xffffffffu, used, o);
+            if (lane >= o) {
+                s += t;
+                used += u;
+            }
+        }
+        if (lane == 31) {
+            wsum[w][0] = s;
+            wsum[w][1] = used;
+        }
+    }
+    __syncthreads();
+
+    if (tid < NE) {
+        const int c = count[tid];
+        int s = c, used = c > 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int t = __shfl_up_sync(0xffffffffu, s, o), u = __shfl_up_sync(0xffffffffu, used, o);
+            if (lane >= o) {
+                s += t;
+                used += u;
+            }
+        }
+        int at = 0, g = 0;
+        for (int j = 0; j < w; ++j) {
+            at += wsum[j][0];
+            g += wsum[j][1];
+        }
+        first[tid] = at + s - c;
+        if (c > 0) {
+            gblob[g + used - 1] = blob[tid];
+            ptr[g + used - 1] = blob[tid];
+            start[g + used - 1] = at + s - c;
+        }
+        if (tid == NE - 1) {
+            start[g + used] = at + s;
+            start[g + used + 1] = at + s;
+            *n_groups = g + used;
+            groups = g + used;
+        }
+        if (tally && c) atomicAdd(&tally[tid], (uint32_t) c);
+    }
+    __syncthreads();
+
+    if (rec_blobs && tid < kAheadExperts) {
+        const int ng = groups;
+        rec_blobs[tid] = tid < ng ? gblob[tid] : 0ull;
+        if (tid == 0) *rec_n = ng < kAheadExperts ? ng : kAheadExperts;
+    }
+    const int n = rows * k;
+    for (int i = tid; i < n; i += 256) {
+        const int x = sid[i];
+        if (!blob[x]) continue;
+        int before = 0;
+        for (int j = 0; j < i; ++j) before += sid[j] == x;
+        const int p = first[x] + before;
+        dst[p] = i;
+        tok[p] = i / k;
+    }
+}
+
+void router_select_plan(const float* logits, const float* bias, int rows, int k, int n_expert, float weight_scale,
+                        int32_t* ids, float* weights, const unsigned long long* blobs, unsigned long long* ptr,
+                        int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream,
+                        uint32_t* tally, unsigned long long* rec_blobs, int32_t* rec_n) {
+    if (rows <= 0) return;
+    if (n_expert != 128 || rows * k > 1024 || k > 16)
+        throw std::runtime_error("inkling2 router_select_plan: unsupported geometry");
+    if (rows == 1) {
+        bk::launch_pdl(router_select_plan_kernel, dim3(1), dim3(128), 0, (cudaStream_t) stream, logits, bias, k,
+                       weight_scale, ids, weights, blobs, ptr, start, n_groups, dst, tok, tally, rec_blobs, rec_n);
+    } else {
+        bk::launch_pdl(router_select_plan_multi_kernel, dim3(1), dim3(256), 0, (cudaStream_t) stream, logits, bias, rows, k,
+                       weight_scale, ids, weights, blobs, ptr, start, n_groups, dst, tok, tally, rec_blobs, rec_n);
+    }
+    check("router_select_plan");
+}
+
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
               int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally,
               unsigned long long* rec_blobs, int32_t* rec_n) {
@@ -743,9 +1029,9 @@ void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned 
     check("moe_plan");
 }
 
-void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream) {
+void moe_combine(const float* out, const float* w, int rows, int k, float* y, void* stream, const int32_t* ids) {
     if (rows <= 0) return;
-    moe_combine_kernel<<<dim3((kWidth + 255) / 256, (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(out, w, k, y);
+    moe_combine_kernel<<<dim3((kWidth + 255) / 256, (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(out, w, k, y, ids);
     check("moe_combine");
 }
 

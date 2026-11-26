@@ -9,6 +9,7 @@ figure: what an API would have charged for the same work.
 """
 from __future__ import annotations
 import json
+import math
 import os
 import tempfile
 import time
@@ -29,6 +30,15 @@ def totals_path_of(given: str, config: str | None) -> str | None:
     return str(Path(config).with_suffix("")) + ".totals.json"
 
 
+def totals_path_for_model(path: str, model: str) -> str:
+    """With several models each keeps its own file: the model's name lowercased, with only letters, digits and dots kept
+    ('Qwen 3.8 FN' -> '<config>.totals.qwen3.8fn.json')."""
+    slug = "".join(c for c in model.lower() if c.isascii() and (c.isalnum() or c == "."))
+    if not slug.strip("."):
+        raise ValueError(f"model name {model!r} has no letters or digits to name its totals file")
+    return str(Path(path).with_suffix("")) + f".{slug}.json"
+
+
 def totals_load_file(path: str | Path) -> dict:
     """Read a saved totals file. A missing or broken file is a first start: returns {}.
     A file whose top-level value is not a dict (a list, string, number, etc.) is treated the same way."""
@@ -42,16 +52,21 @@ def totals_load_file(path: str | Path) -> dict:
     return data
 
 
+def _finite_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def totals_add_saved(totals: dict, saved: dict) -> dict:
-    """Add a saved file's counts into the live totals dict. Only numbers are added; a file another
+    """Add a saved file's counts into the live totals dict. Only finite numbers are added; a file another
     version wrote or a hand-edit cannot spoil a start. The 'since' timestamp moves back to the
     saved one so the printed window covers every start the file remembers."""
     for key in TOTALS_KEYS:
         v = saved.get(key)
-        if isinstance(v, (int, float)):
+        if _finite_number(v):
             totals[key] = totals.get(key, 0) + v
-    if isinstance(saved.get("since"), (int, float)) and saved["since"] < totals.get("since", float("inf")):
-        totals["since"] = saved["since"]
+    since = saved.get("since")
+    if _finite_number(since) and since < totals.get("since", float("inf")):
+        totals["since"] = since
     return totals
 
 

@@ -297,12 +297,14 @@ static_assert(kWidth % (kSlice / 2) == 0 && kSlice % 64 == 0, "a slice is whole 
 // RMAX: the rows a launch takes at most (2, 4 or kDecodeRows). A lane loads all of its input pairs of up to 4 rows before
 // their first sum; 8 rows take two such passes (registers).
 template<int O, int RMAX>
-__global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, int rows) {
+__global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, int rows_all) {
     __shared__ float part[kDownWarps][O][RMAX][2];
+    const int r0 = (int) blockIdx.z * RMAX;
+    const int rows = min(RMAX, rows_all - r0);
     const int o0 = blockIdx.x * O, s = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const bool second = w >= kDownWarps / 2;
     const int c0 = (w % (kDownWarps / 2)) * kSlice;   // the slice's first channel in its half
-    const float* in = second ? a.msg[s] : a.dest[s];
+    const float* in = (second ? a.msg[s] : a.dest[s]) + (size_t) r0 * kWidth;
     const uint32_t* wr = reinterpret_cast<const uint32_t*>(a.down[s] + (size_t) o0 * 2 * kWidth + (second ? kWidth : 0) + c0);
     // kIn of a lane's input pairs of every row are loaded before their sums, so the loads overlap instead of each waiting
     // for the one before it (a window's 8 rows were 72 loads in a row); the sums are added in the same order as one at a
@@ -382,7 +384,7 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
             dm += part[kDownWarps / 2 + k][j][t][0];
             sm += part[kDownWarps / 2 + k][j][t][1];
         }
-        a.scratch[((size_t) s * kDecodeRows + t) * a.rank + o0 + j] =
+        a.scratch[((size_t) s * kBatchRows + r0 + t) * a.rank + o0 + j] =
             dd * rsqrtf(sd / (float) kWidth + 1e-6f) + dm * rsqrtf(sm / (float) kWidth + 1e-6f);
     }
 }
@@ -390,78 +392,95 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
 // gf[s][r][i] = up_s[i] . hid[s][r] for the 2 kWidth rows of up_s: eight lanes a row (rank / 8 values each), 32 rows a
 // block.
 constexpr int kUpWords = 8;   // a lane's first weight words, read before pdl_wait (all of them up to rank 128)
-__global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows) {
+__global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows_all) {
     extern __shared__ float hs[];   // [rows][rank]
+    const int r0 = (int) blockIdx.z * kDecodeRows;
+    const int rows = min(kDecodeRows, rows_all - r0);
     const int s = blockIdx.y;
     const int row = blockIdx.x * 32 + (threadIdx.x >> 3), part = threadIdx.x & 7;
     const int per = a.rank / 8;
-    const uint32_t* ur = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) row * a.rank + part * per);
-    uint32_t u0w[kUpWords];
+    const uint32_t* urg = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) row * a.rank + part * per);
+    const uint32_t* urf = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) (row + kWidth) * a.rank + part * per);
+    uint32_t ugw[kUpWords], ufw[kUpWords];
 #pragma unroll
-    for (int k = 0; k < kUpWords; ++k) u0w[k] = row < 2 * kWidth && k < per / 2 ? ur[k] : 0u;
+    for (int k = 0; k < kUpWords; ++k) {
+        const bool ok = row < kWidth && k < per / 2;
+        ugw[k] = ok ? urg[k] : 0u;
+        ufw[k] = ok ? urf[k] : 0u;
+    }
     bk::pdl_wait();
     bk::pdl_launch_dependents();
-    const float* hid = a.scratch + (size_t) s * kDecodeRows * a.rank;
+    const float* hid = a.scratch + ((size_t) s * kBatchRows + r0) * a.rank;
     for (int i = threadIdx.x; i < rows * a.rank; i += blockDim.x) hs[i] = hid[i];
     __syncthreads();
-    float acc[kDecodeRows];
+    float acc_g[kDecodeRows], acc_f[kDecodeRows];
 #pragma unroll
-    for (int t = 0; t < kDecodeRows; ++t) acc[t] = 0.f;
-    if (row < 2 * kWidth) {
+    for (int t = 0; t < kDecodeRows; ++t) {
+        acc_g[t] = 0.f;
+        acc_f[t] = 0.f;
+    }
+    if (row < kWidth) {
 #pragma unroll
         for (int k = 0; k < kUpWords; ++k) {
             if (k >= per / 2) break;
-            const uint32_t u = u0w[k];
-            const float u0 = __uint_as_float(u << 16), u1 = __uint_as_float(u & 0xffff0000u);
+            const uint32_t ug = ugw[k], uf = ufw[k];
+            const float g0 = __uint_as_float(ug << 16), g1 = __uint_as_float(ug & 0xffff0000u);
+            const float f0 = __uint_as_float(uf << 16), f1 = __uint_as_float(uf & 0xffff0000u);
             const int kk = part * per + 2 * k;
 #pragma unroll
             for (int t = 0; t < kDecodeRows; ++t) {
                 if (t >= rows) break;
-                acc[t] = fmaf(u1, hs[t * a.rank + kk + 1], fmaf(u0, hs[t * a.rank + kk], acc[t]));
+                const float h0 = hs[t * a.rank + kk], h1 = hs[t * a.rank + kk + 1];
+                acc_g[t] = fmaf(g1, h1, fmaf(g0, h0, acc_g[t]));
+                acc_f[t] = fmaf(f1, h1, fmaf(f0, h0, acc_f[t]));
             }
         }
         for (int k = kUpWords; k < per / 2; ++k) {
-            const uint32_t u = ur[k];
-            const float u0 = __uint_as_float(u << 16), u1 = __uint_as_float(u & 0xffff0000u);
+            const uint32_t ug = urg[k], uf = urf[k];
+            const float g0 = __uint_as_float(ug << 16), g1 = __uint_as_float(ug & 0xffff0000u);
+            const float f0 = __uint_as_float(uf << 16), f1 = __uint_as_float(uf & 0xffff0000u);
             const int kk = part * per + 2 * k;
 #pragma unroll
             for (int t = 0; t < kDecodeRows; ++t) {
                 if (t >= rows) break;
-                acc[t] = fmaf(u1, hs[t * a.rank + kk + 1], fmaf(u0, hs[t * a.rank + kk], acc[t]));
+                const float h0 = hs[t * a.rank + kk], h1 = hs[t * a.rank + kk + 1];
+                acc_g[t] = fmaf(g1, h1, fmaf(g0, h0, acc_g[t]));
+                acc_f[t] = fmaf(f1, h1, fmaf(f0, h0, acc_f[t]));
             }
         }
     }
-    float* gf = a.scratch + (size_t) kMaxStreams * kDecodeRows * a.rank;
+    float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank;
 #pragma unroll
     for (int t = 0; t < kDecodeRows; ++t) {
         if (t >= rows) break;
-        float v = acc[t];
-        v += __shfl_xor_sync(0xffffffffu, v, 1);
-        v += __shfl_xor_sync(0xffffffffu, v, 2);
-        v += __shfl_xor_sync(0xffffffffu, v, 4);
-        if (part == 0 && row < 2 * kWidth) gf[((size_t) s * kDecodeRows + t) * 2 * kWidth + row] = v;
+        float vg = acc_g[t], vf = acc_f[t];
+        vg += __shfl_xor_sync(0xffffffffu, vg, 1);
+        vf += __shfl_xor_sync(0xffffffffu, vf, 1);
+        vg += __shfl_xor_sync(0xffffffffu, vg, 2);
+        vf += __shfl_xor_sync(0xffffffffu, vf, 2);
+        vg += __shfl_xor_sync(0xffffffffu, vg, 4);
+        vf += __shfl_xor_sync(0xffffffffu, vf, 4);
+        if (part == 0 && row < kWidth) {
+            float g, f;
+            asm("tanh.approx.f32 %0, %1;" : "=f"(g) : "f"(vg));
+            asm("tanh.approx.f32 %0, %1;" : "=f"(f) : "f"(vf));
+            const size_t idx = (size_t) (r0 + t) * kWidth + row;
+            yb[((size_t) s * kBatchRows + r0 + t) * kWidth + row] = (1.f - f) * a.dest[s][idx] + g * a.msg[s][idx];
+        }
     }
 }
 
-// The blend of stream s and row r, then its norm into q8_1.
+// The norm into q8_1 of stream s and row r's blended controller state.
 __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const int r = blockIdx.x, s = blockIdx.y;
-    float nw[kPer], de[kPer], ms[kPer];
+    float nw[kPer];
     load_row(a.norm[s], nw);
-    // and the blend's states: written before the controllers' first kernel, which has finished before this one starts
-    load_row(a.dest[s] + (size_t) r * kWidth, de);
-    load_row(a.msg[s] + (size_t) r * kWidth, ms);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kWarpsB + 1];
-    const float* gf = a.scratch + (size_t) kMaxStreams * kDecodeRows * a.rank + ((size_t) s * kDecodeRows + r) * 2 * kWidth;
+    const float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank + ((size_t) s * kBatchRows + r) * kWidth;
     float y[kPer];
-#pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int c = threadIdx.x + j * kThreads;
-        const float g = tanhf(gf[c]), f = tanhf(gf[kWidth + c]);
-        y[j] = (1.f - f) * de[j] + g * ms[j];
-    }
+    load_row(yb, y);
     norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
 }
 
@@ -478,13 +497,14 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
     const int p = a.pos[r];
     if (w < 2) {
         // a batch window's row: its conversation's caches, and its rows of the window from its segment's first
-        const int k = bk::seg_of(a.seg.at, r);
-        const bool b = a.seg.at.n > 0;
+        const bk::WindowSegs& at = seg_table(a.seg);
+        const int k = bk::seg_of(at, r);
+        const bool b = at.n > 0;
         const SegCaches& sc = a.seg.c[k];
         float* ring = w ? (b ? sc.v_ring : a.v_ring) : (b ? sc.k_ring : a.k_ring);
         void* cache = w ? (b ? sc.v : a.v_cache) : (b ? sc.k : a.k_cache);
         float val[4], raw[4], f, scale[2] = {};
-        prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f, ring, b ? a.seg.at.row0[k] : 0, scale);
+        prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f, ring, b ? at.row0[k] : 0, scale);
         const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
         void* row = static_cast<uint8_t*>(cache) + ((size_t) (p % a.cap) * kKvHeads + g) * row_bytes;
 #pragma unroll
@@ -512,8 +532,9 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
     // the window; every input is read before the first store (the ring is one of them)
     const int r = blockIdx.x, pr = a.pos[r];
     // a batch window's row: its conversation's ring, and its rows of the window from its segment's first
-    const int sk = bk::seg_of(a.seg.at, r), first = a.seg.at.n > 0 ? a.seg.at.row0[sk] : 0;
-    float* const ring = a.seg.at.n > 0 ? a.seg.c[sk].a_ring : a.ring;
+    const bk::WindowSegs& at = seg_table(a.seg);
+    const int sk = bk::seg_of(at, r), first = at.n > 0 ? at.row0[sk] : 0;
+    float* const ring = at.n > 0 ? a.seg.c[sk].a_ring : a.ring;
     float v[kMaxMix][kPer];
     const int nb = a.n_blocks + (a.boundary ? 1 : 0), n = nb + 1;
 #pragma unroll
@@ -578,8 +599,9 @@ __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
     const int r = blockIdx.x;
     const int c = blockIdx.y * 256 + threadIdx.x;
     // a batch window's row: its conversation's ring, and its rows of the window from its segment's first
-    const int sk = bk::seg_of(a.seg.at, r), first = a.seg.at.n > 0 ? a.seg.at.row0[sk] : 0;
-    float* const ring = a.seg.at.n > 0 ? a.seg.c[sk].m_ring : a.ring;
+    const bk::WindowSegs& at = seg_table(a.seg);
+    const int sk = bk::seg_of(at, r), first = at.n > 0 ? at.row0[sk] : 0;
+    float* const ring = at.n > 0 ? a.seg.c[sk].m_ring : a.ring;
     float taps[kConv];   // read while the kernel before finishes
 #pragma unroll
     for (int j = 0; j < kConv; ++j) taps[j] = a.taps[c * kConv + (kConv - 1 - j)];
@@ -615,7 +637,7 @@ __global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
 }
 
 void check_rows(int rows, const char* what) {
-    if (rows > kDecodeRows) throw std::runtime_error(std::string("inkling2 ") + what + ": more rows than a decode window");
+    if (rows > kBatchRows) throw std::runtime_error(std::string("inkling2 ") + what + ": more rows than a batch window");
 }
 
 }  // namespace
@@ -631,7 +653,7 @@ void mix_norm(const MixNorm& a, int n_out, int rows, void* stream) {
 }
 
 size_t ctrl_scratch_floats(int rank) {
-    return (size_t) kMaxStreams * kDecodeRows * ((size_t) rank + 2 * kWidth);
+    return (size_t) kMaxStreams * kBatchRows * ((size_t) rank + 2 * kWidth);
 }
 
 void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
@@ -639,13 +661,16 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     check_rows(rows, "controllers");
     if (streams < 1 || streams > kMaxStreams || a.rank <= 0 || a.rank % 16) throw std::runtime_error("inkling2 controllers: streams or rank");
     cudaStream_t s = (cudaStream_t) stream;
-    // 3-4 rows read their inputs once for 4 outputs (they are 8 rows x 18 KB), 5-8 rows once for 2 (twice the blocks, half
+    const unsigned z = (unsigned) ((rows + kDecodeRows - 1) / kDecodeRows);
+    const int up_rows = std::min(rows, kDecodeRows);
+    // 3-4 rows read their inputs once for 4 outputs (they are 8 rows x 18 KB), 5+ rows once for 2 (twice the blocks, half
     // the dots and sums on each one's chain), a lone row keeps rank blocks
-    if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
-    else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
-    else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams), dim3(kDownWarps * 32), 0, s, a, rows);
+    if (rows >= 9) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams, z), dim3(kDownWarps * 32), 0, s, a, rows);
+    else if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<2, 8>, dim3((unsigned) a.rank / 2, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
+    else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
+    else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");
-    bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (2 * kWidth / 32), (unsigned) streams), dim3(256), (size_t) rows * a.rank * 4, s, a, rows);
+    bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), (size_t) up_rows * a.rank * 4, s, a, rows);
     check("controllers/up");
     bk::launch_pdl(ctrl_blend_kernel, dim3((unsigned) rows, (unsigned) streams), dim3(kThreads), 0, s, a);
     check("controllers/blend");

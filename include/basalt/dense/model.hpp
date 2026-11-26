@@ -10,7 +10,7 @@
 #pragma once
 
 #include "basalt/core/model_file.hpp"
-#include "basalt/dense/split_plan.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gdn_window.hpp"
 #include "basalt/model/adapter.hpp"
@@ -148,16 +148,16 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
 /// (the block drafter's planes and copies).
 bool attach_drafter(Model& m, std::string& err);
 std::unique_ptr<model::ModelSession> make_session(Model& m, std::string& err);
-/// Layers a prompt split's card holds (the last ones): the most any prompt's split puts there.
+/// Layers a prompt split's card may hold (the last ones): the most its share's cut puts there.
 constexpr int kPromptSplitLayers = 20;
-/// The prompt split: CUDA device `dev` reads the last layers of long prompts' chunks while the main card reads the next
-/// chunk's first layers.  `w` holds the weights of layers [l_min, n_layers) on `dev` (the others empty), still to be read.
+/// The prompt split: CUDA device `dev` reads layers [l_min, n_layers) of long prompts' chunks while the main card reads the
+/// next chunk's first layers.  `w` holds the weights of those layers on `dev` (the others empty), still to be read.
 /// Allocates the stage (its session, buffers and hand-off memory); called with the main card current, before any session
 /// is made.  True with no stage when the context is too short for one.
 bool plan_prompt_split(Model& m, int dev, int l_min, const Weights& w, std::string& err);
-/// Once the weights have landed: the stage times both cards' layers, which prices each read.  False (the stage is dropped
-/// and prompts stay on the main card) when that fails.
-bool attach_prompt_split(Model& m, std::string& err);
+/// Once the stage's weights have landed: one chunk of zero rows through its layers, so that its kernels are loaded before the first
+/// prompt reads them (a lazily loaded kernel stalls the main card's queue).  Its state is left empty.  True with no stage.
+bool warm_prompt_split(Model& m, std::string& err);
 /// The layer split: CUDA device `dev` holds layers [cut, n) of `w` (their weights already on `dev`, the others empty) with
 /// their cells and recurrent state, and runs them in every decode window and prompt chunk of `m`, which holds layers
 /// [0, cut).  The second card plans its products as the main card, so the output is the main card's alone to the bit.
@@ -182,9 +182,11 @@ uint64_t session_host_bytes(const Geometry& g, int64_t max_context, int kv, int6
 uint64_t shared_bytes(const Geometry& g, int64_t max_context, int kv = 0, int64_t kv_resident = 0);
 /// Device bytes a session's block drafter keeps (its context ring and its window rows); 0 without one.
 uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd);
-/// The layer split's inputs for `o` (its sessions, context and drafter) on a main card with `main_free` bytes free and a second
-/// card with `peer_free`: `layer_weights` per layer, `main_weights` the rest the main card holds (head, norms, drafter).
-SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
-                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card);
+/// What a two-card layer split divides for `o` (its sessions, context and drafter): per layer its weights (`layer_weights`)
+/// and every slot's cells and state there; per card what it holds whatever its layers: the main card `main_weights` (head,
+/// norms, drafter), the shared scratch, each slot's rest and the hand-off buffers, the second card its scratch and landing
+/// residuals. The rooms are the caller's.
+model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
+                            uint64_t main_weights);
 
 }  // namespace basalt::dense

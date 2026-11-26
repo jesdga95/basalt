@@ -22,8 +22,9 @@ Flow Request::decode_loop(B& b) {
     draft_offered = 0;
     draft_accepted = 0;
     windows = 0;
-    window = std::vector<int32_t>((size_t) b.max_window());
-    outv = std::vector<int32_t>((size_t) b.max_window());
+    const size_t win_cap = (size_t) std::max<int64_t>(b.max_window(), n - fold_p0);
+    window = std::vector<int32_t>(win_cap);
+    outv = std::vector<int32_t>(win_cap);
     consumed.reserve((size_t) (n + max_new + b.max_window()));
     for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
     finish = "length";
@@ -79,7 +80,7 @@ Flow Request::decode_loop(B& b) {
         if constexpr (kSpec) held_run = b.take_held(T);
         if (!ran || b.window_failed()) {
             std::printf("ERR %s\n", b.window_error());
-            return Flow::error;
+            return b.window_refused() ? Flow::next : Flow::error;   // refused: the session holds what it held, the engine serves on
         }
         int a = 0;
         if (e0 > 0) {

@@ -115,6 +115,15 @@ class Controls(unittest.TestCase):
             list(svc.run(svc.tok.encode("x"), thinking, None, 16, {"_grammar": {"kind": "json_object"}}, threading.Event()))
             self.assertEqual(svc.engine.requests[-1][1]["_grammar"], want, thinking)
 
+    def test_thinking_off_without_a_grammar_sends_the_one_that_forbids_thinking(self):
+        for thinking, want in ((False, {"kind": "text", "calls": False, "think": False}), (True, None)):
+            svc = service(HEADER + TEXT + "Four." + END)
+            list(svc.run(svc.tok.encode("x"), thinking, None, 16, None, threading.Event()))
+            self.assertEqual((svc.engine.requests[-1][1] or {}).get("_grammar"), want, thinking)
+
+    def test_the_prompt_is_not_prefilled_when_thinking_is_off(self):
+        self.assertTrue(self.prompt(enable_thinking=False).endswith(self.tail))
+
     def test_off_is_the_lowest_effort(self):
         self.assertEqual(self.prompt(enable_thinking=False), EFFORT.format("0") + self.tail)
 
@@ -207,6 +216,20 @@ class Parse(unittest.TestCase):
     def test_the_reply_ends_the_turn(self):
         svc = service(HEADER + TEXT + "done" + END)
         self.assertEqual(svc.dialect.stop_texts, (END_TURN,))
+
+    def test_zero_arg_and_spaced_args_streaming_emit_valid_tool_args(self):
+        for reply, want in (
+            (HEADER + "get_time" + TOOL_JSON + '{"name":"get_time"}' + END, {}),
+            (HEADER + "get_weather" + TOOL_JSON + '{"name":"get_weather","args" : {"city":"NYC"}}' + END,
+             {"city": "NYC"}),
+        ):
+            for chunk in (None, 1, 3, 7):
+                events = parse(reply, chunk)
+                args_text = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(args_text), want, (reply, chunk, events))
+                calls = [e.call for e in events if e.kind == "tool_call"]
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].arguments, want)
 
 
 class Tokens(unittest.TestCase):

@@ -1,4 +1,5 @@
 // src/models/qwen4exp/kernels/cvec.cu - see include/basalt/models/qwen4exp/kernels/cvec.hpp.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
 
 #include <cuda_runtime.h>
@@ -29,9 +30,9 @@ bool upload_here(std::string& err) {
     const int flag = g_on_host ? 1 : 0;
     if (cudaMalloc(&t.dir, g_dir_host.size() * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&t.s, g_s_host.size() * sizeof(float)) != cudaSuccess || cudaMalloc(&t.on, sizeof(int)) != cudaSuccess ||
-        cudaMemcpy(t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(t.on, &flag, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        basalt::core::device_copy(t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+        basalt::core::device_copy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+        basalt::core::device_copy(t.on, &flag, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
         err = "control vector: device allocation failed";
         t = DevTables{};
         return false;
@@ -143,7 +144,7 @@ void cvec_set_enabled(bool on) {
         if (g_dev[d].on == nullptr) continue;
         cudaSetDevice(d);
         cudaDeviceSynchronize();   // nothing in flight may still read the flag
-        cudaMemcpy(g_dev[d].on, &v, sizeof(int), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(g_dev[d].on, &v, sizeof(int), cudaMemcpyHostToDevice);
     }
     cudaSetDevice(prev);
     g_on_host = on;

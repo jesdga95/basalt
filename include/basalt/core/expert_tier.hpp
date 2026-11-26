@@ -21,6 +21,7 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/route_lossy.hpp"
+#include "basalt/model/peer_hooks.hpp"
 #include "basalt/prefill/peer_share.hpp"
 #include "basalt/platform/mapped_file.hpp"
 #include "basalt/core/file_reads.hpp"
@@ -55,7 +56,9 @@ struct ExpertTierSpec {
     std::string path;           ///< the pack
     int fd = -1;                ///< a descriptor of it
     FileRange range;            ///< the experts section
-    std::vector<int> peer_devices;   ///< the second cards, in block order
+    /// The cards the load received: in gpu-mode peer the cards after the main one are the second cards, each holding a
+    /// block of layers, dealt by model::PeerHooks.
+    model::GpuCards gpus;
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< fixed experts per layer (-1: sized from free memory)
     bool diag_tier_frozen = false;
     int vram_reserve_mib = 0, peer_reserve_mib = 600;
@@ -99,7 +102,9 @@ struct ExpertTierSpec {
     float route_prior = 0.0f;
 };
 
-class ExpertTier {
+/// The tier is the peer of every model that runs it (model/peer_hooks.hpp): each second card holds the second-card homes of
+/// a block of layers and the prompt share of those layers.
+class ExpertTier final : public model::PeerHooks {
 public:
     static constexpr int kMaxK = 128;     ///< distinct experts one lookup holds (a window of up to 8 rows, 16 each)
     static constexpr int kMaxWindow = 8;
@@ -239,8 +244,12 @@ public:
     prefill::PeerShare* share_for(int layer) const {
         return shares_.empty() ? nullptr : shares_[(size_t) layer_card_[(size_t) layer]].get();
     }
-    /// What the split of a layer's experts between the cards prices them at.
-    const prefill::ShareRates& share_rates(int layer) const { return rates_[(size_t) layer]; }
+    /// Of a prompt layer's experts in pinned RAM (`ram_rows`, in the order the second card takes them), how many the second
+    /// card computes beside its own experts' `peer_rows`, against the main card's `main_rows` and bus bytes `main_bytes`, at
+    /// the layer's prices (prefill::peer_take). In a ringed chunk of `tokens` rows the main card's link reads ahead while
+    /// the layer's attention runs, `pre_route_cycles` main card SM-cycles a row.
+    int peer_take(int layer, const std::vector<int64_t>& ram_rows, int64_t main_rows, double main_bytes, int64_t peer_rows,
+                  int tokens, double pre_route_cycles) const;
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
 
@@ -324,6 +333,14 @@ private:
     bool land_ram(std::string& err);
     bool open_share(size_t card, std::string& err);
     void fill_share_rates();
+    // model::PeerHooks: each second card's plain slots and prompt share, the blocks dealt by the rooms they leave
+    bool peer_card(size_t card, int device, std::string& err) override;
+    uint64_t peer_room(size_t card) const override;
+    model::PeerSpec peer_spec() const override;
+    bool peer_place(const model::PeerPlacement& p, std::string& err) override;
+    std::string peer_main() const override;
+    float* peer_rows_ = nullptr;            ///< the mapped rows the second cards share with the CPU pool, while open() runs
+    int main_homes_ = 0;                    ///< the homes the main card can hold, while open() runs
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     /// `n` copies in each layer, or with `base_shares` each layer's base arena share (base_n).

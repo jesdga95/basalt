@@ -44,7 +44,7 @@ import threading
 import time
 from pathlib import Path
 
-from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
+from serve.api.grammar import GPROMPT_KEY, REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key, gprompt_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
@@ -53,7 +53,7 @@ from serve.engine.console import LINES as CONSOLE_LINES, ConsoleLines
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
-from serve.prompt import PromptText
+from serve.prompt import REPLY_KEY, PromptText, room_error
 from serve.util import vram
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
@@ -123,7 +123,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
+                  "PROMPT ", "PMATCH ", "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
 
 
 def log_unparsed(line: str, log) -> None:
@@ -156,6 +156,12 @@ def pump_lines(stream, sink) -> None:
             sink(engine_line(line))
     except (OSError, ValueError):
         pass
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 REQUEST_LINES = False    # --request-lines: echo each request's DONE figures on stdout
@@ -321,8 +327,12 @@ class ProcessEngine:
                                        text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
         except OSError as e:                            # missing or not executable: nothing started, so this is a start error
             loading.set()                               # the narrator stops and the log handle goes back
-            if log:
-                self.log.close()
+            if log and self.log not in (None, subprocess.DEVNULL):
+                try:
+                    self.log.close()
+                except OSError:
+                    pass
+                self.log = None
             raise EngineStartError(f"the engine could not be started: {e}", log) from e
         frame_pipes(self.proc, sink is not None)
         proc = self.proc
@@ -368,14 +378,18 @@ class ProcessEngine:
                     self.proc.kill()
                 except OSError:
                     pass
-            try:                                        # close its pipes and our log handle
+            try:
                 self.proc.wait(timeout=5)
-                self.proc.stdin.close()
-                self.proc.stdout.close()
-                if log:
-                    self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr,
+                           self.log if self.log not in (None, subprocess.DEVNULL) else None):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            self.log = None
             if timed_out:
                 reason = f"the engine did not report READY within {ENGINE_READY_S:.0f} s"
             elif errors := start_errors(log, log_start):   # the engine's own reason
@@ -458,50 +472,54 @@ class ProcessEngine:
         proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
         slot_q, prompt_q = self.slot_q, self.prompt_q
         line = None
-        for line in proc.stdout:
-            line = engine_line(line)
-            log_unparsed(line, log)
-            if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
-                continue
-            if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
-                if self.proc is proc:
-                    self.info.update(info_facts(line))
-                continue
-            if line.startswith(CONSOLE_LINES):          # the console's figures (STATS); never a reply line
-                if self.proc is proc:
-                    self.console.feed(line)
-                continue
-            if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
-                if self.proc is proc:
-                    self.conversation = {**self.conversation, **conversation_facts(line)}
-                continue
-            if line.startswith(FATAL_PREFIXES):         # before batch routing
-                if self.proc is proc:
-                    self.silent_note = "unrecoverable verification failure: " + line[4:].strip()
-                    self.ended = True
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-                break                                   # publish EOF, never the trailing DONE
-            if line.startswith("PROMPT "):              # the answer to a held prompt, for whoever sent it
-                prompt_q.put(line)
-                continue
-            if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
-                try:
-                    slot_q[int(line.split()[1])].put(line)
+        try:
+            for line in proc.stdout:
+                line = engine_line(line)
+                log_unparsed(line, log)
+                if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
                     continue
-                except (IndexError, ValueError):
-                    pass
-            lines.put(line)
-        if self.proc is proc:                           # a killed engine's pump must not mark its successor
-            self.ended = True                           # output closed: it is gone
-            if line and line.startswith("ERR"):         # why it exited, when no request read it
-                self.last_err = line[4:].strip()
-        lines.put(None)
-        prompt_q.put(None)
-        for q in slot_q:
-            q.put(None)
+                if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
+                    if self.proc is proc:
+                        self.info.update(info_facts(line))
+                    continue
+                if line.startswith(CONSOLE_LINES):          # the console's figures (STATS); never a reply line
+                    if self.proc is proc:
+                        self.console.feed(line)
+                    continue
+                if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
+                    if self.proc is proc:
+                        self.conversation = {**self.conversation, **conversation_facts(line)}
+                    continue
+                if line.startswith(FATAL_PREFIXES):         # before batch routing
+                    if self.proc is proc:
+                        self.silent_note = "unrecoverable verification failure: " + line[4:].strip()
+                        self.ended = True
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    break                                   # publish EOF, never the trailing DONE
+                if line.startswith("PROMPT "):              # the answer to a held prompt, for whoever sent it
+                    prompt_q.put(line)
+                    continue
+                if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
+                    try:
+                        slot_q[int(line.split()[1])].put(line)
+                        continue
+                    except (IndexError, ValueError):
+                        pass
+                lines.put(line)
+        except (OSError, ValueError):                       # pipe closed under us (killed or closed)
+            pass
+        finally:
+            if self.proc is proc:                           # a killed engine's pump must not mark its successor
+                self.ended = True                           # output closed: it is gone
+                if line and line.startswith("ERR"):         # why it exited, when no request read it
+                    self.last_err = line[4:].strip()
+            lines.put(None)
+            prompt_q.put(None)
+            for q in slot_q:
+                q.put(None)
 
     _NT_CRASH_CODES = {
         0x40000015: "STATUS_FATAL_APP_EXIT",
@@ -602,6 +620,30 @@ class ProcessEngine:
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
         self.close()
         self.unloaded = True
+
+    def discard(self):
+        """End the engine without giving a sleeping one its GPU state back: the VRAM it left is in use by another model,
+        so it is killed where it sleeps and its RAM-only conversations are lost."""
+        with self.sleep_lock:
+            if self.asleep and self.proc is not None:
+                self.asleep = False
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=20)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        self.unload()
+
+    def held_mib(self) -> int | None:
+        """The RAM this engine's process holds besides file-backed pages: anonymous and shared memory from
+        /proc/PID/status; None where that is unreadable."""
+        try:
+            with open(f"/proc/{self.proc.pid}/status", encoding="ascii") as f:
+                kb = {k: int(v.split()[0]) for k, _, v in (line.partition(":") for line in f)
+                      if k in ("RssAnon", "RssShmem")}
+        except (OSError, AttributeError, ValueError, IndexError):
+            return None
+        return sum(kb.values()) >> 10 if len(kb) == 2 else None
 
     RESTART_RETRY_S = 15.0   # between restart() tries, for VRAM to be released
 
@@ -724,14 +766,18 @@ class ProcessEngine:
         """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write(command + "\n")
-        self.proc.stdin.flush()
         what = command.split()[0]
-        deadline = time.time() + timeout
+        try:
+            self._send(command)
+        except EngineDied:
+            self._retire(f"the {what} command failed")
+            raise
+        deadline = time.monotonic() + timeout
         while True:
             try:
-                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
             except queue.Empty:
+                self._retire(f"the {what} command timed out")
                 raise EngineDied(f"the engine did not answer the {what} command") from None
             if line is None:
                 raise EngineDied("the engine ended")
@@ -746,7 +792,8 @@ class ProcessEngine:
                 self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
                 self.info["vram"] = out
                 return out
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
+                self._retire(f"the {what} command timed out")
                 raise EngineDied(f"the engine did not answer the {what} command")
 
     ENC_TIMEOUT_S = 300.0
@@ -856,8 +903,12 @@ class ProcessEngine:
             keys += " relax=0"
         elif _number(rd):
             keys += f" relax={float(rd)!r}"
+        gram = grammar_key(sampling.get(GRAMMAR_KEY))
+        gp = gprompt_key(sampling.get(GPROMPT_KEY)) if gram else ""
+        reply = sampling.get(REPLY_KEY)
+        rk = f" reply={int(reply)}" if _number(reply) and int(reply) > 0 else ""   # the ids past it are the reply so far
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + grammar_key(sampling.get(GRAMMAR_KEY)) + logprobs_key(sampling.get(LOGPROBS_KEY))
+            + gram + gp + rk + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -870,7 +921,7 @@ class ProcessEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone
+        except (OSError, ValueError, AttributeError):    # the pipe is gone
             raise self._died() from None
 
     def _control(self, cancel, on_token, stop_when=None, idle=None, stop_soon=None):
@@ -968,10 +1019,11 @@ class ProcessEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: int | None = None, wait_s: float = 0.0):
+    def _release_slot_when_done(self, slot: int, stream: int | None = None, wait_s: float = 0.0, cancel=None):
         """BSTOP a slot whose consumer left and free it at BDONE; `stream` (the tokens of the prompt and the tokens so
-        far) becomes what the slot holds. Waits up to `wait_s` for the BDONE and returns its fields (None when it has not come: the
-        rest is freed in the background)."""
+        far) becomes what the slot holds. Waits up to `wait_s` for the BDONE (or, while `cancel` is unset, until the
+        slot finishes or `cancel` fires) and returns its fields (None when it has not come: the rest is freed in the
+        background)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots
             return None
         try:
@@ -981,11 +1033,17 @@ class ProcessEngine:
         q, busy = self.slot_q[slot], self.slot_busy     # restart() replaces them
         tail = [stream or 0]                            # the tokens the slot holds so far, one counted past the fed ones
 
-        def drain(end):             # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
+        def drain(end, stop_ev=None):   # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
             while time.monotonic() < end:
+                if stop_ev is not None and stop_ev.is_set():
+                    return "wait", None
+                step = 0.2 if stop_ev is not None else 5.0
                 try:
-                    line = q.get(timeout=max(0.01, min(5.0, end - time.monotonic())))
+                    line = q.get(timeout=max(0.01, min(step, end - time.monotonic())))
                 except queue.Empty:
+                    if stop_ev is not None and not self.alive():
+                        tail[0] = 0
+                        return "gone", None
                     continue
                 if line is None:
                     tail[0] = 0
@@ -1004,7 +1062,10 @@ class ProcessEngine:
                 busy[slot] = False
                 self.slot_cv.notify_all()
 
-        state, fields = drain(time.monotonic() + wait_s) if wait_s > 0 else ("wait", None)
+        if cancel is not None and not cancel.is_set():
+            state, fields = drain(time.monotonic() + 600.0, stop_ev=cancel)
+        else:
+            state, fields = drain(time.monotonic() + wait_s) if wait_s > 0 else ("wait", None)
         if state != "wait":
             free()
             return fields
@@ -1181,18 +1242,19 @@ class ProcessEngine:
         meet, epoch = [], []          # per slot: the tokens of the prompt it covers, and the slot's epoch when it said so
         handle = held["handle"]
 
-        def attach() -> None:       # the control lines are held: the prompt on this engine, and what its slots cover of it
+        def attach(match: bool = True) -> None:       # the control lines are held: the prompt on this engine, and what its slots cover of it
             nonlocal handle, meet, epoch
             if held["gen"] != self.gen:             # the engine restarted while this request waited: hold it again
                 handle, _ = self._hold_prompt(ids, embeddings)
                 held.update(handle=handle, gen=self.gen)
-                meet = []
-            if not meet:
+                meet, epoch = [], []
+            if match and (not meet or epoch != self.slot_epoch):
+                snap = list(self.slot_epoch)
                 meet = self._meet(handle, self.gen)
-                epoch = list(self.slot_epoch)
+                epoch = snap
 
         def gen_keys() -> str:      # a run that continues after tokens were generated tells the grammar where the prompt ends
-            return keys + (f" gprompt={n}" if out and " grammar=" in keys else "")
+            return keys + (f" gprompt={n}" if out and " grammar=" in keys and " gprompt=" not in keys else "")
 
         def size() -> int:
             return n + len(extra)
@@ -1209,7 +1271,7 @@ class ProcessEngine:
         if not ok:
             return
         holding, born = True, self.gen                  # born: engine generation holding the control lines
-        slot, gen0, reserved = None, None, None
+        slot, slot_gen, gen0, reserved, reserved_gen = None, None, None, None, None
         solo_slot, run0, run_size, ctl_epoch = None, 0, 0, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
@@ -1241,7 +1303,7 @@ class ProcessEngine:
                         else:
                             self.slot_busy[solo_slot] = True
                             self.claim_slot(solo_slot, session)
-                            reserved = solo_slot
+                            reserved, reserved_gen = solo_slot, self.gen
                 if alone and left > 1:
                     if solo_slot is not None:
                         head = f"SGENI {solo_slot} {left}{gen_keys()} {embeddings}" if embeddings else \
@@ -1272,6 +1334,7 @@ class ProcessEngine:
                                         if reserved is not None:
                                             self.slot_busy[reserved] = True
                                             self.claim_slot(reserved, session)
+                                            reserved_gen = self.gen
                                 if reserved is not None:    # (a solo run in a slot parks its read in that slot)
                                     self._send(f"BYIELD {reserved}")
                                     yield_sent = True
@@ -1283,15 +1346,16 @@ class ProcessEngine:
                         out.append(t)
                         yield t
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
-                        slot, reserved = reserved, None     # gave way: the read continues in that slot
+                        slot, slot_gen, reserved, reserved_gen = reserved, reserved_gen, None, None
                     elif reserved is not None:              # did not give way: release the slot
-                        self._solo_kept(solo_slot, run_size, out[run0:])
-                        if solo_slot is not None:
-                            note(solo_slot)
-                        with self.slot_cv:
-                            self.slot_busy[reserved] = False
-                            self.slot_cv.notify_all()
-                        reserved = None
+                        if self.gen == reserved_gen:
+                            self._solo_kept(solo_slot, run_size, out[run0:])
+                            if solo_slot is not None:
+                                note(solo_slot)
+                            with self.slot_cv:
+                                self.slot_busy[reserved] = False
+                                self.slot_cv.notify_all()
+                        reserved, reserved_gen = None, None
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
@@ -1301,17 +1365,30 @@ class ProcessEngine:
                             return
                         self._carry_run(carry, first, last0, False)
                         extra = list(out)                   # continues in a batch slot
-                while True:
-                    if slot is None:
-                        # prefer the slot holding this prompt's start, else the longest unused
-                        with self.slot_cv:
-                            ticket = self.admission.join()
-                            try:
+                ticket = None
+                try:
+                    while True:
+                        if slot is None:
+                            # prefer the slot holding this prompt's start, else the longest unused
+                            refresh = False
+                            with self.slot_cv:
+                                if ticket is None:
+                                    ticket = self.admission.join()
                                 while True:
-                                    slot = self.pick_slot(meets(), size(), session)
-                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, meets(), size())):
+                                    if any(not self.slot_busy[b] and self.slot_held[b] > 0
+                                           and (b >= len(epoch) or epoch[b] != self.slot_epoch[b])
+                                           for b in self.slot_order):
+                                        refresh = True
+                                        break
+                                    cur_meets = meets()
+                                    slot = self.pick_slot(cur_meets, size(), session)
+                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size())):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
+                                        slot_gen = self.gen
+                                        self.admission.leave(ticket)
+                                        ticket = None
+                                        self.slot_cv.notify_all()
                                         break
                                     slot = None
                                     if holding:
@@ -1323,64 +1400,88 @@ class ProcessEngine:
                                     self.slot_cv.wait(timeout=10.0)
                                     if cancel.is_set():
                                         return
-                            finally:
-                                self.admission.leave(ticket)
-                                self.slot_cv.notify_all()
-                    if not holding:                         # waited for the slot: take the control lines again
-                        ok = yield from self._take_control(cancel, size())
-                        if not ok:
-                            return
-                        holding, born = True, self.gen
-                        attach()
-                    if self._yielded is not None:           # gave way: waiting requests go first
-                        self._hold(slot, self._yielded[1])
-                        note(slot)
-                        self._yielded = None
-                        yields += 1
-                        self.ctl.release()
-                        holding = False
-                        with self.slot_cv:
-                            ctl_epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, size(), after_epoch=ctl_epoch)
-                        if not ok:
-                            return
-                        holding, born = True, self.gen
-                        attach()
-                    left = max(1, min(left, self.max_context - size() - SLOT_MARGIN))   # the slot's room
-                    while not self.slot_q[slot].empty():
-                        self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
-                    self._send(f"{head} {ref()}")
-                    self._hold(slot, 0)                     # admission overwrites the slot
-                    phase = "admit"
-                    self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
-                    self._ctl_erred = False
-                    asked = False
+                            if refresh:
+                                if not holding:
+                                    ok = yield from self._take_control(cancel, size())
+                                    if not ok:
+                                        return
+                                    holding, born = True, self.gen
+                                attach()
+                                continue
+                        if not holding:                         # waited for the slot: take the control lines again
+                            ok = yield from self._take_control(cancel, size())
+                            if not ok:
+                                return
+                            holding, born = True, self.gen
+                            attach(match=slot_gen != born)
+                            if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                                slot, slot_gen = None, None
+                                self._yielded = None
+                                continue
+                        if self._yielded is not None:           # gave way: waiting requests go first
+                            self._hold(slot, self._yielded[1])
+                            note(slot)
+                            self._yielded = None
+                            yields += 1
+                            self.ctl.release()
+                            holding = False
+                            with self.slot_cv:
+                                ctl_epoch = self.ctl_epoch
+                            ok = yield from self._take_control(cancel, size(), after_epoch=ctl_epoch)
+                            if not ok:
+                                return
+                            holding, born = True, self.gen
+                            attach(match=slot_gen != born)
+                            if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
+                                slot, slot_gen = None, None
+                                continue
+                        slot_ctx = int((self.info or {}).get("slot_context") or 0) or self.max_context
+                        room = slot_ctx - size() - SLOT_MARGIN
+                        if left < 1 or room < 1:
+                            if out or left < 1:
+                                self._carry_run(carry, first, last0, True)
+                                return
+                            raise room_error(size(), slot_ctx)
+                        left = min(left, room)                  # the slot's room
+                        while not self.slot_q[slot].empty():
+                            self.slot_q[slot].get_nowait()
+                        head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
+                        self._send(f"{head} {ref()}")
+                        self._hold(slot, 0)                     # admission overwrites the slot
+                        phase = "admit"
+                        self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                        self._ctl_erred = False
+                        asked = False
 
-                    def ask_yield():    # a shorter request waits: the read gives way at its next chunk boundary
-                        nonlocal asked
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(size())):
-                            self._send(f"BYIELD {slot}")
-                            asked = True
-                    for x in self._control(cancel, pending.append, idle=ask_yield):
+                        def ask_yield():    # a shorter request waits: the read gives way at its next chunk boundary
+                            nonlocal asked
+                            if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                                    self._shorter_waiting(size())):
+                                self._send(f"BYIELD {slot}")
+                                asked = True
+                        for x in self._control(cancel, pending.append, idle=ask_yield):
+                            while pending:
+                                t = pending.pop(0)
+                                out.append(t)
+                                yield t
+                            if x is None:
+                                ask_yield()
+                                yield None
+                        self._note_first_reused(first, last0)
+                        cont = bool(self._ctl_result and self._ctl_result[1])
+                        phase = "slot" if cont else "none"
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
                             yield t
-                        if x is None:
-                            ask_yield()
-                            yield None
-                    self._note_first_reused(first, last0)
-                    cont = bool(self._ctl_result and self._ctl_result[1])
-                    phase = "slot" if cont else "none"
-                    while pending:
-                        t = pending.pop(0)
-                        out.append(t)
-                        yield t
-                    if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
-                        continue                            # gave way: retry after the shorter request
-                    break
+                        if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
+                            continue                            # gave way: retry after the shorter request
+                        break
+                finally:
+                    if ticket is not None:
+                        with self.slot_cv:
+                            self.admission.leave(ticket)
+                            self.slot_cv.notify_all()
                 self.ctl.release()
                 holding = False
                 if not cont:
@@ -1437,11 +1538,12 @@ class ProcessEngine:
                         self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path
-                            self.slot_used[slot] = time.time()
-                            with self.slot_cv:
-                                self.slot_busy[slot] = False
-                                self.slot_cv.notify_all()
-                            slot, gen0 = None, None
+                            if self.gen == slot_gen:
+                                self.slot_used[slot] = time.time()
+                                with self.slot_cv:
+                                    self.slot_busy[slot] = False
+                                    self.slot_cv.notify_all()
+                            slot, slot_gen, gen0 = None, None, None
                             extra, left = list(out), int(max_new) - len(out)
                             solo_again += 1
                             break
@@ -1467,18 +1569,18 @@ class ProcessEngine:
                 pass
             if holding:
                 self.ctl.release()
-            if reserved is not None:
+            if reserved is not None and self.gen == reserved_gen:
                 if reserved == solo_slot:
                     self._solo_kept(solo_slot, run_size, out[run0:])
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_cv.notify_all()
-            if slot is not None:
+            if slot is not None and self.gen == slot_gen:
                 self.slot_used[slot] = time.time()
                 if phase == "slot":
                     self._hold(slot, 0)
                     stream = size() + len(out) - gen0 if gen0 is not None and len(out) > gen0 else None
-                    f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S)
+                    f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S, cancel=cancel)
                     if f is not None:
                         self._bdone_last(f)
                         self._carry_run(carry, first, last0, True)
@@ -1515,23 +1617,25 @@ class ProcessEngine:
         The engine answers at once, whatever it is doing. Returns (handle, tokens)."""
         with self.prompt_lock:                  # the answers come in the order the prompts were sent
             try:
-                if isinstance(ids, PromptText):
-                    body = ids.text
-                    spans = ids.byte_spans()
-                    plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
-                    with self.wlock:
+                with self.wlock:
+                    q, gen = self.prompt_q, self.gen
+                    if isinstance(ids, PromptText):
+                        body = ids.text
+                        spans = ids.byte_spans()
+                        plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
                         self.proc.stdin.write(f"PROMPT {len(body.encode('utf-8'))}{plain}\n{body}")
-                        self.proc.stdin.flush()
-                else:
-                    self._send("PROMPTI" + (" img" if embeddings else "") + " " + ",".join(str(int(t)) for t in ids))
+                    else:
+                        self.proc.stdin.write("PROMPTI" + (" img" if embeddings else "") + " " +
+                                              ",".join(str(int(t)) for t in ids) + "\n")
+                    self.proc.stdin.flush()
             except (OSError, AttributeError):
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
             while True:
                 try:
-                    line = self.prompt_q.get(timeout=1.0)
+                    line = q.get(timeout=1.0)
                     break
                 except queue.Empty:
-                    if not self.alive():
+                    if self.gen != gen or not self.alive():
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         if line is None:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -1815,16 +1919,17 @@ class ProcessEngine:
         except OSError:
             pass
         finally:
-            if self.proc.poll() is not None:
+            if self.proc is not None and self.proc.poll() is not None:
                 if self.pump is not None:
                     self.pump.join(timeout=2)
-                try:
-                    self.proc.stdin.close()             # buffered data may flush after exit
-                except OSError:
-                    pass
-                self.proc.stdout.close()
-                if self.log not in (None, subprocess.DEVNULL):
-                    self.log.close()
+                for stream in (self.proc.stdin, self.proc.stdout, getattr(self.proc, "stderr", None),
+                               self.log if self.log not in (None, subprocess.DEVNULL) else None):
+                    if stream is not None and hasattr(stream, "close"):
+                        try:
+                            stream.close()              # buffered data may flush after exit
+                        except (OSError, ValueError):
+                            pass
+                self.log = None
                 self.proc = None
                 self.ended = True
                 self.progress, self.last, self.conversation = None, {}, {}

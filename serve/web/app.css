@@ -97,6 +97,7 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 
 main { flex: 1; min-height: 0; display: flex; flex-direction: column; width: 100%; max-width: 1600px; margin: 0 auto; padding: 0 var(--gut); }
 
+
 /* ---------- the hero: decode | prefill | experts. Two focal points: the decode number and the expert map ---------- */
 .hero { flex: 1 0 auto; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(380px, 470px); grid-template-rows: auto minmax(0, 1fr); column-gap: 72px; padding: 34px 0 30px; }
 /* decode and prefill share two rows (head, chart) so the charts start and end level; the expert map spans both */
@@ -392,17 +393,18 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .sl:not(.dense) { --cols: 120px 72px minmax(0, 1fr) 140px 150px 80px; }
 
 /* Logs */
-.pane.logs { padding: 0; overflow: hidden; }
-#log { height: 100%; overflow: auto; padding: 12px 0; -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px); mask-image: linear-gradient(to bottom, transparent 0, #000 14px); font: 400 13px/1.7 var(--font-mono); color: var(--fg-2); }
+.pane.logs { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.lstat { flex: none; padding: 12px 2px 0; font: 400 12px/1 var(--font-mono); color: var(--fg-3); }
+#log { flex: 1; min-height: 0; overflow: auto; padding: 12px 0; -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px); mask-image: linear-gradient(to bottom, transparent 0, #000 14px); font: 400 13px/1.7 var(--font-mono); color: var(--fg-2); }
 #log > div { display: grid; grid-template-columns: 76px 60px minmax(0, 1fr); gap: 10px; padding: 0 4px; border-radius: 3px; }
 #log > div:hover { background: rgba(255, 255, 255, .025); }
 #log i { font-style: normal; color: var(--fg-3); }
 #log u { text-decoration: none; color: var(--fg-3); }
 #log span { white-space: pre-wrap; word-break: break-word; }
 #log .warn span, #log .warn u { color: var(--warn); }
-#log .error span, #log .error u { color: var(--err); }
-#log.warnonly > div:not(.warn):not(.error):not(.empty) { display: none; }
-#log > div:last-child:not(.empty) span { color: var(--fg); }
+#log .err span, #log .err u { color: var(--err); }
+#log.warnonly > div:not(.warn):not(.err):not(.empty) { display: none; }
+#log > div:last-child:not(.warn):not(.err):not(.empty) span { color: var(--fg); }
 #log .empty { display: block; color: var(--fg-3); }
 
 /* ---------- the footer: the newest log line, totals ---------- */
@@ -411,7 +413,7 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .ticker { display: flex; align-items: center; gap: 10px; padding: 0; min-width: 0; flex: 1; text-align: left; color: var(--fg-2); }
 .ticker span { overflow: hidden; text-overflow: ellipsis; white-space: pre; }
 .ticker[data-lvl="warn"] span { color: var(--warn); }
-.ticker[data-lvl="error"] span { color: var(--err); }
+.ticker[data-lvl="err"] span { color: var(--err); }
 .ticker:hover span { color: var(--fg); }
 .tot { flex: none; white-space: nowrap; }
 .tot b { color: var(--fg-2); font-weight: 500; }

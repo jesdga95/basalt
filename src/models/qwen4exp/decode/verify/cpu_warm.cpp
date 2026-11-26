@@ -1,8 +1,10 @@
+#include "basalt/core/device_copy.hpp"
 #include "cpu_warm.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
 #include "basalt/platform/compiler.hpp"
+#include "basalt/kernels/cpu/neon.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
@@ -13,10 +15,10 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
-#include <immintrin.h>
 
 namespace basalt::core::verify_detail {
 
+#if defined(BASALT_ARCH_X86)
 // layer `c.layer`'s router rows [e0, e1) on the job's tokens
 BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
     const int NB = c.n_embd / 32, pt = c.n_tok;
@@ -53,6 +55,21 @@ BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const s
         }
     }
 }
+#else
+// layer `c.layer`'s router rows [e0, e1) on the job's tokens
+void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
+    static_assert(basalt::kernels::kVerifyMaxT <= basalt::kernels::cpu::MAXT, "a window fits the NEON router dot");
+    const int NB = c.n_embd / 32, pt = c.n_tok;
+    const uint8_t* R = c.rq.data() + (size_t) c.layer * c.n_expert * (c.n_embd / 2);
+    const float* S = c.rs.data() + (size_t) c.layer * c.n_expert * NB;
+    float out[basalt::kernels::kVerifyMaxT];
+    for (int e = e0; e < e1; ++e) {
+        if (stop.load(std::memory_order_relaxed)) return;
+        basalt::kernels::cpu::router_q4_dot_neon(R + (size_t) e * (c.n_embd / 2), S + (size_t) e * NB, NB, c.xq, pt, out);
+        for (int t = 0; t < pt; ++t) c.logits[(size_t) t * c.n_expert + e] = out[t];
+    }
+}
+#endif
 
 // every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the likeliest
 void warm_select(CpuWarm& c) {
@@ -94,7 +111,7 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
     } else {
         while (c.ready.load(std::memory_order_acquire) == 0) {
             if (stop.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+            basalt::platform::cpu_relax();
         }
     }
     // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
@@ -134,7 +151,7 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
     for (int64_t l = 0; l < L; ++l) {
         const WeightRef* w = LayerView(wt, l).get("ffn_gate_inp.weight");
         if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) return false;
-        if (cudaMemcpy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault) != cudaSuccess) {
+        if (basalt::core::device_copy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault) != cudaSuccess) {
             cudaGetLastError();
             return false;
         }
@@ -170,8 +187,8 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
 // The peer warm-up's predictor rows (router_codes' int8 ones) on the current device.
 bool warm_router(const std::vector<int8_t>& q, const std::vector<float>& sc, int8_t** rq, float** rs) {
     if (cudaMalloc((void**) rq, q.size()) != cudaSuccess || cudaMalloc((void**) rs, sc.size() * 4) != cudaSuccess ||
-        cudaMemcpy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(*rs, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        basalt::core::device_copy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+        basalt::core::device_copy(*rs, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaGetLastError();
         if (*rq) cudaFree(*rq);
         if (*rs) cudaFree(*rs);

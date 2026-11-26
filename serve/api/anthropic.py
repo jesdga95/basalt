@@ -42,7 +42,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return "content_block_delta", e
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live,
+                           stream_tools=bool(req.get("stream"))):
         if not started and (kind != "ping" or tokens_known(ids)):
             started = True
             yield start()
@@ -115,17 +116,18 @@ def anthropic_collect(events) -> dict:
         if name == "content_block_start" and e["content_block"]["type"] == "tool_use":
             tool_n += 1
         if "logprobs" in e:
-            lps = lps or []
+            if lps is None:
+                lps = []
             if name == "message_delta":
                 part = e["logprobs"]
-                lps += part["content"]
-                lps_reasoning += part.get("reasoning_content") or []
+                lps.extend(part["content"])
+                lps_reasoning.extend(part.get("reasoning_content") or [])
                 for t in part.get("tool_calls") or []:
                     lps_tools.setdefault(t["index"], []).extend(t["content"])
             elif e["delta"]["type"] == "text_delta":
-                lps += e["logprobs"]
+                lps.extend(e["logprobs"])
             elif e["delta"]["type"] == "thinking_delta":
-                lps_reasoning += e["logprobs"]
+                lps_reasoning.extend(e["logprobs"])
             else:
                 lps_tools.setdefault(tool_n, []).extend(e["logprobs"])
         if name == "message_start":
@@ -147,9 +149,19 @@ def anthropic_collect(events) -> dict:
             except ValueError:                     # a call the output ended inside: it has no input to give
                 blocks.pop()
         elif name == "message_delta":
+            if msg is None:
+                msg = {"id": "", "type": "message", "role": "assistant", "model": "", "content": [],
+                       "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+    if blocks and "_json" in blocks[-1]:
+        blocks.pop()
+    if msg is None:
+        msg = {"id": "", "type": "message", "role": "assistant", "model": "", "content": [],
+               "stop_reason": "end_turn", "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}
+    elif msg.get("stop_reason") is None:
+        msg["stop_reason"] = "end_turn"
     msg["content"] = blocks
     if lps is not None:
         msg["logprobs"] = logprobs_part(lps, lps_reasoning, lps_tools)

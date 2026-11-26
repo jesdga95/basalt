@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 
 namespace basalt::core {
@@ -130,7 +131,7 @@ bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::str
                                      (uint64_t) (p % ring) * lay[i].page_bytes;
                 const size_t off = (size_t) ((uint64_t) p * lay[i].page_bytes);
                 if (!dst[i]->visit(off, (size_t) ((uint64_t) n * lay[i].page_bytes), [&](uint8_t* q, size_t m, size_t at) {
-                        return cudaMemcpy(q, src + (at - off), m, cudaMemcpyDeviceToHost) == cudaSuccess;
+                        return basalt::core::device_copy(q, src + (at - off), m, cudaMemcpyDeviceToHost) == cudaSuccess;
                     })) {
                     err = "mtp: saving the K/V failed";
                     return false;

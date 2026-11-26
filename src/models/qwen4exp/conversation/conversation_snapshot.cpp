@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
@@ -119,7 +120,7 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
-    const cudaError_t e = cudaMemcpy(dst, src, n, cudaMemcpyDefault);
+    const cudaError_t e = basalt::core::device_copy(dst, src, n, cudaMemcpyDefault);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;

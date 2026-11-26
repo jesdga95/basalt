@@ -16,10 +16,10 @@ slots still depend on when each arrives.
 
 | Setting | Default | Trade-off |
 | --- | --- | --- |
-| `adapt-every` | 1 on a server, 4 with a layer split | Fewer, later rounds cost less link, but a topic change or a fresh engine waits N windows. |
-| `adapt-swaps` | 96 | Bigger rounds catch up faster and move more bytes (about 2.6 MiB per NVFP4 expert each way). The RAM copy keeps four times N free places. |
+| `adapt-every` | 1 on a server, 4 with `gpu-mode split` | Fewer, later rounds cost less link, but a topic change or a fresh engine waits N windows. |
+| `adapt-swaps` | 96 | Bigger rounds catch up faster and move more bytes (about 2.6 MiB per NVFP4 expert each way). The RAM copy keeps four times N free places for the evicted experts; when the RAM has no room beside the experts, the copy gives back the coldest ones to keep them and warns when it cannot. |
 | `peer-adapt-swaps` | `adapt-swaps` | Same, on the peer's link. `0` freezes the peer tier. |
-| `adapt-decay` | 0.85 (0.7 with a layer split) | Lower follows topic changes sooner. Higher keeps a long-run placement. |
+| `adapt-decay` | 0.85 (0.7 with `gpu-mode split`) | Lower follows topic changes sooner. Higher keeps a long-run placement. |
 | `expert-profile-save` | off | Saves the placement; a continuing workload starts on it, a different one starts wrong. |
 
 `hit=` in the `done` line counts only the main card's VRAM lookups, so a higher `hit` is not always faster. Compare `tg`.
