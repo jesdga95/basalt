@@ -46,6 +46,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -244,6 +245,7 @@ public:
         if (sh_) std::erase(sh_->heat_sessions, this);
         if (stream_) cudaStreamSynchronize(stream_);
         if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
+        drain_fills();
         if (!m_.wedged() && m_.has_spill() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {
@@ -1505,10 +1507,10 @@ private:
             // the next visit's input projection into L2 on its own side stream, from when the card's experts are done
             // through the merge's wait on the CPU pool; it only reads, and joins with the other side streams
             if (k.fl_blocks > 0 && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card) {
-                cudaEventRecord(k.fl_ev, k.stream);
-                cudaStreamWaitEvent(k.fl_st, k.fl_ev, 0);
+                k.fl_on = true;   // before anything that can fail, so the join and the drain cover it
+                if (cudaEventRecord(k.fl_ev, k.stream) != cudaSuccess || cudaStreamWaitEvent(k.fl_st, k.fl_ev, 0) != cudaSuccess)
+                    throw std::runtime_error("inkling2: the projection fill's fork failed");
                 l2_fill(m_.layer(g_.visits[(size_t) vi + 1].layer).proj, proj_bytes(), k.fl_blocks, x.fl_sink_, k.fl_st);
-                k.fl_on = true;
             }
             sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
             fork_open_ = false;
@@ -1664,6 +1666,19 @@ private:
     // The bytes of a layer's input projection planes (codes, then scales).
     size_t proj_bytes() const { return (size_t) kProj * (size_t) (g_.n_embd / 32 * 34); }
 
+    // Waits for each card's projection fills: a window that failed before its join can leave one queued, and it writes the
+    // model's shared sink. A card whose window stream is capturing is left alone (the capture's failure path ends it first).
+    cudaError_t drain_fills() {
+        cudaError_t e = cudaSuccess;
+        for (Lane& k : lane_) {
+            if (!k.fl_st) continue;
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            if (k.stream && (cudaStreamIsCapturing(k.stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone)) continue;
+            if (const cudaError_t s = cudaStreamSynchronize(k.fl_st); s != cudaSuccess && e == cudaSuccess) e = s;
+        }
+        return e;
+    }
+
     // The projection fill's grid on `device`: two blocks a multiprocessor, or 0 when its L2 cannot hold a projection beside
     // the most a visit's guess or read-ahead requests (that many experts' gate and up parts, any layer).
     int fill_blocks(int device) const {
@@ -1690,11 +1705,11 @@ private:
             cudaEventRecord(k.pf_join, k.pf_st);
             cudaStreamWaitEvent(k.stream, k.pf_join, 0);
         }
-        if (k.fl_on) {
-            cudaEventRecord(k.fl_join, k.fl_st);
-            cudaStreamWaitEvent(k.stream, k.fl_join, 0);
-        }
+        const bool fill = k.fl_on;
         k.ra_on = k.pf_on = k.fl_on = false;
+        if (fill && (cudaEventRecord(k.fl_join, k.fl_st) != cudaSuccess ||
+                     cudaStreamWaitEvent(k.stream, k.fl_join, 0) != cudaSuccess))
+            throw std::runtime_error("inkling2: the projection fill's join failed");
     }
 
     // The layer split: the window crosses from card `from` to segment `sg`'s card, which waits for it and takes the row
@@ -1831,6 +1846,7 @@ private:
     // After the sync of the window stream that ends a call's windows (`synced`: its status): gives admission up. False:
     // a sync failed or the abort came first, and the call's results are discarded.
     bool complete(cudaError_t synced) {
+        if (const cudaError_t drained = drain_fills(); synced == cudaSuccess) synced = drained;
         if (!admitted_) return synced == cudaSuccess;
         admitted_ = false;
         if (synced == cudaSuccess && lane_[1].stream) synced = cudaStreamSynchronize(lane_[1].stream);
