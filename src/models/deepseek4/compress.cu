@@ -1,5 +1,6 @@
 #include "basalt/models/deepseek4/compress.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -123,9 +124,11 @@ __global__ void compress_kernel(CompressKind kind, int ratio, int n_tokens, cons
             }
         }
         const float compressed = denominator > 0.0f ? numerator / denominator : 0.0f;
-        values[c] = compressed;
-        const float square_sum = block_sum(compressed * compressed, warp_sums);
-        float normalized = compressed * rsqrtf(square_sum / kHeadDim + rms_eps) * norm_w[c];
+        // The reference casts pooled KV to the input dtype (BF16) before RMSNorm.
+        values[c] = __bfloat162float(__float2bfloat16_rn(compressed));
+        const float square_sum = block_sum(values[c] * values[c], warp_sums);
+        float normalized = __bfloat162float(__float2bfloat16_rn(
+            values[c] * rsqrtf(square_sum / kHeadDim + rms_eps) * norm_w[c]));
         values[c] = normalized;
         __syncthreads();
         if (c >= kHeadDim - kRopeDim) {
@@ -133,7 +136,7 @@ __global__ void compress_kernel(CompressKind kind, int ratio, int n_tokens, cons
             float x0 = values[kHeadDim - kRopeDim + pair * 2];
             float x1 = values[kHeadDim - kRopeDim + pair * 2 + 1];
             rotate_pair(x0, x1, (float) source_start, rope_freq[pair]);
-            normalized = (c & 1) ? x1 : x0;
+            normalized = __bfloat162float(__float2bfloat16_rn((c & 1) ? x1 : x0));
         }
         out[(size_t) row_index * kHeadDim + c] = normalized;
         __syncthreads();

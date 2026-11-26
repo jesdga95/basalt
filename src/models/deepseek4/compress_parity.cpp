@@ -2,8 +2,10 @@
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -15,6 +17,12 @@ constexpr int D = 512;
 constexpr int R = 64;
 // Match deepseek-ai/DeepSeek-V4-Flash-Vision-Exp's configured RMS epsilon.
 constexpr float eps = 1e-20f;
+
+float bf16_rn(float value) {
+    uint32_t bits = std::bit_cast<uint32_t>(value);
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return std::bit_cast<float>(bits & 0xffff0000u);
+}
 
 void reference(CompressKind kind, int ratio, int n_tokens, const std::vector<float>& kv,
                const std::vector<float>& score, const std::vector<float>& ape, const std::vector<int32_t>& pos,
@@ -69,21 +77,21 @@ void reference(CompressKind kind, int ratio, int n_tokens, const std::vector<flo
                     numerator += v[j] * weight;
                 }
             }
-            compressed[c] = denominator > 0.0 ? numerator / denominator : 0.0;
+            compressed[c] = bf16_rn((float) (denominator > 0.0 ? numerator / denominator : 0.0));
         }
         double square_sum = 0.0;
         for (double value : compressed) square_sum += value * value;
         const double inverse = 1.0 / std::sqrt(square_sum / D + eps);
         std::vector<double> normalized(D);
-        for (int c = 0; c < D; ++c) normalized[c] = compressed[c] * inverse * norm[c];
+        for (int c = 0; c < D; ++c) normalized[c] = bf16_rn((float) (compressed[c] * inverse * norm[c]));
         const int row = p / ratio;
         for (int c = D - R; c < D; c += 2) {
             const int pair = (c - (D - R)) / 2;
             const double angle = (double) start * freq[pair];
             const double cosine = std::cos(angle), sine = std::sin(angle);
             const double x0 = normalized[c], x1 = normalized[c + 1];
-            normalized[c] = x0 * cosine - x1 * sine;
-            normalized[c + 1] = x0 * sine + x1 * cosine;
+            normalized[c] = bf16_rn((float) (x0 * cosine - x1 * sine));
+            normalized[c + 1] = bf16_rn((float) (x0 * sine + x1 * cosine));
         }
         for (int c = 0; c < D; ++c) out[(size_t) row * D + c] = (float) normalized[c];
     }
