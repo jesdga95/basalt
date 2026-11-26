@@ -43,13 +43,19 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap) {
     return v;
 }
 
+/// The most checkpoints the chains can hold together: `prompt_cache` in the solo chain and in a batch slot's request, two
+/// in every other slot (`slots` 0: the solo chain alone).
 /// The checkpoints every chain of a server holds together (the solo session's and every batch slot's) under a pool of
 /// `pool_bytes`: as many as it fits past the one a save fills before the least recently used leaves, and no more than
 /// the chains can hold (`prompt_cache` in the solo chain and in a batch slot's request, two in every other slot; `slots`
 /// 0: the solo chain alone).  A checkpoint with no bytes takes nothing from the pool.  0: the pool fits fewer than two.
+inline size_t pool_most(int64_t prompt_cache, int64_t slots) {
+    if (prompt_cache <= 0) return 0;
+    return (size_t) (slots > 0 ? 2 * (uint64_t) prompt_cache + 2 * (uint64_t) slots : (uint64_t) prompt_cache);
+}
 inline size_t pool_checkpoints(uint64_t pool_bytes, uint64_t checkpoint_bytes, int64_t prompt_cache, int64_t slots) {
     if (prompt_cache <= 0) return 0;
-    const uint64_t most = slots > 0 ? 2 * (uint64_t) prompt_cache + 2 * (uint64_t) slots : (uint64_t) prompt_cache;
+    const uint64_t most = pool_most(prompt_cache, slots);
     if (checkpoint_bytes == 0) return (size_t) most;
     const uint64_t fit = pool_bytes / checkpoint_bytes;
     return fit < 2 ? 0 : (size_t) std::min(fit - 1, most);

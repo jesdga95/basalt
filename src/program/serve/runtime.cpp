@@ -128,6 +128,15 @@ bool Runtime::slot_turn_checkpoint(int b) {
     return true;
 }
 
+namespace {
+// A checkpoint's running-state bytes, every card's part.
+uint64_t state_bytes(const ConvCheckpoint& c) {
+    uint64_t n = c.state_a.size() + c.state_b.size() + c.state_c.size() + c.state_d.size() + c.state_e.size();
+    for (const ConvCheckpoint& p : c.stage_parts) n += state_bytes(p);
+    return n;
+}
+}  // namespace
+
 void Runtime::trim_check_pool() {
     for (;;) {   // the pool every chain shares: the solo session's, the one a request in another slot set aside, every slot's
         std::vector<std::vector<ConvCheckpoint>*> chains{&checks};
@@ -135,11 +144,16 @@ void Runtime::trim_check_pool() {
         for (BSlot& s : bs) chains.push_back(&s.checks);
         std::vector<std::vector<uint64_t>> stamps(chains.size());
         size_t held = 0;
+        uint64_t held_bytes = 0;
         for (size_t i = 0; i < chains.size(); ++i) {
-            for (const ConvCheckpoint& k : *chains[i]) stamps[i].push_back(k.used);
+            for (const ConvCheckpoint& k : *chains[i]) {
+                stamps[i].push_back(k.used);
+                held_bytes += state_bytes(k);
+            }
             held += chains[i]->size();
         }
-        if (held <= check_pool) return;
+        const size_t most = basalt::program::conv_cache::pool_most(o.prompt_cache, o.batch);
+        if (held <= most && (check_bytes == 0 || held_bytes <= check_pool * check_bytes)) return;
         const auto [chain, at] = basalt::program::conv_cache::pool_victim(stamps);
         std::vector<ConvCheckpoint>& ch = *chains[chain];
         if (ch[at].state_a.data() == ckd.pending()) {

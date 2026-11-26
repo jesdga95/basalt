@@ -358,6 +358,7 @@ public:
         const size_t bytes = session().running_bytes();
         check_pool = basalt::program::conv_cache::pool_checkpoints((uint64_t) o.checkpoint_pool_mib << 20, bytes,
                                                                    o.prompt_cache, o.batch);
+        check_bytes = bytes;
         if (bytes == 0) return true;
         if (check_pool == 0) {
             basalt::log::error("basalt serve", "--checkpoint-pool-mib %lld fits fewer than two checkpoints of this model "

@@ -486,6 +486,7 @@ int QfnRuntime::init_conversations() {
         for (const auto& st : stages) bytes += basalt::core::conversation_checkpoint_bytes(st->ss, g);
         check_pool = basalt::program::conv_cache::pool_checkpoints((uint64_t) o.checkpoint_pool_mib << 20, bytes,
                                                                    o.prompt_cache, o.batch);
+        check_bytes = bytes;
     }
     if (o.prompt_cache > 0 && !multi_gpu) {
         std::string ce;

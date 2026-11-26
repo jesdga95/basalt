@@ -207,11 +207,15 @@ public:
     /// the device now, it moves to the host while the work goes on (ckd).
     bool capture_check(basalt::model::ModelSession& s, int64_t to, ConvCheckpoint::Source source, const int32_t* ids,
                        std::vector<ImgKey> imgs, ConvCheckpoint& c);
-    /// Past the pool (check_pool), the least recently used checkpoint of every chain goes.
+    /// Past the pool (check_pool x check_bytes, or more checkpoints than the chains hold), the least recently used
+    /// checkpoint of every chain goes.
     void trim_check_pool();
-    /// The checkpoints every chain holds together: the pool --checkpoint-pool-mib fits (conv_cache::pool_checkpoints),
-    /// set by the runtime once it knows a checkpoint's bytes.
+    /// The checkpoints of the largest running state every chain holds together: the pool --checkpoint-pool-mib fits
+    /// (conv_cache::pool_checkpoints), set by the runtime once it knows that state's bytes (check_bytes).  Shorter
+    /// conversations' checkpoints take their own bytes: the chains hold up to check_pool x check_bytes, and at most
+    /// conv_cache::pool_most checkpoints.
     size_t check_pool{};
+    uint64_t check_bytes{};
     uint64_t check_clock{};
     bool cvec_cached{};
     std::optional<basalt::core::ConversationCache> conversations;
