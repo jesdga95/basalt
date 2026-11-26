@@ -1,5 +1,6 @@
 #include "basalt/log.hpp"
 #include "models/deepseek4/pack.hpp"
+#include "basalt/vision/mmproj.hpp"
 
 #include <cstdio>
 
@@ -14,13 +15,30 @@ int main(int argc, char** argv) {
         basalt::log::error("deepseek4 pack test", "%s", err.c_str());
         return 1;
     }
+    basalt::vision::Mmproj mmproj;
+    if (!mmproj.open(pack.vision, err, "deepseek4v")) {
+        basalt::log::error("deepseek4 pack test", "embedded projector: %s", err.c_str());
+        return 1;
+    }
     const auto& g = pack.geo;
+    const auto& v = mmproj.hp();
+    const char* image_rows[] = {"v.token_embd.img_start", "v.token_embd.img_end", "v.token_embd.img_pad", "v.image_newline"};
+    for (const char* name : image_rows) {
+        const auto* tensor = mmproj.find(name);
+        if (!tensor || tensor->type != 0 || tensor->elems() != g.n_embd) {
+            basalt::log::error("deepseek4 pack test", "projector is missing the expected F32 image row %s", name);
+            return 1;
+        }
+    }
     if (g.n_layers != 43 || g.n_embd != 4096 || g.n_vocab != 129280 || g.n_expert != 256 ||
-        g.n_used != 6 || g.hash_layers != 3 || pack.vision.empty()) {
+        g.n_used != 6 || g.hash_layers != 3 || v.layers != 32 || v.embd != 1024 || v.heads != 16 ||
+        v.ffn != 2816 || v.patch != 14 || v.merge != 3 || v.proj != 4096 || v.min_pixels != 147456 ||
+        pack.vision.empty()) {
         basalt::log::error("deepseek4 pack test", "the opened pack does not have the verified V4 Vision geometry");
         return 1;
     }
-    std::printf("deepseek4 pack ok: %d layers, %d vocab, %zu tensor records, vision section %llu bytes\n",
-                g.n_layers, g.n_vocab, pack.tensors.size(), (unsigned long long) pack.vision.bytes);
+    std::printf("deepseek4 pack ok: %d layers, %d vocab, %zu tensor records; vision %d layers / %d width / %d heads / %d FFN / %d patch / %d merge; section %llu bytes\n",
+                g.n_layers, g.n_vocab, pack.tensors.size(), v.layers, v.embd, v.heads, v.ffn, v.patch, v.merge,
+                (unsigned long long) pack.vision.bytes);
     return 0;
 }

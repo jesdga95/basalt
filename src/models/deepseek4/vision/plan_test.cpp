@@ -47,6 +47,15 @@ int main() {
                  block.types[3] == ImageToken::Start && block.types[4] == ImageToken::Patch,
                  "alignment pads precede image start and interleaved content");
 
+    VisionPlan odd_grid;
+    ok &= expect(plan_image(150, 203, odd_grid, err) && odd_grid.width == 336 && odd_grid.height == 448 &&
+                 odd_grid.n_llm_h == 11 && odd_grid.n_llm_w == 8 && odd_grid.n_tokens == 110,
+                 "minimum-area upscale preserves an odd merged-grid height");
+    ImageBlock odd_block;
+    ok &= expect(build_image_block(odd_grid, 2, odd_block, err) && odd_block.alignment_pad == 1 &&
+                 odd_block.padded_rows == 12 && odd_block.patch_order.size() == 88,
+                 "odd merged-grid height pads and permutes the final N-layout row");
+
     basalt::vision::Image image;
     image.w = image.h = 1;
     image.rgb = {127, 127, 127};
