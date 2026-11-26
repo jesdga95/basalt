@@ -14,6 +14,7 @@
 #include "models/inkling2/pack.hpp"
 #include "models/inkling2/spill.hpp"
 #include "models/inkling2/vision_encoder.hpp"   // [vision]
+#include "models/inkling2/wide_chunk.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -222,6 +223,13 @@ public:
     bool lend_room(uint64_t bytes, std::string& err);
     /// [vision] The lent layers' memory comes back at the same addresses with the same bytes, then the copies (promote).
     void refill();
+    /// A long prompt read's wider chunk (wide_chunk.hpp): frees `bytes` more, the lowest-ranked card copies going back to RAM
+    /// first, and counts them as taken. Refused, with nothing moved, when the copies hold less (by the counted room, never a
+    /// fresh reading of the card); Failed when the copies could not be put back as they were.
+    Take take_room(uint64_t bytes);
+    /// The wider chunk's `bytes` are free again: the copies take_room sent back return, so the card holds the set it held.
+    /// False when not every one of them came back.
+    bool give_room(uint64_t bytes) noexcept;
 
 private:
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err,
@@ -298,6 +306,8 @@ private:
     /// With --vram-reserve-mib: kLateRoom, the room the copies leave for what loads after them (room() does not see it
     /// load); 0 without it.
     uint64_t late_room() const;
+    /// Copies `pairs` to the card in that order while `keep_free` bytes stay free (promote's body).
+    uint64_t promote_pairs(const std::vector<size_t>& pairs, uint64_t keep_free);
     int64_t room_ = 0;   ///< room(): may run below 0 when the caches grow past what placement counted
     bool map_short_ = false;   ///< a promote could not map a page it counted (note_shortage)
     uint8_t* copies_va_ = nullptr;
@@ -335,6 +345,7 @@ private:
     };
     std::vector<LentRange> lent_ranges_;
     int64_t lend_copies_ = 0;   ///< card copies demoted for the encoder
+    std::vector<size_t> wide_out_;   ///< the copies a long read's wider chunk sent back (take_room), until give_room
     // gpu-mode peer: the second card's experts, layer by layer in expert order in one cache (peer_first_ the layer's first slot)
     std::unique_ptr<core::PeerExperts> peer_;
     std::vector<int32_t> peer_slot_;         ///< [layer * n_expert + e] the expert's slot there, -1: not there

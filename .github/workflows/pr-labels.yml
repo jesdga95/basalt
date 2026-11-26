@@ -3,15 +3,16 @@ name: pr-labels
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
-  push:
-    branches: [main]
+  # Main moving can make any open PR conflict; a sweep every half hour labels those (GitHub has computed mergeable by then).
+  schedule:
+    - cron: "17,47 * * * *"
   workflow_dispatch:
 
 permissions:
   pull-requests: write
 
 concurrency:
-  group: pr-labels-${{ github.event.pull_request.number || 'main' }}
+  group: pr-labels-${{ github.event.pull_request.number || 'sweep' }}
   cancel-in-progress: true
 
 jobs:
@@ -41,10 +42,14 @@ jobs:
               return json.loads(subprocess.check_output(["gh", *args], text=True))
 
           def add_label(num, label):
-              subprocess.check_call([
+              # A failed add (a transient API error, a race with the PR's own run) is logged; the next run retries it.
+              r = subprocess.run([
                   "gh", "api", "--silent", "-X", "POST",
                   f"repos/{repo}/issues/{num}/labels", "-f", f"labels[]={label}"
               ])
+              if r.returncode != 0:
+                  print(f"#{num}: could not add {label}")
+              return r.returncode == 0
 
           def rm_label(num, label):
               subprocess.call([
@@ -55,10 +60,10 @@ jobs:
           def fetch_pr(num):
               return gh_json("api", f"repos/{repo}/pulls/{num}")
 
-          def sync_one(pr):
+          def sync_one(pr, polls):
               num = pr["number"]
               # Poll briefly if GitHub has not computed mergeable yet
-              for _ in range(4):
+              for _ in range(polls):
                   if pr.get("mergeable") is not None:
                       break
                   time.sleep(3)
@@ -71,8 +76,8 @@ jobs:
 
               # 1. rebase-needed: auto-add on conflict, auto-remove when mergeable
               if mergeable is False and "rebase-needed" not in labels:
-                  add_label(num, "rebase-needed")
-                  print(f"#{num}: +rebase-needed")
+                  if add_label(num, "rebase-needed"):
+                      print(f"#{num}: +rebase-needed")
               elif mergeable is True and "rebase-needed" in labels:
                   rm_label(num, "rebase-needed")
                   print(f"#{num}: -rebase-needed")
@@ -80,19 +85,20 @@ jobs:
               # 2. hardware-specific labels (skip community benchmark rows)
               if title.lower().startswith("community:"):
                   return
-              text = f"{title}\n{head}"
-              if spark_re.search(text) and "dgx-spark" not in labels:
-                  add_label(num, "dgx-spark")
+              # Title and branch are matched apart, so the branch prefix (^spark-) anchors on the branch.
+              def names(rx):
+                  return rx.search(title) or rx.search(head)
+              if names(spark_re) and "dgx-spark" not in labels and add_label(num, "dgx-spark"):
                   print(f"#{num}: +dgx-spark")
-              if multi_re.search(text) and "multi-card" not in labels:
-                  add_label(num, "multi-card")
+              if names(multi_re) and "multi-card" not in labels and add_label(num, "multi-card"):
                   print(f"#{num}: +multi-card")
 
           if pr_num:
-              sync_one(fetch_pr(pr_num))
+              sync_one(fetch_pr(pr_num), 4)
           else:
-              # Push to main or manual dispatch: sweep all open PRs
-              prs = gh_json("api", "--paginate", f"repos/{repo}/pulls?state=open&per_page=100")
-              for p in prs:
-                  sync_one(fetch_pr(p["number"]))
+              # Scheduled or manual sweep of every open PR, without polling: a PR whose mergeable GitHub has not computed yet
+              # (reading it starts the computation) is labelled by the next sweep or its own next run.
+              pages = gh_json("api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100")
+              for p in (pr for page in pages for pr in page):
+                  sync_one(fetch_pr(p["number"]), 0)
           EOF

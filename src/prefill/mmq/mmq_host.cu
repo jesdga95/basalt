@@ -2,6 +2,7 @@
 // that the stream-k fixup of a launch takes from, and the explicit load of a kernel.
 #include "mmq_common.cuh"
 #include "basalt/core/device.hpp"
+#include "basalt/core/on_device.hpp"
 
 #include <cuda.h>
 
@@ -67,6 +68,8 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 namespace {
 // Buffers are kept and reused: MMQ asks for the same few sizes every launch (its stream-k fixup tiles).
 struct CachingPool : ggml_cuda_pool {
+    int device;
+    explicit CachingPool(int dev) : device(dev) {}
     struct Buf { void * p; size_t size; bool used; };
     std::vector<Buf> bufs;
     std::mutex mu;
@@ -74,6 +77,7 @@ struct CachingPool : ggml_cuda_pool {
         std::lock_guard<std::mutex> lk(mu);
         for (auto & b : bufs)
             if (!b.used && b.size >= size) { b.used = true; *actual_size = b.size; return b.p; }
+        const basalt::core::OnDevice od(device);
         void * p = nullptr;
         CUDA_CHECK(cudaMalloc(&p, size));
         bufs.push_back({p, size, true});
@@ -86,13 +90,14 @@ struct CachingPool : ggml_cuda_pool {
             if (b.p == ptr) { b.used = false; return; }
     }
     ~CachingPool() override {
+        const basalt::core::OnDevice od(device);
         for (auto & b : bufs) cudaFree(b.p);
     }
 };
 }  // namespace
 
-std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int) {
-    return std::unique_ptr<ggml_cuda_pool>(new CachingPool());
+std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int device) {
+    return std::unique_ptr<ggml_cuda_pool>(new CachingPool(device));
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {}

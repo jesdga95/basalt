@@ -99,6 +99,37 @@ class Lines(unittest.TestCase):
         self.assertEqual(m["routed"], [0, 0, 0, 0])
         self.assertLess(m["recent"][3], 1.0)
 
+    def test_expert_map_is_thread_safe_under_concurrent_xmap_feeds(self):
+        c = ConsoleLines()
+        c.feed("XMAP 8 0123 1,2,3,4")
+        stop = threading.Event()
+        errors = []
+
+        def writer():
+            try:
+                for i in range(1000):
+                    c.feed(f"XMAP 8 0123 {i % 5},1,2,3")
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                stop.set()
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    m = c.expert_map()
+                    if m is not None:
+                        self.assertEqual(m["total"], 8)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer), *(threading.Thread(target=reader) for _ in range(3))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(errors, [])
+
 
 class Hardware(unittest.TestCase):
     def test_cards_and_groups(self):

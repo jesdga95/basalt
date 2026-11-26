@@ -56,7 +56,7 @@ __device__ __forceinline__ bool kv_far(const KvFar& f, int64_t& c) {
 // The windows one launch takes: segment k is rows [row0[k], row0[k + 1]) of q, the partials and the output, its 16-row
 // tiles of (row, head) pairs [tile0[k], tile0[k + 1]) of the grid, with its own cache and range.  Each block and each
 // merged row computes exactly what a launch of its segment alone would.
-constexpr int kMaxSegs = kGqaMaxWindow;
+constexpr int kMaxSegs = 32;
 struct DecSegs {
     int n = 1;
     int row0[kMaxSegs + 1] = {};

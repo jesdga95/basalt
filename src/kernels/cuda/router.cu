@@ -172,9 +172,10 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
                                     int k, float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights,
                                     SelectScratch& sh, const ResidentTabs& held, float prior) {
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
-    const float s = score(logits[e], gate);
+    float s = score(logits[e], gate);
     float b = s + bias[e];
     if (kPrior && held.held(e)) b += prior;
+    if (isnan(b)) { b = -INFINITY; s = 0.f; }
     float m = b;
 #pragma unroll
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
@@ -215,8 +216,22 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
     if (e == 0) {
         float sum = 0.f;
         for (int r = 0; r < k; ++r) sum += sh.sel[r];
-        const float denom = sum + 1e-20f;
-        for (int r = 0; r < k; ++r) weights[r] = sh.sel[r] / denom * scale;
+        if (isfinite(sum)) {
+            const float denom = sum + 1e-20f;
+            for (int r = 0; r < k; ++r) weights[r] = sh.sel[r] / denom * scale;
+        } else {
+            int n_inf = 0;
+            for (int r = 0; r < k; ++r) n_inf += isinf(sh.sel[r]);
+            if (n_inf > 0) {
+                const float w_inf = scale / (float) n_inf;
+                for (int r = 0; r < k; ++r) weights[r] = isinf(sh.sel[r]) ? w_inf : 0.f;
+            } else {
+                double dsum = 0.0;
+                for (int r = 0; r < k; ++r) dsum += (double) sh.sel[r];
+                const double denom = dsum + 1e-20;
+                for (int r = 0; r < k; ++r) weights[r] = (float) ((double) sh.sel[r] / denom) * scale;
+            }
+        }
     }
 }
 
@@ -234,7 +249,131 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
 
 }  // namespace
 
+// Two gate rows per block for n_embd == 2304 (576 float4s = 2 * 256 + 64) with PDL overlap: halves activation reloads across
+// multi-token decode windows while preserving router_logits_row's exact FP32 summation order bit-for-bit.
+__global__ void __launch_bounds__(kLogitThreads)
+router_logits_2304_g2_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_expert, int n_tokens,
+                             float* __restrict__ logits) {
+    constexpr int n_embd = 2304, n4 = n_embd >> 2, G = 2;
+    __shared__ float red[G][kMaxTok * (kLogitThreads / 32)];
+    const int r0 = blockIdx.x * G, t0 = blockIdx.y * kMaxTok, nt = min(kMaxTok, n_tokens - t0);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float4 w[G][3];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float4* gr = reinterpret_cast<const float4*>(gate + (size_t) (r0 + g) * n_embd);
+        w[g][0] = gr[tid];
+        w[g][1] = gr[tid + kLogitThreads];
+        if (tid + 2 * kLogitThreads < n4) w[g][2] = gr[tid + 2 * kLogitThreads];
+    }
+    pdl_wait();
+    pdl_launch_dependents();
+    for (int t = 0; t < nt; ++t) {
+        const float4* xv = reinterpret_cast<const float4*>(x + (size_t) (t0 + t) * n_embd);
+        float acc[G] = {0.f, 0.f};
+        const float4 v0 = xv[tid];
+        const float4 v1 = xv[tid + kLogitThreads];
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            acc[g] = fmaf(w[g][0].x, v0.x, acc[g]);
+            acc[g] = fmaf(w[g][0].y, v0.y, acc[g]);
+            acc[g] = fmaf(w[g][0].z, v0.z, acc[g]);
+            acc[g] = fmaf(w[g][0].w, v0.w, acc[g]);
+            acc[g] = fmaf(w[g][1].x, v1.x, acc[g]);
+            acc[g] = fmaf(w[g][1].y, v1.y, acc[g]);
+            acc[g] = fmaf(w[g][1].z, v1.z, acc[g]);
+            acc[g] = fmaf(w[g][1].w, v1.w, acc[g]);
+        }
+        if (tid + 2 * kLogitThreads < n4) {
+            const float4 v2 = xv[tid + 2 * kLogitThreads];
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                acc[g] = fmaf(w[g][2].x, v2.x, acc[g]);
+                acc[g] = fmaf(w[g][2].y, v2.y, acc[g]);
+                acc[g] = fmaf(w[g][2].z, v2.z, acc[g]);
+                acc[g] = fmaf(w[g][2].w, v2.w, acc[g]);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            const float sum = warp_sum(acc[g]);
+            if (lane == 0) red[g][t * (kLogitThreads / 32) + warp] = sum;
+        }
+    }
+    __syncthreads();
+    const int g = tid / kMaxTok, t = tid % kMaxTok;
+    if (g < G && t < nt) {
+        float s = 0.f;
+#pragma unroll
+        for (int i = 0; i < kLogitThreads / 32; ++i) s += red[g][t * (kLogitThreads / 32) + i];
+        logits[(size_t) (t0 + t) * n_expert + r0 + g] = s;
+    }
+}
+
+// Warp-register Top-k router selection for NE in {128, 256} (4 warps = 4 tokens per block, zero barriers, bitwise identical).
+template <int NE>
+__global__ void __launch_bounds__(128)
+router_select_warp_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_tokens, int k,
+                          float scale, int gate, int32_t* __restrict__ ids, float* __restrict__ weights) {
+    constexpr int EP = NE / 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int t = blockIdx.x * 4 + warp;
+    float bias_reg[EP];
+#pragma unroll
+    for (int j = 0; j < EP; ++j) bias_reg[j] = bias[lane + 32 * j];
+    pdl_wait();
+    pdl_launch_dependents();
+    if (t >= n_tokens) return;
+    const float* tl = logits + (size_t) t * NE;
+    float s[EP], b[EP];
+#pragma unroll
+    for (int j = 0; j < EP; ++j) {
+        s[j] = score(tl[lane + 32 * j], gate);
+        b[j] = s[j] + bias_reg[j];
+    }
+    int sel_id = 0;
+    float sel_s = 0.f;
+    for (int r = 0; r < k; ++r) {
+        float bv = b[0], bs = s[0];
+        int bi = lane;
+#pragma unroll
+        for (int j = 1; j < EP; ++j) {
+            const int idx = lane + 32 * j;
+            if (b[j] > bv || (b[j] == bv && idx < bi)) {
+                bv = b[j];
+                bi = idx;
+                bs = s[j];
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            const float os = __shfl_xor_sync(0xffffffffu, bs, o);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+                bs = os;
+            }
+        }
+        if (lane == r) {
+            sel_id = bi;
+            sel_s = bs;
+        }
+#pragma unroll
+        for (int j = 0; j < EP; ++j)
+            if (bi == lane + 32 * j) b[j] = -INFINITY;
+    }
+    float sum = 0.f;
+    for (int r = 0; r < k; ++r) sum += __shfl_sync(0xffffffffu, sel_s, r);
+    if (lane < k) {
+        ids[(size_t) t * k + lane] = sel_id;
+        weights[(size_t) t * k + lane] = sel_s / (sum + 1e-20f) * scale;
+    }
+}
+
 void router_logits(const float* x, const float* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
+    if (n_tokens <= 0) return;
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 16 || a.k > a.n_expert)
         throw std::invalid_argument("router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
@@ -243,6 +382,7 @@ void router_logits(const float* x, const float* gate, int n_tokens, const Router
     constexpr int kRowsG = 4;
     const bool rows4 = n_tokens >= kRowsMinTok && a.n_embd == 4 * 3 * kLogitThreads && a.n_expert % kRowsG == 0;
     const bool rows4w = n_tokens >= kRowsMinTok && a.n_embd == 4 * 5 * kLogitThreads && a.n_expert % kRowsG == 0;
+    const bool rows2_2304 = n_tokens >= 2 && a.n_embd == 2304 && a.n_expert % 2 == 0;
     for (int t0 = 0; t0 < n_tokens; t0 += kLaunchTok) {
         const int nt = n_tokens - t0 < kLaunchTok ? n_tokens - t0 : kLaunchTok;
         if (rows4) {
@@ -253,6 +393,11 @@ void router_logits(const float* x, const float* gate, int n_tokens, const Router
         if (rows4w) {
             router_logits_rows_kernel<5, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
                 x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
+            continue;
+        }
+        if (rows2_2304) {
+            launch_pdl(router_logits_2304_g2_kernel, dim3(a.n_expert / 2, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
+                       x + (size_t) t0 * a.n_embd, gate, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
             continue;
         }
         launch_pdl(router_logits_kernel, dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
@@ -268,12 +413,19 @@ void router(const float* x, const float* gate, const float* bias, int n_tokens, 
 
 void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,
                    void* stream) {
+    if (n_tokens <= 0) return;
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.k < 1 || a.k > 16 || a.k > a.n_expert)
         throw std::invalid_argument("router_select: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
     if (a.prior > 0.0f && a.held.n > 0)
         launch_pdl(router_select_kernel<true>, dim3(n_tokens), dim3(a.n_expert), 0, st, logits, bias, a.n_expert, a.k, a.weight_scale,
                    (int) a.gate, ids, weights, a.held, a.prior);
+    else if (a.n_expert == 128)
+        launch_pdl(router_select_warp_kernel<128>, dim3((n_tokens + 3) / 4), dim3(128), 0, st, logits, bias, n_tokens, a.k, a.weight_scale,
+                   (int) a.gate, ids, weights);
+    else if (a.n_expert == 256)
+        launch_pdl(router_select_warp_kernel<256>, dim3((n_tokens + 3) / 4), dim3(128), 0, st, logits, bias, n_tokens, a.k, a.weight_scale,
+                   (int) a.gate, ids, weights);
     else
         launch_pdl(router_select_kernel<false>, dim3(n_tokens), dim3(a.n_expert), 0, st, logits, bias, a.n_expert, a.k, a.weight_scale,
                    (int) a.gate, ids, weights, a.held, 0.0f);

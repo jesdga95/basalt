@@ -133,8 +133,14 @@ jobs:
           set -euo pipefail
           plan="${RUNNER_TEMP}/plan.json"
           marker='<!-- community-gate -->'
-          for l in "community: needs review" "community: rejected" "community: needs changes" "community: automatic merge"; do
-            gh label create "$l" --repo "${GITHUB_REPOSITORY}" --color F9D0C4 --force >/dev/null
+          declare -A about=(
+            [community-needs-review]="Community run: a person reviews it"
+            [community-rejected]="Community run: rejected by the review"
+            [community-needs-changes]="Community run: the gate found something to fix"
+            [community-auto-merge]="Community run: passed the gate and the review, merged automatically"
+          )
+          for l in "community-needs-review" "community-rejected" "community-needs-changes" "community-auto-merge"; do
+            gh label create "$l" --repo "${GITHUB_REPOSITORY}" --color F9D0C4 --description "${about[$l]}" --force >/dev/null
             if jq -e --arg l "$l" '.labels | index($l)' "$plan" >/dev/null; then
               gh pr edit "${PR}" --repo "${GITHUB_REPOSITORY}" --add-label "$l"
             else

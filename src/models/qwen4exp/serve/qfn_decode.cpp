@@ -51,10 +51,8 @@ void QfnRequest::decode_state_begin() {
     drafts = std::vector<int32_t>((size_t) std::max(runtime_.S, basalt::core::kMtpChainMax), 0);
     dprob = std::vector<float>((size_t) std::max(runtime_.S, basalt::core::kMtpChainMax), 0.0f);
     sbuf = std::vector<int32_t>((size_t) runtime_.S, 0);
-    if (runtime_.o.suffix_draft > 0) {
-        runtime_.sfx->reset();
-        for (int64_t t : ids) runtime_.sfx->append((int32_t) t);
-    }
+    if (runtime_.o.suffix_draft > 0 && (!in_slot || solo_req))
+        runtime_.sfx->sync(ids32.data(), ids32.size());
     sfx_windows = 0;
     sfx_drafts = 0;
     sfx_ok = 0;

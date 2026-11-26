@@ -81,7 +81,7 @@ endif()
 # The `warnings` and `platform` targets, one file shared with the standalone `tools/vision` configuration.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/platform.cmake)
 
-# BASALT_MODELS: which models this build contains (all of them by default).
+# BASALT_MODELS: which models this build contains (required).
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/models.cmake)
 
 # The application manifest, for every program that names a file path in its command line. Windows decodes argv and
@@ -242,7 +242,6 @@ if(BUILD_TESTING)
   add_executable(hy4flash_vision_test src/models/hy4flash/vision_test.cpp src/models/hy4flash/vision.cpp)
   target_include_directories(hy4flash_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(hy4flash_vision_test PRIVATE vision_core warnings)
-  basalt_gpu_test(NAME hy4_encoder_parity COMMAND hy4_encoder_parity)
   basalt_cpu_test(NAME hy4flash_vision_test COMMAND hy4flash_vision_test ${CMAKE_CURRENT_SOURCE_DIR}/assets/basalt-lockup-light.png)
   add_executable(hy4flash_pretok_test src/models/hy4flash/pretok_test.cpp src/models/hy4flash/pretok_hy4.cpp)
   target_include_directories(hy4flash_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
@@ -253,14 +252,14 @@ endif()
 
 if(BASALT_MODEL_INKLING2)
 add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu
-  src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/attn_prompt.cu
-  src/models/inkling2/kernels/prompt_ops.cu)
+  src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/dflash2.cu
+  src/models/inkling2/kernels/attn_prompt.cu src/models/inkling2/kernels/prompt_ops.cu)
 target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
   src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
   src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp
-  src/models/inkling2/dspark.cpp src/models/inkling2/spill.cpp src/models/inkling2/cpu_experts.cpp)
+  src/models/inkling2/dspark.cpp src/models/inkling2/dflash2.cpp src/models/inkling2/spill.cpp src/models/inkling2/cpu_experts.cpp)
 target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_inkling2 PUBLIC model tokenizer engine_session inkling2_kernels tiers kernels kernels_cpu window_gemm mmq prefill_fp4 prefill_mxfp8 prefill_q8 core vision_cuda ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -276,6 +275,10 @@ if(BUILD_TESTING)
   target_include_directories(inkling2_dspark_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2_dspark_parity COMMAND inkling2_dspark_parity)
+  add_executable(inkling2_dflash2_parity src/models/inkling2/kernels/dflash2_parity.cpp)
+  target_include_directories(inkling2_dflash2_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(inkling2_dflash2_parity PRIVATE inkling2_kernels kernels window_gemm ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_dflash2_parity COMMAND inkling2_dflash2_parity)
   add_executable(inkling2_prompt_parity src/models/inkling2/kernels/prompt_parity.cpp)
   target_include_directories(inkling2_prompt_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2_prompt_parity PRIVATE inkling2_kernels kernels mmq prefill_q8 window_gemm prefill_fp4 ggml_quants ${_gpu_runtime_target})
@@ -305,6 +308,9 @@ if(BUILD_TESTING)
   add_executable(inkling2_copy_heat_test src/models/inkling2/copy_heat_test.cpp)
   target_include_directories(inkling2_copy_heat_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_cpu_test(NAME inkling2_copy_heat_test COMMAND inkling2_copy_heat_test)
+  add_executable(inkling2_wide_chunk_test src/models/inkling2/wide_chunk_test.cpp)
+  target_include_directories(inkling2_wide_chunk_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_cpu_test(NAME inkling2_wide_chunk_test COMMAND inkling2_wide_chunk_test)
   add_executable(inkling2_expert_map_test src/models/inkling2/expert_map_test.cpp)
   target_include_directories(inkling2_expert_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_cpu_test(NAME inkling2_expert_map_test COMMAND inkling2_expert_map_test)
@@ -317,6 +323,12 @@ if(BUILD_TESTING)
   add_executable(inkling2_vision_parity src/models/inkling2/vision_parity.cpp src/models/inkling2/vision.cpp)
   target_include_directories(inkling2_vision_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(inkling2_vision_parity PRIVATE vision_cuda)
+  # parked conversation round-trip: save_cells / restore_cells + running_state / running_restored + drafter window
+  # (Inkling 2 pack: argument or BASALT_INKLING2_PACK; skipped without one)
+  add_executable(inkling2_checkpoint_round_trip tests/models/inkling2/checkpoint_round_trip.cpp)
+  target_link_libraries(inkling2_checkpoint_round_trip PRIVATE model_inkling2 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_checkpoint_round_trip COMMAND inkling2_checkpoint_round_trip)
+  set_tests_properties(inkling2_checkpoint_round_trip PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 endif()
 
@@ -434,6 +446,12 @@ if(BUILD_TESTING)
   target_include_directories(batch_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
   target_link_libraries(batch_window_test PRIVATE warnings)
   basalt_cpu_test(NAME batch_window_test COMMAND batch_window_test)
+  # a composition's graph that finds no device memory: the batch goes on without it (GPU)
+  add_executable(batch_graph_memory_test tests/model/batch_graph_memory_test.cu)
+  target_include_directories(batch_graph_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(batch_graph_memory_test PRIVATE core ${_gpu_runtime_target})
+  basalt_gpu_test(NAME batch_graph_memory_test COMMAND batch_graph_memory_test)
+  set_tests_properties(batch_graph_memory_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   # the real adapters, through the program's registration (needs the CUDA runtime, not a GPU's work)
   add_executable(adapter_builtin_test tests/model/adapter_builtin_test.cpp)
   target_link_libraries(adapter_builtin_test PRIVATE models)
@@ -866,6 +884,9 @@ if(BUILD_TESTING)
   add_executable(vision_resize_test tests/vision/preprocess_test.cpp)
   target_link_libraries(vision_resize_test PRIVATE vision_core warnings)
   basalt_cpu_test(NAME vision_resize_test COMMAND vision_resize_test)
+  if(BASALT_MODEL_HY4FLASH)
+    basalt_gpu_test(NAME hy4_encoder_parity COMMAND hy4_encoder_parity)
+  endif()
   basalt_gpu_test(NAME cls_encoder_parity COMMAND cls_encoder_parity)
   # FFmpeg found at run time, or the reason it is not (any machine: CI has no FFmpeg)
   add_executable(ffmpeg_load_test tests/vision/ffmpeg_load_test.cpp)
@@ -902,7 +923,7 @@ target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_DEVICE="$<TARGET_FILE:basalt-device>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
   BASALT_BENCH_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-  BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+  BASALT_BENCH_BUILD_TYPE="$<CONFIG>"
   BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
 
 # basalt-probe: starts the engine, measures its rates and cold decode speed, prints a report
@@ -916,45 +937,68 @@ target_compile_definitions(basalt-probe PRIVATE
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench")
 
 if(BUILD_TESTING)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
 # closing the engine's stdin mid-request stops it (runs the real engine on a model pack:
 # -DBASALT_STDIN_STOP_MODEL=<pack>, with python3)
 if(BASALT_STDIN_STOP_MODEL AND Python3_Interpreter_FOUND)
-  add_test(NAME stdin_stop_test
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/stdin_stop_test.py
-                   $<TARGET_FILE:basalt> ${BASALT_STDIN_STOP_MODEL} ${CMAKE_CURRENT_SOURCE_DIR}/data/bench/conv.ids
-                   ${BASALT_STDIN_STOP_ARGS})
-  set_property(TEST stdin_stop_test APPEND PROPERTY LABELS gpu)
+  basalt_gpu_test(NAME stdin_stop_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/stdin_stop_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_STDIN_STOP_MODEL} ${CMAKE_CURRENT_SOURCE_DIR}/data/bench/conv.ids
+                          ${BASALT_STDIN_STOP_ARGS})
   set_tests_properties(stdin_stop_test PROPERTIES TIMEOUT 600)
 endif()
 
 # the engine enforces a request grammar on what it samples (runs the real engine on a model pack:
 # -DBASALT_GRAMMAR_MODEL=<pack>, with python3)
 if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
-  add_test(NAME grammar_engine_test
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_engine_test.py
-                   $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_ARGS})
-  set_property(TEST grammar_engine_test APPEND PROPERTY LABELS gpu)
+  basalt_gpu_test(NAME grammar_engine_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_engine_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_ARGS})
   set_tests_properties(grammar_engine_test PROPERTIES TIMEOUT 900)
 endif()
 
 # grammar requests under --batch: each slot held to its own grammar (starts the server on a model pack, same
 # -DBASALT_GRAMMAR_MODEL, with python3; -DBASALT_GRAMMAR_BATCH_ARGS=<server args>)
 if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
-  add_test(NAME grammar_batch_test
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_batch_test.py
-                   $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_BATCH_ARGS})
-  set_property(TEST grammar_batch_test APPEND PROPERTY LABELS gpu)
+  basalt_gpu_test(NAME grammar_batch_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_batch_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_BATCH_ARGS})
   set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
 endif()
 
-# speculative multi-slot batch identity (`--serve --batch 2/4/8 --spec 8` vs `--batch 1`, cold + warm replay;
+# speculative multi-slot batch identity (`--serve --batch 2..64 --spec 8` vs `--batch 1`, cold + warm replay;
 # configure with -DBASALT_BATCH_IDENTITY_MODEL=/path/to/model.basalt and optional -DBASALT_BATCH_IDENTITY_ARGS=...)
 if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
-  add_test(NAME batch_spec_identity_test
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_spec_identity_test.py
-                   $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
-  set_property(TEST batch_spec_identity_test APPEND PROPERTY LABELS gpu)
+  basalt_gpu_test(NAME batch_spec_identity_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_spec_identity_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
   set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
+endif()
+
+# a batch slot stopped by its client holds what the client saw, so the conversation continues without a re-read (same model
+# variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME batch_stop_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_stop_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(batch_stop_test PROPERTIES TIMEOUT 600)
+endif()
+
+# a pass that continues a reply takes no turn checkpoint inside it (same model variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME reply_checkpoint_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/reply_checkpoint_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(reply_checkpoint_test PROPERTIES TIMEOUT 600)
+endif()
+
+# a reply read again (a run that continues it, no prompt cache) keeps the bits its decode wrote (same model variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME reply_read_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/reply_read_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(reply_read_test PROPERTIES TIMEOUT 600)
 endif()
 
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE
@@ -1016,7 +1060,6 @@ basalt_embed_manifest(iq_parity)
 # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
-find_package(Python3 COMPONENTS Interpreter QUIET)
 
 # writing a community run file under docs/community/runs: formatting cases, and a byte comparison with
 # tools/check_benchmarks.py (python3)
@@ -1074,9 +1117,14 @@ else()
   if(Python3_Interpreter_FOUND)
     list(APPEND _iq_candidates ${Python3_EXECUTABLE})
   endif()
-  list(APPEND _iq_candidates "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python"
-                              /usr/bin/python3
-                              python3)
+  if(WIN32)
+    list(APPEND _iq_candidates "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe"
+                                python)
+  else()
+    list(APPEND _iq_candidates "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python"
+                                /usr/bin/python3
+                                python3)
+  endif()
 endif()
 foreach(_cand IN LISTS _iq_candidates)
   if(_cand STREQUAL "")

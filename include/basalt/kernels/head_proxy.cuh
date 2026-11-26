@@ -324,7 +324,14 @@ __device__ __forceinline__ void pick(const Final& f, int n, int n_tiles, const i
         if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
     }
     if constexpr (!PROB) {
-        if (lane == 0) *out_id = bi < 0x7fffffff ? (MAPPED ? map[bi] : bi) : (MAPPED ? map[0] : 0);
+        if (lane == 0) {
+            if constexpr (MAPPED) {
+                const int32_t id = map[bi < 0x7fffffff ? bi : 0];
+                *out_id = id < 0 ? 0 : id;
+            } else {
+                *out_id = bi < 0x7fffffff ? bi : 0;
+            }
+        }
         return;
     }
     float sum = 0.0f;
@@ -339,9 +346,13 @@ __device__ __forceinline__ void pick(const Final& f, int n, int n_tiles, const i
         float one = 0.0f;   // the pick's own term is exactly 1
         for (int c = 0; c < n; ++c) if (f.list[c] == bi) one = 1.0f;
         sum = fmaxf(sum, one);
-        if constexpr (MAPPED) *out_id = map[bi < 0x7fffffff ? bi : 0];
-        else *out_id = bi < 0x7fffffff ? bi : 0;
-        *out_prob = 1.0f / sum;
+        if constexpr (MAPPED) {
+            const int32_t id = map[bi < 0x7fffffff ? bi : 0];
+            *out_id = id < 0 ? 0 : id;
+        } else {
+            *out_id = bi < 0x7fffffff ? bi : 0;
+        }
+        *out_prob = bi < 0x7fffffff && sum > 0.0f ? 1.0f / sum : 1.0f;
     }
 }
 
@@ -385,9 +396,13 @@ __device__ __forceinline__ void pick_block(Final& f, int n, int n_tiles, const i
         float one = 0.0f;   // the pick's own term is exactly 1
         for (int c = 0; c < n; ++c) if (f.list[c] == bi) one = 1.0f;
         sum = fmaxf(sum, one);
-        if constexpr (MAPPED) *out_id = map[bi < 0x7fffffff ? bi : 0];
-        else *out_id = bi < 0x7fffffff ? bi : 0;
-        *out_prob = 1.0f / sum;
+        if constexpr (MAPPED) {
+            const int32_t id = map[bi < 0x7fffffff ? bi : 0];
+            *out_id = id < 0 ? 0 : id;
+        } else {
+            *out_id = bi < 0x7fffffff ? bi : 0;
+        }
+        *out_prob = bi < 0x7fffffff && sum > 0.0f ? 1.0f / sum : 1.0f;
     }
 }
 

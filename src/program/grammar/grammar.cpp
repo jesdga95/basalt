@@ -25,41 +25,122 @@ using Rule = std::vector<Element>;
 
 // --------------------------------------------------------------------------------------------- parser
 
-// A rule that can reach itself as its leftmost symbol would never leave the closure.
-bool left_recursive(const std::vector<Rule>& rules, size_t idx, std::vector<bool>& visited,
-                    std::vector<bool>& in_progress, std::vector<bool>& may_be_empty) {
-    if (in_progress[idx]) return true;
-    in_progress[idx] = true;
-    const Rule& rule = rules[idx];
-    bool at_start = true;
-    for (const Element& e : rule) {
-        if (end_of_seq(e)) {
-            if (at_start) {
-                may_be_empty[idx] = true;
-                break;
+// Computes which rules can derive the empty string (transitively) in O(V + E).
+std::vector<bool> compute_nullable(const std::vector<Rule>& rules) {
+    const size_t n = rules.size();
+    std::vector<bool> nullable(n, false);
+    struct AltInfo {
+        size_t owner;
+        size_t remaining;
+    };
+    std::vector<AltInfo> alts;
+    std::vector<std::vector<size_t>> ref_to_alts(n);
+    std::vector<size_t> queue;
+
+    for (size_t r = 0; r < n; ++r) {
+        const Rule& rule = rules[r];
+        size_t i = 0;
+        while (i < rule.size()) {
+            bool has_terminal = false;
+            std::vector<uint32_t> refs;
+            while (i < rule.size() && !end_of_seq(rule[i])) {
+                if (rule[i].type == ElemType::RuleRef) {
+                    refs.push_back(rule[i].value);
+                } else {
+                    has_terminal = true;
+                }
+                ++i;
             }
-            at_start = true;
-        } else {
-            at_start = false;
+            if (!has_terminal) {
+                std::sort(refs.begin(), refs.end());
+                refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+                if (refs.empty()) {
+                    if (!nullable[r]) {
+                        nullable[r] = true;
+                        queue.push_back(r);
+                    }
+                } else {
+                    const size_t alt_id = alts.size();
+                    alts.push_back({r, refs.size()});
+                    for (uint32_t target : refs) ref_to_alts[target].push_back(alt_id);
+                }
+            }
+            if (i < rule.size() && rule[i].type == ElemType::Alt) ++i;
+            else break;
         }
     }
-    bool descend = true;
-    for (const Element& e : rule) {
-        if (e.type == ElemType::RuleRef && descend) {
-            if (left_recursive(rules, e.value, visited, in_progress, may_be_empty)) return true;
-            if (!may_be_empty[e.value]) descend = false;
-        } else if (end_of_seq(e)) {
-            descend = true;
-        } else {
-            descend = false;
+
+    for (size_t head = 0; head < queue.size(); ++head) {
+        const size_t r = queue[head];
+        for (size_t alt_id : ref_to_alts[r]) {
+            AltInfo& info = alts[alt_id];
+            if (info.remaining > 0 && --info.remaining == 0 && !nullable[info.owner]) {
+                nullable[info.owner] = true;
+                queue.push_back(info.owner);
+            }
         }
     }
-    in_progress[idx] = false;
-    visited[idx] = true;
-    return false;
+    return nullable;
+}
+
+// Iterative Tarjan strongly connected components in O(V + E).
+std::vector<uint32_t> compute_sccs(size_t n, const std::vector<std::vector<uint32_t>>& adj) {
+    std::vector<uint32_t> index(n, UINT32_MAX), low(n, 0), scc(n, UINT32_MAX);
+    std::vector<uint8_t> on_stack(n, 0);
+    std::vector<uint32_t> tarjan_stk;
+    struct Frame {
+        uint32_t u;
+        size_t edge;
+    };
+    std::vector<Frame> call_stk;
+    uint32_t next_idx = 0, next_scc = 0;
+
+    for (uint32_t start = 0; start < (uint32_t) n; ++start) {
+        if (index[start] != UINT32_MAX) continue;
+        index[start] = low[start] = next_idx++;
+        tarjan_stk.push_back(start);
+        on_stack[start] = 1;
+        call_stk.push_back({start, 0});
+
+        while (!call_stk.empty()) {
+            Frame& f = call_stk.back();
+            const uint32_t u = f.u;
+            if (f.edge < adj[u].size()) {
+                const uint32_t v = adj[u][f.edge++];
+                if (index[v] == UINT32_MAX) {
+                    index[v] = low[v] = next_idx++;
+                    tarjan_stk.push_back(v);
+                    on_stack[v] = 1;
+                    call_stk.push_back({v, 0});
+                } else if (on_stack[v]) {
+                    if (index[v] < low[u]) low[u] = index[v];
+                }
+            } else {
+                call_stk.pop_back();
+                if (!call_stk.empty()) {
+                    const uint32_t p = call_stk.back().u;
+                    if (low[u] < low[p]) low[p] = low[u];
+                }
+                if (low[u] == index[u]) {
+                    for (;;) {
+                        const uint32_t w = tarjan_stk.back();
+                        tarjan_stk.pop_back();
+                        on_stack[w] = 0;
+                        scc[w] = next_scc;
+                        if (w == u) break;
+                    }
+                    ++next_scc;
+                }
+            }
+        }
+    }
+    return scc;
 }
 
 // Throws if a rule refers to a rule that is not defined or if any rule is left-recursive.
+// A left-call cycle that pushes a return frame would grow Arena::closure() stacks without bound; direct leftmost
+// cycles (every edge at index 0) are rejected as well. Pure tail recursion after a nullable prefix (as in `([x]*)*`)
+// does not push a return frame and terminates cleanly via closure deduplication.
 void check_rules(const std::vector<Rule>& rules, const std::function<std::string(uint32_t)>& name_of) {
     for (const Rule& r : rules) {
         if (r.empty() || r.back().type != ElemType::End) throw std::runtime_error("undefined rule");
@@ -70,10 +151,48 @@ void check_rules(const std::vector<Rule>& rules, const std::function<std::string
                 throw std::runtime_error("undefined rule identifier '" + name_of(e.value) + "'");
         }
     }
-    std::vector<bool> visited(rules.size()), in_progress(rules.size()), may_be_empty(rules.size());
-    for (size_t i = 0; i < rules.size(); ++i) {
-        if (!visited[i] && left_recursive(rules, i, visited, in_progress, may_be_empty))
-            throw std::runtime_error("left recursion in rule '" + name_of((uint32_t) i) + "'");
+    const std::vector<bool> may_be_empty = compute_nullable(rules);
+    std::vector<std::vector<uint32_t>> left_adj(rules.size());
+    std::vector<std::vector<uint32_t>> start_adj(rules.size());
+    std::vector<std::pair<uint32_t, uint32_t>> push_edges;
+
+    for (size_t r = 0; r < rules.size(); ++r) {
+        const Rule& rule = rules[r];
+        bool descend = true;
+        bool at_start = true;
+        for (size_t k = 0; k < rule.size(); ++k) {
+            const Element& e = rule[k];
+            if (e.type == ElemType::RuleRef && descend) {
+                left_adj[r].push_back(e.value);
+                if (at_start) start_adj[r].push_back(e.value);
+                if (k + 1 < rule.size() && !end_of_seq(rule[k + 1])) {
+                    push_edges.emplace_back((uint32_t) r, e.value);
+                }
+                at_start = false;
+                if (!may_be_empty[e.value]) descend = false;
+            } else if (end_of_seq(e)) {
+                descend = true;
+                at_start = true;
+            } else {
+                descend = false;
+                at_start = false;
+            }
+        }
+    }
+
+    const std::vector<uint32_t> left_scc = compute_sccs(rules.size(), left_adj);
+    for (const auto& edge : push_edges) {
+        if (left_scc[edge.first] == left_scc[edge.second]) {
+            throw std::runtime_error("left recursion in rule '" + name_of(edge.first) + "'");
+        }
+    }
+    const std::vector<uint32_t> start_scc = compute_sccs(rules.size(), start_adj);
+    for (size_t u = 0; u < rules.size(); ++u) {
+        for (uint32_t v : start_adj[u]) {
+            if (start_scc[u] == start_scc[v]) {
+                throw std::runtime_error("left recursion in rule '" + name_of((uint32_t) u) + "'");
+            }
+        }
     }
 }
 
@@ -185,6 +304,8 @@ private:
             if (((unsigned char) p[i] & 0xC0) != 0x80) throw fail("invalid UTF-8", p);
             v = (v << 6) | ((unsigned char) p[i] & 0x3F);
         }
+        static constexpr uint32_t kMinCp[5] = {0, 0, 0x80, 0x800, 0x10000};
+        if (v < kMinCp[len] || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) throw fail("invalid UTF-8", p);
         return {v, p + len};
     }
 
@@ -249,12 +370,14 @@ private:
         // S{m,n} becomes m copies of S followed by a chain of n-m optional S rules; S* and S+ use one recursive rule.
         auto repeat = [&](uint64_t min_t, uint64_t max_t) {
             bool no_max = max_t == UINT64_MAX;
+            if (!no_max && max_t < min_t) throw std::runtime_error("repetition minimum exceeds maximum");
             if (last_start == rule.size()) throw fail("expecting an item before a repetition", pos);
             Rule prev(rule.begin() + (std::ptrdiff_t) last_start, rule.end());
             uint64_t total = 1;
             if (!no_max && max_t > 0) total = max_t;
             else if (min_t > 0) total = min_t;
-            if (n_prev * total > kMaxRepetition) throw std::runtime_error("repetition is too large");
+            if (total > kMaxRepetition / (std::max<uint64_t>)(1, n_prev))
+                throw std::runtime_error("repetition is too large");
             if (min_t == 0) {
                 rule.resize(last_start);
             } else {
@@ -374,6 +497,7 @@ private:
                 } else {
                     throw fail("expecting ','", pos);
                 }
+                if (max_t < min_t) throw std::runtime_error("repetition minimum exceeds maximum");
                 if (min_t > kMaxRepetition) throw std::runtime_error("repetition is too large");
                 if (max_t != UINT64_MAX && max_t > kMaxRepetition) max_t = UINT64_MAX;
                 repeat(min_t, max_t);
@@ -394,6 +518,36 @@ std::shared_ptr<const Grammar> Grammar::make(const std::vector<std::vector<Eleme
         g->rule_start_.push_back((uint32_t) g->elems_.size());
         g->elems_.insert(g->elems_.end(), r.begin(), r.end());
     }
+    // Partition [0, 0x10FFFF] into equivalence classes whose code points match the same grammar elements.
+    std::vector<uint32_t> bp = {0u, 0x80u, 0x110000u};
+    for (size_t i = 0; i < g->elems_.size(); ++i) {
+        const ElemType ty = g->elems_[i].type;
+        if (ty == ElemType::Char || ty == ElemType::CharNot || ty == ElemType::CharAlt) {
+            const uint32_t lo = g->elems_[i].value;
+            uint32_t hi = lo;
+            if (i + 1 < g->elems_.size() && g->elems_[i + 1].type == ElemType::CharRngUpper) hi = g->elems_[++i].value;
+            if (lo <= hi && lo <= 0x10FFFFu) {
+                bp.push_back(lo);
+                if (hi < 0x10FFFFu) bp.push_back(hi + 1);
+            }
+        }
+    }
+    std::sort(bp.begin(), bp.end());
+    bp.erase(std::unique(bp.begin(), bp.end()), bp.end());
+    g->class_rep_.reserve(bp.size() - 1);
+    for (size_t k = 0; k + 1 < bp.size(); ++k) {
+        const uint32_t lo = bp[k], hi = bp[k + 1];
+        g->class_rep_.push_back(lo);
+        if (lo < 0x80u) {
+            const uint32_t end = (std::min)(hi, 0x80u);
+            for (uint32_t c = lo; c < end; ++c) g->ascii_cls_[c] = (uint16_t) k;
+        } else if (lo == 0x80u) {
+            g->wide_base_ = (uint32_t) k;
+        } else {
+            g->wide_bp_.push_back(lo);
+        }
+    }
+    g->n_classes_ = (uint32_t) g->class_rep_.size();
     return g;
 }
 
@@ -433,23 +587,78 @@ std::shared_ptr<const Grammar> Grammar::from_rules(const std::vector<std::vector
 
 // --------------------------------------------------------------------------------------------- stacks
 
+namespace {
+
+// Valid non-surrogate Unicode intervals reachable by completing a partial UTF-8 sequence `(value, n_remain)`.
+// Returns 0 (no valid completion: overlong lead, surrogate block, or > U+10FFFF), 1, or 2 disjoint intervals.
+int utf8_partial_ranges(uint32_t value, int n_remain, uint32_t out_lo[2], uint32_t out_hi[2]) {
+    if (n_remain <= 0 || n_remain > 3 || (n_remain == 1 && value < 2)) return 0;
+    uint32_t low = value << (n_remain * 6);
+    uint32_t high = low | ((1u << (n_remain * 6)) - 1);
+    if (low == 0) {
+        if (n_remain == 2) low = 1u << 11;
+        else if (n_remain == 3) low = 1u << 16;
+    }
+    if (high > 0x10FFFFu) high = 0x10FFFFu;
+    if (low > high) return 0;
+    if (high < 0xD800u || low > 0xDFFFu) {
+        out_lo[0] = low;
+        out_hi[0] = high;
+        return 1;
+    }
+    if (low >= 0xD800u && high <= 0xDFFFu) return 0;
+    int n = 0;
+    if (low < 0xD800u) {
+        out_lo[n] = low;
+        out_hi[n] = 0xD7FFu;
+        ++n;
+    }
+    if (high > 0xDFFFu) {
+        out_lo[n] = 0xE000u;
+        out_hi[n] = high;
+        ++n;
+    }
+    return n;
+}
+
+uint64_t hash_u32_vec(const std::vector<uint32_t>& v) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ ((uint64_t) v.size() * 0xFF51AFD7ED558CCDull);
+    for (uint32_t x : v) {
+        h ^= (uint64_t) x + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h *= 0xBF58476D1CE4E5B9ull;
+    }
+    return h ^ (h >> 31);
+}
+
+}  // namespace
+
 // A stack is a chain of interned (element, parent) nodes; the element is the next one to match in its rule
-// sequence. Node 0 is the empty stack. Closures and character steps are memoized per node.
+// sequence. Node 0 is the empty stack. Closures, single-stack steps, and stack-set DFA transitions are memoized
+// by grammar character equivalence class.
 struct GrammarState::Arena {
     struct Node {
         uint32_t elem;
         uint32_t parent;
     };
+    static constexpr size_t kMaxFlatEntries = 4u * 1024u * 1024u;
     const Grammar* g;
+    uint32_t n_cls = 1;
+    size_t max_flat_nodes = 0;
+    size_t max_flat_sets = 0;
     std::vector<Node> nodes;
     std::unordered_map<uint64_t, uint32_t> interned;
-    std::deque<std::vector<uint32_t>> sets;       // stable references
+    std::deque<std::vector<uint32_t>> sets;       // stable references; set 0 is always {}
+    std::vector<uint8_t> set_flags;               // bit 0: has token element; bit 1: accepts (front == 0); bit 2: only {0}
+    std::unordered_map<uint64_t, std::vector<int32_t>> set_buckets;
     std::vector<int32_t> closure_set;             // per node, -1 = not computed
-    std::vector<int32_t> ascii_step;              // node * 128 + cp, -1 = not computed
-    std::unordered_map<uint64_t, int32_t> wide_step;
+    std::vector<int32_t> node_step;               // node * n_cls + cls -> set_id, -1 = not computed
+    std::unordered_map<uint64_t, int32_t> node_step_overflow;
+    std::vector<int32_t> set_trans;               // set_id * n_cls + cls -> next set_id, -1 = not computed
+    std::unordered_map<uint64_t, int32_t> set_trans_overflow;
+    std::vector<uint32_t> merge_scratch;
     struct MaskEntry {
         uint64_t vocab;
-        std::vector<uint32_t> stacks;
+        int32_t set_id;
         std::vector<uint8_t> mask;
         uint64_t used;
     };
@@ -457,10 +666,16 @@ struct GrammarState::Arena {
     std::vector<MaskEntry> masks;
     uint64_t tick = 0;
 
-    explicit Arena(const Grammar* gr) : g(gr) {
+    explicit Arena(const Grammar* gr) : g(gr), n_cls(gr ? (std::max)(1u, gr->class_count()) : 1u) {
+        max_flat_nodes = n_cls <= 256 ? kMaxFlatEntries / n_cls : 0;
+        max_flat_sets = n_cls <= 256 ? kMaxFlatEntries / n_cls : 0;
         nodes.push_back({0, 0});
         closure_set.push_back(-1);
-        ascii_step.assign(128, -1);
+        if (max_flat_nodes > 0) node_step.assign(n_cls, -1);
+        // set 0 is the empty stack set {}
+        sets.emplace_back();
+        set_flags.push_back(0);
+        if (max_flat_sets > 0) set_trans.assign(n_cls, 0);
     }
 
     const Element& el(uint32_t i) const { return g->elements()[i]; }
@@ -468,6 +683,9 @@ struct GrammarState::Arena {
     bool token_matches(uint32_t e, uint32_t id) const {
         return el(e).type == ElemType::Token ? el(e).value == id : el(e).value != id;
     }
+    bool set_has_token(int32_t set_id) const { return (set_flags[(size_t) set_id] & 1u) != 0; }
+    bool set_accepts(int32_t set_id) const { return (set_flags[(size_t) set_id] & 2u) != 0; }
+    bool set_only_empty(int32_t set_id) const { return (set_flags[(size_t) set_id] & 4u) != 0; }
 
     uint32_t push(uint32_t parent, uint32_t elem) {
         uint64_t key = ((uint64_t) elem << 32) | parent;
@@ -476,14 +694,37 @@ struct GrammarState::Arena {
         uint32_t id = (uint32_t) nodes.size();
         nodes.push_back({elem, parent});
         closure_set.push_back(-1);
-        ascii_step.resize(ascii_step.size() + 128, -1);
+        if (nodes.size() <= max_flat_nodes) node_step.resize(nodes.size() * n_cls, -1);
         interned.emplace(key, id);
         return id;
     }
 
-    // The stacks (each ending at a character element, or empty) a stack can be expanded into.
-    const std::vector<uint32_t>& closure(uint32_t s) {
-        if (closure_set[s] >= 0) return sets[(size_t) closure_set[s]];
+    int32_t intern_set(std::vector<uint32_t>&& s) {
+        if (s.empty()) return 0;
+        const uint64_t h = hash_u32_vec(s);
+        auto& bucket = set_buckets[h];
+        for (int32_t id : bucket) {
+            if (sets[(size_t) id] == s) return id;
+        }
+        const int32_t id = (int32_t) sets.size();
+        uint8_t fl = 0;
+        if (s.front() == 0) {
+            fl |= 2u;
+            if (s.size() == 1) fl |= 4u;
+        }
+        for (uint32_t st : s) {
+            if (st != 0 && is_token(nodes[st].elem)) { fl |= 1u; break; }
+        }
+        sets.push_back(std::move(s));
+        set_flags.push_back(fl);
+        if (sets.size() <= max_flat_sets) set_trans.resize(sets.size() * n_cls, -1);
+        bucket.push_back(id);
+        return id;
+    }
+
+    // The interned stack set (each stack ending at a character/token element, or empty) a stack expands into.
+    int32_t closure_id(uint32_t s) {
+        if (closure_set[s] >= 0) return closure_set[s];
         std::vector<uint32_t> todo{s}, out;
         std::unordered_set<uint32_t> seen;
         while (!todo.empty()) {
@@ -512,9 +753,9 @@ struct GrammarState::Arena {
         }
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
-        sets.push_back(std::move(out));
-        closure_set[s] = (int32_t) sets.size() - 1;
-        return sets.back();
+        const int32_t id = intern_set(std::move(out));
+        closure_set[s] = id;
+        return id;
     }
 
     // Whether `cp` matches the class at element `e`, and the element after the class.
@@ -538,58 +779,130 @@ struct GrammarState::Arena {
         return found == positive;
     }
 
-    // Whether some completion of a partial UTF-8 sequence could match the class at element `e`.
-    bool match_partial(uint32_t e, uint32_t value, int n_remain) const {
+    // Whether some valid completion in the disjoint intervals [r_lo[r], r_hi[r]] matches the class at element `e`.
+    bool match_partial_ranges(uint32_t e, const uint32_t r_lo[2], const uint32_t r_hi[2], int n_ranges) const {
         const Element* p = &g->elements()[e];
-        bool positive = p->type == ElemType::Char || p->type == ElemType::CharAny;
-        if (n_remain < 0 || (n_remain == 1 && value < 2)) return false;
-        uint32_t low = value << (n_remain * 6);
-        uint32_t high = low | ((1u << (n_remain * 6)) - 1);
-        if (low == 0) {
-            if (n_remain == 2) low = 1u << 11;
-            else if (n_remain == 3) low = 1u << 16;
+        if (p->type == ElemType::CharAny) return true;
+        const bool positive = p->type == ElemType::Char;
+        if (positive) {
+            do {
+                uint32_t lo = p->value, hi = lo;
+                if (p[1].type == ElemType::CharRngUpper) { hi = p[1].value; p += 2; }
+                else { p += 1; }
+                if (lo <= hi) {
+                    for (int r = 0; r < n_ranges; ++r) {
+                        if (lo <= r_hi[r] && r_lo[r] <= hi) return true;
+                    }
+                }
+            } while (p->type == ElemType::CharAlt);
+            return false;
         }
+        // Negated class: matches some valid completion iff the excluded ranges do not completely cover [r_lo, r_hi].
+        const uint32_t span_lo = r_lo[0], span_hi = r_hi[n_ranges - 1];
+        std::pair<uint32_t, uint32_t> stack_buf[16];
+        size_t n_excl = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> heap_buf;
         do {
-            if (p[1].type == ElemType::CharRngUpper) {
-                if (p->value <= high && low <= p[1].value) return positive;
-                p += 2;
-            } else if (p->type == ElemType::CharAny) {
-                return true;
-            } else {
-                if (low <= p->value && p->value <= high) return positive;
-                p += 1;
+            uint32_t lo = p->value, hi = lo;
+            if (p[1].type == ElemType::CharRngUpper) { hi = p[1].value; p += 2; }
+            else { p += 1; }
+            if (lo <= hi && lo <= span_hi && span_lo <= hi) {
+                if (n_excl < 16) {
+                    stack_buf[n_excl++] = {lo, hi};
+                } else {
+                    if (heap_buf.empty()) heap_buf.assign(stack_buf, stack_buf + 16);
+                    heap_buf.emplace_back(lo, hi);
+                    ++n_excl;
+                }
             }
         } while (p->type == ElemType::CharAlt);
-        return !positive;
+        if (n_excl == 0) return true;
+        std::pair<uint32_t, uint32_t>* excl = heap_buf.empty() ? stack_buf : heap_buf.data();
+        if (n_excl > 1) {
+            std::sort(excl, excl + n_excl,
+                      [](const auto& a, const auto& b) { return a.first != b.first ? a.first < b.first : a.second < b.second; });
+        }
+        for (int r = 0; r < n_ranges; ++r) {
+            uint32_t cur = r_lo[r];
+            const uint32_t end = r_hi[r];
+            for (size_t i = 0; i < n_excl; ++i) {
+                if (excl[i].second < cur) continue;
+                if (excl[i].first > cur) return true;
+                if (excl[i].second >= end) { cur = end + 1; break; }
+                cur = excl[i].second + 1;
+            }
+            if (cur <= end) return true;
+        }
+        return false;
     }
 
-    // The stacks after `s` consumes `cp`; empty when it does not match.
-    const std::vector<uint32_t>& step(uint32_t s, uint32_t cp) {
-        int32_t* slot;
-        if (cp < 128) {
-            slot = &ascii_step[(size_t) s * 128 + cp];
+    // The interned stack set after single stack `s` consumes character class `cls`; 0 when it does not match.
+    int32_t step_cls(uint32_t s, uint32_t cls) {
+        const bool flat = s < max_flat_nodes;
+        if (flat) {
+            const int32_t cached = node_step[(size_t) s * n_cls + cls];
+            if (cached >= 0) return cached;
         } else {
-            slot = &wide_step.emplace(((uint64_t) s << 32) | cp, -1).first->second;
+            const auto it = node_step_overflow.find(((uint64_t) s << 32) | cls);
+            if (it != node_step_overflow.end()) return it->second;
         }
-        if (*slot >= 0) return sets[(size_t) *slot];
-        std::vector<uint32_t> out;
+        int32_t id = 0;
         uint32_t next;
+        const uint32_t cp = g->class_rep(cls);
         if (s != 0 && !is_token(nodes[s].elem) && match(nodes[s].elem, cp, next)) {
             uint32_t ns = nodes[s].parent;
             if (!end_of_seq(el(next))) ns = push(ns, next);
-            out = closure(ns);
+            id = closure_id(ns);
         }
-        sets.push_back(std::move(out));
-        // push() may have grown ascii_step, so the slot is looked up again
-        int32_t idx = (int32_t) sets.size() - 1;
-        if (cp < 128) ascii_step[(size_t) s * 128 + cp] = idx;
-        else wide_step[((uint64_t) s << 32) | cp] = idx;
-        return sets.back();
+        if (flat) node_step[(size_t) s * n_cls + cls] = id;
+        else node_step_overflow[((uint64_t) s << 32) | cls] = id;
+        return id;
     }
 
-    bool partial_ok(const std::vector<uint32_t>& stacks, uint32_t value, int n_remain) const {
-        for (uint32_t s : stacks) {
-            if (s != 0 && !is_token(nodes[s].elem) && match_partial(nodes[s].elem, value, n_remain)) return true;
+    // The interned stack set after stack set `set_id` consumes character class `cls`; 0 when no stack survives.
+    int32_t set_step_cls(int32_t set_id, uint32_t cls) {
+        if (set_id == 0) return 0;
+        const bool flat = (size_t) set_id < max_flat_sets;
+        if (flat) {
+            const int32_t cached = set_trans[(size_t) set_id * n_cls + cls];
+            if (cached >= 0) return cached;
+        } else {
+            const auto it = set_trans_overflow.find(((uint64_t) (uint32_t) set_id << 32) | cls);
+            if (it != set_trans_overflow.end()) return it->second;
+        }
+        int32_t next_id = 0;
+        const std::vector<uint32_t>& st = sets[(size_t) set_id];
+        if (st.size() == 1) {
+            next_id = step_cls(st[0], cls);
+        } else {
+            merge_scratch.clear();
+            for (uint32_t s : st) {
+                const int32_t sub = step_cls(s, cls);
+                if (sub == 0) continue;
+                const std::vector<uint32_t>& r = sets[(size_t) sub];
+                merge_scratch.insert(merge_scratch.end(), r.begin(), r.end());
+            }
+            if (!merge_scratch.empty()) {
+                std::sort(merge_scratch.begin(), merge_scratch.end());
+                merge_scratch.erase(std::unique(merge_scratch.begin(), merge_scratch.end()), merge_scratch.end());
+                std::vector<uint32_t> tmp(merge_scratch);
+                next_id = intern_set(std::move(tmp));
+            }
+        }
+        if (flat) set_trans[(size_t) set_id * n_cls + cls] = next_id;
+        else set_trans_overflow[((uint64_t) (uint32_t) set_id << 32) | cls] = next_id;
+        return next_id;
+    }
+
+    bool partial_ok_set(int32_t set_id, uint32_t value, int n_remain) {
+        if (set_id == 0) return false;
+        uint32_t r_lo[2], r_hi[2];
+        const int n_ranges = utf8_partial_ranges(value, n_remain, r_lo, r_hi);
+        if (n_ranges == 0) return false;
+        if (g->wide_uniform()) return set_step_cls(set_id, g->wide_base()) != 0;
+        for (uint32_t s : sets[(size_t) set_id]) {
+            if (s != 0 && !is_token(nodes[s].elem) && match_partial_ranges(nodes[s].elem, r_lo, r_hi, n_ranges))
+                return true;
         }
         return false;
     }
@@ -601,29 +914,67 @@ Vocab::Vocab(std::vector<std::string> bytes, std::vector<int32_t> end_ids)
     : bytes_(std::move(bytes)), end_ids_(std::move(end_ids)) {
     static std::atomic<uint64_t> next_id{1};
     id_ = next_id.fetch_add(1);
-    nodes_.emplace_back();
+    struct BuildNode {
+        uint32_t first_child = 0;
+        uint32_t next_sibling = 0;
+        int32_t first_token = -1;
+        uint8_t byte = 0;
+    };
+    std::vector<BuildNode> build(1);
     next_token_.assign(bytes_.size(), -1);
-    std::vector<int32_t> is_end(bytes_.size(), 0);
+    std::vector<uint8_t> is_end(bytes_.size(), 0);
     for (int32_t e : end_ids_) if (e >= 0 && (size_t) e < bytes_.size()) is_end[(size_t) e] = 1;
     for (size_t t = 0; t < bytes_.size(); ++t) {
         if (bytes_[t].empty() || is_end[t]) continue;
         uint32_t cur = 0;
         for (unsigned char b : bytes_[t]) {
-            uint32_t c = nodes_[cur].first_child;
-            while (c != 0 && nodes_[c].byte != b) c = nodes_[c].next_sibling;
+            uint32_t c = build[cur].first_child;
+            while (c != 0 && build[c].byte != b) c = build[c].next_sibling;
             if (c == 0) {
-                c = (uint32_t) nodes_.size();
-                Node n;
+                c = (uint32_t) build.size();
+                BuildNode n;
                 n.byte = b;
-                n.next_sibling = nodes_[cur].first_child;
-                nodes_.push_back(n);
-                nodes_[cur].first_child = c;
+                n.next_sibling = build[cur].first_child;
+                build.push_back(n);
+                build[cur].first_child = c;
             }
             cur = c;
         }
-        next_token_[t] = nodes_[cur].first_token;
-        nodes_[cur].first_token = (int32_t) t;
+        next_token_[t] = build[cur].first_token;
+        build[cur].first_token = (int32_t) t;
     }
+    // Compact the trie into DFS preorder with children ordered by byte value so walks scan linearly and skip dead
+    // subtrees in O(1).
+    nodes_.reserve(build.size());
+    nodes_.push_back({(uint32_t) build.size(), -1, 0});
+    struct Frame {
+        uint32_t idx;
+        uint32_t depth;
+        bool exit;
+    };
+    std::vector<Frame> stk;
+    std::vector<uint32_t> kids;
+    auto push_children = [&](uint32_t parent, uint32_t depth) {
+        kids.clear();
+        for (uint32_t c = build[parent].first_child; c != 0; c = build[c].next_sibling) kids.push_back(c);
+        std::sort(kids.begin(), kids.end(), [&](uint32_t a, uint32_t b) { return build[a].byte > build[b].byte; });
+        for (uint32_t c : kids) stk.push_back({c, depth, false});
+    };
+    push_children(0, 1);
+    while (!stk.empty()) {
+        const Frame f = stk.back();
+        stk.pop_back();
+        if (f.exit) {
+            nodes_[f.idx].skip = (uint32_t) nodes_.size();
+            continue;
+        }
+        const uint32_t flat_idx = (uint32_t) nodes_.size();
+        nodes_.push_back({0, build[f.idx].first_token, (f.depth << 8) | build[f.idx].byte});
+        if (f.depth > max_depth_) max_depth_ = f.depth;
+        stk.push_back({flat_idx, 0, true});
+        push_children(f.idx, f.depth + 1);
+    }
+    nodes_[0].skip = (uint32_t) nodes_.size();
 }
 
 // --------------------------------------------------------------------------------------------- state
@@ -843,13 +1194,14 @@ GrammarState::GrammarState(std::shared_ptr<const Grammar> g, Triggers triggers)
     reset();
 }
 
-std::vector<uint32_t> GrammarState::root_stacks() const {
+int32_t GrammarState::root_set() const {
     std::vector<uint32_t> out;
     Arena& a = *arena_;
     uint32_t sub = g_->rule_start(g_->root());
     for (;;) {
         uint32_t s = end_of_seq(a.el(sub)) ? 0 : a.push(0, sub);
-        const std::vector<uint32_t>& c = a.closure(s);
+        const int32_t cid = a.closure_id(s);
+        const std::vector<uint32_t>& c = a.sets[(size_t) cid];
         out.insert(out.end(), c.begin(), c.end());
         while (!end_of_seq(a.el(sub))) ++sub;
         if (a.el(sub).type == ElemType::Alt) ++sub;
@@ -857,7 +1209,7 @@ std::vector<uint32_t> GrammarState::root_stacks() const {
     }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
+    return a.intern_set(std::move(out));
 }
 
 void GrammarState::reset() {
@@ -865,24 +1217,29 @@ void GrammarState::reset() {
     utf8_ = Utf8{};
     tail_.clear();
     pieces_.clear();
-    stacks_ = root_stacks();
+    set_id_ = root_set();
 }
 
 bool GrammarState::accepting() const {
     if (!active_) return true;
-    return utf8_.n_remain == 0 && !stacks_.empty() && stacks_.front() == 0;
+    return utf8_.n_remain == 0 && arena_ != nullptr && arena_->set_accepts(set_id_);
 }
 
-// Feeds bytes through the stacks. False on a byte that no stack accepts.
-bool GrammarState::feed(const std::string_view& bytes, std::vector<uint32_t>& stacks, Utf8& u) const {
+// Feeds bytes through the interned stack set. False on a byte that no stack accepts.
+bool GrammarState::feed(const std::string_view& bytes, int32_t& set_id, Utf8& u) const {
     Arena& a = *arena_;
-    std::vector<uint32_t> tmp;
+    const Grammar& g = *g_;
+    const uint16_t* ascii_cls = g.ascii_classes();
+    int32_t cur = set_id;
     for (unsigned char b : bytes) {
+        if (u.n_remain == 0 && b < 0x80) {
+            cur = a.set_step_cls(cur, ascii_cls[b]);
+            if (cur == 0) return false;
+            continue;
+        }
         uint32_t cp;
         if (u.n_remain == 0) {
-            if (b < 0x80) {
-                cp = b;
-            } else if (b >= 0xC2 && b <= 0xDF) {
+            if (b >= 0xC2 && b <= 0xDF) {
                 u = {(uint32_t) (b & 0x1F), 1};
                 continue;
             } else if (b >= 0xE0 && b <= 0xEF) {
@@ -896,62 +1253,60 @@ bool GrammarState::feed(const std::string_view& bytes, std::vector<uint32_t>& st
             }
         } else {
             if ((b & 0xC0) != 0x80) return false;
+            if (u.n_remain == 2 && ((u.value == 0 && b < 0xA0) || (u.value == 0x0D && b >= 0xA0))) return false;
+            if (u.n_remain == 3 && ((u.value == 0 && b < 0x90) || (u.value == 4 && b >= 0x90))) return false;
             u.value = (u.value << 6) | (b & 0x3F);
             if (--u.n_remain > 0) continue;
             cp = u.value;
             if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
         }
-        tmp.clear();
-        for (uint32_t s : stacks) {
-            const std::vector<uint32_t>& r = a.step(s, cp);
-            tmp.insert(tmp.end(), r.begin(), r.end());
-        }
-        std::sort(tmp.begin(), tmp.end());
-        tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
-        if (tmp.empty()) return false;
-        stacks.swap(tmp);
+        cur = a.set_step_cls(cur, g.char_class(cp));
+        if (cur == 0) return false;
     }
-    if (u.n_remain > 0 && !a.partial_ok(stacks, u.value, u.n_remain)) return false;
+    if (u.n_remain > 0 && !a.partial_ok_set(cur, u.value, u.n_remain)) return false;
+    set_id = cur;
     return true;
 }
 
-// Advances `stacks` over one token: a stack waiting for a token reference takes the token by id, the others read its
+// Advances `set_id` over one token: a stack waiting for a token reference takes the token by id, the others read its
 // bytes. False if no stack survives.
-bool GrammarState::advance(std::vector<uint32_t>& stacks, Utf8& u, std::string_view bytes, int32_t token_id) const {
+bool GrammarState::advance(int32_t& set_id, Utf8& u, std::string_view bytes, int32_t token_id) const {
     Arena& a = *arena_;
-    bool any_token = false;
-    for (uint32_t s : stacks) {
-        if (s != 0 && a.is_token(a.nodes[s].elem)) any_token = true;
-    }
-    if (!any_token) return feed(bytes, stacks, u);
+    if (set_id == 0) return false;
+    if (!a.set_has_token(set_id)) return feed(bytes, set_id, u);
     std::vector<uint32_t> text, out;
-    for (uint32_t s : stacks) {
+    for (uint32_t s : a.sets[(size_t) set_id]) {
         if (s == 0 || !a.is_token(a.nodes[s].elem)) {
             text.push_back(s);
         } else if (token_id >= 0 && a.token_matches(a.nodes[s].elem, (uint32_t) token_id)) {
             uint32_t e = a.nodes[s].elem;
             uint32_t ns = a.nodes[s].parent;
             if (!end_of_seq(a.el(e + 1))) ns = a.push(ns, e + 1);
-            const std::vector<uint32_t>& c = a.closure(ns);
+            const int32_t cid = a.closure_id(ns);
+            const std::vector<uint32_t>& c = a.sets[(size_t) cid];
             out.insert(out.end(), c.begin(), c.end());
         }
     }
     Utf8 nu = u;
-    if (!text.empty() && feed(bytes, text, nu)) {
-        out.insert(out.end(), text.begin(), text.end());
-        u = nu;
+    if (!text.empty()) {
+        int32_t tid = a.intern_set(std::move(text));
+        if (feed(bytes, tid, nu)) {
+            const std::vector<uint32_t>& survived = a.sets[(size_t) tid];
+            out.insert(out.end(), survived.begin(), survived.end());
+            u = nu;
+        }
     }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     if (out.empty()) return false;
-    stacks.swap(out);
+    set_id = a.intern_set(std::move(out));
     return true;
 }
 
 // Starts the grammar from the root and feeds it the output from `from` on (the replay of the buffered tokens when
 // patterns are in use); on failure the state is unchanged.
 bool GrammarState::fire(size_t from, bool by_token, int32_t token_id, std::string_view bytes) {
-    std::vector<uint32_t> st = root_stacks();
+    int32_t st = root_set();
     Utf8 u;
     if (by_token) {
         if (!advance(st, u, bytes, token_id)) return false;
@@ -964,24 +1319,24 @@ bool GrammarState::fire(size_t from, bool by_token, int32_t token_id, std::strin
     } else if (!advance(st, u, std::string_view(tail_).substr(from), -1)) {
         return false;
     }
-    stacks_.swap(st);
+    set_id_ = st;
     utf8_ = u;
     active_ = true;
     tail_.clear();
     pieces_.clear();
-    if (stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
+    if (arena_->set_only_empty(set_id_) && utf8_.n_remain == 0) reset();
     return true;
 }
 
 bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
     if (!g_) return true;
     if (active_) {
-        std::vector<uint32_t> st = stacks_;
+        int32_t st = set_id_;
         Utf8 u = utf8_;
         if (!advance(st, u, bytes, token_id)) return false;
-        stacks_.swap(st);
+        set_id_ = st;
         utf8_ = u;
-        if (triggers_.lazy() && stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
+        if (triggers_.lazy() && arena_->set_only_empty(set_id_) && utf8_.n_remain == 0) reset();
         return true;
     }
     for (int32_t t : triggers_.tokens) {
@@ -1036,56 +1391,90 @@ bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
 }
 
 bool GrammarState::allows(std::string_view bytes, int32_t token_id) const {
+    if (!g_) return true;
+    if (active_) {
+        int32_t st = set_id_;
+        Utf8 u = utf8_;
+        return advance(st, u, bytes, token_id);
+    }
     GrammarState copy = *this;
     return copy.accept(bytes, token_id);
 }
 
-void GrammarState::walk(const Vocab& v, uint32_t node, const std::vector<uint32_t>& stacks, const Utf8& u,
-                        std::vector<uint8_t>& out) const {
+void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std::vector<uint8_t>& out) const {
+    const size_t n_nodes = v.nodes_.size();
+    if (n_nodes <= 1) return;
     Arena& a = *arena_;
-    std::vector<uint32_t> tmp;
-    for (uint32_t c = v.nodes_[node].first_child; c != 0; c = v.nodes_[c].next_sibling) {
-        unsigned char b = v.nodes_[c].byte;
-        Utf8 nu = u;
-        const std::vector<uint32_t>* next = &stacks;
-        uint32_t cp = 0;
-        bool complete = false;
-        if (nu.n_remain == 0) {
-            if (b < 0x80) { cp = b; complete = true; }
-            else if (b >= 0xC2 && b <= 0xDF) nu = {(uint32_t) (b & 0x1F), 1};
-            else if (b >= 0xE0 && b <= 0xEF) nu = {(uint32_t) (b & 0x0F), 2};
-            else if (b >= 0xF0 && b <= 0xF4) nu = {(uint32_t) (b & 0x07), 3};
-            else continue;
-        } else {
-            if ((b & 0xC0) != 0x80) continue;
-            nu.value = (nu.value << 6) | (b & 0x3F);
-            if (--nu.n_remain == 0) {
-                cp = nu.value;
-                if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) continue;
-                complete = true;
-            }
-        }
-        if (complete) {
-            if (stacks.size() == 1) {
-                next = &a.step(stacks[0], cp);
+    const Grammar& g = *g_;
+    const uint16_t* ascii_cls = g.ascii_classes();
+    const Vocab::Node* nodes = v.nodes_.data();
+    const int32_t* next_tok = v.next_token_.data();
+    const size_t depth_cap = (size_t) v.max_depth_ + 1;
+    int32_t stack_set_buf[256];
+    Utf8 stack_u_buf[256];
+    std::vector<int32_t> heap_set;
+    std::vector<Utf8> heap_u;
+    int32_t* set_stk = stack_set_buf;
+    Utf8* u_stk = stack_u_buf;
+    if (depth_cap > 256) {
+        heap_set.resize(depth_cap);
+        heap_u.resize(depth_cap);
+        set_stk = heap_set.data();
+        u_stk = heap_u.data();
+    }
+    set_stk[0] = root_set_id;
+    u_stk[0] = u;
+    const uint32_t n_cls = a.n_cls;
+    const size_t max_flat = a.max_flat_sets;
+    uint8_t* out_data = out.data();
+    for (uint32_t i = 1; i < n_nodes;) {
+        const Vocab::Node& nd = nodes[i];
+        const uint32_t d = nd.depth_byte >> 8;
+        const unsigned char b = (unsigned char) (nd.depth_byte & 0xFFu);
+        const int32_t parent_set = set_stk[d - 1];
+        Utf8 nu = u_stk[d - 1];
+        int32_t next_set = parent_set;
+        if (nu.n_remain == 0 && b < 0x80) {
+            const uint32_t cls = ascii_cls[b];
+            if ((size_t) parent_set < max_flat) {
+                next_set = a.set_trans[(size_t) parent_set * n_cls + cls];
+                if (next_set < 0) next_set = a.set_step_cls(parent_set, cls);
             } else {
-                tmp.clear();
-                for (uint32_t s : stacks) {
-                    const std::vector<uint32_t>& r = a.step(s, cp);
-                    tmp.insert(tmp.end(), r.begin(), r.end());
-                }
-                std::sort(tmp.begin(), tmp.end());
-                tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
-                next = &tmp;
+                next_set = a.set_step_cls(parent_set, cls);
             }
-            if (next->empty()) continue;
-        } else if (!a.partial_ok(stacks, nu.value, nu.n_remain)) {
-            continue;
+            if (next_set == 0) {
+                i = nd.skip;
+                continue;
+            }
+        } else {
+            uint32_t cp = 0;
+            bool complete = false;
+            if (nu.n_remain == 0) {
+                if (b >= 0xC2 && b <= 0xDF) nu = {(uint32_t) (b & 0x1F), 1};
+                else if (b >= 0xE0 && b <= 0xEF) nu = {(uint32_t) (b & 0x0F), 2};
+                else if (b >= 0xF0 && b <= 0xF4) nu = {(uint32_t) (b & 0x07), 3};
+                else { i = nd.skip; continue; }
+            } else {
+                if ((b & 0xC0) != 0x80) { i = nd.skip; continue; }
+                nu.value = (nu.value << 6) | (b & 0x3F);
+                if (--nu.n_remain == 0) {
+                    cp = nu.value;
+                    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { i = nd.skip; continue; }
+                    complete = true;
+                }
+            }
+            if (complete) {
+                next_set = a.set_step_cls(parent_set, g.char_class(cp));
+                if (next_set == 0) { i = nd.skip; continue; }
+            } else if (!a.partial_ok_set(parent_set, nu.value, nu.n_remain)) {
+                i = nd.skip;
+                continue;
+            }
         }
-        for (int32_t t = v.nodes_[c].first_token; t >= 0; t = v.next_token_[(size_t) t]) out[(size_t) t] = 1;
-        if (v.nodes_[c].first_child != 0) {
-            walk(v, c, *next, nu, out);
-        }
+        for (int32_t t = nd.first_token; t >= 0; t = next_tok[(size_t) t]) out_data[(size_t) t] = 1;
+        set_stk[d] = next_set;
+        u_stk[d] = nu;
+        ++i;
     }
 }
 
@@ -1098,7 +1487,7 @@ void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool
     use_cache = use_cache && utf8_.n_remain == 0;
     if (use_cache) {
         for (Arena::MaskEntry& m : a.masks) {
-            if (m.vocab == vocab.id() && m.stacks == stacks_) {
+            if (m.vocab == vocab.id() && m.set_id == set_id_) {
                 m.used = ++a.tick;
                 out = m.mask;
                 return;
@@ -1106,9 +1495,9 @@ void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool
         }
     }
     out.assign(vocab.size(), 0);
-    if (!stacks_.empty()) walk(vocab, 0, stacks_, utf8_, out);
-    if (utf8_.n_remain == 0) {
-        for (uint32_t s : stacks_) {
+    if (set_id_ != 0) walk(vocab, set_id_, utf8_, out);
+    if (utf8_.n_remain == 0 && set_id_ != 0 && a.set_has_token(set_id_)) {
+        for (uint32_t s : a.sets[(size_t) set_id_]) {
             if (s == 0 || !a.is_token(a.nodes[s].elem)) continue;
             const Element& t = a.el(a.nodes[s].elem);
             if (t.type == ElemType::Token) {
@@ -1126,19 +1515,19 @@ void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool
     }
     if (!use_cache) return;
     if (a.masks.size() < Arena::kMaskCache) {
-        a.masks.push_back({vocab.id(), stacks_, out, ++a.tick});
+        a.masks.push_back({vocab.id(), set_id_, out, ++a.tick});
     } else {
         auto oldest = std::min_element(a.masks.begin(), a.masks.end(),
                                        [](const Arena::MaskEntry& x, const Arena::MaskEntry& y) { return x.used < y.used; });
-        *oldest = {vocab.id(), stacks_, out, ++a.tick};
+        *oldest = {vocab.id(), set_id_, out, ++a.tick};
     }
 }
 
 std::vector<std::vector<Element>> GrammarState::stack_elements() const {
     std::vector<std::vector<Element>> out;
-    if (!g_) return out;
+    if (!g_ || !arena_ || set_id_ == 0) return out;
     const Arena& a = *arena_;
-    for (uint32_t s : stacks_) {
+    for (uint32_t s : a.sets[(size_t) set_id_]) {
         std::vector<Element> st;
         for (uint32_t n = s; n != 0; n = a.nodes[n].parent) st.push_back(a.el(a.nodes[n].elem));
         std::reverse(st.begin(), st.end());

@@ -139,6 +139,9 @@ struct PrefillRequest {
     std::function<bool()> stop;          ///< optional: true ends the read at a chunk's end; nothing can continue from there
     int total_tokens = 0;                ///< what the whole prompt still has to read, this part included: sizes the workspaces
     bool more = false;                   ///< another part follows: the workspaces stay until end_prompt()
+    /// The tokens are a reply's own (decoded before, here read again): a model whose prompt path and decode path differ in bits
+    /// runs them as decode windows, so a reply's cells carry the bits its decode wrote whichever run reads them.
+    bool reply = false;
 };
 
 /// The merged tokens of an encoded picture or video group: `nx` across, `ny` down (0: placed as a sequence).
@@ -180,6 +183,9 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// True when the last decode_window ran uncaptured or instantiated a new CUDA graph.
+    virtual bool window_cold() const { return false; }
+    virtual int prompt_fold_window() const { return 1; }
     /// The most rows a decode window starting at `pos` may hold, so that it ends at a position where the session changes
     /// state between windows (0: no limit). Only drafted windows are shortened; a row gives the same bits in any window.
     virtual int window_limit(int64_t pos) const { (void) pos; return 0; }

@@ -103,7 +103,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("engine")
     ap.add_argument("model")
-    ap.add_argument("--slots", default="2,4,8")
+    ap.add_argument("--slots", default="2,4,8,16,32,64")
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--fixtures", default="")
     args, extra = ap.parse_known_args()

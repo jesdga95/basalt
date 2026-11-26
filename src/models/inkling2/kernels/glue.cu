@@ -399,75 +399,88 @@ __global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows_all) 
     const int s = blockIdx.y;
     const int row = blockIdx.x * 32 + (threadIdx.x >> 3), part = threadIdx.x & 7;
     const int per = a.rank / 8;
-    const uint32_t* ur = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) row * a.rank + part * per);
-    uint32_t u0w[kUpWords];
+    const uint32_t* urg = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) row * a.rank + part * per);
+    const uint32_t* urf = reinterpret_cast<const uint32_t*>(a.up[s] + (size_t) (row + kWidth) * a.rank + part * per);
+    uint32_t ugw[kUpWords], ufw[kUpWords];
 #pragma unroll
-    for (int k = 0; k < kUpWords; ++k) u0w[k] = row < 2 * kWidth && k < per / 2 ? ur[k] : 0u;
+    for (int k = 0; k < kUpWords; ++k) {
+        const bool ok = row < kWidth && k < per / 2;
+        ugw[k] = ok ? urg[k] : 0u;
+        ufw[k] = ok ? urf[k] : 0u;
+    }
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     const float* hid = a.scratch + ((size_t) s * kBatchRows + r0) * a.rank;
     for (int i = threadIdx.x; i < rows * a.rank; i += blockDim.x) hs[i] = hid[i];
     __syncthreads();
-    float acc[kDecodeRows];
+    float acc_g[kDecodeRows], acc_f[kDecodeRows];
 #pragma unroll
-    for (int t = 0; t < kDecodeRows; ++t) acc[t] = 0.f;
-    if (row < 2 * kWidth) {
+    for (int t = 0; t < kDecodeRows; ++t) {
+        acc_g[t] = 0.f;
+        acc_f[t] = 0.f;
+    }
+    if (row < kWidth) {
 #pragma unroll
         for (int k = 0; k < kUpWords; ++k) {
             if (k >= per / 2) break;
-            const uint32_t u = u0w[k];
-            const float u0 = __uint_as_float(u << 16), u1 = __uint_as_float(u & 0xffff0000u);
+            const uint32_t ug = ugw[k], uf = ufw[k];
+            const float g0 = __uint_as_float(ug << 16), g1 = __uint_as_float(ug & 0xffff0000u);
+            const float f0 = __uint_as_float(uf << 16), f1 = __uint_as_float(uf & 0xffff0000u);
             const int kk = part * per + 2 * k;
 #pragma unroll
             for (int t = 0; t < kDecodeRows; ++t) {
                 if (t >= rows) break;
-                acc[t] = fmaf(u1, hs[t * a.rank + kk + 1], fmaf(u0, hs[t * a.rank + kk], acc[t]));
+                const float h0 = hs[t * a.rank + kk], h1 = hs[t * a.rank + kk + 1];
+                acc_g[t] = fmaf(g1, h1, fmaf(g0, h0, acc_g[t]));
+                acc_f[t] = fmaf(f1, h1, fmaf(f0, h0, acc_f[t]));
             }
         }
         for (int k = kUpWords; k < per / 2; ++k) {
-            const uint32_t u = ur[k];
-            const float u0 = __uint_as_float(u << 16), u1 = __uint_as_float(u & 0xffff0000u);
+            const uint32_t ug = urg[k], uf = urf[k];
+            const float g0 = __uint_as_float(ug << 16), g1 = __uint_as_float(ug & 0xffff0000u);
+            const float f0 = __uint_as_float(uf << 16), f1 = __uint_as_float(uf & 0xffff0000u);
             const int kk = part * per + 2 * k;
 #pragma unroll
             for (int t = 0; t < kDecodeRows; ++t) {
                 if (t >= rows) break;
-                acc[t] = fmaf(u1, hs[t * a.rank + kk + 1], fmaf(u0, hs[t * a.rank + kk], acc[t]));
+                const float h0 = hs[t * a.rank + kk], h1 = hs[t * a.rank + kk + 1];
+                acc_g[t] = fmaf(g1, h1, fmaf(g0, h0, acc_g[t]));
+                acc_f[t] = fmaf(f1, h1, fmaf(f0, h0, acc_f[t]));
             }
         }
     }
-    float* gf = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank;
+    float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank;
 #pragma unroll
     for (int t = 0; t < kDecodeRows; ++t) {
         if (t >= rows) break;
-        float v = acc[t];
-        v += __shfl_xor_sync(0xffffffffu, v, 1);
-        v += __shfl_xor_sync(0xffffffffu, v, 2);
-        v += __shfl_xor_sync(0xffffffffu, v, 4);
-        if (part == 0 && row < 2 * kWidth) gf[((size_t) s * kBatchRows + r0 + t) * 2 * kWidth + row] = v;
+        float vg = acc_g[t], vf = acc_f[t];
+        vg += __shfl_xor_sync(0xffffffffu, vg, 1);
+        vf += __shfl_xor_sync(0xffffffffu, vf, 1);
+        vg += __shfl_xor_sync(0xffffffffu, vg, 2);
+        vf += __shfl_xor_sync(0xffffffffu, vf, 2);
+        vg += __shfl_xor_sync(0xffffffffu, vg, 4);
+        vf += __shfl_xor_sync(0xffffffffu, vf, 4);
+        if (part == 0 && row < kWidth) {
+            float g, f;
+            asm("tanh.approx.f32 %0, %1;" : "=f"(g) : "f"(vg));
+            asm("tanh.approx.f32 %0, %1;" : "=f"(f) : "f"(vf));
+            const size_t idx = (size_t) (r0 + t) * kWidth + row;
+            yb[((size_t) s * kBatchRows + r0 + t) * kWidth + row] = (1.f - f) * a.dest[s][idx] + g * a.msg[s][idx];
+        }
     }
 }
 
-// The blend of stream s and row r, then its norm into q8_1.
+// The norm into q8_1 of stream s and row r's blended controller state.
 __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const int r = blockIdx.x, s = blockIdx.y;
-    float nw[kPer], de[kPer], ms[kPer];
+    float nw[kPer];
     load_row(a.norm[s], nw);
-    // and the blend's states: written before the controllers' first kernel, which has finished before this one starts
-    load_row(a.dest[s] + (size_t) r * kWidth, de);
-    load_row(a.msg[s] + (size_t) r * kWidth, ms);
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     __shared__ float red[kWarpsB + 1];
-    const float* gf = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank + ((size_t) s * kBatchRows + r) * 2 * kWidth;
+    const float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank + ((size_t) s * kBatchRows + r) * kWidth;
     float y[kPer];
-#pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int c = threadIdx.x + j * kThreads;
-        float g, f;
-        asm("tanh.approx.f32 %0, %1;" : "=f"(g) : "f"(gf[c]));
-        asm("tanh.approx.f32 %0, %1;" : "=f"(f) : "f"(gf[kWidth + c]));
-        y[j] = (1.f - f) * de[j] + g * ms[j];
-    }
+    load_row(yb, y);
     norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
 }
 
@@ -657,7 +670,7 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");
-    bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (2 * kWidth / 32), (unsigned) streams, z), dim3(256), (size_t) up_rows * a.rank * 4, s, a, rows);
+    bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), (size_t) up_rows * a.rank * 4, s, a, rows);
     check("controllers/up");
     bk::launch_pdl(ctrl_blend_kernel, dim3((unsigned) rows, (unsigned) streams), dim3(kThreads), 0, s, a);
     check("controllers/blend");

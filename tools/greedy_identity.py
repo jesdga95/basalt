@@ -4,7 +4,7 @@
 
 Each binary runs as `--serve` with BASE plus any flags after `--` (which replace BASE values). The bench fixtures'
 prompts (conv, struct, prose: comma-separated token ids per line) run at temperature 0 and every token is compared.
-Adaptive swaps and the PCIe share are off so placement cannot drift; pin the main card's tier too (`-- --expert-cache
+For qwen4exp packs, adaptive swaps are off so placement cannot drift; pin the main card's tier too (`-- --expert-cache
 N`) when the builds' VRAM use differs, since auto-sized tiers change rounding. A second card's tier holds what fits:
 check that its expert count ("peer GPU 1: N experts" in both logs) matches.
 
@@ -13,6 +13,8 @@ Prints "GREEDY IDENTICAL" (exit 0) or "GREEDY DIFFERS" with the first difference
 from __future__ import annotations
 
 import argparse
+import json
+import struct
 import subprocess
 import sys
 import tempfile
@@ -20,11 +22,28 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from model_file import ModelFile  # noqa: E402
 
 PROMPTS = ("conv", "struct", "prose")
 # flags after `--` replace these
 BASE = ["--spec", "7", "--max-context", "8192"]
 PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
+
+
+def model_arch(model_path: str) -> str | None:
+    """Read general.architecture from a .basalt pack's meta section (None when unreadable or absent)."""
+    try:
+        mf = ModelFile(model_path, versions=(1, 2))
+        meta = json.loads(mf.read("meta"))
+    except (OSError, ValueError, KeyError, struct.error):
+        return None
+    return (meta.get("gguf_kv") or {}).get("general.architecture")
+
+
+def build_args(model_path: str, extra: list[str]) -> list[str]:
+    """Engine args for `model_path`: qwen4exp-only adaptive-swap pinning is added only for qwen4exp packs."""
+    pinned = PINNED if model_arch(model_path) == "qwen4exp" else []
+    return set_args(["--model", model_path, *BASE], pinned + extra)
 
 
 def set_args(args: list[str], extra: list[str]) -> list[str]:
@@ -79,14 +98,24 @@ def run(label: str, engine_bin: str, args: list[str], prompts: list[str], tokens
     except (BrokenPipeError, subprocess.TimeoutExpired):
         return None
     finally:
+        for pipe in (proc.stdin, proc.stdout):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
         if proc.poll() is None:
             proc.terminate()
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         err.close()
 
 
-def main() -> int:
-    argv = sys.argv[1:]
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
     extra: list[str] = []
     if "--" in argv:
         k = argv.index("--")
@@ -106,7 +135,7 @@ def main() -> int:
             print(f"greedy_identity: {path} is missing", file=sys.stderr)
             return 2
         prompts.append(path.read_text().strip())
-    args = set_args(["--model", a.model, *BASE], PINNED + extra)
+    args = build_args(a.model, extra)
 
     logs = Path(tempfile.mkdtemp(prefix="greedy-identity-"))
     results = {}

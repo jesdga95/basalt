@@ -120,12 +120,15 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | MX8 pack, 100 chunks, the sm_120 prompt and decode kernels (#579's build; 0.00442, 97.17%, 7.0704 before it) | 0.00441 | 97.22% | 7.0647 |
 
 Which RAM experts have a card copy changes their arithmetic (the card's q8_1 activations against the CPU's Q8_0), so
-placement is part of the result. With `--vram-reserve-mib 300` at `--max-context 8192` (1,049 experts planned into RAM,
-250 copied back to the card, 90.17% of decode lookups on the card), 100 chunks against the base build (no copy-back):
+placement is part of the result. Measured when copies were ranked by lookups per token (the earlier ranking): with
+`--vram-reserve-mib 300` at `--max-context 8192` (1,049 experts planned into RAM, 250 copied back to the card, 90.17% of
+decode lookups on the card), 100 chunks against the base build (no copy-back):
 PPL 7.0708 to 7.0725, paired NLL difference +0.00025 +- 0.00042, top-1 98.22% of rows the same (RTX 5080 at 360 W).
 The copies then follow the session's own lookups and the prompt loan adds more while decode runs, so which pairs the card
 computes depends on the conversation; it changes only at positions the requests fix, so a greedy request's placement, and
-its tokens, are the same on every run.
+its tokens, are the same on every run. The ranking that picks those pairs (lookups discounted by the visits of each expert's
+layer, [placement](../models/inkling2.md)) changes which pairs the card computes, not how: at equal placement the
+arithmetic is the same.
 
 The final rebased quality rows above use the DQ8 pack `/mnt/storage/Projects/basalt/models/Inkling-2-Mini-NVFP4-q8.basalt` and the BF16-derived reference `/mnt/storage/kld/inkling2-q6cr-eval/inkling2-bf16-base.kld`, with the same 100 wikitext-2 chunks (25,500 scored rows), T=3, and RTX 5090 power limit 475 W. The scored-row base PPL was 7.0644 for each run. Earlier quality rows and 256K VRAM readings were measured at 400 W unless noted. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512).
 
@@ -208,3 +211,9 @@ The previous INT8 row-writer parity matched the CPU reference for 257 rows of wi
 The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output
 with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
 2,405-token prompt checked).
+
+The prompt attention and the FP4 experts round a row the same at any chunk width (the parity test checks both, the experts
+in an 8,192-row chunk against a 256-row one); Q8_0 experts through MMQ do not, since MMQ splits K by the chunk. The
+drafter's context of a chunk's rows comes from MMQ products over the whole chunk, so its last bits follow the chunk's width:
+a read that runs 8,192-row chunks (more than 4,096 tokens, experts in RAM) gives the drafter other bits than 4,096-row
+chunks would, and its drafts can differ (the target still checks every one).

@@ -10,6 +10,7 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/router.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -2055,6 +2056,65 @@ void test_attention_window_boundary() {
     }
 }
 
+void test_router_select_plan() {
+    std::printf("router_select_plan (rows = 1..64)\n");
+    constexpr int H = kWidth, NE = 128, K = 8, RMAX = kBatchRows;
+    const std::vector<float> x = randn((size_t) RMAX * H, 0.5f), gate = randn((size_t) NE * H, 0.05f), bias = randn(NE, 0.1f);
+    std::vector<unsigned long long> table(NE);
+    for (int e = 0; e < NE; ++e) table[(size_t) e] = e == 17 ? 0ull : (unsigned long long) (0x100000ull + (uint64_t) e * 4096ull);
+    float *dx = dev(x), *dg = dev(gate), *db = dev(bias), *dlog = zeros<float>(RMAX * NE), *dlog1 = zeros<float>(RMAX * NE);
+    float *dw_ref = zeros<float>(RMAX * K), *dw_got = zeros<float>(RMAX * K);
+    int32_t *di_ref = zeros<int32_t>(RMAX * K), *di_got = zeros<int32_t>(RMAX * K);
+    unsigned long long *dt = dev(table), *p_ref = zeros<unsigned long long>(NE), *p_got = zeros<unsigned long long>(NE);
+    unsigned long long *rb_ref = zeros<unsigned long long>(kAheadExperts), *rb_got = zeros<unsigned long long>(kAheadExperts);
+    int32_t *s_ref = zeros<int32_t>(NE + 2), *s_got = zeros<int32_t>(NE + 2), *ng_ref = zeros<int32_t>(1), *ng_got = zeros<int32_t>(1);
+    int32_t *dst_ref = zeros<int32_t>(RMAX * K), *dst_got = zeros<int32_t>(RMAX * K);
+    int32_t *tok_ref = zeros<int32_t>(RMAX * K), *tok_got = zeros<int32_t>(RMAX * K);
+    int32_t *rn_ref = zeros<int32_t>(1), *rn_got = zeros<int32_t>(1);
+    uint32_t *tl_ref = zeros<uint32_t>(NE), *tl_got = zeros<uint32_t>(NE);
+    bk::RouterArgs ra;
+    ra.n_expert = NE;
+    ra.n_embd = H;
+    ra.k = K;
+    ra.weight_scale = 2.5f;
+    ra.gate = bk::RouterGate::Sigmoid;
+    for (int r = 0; r < RMAX; ++r) bk::router_logits(dx + (size_t) r * H, dg, 1, ra, dlog1 + (size_t) r * NE, nullptr);
+    const std::vector<float> ref_log = host(dlog1, RMAX * NE);
+    bool ok = true;
+    for (int R : {1, 2, 7, 16, 35, 64}) {
+        bk::router_logits(dx, dg, R, ra, dlog, nullptr);
+        const std::vector<float> got_log = host(dlog, R * NE);
+        ok = ok && std::memcmp(ref_log.data(), got_log.data(), (size_t) R * NE * 4) == 0;
+        cudaMemset(tl_ref, 0, NE * 4);
+        cudaMemset(tl_got, 0, NE * 4);
+        bk::router_select(dlog1, db, R, ra, di_ref, dw_ref, nullptr);
+        moe_plan(di_ref, R, K, NE, dt, p_ref, s_ref, ng_ref, dst_ref, tok_ref, nullptr, tl_ref, rb_ref, rn_ref);
+        router_select_plan(dlog, db, R, K, NE, ra.weight_scale, di_got, dw_got, dt, p_got, s_got, ng_got, dst_got, tok_got, nullptr,
+                           tl_got, rb_got, rn_got);
+        cudaDeviceSynchronize();
+        const int g_r = host(ng_ref, 1)[0], g_g = host(ng_got, 1)[0];
+        const auto sr = host(s_ref, g_r + 2), sg = host(s_got, g_g + 2);
+        const int tot = sr[(size_t) g_r];
+        ok = ok && g_r == g_g && sr == sg &&
+             host(di_ref, R * K) == host(di_got, R * K) &&
+             std::memcmp(host(dw_ref, R * K).data(), host(dw_got, R * K).data(), (size_t) R * K * 4) == 0 &&
+             host(p_ref, g_r) == host(p_got, g_g) &&
+             host(dst_ref, tot) == host(dst_got, tot) &&
+             host(tok_ref, tot) == host(tok_got, tot) &&
+             host(tl_ref, NE) == host(tl_got, NE) &&
+             host(rb_ref, kAheadExperts) == host(rb_got, kAheadExperts) &&
+             host(rn_ref, 1) == host(rn_got, 1);
+    }
+    std::printf("%-34s %s\n", "  logits + select + plan (1..64)", ok ? "bitwise" : "FAIL");
+    failures += !ok;
+    cudaFree(dx); cudaFree(dg); cudaFree(db); cudaFree(dlog); cudaFree(dlog1);
+    cudaFree(dw_ref); cudaFree(dw_got); cudaFree(di_ref); cudaFree(di_got);
+    cudaFree(dt); cudaFree(p_ref); cudaFree(p_got); cudaFree(rb_ref); cudaFree(rb_got);
+    cudaFree(s_ref); cudaFree(s_got); cudaFree(ng_ref); cudaFree(ng_got);
+    cudaFree(dst_ref); cudaFree(dst_got); cudaFree(tok_ref); cudaFree(tok_got);
+    cudaFree(rn_ref); cudaFree(rn_got); cudaFree(tl_ref); cudaFree(tl_got);
+}
+
 }  // namespace
 
 int main() {
@@ -2084,6 +2144,7 @@ int main() {
     test_heat_fold();
     test_batch_window();
     test_attention_window_boundary();
+    test_router_select_plan();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

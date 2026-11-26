@@ -32,11 +32,14 @@ Flow Request::read_prompt() {
     // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
     // chat renders the same history - but not always the same header or the thinking of this reply - so that
     // checkpoint is the one it reuses.
+    // The ids past `reply=N` are the reply this request continues (a thinking budget closed, the reply goes on): no turn
+    // begins in them, and a checkpoint there would push out the turn boundary the next turn of the chat needs.
+    const int64_t turn_end = req_reply > 0 && req_reply < n ? req_reply : n;
     turn_at = -1;
     if (runtime_.o.prompt_cache > 0 && runtime_.o.turn_token >= 0)
-        for (int64_t i = n - 1; i > resume; --i)
+        for (int64_t i = turn_end - 1; i > resume; --i)
             if (ids[(size_t) i] == runtime_.o.turn_token) { turn_at = i; break; }
-    if (runtime_.o.prompt_cache > 0 && turn_checkpoint_at_last_token() && n - 1 > resume) turn_at = n - 1;
+    if (runtime_.o.prompt_cache > 0 && turn_checkpoint_at_last_token() && turn_end - 1 > resume) turn_at = turn_end - 1;
     // (opt-in) a short turn of --tail-role-token's role right before the new assistant turn (the server's
     // trailing reasoning-effort turn) stays out of the checkpoint, so the next request - another effort, or the
     // next turn of the chat - finds the conversation without it

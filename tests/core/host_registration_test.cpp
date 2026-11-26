@@ -84,7 +84,7 @@ int main() {
     unpin_ram(host, whole);
     ck(cudaGetLastError());
 
-    if constexpr (kBoundHostRegistration) {
+    {
         // The last range belongs to another registration. Whole registration must fail without taking ownership of it.
         ck(cudaHostRegister(host + 2 * chunk, chunk, cudaHostRegisterPortable | cudaHostRegisterMapped));
         RamPin sliced = pin_ram(host, 3 * chunk, 0, {0, chunk, 2 * chunk, 3 * chunk}, true, &device);

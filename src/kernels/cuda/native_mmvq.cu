@@ -1863,7 +1863,7 @@ bool launch_q80_mma(const void* weights, const void* x_q8_1, float* y, int n_in,
     return true;
 }
 
-constexpr int MAX_PLANES_NCOLS = 32;
+constexpr int MAX_PLANES_NCOLS = 128;
 constexpr int MAX_QUANT_NCOLS = 128;
 
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
@@ -1877,7 +1877,7 @@ void validate_planes_shape(int n_in, int ncols, int block_elems = Q8K) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
     if (ncols < 1 || ncols > MAX_PLANES_NCOLS) {
-        throw std::invalid_argument("native planes MMVQ requires 1 <= ncols <= 32 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
+        throw std::invalid_argument("native planes MMVQ requires 1 <= ncols <= 128 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
     }
 }
 void validate_quant_shape(int n_in, int ncols, int block_elems = Q8K) {
@@ -2295,7 +2295,7 @@ __host__ __device__ __forceinline__ Q8Planes q8p_offset(Q8Planes p, int row0, in
 // Two lanes cover each 32-value block (lane&1 picks bytes 0..15 or 16..31), so one warp sweeps 16 blocks (512 bytes) per step.
 template<int NCOLS, int NPRE>
 __device__ __forceinline__ void q8p_w1_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
-                                            int n_in, int n_out, int bx) {
+                                            int n_in, int n_out, int bx, float softcap = 0.0f) {
     const int row = bx * WARPS + int(threadIdx.y);
     if (row >= n_out) {
         pdl_launch_dependents();
@@ -2356,17 +2356,18 @@ __device__ __forceinline__ void q8p_w1_body(Q8Planes w, const Q81Block* __restri
             tmp[j] = fmaf(__fmul_rn(d, __low2float(xj->ds)), float(sumi), tmp[j]);
         }
     }
+    const float inv_cap = softcap > 0.0f ? 1.0f / softcap : 0.0f;
 #pragma unroll
     for (int j = 0; j < NCOLS; ++j) {
-        tmp[j] = warp_sum(tmp[j]);
-        if (lane == 0) y[std::size_t(j) * n_out + row] = tmp[j];
+        float val = warp_sum(tmp[j]);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = softcap > 0.0f ? softcap * tanhf(val * inv_cap) : val;
     }
 }
 
 template<int NCOLS, int NPRE>
 __launch_bounds__(WARPS * WARP)
-__global__ void native_q8p_w1_kernel(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
-    q8p_w1_body<NCOLS, NPRE>(w, x, y, n_in, n_out, int(blockIdx.x));
+__global__ void native_q8p_w1_kernel(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y, int n_in, int n_out, float softcap) {
+    q8p_w1_body<NCOLS, NPRE>(w, x, y, n_in, n_out, int(blockIdx.x), softcap);
 }
 
 template<int NCOLS, int NPRE>
@@ -2381,7 +2382,7 @@ __global__ void native_q8p_w1_seg_kernel(Q8Planes w, SegArgs a, int n_in) {
 // tiles sharing one weight stream so every column at 1..32 columns is bitwise identical to a single-column call.
 template<int CTILES>
 __device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restrict__ x, float* __restrict__ y,
-                                             int n_in, int n_out, int ncols, int bx) {
+                                             int n_in, int n_out, int ncols, int bx, float softcap = 0.0f) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int NPRE = CTILES <= 2 ? 3 : 1;
     __shared__ float s_part[8 * 16 * 17];
@@ -2466,7 +2467,10 @@ __device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restr
 #pragma unroll
             for (int L = 0; L < 4; ++L) r4[L] = __fadd_rn(r8[L], r8[L + 4]);
             const float r2a = __fadd_rn(r4[0], r4[2]), r2b = __fadd_rn(r4[1], r4[3]);
-            if (row0 + row < n_out) y[(size_t) (8 * ct + col) * n_out + row0 + row] = __fadd_rn(r2a, r2b);
+            if (row0 + row < n_out) {
+                const float val = __fadd_rn(r2a, r2b);
+                y[(size_t) (8 * ct + col) * n_out + row0 + row] = softcap > 0.0f ? softcap * tanhf(val * (1.0f / softcap)) : val;
+            }
         }
     }
 #elif defined(__CUDA_ARCH__)
@@ -2475,51 +2479,65 @@ __device__ __forceinline__ void q8p_mma_body(Q8Planes w, const Q81Block* __restr
 }
 
 template<int CTILES>
-__global__ void __launch_bounds__(256) native_q8p_mma_kernel(Q8Planes w, const Q81Block* __restrict__ x,
-                                                             float* __restrict__ y, int n_in, int n_out, int ncols) {
-    q8p_mma_body<CTILES>(w, x, y, n_in, n_out, ncols, int(blockIdx.x));
+__global__ void __launch_bounds__(256, CTILES <= 4 ? 2 : 1) native_q8p_mma_kernel(Q8Planes w, const Q81Block* __restrict__ x,
+                                                                                   float* __restrict__ y, int n_in, int n_out, int ncols, float softcap) {
+    const int c0 = int(blockIdx.y) * (8 * CTILES);
+    const int sub = min(8 * CTILES, ncols - c0);
+    if (sub > 0)
+        q8p_mma_body<CTILES>(w, x + std::size_t(c0) * (n_in / 32), y + std::size_t(c0) * n_out, n_in, n_out, sub, int(blockIdx.x), softcap);
 }
 
 template<int CTILES>
-__global__ void __launch_bounds__(256) native_q8p_mma_seg_kernel(Q8Planes w, SegArgs a, int n_in, int ncols) {
+__global__ void __launch_bounds__(256, CTILES <= 4 ? 2 : 1) native_q8p_mma_seg_kernel(Q8Planes w, SegArgs a, int n_in, int ncols) {
     const SegPick p = seg_pick(a);
-    q8p_mma_body<CTILES>(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, ncols, p.bx);
+    const int c0 = int(blockIdx.y) * (8 * CTILES);
+    const int sub = min(8 * CTILES, ncols - c0);
+    if (sub > 0)
+        q8p_mma_body<CTILES>(q8p_offset(w, p.row0, n_in), p.x + std::size_t(c0) * (n_in / 32), p.y + std::size_t(c0) * p.n_out, n_in, p.n_out, sub, p.bx);
 }
 
-void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s, float softcap = 0.0f) {
     const dim3 threads(WARP, WARPS);
     if (n_in >= 1024 && mmvq_mma_sms() != 0 && (ncols > 8 || (n_out >= 65536 && ncols >= 4) || (n_out >= 4096 && ncols >= 7))) {
         const dim3 grid{unsigned((n_out + 15) / 16)};
+        if (ncols > 32 && std::size_t(n_out) * std::size_t(n_in) <= (32u << 20)) {
+            launch_pdl(native_q8p_mma_kernel<4>, dim3(grid.x, unsigned((ncols + 31) / 32)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap);
+            return;
+        }
         switch ((ncols + 7) / 8) {
-        case 1: launch_pdl(native_q8p_mma_kernel<1>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
-        case 2: launch_pdl(native_q8p_mma_kernel<2>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
-        case 3: launch_pdl(native_q8p_mma_kernel<3>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
-        default: launch_pdl(native_q8p_mma_kernel<4>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols); break;
+        case 1: launch_pdl(native_q8p_mma_kernel<1>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
+        case 2: launch_pdl(native_q8p_mma_kernel<2>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
+        case 3: launch_pdl(native_q8p_mma_kernel<3>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
+        case 4: launch_pdl(native_q8p_mma_kernel<4>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
+        case 5: launch_pdl(native_q8p_mma_kernel<5>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
+        case 6: launch_pdl(native_q8p_mma_kernel<6>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
+        case 7: launch_pdl(native_q8p_mma_kernel<7>, grid, dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
+        default: launch_pdl(native_q8p_mma_kernel<8>, dim3(grid.x, unsigned((ncols + 63) / 64)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols, softcap); break;
         }
         return;
     }
     if (ncols > 8) {
         for (int c0 = 0; c0 < ncols; c0 += 8)
-            launch_q8p(w, x + std::size_t(c0) * (n_in / 32), y + std::size_t(c0) * n_out, n_in, n_out, std::min(8, ncols - c0), s);
+            launch_q8p(w, x + std::size_t(c0) * (n_in / 32), y + std::size_t(c0) * n_out, n_in, n_out, std::min(8, ncols - c0), s, softcap);
         return;
     }
     const dim3 grid{unsigned((n_out + WARPS - 1) / WARPS)};
     switch (ncols) {
-    case 1: launch_pdl(native_q8p_w1_kernel<1, 2>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 2: launch_pdl(native_q8p_w1_kernel<2, 2>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 3: launch_pdl(native_q8p_w1_kernel<3, 2>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 4: launch_pdl(native_q8p_w1_kernel<4, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 5: launch_pdl(native_q8p_w1_kernel<5, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 6: launch_pdl(native_q8p_w1_kernel<6, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    case 7: launch_pdl(native_q8p_w1_kernel<7, 1>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
-    default: launch_pdl(native_q8p_w1_kernel<8, 0>, grid, threads, 0, s, w, x, y, n_in, n_out); break;
+    case 1: launch_pdl(native_q8p_w1_kernel<1, 2>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
+    case 2: launch_pdl(native_q8p_w1_kernel<2, 2>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
+    case 3: launch_pdl(native_q8p_w1_kernel<3, 2>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
+    case 4: launch_pdl(native_q8p_w1_kernel<4, 1>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
+    case 5: launch_pdl(native_q8p_w1_kernel<5, 1>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
+    case 6: launch_pdl(native_q8p_w1_kernel<6, 1>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
+    case 7: launch_pdl(native_q8p_w1_kernel<7, 1>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
+    default: launch_pdl(native_q8p_w1_kernel<8, 0>, grid, threads, 0, s, w, x, y, n_in, n_out, softcap); break;
     }
 }
 
 }  // namespace
 
 void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-                           void* stream) {
+                           void* stream, float softcap) {
     validate_planes_shape(n_in, ncols, 32);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(planes);
@@ -2529,7 +2547,7 @@ void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int
     const auto* codes = static_cast<const int8_t*>(planes);
     const auto* scales = reinterpret_cast<const half*>(codes + std::size_t(n_out) * n_in);
     launch_q8p({codes, scales}, static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out, ncols,
-               static_cast<cudaStream_t>(stream));
+               static_cast<cudaStream_t>(stream), softcap);
     launch_check();
 }
 
@@ -2574,11 +2592,20 @@ void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q8
     }
     const dim3 grid{unsigned(end)}, threads(WARP, WARPS);
     if (mma) {
+        if (ncols > 32 && std::size_t(sum_rows) * std::size_t(n_in) <= (32u << 20)) {
+            launch_pdl(native_q8p_mma_seg_kernel<4>, dim3(grid.x, unsigned((ncols + 31) / 32)), dim3(256), 0, s, w, a, n_in, ncols);
+            launch_check();
+            return;
+        }
         switch ((ncols + 7) / 8) {
         case 1: launch_pdl(native_q8p_mma_seg_kernel<1>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
         case 2: launch_pdl(native_q8p_mma_seg_kernel<2>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
         case 3: launch_pdl(native_q8p_mma_seg_kernel<3>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
-        default: launch_pdl(native_q8p_mma_seg_kernel<4>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 4: launch_pdl(native_q8p_mma_seg_kernel<4>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 5: launch_pdl(native_q8p_mma_seg_kernel<5>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 6: launch_pdl(native_q8p_mma_seg_kernel<6>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        case 7: launch_pdl(native_q8p_mma_seg_kernel<7>, grid, dim3(256), 0, s, w, a, n_in, ncols); break;
+        default: launch_pdl(native_q8p_mma_seg_kernel<8>, dim3(grid.x, unsigned((ncols + 63) / 64)), dim3(256), 0, s, w, a, n_in, ncols); break;
         }
         launch_check();
         return;

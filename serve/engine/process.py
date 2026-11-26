@@ -53,7 +53,7 @@ from serve.engine.console import LINES as CONSOLE_LINES, ConsoleLines
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
-from serve.prompt import PromptText
+from serve.prompt import REPLY_KEY, PromptText, room_error
 from serve.util import vram
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
@@ -123,7 +123,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
+                  "PROMPT ", "PMATCH ", "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
 
 
 def log_unparsed(line: str, log) -> None:
@@ -156,6 +156,12 @@ def pump_lines(stream, sink) -> None:
             sink(engine_line(line))
     except (OSError, ValueError):
         pass
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 REQUEST_LINES = False    # --request-lines: echo each request's DONE figures on stdout
@@ -321,8 +327,12 @@ class ProcessEngine:
                                        text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
         except OSError as e:                            # missing or not executable: nothing started, so this is a start error
             loading.set()                               # the narrator stops and the log handle goes back
-            if log:
-                self.log.close()
+            if log and self.log not in (None, subprocess.DEVNULL):
+                try:
+                    self.log.close()
+                except OSError:
+                    pass
+                self.log = None
             raise EngineStartError(f"the engine could not be started: {e}", log) from e
         frame_pipes(self.proc, sink is not None)
         proc = self.proc
@@ -368,14 +378,18 @@ class ProcessEngine:
                     self.proc.kill()
                 except OSError:
                     pass
-            try:                                        # close its pipes and our log handle
+            try:
                 self.proc.wait(timeout=5)
-                self.proc.stdin.close()
-                self.proc.stdout.close()
-                if log:
-                    self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr,
+                           self.log if self.log not in (None, subprocess.DEVNULL) else None):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            self.log = None
             if timed_out:
                 reason = f"the engine did not report READY within {ENGINE_READY_S:.0f} s"
             elif errors := start_errors(log, log_start):   # the engine's own reason
@@ -458,50 +472,54 @@ class ProcessEngine:
         proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
         slot_q, prompt_q = self.slot_q, self.prompt_q
         line = None
-        for line in proc.stdout:
-            line = engine_line(line)
-            log_unparsed(line, log)
-            if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
-                continue
-            if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
-                if self.proc is proc:
-                    self.info.update(info_facts(line))
-                continue
-            if line.startswith(CONSOLE_LINES):          # the console's figures (STATS); never a reply line
-                if self.proc is proc:
-                    self.console.feed(line)
-                continue
-            if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
-                if self.proc is proc:
-                    self.conversation = {**self.conversation, **conversation_facts(line)}
-                continue
-            if line.startswith(FATAL_PREFIXES):         # before batch routing
-                if self.proc is proc:
-                    self.silent_note = "unrecoverable verification failure: " + line[4:].strip()
-                    self.ended = True
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-                break                                   # publish EOF, never the trailing DONE
-            if line.startswith("PROMPT "):              # the answer to a held prompt, for whoever sent it
-                prompt_q.put(line)
-                continue
-            if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
-                try:
-                    slot_q[int(line.split()[1])].put(line)
+        try:
+            for line in proc.stdout:
+                line = engine_line(line)
+                log_unparsed(line, log)
+                if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
                     continue
-                except (IndexError, ValueError):
-                    pass
-            lines.put(line)
-        if self.proc is proc:                           # a killed engine's pump must not mark its successor
-            self.ended = True                           # output closed: it is gone
-            if line and line.startswith("ERR"):         # why it exited, when no request read it
-                self.last_err = line[4:].strip()
-        lines.put(None)
-        prompt_q.put(None)
-        for q in slot_q:
-            q.put(None)
+                if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
+                    if self.proc is proc:
+                        self.info.update(info_facts(line))
+                    continue
+                if line.startswith(CONSOLE_LINES):          # the console's figures (STATS); never a reply line
+                    if self.proc is proc:
+                        self.console.feed(line)
+                    continue
+                if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
+                    if self.proc is proc:
+                        self.conversation = {**self.conversation, **conversation_facts(line)}
+                    continue
+                if line.startswith(FATAL_PREFIXES):         # before batch routing
+                    if self.proc is proc:
+                        self.silent_note = "unrecoverable verification failure: " + line[4:].strip()
+                        self.ended = True
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    break                                   # publish EOF, never the trailing DONE
+                if line.startswith("PROMPT "):              # the answer to a held prompt, for whoever sent it
+                    prompt_q.put(line)
+                    continue
+                if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
+                    try:
+                        slot_q[int(line.split()[1])].put(line)
+                        continue
+                    except (IndexError, ValueError):
+                        pass
+                lines.put(line)
+        except (OSError, ValueError):                       # pipe closed under us (killed or closed)
+            pass
+        finally:
+            if self.proc is proc:                           # a killed engine's pump must not mark its successor
+                self.ended = True                           # output closed: it is gone
+                if line and line.startswith("ERR"):         # why it exited, when no request read it
+                    self.last_err = line[4:].strip()
+            lines.put(None)
+            prompt_q.put(None)
+            for q in slot_q:
+                q.put(None)
 
     _NT_CRASH_CODES = {
         0x40000015: "STATUS_FATAL_APP_EXIT",
@@ -748,14 +766,18 @@ class ProcessEngine:
         """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write(command + "\n")
-        self.proc.stdin.flush()
         what = command.split()[0]
-        deadline = time.time() + timeout
+        try:
+            self._send(command)
+        except EngineDied:
+            self._retire(f"the {what} command failed")
+            raise
+        deadline = time.monotonic() + timeout
         while True:
             try:
-                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
             except queue.Empty:
+                self._retire(f"the {what} command timed out")
                 raise EngineDied(f"the engine did not answer the {what} command") from None
             if line is None:
                 raise EngineDied("the engine ended")
@@ -770,7 +792,8 @@ class ProcessEngine:
                 self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
                 self.info["vram"] = out
                 return out
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
+                self._retire(f"the {what} command timed out")
                 raise EngineDied(f"the engine did not answer the {what} command")
 
     ENC_TIMEOUT_S = 300.0
@@ -882,8 +905,10 @@ class ProcessEngine:
             keys += f" relax={float(rd)!r}"
         gram = grammar_key(sampling.get(GRAMMAR_KEY))
         gp = gprompt_key(sampling.get(GPROMPT_KEY)) if gram else ""
+        reply = sampling.get(REPLY_KEY)
+        rk = f" reply={int(reply)}" if _number(reply) and int(reply) > 0 else ""   # the ids past it are the reply so far
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + gram + gp + logprobs_key(sampling.get(LOGPROBS_KEY))
+            + gram + gp + rk + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -896,7 +921,7 @@ class ProcessEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone
+        except (OSError, ValueError, AttributeError):    # the pipe is gone
             raise self._died() from None
 
     def _control(self, cancel, on_token, stop_when=None, idle=None, stop_soon=None):
@@ -1410,7 +1435,14 @@ class ProcessEngine:
                             if slot_gen != born:                # engine restarted while waiting: re-pick on new gen
                                 slot, slot_gen = None, None
                                 continue
-                        left = max(1, min(left, self.max_context - size() - SLOT_MARGIN))   # the slot's room
+                        slot_ctx = int((self.info or {}).get("slot_context") or 0) or self.max_context
+                        room = slot_ctx - size() - SLOT_MARGIN
+                        if left < 1 or room < 1:
+                            if out or left < 1:
+                                self._carry_run(carry, first, last0, True)
+                                return
+                            raise room_error(size(), slot_ctx)
+                        left = min(left, room)                  # the slot's room
                         while not self.slot_q[slot].empty():
                             self.slot_q[slot].get_nowait()
                         head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
@@ -1887,16 +1919,17 @@ class ProcessEngine:
         except OSError:
             pass
         finally:
-            if self.proc.poll() is not None:
+            if self.proc is not None and self.proc.poll() is not None:
                 if self.pump is not None:
                     self.pump.join(timeout=2)
-                try:
-                    self.proc.stdin.close()             # buffered data may flush after exit
-                except OSError:
-                    pass
-                self.proc.stdout.close()
-                if self.log not in (None, subprocess.DEVNULL):
-                    self.log.close()
+                for stream in (self.proc.stdin, self.proc.stdout, getattr(self.proc, "stderr", None),
+                               self.log if self.log not in (None, subprocess.DEVNULL) else None):
+                    if stream is not None and hasattr(stream, "close"):
+                        try:
+                            stream.close()              # buffered data may flush after exit
+                        except (OSError, ValueError):
+                            pass
+                self.log = None
                 self.proc = None
                 self.ended = True
                 self.progress, self.last, self.conversation = None, {}, {}

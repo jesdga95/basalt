@@ -57,7 +57,7 @@ UPSERT_META = "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO 
 
 def run_rows(runs):
     """[(id, model, data)] for the (relative path, row) pairs of check_benchmarks.check_dir: data is the row as compact JSON."""
-    return [(Path(rel).stem, row["model"], json.dumps(row, ensure_ascii=False, separators=(",", ":"))) for rel, row in runs]
+    return [(Path(rel).stem, row["model"], json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False)) for rel, row in runs]
 
 
 def insert_statements(gen, rows):
@@ -69,7 +69,7 @@ def insert_statements(gen, rows):
     out, chunk, size = [], [], 0
 
     def flush():
-        sql = f"INSERT INTO runs (gen, id, model, data) VALUES " + ", ".join(f"({gen}, ?, ?, ?)" for _ in chunk)
+        sql = f"INSERT OR REPLACE INTO runs (gen, id, model, data) VALUES " + ", ".join(f"({gen}, ?, ?, ?)" for _ in chunk)
         out.append((sql, [v for r in chunk for v in r]))
 
     for r in rows:
@@ -111,7 +111,7 @@ class D1:
     def post(self, body):
         """The `result` list of a successful call. The 429 and 5xx answers are retried; anything else raises RuntimeError
         with Cloudflare's own error messages (never the request's headers)."""
-        data = json.dumps(body).encode("utf-8")
+        data = json.dumps(body, allow_nan=False).encode("utf-8")
         for attempt in range(RETRIES + 1):
             req = urllib.request.Request(self.url, data=data, method="POST",
                                          headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
@@ -189,7 +189,7 @@ def main(argv):
         print("\n".join(problems))
         print("the run files are not valid; nothing was synced")
         return 1
-    preset = json.loads(cb.read_text(os.path.join(root, cb.PRESET_FILE)))["preset"]
+    preset = cb.loads_strict(cb.read_text(os.path.join(root, cb.PRESET_FILE)))["preset"]
     db = D1(os.environ["CLOUDFLARE_ACCOUNT_ID"], os.environ["COMMUNITY_D1_ID"], os.environ["CLOUDFLARE_D1_TOKEN"])
     try:
         sync(db, preset, run_rows(runs))

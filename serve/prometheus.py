@@ -123,7 +123,10 @@ def _num(v: float | int) -> str:
         return "NaN"
     if math.isinf(v):
         return "+Inf" if v > 0 else "-Inf"
-    return f"{v:.6g}" if v != 0 else "0"
+    if v == 0:
+        return "0"
+    s = repr(float(v))
+    return s[:-2] if s.endswith(".0") else s
 
 
 class _Builder:
