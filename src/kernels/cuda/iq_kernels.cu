@@ -3247,8 +3247,9 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 namespace {
 // The NVFP4 and MXFP8 grouped experts at 2304 x 1152 on persistent grids. CT 2 (chunks of 16 entries): gate/up a block an
 // SM (each holds the whole register file), down two. CT 1 (chunks of 8, half the activation registers), for calls of
-// fewer than kStreamWide entries: gate/up two blocks an SM as well. An entry's arithmetic is the same in both. NVFP4 runs
-// CT 2 from kStreamWide entries (the per-tile kernels are as fast below, with the same bits); MXFP8 at every row count.
+// fewer than kStreamWide entries: gate/up two blocks an SM as well. An entry's arithmetic is the same in both. NVFP4
+// gate/up runs CT 2 from kStreamWide entries (the per-tile kernels are as fast below, with the same bits); NVFP4 down and
+// MXFP8 at every row count (their bits are these kernels').
 constexpr int64_t kStreamWide = 160;
 template<int TY, int CT>
 __global__ void __launch_bounds__(256, CT == 1 ? 2 : 1) native_gu_stream_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -3301,7 +3302,7 @@ void stream_smem() {
     int dev = 0;
     cudaGetDevice(&dev);
     if (set[dev]) return;
-    set[dev] = stream_smem_one<40, 2>() && stream_smem_one<46, 1>() && stream_smem_one<46, 2>();
+    set[dev] = stream_smem_one<40, 1>() && stream_smem_one<40, 2>() && stream_smem_one<46, 1>() && stream_smem_one<46, 2>();
 }
 
 template<int TY, int CT>
@@ -3628,9 +3629,8 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     if (g_exp_phase == 1) return;
     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
-    if (!v1 && !g_old_kernels && L.d_type == 40 && cap_entries >= kStreamWide && cap_groups <= kNvMaxGroups && L.n_ff == 1152 &&
-        L.n_embd % 32 == 0) {
-        launch_down_stream<40, 2>(s, chain, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    if (!v1 && !g_old_kernels && L.d_type == 40 && cap_groups <= kNvMaxGroups && L.n_ff == 1152 && L.n_embd % 32 == 0) {
+        down_stream<40>(cap_entries, s, chain, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);   // every row count: its bits
     } else if (!v1 && !g_old_kernels && L.d_type == 46 && cap_groups <= kNvMaxGroups && L.n_ff == 1152 && L.n_embd % 16 == 0) {
         down_stream<46>(cap_entries, s, chain, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);   // every row count: its bits
     } else switch (L.d_type) {

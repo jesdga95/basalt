@@ -1,9 +1,11 @@
 #pragma once
-// Grouped expert stage functions at 2304 x 1152 that stream the weights through shared memory. NVFP4 (type 40) sums exact
-// int32 sub-block dots on mma.m16n8k16.s32.s8.s8.s32 in row_dot_sub8's tree order (v1's bits at every row count). MXFP8
-// (type 46) sums each 32-value block's E4M3 x int8 products on mma.m16n8k16.f32.f16.f16.f32 (both decode to f16 exactly)
-// and the blocks in one fixed order: its own bits, the same at every row count. The MXFP8 tile design (weights as the M
-// side, a thread's k positions as contiguous code bytes) is adapted from ingine-batch's batch/moe.cu (Apache-2.0).
+// Grouped expert stage functions at 2304 x 1152 that stream the weights through shared memory. NVFP4 gate/up (type 40) sums
+// exact int32 sub-block dots on mma.m16n8k16.s32.s8.s8.s32 in row_dot_sub8's tree order (v1's bits at every row count).
+// MXFP8 (type 46) and NVFP4 down sum each 32-value block on two mma.m16n8k16.f32.f16.f16.f32 from zero on exact f16 forms
+// of the weights (E4M3, or E2M1 times its UE4M3 sub-block scale) and of the int8 activations, then one fp32 chain step,
+// and the blocks in one fixed order: their own bits, the same at every row count. The f16 tile design (weights as the M
+// side, a thread's k positions chosen so its code bytes are contiguous) is adapted from ingine-batch's batch/moe.cu
+// (Apache-2.0).
 
 namespace {
 
@@ -32,8 +34,9 @@ __device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1
 // thread holds the activation words and scales its k steps meet, for up to 8 CT of a group's entries, in registers: read once
 // for all the group's tiles of the run. Each warp multiplies the tile's 16 rows against them over its share of K on
 // mma.m16n8k16, and the block adds the warps' sums in row_dot_sub8's tree order: the arithmetic and its order are the
-// per-tile stage's, on the same bytes, so every NVFP4 entry's bits are v1's at any row count. MXFP8 runs the same frame
-// with its own block products (mx_tile_mma) and the same tree; an entry's arithmetic never depends on the entries beside it.
+// per-tile stage's, on the same bytes, so every NVFP4 gate/up entry's bits are v1's at any row count. MXFP8 and NVFP4 down
+// run the same frame with their own block products (mx_tile_mma) and the same tree; an entry's arithmetic never depends on
+// the entries beside it.
 constexpr int kNvSubRows = 16;
 // bytes of a weight row of K NVFP4 values (blocks of 64 values in 36 bytes); a tile's bytes; tiles in flight; a warp's k16
 // steps (k = wp + 8 j; MXFP8 rows are K / 128 blocks of 132 bytes, a warp's steps its 32-value blocks u = wp + 8 j)
@@ -122,10 +125,12 @@ __device__ __forceinline__ void nv_tile_mma(const uint8_t* wra, const uint8_t* w
 #endif
 }
 
-// MXFP8: a thread's activations for a chunk of up to 8 CT entries, as f16 (an int8 is exact in f16). In block u = wp + 8 j
-// the thread's k positions are 4 t .. 4 t + 3 (the first k16 MMA) and 16 + 4 t .. 16 + 4 t + 3 (the second), a permutation
-// of each MMA's k that the weights share: b[ct][j] holds entry 8 ct + g's {4 t, 4 t + 1}, {4 t + 2, 4 t + 3}, then the same
-// 16 on, and d0 / d1 the scales of entries 8 ct + 2 t and + 1 (0 past the chunk or past K).
+// MXFP8 and NVFP4 down: a thread's activations for a chunk of up to 8 CT entries, as f16 (an int8 is exact in f16), for
+// the two k16 MMAs of each 32-value block u = wp + 8 j: b[ct][j] holds entry 8 ct + g's pairs for the first MMA's B
+// fragment (its k 2 t, 2 t + 1 and 2 t + 8, 2 t + 9), then the second's, and d0 / d1 the scales of entries 8 ct + 2 t and
+// + 1 (0 past the chunk or past K). The MMA k is a permutation of the block's 32 positions that the weights share: NVFP4
+// the natural one (a sub-block of 16 a MMA, as its codes pair value j with j + 8), MXFP8 4 t .. 4 t + 3 then
+// 16 + 4 t .. 16 + 4 t + 3 (contiguous code bytes).
 template<int K, int CT>
 struct MxCols {
     uint32_t b[CT][kMxSteps<K>][4];
@@ -135,7 +140,7 @@ __device__ __forceinline__ uint32_t s8x2_half2(uint32_t w) {
     const __half2 h = __halves2half2(__short2half_rn((short) (int8_t) (w & 0xFFu)), __short2half_rn((short) (int8_t) (w >> 8)));
     return *reinterpret_cast<const uint32_t*>(&h);
 }
-template<int K, bool GU, int CT>
+template<int TY, int K, bool GU, int CT>
 __device__ __forceinline__ void mx_cols_load(MxCols<K, CT>& x, const block_q8_1* __restrict__ xq, const int32_t* __restrict__ ent, int e,
                                              int ne, int wp, int g, int t) {
     const auto entry = [&](int c) {
@@ -151,11 +156,17 @@ __device__ __forceinline__ void mx_cols_load(MxCols<K, CT>& x, const block_q8_1*
         for (int j = 0; j < kMxSteps<K>; ++j) {
             const int u = wp + 8 * j;
             const bool in = u < K / 32;
-            const uint32_t q0 = xg && in ? __ldg(xg + 9 * u + 1 + t) : 0u, q1 = xg && in ? __ldg(xg + 9 * u + 5 + t) : 0u;
-            x.b[ct][j][0] = s8x2_half2(q0);
-            x.b[ct][j][1] = s8x2_half2(q0 >> 16);
-            x.b[ct][j][2] = s8x2_half2(q1);
-            x.b[ct][j][3] = s8x2_half2(q1 >> 16);
+            if constexpr (TY == 40) {   // bytes 2 t, 2 t + 8, 16 + 2 t, 24 + 2 t and the ones after them
+                const int w = 1 + (t >> 1), sh = 16 * (t & 1);
+#pragma unroll
+                for (int m = 0; m < 4; ++m) x.b[ct][j][m] = s8x2_half2(xg && in ? __ldg(xg + 9 * u + w + 2 * m) >> sh : 0u);
+            } else {
+                const uint32_t q0 = xg && in ? __ldg(xg + 9 * u + 1 + t) : 0u, q1 = xg && in ? __ldg(xg + 9 * u + 5 + t) : 0u;
+                x.b[ct][j][0] = s8x2_half2(q0);
+                x.b[ct][j][1] = s8x2_half2(q0 >> 16);
+                x.b[ct][j][2] = s8x2_half2(q1);
+                x.b[ct][j][3] = s8x2_half2(q1 >> 16);
+            }
             x.d0[ct][j] = x0 && in ? __low2float(*reinterpret_cast<const half2*>(x0 + 9 * u)) : 0.0f;
             x.d1[ct][j] = x1 && in ? __low2float(*reinterpret_cast<const half2*>(x1 + 9 * u)) : 0.0f;
         }
@@ -173,11 +184,26 @@ __device__ __forceinline__ uint32_t e4m3x2_half2(uint32_t w) {
     const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (w & 0xFFFFu), __NV_E4M3);
     return *reinterpret_cast<const uint32_t*>(&h);
 }
+// two E2M1 codes (the low byte, the first in its low nibble) as an f16 pair, exactly
+// (an f16 E2M1 value has a zero low byte: the high byte of magnitude m comes from a table, the sign from bit 3)
+__device__ __forceinline__ uint32_t e2m1x2_half2(uint32_t w) {
+    const uint32_t hi = __byte_perm(0x3E3C3800u, 0x46444240u, ((w & 7u) << 4) | ((w & 0x70u) << 8));
+    return hi | ((w & 8u) << 12) | ((w & 0x80u) << 24);
+}
+// NVFP4's UE4M3 sub-block scale as nvfp4_scale_dev reads it, but whole (ggml halves it and doubles the codes), in both
+// halves of an f16 pair: bit 7 ignored, 0x7F as 0
+__device__ __forceinline__ uint32_t ue4m3_half2(uint32_t x) {
+    const uint32_t v = x & 0x7Fu;
+    const uint32_t h = v == 0x7Fu ? 0u : e4m3x2_half2(v) & 0xFFFFu;
+    return h | h << 16;
+}
 #endif
 
-// A warp's sums of a tile's rows g and g + 8 (wra, wrb: MXFP8 rows) against the first CU column tiles of x: block u = wp + 8 j is two
-// k16 MMAs from zero (its E4M3 x int8 products), then acc[.][j % 4] += (d_x * d_w) * that, d_w the block's UE8M0 scale.
-template<int K, int CU, int CT>
+// A warp's sums of a tile's rows g and g + 8 (wra, wrb) against the first CU column tiles of x: block u = wp + 8 j is two
+// k16 MMAs from zero, then acc[.][j % 4] += (d_x * d_w) * that. MXFP8: the E4M3 codes times int8, d_w the block's UE8M0
+// scale. NVFP4: the E2M1 codes times their sub-block's UE4M3 scale (exact in f16) times int8, d_w 1 (the expert's FP32
+// scale multiplies the sum).
+template<int TY, int K, int CU, int CT>
 __device__ __forceinline__ void mx_tile_mma(const uint8_t* wra, const uint8_t* wrb, const MxCols<K, CT>& x, int wp, int t,
                                             float (&acc)[CT][4][4]) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -186,15 +212,40 @@ __device__ __forceinline__ void mx_tile_mma(const uint8_t* wra, const uint8_t* w
         const int u = wp + 8 * j;
         if ((K / 32) % 8 != 0 && u >= K / 32) break;   // warp-uniform: the warps past K's last block
         const int s = j & 3;
-        const uint8_t* ba = wra + (u >> 2) * 132;
-        const uint8_t* bb = wrb + (u >> 2) * 132;
-        const uint8_t* qa = ba + 4 + 32 * (u & 3) + 4 * t;
-        const uint8_t* qb = bb + 4 + 32 * (u & 3) + 4 * t;
-        const uint32_t wa0 = *reinterpret_cast<const uint32_t*>(qa), wa1 = *reinterpret_cast<const uint32_t*>(qa + 16);
-        const uint32_t wb0 = *reinterpret_cast<const uint32_t*>(qb), wb1 = *reinterpret_cast<const uint32_t*>(qb + 16);
-        const uint32_t a0[4] = { e4m3x2_half2(wa0), e4m3x2_half2(wb0), e4m3x2_half2(wa0 >> 16), e4m3x2_half2(wb0 >> 16) };
-        const uint32_t a1[4] = { e4m3x2_half2(wa1), e4m3x2_half2(wb1), e4m3x2_half2(wa1 >> 16), e4m3x2_half2(wb1 >> 16) };
-        const float dwa = ue8m0_scale_dev(ba[u & 3]), dwb = ue8m0_scale_dev(bb[u & 3]);
+        uint32_t a0[4], a1[4];
+        float dwa = 1.0f, dwb = 1.0f;
+        if constexpr (TY == 40) {   // block u >> 1, sub-blocks 2 (u & 1) and the next: bytes 2 t, 2 t + 1 of each
+            const uint8_t* ba = wra + (u >> 1) * 36;
+            const uint8_t* bb = wrb + (u >> 1) * 36;
+            const int s0 = 2 * (u & 1);
+            const auto frag = [&](uint32_t (&a)[4], int sb) {
+                const uint32_t ca = *reinterpret_cast<const uint16_t*>(ba + 4 + 8 * sb + 2 * t);
+                const uint32_t cb = *reinterpret_cast<const uint16_t*>(bb + 4 + 8 * sb + 2 * t);
+                const uint32_t ha = ue4m3_half2(ba[sb]), hb = ue4m3_half2(bb[sb]);
+                const auto mul = [](uint32_t v, uint32_t sc) {
+                    const __half2 r = __hmul2(*reinterpret_cast<const __half2*>(&v), *reinterpret_cast<const __half2*>(&sc));
+                    return *reinterpret_cast<const uint32_t*>(&r);
+                };
+                // low nibbles: values 2 t, 2 t + 1; high: 2 t + 8, 2 t + 9
+                a[0] = mul(e2m1x2_half2((ca & 0x0Fu) | ((ca >> 4) & 0xF0u)), ha);
+                a[1] = mul(e2m1x2_half2((cb & 0x0Fu) | ((cb >> 4) & 0xF0u)), hb);
+                a[2] = mul(e2m1x2_half2(((ca >> 4) & 0x0Fu) | ((ca >> 8) & 0xF0u)), ha);
+                a[3] = mul(e2m1x2_half2(((cb >> 4) & 0x0Fu) | ((cb >> 8) & 0xF0u)), hb);
+            };
+            frag(a0, s0);
+            frag(a1, s0 + 1);
+        } else {
+            const uint8_t* ba = wra + (u >> 2) * 132;
+            const uint8_t* bb = wrb + (u >> 2) * 132;
+            const uint8_t* qa = ba + 4 + 32 * (u & 3) + 4 * t;
+            const uint8_t* qb = bb + 4 + 32 * (u & 3) + 4 * t;
+            const uint32_t wa0 = *reinterpret_cast<const uint32_t*>(qa), wa1 = *reinterpret_cast<const uint32_t*>(qa + 16);
+            const uint32_t wb0 = *reinterpret_cast<const uint32_t*>(qb), wb1 = *reinterpret_cast<const uint32_t*>(qb + 16);
+            a0[0] = e4m3x2_half2(wa0); a0[1] = e4m3x2_half2(wb0); a0[2] = e4m3x2_half2(wa0 >> 16); a0[3] = e4m3x2_half2(wb0 >> 16);
+            a1[0] = e4m3x2_half2(wa1); a1[1] = e4m3x2_half2(wb1); a1[2] = e4m3x2_half2(wa1 >> 16); a1[3] = e4m3x2_half2(wb1 >> 16);
+            dwa = ue8m0_scale_dev(ba[u & 3]);
+            dwb = ue8m0_scale_dev(bb[u & 3]);
+        }
         constexpr float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
         for (int ct = 0; ct < CU; ++ct) {
@@ -297,7 +348,8 @@ __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int t
     }
     if (i0 >= i1) return;
     __syncthreads();   // the barriers' init seen
-    std::conditional_t<TY == 40, NvCols<K, CT>, MxCols<K, CT>> x;
+    constexpr bool kInt8 = TY == 40 && GU;   // NVFP4 gate/up: v1's exact sub-block dots
+    std::conditional_t<kInt8, NvCols<K, CT>, MxCols<K, CT>> x;
     int held_e = -1, gi = 0;
     for (int i = i0, k = 0; i < i1; ++i, ++k) {
         int e, row0;
@@ -308,8 +360,8 @@ __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int t
         const float sc = TY == 40 ? nvfp4_tail((const void*) grp_ptr[gi], L)[GU ? (is_up ? 1 : 0) : 2] : 1.0f;
         const int ne = min(C, grp_start[gi + 1] - e);
         if (held_e != e) {   // entries are each one group's, so the first entry names the chunk
-            if constexpr (TY == 40) nv_cols_load<K, GU, CT>(x, xq, ent, e, ne, wp, g, t);
-            else mx_cols_load<K, GU, CT>(x, xq, ent, e, ne, wp, g, t);
+            if constexpr (kInt8) nv_cols_load<K, GU, CT>(x, xq, ent, e, ne, wp, g, t);
+            else mx_cols_load<TY, K, GU, CT>(x, xq, ent, e, ne, wp, g, t);
             held_e = e;
         }
         uint8_t* tile = smem + (k % NS) * TB;
@@ -317,12 +369,12 @@ __device__ __forceinline__ void expert_stream_stage(int block, int blocks, int t
         const uint8_t* wrb = wra + 8 * RB;
         gu_mb_wait(&bar[k % NS], (unsigned) (k / NS) & 1u);
         float acc[CT][4][4] = {};
-        if constexpr (TY == 40) {
+        if constexpr (kInt8) {
             if (CT == 1 || ne <= 8) nv_tile_mma<K, 1, CT>(wra, wrb, x, wp, t, acc);
             else nv_tile_mma<K, CT, CT>(wra, wrb, x, wp, t, acc);
         } else {
-            if (CT == 1 || ne <= 8) mx_tile_mma<K, 1, CT>(wra, wrb, x, wp, t, acc);
-            else mx_tile_mma<K, CT, CT>(wra, wrb, x, wp, t, acc);
+            if (CT == 1 || ne <= 8) mx_tile_mma<TY, K, 1, CT>(wra, wrb, x, wp, t, acc);
+            else mx_tile_mma<TY, K, CT, CT>(wra, wrb, x, wp, t, acc);
         }
 #pragma unroll
         for (int ct = 0; ct < CT; ++ct) {

@@ -11,8 +11,9 @@
 // Every gate/up format with every down format; calls of 0..cap groups of 1..T entries each (an empty call is what the
 // verify window's PCIe call usually is), entries from 0 and from past 0 (the PCIe call's follow the VRAM call's),
 // scattered destinations, stale scratch, grid_groups 0 (= cap), 1, 2, 3, 4 and above cap: the output must be BITWISE
-// equal to v1's, the rows the call must not write included (both start from the same NaN pattern). MXFP8 at 2304 x 1152
-// sums in its own fixed order: check_invariant holds it to its own bits at every grouping, and to v1 within rounding.
+// equal to v1's, the rows the call must not write included (both start from the same NaN pattern). NVFP4 (its down rows)
+// and MXFP8 at 2304 x 1152 sum in their own fixed order: check_invariant holds them to their own bits at every grouping,
+// and to v1 within rounding.
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
@@ -560,17 +561,11 @@ void bench_wide(cudaStream_t s, std::mt19937& rng, int R, int type, int phase) {
     ck(cudaMemcpy(S.tok, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice), "tok");
     ck(cudaMemcpy(S.ptr, lptr[0], (size_t) ng * 8, cudaMemcpyDeviceToDevice), "ptr");
     const auto ref = S.result(true, 0, 0x00, s), got = S.result(false, 0, 0x7F, s);
-    if (type == 46) {   // its own order: within rounding of v1 (check_invariant holds its bits)
+    {   // its own order: within rounding of v1 (check_invariant holds its bits)
         const double rel = diff_over_rms(ref, got, (size_t) R * kTop * 2304);
         std::printf("wide %s 2304 x 1152, %d rows x top %d of %d: %d groups, output vs v1: rms diff / rms %.2g%s\n", name_of(type), R,
                     kTop, kExperts, ng, rel, rel > 1e-4 || !std::isfinite(rel) ? "  FAIL" : "");
         g_fail += rel > 1e-4 || !std::isfinite(rel);
-    } else {
-        size_t diff = 0;
-        for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
-        std::printf("wide %s 2304 x 1152, %d rows x top %d of %d: %d groups, output vs v1: %s (%zu differ)\n", name_of(type), R, kTop,
-                    kExperts, ng, diff ? "FAIL" : "bitwise equal", diff);
-        g_fail += diff != 0;
     }
     auto graph = [&](bool v1) {
         k::native_grouped_set_v1(v1);
@@ -810,8 +805,8 @@ int main(int argc, char** argv) {
     check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);
-    check(40, 40, 2304, 1152, s, rng, 64);
-    for (const int t : {1, 3, 64}) check_invariant(46, 2304, 1152, t, s, rng);   // MXFP8's own order
+    for (const int ty : {40, 46})   // NVFP4's (down) and MXFP8's own order at Inkling's shape
+        for (const int t : {1, 3, 64}) check_invariant(ty, 2304, 1152, t, s, rng);
     check(21, 23, 2560, 768, s, rng);
     check(18, 20, 2560, 640, s, rng);
     check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries
