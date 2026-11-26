@@ -3,8 +3,10 @@
 #include "models/deepseek4/pack.hpp"
 #include "models/deepseek4/meta.hpp"
 #include "models/deepseek4/context_policy.hpp"
+#include "models/deepseek4/expert_tier_spec.hpp"
 #include "basalt/vision/mmproj.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 int main(int argc, char** argv) {
@@ -46,6 +48,38 @@ int main(int argc, char** argv) {
         basalt::log::error("deepseek4 pack test", "native cache plan: %s",
                            cache_plan.error.empty() ? "native context was changed" : cache_plan.error.c_str());
         return 1;
+    }
+    basalt::model::LoadRequest tier_request;
+    tier_request.diag_tier_ram = 7;
+    tier_request.diag_tier_vram = 11;
+    tier_request.vram_reserve_mib = 512;
+    tier_request.expert_cache = 64;
+    tier_request.resident_budget = 3ull << 30;
+    tier_request.route.tail_skip = 2;
+    tier_request.route.prior = 0.125f;
+    basalt::core::ExpertTierSpec tier;
+    if (!basalt::models::deepseek4::make_expert_tier_spec(pack, argv[1], 0, tier_request, tier, err)) {
+        basalt::log::error("deepseek4 pack test", "expert tier spec: %s", err.c_str());
+        return 1;
+    }
+    uint64_t expected_stride = 0;
+    for (const auto& expert : pack.experts) expected_stride = std::max(expected_stride, expert.bytes);
+    if (tier.name != "deepseek4" || tier.n_layers != g.n_layers || tier.n_expert != g.n_expert ||
+        tier.top_k != g.n_used || tier.layers.size() != pack.experts.size() || tier.range.bytes == 0 ||
+        tier.share_stride != expected_stride || tier.diag_tier_ram != 7 || tier.diag_tier_vram != 11 ||
+        tier.vram_reserve_mib != 512 || tier.expert_cache != 64 || tier.resident_budget != (3ull << 30) ||
+        tier.route_tail_skip != 2 || tier.route_prior != 0.125f) {
+        basalt::log::error("deepseek4 pack test", "expert tier spec differs from the pack or requested tier policy");
+        return 1;
+    }
+    for (size_t layer = 0; layer < pack.experts.size(); ++layer) {
+        const auto& expected = pack.experts[layer];
+        const auto& actual = tier.layers[layer];
+        if (actual.gu_type != expected.gate_up_type || actual.d_type != expected.down_type ||
+            actual.offset != expected.offset || actual.blob_bytes != expected.bytes || actual.clamp != 0.f) {
+            basalt::log::error("deepseek4 pack test", "expert tier layer %zu differs from experts.layout", layer);
+            return 1;
+        }
     }
     const char* image_rows[] = {"v.token_embd.img_start", "v.token_embd.img_end", "v.token_embd.img_pad", "v.image_newline"};
     for (const char* name : image_rows) {

@@ -13,7 +13,7 @@ add_library(deepseek4_vision_plan STATIC src/models/deepseek4/vision/plan.cpp)
 target_include_directories(deepseek4_vision_plan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(deepseek4_vision_plan PUBLIC vision_core vision_transformer warnings)
 
-add_library(deepseek4_pack STATIC src/models/deepseek4/pack.cpp)
+add_library(deepseek4_pack STATIC src/models/deepseek4/pack.cpp src/models/deepseek4/expert_tier_spec.cpp)
 target_include_directories(deepseek4_pack PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(deepseek4_pack PUBLIC core)
 
