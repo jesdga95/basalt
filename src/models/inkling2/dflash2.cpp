@@ -782,8 +782,9 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     const Dflash2Geometry& d = w->geo;
     const size_t E = kE, ff = (size_t) d.n_ff;
     const int S_all = std::min(max_sessions, (int) bk::kWindowSegsMax);
-    const int CR = kChunkSlots * kDf2Block;       // 64
-    const int CD = kChunkSlots * kDf2Drafts;      // 56
+    const int CR = S_all * kDf2Block;      // block rows of a pass
+    const int CD = S_all * kHeadDrafts;    // draft rows of a head pass
+    const int CG = (std::max(CR, max_rows) + wg::kRows - 1) / wg::kRows;   // row groups of the widest product
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };
 
@@ -794,7 +795,7 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
 
     c_tap_bf16_ = dev(wg::act_bytes((int64_t) kDf2Targets * kE), ok);
     c_raw_ = f((size_t) wg::kRows * E);
-    c_act_ = dev(std::max(wg::act_bytes(kE), (size_t) (max_rows + wg::kRows) * E * sizeof(uint16_t)), ok);
+    c_act_ = dev((size_t) std::max(max_rows, wg::kRows) * E * sizeof(uint16_t), ok);
     c_kb_ = f((size_t) max_rows * kDf2KV);
     c_vb_ = f((size_t) max_rows * kDf2KV);
 
@@ -807,19 +808,21 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     vb_ = f((size_t) CR * kDf2KV);
     qr_ = f((size_t) CR * kDf2Q);
     attn_ = f((size_t) CR * kDf2Q);
-    act_a_ = dev(wg::act_bytes(kE), ok);
-    act_q_ = dev(wg::act_bytes(kDf2Q), ok);
-    act_h_ = dev(wg::act_bytes((int64_t) ff), ok);
+    act_a_ = dev((size_t) CR * E * sizeof(uint16_t), ok);
+    act_q_ = dev((size_t) CR * kDf2Q * sizeof(uint16_t), ok);
+    act_h_ = dev((size_t) CR * ff * sizeof(uint16_t), ok);
     {
         size_t pf = 0, tk = 0;
         ws_need(d, w->n_vocab, w->head_fp4 != nullptr, pf, tk);
+        pf *= (size_t) CG;
+        tk *= (size_t) CG;
         ws_.partial = f(std::max<size_t>(pf, 1));
         ws_.tickets = (int32_t*) dev(std::max<size_t>(tk, 1) * 4, ok);
         ws_.partial_floats = pf;
         ws_.tickets_n = tk;
     }
     att_cells_ = ring_cells(d);
-    att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, CR, kDf2Heads, kDf2HeadDim));
+    att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, bk::kGqaMaxWindow, kDf2Heads, kDf2HeadDim));
 
     logits_ = f((size_t) CD * (size_t) w->n_vocab);
     g_ = f((size_t) CD * kDf2Rank);
@@ -878,16 +881,13 @@ void Dflash2Batch::commit(Dflash2Hook* const* hooks, int n_seg, const bk::Window
             segs.k[i] = hooks[i]->cache_[(size_t) l].k;
             segs.v[i] = hooks[i]->cache_[(size_t) l].v;
         }
-        for (int r0 = 0; r0 < rows; r0 += wg::kRows) {
-            const int n = std::min(wg::kRows, rows - r0);
-            wg::Call kv;
-            kv.fmt = wg::Format::Nvfp4;
-            kv.K = kE;
-            kv.n = 2;
-            kv.m[0] = mat(L.wk, kDf2KV, L.fp4_scale + 1, c_kb_ + (size_t) r0 * kDf2KV, kDf2KV);
-            kv.m[1] = mat(L.wv, kDf2KV, L.fp4_scale + 2, c_vb_ + (size_t) r0 * kDf2KV, kDf2KV);
-            wg::gemm(kv, static_cast<const uint16_t*>(c_act_) + (size_t) r0 * kE, n, ws_, stream);
-        }
+        wg::Call kv;
+        kv.fmt = wg::Format::Nvfp4;
+        kv.K = kE;
+        kv.n = 2;
+        kv.m[0] = mat(L.wk, kDf2KV, L.fp4_scale + 1, c_kb_, kDf2KV);
+        kv.m[1] = mat(L.wv, kDf2KV, L.fp4_scale + 2, c_vb_, kDf2KV);
+        wg::gemm(kv, c_act_, rows, ws_, stream);
         dspark_kv_commit_batch(c_kb_, c_vb_, L.k_norm, d.rms_eps, d.rope_base, pos_d, rows, segs, cap, stream);
     }
 }
@@ -937,47 +937,49 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
     try {
         bk::PdlScope pdl(true);
         // a block of the anchor and as many masks as drafts are wanted: its attention sees only these rows (the drafts then
-        // differ from a whole block's), and a chunk holds as many blocks as its rows take
+        // differ from a whole block's); every slot's block runs in one pass, each product one launch over all its rows
         int n_max = 1;
         for (int b = 0; b < B; ++b) n_max = std::max(n_max, act_n[b]);
         const int blk = n_max + 1;
-        const int chunk_slots = kChunkSlots * kDf2Block / blk;
-        for (int s0 = 0; s0 < B; s0 += chunk_slots) {
-            const int cn = std::min(chunk_slots, B - s0);
-            const int R = cn * blk;
-            const int sub_nmax = n_max;
-            const int D_rows = cn * sub_nmax;
+        const int R = B * blk;
+        // the attention takes up to kGqaMaxWindow rows of at most kAttnSegs slots a launch
+        const int att_slots = std::min(kAttnSegs, bk::kGqaMaxWindow / blk);
 
-            dflash2_block_inputs_batch(w.embedding, meta_d_ + 2 * s0, w.embed_norm, w.target_eps, w.mask, blk, cn,
-                                       x_, st);
-            wg::norm_pack(x_, w.layer[0].attn_norm, d.rms_eps, kE, R, act_a_, xn_, st);
-            for (int l = 0; l < d.n_layers; ++l) {
-                const Dflash2Layer& L = w.layer[(size_t) l];
-                const float* sc = L.fp4_scale;
-                wg::Call ca;
-                ca.fmt = wg::Format::Q8;
-                ca.K = kE;
-                ca.m[0] = mat(L.conv_a, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
-                wg::gemm(ca, act_a_, R, ws_, st);
-                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, blk, cn, act_a_, nullptr, st);
+        dflash2_block_inputs_batch(w.embedding, meta_d_, w.embed_norm, w.target_eps, w.mask, blk, B, x_, st);
+        wg::norm_pack(x_, w.layer[0].attn_norm, d.rms_eps, kE, R, act_a_, xn_, st);
+        for (int l = 0; l < d.n_layers; ++l) {
+            const Dflash2Layer& L = w.layer[(size_t) l];
+            const float* sc = L.fp4_scale;
+            wg::Call ca;
+            ca.fmt = wg::Format::Q8;
+            ca.K = kE;
+            ca.m[0] = mat(L.conv_a, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
+            wg::gemm(ca, act_a_, R, ws_, st);
+            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, blk, B, act_a_, nullptr, st);
 
-                wg::Call qkv;
-                qkv.fmt = wg::Format::Nvfp4;
-                qkv.K = kE;
-                qkv.n = 3;
-                qkv.m[0] = mat(L.wq, kDf2Q, sc + 0, q_, kDf2Q);
-                qkv.m[1] = mat(L.wk, kDf2KV, sc + 1, kb_, kDf2KV);
-                qkv.m[2] = mat(L.wv, kDf2KV, sc + 2, vb_, kDf2KV);
-                wg::gemm(qkv, act_a_, R, ws_, st);
+            wg::Call qkv;
+            qkv.fmt = wg::Format::Nvfp4;
+            qkv.K = kE;
+            qkv.n = 3;
+            qkv.m[0] = mat(L.wq, kDf2Q, sc + 0, q_, kDf2Q);
+            qkv.m[1] = mat(L.wk, kDf2KV, sc + 1, kb_, kDf2KV);
+            qkv.m[2] = mat(L.wv, kDf2KV, sc + 2, vb_, kDf2KV);
+            wg::gemm(qkv, act_a_, R, ws_, st);
 
-                DsBatchKv kv;
-                bk::GqaWindowSeg gsegs[bk::kWindowSegsMax] = {};
+            DsBatchKv kv;
+            const int64_t cap = act[0]->cache_[(size_t) l].cap;
+            for (int c = 0; c < B; ++c) {
+                kv.k[c] = act[c]->cache_[(size_t) l].k;
+                kv.v[c] = act[c]->cache_[(size_t) l].v;
+            }
+            dflash2_block_qk_prep_batch(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, d.rope_base, meta_d_, blk, B, qr_, kv,
+                                        cap, st);
+            for (int s0 = 0; s0 < B; s0 += att_slots) {
+                const int cn = std::min(att_slots, B - s0);
+                bk::GqaWindowSeg gsegs[kAttnSegs] = {};
                 int64_t max_cells = 0;
-                const int64_t cap = act[s0]->cache_[(size_t) l].cap;
                 for (int c = 0; c < cn; ++c) {
                     const Dflash2Hook::Cache& cc = act[s0 + c]->cache_[(size_t) l];
-                    kv.k[c] = cc.k;
-                    kv.v[c] = cc.v;
                     const int64_t p0 = act_pos[s0 + c];
                     int64_t win = d.window;
                     bool block_win = false;
@@ -986,50 +988,54 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                     max_cells = std::max(max_cells, std::min(att_cells_, cells));
                     gsegs[c] = {cc.k, cc.v, p0, blk, p0 + blk, win, cc.cap, block_win};
                 }
-                dflash2_block_qk_prep_batch(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, d.rope_base, meta_d_ + 2 * s0,
-                                            blk, cn, qr_, kv, cap, st);
-                bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, cn, att_scr_, max_cells, attn_, st);
-
-                wg::pack(attn_, kDf2Q, kDf2Q, R, act_q_, st);
-                wg::Call o;
-                o.fmt = wg::Format::Nvfp4;
-                o.K = kDf2Q;
-                o.m[0] = mat(L.wo, kE, sc + 3, z_, kE);
-                wg::gemm(o, act_q_, R, ws_, st);
-                dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_a, blk, cn, x_, L.post_norm, d.rms_eps,
-                                            act_a_, xn_, st);
-
-                wg::Call cf;
-                cf.fmt = wg::Format::Q8;
-                cf.K = kE;
-                cf.m[0] = mat(L.conv_f, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
-                wg::gemm(cf, act_a_, R, ws_, st);
-                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, blk, cn, act_a_, nullptr, st);
-
-                wg::Call gu;
-                gu.fmt = wg::Format::Nvfp4;
-                gu.K = kE;
-                gu.n = 2;
-                gu.epi = wg::Epilogue::SwiGLU;
-                gu.m[0] = mat(L.gate, d.n_ff, sc + 4, nullptr, d.n_ff);
-                gu.m[1] = mat(L.up, d.n_ff, sc + 5, nullptr, d.n_ff);
-                gu.act_out = act_h_;
-                wg::gemm(gu, act_a_, R, ws_, st);
-
-                wg::Call dn;
-                dn.fmt = wg::Format::Nvfp4;
-                dn.K = d.n_ff;
-                dn.m[0] = mat(L.down, kE, sc + 6, z_, kE);
-                wg::gemm(dn, act_h_, R, ws_, st);
-                if (l + 1 < d.n_layers) {
-                    dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_f, blk, cn, x_,
-                                                w.layer[(size_t) l + 1].attn_norm, d.rms_eps, act_a_, xn_, st);
-                } else {
-                    dflash2_conv2_add(z_, dyn_, kDf2Dyn, L.base_f, blk, cn, x_, st);
-                }
+                bk::gqa_window_attn_segs(qr_ + (size_t) s0 * blk * kDf2Q, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, cn,
+                                         att_scr_, max_cells, attn_ + (size_t) s0 * blk * kDf2Q, st);
             }
 
-            dflash2_norm_draft_pack(x_, w.norm, d.rms_eps, blk, cn, sub_nmax, act_a_, hq_, nullptr, st);
+            wg::pack(attn_, kDf2Q, kDf2Q, R, act_q_, st);
+            wg::Call o;
+            o.fmt = wg::Format::Nvfp4;
+            o.K = kDf2Q;
+            o.m[0] = mat(L.wo, kE, sc + 3, z_, kE);
+            wg::gemm(o, act_q_, R, ws_, st);
+            dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_a, blk, B, x_, L.post_norm, d.rms_eps, act_a_, xn_, st);
+
+            wg::Call cf;
+            cf.fmt = wg::Format::Q8;
+            cf.K = kE;
+            cf.m[0] = mat(L.conv_f, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
+            wg::gemm(cf, act_a_, R, ws_, st);
+            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, blk, B, act_a_, nullptr, st);
+
+            wg::Call gu;
+            gu.fmt = wg::Format::Nvfp4;
+            gu.K = kE;
+            gu.n = 2;
+            gu.epi = wg::Epilogue::SwiGLU;
+            gu.m[0] = mat(L.gate, d.n_ff, sc + 4, nullptr, d.n_ff);
+            gu.m[1] = mat(L.up, d.n_ff, sc + 5, nullptr, d.n_ff);
+            gu.act_out = act_h_;
+            wg::gemm(gu, act_a_, R, ws_, st);
+
+            wg::Call dn;
+            dn.fmt = wg::Format::Nvfp4;
+            dn.K = d.n_ff;
+            dn.m[0] = mat(L.down, kE, sc + 6, z_, kE);
+            wg::gemm(dn, act_h_, R, ws_, st);
+            if (l + 1 < d.n_layers) {
+                dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_f, blk, B, x_, w.layer[(size_t) l + 1].attn_norm,
+                                            d.rms_eps, act_a_, xn_, st);
+            } else {
+                dflash2_conv2_add(z_, dyn_, kDf2Dyn, L.base_f, blk, B, x_, st);
+            }
+        }
+
+        // the head over the draft rows, as many slots a pass as its kHeadDrafts rows a slot hold
+        const int head_slots = max_sessions_ * kHeadDrafts / n_max;
+        for (int s0 = 0; s0 < B; s0 += head_slots) {
+            const int cn = std::min(head_slots, B - s0);
+            const int D_rows = cn * n_max;
+            dflash2_norm_draft_pack(x_ + (size_t) s0 * blk * kE, w.norm, d.rms_eps, blk, cn, n_max, act_a_, hq_, nullptr, st);
             wg::Call hc;
             hc.fmt = w.head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8;
             hc.K = kE;
@@ -1043,7 +1049,7 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
             wg::gemm(sc_call, act_a_, D_rows, ws_, st);
 
             dflash2_top16(logits_, w.head, true, hq_, D_rows, w.n_vocab, d.logit_softcap, top_scr_, cand_, tail_lse_, st);
-            dflash2_select(meta_d_ + 2 * s0, 2, cand_, tail_lse_, g_, w.pred, w.succ, cn, sub_nmax, d.logit_softcap,
+            dflash2_select(meta_d_ + 2 * s0, 2, cand_, tail_lse_, g_, w.pred, w.succ, cn, n_max, d.logit_softcap,
                            ids_d_ + (size_t) s0 * kDf2Block, kDf2Block, conf_d_ + (size_t) s0 * kDf2Block, kDf2Block, st);
         }
         cudaMemcpyAsync(ids_h_, ids_d_, (size_t) B * kDf2Block * 4, cudaMemcpyDeviceToHost, st);

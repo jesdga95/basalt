@@ -174,8 +174,10 @@ private:
     void *c_tap_bf16_ = nullptr, *c_act_ = nullptr;
     float *c_raw_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
 
-    // block + head chunk scratch (up to kChunkSlots = 8 slots -> R <= 64 block rows, D <= 56 draft rows)
-    static constexpr int kChunkSlots = 8;
+    // block scratch for every slot's whole block; the head takes up to kHeadDrafts draft rows a slot a pass; the
+    // attention up to kAttnSegs slots a launch
+    static constexpr int kHeadDrafts = 4;
+    static constexpr int kAttnSegs = 32;
     float *x_ = nullptr, *xn_ = nullptr, *z_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr;
     float *qr_ = nullptr, *attn_ = nullptr, *att_scr_ = nullptr;
     void *act_a_ = nullptr, *act_q_ = nullptr, *act_h_ = nullptr;
