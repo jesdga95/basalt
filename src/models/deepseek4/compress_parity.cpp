@@ -1,5 +1,5 @@
 #include "basalt/models/deepseek4/compress.hpp"
-#include "test_util.hpp"
+#include "parity_util.hpp"
 
 #include <cuda_fp8.h>
 
@@ -12,7 +12,7 @@
 #include <vector>
 
 using namespace basalt::models::deepseek4;
-using dstest::Dev;
+using ds4test::Dev;
 
 namespace {
 constexpr int D = 512;
@@ -128,10 +128,10 @@ double max_score_error(const std::vector<float>& got, const std::vector<float>& 
 bool run_case(CompressKind kind, int ratio, int total_tokens, int chunk, uint32_t seed) {
     const int width = kind == CompressKind::Csa ? 2 * D : D;
     const int state_rows = kind == CompressKind::Csa ? 2 * ratio : ratio;
-    auto kv = dstest::randn((size_t) total_tokens * width, seed, 0.25f);
-    auto score = dstest::randn((size_t) total_tokens * width, seed + 1, 0.7f);
-    auto ape = dstest::randn((size_t) ratio * width, seed + 2, 0.2f);
-    auto norm = dstest::randn(D, seed + 3, 0.05f, 1.0f);
+    auto kv = ds4test::randn((size_t) total_tokens * width, seed, 0.25f);
+    auto score = ds4test::randn((size_t) total_tokens * width, seed + 1, 0.7f);
+    auto ape = ds4test::randn((size_t) ratio * width, seed + 2, 0.2f);
+    auto norm = ds4test::randn(D, seed + 3, 0.05f, 1.0f);
     std::vector<float> freq(R / 2);
     for (int i = 0; i < R / 2; ++i) freq[i] = std::pow(10000.0f, -2.0f * i / R);
     std::vector<int32_t> pos(total_tokens);
@@ -148,7 +148,7 @@ bool run_case(CompressKind kind, int ratio, int total_tokens, int chunk, uint32_
     Dev<int32_t> dpos(pos);
     Dev<float> dstate_kv(state_count), dstate_score(state_count), dout(got_out.size());
     Dev<int32_t> drow(total_tokens);
-    dstest::check(cudaMemset(dout.p, 0, got_out.size() * sizeof(float)), "out clear");
+    ds4test::check(cudaMemset(dout.p, 0, got_out.size() * sizeof(float)), "out clear");
     reset_compress_state(kind, ratio, dstate_kv.p, dstate_score.p, nullptr);
     for (int start = 0; start < total_tokens; start += chunk) {
         const int count = std::min(chunk, total_tokens - start);
@@ -160,8 +160,8 @@ bool run_case(CompressKind kind, int ratio, int total_tokens, int chunk, uint32_
     got_score = dstate_score.down();
     got_out = dout.down();
     got_rows = drow.down();
-    const auto out_err = dstest::compare(got_out, ref_out);
-    const auto kv_err = dstest::compare(got_kv, ref_kv);
+    const auto out_err = ds4test::compare(got_out, ref_out);
+    const auto kv_err = ds4test::compare(got_kv, ref_kv);
     const double score_err = max_score_error(got_score, ref_score);
     const bool rows_ok = got_rows == ref_rows;
     std::printf("%s ratio=%d T=%d chunks=%d: output max abs %.3g rel RMS %.3g; state kv %.3g, score %.3g; row ids %s\n",
@@ -180,20 +180,20 @@ int main() {
 
     // One HCA group over a complete ratio-128 window, the larger real geometry.
     const int width = D;
-    auto kv = dstest::randn(8 * width, 0x616263u, 0.25f);
-    auto score = dstest::randn(8 * width, 0x616264u, 0.7f);
-    auto ape = dstest::randn(128 * width, 0x616265u, 0.2f);
+    auto kv = ds4test::randn(8 * width, 0x616263u, 0.25f);
+    auto score = ds4test::randn(8 * width, 0x616264u, 0.7f);
+    auto ape = ds4test::randn(128 * width, 0x616265u, 0.2f);
     std::vector<int32_t> pos(8);
     for (int i = 0; i < 8; ++i) pos[i] = 120 + i;
-    std::vector<float> norm = dstest::randn(D, 0x616266u, 0.05f, 1.0f);
+    std::vector<float> norm = ds4test::randn(D, 0x616266u, 0.05f, 1.0f);
     std::vector<float> freq(R / 2);
     for (int i = 0; i < R / 2; ++i) freq[i] = std::pow(10000.0f, -2.0f * i / R);
     Dev<float> dkv(kv), dscore(score), dape(ape), dnorm(norm), dfreq(freq);
     Dev<int32_t> dpos(pos), drow(8);
     Dev<float> dstate_kv(128 * width), dstate_score(128 * width), dout(D);
     reset_compress_state(CompressKind::Hca, 128, dstate_kv.p, dstate_score.p, nullptr);
-    std::vector<float> prefix_kv = dstest::randn(120 * width, 0x707265u, 0.25f);
-    std::vector<float> prefix_score = dstest::randn(120 * width, 0x707273u, 0.7f);
+    std::vector<float> prefix_kv = ds4test::randn(120 * width, 0x707265u, 0.25f);
+    std::vector<float> prefix_score = ds4test::randn(120 * width, 0x707273u, 0.7f);
     std::vector<float> all_kv = prefix_kv, all_score = prefix_score;
     all_kv.insert(all_kv.end(), kv.begin(), kv.end());
     all_score.insert(all_score.end(), score.begin(), score.end());
@@ -214,20 +214,20 @@ int main() {
                            dstate_kv.p, dstate_score.p, dout.p, drow.p, nullptr);
     compress_projected(CompressKind::Hca, 128, 8, dkv.p, dscore.p, dape.p, dpos.p, dnorm.p, eps, dfreq.p,
                        dstate_kv.p, dstate_score.p, dout.p, drow.p, nullptr);
-    const auto hca_out = dstest::compare(dout.down(), ref_out);
-    const auto hca_kv = dstest::compare(dstate_kv.down(), ref_kv);
+    const auto hca_out = ds4test::compare(dout.down(), ref_out);
+    const auto hca_kv = ds4test::compare(dstate_kv.down(), ref_kv);
     const double hca_score = max_score_error(dstate_score.down(), ref_score);
     const auto hca_rows = drow.down();
     const bool rows_match = hca_rows == std::vector<int32_t>(ref_rows.end() - 8, ref_rows.end());
     std::printf("HCA continuation at token 120: output max abs %.3g rel RMS %.3g; state kv %.3g, score %.3g; row ids %s\n",
                 hca_out.max_abs, hca_out.rms_rel, hca_kv.max_abs, hca_score, rows_match ? "match" : "MISMATCH");
     failures += !(hca_out.max_abs < 3e-5 && hca_kv.max_abs == 0.0 && hca_score == 0.0 && rows_match);
-    const double us = dstest::bench_stream_us([&](void* stream) {
+    const double us = ds4test::bench_stream_us([&](void* stream) {
         compress_projected(CompressKind::Hca, 128, 8, dkv.p, dscore.p, dape.p, dpos.p, dnorm.p, eps, dfreq.p,
                            dstate_kv.p, dstate_score.p, dout.p, drow.p, stream);
     }, 100);
     const double bytes = (128.0 * D * 2 + 8.0 * D * 3 + D) * sizeof(float);
-    dstest::bench_line("DS4 HCA compress T=8 ratio=128", us, bytes);
+    ds4test::bench_line("DS4 HCA compress T=8 ratio=128", us, bytes);
 
     return failures ? 1 : 0;
 }

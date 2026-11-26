@@ -20,4 +20,13 @@ void compress_projected(CompressKind kind, int ratio, int n_tokens, const float*
 /// Zeroes only the rolling partial-group state. Call at the start of a sequence.
 void reset_compress_state(CompressKind kind, int ratio, float* state_kv, float* state_score, void* stream);
 
+/// The 128-wide ratio-4 compressor owned by V4's sparse-attention indexer. Its cache uses the source's
+/// BF16 -> Hadamard -> FP4 quant/dequant path and does not share the attention compressor's FP8 rows.
+constexpr int kIndexerHeadDim = 128;
+constexpr int kIndexerRatio = 4;
+void indexer_compress_projected(int n_tokens, const float* kv, const float* score, const float* ape,
+                                const int32_t* pos, const float* norm_w, float rms_eps, const float* rope_freq,
+                                float* state_kv, float* state_score, float* out, int32_t* row_of, void* stream);
+void reset_indexer_compress_state(float* state_kv, float* state_score, void* stream);
+
 }  // namespace basalt::models::deepseek4

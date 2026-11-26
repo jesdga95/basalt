@@ -431,6 +431,10 @@ endif()
 include(src/models/deepseek41/vision/vision.cmake)
 endif()
 
+if(BASALT_MODEL_DEEPSEEK4)
+include(src/models/deepseek4/kernels.cmake)
+endif()
+
 add_executable(basalt-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(basalt-gguf PRIVATE artifact models)
 basalt_embed_manifest(basalt-gguf)
