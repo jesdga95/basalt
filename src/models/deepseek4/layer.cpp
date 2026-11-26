@@ -2,6 +2,7 @@
 
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/row_norm.hpp"
 
 #include "shared_expert.hpp"
@@ -47,6 +48,18 @@ void prepare_ffn_routes(const float* streams, int n_tokens, const FfnRouteWeight
                              weights.hc.rms_eps, scratch.collapsed, scratch.normalized, stream);
     router_step(scratch.normalized, weights.gate, n_tokens, n_embd, weights.routing, scratch.logits,
                 scratch.ids, scratch.weights, stream);
+}
+
+void finish_ffn_layer(const float* streams, const float* coefficients, float* shared_output,
+                      const float* routed_output, int n_tokens, int n_embd, float* next_streams, void* stream) {
+    if (!streams || !coefficients || !shared_output || !routed_output || !next_streams ||
+        n_tokens <= 0 || n_embd <= 0 || streams == shared_output || streams == routed_output ||
+        shared_output == routed_output || coefficients == shared_output || next_streams == streams ||
+        next_streams == coefficients ||
+        next_streams == shared_output || next_streams == routed_output)
+        throw std::invalid_argument("deepseek4 FFN layer finish: invalid state or output");
+    kernels::add_scaled(shared_output, routed_output, nullptr, (int64_t) n_tokens * n_embd, stream);
+    kernels::hc_post(shared_output, streams, coefficients, kernels::kHcCoef, n_tokens, n_embd, next_streams, stream);
 }
 
 void shared_expert_step(const float* normalized, int n_tokens, const SharedExpertWeights& weights,

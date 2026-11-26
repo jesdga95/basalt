@@ -98,6 +98,11 @@ struct RoutedExpertScratch {
 void prepare_ffn_routes(const float* streams, int n_tokens, const FfnRouteWeights& weights,
                         const FfnRouteScratch& scratch, void* stream);
 
+/// Adds the shared and top-6 routed expert results, then expands them through FFN mHC into [T][4][n_embd].
+/// `shared_output` is consumed in place; all other inputs remain unchanged.
+void finish_ffn_layer(const float* streams, const float* coefficients, float* shared_output,
+                      const float* routed_output, int n_tokens, int n_embd, float* next_streams, void* stream);
+
 /// Runs the checkpoint's shared SwiGLU expert on normalized [T][n_embd] rows, T=1..8.
 /// The returned [T][n_embd] output is the unweighted branch added to routed-expert output.
 void shared_expert_step(const float* normalized, int n_tokens, const SharedExpertWeights& weights,

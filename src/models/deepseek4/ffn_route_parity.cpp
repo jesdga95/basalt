@@ -1,4 +1,5 @@
 #include "basalt/models/deepseek4/layer.hpp"
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "parity_util.hpp"
 
@@ -8,7 +9,7 @@
 
 using namespace ds4test;
 
-int main() {
+int main(int argc, char** argv) {
     using namespace basalt::kernels;
     using namespace basalt::models::deepseek4;
     int devices = 0;
@@ -69,8 +70,26 @@ int main() {
     const auto got_weights = d_weights.down();
     const auto expected_weights = ref_weights.down();
     const bool weights_equal = got_weights == expected_weights;
-    std::printf("DeepSeek4 FFN route prep T=%d: normalized rows %s, expert ids %s, route weights %s\n",
+    const auto shared = randn((size_t) Tokens * Embd, 0x46524f37, 0.2f);
+    const auto routed = randn((size_t) Tokens * Embd, 0x46524f38, 0.1f);
+    Dev<float> d_shared(shared), d_routed(routed), d_next((size_t) Tokens * 4 * Embd);
+    Dev<float> ref_shared(shared), ref_next((size_t) Tokens * 4 * Embd);
+    finish_ffn_layer(d_streams.p, d_coef.p, d_shared.p, d_routed.p, Tokens, Embd, d_next.p, nullptr);
+    add_scaled(ref_shared.p, d_routed.p, nullptr, (int64_t) Tokens * Embd, nullptr);
+    hc_post(ref_shared.p, d_streams.p, d_coef.p, kHcCoef, Tokens, Embd, ref_next.p, nullptr);
+    const bool output_equal = d_next.down() == ref_next.down();
+    std::printf("DeepSeek4 FFN route prep T=%d: normalized rows %s, expert ids %s, route weights %s; "
+                "expert merge and mHC output %s\n",
                 Tokens, norm_equal ? "bitwise" : "DIFFERS", ids_equal ? "bitwise" : "DIFFERS",
-                weights_equal ? "bitwise" : "DIFFERS");
-    return norm_equal && ids_equal && weights_equal ? 0 : 1;
+                weights_equal ? "bitwise" : "DIFFERS", output_equal ? "bitwise" : "DIFFERS");
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        const std::vector<float> zero((size_t) Tokens * Embd, 0.f);
+        Dev<float> d_zero(zero);
+        const double us = bench_stream_us([&](void* s) {
+            finish_ffn_layer(d_streams.p, d_coef.p, d_shared.p, d_zero.p, Tokens, Embd, d_next.p, s);
+        });
+        bench_line("deepseek4 FFN mHC merge T=8", (double) us,
+                   (double) Tokens * Embd * 4 * sizeof(float) * 12);
+    }
+    return norm_equal && ids_equal && weights_equal && output_equal ? 0 : 1;
 }
