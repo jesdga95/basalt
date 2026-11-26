@@ -266,7 +266,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
                 return refuse("gpu-mode peer: " + who + " is " + arch_name(g) +
                               (ada ? "; peer takes sm_89 in a -DPEER_ADA=ON build" : "; peer runs on sm_120 cards"));
         } else if (!gpu_main_supported(g)) {
-            return refuse("gpu-mode " + mode_text + ": " + who + " is " + arch_name(g) + "; split and tensor run on sm_120 cards" +
+            return refuse("gpu-mode " + mode_text + ": " + who + " is " + arch_name(g) + "; split and tensor run on " + core::cuda_cc_name() + " cards" +
                           (ada ? " (peer takes sm_89 in a -DPEER_ADA=ON build)" : ""));
         }
     }
@@ -294,7 +294,7 @@ std::string check_gpu_modes(const GpuChoice& c, const std::string& model, const 
     for (size_t i = 1; c.mode == GpuMode::Peer && !m.peer_ada && i < c.cards.size(); ++i) {
         const int k = c.cards[i];
         if (k >= 0 && (size_t) k < visible.size() && visible[(size_t) k].cc_major == 8 && visible[(size_t) k].cc_minor == 9)
-            return "gpu-mode peer: " + gpu_label(visible, k) + " is " + arch_name(visible[(size_t) k]) + "; " + model + " runs peer on sm_120 cards";
+            return "gpu-mode peer: " + gpu_label(visible, k) + " is " + arch_name(visible[(size_t) k]) + "; " + model + " runs peer on " + core::cuda_cc_name() + " cards";
     }
     return {};
 }
