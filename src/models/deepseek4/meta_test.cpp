@@ -1,4 +1,5 @@
 #include "models/deepseek4/pack.hpp"
+#include "models/deepseek4/meta.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -55,6 +56,26 @@ int main() {
     incomplete.count = 2;
     check(!parse_compression_ratios(incomplete, ratios, err), "truncated metadata array must be refused");
     check(!parse_compression_ratios(integer(4), ratios, err), "non-array schedule must be refused");
+
+    basalt::MetaValue schedule;
+    schedule.type = basalt::MetaType::ARRAY;
+    schedule.elem = basalt::MetaType::I32;
+    schedule.count = 5;
+    for (uint64_t ratio : {0, 4, 0, 0, 0}) {
+        basalt::MetaValue item;
+        item.type = schedule.elem;
+        item.u = ratio;
+        schedule.items.push_back(item);
+    }
+    check(basalt::models::deepseek4::validate_compression_ratios(&schedule, 2).empty(),
+          "valid integer GGUF schedule");
+    schedule.elem = basalt::MetaType::F32;
+    check(!basalt::models::deepseek4::validate_compression_ratios(&schedule, 2).empty(),
+          "floating-point GGUF schedule must be refused");
+    schedule.elem = basalt::MetaType::I32;
+    schedule.items[0].type = basalt::MetaType::F32;
+    check(!basalt::models::deepseek4::validate_compression_ratios(&schedule, 2).empty(),
+          "inconsistent GGUF array item type must be refused");
 
     if (failures) return 1;
     std::puts("deepseek4 metadata validation: ok");

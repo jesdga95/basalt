@@ -3,13 +3,38 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/model/adapter.hpp"
 
+#include <cmath>
 #include <string>
 
 namespace basalt::models::deepseek4 {
 
 inline double key_num(const GgufFile& file, const char* suffix, double fallback = 0.0) {
     const MetaValue* value = file.get(std::string("deepseek4.") + suffix);
-    return value && value->is_num() ? value->num() : fallback;
+    if (!value || !value->is_num()) return fallback;
+    const double number = value->num();
+    return std::isfinite(number) ? number : fallback;
+}
+
+inline bool integer_meta_type(MetaType type) {
+    return type == MetaType::U8 || type == MetaType::I8 || type == MetaType::U16 || type == MetaType::I16 ||
+           type == MetaType::U32 || type == MetaType::I32 || type == MetaType::U64 || type == MetaType::I64;
+}
+
+inline std::string validate_compression_ratios(const MetaValue* ratios, int layers) {
+    if (!ratios || ratios->type != MetaType::ARRAY || !integer_meta_type(ratios->elem) ||
+        ratios->count != (uint64_t) layers + 3 || ratios->items.size() != ratios->count)
+        return "deepseek4.attention.compress_ratios must be an integer array covering trunk and three MTP slots";
+    for (int i = 0; i < layers; ++i) {
+        const MetaValue& item = ratios->items[(size_t) i];
+        const uint64_t ratio = item.u;
+        if (item.type != ratios->elem || (ratio != 0 && ratio != 4 && ratio != 128))
+            return "unsupported or non-integer compression ratio at deepseek4 layer " + std::to_string(i);
+    }
+    for (size_t i = (size_t) layers; i < ratios->items.size(); ++i) {
+        if (ratios->items[i].type != ratios->elem || ratios->items[i].u != 0)
+            return "deepseek4 MTP compression schedule must contain integer zeros";
+    }
+    return {};
 }
 
 inline std::string validate_meta(const GgufFile& file) {
@@ -36,16 +61,8 @@ inline std::string validate_meta(const GgufFile& file) {
     if (key_num(file, "expert_used_count") > experts || key_num(file, "hash_layer_count") > layers)
         return "deepseek4 metadata has an invalid expert or hash-layer count";
 
-    const MetaValue* ratios = file.get("deepseek4.attention.compress_ratios");
-    if (!ratios || ratios->type != MetaType::ARRAY || ratios->count != (uint64_t) layers + 3 ||
-        ratios->items.size() != ratios->count) return "deepseek4.attention.compress_ratios must cover trunk and three MTP slots";
-    for (int i = 0; i < layers; ++i) {
-        const uint64_t ratio = ratios->items[(size_t) i].u;
-        if (ratio != 0 && ratio != 4 && ratio != 128)
-            return "unsupported compression ratio at deepseek4 layer " + std::to_string(i);
-    }
-    for (size_t i = (size_t) layers; i < ratios->items.size(); ++i)
-        if (ratios->items[i].u != 0) return "MTP compression schedule must be zero for this runtime";
+    if (std::string schedule_err = validate_compression_ratios(file.get("deepseek4.attention.compress_ratios"), layers);
+        !schedule_err.empty()) return schedule_err;
 
     if (key_num(file, "hyper_connection.count") != 4 || key_num(file, "attention.head_count_kv") != 1 ||
         key_num(file, "rope.freq_base") <= 0.0 || key_num(file, "attention.compress_rope_freq_base") <= 0.0 ||
