@@ -15,9 +15,12 @@ struct Geometry {
     int o_groups = 0, o_lora = 0;
     int n_expert = 0, n_used = 0, n_ff_exp = 0, n_shared = 0;
     int hc_mult = 0, sinkhorn_iters = 0, hash_layers = 0;
+    int n_head_kv = 0, router_func = -1, output_embd = 0;
     int idx_heads = 0, idx_dim = 0, idx_top_k = 0;
+    bool route_norm = false;
     float rms_eps = 0.f, hc_eps = 0.f, route_scale = 0.f;
     float rope_base = 0.f, comp_rope_base = 0.f, yarn_factor = 0.f;
+    float yarn_beta_fast = 0.f, yarn_beta_slow = 0.f;
     int64_t context_length = 0;
     int yarn_orig_ctx = 0;
     std::vector<int> compress_ratio;

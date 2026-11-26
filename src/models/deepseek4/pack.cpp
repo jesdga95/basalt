@@ -28,8 +28,12 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
     g.window = integer(member(json, "attention.sliding_window"));
     g.o_groups = integer(member(json, "attention.output_group_count"));
     g.o_lora = integer(member(json, "attention.output_lora_rank"));
+    g.n_head_kv = integer(member(json, "attention.head_count_kv"));
     g.n_expert = integer(member(json, "expert_count"));
     g.n_used = integer(member(json, "expert_used_count"));
+    g.router_func = integer(member(json, "expert_gating_func"), -1);
+    g.output_embd = integer(member(json, "embedding_length_out"));
+    if (const Json* norm = member(json, "expert_weights_norm")) g.route_norm = norm->type == Json::Type::Bool && norm->b;
     g.n_ff_exp = integer(member(json, "expert_feed_forward_length"));
     g.n_shared = integer(member(json, "expert_shared_count"));
     g.hc_mult = integer(member(json, "hyper_connection.count"));
@@ -46,14 +50,19 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
     g.context_length = (int64_t) number(member(json, "context_length"));
     g.yarn_factor = (float) number(member(json, "rope.scaling.factor"));
     g.yarn_orig_ctx = integer(member(json, "rope.scaling.original_context_length"));
+    g.yarn_beta_fast = (float) number(member(json, "rope.scaling.yarn_beta_fast"));
+    g.yarn_beta_slow = (float) number(member(json, "rope.scaling.yarn_beta_slow"));
 
     const Json* ratios = member(json, "attention.compress_ratios");
     if (ratios && ratios->is_array())
         for (const Json& value : ratios->items) g.compress_ratio.push_back((int) value.num());
 
-    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.head_dim <= 0 || g.rope_dim <= 0 ||
-        g.q_lora <= 0 || g.o_groups <= 0 || g.o_lora <= 0 || g.n_expert <= 0 || g.n_used <= 0 ||
-        g.n_ff_exp <= 0 || g.hc_mult != 4 || g.context_length <= 0 || g.rms_eps <= 0.f || g.hc_eps <= 0.f) {
+    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv != 1 || g.head_dim <= 0 ||
+        g.rope_dim <= 0 || g.q_lora <= 0 || g.o_groups <= 0 || g.o_lora <= 0 || g.n_expert <= 0 ||
+        g.n_used <= 0 || g.n_ff_exp <= 0 || g.hc_mult != 4 || g.idx_heads <= 0 || g.idx_dim <= 0 ||
+        g.idx_top_k <= 0 || g.output_embd <= 0 || !g.route_norm || g.context_length <= 0 || g.rms_eps <= 0.f ||
+        g.hc_eps <= 0.f || g.rope_base <= 0.f || g.comp_rope_base <= 0.f || g.yarn_factor < 1.f ||
+        g.yarn_orig_ctx <= 0 || g.yarn_beta_fast <= 0.f || g.yarn_beta_slow <= 0.f) {
         err = "meta.geometry is incomplete or outside the supported DeepSeek-V4 geometry";
         return false;
     }

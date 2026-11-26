@@ -4,7 +4,7 @@
 
 Implement V4 as its own registered Basalt model (`deepseek4`) with a dedicated pack reader and session. Reuse the proven DeepSeek-V4.1 infrastructure only where the source geometry and semantics match: adapter lifecycle, expert tier, hyper-connection (mHC) execution, checkpoint transfer, peer hooks, batching scaffolding, and the vision service integration points. Keep V4 cache construction and attention separate from V4.1; their compression schedules and cache semantics differ.
 
-The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted from its source GGUF/safetensors into a Basalt pack. The current converter work preserves the source tensors and projector; that does not constitute runtime support.
+The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted from its source GGUF/safetensors into a Basalt pack. The current pack has the 43 trunk layers, token-to-expert tensors for the first three layers, and an embedded projector. Its manifest has no MTP tensors or drafter section, so an MTP drafter is not available in this artifact. Preserving the source tensors and projector does not constitute runtime support.
 
 ## Model path
 
