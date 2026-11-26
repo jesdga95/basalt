@@ -112,7 +112,7 @@ function drawTotals(t) {
   $("#totals").onclick = () => openPricing();
 }
 
-/* ---- the heat scale: 0..400 tok/s and up; only the colour of the live decode number uses it ---- */
+/* ---- the heat scale: 0..400 tok/s and up; only the colour of the live decode and prefill numbers uses it ---- */
 const HEAT = [[0, [42, 51, 60]], [.30, [90, 42, 30]], [.48, [184, 64, 26]], [.64, [242, 102, 43]], [.82, [255, 181, 71]], [1, [255, 241, 214]]];
 function heatAt(t) {
   t = clamp(t, 0, 1);
@@ -161,6 +161,7 @@ function drawHero(live, hist, reqs, best, slots, total) {
   html($("#pre-k"), `Prefill${!livePre && lastPre != null ? `<span>${rp === reqs[0] ? "last request" : "last read"}</span>` : ""}`);
   html($("#pre-v"), num(pre) ? `${fmt(pre)}<small>tok/s</small>` : "-");
   $("#pre-v").classList.toggle("idle", !livePre);
+  $("#pre-v").style.color = livePre ? heatAt(Math.max(.56, clamp(pre / heatTop(bp && bp.tok_s, pre), 0, 1))) : "";
   const pa = tail(hist.prefill_tok_s_mean).map(v => v > 0 ? v : v === 0 ? 0 : null);
   html($("#pre-chart"), miniChart(pa, livePre ? "var(--accent)" : "var(--fg-2)", "rgba(154,164,173,.08)", pre));
   const lp = r && num(r.prompt_tokens) ? `${fmt(r.prompt_tokens)} tok${num(r.prompt_ms) ? ` in ${(r.prompt_ms / 1000).toFixed(2)} s` : ""}` : "";
