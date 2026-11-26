@@ -84,6 +84,24 @@ session. That is safe because the engine runs one call at a time: each session c
 the driver syncs every session's stream before a batch runs on the leader's. A model sizes its memory as per-session state
 times the slots plus the shared scratch once, so more slots cost only their caches.
 
+### The KV pool
+
+Every slot reaches the whole `--max-context`; there is no per-slot share. A model may back its sessions' per-position cells
+from one pool per card (`core::KvPool`): each cache reserves the address range of the whole context (`core::ElasticArray`,
+one allocation granule a step) and maps it as the conversation grows, so addresses, kernels and captured graphs are those of
+a contiguous cache and a row's bits do not change. The model sizes the pool at start from what its weights, the sessions' own
+buffers (rings, small state), the shared scratch and the spare leave: at least one session at the whole context or every
+session at its first granule, whichever is more, spilling experts only below that. The session hooks are `ModelSession::kv_back` (Refused, nothing
+changed, when the pool is short), `kv_trim` and `kv_pool_line`; a model without a pool keeps the defaults and sizes every
+session at the whole context.
+
+The session runtime (`session_engine.cpp`) backs a request's prompt and first window before it reads (`admit_room`) and every
+active slot's next window before each round (`next_batch_window`). A short pool parks idle conversations first, the longest
+idle first, into the RAM tier (`ConversationCache::put_slot`) or only on disk, else they are dropped; then a batch admission
+answers `BWAIT <slot>` and the server asks again after the next `BDONE`, no admission runs while a slot waits, and a slot
+that cannot grow sits out (`slot_ready`). When every running slot waits, the newest ends with finish `room` and keeps its
+conversation, which the next round parks.
+
 ### Adding batching to a model
 
 1. Split the session's allocations: per-slot state in the session, the forward scratch in one object the sessions share.

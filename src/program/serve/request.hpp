@@ -125,6 +125,8 @@ protected:
     Flow parse();
     Flow prepare_prompt();
     virtual Flow prepare_image() = 0;
+    /// Once the prompt is known and fits the context: the room its slot's KV takes (Flow::next: the request does not run now).
+    virtual Flow admit_room() { return Flow::proceed; }
     /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window.
     Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();

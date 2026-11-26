@@ -19,7 +19,9 @@ Protocol (one line each):
     and the tokens it holds.
     `BGEN`/`SGEN` then name the prompt where the ids go: `#<handle>[+<id>,...]` (the ids a request that ran in several
     engine runs adds after it); `PFREE <handle>` drops it.
-  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`; with
+  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`
+    (finish `room`: the KV pool had no room for the slot to go on); `BWAIT <slot>` instead of BADM: the KV pool has no
+    room for the request now, it waits for a slot's BDONE and asks again; with
     `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`);
     `more=1` on a BGEN: another request waits to be admitted, so the engine waits briefly for its lines before its next round.
@@ -125,7 +127,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "PROMPT ", "PMATCH ", "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
+                  "PROMPT ", "PMATCH ", "BADM ", "BWAIT ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
 
 
 def log_unparsed(line: str, log) -> None:
@@ -438,6 +440,7 @@ class ProcessEngine:
         self.slot_held: list[int] = [0] * self.batch
         self.slot_used = [0.0] * self.batch
         self.slot_epoch = [0] * self.batch
+        self.slot_ends = 0                              # BDONE lines so far: a request that got BWAIT waits for the next
         # session identity (a load-balancer header) -> the slots its conversations run in, one owner per slot: a
         # conversation stays in the slot where its K/V sits, so its next turn continues it instead of being admitted
         # wherever and copied in.  A session may hold several slots: parallel agents of one session (a subagent
@@ -525,6 +528,10 @@ class ProcessEngine:
                 if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                     try:
                         slot_q[int(line.split()[1])].put(line)
+                        if line.startswith("BDONE "):       # a request that waits for KV room asks again
+                            with self.slot_cv:
+                                self.slot_ends += 1
+                                self.slot_cv.notify_all()
                         continue
                     except (IndexError, ValueError):
                         pass
@@ -1003,6 +1010,9 @@ class ProcessEngine:
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
+            elif line.startswith("BWAIT "):             # no KV room for the admission now: nothing ran
+                self._ctl_result = ("wait",)
+                return
             elif line.startswith("BADM "):
                 f = line.split()
                 # BADM <slot> 1: continues, the admission's token already sent; 2: continues, no token yet (the slot's
@@ -1490,6 +1500,28 @@ class ProcessEngine:
                             if x is None:
                                 ask_yield()
                                 yield None
+                        if self._ctl_result and self._ctl_result[0] == "wait":
+                            # no KV room for it now: the slot goes back and the request asks again once a slot ends
+                            phase = "none"
+                            with self.slot_cv:
+                                ends = self.slot_ends
+                                self.slot_busy[slot] = False
+                                self.slot_cv.notify_all()
+                            slot, slot_gen = None, None
+                            self.ctl.release()
+                            holding = False
+                            beat = time.monotonic()
+                            while not cancel.is_set():
+                                with self.slot_cv:
+                                    if self.slot_ends != ends or not any(self.slot_busy):
+                                        break
+                                    self.slot_cv.wait(timeout=1.0)
+                                if time.monotonic() - beat >= 10.0:
+                                    beat = time.monotonic()
+                                    yield None
+                            if cancel.is_set():
+                                return
+                            continue
                         self._note_first_reused(first, last0)
                         cont = bool(self._ctl_result and self._ctl_result[1])
                         phase = "slot" if cont else "none"
