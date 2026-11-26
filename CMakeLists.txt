@@ -542,6 +542,7 @@ if(PEER_ADA)
     src/prefill/mmq/instances/mmq_iq3_s.cu
     src/prefill/mmq/instances/mmq_iq4_nl.cu
     src/prefill/mmq/instances/mmq_mxfp4.cu
+    src/prefill/mmq/instances/mmq_nvfp4.cu
     src/prefill/mmq/instances/mmq_iq4_xs.cu
     src/prefill/mmq/instances/mmq_q8_0.cu
     src/prefill/mmq/instances/mmq_q5_0.cu
@@ -625,6 +626,12 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/models/qwen4exp/kernels/q80_proxy.cu
     src/models/qwen4exp/kernels/q80_vhead.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+if(PEER_ADA)
+  # the two-stage head's share of the vocabulary (q80p_vhead) runs on the peer, behind its window; appended, since the
+  # line above sets this file's options
+  set_property(SOURCE src/models/qwen4exp/kernels/q80_vhead.cu APPEND PROPERTY COMPILE_OPTIONS
+               "--generate-code=arch=compute_89,code=sm_89")
+endif()
 
 # ---- engine -----------------------------------------------------
 # The COMPOSED layer lives here and not in `core`, because it calls kernels and `kernels`
@@ -1950,6 +1957,11 @@ if(BUILD_TESTING)
   target_link_libraries(peer_share_parity PRIVATE peer_share core ggml_quants ${_gpu_runtime_target})
   basalt_gpu_test(NAME peer_share_parity COMMAND peer_share_parity)
   set_tests_properties(peer_share_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  if(PEER_ADA)
+    # its SwiGLU runs on the second card, which may be the sm_89 peer
+    set_property(SOURCE tests/prefill/peer_share_parity.cu APPEND PROPERTY COMPILE_OPTIONS
+                 "--generate-code=arch=compute_89,code=sm_89")
+  endif()
   if(BASALT_MODEL_QWEN4EXP)
   add_executable(prefill_pinned_copy_test tests/models/qwen4exp/prefill/prefill_pinned_copy_test.cpp)
   target_include_directories(prefill_pinned_copy_test PRIVATE src)

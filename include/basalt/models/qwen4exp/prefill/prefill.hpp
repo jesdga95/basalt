@@ -132,9 +132,9 @@ public:
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every routed-only prompt chunk up to a fixed size,
     /// with the rows crossing through host memory.  Allocates the peer's buffers for those chunks.
     bool set_peer(core::PeerExperts* peer, std::string& err);
-    /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
-    /// leaves them free when it sizes itself.
-    static uint64_t peer_bytes(int64_t chunk);
+    /// The bytes `set_peer` takes on peer card `peer_dev` for chunks of up to `chunk` tokens (0: no peer share); the
+    /// peer tier leaves them free when it sizes itself.
+    static uint64_t peer_bytes(int64_t chunk, int peer_dev);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);

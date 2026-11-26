@@ -33,9 +33,10 @@ int cache_size(Context& context) {
         return 1;
     }
     // what the peer's prompt buffers take on its card: they are allocated after its tier is filled, so the tier leaves them
-    // free.  A peer takes the rows of the routed-only chunks up to kPeerSlowRows, no streamed chunk.
+    // free.  A peer takes the rows of the routed-only chunks up to kPeerSlowRows (kPeerNoFp4Rows for an NVFP4 pack on a
+    // card without FP4 tensor cores), no streamed chunk.
     auto peer_prompt_bytes = [&]() -> uint64_t {
-        return o.serve && o.peer_device >= 1 ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk) : 0;
+        return o.serve && o.peer_device >= 1 ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, o.peer_device) : 0;
     };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
