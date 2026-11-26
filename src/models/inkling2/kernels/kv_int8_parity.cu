@@ -890,18 +890,22 @@ static bool check_decode_graph(bool reduced) {
         for (const auto& out : fp32)
             for (const float x : out) finite &= std::isfinite(x);
         const bool identical = fp32[0] == fp32[1] && q8[0] == q8[1];
-        // the plan this launch takes and the keys it primes, from a launch of the same window with PDL on
+        // the plan this chain's reader takes and its priming, from the chain with PDL on, run directly: the preparation
+        // first, then the reader, as the captured chain and the serving window queue them
         ink::Int8MmaPlanInfo info;
         {
             basalt::kernels::PdlScope scope(true, true);
+            ink::decode_prepare(pa, rows, stream);
             ok = ok && ink::attention_decode_int8_test(aa, rows, bucket, scratch, dout, stream, true, plan, &info) &&
                  check_cuda(cudaStreamSynchronize(stream), "graph plan");
         }
+        // the shared ring takes its narrow form at two rows, which primes
+        const bool primed = plan != ink::Int8MmaPlan::SharedRing || info.prime_span > 0;
         std::printf("kv MMA graph: depth=%d T=%d %s plan=%s replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld "
                     "finite=%d pdl_launches=%ld\n", shape.depth, rows, mma_plan_name(plan),
                     info.stages == 0 ? (info.ping_pong ? "registers-ping-pong" : "registers") : mma_ring_name(info), replays,
                     info.prime_span, identical, (long long) bucket, (long long) fewest, finite, pdl_launches);
-        pass &= identical && finite && pdl_launches > 0;
+        pass &= identical && finite && pdl_launches > 0 && primed;
     }
     if (stream) cudaStreamDestroy(stream);
     for (void* p : {(void*) dy, (void*) dtaps, (void*) dqs, (void*) drs, (void*) dkr, (void*) dvr, (void*) dtable, (void*) dq,
