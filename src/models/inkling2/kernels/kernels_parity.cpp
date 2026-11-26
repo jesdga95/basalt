@@ -1013,7 +1013,8 @@ void test_attention_window() {
     struct Case { bool window; int p0, R; int64_t cap; };
     const Case cases[] = {{true, 0, 1, kExtent + 8}, {true, 300, 3, kExtent + 8}, {true, 2900, 8, kExtent + 8},
                           {false, 700, 8, 4096}, {false, 120, 2, 4096}, {false, 2000, 2, 4096},
-                          {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096}};   // 2 rows: one slice, a slice each, the ring before position 0
+                          {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096},   // 2 rows: one slice, a slice each, the ring before position 0
+                          {false, 1012, 8, 4096}, {false, 1020, 8, 4096}};   // full keys up to 1019 (one kernel), past 1024 (prepare, splits, merge)
     for (const Kv kv : kAllKv)
         for (const Case& k : cases) {
             const int R = k.R;
@@ -1089,6 +1090,10 @@ void test_attention_window() {
                 std::printf("  %.1f us a call (1 row, 1 key, fused)  %.1f us (prepare + attention)%s\n",
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
                             time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }), kv_tag(kv));
+            }
+            if (!k.window && R == 8 && k.p0 == 700) {
+                std::printf("  %.1f us a call (8 rows, 708 keys%s: one kernel)\n",
+                            time_us([&] { attention_window(pa[1], aa[1], R, max_keys, scr, nullptr); }), kv_tag(kv));
             }
             if (k.window && R == 3) {
                 std::printf("  %.1f us a call (1 row, 301 keys, fused)  %.1f us (prepare + attention)%s\n",
