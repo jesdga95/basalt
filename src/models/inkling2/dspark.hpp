@@ -301,7 +301,7 @@ private:
     // commit_batch scratch [max_rows]
     float *c_mix_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
     void* c_act_ = nullptr;
-    // block chunk scratch [kChunkSlots * kDsBlock <= 32]
+    // block chunk scratch: kChunkSlots * kDsBlock rows, whole blocks of 8 slots or shorter blocks of more
     static constexpr int kChunkSlots = 8;
     static constexpr int kMaxDraftSessions = 16;
     float *x_ = nullptr, *h_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr, *qr_ = nullptr, *attn_ = nullptr;

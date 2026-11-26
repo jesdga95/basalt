@@ -112,13 +112,11 @@ __device__ __forceinline__ void block_inputs_stage(int t, const uint16_t* __rest
     const int32_t anchor = meta[0], pos0 = meta[1];
     float* row = x + (int64_t) t * kWidth;
     if (pos3 && threadIdx.x < 3) pos3[t * 3 + threadIdx.x] = pos0 + t;
-    if (t == 1) {   // the Markov head's start
+    if (t == 1) {   // the Markov head's start and context (a block has at least one mask)
         if (threadIdx.x == 0) *prev = anchor;
         for (int i = threadIdx.x; i < kDsRank; i += kThreads) state[i] = 0.f;
         if (threadIdx.x < kDsRank / 8)
             reinterpret_cast<uint4*>(w1_row)[threadIdx.x] = reinterpret_cast<const uint4*>(w1 + (int64_t) anchor * kDsRank)[threadIdx.x];
-    }
-    if (t == 2) {
         const float* src = fr + (int64_t) ((pos0 - 1) % fr_cap) * kWidth;
 #pragma unroll
         for (int i = 0; i < kPer; ++i) fr_out[threadIdx.x + i * kThreads] = src[threadIdx.x + i * kThreads];

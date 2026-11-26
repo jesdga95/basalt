@@ -1163,8 +1163,10 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
             const int cb = std::min(step_B, B - b0);
             int sub_nmax = 1;
             for (int i = 0; i < cb; ++i) sub_nmax = std::max(sub_nmax, act_n[b0 + i]);
-            const int blk = kDsBlock;
-            const int chunk_slots = std::min(cb, kChunkSlots);
+            // a block of the anchor and as many masks as drafts are wanted: its attention sees only these rows (the drafts
+            // then differ from a whole block's), and a chunk holds as many blocks as its rows take
+            const int blk = sub_nmax + 1;
+            const int chunk_slots = std::min(cb, kChunkSlots * kDsBlock / blk);
             for (int s0 = 0; s0 < cb; s0 += chunk_slots) {
                 const int cn = std::min(chunk_slots, cb - s0);
                 const int R = cn * blk;
