@@ -1071,6 +1071,9 @@ public:
         if (save && (int64_t) hist_.size() - pos > kWindowRows)
             return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kWindowRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "inkling2: a checkpoint past the session's position"};
+        st.head.clear();
+        st.regions.clear();
+        st.peer_regions.clear();
         const size_t kv_ring = (size_t) kConvRing * kKvHeads * kHeadDim * 4, e_ring = (size_t) kConvRing * g_.n_embd * 4;
         for (size_t i = 0; i < vc_.size(); ++i) {   // the second card's visits go with its stream
             const VisitCache& c = vc_[i];
@@ -1084,7 +1087,7 @@ public:
             to.push_back({c.a_ring, e_ring});
             to.push_back({c.m_ring, e_ring});
         }
-        dspark_.running_regions(st);   // DSPARK HOOK
+        dspark_.running_state(pos, save, st);   // DSPARK HOOK
         st.stream = stream_;
         if (lane_[1].stream) {
             st.peer_stream = lane_[1].stream;
@@ -1093,7 +1096,9 @@ public:
         return {};
     }
 
-    model::Result running_restored(int64_t pos, const uint8_t*) override {
+    model::Result running_restored(int64_t pos, const uint8_t* head) override {
+        if (!dspark_.running_restored(pos, head))
+            return {model::Status::Error, "inkling2: restoring the drafter's state failed"};
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         stale_ = false;   // the rings are the checkpoint's again
         return {};
@@ -1160,6 +1165,7 @@ public:
         }
         if (dspark_.on() && !dspark_.restore_cells(kv, i, positions, stream_))   // DSPARK HOOK
             return {model::Status::Error, "inkling2: a parked conversation has no drafter cells"};
+        if (i != kv.size()) return {model::Status::Error, "inkling2: a parked conversation has other caches"};
         return {};
     }
 

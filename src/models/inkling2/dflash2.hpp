@@ -112,8 +112,12 @@ public:
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, void* stream);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, void* stream);
 
+    static constexpr size_t kRunHeadBytes = 2 * sizeof(int64_t);
     size_t running_bytes() const;
-    void running_regions(core::RunningState& st) const;
+    void running_state(int64_t pos, bool save, core::RunningState& st) const;
+    bool running_restored(int64_t pos, const uint8_t* head);
+    bool save_cells(int64_t positions, void* stream) const;
+    bool restore_cells(size_t kv_size, size_t at, int64_t positions, void* stream);
     int64_t backed_cells() const { return context_ + kDf2Block; }
 
 private:

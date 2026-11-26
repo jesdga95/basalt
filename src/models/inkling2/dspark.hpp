@@ -184,7 +184,8 @@ public:
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed& need, void* stream);
     /// Conversations: the sliding-window layers' rings are running state, the full layers' cells go with the target's.
     size_t running_bytes() const;
-    void running_regions(core::RunningState& st) const;
+    void running_state(int64_t pos, bool save, core::RunningState& st) const;
+    bool running_restored(int64_t pos, const uint8_t* head);
     size_t cells_bytes(int64_t positions) const;
     /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
     /// positions and a block past them; trim gives back what lies past them.

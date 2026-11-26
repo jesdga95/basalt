@@ -494,9 +494,12 @@ void Dflash2Hook::commit_prompt(const int32_t* pos_d, int rows, basalt::prefill:
 
 void Dflash2Hook::note(int64_t pos0, int rows) {
     if (!w_ || rows <= 0) return;
-    if (pos0 > hi_ || pos0 + rows < lo_) lo_ = pos0;
-    else lo_ = std::min(lo_, pos0);
-    hi_ = pos0 + rows;
+    const int64_t cap = cache_[0].cap;
+    const int64_t end = pos0 + rows;
+    const int64_t start = rows > cap ? end - cap : pos0;
+    if (pos0 == 0 || start > hi_ || end < lo_) lo_ = start;
+    else lo_ = std::max(std::min(lo_, start), end - cap);
+    hi_ = end;
 }
 
 void Dflash2Hook::stage(int k, int n, void* stream) {
@@ -689,16 +692,70 @@ model::Result Dflash2Hook::draft_end(int32_t* ids, float* conf, int max_n, int& 
 }
 
 size_t Dflash2Hook::running_bytes() const {
-    size_t n = 0;
+    if (!w_) return 0;
+    size_t n = kRunHeadBytes;
     for (const Cache& c : cache_) n += 2 * (size_t) c.cap * kDf2KV * 2;
     return n;
 }
 
-void Dflash2Hook::running_regions(core::RunningState& st) const {
+// All 5 DFlash 2 layers are sliding-window rings (cell p at p % cap) with intra-block 2-tap convolutions, so
+// RunningState carries both the GPU KV rings and the valid context span below `pos` (as dense::Session does).
+void Dflash2Hook::running_state(int64_t pos, bool save, core::RunningState& st) const {
+    if (!w_) return;
+    if (save) {
+        const int64_t W = std::min<int64_t>(w_->geo.window, cache_[0].cap);
+        const int64_t valid = (pos >= lo_ && pos <= hi_)
+                                  ? std::clamp<int64_t>(pos - lo_, 0, std::min<int64_t>(W, pos))
+                                  : 0;
+        const int64_t h[2] = {pos, valid};
+        st.head.insert(st.head.end(), reinterpret_cast<const uint8_t*>(h),
+                       reinterpret_cast<const uint8_t*>(h) + sizeof(h));
+    } else {
+        st.head.insert(st.head.end(), kRunHeadBytes, 0);
+    }
     for (const Cache& c : cache_) {
         st.regions.push_back({c.k, (size_t) c.cap * kDf2KV * 2});
         st.regions.push_back({c.v, (size_t) c.cap * kDf2KV * 2});
     }
+}
+
+bool Dflash2Hook::running_restored(int64_t pos, const uint8_t* head) {
+    if (!w_) return true;
+    pending_ = 0;
+    batch_owner_ = nullptr;
+    batch_slot_ = -1;
+    if (!head) {
+        lo_ = hi_ = pos;
+        return false;
+    }
+    int64_t h[2] = {};
+    std::memcpy(h, head, sizeof(h));
+    const int64_t W = std::min<int64_t>(w_->geo.window, cache_[0].cap);
+    if (h[0] != pos || h[1] < 0 || h[1] > W || h[1] > pos) {
+        lo_ = hi_ = pos;
+        return false;
+    }
+    lo_ = pos - h[1];
+    hi_ = pos;
+    return true;
+}
+
+// DFlash 2 has no full-attention layers: its 5 sliding-window rings travel in RunningState (`state_a`).
+bool Dflash2Hook::save_cells(int64_t positions, void* stream) const {
+    if (!w_) return true;
+    if (positions < 0 || positions > backed_cells()) return false;
+    return !stream || cudaStreamSynchronize((cudaStream_t) stream) == cudaSuccess;
+}
+
+bool Dflash2Hook::restore_cells(size_t kv_size, size_t at, int64_t positions, void* stream) {
+    if (!w_) return true;
+    if (positions < 0 || positions > backed_cells() || at != kv_size) return false;
+    if (stream && cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) return false;
+    pending_ = 0;
+    batch_owner_ = nullptr;
+    batch_slot_ = -1;
+    lo_ = hi_ = positions;   // empty until running_restored mounts the matching ring window
+    return true;
 }
 
 // ---- multi-session batched DFlash 2 commit & draft -------------------------------------------------------------------

@@ -323,6 +323,12 @@ if(BUILD_TESTING)
   add_executable(inkling2_vision_parity src/models/inkling2/vision_parity.cpp src/models/inkling2/vision.cpp)
   target_include_directories(inkling2_vision_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(inkling2_vision_parity PRIVATE vision_cuda)
+  # parked conversation round-trip: save_cells / restore_cells + running_state / running_restored + drafter window
+  # (Inkling 2 pack: argument or BASALT_INKLING2_PACK; skipped without one)
+  add_executable(inkling2_checkpoint_round_trip tests/models/inkling2/checkpoint_round_trip.cpp)
+  target_link_libraries(inkling2_checkpoint_round_trip PRIVATE model_inkling2 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_checkpoint_round_trip COMMAND inkling2_checkpoint_round_trip)
+  set_tests_properties(inkling2_checkpoint_round_trip PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 endif()
 

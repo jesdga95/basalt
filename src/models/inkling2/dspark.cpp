@@ -859,9 +859,9 @@ size_t DsparkHook::running_bytes() const {
     return n;
 }
 
-void DsparkHook::running_regions(core::RunningState& st) const {
+void DsparkHook::running_state(int64_t pos, bool save, core::RunningState& st) const {
     if (df2_) {
-        df2_->running_regions(st);
+        df2_->running_state(pos, save, st);
         return;
     }
     for (const Cache& c : cache_) {
@@ -869,6 +869,11 @@ void DsparkHook::running_regions(core::RunningState& st) const {
         st.regions.push_back({c.k, (size_t) c.cap * kKV * 2});
         st.regions.push_back({c.v, (size_t) c.cap * kKV * 2});
     }
+}
+
+bool DsparkHook::running_restored(int64_t pos, const uint8_t* head) {
+    if (df2_) return df2_->running_restored(pos, head);
+    return true;
 }
 
 size_t DsparkHook::cells_bytes(int64_t positions) const {
@@ -914,7 +919,8 @@ void DsparkHook::trim(int64_t positions) {
 }
 
 bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const {
-    if (df2_) return positions >= 0 && positions <= df2_->backed_cells();
+    if (df2_) return df2_->save_cells(positions, stream);
+    if (!w_) return true;
     if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
     for (const Cache& c : cache_) {
@@ -939,7 +945,8 @@ bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t posit
 }
 
 bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream) {
-    if (df2_) return positions >= 0 && positions <= df2_->backed_cells();
+    if (df2_) return df2_->restore_cells(kv.size(), at, positions, stream);
+    if (!w_) return at == kv.size();
     if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
     const size_t run = (size_t) positions * kKV * sizeof(uint16_t);
