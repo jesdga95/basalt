@@ -127,11 +127,16 @@ One older architecture can be built for the peer's kernels: sm_89 (Ada), beside 
 flag (off by default to keep build times down). Without it, or for any other pre-Blackwell card, the card is refused at the start.
 What such a peer does:
 
-- It holds experts and computes their rows in every decode window with the standard-CUDA kernels (Q8_1/Q2_0 and the GGUF i-quant
-  rows, dp4a arithmetic). It reads its experts' share of a prompt chunk under the slower-card rule (chunks up to 2,559 rows).
+- It holds experts and computes their rows with the standard-CUDA kernels (Q8_1/Q2_0 and the GGUF i-quant rows, dp4a
+  arithmetic), in a decode window and in a prompt's expert blocks alike. Its rows reach the main card over the host: no
+  consumer card can read another card's memory, and the tier scatters them into the pinned block the main card already
+  reads. A model that stages its prompts lets the peer read its experts' share of a prompt chunk too, under the
+  slower-card rule (chunks up to 2,559 rows); a model that states no prompt chunk gives its peer no staging buffers.
 - It does not run the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4 tensor-core expert kernels stay
   on the Blackwell card, so an NVFP4 pack's FP4 experts are main-card only.
-- Only Flash-Next's peer kernels are built for it; the other models refuse an sm_89 card. Split and tensor need sm_120 cards
+- Two models take an sm_89 peer: Qwen3.8-Flash-Next and GLM-5.3-Flash, whose peer kernels are among those this build
+  compiles for sm_89. The others refuse the card (`gpu-mode peer: GPU 1 (RTX 4060 Ti) is sm_89; Hy4-flash runs peer on sm_120 cards`).
+  Split and tensor need sm_120 cards
   (`gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on sm_120 cards`).
 
 Three or more cards are community-tested: the path is checked on two cards. Reports from machines with three or four cards are

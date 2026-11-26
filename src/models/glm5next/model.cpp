@@ -40,6 +40,7 @@ GlmModel::~GlmModel() {
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (h_rows_) cudaFreeHost(h_rows_);
+    if (h_act_) cudaFreeHost(h_act_);
     if (read_fd_ >= 0) platform::close_fd(read_fd_);
 }
 
@@ -300,6 +301,10 @@ model::Result GlmModel::plan(const model::LoadRequest& req, core::LoadPlan& read
     return {};
 }
 
+// The tier is the peer driver, the same as DeepSeek 4.1's and Hy4-flash's: it opens the second card's expert slots,
+// takes the block of layers it is dealt and reports what each card holds.
+model::PeerHooks* GlmModel::peer() const { return tier_.get(); }
+
 core::ExpertTierSpec GlmModel::tier_spec() const {
     const Geometry& g = pack_.geo;
     core::ExpertTierSpec s;
@@ -348,9 +353,13 @@ bool GlmModel::ensure_tier(core::LoadPlan& reads, std::string& err) {
     if (req_.vram_reserve_mib < kScratchReserveMib + own_mib) req_.vram_reserve_mib = kScratchReserveMib + own_mib;
     basalt::log::info("basalt glm5next", "the pass holds %d MiB on the card outside a window, so the tier leaves at least %d MiB free",
                       own_mib, req_.vram_reserve_mib);
+    // Portable as well as mapped: a second card reads the rows its experts compute land in, and the activations it
+    // multiplies, through its own driver (core::PeerExperts), which maps them on its device too.
+    constexpr unsigned kPinned = cudaHostAllocMapped | cudaHostAllocPortable;
     if (cudaHostAlloc(reinterpret_cast<void**>(&h_rows_),
-                      (size_t) kExpertRows * geo().n_used * geo().n_embd * sizeof(float), cudaHostAllocMapped) !=
-        cudaSuccess) {
+                      (size_t) kExpertRows * geo().n_used * geo().n_embd * sizeof(float), kPinned) != cudaSuccess ||
+        cudaHostAlloc(reinterpret_cast<void**>(&h_act_), (size_t) kExpertRows * geo().n_embd * sizeof(float),
+                      kPinned) != cudaSuccess) {
         err = "cannot allocate the pinned expert rows";
         return false;
     }
@@ -393,6 +402,9 @@ bool GlmModel::ensure_tier(core::LoadPlan& reads, std::string& err) {
 core::ExpertTierSpec GlmModel::draft_spec() const {
     const Geometry& g = pack_.geo;
     core::ExpertTierSpec s = tier_spec();
+    // The drafter's tier runs on the main card alone: a peer would take its own buffers on the second card for the one
+    // layer this tier knows, and a draft is a single row whose experts the RAM tier reads beside the model's anyway.
+    s.gpus.mode = program::GpuMode::One;
     s.area = "basalt glm5next drafter";
     s.name = "glm5next-mtp";
     s.n_layers = 1;   // the block is not a model layer, and it is the only one this tier places

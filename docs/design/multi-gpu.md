@@ -138,6 +138,7 @@ refused with its numbers); `*_open`; both start lines. `GpuCards` replaced `Load
 | Hy4-flash | yes, up to 4 cards (`kMaxSecondCards` 3): experts by layer block | refused | refused |
 | Qwen3.8-27B | yes, 2 cards: one prompt stage | yes, 2 cards (#388 widens it) | refused until the tensor PR lands |
 | Inkling 2 Mini | yes, 2 cards: spilled experts on the peer (step 9) | yes, 2 cards | refused |
+| GLM-5.3-Flash | yes, 2 cards (`peer_ada`: an sm_89 peer in a `-DPEER_ADA=ON` build): experts by layer block, computed in every expert block; no prompt share | refused | refused |
 
 ## Today's code, and what happens to it
 

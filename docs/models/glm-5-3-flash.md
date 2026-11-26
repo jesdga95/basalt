@@ -76,6 +76,35 @@ the same process differ at 162 of the 255 scored rows by more than 0.01 nats (wo
 agree to 0.01 nats; the aggregate is stable and the individual row is not. Two separate processes with either
 pin agree pick for pick, which is why every number in this page is quoted with one of them.
 
+## Two cards
+
+`--gpu 1,0 --gpu-mode peer` deals a second card a block of layers' expert homes, in the shared tier the other
+mixture-of-experts models use ([several GPUs](../configuration/gpus.md)): the start adds `peer GPU 0: N experts` and
+reads `expert homes of 288 per layer: main card A, second card B, RAM C, file D`, and `TIER final` gains a
+`B% second card` term between VRAM and bus copy. That line is still the only account.
+
+The peer computes its experts with the card's own grouped kernels, over a `q8_1` copy of the same block activations
+the card quantizes on the device, so its rows are card rows rather than pool rows: the difference between the two
+paths above is card-versus-pool, not one card versus another. Its share of a block goes out before the lookup, so the
+peer works while the main card's launches and the pool's rows are in flight, and its rows land in the same pinned
+block the pool writes into: `cudaDeviceCanAccessPeer` is 0 between consumer cards (checked on a GeForce RTX 4070 Ti
+SUPER and a 5080, both ways), so every row a peer computes comes home over the host. This model has one expert path,
+so a peer-held expert is computed in a prompt's blocks as it is in a decode window, and the peer gets no prompt
+staging buffers: the model reads no prompt stages.
+
+An sm_89 (Ada) card is accepted as the peer of a `-DPEER_ADA=ON` build ([an older peer
+card](../configuration/gpus.md#an-older-peer-card)); the tier's kernels this path uses are among those it compiles for
+sm_89. The drafter's tier stays on the main card whatever the cards: a draft is one row, and its block would compete
+with 45 model layers for the peer's slots.
+
+Peer speed is not measured. For a run that reads across processes, pin the tier, which makes each arm reproducible
+(the two arms will not agree pick for pick: a peer takes homes the main card or RAM would otherwise have had):
+
+```
+bin/basalt --model GLM5.3-Flash-UD-IQ1_S.basalt --gpu 1              --diag-tier-frozen ...
+bin/basalt --model GLM5.3-Flash-UD-IQ1_S.basalt --gpu 1,0 --gpu-mode peer --diag-tier-frozen ...
+```
+
 ## Parity
 
 - Against the original checkpoint, tensor by tensor: every F32 tensor of all 46 blocks (norms, conv taps,
@@ -113,6 +142,6 @@ pin agree pick for pick, which is why every number in this page is quoted with o
 
 ## Not measured
 
-`gpu-mode peer` and `split`; idle sleep and wake; `--kv` alternatives; pictures; prompt skip. `--logprobs` with
+`gpu-mode split`; peer speed; idle sleep and wake; `--kv` alternatives; pictures; prompt skip. `--logprobs` with
 `K` is refused: the session reads a window's rows for the perplexity gate (`copy_logits`) but does not
 implement `row_logprobs`, so a request asking for `K` gets "this model keeps no logits".

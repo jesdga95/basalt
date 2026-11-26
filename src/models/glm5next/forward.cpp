@@ -1215,6 +1215,17 @@ bool GlmForward::draft(int32_t anchor, int64_t pos, int32_t& id, float& conf, st
     return ck(cudaGetLastError(), "the drafter", err);
 }
 
+// A second-card share armed for a block that never reached its plan still has to be released: its kernels wait on the
+// card for the plan word, and the next `arm` waits for that share to leave the stream. Releasing a share that was
+// raised costs nothing (core::PeerExperts::raise returns at once when nothing is armed).
+struct PeerArm {
+    core::PeerExperts* peer = nullptr;
+    ~PeerArm() {
+        std::string e;
+        if (peer) peer->raise(0, nullptr, nullptr, e);
+    }
+};
+
 /// The MLP of one layer: the dense lead layers' SwiGLU, the rest the router over the resident experts plus the shared
 /// ones added on top. The result lands in `ffn_out`.
 bool GlmForward::mlp(int layer, const float* normed, int T, std::string& err) {
@@ -1274,10 +1285,27 @@ bool GlmForward::mlp(int layer, const float* normed, int T, std::string& err) {
         return false;
     if (!ck(cudaMemsetAsync(s->ffn_out, 0, (size_t) T * E * sizeof(float), session_.stream()), "expert sum", err))
         return false;
+    // The second card that holds this layer's experts, if the tier was dealt one. It computes its experts' rows with the
+    // same grouped kernels the card's own experts use, reading this block's activations from the model's pinned block,
+    // and scatters the rows into the same pinned rows the CPU pool writes into: neither card here can read the other's
+    // memory (no peer access between consumer cards), so every row a peer computes comes home over the host - and the
+    // sum already reads those rows for every pick the card did not write itself.
+    core::PeerExperts* peer = tier->peer_for(tlayer);
+    kernels::NativeExpertLayout playout = L;   // the peer's grouped kernels take the SwiGLU clamp inside the layout
+    playout.swiglu_limit = clamp_exp;
+    PeerArm armed;
     // The window in blocks of the tier's size. Everything a block needs is decided by one lookup of its distinct
     // picks, so the pool, the card's link and the card itself all start on this block's experts at once.
     for (int t0 = 0; t0 < T; t0 += kExpertRows) {
         const int nt = std::min(kExpertRows, T - t0);
+        // The peer's share goes out before anything else: its kernels wait on the card for the plan, so it computes
+        // while this block's lookups and the card's launches go out. Its activations are the block's rows, which the
+        // pool reads from the pageable copy, so they are copied to the pinned block the peer's card maps.
+        if (peer) {
+            std::memcpy(model_.host_act(), host_act_.data() + (size_t) t0 * E, (size_t) nt * E * sizeof(float));
+            if (!peer->arm(playout, model_.host_act(), nt, K, core::policy::peer_groups(nt), err)) return false;
+            armed.peer = peer;
+        }
         // what this layer's head left the bus of the promotions queued before it
         tier->pump(tlayer, 2 + nt);
         // one q8_1 activation per token of the block, for every expert the card computes
@@ -1306,14 +1334,20 @@ bool GlmForward::mlp(int layer, const float* normed, int T, std::string& err) {
         core::ExpertTier::Lookup lk;
         if (!tier->lookup(tlayer, uniq, nu, lk, err)) return false;
         const int n_fetched = tier->fetch(tlayer, lk);   // the pinned misses the card's link copies in
+        // The peer's plan, raised before its rows are needed and before the pool starts: entry t * K + k of the block,
+        // 0 not its expert, 2 one of the experts it holds, 3 one the tier is copying into its scratch slots. A pick
+        // the router dropped has no source at all, so the peer is told nothing about it.
+        if (peer) {
+            int32_t kind[kMaxSumRows];
+            for (int r = 0; r < nt * K; ++r) {
+                const int i = uidx[r];
+                kind[r] = !lk.peer[i] ? 0 : lk.fetched[i] ? 3 : 2;
+            }
+            if (!peer->raise(tlayer, host_rids_.data() + (size_t) t0 * K, kind, err)) return false;
+        }
         bool cpu = false, reading = false;
         for (int i = 0; i < nu; ++i) {
-            if (lk.peer[i]) {
-                err = "glm5next forward: the tier put an expert of layer " + std::to_string(layer) +
-                      " on a second card, which this model does not run";
-                return false;
-            }
-            cpu = cpu || (!lk.dev[i] && !lk.reading[i] && !lk.dropped[i]);
+            cpu = cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i] && !lk.dropped[i]);
             reading = reading || lk.reading[i];
         }
         // The pool's share goes first: it takes the longest, and its workers run while the card's share launches.
@@ -1361,6 +1395,8 @@ bool GlmForward::mlp(int layer, const float* normed, int T, std::string& err) {
             tier->await_fetch(session_.stream());   // the copies the fetch started, now landed
             if (ngf) gpu_share(fetched, ngf, nef, plan_dev_[1]);
         }
+        // The experts the peer is fetching into its own scratch slots go behind their copies, on its card.
+        if (peer && !peer->run_fetched(err)) return false;
         // The pool's rows have landed by the time the sum runs, and a place still being read from the pack joins the
         // pool's share once its read does.
         if (cpu) tier->finish_cpu();
@@ -1370,6 +1406,9 @@ bool GlmForward::mlp(int layer, const float* normed, int T, std::string& err) {
                                    /*reading=*/true);
             tier->finish_cpu();
         }
+        // The peer's rows are in the same pinned rows by now: the host waits for the peer the way it waits for the
+        // pool, with both cards still working while it does.
+        if (peer && !peer->finish(nullptr, err)) return false;
         weighted_sum_block(rp, s->rweights + (size_t) t0 * K, nt, K, E, s->ffn_out + (size_t) t0 * E,
                            session_.stream());
         if (cpu || reading) tier->promote(tlayer, lk);

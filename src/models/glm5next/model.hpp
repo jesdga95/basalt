@@ -68,12 +68,18 @@ public:
     /// The drafter's block's own tier, for the same reason it has its own experts section: its rows are a different
     /// format from the model's, and the tier plans a placement per layer of its own. Null when the block cannot run.
     core::ExpertTier* draft_tier() const { return draft_tier_.get(); }
+    /// The model's peer driver: the expert tier is one (core::ExpertTier derives model::PeerHooks), so a second card
+    /// held a block of layers' experts and computes their rows in every expert block.
+    model::PeerHooks* peer() const override;
     /// The pinned rows the CPU pool writes one expert block's outputs into: `kExpertRows * n_used` rows of `n_embd`
     /// floats, row `t * n_used + k` of block token t's k-th pick.
     float* host_rows() const { return h_rows_; }
     /// The same rows as the card sees them (the allocation is mapped), for the sum that reads them beside the rows the
     /// card's own experts wrote.
     float* host_rows_dev() const { return h_rows_dev_; }
+    /// One expert block's activations in pinned memory, `kExpertRows` rows of `n_embd` floats: what a second card
+    /// quantizes and multiplies for the experts it holds (core::PeerExperts::arm reads them where they are).
+    float* host_act() const { return h_act_; }
     /// One layer's packed expert rows as the card's grouped kernel reads them (blob_bytes checked against it at the
     /// open). Valid for every layer `has_experts` names.
     const kernels::NativeExpertLayout& expert_layout(int layer) const { return elayouts_[(size_t) layer]; }
@@ -121,6 +127,7 @@ private:
     std::shared_ptr<core::ExpertTier> draft_tier_;   ///< the drafter block's own, null when it cannot run
     float* h_rows_ = nullptr;   ///< pinned: the CPU pool's expert rows, kExpertRows x n_used x n_embd
     float* h_rows_dev_ = nullptr;   ///< the same, as the card reads them
+    float* h_act_ = nullptr;   ///< pinned, portable: one expert block's activations, as a second card reads them
     std::vector<kernels::NativeExpertLayout> elayouts_;   ///< per routed layer, in pack_.experts' order
     kernels::NativeExpertLayout draft_elayout_{};         ///< the drafter block's own, empty when it cannot be used
 };

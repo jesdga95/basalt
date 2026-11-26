@@ -104,7 +104,8 @@ int main() {
           "the end tokens are the checkpoint's three eos ids");
     check(n.turn == "<|assistant|>" && n.reply_role.empty(), "the model's own turn token opens its reply");
     const program::GpuModes m = ad.gpu_modes();
-    check(m.peer == 1 && m.split == 0 && m.tensor == 0, "one card: no expert tier and no stage to advertise");
+    check(m.peer == 2 && m.split == 0 && m.tensor == 0, "the main card and one peer that holds experts");
+    check(m.peer_ada, "an Ada card can be that peer, whose kernels -DPEER_ADA=ON builds for sm_89");
 
     test_grammar(ad);
 

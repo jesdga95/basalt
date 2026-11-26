@@ -58,9 +58,10 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "glm5next"}; }
 
-    // The experts are resident: there is no CPU tier to fall back to and no prompt or layer stage, so the model runs on
-    // one card and asks the launcher for nothing else.
-    program::GpuModes gpu_modes() const override { return {1, 0, 0}; }
+    // The main card and one peer that holds experts: core::ExpertTier is the model's peer driver, so a second card is
+    // dealt a block of layers' homes and computes their rows with the grouped kernels this build also compiles for
+    // sm_89 (-DPEER_ADA=ON). There is no prompt stage and no layer split to deal.
+    program::GpuModes gpu_modes() const override { return {2, 0, 0, true}; }
 
     PreTokenizer pretokenizer() const override { return {"glm4", program::tokenizer::pretok_glm4}; }
 

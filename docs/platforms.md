@@ -4,7 +4,7 @@ Linux x64 and Windows x64 with NVIDIA Blackwell (sm_120), and Linux Arm64 with t
 Spark, described in [arm64](arm64.md). Linux x64 is where the engine is tested and benchmarked. CI builds all three and runs the
 CPU tests on each. The GPU tests and the quality gate need a card.
 
-The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON`, a second card of sm_89 (Ada) can be a Flash-Next peer that holds and
+The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON`, a second card of sm_89 (Ada) can be a Flash-Next or GLM-5.3-Flash peer that holds and
 computes experts (`gpu-mode peer`, [GPUs](configuration/gpus.md#an-older-peer-card)); every other path and every other
 architecture is Blackwell-only.
 

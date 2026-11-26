@@ -328,6 +328,9 @@ int ExpertTier::peer_take(int layer, const std::vector<int64_t>& ram_rows, int64
 
 // Second card `card`'s prompt share takes its buffers before the card's slots are sized, and the prices of its layers.
 bool ExpertTier::open_share(size_t card, std::string& err) {
+    // A model that states no prompt chunk has no prompt share: the peer holds and computes experts, and the model's own
+    // prompt path reads them the way it reads the rest, so no staging goes on that card.
+    if (!s_.share_max_tokens) return true;
     prefill::PeerShare::Dims d;
     d.n_embd = s_.n_embd;
     d.n_ff = s_.n_ff;
