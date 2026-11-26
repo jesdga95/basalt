@@ -710,7 +710,7 @@ static bool check_attention_mma(bool reduced) {
                 singleton_schedule[j] &= matches_plan(j, 1, ink::Int8MmaPlan::Direct, bound, singleton[j]);
             }
         }
-        for (const int width : {1, 2, 3, 5, 6, 7, 8}) {
+        for (const int width : {1, 2, 3, 4, 5, 6, 7, 8}) {
             if (!ok) break;
             const int first = 3 - (width - 1) / 2;
             DecodeResult scalar, mma, padded, automatic, auto_padded, segmented, separate;
@@ -736,7 +736,9 @@ static bool check_attention_mma(bool reduced) {
                     }
                 }
             }
-            if (ok && width == rows)
+            // a batch window of two segments, rows [0, 5) and [5, width) of the window, each its own cache
+            const bool batched = width > 5;
+            if (ok && batched)
                 ok = run(first, width, Reader::Auto, segmented, true) &&
                      run(first + 5, width - 5, Reader::Auto, separate, false, true);
             if (!ok) break;
@@ -744,7 +746,7 @@ static bool check_attention_mma(bool reduced) {
                 const bool invariant = same_output(mma, j, singleton[first + j], 0) && same_output(mma, j, padded, j);
                 const auto& expected = pos[first + j] + 1 >= mma_min_keys ? mma : scalar;
                 const bool dispatched = same_output(automatic, j, expected, j) && same_output(auto_padded, j, expected, j);
-                const bool batch_invariant = width != rows ||
+                const int batch_invariant = !batched ? -1 :
                     (j < 5 ? same_output(automatic, j, segmented, j) : same_output(separate, j - 5, segmented, j));
                 report(width, first, j, scalar, mma, invariant, dispatched, batch_invariant,
                        schedule && singleton_schedule[first + j], shard_invariant);
@@ -820,7 +822,10 @@ static bool check_decode_graph(bool reduced) {
               alloc(&scratch, ink::attention_decode_scratch(rows, cap)) &&
               check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "graph stream");
     bool pass = true;
-    for (const Shape& shape : shapes) {
+    // Each shape under the serving plan and under the shared ring (the narrow ring, which copies its first tile before the
+    // preparation's wait), each reporting the plan it took and the keys it primed.
+    for (const Shape& shape : shapes)
+    for (const ink::Int8MmaPlan plan : {ink::Int8MmaPlan::Auto, ink::Int8MmaPlan::SharedRing}) {
         if (!ok) break;
         const int pos0 = shape.depth - rows;   // the last row reads `depth` keys
         int64_t bucket = 1024;                 // the serving graph's key bound (session.cpp full_keys_of)
@@ -847,7 +852,8 @@ static bool check_decode_graph(bool reduced) {
                 // The preparation follows the poisoning copies (a plain launch); the reader and the merge may start early.
                 basalt::kernels::PdlScope scope(pdl, true);
                 ink::decode_prepare(pa, rows, stream);
-                ink::attention_decode(aa, rows, bucket, scratch, dout, stream);
+                if (plan == ink::Int8MmaPlan::Auto) ink::attention_decode(aa, rows, bucket, scratch, dout, stream);
+                else ink::attention_decode_int8_test(aa, rows, bucket, scratch, dout, stream, true, plan);
             };
             // A shape's first window runs directly, as the session's does, before its graph is captured.
             ok = ok && check_cuda(basalt::core::device_copy(dy, ys[replays].data(), ys[replays].size() * 4, cudaMemcpyHostToDevice), "graph y");
@@ -884,12 +890,17 @@ static bool check_decode_graph(bool reduced) {
         for (const auto& out : fp32)
             for (const float x : out) finite &= std::isfinite(x);
         const bool identical = fp32[0] == fp32[1] && q8[0] == q8[1];
-        // The reader's prefix slice: whole passes of its block, at most 64 slices, for the proven bound's keys.
-        const int64_t units = (fewest + 128 * 64 - 1) / (128 * 64);
-        const int prime_span = (int) std::max<int64_t>(units, 1) * 128;
-        std::printf("kv MMA graph: depth=%d T=%d replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld finite=%d "
-                    "pdl_launches=%ld\n", shape.depth, rows, replays, prime_span, identical, (long long) bucket,
-                    (long long) fewest, finite, pdl_launches);
+        // the plan this launch takes and the keys it primes, from a launch of the same window with PDL on
+        ink::Int8MmaPlanInfo info;
+        {
+            basalt::kernels::PdlScope scope(true, true);
+            ok = ok && ink::attention_decode_int8_test(aa, rows, bucket, scratch, dout, stream, true, plan, &info) &&
+                 check_cuda(cudaStreamSynchronize(stream), "graph plan");
+        }
+        std::printf("kv MMA graph: depth=%d T=%d %s plan=%s replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld "
+                    "finite=%d pdl_launches=%ld\n", shape.depth, rows, mma_plan_name(plan),
+                    info.stages == 0 ? (info.ping_pong ? "registers-ping-pong" : "registers") : mma_ring_name(info), replays,
+                    info.prime_span, identical, (long long) bucket, (long long) fewest, finite, pdl_launches);
         pass &= identical && finite && pdl_launches > 0;
     }
     if (stream) cudaStreamDestroy(stream);
