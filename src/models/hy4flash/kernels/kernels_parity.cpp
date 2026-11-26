@@ -1378,6 +1378,8 @@ void test_mmq_expert(int type, const char* label) {
 // An NVFP4 expert (blob [gate | up | down] and its FP32 tail {s_gate, s_up, s_down, 0}) through the prompt path's chain - MMQ
 // gate/up, the clamped SwiGLU with the blob's scales, MMQ down - against the decode path's grouped kernel on the same rows. The
 // MMQ products leave the tail out, so a prompt path that forgets it is off by the scales.
+bool peer_only = false;   // an older peer card: only the expert-tier kernels it runs
+
 void test_prompt_vs_decode_nvfp4() {
     namespace mmq = basalt::prefill::mmq;
     constexpr int kNvfp4 = 40;
@@ -1424,8 +1426,11 @@ void test_prompt_vs_decode_nvfp4() {
     cudaMalloc(&scr, bk::native_expert_scratch_bytes(R, F));
     float* dec = devf((size_t) R * L);
     const size_t row_q8 = bk::native_q8_1_bytes(L, 1);
-    for (int c0 = 0; c0 < R; c0 += 8)   // the decode quantizer takes up to 8 rows a launch
-        bk::native_quantize_q8_1(dx + (size_t) c0 * L, (uint8_t*) x8 + row_q8 * c0, L, std::min(8, R - c0), st);
+    if (peer_only)   // the peer's own quantizer, as PeerExperts runs it before the grouped kernel
+        bk::quantize_q8_1_rows_copy(dx, R, L, x8, nullptr, nullptr, 0, st);
+    else
+        for (int c0 = 0; c0 < R; c0 += 8)   // the decode quantizer takes up to 8 rows a launch
+            bk::native_quantize_q8_1(dx + (size_t) c0 * L, (uint8_t*) x8 + row_q8 * c0, L, std::min(8, R - c0), st);
     bk::native_expert_grouped_clamped(lay, limit, dgp, db, dng, dt, dt, NE, R, x8, scr, dec, st);
     // the prompt path's chain
     void *xq1 = nullptr, *xq2 = nullptr;
@@ -1472,6 +1477,17 @@ void test_prompt_vs_decode_nvfp4() {
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return 77;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess && prop.major < 12) {
+        // an older peer card (a -DPEER_ADA=ON build) runs only the expert tier: its MMQ products and the prompt chain
+        std::printf("compute capability %d.%d: the expert-tier kernels only\n", prop.major, prop.minor);
+        peer_only = true;
+        test_mmq_expert(12, "mmq experts Q4_K");
+        test_mmq_expert(14, "mmq experts Q6_K");
+        test_prompt_vs_decode_nvfp4();
+        std::printf(failures ? "FAILED\n" : "all ok\n");
+        return failures ? 1 : 0;
+    }
     test_hc();
     test_add_norm_rows();
     test_gemv();

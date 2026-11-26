@@ -72,7 +72,7 @@ public:
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
     /// Peer: the second cards hold experts, each a contiguous block of layers.
-    program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }
+    program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0, true}; }   // peer_ada: prefill_ffn.cu builds for sm_89
 
     const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
     const char* community_kv() const override { return "fp8"; }

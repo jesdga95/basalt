@@ -207,7 +207,14 @@ int main() {
     cudaStream_t st;
     check(cudaStreamCreate(&st), "stream");
     std::mt19937 rng(41);
-    test_engram_dense_rows(v, st);
+    // the Engram projection is the main card's dense work; on an older card (the sm_89 peer of a -DPEER_ADA=ON build)
+    // only the expert checks below run, the work such a peer is given
+    cudaDeviceProp prop{};
+    check(cudaGetDeviceProperties(&prop, 0), "device properties");
+    if (prop.major >= 12)
+        test_engram_dense_rows(v, st);
+    else
+        std::printf("engram: skipped on sm_%d%d (main-card work)\n", prop.major, prop.minor);
 
     ExpertLayer el;
     el.gu_type = el.d_type = GGML_TYPE_NVFP4;
