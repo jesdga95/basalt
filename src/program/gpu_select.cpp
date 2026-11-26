@@ -174,7 +174,10 @@ std::string arch_name(const GpuCard& c) { return "sm_" + std::to_string(c.cc_maj
 // rule. Whether this build holds device code for a card is checked at start (build_archs.hpp): an Ada card beside a
 // Blackwell one needs -DCMAKE_CUDA_ARCHITECTURES="120;89" (or -DPEER_ADA=ON, which adds 89).
 bool gpu_main_supported(const GpuCard& c) {
-    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 8 && c.cc_minor == 9);
+    // 12.0 (discrete Blackwell) and 12.1 (the GB10/N1X family, the Arm64 build) are the family this fork
+    // keeps whole; 8.9 is the Ada port every kernel has a form for
+    return c.cc_major == 0 || (c.cc_major == 12 && (c.cc_minor == 0 || c.cc_minor == 1)) ||
+           (c.cc_major == 8 && c.cc_minor == 9);
 }
 // Every architecture a main card takes is also a second card here: this build's kernels all have an 8.9 form.
 bool gpu_peer_supported(const GpuCard& c) { return gpu_main_supported(c); }
