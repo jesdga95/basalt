@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/prompt.cpp - prompt operations for the persistent engine.
 #include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/prefill/chunk_plan.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
