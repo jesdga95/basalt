@@ -365,6 +365,17 @@ target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision expert_tier tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
 
+if(BASALT_MODEL_DEEPSEEK4)
+add_library(model_deepseek4 STATIC src/models/deepseek4/adapter.cpp)
+target_include_directories(model_deepseek4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(model_deepseek4 PUBLIC model tokenizer deepseek4_tokenizer core)
+if(BUILD_TESTING)
+  add_executable(ds4_adapter_test src/models/deepseek4/adapter_test.cpp)
+  target_link_libraries(ds4_adapter_test PRIVATE model_deepseek4 warnings)
+  basalt_cpu_test(NAME ds4_adapter_test COMMAND ds4_adapter_test)
+endif()
+endif()
+
 if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it

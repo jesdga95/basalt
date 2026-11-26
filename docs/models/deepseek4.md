@@ -6,11 +6,12 @@ The target pack is the DeepSeek-V4-Flash-Vision-Exp checkpoint derived from V4-F
 `deepseek4` and a `deepseek4v` vision projector GGUF. Its text reference is checkpoint-specific: the converted source
 uses MXFP4 routed experts and Q8_0 for source FP8 linears, so it is not a BF16 0731 reference.
 
-The converter, pack validation, serving dialect, and model-local CUDA primitives exist. The pack reader can fetch validated
-BF16 token-embedding rows from the GGUF section on demand. The engine does not yet register
-`deepseek4` as a loadable model: there is no `ModelAdapter`, `LoadedModel`, `ModelSession`, or full transformer forward.
-The final BF16 RMSNorm and logits projection stage is implemented and verified against the real output head, but is not yet
-connected to a session.
+The converter, pack validation, serving dialect, model-local CUDA primitives, and C++ metadata adapter exist. The adapter
+selects the pack's `joyai-llm` tokenizer, V4 token names, image pad, DSML grammar, and one-GPU mode; its metadata test and
+real-pack validation pass. The pack reader can fetch validated BF16 token-embedding rows from the GGUF section on demand.
+The engine does not yet register `deepseek4` as loadable: there is no `LoadedModel`, `ModelSession`, or full transformer
+forward. The final BF16 RMSNorm and logits projection stage is implemented and verified against the real output head, but
+is not yet connected to a session.
 The CPU image planner and patch formatter exist, but the vision transformer/projector execution is not integrated into a
 Basalt session. The attention stage now accepts decode windows of up to eight rows and matches sequential one-row output and
 cache state bitwise. Do not describe this pack as runnable until text decode, image prefill, and serving tests pass.
@@ -21,8 +22,9 @@ cache state bitwise. Do not describe this pack as runnable until text decode, im
   Hugging Face checkpoint through `--hf-dir` to preserve the final `hc_head_*` weights, which the source GGUF omits. The
   vision sidecar stores the projector section separately and validates its projector type; the engine pack reader checks
   section bounds.
-- `src/models/deepseek4/pack.*` owns V4 geometry and tensor validation. The future adapter and model/session stay under
-  `src/models/deepseek4/` and `include/basalt/models/deepseek4/`; shared code must not name this architecture.
+- `src/models/deepseek4/adapter.*` owns model metadata, tokenizer, control-token, and DSML grammar choices. Pack geometry
+  stays in `pack.*`; the model/session implementation also belongs under `src/models/deepseek4/` and
+  `include/basalt/models/deepseek4/`, while shared code must not name this architecture.
 - Text execution owns V4-specific hyper-connections, hash routing, indexer/compression scheduling, attention and cache
   layout. Reuse shared quantized matrix, router, expert-tier, load-plan, batch, elastic-cache, and serving APIs where their
   contracts match. Do not copy V4.1's forward loop: V4 has distinct hash routing and compression semantics.

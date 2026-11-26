@@ -42,6 +42,9 @@ inline std::string validate_meta(const GgufFile& file) {
     const MetaValue* arch = file.get("general.architecture");
     if (!arch || arch->type != MetaType::STRING) return "missing or invalid general.architecture";
     if (arch->s != "deepseek4") return "architecture is '" + arch->s + "', this adapter requires 'deepseek4'";
+    const MetaValue* pre = file.get("tokenizer.ggml.pre");
+    if (!pre || pre->type != MetaType::STRING || pre->s != "joyai-llm")
+        return "tokenizer.ggml.pre must be 'joyai-llm' for DeepSeek4";
 
     for (const char* key : {"block_count", "context_length", "embedding_length", "attention.head_count",
                             "attention.head_count_kv", "attention.key_length", "attention.q_lora_rank",
