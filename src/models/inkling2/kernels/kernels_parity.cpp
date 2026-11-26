@@ -1357,6 +1357,16 @@ bool rows_acked(CpuBell* bell) {
     return pub != 0;
 }
 
+// rows_acked, or the case stops: the test's host is joined (it may still own the buffer), the failure printed, and the
+// process ends before anything reuses or frees the buffers.
+void require_ack(CpuBell* bell, BellServer& sv, const char* where) {
+    if (rows_acked(bell)) return;
+    sv.end();
+    std::printf("moe_cpu_ring + merge: doorbell FAIL (%s: rows not acknowledged)\n", where);
+    std::fflush(stdout);
+    std::_Exit(1);
+}
+
 // Replay a ring/merge graph with a delayed host. Only RAM visits advance the ticket and publish their choices and
 // RAM rows. The merge takes the host's rows only for the matching ticket in each replay.
 void test_cpu_ring() {
@@ -1433,7 +1443,7 @@ void test_cpu_ring() {
                 sv.replay.store(replay);
                 cudaGraphLaunch(exec, st);
                 ok &= cudaStreamSynchronize(st) == cudaSuccess;
-                ok &= rows_acked(bell);   // published, and read and handed back by the host
+                require_ack(bell, sv, "a replay");   // published, and read and handed back by the host
                 if (grows) {
                     ++served;
                     last_rows = rows;
@@ -1479,7 +1489,7 @@ void test_cpu_ring() {
                         moe_cpu_ring(di + r * K, 1, K, dt, L, ids_md, bell_d, seq, st);
                         moe_cpu_merge(di + r * K, 1, K, dt, out_md, dy, nullptr, st, bell_d, seq);
                         ok &= cudaStreamSynchronize(st) == cudaSuccess;
-                        ok &= rows_acked(bell);   // before the next row's poison
+                        require_ack(bell, sv, "a one-row visit");   // before the next row's poison
                         const auto single = host(dy, row_values);
                         ok &= std::memcmp(single.data(), y.data() + (size_t) r * row_values, row_values * sizeof(float)) == 0;
                         if (grows >> r & 1) {
@@ -1492,7 +1502,7 @@ void test_cpu_ring() {
             if (rows == 1 && mode == 0)
                 std::printf("  moe_cpu_rows %.1f us a call (1 row, the host acknowledging each)\n",
                             time_us([&] { moe_cpu_rows(dx, 1, L, x_md, bell_d, seq, nullptr); }));
-            ok &= rows_acked(bell);
+            require_ack(bell, sv, "the timing calls");
             sv.end();
             const uint32_t expected = (uint32_t) served;
             ok &= bell->ring == 0 && bell->ticket == expected && bell->abort == 0;
@@ -1899,7 +1909,12 @@ void test_cpu_rows_reuse() {
         cudaError_t q = cudaErrorNotReady;
         while ((q = cudaStreamQuery(st)) == cudaErrorNotReady && std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        ok &= q == cudaSuccess && bell->rows == 1 && bell->rows_ack == 0;
+        if (q != cudaSuccess) {   // the device may still write the shared buffers: neither read nor freed
+            std::printf("moe_cpu_rows: buffer hand-back FAIL (an aborted wait did not drain)\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        ok &= bell->rows == 1 && bell->rows_ack == 0;
         ok &= std::memcmp(x_m, g1.data(), g1.size() * 4) == 0;   // the first visit's rows, not overwritten
     }
     std::printf("%-34s %s\n", "moe_cpu_rows: buffer hand-back", ok ? "ok" : "FAIL");
