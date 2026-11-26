@@ -40,6 +40,7 @@ jobs:
       - name: Screenshot check
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_LOGIN: ${{ steps.bot.outputs.app-slug && format('{0}[bot]', steps.bot.outputs.app-slug) || 'github-actions[bot]' }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
@@ -47,6 +48,7 @@ jobs:
           import json, os, re, subprocess
 
           repo, pr = os.environ["REPO"], os.environ["PR"]
+          bot_logins = {x for x in (os.environ.get("BOT_LOGIN"), "github-actions[bot]") if x}
           marker = "<!-- basalt-ui-screenshot -->"
           ui = re.compile(r"^serve/web/")
           # A Markdown or HTML image, or a file GitHub hosts for an upload (images and videos both land there).
@@ -74,7 +76,8 @@ jobs:
                       for c in page]
           texts = [info.get("body") or ""] + [c["body"] or "" for c in comments if c["user"]["login"] == author]
           has_shot = any(shot.search(t) for t in texts)
-          ours = [c for c in comments if marker in (c["body"] or "")]
+          ours = [c for c in comments
+                  if (c.get("user") or {}).get("login") in bot_logins and (c["body"] or "").startswith(marker)]
 
           if has_shot:
               for c in ours:
