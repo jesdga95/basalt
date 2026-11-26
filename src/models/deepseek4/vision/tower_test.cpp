@@ -7,12 +7,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <fstream>
 #include <string>
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::puts("skip: pass a DeepSeek-V4 Vision Basalt pack to exercise its projector");
+    if (argc < 2 || argc > 3) {
+        std::puts("usage: ds4_vision_tower_test PACK.basalt [reference.bin]");
+        if (argc < 2) std::puts("skip: pass a DeepSeek-V4 Vision Basalt pack to exercise its projector");
         return 77;
     }
     basalt::models::deepseek4::Pack pack;
@@ -36,7 +39,8 @@ int main(int argc, char** argv) {
     // A 3x3 patch grid is the smallest complete aligner cell and exercises the actual ViT, 2D RoPE and GELU projector.
     constexpr int gx = 3, gy = 3, width = 4096;
     const basalt::vision::TransformerGrid grid{gx, gy, 1, 1};
-    std::vector<float> patches((size_t) gx * gy * basalt::models::deepseek4::kVisionPatchValues, 0.f);
+    std::vector<float> patches((size_t) gx * gy * basalt::models::deepseek4::kVisionPatchValues);
+    for (size_t i = 0; i < patches.size(); ++i) patches[i] = (float) ((int) (i % 17) - 8) / 8.f;
     std::vector<float> cells;
     if (!encoder.encode_grid(patches, grid, cells, err)) {
         basalt::log::error("deepseek4 vision tower test", "encode grid: %s", err.c_str());
@@ -45,6 +49,34 @@ int main(int argc, char** argv) {
     if (cells.size() != width || !std::all_of(cells.begin(), cells.end(), [](float x) { return std::isfinite(x); })) {
         basalt::log::error("deepseek4 vision tower test", "projected grid has an invalid shape or non-finite value");
         return 1;
+    }
+    if (argc == 3) {
+        std::ifstream ref_file(argv[2], std::ios::binary);
+        int32_t header[2] = {};
+        ref_file.read(reinterpret_cast<char*>(header), sizeof(header));
+        if (!ref_file || header[0] != 1 || header[1] != width) {
+            basalt::log::error("deepseek4 vision tower test", "reference header must be [1, 4096]");
+            return 1;
+        }
+        std::vector<float> reference((size_t) header[0] * header[1]);
+        ref_file.read(reinterpret_cast<char*>(reference.data()), (std::streamsize) (reference.size() * sizeof(float)));
+        if (!ref_file || ref_file.peek() != std::ifstream::traits_type::eof() ||
+            !std::all_of(reference.begin(), reference.end(), [](float x) { return std::isfinite(x); })) {
+            basalt::log::error("deepseek4 vision tower test", "reference payload is truncated, oversized, or non-finite");
+            return 1;
+        }
+        double diff = 0.0, norm = 0.0;
+        for (size_t i = 0; i < cells.size(); ++i) {
+            const double d = (double) cells[i] - reference[i];
+            diff += d * d;
+            norm += (double) reference[i] * reference[i];
+        }
+        const double relative_rms = std::sqrt(diff / (norm + 1e-30));
+        std::printf("projected-grid relative RMS %.3e\n", relative_rms);
+        if (relative_rms >= 3e-2) {
+            basalt::log::error("deepseek4 vision tower test", "projected grid differs from the source reference");
+            return 1;
+        }
     }
 
     basalt::models::deepseek4::VisionPlan plan;
