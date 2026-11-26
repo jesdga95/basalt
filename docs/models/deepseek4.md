@@ -1,59 +1,63 @@
-# DeepSeek-V4-Flash-Vision-Exp
+# DeepSeek V4 Vision in Basalt
 
-## Architecture decision
+## Target and current state
 
-Implement V4 as its own registered Basalt model (`deepseek4`) with a dedicated pack reader and session. Reuse the proven DeepSeek-V4.1 infrastructure only where the source geometry and semantics match: adapter lifecycle, expert tier, hyper-connection (mHC) execution, checkpoint transfer, peer hooks, batching scaffolding, and the vision service integration points. Keep V4 cache construction and index selection model-specific because their compression schedules and cache semantics differ. The source uses the same 64-head, 512-wide sparse MQA shape, but its `act_quant(..., inplace=True)` path simulates FP8 and rounds back into BF16, its query and KV tensors are BF16, and the attention result is BF16. Shared `basalt::kernels::sparse_mqa` now handles F32/F16/BF16 rows, the sink and inverse RoPE, and optional BF16 output rounding; the V4.1 wrapper delegates its F32/F16 cases to it while retaining its packed FP8/FP4 path. On an RTX 5090, the generic BF16-row/output case at T=4 with 512 selected and 128 window rows reports max-absolute 6.104e-5 and relative RMS 6.651e-6 against a double reference, with bitwise batch/token independence. F16 and F32 cases report relative RMS 1.399e-7 and 1.435e-7. The V4 MQA compute path is now reusable for already-rounded BF16 rows; the source's UE8M0 FP8 fake-quant operation and the V4 cache writer/row-identity contract still need separate parity and runtime integration.
+The target pack is the DeepSeek-V4-Flash-Vision-Exp checkpoint derived from V4-Flash-0731. It has text architecture
+`deepseek4` and a `deepseek4v` vision projector GGUF. Its text reference is checkpoint-specific: the converted source
+uses MXFP4 routed experts and Q8_0 for source FP8 linears, so it is not a BF16 0731 reference.
 
-The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted from its source GGUF/safetensors into a Basalt pack. Its 12 sections and all 1,371 source tensors were verified against the source GGUF; every section hash and tensor hash matched. It has the 43 trunk layers, token-to-expert tensors for the first three layers, and an embedded `deepseek4v` projector. Its manifest has no MTP tensors or drafter section, so an MTP drafter is not available in this artifact. Preserving the source tensors and projector does not constitute runtime support.
+The converter, pack validation, serving dialect, and model-local CUDA primitives exist. The engine does not yet register
+`deepseek4` as a loadable model: there is no `ModelAdapter`, `LoadedModel`, `ModelSession`, or full transformer forward.
+The CPU image planner and patch formatter exist, but the vision transformer/projector execution is not integrated into a
+Basalt session. Do not describe this pack as runnable until text decode, image prefill, and serving tests pass.
 
-## Runtime layout
+## Architecture and ownership
 
-- `Pack` owns the validated V4 geometry, named dense tensor references, per-layer expert ranges, and the embedded projector file range. `plan` places the dense working set on the primary GPU and queues the source ranges once through `LoadPlan`; the token embedding stays file-backed for row reads, and routed experts stay in the `ExpertTier` file/RAM/VRAM placement rather than being duplicated.
-- A V4 `BatchSession` owns per-slot attention state. Its `ElasticArray` cache rows retain their source position and layer schedule: sliding rows, ratio-4 CSA rows, ratio-128 HCA rows, and separate indexer rows. Chunk continuation, rewind, save/restore, and batch slots must preserve those identities. The cache builder and selected-position attention stay V4-specific; mHC mixing and compatible router/expert primitives are shared.
-- A text step expands the mHC stream, applies the layer's attention and cache update, runs V4's token/hash routing plus shared expert, then collapses the stream. Prompt chunks initially use the same single-token path for identity; a batched prefill path is admitted only after matching it. Peer mode distributes expert tiers only, with one-card identity as the reference.
-- Vision follows the V4.1 loan lifecycle but uses V4 preprocessing and N-layout. At rest, the session owns no image bytes, patch buffers, or encoder weights. On an image request it borrows expert-tier room, decodes and grows per-slot buffers, loads the embedded `deepseek4v` tower, encodes and assembles rows, then releases buffers and encoder weights in `images_done` before the tier regrows. The image token positions must reach V4's positional path; text-only hash lookup must not treat image rows as text IDs.
-- The existing `serve/models/deepseek4.py` uses the DeepSeek message encoder and shared incremental DSML parser with V4's tool-tag spelling, EOS, reasoning marker, and image placeholder. Keep that dialect model-local; C++ metadata supplies EOS, image, and pad token IDs and the joyai-llm pre-tokenizer.
+- `tools/convert/arch/deepseek4.py` maps checkpoint/GGUF metadata and tensors into the Basalt pack. The vision sidecar
+  stores the projector section separately and validates its projector type; the engine pack reader checks section bounds.
+- `src/models/deepseek4/pack.*` owns V4 geometry and tensor validation. The future adapter and model/session stay under
+  `src/models/deepseek4/` and `include/basalt/models/deepseek4/`; shared code must not name this architecture.
+- Text execution owns V4-specific hyper-connections, hash routing, indexer/compression scheduling, attention and cache
+  layout. Reuse shared quantized matrix, router, expert-tier, load-plan, batch, elastic-cache, and serving APIs where their
+  contracts match. Do not copy V4.1's forward loop: V4 has distinct hash routing and compression semantics.
+- `src/models/deepseek4/vision/` owns V4 image-grid planning and patch ordering. Shared `src/vision/` owns image decode
+  and reusable preprocessing primitives. Model-specific CUDA tower/projector operations belong under
+  `src/models/deepseek4/` unless another model can use the exact same tensor contract.
+- `serve/models/deepseek4.py` owns prompt rendering, image placeholders, stop/reasoning/tool parsing. Shared `serve/`
+  code remains architecture-agnostic.
 
-The staged path is registration/adapter and one-card serial decode, then token identity and KLD, then chunked prefill and persistent state, then expert-tier and peer/batch behavior, and finally request-level Vision and zero-idle-memory checks. Do not register an adapter that cannot execute the selected pack.
+## Memory and execution plan
 
-## Model path
+Text weights are read from the pack into the GPU or RAM/file-backed expert tiers according to `core::LoadPlan` and
+`core::ExpertTier`. Token embeddings remain file-backed where the pack loader supports row reads. Per-session state owns
+KV/sliding-window rows, compressed attention rows, index keys, mHC state, prefill/decode scratch, and position state;
+`core::ElasticArray` should grow those caches on demand and participate in cell save/restore. Model-shared tier and batch
+state must not be duplicated per session.
 
-1. Validate and describe `general.architecture=deepseek4` metadata, including geometry, compression schedule, MoE routing, tokenizer, context and multimodal fields.
-2. Parse the Basalt pack into a V4-specific `Pack`/`Geometry`; validate the V4-0731 geometry, tensor presence, shapes, storage types and per-layer schedule before allocating runtime state. `ds4_pack_test` opens the converted checkpoint through the C++ reader and passes the 43-layer geometry, all tensor shape/type checks, hash tables, expert layout and vision section checks.
-3. Load embeddings, attention projections, mHC matrices, indexer, router/hash tensors, shared expert and routed experts. Reuse DeepSeek-V4.1 expert-tier placement and file/RAM/VRAM read mechanisms where tensor formats match; reject unsupported storage explicitly.
-4. Implement text prefill and decode with V4's attention and cache contracts. Integrate V4-specific compression states and attention indexing. Share only shape-compatible projection and mHC primitives with V4.1.
-5. Add the model's tokenizer/chat dialect and serving registration. Keep checkpoints, batch execution and peer execution semantically equivalent to single-session execution.
+Implement one correct token path first, then chunked prefill through the same layer semantics. Each layer must follow the
+checkpoint's ordering: hyper-connection expansion, indexer/compressor work where scheduled, latent attention and output
+projection, feed-forward hyper-connections, hash/expert routing, expert and shared-expert accumulation, then collapse.
+Reuse existing kernels; add a device stage only when no shared kernel implements the exact contract. Keep CUDA wrappers
+thin and translation units independently compilable.
 
-## V4 cache and attention
+Image input is resized and tiled by the V4 planner, normalized to the checkpoint's RGB range with BF16 boundary rounding,
+then encoded by the vision tower and projector. Preserve the planner's patch permutation and image token layout when
+building prompt positions. Add the encoder's CPU reference before CUDA parity. Image weights and patch buffers must be
+staged only while encoding; `--vision dynamic` must return encoder memory to the expert tier after each image batch.
 
-V4 uses a per-layer compression schedule, including sliding attention, ratio-4 CSA, and ratio-128 HCA layers. CSA has overlapping candidate windows and separate key/value and score lanes; HCA uses a non-overlapping long window. Both require the learned APE contribution and their own normalization/RoPE behavior. The indexer has a separate compressor and supplies the selected positions used by attention. Cache state, row identity, sequence boundaries and chunk continuation must be explicit in the V4 session.
+## Milestones and gates
 
-`compress.cu` implements projected CSA/HCA pooling, BF16/RoPE rounding, and the source's FP8 cache simulation. `project_and_compress` applies the checkpoint's BF16 gate/KV matrices to FP32 layer inputs before updating CSA or HCA state. At T=8, CPU-reference projection relative RMS is 1.9e-5 for both paths; CSA output relative RMS is 3.05e-5, and the HCA window ending at token 127 matches the CPU compressor reference exactly. These tests exercise V4's 4096-wide input, 1024-row CSA projection, and 512-row HCA projection. `indexer_compress.cu` implements the separate 128-wide ratio-4 path with BF16, Hadamard, and FP4 round trips. `indexer_project.cu` builds the BF16 query/head-weight projections and applies the indexer's RoPE, Hadamard, and FP4 path; `indexer_select.cu` scores visible compressed keys and selects the top 512 with per-token causal limits. `attention.cpp` connects native Q8_1 activation quantization and Q8_0 `wkv` MMVQ to `attention.cu`, which prepares the row with source BF16 RMSNorm/RoPE and UE8M0 E4M3 fake-quant on non-RoPE lanes. `cache_attention_window` writes those rows to their position-indexed 128-row ring slots. The projection reports CPU-double max absolute error 1.52588e-5 and relative RMS 8.83e-8 at K=4096/N=512; the final KV boundary at T=5 reports relative RMS 1.1453e-4 and max absolute error 0.00390625, with cache rows matching exactly and token-width independence. The shared attention module provides query projection/RoPE, optional per-head Q RMS normalization, and grouped output projection at V4's geometry; per-head normalization has CPU-double relative RMS 4.84e-8 and is bitwise independent of token width. These kernels and projection paths are still not connected to V4 layer cache allocation, MLA attention, or a model session.
+1. Finish converter identity/metadata checks and document pack tensor coverage.
+2. Register the model behind `BASALT_MODEL_DEEPSEEK4`; implement adapter, strict pack loader, expert-tier planning, and
+   session lifecycle.
+3. Implement decode and chunked prefill; compare token, chunk, and window execution against CPU-double references and
+   the converted checkpoint. Add greedy/batch identity and the Wikitext KLD gate.
+4. Implement vision CPU reference, CUDA tower/projector, dynamic memory give-back, and image prompt integration. Verify
+   CUDA/CPU parity, low-VRAM behavior, and OpenAI/Anthropic image requests.
+5. Add save/restore, sleep/wake, context refusal, peer hooks, and batch behavior. Add benchmark fixtures and report cold
+   decode, prefill, and power-limit data.
 
-Three repeated standalone sm_120 microbench runs measured HCA compression at 55.46–57.83 µs/call, indexer compression at 9.12–9.13 µs for T=16/chunk 8 and 5.16–5.18 µs for chunk 4, indexer projection at 14.65–14.98 µs, and index selection at 148.74–148.78 µs (T=8, 702 visible rows, top-512). The shared sparse MQA harness measured 13.05–13.12 µs/call at T=4, top-512 and 128 window rows across three runs. Native Q8_0 projection plus KV preparation measured 6.40 µs/call at T=1; the KV boundary alone measured 3.23 µs/call at T=5 (9.5 GB/s), and the T=5 cache ring write measured 1.32 µs/call (15.6 GB/s). RTX 5090, 475 W power limit. CUDA 13.4 `nvcc --time` reported cicc/ptxas phases of 1.246/0.651 s for `sparse_mqa.cu`, 0.621/0.265 s for `attn_mqa.cu`, and 0.257/0.036 s for `attention.cu` on sm_120. These are kernel harness timings, not end-to-end model throughput.
-
-## MoE routing
-
-The source computes gate logits in FP32, applies `sqrt(softplus(logit))`, and scales normalized selected weights by 1.5. Layers 0–2 use `tid2eid` to choose the fixed top-6 experts for ordinary text tokens, but still derive their weights from those experts' current gate scores. Later layers choose top-6 from the gate scores plus the learned selection bias. Selection bias affects expert choice only; it is excluded from the routed weights. Image-token IDs (IDs at or above the text vocabulary size) use score-based top-6 with `bias_vl`, including in the hash-routed layers. The shared expert runs alongside these six routed experts.
-
-This routing contract is distinct from DeepSeek-V4.1's generic top-k router. The V4 route-row helper marks ordinary text rows for hash lookup in layers 0–2 and image-token rows for alternate-bias selection in every layer. The shared mixed router gathers fixed IDs from the token-indexed table and normalizes the selected unbiased scores. This route path is not yet connected to a V4 session; validate token IDs and table bounds before dispatch.
-
-## Vision path
-
-The source uses 14-pixel patches, 3x3 downsampling, a 384-token image budget, 147,456 minimum pixels and an 8:1 landscape cap. Its N-layout interleaves adjacent rows, adds newline and pad token types, and inserts up to three leading pad tokens to align image positions to four. These rules differ from V4.1's ordinary merged-grid image blocks.
-
-`include/basalt/models/deepseek4/vision.hpp` and `src/models/deepseek4/vision/plan.cpp` implement CPU resize planning, BF16-rounded patch extraction, N-layout type/permutation and assembly of encoded patch rows with the learned start/end/pad/newline rows. The shared CUDA transformer loads the embedded projector and returns projected grid rows; V4 assembles those rows in its own N-layout. The CPU planner test and real-pack GPU test pass. Against the official PyTorch Vision/Aligner using deterministic nonzero 3x3 patches, the shared CUDA tower's projected grid has 8.004e-3 relative RMS; the test also checks finite output and V4 special-row assembly. This is a small-input encoder parity check, not full-image preprocessing or request-path parity. Recreate the source dump with `python3 tools/vision/deepseek4_reference.py --source /mnt/storage/models/deepseek/source-vision --output /tmp/ds4-vision-reference.bin`, then configure CMake with `-DBASALT_DEEPSEEK4_VISION_REFERENCE=/tmp/ds4-vision-reference.bin` alongside `BASALT_DEEPSEEK4_PACK` and run `ctest -R '^ds4_vision_tower_test$' --verbose`. Spatial token embeddings, language position assignment, prompt integration and dynamic memory lifecycle remain unimplemented. The model is not runnable.
-
-The V4 reference tower matches V4.1's encoder geometry: 32 layers, width 1024, 16 heads, FFN 2816, patch 14, 2D RoPE theta 10000, and a 3x3 GELU aligner to width 4096. The ViT and aligner math now live in the model-neutral `basalt::vision::TransformerEncoder`; it can return projected grid rows or the V4.1 START/NEWLINE/END block. DeepSeek-V4 applies its N-layout permutation and learned START/END/PAD/NEWLINE assembly separately.
-
-## Verification gates
-
-- Converter output: all source tensors accounted for; projector and tokenizer metadata retained; pack shape/type checks pass.
-- Model registration: `deepseek4` builds independently under the model option and is discoverable by Basalt's adapter registry.
-- Kernels: CPU/reference parity and chunk-boundary consistency for compression, indexer and attention; each new kernel has a microbench entry.
-- Runtime: source-precision identity and KLD against a trusted reference, prompt-chunk consistency, decode, save/restore, multi-slot batching and supported peer mode.
-- Vision: preprocessing/encoder parity, dynamic mode idle-memory check, image request endpoint test, and text-only behavior with vision enabled.
-- Quality and performance: perplexity/KLD gates from the precision policy, representative decode/prefill benchmark, and reported run-to-run variance.
-- Repository: model-layering checks, clean Release builds for this model and `all`, relevant test suite, updated model and precision docs (each under 300 lines).
-
-Progress is incomplete until these gates are evidenced on the current Basalt runtime.
+The definition of done is the complete verification list in the implementation objective: both clean model-only and
+`all` builds, repository static checks, converter and serving suites, CPU/GPU parity, identity gates, KLD against the
+matching converted checkpoint, vision end-to-end tests, and benchmarks. Until those pass, this document describes a
+work-in-progress implementation rather than a supported model.
