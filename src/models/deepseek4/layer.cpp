@@ -1,9 +1,11 @@
 #include "basalt/models/deepseek4/layer.hpp"
 
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/row_norm.hpp"
 
 #include "shared_expert.hpp"
+#include "routed_expert.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -70,6 +72,28 @@ void shared_expert_step(const float* normalized, int n_tokens, const SharedExper
     kernels::native_quantize_q8_1(scratch.hidden, scratch.hidden_q8, weights.n_ff, n_tokens, stream);
     kernels::native_mmvq(weights.down_type, weights.down, scratch.hidden_q8, output, weights.n_ff, weights.n_embd,
                          n_tokens, stream);
+}
+
+void routed_expert_step(const float* normalized, const float* route_weights, int n_tokens,
+                        const RoutedExpertWeights& weights, const RoutedExpertPlan& plan,
+                        const RoutedExpertScratch& scratch, float* output, void* stream) {
+    constexpr int K = 6;
+    if (!normalized || !route_weights || !output || normalized == output || n_tokens <= 0 || n_tokens > 8 ||
+        weights.n_embd <= 0 || weights.n_ff <= 0 || weights.n_embd % 32 != 0 || weights.n_ff % 32 != 0 ||
+        !std::isfinite(weights.swiglu_limit) || !(weights.swiglu_limit > 0.f) || !plan.group_ptr ||
+        !plan.group_start || !plan.group_count || !plan.entry_dst || !plan.entry_token || plan.cap_groups <= 0 ||
+        plan.cap_groups > n_tokens * K || plan.cap_entries < n_tokens * K || !scratch.input_q8 || !scratch.expert ||
+        !scratch.expert_rows || !stream ||
+        !kernels::native_expert_supported(weights.gate_up_type, weights.down_type, weights.n_embd, weights.n_ff))
+        throw std::invalid_argument("deepseek4 routed expert: invalid weights, plan, or workspace");
+
+    const kernels::NativeExpertLayout layout = kernels::native_expert_layout(
+        weights.gate_up_type, weights.down_type, weights.n_embd, weights.n_ff, weights.swiglu_limit);
+    kernels::native_quantize_q8_1(normalized, scratch.input_q8, weights.n_embd, n_tokens, stream);
+    kernels::native_expert_grouped_clamped(layout, weights.swiglu_limit, plan.group_ptr, plan.group_start,
+        plan.group_count, plan.entry_dst, plan.entry_token, plan.cap_groups, plan.cap_entries, scratch.input_q8,
+        scratch.expert, scratch.expert_rows, stream);
+    weighted_route_sum(scratch.expert_rows, route_weights, n_tokens, weights.n_embd, output, stream);
 }
 
 }  // namespace basalt::models::deepseek4

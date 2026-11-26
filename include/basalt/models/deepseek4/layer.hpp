@@ -69,6 +69,30 @@ struct SharedExpertScratch {
     float* hidden = nullptr;
 };
 
+struct RoutedExpertWeights {
+    int gate_up_type = -1;
+    int down_type = -1;
+    int n_embd = 0;
+    int n_ff = 0;
+    float swiglu_limit = 10.f;
+};
+
+struct RoutedExpertPlan {
+    const unsigned long long* group_ptr = nullptr;
+    const int32_t* group_start = nullptr;
+    const int32_t* group_count = nullptr;
+    const int32_t* entry_dst = nullptr;
+    const int32_t* entry_token = nullptr;
+    int cap_groups = 0;
+    int cap_entries = 0;
+};
+
+struct RoutedExpertScratch {
+    void* input_q8 = nullptr;
+    void* expert = nullptr;
+    float* expert_rows = nullptr;
+};
+
 /// Collapses and normalizes [T][4][n_embd] streams, then computes V4's hash/image-aware top-6 FFN routes.
 /// `normalized`, `ids`, and `weights` become the inputs to the shared and routed experts; all storage is caller-owned.
 void prepare_ffn_routes(const float* streams, int n_tokens, const FfnRouteWeights& weights,
@@ -78,5 +102,11 @@ void prepare_ffn_routes(const float* streams, int n_tokens, const FfnRouteWeight
 /// The returned [T][n_embd] output is the unweighted branch added to routed-expert output.
 void shared_expert_step(const float* normalized, int n_tokens, const SharedExpertWeights& weights,
                         const SharedExpertScratch& scratch, float* output, void* stream);
+
+/// Runs the grouped routed-expert plan for top-6 routes and sums rows by the router weights.
+/// `entry_dst` indexes [token][route], and `entry_token` indexes normalized input rows.
+void routed_expert_step(const float* normalized, const float* route_weights, int n_tokens,
+                        const RoutedExpertWeights& weights, const RoutedExpertPlan& plan,
+                        const RoutedExpertScratch& scratch, float* output, void* stream);
 
 }  // namespace basalt::models::deepseek4
