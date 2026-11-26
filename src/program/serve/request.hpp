@@ -31,6 +31,7 @@ protected:
     std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     bool req_bias_present{};
     int64_t req_gprompt{};
+    int64_t req_reply{};   ///< reply=N: the first N ids are the prompt, the rest the reply being written (no turn begins there)
     std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};
     float req_relax{};

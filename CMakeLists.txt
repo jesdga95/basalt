@@ -969,6 +969,14 @@ if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
   set_tests_properties(batch_stop_test PROPERTIES TIMEOUT 600)
 endif()
 
+# a pass that continues a reply takes no turn checkpoint inside it (same model variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME reply_checkpoint_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/reply_checkpoint_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(reply_checkpoint_test PROPERTIES TIMEOUT 600)
+endif()
+
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE
 # model's geometry (GPU, synthetic, no model; --bench times the window kernel)
 add_executable(route_tail_skip_parity tests/kernels/route_tail_skip_parity.cpp)
