@@ -21,7 +21,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
-    "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
+    "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "kv-pool", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -291,6 +291,8 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
             if flag in file_words or flag in cli_words:
                 raise ValueError(f"parallel and engine {flag} both set: use parallel")
         (cli_words if a_cli.parallel else file_words).extend(["--batch", str(a.parallel)])
+    if not a.kv_pool:   # every slot's KV its own, fixed at start at the whole --max-context
+        (cli_words if a_cli.kv_pool is False else file_words).extend(["--kv-pool", "off"])
     return a, file_argv + cli, file_words, cli_words
 
 
@@ -346,9 +348,9 @@ def start_items(file_words: list[str], cli_words: list[str], grammar: tuple[bool
     return items
 
 
-def slots_text(parallel: int, per_slot: int) -> str:
-    """The startup slot line: the slots and the context each one can reach."""
-    return f"slots {parallel} \u00d7 up to {per_slot} ctx"
+def slots_text(parallel: int, per_slot: int, pool: bool) -> str:
+    """The startup slot line: the slots and the context each one can reach (the KV pool) or holds (--no-kv-pool)."""
+    return f"slots {parallel} \u00d7 {'up to ' if pool else ''}{per_slot} ctx"
 
 
 def with_spec(items: list[str], spec) -> list[str]:
@@ -550,8 +552,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--parallel", type=parallel_count, metavar="N",
                     help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
                          "their turn. Every slot can reach the whole --max-context: a model with a KV pool backs the "
-                         "slots' cells from it as their conversations grow (the start log states its size), any other "
-                         "gives each slot the whole context's cache")
+                         "slots' cells from it as their conversations grow (the start log states its size), any other, "
+                         "or any with --no-kv-pool, gives each slot the whole context's cache")
+    ap.add_argument("--kv-pool", action=argparse.BooleanOptionalAction, default=True,
+                    help="back every slot's KV cells from one pool as its conversation grows (on by default, for a model "
+                         "that has one); --no-kv-pool gives each slot its own KV for the whole --max-context, fixed at "
+                         "start: N slots cost N times the KV cache")
     ap.add_argument("--config", metavar="FILE",
                     help="a JSON file {\"server\": {...}, \"engine\": {...}, \"models\": [{\"model\": FILE, ...}]}: settings "
                          "named without the dashes. \"server\" holds what the server shares, \"engine\" what applies to "

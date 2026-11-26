@@ -67,6 +67,7 @@ struct CommonOptions {
     /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
     /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
     bool grammar = false;
+    bool kv_pool = true;               ///< --kv-pool on|off: a model with a KV pool backs every slot's cells from it (off: each slot's own, fixed)
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).

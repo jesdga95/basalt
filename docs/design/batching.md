@@ -102,6 +102,10 @@ answers `BWAIT <slot>` and the server asks again after the next `BDONE`, no admi
 that cannot grow sits out (`slot_ready`). When every running slot waits, the newest ends with finish `room` and keeps its
 conversation, which the next round parks.
 
+With `--kv-pool off` (the server's `--no-kv-pool`) the model sizes the pool as every session at the whole context and each
+session backs all of it when it starts and never trims it: dedicated, fixed per-slot KV, the same cells and bits as a model
+without a pool, and `kv_back` never refuses.
+
 ### Adding batching to a model
 
 1. Split the session's allocations: per-slot state in the session, the forward scratch in one object the sessions share.

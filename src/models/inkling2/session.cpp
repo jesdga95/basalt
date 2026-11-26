@@ -454,6 +454,7 @@ public:
                           err))
             return false;
         count_backed();
+        if (!m_.flags().kv_pool && !ensure_positions(m_.context(), err)) return false;   // --kv-pool off: the whole context, held
         if (heat_tally_) sh_->heat_sessions.push_back(this);
         return true;
     }
@@ -976,6 +977,7 @@ public:
     uint64_t grow_bytes(int64_t positions) const { return grow_on(0, positions) + (m_.cards() > 1 ? grow_on(1, positions) : 0); }
     // The caches give their pools back what lies past `keep` positions.
     bool trim_to(int64_t keep) {
+        if (!m_.flags().kv_pool) return caches_usable();   // --kv-pool off: a slot keeps its whole context
         uint64_t base[2] = {backing_on(0), m_.cards() > 1 ? backing_on(1) : 0};
         for (size_t i = 0; i < elastic_.size(); ++i) {
             const core::OnDevice on(m_.card_device(elastic_card_[i]));

@@ -16,7 +16,8 @@ beside it; the start log's `KV pool` line states its size and the positions it h
 move to the conversation cache first (the longest idle first), then a new request waits for a running one to end, and a running slot
 that cannot grow sits out until there is room; only when every running slot waits does the newest one end with an error that says so
 (its conversation stays, so asking again continues it). Any other model gives each slot the whole context's cache, so N slots take N
-times its KV; lower `--max-context` when they do not fit.
+times its KV; lower `--max-context` when they do not fit. `--no-kv-pool` (config `"kv-pool": false`) gives every slot of a model
+with a KV pool its own KV for the whole `--max-context` too, fixed at start: no slot waits for room or parks, at N times the KV.
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 

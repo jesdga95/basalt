@@ -20,7 +20,7 @@ and starts the next, or [parks](#parking-models-in-ram) it.
 - `engine`: applies to every model that takes it. An entry's own value wins.
 - `server`: shared by the whole server: `host`, `port`, `allowed-host`, `cors-origin`, `image-url-host`, `image-dir`,
   `image-remote-only`, `max-payload-mib`, `model-cache-mib`, `lazy`, `open`, `debug`, `request-lines`.
-- An entry takes engine flags and these server options: `gpu`, `vision`, `parallel`, `idle-sleep`,
+- An entry takes engine flags and these server options: `gpu`, `vision`, `parallel`, `kv-pool`, `idle-sleep`,
   `idle-unload`, `min-free-vram-mib`, `fit-max-tokens`, `grammar`, `video-max-tokens`, the reasoning settings and the sampling
   defaults.
 - `version` is `2`. A file in the old shape (no `models`) is refused.

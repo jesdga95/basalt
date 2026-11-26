@@ -428,7 +428,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const auto one_on = [&](int c, int64_t positions, uint64_t round) {
             return pool_bytes(g, positions, fp8_, int8_, round, cut_, c) + (c == 0 && dspark_ ? dspark_pool_bytes(pack_, positions, round) : 0);
         };
-        const auto pool_on = [&](int c) { return std::max(one_on(c, want, gran), (uint64_t) n_sess * one_on(c, 1, gran)); };
+        // with --kv-pool off every session holds the whole context: the pool is all of them at once, each backed at start
+        const auto pool_on = [&](int c) {
+            return req.kv_pool ? std::max(one_on(c, want, gran), (uint64_t) n_sess * one_on(c, 1, gran)) : (uint64_t) n_sess * one_on(c, want, gran);
+        };
         // a position's bytes in card c's pool, granules aside
         const auto per_on = [&](int c) { return one_on(c, 2, 1) - one_on(c, 1, 1); };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
@@ -539,10 +542,15 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         ctx_ = want;
         }
         for (int c = 0; c < cards(); ++c)
-            basalt::log::info("basalt inkling2", "KV pool%s: %.0f MiB, about %lld positions across the %d slot%s (one slot can reach %lld)",
-                              cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "",
-                              (double) kv_pool_[c].budget() / (double) kMiB, (long long) (kv_pool_[c].budget() / std::max<uint64_t>(per_on(c), 1)), n_sess,
-                              n_sess == 1 ? "" : "s", (long long) want);
+            if (!req.kv_pool)
+                basalt::log::info("basalt inkling2", "KV%s: each of the %d slot%s holds its own %lld positions (--kv-pool off)",
+                                  cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "", n_sess, n_sess == 1 ? "" : "s",
+                                  (long long) want);
+            else
+                basalt::log::info("basalt inkling2", "KV pool%s: %.0f MiB, about %lld positions across the %d slot%s (one slot can reach %lld)",
+                                  cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "",
+                                  (double) kv_pool_[c].budget() / (double) kMiB, (long long) (kv_pool_[c].budget() / std::max<uint64_t>(per_on(c), 1)), n_sess,
+                                  n_sess == 1 ? "" : "s", (long long) want);
     }
     basalt::log::info("basalt inkling2", "weights on the GPU: dense %.2f GiB, experts %.2f GiB; the embedding in host memory (%.2f GiB)",
                       (double) dense / (double) kGiB, (double) experts / (double) kGiB,
@@ -732,10 +740,11 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
                                2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
                                prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
         // a sliding-window visit's rings in every slot; a full visit's cells in the card's KV pool, at least one slot at the
-        // whole context or every slot at one granule
+        // whole context or every slot at one granule (with --kv-pool off, every slot at the whole context)
         const uint64_t cells = (uint64_t) kKvHeads * kv_cache_row_bytes(fp8, int8) * (uint64_t) want;
+        const uint64_t full = (cells + gran - 1) / gran * gran;
         const uint64_t kv = g.swa[(size_t) l] ? visit_cache_bytes(g, l, want, fp8, int8) * n_sess
-                                              : 2 * std::max((cells + gran - 1) / gran * gran, n_sess * gran);
+                                              : 2 * (req.kv_pool ? std::max(full, n_sess * gran) : n_sess * full);
         s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense + (uint64_t) visits[(size_t) l] * kv);
     }
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)

@@ -488,7 +488,7 @@ class SlotContext(unittest.TestCase):
 
     def test_the_slot_line_shows_each_slots_reach(self):
         from serve.config import slots_text
-        self.assertEqual(slots_text(8, 262144), "slots 8 \u00d7 up to 262144 ctx")
+        self.assertEqual(slots_text(8, 262144, True), "slots 8 \u00d7 up to 262144 ctx")
 
     def test_parallel_conflicts_with_batch_and_slots(self):
         for flag in ("--batch", "--slots"):
@@ -512,6 +512,22 @@ class SlotContext(unittest.TestCase):
             check_engine_flags(cli_words, {"--batch", "--max-context"}, "command line")
         (_, _, file_words, _), = model_settings(build_parser(), ["--config", conf({"models": [{"model": "a.basalt", "slot-full-context": True}]})])
         self.assertIn("--slot-full-context", file_words)
+
+    def test_kv_pool_setting(self):
+        """On by default (no engine word); --no-kv-pool or "kv-pool": false asks the engine for --kv-pool off, and the
+        context stays per slot as given."""
+        _, _, file_words, cli_words = parse(["--parallel", "4", "--max-context", "65536"])
+        self.assertNotIn("--kv-pool", file_words + cli_words)
+        a, _, file_words, cli_words = parse(["--parallel", "4", "--max-context", "65536", "--no-kv-pool"])
+        self.assertFalse(a.kv_pool)
+        self.assertEqual(flag_value(cli_words, "--kv-pool"), "off")
+        self.assertEqual(flag_value(cli_words, "--max-context"), "65536")
+        (a, _, file_words, _), = model_settings(build_parser(), ["--config", conf({"models": [{"model": "a.basalt", "kv-pool": False}]})])
+        self.assertFalse(a.kv_pool)
+        self.assertEqual(flag_value(file_words, "--kv-pool"), "off")
+        from serve.config import slots_text
+        self.assertEqual(slots_text(4, 65536, True), "slots 4 \u00d7 up to 65536 ctx")
+        self.assertEqual(slots_text(4, 65536, False), "slots 4 \u00d7 65536 ctx")
 
     def test_answer_room_setting(self):
         """auto by default; auto or a whole number of tokens by the command line or the config; anything else is refused."""
@@ -559,8 +575,8 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            # grammar is on by default: its no- form differs (test_grammar)
-            if name in ("api-key", "api-key-file", "engine-bin", "grammar"):
+            # grammar and kv-pool are on by default: their no- forms differ (test_grammar, test_kv_pool_setting)
+            if name in ("api-key", "api-key-file", "engine-bin", "grammar", "kv-pool"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):

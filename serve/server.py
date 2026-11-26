@@ -484,7 +484,7 @@ def main() -> int:
                 if not a.mock_engine:
                     warn_tight_ram(engine.info.get("arena_mib"))
                 if getattr(engine, "batch", 0):
-                    print(tagged("slots", slots_text(engine.batch, engine.max_context) + ", others queue"),
+                    print(tagged("slots", slots_text(engine.batch, engine.max_context, m.kv_pool) + ", others queue"),
                           flush=True)
             print(tagged("weights", f"loaded{f' {s.model}' if multi else ''}, ctx={engine.max_context} "
                                     f"images={'on' if s.vision else 'off'}"), flush=True)
