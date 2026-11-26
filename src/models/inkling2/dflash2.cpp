@@ -793,9 +793,10 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     tap_rows_ = std::max(tap_rows, kSlice);
     tap_ = tap;
 
-    c_tap_bf16_ = dev(wg::act_bytes((int64_t) kDf2Targets * kE), ok);
-    c_raw_ = f((size_t) wg::kRows * E);
-    c_act_ = dev((size_t) std::max(max_rows, wg::kRows) * E * sizeof(uint16_t), ok);
+    const int CM = std::max(max_rows, wg::kRows);   // commit rows
+    c_tap_bf16_ = dev((size_t) CM * kDf2Targets * E * sizeof(uint16_t), ok);
+    c_raw_ = f((size_t) CM * E);
+    c_act_ = dev((size_t) CM * E * sizeof(uint16_t), ok);
     c_kb_ = f((size_t) max_rows * kDf2KV);
     c_vb_ = f((size_t) max_rows * kDf2KV);
 
@@ -860,17 +861,13 @@ void Dflash2Batch::commit(Dflash2Hook* const* hooks, int n_seg, const bk::Window
         return wg::Matrix{(const uint8_t*) p, r, scale, y, ld_y};
     };
 
-    for (int r0 = 0; r0 < rows; r0 += wg::kRows) {
-        const int n = std::min(wg::kRows, rows - r0);
-        dflash2_pack_tap_bf16(tap_ + (size_t) r0 * kE, (int64_t) tap_rows_ * kE, n, c_tap_bf16_, stream);
-        wg::Call fc;
-        fc.fmt = wg::Format::Q8;
-        fc.K = kDf2Targets * kE;
-        fc.m[0] = mat(w_->fc_p, kE, nullptr, c_raw_, kE);
-        wg::gemm(fc, c_tap_bf16_, n, ws_, stream);
-        wg::norm_pack(c_raw_, w_->hidden_norm, d.rms_eps, kE, n, static_cast<uint16_t*>(c_act_) + (size_t) r0 * kE,
-                      nullptr, stream);
-    }
+    dflash2_pack_tap_bf16(tap_, (int64_t) tap_rows_ * kE, rows, c_tap_bf16_, stream);
+    wg::Call fc;
+    fc.fmt = wg::Format::Q8;
+    fc.K = kDf2Targets * kE;
+    fc.m[0] = mat(w_->fc_p, kE, nullptr, c_raw_, kE);
+    wg::gemm(fc, c_tap_bf16_, rows, ws_, stream);
+    wg::norm_pack(c_raw_, w_->hidden_norm, d.rms_eps, kE, rows, c_act_, nullptr, stream);
 
     DsCommitSegs segs;
     segs.at_d = at_d;

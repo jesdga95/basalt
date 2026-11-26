@@ -27,7 +27,7 @@ constexpr int kDf2Rank = 256;
 constexpr int kDf2TopK = 16;
 constexpr int kDf2Rescore = 64;
 
-/// Gathers the four slot-major target feature taps (tap + k * tap_stride + r * kWidth, k = 0..3) of `rows` rows (<= 64)
+/// Gathers the four slot-major target feature taps (tap + k * tap_stride + r * kWidth, k = 0..3) of `rows` rows
 /// directly into BF16 [rows][4 * kWidth] activations for Tensor Core wgemm.
 void dflash2_pack_tap_bf16(const float* tap, int64_t tap_stride, int rows, void* act_bf16, void* stream);
 
