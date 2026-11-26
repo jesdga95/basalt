@@ -2,9 +2,9 @@
 
 ## Architecture decision
 
-Implement V4 as its own registered Basalt model (`deepseek4`) with a dedicated pack reader and session. Reuse the proven DeepSeek-V4.1 infrastructure only where the source geometry and semantics match: adapter lifecycle, expert tier, hyper-connection (mHC) execution, checkpoint transfer, peer hooks, batching scaffolding, and the vision service integration points. Keep V4 cache construction and attention separate from V4.1; their compression schedules and cache semantics differ.
+Implement V4 as its own registered Basalt model (`deepseek4`) with a dedicated pack reader and session. Reuse the proven DeepSeek-V4.1 infrastructure only where the source geometry and semantics match: adapter lifecycle, expert tier, hyper-connection (mHC) execution, checkpoint transfer, peer hooks, batching scaffolding, and the vision service integration points. Keep V4 cache construction and index selection model-specific because their compression schedules and cache semantics differ. The source uses the same 64-head, 512-wide sparse MQA shape; validate whether the generic F32 MQA path can consume V4's dequantized BF16/FP8 cache rows and match its sink, RoPE, and output rounding before sharing that compute path.
 
-The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted from its source GGUF/safetensors into a Basalt pack. The current pack has the 43 trunk layers, token-to-expert tensors for the first three layers, and an embedded projector. Its manifest has no MTP tensors or drafter section, so an MTP drafter is not available in this artifact. Preserving the source tensors and projector does not constitute runtime support.
+The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted from its source GGUF/safetensors into a Basalt pack. Its 12 sections and all 1,371 source tensors were verified against the source GGUF; every section hash and tensor hash matched. It has the 43 trunk layers, token-to-expert tensors for the first three layers, and an embedded `deepseek4v` projector. Its manifest has no MTP tensors or drafter section, so an MTP drafter is not available in this artifact. Preserving the source tensors and projector does not constitute runtime support.
 
 ## Model path
 
@@ -18,7 +18,7 @@ The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted f
 
 V4 uses a per-layer compression schedule, including sliding attention, ratio-4 CSA, and ratio-128 HCA layers. CSA has overlapping candidate windows and separate key/value and score lanes; HCA uses a non-overlapping long window. Both require the learned APE contribution and their own normalization/RoPE behavior. The indexer has a separate compressor and supplies the selected positions used by attention. Cache state, row identity, sequence boundaries and chunk continuation must be explicit in the V4 session.
 
-`compress.cu` implements projected CSA/HCA pooling, BF16/RoPE rounding, and the source's FP8 cache simulation. `indexer_compress.cu` implements the separate 128-wide ratio-4 path with BF16, Hadamard, and FP4 round trips. `indexer_project.cu` builds the BF16 query/head-weight projections and applies the indexer's RoPE, Hadamard, and FP4 path; `indexer_select.cu` scores visible compressed keys and selects the top 512 with per-token causal limits. Their parity/benchmark harnesses compile and link, but have not run on the GPU. The projected attention compressor is not yet fed from pack weights, and none of these paths is connected to pack loading, cache allocation, MLA attention, or a V4 session, so the model is not runnable yet.
+`compress.cu` implements projected CSA/HCA pooling, BF16/RoPE rounding, and the source's FP8 cache simulation. `indexer_compress.cu` implements the separate 128-wide ratio-4 path with BF16, Hadamard, and FP4 round trips. `indexer_project.cu` builds the BF16 query/head-weight projections and applies the indexer's RoPE, Hadamard, and FP4 path; `indexer_select.cu` scores visible compressed keys and selects the top 512 with per-token causal limits. All four sm_120 translation units and parity executables build. GPU parity has not run because this environment has no CUDA device. The projected attention compressor is not yet fed from pack weights, and none of these paths is connected to pack loading, cache allocation, MLA attention, or a V4 session.
 
 ## MoE routing
 
@@ -28,7 +28,9 @@ This routing contract is distinct from DeepSeek-V4.1's generic top-k router. The
 
 ## Vision path
 
-Reuse the existing Basalt image request, image decoding, projector loading and dynamic vision lifecycle where tensor layout and preprocessing match. Add a V4 projector/vision adapter for its actual source metadata, patch geometry, positional handling and image-to-token output. Dynamic mode must return temporary weights/workspaces after each image request and leave no vision-specific VRAM or RAM resident at idle. Verify image inputs through the model's serving endpoint as well as direct encoder parity.
+The source uses 14-pixel patches, 3x3 downsampling, a 384-token image budget, 147,456 minimum pixels and an 8:1 landscape cap. Its N-layout interleaves adjacent rows, adds newline and pad token types, and inserts up to three leading pad tokens to align image positions to four. These rules differ from V4.1's ordinary merged-grid image blocks.
+
+`include/basalt/models/deepseek4/vision.hpp` and `src/models/deepseek4/vision/plan.cpp` now implement CPU resize planning, BF16-rounded patch extraction and the N-layout type/permutation reference. The CPU test covers reference dimensions, token budget, alignment and row ordering. The CUDA tower, projector attachment, spatial token embeddings, MRoPE assignment, prompt integration and dynamic memory lifecycle remain unimplemented. The model is not runnable.
 
 ## Verification gates
 
