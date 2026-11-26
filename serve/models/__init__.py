@@ -66,6 +66,9 @@ class Dialect:
 
 def dialect_for(arch: str | None) -> Dialect:
     """The dialect of a model file's architecture; None (no file: the mock engine) is the plain chat-template one."""
+    if arch == "deepseek4":
+        from serve.models.deepseek4 import DeepSeek4
+        return DeepSeek4()
     if arch == "deepseek41":
         from serve.models.deepseek41 import DeepSeek41
         return DeepSeek41()

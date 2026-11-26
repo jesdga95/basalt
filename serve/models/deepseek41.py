@@ -7,13 +7,10 @@ block), the answer, then `<｜DSML｜ calls>` holding `<｜DSML｜ invoke name="
 """
 from __future__ import annotations
 
-import json
-import re
-
 from serve import frontend
-from serve.frontend import Event, ToolCall
 from serve.models import Dialect
 from serve.models import deepseek41_encoding as enc
+from serve.models.dsml_parser import DsmlParser
 
 EOS = enc.eos_token
 THINK_END = enc.thinking_end_token
@@ -24,10 +21,6 @@ INVOKE_END = f"</{enc.dsml_token}{enc.tool_call_tag_name}>"
 PARAM_START = f"<{enc.dsml_token}{enc.tool_parameter_tag_name}"
 PARAM_END = f"</{enc.dsml_token}{enc.tool_parameter_tag_name}>"
 CALLS_GAP = "\n\n"                      # between the answer and the call block
-INVOKE_HEAD = re.compile(r'^' + re.escape(INVOKE_START) + r' name="([^"]*)">')
-PARAM_HEAD = re.compile(r'^' + re.escape(PARAM_START) + r' name="([^"]*)" string="(true|false)">')
-INVOKE_PREFIX = INVOKE_START + ' name="'
-PARAM_PREFIX = PARAM_START + ' name="'
 DSML_MARK = "\U000F2000"                # stands for the DSML marker while a message is rendered
 
 # the frontend's levels -> the encoder's scale (low 50, high 75, max 100, or 1-100); medium is the model's default (high)
@@ -59,179 +52,17 @@ class DeepseekTemplate:
         return text
 
 
-def _value(text: str, is_string: bool):
-    if is_string:
-        return text
-    try:
-        return json.loads(text)
-    except ValueError:
-        return text
-
-
-class DeepseekParser:
-    """Incremental parser of the model's text. `state` is "reasoning", "content" or "call"; text is held back
-    while it may still be the start of a marker."""
+class DeepseekParser(DsmlParser):
+    """DeepSeek-V4.1's DSML spacing configured on the shared incremental parser."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
-        self.state = "reasoning" if thinking else "content"
-        self.buf = ""
-        self.stream_tools = stream_tools
-        self.sub = "between"            # inside a call block: between | invoke | value
-        self.call: ToolCall | None = None
-        self.args: dict = {}
-        self.first = True               # no argument written yet
-        self.pname, self.pstring, self.pvalue = "", True, ""
-        self.block_called = False
-
-    # ------------------------------------------------------------------ helpers
-    def _args(self, out: list, piece: str) -> None:
-        if piece and self.stream_tools:
-            out.append(Event("tool_args", piece, call=self.call))
-
-    def _end_call(self, out: list) -> None:
-        self._args(out, "}")
-        out.append(Event("tool_call", call=ToolCall(name=self.call.name, arguments=self.args, id=self.call.id)))
-        self.call = None
-
-    # ------------------------------------------------------------------ text outside the call block
-    def _reasoning(self, out: list) -> bool:
-        """Advance reasoning; True when the state changed."""
-        end, calls = self.buf.find(THINK_END), self.buf.find(CALLS_START)
-        if end >= 0 and (calls < 0 or end < calls):
-            if end:
-                out.append(Event("reasoning", self.buf[:end]))
-            self.buf, self.state = self.buf[end + len(THINK_END):], "content"
-            return True
-        if calls >= 0:                  # the thinking ran straight into the calls
-            text = self.buf[:calls].rstrip()
-            if text:
-                out.append(Event("reasoning", text))
-            self.buf, self.state, self.sub, self.block_called = self.buf[calls + len(CALLS_START):], "call", "between", False
-            return True
-        keep = frontend.hold_back(self.buf, (THINK_END, CALLS_GAP + CALLS_START, CALLS_START))
-        if len(self.buf) > keep:
-            out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
-            self.buf = self.buf[len(self.buf) - keep:]
-        return False
-
-    def _content(self, out: list) -> bool:
-        calls = self.buf.find(CALLS_START)
-        if calls >= 0:
-            text = self.buf[:calls].rstrip("\n")
-            if text:
-                out.append(Event("content", text))
-            self.buf, self.state, self.sub, self.block_called = self.buf[calls + len(CALLS_START):], "call", "between", False
-            return True
-        keep = frontend.hold_back(self.buf, (CALLS_GAP + CALLS_START, CALLS_START))
-        if len(self.buf) > keep:
-            out.append(Event("content", self.buf[:len(self.buf) - keep]))
-            self.buf = self.buf[len(self.buf) - keep:]
-        return False
-
-    # ------------------------------------------------------------------ the call block
-    def _call(self, out: list) -> bool:
-        """Advance inside the call block; True when more may follow in the buffer."""
-        if self.sub == "between":
-            s = self.buf.lstrip()
-            if s.startswith(CALLS_END):
-                self.buf, self.state = s[len(CALLS_END):], "content"
-                return True
-            m = INVOKE_HEAD.match(s)
-            if m:
-                self.call = ToolCall(name=m.group(1), arguments={})
-                self.args, self.first, self.sub, self.block_called = {}, True, "invoke", True
-                self.buf = s[m.end():]
-                if self.stream_tools:
-                    out.append(Event("tool_start", call=self.call))
-                self._args(out, "{")
-                return True
-            if s and not (CALLS_END.startswith(s) or INVOKE_PREFIX.startswith(s) or
-                          (s.startswith(INVOKE_PREFIX) and ">" not in s and "\n" not in s)):
-                if not self.block_called:
-                    out.append(Event("content", CALLS_START))    # not a call block: the opener is text
-                else:
-                    self.buf = s
-                self.state, self.sub = "content", "between"
-                return True
-            return False
-        if self.sub == "invoke":
-            s = self.buf.lstrip()
-            if s.startswith(INVOKE_END):
-                self.buf, self.sub = s[len(INVOKE_END):], "between"
-                self._end_call(out)
-                return True
-            m = PARAM_HEAD.match(s)
-            if m:
-                self.pname, self.pstring, self.pvalue = m.group(1), m.group(2) == "true", ""
-                self._args(out, ("" if self.first else ",") + json.dumps(m.group(1), ensure_ascii=False) + ":")
-                self.first = False
-                if self.pstring:
-                    self._args(out, '"')
-                self.buf, self.sub = s[m.end():], "value"
-                return True
-            if not s or INVOKE_END.startswith(s) or PARAM_PREFIX.startswith(s) or (
-                    s.startswith(PARAM_PREFIX) and ">" not in s and "\n" not in s):
-                return False                # a tag still arriving
-            # malformed tag or unexpected text inside an invoke: close streamed JSON (no tool_call) and recover
-            self._args(out, "}")
-            self.call = None
-            if s.startswith(CALLS_END) or CALLS_END.startswith(s) or s.startswith(INVOKE_START) or INVOKE_START.startswith(s):
-                self.buf, self.sub = s, "between"
-                return True
-            self.state, self.sub = "content", "between"
-            return True
-        end = self.buf.find(PARAM_END)  # a value
-        if end >= 0:
-            text = self.buf[:end]
-            self.pvalue += text
-            self.args[self.pname] = _value(self.pvalue, self.pstring)
-            if self.pstring:
-                self._args(out, json.dumps(text, ensure_ascii=False)[1:-1] + '"')
-            else:
-                self._args(out, json.dumps(self.args[self.pname], ensure_ascii=False))
-            self.buf, self.sub = self.buf[end + len(PARAM_END):], "invoke"
-            return True
-        keep = frontend.hold_back(self.buf, (PARAM_END,))
-        text, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
-        self.pvalue += text
-        if self.pstring:
-            self._args(out, json.dumps(text, ensure_ascii=False)[1:-1])
-        return False
-
-    # ------------------------------------------------------------------ interface
-    def feed(self, delta: str) -> list[Event]:
-        self.buf += delta
-        out: list[Event] = []
-        while True:
-            if self.state == "reasoning":
-                more = self._reasoning(out)
-            elif self.state == "content":
-                more = self._content(out)
-            else:
-                more = self._call(out)
-            if not more:
-                return out
-
-    def finish(self) -> list[Event]:
-        """End of generation: flush what is held. A call cut off mid-way is closed without a "tool_call"; text
-        that was only the start of a marker is text."""
-        out: list[Event] = []
-        if self.state == "call":
-            if self.call is not None:
-                if self.sub == "value":
-                    self.pvalue += self.buf
-                    if self.pstring:
-                        self._args(out, json.dumps(self.buf, ensure_ascii=False)[1:-1] + '"')
-                    else:
-                        self._args(out, json.dumps(self.pvalue))
-                self._args(out, "}")
-                self.call = None
-            elif not self.block_called:
-                out.append(Event("content", CALLS_START + self.buf))
-        elif self.buf:
-            out.append(Event("reasoning" if self.state == "reasoning" else "content", self.buf))
-        self.buf = ""
-        return out
+        super().__init__(
+            thinking=thinking, tools=tools, stream_tools=stream_tools,
+            calls_start=CALLS_START, calls_end=CALLS_END,
+            invoke_start=INVOKE_START, invoke_end=INVOKE_END,
+            param_start=PARAM_START, param_end=PARAM_END,
+            thinking_end=THINK_END, calls_gap=CALLS_GAP,
+        )
 
 
 class DeepSeek41(Dialect):
