@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../cli/tokens.hpp"
+#include "batch_plan.hpp"
 #include "console_stats.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
@@ -325,6 +326,8 @@ public:
     bool batch_round();
     /// The batch windows' draft policy, which the runtime sets up, and each slot's sampling (slot_set_sampling).
     std::optional<basalt::spec::DraftPolicy> bpolicy{};
+    /// The batch rounds' measured time by their rows (batch_budget's costs).
+    RoundCost round_cost{};
     std::vector<basalt::kernels::SamplerParams> slot_sampling{};
     void slot_window_begin(int b, SlotWin& w, int limit);
     bool slot_window_finish(int b, SlotWin& w);

@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -34,6 +36,56 @@ inline std::vector<int> batch_shares(const std::vector<std::vector<double>>& joi
     }
     for (size_t i = 0; left > 0; i = (i + 1) % n, --left) ++rows[i];
     return rows;
+}
+
+/// A batch round's wall time by its rows (verification, the tokens out and the next drafts), learned as rounds run: rows
+/// in buckets of kStep, each a moving average. A bucket not measured lately goes as the line through the measured ones
+/// around it, or as the nearest one past the last, so a budget not tried lately is tried again.
+struct RoundCost {
+    static constexpr int kStep = 8, kBuckets = 32, kStale = 400;
+    static constexpr double kAlpha = 0.125;
+    double ms[kBuckets] = {};
+    int64_t seen[kBuckets] = {};
+    int64_t round = 0;
+    bool fresh(int b) const { return seen[b] > 0 && round - seen[b] <= kStale; }
+    static int bucket(int rows) { return std::clamp((rows - 1) / kStep, 0, kBuckets - 1); }
+    void observe(int rows, double t) {
+        const int b = bucket(rows);
+        ms[b] = fresh(b) ? ms[b] + kAlpha * (t - ms[b]) : t;
+        seen[b] = ++round;
+    }
+    /// The expected ms of a round of `rows`, 0 when no bucket is measured lately.
+    double at(int rows) const {
+        const int b = bucket(rows);
+        if (fresh(b)) return ms[b];
+        int lo = -1, hi = -1;
+        for (int u = b - 1; u >= 0 && lo < 0; --u)
+            if (fresh(u)) lo = u;
+        for (int u = b + 1; u < kBuckets && hi < 0; ++u)
+            if (fresh(u)) hi = u;
+        if (lo >= 0 && hi >= 0) return ms[lo] + (ms[hi] - ms[lo]) * (double) (b - lo) / (double) (hi - lo);
+        return lo >= 0 ? ms[lo] : hi >= 0 ? ms[hi] : 0.0;
+    }
+};
+
+/// The rows of a batch round of `n` slots: their n anchors and the likeliest of the draft rows (`chances`: each one's
+/// chance of being kept, its slot's earlier drafts with it), as many as give the most expected tokens per ms by `cost`,
+/// within `cap`. With nothing measured, the anchors alone.
+inline int batch_budget(int n, std::vector<double> chances, int cap, const RoundCost& cost) {
+    std::sort(chances.begin(), chances.end(), std::greater<>());
+    const double c0 = cost.at(n);
+    if (c0 <= 0) return std::min(n, cap);
+    double e = n, best = e / c0;
+    int best_r = n;
+    for (int r = n + 1; r <= cap && r - n <= (int) chances.size(); ++r) {
+        e += chances[(size_t) (r - n - 1)];
+        const double c = cost.at(r);
+        if (c > 0 && e / c > best) {
+            best = e / c;
+            best_r = r;
+        }
+    }
+    return std::min(best_r, cap);
 }
 
 /// The same for drafters that set their own windows' length (no chances to weigh): from the rows each window would take

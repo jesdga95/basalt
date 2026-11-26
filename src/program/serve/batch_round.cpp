@@ -197,6 +197,8 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             const double ms = s.window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
             if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
             else bpolicy->observe_window(w.chance, T, a, ms);
+        } else if (!w.from_sfx) {
+            bpolicy->observe_chances(w.chance, T, a);
         }
     }
     if (fin != nullptr) end_slot(b, fin);
@@ -250,22 +252,25 @@ bool Runtime::batch_round() {
         }
         return true;
     }
-    // the windows of a round share the batch's rows.  Drafts with stated chances: with no more slots than rows one pass
-    // serves all, the rows going to the drafts likeliest kept.  Drafters that set their own length: each window as it would
-    // run alone, shared max-min fairly when they do not fit (a window held to fewer takes its drafts again within its share)
+    // the windows of a round share the batch's rows.  Drafts with stated chances: the round takes the anchors and the
+    // likeliest drafts, as many as its measured cost by rows says pay (batch_budget), the rows going to the drafts
+    // likeliest kept.  Drafters that set their own length: each window as it would run alone, shared max-min fairly when
+    // they do not fit (a window held to fewer takes its drafts again within its share)
     constexpr int kShortSpecCap = 16;
     constexpr int kLongSpecCap = 96;
+    const Clock::time_point round_t0 = Clock::now();
     const int n_act = (int) act.size();
-    int64_t max_pos = 0;
-    for (int i = 0; i < n_act; ++i) max_pos = std::max(max_pos, bs[(size_t) act[(size_t) i]].p);
-    const int spec_cap = max_pos >= 4096 ? std::min(cap, kLongSpecCap) : std::min(cap, kShortSpecCap);
-    const int row_cap = std::min(cap, std::max(n_act, spec_cap));
-    const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : row_cap;
-    const int per_slot_cap = std::min(row_cap, slot_cap_by_n);
+    const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : cap;
+    int spec_cap = cap, per_slot_cap = std::min(cap, slot_cap_by_n);
     std::vector<SlotWin> wins(act.size());
     std::vector<int> rows(act.size());
     const BSlot& s0 = bs[(size_t) act[0]];
     if (slot_session(act[0]).own_window(s0.dprob, s0.n_dr) > 0) {
+        int64_t max_pos = 0;
+        for (int i = 0; i < n_act; ++i) max_pos = std::max(max_pos, bs[(size_t) act[(size_t) i]].p);
+        spec_cap = max_pos >= 4096 ? std::min(cap, kLongSpecCap) : std::min(cap, kShortSpecCap);
+        const int row_cap = std::min(cap, std::max(n_act, spec_cap));
+        per_slot_cap = std::min(row_cap, slot_cap_by_n);
         for (int i = 0; i < n_act; ++i) {
             slot_window_begin(act[(size_t) i], wins[(size_t) i], per_slot_cap);
             rows[(size_t) i] = wins[(size_t) i].T;
@@ -278,19 +283,24 @@ bool Runtime::batch_round() {
             }
     } else {
         std::vector<std::vector<double>> joint(act.size());
+        std::vector<double> chances;
         for (int i = 0; i < n_act; ++i) {
             const BSlot& sl = bs[(size_t) act[(size_t) i]];
             double all = 1.0;
             const int max_k = std::min(sl.n_dr, std::max(0, per_slot_cap - 1));
-            for (int k = 0; k < max_k; ++k) joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
+            for (int k = 0; k < max_k; ++k) {
+                joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
+                chances.push_back(all);
+            }
         }
-        const std::vector<int> share = batch_shares(joint, row_cap);
+        const std::vector<int> share = batch_shares(joint, n_act > 1 ? batch_budget(n_act, chances, cap, round_cost) : cap);
         for (int i = 0; i < n_act; ++i) {
             slot_window_begin(act[(size_t) i], wins[(size_t) i], std::min(share[(size_t) i], per_slot_cap));
             rows[(size_t) i] = wins[(size_t) i].T;
         }
     }
-    for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
+    const std::vector<std::vector<size_t>> groups = batch_groups(rows, cap);
+    for (const std::vector<size_t>& group : groups) {
         const Clock::time_point t0 = Clock::now();
         stats_lookups_begin();
         std::vector<basalt::model::ModelSession*> ss;
@@ -333,6 +343,11 @@ bool Runtime::batch_round() {
         stats_lookups_end();
         for (const size_t i : group)
             if (!slot_window_end(act[i], wins[i])) return false;
+    }
+    if (groups.size() == 1 && n_act > 1) {
+        int all_rows = 0;
+        for (const int r : rows) all_rows += r;
+        round_cost.observe(all_rows, std::chrono::duration<double, std::milli>(Clock::now() - round_t0).count());
     }
     return true;
 }
