@@ -30,10 +30,11 @@ struct SlotWin {
     bool drafting = false;
     bool solo = true;
     bool reading = false;    // the rows are prompt tokens the slot reads (BSlot::pend)
+    bool confident = false;   // a batch round's window of stated-chance drafts: the rows batch_confident_shares gave it
 };
 
-// The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, or as its drafter's
-// own length rule keeps).
+// The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, as its drafter's
+// own length rule keeps, or in a confident window as many as the limit).
 void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
     BSlot& sl = bs[(size_t) b];
     basalt::model::ModelSession& s = slot_session(b);
@@ -58,7 +59,7 @@ void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
     const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit,
                                               own_limit > 0 ? (int64_t) own_limit : INT64_MAX});
     const int own = s.own_window(sl.dprob, sl.n_dr);
-    w.T = std::max(1, std::min(own > 0 ? own : bpolicy->window(sl.dprob, sl.n_dr), most));
+    w.T = std::max(1, std::min(own > 0 ? own : w.confident ? sl.n_dr + 1 : bpolicy->window(sl.dprob, sl.n_dr), most));
     w.from_sfx = false;
     w.match = 0;
     if (sl.sfx && most >= 2) {   // a lookup proposal, as in the solo loop
@@ -230,7 +231,7 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
     basalt::core::progress_beat();
     if (w.drafting) {
         const int max_n = std::min(s.max_window() - 1, (int) std::size(sl.dr));
-        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || bpolicy->may_verify(c, j, m); };
+        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || w.confident || bpolicy->may_verify(c, j, m); };
         if (const basalt::model::Result r = s.draft_end(sl.dr, sl.dprob, max_n, sl.n_dr, need); !r.ok()) {
             std::printf("ERR %s\n", r.message.c_str());
             return false;
@@ -305,6 +306,7 @@ bool Runtime::batch_round() {
     const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : cap;
     int spec_cap = cap, per_slot_cap = std::min(cap, slot_cap_by_n);
     std::vector<SlotWin> wins(act.size());
+    bool confident = false;
     std::vector<int> rows(act.size());
     const BSlot& s0 = bs[(size_t) act[0]];
     if (slot_session(act[0]).own_window(s0.dprob, s0.n_dr) > 0) {
@@ -324,19 +326,18 @@ bool Runtime::batch_round() {
                 rows[(size_t) i] = wins[(size_t) i].T;
             }
     } else {
+        confident = n_act > 1;
+        if (confident) per_slot_cap = std::min(cap, kSpecMax + 1);
         std::vector<std::vector<double>> joint(act.size());
-        std::vector<double> chances;
         for (int i = 0; i < n_act; ++i) {
             const BSlot& sl = bs[(size_t) act[(size_t) i]];
             double all = 1.0;
             const int max_k = std::min(sl.n_dr, std::max(0, per_slot_cap - 1));
-            for (int k = 0; k < max_k; ++k) {
-                joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
-                chances.push_back(all);
-            }
+            for (int k = 0; k < max_k; ++k) joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
         }
-        const std::vector<int> share = batch_shares(joint, n_act > 1 ? batch_budget(n_act, chances, cap, round_cost) : cap);
+        const std::vector<int> share = confident ? batch_confident_shares(joint, (int) bs.size(), cap) : batch_shares(joint, cap);
         for (int i = 0; i < n_act; ++i) {
+            wins[(size_t) i].confident = confident;
             slot_window_begin(act[(size_t) i], wins[(size_t) i], std::min(share[(size_t) i], per_slot_cap));
             rows[(size_t) i] = wins[(size_t) i].T;
         }
@@ -366,8 +367,10 @@ bool Runtime::batch_round() {
             wins[i].solo = group.size() == 1;
             if (!slot_window_accept(act[i], wins[i])) return false;
             kept.push_back(wins[i].kept);
-            // bound drafted tokens to what a slot's share of the batch window can verify next round
-            wins[i].want = std::min(wins[i].want, std::min(per_slot_cap - 1, std::max(0, (spec_cap + n_act - 1) / n_act - 1)));
+            // bound drafted tokens to what a slot's share of the batch window can verify next round; a confident round's
+            // slots draft the most the rule may take
+            if (confident && wins[i].want > 0) wins[i].want = kSpecMax;
+            else wins[i].want = std::min(wins[i].want, std::min(per_slot_cap - 1, std::max(0, (spec_cap + n_act - 1) / n_act - 1)));
             if (wins[i].want > 0) {
                 const BSlot& sl = bs[(size_t) act[i]];
                 ds.push_back(&slot_session(act[i]));

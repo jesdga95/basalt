@@ -17,6 +17,7 @@
 #include "basalt/platform/system.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/q8_gemm.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/model/multi_gpu.hpp"
 #include "models/inkling2/loan_layout.hpp"
 #include "models/inkling2/prompt.hpp"
@@ -51,6 +52,10 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 constexpr uint64_t kSharedFixed = 896 * kMiB;
 constexpr uint64_t kSessionFixed = 44 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
+// a batch window's graph on the main card (its kernel nodes): a batch of slots keeps up to BatchShared::kGraphs of them,
+// instantiated as compositions come, so the plan holds them beside the KV pool
+constexpr uint64_t kBatchGraphBytes = 3 * kMiB;
+uint64_t batch_graphs_bytes(int n_sess) { return n_sess > 1 ? kBatchGraphBytes * model::BatchShared::kGraphs : 0; }
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
 constexpr uint64_t kLateRoom = 256 * kMiB;
@@ -436,7 +441,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const auto per_on = [&](int c) { return one_on(c, 2, 1) - one_on(c, 1, 1); };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         // what card c keeps beside its pool: the sessions' own buffers, what they share and the spare
-        const auto kept_on = [&](int c) { return own_on(c) * (uint64_t) n_sess + (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare); };
+        const auto kept_on = [&](int c) {
+            return own_on(c) * (uint64_t) n_sess + (c == 0 ? shared + batch_graphs_bytes(n_sess) + spare : shared_bytes(g, false) + kCardSpare);
+        };
         const auto size_pool = [&](int c, uint64_t free_b) -> model::Result {
             const uint64_t kept = kept_on(c);
             const uint64_t least = pool_on(c);
@@ -748,7 +755,7 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
         s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense + (uint64_t) visits[(size_t) l] * kv);
     }
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
-    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
+    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + batch_graphs_bytes(n_sess) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
                kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
     for (const model::GpuCards::Card& card : c.cards) {
         cudaSetDevice(card.device);

@@ -1005,7 +1005,7 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     const size_t E = kE, V = (size_t) w->n_vocab, ff = (size_t) d.n_ff;
     const int S = std::min(max_sessions, kMaxDraftSessions);
     const int S_all = std::max(S, std::min(max_sessions, (int) bk::kWindowSegsMax));
-    const int max_dr_rows = std::max(S * kDsDrafts, S_all * 2);
+    const int max_dr_rows = std::max(S * kDsDrafts, S_all * kBatchDrafts);
     const int CR = 64;
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };

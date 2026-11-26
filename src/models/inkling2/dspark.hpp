@@ -298,7 +298,9 @@ private:
     const DsparkWeights* w_ = nullptr;
     std::unique_ptr<Dflash2Batch> df2_;
     std::vector<void*> allocs_, pinned_;
-    int max_sessions_ = 0, max_dr_rows_ = 0, max_rows_ = 0, tap_rows_ = 0;   // max_dr_rows_: the head's draft rows a pass holds
+    // the head's draft rows a pass holds: every slot at kBatchDrafts drafts, or kMaxDraftSessions at a whole block's
+    static constexpr int kBatchDrafts = 4;
+    int max_sessions_ = 0, max_dr_rows_ = 0, max_rows_ = 0, tap_rows_ = 0;
     int64_t att_cells_ = 0;
     float* tap_ = nullptr;
     // commit_batch scratch [max_rows]

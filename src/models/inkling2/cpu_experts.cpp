@@ -28,7 +28,7 @@
 namespace basalt::models::inkling2 {
 namespace cpu = kernels::cpu;
 
-static_assert(kBatchRows * 8 <= 1024, "a batch visit's RAM pairs fit one call");
+static_assert(kBatchRows * 8 <= kMaxPairs, "a batch visit's RAM pairs fit one call");
 
 namespace {
 // The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
@@ -211,7 +211,7 @@ CpuExperts::~CpuExperts() = default;
 std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string& err) {
     if (!m.spill().any()) return nullptr;
     const Geometry& g = m.geo();
-    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kBatchRows > 1024) {
+    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kBatchRows > kMaxPairs) {
         err = "the CPU experts do not fit this geometry";
         return nullptr;
     }
