@@ -551,11 +551,14 @@ if(PEER_ADA)
     src/prefill/mmq/instances/mmq_q4_k.cu
     src/prefill/mmq/instances/mmq_q5_k.cu
     src/prefill/mmq/instances/mmq_q6_k.cu
+    src/prefill/mmq/instances/mmq_nvfp4.cu   # NVFP4 experts on the peer (integer per-16-scale dot, no FP4 tensor cores)
     src/kernels/cuda/iq_kernels.cu
     src/kernels/cuda/quantize_act.cu
     src/kernels/cuda/wait_abort.cu
     src/kernels/cuda/sampler.cu
     src/kernels/cuda/elementwise.cu
+    src/models/deepseek41/prefill_ffn.cu   # swiglu_split_clamped: the activation of DeepSeek's peer prompt share
+    src/models/hy4flash/kernels/ops.cu     # swiglu_split_clamped: the activation of Hy4-flash's peer prompt share
     PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
 endif()
 
