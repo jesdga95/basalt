@@ -515,9 +515,12 @@ function lastList(reqs, best) {
     + (bp ? `<div title="${esc(bp.id)}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}${bp.recent ? ", the fastest of the recent requests" : ""}"><dt>Prefill</dt><dd>${fmt(bp.tok_s)} tok/s</dd></div>` : kv("Prefill", "-")) + `</dl>`;
 }
 function cacheList(conv, live) {
-  return cached(conv, live) ? `<h3>Conversation cache</h3><dl class="kv">${kv("Cached", `${conv.parked} chat${conv.parked === 1 ? "" : "s"} · ${gib(conv.bytes)} GiB`)}`
-    + (num(conv.evictions) ? kv("Evicted to make room", fmt(conv.evictions)) : "")
-    + (num(conv.restored) ? kv("Last restore", `${fmt(conv.restored)} tok${num(conv.restored_ms) ? ` in ${Math.round(conv.restored_ms)} ms` : ""}`) : "") + `</dl>` : "";
+  const up = !["unloaded", "asleep", "loading"].includes(live.state) && conv, refused = up && num(conv.refused) && conv.refused > 0;
+  if (!cached(conv, live) && !refused) return "";
+  return `<h3>Conversation cache</h3><dl class="kv">${cached(conv, live) ? kv("Cached", `${conv.parked} chat${conv.parked === 1 ? "" : "s"} · ${gib(conv.bytes)} GiB`) : ""}`
+    + (num(conv.evictions) && cached(conv, live) ? kv("Evicted to make room", fmt(conv.evictions)) : "")
+    + (refused ? kv("Parking refused", fmt(conv.refused)) : "")
+    + (num(conv.restored) && cached(conv, live) ? kv("Last restore", `${fmt(conv.restored)} tok${num(conv.restored_ms) ? ` in ${Math.round(conv.restored_ms)} ms` : ""}`) : "") + `</dl>`;
 }
 function sessionList(t) {
   const n = t && num(t.requests) ? t : null;
