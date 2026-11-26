@@ -1,0 +1,56 @@
+{
+  "submitter": "nilspolek",
+  "date": "2026-11-26",
+  "commit": "9b76276db9",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 575,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 23.7
+    },
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 575,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 27.6
+    },
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 575,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 27.8
+    },
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 500,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 27.9
+    }
+  ],
+  "ram_gib": 787,
+  "cpu": "AMD EPYC 7763, 128 cores",
+  "ram_gbps": 119.9,
+  "os": "Linux",
+  "quant": "IQ1_S",
+  "kv": "int8",
+  "prefill_16k_tps": 3157.4,
+  "prefill_64k_tps": 9428.1,
+  "decode_tps": 520.9,
+  "decode_conv_tps": 399.7,
+  "decode_struct_tps": 625.4,
+  "decode_prose_tps": 301.9,
+  "accept_conv_pct": 67.2,
+  "accept_struct_pct": 94.8,
+  "accept_prose_pct": 63.4,
+  "draft_len_conv": 2.6,
+  "draft_len_struct": 6.7,
+  "draft_len_prose": 1.8,
+  "engine_args": "--gpu 0,1,2,3 --gpu-mode peer --max-context 66661 --kv int8"
+}
