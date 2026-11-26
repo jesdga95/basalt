@@ -1056,7 +1056,7 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                     max_cells = std::max(max_cells, std::min(att_cells_, cells));
                     gsegs[c] = {cc.k, cc.v, p0, blk, p0 + blk, win, cc.cap, block_win};
                 }
-                bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, B, att_scr_, max_cells, attn_, st);
+                bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, B, att_scr_, max_cells, attn_, st, true);
             }
 
             bp::fp4_dense::quantize(attn_, R, kDf2Q, kDf2Q, a4_, gs4_, st);
