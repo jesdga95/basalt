@@ -1840,7 +1840,8 @@ endforeach()
 target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx2.cpp src/kernels/cpu/nvfp4_avx2_vnni.cpp
-                                           src/kernels/cpu/nvfp4_avx2_dpbusd.cpp
+                                         src/kernels/cpu/nvfp4_avx2_dpbusd.cpp
+                                         src/kernels/cpu/mxfp4_avx2.cpp src/kernels/cpu/mxfp4_avx2_vnni.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx2_vnni.cpp
                                          src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
@@ -1862,6 +1863,8 @@ set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OP
 set_source_files_properties(src/kernels/cpu/nvfp4_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnniint8_flags}")
 # the same rows with AVX-VNNI (`vpdpbusd`), for the AVX2 CPUs without AVX-VNNI-INT8, called behind cpu_avxvnni_ok()
 set_source_files_properties(src/kernels/cpu/nvfp4_avx2_dpbusd.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
+set_source_files_properties(src/kernels/cpu/mxfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/mxfp4_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
