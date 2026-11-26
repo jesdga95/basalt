@@ -8,9 +8,12 @@ uses MXFP4 routed experts and Q8_0 for source FP8 linears, so it is not a BF16 0
 
 The converter, pack validation, serving dialect, model-local CUDA primitives, and C++ metadata adapter exist. The adapter
 selects the pack's `joyai-llm` tokenizer, V4 token names, image pad, DSML grammar, and one-GPU mode; its metadata test and
-real-pack validation pass. The pack reader can fetch validated BF16 token-embedding rows from the GGUF section on demand.
-The engine does not yet register `deepseek4` as loadable: there is no `LoadedModel`, `ModelSession`, or full transformer
-forward. The final BF16 RMSNorm and logits projection stage is implemented and verified against the real output head, but
+real-pack validation pass. `ModelWeights` now queues the pack's dense tensors in the start's `LoadPlan`, widens the BF16
+router gate to F32, and leaves token embeddings and hash routes file-backed; a real-pack GPU test validates that plan.
+MXFP4 grouped experts now accept gate/up as well as down tensors, with Basalt's grouped parity suite covering synthetic
+and double-reference V4-shaped cases. The pack reader can fetch validated BF16 token-embedding rows from the GGUF section
+on demand. The engine does not yet register `deepseek4` as loadable: there is no `LoadedModel`, `ModelSession`, or full
+transformer forward. The final BF16 RMSNorm and logits projection stage is implemented and verified against the real output head, but
 is not yet connected to a session.
 The CPU image planner and patch formatter exist, but the vision transformer/projector execution is not integrated into a
 Basalt session. The attention stage now accepts decode windows of up to eight rows and matches sequential one-row output and

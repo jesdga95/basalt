@@ -1,0 +1,52 @@
+#pragma once
+
+#include "models/deepseek4/pack.hpp"
+#include "basalt/model/adapter.hpp"
+
+#include <map>
+#include <string>
+#include <vector>
+
+namespace basalt::core {
+class LoadPlan;
+struct ExpertTierSpec;
+}
+
+namespace basalt::models::deepseek4 {
+
+struct DeviceTensor {
+    void* ptr = nullptr;
+    int type = 0;
+    uint64_t bytes = 0;
+    std::vector<uint64_t> shape;
+};
+
+/// Owns DeepSeek4's validated pack and the dense tensors queued for the start's single LoadPlan pass.
+class ModelWeights {
+public:
+    ModelWeights() = default;
+    ~ModelWeights();
+    ModelWeights(const ModelWeights&) = delete;
+    ModelWeights& operator=(const ModelWeights&) = delete;
+
+    bool plan(const std::string& path, int device, core::LoadPlan& reads, std::string& err);
+    const Pack& pack() const { return pack_; }
+    const Geometry& geo() const { return pack_.geo; }
+    int device() const { return device_; }
+    const DeviceTensor* tensor(const std::string& name) const;
+    const DeviceTensor* tensor(int layer, const char* suffix) const;
+    bool embedding_row(int32_t token, std::vector<float>& row, std::string& err) const;
+    bool hash_route_table(int layer, std::vector<int32_t>& ids, std::string& err) const;
+    bool expert_tier_spec(const model::LoadRequest& request, core::ExpertTierSpec& spec, std::string& err) const;
+
+private:
+    void reset();
+
+    Pack pack_;
+    std::map<std::string, DeviceTensor> tensors_;
+    std::string path_;
+    int fd_ = -1;
+    int device_ = -1;
+};
+
+}  // namespace basalt::models::deepseek4

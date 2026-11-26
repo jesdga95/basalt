@@ -21,6 +21,10 @@ add_library(deepseek4_pack STATIC src/models/deepseek4/pack.cpp src/models/deeps
 target_include_directories(deepseek4_pack PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(deepseek4_pack PUBLIC core)
 
+add_library(deepseek4_model_weights STATIC src/models/deepseek4/model_weights.cpp)
+target_include_directories(deepseek4_model_weights PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(deepseek4_model_weights PUBLIC deepseek4_pack kernels core ${_gpu_runtime_target})
+
 if(BUILD_TESTING)
   add_executable(ds4_context_policy_test src/models/deepseek4/context_policy_test.cpp)
   target_include_directories(ds4_context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -121,6 +125,16 @@ if(BUILD_TESTING)
     basalt_cpu_test(NAME ds4_pack_test COMMAND ds4_pack_test)
     set_tests_properties(ds4_pack_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+
+  add_executable(ds4_model_weights_test src/models/deepseek4/model_weights_test.cpp)
+  target_include_directories(ds4_model_weights_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${_gpu_include_directories})
+  target_link_libraries(ds4_model_weights_test PRIVATE deepseek4_model_weights ${_gpu_runtime_target})
+  if(BASALT_DEEPSEEK4_PACK)
+    basalt_gpu_test(NAME ds4_model_weights_test COMMAND ds4_model_weights_test "${BASALT_DEEPSEEK4_PACK}")
+  else()
+    basalt_gpu_test(NAME ds4_model_weights_test COMMAND ds4_model_weights_test)
+  endif()
+  set_tests_properties(ds4_model_weights_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
   add_executable(ds4_vision_tower_test src/models/deepseek4/vision/tower_test.cpp)
   target_include_directories(ds4_vision_tower_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -19,9 +19,8 @@
 // NVFP4 blocks come in three scale profiles (narrow; pack-like block values with 2e-5..2e-4 tails; pack-like with scale
 // bytes 0x7F, 0xFF, bit 7 set, 0 and subnormals), all of which every path must decode alike.
 //
-// MXFP4 is checked as a down format only: its blocks take E8M0 scale bytes in the packs' range (118..123), and
-// the double reference dequantizes its down weights with basalt::dequantize_mxfp4.  Its GPU dequantizer is also
-// checked bitwise against that host port at the E8M0 exponent edges.
+// MXFP4 blocks take E8M0 scale bytes in the packs' range (118..123); the double reference dequantizes down weights
+// with basalt::dequantize_mxfp4. Its GPU dequantizer is checked bitwise against that host port at E8M0 exponent edges.
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
@@ -463,7 +462,7 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
     std::vector<double> hq((size_t) FF);
     double o_abs = 0, o_num = 0, o_den = 0, o_mrel = 0, r_abs = 0, r_num = 0, r_den = 0, r_mrel = 0, r_maxref = 0,
            r_entrel = 0;
-    size_t dq_diff = 0;
+    size_t dq_diff = 0, gu_dq_diff = 0;
     const auto mrel = [](double err, double ref) {
         return ref == 0.0 ? (err == 0.0 ? 0.0 : 1e300) : err / std::fabs(ref);
     };
@@ -473,6 +472,16 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
         ck(cudaMemcpy(wg.data(), df, wg.size() * 4, cudaMemcpyDeviceToHost), "gate");
         k::iq_dequant_f32(gu, blob + G.L.up_off, FF * H, df, s);
         ck(cudaMemcpy(wu.data(), df, wu.size() * 4, cudaMemcpyDeviceToHost), "up");
+        if (gu == 39) {
+            const std::pair<const uint8_t*, const std::vector<float>*> roles[] = {{blob, &wg}, {blob + G.L.up_off, &wu}};
+            for (const auto& role : roles) {
+                std::vector<uint8_t> encoded((size_t) FF * G.L.gu_row);
+                ck(cudaMemcpy(encoded.data(), role.first, encoded.size(), cudaMemcpyDeviceToHost), "MXFP4 gate/up");
+                const auto host = mxfp4_dequant_host(encoded.data(), FF, H);
+                for (size_t i = 0; i < host.size(); ++i)
+                    gu_dq_diff += std::memcmp(&host[i], &(*role.second)[i], sizeof(float)) != 0;
+            }
+        }
         if (dt == 39) {
             std::vector<uint8_t> dw((size_t) H * G.L.d_row);
             ck(cudaMemcpy(dw.data(), blob + G.L.down_off, dw.size(), cudaMemcpyDeviceToHost), "down");
@@ -541,6 +550,10 @@ void check_grouped_ref(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, st
         std::printf("  MXFP4 down GPU dequantizer vs host port: %zu of %zu values differ\n", dq_diff,
                     (size_t) G.n_groups * FF * H);
         if (dq_diff != 0) ++g_fail;
+    }
+    if (gu == 39) {
+        std::printf("  MXFP4 gate/up GPU dequantizer vs host port: %zu differing values\n", gu_dq_diff);
+        if (gu_dq_diff != 0) ++g_fail;
     }
     if (!ok) ++g_fail;
     cudaFree(df);
@@ -648,6 +661,17 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         }
         std::printf("   GB/s (new):%s\n", gbs.c_str());
     }
+    std::printf("MXFP4/MXFP4 grouped, 16 groups of m entries, DeepSeek4 4096 x 2048:");
+    std::string mxfp4_gbs;
+    for (int m : {1, 2, 3, 4, 8}) {
+        Grouped G(39, 39, 4096, 2048, std::vector<int>(16, m), 8, rng);
+        const float us = 1e3f * time_ms(s, 50, [&] { G.run(false, s); });
+        std::printf("  m=%d: %.1f", m, us);
+        char b[32];
+        std::snprintf(b, sizeof b, " %.0f", 16.0 * (double) G.L.bytes / (us * 1e3));
+        mxfp4_gbs += b;
+    }
+    std::printf("   GB/s:%s\n", mxfp4_gbs.c_str());
 }
 
 // both q8_1 activation quantizers (quantize_q8_1_rows and native_quantize_q8_1) against a host transcription
@@ -726,7 +750,7 @@ int main(int argc, char** argv) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) {
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 39, 42}) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
@@ -737,14 +761,18 @@ int main(int argc, char** argv) {
     }
     check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
     check_grouped(40, 40, 1024, 512, s, rng);
+    check_grouped(39, 39, 2560, 640, s, rng);                               // MXFP4 gate/up and down at V4's geometry
+    check_grouped(39, 39, 1024, 512, s, rng);
+    check_grouped(39, 39, 4096, 2048, s, rng);                              // the real DeepSeek4 expert shape
     for (int gu : {16, 18}) check_grouped(gu, 39, 2560, 640, s, rng);       // MXFP4 down at the small n_ff
     check_grouped(18, 39, 1024, 512, s, rng);                               // and the generic down path
     check_grouped(18, 39, 5120, 2304, s, rng);
     // the UD file's real pairs at its real expert shape: bitwise, and against the double reference
-    for (auto [gu, dt] : {std::pair<int, int>{16, 39}, {17, 39}, {22, 39}, {18, 21}, {22, 21}})
+    for (auto [gu, dt] : {std::pair<int, int>{16, 39}, {17, 39}, {22, 39}, {39, 39}, {18, 21}, {22, 21}})
         check_grouped_ref(gu, dt, 5120, 2304, s, rng);
     check_grouped(39, 39, 2048, 2048, s, rng);                               // ERNIE 5.5 MXFP4 gate/up + down
     check_grouped_ref(39, 39, 2048, 2048, s, rng);
+    check_grouped_ref(39, 39, 4096, 2048, s, rng);                          // V4 shape against host dequant + double dots
     check_mxfp4_edge_scales(s, rng);   // the MXFP4 dequantizer at the E8M0 exponent edges
     check_mmvq(21, 2304, 67, s, rng);                                       // IQ3_S rows at the down row length
     check_mmvq_mma(s, rng);
