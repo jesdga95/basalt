@@ -53,7 +53,7 @@ from serve.engine.console import LINES as CONSOLE_LINES, ConsoleLines
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
-from serve.prompt import PromptText, room_error
+from serve.prompt import REPLY_KEY, PromptText, room_error
 from serve.util import vram
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
@@ -905,8 +905,10 @@ class ProcessEngine:
             keys += f" relax={float(rd)!r}"
         gram = grammar_key(sampling.get(GRAMMAR_KEY))
         gp = gprompt_key(sampling.get(GPROMPT_KEY)) if gram else ""
+        reply = sampling.get(REPLY_KEY)
+        rk = f" reply={int(reply)}" if _number(reply) and int(reply) > 0 else ""   # the ids past it are the reply so far
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + gram + gp + logprobs_key(sampling.get(LOGPROBS_KEY))
+            + gram + gp + rk + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
