@@ -5,8 +5,8 @@
 // (both exact).  Products: mma m16n8k16 (bf16 in, fp32 accumulate) with the window's rows as the columns, 8 per mma.  A
 // column's sums never meet another column's, and the order of a row's sums (fixed chunks of K in order within a K slice,
 // the slices added in slice order; FP8 slices K across a block's warps, the others across blocks) depends only on the
-// shapes of the call's matrices: a row's bits do not depend on T or on what the other rows hold, so a drafted or
-// batched window gives the same rows as plain decoding.
+// shapes of the call's matrices (and its row groups, see gemm): a row's bits do not depend on T up to kRows or on what the
+// other rows hold, so a drafted or batched window gives the same rows as plain decoding.
 //
 // Products start as programmatic dependents inside a PdlScope (pdl.hpp): each stages its first weights before it waits
 // for the kernel before it.
@@ -87,7 +87,8 @@ void plan_device(int device);
 void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tickets);
 
 /// Runs the call for rows 0..T-1 of `act` (packed for c.K; T up to kRows for F8, any T for the others, each group of kRows
-/// rows with its own workspace part, so the workspace holds ceil(T / kRows) of workspace_need's).  F8: K a multiple of
+/// rows with its own workspace part, so the workspace holds ceil(T / kRows) of workspace_need's).  A call of several
+/// groups may take fewer K slices than one group: its rows' bits are those of any call of as many groups.  F8: K a multiple of
 /// 128, W 16-byte aligned.  NVFP4: W in planes, rows a multiple of 128, K a multiple of 128.
 void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stream);
 
