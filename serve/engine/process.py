@@ -1510,10 +1510,6 @@ class ProcessEngine:
                             slot, slot_gen = None, None
                             self.ctl.release()
                             holding = False
-                            # the engine holds a bounded number of prompts and newer requests' may push this one out
-                            # while it waits: it is held again when the request asks again
-                            self._send(f"PFREE {handle}")
-                            held["gen"] = None
                             beat = time.monotonic()
                             while not cancel.is_set():
                                 with self.slot_cv:
@@ -1525,6 +1521,12 @@ class ProcessEngine:
                                     yield None
                             if cancel.is_set():
                                 return
+                            if held["gen"] == self.gen:
+                                # the engine holds a bounded number of prompts and newer requests' may have pushed this
+                                # one out while it waited: it is held again before the request asks again
+                                self._send(f"PFREE {handle}")
+                                handle, _ = self._hold_prompt(ids, embeddings)
+                                held["handle"] = handle
                             continue
                         self._note_first_reused(first, last0)
                         cont = bool(self._ctl_result and self._ctl_result[1])
