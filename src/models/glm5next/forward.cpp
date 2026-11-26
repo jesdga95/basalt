@@ -236,6 +236,11 @@ GlmForward::GlmForward(GlmSession& session, std::string& err)
             !ck(cudaMalloc(reinterpret_cast<void**>(&plan_dev_[0]), sizeof(ExpertPlan)), "expert plan", err) ||
             !ck(cudaMalloc(reinterpret_cast<void**>(&plan_dev_[1]), sizeof(ExpertPlan)), "expert plan 2", err))
             return;
+        // The word the sums of blocks whose rows the CPU pool or a second card fill queue behind. The card spins on
+        // it in host memory, mapped like the rows those writers land.
+        if (!ck(cudaHostAlloc(&h_join_, 64, cudaHostAllocMapped | cudaHostAllocPortable), "join word", err) ||
+            !ck(cudaHostGetDevicePointer(&d_join_, h_join_, 0), "join word mapping", err))
+            return;
     }
     // Pack the KDA conv taps once. They arrive as three [conv,1,D] tensors (D contiguous) and kda_front wants
     // [3][conv][D] (D contiguous), so each tap stream is transposed. The projections themselves are not packed:
@@ -346,6 +351,7 @@ GlmForward::~GlmForward() {
     if (ex_rows_) cudaFree(ex_rows_);
     for (void* p : plan_dev_)
         if (p) cudaFree(p);
+    if (h_join_) cudaFreeHost(h_join_);
     delete s_;
 }
 
@@ -1397,6 +1403,20 @@ bool GlmForward::mlp(int layer, const float* normed, int T, std::string& err) {
         }
         // The experts the peer is fetching into its own scratch slots go behind their copies, on its card.
         if (peer && !peer->run_fetched(err)) return false;
+        // The sum reads the pool's and the peer's rows too, so it goes out now, behind a word this thread raises once
+        // those landed: the card starts it the moment the last row arrives, not when this thread gets back from
+        // waiting for the writers. JoinWord raises the word on every way out of the block, so the stream never waits
+        // for good. The wait is ">=", not equality: this thread may queue the next block's wait, and raise its word,
+        // while the card is still working through this one, so a word that has moved on has to pass the block behind it.
+        core::JoinWord jw;
+        if (cpu || reading || peer) {
+            jw.word = (uint32_t*) h_join_;
+            jw.value = ++join_seq_;
+            jw.armed = true;
+            kernels::wait_flag_ge((const uint32_t*) d_join_, jw.value, session_.stream());
+        }
+        weighted_sum_block(rp, s->rweights + (size_t) t0 * K, nt, K, E, s->ffn_out + (size_t) t0 * E,
+                           session_.stream());
         // The pool's rows have landed by the time the sum runs, and a place still being read from the pack joins the
         // pool's share once its read does.
         if (cpu) tier->finish_cpu();
@@ -1408,9 +1428,10 @@ bool GlmForward::mlp(int layer, const float* normed, int T, std::string& err) {
         }
         // The peer's rows are in the same pinned rows by now: the host waits for the peer the way it waits for the
         // pool, with both cards still working while it does.
-        if (peer && !peer->finish(nullptr, err)) return false;
-        weighted_sum_block(rp, s->rweights + (size_t) t0 * K, nt, K, E, s->ffn_out + (size_t) t0 * E,
-                           session_.stream());
+        bool peer_ok = true;
+        if (peer) peer_ok = peer->finish(nullptr, err);
+        jw.raise();
+        if (!peer_ok) return false;
         if (cpu || reading) tier->promote(tlayer, lk);
         tier->mark_gap(session_.stream());   // the promotions' copies start behind the sum
     }

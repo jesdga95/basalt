@@ -217,6 +217,12 @@ private:
     void* ex_scr_ = nullptr;           ///< kernels::native_expert_grouped's scratch
     float* ex_rows_ = nullptr;         ///< the experts the card computed: kMaxSumRows rows of n_embd
     void* plan_dev_[2] = {};           ///< the grouped plan: the homed experts, then the ones still being copied in
+    /// The word a block's weighted sum waits for on this model's stream, armed once per block: this thread raises it
+    /// when the CPU pool's and the second card's rows landed, so the card starts the sum the moment they do instead of
+    /// when this thread gets back from waiting for them. core::JoinWord raises it on every way out.
+    void* h_join_ = nullptr;           ///< the word, in memory the card spins on
+    void* d_join_ = nullptr;           ///< the same word, mapped for the card
+    uint32_t join_seq_ = 0;            ///< the value the next block's sum queues behind
 };
 
 }  // namespace basalt::models::glm5next
