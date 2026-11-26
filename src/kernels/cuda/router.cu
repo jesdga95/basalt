@@ -260,6 +260,54 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
                                 weights + (size_t) t * k, sh, held, prior);
 }
 
+__global__ void router_select_mixed_kernel(const float* __restrict__ logits, const int32_t* __restrict__ fixed_ids,
+                                            const uint8_t* __restrict__ fixed_mask, const uint8_t* __restrict__ alternate_mask,
+                                            const float* __restrict__ bias, const float* __restrict__ alternate_bias,
+                                            int n_expert, int k, float scale, int gate,
+                                            int32_t* __restrict__ ids, float* __restrict__ weights) {
+    pdl_wait();
+    pdl_launch_dependents();
+    __shared__ SelectScratch sh;
+    const int t = blockIdx.x;
+    const float* row = logits + (size_t) t * n_expert;
+    if (fixed_mask && fixed_mask[t]) {
+        const int lane = threadIdx.x;
+        if (lane < k) {
+            const int32_t expert = fixed_ids[(size_t) t * k + lane];
+            float s = score(row[expert], gate);
+            if (isnan(s)) s = 0.f;
+            ids[(size_t) t * k + lane] = expert;
+            sh.sel[lane] = s;
+        }
+        __syncthreads();
+        if (lane == 0) {
+            float sum = 0.f;
+            for (int r = 0; r < k; ++r) sum += sh.sel[r];
+            float* out = weights + (size_t) t * k;
+            if (isfinite(sum)) {
+                const float denom = sum + 1e-20f;
+                for (int r = 0; r < k; ++r) out[r] = sh.sel[r] / denom * scale;
+            } else {
+                int n_inf = 0;
+                for (int r = 0; r < k; ++r) n_inf += isinf(sh.sel[r]);
+                if (n_inf > 0) {
+                    const float w_inf = scale / (float) n_inf;
+                    for (int r = 0; r < k; ++r) out[r] = isinf(sh.sel[r]) ? w_inf : 0.f;
+                } else {
+                    double dsum = 0.0;
+                    for (int r = 0; r < k; ++r) dsum += (double) sh.sel[r];
+                    const double denom = dsum + 1e-20;
+                    for (int r = 0; r < k; ++r) out[r] = (float) ((double) sh.sel[r] / denom) * scale;
+                }
+            }
+        }
+    } else {
+        const float* row_bias = alternate_mask && alternate_mask[t] ? alternate_bias : bias;
+        router_select_token<false>(row, row_bias, n_expert, k, scale, gate, ids + (size_t) t * k,
+                                   weights + (size_t) t * k, sh, ResidentTabs{}, 0.f);
+    }
+}
+
 // G gate rows per block for n_embd == 2304 (576 float4s = 2 * 256 + 64) with PDL overlap: a block reads its tokens'
 // activations once for G rows (2 for a decode window, 8 for a batch window, where those reads bound the launch) while
 // preserving router_logits_row's exact FP32 summation order bit-for-bit, whatever G.
@@ -467,6 +515,18 @@ void router_select(const float* logits, const float* bias, int n_tokens, const R
     else
         launch_pdl(router_select_kernel<false>, dim3(n_tokens), dim3(a.n_expert), 0, st, logits, bias, a.n_expert, a.k, a.weight_scale,
                    (int) a.gate, ids, weights, a.held, 0.0f);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void router_select_mixed(const float* logits, int n_tokens, const RouterMixedArgs& a, int32_t* ids, float* weights,
+                         void* stream) {
+    if (n_tokens <= 0) return;
+    if (!logits || !ids || !weights || !a.bias || a.n_expert % 32 || a.n_expert > kMaxExpert || a.k < 1 || a.k > 16 ||
+        a.k > a.n_expert || (a.fixed_mask && !a.fixed_ids) || (a.alternate_mask && !a.alternate_bias))
+        throw std::invalid_argument("router_select_mixed: invalid pointers or unsupported geometry");
+    cudaStream_t st = (cudaStream_t) stream;
+    launch_pdl(router_select_mixed_kernel, dim3(n_tokens), dim3(a.n_expert), 0, st, logits, a.fixed_ids, a.fixed_mask,
+               a.alternate_mask, a.bias, a.alternate_bias, a.n_expert, a.k, a.weight_scale, (int) a.gate, ids, weights);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

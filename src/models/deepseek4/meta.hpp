@@ -25,7 +25,17 @@ inline std::string validate_meta(const GgufFile& file) {
                             "hyper_connection.count", "hash_layer_count"}) {
         if (key_num(file, key) <= 0.0) return std::string("missing or zero deepseek4.") + key;
     }
+    const MetaValue* norm = file.get("deepseek4.expert_weights_norm");
+    if (!norm || norm->type != MetaType::BOOL || norm->u != 1 ||
+        key_num(file, "expert_used_count") != 6 || key_num(file, "hash_layer_count") != 3 ||
+        key_num(file, "expert_weights_scale") != 1.5)
+        return "deepseek4 routing metadata is outside the supported top-6 hash-routing contract";
+
     const int layers = (int) key_num(file, "block_count");
+    const double experts = key_num(file, "expert_count");
+    if (key_num(file, "expert_used_count") > experts || key_num(file, "hash_layer_count") > layers)
+        return "deepseek4 metadata has an invalid expert or hash-layer count";
+
     const MetaValue* ratios = file.get("deepseek4.attention.compress_ratios");
     if (!ratios || ratios->type != MetaType::ARRAY || ratios->count != (uint64_t) layers + 3 ||
         ratios->items.size() != ratios->count) return "deepseek4.attention.compress_ratios must cover trunk and three MTP slots";

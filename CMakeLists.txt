@@ -620,6 +620,14 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/row_norm.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
+if(BUILD_TESTING)
+  # fixed expert ids mixed with score-selected routes; CPU reference, row independence and a microbench
+  add_executable(router_mixed_parity tests/kernels/router_mixed_parity.cpp)
+  target_include_directories(router_mixed_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
+  target_link_libraries(router_mixed_parity PRIVATE kernels warnings ${_gpu_runtime_target})
+  basalt_gpu_test(NAME router_mixed_parity COMMAND router_mixed_parity)
+  set_tests_properties(router_mixed_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
 if(BASALT_MODEL_QWEN4EXP)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
 if(BUILD_TESTING)

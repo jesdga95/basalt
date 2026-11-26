@@ -1,5 +1,6 @@
 #include "models/deepseek4/pack.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
 
@@ -62,7 +63,8 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
         g.n_used <= 0 || g.n_ff_exp <= 0 || g.hc_mult != 4 || g.idx_heads <= 0 || g.idx_dim <= 0 ||
         g.idx_top_k <= 0 || g.output_embd <= 0 || !g.route_norm || g.context_length <= 0 || g.rms_eps <= 0.f ||
         g.hc_eps <= 0.f || g.rope_base <= 0.f || g.comp_rope_base <= 0.f || g.yarn_factor < 1.f ||
-        g.yarn_orig_ctx <= 0 || g.yarn_beta_fast <= 0.f || g.yarn_beta_slow <= 0.f) {
+        g.yarn_orig_ctx <= 0 || g.yarn_beta_fast <= 0.f || g.yarn_beta_slow <= 0.f || g.n_used != 6 ||
+        g.hash_layers != 3 || g.route_scale != 1.5f) {
         err = "meta.geometry is incomplete or outside the supported DeepSeek-V4 geometry";
         return false;
     }
@@ -144,6 +146,57 @@ bool validate_tensor_layout(const Pack& pack, std::string& err) {
                           {6, (uint64_t) g.n_vocab}, 26)) {
             err = "hash-routed layer " + std::to_string(layer) + " has an invalid token-to-expert tensor";
             return false;
+        }
+    }
+    return true;
+}
+
+bool validate_hash_tables(const Pack& pack, std::string& err) {
+    const Geometry& g = pack.geo;
+    if (g.hash_layers == 0) return true;
+    const core::FileRange gguf = pack.file.range("gguf");
+    if (gguf.empty()) {
+        err = "GGUF tensor section is missing for hash routing";
+        return false;
+    }
+    constexpr uint64_t kHashWidth = 6;
+    const uint64_t row_bytes = kHashWidth * sizeof(int32_t);
+    for (int layer = 0; layer < g.hash_layers; ++layer) {
+        const std::string name = "blk." + std::to_string(layer) + ".ffn_gate_tid2eid.weight";
+        const TensorRef* tensor = pack.find(name);
+        if (!tensor || tensor->bytes != (uint64_t) g.n_vocab * row_bytes || tensor->offset < gguf.offset ||
+            tensor->offset - gguf.offset > gguf.bytes || tensor->bytes > gguf.bytes - (tensor->offset - gguf.offset)) {
+            err = "hash-routed layer " + std::to_string(layer) + " has an invalid token-to-expert data range";
+            return false;
+        }
+        constexpr int kChunkTokens = 4096;
+        std::vector<int32_t> ids((size_t) kChunkTokens * kHashWidth);
+        for (int first_token = 0; first_token < g.n_vocab; first_token += kChunkTokens) {
+            const int token_count = std::min(kChunkTokens, g.n_vocab - first_token);
+            const uint64_t chunk_bytes = (uint64_t) token_count * row_bytes;
+            const uint64_t chunk_offset = tensor->offset - gguf.offset + (uint64_t) first_token * row_bytes;
+            if (!core::read_range_at(gguf, chunk_offset, ids.data(), chunk_bytes, err)) {
+                err = "cannot read hash-routed layer " + std::to_string(layer) + ": " + err;
+                return false;
+            }
+            for (int row_index = 0; row_index < token_count; ++row_index) {
+                const int token = first_token + row_index;
+                const int32_t* row = ids.data() + (size_t) row_index * kHashWidth;
+                for (uint64_t i = 0; i < kHashWidth; ++i) {
+                    if (row[i] < 0 || row[i] >= g.n_expert) {
+                        err = "hash-routed layer " + std::to_string(layer) + " has an out-of-range expert id at token " +
+                              std::to_string(token);
+                        return false;
+                    }
+                    for (uint64_t j = 0; j < i; ++j) {
+                        if (row[i] == row[j]) {
+                            err = "hash-routed layer " + std::to_string(layer) + " has duplicate expert ids at token " +
+                                  std::to_string(token);
+                            return false;
+                        }
+                    }
+                }
+            }
         }
     }
     return true;
@@ -246,6 +299,10 @@ bool open_pack(const std::string& path, Pack& pack, std::string& err) {
     }
 
     if (!validate_tensor_layout(pack, err)) {
+        err = path + ": " + err;
+        return false;
+    }
+    if (!validate_hash_tables(pack, err)) {
         err = path + ": " + err;
         return false;
     }
