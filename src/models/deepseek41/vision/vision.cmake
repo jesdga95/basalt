@@ -1,9 +1,9 @@
-# DeepSeek-V4.1 vision encoder: the library and its parity tool. Included from the top-level CMakeLists.txt.
+# DeepSeek-V4.1 preprocessing adapter and parity tools. The tower math is in the model-neutral vision_transformer target.
 add_library(deepseek41_vision STATIC
   src/models/deepseek41/vision/plan.cpp
-  src/models/deepseek41/vision/encoder.cu)
+  src/models/deepseek41/vision/encoder_adapter.cpp)
 target_include_directories(deepseek41_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(deepseek41_vision PUBLIC vision_core CUDA::cudart CUDA::cublas)
+target_link_libraries(deepseek41_vision PUBLIC vision_core vision_transformer)
 if(BUILD_TESTING)
   add_executable(ds41_vision_parity src/models/deepseek41/vision/parity.cpp)
   target_link_libraries(ds41_vision_parity PRIVATE deepseek41_vision)

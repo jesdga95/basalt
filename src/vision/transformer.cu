@@ -1,8 +1,8 @@
-// DeepSeek-V4.1 vision encoder on one CUDA device. Weights stay bf16 as stored; the residual stream, attention scores
+// Reusable BF16 vision transformer on one CUDA device. Weights stay bf16 as stored; the residual stream, attention scores
 // and aligner output are fp32; the inputs of the products are bf16. Attention runs one head at a time as two products
-// around a row softmax. The graph follows llama.cpp's mtmd deepseek4v encoder (MIT).
+// around a row softmax. The patch, attention and aligner geometry comes from the projector hyper-parameters.
 #include "basalt/core/device_copy.hpp"
-#include "basalt/models/deepseek41/vision.hpp"
+#include "basalt/vision/transformer.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace basalt::models::deepseek41 {
+namespace basalt::vision {
 
 namespace {
 
@@ -148,7 +148,7 @@ __global__ void k_assemble(const float* aligned, const float* start, const float
 
 }  // namespace
 
-struct VisionEncoder::Impl {
+struct TransformerEncoder::Impl {
     int layers = 0, proj = 0, cap = 0, ng_cap = 0, tok_cap = 0;
     float eps = 1e-6f;
     cublasHandle_t blas = nullptr;   // borrowed from the VisionBlas
@@ -201,10 +201,11 @@ struct VisionEncoder::Impl {
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
     }
 
-    bool load(const basalt::vision::Mmproj& m, std::string& e) {
-        using basalt::vision::TensorRef;
+    bool load(const Mmproj& m, std::string& e) {
+        using TensorRef = basalt::vision::TensorRef;
         const auto& hp = m.hp();
-        if (hp.embd != E || hp.heads != H || hp.ffn != F || hp.patch != kVisionPatch || hp.merge != 3 || hp.layers < 1) {
+        if (hp.embd != E || hp.heads != H || hp.ffn != F || hp.patch != kTransformerPatch ||
+            hp.merge != kTransformerMerge || hp.layers < 1) {
             e = "unexpected projector hyper-parameters";
             return false;
         }
@@ -222,7 +223,7 @@ struct VisionEncoder::Impl {
             const TensorRef* t = need(n, 30, elems);
             return t ? upload<__nv_bfloat16>(t) : nullptr;
         };
-        wpatch = f32("v.patch_embd.weight", (int64_t) E * kVisionPatchValues);
+        wpatch = f32("v.patch_embd.weight", (int64_t) E * kTransformerPatchValues);
         bpatch = f32("v.patch_embd.bias", E);
         postw = f32("v.post_ln.weight", E);
         w1 = bf("mm.1.weight", (int64_t) MERGED * proj);
@@ -266,7 +267,7 @@ struct VisionEncoder::Impl {
         const int want = std::max(n, cap), want_ng = std::max(ng, ng_cap), want_tok = std::max(ntok, tok_cap);
         drop_work();
         const size_t N = want;
-        const bool ok = alloc(d_rows, N * kVisionPatchValues) && alloc(x, N * E) && alloc(g, N * QKV) && alloc(g2, N * F) &&
+        const bool ok = alloc(d_rows, N * kTransformerPatchValues) && alloc(x, N * E) && alloc(g, N * QKV) && alloc(g2, N * F) &&
                         alloc(q, N * E) && alloc(k, N * E) && alloc(v, N * E) && alloc(ao, N * E) && alloc(S, N * N) &&
                         alloc(y, N * E) && alloc(act, N * F) && alloc(aout, (size_t) want_ng * proj) &&
                         alloc(mrg, (size_t) want_ng * MERGED) && alloc(h1, (size_t) want_ng * proj) &&
@@ -284,27 +285,27 @@ struct VisionEncoder::Impl {
     // The bytes ensure(n, ng, ntok) holds.
     size_t work_bytes(int n, int ng, int ntok) const {
         const size_t N = n;
-        return N * kVisionPatchValues * sizeof(float) + N * (6 * E + QKV + F + N) * sizeof(float) + N * F * sizeof(__nv_bfloat16) +
+        return N * kTransformerPatchValues * sizeof(float) + N * (6 * E + QKV + F + N) * sizeof(float) + N * F * sizeof(__nv_bfloat16) +
                (size_t) ng * proj * sizeof(float) + (size_t) ng * (MERGED + proj) * sizeof(__nv_bfloat16) +
                (size_t) ntok * proj * sizeof(float);
     }
 };
 
-VisionEncoder::VisionEncoder() : impl_(new Impl) {}
-VisionEncoder::~VisionEncoder() = default;
-int VisionEncoder::width() const { return impl_->proj; }
+TransformerEncoder::TransformerEncoder() : impl_(new Impl) {}
+TransformerEncoder::~TransformerEncoder() = default;
+int TransformerEncoder::width() const { return impl_->proj; }
 
-struct VisionBlas::Impl {
+struct TransformerBlas::Impl {
     cublasHandle_t blas = nullptr;
     ~Impl() {
         if (blas) cublasDestroy(blas);
     }
 };
 
-VisionBlas::VisionBlas() : impl_(new Impl) {}
-VisionBlas::~VisionBlas() = default;
+TransformerBlas::TransformerBlas() : impl_(new Impl) {}
+TransformerBlas::~TransformerBlas() = default;
 
-bool VisionBlas::open(std::string& err) {
+bool TransformerBlas::open(std::string& err) {
     if (impl_->blas) return true;
     if (cublasCreate(&impl_->blas) != CUBLAS_STATUS_SUCCESS) {
         impl_->blas = nullptr;
@@ -336,7 +337,7 @@ bool VisionBlas::open(std::string& err) {
     return ok;
 }
 
-bool VisionEncoder::init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std::string& err) {
+bool TransformerEncoder::init(const Mmproj& mp, TransformerBlas& blas, std::string& err) {
     if (!blas.open(err)) return false;
     impl_->blas = blas.impl_->blas;
     if (!impl_->load(mp, err)) {
@@ -346,9 +347,9 @@ bool VisionEncoder::init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std
     return true;
 }
 
-bool VisionEncoder::reserve(const VisionPlan& pl, std::string& err) {
+bool TransformerEncoder::reserve(const TransformerGrid& pl, std::string& err) {
     Impl& s = *impl_;
-    const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();
+    const int n = pl.n_patches(), ng = pl.n_cells(), ntok = pl.n_block_rows();
     if (s.ensure(n, ng, ntok)) return true;
     err = "no device memory for the image encoder's work buffers (" + std::to_string(s.work_bytes(n, ng, ntok) >> 20) + " MiB)";
     return false;
@@ -356,21 +357,26 @@ bool VisionEncoder::reserve(const VisionPlan& pl, std::string& err) {
 
 static int blocks(size_t n) { return (int) ((n + 255) / 256); }
 
-bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl, std::vector<float>& out, std::string& err) {
-    Impl& s = *impl_;
-    const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();
-    if ((size_t) n * kVisionPatchValues != rows.size()) {
+static bool encode_impl(TransformerEncoder::Impl& s, const std::vector<float>& rows, const TransformerGrid& pl,
+                        std::vector<float>& out, std::string& err, bool block_output) {
+    const int n = pl.n_patches(), ng = pl.n_cells(), ntok = pl.n_block_rows();
+    if (pl.gx <= 0 || pl.gy <= 0 || pl.lw != (pl.gx + 2) / 3 || pl.lh != (pl.gy + 2) / 3 ||
+        (size_t) n * kTransformerPatchValues != rows.size()) {
         err = "patch rows do not match the plan";
         return false;
     }
-    if (!reserve(pl, err)) return false;
+    if (!s.ensure(n, ng, ntok)) {
+        err = "no device memory for the image encoder's work buffers (" + std::to_string(s.work_bytes(n, ng, ntok) >> 20) + " MiB)";
+        return false;
+    }
     basalt::core::device_copy(s.d_rows, rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice);
     // patch embedding (fp32 product) + bias
-    s.gemm(CUDA_R_32F, s.d_rows, kVisionPatchValues, s.wpatch, kVisionPatchValues, s.x, E, n, E, kVisionPatchValues);
+    s.gemm(CUDA_R_32F, s.d_rows, kTransformerPatchValues, s.wpatch, kTransformerPatchValues, s.x, E, n, E,
+           kTransformerPatchValues);
     k_bias_add<<<blocks((size_t) n * E), 256>>>(s.x, s.bpatch, (size_t) n * E, E);
     bool ok = true;
     for (int l = 0; l < s.layers && ok; ++l) {
-        const Impl::Layer& Ly = s.L[l];
+        const TransformerEncoder::Impl::Layer& Ly = s.L[l];
         k_rmsnorm<<<n, 256>>>(s.x, Ly.ln1, s.act, nullptr, s.eps);
         ok &= s.gemm(CUDA_R_16BF, s.act, E, Ly.wqkv, E, s.g, QKV, n, QKV, E);
         k_qkv<<<blocks((size_t) n * E), 256>>>(s.g, Ly.bqkv, s.q, s.k, s.v, n, pl.gx);
@@ -403,9 +409,15 @@ bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl,
     k_gelu<<<blocks((size_t) ng * s.proj), 256>>>(s.aout, s.b1, s.h1, (size_t) ng * s.proj, s.proj);
     ok &= s.gemm(CUDA_R_16BF, s.h1, s.proj, s.w2, s.proj, s.aout, s.proj, ng, s.proj, s.proj);
     k_bias_add<<<blocks((size_t) ng * s.proj), 256>>>(s.aout, s.b2, (size_t) ng * s.proj, s.proj);
-    k_assemble<<<ntok, 256>>>(s.aout, s.start, s.endv, s.nl, s.dout, pl.lw, pl.lh, s.proj);
-    out.resize((size_t) ntok * s.proj);
-    const cudaError_t ce = basalt::core::device_copy(out.data(), s.dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    const float* result = s.aout;
+    size_t result_rows = (size_t) ng;
+    if (block_output) {
+        k_assemble<<<ntok, 256>>>(s.aout, s.start, s.endv, s.nl, s.dout, pl.lw, pl.lh, s.proj);
+        result = s.dout;
+        result_rows = (size_t) ntok;
+    }
+    out.resize(result_rows * s.proj);
+    const cudaError_t ce = basalt::core::device_copy(out.data(), result, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
     if (!ok || ce != cudaSuccess) {
         err = ok ? std::string("encode failed: ") + cudaGetErrorString(ce) : "a product failed";
         return false;
@@ -413,4 +425,14 @@ bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl,
     return true;
 }
 
-}  // namespace basalt::models::deepseek41
+bool TransformerEncoder::encode_grid(const std::vector<float>& patches, const TransformerGrid& grid,
+                                    std::vector<float>& rows, std::string& err) {
+    return encode_impl(*impl_, patches, grid, rows, err, false);
+}
+
+bool TransformerEncoder::encode_block(const std::vector<float>& patches, const TransformerGrid& grid,
+                                      std::vector<float>& rows, std::string& err) {
+    return encode_impl(*impl_, patches, grid, rows, err, true);
+}
+
+}  // namespace basalt::vision

@@ -349,6 +349,12 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_DEEPSEEK41 OR BASALT_MODEL_DEEPSEEK4)
+add_library(vision_transformer STATIC src/vision/transformer.cu)
+target_include_directories(vision_transformer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(vision_transformer PUBLIC vision_core CUDA::cudart CUDA::cublas)
+endif()
+
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
