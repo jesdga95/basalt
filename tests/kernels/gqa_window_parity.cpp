@@ -10,6 +10,8 @@
 // The int8 cache (KvInt8, the drafter's full layer with --kv int8): codes and per-64 scales by the cache's rule; every
 // output's bits against the fp16 path on the cache's decoded values (the same fp16 the kernel decodes to), and against the
 // CPU reference on those values; rows bitwise the same at every width.
+// The segmented reader (gqa_window_attn_segs): int8 and fp16 segments over distinct caches and depths, each bitwise its
+// own solo call; segment 1 read with segment 0's scales must differ.
 // --bench: the full-attention layer's call (a window of 1..32 rows over every cell) at 4K..160K cells, fp16 and int8, us per
 // call and the K/V bytes read once per call over that time, and the sliding layer's call.  Exit 77 without a GPU.
 #include "basalt/kernels/f16_bits.hpp"
@@ -290,6 +292,88 @@ int main(int argc, char** argv) {
         std::printf("gqa_window_attn int8: rows bitwise the same at widths 1, 3, 8, 17, %d: %s (%d of %d differ)\n", BW,
                     wdiff ? "NO" : "yes", wdiff, wchecked);
         if (wdiff) ++fails;
+
+        // the segmented reader (a batch window's sessions in one call): segments over distinct caches at distinct depths,
+        // each segment's rows bitwise its own solo call with the same scratch.  Int8: two full caches and a sliding window
+        // of the first; fp16: two rings.  A copy of the int8 call with segment 1's scales swapped for segment 0's must differ.
+        {
+            Cache full2 = make_cache(full_cap, rng), ring2 = make_cache(ring_cap, rng);
+            Cache8 q82;
+            Cache deq2;
+            quantize(full2.k, q82.k, q82.ks, deq2.k);
+            quantize(full2.v, q82.v, q82.vs, deq2.v);
+            q82.d.k = to_dev(q82.k);
+            q82.d.v = to_dev(q82.v);
+            q82.d.ks = to_dev(q82.ks);
+            q82.d.vs = to_dev(q82.vs);
+            const auto seg = [](const Cache* c, basalt::kernels::KvInt8 q, int64_t pos, int T, int64_t window, int64_t cap, bool block) {
+                basalt::kernels::GqaWindowSeg g;
+                if (c != nullptr) { g.k_cache = c->dk; g.v_cache = c->dv; }
+                g.q8 = q;
+                g.pos0 = pos;
+                g.T = T;
+                g.hi = pos + T;
+                g.window = window > 0 ? window : pos + T;
+                g.cap = cap;
+                g.block = block;
+                return g;
+            };
+            const auto run_segs = [&](const std::vector<basalt::kernels::GqaWindowSeg>& sg, std::vector<float>& outv) {
+                int64_t scells = 0, rows = 0;
+                for (const auto& g : sg) {
+                    const int64_t lo = std::max<int64_t>(0, g.pos0 - g.window + 1);
+                    scells = std::max(scells, std::min<int64_t>(g.cap, g.hi - lo + 64));
+                    rows += g.T;
+                }
+                basalt::kernels::gqa_window_attn_segs(dq, NH, NKV, HD, sg.data(), (int) sg.size(), dscr, scells, dout, S);
+                ck(cudaStreamSynchronize(S), "window attention segments");
+                outv.resize((size_t) rows * NH * HD);
+                ck(cudaMemcpy(outv.data(), dout, outv.size() * 4, cudaMemcpyDeviceToHost), "copy");
+                return scells;
+            };
+            // segment k's rows against its solo call (its queries at its rows' offset), bitwise
+            const auto check_solo = [&](const std::vector<basalt::kernels::GqaWindowSeg>& sg, const std::vector<float>& segv,
+                                        int64_t scells, int& diff, int& n) {
+                size_t row0 = 0;
+                for (const auto& g : sg) {
+                    basalt::kernels::gqa_window_attn(dq + row0 * NH * HD, g.k_cache, g.v_cache, NH, NKV, HD, g.pos0, g.T, g.hi,
+                                                     g.window, g.cap, dscr, scells, dwide, S, g.block, g.q8);
+                    ck(cudaStreamSynchronize(S), "window attention");
+                    ck(cudaMemcpy(got.data(), dwide, (size_t) g.T * NH * HD * 4, cudaMemcpyDeviceToHost), "copy");
+                    if (std::memcmp(got.data(), &segv[row0 * NH * HD], (size_t) g.T * NH * HD * 4)) ++diff;
+                    ++n;
+                    row0 += (size_t) g.T;
+                }
+            };
+            int sdiff = 0, sn = 0;
+            const std::vector<basalt::kernels::GqaWindowSeg> s8 = {
+                seg(nullptr, q8[0].d, 12345, 8, 0, full_cap, true),
+                seg(nullptr, q82.d, 4097, 5, 0, full_cap, true),
+                seg(nullptr, q8[0].d, 777, 3, 500, full_cap, false),
+            };
+            std::vector<float> seg8, seg16, swapped;
+            int64_t sc = run_segs(s8, seg8);
+            check_solo(s8, seg8, sc, sdiff, sn);
+            const std::vector<basalt::kernels::GqaWindowSeg> s16 = {
+                seg(&ring, {}, 5001, 8, ring_window, ring_cap, true),
+                seg(&ring2, {}, 3000, 5, ring_window, ring_cap, true),
+            };
+            sc = run_segs(s16, seg16);
+            check_solo(s16, seg16, sc, sdiff, sn);
+            std::printf("gqa_window_attn_segs: segments bitwise their solo calls (int8 x 3, fp16 rings x 2): %s (%d of %d differ)\n",
+                        sdiff ? "NO" : "yes", sdiff, sn);
+            if (sdiff) ++fails;
+            std::vector<basalt::kernels::GqaWindowSeg> bad = s8;
+            bad[1].q8.ks = q8[0].d.ks;
+            bad[1].q8.vs = q8[0].d.vs;
+            run_segs(bad, swapped);
+            const size_t r1 = (size_t) s8[0].T * NH * HD, n1 = (size_t) s8[1].T * NH * HD;
+            const bool seen = std::memcmp(&swapped[r1], &seg8[r1], n1 * 4) != 0;
+            std::printf("gqa_window_attn_segs: segment 1 read with segment 0's scales differs: %s\n", seen ? "yes" : "NO");
+            if (!seen) ++fails;
+            cudaFree(full2.dk); cudaFree(full2.dv); cudaFree(ring2.dk); cudaFree(ring2.dv);
+            cudaFree(q82.d.k); cudaFree(q82.d.v); cudaFree(q82.d.ks); cudaFree(q82.d.vs);
+        }
         for (int i = 0; i < 2; ++i) {
             cudaFree(deq[i].dk); cudaFree(deq[i].dv);
             cudaFree(q8[i].d.k); cudaFree(q8[i].d.v); cudaFree(q8[i].d.ks); cudaFree(q8[i].d.vs);
