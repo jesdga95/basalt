@@ -2,6 +2,7 @@
 // layers' to the second), the embedding to mapped host memory, then the context sized from what the weights leave.
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
+#include "models/inkling2/caches.hpp"
 #include "models/inkling2/model.hpp"
 
 #include "basalt/core/elastic_kv.hpp"
@@ -94,7 +95,7 @@ namespace {
 // The cached keys and values of one visit of layer `layer` for `context` positions (a sliding-window layer: its ring).
 uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8, bool int8) {
     const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);
-    return per_pos * (g.swa[(size_t) layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
+    return per_pos * (uint64_t) visit_cells(g.swa[(size_t) layer], (int64_t) g.window, context);
 }
 }  // namespace
 

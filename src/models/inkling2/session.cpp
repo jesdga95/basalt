@@ -325,7 +325,7 @@ public:
             for (const Visit& v : g_.visits) {
                 const int c = m_.card_of(v.layer);
                 const bool ring = g_.swa[(size_t) v.layer];
-                const int64_t cap = ring ? (int64_t) g_.window + kWindowRows : ctx;
+                const int64_t cap = visit_cells(ring, (int64_t) g_.window, ctx);
                 if (ring || !m_.elastic()) need[c] += 2 * align256((size_t) kKvHeads * (size_t) cap * row_bytes);
                 need[c] += 2 * align256((size_t) kConvRing * kKvHeads * kHeadDim * 4);
                 need[c] += 2 * align256((size_t) kConvRing * (size_t) E * 4);
@@ -361,7 +361,7 @@ public:
             slot_card_[(size_t) v.slot] = m_.card_of(v.layer);
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
-            c.cap = c.ring ? (int64_t) g_.window + kWindowRows : ctx;
+            c.cap = visit_cells(c.ring, (int64_t) g_.window, ctx);
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
@@ -803,9 +803,9 @@ public:
     }
 
     // ---- conversations: the full-attention visits' cells by position (save_cells / restore_cells), the window rings and
-    // the convolutions' rings by checkpoint (running_state). A window ring holds window + kWindowRows positions and a
-    // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kWindowRows
-    // rows past it.
+    // the convolutions' rings by checkpoint (running_state). A window ring holds its window (or the context) and
+    // kWindowRows positions past it, and a convolution ring kConvRing, so a checkpoint at `pos` is intact while the
+    // session has not run more than kWindowRows rows past it.
     size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
     static model::Result stale() {
         return {model::Status::Error, "inkling2: a failed read left the conversation's state unknown: start it over or restore a checkpoint"};
