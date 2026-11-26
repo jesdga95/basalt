@@ -20,6 +20,12 @@ V4 uses a per-layer compression schedule, including sliding attention, ratio-4 C
 
 `src/models/deepseek4/compress.cu` currently provides only a parity-tested compression primitive. It is not connected to pack loading, the indexer, cache allocation or attention and does not establish runnable model support. Its parity and microbench are prerequisites for integration, not acceptance gates by themselves.
 
+## MoE routing
+
+The source computes gate logits in FP32, applies `sqrt(softplus(logit))`, and scales normalized selected weights by 1.5. Layers 0–2 use `tid2eid` to choose the fixed top-6 experts for ordinary text tokens, but still derive their weights from those experts' current gate scores. Later layers choose top-6 from the gate scores plus the learned selection bias. Selection bias affects expert choice only; it is excluded from the routed weights. Image-token IDs (IDs at or above the text vocabulary size) use score-based top-6 with `bias_vl`, including in the hash-routed layers. The shared expert runs alongside these six routed experts.
+
+This routing contract is distinct from DeepSeek-V4.1's generic top-k router. Reuse its FP32 gate-logit kernel, then use a V4-specific selector for fixed hash IDs and image-token selection; keep weight gathering and normalization consistent with the source. Validate IDs and table bounds before dispatch.
+
 ## Vision path
 
 Reuse the existing Basalt image request, image decoding, projector loading and dynamic vision lifecycle where tensor layout and preprocessing match. Add a V4 projector/vision adapter for its actual source metadata, patch geometry, positional handling and image-to-token output. Dynamic mode must return temporary weights/workspaces after each image request and leave no vision-specific VRAM or RAM resident at idle. Verify image inputs through the model's serving endpoint as well as direct encoder parity.
