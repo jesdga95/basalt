@@ -79,9 +79,10 @@ pin agree pick for pick, which is why every number in this page is quoted with o
 ## Two cards
 
 `--gpu 1,0 --gpu-mode peer` deals a second card a block of layers' expert homes, in the shared tier the other
-mixture-of-experts models use ([several GPUs](../configuration/gpus.md)): the start adds `peer GPU 0: N experts` and
-reads `expert homes of 288 per layer: main card A, second card B, RAM C, file D`, and `TIER final` gains a
-`B% second card` term between VRAM and bus copy. That line is still the only account.
+mixture-of-experts models use ([several GPUs](../configuration/gpus.md)): the start adds
+`peer GPU 1: 2205 experts` - the peer's CUDA ordinal, which is 1 inside the narrowed view however `nvidia-smi`
+numbers it - and reads `expert homes of 288 per layer: main card A, second card B, RAM C, file D`, and `TIER final`
+gains a `B% second card` term between VRAM and bus copy. That line is still the only account.
 
 The peer computes its experts with the card's own grouped kernels, over a `q8_1` copy of the same block activations
 the card quantizes on the device, so its rows are card rows rather than pool rows: the difference between the two
@@ -97,13 +98,26 @@ card](../configuration/gpus.md#an-older-peer-card)); the tier's kernels this pat
 sm_89. The drafter's tier stays on the main card whatever the cards: a draft is one row, and its block would compete
 with 45 model layers for the peer's slots.
 
-Peer speed is not measured. For a run that reads across processes, pin the tier, which makes each arm reproducible
-(the two arms will not agree pick for pick: a peer takes homes the main card or RAM would otherwise have had):
+Peer speed, measured against the RTX 5080 alone with a GeForce RTX 4070 Ti SUPER as its peer - IQ1_S pack,
+`--max-context 4096 --max-new 128 --diag-tier-frozen`, one 6-token prompt: 128 tokens in **8,288 ms** against
+**7,369 ms** with the peer, 15.4 against **17.4 tok/s (+12.5%)**, and those five prompt rows in 323 against 295 ms.
+The peer took `peer GPU 1: 2205 experts`: 49 of the 288 a layer across layers 0-44, 12.9 GiB of its 16 GiB at the
+default `--peer-reserve-mib 600`. `TIER final` read `10.4% VRAM, 0.0% second card, 89.6% CPU` on one card and
+`10.6% VRAM, 15.5% second card, 73.8% CPU` with it - the 6,977 lookups the peer took are the ones the pool gave up,
+and the pool is the bottleneck path, so the move pays almost as much as it costs: two thirds of the ideal gain, the
+rest being the host wait `peer->finish` puts between a block's launches and its sum. DeepSeek 4.1 hides that wait
+with a word the sum waits for on the card (`wait_word`, raised after `finish`); this pass has not.
+
+Pin the tier when a number has to read across runs; the arms never agree pick for pick, because a peer takes homes
+the main card or RAM would otherwise have had:
 
 ```
 bin/basalt --model GLM5.3-Flash-UD-IQ1_S.basalt --gpu 1              --diag-tier-frozen ...
 bin/basalt --model GLM5.3-Flash-UD-IQ1_S.basalt --gpu 1,0 --gpu-mode peer --diag-tier-frozen ...
 ```
+
+`--diag-tier-vram` is the other pin, but it caps the main card's slots only: it leaves the deal of the peer's homes
+alone, so use `--diag-tier-frozen` across a peer comparison.
 
 ## Parity
 
@@ -142,6 +156,6 @@ bin/basalt --model GLM5.3-Flash-UD-IQ1_S.basalt --gpu 1,0 --gpu-mode peer --diag
 
 ## Not measured
 
-`gpu-mode split`; peer speed; idle sleep and wake; `--kv` alternatives; pictures; prompt skip. `--logprobs` with
+`gpu-mode split`; idle sleep and wake; `--kv` alternatives; pictures; prompt skip. `--logprobs` with
 `K` is refused: the session reads a window's rows for the perplexity gate (`copy_logits`) but does not
 implement `row_logprobs`, so a request asking for `K` gets "this model keeps no logits".
