@@ -29,6 +29,10 @@ struct CpuTopology {
 /// ordered for `affinity`. `skip_first` takes the first one out of `worker_cores` and names it `host_core`.
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity = CpuAffinity::All);
 
+/// Puts the calling thread on processor `cpu` (named as above) and nowhere else. False when the OS refuses, which is
+/// not fatal: an unpinned thread is placed by the scheduler as before. A negative `cpu` does nothing.
+bool pin_current_thread(int cpu);
+
 /// What the machine's processor is called and how many physical cores it has, for a benchmark row. `name` is the
 /// vendor string as the OS gives it (empty when it gives none); `physical_cores` counts every core the OS lists,
 /// whether or not this process may run on it (0 when unknown).

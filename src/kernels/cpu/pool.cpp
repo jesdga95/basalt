@@ -120,7 +120,15 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     fused_.reset(new FusedExpert[(size_t) kMaxSplitMulti]);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        threads_.emplace_back([this, i] { worker(i); });
+        // One worker per physical core, and pinned there: the expert kernels are latency sensitive, and an unpinned
+        // worker is free to land on an SMT sibling of another worker, where the two then share that core's load/store
+        // units.  `worker_cores` comes from detect_cpu_topology, so it names physical cores only.  A worker past the end
+        // of that list (an explicit --pool-workers above the physical core count) stays unpinned.
+        const int cpu = (size_t) i < topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1;
+        threads_.emplace_back([this, i, cpu] {
+            if (cpu >= 0) platform::pin_current_thread(cpu);
+            worker(i);
+        });
     }
 }
 
