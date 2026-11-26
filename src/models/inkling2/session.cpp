@@ -462,9 +462,9 @@ public:
                           err))
             return false;
         count_backed();
-        // the caches backed at start: with the pool a granule step of each (a short conversation's admission maps nothing,
-        // and a trim keeps it), without it the whole context, held
-        if (!ensure_positions(m_.flags().kv_pool ? kv_floor() : m_.context(), err)) return false;
+        // the caches backed at start: with the pool a grow step of each (a short conversation's admission maps nothing, and
+        // a trim keeps it), without it the whole context, held
+        if (!ensure_positions(m_.flags().kv_pool ? 1 : m_.context(), err)) return false;
         if (heat_tally_) sh_->heat_sessions.push_back(this);
         return true;
     }
@@ -907,14 +907,14 @@ public:
         if (positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kv_step() - 1) / kv_step() * kv_step());
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
-        uint64_t grow = grow_bytes(target);
+        uint64_t grow = grow_bytes(target, positions);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
         const int64_t at = backed_;
         // the pool first: a short pool changes nothing
         uint64_t taken[2] = {}, base[2] = {};
         for (int c = 0; c < m_.cards(); ++c) {
             base[c] = backing_on(c);
-            taken[c] = grow_on(c, target);
+            taken[c] = grow_on(c, target, positions);
             if (!m_.kv_pool(c).take(taken[c])) {
                 for (int k = 0; k < c; ++k) m_.kv_pool(k).give(taken[k]);
                 err = "the KV pool has no room for " + std::to_string(target) + " positions in this slot (" +
@@ -963,7 +963,7 @@ public:
                     return false;
                 }
             }
-            if (dspark_.ensure(target, err)) return true;   // DSPARK HOOK
+            if (dspark_.ensure(target, positions, err)) return true;   // DSPARK HOOK
             out_of_memory = dspark_.out_of_memory();
             return false;
         };
@@ -976,7 +976,7 @@ public:
                               (long long) at, err.c_str());
             m_.sync_room();
             backing0 = backing_bytes();   // the reading includes what the first try mapped
-            grow = grow_bytes(target);    // and the retry needs only what it left
+            grow = grow_bytes(target, positions);    // and the retry needs only what it left
             if (make_room()) {
                 err.clear();
                 mapped = map();
@@ -1007,13 +1007,16 @@ public:
     }
     uint64_t backing_bytes() const { return backing_on(0) + (m_.cards() > 1 ? backing_on(1) : 0); }
     // The device bytes the caches map to back `positions` positions (ensure_positions), the allocation rounding included.
-    uint64_t grow_on(int card, int64_t positions) const {
-        uint64_t n = card == 0 ? dspark_.grow_bytes(positions) : 0;   // DSPARK HOOK
+    // (the visits' caches for `positions`, the drafter's for `dpos`: its rings back the positions themselves)
+    uint64_t grow_on(int card, int64_t positions, int64_t dpos) const {
+        uint64_t n = card == 0 ? dspark_.grow_bytes(positions, dpos) : 0;   // DSPARK HOOK
         for (size_t i = 0; i < elastic_.size(); ++i)
             if (elastic_card_[i] == card) n += elastic_[i]->growth(cell_bytes() * (uint64_t) positions);
         return n;
     }
-    uint64_t grow_bytes(int64_t positions) const { return grow_on(0, positions) + (m_.cards() > 1 ? grow_on(1, positions) : 0); }
+    uint64_t grow_bytes(int64_t positions, int64_t dpos) const {
+        return grow_on(0, positions, dpos) + (m_.cards() > 1 ? grow_on(1, positions, dpos) : 0);
+    }
     // The caches give their pools back what lies past `keep` positions.
     bool trim_to(int64_t keep) {
         if (!m_.flags().kv_pool) return caches_usable();   // --kv-pool off: a slot keeps its whole context
@@ -1023,7 +1026,7 @@ public:
             const core::OnDevice on(m_.card_device(elastic_card_[i]));
             elastic_[i]->trim(cell_bytes() * (uint64_t) backed_keep);
         }
-        dspark_.trim(backed_keep);
+        dspark_.trim(keep);
         int64_t moved = 0;
         for (int c = 0; c < m_.cards(); ++c) {
             const uint64_t now = backing_on(c);
@@ -1138,7 +1141,7 @@ public:
         if (keep < backed_ && !trim_to(keep)) return false;
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             const int64_t before = m_.card_copies();
-            const uint64_t grow = grow_bytes(keep);
+            const uint64_t grow = grow_bytes(keep, keep);
             m_.promote(m_.held_free(kElasticKeep) + grow);
             m_.note_shortage("position " + std::to_string(at));
             m_.log_copy_change(at == 0 ? "new conversation" : ("resume at " + std::to_string(at)).c_str(), before, grow);

@@ -190,28 +190,17 @@ public:
     void running_state(int64_t pos, bool save, core::RunningState& st) const;
     bool running_restored(int64_t pos, const uint8_t* head);
     size_t cells_bytes(int64_t positions) const;
-    /// The full layers' caches: the device bytes ensure(positions) maps, backing the cells of `positions` positions and a block
-    /// past them; trim gives back what lies past them.
-    uint64_t grow_bytes(int64_t positions) const;
-    bool ensure(int64_t positions, std::string& err);
+    /// The pooled caches (DSpark's full layers for `target` positions, the session's grow step; DFlash 2's rings for
+    /// `positions`, the positions themselves): the device bytes ensure maps, backing their cells and a block past them;
+    /// trim gives back what lies past them.
+    uint64_t grow_bytes(int64_t target, int64_t positions) const;
+    bool ensure(int64_t target, int64_t positions, std::string& err);
     void trim(int64_t positions);
     int64_t backed_cells() const;
-    bool usable() const {
-        for (const auto& a : full_)
-            if (!a->usable()) return false;
-        return true;
-    }
+    bool usable() const;
     /// The last ensure failed only because the device lacked the memory.
-    bool out_of_memory() const {
-        for (const auto& a : full_)
-            if (a->out_of_memory()) return true;
-        return false;
-    }
-    uint64_t backing_bytes() const {
-        uint64_t n = 0;
-        for (const auto& a : full_) n += a->backed();
-        return n;
-    }
+    bool out_of_memory() const;
+    uint64_t backing_bytes() const;
     bool save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const;
     /// Restores from kv[at..]; `at` moves past what it read. False when kv holds no drafter cells of that shape.
     bool restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream);

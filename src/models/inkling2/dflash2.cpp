@@ -266,10 +266,13 @@ model::Result Dflash2Weights::finish(const void* head_q8, const uint16_t* emb, c
     return {};
 }
 
-uint64_t dflash2_session_bytes(const Pack& pack) {
+uint64_t dflash2_session_bytes(const Pack& pack) { return pack.dflash2.present ? 4096 : 0; }
+
+uint64_t dflash2_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran) {
     const Dflash2Geometry& d = pack.dflash2;
     if (!d.present) return 0;
-    return (uint64_t) d.n_layers * 2ull * (uint64_t) ring_cells(d) * kDf2KV * 2 + 4096;
+    const uint64_t b = (uint64_t) std::min<int64_t>(ring_cells(d), positions + kDf2Block) * kDf2KV * 2;
+    return (uint64_t) d.n_layers * 2ull * ((b + gran - 1) / gran * gran);
 }
 
 const Dflash2Weights::SharedScratch* Dflash2Weights::ensure_shared_scratch(std::string& err) const {
@@ -364,17 +367,23 @@ bool Dflash2Hook::init(const Dflash2Weights* w, const Geometry& g, int64_t conte
     slot_.assign(g.visits.size(), -1);
     for (int k = 0; k + 1 < kDf2Targets; ++k) slot_[(size_t) d.targets[(size_t) k]] = k;
 
+    // the rings: each reserves its whole range and backs it from the KV pool as the conversation grows (a granule at
+    // start, kept)
     const int64_t cap = ring_cells(d);
+    ring_ = cap;
     const size_t ring_b = (size_t) cap * kDf2KV * 2;
-    void* slab = dev((size_t) d.n_layers * 2 * ring_b, ok);
     cache_.assign((size_t) d.n_layers, Cache{});
     for (int l = 0; ok && l < d.n_layers; ++l) {
         Cache& c = cache_[(size_t) l];
         c.cap = cap;
-        auto* base = static_cast<uint8_t*>(slab) + (size_t) l * 2 * ring_b;
-        c.k = reinterpret_cast<uint16_t*>(base);
-        c.v = reinterpret_cast<uint16_t*>(base + ring_b);
+        for (int j = 0; j < 2; ++j) {
+            auto a = std::make_unique<core::ElasticArray>();
+            if (!a->open(ring_b, err, 1)) ok = false;
+            (j ? c.v : c.k) = reinterpret_cast<uint16_t*>(a->data());
+            rings_.push_back(std::move(a));
+        }
     }
+    if (ok && !ensure(1, err)) return false;
 
     meta_d_ = (int32_t*) dev(2 * 4, ok);
     ids_d_ = (int32_t*) dev(kDf2Block * 4, ok);
@@ -704,6 +713,54 @@ model::Result Dflash2Hook::draft_end(int32_t* ids, float* conf, int max_n, int& 
     return {};
 }
 
+void Dflash2Hook::count_cells() {
+    cells_ = ring_;
+    for (const auto& a : rings_) cells_ = std::min<int64_t>(cells_, (int64_t) (a->backed() / (kDf2KV * 2)));
+}
+
+uint64_t Dflash2Hook::grow_bytes(int64_t positions) const {
+    uint64_t n = 0;
+    for (const auto& a : rings_) n += a->growth((uint64_t) ring_cells_for(positions) * kDf2KV * 2);
+    return n;
+}
+
+bool Dflash2Hook::ensure(int64_t positions, std::string& err) {
+    if (ring_cells_for(positions) <= cells_) return true;
+    const uint64_t bytes = (uint64_t) ring_cells_for(positions) * kDf2KV * 2;
+    for (const auto& a : rings_)
+        if (!a->ensure(bytes, 0, err)) {
+            err = "the drafter's rings cannot grow to " + std::to_string(positions) + " positions: " + err;
+            count_cells();
+            return false;
+        }
+    count_cells();
+    return true;
+}
+
+void Dflash2Hook::trim(int64_t positions) {
+    const uint64_t keep = (uint64_t) ring_cells_for(std::max<int64_t>(positions, 1)) * kDf2KV * 2;
+    for (const auto& a : rings_) a->trim(keep);
+    count_cells();
+}
+
+uint64_t Dflash2Hook::backing_bytes() const {
+    uint64_t n = 0;
+    for (const auto& a : rings_) n += a->backed();
+    return n;
+}
+
+bool Dflash2Hook::out_of_memory() const {
+    for (const auto& a : rings_)
+        if (a->out_of_memory()) return true;
+    return false;
+}
+
+bool Dflash2Hook::usable() const {
+    for (const auto& a : rings_)
+        if (!a->usable()) return false;
+    return true;
+}
+
 size_t Dflash2Hook::running_bytes() const {
     if (!w_) return 0;
     size_t n = kRunHeadBytes;
@@ -726,9 +783,12 @@ void Dflash2Hook::running_state(int64_t pos, bool save, core::RunningState& st) 
     } else {
         st.head.insert(st.head.end(), kRunHeadBytes, 0);
     }
+    // the cells positions up to pos + a block sit in (the ring's first ones until it wraps): backed while the session
+    // holds pos
+    const size_t cells = (size_t) ring_cells_for(pos);
     for (const Cache& c : cache_) {
-        st.regions.push_back({c.k, (size_t) c.cap * kDf2KV * 2});
-        st.regions.push_back({c.v, (size_t) c.cap * kDf2KV * 2});
+        st.regions.push_back({c.k, cells * kDf2KV * 2});
+        st.regions.push_back({c.v, cells * kDf2KV * 2});
     }
 }
 

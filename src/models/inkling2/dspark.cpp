@@ -329,8 +329,9 @@ uint64_t dspark_session_bytes(const Pack& pack) {
 }
 
 uint64_t dspark_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran) {
+    if (pack.dflash2.present) return dflash2_pool_bytes(pack, positions, gran);
     const DsparkGeometry& d = pack.dspark;
-    if (pack.dflash2.present || !d.present) return 0;
+    if (!d.present) return 0;
     const uint64_t cells = (uint64_t) full_cells(positions) * kKV * 2;
     uint64_t n = 0;
     for (int l = 0; l < d.n_layers; ++l)
@@ -898,15 +899,18 @@ void DsparkHook::count_backed() {
     for (const auto& a : full_) backed_cells_ = std::min<int64_t>(backed_cells_, (int64_t) (a->backed() / (kKV * 2)));
 }
 
-uint64_t DsparkHook::grow_bytes(int64_t positions) const {
-    if (df2_) return 0;
+uint64_t DsparkHook::grow_bytes(int64_t target, int64_t positions) const {
+    if (df2_) return df2_->grow_bytes(positions);
+    positions = target;
     uint64_t n = 0;
     for (const auto& a : full_) n += a->growth((uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2);
     return n;
 }
 
-bool DsparkHook::ensure(int64_t positions, std::string& err) {
-    if (df2_ || full_.empty() || full_cells(positions) <= backed_cells_) return true;
+bool DsparkHook::ensure(int64_t target, int64_t positions, std::string& err) {
+    if (df2_) return df2_->ensure(positions, err);
+    positions = target;
+    if (full_.empty() || full_cells(positions) <= backed_cells_) return true;
     const uint64_t bytes = (uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2;
     for (const auto& a : full_)
         if (!a->ensure(bytes, 0, err)) {
@@ -917,8 +921,29 @@ bool DsparkHook::ensure(int64_t positions, std::string& err) {
     return true;
 }
 
+bool DsparkHook::usable() const {
+    if (df2_ && !df2_->usable()) return false;
+    for (const auto& a : full_)
+        if (!a->usable()) return false;
+    return true;
+}
+bool DsparkHook::out_of_memory() const {
+    if (df2_ && df2_->out_of_memory()) return true;
+    for (const auto& a : full_)
+        if (a->out_of_memory()) return true;
+    return false;
+}
+uint64_t DsparkHook::backing_bytes() const {
+    uint64_t n = df2_ ? df2_->backing_bytes() : 0;
+    for (const auto& a : full_) n += a->backed();
+    return n;
+}
+
 void DsparkHook::trim(int64_t positions) {
-    if (df2_) return;
+    if (df2_) {
+        df2_->trim(positions);
+        return;
+    }
     const uint64_t keep = positions > 0 ? (uint64_t) full_cells(positions) * kKV * 2 : 0;   // none once the conversation left
     for (const auto& a : full_) a->trim(keep);
     count_backed();

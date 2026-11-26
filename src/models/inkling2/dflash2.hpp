@@ -14,6 +14,7 @@
 
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/adapter.hpp"
@@ -90,6 +91,8 @@ private:
 
 model::Result dflash2_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<Dflash2Weights>& out);
 uint64_t dflash2_session_bytes(const Pack& pack);
+/// The KV pool bytes one session's rings back for `positions` positions (granules of `gran`).
+uint64_t dflash2_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran);
 
 class Dflash2Batch;
 
@@ -119,7 +122,16 @@ public:
     bool running_restored(int64_t pos, const uint8_t* head);
     bool save_cells(int64_t positions, void* stream) const;
     bool restore_cells(size_t kv_size, size_t at, int64_t positions, void* stream);
-    int64_t backed_cells() const { return context_ + kDf2Block; }
+    /// The positions the rings back: all of them once the rings are whole, else the cells backed (from cell 0).
+    int64_t backed_cells() const { return cells_ >= ring_ ? context_ + kDf2Block : cells_; }
+    /// The rings back the cells of `positions` positions and a block past them from the KV pool, a granule at a time;
+    /// trim gives back what lies past them (one granule each stays).
+    uint64_t grow_bytes(int64_t positions) const;
+    bool ensure(int64_t positions, std::string& err);
+    void trim(int64_t positions);
+    uint64_t backing_bytes() const;
+    bool out_of_memory() const;
+    bool usable() const;
 
 private:
     friend class Dflash2Batch;
@@ -134,6 +146,10 @@ private:
     const Dflash2Weights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
     std::vector<Cache> cache_;
+    std::vector<std::unique_ptr<basalt::core::ElasticArray>> rings_;   // each layer's keys, then its values
+    int64_t ring_ = 0, cells_ = 0;   // a ring's cells; the cells every ring backs
+    int64_t ring_cells_for(int64_t positions) const { return std::min<int64_t>(ring_, positions + kDf2Block); }
+    void count_cells();
     std::vector<int> slot_;
     int tap_rows_ = 0;
     int64_t context_ = 0;
