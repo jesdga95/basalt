@@ -33,7 +33,7 @@ on an NVIDIA Blackwell GPU (sm_120) - or, in this fork, an Ada GPU (sm_89, RTX 4
 
 ## Quick start
 
-This fork builds from source (prebuilt archives come with its first release); upstream's [releases](https://github.com/jesdga95/basalt/releases) ([what they need](docs/platforms.md#release-archives)) target Blackwell:
+This fork builds from source; its [releases](https://github.com/FahadAlAlawi/basalt-RTX40/releases) carry prebuilt Linux x64, Linux Arm64 and Windows x64 archives built for the 40-series alongside Blackwell (upstream's [releases](https://github.com/jesdga95/basalt/releases), [what they need](docs/platforms.md#release-archives), target Blackwell only):
 
 ```sh
 git clone https://github.com/FahadAlAlawi/basalt-RTX40 && cd basalt-RTX40
