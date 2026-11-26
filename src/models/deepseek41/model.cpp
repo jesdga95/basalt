@@ -221,8 +221,8 @@ const DevTensor* DsModel::tensor(const std::string& name) const {
 
 bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
     const TensorRef* t = pack_.find("token_embd.weight");
-    if (!t || (t->type != 14 && t->type != 13 && t->type != 8) || t->shape.size() != 2) {
-        err = "token_embd.weight is missing or not Q5_K, Q6_K or Q8_0";
+    if (!t || (t->type != 30 && t->type != 14 && t->type != 13 && t->type != 8) || t->shape.size() != 2) {
+        err = "token_embd.weight is missing or not BF16, Q5_K, Q6_K or Q8_0";
         return false;
     }
     const uint64_t n_embd = t->shape[0];
@@ -231,14 +231,20 @@ bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
         return false;
     }
     const bool q8 = t->type == 8;
+    const bool bf16 = t->type == 30;
     const uint64_t q5_block = 176;
-    const uint64_t row_bytes = q8 ? n_embd / 32 * 34 : n_embd / 256 * (t->type == 13 ? q5_block : 210);
+    const uint64_t row_bytes = bf16 ? n_embd * 2 : q8 ? n_embd / 32 * 34 : n_embd / 256 * (t->type == 13 ? q5_block : 210);
     std::vector<uint8_t> row(row_bytes);
     if (!platform::pread_all(embd_fd_, row.data(), row_bytes, t->offset + (uint64_t) token * row_bytes)) {
         err = "cannot read the embedding row";
         return false;
     }
-    if (q8) {
+    if (bf16) {
+        for (uint64_t i = 0; i < n_embd; ++i) {
+            const uint16_t bits = (uint16_t) row[2 * i] | ((uint16_t) row[2 * i + 1] << 8);
+            out[i] = bf16_to_fp32(bits);
+        }
+    } else if (q8) {
         for (uint64_t b = 0; b < n_embd / 32; ++b) dequantize_q8_0(row.data() + b * 34, out + b * 32);
     } else if (t->type == 13) {
         for (uint64_t b = 0; b < n_embd / 256; ++b) dequantize_q5_K(row.data() + b * q5_block, out + b * 256);
