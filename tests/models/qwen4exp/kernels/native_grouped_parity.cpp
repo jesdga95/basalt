@@ -11,7 +11,8 @@
 // Every gate/up format with every down format; calls of 0..cap groups of 1..T entries each (an empty call is what the
 // verify window's PCIe call usually is), entries from 0 and from past 0 (the PCIe call's follow the VRAM call's),
 // scattered destinations, stale scratch, grid_groups 0 (= cap), 1, 2, 3, 4 and above cap: the output must be BITWISE
-// equal to v1's, the rows the call must not write included (both start from the same NaN pattern).
+// equal to v1's, the rows the call must not write included (both start from the same NaN pattern). MXFP8 at 2304 x 1152
+// sums in its own fixed order: check_invariant holds it to its own bits at every grouping, and to v1 within rounding.
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
@@ -228,6 +229,24 @@ struct Setup {
         ck(cudaMemcpy(tok, tk_v.data(), tk_v.size() * 4, cudaMemcpyHostToDevice), "tok");
         return ng;
     }
+    // groups on these blobs with these sizes from entry `base` on, the entries' tokens and destinations as given
+    void plan_exact(const std::vector<int>& blob, const std::vector<int>& sizes, const std::vector<int32_t>& tk_v,
+                    const std::vector<int32_t>& ds, int base) {
+        std::vector<unsigned long long> p;
+        if (base + (int) tk_v.size() > cap) { std::fprintf(stderr, "plan: %d entries > cap %d\n", base + (int) tk_v.size(), cap); std::exit(2); }
+        std::vector<int32_t> st(1, base), tk_all(cap, 0), ds_all(cap, 0);
+        for (size_t g = 0; g < sizes.size(); ++g) {
+            p.push_back((unsigned long long) (blobs + slot * (size_t) blob[g]));
+            st.push_back(st.back() + sizes[g]);
+        }
+        for (size_t e = 0; e < tk_v.size(); ++e) { tk_all[(size_t) base + e] = tk_v[e]; ds_all[(size_t) base + e] = ds[e]; }
+        const int ng = (int) p.size();
+        if (ng) ck(cudaMemcpy(ptr, p.data(), p.size() * 8, cudaMemcpyHostToDevice), "ptr");
+        ck(cudaMemcpy(start, st.data(), st.size() * 4, cudaMemcpyHostToDevice), "start");
+        ck(cudaMemcpy(n, &ng, 4, cudaMemcpyHostToDevice), "n");
+        ck(cudaMemcpy(dst, ds_all.data(), ds_all.size() * 4, cudaMemcpyHostToDevice), "dst");
+        ck(cudaMemcpy(tok, tk_all.data(), tk_all.size() * 4, cudaMemcpyHostToDevice), "tok");
+    }
     void call(int64_t grid_groups, cudaStream_t s) {   // the groups at most as the engines bound them: the entries, or the experts
         k::native_expert_grouped(L, ptr, start, n, dst, tok, std::min(cap, n_blobs), cap, xq, scr, out, s, grid_groups);
     }
@@ -286,6 +305,95 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
     std::printf("%-8s/%-7s %5lld x %4lld  T %2d  %d calls: %s (%zu output floats written in all)\n", name_of(gu),
                 name_of(dt), (long long) H, (long long) FF, S.T, calls, bad ? "FAIL" : "bitwise equal to v1", written);
     if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
+    g_fail += bad;
+}
+
+// the RMS of got - ref over the RMS of ref, on the first n floats (a SwiGLU output that rounds to the next q8_1 step
+// moves its down sums by a whole weight, so the largest difference is no measure)
+double diff_over_rms(const std::vector<uint32_t>& ref, const std::vector<uint32_t>& got, size_t n) {
+    double ss = 0, dd = 0;
+    for (size_t i = 0; i < n; ++i) {
+        float a, b;
+        std::memcpy(&a, &ref[i], 4);
+        std::memcpy(&b, &got[i], 4);
+        ss += (double) a * a;
+        dd += ((double) a - (double) b) * ((double) a - (double) b);
+    }
+    return std::sqrt(dd / ss);
+}
+
+// A format with its own fixed summation order (MXFP8 at 2304 x 1152): T tokens x 8 of 24 experts in groups of up to T
+// entries. Every entry's output row must be BITWISE the same as when it runs alone (one group of one entry) and when the
+// pairs are grouped another way (each group reversed, from a later entry on, the groups in reverse order); against v1 it must
+// agree within float rounding (the RMS of the difference over the RMS of v1's output).
+void check_invariant(int type, int64_t H, int64_t FF, int tokens, cudaStream_t s, std::mt19937& rng) {
+    constexpr int kTop = 8, kBlobs = 24;
+    Setup S(type, type, H, FF, tokens, kTop + 1, kBlobs, rng, s);   // room for the regrouped call's leading entries
+    const int pairs = tokens * kTop;
+    std::vector<int> ids((size_t) pairs), ord(kBlobs);
+    for (int r = 0; r < tokens; ++r) {
+        std::iota(ord.begin(), ord.end(), 0);
+        std::shuffle(ord.begin(), ord.end(), rng);
+        for (int j = 0; j < kTop; ++j) ids[(size_t) r * kTop + j] = ord[(size_t) j];
+    }
+    // groups in expert order, entries by token; pair i = token i / 8, destination row i
+    std::vector<int> blob, sizes;
+    std::vector<int32_t> tk, ds;
+    for (int e = 0; e < kBlobs; ++e) {
+        int m = 0;
+        for (int i = 0; i < pairs; ++i)
+            if (ids[(size_t) i] == e) { tk.push_back(i / kTop); ds.push_back(i); ++m; }
+        if (m) { blob.push_back(e); sizes.push_back(m); }
+    }
+    const auto run = [&](bool v1) {
+        ck(cudaMemset(S.out, 0xFF, S.out_floats * 4), "memset");
+        k::native_grouped_set_v1(v1);
+        S.call(0, s);
+        k::native_grouped_set_v1(false);
+        ck(cudaStreamSynchronize(s), "sync");
+        std::vector<uint32_t> o(S.out_floats);
+        ck(cudaMemcpy(o.data(), S.out, o.size() * 4, cudaMemcpyDeviceToHost), "out");
+        return o;
+    };
+    S.plan_exact(blob, sizes, tk, ds, 0);
+    const auto ref = run(true), got = run(false);
+    const double rel = diff_over_rms(ref, got, (size_t) pairs * (size_t) H);
+    int bad = rel > 1e-4 || !std::isfinite(rel);
+    // regrouped: each group reversed, in reverse order, from entry `tokens` on (the call writes the same destinations)
+    {
+        std::vector<int> b2(blob.rbegin(), blob.rend()), s2(sizes.rbegin(), sizes.rend());
+        std::vector<int32_t> t2, d2;
+        int at = (int) tk.size();
+        for (size_t g = sizes.size(); g-- > 0;) {
+            at -= sizes[g];
+            for (int j = sizes[g] - 1; j >= 0; --j) { t2.push_back(tk[(size_t) (at + j)]); d2.push_back(ds[(size_t) (at + j)]); }
+        }
+        S.plan_exact(b2, s2, t2, d2, tokens);
+        const auto re = run(false);
+        size_t diff = 0;
+        for (size_t i = 0; i < re.size(); ++i) diff += re[i] != got[i];
+        if (diff) { std::printf("  regrouped: %zu floats differ  FAIL\n", diff); ++bad; }
+    }
+    // alone: one group of one entry, for every 7th pair
+    size_t alone_diff = 0;
+    int alone = 0;
+    {
+        int at = 0;
+        for (size_t g = 0; g < sizes.size(); ++g) {
+            for (int j = 0; j < sizes[g]; ++j, ++at) {
+                if (at % 7) continue;
+                S.plan_exact({blob[g]}, {1}, {tk[(size_t) at]}, {ds[(size_t) at]}, 0);
+                const auto one = run(false);
+                const size_t row = (size_t) ds[(size_t) at] * (size_t) H;
+                for (size_t c = 0; c < (size_t) H; ++c) alone_diff += one[row + c] != got[row + c];
+                ++alone;
+            }
+        }
+    }
+    if (alone_diff) { std::printf("  alone: %zu floats differ  FAIL\n", alone_diff); ++bad; }
+    std::printf("%-8s/%-7s %5lld x %4lld  T %2d  %zu groups: vs v1 rms diff / rms %.2g, regrouped and %d pairs alone %s\n",
+                name_of(type), name_of(type), (long long) H, (long long) FF, tokens, sizes.size(), rel, alone,
+                bad ? "FAIL" : "bitwise equal");
     g_fail += bad;
 }
 
@@ -452,11 +560,18 @@ void bench_wide(cudaStream_t s, std::mt19937& rng, int R, int type, int phase) {
     ck(cudaMemcpy(S.tok, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice), "tok");
     ck(cudaMemcpy(S.ptr, lptr[0], (size_t) ng * 8, cudaMemcpyDeviceToDevice), "ptr");
     const auto ref = S.result(true, 0, 0x00, s), got = S.result(false, 0, 0x7F, s);
-    size_t diff = 0;
-    for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
-    std::printf("wide %s 2304 x 1152, %d rows x top %d of %d: %d groups, output vs v1: %s (%zu differ)\n", name_of(type), R, kTop, kExperts,
-                ng, diff ? "FAIL" : "bitwise equal", diff);
-    g_fail += diff != 0;
+    if (type == 46) {   // its own order: within rounding of v1 (check_invariant holds its bits)
+        const double rel = diff_over_rms(ref, got, (size_t) R * kTop * 2304);
+        std::printf("wide %s 2304 x 1152, %d rows x top %d of %d: %d groups, output vs v1: rms diff / rms %.2g%s\n", name_of(type), R,
+                    kTop, kExperts, ng, rel, rel > 1e-4 || !std::isfinite(rel) ? "  FAIL" : "");
+        g_fail += rel > 1e-4 || !std::isfinite(rel);
+    } else {
+        size_t diff = 0;
+        for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
+        std::printf("wide %s 2304 x 1152, %d rows x top %d of %d: %d groups, output vs v1: %s (%zu differ)\n", name_of(type), R, kTop,
+                    kExperts, ng, diff ? "FAIL" : "bitwise equal", diff);
+        g_fail += diff != 0;
+    }
     auto graph = [&](bool v1) {
         k::native_grouped_set_v1(v1);
         cudaGraph_t g;
@@ -696,7 +811,7 @@ int main(int argc, char** argv) {
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);
     check(40, 40, 2304, 1152, s, rng, 64);
-    check(46, 46, 2304, 1152, s, rng, 64);
+    for (const int t : {1, 3, 64}) check_invariant(46, 2304, 1152, t, s, rng);   // MXFP8's own order
     check(21, 23, 2560, 768, s, rng);
     check(18, 20, 2560, 640, s, rng);
     check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries

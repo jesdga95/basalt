@@ -397,6 +397,17 @@ proposed tokens), the gated attention and the GDN output gate. Licensed under th
 reproduced above.
 
 ================================================================================
+ingine-batch (https://github.com/satellitedown/ingine-batch), Apache License 2.0
+Copyright 2026 satellitedown.
+================================================================================
+
+The MXFP8 grouped expert tiles in src/kernels/cuda/nvfp4_grouped_mma.cuh adapt the design of ingine-batch's
+batched expert GEMM (native/src/kernels/batch/moe.cu): the expert weights as the M side of mma.m16n8k16 against the
+tokens, E4M3 codes decoded exactly to f16 in registers, and each thread's k positions taken as contiguous code bytes
+(a permutation of each MMA's k shared by the weights and the activations). Licensed under the Apache License,
+Version 2.0, reproduced above.
+
+================================================================================
 DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in
 serve/models/deepseek41_encoding.py
 ================================================================================

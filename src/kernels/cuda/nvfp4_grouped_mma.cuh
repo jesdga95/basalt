@@ -1,15 +1,14 @@
 #pragma once
-// Bitwise-identical high-concurrency grouped expert stage functions at 2304 x 1152: NVFP4 (type 40) streams its weights
-// through shared memory and sums exact int32 sub-block dots on mma.m16n8k16.s32.s8.s8.s32 in row_dot_sub8's tree order;
-// MXFP8 (type 46) stages up to 8 columns and runs row_dot_sub8 itself.
+// Grouped expert stage functions at 2304 x 1152 that stream the weights through shared memory. NVFP4 (type 40) sums exact
+// int32 sub-block dots on mma.m16n8k16.s32.s8.s8.s32 in row_dot_sub8's tree order (v1's bits at every row count). MXFP8
+// (type 46) sums each 32-value block's E4M3 x int8 products on mma.m16n8k16.f32.f16.f16.f32 (both decode to f16 exactly)
+// and the blocks in one fixed order: its own bits, the same at every row count. The MXFP8 tile design (weights as the M
+// side, a thread's k positions as contiguous code bytes) is adapted from ingine-batch's batch/moe.cu (Apache-2.0).
 
 namespace {
 
-constexpr int kFastMoeRows = 32;
 constexpr int kFastMoeCols = 16;
 constexpr int kFastMoeCTiles = kFastMoeCols / 8;
-constexpr int kFastGuWords = 72 * 9;            // 648 words per 2304-dim q8_1 entry
-constexpr int kFastDnWords = 36 * 9;            // 324 words per 1152-dim q8_1 entry
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ uint32_t nvfp4_frag_s8(const block_nvfp4* b, int iqs, int t) {
@@ -28,23 +27,27 @@ __device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1
 }
 #endif
 
-// The NVFP4 stages stream the experts' weights: the work is (group, 16-row tile of its gate and up rows, or of its down
+// The stages stream the experts' weights: the work is (group, 16-row tile of its gate and up rows, or of its down
 // rows), group-major, and a block takes one contiguous run of it (the runs split it evenly), so it reads its weights as one
 // stream. The tiles come into shared memory as bulk copies, NS in flight, the next one past them requested into L2. A
 // thread holds the activation words and scales its k steps meet, for up to 16 of a group's entries, in registers: read once
 // for all the group's tiles of the run. Each warp multiplies the tile's 16 rows against them over its share of K on
 // mma.m16n8k16, and the block adds the warps' sums in row_dot_sub8's tree order: the arithmetic and its order are the
-// per-tile stage's, on the same bytes, so every entry's bits are v1's at any row count.
+// per-tile stage's, on the same bytes, so every NVFP4 entry's bits are v1's at any row count. MXFP8 runs the same frame
+// with its own block products (mx_tile_mma) and the same tree; an entry's arithmetic never depends on the entries beside it.
 constexpr int kNvSubRows = 16;
 // bytes of a weight row of K NVFP4 values (blocks of 64 values in 36 bytes); a tile's bytes; tiles in flight; a warp's k16
-// steps (k = wp + 8 j)
-template<int K> constexpr int kNvRowBytes = K / 64 * 36;
-template<int K> constexpr int kNvTileBytes = kNvSubRows * kNvRowBytes<K>;
+// steps (k = wp + 8 j; MXFP8 rows are K / 128 blocks of 132 bytes, a warp's steps its 32-value blocks u = wp + 8 j)
+template<int TY, int K> constexpr int kNvRowBytes = TY == 40 ? K / 64 * 36 : K / 128 * 132;
+template<int TY, int K> constexpr int kNvTileBytes = kNvSubRows * kNvRowBytes<TY, K>;
 template<bool GU> constexpr int kNvStages = GU ? 2 : 3;
 template<int K> constexpr int kNvSteps = K / 128;
-template<int K, bool GU> constexpr size_t kNvSmemBytes = (size_t) kNvStages<GU> * kNvTileBytes<K> + (size_t) kFastMoeCols * kNvSubRows * 9 * 4;
-constexpr size_t kGuSmemBytes = kNvSmemBytes<2304, true>;
-constexpr size_t kDnSmemBytes = kNvSmemBytes<1152, false>;
+template<int K> constexpr int kMxSteps = (K / 32 + 7) / 8;
+template<int TY, int K, bool GU> constexpr size_t kNvSmemBytes = (size_t) kNvStages<GU> * kNvTileBytes<TY, K> + (size_t) kFastMoeCols * kNvSubRows * 9 * 4;
+constexpr size_t kGuSmemBytes = kNvSmemBytes<40, 2304, true>;
+constexpr size_t kDnSmemBytes = kNvSmemBytes<40, 1152, false>;
+constexpr size_t kMxGuSmemBytes = kNvSmemBytes<46, 2304, true>;
+constexpr size_t kMxDnSmemBytes = kNvSmemBytes<46, 1152, false>;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 __device__ __forceinline__ unsigned gu_su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
@@ -123,16 +126,106 @@ __device__ __forceinline__ void nv_tile_mma(const uint8_t* wra, const uint8_t* w
 #endif
 }
 
+// MXFP8: a thread's activations for a chunk of up to 16 entries, as f16 (an int8 is exact in f16). In block u = wp + 8 j
+// the thread's k positions are 4 t .. 4 t + 3 (the first k16 MMA) and 16 + 4 t .. 16 + 4 t + 3 (the second), a permutation
+// of each MMA's k that the weights share: b[ct][j] holds entry 8 ct + g's {4 t, 4 t + 1}, {4 t + 2, 4 t + 3}, then the same
+// 16 on, and d0 / d1 the scales of entries 8 ct + 2 t and + 1 (0 past the chunk or past K).
+template<int K>
+struct MxCols {
+    uint32_t b[kFastMoeCTiles][kMxSteps<K>][4];
+    float d0[kFastMoeCTiles][kMxSteps<K>], d1[kFastMoeCTiles][kMxSteps<K>];
+};
+__device__ __forceinline__ uint32_t s8x2_half2(uint32_t w) {
+    const __half2 h = __halves2half2(__short2half_rn((short) (int8_t) (w & 0xFFu)), __short2half_rn((short) (int8_t) (w >> 8)));
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+template<int K, bool GU>
+__device__ __forceinline__ void mx_cols_load(MxCols<K>& x, const block_q8_1* __restrict__ xq, const int32_t* __restrict__ ent, int e,
+                                             int ne, int wp, int g, int t) {
+    const auto entry = [&](int c) {
+        return reinterpret_cast<const uint32_t*>(xq + (GU ? (size_t) ent[e + c] : (size_t) (e + c)) * (K / 32));
+    };
+#pragma unroll
+    for (int ct = 0; ct < kFastMoeCTiles; ++ct) {
+        const int cg = 8 * ct + g, c0 = 8 * ct + 2 * t, c1 = c0 + 1;
+        const uint32_t* xg = cg < ne ? entry(cg) : nullptr;
+        const uint32_t* x0 = c0 < ne ? entry(c0) : nullptr;
+        const uint32_t* x1 = c1 < ne ? entry(c1) : nullptr;
+#pragma unroll
+        for (int j = 0; j < kMxSteps<K>; ++j) {
+            const int u = wp + 8 * j;
+            const bool in = u < K / 32;
+            const uint32_t q0 = xg && in ? __ldg(xg + 9 * u + 1 + t) : 0u, q1 = xg && in ? __ldg(xg + 9 * u + 5 + t) : 0u;
+            x.b[ct][j][0] = s8x2_half2(q0);
+            x.b[ct][j][1] = s8x2_half2(q0 >> 16);
+            x.b[ct][j][2] = s8x2_half2(q1);
+            x.b[ct][j][3] = s8x2_half2(q1 >> 16);
+            x.d0[ct][j] = x0 && in ? __low2float(*reinterpret_cast<const half2*>(x0 + 9 * u)) : 0.0f;
+            x.d1[ct][j] = x1 && in ? __low2float(*reinterpret_cast<const half2*>(x1 + 9 * u)) : 0.0f;
+        }
+    }
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void mma_f16_k16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, const float (&c)[4]) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+// two E4M3 codes (the low 16 bits) as an f16 pair, exactly
+__device__ __forceinline__ uint32_t e4m3x2_half2(uint32_t w) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (w & 0xFFFFu), __NV_E4M3);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+#endif
+
+// A warp's sums of a tile's rows g and g + 8 (wra, wrb: MXFP8 rows) against CT column tiles of x: block u = wp + 8 j is two
+// k16 MMAs from zero (its E4M3 x int8 products), then acc[.][j % 4] += (d_x * d_w) * that, d_w the block's UE8M0 scale.
+template<int K, int CT>
+__device__ __forceinline__ void mx_tile_mma(const uint8_t* wra, const uint8_t* wrb, const MxCols<K>& x, int wp, int t,
+                                            float (&acc)[kFastMoeCTiles][4][4]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#pragma unroll
+    for (int j = 0; j < kMxSteps<K>; ++j) {
+        const int u = wp + 8 * j;
+        if ((K / 32) % 8 != 0 && u >= K / 32) break;   // warp-uniform: the warps past K's last block
+        const int s = j & 3;
+        const uint8_t* ba = wra + (u >> 2) * 132;
+        const uint8_t* bb = wrb + (u >> 2) * 132;
+        const uint8_t* qa = ba + 4 + 32 * (u & 3) + 4 * t;
+        const uint8_t* qb = bb + 4 + 32 * (u & 3) + 4 * t;
+        const uint32_t wa0 = *reinterpret_cast<const uint32_t*>(qa), wa1 = *reinterpret_cast<const uint32_t*>(qa + 16);
+        const uint32_t wb0 = *reinterpret_cast<const uint32_t*>(qb), wb1 = *reinterpret_cast<const uint32_t*>(qb + 16);
+        const uint32_t a0[4] = { e4m3x2_half2(wa0), e4m3x2_half2(wb0), e4m3x2_half2(wa0 >> 16), e4m3x2_half2(wb0 >> 16) };
+        const uint32_t a1[4] = { e4m3x2_half2(wa1), e4m3x2_half2(wb1), e4m3x2_half2(wa1 >> 16), e4m3x2_half2(wb1 >> 16) };
+        const float dwa = ue8m0_scale_dev(ba[u & 3]), dwb = ue8m0_scale_dev(bb[u & 3]);
+        constexpr float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) {
+            float c[4];
+            mma_f16_k16(c, a0, x.b[ct][j][0], x.b[ct][j][1], kZero);
+            mma_f16_k16(c, a1, x.b[ct][j][2], x.b[ct][j][3], c);
+            acc[ct][s][0] = __fmaf_rn(__fmul_rn(x.d0[ct][j], dwa), c[0], acc[ct][s][0]);
+            acc[ct][s][1] = __fmaf_rn(__fmul_rn(x.d1[ct][j], dwa), c[1], acc[ct][s][1]);
+            acc[ct][s][2] = __fmaf_rn(__fmul_rn(x.d0[ct][j], dwb), c[2], acc[ct][s][2]);
+            acc[ct][s][3] = __fmaf_rn(__fmul_rn(x.d1[ct][j], dwb), c[3], acc[ct][s][3]);
+        }
+    }
+#else
+    (void) wra; (void) wrb; (void) x; (void) wp; (void) t; (void) acc;
+#endif
+}
+
 // A call's groups at most (the stage's prefix of their chunks sits in shared memory)
 constexpr int kNvMaxGroups = 256;
 
-// GU: gate/up (K = n_embd 2304, rows 2 n_ff, entries' tokens `ent`, out0 gate and out1 up [entry][n_ff]); else down (K =
+// TY: 40 NVFP4 or 46 MXFP8. GU: gate/up (K = n_embd 2304, rows 2 n_ff, entries' tokens `ent`, out0 gate and out1 up [entry][n_ff]); else down (K =
 // n_ff 1152, rows n_embd, entries' destinations `ent`, out0 [dest][n_embd]). DEP: a programmatic dependent, its weights
 // requested before the wait (they and the plan are ready before the kernel before it starts). A group of more than 16
 // entries runs as one per 16 of them (chunk-major), each streaming the group's weights again, so a thread's activations
 // change only when its run reaches another chunk.
-template<int K, bool GU, bool DEP>
-__device__ __forceinline__ void nvfp4_stream_stage(int block, int blocks, int tid, uint8_t* smem,
+template<int TY, int K, bool GU, bool DEP>
+__device__ __forceinline__ void expert_stream_stage(int block, int blocks, int tid, uint8_t* smem,
                                                    const unsigned long long* __restrict__ grp_ptr,
                                                    const int32_t* __restrict__ grp_start,
                                                    const int32_t* __restrict__ n_groups,
@@ -142,7 +235,7 @@ __device__ __forceinline__ void nvfp4_stream_stage(int block, int blocks, int ti
                                                    float* __restrict__ out0,
                                                    float* __restrict__ out1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    constexpr int RB = kNvRowBytes<K>, TB = kNvTileBytes<K>, NS = kNvStages<GU>;
+    constexpr int RB = kNvRowBytes<TY, K>, TB = kNvTileBytes<TY, K>, NS = kNvStages<GU>;
     if constexpr (!DEP) pdl_launch_dependents();
     __shared__ int s_pre[kNvMaxGroups + 1];   // the work items before each group: nx a chunk of 16 entries
     __shared__ int s_wsum[8];
@@ -207,7 +300,7 @@ __device__ __forceinline__ void nvfp4_stream_stage(int block, int blocks, int ti
     }
     if (i0 >= i1) return;
     __syncthreads();   // the barriers' init seen
-    NvCols<K> x;
+    std::conditional_t<TY == 40, NvCols<K>, MxCols<K>> x;
     int held_e = -1, gi = 0;
     for (int i = i0, k = 0; i < i1; ++i, ++k) {
         int e, row0;
@@ -215,10 +308,11 @@ __device__ __forceinline__ void nvfp4_stream_stage(int block, int blocks, int ti
         const bool is_up = GU && row0 >= (int) L.n_ff;
         const int r0 = is_up ? row0 - (int) L.n_ff : row0;
         float* dst = is_up ? out1 : out0;
-        const float sc = nvfp4_tail((const void*) grp_ptr[gi], L)[GU ? (is_up ? 1 : 0) : 2];
+        const float sc = TY == 40 ? nvfp4_tail((const void*) grp_ptr[gi], L)[GU ? (is_up ? 1 : 0) : 2] : 1.0f;
         const int ne = min(kFastMoeCols, grp_start[gi + 1] - e);
         if (held_e != e) {   // entries are each one group's, so the first entry names the chunk
-            nv_cols_load<K, GU>(x, xq, ent, e, ne, wp, g, t);
+            if constexpr (TY == 40) nv_cols_load<K, GU>(x, xq, ent, e, ne, wp, g, t);
+            else mx_cols_load<K, GU>(x, xq, ent, e, ne, wp, g, t);
             held_e = e;
         }
         uint8_t* tile = smem + (k % NS) * TB;
@@ -226,8 +320,13 @@ __device__ __forceinline__ void nvfp4_stream_stage(int block, int blocks, int ti
         const uint8_t* wrb = wra + 8 * RB;
         gu_mb_wait(&bar[k % NS], (unsigned) (k / NS) & 1u);
         float acc[kFastMoeCTiles][4][4] = {};
-        if (ne <= 8) nv_tile_mma<K, 1>(wra, wrb, x, wp, t, acc);
-        else nv_tile_mma<K, 2>(wra, wrb, x, wp, t, acc);
+        if constexpr (TY == 40) {
+            if (ne <= 8) nv_tile_mma<K, 1>(wra, wrb, x, wp, t, acc);
+            else nv_tile_mma<K, 2>(wra, wrb, x, wp, t, acc);
+        } else {
+            if (ne <= 8) mx_tile_mma<K, 1>(wra, wrb, x, wp, t, acc);
+            else mx_tile_mma<K, 2>(wra, wrb, x, wp, t, acc);
+        }
 #pragma unroll
         for (int ct = 0; ct < kFastMoeCTiles; ++ct) {
             if (8 * ct >= ne) break;
@@ -250,7 +349,7 @@ __device__ __forceinline__ void nvfp4_stream_stage(int block, int blocks, int ti
             const float r4_0 = __fadd_rn(p[0], p[4]), r4_1 = __fadd_rn(p[1], p[5]);
             const float r4_2 = __fadd_rn(p[2], p[6]), r4_3 = __fadd_rn(p[3], p[7]);
             const float r2_0 = __fadd_rn(r4_0, r4_2), r2_1 = __fadd_rn(r4_1, r4_3);
-            const float v = __fmul_rn(__fadd_rn(r2_0, r2_1), sc);
+            const float v = TY == 40 ? __fmul_rn(__fadd_rn(r2_0, r2_1), sc) : __fadd_rn(r2_0, r2_1);
             if constexpr (GU) dst[(size_t) (e + col) * L.n_ff + r0 + row] = v;
             else dst[(size_t) ent[e + col] * L.n_embd + r0 + row] = v;
         }
@@ -261,148 +360,6 @@ __device__ __forceinline__ void nvfp4_stream_stage(int block, int blocks, int ti
     (void) xq; (void) L; (void) out0; (void) out1;
     __trap();
 #endif
-}
-
-constexpr int kFastMxfp8Cols = 8;
-
-__device__ __forceinline__ void native_gu_mxfp8_sx8_stage(dim3 block_idx, dim3 grid_dim, int tid,
-                                                          const unsigned long long* __restrict__ grp_ptr,
-                                                          const int32_t* __restrict__ grp_start,
-                                                          const int32_t* __restrict__ n_groups,
-                                                          const int32_t* __restrict__ ent_tok,
-                                                          const block_q8_1* __restrict__ xq,
-                                                          NativeExpertLayout L,
-                                                          float* __restrict__ gate,
-                                                          float* __restrict__ up) {
-    const int ng = *n_groups;
-    if (ng <= (int) grid_dim.y) pdl_launch_dependents();
-    if ((int) block_idx.y >= ng) return;
-    __shared__ __align__(16) uint32_t s_x[kFastMxfp8Cols * kFastGuWords];
-    const block_q8_1* sx = reinterpret_cast<const block_q8_1*>(s_x);
-    const int r_sub_off = tid >> 3, t_sub = tid & 7;
-    const int row0 = (int) block_idx.x * kFastMoeRows;
-    const int row = row0 + r_sub_off;
-    const bool valid = row < 2 * (int) L.n_ff;
-    const bool is_up = row >= (int) L.n_ff;
-    const int r = is_up ? row - (int) L.n_ff : row;
-    const size_t w_off = valid ? (is_up ? L.up_off : 0) + (size_t) r * L.gu_row : 0;
-    float* dst = is_up ? up : gate;
-    for (int gi = (int) block_idx.y; gi < ng; gi += (int) grid_dim.y) {
-        const uint8_t* wr = (const uint8_t*) grp_ptr[gi] + w_off;
-        const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
-        for (int e = e0; e < e1; e += kFastMxfp8Cols) {
-            const int ne = min(kFastMxfp8Cols, e1 - e);
-            if (ne <= 2) {
-                if (valid) {
-                    if (ne == 1) {
-                        const int off1[1] = { ent_tok[e] * 72 };
-                        float s1[1];
-                        row_dot_sub8<46, 1, true, 288>(wr, xq, off1, 1, 288, t_sub, s1);
-                        if (t_sub == 0) dst[(size_t) e * L.n_ff + r] = s1[0];
-                    } else {
-                        const int off2[2] = { ent_tok[e] * 72, ent_tok[e + 1] * 72 };
-                        float s2[2];
-                        row_dot_sub8<46, 2, true, 288>(wr, xq, off2, 2, 288, t_sub, s2);
-                        if (t_sub < 2) dst[(size_t) (e + t_sub) * L.n_ff + r] = s2[t_sub];
-                    }
-                }
-                continue;
-            }
-            __syncthreads();
-            for (int idx = tid; idx < ne * kFastGuWords; idx += 256) {
-                const int c = idx / kFastGuWords, rem = idx - c * kFastGuWords;
-                s_x[idx] = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + c] * 72)[rem];
-            }
-            __syncthreads();
-            if (valid) {
-                if (ne <= 4) {
-                    int off4[4];
-#pragma unroll
-                    for (int c = 0; c < 4; ++c) off4[c] = min(c, ne - 1) * 72;
-                    float s4[4];
-                    row_dot_sub8<46, 4, false, 288>(wr, sx, off4, ne, 288, t_sub, s4);
-                    if (t_sub < ne) dst[(size_t) (e + t_sub) * L.n_ff + r] = s4[t_sub];
-                } else {
-                    int off8[8];
-#pragma unroll
-                    for (int c = 0; c < 8; ++c) off8[c] = min(c, ne - 1) * 72;
-                    float s8[8];
-                    row_dot_sub8<46, 8, false, 288>(wr, sx, off8, ne, 288, t_sub, s8);
-                    if (t_sub < ne) dst[(size_t) (e + t_sub) * L.n_ff + r] = s8[t_sub];
-                }
-            }
-        }
-    }
-}
-
-template<bool DEP = false>
-__device__ __forceinline__ void native_down_mxfp8_sx8_stage(dim3 block_idx, dim3 grid_dim, int tid,
-                                                            const unsigned long long* __restrict__ grp_ptr,
-                                                            const int32_t* __restrict__ grp_start,
-                                                            const int32_t* __restrict__ n_groups,
-                                                            const int32_t* __restrict__ ent_dst,
-                                                            const block_q8_1* __restrict__ hq,
-                                                            NativeExpertLayout L,
-                                                            float* __restrict__ out) {
-    if constexpr (DEP) {
-        pdl_wait();
-        pdl_launch_dependents();
-    }
-    const int ng = *n_groups;
-    if ((int) block_idx.y >= ng) return;
-    __shared__ __align__(16) uint32_t s_x[kFastMxfp8Cols * kFastDnWords];
-    const block_q8_1* sx = reinterpret_cast<const block_q8_1*>(s_x);
-    const int r_sub_off = tid >> 3, t_sub = tid & 7;
-    const int row0 = (int) block_idx.x * kFastMoeRows;
-    const int row = row0 + r_sub_off;
-    const bool valid = row < (int) L.n_embd;
-    const size_t w_off = valid ? L.down_off + (size_t) row * L.d_row : 0;
-    for (int gi = (int) block_idx.y; gi < ng; gi += (int) grid_dim.y) {
-        const uint8_t* wr = (const uint8_t*) grp_ptr[gi] + w_off;
-        const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
-        for (int e = e0; e < e1; e += kFastMxfp8Cols) {
-            const int ne = min(kFastMxfp8Cols, e1 - e);
-            if (ne <= 2) {
-                if (valid) {
-                    if (ne == 1) {
-                        const int off1[1] = { e * 36 };
-                        float s1[1];
-                        row_dot_sub8<46, 1, true, 144>(wr, hq, off1, 1, 144, t_sub, s1);
-                        if (t_sub == 0) out[(size_t) ent_dst[e] * L.n_embd + row] = s1[0];
-                    } else {
-                        const int off2[2] = { e * 36, (e + 1) * 36 };
-                        float s2[2];
-                        row_dot_sub8<46, 2, true, 144>(wr, hq, off2, 2, 144, t_sub, s2);
-                        if (t_sub < 2) out[(size_t) ent_dst[e + t_sub] * L.n_embd + row] = s2[t_sub];
-                    }
-                }
-                continue;
-            }
-            __syncthreads();
-            for (int idx = tid; idx < ne * kFastDnWords; idx += 256) {
-                const int c = idx / kFastDnWords, rem = idx - c * kFastDnWords;
-                s_x[idx] = reinterpret_cast<const uint32_t*>(hq + (size_t) (e + c) * 36)[rem];
-            }
-            __syncthreads();
-            if (valid) {
-                if (ne <= 4) {
-                    int off4[4];
-#pragma unroll
-                    for (int c = 0; c < 4; ++c) off4[c] = min(c, ne - 1) * 36;
-                    float s4[4];
-                    row_dot_sub8<46, 4, false, 144>(wr, sx, off4, ne, 144, t_sub, s4);
-                    if (t_sub < ne) out[(size_t) ent_dst[e + t_sub] * L.n_embd + row] = s4[t_sub];
-                } else {
-                    int off8[8];
-#pragma unroll
-                    for (int c = 0; c < 8; ++c) off8[c] = min(c, ne - 1) * 36;
-                    float s8[8];
-                    row_dot_sub8<46, 8, false, 144>(wr, sx, off8, ne, 144, t_sub, s8);
-                    if (t_sub < ne) out[(size_t) ent_dst[e + t_sub] * L.n_embd + row] = s8[t_sub];
-                }
-            }
-        }
-    }
 }
 
 }  // namespace
