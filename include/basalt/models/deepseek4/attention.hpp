@@ -19,4 +19,7 @@ void project_attention_kv(const float* x, int wkv_type, const void* wkv, const f
                           const int32_t* positions, const kernels::MqaRopeTable& rope, int n_tokens,
                           void* q8_scratch, float* projected, float* out, void* stream);
 
+/// Writes prepared `[T][512]` rows to the sliding cache slot `position % 128`; ring slots must be unique within the call.
+void cache_attention_window(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream);
+
 }  // namespace basalt::models::deepseek4

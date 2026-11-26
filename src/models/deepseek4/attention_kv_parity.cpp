@@ -78,6 +78,19 @@ int main(int argc, char** argv) {
     const auto ref = reference(projected, norm, positions, rope);
     const Err error = compare(got, ref);
 
+    const std::vector<float> initial((size_t) 128 * D, -13.f);
+    Dev<float> dcache(initial);
+    const std::vector<int32_t> cache_positions = {1, 3, 126, 127, 128};
+    Dev<int32_t> dcache_positions(cache_positions);
+    cache_attention_window(dcache.p, dout.p, dcache_positions.p, T, nullptr);
+    const auto cache = dcache.down();
+    std::vector<float> cache_ref = initial;
+    for (int t = 0; t < T; ++t) {
+        const size_t slot = (size_t) cache_positions[(size_t) t] % 128;
+        std::copy_n(got.data() + (size_t) t * D, D, cache_ref.data() + slot * D);
+    }
+    const bool cache_matches = cache == cache_ref;
+
     bool independent = true;
     for (int t = 0; t < T; ++t) {
         std::vector<float> row(projected.begin() + (size_t) t * D, projected.begin() + (size_t) (t + 1) * D);
@@ -88,14 +101,19 @@ int main(int argc, char** argv) {
         independent = independent && std::memcmp(single.data(), got.data() + (size_t) t * D, D * sizeof(float)) == 0;
     }
 
-    std::printf("DeepSeek4 KV boundary D=%d T=%d: CPU-double max abs %.6g rel RMS %.6g; token-width independence %s\n",
-                D, T, error.max_abs, error.rms_rel, independent ? "bitwise" : "DIFFERS");
-    if (error.max_abs > 0.02 || error.rms_rel > 0.002 || !independent) return 1;
+    std::printf("DeepSeek4 KV boundary D=%d T=%d: CPU-double max abs %.6g rel RMS %.6g; cache rows %s; "
+                "token-width independence %s\n", D, T, error.max_abs, error.rms_rel,
+                cache_matches ? "match" : "DIFFERS", independent ? "bitwise" : "DIFFERS");
+    if (error.max_abs > 0.02 || error.rms_rel > 0.002 || !cache_matches || !independent) return 1;
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         const double us = bench_stream_us([&](void* stream) {
             prepare_attention_kv(dprojected.p, dnorm.p, eps, dpositions.p, rope, T, dout.p, stream);
         });
         bench_line("deepseek4 KV boundary T=5", us, (double) T * (2 * D + D + 1) * sizeof(float));
+        const double cache_us = bench_stream_us([&](void* stream) {
+            cache_attention_window(dcache.p, dout.p, dcache_positions.p, T, stream);
+        });
+        bench_line("deepseek4 KV ring write T=5", cache_us, (double) T * D * 2 * sizeof(float));
     }
     return 0;
 }

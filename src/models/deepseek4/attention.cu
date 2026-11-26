@@ -105,6 +105,15 @@ __global__ void prepare_kv_kernel(const float* projected, const float* norm, flo
     out[base + i] = value;
 }
 
+__global__ void cache_window_kernel(float* ring, const float* rows, const int32_t* positions, int n_tokens) {
+    const int token = blockIdx.x;
+    const int position = positions[token];
+    if (position < 0) return;
+    const size_t dst = (size_t) (position % 128) * D;
+    const size_t src = (size_t) token * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) ring[dst + i] = rows[src + i];
+}
+
 void check_launch() {
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(std::string("deepseek4 prepare_attention_kv: ") + cudaGetErrorString(error));
@@ -118,6 +127,13 @@ void prepare_attention_kv(const float* projected, const float* norm, float rms_e
         !(rms_eps > 0.f) || !std::isfinite(rms_eps) || !std::isfinite(rope.mscale))
         throw std::invalid_argument("deepseek4 prepare_attention_kv: invalid arguments");
     prepare_kv_kernel<<<n_tokens, Threads, 0, (cudaStream_t) stream>>>(projected, norm, rms_eps, positions, rope, out);
+    check_launch();
+}
+
+void cache_attention_window(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream) {
+    if (!ring || !rows || !positions || n_tokens < 1 || n_tokens > 8)
+        throw std::invalid_argument("deepseek4 cache_attention_window: invalid arguments");
+    cache_window_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(ring, rows, positions, n_tokens);
     check_launch();
 }
 
