@@ -35,6 +35,8 @@ struct SparseMqaQWeights {
     float rms_eps = 1e-20f;
     int n_embd = 0;
     int q_rank = 0;
+    /// Optional per-head RMS normalization before RoPE; zero disables it.
+    float head_rms_eps = 0.f;
 };
 
 size_t sparse_mqa_q_scratch_bytes(int n_tokens, int q_rank);

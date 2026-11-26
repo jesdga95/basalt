@@ -125,6 +125,38 @@ __global__ void q_rope_rows_kernel(float* rows, int n_rows, int stride, int rows
     rows[(size_t) row_id * stride + first + pair * 2 + 1] = b;
 }
 
+__global__ void __launch_bounds__(256) q_head_norm_rope_kernel(float* q, const int32_t* pos, MqaRopeTable rope,
+                                                                float eps) {
+    const int row = blockIdx.x;
+    const int d = threadIdx.x * 2;
+    const size_t base = (size_t) row * kSparseMqaDim;
+    float a = q[base + d], b = q[base + d + 1];
+    float sum = a * a + b * b;
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+    __shared__ float warp_sum[8];
+    if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    float total = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) total += warp_sum[i];
+    const float scale = rsqrtf(total / kSparseMqaDim + eps);
+    a *= scale;
+    b *= scale;
+    if (d >= kSparseMqaDim - kSparseMqaRopeDim) {
+        const int pair = (d - (kSparseMqaDim - kSparseMqaRopeDim)) / 2;
+        float s, c;
+        sincosf((float) pos[row / kSparseMqaHeads] * rope.step[pair], &s, &c);
+        c *= rope.mscale;
+        s *= rope.mscale;
+        const float x = a * c - b * s;
+        b = a * s + b * c;
+        a = x;
+    }
+    q[base + d] = a;
+    q[base + d + 1] = b;
+}
+
 template <class W, class C, int HB>
 __global__ void __launch_bounds__(kThreads) mqa_partial_kernel(SparseMqaArgs a, int n_win, int n_chunks_total,
                                                                 float* o_part, float* ml) {
@@ -264,12 +296,19 @@ void sparse_mqa_q_latent(const void* x_q8_1, const SparseMqaQWeights& w, int n_t
 void sparse_mqa_q_heads(const SparseMqaQWeights& w, int n_tokens, const int32_t* pos, const MqaRopeTable& rope,
                         const void* qr_q8_1, float* q, void* stream) {
     sparse_mqa_q_scratch_bytes(n_tokens, w.q_rank);
-    if (!w.wq_b || !pos || !qr_q8_1 || !q || !stream || w.wq_b_type < 0 || !std::isfinite(rope.mscale))
+    if (!w.wq_b || !pos || !qr_q8_1 || !q || !stream || w.wq_b_type < 0 || !std::isfinite(rope.mscale) ||
+        w.head_rms_eps < 0.f || !std::isfinite(w.head_rms_eps))
         throw std::invalid_argument("sparse_mqa_q_heads: invalid input");
     native_mmvq(w.wq_b_type, w.wq_b, qr_q8_1, q, w.q_rank, kSparseMqaHeads * kSparseMqaDim, n_tokens, stream);
-    q_rope_rows_kernel<<<n_tokens * kSparseMqaHeads, kSparseMqaRopeDim / 2, 0, (cudaStream_t) stream>>>(
-        q, n_tokens * kSparseMqaHeads, kSparseMqaDim, kSparseMqaHeads, pos, rope, false);
-    check_launch("sparse_mqa_q_heads rope");
+    if (w.head_rms_eps > 0.f) {
+        q_head_norm_rope_kernel<<<n_tokens * kSparseMqaHeads, kSparseMqaDim / 2, 0, (cudaStream_t) stream>>>(
+            q, pos, rope, w.head_rms_eps);
+        check_launch("sparse_mqa_q_heads norm and rope");
+    } else {
+        q_rope_rows_kernel<<<n_tokens * kSparseMqaHeads, kSparseMqaRopeDim / 2, 0, (cudaStream_t) stream>>>(
+            q, n_tokens * kSparseMqaHeads, kSparseMqaDim, kSparseMqaHeads, pos, rope, false);
+        check_launch("sparse_mqa_q_heads rope");
+    }
 }
 
 void sparse_mqa_rope_rows(float* rows, int n_rows, int row_stride, int rows_per_pos, const int32_t* pos,
