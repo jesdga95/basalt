@@ -22,8 +22,9 @@ int main() {
         check(kv_batch_refusal(kv, 0).empty(), "no batch takes any format");
     }
     const std::string r = kv_batch_refusal("k8v4", 8);
-    check(has(r, "--kv k8v4") && has(r, "8 slots") && has(r, "parallel") && has(r, "--kv int8"),
-          "k8v4 with slots is refused by name, with the format that works");
-    check(!kv_batch_refusal("fp16", 2).empty() && !kv_batch_refusal("q4_0", 2).empty(), "the other formats are refused too");
+    check(has(r, "--kv k8v4") && has(r, "8 slots") && has(r, "parallel") && has(r, "--kv int8") && has(r, "resident --kv fp16"),
+          "k8v4 with slots is refused by name, with the formats that work");
+    check(kv_batch_refusal("fp16", 2).empty(), "a resident fp16 runs with slots");
+    check(!kv_batch_refusal("q4_0", 2).empty() && !kv_batch_refusal("k8v4", 2).empty(), "the other formats are refused too");
     return failures == 0 ? 0 : 1;
 }
