@@ -2324,7 +2324,9 @@ constexpr int kQcStride = 144;   // a column's or a row's 4 blocks a step (144 /
 // a block: RW row tiles of 16 rows times CG column groups of 8 CT columns, a warp each MT row tiles of a column group
 // (a column's activations read once for MT tiles)
 template<int CT, int CG, int RW> constexpr int kQcStageBytes = (8 * CT * CG + 16 * RW) * kQcStride + 16 * RW * 8;
-template<int CT, int CG, int RW> constexpr int kQcSmemBytes = kQcStages<CT, CG> * kQcStageBytes<CT, CG, RW>;
+// past the stages: the current step's scales as floats, the columns' [4][8 CT CG] then the rows' [16 RW][4] (converted once
+// a step, not once a fragment)
+template<int CT, int CG, int RW> constexpr int kQcSmemBytes = kQcStages<CT, CG> * kQcStageBytes<CT, CG, RW> + 4 * (8 * CT * CG + 16 * RW) * 4;
 
 template<int CT, int CG, int RW, int MT>
 __global__ void __launch_bounds__(32 * CG * RW / MT) native_q8p_chain_kernel(Q8Planes w, SegArgs a, int n_in, int ncols, float softcap) {
@@ -2337,24 +2339,35 @@ __global__ void __launch_bounds__(32 * CG * RW / MT) native_q8p_chain_kernel(Q8P
     const int c0 = int(blockIdx.x) * COLS, nc = min(COLS, ncols - c0);
     const int row0 = p.bx * ROWS;
     const uint8_t* xb = reinterpret_cast<const uint8_t*>(p.x + (size_t) c0 * nb);
-    // a step: each column's 4 blocks (9 pieces of 16 bytes), each row's 4 blocks of codes (8 pieces) and scales (8 bytes)
+    // a step: each column's 4 blocks (9 pieces of 16 bytes), each row's 4 blocks of codes (8 pieces) and scales (8 bytes);
+    // piece i of a step is thread i % NT's; the rows' sources sit in shared memory and the columns' piece offsets in
+    // registers, so a step's requests do no index arithmetic
+    __shared__ const int8_t* s_wrow[ROWS];
+    for (int i = tid; i < ROWS; i += NT) s_wrow[i] = w.codes + (size_t) (p.row0 + min(row0 + i, p.n_out - 1)) * n_in;
+    __syncthreads();
+    constexpr int AP = (9 * COLS + NT - 1) / NT, WPC = (8 * ROWS + NT - 1) / NT;
+    int aoff[AP], adst[AP];   // a column piece's source offset (-1: none) and slot offset
+#pragma unroll
+    for (int k = 0; k < AP; ++k) {
+        const int i = tid + k * NT, c = i / 9, part = i - 9 * c;
+        aoff[k] = c < nc ? c * nb * 36 + part * 16 : -1;
+        adst[k] = c * kQcStride + part * 16;
+    }
+    const half* const ssrc = w.scales + (size_t) (p.row0 + min(row0 + tid, p.n_out - 1)) * nb;
     const auto request = [&](int st, int slot, bool acts) {
         uint8_t* sm = qc_smem + slot * SB;
         if (acts) {
-            for (int i = tid; i < nc * 9; i += NT) {
-                const int c = i / 9, part = i - 9 * c;
-                qc_copy16(sm + c * kQcStride + part * 16, xb + ((size_t) c * nb + 4 * st) * 36 + part * 16);
-            }
+#pragma unroll
+            for (int k = 0; k < AP; ++k)
+                if (aoff[k] >= 0) qc_copy16(sm + adst[k], xb + aoff[k] + 144 * st);
         } else {
-            for (int i = tid; i < ROWS * 8; i += NT) {
-                const int rr = i >> 3, part = i & 7;
-                const int r = p.row0 + min(row0 + rr, p.n_out - 1);
-                qc_copy16(sm + COLS * kQcStride + rr * kQcStride + part * 16, w.codes + (size_t) r * n_in + 128 * st + part * 16);
+#pragma unroll
+            for (int k = 0; k < WPC; ++k) {
+                const int i = tid + k * NT;
+                if (8 * ROWS % NT == 0 || i < 8 * ROWS)
+                    qc_copy16(sm + COLS * kQcStride + (i >> 3) * kQcStride + (i & 7) * 16, s_wrow[i >> 3] + 128 * st + (i & 7) * 16);
             }
-            for (int i = tid; i < ROWS; i += NT) {
-                const int r = p.row0 + min(row0 + i, p.n_out - 1);
-                qc_copy8(sm + (COLS + ROWS) * kQcStride + i * 8, w.scales + (size_t) r * nb + 4 * st);
-            }
+            if (tid < ROWS) qc_copy8(sm + (COLS + ROWS) * kQcStride + tid * 8, ssrc + 4 * st);
         }
     };
     for (int j = 0; j < NS && j < steps; ++j) request(j, j, false);
@@ -2366,6 +2379,8 @@ __global__ void __launch_bounds__(32 * CG * RW / MT) native_q8p_chain_kernel(Q8P
     }
     const int rt = wp % (RW / MT), ch = wp / (RW / MT);   // row tiles MT rt .. MT rt + MT - 1
     float acc[4][MT][CT][4] = {};   // [chain]
+    float* const dxf = reinterpret_cast<float*>(qc_smem + NS * SB);   // [kb][column]
+    float* const dwf = dxf + 4 * COLS;                                // [row][kb]
     for (int st = 0; st < steps; ++st) {
         const uint8_t* sm = qc_smem + (st % NS) * SB;
         qc_wait<NS - 1>();
@@ -2373,13 +2388,19 @@ __global__ void __launch_bounds__(32 * CG * RW / MT) native_q8p_chain_kernel(Q8P
         const uint8_t* xs = sm;
         const uint8_t* wsm = sm + COLS * kQcStride;
         const half* scs = reinterpret_cast<const half*>(sm + (COLS + ROWS) * kQcStride);
-        // the rows' 4 scales of the step in one 8-byte read each; the codes by ldmatrix (matrices: rows 0-7 and 8-15 of
+        for (int i = tid; i < 4 * COLS; i += NT) {
+            const int c = i >> 2, kb = i & 3;
+            dxf[kb * COLS + c] = __low2float(*reinterpret_cast<const half2*>(xs + c * kQcStride + kb * 36));
+        }
+        for (int i = tid; i < 4 * ROWS; i += NT) dwf[i] = __half2float(scs[i]);
+        __syncthreads();
+        // the rows' 4 scales of the step in one 16-byte read each; the codes by ldmatrix (matrices: rows 0-7 and 8-15 of
         // the tile, bytes 0-15 then 16-31 of the block: a0, a1, a2, a3)
-        uint2 sga[MT], sgb[MT];
+        float4 sga[MT], sgb[MT];
 #pragma unroll
         for (int mi = 0; mi < MT; ++mi) {
-            sga[mi] = *reinterpret_cast<const uint2*>(scs + (16 * (MT * rt + mi) + g) * 4);
-            sgb[mi] = *reinterpret_cast<const uint2*>(scs + (16 * (MT * rt + mi) + g + 8) * 4);
+            sga[mi] = *reinterpret_cast<const float4*>(dwf + (16 * (MT * rt + mi) + g) * 4);
+            sgb[mi] = *reinterpret_cast<const float4*>(dwf + (16 * (MT * rt + mi) + g + 8) * 4);
         }
         const uint8_t* wl = wsm + (16 * MT * rt + (lane & 7) + ((lane >> 3) & 1) * 8) * kQcStride + (lane >> 4) * 16;
 #pragma unroll
@@ -2389,16 +2410,16 @@ __global__ void __launch_bounds__(32 * CG * RW / MT) native_q8p_chain_kernel(Q8P
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 qc_ldsm_x4(a0[mi], a1[mi], a2[mi], a3[mi], wl + mi * 16 * kQcStride + kb * 32);
-                da[mi] = __half2float(reinterpret_cast<const half*>(&sga[mi])[kb]);
-                db[mi] = __half2float(reinterpret_cast<const half*>(&sgb[mi])[kb]);
+                da[mi] = reinterpret_cast<const float*>(&sga[mi])[kb];
+                db[mi] = reinterpret_cast<const float*>(&sgb[mi])[kb];
             }
 #pragma unroll
             for (int ct = 0; ct < CT; ++ct) {
                 const int cb = 8 * CT * ch + 8 * ct;
                 const uint8_t* xg = xs + (cb + g) * kQcStride + kb * 36 + 4 + 4 * t;   // a Q81Block: half2 ds, then 32 values
                 const uint32_t b0 = *reinterpret_cast<const uint32_t*>(xg), b1 = *reinterpret_cast<const uint32_t*>(xg + 16);
-                const float dx0 = __low2float(*reinterpret_cast<const half2*>(xs + (cb + 2 * t) * kQcStride + kb * 36));
-                const float dx1 = __low2float(*reinterpret_cast<const half2*>(xs + (cb + 2 * t + 1) * kQcStride + kb * 36));
+                const float2 dx = *reinterpret_cast<const float2*>(dxf + kb * COLS + cb + 2 * t);
+                const float dx0 = dx.x, dx1 = dx.y;
 #pragma unroll
                 for (int mi = 0; mi < MT; ++mi) {
                     int d[4];
