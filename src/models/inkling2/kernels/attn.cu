@@ -1717,7 +1717,7 @@ void mma_probe_plans(MmaDevice& device, int per_block, int per_sm, int reserved)
         throw std::runtime_error("inkling2: no resident attention MMA block");
 }
 
-const MmaDevice& mma_device(int dev) {
+MmaDevice& probed_device(int dev) {
     static MmaDevice devices[kOptInDevices];
     static std::once_flag probed[kOptInDevices];
     std::call_once(probed[dev], [dev] {
@@ -1763,6 +1763,8 @@ const MmaDevice& mma_device(int dev) {
     });
     return devices[dev];
 }
+
+const MmaDevice& mma_device(int dev) { return probed_device(dev); }
 
 // A row's slices as the shard model sees them: their count and the last one's share of a full slice's keys.
 struct SliceShape {
@@ -2044,6 +2046,15 @@ bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, v
 }
 
 int attention_decode_int8_test_min_keys() { return kMmaMinKeys; }
+
+int attention_decode_int8_slices() { return mma_device(opt_in_device()).slices; }
+
+void attention_decode_int8_test_set_slices(int slices) {
+    if (slices < kWindowMmaSplits || slices > kMaxSplits) throw std::invalid_argument("inkling2: test slice count out of range");
+    MmaDevice& d = probed_device(opt_in_device());
+    d.slices = slices;
+    check_mma_probe(cudaMemcpyToSymbol(c_slices, &d.slices, sizeof(int)));
+}
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;

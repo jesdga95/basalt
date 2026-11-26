@@ -173,6 +173,10 @@ bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, v
                                 bool mma, Int8MmaPlan plan = Int8MmaPlan::Auto, Int8MmaPlanInfo* info = nullptr,
                                 Int8MmaShards shards = Int8MmaShards::Auto, int shard_count = 0);
 int attention_decode_int8_test_min_keys();
+/// The current device's INT8 slice count: the most slices a full-cache INT8 row takes (FP16 and E4M3 rows take 64).
+int attention_decode_int8_slices();
+/// Parity entry point: set the current device's INT8 slice count, within the rule's range.
+void attention_decode_int8_test_set_slices(int slices);
 
 /// out[r] = attn[r] * sigmoid(yq[r][kOffGate..]), the attention output gated by its own row's gate projection.
 void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream, int64_t yq_ld = kProjQ);
