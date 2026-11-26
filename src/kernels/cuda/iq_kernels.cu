@@ -3254,7 +3254,28 @@ __global__ void __launch_bounds__(256, 1) native_gu_nvfp4_mma_kernel(const unsig
                                                                      NativeExpertLayout L,
                                                                      float* __restrict__ gate,
                                                                      float* __restrict__ up) {
-    native_gu_nvfp4_mma_stage(blockIdx, gridDim, (int) threadIdx.x, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up);
+    extern __shared__ __align__(128) uint8_t gu_smem[];
+    native_gu_nvfp4_mma_stage((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, gu_smem, grp_ptr, grp_start, n_groups,
+                              ent_tok, xq, L, gate, up);
+}
+
+// The SMs of the current device: the persistent grids take as many blocks as fit on every one.
+int sm_count() {
+    static int sms[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (sms[dev] == 0) cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
+    return sms[dev];
+}
+
+// The persistent gate/up grid: a block an SM (each holds the whole register file).
+int gu_nvfp4_mma_blocks() {
+    static bool set[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (!set[dev]) set[dev] = cudaFuncSetAttribute(native_gu_nvfp4_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                   (int) kGuSmemBytes) == cudaSuccess;
+    return sm_count();
 }
 
 template<bool DEP = false>
@@ -3265,8 +3286,13 @@ __global__ void __launch_bounds__(256, 2) native_down_nvfp4_mma_kernel(const uns
                                                                        const block_q8_1* __restrict__ hq,
                                                                        NativeExpertLayout L,
                                                                        float* __restrict__ out) {
-    native_down_nvfp4_mma_stage<DEP>(blockIdx, gridDim, (int) threadIdx.x, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    extern __shared__ __align__(128) uint8_t dn_smem[];
+    native_down_nvfp4_mma_stage<DEP>((int) blockIdx.x, (int) gridDim.x, (int) threadIdx.x, dn_smem, grp_ptr, grp_start, n_groups,
+                                     ent_dst, hq, L, out);
 }
+
+// The persistent down grid: two blocks an SM (its shared memory is under the default 48 KiB).
+int down_nvfp4_mma_blocks() { return 2 * sm_count(); }
 
 __global__ void __launch_bounds__(256, 2) native_gu_mxfp8_sx8_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                       const int32_t* __restrict__ grp_start,
@@ -3539,8 +3565,8 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
             default: basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d", L.gu_type, L.up_type); std::exit(1);
         }
     } else if (!v1 && !g_old_kernels && L.gu_type == 40 && cap_entries >= 160 && L.n_embd == 2304 && L.n_ff % 16 == 0) {
-        const dim3 gm((unsigned) (2 * L.n_ff / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
-        native_gu_nvfp4_mma_kernel<<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        native_gu_nvfp4_mma_kernel<<<gu_nvfp4_mma_blocks(), 256, kGuSmemBytes, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                                                                   gate, up);
     } else if (!v1 && !g_old_kernels && L.gu_type == 46 && cap_entries >= 128 && L.n_embd == 2304) {
         const dim3 gm((unsigned) ((2 * L.n_ff + kFastMoeRows - 1) / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
         native_gu_mxfp8_sx8_kernel<<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
@@ -3585,9 +3611,9 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
     if (!v1 && !g_old_kernels && L.d_type == 40 && cap_entries >= 160 && L.n_ff == 1152 && L.n_embd % 32 == 0) {
-        const dim3 gm((unsigned) (L.n_embd / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
-        if (chain) launch_dependent(native_down_nvfp4_mma_kernel<true>, gm, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        else native_down_nvfp4_mma_kernel<false><<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        const dim3 gm((unsigned) down_nvfp4_mma_blocks());
+        if (chain) launch_dependent_smem(native_down_nvfp4_mma_kernel<true>, gm, kDnSmemBytes, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_nvfp4_mma_kernel<false><<<gm, 256, kDnSmemBytes, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else if (!v1 && !g_old_kernels && L.d_type == 46 && cap_entries >= 128 && L.n_ff == 1152) {
         const dim3 gm((unsigned) ((L.n_embd + kFastMoeRows - 1) / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
         if (chain) launch_dependent(native_down_mxfp8_sx8_kernel<true>, gm, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);

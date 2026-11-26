@@ -410,6 +410,90 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
     cudaEventDestroy(e1);
 }
 
+// ------------------------------------------------------------------------------------------------ --wide
+// A batch window's experts at Inkling's shape (2304 x 1152 NVFP4 or MXFP8, 128 experts a layer, top 8): R rows routed to 8 distinct
+// experts each, so about 128 * (1 - (120/128)^R) groups a call. 12 layers' own copies of the experts (the calls cycle
+// through them, so the weights stream from DRAM), the call's output checked bitwise against v1, then the 48 calls
+// timed against v1 in a graph, alternating as in --bench. Prints the weight bytes a call reads and the rate.
+void bench_wide(cudaStream_t s, std::mt19937& rng, int R, int type) {
+    constexpr int kExperts = 128, kTop = 8, kLayers = 12;
+    Setup S(type, type, 2304, 1152, R, kTop, kExperts, rng, s);
+    std::vector<int> ids((size_t) R * kTop), ord(kExperts);
+    for (int r = 0; r < R; ++r) {
+        std::iota(ord.begin(), ord.end(), 0);
+        std::shuffle(ord.begin(), ord.end(), rng);
+        for (int j = 0; j < kTop; ++j) ids[(size_t) r * kTop + j] = ord[j];
+    }
+    // the plan moe_plan makes: groups in expert order, entries by row
+    std::vector<int32_t> st(1, 0), tk, ds;
+    std::vector<int> grp;
+    for (int e = 0; e < kExperts; ++e) {
+        int m = 0;
+        for (int i = 0; i < R * kTop; ++i)
+            if (ids[(size_t) i] == e) { tk.push_back(i / kTop); ds.push_back(i); ++m; }
+        if (m) { grp.push_back(e); st.push_back(st.back() + m); }
+    }
+    const int ng = (int) grp.size();
+    uint8_t* arena = dalloc<uint8_t>(S.slot * (size_t) kLayers * kExperts);
+    std::vector<unsigned long long*> lptr;
+    for (int l = 0; l < kLayers; ++l) {
+        std::vector<unsigned long long> p;
+        for (int g = 0; g < ng; ++g) {
+            uint8_t* d = arena + S.slot * (size_t) (l * kExperts + grp[(size_t) g]);
+            ck(cudaMemcpy(d, S.blobs + S.slot * (size_t) grp[(size_t) g], S.L.bytes, cudaMemcpyDeviceToDevice), "blob copy");
+            p.push_back((unsigned long long) d);
+        }
+        lptr.push_back(dalloc<unsigned long long>(p.size()));
+        ck(cudaMemcpy(lptr.back(), p.data(), p.size() * 8, cudaMemcpyHostToDevice), "ptr");
+    }
+    ck(cudaMemcpy(S.start, st.data(), st.size() * 4, cudaMemcpyHostToDevice), "start");
+    ck(cudaMemcpy(S.n, &ng, 4, cudaMemcpyHostToDevice), "n");
+    ck(cudaMemcpy(S.dst, ds.data(), ds.size() * 4, cudaMemcpyHostToDevice), "dst");
+    ck(cudaMemcpy(S.tok, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice), "tok");
+    ck(cudaMemcpy(S.ptr, lptr[0], (size_t) ng * 8, cudaMemcpyDeviceToDevice), "ptr");
+    const auto ref = S.result(true, 0, 0x00, s), got = S.result(false, 0, 0x7F, s);
+    size_t diff = 0;
+    for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
+    std::printf("wide %s 2304 x 1152, %d rows x top %d of %d: %d groups, output vs v1: %s (%zu differ)\n", name_of(type), R, kTop, kExperts,
+                ng, diff ? "FAIL" : "bitwise equal", diff);
+    g_fail += diff != 0;
+    auto graph = [&](bool v1) {
+        k::native_grouped_set_v1(v1);
+        cudaGraph_t g;
+        cudaGraphExec_t ge;
+        ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
+        for (int c = 0; c < 48; ++c)
+            k::native_expert_grouped(S.L, lptr[(size_t) (c % kLayers)], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr,
+                                     S.out, s);
+        ck(cudaStreamEndCapture(s, &g), "capture");
+        ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+        ck(cudaGraphDestroy(g), "graph");
+        k::native_grouped_set_v1(false);
+        return ge;
+    };
+    cudaGraphExec_t ga = graph(true), gb = graph(false);
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+    std::vector<float> ta, tb;
+    for (int i = 0; i < kWarmPairs + kPairs; ++i) {
+        const bool a_first = i % 2 == 0;
+        const float x = launch_us(s, a_first ? ga : gb, e0, e1), y = launch_us(s, a_first ? gb : ga, e0, e1);
+        if (i < kWarmPairs) continue;
+        ta.push_back(a_first ? x : y);
+        tb.push_back(a_first ? y : x);
+    }
+    const double mb = (double) ng * (double) (S.L.bytes) / 1e6;
+    std::printf("  us per call v1 / new: %.1f / %.1f; %.1f MB of weights a call: %.0f / %.0f GB/s\n", median(ta), median(tb), mb,
+                mb / median(ta) * 1e3, mb / median(tb) * 1e3);
+    ck(cudaGraphExecDestroy(ga), "graph");
+    ck(cudaGraphExecDestroy(gb), "graph");
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    for (auto* p : lptr) cudaFree(p);
+    cudaFree(arena);
+}
+
 // ------------------------------------------------------------------------------------------------ --glue
 // dec_moe_glue (the engine's gate/up + SwiGLU + down launches with the plan built inside) on synthetic experts: T tokens
 // route to top-10 experts drawn from a pool of `pool` (so about `pool` distinct experts a window), 48 layers each with its
@@ -544,7 +628,7 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
 
 int main(int argc, char** argv) {
     bool do_bench = false, gu2 = false, do_glue = false, glue_one = false;
-    int glue_t = 3, glue_pool = 22;
+    int glue_t = 3, glue_pool = 22, wide = 0, wide_type = 40;
     BenchOptions bo;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--glue") { bo.down = 20; bo.ff = 640; }   // the shape the glue launches cover
@@ -552,6 +636,8 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         auto num = [&](int& dst) { if (i + 1 < argc) dst = std::atoi(argv[++i]); };
         if (a == "--bench") do_bench = true;
+        else if (a == "--wide") num(wide);
+        else if (a == "--wide-type") num(wide_type);   // 40 NVFP4, 46 MXFP8
         else if (a == "--glue") do_glue = true;
         else if (a == "--glue-t") { num(glue_t); glue_one = true; }
         else if (a == "--glue-pool") num(glue_pool);
@@ -570,7 +656,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench-sizes" && i + 1 < argc) bo.sizes = argv[++i];
         else if (a == "--bench-ab" && i + 1 < argc) bo.ab = argv[++i];
         else {
-            std::printf("usage: native_grouped_parity [--gu2] [--glue [--glue-t N] [--glue-pool N]] [--bench [--bench-gu N] "
+            std::printf("usage: native_grouped_parity [--wide ROWS [--wide-type 40|46]] [--gu2] [--glue [--glue-t N] [--glue-pool N]] [--bench [--bench-gu N] "
                         "[--bench-down N] [--bench-ff N] [--bench-t N] [--bench-gy N] [--bench-phase N] [--bench-sizes LIST] [--bench-ab gu2]]\n");
             return 2;
         }
@@ -578,6 +664,11 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
+    if (wide > 0) {   // only the wide batch call: its bits against v1 and its timing
+        bench_wide(s, rng, wide, wide_type);
+        std::printf("native_grouped_parity: %d failures\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (do_glue) {   // only the engine-shaped glue call: no format sweep
         if (glue_one) {   // one configuration, as the options give it
             glue_bench(s, rng, bo.gu, bo.down, bo.ff, glue_t, glue_pool, 60);

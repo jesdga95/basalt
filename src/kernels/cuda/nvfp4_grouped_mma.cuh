@@ -31,7 +31,39 @@ __device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1
 }
 #endif
 
-__device__ __forceinline__ void native_gu_nvfp4_mma_stage(dim3 block_idx, dim3 grid_dim, int tid,
+// The gate/up stage's work items: (group, 32-row tile of its gate and up rows), group-major. A block takes items
+// blockIdx.x, + gridDim.x, ... Each item's weight tile comes into shared memory as one bulk copy (a tile's 32 rows are
+// contiguous), and the block's next tile is requested into L2 while it multiplies the current one: the weights stream
+// in large requests instead of waiting on a warp's loads. The arithmetic and its order are the per-tile stage's, on the
+// same bytes. (Two tiles and the activations do not fit a block's shared memory on sm_120.)
+constexpr int kGuTileBytes = kFastMoeRows * 36 * 36;   // 32 rows of 2304 NVFP4 values (36 blocks of 36 bytes)
+constexpr size_t kGuSmemBytes = (size_t) kGuTileBytes + (size_t) kFastMoeCols * kFastGuStride * 4;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+__device__ __forceinline__ unsigned gu_su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
+__device__ __forceinline__ void gu_mb_wait(unsigned long long* b, unsigned phase) {
+    asm volatile("{\n.reg .pred d;\nw_%=:\nmbarrier.try_wait.parity.shared::cta.b64 d, [%0], %1, %2;\n@d bra e_%=;\nbra w_%=;\ne_%=:\n}\n"
+                 ::"r"(gu_su(b)), "r"(phase), "r"(0x989680u) : "memory");
+}
+// item w's gate/up tile in global memory
+__device__ __forceinline__ const uint8_t* gu_tile_src(const unsigned long long* grp_ptr, int w, int nx, const NativeExpertLayout& L) {
+    const int gi = w / nx, row0 = (w - gi * nx) * kFastMoeRows;
+    const bool is_up = row0 >= (int) L.n_ff;
+    return (const uint8_t*) grp_ptr[gi] + (is_up ? L.up_off : 0) + (size_t) (is_up ? row0 - (int) L.n_ff : row0) * L.gu_row;
+}
+// thread 0: `bytes` from `src` into `dst`, completing on `bar`
+__device__ __forceinline__ void tile_load(uint8_t* dst, unsigned long long* bar, const uint8_t* src, unsigned bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(gu_su(bar)), "r"(bytes) : "memory");
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 ::"r"(gu_su(dst)), "l"(src), "r"(bytes), "r"(gu_su(bar)) : "memory");
+}
+// thread 0: `bytes` from `src` into L2
+__device__ __forceinline__ void tile_prefetch(const uint8_t* src, unsigned bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes) : "memory");
+}
+#endif
+
+__device__ __forceinline__ void native_gu_nvfp4_mma_stage(int block, int blocks, int tid, uint8_t* smem,
                                                           const unsigned long long* __restrict__ grp_ptr,
                                                           const int32_t* __restrict__ grp_start,
                                                           const int32_t* __restrict__ n_groups,
@@ -40,33 +72,44 @@ __device__ __forceinline__ void native_gu_nvfp4_mma_stage(dim3 block_idx, dim3 g
                                                           NativeExpertLayout L,
                                                           float* __restrict__ gate,
                                                           float* __restrict__ up) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    const int ng = *n_groups;
-    if (ng <= (int) grid_dim.y) pdl_launch_dependents();
-    if ((int) block_idx.y >= ng) return;
-    __shared__ __align__(16) uint32_t s_x[kFastMoeCols * kFastGuStride];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    pdl_launch_dependents();
+    const int nx = 2 * (int) L.n_ff / kFastMoeRows;
+    const int total = *n_groups * nx;
+    if (block >= total) return;
+    __shared__ __align__(8) unsigned long long bar;
+    uint32_t* s_x = reinterpret_cast<uint32_t*>(smem + kGuTileBytes);
     float* s_part = reinterpret_cast<float*>(s_x);
+    if (tid == 0) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(gu_su(&bar)) : "memory");
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
     const int wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int r_sub_off = tid >> 3, t_sub = tid & 7;
-    const int row0 = (int) block_idx.x * kFastMoeRows;
-    const bool is_up = row0 >= (int) L.n_ff;
-    const int r0 = is_up ? row0 - (int) L.n_ff : row0;
-    const size_t half_off = is_up ? L.up_off : 0;
-    const size_t base_off = half_off + (size_t) (r0 + g) * L.gu_row;
-    const size_t sub_off = half_off + (size_t) (r0 + r_sub_off) * L.gu_row;
-    float* dst = is_up ? up : gate;
-    for (int gi = (int) block_idx.y; gi < ng; gi += (int) grid_dim.y) {
+    for (int w = block, k = 0; w < total; w += blocks, ++k) {
+        __syncthreads();   // every thread is done with the tile before (and sees the barrier's init)
+        if (tid == 0) {
+            tile_load(smem, &bar, gu_tile_src(grp_ptr, w, nx, L), (unsigned) kGuTileBytes);
+            if (w + blocks < total) tile_prefetch(gu_tile_src(grp_ptr, w + blocks, nx, L), (unsigned) kGuTileBytes);
+        }
+        const int gi = w / nx, row0 = (w - gi * nx) * kFastMoeRows;
+        const bool is_up = row0 >= (int) L.n_ff;
+        const int r0 = is_up ? row0 - (int) L.n_ff : row0;
+        float* dst = is_up ? up : gate;
         const uint8_t* blob = (const uint8_t*) grp_ptr[gi];
         const float sc = nvfp4_tail((const void*) blob, L)[is_up ? 1 : 0];
         const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
-        const uint8_t* wra0 = blob + base_off;
+        const uint8_t* tile = smem;   // rows r0 .. r0 + 31 of the half
+        const uint8_t* wra0 = tile + (size_t) g * L.gu_row;
         const uint8_t* wrb0 = wra0 + 8 * L.gu_row;
         const uint8_t* wra1 = wra0 + 16 * L.gu_row;
         const uint8_t* wrb1 = wra0 + 24 * L.gu_row;
+        bool landed = false;
         for (int e = e0; e < e1; e += kFastMoeCols) {
             const int ne = min(kFastMoeCols, e1 - e);
             if (ne <= 2) {
-                const uint8_t* wr_sub = blob + sub_off;
+                if (!landed) { gu_mb_wait(&bar, (unsigned) k & 1u); landed = true; }
+                const uint8_t* wr_sub = tile + (size_t) r_sub_off * L.gu_row;
                 if (ne == 1) {
                     const int off1[1] = { ent_tok[e] * 72 };
                     float s1[1];
@@ -85,6 +128,7 @@ __device__ __forceinline__ void native_gu_nvfp4_mma_stage(dim3 block_idx, dim3 g
                 const int c = idx / kFastGuWords, rem = idx - c * kFastGuWords;
                 s_x[c * kFastGuStride + rem] = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + c] * 72)[rem];
             }
+            if (!landed) { gu_mb_wait(&bar, (unsigned) k & 1u); landed = true; }
             __syncthreads();
             float acc[2][kFastMoeCTiles][4][4] = {};
             for (int m = 0; m < 5; ++m) {
@@ -154,14 +198,18 @@ __device__ __forceinline__ void native_gu_nvfp4_mma_stage(dim3 block_idx, dim3 g
         }
     }
 #else
-    (void) block_idx; (void) grid_dim; (void) tid;
+    (void) block; (void) blocks; (void) tid; (void) smem;
     (void) grp_ptr; (void) grp_start; (void) n_groups; (void) ent_tok; (void) xq; (void) L; (void) gate; (void) up;
     __trap();
 #endif
 }
 
+// The down stage the same way: items (group, 32-row tile of its down rows), a tile one bulk copy (its rows contiguous).
+constexpr int kDnTileBytes = kFastMoeRows * 18 * 36;   // 32 rows of 1152 NVFP4 values (18 blocks of 36 bytes)
+constexpr size_t kDnSmemBytes = (size_t) kDnTileBytes + (size_t) kFastMoeCols * kFastDnStride * 4;
+
 template<bool DEP = false>
-__device__ __forceinline__ void native_down_nvfp4_mma_stage(dim3 block_idx, dim3 grid_dim, int tid,
+__device__ __forceinline__ void native_down_nvfp4_mma_stage(int block, int blocks, int tid, uint8_t* smem,
                                                             const unsigned long long* __restrict__ grp_ptr,
                                                             const int32_t* __restrict__ grp_start,
                                                             const int32_t* __restrict__ n_groups,
@@ -169,32 +217,48 @@ __device__ __forceinline__ void native_down_nvfp4_mma_stage(dim3 block_idx, dim3
                                                             const block_q8_1* __restrict__ hq,
                                                             NativeExpertLayout L,
                                                             float* __restrict__ out) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if constexpr (DEP) {
         pdl_wait();
         pdl_launch_dependents();
     }
-    const int ng = *n_groups;
-    if ((int) block_idx.y >= ng) return;
-    __shared__ __align__(16) uint32_t s_x[kFastMoeCols * kFastDnStride];
+    const int nx = (int) L.n_embd / kFastMoeRows;
+    const int total = *n_groups * nx;
+    if (block >= total) return;
+    __shared__ __align__(8) unsigned long long bar;
+    uint32_t* s_x = reinterpret_cast<uint32_t*>(smem + kDnTileBytes);
     float* s_part = reinterpret_cast<float*>(s_x);
+    if (tid == 0) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(gu_su(&bar)) : "memory");
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
     const int wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int r_sub_off = tid >> 3, t_sub = tid & 7;
-    const int row0 = (int) block_idx.x * kFastMoeRows;
-    const size_t base_off = L.down_off + (size_t) (row0 + g) * L.d_row;
-    const size_t sub_off = L.down_off + (size_t) (row0 + r_sub_off) * L.d_row;
-    for (int gi = (int) block_idx.y; gi < ng; gi += (int) grid_dim.y) {
+    const auto src = [&](int w) {
+        const int gi = w / nx;
+        return (const uint8_t*) grp_ptr[gi] + L.down_off + (size_t) ((w - gi * nx) * kFastMoeRows) * L.d_row;
+    };
+    for (int w = block, k = 0; w < total; w += blocks, ++k) {
+        __syncthreads();   // every thread is done with the tile before (and sees the barrier's init)
+        if (tid == 0) {
+            tile_load(smem, &bar, src(w), (unsigned) kDnTileBytes);
+            if (w + blocks < total) tile_prefetch(src(w + blocks), (unsigned) kDnTileBytes);
+        }
+        const int gi = w / nx, row0 = (w - gi * nx) * kFastMoeRows;
         const uint8_t* blob = (const uint8_t*) grp_ptr[gi];
         const float sc = nvfp4_tail((const void*) blob, L)[2];
         const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
-        const uint8_t* wra0 = blob + base_off;
+        const uint8_t* tile = smem;   // rows row0 .. row0 + 31
+        const uint8_t* wra0 = tile + (size_t) g * L.d_row;
         const uint8_t* wrb0 = wra0 + 8 * L.d_row;
         const uint8_t* wra1 = wra0 + 16 * L.d_row;
         const uint8_t* wrb1 = wra0 + 24 * L.d_row;
+        bool landed = false;
         for (int e = e0; e < e1; e += kFastMoeCols) {
             const int ne = min(kFastMoeCols, e1 - e);
             if (ne <= 2) {
-                const uint8_t* wr_sub = blob + sub_off;
+                if (!landed) { gu_mb_wait(&bar, (unsigned) k & 1u); landed = true; }
+                const uint8_t* wr_sub = tile + (size_t) r_sub_off * L.d_row;
                 if (ne == 1) {
                     const int off1[1] = { e * 36 };
                     float s1[1];
@@ -213,6 +277,7 @@ __device__ __forceinline__ void native_down_nvfp4_mma_stage(dim3 block_idx, dim3
                 const int c = idx / kFastDnWords, rem = idx - c * kFastDnWords;
                 s_x[c * kFastDnStride + rem] = reinterpret_cast<const uint32_t*>(hq + (size_t) (e + c) * 36)[rem];
             }
+            if (!landed) { gu_mb_wait(&bar, (unsigned) k & 1u); landed = true; }
             __syncthreads();
             float acc[2][kFastMoeCTiles][4][4] = {};
             for (int m = 0; m < 3; ++m) {
@@ -282,7 +347,7 @@ __device__ __forceinline__ void native_down_nvfp4_mma_stage(dim3 block_idx, dim3
         }
     }
 #else
-    (void) block_idx; (void) grid_dim; (void) tid;
+    (void) block; (void) blocks; (void) tid; (void) smem;
     (void) grp_ptr; (void) grp_start; (void) n_groups; (void) ent_dst; (void) hq; (void) L; (void) out;
     __trap();
 #endif
