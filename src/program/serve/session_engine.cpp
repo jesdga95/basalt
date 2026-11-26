@@ -108,7 +108,7 @@ public:
         return "quant=" + quant + " gpus=" + ids + " ";
     }
     int init_after_input() override {
-        reserve_checkpoints();
+        if (!reserve_checkpoints()) return 1;
         for (auto& s : sessions_)
             if (const basalt::model::Result r = s->prepare(); !r.ok()) {
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
@@ -361,15 +361,26 @@ public:
         return session().running_restored(pos, from.data());
     }
 
-    /// The host blocks the checkpoints take (page-locked, their pages written) and the device buffer a save is
-    /// snapshotted into, held before the models' RAM and VRAM tiers are sized so they plan beside them.
-    void reserve_checkpoints() {
-        if (o.prompt_cache <= 0) return;
+    /// The pool every chain's checkpoints share (page-locked host blocks, their pages written: what --checkpoint-pool-mib
+    /// fits) and the device buffer a save is snapshotted into, held before the models' RAM and VRAM tiers are sized so
+    /// they plan beside them.  False when the pool fits fewer than two checkpoints.
+    bool reserve_checkpoints() {
+        if (o.prompt_cache <= 0) return true;
         const size_t bytes = session().running_bytes();
-        if (bytes == 0) return;
-        const size_t keep = (size_t) (o.prompt_cache + 1) * (size_t) std::max(o.batch, 1);
-        if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, keep, &basalt::core::kCheckpointPin))
+        check_pool = basalt::program::conv_cache::pool_checkpoints((uint64_t) o.checkpoint_pool_mib << 20, bytes,
+                                                                   o.prompt_cache, o.batch);
+        if (bytes == 0) return true;
+        if (check_pool == 0) {
+            basalt::log::error("basalt serve", "--checkpoint-pool-mib %lld fits fewer than two checkpoints of this model "
+                               "(%zu MiB each): raise it, or turn checkpoints off with --prompt-cache 0",
+                               (long long) o.checkpoint_pool_mib, (bytes + (1u << 20) - 1) >> 20);
+            return false;
+        }
+        if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, check_pool + 1, &basalt::core::kCheckpointPin))
             basalt::log::warn("basalt serve", "checkpoint blocks not reserved: out of host memory");
+        else
+            basalt::log::info("basalt serve", "checkpoint pool: %zu checkpoints of %.1f MiB and one for a save, %.0f MiB page-locked",
+                              check_pool, (double) bytes / 1048576.0, (double) bytes * (double) (check_pool + 1) / 1048576.0);
         if (std::string e; !ckd.reserve(bytes, e)) basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
         basalt::core::RunningState rs;   // a split model's second card keeps a spare of its own part
         if (session().running_state(0, false, rs).ok() && !rs.peer_regions.empty()) {
@@ -378,6 +389,7 @@ public:
             if (std::string e; !ckd_peer.reserve(basalt::core::RunningState::sum(rs.peer_regions), e))
                 basalt::log::warn("basalt serve", "deferred checkpoint copy off on the second card: %s", e.c_str());
         }
+        return true;
     }
 
     basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }

@@ -134,6 +134,9 @@ struct CommonOptions {
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
     /// RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
+    /// --serve: the page-locked RAM, in MiB, the checkpoints of every chain share (the solo session's and every batch
+    /// slot's).  Held from the start; when the chains hold more than it fits, the least recently used checkpoint leaves.
+    int64_t checkpoint_pool_mib = 4096;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;

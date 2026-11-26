@@ -97,7 +97,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
-                 a == "--conversation-cache-min-tokens" || a == "--ram-reserve-mib") {
+                 a == "--conversation-cache-min-tokens" || a == "--ram-reserve-mib" || a == "--checkpoint-pool-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -112,6 +112,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = (int) number;
             else if (a == "--ram-reserve-mib") o.ram_reserve_mib = number;
+            else if (a == "--checkpoint-pool-mib") o.checkpoint_pool_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));

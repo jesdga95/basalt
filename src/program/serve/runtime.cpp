@@ -82,6 +82,25 @@ void Runtime::keep_check(ConvCheckpoint&& c) {
         }
         checks.erase(checks.begin() + (std::ptrdiff_t) victim);
     }
+    for (;;) {   // the pool every chain shares: the solo session's, the one a request in another slot set aside, every slot's
+        std::vector<std::vector<ConvCheckpoint>*> chains{&checks};
+        if (solo_out != nullptr) chains.push_back(&solo_out->checks);
+        for (BSlot& s : bs) chains.push_back(&s.checks);
+        std::vector<std::vector<uint64_t>> stamps(chains.size());
+        size_t held = 0;
+        for (size_t i = 0; i < chains.size(); ++i) {
+            for (const ConvCheckpoint& k : *chains[i]) stamps[i].push_back(k.used);
+            held += chains[i]->size();
+        }
+        if (held <= check_pool) return;
+        const auto [chain, at] = basalt::program::conv_cache::pool_victim(stamps);
+        std::vector<ConvCheckpoint>& ch = *chains[chain];
+        if (ch[at].state_a.data() == ckd.pending()) {
+            ckd_finish();   // a failed save drops its own checkpoint: look again
+            continue;
+        }
+        ch.erase(ch.begin() + (std::ptrdiff_t) at);
+    }
 }
 
 int Runtime::execute() {

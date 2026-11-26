@@ -88,6 +88,8 @@ void usage() {
                  "                       reads, the same math from the last prompt token on, another batch shape's rounding\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
+                 "  --checkpoint-pool-mib N  --serve: page-locked RAM every slot's checkpoints share, held from the start\n"
+                 "                       (default 4096); past it the least recently used checkpoint leaves\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"

@@ -199,8 +199,12 @@ public:
     int ckd_peer_dev = -1;
     /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
     bool touch_check(int64_t to, ConvCheckpoint::Source source);
-    /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.
+    /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache, and past the pool
+    /// (check_pool) the least recently used one of every chain.
     void keep_check(ConvCheckpoint&& c);
+    /// The checkpoints every chain holds together: the pool --checkpoint-pool-mib fits (conv_cache::pool_checkpoints),
+    /// set by the runtime once it knows a checkpoint's bytes.
+    size_t check_pool{};
     uint64_t check_clock{};
     bool cvec_cached{};
     std::optional<basalt::core::ConversationCache> conversations;
