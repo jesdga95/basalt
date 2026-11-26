@@ -1344,6 +1344,19 @@ struct BellServer {
     }
 };
 
+// After a stream's visits have run: the latest rows publication, acquired, and whether the host acknowledged it within a
+// deadline (an all-card visit's stream can finish while the host still reads its rows), before the payload is checked or
+// poisoned again.
+bool rows_acked(CpuBell* bell) {
+    const uint32_t pub = std::atomic_ref<uint32_t>(bell->rows).load(std::memory_order_acquire);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::atomic_ref<uint32_t>(bell->rows_ack).load(std::memory_order_acquire) != pub) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::yield();
+    }
+    return pub != 0;
+}
+
 // Replay a ring/merge graph with a delayed host. Only RAM visits advance the ticket and publish their choices and
 // RAM rows. The merge takes the host's rows only for the matching ticket in each replay.
 void test_cpu_ring() {
@@ -1420,6 +1433,7 @@ void test_cpu_ring() {
                 sv.replay.store(replay);
                 cudaGraphLaunch(exec, st);
                 ok &= cudaStreamSynchronize(st) == cudaSuccess;
+                ok &= rows_acked(bell);   // published, and read and handed back by the host
                 if (grows) {
                     ++served;
                     last_rows = rows;
@@ -1444,9 +1458,8 @@ void test_cpu_ring() {
                         std::memcpy(&bits, &got, 4);
                         ok &= r < rows ? std::memcmp(&got, &gx[(size_t) r * E + c], 4) == 0 : bits == 0xffffffffu;
                     }
-                // published with this visit's shape and acknowledged once read
-                ok &= bell->rows != 0 && bell->rows_ack == bell->rows &&
-                      bell->rows_shape == (1u | (uint32_t) L << 8 | (uint32_t) rows << 16);
+                ok &= std::atomic_ref<uint32_t>(bell->rows_shape).load(std::memory_order_relaxed) ==
+                      (1u | (uint32_t) L << 8 | (uint32_t) rows << 16);   // this visit's shape
                 for (int p = 0; p < kDecodeRows * K; ++p) ok &= ids_m[p] == (grows && p < pairs ? gids[(size_t) p] : -1);
 
                 // The merge without a bell takes the same completed host rows without the hand-off.
@@ -1466,6 +1479,7 @@ void test_cpu_ring() {
                         moe_cpu_ring(di + r * K, 1, K, dt, L, ids_md, bell_d, seq, st);
                         moe_cpu_merge(di + r * K, 1, K, dt, out_md, dy, nullptr, st, bell_d, seq);
                         ok &= cudaStreamSynchronize(st) == cudaSuccess;
+                        ok &= rows_acked(bell);   // before the next row's poison
                         const auto single = host(dy, row_values);
                         ok &= std::memcmp(single.data(), y.data() + (size_t) r * row_values, row_values * sizeof(float)) == 0;
                         if (grows >> r & 1) {
@@ -1478,6 +1492,7 @@ void test_cpu_ring() {
             if (rows == 1 && mode == 0)
                 std::printf("  moe_cpu_rows %.1f us a call (1 row, the host acknowledging each)\n",
                             time_us([&] { moe_cpu_rows(dx, 1, L, x_md, bell_d, seq, nullptr); }));
+            ok &= rows_acked(bell);
             sv.end();
             const uint32_t expected = (uint32_t) served;
             ok &= bell->ring == 0 && bell->ticket == expected && bell->abort == 0;
@@ -1868,6 +1883,25 @@ void test_cpu_rows_reuse() {
         ok &= sv.rings.load() == rung && bell->ring == 0 && bell->ticket == ticket && bell->rows == (uint32_t) sent.size() + 1;
     }
     sv.end();
+    // nobody acknowledges: the second publication waits for the first's acknowledgement until an abort from outside the
+    // stream ends the wait; it then copies and publishes nothing
+    {
+        *bell = CpuBell{};
+        cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
+        const std::vector<float> g1 = randn((size_t) rows * E);
+        basalt::core::device_copy(xa, g1.data(), g1.size() * 4, cudaMemcpyHostToDevice);
+        moe_cpu_rows(xa, rows, L, x_md, bell_d, seq, st);
+        moe_cpu_rows(xb, rows, L, x_md, bell_d, seq, st);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ok &= cudaStreamQuery(st) == cudaErrorNotReady;   // the second is waiting
+        std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        cudaError_t q = cudaErrorNotReady;
+        while ((q = cudaStreamQuery(st)) == cudaErrorNotReady && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ok &= q == cudaSuccess && bell->rows == 1 && bell->rows_ack == 0;
+        ok &= std::memcmp(x_m, g1.data(), g1.size() * 4) == 0;   // the first visit's rows, not overwritten
+    }
     std::printf("%-34s %s\n", "moe_cpu_rows: buffer hand-back", ok ? "ok" : "FAIL");
     failures += !ok;
     cudaGraphExecDestroy(exec);
