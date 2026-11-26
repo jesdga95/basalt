@@ -161,6 +161,7 @@ public:
             joiner_.join();
         }
         if (ra_st_) cudaStreamSynchronize(ra_st_);
+        release_slot_state();
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
@@ -170,7 +171,8 @@ public:
         if (stream_) cudaStreamDestroy(stream_);
     }
 
-    bool init(std::string& err) {
+    bool init(std::string& err, bool secondary = false) {
+        secondary_ = secondary;
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess ||
             cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
@@ -243,28 +245,25 @@ public:
         ea_.resize((size_t) g_.n_layers);
         pea_.resize((size_t) g_.n_layers);
         for (int l = 0; ok && l < g_.n_layers; ++l) {
-            if (g_.swa[(size_t) l]) {
-                cache_[(size_t) l] = (uint8_t*) alloc((size_t) swa_ring() * kRowWidth * elem(), ok);
-            } else {
+            if (!g_.swa[(size_t) l]) {
                 ea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 pea_[(size_t) l] = std::make_unique<core::ElasticArray>();
                 if (!ea_[(size_t) l]->open((uint64_t) ctx * sparse_row_bytes(), err) || !pea_[(size_t) l]->open((uint64_t) pools * g_.idx_dim * 2, err)) return false;
                 cache_[(size_t) l] = ea_[(size_t) l]->data();
                 ipool_[(size_t) l] = (uint16_t*) pea_[(size_t) l]->data();
-                ival_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
-                igate_[(size_t) l] = f((int64_t) kRawRing * g_.idx_dim);
             }
         }
         if (!ok) {
             err = "out of device memory for the session";
             return false;
         }
-        if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
         use(sc_->dec);
-        // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
-        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
-            return false;
-        dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
+        // Secondary batch slots start dormant (0 physical VRAM for rings, elastic KV, and drafter) so solo operation
+        // keeps the full expert tier; ensure_slot_active() wakes them on demand in a few ms when a concurrent request arrives.
+        if (!secondary_) {
+            if (!alloc_slot_state(err)) return false;
+            if (!ensure_positions(kv_base(), err)) return false;
+        }
         return true;
     }
 
@@ -598,6 +597,7 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        if (!ensure_slot_active(err)) return {model::Status::Error, "hy4flash: " + err};
         // the lossy routing flags apply to decode windows only: prompts route as the model does
         struct Lossy {
             core::ExpertTier*& t;
@@ -644,6 +644,7 @@ protected:
     bool batch_ready() const override { return !rope_on_ && m_.diag_dump().empty(); }   // [vision] a picture's rotary table: in turn
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
         release_prompt();
+        if (!ensure_slot_active(err)) return false;
         if (r.pos > (int64_t) hist_.size()) {
             err = "position " + std::to_string(r.pos) + " does not follow the state's " + std::to_string(hist_.size());
             return false;
@@ -707,6 +708,7 @@ public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
+        if (!ensure_slot_active(err)) return {model::Status::Error, "hy4flash: " + err};
         dfly_.invalidate();   // DFLY HOOK
         if (!big_.rows) {   // a prompt starts
             turn_report();
@@ -714,8 +716,9 @@ public:
         }
         if (!big_.rows && elastic()) {   // a prompt starts: its positions against what the caches back and can back
             const int64_t need = std::min<int64_t>(m_.context(), r.pos + std::max(r.total_tokens, r.n_tokens));
-            const int64_t keep = std::max(kv_base(), std::min<int64_t>(m_.context(), (need + kGrowPositions - 1) / kGrowPositions * kGrowPositions));
-            if (backed_ > keep) trim_positions(keep);
+            const int64_t keep = need <= kv_base() ? kv_base()
+                : std::min<int64_t>(m_.context(), (need + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
+            if (backed_ > keep) trim_kv(keep);
             if (need > backed_) {
                 const int64_t ceiling = kv_ceiling();
                 if (need > ceiling)
@@ -789,6 +792,7 @@ public:
         img_start_ = rope_.next();
         img_nx_ = grid.nx;
         std::string err;
+        if (!ensure_slot_active(err)) return {model::Status::Error, "hy4flash: " + err};
         if (!open_prompt(n_rows, err)) return {model::Status::Error, "hy4flash: " + err};
         const std::vector<int32_t> dead((size_t) rows_, -1);
         for (int at = 0; at < n_rows; at += rows_) {
@@ -808,15 +812,109 @@ public:
         std::string e;
         if (!ensure_tier(e)) return {model::Status::Error, "hy4flash: " + e};
         if (elastic())
-            core::log_elastic_kv_ceiling(kv_ceiling(), m_.sessions(), (int64_t) m_.sessions() * m_.context(), (int64_t) (prompt_floor_bytes() / stride_));
+            core::log_elastic_kv_ceiling(kv_ceiling_total(), m_.sessions(), (int64_t) m_.sessions() * m_.context(), (int64_t) (prompt_floor_bytes() / stride_));
         return {};
     }
 
-    // ---- the elastic KV (core/elastic_kv.hpp): with a context above kElasticKvBase a session backs its first kElasticKvBase
-    // positions at start; more come out of the expert tier when a prompt or a generation needs them (ensure_positions), and a
-    // later prompt that needs fewer gives them back (trim_positions), so a short conversation decodes with the larger tier.
-    bool elastic() const { return m_.context() > core::kElasticKvBase; }
-    int64_t kv_base() const { return std::min<int64_t>(m_.context(), core::kElasticKvBase); }
+    // ---- the elastic KV (core/elastic_kv.hpp): with a context above kv_base_limit() a session backs its first kv_base()
+    // positions at start (kElasticKvBase solo, kElasticKvBaseBatch with --batch); more come out of the expert tier when a
+    // prompt or a generation needs them (ensure_positions), and a later prompt or idle park gives them back (trim_kv).
+    int64_t kv_base_limit() const { return m_.sessions() > 1 ? core::kElasticKvBaseBatch : core::kElasticKvBase; }
+    bool elastic() const { return m_.context() > kv_base_limit(); }
+    int64_t kv_base() const { return std::min<int64_t>(m_.context(), kv_base_limit()); }
+    bool kv_above_base() const override {
+        if (secondary_) return active_state_ || backed_ > 0;
+        return elastic() && backed_ > kv_base();
+    }
+    size_t slot_state_bytes() const {
+        size_t n = running_bytes();
+        if (m_.dfly()) n += 128ull << 20;
+        return n;
+    }
+    bool alloc_slot_state(std::string& err) {
+        bool ok = true;
+        auto alloc_ring = [&](size_t bytes) -> void* {
+            void* p = nullptr;
+            if (!ok || cudaMalloc(&p, std::max<size_t>(bytes, 16)) != cudaSuccess) {
+                ok = false;
+                return nullptr;
+            }
+            ring_allocs_.push_back(p);
+            return p;
+        };
+        for (int l = 0; ok && l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) {
+                cache_[(size_t) l] = (uint8_t*) alloc_ring((size_t) swa_ring() * kRowWidth * elem());
+            } else {
+                ival_[(size_t) l] = (float*) alloc_ring((size_t) kRawRing * g_.idx_dim * 4);
+                igate_[(size_t) l] = (float*) alloc_ring((size_t) kRawRing * g_.idx_dim * 4);
+            }
+        }
+        if (ok) {
+            ok = dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), m_.context(),
+                            [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err);
+            if (ok) dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
+        }
+        if (!ok) {
+            release_slot_state();
+            if (err.empty()) err = "out of device memory for the session";
+            return false;
+        }
+        active_state_ = true;
+        return true;
+    }
+    void release_slot_state() {
+        if (stream_ && (!ring_allocs_.empty() || dfly_.on())) cudaStreamSynchronize(stream_);
+        for (cudaGraphExec_t& g : gx_)
+            if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+        for (cudaGraphExec_t& g : gbx_)
+            if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+        dfly_.release();
+        for (void* p : ring_allocs_) cudaFree(p);
+        ring_allocs_.clear();
+        for (int l = 0; l < g_.n_layers; ++l) {
+            if (g_.swa[(size_t) l]) {
+                if ((size_t) l < cache_.size()) cache_[(size_t) l] = nullptr;
+            } else {
+                if ((size_t) l < ival_.size()) ival_[(size_t) l] = nullptr;
+                if ((size_t) l < igate_.size()) igate_[(size_t) l] = nullptr;
+            }
+        }
+        active_state_ = false;
+    }
+    bool ensure_slot_active(std::string& err) {
+        if (active_state_) return true;
+        if (!ensure_tier(err)) return false;
+        const double t0 = now_ms();
+        bool lent = false;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            std::string e;
+            if (alloc_slot_state(e)) {
+                if (lent && tier_) {
+                    std::string r;
+                    if (!tier_->reclaim(r)) basalt::log::warn("basalt hy4flash", "waking slot: tier reclaim: %s", r.c_str());
+                }
+                basalt::log::info("basalt hy4flash", "secondary slot woke in %.1f ms (%.0f MiB rings + drafter)",
+                                  now_ms() - t0, (double) running_bytes() / 1048576.0);
+                return true;
+            }
+            if (!tier_ || attempt == 3) {
+                if (lent && tier_) { std::string r; tier_->reclaim(r); }
+                err = e;
+                return false;
+            }
+            cudaStreamSynchronize(stream_);
+            if (attempt == 0) {
+                tier_->shrink();
+            } else if (attempt == 1 && tier_->partial_lend() && tier_->lend(slot_state_bytes() + kExpertLendSegment)) {
+                lent = true;
+            } else {
+                tier_->lend_all();
+                lent = true;
+            }
+        }
+        return false;
+    }
     // device bytes a position takes in the sparse layers' caches (its row and a quarter of a pooled key)
     double cell_bytes() const {
         int sparse = 0;
@@ -827,25 +925,62 @@ public:
     // (open_prompt falls back to per-layer staging when it does not fit)
     static constexpr uint64_t kPromptFloorBuffers = 1ull << 30;
     uint64_t prompt_floor_bytes() const { return kPromptFloorBuffers; }
-    // the positions the caches can back before the expert tier's slots and the free memory above its floor would no longer hold
-    // a prompt chunk's needs
-    int64_t kv_ceiling() override {
-        if (!elastic() || !tier_) return -1;
+    double kv_spare_bytes() const {
         size_t free_b = 0, total_b = 0;
         basalt::core::gpu_mem_info(&free_b, &total_b);
-        const double spare = (double) free_b - (double) tier_->free_floor() + (double) tier_->slots() * (double) stride_ - (double) prompt_floor_bytes();
-        return std::min<int64_t>(m_.context(), backed_ + (int64_t) (std::max(0.0, spare) / cell_bytes()));
+        return (double) free_b - (double) tier_->free_floor() + (double) tier_->slots() * (double) stride_ - (double) prompt_floor_bytes();
     }
-    // the backing past `keep` positions goes back to the driver (the tier takes it at the prompt's end)
+    // the positions this session can back before the expert tier's slots and free memory above its floor would no longer
+    // hold a prompt chunk's needs
+    int64_t kv_ceiling() override {
+        if (!elastic() || !tier_) return -1;
+        return std::min<int64_t>(m_.context(), backed_ + (int64_t) (std::max(0.0, kv_spare_bytes()) / cell_bytes()));
+    }
+    // total positions across all sessions at start (for the startup ceiling line; secondary slots start dormant)
+    int64_t kv_ceiling_total() const {
+        if (!elastic() || !tier_) return -1;
+        const int64_t full = (int64_t) m_.sessions() * m_.context();
+        const double dormant_cost = (double) std::max(0, m_.sessions() - 1) * (double) slot_state_bytes();
+        return std::min<int64_t>(full, backed_ + (int64_t) (std::max(0.0, kv_spare_bytes() - dormant_cost) / cell_bytes()));
+    }
+    // the backing past `keep` positions goes back to the driver
     void trim_positions(int64_t keep) {
         cudaStreamSynchronize(stream_);
         for (int l = 0; l < g_.n_layers; ++l) {
             if (g_.swa[(size_t) l]) continue;
-            ea_[(size_t) l]->trim((uint64_t) keep * sparse_row_bytes());
-            pea_[(size_t) l]->trim((uint64_t) (keep / g_.idx_pool + 1) * g_.idx_dim * 2);
+            ea_[(size_t) l]->trim(keep <= 0 ? 0 : (uint64_t) keep * sparse_row_bytes());
+            pea_[(size_t) l]->trim(keep <= 0 ? 0 : (uint64_t) (keep / g_.idx_pool + 1) * g_.idx_dim * 2);
         }
         basalt::log::info("basalt hy4flash", "elastic KV: %lld -> %lld positions backed", (long long) backed_, (long long) keep);
         backed_ = keep;
+    }
+    int64_t trim_kv(int64_t keep) override {
+        if (!elastic()) return 0;
+        if (secondary_ && keep <= 0) {
+            const bool was_active = active_state_;
+            const int64_t freed = backed_;
+            if (backed_ > 0) trim_positions(0);
+            if (active_state_) release_slot_state();
+            if ((freed > 0 || was_active) && tier_ && !big_.rows) {
+                std::string e;
+                if (!tier_->reclaim(e, /*restore=*/true))
+                    basalt::log::warn("basalt hy4flash", "elastic KV trim: tier reclaim failed: %s", e.c_str());
+                tier_->grow();
+            }
+            return freed > 0 ? freed : (was_active ? 1 : 0);
+        }
+        const int64_t target = keep <= kv_base() ? kv_base()
+            : std::min<int64_t>(m_.context(), (keep + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
+        if (backed_ <= target) return 0;
+        const int64_t freed = backed_ - target;
+        trim_positions(target);
+        if (tier_ && !big_.rows) {
+            std::string e;
+            if (!tier_->reclaim(e, /*restore=*/true))
+                basalt::log::warn("basalt hy4flash", "elastic KV trim: tier reclaim failed: %s", e.c_str());
+            tier_->grow();
+        }
+        return freed;
     }
 
     ExpertCounts expert_counts() const override {
@@ -914,6 +1049,11 @@ public:
     }
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
+        if (save && !active_state_) return {model::Status::Error, "hy4flash: dormant slot has no running state"};
+        if (!save) {
+            std::string e;
+            if (!ensure_slot_active(e)) return {model::Status::Error, "hy4flash: " + e};
+        }
         if (save && (int64_t) hist_.size() - pos > kAttRows)
             return {model::Status::Error, "hy4flash: the rings have moved on more than " + std::to_string(kAttRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "hy4flash: a checkpoint past the session's position"};
@@ -973,7 +1113,7 @@ public:
 
     model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
         std::string e;
-        if (!ensure_positions(positions, e)) return {model::Status::Error, "hy4flash: " + e};
+        if (!ensure_slot_active(e) || !ensure_positions(positions, e)) return {model::Status::Error, "hy4flash: " + e};
         cudaStreamSynchronize(stream_);
         const int64_t pools = positions / g_.idx_pool + 1;
         size_t i = 0;
@@ -2851,7 +2991,8 @@ private:
     bool ensure_positions(int64_t positions, std::string& err) {
         grow_failed_ = false;
         if (positions <= backed_) return true;
-        const int64_t target = std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
+        const int64_t target = positions <= kv_base() ? kv_base()
+            : std::min<int64_t>(m_.context(), (positions + kGrowPositions - 1) / kGrowPositions * kGrowPositions);
         const uint64_t keep = tier_ ? tier_->free_floor() : 256ull << 20;
         bool lent = false, lent_all = false;
         for (int attempt = 0; attempt < 4; ++attempt) {
@@ -3082,6 +3223,9 @@ private:
     std::vector<float*> ival_, igate_;
     std::vector<uint16_t*> ipool_;   // fp16 pooled keys
     DflyHook dfly_;   // DFLY HOOK
+    bool secondary_ = false;
+    bool active_state_ = false;
+    std::vector<void*> ring_allocs_;
     std::vector<std::unique_ptr<core::ElasticArray>> ea_, pea_;
     int64_t backed_ = 0;   // positions the sparse layers' caches are backed for
     std::vector<int32_t> hist_, picks_;
@@ -3111,9 +3255,9 @@ private:
 
 }  // namespace
 
-std::unique_ptr<model::ModelSession> make_session(Hy4Model& model, std::string& err) {
+std::unique_ptr<model::ModelSession> make_session(Hy4Model& model, std::string& err, bool secondary) {
     auto s = std::make_unique<Session>(model);
-    if (!s->init(err)) return nullptr;
+    if (!s->init(err, secondary)) return nullptr;
     return s;
 }
 

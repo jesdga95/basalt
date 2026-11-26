@@ -209,8 +209,9 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         basalt::core::gpu_mem_info(&free_b, &total_b);
         int sparse = 0;
         for (int l = 0; l < g.n_layers; ++l) sparse += !g.swa[(size_t) l];
+        const int n_sessions = std::max(req.sessions, 1);
         const ctxp::Plan p = ctxp::plan_context(req.max_context > 0 ? req.max_context : kDefaultContext, g.context_length,
-                                                free_b / (uint64_t) std::max(req.sessions, 1), sparse, fp8_);
+                                                free_b / (uint64_t) n_sessions, sparse, fp8_, n_sessions);
         if (!p.error.empty()) return {model::Status::Error, "hy4flash: " + p.error};
         ctx_ = p.context;
     }
@@ -230,7 +231,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     planning_ = &reads;
     model::Result r;
     for (int i = 0; r.ok() && i < std::max(req.sessions, 1); ++i) {
-        std::unique_ptr<model::ModelSession> s = make_session(*this, err);
+        std::unique_ptr<model::ModelSession> s = make_session(*this, err, /*secondary=*/i > 0);
         if (!s) r = {model::Status::Error, "hy4flash: " + err};
         else sessions.push_back(std::move(s));
     }

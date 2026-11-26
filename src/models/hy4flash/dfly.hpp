@@ -222,6 +222,7 @@ public:
     /// `fp8`: the target's sparse caches hold --kv fp8 rows.
     bool init(const DflyWeights* w, int sel_cap, int64_t ctx, std::function<bool(int32_t, float*)> embed,
               const std::string& dump, bool fp8, std::string& err);
+    void release() { tap_.reset(); runner_.reset(); row0_ = -1; pending_ = 0; }
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
     void invalidate() { if (tap_) tap_->invalidate(); }
