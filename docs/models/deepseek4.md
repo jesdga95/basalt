@@ -9,7 +9,7 @@ The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted f
 ## Model path
 
 1. Validate and describe `general.architecture=deepseek4` metadata, including geometry, compression schedule, MoE routing, tokenizer, context and multimodal fields.
-2. Parse the Basalt pack into a V4-specific `Pack`/`Geometry`; validate tensor presence, shapes, storage types and per-layer schedule before allocating runtime state.
+2. Parse the Basalt pack into a V4-specific `Pack`/`Geometry`; validate tensor presence, shapes, storage types and per-layer schedule before allocating runtime state. `ds4_pack_test` opens the converted checkpoint through the C++ reader and passes the 43-layer geometry, all tensor shape/type checks, hash tables, expert layout and vision section checks.
 3. Load embeddings, attention projections, mHC matrices, indexer, router/hash tensors, shared expert and routed experts. Reuse DeepSeek-V4.1 expert-tier placement and file/RAM/VRAM read mechanisms where tensor formats match; reject unsupported storage explicitly.
 4. Implement text prefill and decode with V4's attention and cache contracts. Integrate V4-specific compression states and attention indexing. Share only shape-compatible projection and mHC primitives with V4.1.
 5. Add the model's tokenizer/chat dialect and serving registration. Keep checkpoints, batch execution and peer execution semantically equivalent to single-session execution.
