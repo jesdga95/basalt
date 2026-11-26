@@ -3,7 +3,8 @@
 Sent only for a request with tools or a JSON response format, and only when the server option is on or the request
 sets strict: true on the schema or on a tool function. A JSON format with tools offered (tool_choice auto) holds the
 answer to tool calls or the JSON value; a forced call keeps the tools grammar alone. For a model that thinks in blocks
-of its reply, a request whose thinking is off also says "think": false (Service.run): it answers at once."""
+of its reply, a request whose thinking is off also says "think": false (Service.run): it answers at once. Without any
+grammar that request sends {"kind": "text", "calls": <tools offered>, "think": false}."""
 from __future__ import annotations
 
 import json
@@ -11,6 +12,7 @@ import json
 from serve.frontend import tool_choice_of
 
 REQUEST_KEY = "_grammar"        # in the request dict handed to the engine
+GPROMPT_KEY = "_gprompt"        # token count of the original prompt when generated/forced tokens follow it
 
 
 def _strict(value) -> bool:
@@ -44,10 +46,14 @@ def grammar_spec(enabled: bool, tools, tool_choice, raw_tools, response_format) 
     if not tools:
         return answer
     calls = [_as_function(t) for t in tools]
-    if answer and tool_choice_of(tool_choice)[0] == "auto":
+    kind_tc, forced_name = tool_choice_of(tool_choice)
+    if answer and kind_tc == "auto":
         return dict(answer, tools=calls)
     if enabled or _strict(raw_tools):
-        return {"kind": "tools", "tools": calls, "tool_choice": "auto" if tool_choice is None else tool_choice}
+        tc = "auto" if tool_choice is None else tool_choice
+        if kind_tc == "named" and isinstance(tool_choice, dict) and tool_choice.get("namespace"):
+            tc = {"type": "function", "function": {"name": forced_name}}
+        return {"kind": "tools", "tools": calls, "tool_choice": tc}
     return None
 
 
@@ -63,4 +69,9 @@ def engine_key(spec: dict | None) -> str:
         return ""
     text = json.dumps(spec, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     return " grammar=" + text.replace(" ", "\\u0020")
+
+
+def gprompt_key(gprompt) -> str:
+    """The engine protocol's ` gprompt=<N>` when generated or forced tokens already follow the prompt."""
+    return f" gprompt={int(gprompt)}" if gprompt is not None and int(gprompt) > 0 else ""
 

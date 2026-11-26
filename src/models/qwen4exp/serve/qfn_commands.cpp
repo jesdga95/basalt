@@ -1,4 +1,5 @@
 // src/models/qwen4exp/serve/qfn_commands.cpp - the protocol commands that reach Flash-Next's tiers.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/program/qwen_forms.hpp"
 #include "models/qwen4exp/adapter.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
@@ -165,7 +166,7 @@ void QfnRuntime::print_info() {
     // what the server's Monitor tab shows (the server skips unknown lines until READY)
     {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
         const int64_t slots_primary = (int64_t) xcache.slots();
         const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);

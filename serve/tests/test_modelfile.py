@@ -237,7 +237,7 @@ class Cli(Tmp):
         (self.engine_bin.parent / "basalt-vision").write_text("")
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
 
-        def plan(engine_bin, path, value, words):        # the engine's own choice for --gpu 0
+        def plan(engine_bin, path, value, words, mode=None, share=None):        # the engine's own choice for --gpu 0
             return {"devices": [0], "cards": [{"smi": 0}], "notes": [], "warning": None}
         def name(index):                                 # nvidia-smi knows card 9 (an older card), not card 8
             return None if index == 8 else "GeForce RTX 3070"

@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -66,15 +67,20 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         for (int64_t m = 0; m < l; ++m) qi += is_qsa_layer(*g_, m) ? 1 : 0;
         for (SessionState* x : slots) {
             const QsaState& st = x->qsa_states[qi];
-            if (st.kv_mode > 1 || !st.kv_int8 || st.kv_rot || st.kv_hybrid || st.kv_q4) {
+            if (st.kv_mode > 1 || st.kv_rot || st.kv_hybrid || st.kv_q4) {
                 err = "verify: batch windows need INT8 K/V without rotation, resident or streamed (--kv int8)";
                 return false;
             }
-            if (st.kv_mode == 1 && st.n_slots < basalt::kernels::kKvStreamMinSlots) {   // one step of the resolve's sweep
+            // FP16 is supported by the batch chain only resident: the streamed resolve copies INT8 pools.
+            if (!st.kv_int8 && st.kv_mode != 0) {
+                err = "verify: a batch window's FP16 K/V must be resident (drop --kv-resident)";
+                return false;
+            }
+            if (st.kv_int8 && st.kv_mode == 1 && st.n_slots < basalt::kernels::kKvStreamMinSlots) {
                 err = "verify: a streamed slot holds too few pages for the resolve; raise --kv-resident";
                 return false;
             }
-            batch_stream_ = batch_stream_ || st.kv_mode == 1;
+            batch_stream_ = batch_stream_ || (st.kv_int8 && st.kv_mode == 1);
         }
     }
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
@@ -99,7 +105,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     {   // static per-slot pointers: the PLE histories and, per QSA layer, the slots' caches and indexer state
         std::vector<float*> ph((size_t) S);
         for (int64_t i = 0; i < S; ++i) ph[(size_t) i] = slots[(size_t) i]->ple_hist;
-        cudaMemcpy(d_ple_slots_, ph.data(), (size_t) S * sizeof(float*), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(d_ple_slots_, ph.data(), (size_t) S * sizeof(float*), cudaMemcpyHostToDevice);
         d_qslots_.assign((size_t) nQ, nullptr);
         QsaSegSlot* dev = (QsaSegSlot*) ((uint8_t*) d + b5);
         for (int64_t l = lb_; l < le_; ++l) {
@@ -117,7 +123,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
                 e.tail_snap = tail_snap_b_ + ((size_t) i * nQ + qi) * TS;
                 e.block_pos = st.idx_block_pos; e.max_cells = (int32_t) st.max_cells;
             }
-            cudaMemcpy(dev, hs.data(), (size_t) S * sizeof(QsaSegSlot), cudaMemcpyHostToDevice);
+            basalt::core::device_copy(dev, hs.data(), (size_t) S * sizeof(QsaSegSlot), cudaMemcpyHostToDevice);
             d_qslots_[(size_t) qi] = dev;
             dev += S;
         }

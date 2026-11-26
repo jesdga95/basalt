@@ -42,6 +42,15 @@ struct DsparkGeometry {
     std::vector<bool> swa;           ///< per drafter layer
 };
 
+/// The DFlash 2 block drafter's settings (`inkling2.dflash2.*`), present when embedded in place of DSpark.
+struct Dflash2Geometry {
+    bool present = false;
+    int n_layers = 0, block = 0, mask_id = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0, window = 0;
+    int conv_kernel = 0, conv_group = 0, selector_rank = 0, selector_top_k = 0;
+    float logit_softcap = 30.f, rope_base = 1e4f, rms_eps = 1e-6f;
+    std::vector<int> targets;        ///< visits whose input it reads; the last is the visit count (the final normed state)
+};
+
 struct TensorRef {
     std::string name;
     int type = 0;
@@ -59,6 +68,7 @@ struct Pack {
     core::ModelFile file;
     Geometry geo;
     DsparkGeometry dspark;
+    Dflash2Geometry dflash2;
     std::map<std::string, TensorRef> tensors;
     std::vector<ExpertLayer> experts;      ///< per layer
     core::FileRange experts_range;

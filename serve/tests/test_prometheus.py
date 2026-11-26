@@ -99,6 +99,23 @@ class UnitPrometheus(unittest.TestCase):
         assert_valid_prometheus(self, text)
         self.assertIn(r'model_name="a\"b\\c\nd"', text)
 
+    def test_large_counters_keep_subsecond_precision(self):
+        stats = PromStats()
+        stats.e2e.observe(100000.0)
+        stats.e2e.observe(0.125)
+        m = {
+            "engine": {"model": "TestModel", "max_context": 4096},
+            "live": {"state": "idle"},
+            "totals": {"prompt_ms": 1_000_000_250.0, "decode_ms": 1_234_567_890.0},
+        }
+        text = render_prometheus([(m, stats.snapshot())])
+        assert_valid_prometheus(self, text)
+        self.assertIn('basalt_prompt_seconds_total{model_name="TestModel"} 1000000.25', text)
+        self.assertIn('basalt_decode_seconds_total{model_name="TestModel"} 1234567.89', text)
+        self.assertIn('basalt_request_duration_seconds_sum{model_name="TestModel"} 100000.125', text)
+        self.assertIn('le="1"', text)
+        self.assertIn('le="0.01"', text)
+
 
 class SingleModelMetrics(unittest.TestCase):
     def setUp(self):
@@ -212,6 +229,33 @@ class MultiModelAndAuthMetrics(unittest.TestCase):
 
         status, _, _ = self.get("/metrics?format=prometheus&model=NoSuch", hdrs)
         self.assertEqual(status, 404)
+
+
+class SpillAndTelemetry(unittest.TestCase):
+    def test_prometheus_renders_dict_spill(self):
+        from serve.prometheus import PromStats, render_prometheus
+        metrics = {
+            "engine": {
+                "model": "TestModel",
+                "max_context": 4096,
+                "spill": {"experts": 34, "total": 3072, "bytes": 193273528},
+                "expert_total": 3072,
+            },
+            "live": {"state": "idle"},
+            "totals": {},
+        }
+        text = render_prometheus([(metrics, PromStats().snapshot())])
+        assert_valid_prometheus(self, text)
+        self.assertIn('basalt_experts_spilled{model_name="TestModel"} 34', text)
+        self.assertIn('basalt_experts{model_name="TestModel"} 3072', text)
+
+    def test_telemetry_disk_handles_none_counters(self):
+        from types import SimpleNamespace
+        from serve.util.telemetry import Telemetry
+        t = Telemetry.__new__(Telemetry)
+        t.ps = SimpleNamespace(disk_io_counters=lambda: None)
+        t._disk_prev = None
+        self.assertIsNone(t._disk())
 
 
 if __name__ == "__main__":

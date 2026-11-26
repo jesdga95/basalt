@@ -9,7 +9,6 @@ int dispatch(Context& context) {
     auto& ppl_base = *context.ppl_base;
     auto& ppl_out = *context.ppl_out;
     auto& model_file = *context.model_file;
-    auto& peer_streamed_share = *context.peer_streamed_share;
     auto& split_at = *context.split_at;
     auto& split_devs = *context.split_devs;
     auto& split_same = *context.split_same;
@@ -69,9 +68,9 @@ int dispatch(Context& context) {
     auto& split_hand_rows = *context.split_hand_rows;
     auto& split_chunk_cap = *context.split_chunk_cap;
     auto& split_peer_rows = *context.split_peer_rows;
-    auto& split_price = context.split_price;
+    auto& split_part = context.split_part;
     auto& split_layers_text = context.split_layers_text;
-    auto& split_stages_text = context.split_stages_text;
+    auto& split_cuts = *context.split_cuts;
     auto& split_stages = *context.split_stages;
 
     // Where the routed experts live, fastest tier first, and a warning when any of them is only in the file (decode
@@ -116,10 +115,32 @@ int dispatch(Context& context) {
                      pct(b_ram + b_top), (double) b_file / kGiB, pct(b_file), total / kGiB);
         std::string levers = ", or a smaller quant";
         if (!o.resident_cpu_experts) levers += ", --resident-experts";
-        if (o.peer_device < 1) levers += ", --gpu 0,1";
+        if (o.peer_device < 1) levers += ", gpu 0,1 with gpu-mode peer";
         if (o.batch > 1) levers += ", fewer --parallel slots";
         basalt::program::warn_spill(tier_spill, levers);
     };
+    if (o.gpus.cards.size() > 1) {   // the start line after the load: each card's part
+        std::vector<std::string> parts(o.gpus.cards.size());
+        auto experts = [&](int64_t n, double gib) {
+            char b[64];
+            std::snprintf(b, sizeof b, "%lld experts (%.1f GiB)", (long long) n, gib);
+            return std::string(b);
+        };
+        if (o.gpus.mode == basalt::program::GpuMode::Split) {
+            // each card's expert cache beside its layers (both stages share CUDA0's under --diag-gpu-same)
+            context.split->part = [&](size_t c) {
+                if (c == 0) return experts(xcache.slots(), xcache.gib());
+                return multi_gpu && c - 1 < stages.size() ? experts(stages[c - 1]->cache.slots(), stages[c - 1]->cache.gib())
+                                                          : std::string();
+            };
+            for (size_t c = 0; c < parts.size(); ++c) parts[c] = context.split->split_report(c);
+            context.split->part = nullptr;   // (its captures end with this block)
+        } else {
+            for (size_t c = 0; c < parts.size(); ++c) parts[c] = context.peers->peer_report(c);
+        }
+        const std::string line = basalt::model::gpu_parts_line(o.gpus, parts);
+        if (!line.empty()) basalt::log::info("basalt", "%s", line.c_str());
+    }
     if (!o.serve) report_expert_tiers();
     if (o.serve) {
         basalt::models::qwen4exp::serve::Context context{
@@ -127,7 +148,6 @@ int dispatch(Context& context) {
             .ppl_base = ppl_base,
             .ppl_out = ppl_out,
             .model_file = model_file,
-            .peer_streamed_share = peer_streamed_share,
             .split_at = split_at,
             .split_devs = split_devs,
             .split_same = split_same,
@@ -186,9 +206,9 @@ int dispatch(Context& context) {
             .split_hand_rows = split_hand_rows,
             .split_chunk_cap = split_chunk_cap,
             .split_peer_rows = split_peer_rows,
-            .split_price = split_price,
+            .split_part = split_part,
             .split_layers_text = split_layers_text,
-            .split_stages_text = split_stages_text,
+            .split_cuts = split_cuts,
             .split_stages = split_stages,
             .tier_spill = tier_spill,
             .report_expert_tiers = report_expert_tiers,

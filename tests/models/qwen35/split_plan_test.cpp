@@ -1,17 +1,17 @@
-// tests/models/qwen35/split_plan_test.cpp - dense::plan_split on Qwen3.8-27B's bytes: the main card alone when the model
-// fits it, else the cut that puts the most layers on the faster of two unlike cards or halves the layers' bytes between alike
-// ones, an error when neither fits, and a forced cut taken as given when it fits.  The bytes are what the 27B pack (NVFP4 layers,
-// FP8 head, block drafter) and dense::split_inputs give for each setting; the free memory is what the cards report at start.
-#include "basalt/dense/split_plan.hpp"
+// tests/models/qwen35/split_plan_test.cpp - a two-card split of Qwen3.8-27B by the shares (model::split_cut) on its bytes:
+// the cut follows the cards' free memory, or gpu-share, or --diag-gpu-cut; a card whose part does not fit is refused with
+// its numbers.  The bytes are what the 27B pack (NVFP4 layers, FP8 head, block drafter) and dense::split_spec give for each
+// setting; the free memory is what the cards report at start.
+#include "basalt/model/multi_gpu.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using basalt::dense::SplitCard;
-using basalt::dense::SplitInputs;
-using basalt::dense::SplitPlan;
+using basalt::model::GpuCards;
+using basalt::model::SplitCut;
+using basalt::model::SplitSpec;
 
 namespace {
 
@@ -29,76 +29,74 @@ constexpr uint64_t kPeerFixed = 2165045508;                           // the sec
 constexpr uint64_t kMargin = 512ull << 20;
 constexpr uint64_t k5090 = 32622837760, k16GB = 15979839488;          // free at start: RTX 5090, a 16 GB card
 
-SplitCard card(uint64_t free, double gbps) { return {free - kMargin, gbps}; }
+// two cards with this much free at start (the share's default) and the room past the margin the 27B keeps
+GpuCards cards(uint64_t free0, uint64_t free1, std::vector<double> given = {}, int diag = 0) {
+    GpuCards c;
+    c.mode = basalt::program::GpuMode::Split;
+    c.given = given;
+    c.diag_cut = diag;
+    for (int i = 0; i < 2; ++i) {
+        GpuCards::Card k;
+        k.device = i;
+        k.index = i;
+        k.label = "GPU " + std::to_string(i);
+        k.free = i == 0 ? free0 : free1;
+        c.cards.push_back(k);
+    }
+    return c;
+}
 
 // every fourth layer attention; `attn_slot`: a slot's cells in an attention layer at the setting's context and KV format
-SplitInputs inputs(uint64_t attn_slot, int slots, uint64_t main_fixed, SplitCard main, SplitCard peer, int forced = 0) {
-    SplitInputs in;
+SplitSpec spec(uint64_t attn_slot, int slots, uint64_t main_fixed, uint64_t free0, uint64_t free1) {
+    SplitSpec s;
     for (int l = 0; l < 64; ++l) {
         const bool attn = l % 4 == 3;
-        in.layer.push_back(attn ? kAttnLayer : kGdnLayer);
-        in.per_slot.push_back(attn ? attn_slot : kGdnSlot);
+        s.layer.push_back((attn ? kAttnLayer : kGdnLayer) + (uint64_t) slots * (attn ? attn_slot : kGdnSlot));
     }
-    in.slots = slots;
-    in.main_fixed = main_fixed + (uint64_t) (slots - 1) * kSlotRest;
-    in.peer_fixed = kPeerFixed;
-    in.main = main;
-    in.peer = peer;
-    in.forced = forced;
-    return in;
+    s.fixed = {main_fixed + (uint64_t) (slots - 1) * kSlotRest, kPeerFixed};
+    s.room = {free0 - kMargin, free1 - kMargin};
+    return s;
 }
 
-void expect(const char* what, const SplitInputs& in, int cut) {
-    const SplitPlan p = basalt::dense::plan_split(in);
-    const bool fits = p.error.empty() && p.main_bytes <= in.main.free && p.peer_bytes <= in.peer.free;
-    check(p.cut == cut && fits, std::string(what) + ": cut " + std::to_string(p.cut) + " (want " + std::to_string(cut) + ")" +
-                                    (p.error.empty() ? "" : ", " + p.error));
+void expect(const char* what, const GpuCards& c, const SplitSpec& s, int lo, int hi) {
+    const SplitCut cut = basalt::model::split_cut(c, s);
+    const int at = cut.first.size() > 1 ? cut.first[1] : 0;
+    check(cut.error.empty() && at >= lo && at <= hi, std::string(what) + ": cut " + std::to_string(at) + " (want " + std::to_string(lo) +
+                                                         "-" + std::to_string(hi) + ")" + (cut.error.empty() ? "" : ", " + cut.error));
 }
 
-void expect_error(const char* what, const SplitInputs& in) {
-    const SplitPlan p = basalt::dense::plan_split(in);
-    check(!p.error.empty() && p.cut == 0, std::string(what) + ": refused (" + p.error + ")");
+void expect_error(const char* what, const GpuCards& c, const SplitSpec& s, const std::string& start) {
+    const SplitCut cut = basalt::model::split_cut(c, s);
+    check(cut.error.rfind(start, 0) == 0, std::string(what) + ": refused (" + cut.error + ")");
 }
 
 }  // namespace
 
 int main() {
     constexpr uint64_t fp16_8k = 33555456, fp16_262k = 1073742848, int8_128k = 276825088, int8_262k = 553649152;
-    const SplitCard r5090 = card(k5090, 1792), r5060 = card(k16GB, 448), r5070 = card(k16GB, 896);
-    // RTX 5090 + RTX 5060 Ti: unlike cards, the most layers on the 5090
-    expect("32+16, 8K fp16 (fits the main card)", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060), 0);
-    expect("32+16, 262K fp16", inputs(fp16_262k, 1, kMainFixed, r5090, r5060), 55);
-    expect("32+16, 262K int8, two slots", inputs(int8_262k, 2, kMainFixed, r5090, r5060), 51);
-    {   // --parallel 2 through the server (every kernel loaded at start: less free); these cut the model, then ran short at load
-        // while each weight was an allocation of its own, rounded up to the allocator's 2 MiB pages
-        const SplitCard m5090{32515883008ull, 1792}, m5060{15872884736ull, 448};   // free past the margin, as planned
-        const auto two = [&](uint64_t attn_slot) {
-            SplitInputs in = inputs(attn_slot, 2, kMainFixed, m5090, m5060);
-            in.main_fixed = 5981882116ull;   // head, drafter, scratch, both slots' logits and drafter rings
-            return in;
-        };
-        expect("32+16, 262K int8, two slots, served", two(553649152), 53);
-        expect("32+16, 229K int8, two slots, served", two(484443136), 57);
-        expect("32+16, 196K int8, two slots, served", two(415237120), 62);
-    }
-    // a slower main card than the second (listed first): the most layers on the second card
-    {
-        const SplitPlan p = basalt::dense::plan_split(inputs(fp16_262k, 1, kMainFixed, card(k5090, 448), card(k5090, 1792)));
-        check(p.error.empty() && p.cut > 0 && p.cut < 20, "a slower main card keeps the fewest layers that fit it: cut " + std::to_string(p.cut));
-    }
-    // two RTX 5090s: alike, the layers' bytes halved
-    expect("32+32, 262K fp16, two slots", inputs(fp16_262k, 2, kMainFixed, r5090, r5090), 32);
-    // two 16 GB cards: the weights alone do not fit one
-    expect("16+16, 8K fp16", inputs(fp16_8k, 1, kMainFixed8K, r5070, r5070), 32);
-    expect("two RTX 5070 Ti, 128K int8, spec 16 (#376)", inputs(int8_128k, 1, kMainFixed, r5070, r5070), 32);
-    expect_error("16+16, 262K fp16 (fits neither one card nor a split)", inputs(fp16_262k, 1, kMainFixed, r5070, r5070));
-    // the diagnostic cut
-    expect("32+16, 8K, forced at 40", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 40), 40);
-    expect("32+16, 8K, forced at 8", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 8), 8);
-    expect_error("32+16, 8K, forced at 4 (the second card cannot hold the rest)", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 4));
-    expect_error("forced at 64 (no layer left for the second card)", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 64));
-    check(basalt::dense::split_cards_alike({0, 896}, {0, 960}) && !basalt::dense::split_cards_alike({0, 1792}, {0, 448}),
-          "cards within 10% of each other's bandwidth are alike");
+    // RTX 5090 + RTX 5060 Ti at 8K: the share of free memory (0.67 / 0.33) gives the second card a third of the bytes, where
+    // the old pick put one layer there
+    expect("32+16, 8K fp16", cards(k5090, k16GB), spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), 40, 46);
+    // gpu-share moves it: 3,1 gives the second card a quarter, 3,2 two fifths
+    expect("32+16, 8K fp16, gpu-share 3,1", cards(k5090, k16GB, {0.75, 0.25}), spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), 47, 51);
+    expect("32+16, 8K fp16, gpu-share 3,2", cards(k5090, k16GB, {0.6, 0.4}), spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), 34, 40);
+    // 262K: the cells follow their layers, the cut by the same shares
+    expect("32+16, 262K fp16", cards(k5090, k16GB), spec(fp16_262k, 1, kMainFixed, k5090, k16GB), 36, 46);
+    expect("32+16, 262K int8, two slots", cards(k5090, k16GB), spec(int8_262k, 2, kMainFixed, k5090, k16GB), 36, 46);
+    // two RTX 5090s: half the bytes each
+    expect("32+32, 262K fp16, two slots", cards(k5090, k5090), spec(fp16_262k, 2, kMainFixed, k5090, k5090), 26, 34);
+    // two 16 GB cards: the weights alone do not fit one; the main card's head and drafter count in its half
+    expect("16+16, 8K fp16", cards(k16GB, k16GB), spec(fp16_8k, 1, kMainFixed8K, k16GB, k16GB), 22, 28);
+    expect("two RTX 5070 Ti, 128K int8, spec 16 (#376)", cards(k16GB, k16GB), spec(int8_128k, 1, kMainFixed, k16GB, k16GB), 20, 30);
+    expect_error("16+16, 262K fp16 (does not fit)", cards(k16GB, k16GB), spec(fp16_262k, 1, kMainFixed, k16GB, k16GB),
+                 "gpu-mode split: GPU ");
+    // the diagnostic cut, taken as given
+    expect("32+16, 8K, --diag-gpu-cut 40", cards(k5090, k16GB, {}, 40), spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), 40, 40);
+    expect("32+16, 8K, --diag-gpu-cut 8", cards(k5090, k16GB, {}, 8), spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), 8, 8);
+    expect_error("32+16, 8K, --diag-gpu-cut 4 (the second card cannot hold the rest)", cards(k5090, k16GB, {}, 4),
+                 spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), "gpu-mode split: GPU 1 takes layers 4-63 at --diag-gpu-cut 4 and needs");
+    expect_error("--diag-gpu-cut 64 (no layer left for the second card)", cards(k5090, k16GB, {}, 64),
+                 spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), "--diag-gpu-cut 64: expected a layer from 1 to 63");
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;
 }

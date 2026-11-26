@@ -139,6 +139,68 @@ void unit_tests() {
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
     }
+    {   // propose_after queries speculative suffix continuations without mutating the history
+        SuffixDrafter d;
+        std::vector<int32_t> doc;
+        for (int i = 0; i < 32; ++i) doc.push_back(700 + i);
+        d.append(doc.data(), doc.size());
+        const size_t before = d.size();
+        const int32_t extra[] = {705, 706, 707, 708, 709, 710, 711, 712};
+        int32_t out_a[8] = {}, out_b[8] = {};
+        int match_len = 0;
+        const int na = d.propose_after(extra, 8, 8, out_a, &match_len);
+        check(d.size() == before, "propose_after leaves indexed history untouched");
+        check(na == 8 && match_len == 8 && out_a[0] == 713 && out_a[7] == 720, "propose_after returns exact continuation");
+        d.append(extra, 8);
+        const int nb = d.propose(8, out_b);
+        check(na == nb && std::memcmp(out_a, out_b, 8 * sizeof(int32_t)) == 0, "propose_after matches append + propose");
+    }
+    {   // sync() extends incrementally on matching prefix and resets cleanly on divergence or shrink
+        SuffixDrafter inc(3, 64, 4096);
+        std::vector<int32_t> turn1;
+        for (int i = 0; i < 64; ++i) turn1.push_back(100 + i);
+        inc.sync(turn1.data(), turn1.size());
+        check(inc.size() == turn1.size(), "sync from empty indexes initial turn");
+
+        std::vector<int32_t> turn2 = turn1;
+        for (int i = 10; i < 18; ++i) turn2.push_back(100 + i);
+        inc.sync(turn2.data(), turn2.size());
+
+        SuffixDrafter fresh(3, 64, 4096);
+        fresh.append(turn2.data(), turn2.size());
+        int32_t oa[8] = {}, ob[8] = {};
+        const int na = inc.propose(8, oa);
+        const int nb = fresh.propose(8, ob);
+        check(na == nb && na == 8 && inc.last_match() == fresh.last_match() &&
+              std::memcmp(oa, ob, 8 * sizeof(int32_t)) == 0, "sync incremental extension matches fresh drafter");
+
+        // exact same sequence is a no-op that still proposes identically
+        inc.sync(turn2.data(), turn2.size());
+        check(inc.last_match() == 0, "sync clears last_match");
+        const int nc = inc.propose(8, oa);
+        check(nc == nb && std::memcmp(oa, ob, 8 * sizeof(int32_t)) == 0, "sync on identical history preserves proposals");
+
+        // divergent sequence resets and does not propose from earlier history
+        std::vector<int32_t> other = {100, 101, 102, 999, 100, 101, 102};
+        inc.sync(other.data(), other.size());
+        const int nd = inc.propose(4, oa);
+        check(inc.size() == other.size() && nd == 4 && oa[0] == 999, "sync on divergent history resets stale entries");
+
+        // shorter prefix resets cleanly
+        std::vector<int32_t> shorter = {100, 101, 102};
+        inc.sync(shorter.data(), shorter.size());
+        check(inc.size() == 3 && inc.propose(4, oa) == 0, "sync on shorter history resets");
+        inc.sync(nullptr, 0);
+        check(inc.size() == 0, "sync to empty clears history");
+    }
+    {   // min_match < 3 clamps both min_match_ and max_match_ to at least 3
+        SuffixDrafter d(1, 2, 1024);
+        const std::vector<int32_t> doc = {10, 11, 12, 13, 14, 10, 11, 12};
+        d.append(doc.data(), doc.size());
+        int32_t out[4] = {};
+        check(d.propose(4, out) == 4 && out[0] == 13 && out[1] == 14 && d.last_match() == 3,
+              "ctor clamps max_match_ to clamped min_match_");
+    }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }
 }  // namespace

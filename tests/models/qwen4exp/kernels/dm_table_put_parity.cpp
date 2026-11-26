@@ -13,6 +13,7 @@
 // another stream of the same card.  The span copy goes through the card's copy queue and finishes only after the
 // burst; the kernels do not wait for it.
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
+#include "basalt/core/device_copy.hpp"
 
 #include <cuda_runtime.h>
 
@@ -105,8 +106,10 @@ int main(int argc, char** argv) {
     std::vector<unsigned long long> ref(kLE);
     for (auto& v : ref) v = (rng() & 1) ? (rng() & ~0xffull) : 0ull;
     std::memcpy(pinned, ref.data(), kLE * 8);
-    if (!ck(cudaMemcpy(d_put, ref.data(), kLE * 8, cudaMemcpyHostToDevice), "init") ||
-        !ck(cudaMemcpy(d_copy, ref.data(), kLE * 8, cudaMemcpyHostToDevice), "init"))
+    // device_copy: on an integrated GPU a copy from pageable memory lands after cudaMemcpy returns, and the first span
+    // copy below was overwritten by it
+    if (!ck(basalt::core::device_copy(d_put, ref.data(), kLE * 8, cudaMemcpyHostToDevice), "init") ||
+        !ck(basalt::core::device_copy(d_copy, ref.data(), kLE * 8, cudaMemcpyHostToDevice), "init"))
         return 1;
     int fails = 0;
     const int sizes[] = {1, 2, 7, 96, 191, 320, 321, 640, 960, 1283};

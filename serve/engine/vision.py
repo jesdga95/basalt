@@ -45,12 +45,14 @@ def _unlink_quietly(path: Path) -> None:
         pass
 
 
-def model_plan(engine_bin: str, path: str, value, words: list[str]) -> dict:
-    """The engine's choice for the gpu setting (`basalt --gpu-plan`) for a model with its flags: the cards, main first, as
-    "devices" (their CUDA_VISIBLE_DEVICES spelling) and "cards", plus the lines to print once. The engine parses the flags
-    by the model's own rules first and loads nothing. ValueError with the engine's reason."""
-    text = gpu_text(value)
-    cmd = [engine_bin, "--model", path, *words, "--gpu-plan"] + (["--gpu", text] if text else [])
+def model_plan(engine_bin: str, path: str, value, words: list[str], mode=None, share=None) -> dict:
+    """The engine's choice for the gpu, gpu-mode and gpu-share settings (`basalt --gpu-plan`) for a model with its flags: the
+    cards, main first, as "devices" (their CUDA_VISIBLE_DEVICES spelling) and "cards", the "mode" and the "shares", plus the
+    lines to print once. The engine parses the flags by the model's own rules first and loads nothing. ValueError with the
+    engine's reason."""
+    text, mode_text, share_text = gpu_text(value), gpu_text(mode), gpu_text(share)
+    cmd = [engine_bin, "--model", path, *words, "--gpu-plan"] + (["--gpu", text] if text else []) + \
+        (["--gpu-mode", mode_text] if mode_text else []) + (["--gpu-share", share_text] if share_text else [])
     try:
         run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
@@ -94,40 +96,78 @@ class Vision:
     """The resident `basalt-vision` encoder: `ENC <image> <out>` and `ENCV <video> <out>` lines in, embeddings out,
     cached by content hash."""
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True, owns_log: bool = False):
         """`start` false: down until the service restarts it, as an unloaded encoder is."""
         args = [cfg["vision_bin"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
+        self._owns_log = owns_log
+        if isinstance(log, (str, os.PathLike)):
+            log = open(log, "a", encoding="utf-8")
+            self._owns_log = True
+        self._log = log
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False
         self.ready_s = 0.0                              # last start's time to READY
         self.proc = None
-        if start:
-            self._start()
-        else:
-            self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int, int]] = {}  # LRU cache: file, image tokens, bytes
         self.cache_bytes = 0
         self.pinned: dict[str, int] = {}                # image -> requests using it
         self.videos: dict[str, VideoRows] = {}          # a cached video's groups, beside its cache entry
+        if start:
+            try:
+                self._start()
+            except BaseException:
+                self.close()
+                raise
+        else:
+            self.stopped = True
+
+    def _cleanup_proc(self, proc=None) -> None:
+        """Kill, reap, and close the pipes of a sidecar child process."""
+        proc = self.proc if proc is None else proc
+        if proc is None:
+            return
+        poll = getattr(proc, "poll", None)
+        kill = getattr(proc, "kill", None)
+        try:
+            if callable(kill) and (not callable(poll) or poll() is None):
+                kill()
+        except OSError:
+            pass
+        wait = getattr(proc, "wait", None)
+        if callable(wait):
+            try:
+                wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            if stream is not None and hasattr(stream, "close"):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        if self.proc is proc:
+            self.proc = None
 
     def _start(self):
         args, log, env = self.spawn
         t0 = time.time()
-        self.proc = lifeline.popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
-                                   text=True, encoding="utf-8", bufsize=1, env=env)
-        frame_pipes(self.proc, False)
+        proc = lifeline.popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
+                              text=True, encoding="utf-8", bufsize=1, env=env)
+        self.proc = proc
         try:
+            frame_pipes(proc, False)
             line = self._readline(VISION_READY_S, "the vision encoder did not start")
-        except RuntimeError:                            # silent: it was ended, and is not left half-started
+            if line.startswith("VIDEO "):                # whether it reads video, before READY
+                self.video = line[6:].strip()
+                line = self._readline(VISION_READY_S, "the vision encoder did not start")
+            if not line.startswith("READY"):
+                raise RuntimeError("the vision encoder did not start: " + line.strip())
+        except BaseException:
             self.stopped = True
+            self._cleanup_proc(proc)
             raise
-        if line.startswith("VIDEO "):                    # whether it reads video, before READY
-            self.video = line[6:].strip()
-            line = self._readline(VISION_READY_S, "the vision encoder did not start")
-        if not line.startswith("READY"):
-            raise RuntimeError("the vision encoder did not start: " + line.strip())
         self.ready_s = time.time() - t0
         self.stopped = False
 
@@ -156,7 +196,7 @@ class Vision:
     video = None                                        # "on <release> ..." or "off <reason>", from the encoder
 
     def alive(self) -> bool:
-        return not self.stopped and self.proc.poll() is None
+        return not self.stopped and self.proc is not None and self.proc.poll() is None
 
     def video_state(self):
         """Whether the encoder reads video ("on ..." / "off <reason>"); None before it has said."""
@@ -173,11 +213,7 @@ class Vision:
 
     def restart(self):
         """Start the encoder again, keeping the cache."""
-        try:
-            if self.proc is not None:
-                self.proc.kill()
-        except OSError:
-            pass
+        self._cleanup_proc()
         self._start()
 
     def read(self, sources: list, allowed: ImageSources | None = None) -> list[bytes]:
@@ -268,7 +304,7 @@ class Vision:
                     for path, _, _ in encoded:
                         f.write(path.read_bytes())
             except BaseException:                       # no partial file is left behind
-                combined.unlink(missing_ok=True)
+                _unlink_quietly(combined)
                 raise
             return combined, [n for _, n, _ in encoded]
         finally:
@@ -298,7 +334,7 @@ class Vision:
                     for path, _ in parts:
                         f.write(path.read_bytes())
             except BaseException:
-                combined.unlink(missing_ok=True)
+                _unlink_quietly(combined)
                 raise
             return combined, [r for _, r in parts]
         finally:
@@ -335,13 +371,26 @@ class Vision:
 
     def _encv(self, video: Path, out: Path, words: str) -> str:
         """One ENCV round trip with the sidecar: its `OK <groups> ...` or `ERR ...` line."""
-        self.proc.stdin.write(f"ENCV {video} {out} {words}\n".rstrip() + "\n")
-        self.proc.stdin.flush()
+        if self.proc is None:
+            self.stopped = True
+            return ""
         try:
-            return self._readline(VISION_ENCODE_S, "the video could not be read").strip()
+            self.proc.stdin.write(f"ENCV {video} {out} {words}\n".rstrip() + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):                   # pipe broken: the sidecar stopped
+            self.stopped = True
+            self._cleanup_proc()
+            return ""
+        try:
+            line = self._readline(VISION_ENCODE_S, "the video could not be read").strip()
         except RuntimeError as e:
             self.stopped = True
+            self._cleanup_proc()
             raise ValueError(str(e)) from None
+        if not line:
+            self.stopped = True
+            self._cleanup_proc()
+        return line
 
     def _pin(self, key: str, pins: list[str]) -> None:
         self.pinned[key] = self.pinned.get(key, 0) + 1
@@ -376,13 +425,26 @@ class Vision:
 
     def _enc(self, img: Path, out: Path) -> str:
         """One ENC round trip with the sidecar: its `OK <n> ...` or `ERR ...` line."""
-        self.proc.stdin.write(f"ENC {img} {out}\n")
-        self.proc.stdin.flush()
+        if self.proc is None:
+            self.stopped = True
+            return ""
         try:
-            return self._readline(VISION_ENCODE_S, "the image could not be read").strip()
+            self.proc.stdin.write(f"ENC {img} {out}\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):                   # pipe broken: the sidecar stopped
+            self.stopped = True
+            self._cleanup_proc()
+            return ""
+        try:
+            line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
         except RuntimeError as e:                       # silent: the encoder was ended
             self.stopped = True                         # alive() is False, so the next request starts it again
+            self._cleanup_proc()
             raise ValueError(str(e)) from None
+        if not line:
+            self.stopped = True
+            self._cleanup_proc()
+        return line
 
     def _remember(self, key: str, out: Path, n: int) -> tuple[Path, int, int]:
         size = out.stat().st_size
@@ -396,23 +458,33 @@ class Vision:
             if self.cache_bytes <= VISION_CACHE_BYTES:
                 break
             path, _, size = self.cache.pop(k)
-            path.unlink(missing_ok=True)
+            _unlink_quietly(path)
             self.cache_bytes -= size
             self.videos.pop(k, None)
 
     def _quit(self):
-        if self.proc is None:
+        proc = self.proc
+        if proc is None:
             return
         try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
+            if proc.poll() is None:
+                proc.stdin.write("QUIT\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+                proc.wait(timeout=10)
         except Exception:
-            self.proc.kill()
+            pass
+        self._cleanup_proc(proc)
 
     def close(self):
         """Shutdown: the encoder quits, and its work folder goes with the embeddings cached in it."""
         self._quit()
+        if getattr(self, "_owns_log", False) and getattr(self, "_log", None) is not None:
+            try:
+                self._log.close()
+            except OSError:
+                pass
+            self._log = None
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -488,7 +560,7 @@ class EngineVision(Vision):
 
 
 def gpu_text(value) -> str:
-    """The gpu setting as the engine reads it: "" (unset), "auto" or "A,B,..."; a config may give a number or a list."""
+    """A gpu setting as the engine reads it: "" (unset) or the text; a config may give a number or a list of them."""
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
@@ -496,21 +568,47 @@ def gpu_text(value) -> str:
     return str(value).strip()
 
 
-def check_gpu(value) -> None:
-    """ValueError unless the gpu setting reads as auto or distinct GPU numbers."""
-    text = gpu_text(value)
-    if text in ("", "auto"):
-        return
-    items = [x.strip() for x in text.split(",")]
-    if not all(x.isdigit() for x in items) or len(set(int(x) for x in items)) != len(items):
-        raise ValueError(text)
+GPU_MODES = ("peer", "split", "tensor")
+
+
+def check_gpu(value, mode=None, share=None) -> None:
+    """ValueError with the engine's text unless gpu, gpu-mode and gpu-share read as settings. What needs the cards (`all`)
+    or the model is left to the engine's --gpu-plan."""
+    text, mode_text, share_text = gpu_text(value), gpu_text(mode), gpu_text(share)
+    cards = None                                    # how many cards gpu names; None: not known without the engine
+    if text == "":
+        cards = 1
+    elif text != "all":
+        items = [x.strip() for x in text.split(",")]
+        if not all(x.isdigit() for x in items) or len(set(int(x) for x in items)) != len(items):
+            raise ValueError(f'gpu "{text}": expected a card number like 0, a list like 0,1 (the first is the main card), '
+                             "or all; see docs/configuration/gpus.md")
+        cards = len(items)
+    if mode_text and mode_text not in GPU_MODES:
+        raise ValueError(f'gpu-mode "{mode_text}": expected peer, split or tensor; see docs/configuration/gpus.md')
+    shown = text or "0"
+    if cards is not None and cards > 1 and not mode_text:
+        raise ValueError(f"gpu {text} names {cards} cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md")
+    if cards == 1 and mode_text:
+        raise ValueError(f'gpu-mode {mode_text}: gpu names one card (gpu "{shown}"); a mode needs two or more')
+    if cards == 1 and share_text:
+        raise ValueError(f'gpu-share: gpu names one card (gpu "{shown}"); shares need two or more')
+    if share_text:
+        items = [x.strip() for x in share_text.split(",")]
+        try:
+            numbers = [float(x) for x in items]
+        except ValueError:
+            numbers = []
+        if not numbers or not all(n > 0 and n != float("inf") for n in numbers) or (cards is not None and len(numbers) != cards):
+            n = f" ({cards} cards)" if cards is not None else ""
+            raise ValueError(f'gpu-share "{share_text}": expected one positive number per card of gpu{n}, like 3,1')
 
 
 def gpu_list(cfg: dict) -> list:
     """The cards the engine runs on, main first, as CUDA_VISIBLE_DEVICES names them (nvidia-smi numbers, or a UUID
     where the environment gave one); [] when none was chosen (the mock engine)."""
     g = gpu_text(cfg.get("gpu"))
-    if g in ("", "auto"):
+    if g in ("", "all"):
         return []
     return [int(x) if x.isdigit() else x for x in (w.strip() for w in g.split(",")) if x]
 

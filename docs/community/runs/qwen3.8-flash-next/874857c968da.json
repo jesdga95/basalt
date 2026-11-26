@@ -1,0 +1,35 @@
+{
+  "submitter": "LeonG",
+  "date": "2026-11-25",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 26.5
+    }
+  ],
+  "ram_gib": 184,
+  "cpu": "Intel Core i5-14600KF, 14 cores",
+  "ram_gbps": 70.7,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 4809.1,
+  "prefill_64k_tps": 5047.2,
+  "decode_tps": 125.0,
+  "decode_conv_tps": 95.5,
+  "decode_struct_tps": 134.5,
+  "decode_prose_tps": 103.5,
+  "accept_conv_pct": 73.1,
+  "accept_struct_pct": 97.6,
+  "accept_prose_pct": 71.8,
+  "draft_len_conv": 2.2,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.7,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

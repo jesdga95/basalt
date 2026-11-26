@@ -153,6 +153,7 @@ void with_type(ggml_type t, F&& f) {
         case GGML_TYPE_IQ3_XXS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ3_XXS>{}); break;
         case GGML_TYPE_IQ3_S: f(std::integral_constant<ggml_type, GGML_TYPE_IQ3_S>{}); break;
         case GGML_TYPE_IQ4_NL: f(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{}); break;
+        case GGML_TYPE_MXFP4: f(std::integral_constant<ggml_type, GGML_TYPE_MXFP4>{}); break;
         case GGML_TYPE_IQ4_XS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ4_XS>{}); break;
         case GGML_TYPE_Q8_0: f(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{}); break;
         case GGML_TYPE_Q5_1: f(std::integral_constant<ggml_type, GGML_TYPE_Q5_1>{}); break;
@@ -179,6 +180,7 @@ bool supported(int t) {
         case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_MXFP4:   // the MXFP4 experts (E8M0 scale per 32 values, no per-expert tail)
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // the UD-Q4_K_XL experts
         case GGML_TYPE_Q5_0:   // the UD packs' down layers that keep 5 bits

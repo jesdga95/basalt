@@ -17,6 +17,7 @@ namespace {
 
 namespace px = basalt::kernels::px;
 using basalt::kernels::launch_pdl;
+using basalt::kernels::pdl_launch_dependents;
 using basalt::kernels::pdl_wait;
 
 constexpr int kThreads = 256;
@@ -86,7 +87,7 @@ __device__ __forceinline__ void mix_stage(int r, int j, const float* __restrict_
         const int c = threadIdx.x + i * kThreads;
         dst[c] = v[i] * inv * w[c];
     }
-    if (j == 0 && threadIdx.x < 3) pos3[r * 3 + threadIdx.x] = p;
+    if (pos3 && j == 0 && threadIdx.x < 3) pos3[r * 3 + threadIdx.x] = p;
 }
 
 __global__ void __launch_bounds__(kThreads) mix_kernel(const float* __restrict__ tap, int64_t tap_stride, DsMixArgs a,
@@ -110,7 +111,7 @@ __device__ __forceinline__ void block_inputs_stage(int t, const uint16_t* __rest
                                                    uint16_t* __restrict__ w1_row, float* red) {
     const int32_t anchor = meta[0], pos0 = meta[1];
     float* row = x + (int64_t) t * kWidth;
-    if (threadIdx.x < 3) pos3[t * 3 + threadIdx.x] = pos0 + t;
+    if (pos3 && threadIdx.x < 3) pos3[t * 3 + threadIdx.x] = pos0 + t;
     if (t == 1) {   // the Markov head's start
         if (threadIdx.x == 0) *prev = anchor;
         for (int i = threadIdx.x; i < kDsRank; i += kThreads) state[i] = 0.f;
@@ -248,9 +249,30 @@ __device__ __forceinline__ float q80_dot(const uint8_t* __restrict__ w, const Q8
     return warp_sum(s);
 }
 
+// One q8_planes row (n_in = nb * 32) by a q8_1 row on a warp (16-byte aligned int4 codes + fp16 scales).
+__device__ __forceinline__ float q8p_dot(const void* __restrict__ planes, int64_t n_vocab, int64_t v, const Q81* x, int nb, int lane) {
+    const int n_in = nb * 32;
+    const int8_t* codes = static_cast<const int8_t*>(planes) + v * n_in;
+    const __half* scales = reinterpret_cast<const __half*>(static_cast<const int8_t*>(planes) + n_vocab * n_in) + v * nb;
+    const int half_b = lane & 1;
+    float s = 0.f;
+    for (int b = lane >> 1; b < nb; b += 16) {
+        const int4 q = __ldg(reinterpret_cast<const int4*>(codes + b * 32 + half_b * 16));
+        const int* xq = reinterpret_cast<const int*>(x[b].qs) + half_b * 4;
+        int sumi = __dp4a(q.x, xq[0], 0);
+        sumi = __dp4a(q.y, xq[1], sumi);
+        sumi = __dp4a(q.z, xq[2], sumi);
+        sumi = __dp4a(q.w, xq[3], sumi);
+        s += __half2float(__ldg(scales + b)) * __low2float(x[b].ds) * (float) sumi;
+    }
+    return warp_sum(s);
+}
+
 // Row v's exact logit (every lane gets it).
 __device__ __forceinline__ float exact_logit(const DsHead& h, int64_t v, const Q81* xh, const Q81* xl, int lane) {
-    const float a = q80_dot(static_cast<const uint8_t*>(h.head) + v * kQ8Row, xh, kHeadNb, lane);
+    const float a = h.head_planes
+                        ? q8p_dot(h.head, h.n_vocab, v, xh, kHeadNb, lane)
+                        : q80_dot(static_cast<const uint8_t*>(h.head) + v * kQ8Row, xh, kHeadNb, lane);
     const float b = q80_dot(static_cast<const uint8_t*>(h.fold) + v * kFoldRow, xl, kFoldNb, lane);
     return capf(a + b + h.fold_b[v], h.cap);
 }
@@ -718,6 +740,360 @@ void dspark_fold(const void* head_q8_0, int64_t n_rows, const uint16_t* w, const
 void dspark_split_rnn(const uint16_t* w, uint16_t* w_sp, uint16_t* w_h, uint16_t* w_f, void* stream) {
     split_rnn_kernel<<<kDsRnn, 256, 0, (cudaStream_t) stream>>>(w, w_sp, w_h, w_f);
     check("split");
+}
+
+// ---- batched multi-session commit & draft kernels -----------------------------------------------------------------------
+
+namespace {
+
+struct DsRopeFreq {
+    float inv[kHeadDim / 2];
+};
+
+DsRopeFreq make_ds_rope(float base) {
+    DsRopeFreq f{};
+    for (int i = 0; i < kHeadDim / 2; ++i) f.inv[i] = (float) std::pow((double) base, -2.0 * (double) i / (double) kHeadDim);
+    return f;
+}
+
+__device__ __forceinline__ float block_sum_128(float v, float* red) {
+    v = warp_sum(v);
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0) red[w] = v;
+    __syncthreads();
+    const float s = red[0] + red[1] + red[2] + red[3];
+    __syncthreads();
+    return s;
+}
+
+__global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* tap, int64_t tap_stride, DsMixArgs a,
+                                                             float* __restrict__ out, int64_t out_stride,
+                                                             const int32_t* pos, DsCommitSegs segs, int fr_cap) {
+    pdl_wait();
+    __shared__ float red[kThreads / 32];
+    const int r = (int) blockIdx.x, j = (int) blockIdx.y;
+    const int sk = segs.at_d ? basalt::kernels::seg_of(*segs.at_d, r) : 0;
+    mix_stage(r, j, tap, tap_stride, a, out, out_stride, pos, segs.fr[sk], fr_cap, nullptr, red);
+}
+
+__global__ void __launch_bounds__(kHeadDim) kv_commit_batch_kernel(const float* kb, const float* vb,
+                                                                   const float* __restrict__ k_norm, float eps,
+                                                                   DsRopeFreq rope, const int32_t* pos, DsCommitSegs segs,
+                                                                   int64_t cap) {
+    pdl_wait();
+    __shared__ float red[kHeadDim / 32];
+    __shared__ float xs[kHeadDim];
+    const int t = (int) blockIdx.x, head = (int) blockIdx.y, d = (int) threadIdx.x;
+    const float x = kb[((int64_t) t * kKvHeads + head) * kHeadDim + d];
+    const float inv = rsqrtf(block_sum_128(x * x, red) / (float) kHeadDim + eps);
+    float y = x * inv * k_norm[d];
+    xs[d] = y;
+    __syncthreads();
+    constexpr int half = kHeadDim / 2;
+    const int i = d < half ? d : d - half;
+    const int32_t p = pos[t];
+    float sn, cs;
+    sincosf((float) p * rope.inv[i], &sn, &cs);
+    y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
+    const int sk = segs.at_d ? basalt::kernels::seg_of(*segs.at_d, t) : 0;
+    const int64_t cell = cap > 0 ? (int64_t) p % cap : (int64_t) p;
+    const int64_t at = (cell * kKvHeads + head) * kHeadDim + d;
+    reinterpret_cast<__half*>(segs.k[sk])[at] = __float2half_rn(y);
+    reinterpret_cast<__half*>(segs.v[sk])[at] = __float2half_rn(vb[((int64_t) t * kKvHeads + head) * kHeadDim + d]);
+}
+
+__global__ void __launch_bounds__(kThreads) block_inputs_batch_kernel(const uint16_t* __restrict__ emb,
+                                                                      const int32_t* meta,
+                                                                      const float* __restrict__ norm, float eps,
+                                                                      const float* __restrict__ mask, int block,
+                                                                      float* __restrict__ x, int32_t* __restrict__ prev,
+                                                                      float* __restrict__ state, DsBatchFr frs, int fr_cap,
+                                                                      float* __restrict__ fr_out,
+                                                                      const uint16_t* __restrict__ w1,
+                                                                      uint16_t* __restrict__ w1_row) {
+    __shared__ float red[kThreads / 32];
+    const int t = (int) blockIdx.x, b = (int) blockIdx.y;
+    block_inputs_stage(t, emb, meta + 2 * b, norm, eps, mask, x + (int64_t) b * block * kWidth, nullptr, prev + b,
+                       state + (int64_t) b * 2 * kDsRank, frs.fr[b], fr_cap, fr_out + (int64_t) b * kWidth, w1,
+                       w1_row + (int64_t) b * kDsRank, red);
+}
+
+__global__ void __launch_bounds__(kHeadDim) block_qk_prep_batch_kernel(const float* q, const float* kb, const float* vb,
+                                                                       const float* __restrict__ q_norm,
+                                                                       const float* __restrict__ k_norm, float eps,
+                                                                       DsRopeFreq rope, const int32_t* meta,
+                                                                       int block, float* q_out, DsBatchKv kv, int64_t cap) {
+    pdl_wait();
+    __shared__ float red[kHeadDim / 32];
+    __shared__ float xs[kHeadDim];
+    const int row = (int) blockIdx.x, j = (int) blockIdx.y, d = (int) threadIdx.x;
+    const int b = row / block, t = row - b * block;
+    const bool is_q = j < kHeads;
+    const int head = is_q ? j : j - kHeads;
+    const float x = is_q ? q[((int64_t) row * kHeads + head) * kHeadDim + d]
+                         : kb[((int64_t) row * kKvHeads + head) * kHeadDim + d];
+    const float inv = rsqrtf(block_sum_128(x * x, red) / (float) kHeadDim + eps);
+    float y = x * inv * (is_q ? q_norm[d] : k_norm[d]);
+    xs[d] = y;
+    __syncthreads();
+    constexpr int half = kHeadDim / 2;
+    const int i = d < half ? d : d - half;
+    const int32_t p = meta[2 * b + 1] + t;
+    float sn, cs;
+    sincosf((float) p * rope.inv[i], &sn, &cs);
+    y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
+    if (is_q) {
+        q_out[((int64_t) row * kHeads + head) * kHeadDim + d] = y;
+        return;
+    }
+    const int64_t cell = cap > 0 ? (int64_t) p % cap : (int64_t) p;
+    const int64_t at = (cell * kKvHeads + head) * kHeadDim + d;
+    reinterpret_cast<__half*>(kv.k[b])[at] = __float2half_rn(y);
+    reinterpret_cast<__half*>(kv.v[b])[at] = __float2half_rn(vb[((int64_t) row * kKvHeads + head) * kHeadDim + d]);
+}
+
+__global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* h_chunk, int block, int slot0,
+                                                              int n_max, float* __restrict__ hd_all) {
+    pdl_wait();
+    const int row = (int) blockIdx.x;
+    const int c = row / n_max, i = row - c * n_max;
+    const float4* src = reinterpret_cast<const float4*>(h_chunk + ((int64_t) c * block + 1 + i) * kWidth);
+    float4* dst = reinterpret_cast<float4*>(hd_all + ((int64_t) (slot0 + c) * n_max + i) * kWidth);
+    for (int j = threadIdx.x; j < kWidth / 4; j += 256) dst[j] = src[j];
+}
+
+// Reads the 2-bit head screen once into registers and scores all `count` sessions' `n_max` draft rows.
+__global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
+                                                              const Q81* x, int count, int n_max,
+                                                              int64_t n_pad, float* __restrict__ approx) {
+    constexpr int kNw4 = kWidth / 64, NW = kNw4 / 4;
+    __shared__ __align__(16) int xi[kDsDrafts][kWidth / 4];
+    __shared__ float xs[kDsDrafts][kHeadNb], xdd[kDsDrafts][kHeadNb];
+    __shared__ float red[kDsDrafts][4][32];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int64_t tile = blockIdx.x;
+    const size_t base = ((size_t) tile * kNw4 + warp * NW) * 32 + lane;
+    uint4 w[NW];
+    uint32_t s[NW];
+#pragma unroll
+    for (int j = 0; j < NW; ++j) {
+        w[j] = __ldcs(wq + base + (size_t) j * 32);
+        s[j] = __ldcs(sc + base + (size_t) j * 32);
+    }
+    pdl_wait();
+    const int64_t row = tile * 32 + lane;
+    for (int b = 0; b < count; ++b) {
+        if (b > 0) __syncthreads();
+        const Q81* xb = x + (size_t) b * n_max * kHeadNb;
+        for (int r = 0; r < n_max; ++r) screen_x(xb + (size_t) r * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < kDsDrafts; ++r)
+            if (r < n_max) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
+        __syncthreads();
+        float* apb = approx + (size_t) b * n_max * n_pad;
+        for (int r = warp; r < n_max; r += 4)
+            apb[r * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+    }
+}
+
+__global__ void __launch_bounds__(kStepWarps * 32) markov_step_batch_kernel(const float* ctx_h,
+                                                                            const float* ctx_f,
+                                                                            const float* __restrict__ bias,
+                                                                            const uint16_t* __restrict__ w_sp,
+                                                                            const uint16_t* w1_row,
+                                                                            float* state, int step_i,
+                                                                            int n_max, float* __restrict__ latent) {
+    pdl_wait();
+    __shared__ float xs[2 * kDsRank];
+    const int blk = (int) blockIdx.x, b = (int) blockIdx.y;
+    const float* st_in = state + ((size_t) b * 2 + (step_i & 1)) * kDsRank;
+    float* st_out = state + ((size_t) b * 2 + ((step_i + 1) & 1)) * kDsRank;
+    markov_step_stage(blk, ctx_h + ((size_t) b * n_max + step_i) * kDsRnn, ctx_f + (size_t) b * kDsRnn, bias, w_sp,
+                      w1_row + (size_t) b * kDsRank, st_in, st_out, latent + (size_t) b * kDsRank, xs);
+}
+
+__global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(const uint4* __restrict__ wq,
+                                                                              const uint32_t* __restrict__ sc,
+                                                                              const Q81* lat_step,
+                                                                              const float* approx,
+                                                                              const float* __restrict__ fold_bp, float cap,
+                                                                              int64_t n_rows, int n_tiles, int step_i,
+                                                                              int n_max, int64_t n_pad,
+                                                                              uint8_t* __restrict__ scratch,
+                                                                              size_t scratch_stride) {
+    constexpr int kNw4 = kDsRank / 64;
+    __shared__ __align__(16) int xi[kDsRank / 4];
+    __shared__ float xs[kFoldNb], xdd[kFoldNb];
+    const int tid = threadIdx.x, lane = tid & 31, b = (int) blockIdx.y;
+    const int tile = (int) blockIdx.x * kTilesPerBlock + (tid >> 5);
+    const int64_t row = (int64_t) tile * 32 + lane;
+    const bool live = tile < n_tiles, real = live && token_of(row, n_tiles) < n_rows;
+    uint4 w[kNw4];
+    uint32_t s[kNw4];
+    float fb = 0.f;
+#pragma unroll
+    for (int j = 0; j < kNw4; ++j) {
+        const size_t at = ((size_t) (live ? tile : 0) * kNw4 + j) * 32 + lane;
+        w[j] = __ldcs(wq + at);
+        s[j] = __ldcs(sc + at);
+    }
+    if (live) fb = __ldg(fold_bp + row);
+    pdl_wait();
+    pdl_launch_dependents();
+    screen_x(lat_step + (size_t) b * kFoldNb, kFoldNb, xi, xs, xdd, tid, 32 * kTilesPerBlock);
+    __syncthreads();
+    if (!live) return;
+    float2* cand = reinterpret_cast<float2*>(scratch + (size_t) b * scratch_stride);
+    float2* part = cand + (size_t) n_tiles * px::kPer;
+    const float* ap = approx + ((size_t) b * n_max + step_i) * n_pad;
+    const float ninf = __int_as_float(0xff800000);
+    float v = ninf;
+    if (real) v = capf(ap[row] + screen_acc<kNw4>(w, s, 0, xi, xs, xdd) + fb, cap);
+    float m = v;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    float e = v > ninf ? __expf(v - m) : 0.0f;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
+    if (lane == 0) part[tile] = make_float2(m, e);
+    for (int k = 0; k < px::kPer; ++k) {
+        float bv = v;
+        int bi = lane;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) cand[tile * px::kPer + k] = make_float2(bv, __int_as_float(tile * 32 + bi));
+        if (lane == bi) v = ninf;
+    }
+}
+
+__global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q81* __restrict__ hq,
+                                                               const Q81* __restrict__ lat_step, int n_tiles, int step_i,
+                                                               int n_max, const uint8_t* __restrict__ scratch,
+                                                               size_t scratch_stride, int32_t* __restrict__ prev,
+                                                               int32_t* __restrict__ ids, float* __restrict__ conf,
+                                                               const uint16_t* __restrict__ w1,
+                                                               uint16_t* __restrict__ w1_row) {
+    __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
+    __shared__ px::Final f;
+    __shared__ uint4 wr[px::kMaxCand][kW1Words];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = (int) blockIdx.x;
+    pdl_wait();
+    pdl_launch_dependents();
+    if (tid == 0) f.cnt = 0;
+    const Q81* xh_g = hq + ((size_t) b * n_max + step_i) * kHeadNb;
+    const Q81* xl_g = lat_step + (size_t) b * kFoldNb;
+    exact_x(xh_g, xl_g, xh, xl, tid, 512);
+    const float2* cand = reinterpret_cast<const float2*>(scratch + (size_t) b * scratch_stride);
+    const float2* part = cand + (size_t) n_tiles * px::kPer;
+    int32_t* prev_b = prev + b;
+    int32_t* ids_b = ids + (size_t) b * kDsBlock;
+    float* conf_b = conf + (size_t) b * kDsBlock;
+    uint16_t* w1_b = w1_row + (size_t) b * kDsRank;
+    const int n = collect_tiles(f, n_tiles, cand, part, prev_b, conf_b + step_i);
+    if (n == 0) {
+        if (tid == 0) ids_b[step_i] = *prev_b;
+        if (warp == 0) reinterpret_cast<uint4*>(w1_b)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) *prev_b * kDsRank)[lane];
+        return;
+    }
+    for (int c = warp; c < n; c += 16) {
+        const int64_t tok = token_of(f.list[c], n_tiles);
+        wr[c][lane] = reinterpret_cast<const uint4*>(w1 + tok * kDsRank)[lane];
+        const float y = exact_logit(h, tok, xh, xl, lane);
+        if (lane == 0) {
+            f.ex[c] = y;
+            f.list[c] = (int) tok;
+        }
+    }
+    __syncthreads();
+    px::pick_block<false>(f, n, n_tiles, nullptr, part, prev_b, conf_b + step_i);
+    __syncthreads();
+    const int pick = *prev_b;
+    if (tid == 0) ids_b[step_i] = pick;
+    for (int c = warp; c < n; c += 16)
+        if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_b)[lane] = wr[c][lane];
+}
+
+}  // namespace
+
+void dspark_mix_batch(const float* tap, int64_t tap_stride, int rows, const DsMixArgs& a, float* out, int64_t out_stride,
+                      const int32_t* pos, const DsCommitSegs& segs, int fr_cap, void* stream) {
+    if (rows <= 0) return;
+    launch_pdl(mix_batch_kernel, dim3((unsigned) rows, kDsMixes), dim3(kThreads), 0, (cudaStream_t) stream, tap, tap_stride, a,
+               out, out_stride, pos, segs, fr_cap);
+    check("mix batch");
+}
+
+void dspark_kv_commit_batch(const float* kb, const float* vb, const float* k_norm, float eps, float rope_base,
+                            const int32_t* pos, int rows, const DsCommitSegs& segs, int64_t cap, void* stream) {
+    if (rows <= 0) return;
+    launch_pdl(kv_commit_batch_kernel, dim3((unsigned) rows, kKvHeads), dim3(kHeadDim), 0, (cudaStream_t) stream, kb, vb,
+               k_norm, eps, make_ds_rope(rope_base), pos, segs, cap);
+    check("kv commit batch");
+}
+
+void dspark_block_inputs_batch(const uint16_t* embedding, const int32_t* meta, const float* embed_norm, float eps,
+                               const float* mask, int block, int count, float* x, int32_t* prev, float* state,
+                               const DsBatchFr& frs, int fr_cap, float* fr_out, const uint16_t* w1, uint16_t* w1_row,
+                               void* stream) {
+    if (count <= 0) return;
+    block_inputs_batch_kernel<<<dim3((unsigned) block, (unsigned) count), kThreads, 0, (cudaStream_t) stream>>>(
+        embedding, meta, embed_norm, eps, mask, block, x, prev, state, frs, fr_cap, fr_out, w1, w1_row);
+    check("block inputs batch");
+}
+
+void dspark_block_qk_prep_batch(const float* q, const float* kb, const float* vb, const float* q_norm, const float* k_norm,
+                                float eps, float rope_base, const int32_t* meta, int block, int count, float* q_out,
+                                const DsBatchKv& kv, int64_t cap, void* stream) {
+    if (count <= 0) return;
+    launch_pdl(block_qk_prep_batch_kernel, dim3((unsigned) (count * block), kHeads + kKvHeads), dim3(kHeadDim), 0,
+               (cudaStream_t) stream, q, kb, vb, q_norm, k_norm, eps, make_ds_rope(rope_base), meta, block, q_out, kv, cap);
+    check("block qk prep batch");
+}
+
+void dspark_pack_draft_rows(const float* h_chunk, int block, int count_chunk, int slot0, int n_max, float* hd_all,
+                            void* stream) {
+    if (count_chunk <= 0 || n_max <= 0) return;
+    launch_pdl(pack_draft_rows_kernel, dim3((unsigned) (count_chunk * n_max)), dim3(256), 0, (cudaStream_t) stream, h_chunk,
+               block, slot0, n_max, hd_all);
+    check("pack draft rows");
+}
+
+void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, float* approx, void* stream) {
+    if (count <= 0 || n_max < 1 || n_max > kDsDrafts) return;
+    launch_pdl(head_base_batch_kernel, dim3((unsigned) px::tiles(h.n_vocab)), dim3(128), 0, (cudaStream_t) stream,
+               (const uint4*) h.head_sc, (const uint32_t*) px::scales(const_cast<void*>(h.head_sc), h.n_vocab, kWidth),
+               (const Q81*) hq, count, n_max, dspark_screen_rows(h.n_vocab), approx);
+    check("head base batch");
+}
+
+void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
+                              const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
+                              void* stream) {
+    if (count <= 0) return;
+    launch_pdl(markov_step_batch_kernel, dim3(kStepBlocks, (unsigned) count), dim3(kStepWarps * 32), 0, (cudaStream_t) stream,
+               ctx_h, ctx_f, bias, w_sp, w1_row, state, step_i, n_max, latent);
+    check("Markov step batch");
+}
+
+void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
+                            int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
+                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
+    if (count <= 0) return;
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int tiles = (int) px::tiles(h.n_vocab);
+    const int64_t n_pad = dspark_screen_rows(h.n_vocab);
+    launch_pdl(head_step_batch_kernel, dim3((unsigned) ((tiles + kTilesPerBlock - 1) / kTilesPerBlock), (unsigned) count),
+               dim3(32 * kTilesPerBlock), 0, s, (const uint4*) h.fold_sc,
+               (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank), (const Q81*) latq_step,
+               approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad, (uint8_t*) scratch, scratch_stride);
+    launch_pdl(head_final_batch_kernel, dim3((unsigned) count), dim3(512), 0, s, h, (const Q81*) hq, (const Q81*) latq_step,
+               tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row);
+    check("head pick batch");
 }
 
 }  // namespace basalt::models::inkling2

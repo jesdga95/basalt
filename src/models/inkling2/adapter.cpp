@@ -45,7 +45,8 @@ public:
         return f;
     }
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
-    int max_expert_cards() const override { return 1; }   // the second card: the layer split (model.hpp card_of)
+    // peer: the second card holds and computes experts the main card cannot (model.hpp peer_held); split: it runs the later layers (card_of)
+    program::GpuModes gpu_modes() const override { return {2, 2, 0}; }
     const char* model_name() const override { return "Inkling-2-Mini"; }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
@@ -53,10 +54,6 @@ public:
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
-            return true;
-        }
-        if (a == "--diag-split-at") {   // diagnostic: the layer split forced, the second card from this layer on
-            o.diag_split_at = std::atoi(args.next("--diag-split-at"));
             return true;
         }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK

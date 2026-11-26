@@ -21,14 +21,7 @@ const shortCpu = s => String(s || "").replace(/\((R|TM)\)/gi, "").replace(/\s+\d
   .replace(/\s+CPU\s+@.*$/i, "").replace(/\s+Processor$/i, "").replace(/\s+/g, " ").trim();
 
 let apiKey = sessionStorage.getItem("basalt.key") || "";
-let M = null;          // the last /metrics reading, with .slots from /slots
-
-async function get(path) {
-  const r = await fetch(path, { cache: "no-store", headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
-  if (r.status === 401) throw Object.assign(new Error("locked"), { locked: true });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
+let M = null;          // the last combined state snapshot
 
 /* ---- fields the page draws once the server sends them. Each is read only through ahead(); until it arrives, its panel is
    hidden or shows what the server sends now, never a made-up figure. Keyed by where the field lives. ---- */
@@ -322,6 +315,7 @@ const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100
 const kc = n => n >= 1048576 ? `${n / 1048576 >= 10 ? Math.round(n / 1048576) : +(n / 1048576).toFixed(1)}M` : kt(n).replace("k", "K");
 const pctOf = (a, b) => b ? Math.round(a / b * 100) : 0;
 const slotWord = s => !s.is_processing ? "Idle" : s.state === "prefill" ? "Reading" : "Decoding";
+
 const accept = s => s.drafts_offered > 20 ? Math.round(s.drafts_accepted / s.drafts_offered * 100) : null;
 const prefixHit = s => num(s.reused) && s.prompt_tokens > 0 ? Math.round(s.reused / s.prompt_tokens * 100) : null;
 const ACC_NOTE = "Drafts accepted over offered, of the slot's current or last request";
@@ -668,10 +662,12 @@ function control(path, id) {
 function settle(models, fresh) {
   if (!pending) return;
   const m = models.find(x => x.id === pending.id), v = m ? m.status.value : null;
-  if ((pending.path === "v1/unload" ? v !== "loaded" : v === "loading" || v === "loaded") || (fresh && pending.ok)) pending = null;
+  if ((pending.path === "v1/unload" ? v !== "loaded" : v === "loading" || (v === "loaded" && !m.asleep)) || (fresh && pending.ok)) pending = null;
 }
 function unloadView(models, live) {
-  const m = models.find(x => x.status.value === "loaded");
+  if (live.state === "loading") return { hidden: true };
+  const m = models.find(x => x.status.value === "loaded" && !x.asleep)
+    || models.find(x => x.status.value === "loaded" && x.parked_mib == null);
   if (!m) return { hidden: true };
   if (pending) return { hidden: false, id: m.id, disabled: true, label: pending.path === "v1/unload" ? ACT["v1/unload"][0] : "Unload", title: "" };
   const busy = live.state === "reading" || live.state === "generating" || live.queued > 0;
@@ -718,7 +714,7 @@ function drawModels(models, shown) {
   const focused = pop.contains(document.activeElement) ? document.activeElement.dataset.v : null;
   pop.replaceChildren(...models.map(m => {
     const b = document.createElement("button"); b.type = "button"; b.setAttribute("role", "menuitemradio");
-    const v = m.status.value, go = v === "unloaded" || v === "failed";
+    const v = m.status.value, go = v === "unloaded" || v === "failed" || (v === "loaded" && !!m.asleep);
     b.className = go ? "opt go" : "opt"; b.dataset.v = m.id; b.disabled = busy;
     b.setAttribute("aria-checked", String(m.id === name));
     const n = document.createElement("b"), w = document.createElement("span");
@@ -809,7 +805,7 @@ function draw() {
   const name = (live.state || "idle")[0].toUpperCase() + (live.state || "idle").slice(1);
   const ld = live.state === "loading" ? live.load || {} : null, weights = ld && ld.kind !== "wake";
   const models = M.models || [];
-  const none = models.length > 0 && !models.some(m => m.status.value === "loaded" || m.status.value === "loading");
+  const none = models.length > 0 && !models.some(m => (m.status.value === "loaded" && m.parked_mib == null) || m.status.value === "loading");
   const [sw, swTip] = stateWord(live, name);
   $("#state").title = swTip;
   if (failed && Date.now() > failed.until) failed = null;
@@ -859,10 +855,11 @@ function lineEl(e) {
   return d;
 }
 function append(lines) {
+  if (!lines || !lines.length) return;
   logEl.querySelector(".empty")?.remove();
   logEl.append(...lines.map(lineEl));
   while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
-  logCount += lines.length; warnCount += lines.filter(l => l.lvl === "warn" || l.lvl === "error").length;
+  logCount += lines.length; warnCount += lines.filter(l => l.lvl === "warn" || l.lvl === "err").length;
   const z = lines[lines.length - 1];
   text($("#ticker-t"), `${clock(z.t * 1000)}  ${srcTag(z.src)}  ${shortLog(z.msg)}`);
   $("#ticker").dataset.lvl = z.lvl;
@@ -881,32 +878,74 @@ function clearLog(note) {
   logCount = 0; warnCount = 0;
   const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
   text($("#ticker-t"), "");
+  $("#ticker").dataset.lvl = "";
 }
 
-/* ---- polling ---- */
-let lastLog = 0;
-async function pollMetrics() {
-  try {
-    const m = await get("metrics");
-    m.slots = await get("slots").catch(() => []);
-    M = m; settle(m.models || [], true); $("#auth").hidden = true; draw(); drawPanes();
-  } catch (e) {
-    $("#auth").hidden = !e.locked; M = null;
-    setState("offline", e.locked ? "Locked" : "Offline");
+/* ---- streamed state and logs ---- */
+function stream(path, receive, status) {
+  let controller = null, retry = null, stopped = false;
+  function cancel() {
+    clearTimeout(retry); retry = null;
+    controller?.abort(); controller = null;
+
   }
-  setTimeout(pollMetrics, 1000);
+  async function connect() {
+    cancel();
+    if (stopped) return;
+    const own = controller = new AbortController();
+    let reader;
+    try {
+      status("connecting");
+      const r = await fetch(path(), { signal: own.signal, cache: "no-store",
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
+      if (own.signal.aborted) return;
+      if (r.status === 401) { status("locked"); return; }
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      reader = r.body.getReader();
+      const decoder = new TextDecoder(), parse = createLogParser(data => { receive(data); status("live"); });
+      while (!own.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("Connection closed");
+        if (!own.signal.aborted) parse(decoder.decode(value, { stream: true }));
+      }
+    } catch (e) {
+      if (own.signal.aborted) return;
+      status("offline"); retry = setTimeout(connect, 2000);
+    } finally {
+      if (reader) { try { await reader.cancel(); } catch (_) {} reader.releaseLock(); }
+    }
+  }
+  window.addEventListener("pagehide", () => { stopped = true; cancel(); });
+  window.addEventListener("pageshow", () => { if (stopped) { stopped = false; connect(); } });
+  return connect;
 }
-async function pollLog() {
-  try {
-    const r = await get(`api/logs?after=${lastLog}`);
-    if (r.last < lastLog) { lastLog = 0; clearLog("The server restarted."); }
-    else if (r.lines.length) { lastLog = r.last; append(r.lines); }
-    else if (!logCount && !logEl.firstChild) clearLog("No log lines yet.");
-  } catch (e) { /* the metrics poll reports the connection */ }
-  setTimeout(pollLog, 1000);
-}
+const connectState = stream(() => "api/state/stream", data => {
+  M = data; settle(M.models || [], true); $("#auth").hidden = true; draw();
+}, state => {
+  if (state === "locked" || state === "offline") {
+    $("#auth").hidden = state !== "locked"; M = null;
+    setState("offline", state === "locked" ? "Locked" : "Offline");
+  }
+});
+let lastLog = null, logInstance = null;
+const connectLogs = stream(() => "api/logs/stream" + (lastLog === null ? "" :
+  `?after=${lastLog}&instance=${encodeURIComponent(logInstance)}`), data => {
+  const reset = data.reset || (logInstance !== null && logInstance !== data.instance_id);
+  if (reset) {
+    clearLog("The server restarted."); lastLog = null;
+  }
+  logInstance = data.instance_id;
+  if (data.dropped) append([{ t: Date.now() / 1000, src: "srv", lvl: "warn", msg: "Some log lines were dropped from the server buffer." }]);
+  const fresh = (data.lines || []).filter(line => lastLog === null || line.id > lastLog);
+  append(fresh);
+  lastLog = data.next;
+  if (!logCount) clearLog("No log lines yet.");
+  if (reset && !fresh.length && !data.dropped) draw();
+}, state => text($("#log-status"), { connecting: "Connecting", locked: "API key required",
+  live: "Live", offline: "Disconnected; retrying" }[state]));
 $("#auth").onsubmit = e => {
   e.preventDefault(); apiKey = $("#key").value.trim(); sessionStorage.setItem("basalt.key", apiKey);
+  connectState(); connectLogs();
 };
 
 /* ---- pricing dialog ---- */
@@ -1010,4 +1049,4 @@ async function resetTotals() {
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
-drawPanes(); pollMetrics(); pollLog();
+drawPanes(); connectState(); connectLogs();

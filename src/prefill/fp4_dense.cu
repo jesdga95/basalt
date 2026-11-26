@@ -253,6 +253,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
             }
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncwarp();
         }
         const int fetch_at = max(first, ktiles - kFetchStages);
 #pragma unroll 1

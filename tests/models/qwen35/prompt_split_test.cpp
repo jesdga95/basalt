@@ -62,6 +62,21 @@ struct Read {
     int stopped_at = 0;              // tokens the stopped read had read when it ended
 };
 
+// CUDA devices 0 and 1 in `mode`, a split's cut given (0: from the shares)
+basalt::model::GpuCards two_cards(basalt::program::GpuMode mode, int cut = 0) {
+    basalt::model::GpuCards c;
+    c.mode = mode;
+    c.diag_cut = cut;
+    for (int d = 0; d < 2; ++d) {
+        basalt::model::GpuCards::Card k;
+        k.device = d;
+        k.index = d;
+        k.label = "GPU " + std::to_string(d);
+        c.cards.push_back(k);
+    }
+    return c;
+}
+
 // A model with (or without) the second card, a session, `n` prompt tokens read; with `stop_test`, a read that is stopped
 // after its second progress report, then the whole prompt again.
 Read run(const model::ModelAdapter& a, const std::string& pack, bool stage, bool draft, bool int8, int n, bool stop_test) {
@@ -71,7 +86,7 @@ Read run(const model::ModelAdapter& a, const std::string& pack, bool stage, bool
     req.draft = draft;
     req.spec = draft ? 16 : 0;
     if (int8) req.kv = "int8";
-    if (stage) req.peer_devices = {1};
+    if (stage) req.gpus = two_cards(basalt::program::GpuMode::Peer);
     model::Started started;
     if (const model::Result e = a.start(req, started); !e.ok()) die("start", e.message);
     std::unique_ptr<model::ModelSession>& s = started.sessions.front();

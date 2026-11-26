@@ -2,6 +2,7 @@
 // hidden state, the target's KV rows of layers 25, 29, .. and the expected block (tools: ~/poc/hy4-ref/dfly_ref.py, vLLM's forward
 // in fp32). usage: hy4flash_dfly_real DIR [DFLY.safetensors DENSE.safetensors]
 //        hy4flash_dfly_real --pack PACK.basalt [DFLY.safetensors]: the pack's dfly section as the loader places it, byte for byte against the file
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/platform/file.hpp"
 #include "models/hy4flash/dfly.hpp"
@@ -97,7 +98,7 @@ static int check_pack(const std::string& pack_path, const std::string& dfly_path
         size_t diff = 0, n = (size_t) s.elems();
         if (s.f32) {
             std::vector<float> got(n);
-            cudaMemcpy(got.data(), w->slot(s.name), n * 4, cudaMemcpyDeviceToHost);
+            basalt::core::device_copy(got.data(), w->slot(s.name), n * 4, cudaMemcpyDeviceToHost);
             for (size_t i = 0; i < n; ++i) diff += got[i] != bf(((const uint16_t*) raw.data())[i]);
         } else {   // as stored, or a projection as the loader rounds it to Q8_0
             std::vector<uint8_t> want = raw;
@@ -106,7 +107,7 @@ static int check_pack(const std::string& pack_path, const std::string& dfly_path
                 basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), n, want.data());
             }
             std::vector<uint8_t> got(want.size());
-            cudaMemcpy(got.data(), w->slot(s.name), got.size(), cudaMemcpyDeviceToHost);
+            basalt::core::device_copy(got.data(), w->slot(s.name), got.size(), cudaMemcpyDeviceToHost);
             for (size_t i = 0; i < got.size(); ++i) diff += got[i] != want[i];
         }
         if (diff) { std::printf("MISMATCH %s: %zu of %zu differ\n", s.name.c_str(), diff, n); ++bad; }
@@ -140,13 +141,13 @@ int main(int argc, char** argv) {
         if (s.f32) {
             std::vector<float> v(raw.size() / 2);
             for (size_t i = 0; i < v.size(); ++i) v[i] = bf(((const uint16_t*) raw.data())[i]);
-            cudaMemcpy(w.slot(s.name), v.data(), v.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(w.slot(s.name), v.data(), v.size() * 4, cudaMemcpyHostToDevice);
         } else if (s.q8 || s.q4) {
             std::vector<uint8_t> q(s.bytes());
             if (s.q4) basalt::core::quantize_bf16_q4_0((const uint16_t*) raw.data(), s.elems(), q.data());
             else basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), s.elems(), q.data());
-            cudaMemcpy(w.slot(s.name), q.data(), q.size(), cudaMemcpyHostToDevice);
-        } else cudaMemcpy(w.slot(s.name), raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            basalt::core::device_copy(w.slot(s.name), q.data(), q.size(), cudaMemcpyHostToDevice);
+        } else basalt::core::device_copy(w.slot(s.name), raw.data(), raw.size(), cudaMemcpyHostToDevice);
     }
     const DflyTensor& hw = dense.t.at("lm_head.weight");
     void* head = nullptr;   // the head as the engine loads it: BF16 rounded to Q8_0
@@ -155,7 +156,7 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> q(raw.size() / 2 / 32 * 34);
         basalt::core::quantize_bf16_q8_0((const uint16_t*) raw.data(), raw.size() / 2, q.data());
         cudaMalloc(&head, q.size());
-        cudaMemcpy(head, q.data(), q.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(head, q.data(), q.size(), cudaMemcpyHostToDevice);
     }
     w.head_q8 = head;
     if (!w.pack_screen(nullptr, err)) { std::printf("%s\n", err.c_str()); return 1; }
@@ -177,7 +178,7 @@ int main(int argc, char** argv) {
 
     float* dhid = nullptr;
     cudaMalloc(&dhid, (size_t) E * 4);
-    cudaMemcpy(dhid, hidb.data(), (size_t) E * 4, cudaMemcpyHostToDevice);
+    basalt::core::device_copy(dhid, hidb.data(), (size_t) E * 4, cudaMemcpyHostToDevice);
     auto tap = DflyTap::create(d, 2056, err);
     tap->begin_window(T - 1);
     tap->hidden(0, dhid, nullptr);
@@ -187,7 +188,7 @@ int main(int argc, char** argv) {
         const std::vector<uint8_t> b = slurp(dir + "/kv" + std::to_string(i) + ".u16");
         uint16_t* p = nullptr;
         cudaMalloc(&p, b.size());
-        cudaMemcpy(p, b.data(), b.size(), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(p, b.data(), b.size(), cudaMemcpyHostToDevice);
         dkv.push_back(p);
     }
     DflyRunner::Env env;

@@ -32,8 +32,13 @@ jobs:
         include:
           - os: ubuntu-24.04
             platform: linux-x64
+            cuda_arch: 120
+          - os: ubuntu-24.04-arm   # the DGX Spark's build: Arm64 with the integrated GB10 (12.1)
+            platform: linux-arm64
+            cuda_arch: 121
           - os: windows-2022
             platform: windows-x64
+            cuda_arch: 120
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     defaults:
@@ -60,7 +65,8 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=OFF
-          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DBASALT_MODELS=all
+          -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_arch }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache

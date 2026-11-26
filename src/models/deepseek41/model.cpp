@@ -8,6 +8,7 @@
 
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/deepseek41/attn_batch.hpp"
@@ -42,7 +43,15 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
     desc_.n_ff_exp = g.n_ff_exp;
     desc_.n_expert_shared = g.n_shared;
     desc_.context_length = g.context_length;
-    for (const ExpertLayer& e : pack_.experts) {
+    // the grouped kernels take every layer's routed pair: refuse an unsupported pack at load, not at the first token
+    for (int l = 0; l < g.n_layers; ++l) {
+        const ExpertLayer& e = pack_.experts[(size_t) l];
+        if (!basalt::kernels::native_expert_supported(e.gu_type, e.d_type, g.n_embd, g.n_ff_exp)) {
+            err = "layer " + std::to_string(l) + ": no grouped expert kernels for gate/up " +
+                  std::string(basalt::ggml_type_name((uint32_t) e.gu_type)) + " (" + std::to_string(e.gu_type) +
+                  "), down " + std::string(basalt::ggml_type_name((uint32_t) e.d_type)) + " (" + std::to_string(e.d_type) + ")";
+            return false;
+        }
         desc_.expert_gate_up_type.push_back(e.gu_type);
         desc_.expert_down_type.push_back(e.d_type);
     }
@@ -130,7 +139,7 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     s.path = path_;
     s.fd = experts_fd();
     s.range = pack_.experts_range;
-    s.peer_devices = peer_devices_;
+    s.gpus = gpus_;
     s.diag_tier_ram = diag_tier_ram_;
     s.diag_tier_vram = diag_tier_vram_;
     s.diag_tier_frozen = tiers_.diag_tier_frozen;
@@ -255,21 +264,7 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     set_diag_dump(req.diag_dump);
     set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
     set_tiers(req);
-    std::vector<int> peers = req.peer_devices;
-    if (peers.size() > (size_t) kMaxSecondCards) {
-        basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),
-                          kMaxSecondCards);
-        peers.resize((size_t) kMaxSecondCards);
-    }
-    // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
-    // peer card here rather than failing at its first launch with 'no kernel image'.
-    for (int dev : peers) {
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !(prop.major == 12 && prop.minor == 0))
-            return {model::Status::Error, "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
-                                              ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
-    }
-    set_peer_devices(std::move(peers));
+    gpus_ = req.gpus;
     // the sessions first (the drafter takes its memory with the first), then the expert tier, sized from what they leave,
     // opened by the first session; what those share queues its reads in the start's plan
     planning_ = &reads;
@@ -289,5 +284,7 @@ model::Result DsModel::attach(const model::LoadRequest&, std::vector<std::unique
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, err};
     return {};
 }
+
+model::PeerHooks* DsModel::peer() const { return shared_tier_.tier.get(); }
 
 }  // namespace basalt::models::deepseek41

@@ -12,10 +12,10 @@
 namespace basalt::prefill::q8 {
 
 /// Row stride (in elements) of coalesced activation scales [cols / 32][act_scale_ld(rows)].
-inline int64_t act_scale_ld(int64_t rows) { return (rows + 63) & ~int64_t(63); }
+inline int64_t act_scale_ld(int64_t rows) { return (rows + 127) & ~int64_t(127); }
 
 /// Row stride (in elements) of coalesced weight scales [cols / 32][scale_plane_ld(rows)].
-inline int64_t scale_plane_ld(int64_t rows) { return (rows + 63) & ~int64_t(63); }
+inline int64_t scale_plane_ld(int64_t rows) { return (rows + 127) & ~int64_t(127); }
 
 /// Bytes of `rows` activation rows of `cols` values (cols a multiple of 64): int8 codes [rows][cols], then fp32
 /// block scales [cols / 32][act_scale_ld(rows)] (16-byte aligned).

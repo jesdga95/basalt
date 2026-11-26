@@ -5,6 +5,7 @@
 // against native_expert_grouped, and the NVFP4 experts on the FP4 tensor cores (moe_fp4, activations as two FP4 terms)
 // against a CPU reference that rounds the activations the same way. Rows are checked for not depending on the chunk's width or their place in it, and timed.
 // Exit 77 without a GPU.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
@@ -43,6 +44,7 @@ namespace {
 constexpr int E = kWidth;
 std::mt19937 rng(29);
 int failures = 0;
+bool g_no_bench = false;
 cudaStream_t S = nullptr;   // every launch's stream (a blocking one: the copies back wait for it)
 
 std::vector<float> randn(size_t n, float s = 1.f, float mean = 0.f) {
@@ -54,12 +56,12 @@ std::vector<float> randn(size_t n, float s = 1.f, float mean = 0.f) {
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
-    cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return p;
 }
 template <class T> std::vector<T> host(const T* d, size_t n) {
     std::vector<T> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 template <class T> T* zeros(size_t n) {
@@ -335,6 +337,146 @@ void test_attention_prompt() {
             cudaFree(dt);
             cudaFree(out);
         }
+    // long-context correctness: a 2,048-row chunk across the 4-stage far-tile pipeline and LPT tile order, in each format,
+    // with non-wrapping cache capacities against CPU FP64, attention_decode (all 2,048 rows), and sub-chunk invariance
+    for (const Kv kv : {kF16, kE4M3, kI8})
+        for (const bool window : {true, false}) {
+            const int R = 2048;
+            const int sub = 137;
+            const int64_t pos0 = window ? 8192 : 16384;
+            KeyBank kb;
+            kb.make(kv, pos0 + R);
+            const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.8f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
+            const std::vector<float> sink = randn((size_t) R * kHeads, 2.0f), table = randn((size_t) kRel * kExtent, 0.3f);
+            const int64_t ring_cap = kExtent + 256, stage_cap = 2048, full_cap = 32768;
+            std::vector<uint8_t> kc, vc, ks, vs;
+            if (window) {
+                kc = kb.cache(true, ring_cap, std::max<int64_t>(0, pos0 + sub - ring_cap), pos0 + sub);
+                vc = kb.cache(false, ring_cap, std::max<int64_t>(0, pos0 + sub - ring_cap), pos0 + sub);
+                ks = kb.cache(true, stage_cap, pos0, pos0 + R);
+                vs = kb.cache(false, stage_cap, pos0, pos0 + R);
+            } else {
+                kc = kb.cache(true, full_cap, 0, pos0 + R);
+                vc = kb.cache(false, full_cap, 0, pos0 + R);
+            }
+            uint8_t *dkc = dev(kc), *dvc = dev(vc), *dks = window ? dev(ks) : dkc, *dvs = window ? dev(vs) : dvc;
+            float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table);
+            float* out = zeros<float>((size_t) R * kHeads * kHeadDim);
+            AttnPromptArgs a;
+            a.q = dq;
+            a.r = drs;
+            a.sink = dsink;
+            a.rel_table = dt;
+            a.pos0 = pos0;
+            a.k_cache = dkc;
+            a.v_cache = dvc;
+            a.cap = window ? ring_cap : full_cap;
+            a.k_chunk = dks;
+            a.v_chunk = dvs;
+            a.chunk_cap = window ? stage_cap : full_cap;
+            a.fp8 = kv == kE4M3;
+            a.int8 = kv == kI8;
+            a.window = window ? kExtent : 0;
+            attention_prompt(a, R, out, S);
+            const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
+            // CPU FP64 reference across boundary, interior, and tail rows of the 2,048-row chunk
+            std::vector<float> gsub;
+            std::vector<double> ref;
+            for (const int r : {0, sub, 511, 1023, 1535, R - 1})
+                for (int h = 0; h < kHeads; ++h) {
+                    const int g = h / 3;
+                    const int64_t p = pos0 + r, lo = window ? std::max<int64_t>(0, p - kExtent + 1) : 0;
+                    std::vector<double> sc;
+                    sc.reserve((size_t) (p - lo + 1));
+                    double m = sink[(size_t) r * kHeads + h];
+                    for (int64_t key = lo; key <= p; ++key) {
+                        double d = 0;
+                        for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kb.key(g, key, i);
+                        d *= a.scale;
+                        const int64_t dist = p - key;
+                        if (dist < kExtent)
+                            for (int i = 0; i < kRel; ++i) d += (double) rs[((size_t) r * kHeads + h) * kRel + i] * table[(size_t) i * kExtent + dist];
+                        sc.push_back(d);
+                        m = std::max(m, d);
+                    }
+                    double den = std::exp(sink[(size_t) r * kHeads + h] - m);
+                    for (double& s : sc) den += (s = std::exp(s - m));
+                    for (int i = 0; i < kHeadDim; ++i) {
+                        double acc = 0;
+                        for (int64_t key = lo; key <= p; ++key) acc += sc[(size_t) (key - lo)] * kb.val(g, key, i);
+                        ref.push_back(acc / den);
+                        gsub.push_back(got[((size_t) r * kHeads + h) * kHeadDim + i]);
+                    }
+                }
+            char name[112];
+            std::snprintf(name, sizeof name, "attention_prompt 2048-row %s %s (pos0=%lld) vs CPU",
+                          window ? "window" : "full", kv_name(kv), (long long) pos0);
+            report(name, gsub, ref, 4e-3);
+            {
+                const int64_t cap = window ? kExtent + R + 64 : full_cap;
+                std::vector<uint8_t> dk = kb.cache(true, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
+                std::vector<uint8_t> dv = kb.cache(false, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
+                uint8_t *ddk = dev(dk), *ddv = dev(dv);
+                std::vector<int32_t> pos(R);
+                for (int r = 0; r < R; ++r) pos[r] = (int32_t) (pos0 + r);
+                int32_t* dpos = dev(pos);
+                AttnArgs d;
+                d.q = dq;
+                d.r = drs;
+                d.sink = dsink;
+                d.rel_table = dt;
+                d.pos = dpos;
+                d.k_cache = ddk;
+                d.v_cache = ddv;
+                d.cap = cap;
+                d.fp8 = a.fp8;
+                d.int8 = a.int8;
+                d.window = a.window;
+                const int64_t max_keys = window ? kExtent : pos0 + R;
+                void* scr = zeros<uint8_t>(attention_decode_scratch(8, max_keys));
+                float* dout = zeros<float>((size_t) R * kHeads * kHeadDim);
+                for (int r0 = 0; r0 < R; r0 += 8) {
+                    AttnArgs w = d;
+                    w.q = dq + (size_t) r0 * kHeads * kHeadDim;
+                    w.r = drs + (size_t) r0 * kHeads * kRel;
+                    w.sink = dsink + (size_t) r0 * kHeads;
+                    w.pos = dpos + r0;
+                    attention_decode(w, std::min(8, R - r0), max_keys, scr, dout + (size_t) r0 * kHeads * kHeadDim, S);
+                }
+                const std::vector<float> dec = host(dout, (size_t) R * kHeads * kHeadDim);
+                std::snprintf(name, sizeof name, "  vs attention_decode (all %d rows)", R);
+                report(name, got, dec, 4e-3);
+                cudaFree(ddk);
+                cudaFree(ddv);
+                cudaFree(dpos);
+                cudaFree(scr);
+                cudaFree(dout);
+            }
+            {
+                AttnPromptArgs b = a;
+                b.pos0 = pos0 + sub;
+                b.q = dq + (size_t) sub * kHeads * kHeadDim;
+                b.r = drs + (size_t) sub * kHeads * kRel;
+                b.sink = dsink + (size_t) sub * kHeads;
+                float* out2 = zeros<float>((size_t) (R - sub) * kHeads * kHeadDim);
+                attention_prompt(b, R - sub, out2, S);
+                const std::vector<float> g2 = host(out2, (size_t) (R - sub) * kHeads * kHeadDim);
+                same_bits("  rows 137.. as a chunk of their own", g2.data(), &got[(size_t) sub * kHeads * kHeadDim], g2.size() * 4);
+                cudaFree(out2);
+            }
+            if (window) {
+                cudaFree(dks);
+                cudaFree(dvs);
+            }
+            cudaFree(dkc);
+            cudaFree(dvc);
+            cudaFree(dq);
+            cudaFree(drs);
+            cudaFree(dsink);
+            cudaFree(dt);
+            cudaFree(out);
+        }
+    if (g_no_bench) return;
     // timing: a 2,048-row chunk of a window layer, and of a full layer after 8K, 32K and 128K positions, in each format
     for (const Kv kv : {kF16, kE4M3, kI8})
         for (const int64_t ctx : {(int64_t) 0, (int64_t) 8192, (int64_t) 32768, (int64_t) 131072}) {
@@ -484,6 +626,28 @@ void test_sort() {
     failures += !ok;
     const double us = time_us([&] { moe_sort(dids, R, K, NE, scr, bounds, tok, dst, ex, S); });
     std::printf("  moe_sort 2,048 rows x 8: %.1f us\n", us);
+
+    // pairs another card computes (id -1) are left out; bounds[NE] counts the rest
+    std::vector<int32_t> part = ids;
+    for (size_t i = 0; i < part.size(); ++i)
+        if (part[i] % 3 == 0) part[i] = -1;
+    moe_sort(dev(part), R, K, NE, scr, bounds, tok, dst, ex, S);
+    std::vector<int32_t> pb(NE + 1, 0), pt, pd, pe;
+    for (int e = 0; e < NE; ++e) {
+        pb[e] = (int32_t) pt.size();
+        for (int i = 0; i < P; ++i)
+            if (part[(size_t) i] == e) {
+                pt.push_back(i / K);
+                pd.push_back(i);
+                pe.push_back(e);
+            }
+    }
+    pb[NE] = (int32_t) pt.size();
+    const std::vector<int32_t> gt = host(tok, P), gd = host(dst, P), ge = host(ex, P);
+    const bool ok2 = host(bounds, NE + 1) == pb && std::equal(pt.begin(), pt.end(), gt.begin()) &&
+                     std::equal(pd.begin(), pd.end(), gd.begin()) && std::equal(pe.begin(), pe.end(), ge.begin());
+    std::printf("%-44s %s\n", "moe_sort leaving pairs out (id -1)", ok2 ? "exact" : "FAIL");
+    failures += !ok2;
 }
 
 // ---- the softcapped SwiGLU of the MMQ path ---------------------------------------------------------------------------------
@@ -822,7 +986,7 @@ void test_experts_fp4() {
     uint8_t* blobs = dev(ex.blobs);
     int32_t* dids = dev(ids);
     float *dw = dev(w), *dx = dev(x);
-    const int RMAX = 2048, PMAX = RMAX * K;
+    const int RMAX = 8192, PMAX = RMAX * K;   // the longest prompt chunk (prompt.hpp kSpillPromptChunk)
     int32_t *bounds = zeros<int32_t>(NE + 1), *tok = zeros<int32_t>(PMAX), *dst = zeros<int32_t>(PMAX), *rexp = zeros<int32_t>(PMAX);
     int32_t *toff = zeros<int32_t>(NE + 1), *boff = zeros<int32_t>(NE + 1);
     void* scr = zeros<uint8_t>(moe_sort_scratch(PMAX, NE));
@@ -915,6 +1079,23 @@ void test_experts_fp4() {
     run(100, dids, dx, dw, y2, true);
     const std::vector<float> g2 = host(y2, (size_t) 100 * E);
     same_bits("  rows 0..99 as a chunk of their own", g2.data(), got.data(), g2.size() * 4);
+    {   // the same rows first in a chunk of the longest width
+        std::vector<int32_t> ids_w((size_t) RMAX * K);
+        std::copy(ids.begin(), ids.end(), ids_w.begin());
+        for (int r = R; r < RMAX; ++r) {
+            std::shuffle(perm.begin(), perm.end(), rng);
+            for (int s = 0; s < K; ++s) ids_w[(size_t) r * K + s] = perm[s];
+        }
+        std::vector<float> w_w = randn((size_t) RMAX * K, 0.5f, 1.f), x_w = randn((size_t) RMAX * E, 1.0f);
+        std::copy(w.begin(), w.end(), w_w.begin());
+        std::copy(x.begin(), x.end(), x_w.begin());
+        int32_t* dids_w = dev(ids_w);
+        float *dw_w = dev(w_w), *dx_w = dev(x_w), *yw = zeros<float>((size_t) RMAX * E);
+        run(RMAX, dids_w, dx_w, dw_w, yw, true);
+        const std::vector<float> gw = host(yw, (size_t) R * E);
+        same_bits("  rows 0..255 first in a 8,192-row chunk", gw.data(), got.data(), gw.size() * 4);
+        for (void* q : {(void*) dids_w, (void*) dw_w, (void*) dx_w, (void*) yw}) cudaFree(q);
+    }
     // deterministic fp16 intermediate pipeline matches fp32 down + moe_combine and CPU double
     {
         float* yf = zeros<float>((size_t) R * E);
@@ -954,15 +1135,16 @@ void test_experts_fp4() {
     }
     // timing at a 2,048-row chunk's shape: 16,384 pairs over the 128 experts
     {
-        std::vector<int32_t> big((size_t) PMAX);
-        for (int r = 0; r < RMAX; ++r) {
+        const int RT = 2048, PT = RT * K;
+        std::vector<int32_t> big((size_t) PT);
+        for (int r = 0; r < RT; ++r) {
             std::shuffle(perm.begin(), perm.end(), rng);
             for (int s = 0; s < K; ++s) big[(size_t) r * K + s] = perm[s];
         }
         int32_t* bids = dev(big);
-        float *bx = dev(randn((size_t) RMAX * E, 1.f)), *bw = dev(randn((size_t) PMAX, 0.5f, 1.f)), *by = zeros<float>((size_t) RMAX * E);
-        const double us = time_us([&] { run(RMAX, bids, bx, bw, by, true); }, 10);
-        const double fl = 2.0 * PMAX * 3 * F * E;
+        float *bx = dev(randn((size_t) RT * E, 1.f)), *bw = dev(randn((size_t) PT, 0.5f, 1.f)), *by = zeros<float>((size_t) RT * E);
+        const double us = time_us([&] { run(RT, bids, bx, bw, by, true); }, 10);
+        const double fl = 2.0 * PT * 3 * F * E;
         std::printf("  FP4 experts, 2,048 rows: sort + quantize + gate/up + H + down + sum %.0f us (%.0f TOP/s)\n", us, fl / us / 1e6);
         cudaFree(bids);
         cudaFree(bx);
@@ -1259,13 +1441,22 @@ void test_dense() {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool attn_only = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--attention-only") attn_only = true;
+        else if (std::string(argv[i]) == "--no-bench") g_no_bench = true;
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("no GPU\n");
         return 77;
     }
     cudaStreamCreate(&S);
+    if (attn_only) {
+        test_attention_prompt();
+        std::printf("inkling2_prompt_parity (attention): %d failures\n", failures);
+        return failures ? 1 : 0;
+    }
     test_dense();
     test_attention_prompt();
     test_stage_to_ring();

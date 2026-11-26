@@ -24,12 +24,7 @@ int run(int argc, char** argv) {
     basalt::program::CommonOptions& common = *options;
     // ---- the GPUs: chosen before any CUDA call, which then sees only them, the main card as device 0
     std::vector<basalt::program::GpuCard> chosen_cards;
-    const auto layer_stage = [&](double main_gbps, double peer_gbps) {
-        return adapter != nullptr && adapter->second_card_runs_layers(common, main_gbps, peer_gbps);
-    };
-    if (const auto code = cli::select_gpus(common, chosen_cards, (adapter != nullptr ? adapter->max_expert_cards() : basalt::model::max_expert_cards()) + 1,
-                                         adapter != nullptr && adapter->second_card_reads_prompts(), layer_stage,
-                                         adapter != nullptr ? adapter->one_card_reason(common) : std::string())) return *code;
+    if (const auto code = cli::select_gpus(common, chosen_cards, adapter)) return *code;
     // ---- where every loader reads from: the sections of the .basalt file
     if (const auto code = cli::prepare_model_process(common)) return *code;
     if (const std::optional<int> code = adapter->run(common, chosen_cards)) return *code;

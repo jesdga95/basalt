@@ -1,4 +1,6 @@
 // src/models/qwen4exp/serve/prompt_split.cpp - request prompt_split operations.
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
@@ -17,7 +19,7 @@ QfnRequest::SplitPlan QfnRequest::split_plan(int64_t a0, int64_t b0, const char*
         if (b0 - a0 > runtime_.read_cap()) decline(skip);
         return plan;
     }
-    const engine_local::SplitPricing pr = runtime_.split_price(a0, b0, n - 1, runtime_.split_stages);
+    const engine_local::SplitPart pr = runtime_.split_part(a0, b0, n - 1);
     if (!pr.why.empty()) decline(pr.why);
     if (pr.chunk <= 0) return plan;   // (no reason: the part is one chunk, not longer than one)
     if (pr.chunk > runtime_.split_chunk_max) {
@@ -25,30 +27,25 @@ QfnRequest::SplitPlan QfnRequest::split_plan(int64_t a0, int64_t b0, const char*
                 std::to_string(runtime_.split_chunk_max));
         return plan;
     }
-    if (pr.price.stages < 2) {
-        decline("no stage set fits the cards' layer windows");
-        return plan;
-    }
-    basalt::log::info("basalt serve", "prompt split: %lld tokens priced %.0f ms on CUDA0, %.0f ms with %s%s; read %s",
-                      (long long) (b0 - a0), pr.price.tier_ms, pr.price.split_ms,
-                      runtime_.split_layers_text(pr.price.stages, pr.price.cuts).c_str(),
-                      runtime_.split_stages_text(pr.price).c_str(), pr.price.split ? "across" : "on CUDA0");
-    if (!pr.price.split) return plan;
-    for (int k = 1; k < pr.price.stages; ++k) {
-        PromptStage& st = *runtime_.pstages[(size_t) (pr.price.stages - 1 - k)];
-        const int64_t l1 = k + 1 < pr.price.stages ? pr.price.cuts[(size_t) k] : runtime_.g.n_layers;
+    const std::vector<int>& cuts = runtime_.split_cuts;
+    const int stages = runtime_.split_stages;
+    for (int k = 1; k < stages; ++k) {
+        PromptStage& st = *runtime_.pstages[(size_t) (stages - 1 - k)];
+        const int64_t l1 = k + 1 < stages ? cuts[(size_t) k] : runtime_.g.n_layers;
         const basalt::core::OnDevice on(st.dev);
         uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
-        if (!runtime_.split_region(st, b0 + 64, pr.chunk, pr.price.cuts[(size_t) k - 1], l1, w_at, s_at, b_at)) {
+        if (!runtime_.split_region(st, b0 + 64, pr.chunk, cuts[(size_t) k - 1], l1, w_at, s_at, b_at)) {
             basalt::log::info("basalt serve", "prompt split: %lld tokens do not fit CUDA%d's slots; read on CUDA0",
                               (long long) (b0 - a0), st.dev);
             return plan;
         }
     }
+    basalt::log::info("basalt serve", "prompt split: %lld tokens read across, %s", (long long) (b0 - a0),
+                      runtime_.split_layers_text(stages, cuts).c_str());
     plan.chunk = pr.chunk;
     plan.head = pr.head;
-    plan.stages = pr.price.stages;
-    plan.cuts = pr.price.cuts;
+    plan.stages = stages;
+    plan.cuts = cuts;
     return plan;
 }
 
@@ -308,7 +305,7 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
             float* h = before_last.hand_buffer(aside_buf);
             const int64_t nr = std::min(aside_rows - aside_at, T - r);
             float* dst = h == nullptr ? nullptr : h + (size_t) (chunk + aside_at) * HCN;
-            if (dst == nullptr || cudaMemcpy(dst, R_rows + (size_t) r * HCN, (size_t) nr * HCN * sizeof(float),
+            if (dst == nullptr || basalt::core::device_copy(dst, R_rows + (size_t) r * HCN, (size_t) nr * HCN * sizeof(float),
                                              cudaMemcpyDeviceToHost) != cudaSuccess) {
                 ce = "prompt split: reading the draft layer's rows back failed";
                 return false;
@@ -320,7 +317,7 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
         }
         if (r0 < T && p0 >= in_place_from) {
             float* h = const_cast<float*>(last.sp.hand_in());
-            if (h == nullptr || cudaMemcpy(h + (size_t) r0 * HCN, R_rows + (size_t) r0 * HCN,
+            if (h == nullptr || basalt::core::device_copy(h + (size_t) r0 * HCN, R_rows + (size_t) r0 * HCN,
                                            (size_t) (T - r0) * HCN * sizeof(float),
                                            cudaMemcpyDeviceToHost) != cudaSuccess) {
                 ce = "prompt split: reading the draft layer's rows back failed";
@@ -453,7 +450,7 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
         size_t pfree = 0, ptotal = 0;
         {
             const basalt::core::OnDevice on(st.dev);
-            if (cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) (void) cudaGetLastError();
+            if (basalt::core::gpu_mem_info(&pfree, &ptotal) != cudaSuccess) (void) cudaGetLastError();
         }
         char b[256];
         std::snprintf(b, sizeof b, "%s%lld on CUDA%d, layers %lld-%lld", k ? ", " : "",

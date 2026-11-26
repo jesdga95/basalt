@@ -333,6 +333,7 @@ struct ConversationStore::Job {
 };
 
 struct ConversationStore::Entry {
+    uint64_t id = 0;                          ///< monotonic entry identity (stable across vector erasures)
     std::string name;                         ///< file name in the directory
     uint64_t key = 0, bytes = 0, used = 0;
     bool mine = true;                         ///< written under this identity (others count for the budget only)
@@ -539,6 +540,7 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
             continue;
         }
         auto e = std::make_unique<Entry>();
+        e->id = ++next_id_;
         e->name = f.name;
         e->bytes = f.bytes;
         e->used = ++clock_;
@@ -657,7 +659,7 @@ ConversationStore::Match ConversationStore::best(const int32_t* prompt, size_t n
         };
         auto consider = [&](int64_t len) {
             if (usable(len) && (len > best.tokens || (len == best.tokens && e.used > best_used))) {
-                best = {i, len};
+                best = {i, len, e.id};
                 best_used = e.used;
             }
         };
@@ -699,20 +701,29 @@ Cut plan_cut(const std::vector<int64_t>& checks, int64_t tokens) {
     return c;
 }
 
-// bytes of a K/V buffer for `cells` cells (data and scales scale with the cells; pooled rows with the indexer blocks)
-uint64_t kv_part_bytes(uint32_t kind, uint64_t stored, int64_t stored_cells, int64_t cells, int64_t rows,
-                       int64_t idx_dim) {
-    if (kind == kPooled) return rows > 0 ? (uint64_t) rows * (uint64_t) idx_dim * sizeof(float) : 0;
+// bytes of a K/V buffer for `cells` cells (data and scales scale with the cells; pooled rows with the stored row width)
+uint64_t kv_part_bytes(uint32_t kind, uint64_t stored, int64_t stored_cells, int64_t stored_rows, int64_t cells,
+                       int64_t rows) {
+    if (kind == kPooled) return stored_rows > 0 && rows > 0 ? stored / (uint64_t) stored_rows * (uint64_t) rows : 0;
     if (stored_cells <= 0) return 0;
     return stored / (uint64_t) stored_cells * (uint64_t) cells;
 }
 
 }  // namespace
 
+ConversationStore::Entry* ConversationStore::find_entry_locked(const Match& m) const {
+    if (m.entry_id == 0) return nullptr;
+    if (m.index < entries_.size() && entries_[m.index]->id == m.entry_id) return entries_[m.index].get();
+    for (const auto& e : entries_)
+        if (e->id == m.entry_id) return e.get();
+    return nullptr;
+}
+
 uint64_t ConversationStore::load_bytes(const Match& m) const {
     std::lock_guard<std::mutex> lk(mu_);
-    if (m.index >= entries_.size()) return 0;
-    const Entry& e = *entries_[m.index];
+    const Entry* ep = find_entry_locked(m);
+    if (ep == nullptr) return 0;
+    const Entry& e = *ep;
     if (e.job) return e.job->image.bytes();   // an upper bound for a copy out of the queue
     uint64_t n = (uint64_t) m.tokens * 4 * 3, state = 0;
     for (const Section& s : e.table) {
@@ -743,8 +754,9 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     std::vector<uint8_t> kinds;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (m.index >= entries_.size() || m.tokens <= 0) { error = "conversation store: no such entry"; return false; }
-        Entry& e = *entries_[m.index];
+        Entry* ep = m.tokens > 0 ? find_entry_locked(m) : nullptr;
+        if (ep == nullptr) { error = "conversation store: no such entry"; return false; }
+        Entry& e = *ep;
         e.used = ++clock_;
         job = e.job;
         name = e.name;
@@ -803,8 +815,8 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             const ConversationBuffer* from[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
             ConversationBuffer* to[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
             for (int b = 0; b < 5; ++b) {
-                const uint64_t n = kv_part_bytes((uint32_t) (kK + b), from[b]->size(), kv.cells, k.cells,
-                                                 k.pooled_rows, kv.idx_dim);
+                const uint64_t n = kv_part_bytes((uint32_t) (kK + b), from[b]->size(), kv.cells, kv.pooled_rows,
+                                                 k.cells, k.pooled_rows);
                 if (n > from[b]->size()) { error = "conversation store: K/V shorter than the match"; return false; }
                 to[b]->resize_for_overwrite(n);
                 to[b]->visit(0, n, [&](uint8_t* p, size_t c, size_t at) { return from[b]->read(p, at, c); });
@@ -1113,6 +1125,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     }
     job->image = std::move(image);
     auto e = std::make_unique<Entry>();
+    e->id = ++next_id_;
     e->name = job->name;
     e->key = job->key;
     e->bytes = bytes;
@@ -1446,6 +1459,19 @@ ConversationStore::Stats ConversationStore::stats() const {
 uint64_t ConversationStore::queued_bytes() const {
     std::lock_guard<std::mutex> lk(mu_);
     return queue_bytes_;
+}
+
+bool ConversationStore::fits(uint64_t bytes) const {
+    if (!open_) return false;
+    const uint64_t queued = queued_bytes(), free_bytes = basalt::platform::disk_free_bytes(dir_);
+    const bool room = free_bytes >= queued + bytes + kSpaceFloor;
+    if (!room && !full_said_.exchange(true))
+        basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, so conversations are not written "
+                          "to disk until it has room (%.0f GiB kept free)", dir_.c_str(), (double) free_bytes / 1073741824.0,
+                          (double) kSpaceFloor / 1073741824.0);
+    else if (room && full_said_.exchange(false))
+        basalt::log::info("basalt serve", "conversation cache: %s has room again", dir_.c_str());
+    return room;
 }
 
 uint64_t conversation_store_hash_file(const std::string& path, uint64_t seed) {

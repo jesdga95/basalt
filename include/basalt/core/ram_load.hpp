@@ -93,6 +93,20 @@ inline uint64_t ram_tier_room(uint64_t avail, uint64_t reserve, bool pinned) {
     return pinned ? above - (above + 36) / 37 : above;
 }
 
+/// The bytes of experts a tier or copy of experts may pack into `room_bytes` when `spare_bytes` of free places, none
+/// larger than `max_spare_blob`, live beside them: `budget_bytes` when the room has that beside it, so a budget with
+/// room to spare keeps every expert it was given, else the room minus the places: the places stay whole beside the
+/// pack, and the coldest experts of the pack are the ones left to the file.  `budget_bytes` unchanged when the room
+/// holds the places and at most one place beside them: such a room funds no places whatever the pack does, since the
+/// check that follows reads the free RAM again and a little lower, and the caller reports them lost.
+inline uint64_t ram_tier_pack_bytes(uint64_t budget_bytes, uint64_t room_bytes, uint64_t spare_bytes,
+                                   uint64_t max_spare_blob) {
+    if (spare_bytes == 0 || spare_bytes >= room_bytes) return budget_bytes;   // no places, or no room for them
+    const uint64_t fits = room_bytes - spare_bytes;
+    if (fits <= max_spare_blob) return budget_bytes;   // the places alone fill the room
+    return budget_bytes < fits ? budget_bytes : fits;
+}
+
 /// What the experts a RAM tier leaves in the file read through the OS file cache, which must keep them for as long as
 /// they are used: every expert of the model's largest layer (`layer_bytes`) and what one prompt chunk reads from the
 /// file beside the layers it computes (`prompt_file_bytes`, 0 when it reads nothing more).

@@ -319,5 +319,105 @@ class LiveRegistry(unittest.TestCase):
         self.assertEqual(live.live, {})
 
 
+class Inkling2AnswerNow(unittest.TestCase):
+    """On Inkling 2 (thinks_in_blocks), parser.state starts in "between": /v1/answer_now during the opening header
+    must see "thinking" (200), not a spurious 409 "answering", while after answer text it returns 409 "answering"."""
+
+    def test_between_before_answer_accepts_answer_now_and_after_answer_refuses(self):
+        from serve.models.inkling2 import END, END_TURN, HEADER, OWN_TOKENS, TEXT, THINK, Inkling2
+
+        FIXTURES = Path(__file__).resolve().parent / "fixtures"
+        OFFICIAL = (FIXTURES / "inkling2_chat_template.jinja").read_text(encoding="utf-8")
+
+        class InkTok(ByteTokenizer):
+            SPECIALS = list(OWN_TOKENS)
+
+        tok = InkTok()
+        dialect = Inkling2()
+        at_header, proceed = threading.Event(), threading.Event()
+        at_after_content, proceed_end = threading.Event(), threading.Event()
+        mode = {"phase": "header"}
+
+        class InkEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+                prompt = self.tok.decode(ids)
+                if prompt.endswith(END) and THINK in prompt:
+                    seq = self.tok.encode(HEADER + TEXT + "4." + END + END_TURN, parse_special=True)
+                    for t in seq[:max_new]:
+                        if cancel.is_set():
+                            return
+                        yield t
+                    return
+                if mode["phase"] == "header":
+                    # Pause right after <|message_model|> while parser.state is still "between"
+                    yield self.tok.encode(HEADER, parse_special=True)[0]
+                    at_header.set()
+                    proceed.wait(10)
+                    rest = self.tok.encode(THINK + ("thinking " * 40) + END + HEADER + TEXT + "4." + END + END_TURN,
+                                           parse_special=True)
+                    for t in rest[:max_new - 1]:
+                        if cancel.is_set():
+                            return
+                        time.sleep(0.001)
+                        yield t
+                else:
+                    # Emit content block and pause in "between" AFTER content was emitted
+                    for t in self.tok.encode(HEADER + TEXT + "Done." + END, parse_special=True):
+                        yield t
+                    at_after_content.set()
+                    proceed_end.wait(10)
+                    yield self.tok.encode(END_TURN, parse_special=True)[0]
+
+        eng = InkEngine(tok, "x", max_context=1 << 16)
+        svc = Service(eng, tok, dialect.template(OFFICIAL), dialect=dialect, model_name="ink")
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            def post(path, body, headers=None):
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json", **(headers or {})})
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return r.status, json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    with e:
+                        return e.code, json.loads(e.read())
+
+            # 1) Calling /v1/answer_now right after <|message_model|> ("between", before any answer) -> 200 thinking
+            out = {}
+            th = threading.Thread(target=lambda: out.setdefault("r", post("/v1/chat/completions", {
+                "model": "ink", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 500},
+                {"x-session-id": "ink1"})), daemon=True)
+            th.start()
+            self.assertTrue(at_header.wait(10))
+            time.sleep(0.05)  # let Service.run process HEADER token and update live.state
+            code, b = post("/v1/answer_now", {}, {"x-session-id": "ink1"})
+            self.assertEqual((code, b.get("state")), (200, "thinking"), b)
+            proceed.set()
+            th.join(30)
+            self.assertEqual(out["r"][0], 200, out["r"])
+            self.assertEqual(out["r"][1]["choices"][0]["message"]["content"], "4.")
+
+            # 2) Calling /v1/answer_now in "between" AFTER content block closed -> 409 answering
+            mode["phase"] = "after_content"
+            out2 = {}
+            th2 = threading.Thread(target=lambda: out2.setdefault("r", post("/v1/chat/completions", {
+                "model": "ink", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 500},
+                {"x-session-id": "ink2"})), daemon=True)
+            th2.start()
+            self.assertTrue(at_after_content.wait(10))
+            time.sleep(0.05)
+            code2, b2 = post("/v1/answer_now", {}, {"x-session-id": "ink2"})
+            self.assertEqual((code2, b2["error"]["state"]), (409, "answering"), b2)
+            proceed_end.set()
+            th2.join(30)
+            self.assertEqual(out2["r"][0], 200)
+        finally:
+            proceed.set()
+            proceed_end.set()
+            httpd.shutdown()
+            httpd.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

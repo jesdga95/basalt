@@ -5,10 +5,11 @@
 namespace basalt::models::qwen4exp::serve {
 
 bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
-    // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
+    // (a layer split reads its stages as a pipeline over one run's chunks, and always exclusively: a read beside
+    // decoding slots evicts experts at every boundary, so on a split a read owns the cards and the windows wait)
     // lend() decides whether the part is read beside the decoding slots; one it does not share the card with reads
     // alone, with the CPU pool free
-    if (runtime_.o.batch <= 0 || (!runtime_.stages.empty() && !runtime_.batch_on()) || !beside_) {
+    if (runtime_.o.batch <= 0 || !runtime_.stages.empty() || !beside_) {
         // no window runs meanwhile, so the CPU pool is free: it takes its share of the streamed experts
         const bool lend_pool = runtime_.o.batch > 0 && !runtime_.multi_gpu && !runtime_.o.no_pool;
         if (lend_pool) { runtime_.sp.set_cpu_pool(&runtime_.pool); runtime_.sp.set_cpu_share(runtime_.o.prefill_cpu_share); }

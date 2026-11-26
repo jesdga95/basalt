@@ -225,75 +225,102 @@ bool Tokenizer::merge_piece(const uint8_t* p, size_t n, std::vector<int32_t>& ou
         const auto it = whole_.find(std::string_view((const char*) p, n));
         if (it != whole_.end()) { out.push_back(it->second); return true; }
     }
+    if (n == 1) {
+        const int32_t id = byte_id_[p[0]];
+        if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
+        out.push_back(id);
+        return true;
+    }
+    if (n <= kScanMaxSymbols) {
+        int32_t sym[kScanMaxSymbols];
+        uint32_t rank[kScanMaxSymbols];
+        int32_t merged[kScanMaxSymbols];
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t id = byte_id_[p[i]];
+            if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
+            sym[i] = id;
+        }
+        size_t count = n;
+        const uint32_t kNone = 0xFFFFFFFFu;
+        for (size_t i = 0; i + 1 < count; ++i) {
+            uint32_t r;
+            merged[i] = find_merge(sym[i], sym[i + 1], r);
+            rank[i] = merged[i] >= 0 ? r : kNone;
+        }
+        for (;;) {
+            size_t best = 0;
+            uint32_t best_rank = kNone;
+            for (size_t i = 0; i + 1 < count; ++i)
+                if (rank[i] < best_rank) { best_rank = rank[i]; best = i; }
+            if (best_rank == kNone) break;
+            sym[best] = merged[best];
+            if (best + 2 < count) std::memmove(sym + best + 1, sym + best + 2, (count - best - 2) * sizeof(int32_t));
+            std::memmove(rank + best, rank + best + 1, (count - best - 1) * sizeof(uint32_t));
+            std::memmove(merged + best, merged + best + 1, (count - best - 1) * sizeof(int32_t));
+            --count;
+            uint32_t r;
+            if (best + 1 < count) {
+                merged[best] = find_merge(sym[best], sym[best + 1], r);
+                rank[best] = merged[best] >= 0 ? r : kNone;
+            } else {
+                rank[best] = kNone;
+            }
+            if (best > 0) {
+                merged[best - 1] = find_merge(sym[best - 1], sym[best], r);
+                rank[best - 1] = merged[best - 1] >= 0 ? r : kNone;
+            }
+        }
+        out.insert(out.end(), sym, sym + count);
+        return true;
+    }
+
     sym_.resize(n);
     for (size_t i = 0; i < n; ++i) {
         const int32_t id = byte_id_[p[i]];
         if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
         sym_[i] = id;
     }
-    size_t count = n;
-    if (count == 1) { out.push_back(sym_[0]); return true; }
-    if (count <= kScanMaxSymbols) {
-        rank_.resize(count);
-        const uint32_t kNone = 0xFFFFFFFFu;
-        for (size_t i = 0; i + 1 < count; ++i) {
-            uint32_t r;
-            rank_[i] = find_merge(sym_[i], sym_[i + 1], r) >= 0 ? r : kNone;
-        }
-        for (;;) {
-            size_t best = 0;
-            uint32_t best_rank = kNone;
-            for (size_t i = 0; i + 1 < count; ++i)
-                if (rank_[i] < best_rank) { best_rank = rank_[i]; best = i; }
-            if (best_rank == kNone) break;
-            uint32_t r;
-            sym_[best] = find_merge(sym_[best], sym_[best + 1], r);
-            int32_t* sym = sym_.data();
-            uint32_t* rank = rank_.data();
-            if (best + 2 < count) std::memmove(sym + best + 1, sym + best + 2, (count - best - 2) * sizeof(int32_t));
-            std::memmove(rank + best, rank + best + 1, (count - best - 1) * sizeof(uint32_t));
-            --count;
-            if (best + 1 < count) rank_[best] = find_merge(sym_[best], sym_[best + 1], r) >= 0 ? r : kNone;
-            else rank_[best] = kNone;
-            if (best > 0) rank_[best - 1] = find_merge(sym_[best - 1], sym_[best], r) >= 0 ? r : kNone;
-        }
-        out.insert(out.end(), sym_.begin(), sym_.begin() + (std::ptrdiff_t) count);
-        return true;
-    }
-
     // a long piece: a linked list of symbols and a min-heap of (rank, position); a stale entry is skipped
-    struct Item { uint32_t rank; uint32_t pos; int32_t left, right; };
-    auto greater = [](const Item& a, const Item& b) { return a.rank != b.rank ? a.rank > b.rank : a.pos > b.pos; };
-    std::vector<int32_t> next(n), prev(n);
-    for (size_t i = 0; i < n; ++i) { next[i] = (int32_t) i + 1 < (int32_t) n ? (int32_t) i + 1 : -1; prev[i] = (int32_t) i - 1; }
-    std::vector<Item> heap;
-    heap.reserve(n * 2);
+    auto greater = [](const HeapItem& a, const HeapItem& b) { return a.rank != b.rank ? a.rank > b.rank : a.pos > b.pos; };
+    next_.resize(n);
+    prev_.resize(n);
+    dead_.assign(n, 0);
+    heap_.clear();
+    if (heap_.capacity() < n * 2) heap_.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        next_[i] = (int32_t) i + 1 < (int32_t) n ? (int32_t) i + 1 : -1;
+        prev_[i] = (int32_t) i - 1;
+    }
     for (size_t i = 0; i + 1 < n; ++i) {
         uint32_t r;
-        if (find_merge(sym_[i], sym_[i + 1], r) >= 0) heap.push_back({r, (uint32_t) i, sym_[i], sym_[i + 1]});
+        const int32_t res = find_merge(sym_[i], sym_[i + 1], r);
+        if (res >= 0) heap_.push_back({r, (uint32_t) i, sym_[i], sym_[i + 1], res});
     }
-    std::make_heap(heap.begin(), heap.end(), greater);
-    std::vector<uint8_t> dead(n, 0);
-    while (!heap.empty()) {
-        std::pop_heap(heap.begin(), heap.end(), greater);
-        const Item it = heap.back();
-        heap.pop_back();
-        const int32_t i = (int32_t) it.pos, j = next[(size_t) i];
-        if (dead[(size_t) i] || sym_[(size_t) i] != it.left || j < 0 || sym_[(size_t) j] != it.right) continue;
+    std::make_heap(heap_.begin(), heap_.end(), greater);
+    while (!heap_.empty()) {
+        std::pop_heap(heap_.begin(), heap_.end(), greater);
+        const HeapItem it = heap_.back();
+        heap_.pop_back();
+        const int32_t i = (int32_t) it.pos, j = next_[(size_t) i];
+        if (dead_[(size_t) i] || sym_[(size_t) i] != it.left || j < 0 || sym_[(size_t) j] != it.right) continue;
+        sym_[(size_t) i] = it.result;
+        dead_[(size_t) j] = 1;
+        const int32_t k = next_[(size_t) j];
+        next_[(size_t) i] = k;
         uint32_t r;
-        sym_[(size_t) i] = find_merge(it.left, it.right, r);
-        dead[(size_t) j] = 1;
-        const int32_t k = next[(size_t) j];
-        next[(size_t) i] = k;
         if (k >= 0) {
-            prev[(size_t) k] = i;
-            if (find_merge(sym_[(size_t) i], sym_[(size_t) k], r) >= 0) { heap.push_back({r, (uint32_t) i, sym_[(size_t) i], sym_[(size_t) k]}); std::push_heap(heap.begin(), heap.end(), greater); }
+            prev_[(size_t) k] = i;
+            const int32_t res = find_merge(sym_[(size_t) i], sym_[(size_t) k], r);
+            if (res >= 0) { heap_.push_back({r, (uint32_t) i, sym_[(size_t) i], sym_[(size_t) k], res}); std::push_heap(heap_.begin(), heap_.end(), greater); }
         }
-        const int32_t pv = prev[(size_t) i];
-        if (pv >= 0 && find_merge(sym_[(size_t) pv], sym_[(size_t) i], r) >= 0) { heap.push_back({r, (uint32_t) pv, sym_[(size_t) pv], sym_[(size_t) i]}); std::push_heap(heap.begin(), heap.end(), greater); }
+        const int32_t pv = prev_[(size_t) i];
+        if (pv >= 0) {
+            const int32_t res = find_merge(sym_[(size_t) pv], sym_[(size_t) i], r);
+            if (res >= 0) { heap_.push_back({r, (uint32_t) pv, sym_[(size_t) pv], sym_[(size_t) i], res}); std::push_heap(heap_.begin(), heap_.end(), greater); }
+        }
     }
     for (size_t i = 0; i < n; ++i)
-        if (!dead[i]) out.push_back(sym_[i]);
+        if (!dead_[i]) out.push_back(sym_[i]);
     return true;
 }
 

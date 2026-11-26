@@ -1,3 +1,4 @@
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -32,7 +33,6 @@ int cache_fill(Context& context) {
     // keeps its weights and the cache just sized, the peer card its free memory less its buffers and reserve, and the
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
-    // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
     // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
     // expert tier is filled, when the GDN mixer split is taken; without it the head's peer rows fit in what the tier
     // leaves free
@@ -44,14 +44,13 @@ int cache_fill(Context& context) {
                                                     std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
         return hs + gs;
     };
-    // what one peer card can hold of experts: its free memory less its buffers (one set per tier it holds) and reserve
+    // what one peer card can hold of experts: its free memory less its tier's buffers and reserve
     auto card_room = [&](int dev, int cur) -> uint64_t {
         size_t pfree = 0, ptotal = 0;
-        if (cudaSetDevice(dev) != cudaSuccess || cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) return 0;
-        const uint64_t tiers = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
+        if (cudaSetDevice(dev) != cudaSuccess || basalt::core::gpu_mem_info(&pfree, &ptotal) != cudaSuccess) return 0;
         const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                  (dev == o.peer_device ? peer_prompt_bytes() : 0) +
-                                 tiers * basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
+                                 basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
                                  (dev == o.peer_device ? (uint64_t) peer_split_bytes(cur) : 0);
         return (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
     };
@@ -63,33 +62,11 @@ int cache_fill(Context& context) {
             (void) cudaGetLastError();
             return 0;
         }
-        std::vector<int> seen;   // each card once; its tiers share its free memory
-        for (int dev : o.peer_devices) {
-            if (dev >= count || std::find(seen.begin(), seen.end(), dev) != seen.end()) continue;
-            seen.push_back(dev);
-            room += card_room(dev, cur);
-        }
+        for (int dev : o.peer_devices)   // (each card once: gpu names a card once)
+            if (dev < count) room += card_room(dev, cur);
         (void) cudaSetDevice(cur);
         (void) cudaGetLastError();
         return room;
-    };
-    // each tier's room for experts: its card's, shared by the tiers the card holds
-    auto peer_tier_rooms = [&]() -> std::vector<basalt::program::TierRoom> {
-        std::vector<basalt::program::TierRoom> rooms(o.peer_devices.size());
-        int cur = 0, count = 0;
-        if (cudaGetDevice(&cur) != cudaSuccess || cudaGetDeviceCount(&count) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return rooms;
-        }
-        for (size_t i = 0; i < rooms.size(); ++i) {
-            const int dev = o.peer_devices[i];
-            const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
-            rooms[i].bytes = dev < count ? card_room(dev, cur) / share : 0;
-            rooms[i].gbps = i < o.peer_gbps.size() ? o.peer_gbps[i] : 0;
-        }
-        (void) cudaSetDevice(cur);
-        (void) cudaGetLastError();
-        return rooms;
     };
     if (model_bytes > 0 && o.mmap_experts) {
         const auto free_ram = basalt::core::conversation_available_memory();
@@ -180,7 +157,7 @@ int cache_fill(Context& context) {
         const basalt::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            basalt::core::gpu_mem_info(&fb, &tb);
             basalt::log::info("basalt generate", "layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB",
                          st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
         }
@@ -243,7 +220,6 @@ int cache_fill(Context& context) {
     context.cache_fill_bytes = &cache_fill_bytes;
     context.peer_split_bytes = peer_split_bytes;
     context.peer_expert_room = peer_expert_room;
-    context.peer_tier_rooms = peer_tier_rooms;
     return token_path(context);
 }
 

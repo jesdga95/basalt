@@ -10,8 +10,12 @@
 #include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_two_pass.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/log.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <string>
 
@@ -81,20 +85,71 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
                                                          EPS, ib, s, st.max_cells,
                                                          basalt::kernels::rope_scaling(), m.cs);
     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+    // A call whose last query has two_pass::kMinBlocks blocks or more takes the two-pass scores (qsa_two_pass.hpp):
+    // qsa_block_topk returns the cells it returns from the 3xTF32 row.  Its scratch is m.attn, which the attention below
+    // writes and nothing reads before; the key norms are this layer's and chunk's (the appends above are complete).
+    // --exp qsa_select_3x=1 scores every call in 3xTF32; --exp qsa_two_pass_check=1 compares each two-pass call with
+    // the 3xTF32 scores and ids of the same queries (the counts are logged at the prompt's end).
+    namespace tp = basalt::kernels::two_pass;
+    static const bool tp_off = basalt::core::exp_flag("qsa_select_3x", 0) != 0;
+    static const bool tp_check = !tp_off && basalt::core::exp_flag("qsa_two_pass_check", 0) != 0;
+    const uint64_t tp_bytes = (uint64_t) T * ZV * sizeof(float);
+    const int64_t tp_nbid = (int64_t) m.steps_host[(size_t) ((T - 1) * basalt::kernels::kStepCount +
+                                                             basalt::kernels::kStepNBid)];
+    const bool tp_ok = !tp_off && tp_nbid + 1 >= tp::kMinBlocks &&
+                       basalt::kernels::qsa_two_pass_keys(st.idx_pooled, tp_nbid, m.sel_batch, m.max_blocks, m.attn,
+                                                          tp_bytes, m.cs);
     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
         const int64_t nb = std::min(m.sel_batch, T - t0);
         const int32_t* steps0 = m.steps_dev + t0 * basalt::kernels::kStepCount;
         // the grid reaches the batch's last query's n_bid (they rise with the position)
         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * basalt::kernels::kStepCount +
                                                                 basalt::kernels::kStepNBid)] + 1;
+        const bool tp_call = tp_ok && active >= tp::kMinBlocks &&
+                             basalt::kernels::qsa_block_scores_two_pass(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                        steps0, nb, m.sel_batch, m.max_blocks, s,
+                                                                        m.sel_scores, m.attn, tp_bytes, m.cs, active);
         // the scores on tensor cores (3xTF32: FP32-level, not bitwise)
-        if (!basalt::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
-                                                             steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                             m.cs, active))
+        if (!tp_call && !basalt::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                         steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                         m.cs, active))
             basalt::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                               m.max_blocks, s, m.sel_scores, m.cs, active);
         basalt::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                         m.sel_ids + t0 * m.cap, m.cs, active);
+        if (tp_call && tp_check) {
+            // this stage's own buffers, on its own card (a layer split runs one Prefill per card), freed with m.owned
+            if (m.tp_ref_sc == nullptr) {
+                float* sc = nullptr;
+                int32_t* ids = nullptr;
+                const bool ok =
+                    cudaMalloc((void**) &sc, (size_t) m.sel_batch * (size_t) m.max_blocks * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &ids, (size_t) m.sel_batch * (size_t) m.cap * sizeof(int32_t)) == cudaSuccess;
+                if (sc) m.owned.push_back(sc);
+                if (ids) m.owned.push_back(ids);
+                if (!ok) {
+                    err = "qsa_two_pass_check: no room for its buffers";
+                    return false;
+                }
+                m.tp_ref_sc = sc;
+                m.tp_ref_ids = ids;
+            }
+            float* const ref_sc = m.tp_ref_sc;
+            int32_t* const ref_ids = m.tp_ref_ids;
+            if (!basalt::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                      m.max_blocks, s, ref_sc, m.cs, active)) {
+                err = "qsa_two_pass_check: the tensor-core scorer did not run";
+                return false;
+            }
+            basalt::kernels::qsa_block_topk(ref_sc, steps0, nb, m.max_blocks, m.cap, s, ref_ids, m.cs, active);
+            if (!basalt::kernels::qsa_two_pass_check(m.sel_scores, m.sel_ids + t0 * m.cap, ref_sc, ref_ids, steps0, nb,
+                                                     m.sel_batch, m.max_blocks, m.cap, m.attn, m.cs)) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    basalt::log::warn("basalt prefill", "qsa_two_pass_check: %lld blocks are too many to check",
+                                      (long long) m.max_blocks);
+            }
+        }
     }
     const basalt::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                        : core::qsa_attn_pools(st);
@@ -115,6 +170,29 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
     ++qsa_index;
     return true;
+}
+
+void log_two_pass_counts(cudaStream_t cs) {
+    namespace tp = basalt::kernels::two_pass;
+    unsigned long long c[tp::kStatCount] = {};
+    if (!basalt::kernels::qsa_two_pass_stats(c, true, cs) || c[tp::kStCalls] == 0) return;
+    const unsigned long long sparse = c[tp::kStQueries], kept = sparse - c[tp::kStFull];
+    basalt::log::info("basalt prefill", "two-pass QSA select: %llu calls, %llu queries (%llu blocks) in single-pass TF32, "
+                      "%llu blocks again in 3xTF32 (%.1f a query, max %llu), %llu queries flagged (%llu 16-query tiles "
+                      "in full), %llu selecting every cell; candidates %.0f a query (max %llu)",
+                      c[tp::kStCalls], sparse, c[tp::kStBlocks], c[tp::kStBand],
+                      kept ? (double) c[tp::kStBand] / (double) kept : 0.0, c[tp::kStBandMax], c[tp::kStFull],
+                      c[tp::kStFullTiles], c[tp::kStIdentity], kept ? (double) c[tp::kStCand] / (double) kept : 0.0,
+                      c[tp::kStCandMax]);
+    if (c[tp::kChkQueries] == 0) return;
+    const uint32_t rb = (uint32_t) c[tp::kChkRatioMax];
+    float ratio = 0.0f;
+    std::memcpy(&ratio, &rb, 4);
+    basalt::log::info("basalt prefill", "two-pass check: %llu queries, %llu with ids not the 3xTF32 scorer's (%llu ids); "
+                      "scored again: %llu of %llu blocks not the 3xTF32 score bit for bit; kept: %llu of %llu "
+                      "single-pass scores outside the bound, the largest |S1 - S3| / bound %.4g",
+                      c[tp::kChkQueries], c[tp::kChkIdQueries], c[tp::kChkIdEntries], c[tp::kChkRescoredDiff],
+                      c[tp::kChkRescored], c[tp::kChkKeptOut], c[tp::kChkKept], (double) ratio);
 }
 
 }  // namespace basalt::prefill

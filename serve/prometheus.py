@@ -123,7 +123,10 @@ def _num(v: float | int) -> str:
         return "NaN"
     if math.isinf(v):
         return "+Inf" if v > 0 else "-Inf"
-    return f"{v:.6g}" if v != 0 else "0"
+    if v == 0:
+        return "0"
+    s = repr(float(v))
+    return s[:-2] if s.endswith(".0") else s
 
 
 class _Builder:
@@ -221,9 +224,12 @@ def render_prometheus(entries: list[tuple[dict, dict]]) -> str:
               ml, float(totals.get("prompt_ms") or 0.0) / 1000.0)
         b.add("basalt_decode_seconds_total", "counter", "Total time spent in token generation in seconds.",
               ml, float(totals.get("decode_ms") or 0.0) / 1000.0)
-        if engine.get("spill") is not None:
+        spill = engine.get("spill")
+        if isinstance(spill, dict):
+            spill = spill.get("experts")
+        if spill is not None:
             b.add("basalt_experts_spilled", "gauge", "Number of routed experts spilled to disk.",
-                  ml, int(engine["spill"]))
+                  ml, int(spill))
         if engine.get("expert_total") is not None:
             b.add("basalt_experts", "gauge", "Total number of routed experts.",
                   ml, int(engine["expert_total"]))

@@ -25,8 +25,9 @@ LEGACY_FILE = "docs/community/benchmarks.json"
 PATH_RE = re.compile(re.escape(RUNS_PREFIX) + r"[^/]+/[0-9a-f]{%d}\.json" % cb.ID_LEN)
 MAX_NEW_ROWS = 12
 PRESET = "community-1"
-# The engine arguments the community preset passes (bench_main.cpp): anything else is a lossy or off-preset run.
-ENGINE_FLAGS = {"--gpu": r"\d+(,\d+)*", "--max-context": r"\d{4,7}", "--kv": "|".join(re.escape(k) for k in cb.KV_FORMATS)}
+# The engine arguments the community preset passes (bench_main.cpp; the cards, their mode and shares are the submitter's): anything else is a lossy or off-preset run.
+ENGINE_FLAGS = {"--gpu": r"\d+(,\d+)*", "--gpu-mode": "peer|split|tensor", "--gpu-share": r"\d+(\.\d+)?(,\d+(\.\d+)?)*",
+                "--max-context": r"\d{4,7}", "--kv": "|".join(re.escape(k) for k in cb.KV_FORMATS)}
 # Band: a new row's decode_tps and prefill_16k_tps must lie in [lowest/BAND, highest*BAND] of the earlier rows of the
 # same model, GPU name and GPU count (different quants of one card spread about 4.5x in the table).
 BAND = 2.5
@@ -37,7 +38,7 @@ RATIO_LOW, RATIO_HIGH = 0.3, 6.0
 CAPS = {"submitter": 40, "notes": 200, "cpu": 80, "engine_args": 300, "quant": 40, "preset": 30, "gpu_name": 80}
 TEXT_RE = re.compile(r"^[^<>`\\]*$")
 URL_RE = re.compile(
-    r"(?i)(https?|ftp|file|data|javascript|ssh|git)\s*:|//|www\.|\bt\.me\b|@"
+    r"(?i)\b(https?|ftp|file|data|javascript|ssh|git)\s*:|//|www\.|\bt\.me\b|@"
     r"|\b[a-z0-9-]+\.(com|net|org|io|dev|ai|app|xyz|co|me|gg|ly|sh|to|cc|info|ru|cn|link|site|top|tk|ml|ga|cf|gq|zip|mov)\b"
     r"|\]\(")
 BIDI_RE = re.compile(r"[​-‏‪-‮⁠-⁩﻿]")
@@ -96,7 +97,7 @@ def check_engine_args(row, label, gate):
     while i < len(toks):
         pat = ENGINE_FLAGS.get(toks[i])
         if pat is None or i + 1 >= len(toks) or not re.fullmatch(pat, toks[i + 1]):
-            gate.fail(f"{label}: engine_args has '{toks[i]}' outside the community preset's --gpu, --max-context and --kv (a lossy or off-preset run)")
+            gate.fail(f"{label}: engine_args has '{toks[i]}' outside the community preset's --gpu, --gpu-mode, --gpu-share, --max-context and --kv (a lossy or off-preset run)")
             return
         i += 2
 
@@ -104,7 +105,9 @@ def check_engine_args(row, label, gate):
 def plausible(row, earlier, label, gate):
     for key in ("decode_tps", "prefill_16k_tps", "prefill_64k_tps"):
         v = row.get(key)
-        if cb.is_pos(v) and v > (CAP_DECODE if key == "decode_tps" else CAP_PREFILL):
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and not cb.is_pos(v):
+            gate.fail(f"{label}: {key} {v} must be a finite number > 0")
+        elif cb.is_pos(v) and v > (CAP_DECODE if key == "decode_tps" else CAP_PREFILL):
             gate.fail(f"{label}: {key} {v} is above the ceiling of any card")
     a, b = row.get("prefill_16k_tps"), row.get("prefill_64k_tps")
     if cb.is_pos(a) and cb.is_pos(b) and not RATIO_LOW <= b / a <= RATIO_HIGH:
@@ -136,7 +139,7 @@ def plausible(row, earlier, label, gate):
 def parse_run(text):
     """The row of a run file's text, or None when it is not a JSON object."""
     try:
-        row = json.loads(text)
+        row = cb.loads_strict(text)
     except ValueError:
         return None
     return row if isinstance(row, dict) else None
@@ -207,7 +210,8 @@ def run_gate(base_files, head_files, author, changed, known_commit):
         old = base_rows.get(path, {})
         human(g, f"{path} ({old.get('submitter')}, {old.get('model')}) was deleted; only a person can approve a deletion")
     g.new_rows = [head_rows[p] for p in added + modified]
-    earlier = [r for p, r in base_rows.items() if p not in head_rows and p not in removed]
+    # Judge every PR row only against trusted base rows (never against other untrusted rows in the same PR).
+    earlier = [r for p, r in base_rows.items() if p not in removed]
     for i, path in enumerate(added + modified):
         r = head_rows[path]
         is_update = path in modified
@@ -225,7 +229,7 @@ def run_gate(base_files, head_files, author, changed, known_commit):
             elif owners != {author.lower()}:
                 human(g, f"{label}: modifies the run of '{before.get('submitter')}', which is not the pull request author "
                          f"'{author}'; only a person can approve changing someone else's numbers")
-        plausible(r, earlier + ([before] if before else []) + [head_rows[p] for p in (added + modified)[:i]], label, g)
+        plausible(r, earlier, label, g)
     return g
 
 
@@ -269,7 +273,7 @@ def main(argv):
         if status in ("added", "modified") and PATH_RE.fullmatch(name) and f.is_file():
             head_files[name] = f.read_text(encoding="utf-8")
     g = run_gate(read_tree(base, RUNS_PREFIX.rstrip("/")), head_files, author, changed, git_known_commit())
-    Path(out).write_text(json.dumps(g.to_json()))
+    Path(out).write_text(json.dumps(g.to_json(), allow_nan=False))
     print(g.status)
     for r in g.reasons:
         print(" -", r)

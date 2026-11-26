@@ -132,6 +132,21 @@ class TextPrompt(unittest.TestCase):
             primed(failing(), PromptText(ByteTokenizer(), "hi"))
         self.assertIs(primed(iter(()), [1, 2]).__class__, iter(()).__class__)
 
+    def test_byte_spans_handles_ascii_non_ascii_unsorted_overlapping_and_edge_indices(self):
+        tok = ByteTokenizer()
+        self.assertEqual(PromptText(tok, "hello", []).byte_spans(), [])
+        cases = [
+            ("plain ascii <think> and </think> text",
+             [(12, 19), (24, 32), (0, 0), (19, 12), (10, 26), (-4, 100), (-100, -1), (32, 24)]),
+            ("héllo 你好 🚀 <think> wörld </think> 終わり",
+             [(18, 11), (0, 1), (11, 18), (6, 12), (25, 33), (25, 33), (10, 10), (-5, 200), (-999, 3), (34, 37)]),
+            ("🚀" * 20, [(15, 20), (0, 5), (3, 12), (10, 10), (-3, -1)]),
+        ]
+        for body, plain in cases:
+            with self.subTest(body=body[:20]):
+                expected = [(len(body[:a].encode("utf-8")), len(body[:b].encode("utf-8"))) for a, b in plain]
+                self.assertEqual(PromptText(tok, body, plain).byte_spans(), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

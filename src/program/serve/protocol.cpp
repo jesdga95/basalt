@@ -1,4 +1,5 @@
 // src/program/serve/protocol.cpp - protocol operations for the persistent engine.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/protocol.hpp"
 #include "state.hpp"
 #include "basalt_git.h"
@@ -286,7 +287,7 @@ int Runtime::init_protocol() {
         // what is left once everything is allocated: a GPU filled to the brim may not fail but page, and a page-in
         // while the verify graph spins on a host flag stalls the request for good
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const int64_t free_mib = (int64_t) (free_b >> 20);
         if (free_mib >= vram_floor_mib()) {
             basalt::log::info("basalt serve", "%lld MiB of VRAM free with everything loaded", (long long) free_mib);

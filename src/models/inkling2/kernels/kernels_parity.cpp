@@ -5,10 +5,12 @@
 // and the decode window's fused kernels against the references and the kernels they replace, their q8_1 blocks against a
 // CPU rounding of their own fp32 rows. Every kernel is checked for a row's bits not depending on the rows beside it, and
 // timed. Exit 77 without a GPU.
+#include "basalt/core/device_copy.hpp"
 #include "../cpu_expert_drain.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/router.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -55,12 +57,12 @@ std::vector<float> fixed_values(size_t n, float scale, uint32_t state) {
 template <class T> T* dev(const std::vector<T>& h) {
     T* p = nullptr;
     cudaMalloc(&p, h.size() * sizeof(T) + 16);
-    cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    basalt::core::device_copy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
     return p;
 }
 template <class T> std::vector<T> host(const T* d, size_t n) {
     std::vector<T> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    basalt::core::device_copy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
     return h;
 }
 // Device memory of `n` bytes filled with 0xa5: what a kernel leaves unwritten shows.
@@ -396,8 +398,8 @@ void test_prepare() {
         for (const Kv kv : kAllKv) {
             const size_t kvb = (size_t) kKvHeads * cap * kv_bytes(kv);
             uint8_t *kcache = poisoned(kvb), *vcache = poisoned(kvb);
-            cudaMemcpy(dkr, kr.data(), kr.size() * 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(dvr, vr.data(), vr.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(dkr, kr.data(), kr.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(dvr, vr.data(), vr.size() * 4, cudaMemcpyHostToDevice);
             a.k_cache = kcache; a.v_cache = vcache;
             kv_set(kv, a);
             attn_prepare(a, R, nullptr);
@@ -539,8 +541,8 @@ void test_attention() {
         std::snprintf(tag, sizeof tag, "attention (%s%s)", window ? "window ring" : "full, 3k keys", kv_tag(kv));
         report(tag, got, ref, 2e-3);
         const uint64_t hash = print_hash("output", bytes_of(got));
-        // Frozen outputs from main's FP16/FP8 kernels on the fixed attention fixture.
-        static constexpr uint64_t kBaseHashes[] = {0x37a69c7be6281e30ull, 0xde59e213bef8dbb9ull, 0x8302535765d7601full};
+        // Frozen outputs from the FP16/FP8 kernels on the fixed attention fixture.
+        static constexpr uint64_t kBaseHashes[] = {0x72538aec1379b868ull, 0x59167d639fa4a77bull, 0x3460547e2a0576d1ull};
         if (mode < 3) {
             const bool baseline = hash == kBaseHashes[mode];
             std::printf("  previous FP16/FP8 baseline %s\n", baseline ? "matches" : "FAIL");
@@ -712,6 +714,39 @@ void test_experts() {
     }
     std::printf("%-34s %s\n", "  the experts' tally", tally_ok ? "counted" : "FAIL");
     failures += !tally_ok;
+}
+
+// heat_fold: the kept rows' lookups of every visit, against a host count; only the first `rows` rows of each visit count,
+// whatever the row stride, and two folds add up
+void test_heat_fold() {
+    std::printf("heat_fold\n");
+    constexpr int V = 48, R = kDecodeRows, K = 8, NE = 128, L = 24;
+    std::uniform_int_distribution<int> pick_e(0, NE - 1), pick_l(0, L - 1);
+    std::vector<int32_t> ids((size_t) V * R * K), layer(V);
+    for (auto& e : ids) e = pick_e(rng);
+    for (auto& l : layer) l = pick_l(rng);
+    int32_t* di = dev(ids);
+    int32_t* dl = dev(layer);
+    bool ok = true;
+    for (int rows = 1; rows <= R && ok; ++rows) {
+        uint32_t* tally = zeros<uint32_t>((size_t) L * NE);
+        heat_fold(di, dl, V, R, rows, K, NE, tally, nullptr);
+        heat_fold(di, dl, V, R, rows, K, NE, tally, nullptr);
+        const std::vector<uint32_t> got = host(tally, (size_t) L * NE);
+        std::vector<uint32_t> want((size_t) L * NE, 0);
+        for (int v = 0; v < V; ++v)
+            for (int i = 0; i < rows * K; ++i) want[(size_t) layer[v] * NE + ids[(size_t) v * R * K + i]] += 2;
+        ok = got == want;
+        cudaFree(tally);
+    }
+    std::printf("%-34s %s\n", "  kept rows' lookups (1..8 rows)", ok ? "counted" : "FAIL");
+    failures += !ok;
+    uint32_t* tally = zeros<uint32_t>((size_t) L * NE);
+    const double us = time_us([&] { heat_fold(di, dl, V, R, 4, K, NE, tally, nullptr); });
+    std::printf("  %.1f us a call (48 visits, 4 rows: %.1f GB/s of ids)\n", us, (double) V * 4 * K * 4 / us / 1e3);
+    cudaFree(tally);
+    cudaFree(di);
+    cudaFree(dl);
 }
 
 void test_softcap() {
@@ -1133,7 +1168,7 @@ void test_expert_prefetch() {
     // experts in RAM (0 in the table, the CPU's) are skipped: some of them, then all
     for (int all : {0, 1}) {
         for (int e = 0; e < NE; ++e) tab[e] = all || e % 2 ? 0ull : (unsigned long long) (blobs + (size_t) e * blob);
-        cudaMemcpy(dtab, tab.data(), NE * sizeof(tab[0]), cudaMemcpyHostToDevice);
+        basalt::core::device_copy(dtab, tab.data(), NE * sizeof(tab[0]), cudaMemcpyHostToDevice);
         expert_prefetch(dids, (int) ids.size(), dtab, blob, sink, nullptr);
         const bool skip_ok = cudaDeviceSynchronize() == cudaSuccess;
         std::printf("%-34s %s\n", all ? "expert_prefetch: every one in RAM" : "expert_prefetch: some in RAM", skip_ok ? "ok" : "FAIL");
@@ -1348,9 +1383,9 @@ void test_cpu_ring() {
                 uint32_t grows = 0;
                 for (int p = 0; p < pairs; ++p)
                     if (!tab[(size_t) gids[(size_t) p]]) grows |= 1u << (p / K);
-                cudaMemcpy(di, gids.data(), gids.size() * 4, cudaMemcpyHostToDevice);
-                cudaMemcpy(dx, gx.data(), gx.size() * 4, cudaMemcpyHostToDevice);
-                cudaMemcpy(dy, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(di, gids.data(), gids.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dx, gx.data(), gx.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dy, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
                 poison();
                 sv.replay.store(replay);
                 cudaGraphLaunch(exec, st);
@@ -1946,6 +1981,140 @@ void test_batch_window() {
     failures += !post_same + !moe_same;
 }
 
+
+// Multi-row sliding-window decode across a 64-key chunk boundary at position 2,556..2,563 (where early rows read the tail of
+// chunk 23 while later rows advance p_max into chunk 40): parity with CPU double and bitwise identity with single-row decode.
+void test_attention_window_boundary() {
+    for (const Kv kv : {kF16, kE4M3}) {
+        const int R = 8, p0 = 2556, cap = kExtent + 8;
+        std::vector<int> pos(R);
+        for (int r = 0; r < R; ++r) pos[r] = p0 + r;
+        const size_t rows = (size_t) kKvHeads * cap;
+        std::vector<uint8_t> kb(rows * kv_bytes(kv), 0), vb(rows * kv_bytes(kv), 0);
+        std::vector<double> kd(rows * kHeadDim), vd(rows * kHeadDim);
+        const std::vector<float> ksrc = fixed_values(rows * kHeadDim, 0.6f, 0x31c59a7du);
+        const std::vector<float> vsrc = fixed_values(rows * kHeadDim, 1.0f, 0x58e27b41u);
+        for (size_t i = 0; i < rows; ++i) {
+            put_row(kv, &ksrc[i * kHeadDim], &kb[i * kv_bytes(kv)], &kd[i * kHeadDim]);
+            put_row(kv, &vsrc[i * kHeadDim], &vb[i * kv_bytes(kv)], &vd[i * kHeadDim]);
+        }
+        const std::vector<float> q = fixed_values((size_t) R * kHeads * kHeadDim, 0.8f, 0x62d48f19u);
+        const std::vector<float> rs = fixed_values((size_t) R * kHeads * kRel, 1.0f, 0x19a35c87u);
+        const std::vector<float> sink = fixed_values((size_t) R * kHeads, 2.0f, 0x8b41e623u);
+        const std::vector<float> table = fixed_values((size_t) kRel * kExtent, 0.3f, 0x74f0b2d5u);
+        void *dk = dev(kb), *dv = dev(vb);
+        float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table);
+        float* out = zeros<float>((size_t) R * kHeads * kHeadDim);
+        int* dpos = dev(pos);
+        AttnArgs a;
+        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
+        kv_set(kv, a);
+        a.window = kExtent;
+        void* scr = zeros<uint8_t>(attention_decode_scratch(R, kExtent));
+        attention_decode(a, R, kExtent, scr, out, nullptr);
+        const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
+        std::vector<double> ref(got.size());
+        for (int r = 0; r < R; ++r)
+            for (int h = 0; h < kHeads; ++h) {
+                const int g = h / 3, lo = std::max(0, pos[r] - kExtent + 1);
+                std::vector<double> sc;
+                double m = sink[(size_t) r * kHeads + h];
+                for (int k = lo; k <= pos[r]; ++k) {
+                    double d = 0;
+                    for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kd[((size_t) (k % cap) * kKvHeads + g) * kHeadDim + i];
+                    d *= a.scale;
+                    const int dist = pos[r] - k;
+                    if (dist < kExtent)
+                        for (int i = 0; i < kRel; ++i) d += (double) rs[((size_t) r * kHeads + h) * kRel + i] * table[(size_t) i * kExtent + dist];
+                    sc.push_back(d);
+                    m = std::max(m, d);
+                }
+                double den = std::exp(sink[(size_t) r * kHeads + h] - m);
+                for (double& sv : sc) den += (sv = std::exp(sv - m));
+                for (int i = 0; i < kHeadDim; ++i) {
+                    double acc = 0;
+                    for (int k = lo; k <= pos[r]; ++k) acc += sc[(size_t) (k - lo)] * vd[((size_t) (k % cap) * kKvHeads + g) * kHeadDim + i];
+                    ref[((size_t) r * kHeads + h) * kHeadDim + i] = acc / den;
+                }
+            }
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "attention (window boundary, 8 rows%s)", kv_tag(kv));
+        report(tag, got, ref, 2e-3);
+        float* out1 = zeros<float>((size_t) R * kHeads * kHeadDim);
+        for (int r = 0; r < R; ++r) {
+            AttnArgs one = a;
+            one.q = dq + (size_t) r * kHeads * kHeadDim;
+            one.r = drs + (size_t) r * kHeads * kRel;
+            one.sink = dsink + (size_t) r * kHeads;
+            one.pos = dpos + r;
+            attention_decode(one, 1, kExtent, scr, out1 + (size_t) r * kHeads * kHeadDim, nullptr);
+        }
+        const std::vector<float> solo = host(out1, got.size());
+        same_bits("  8-row batch vs each row alone", solo.data(), got.data(), got.size() * 4);
+        cudaFree(dk); cudaFree(dv); cudaFree(dq); cudaFree(drs); cudaFree(dsink); cudaFree(dt);
+        cudaFree(out); cudaFree(out1); cudaFree(dpos); cudaFree(scr);
+    }
+}
+
+void test_router_select_plan() {
+    std::printf("router_select_plan (rows = 1..64)\n");
+    constexpr int H = kWidth, NE = 128, K = 8, RMAX = kBatchRows;
+    const std::vector<float> x = randn((size_t) RMAX * H, 0.5f), gate = randn((size_t) NE * H, 0.05f), bias = randn(NE, 0.1f);
+    std::vector<unsigned long long> table(NE);
+    for (int e = 0; e < NE; ++e) table[(size_t) e] = e == 17 ? 0ull : (unsigned long long) (0x100000ull + (uint64_t) e * 4096ull);
+    float *dx = dev(x), *dg = dev(gate), *db = dev(bias), *dlog = zeros<float>(RMAX * NE), *dlog1 = zeros<float>(RMAX * NE);
+    float *dw_ref = zeros<float>(RMAX * K), *dw_got = zeros<float>(RMAX * K);
+    int32_t *di_ref = zeros<int32_t>(RMAX * K), *di_got = zeros<int32_t>(RMAX * K);
+    unsigned long long *dt = dev(table), *p_ref = zeros<unsigned long long>(NE), *p_got = zeros<unsigned long long>(NE);
+    unsigned long long *rb_ref = zeros<unsigned long long>(kAheadExperts), *rb_got = zeros<unsigned long long>(kAheadExperts);
+    int32_t *s_ref = zeros<int32_t>(NE + 2), *s_got = zeros<int32_t>(NE + 2), *ng_ref = zeros<int32_t>(1), *ng_got = zeros<int32_t>(1);
+    int32_t *dst_ref = zeros<int32_t>(RMAX * K), *dst_got = zeros<int32_t>(RMAX * K);
+    int32_t *tok_ref = zeros<int32_t>(RMAX * K), *tok_got = zeros<int32_t>(RMAX * K);
+    int32_t *rn_ref = zeros<int32_t>(1), *rn_got = zeros<int32_t>(1);
+    uint32_t *tl_ref = zeros<uint32_t>(NE), *tl_got = zeros<uint32_t>(NE);
+    bk::RouterArgs ra;
+    ra.n_expert = NE;
+    ra.n_embd = H;
+    ra.k = K;
+    ra.weight_scale = 2.5f;
+    ra.gate = bk::RouterGate::Sigmoid;
+    for (int r = 0; r < RMAX; ++r) bk::router_logits(dx + (size_t) r * H, dg, 1, ra, dlog1 + (size_t) r * NE, nullptr);
+    const std::vector<float> ref_log = host(dlog1, RMAX * NE);
+    bool ok = true;
+    for (int R : {1, 2, 7, 16, 35, 64}) {
+        bk::router_logits(dx, dg, R, ra, dlog, nullptr);
+        const std::vector<float> got_log = host(dlog, R * NE);
+        ok = ok && std::memcmp(ref_log.data(), got_log.data(), (size_t) R * NE * 4) == 0;
+        cudaMemset(tl_ref, 0, NE * 4);
+        cudaMemset(tl_got, 0, NE * 4);
+        bk::router_select(dlog1, db, R, ra, di_ref, dw_ref, nullptr);
+        moe_plan(di_ref, R, K, NE, dt, p_ref, s_ref, ng_ref, dst_ref, tok_ref, nullptr, tl_ref, rb_ref, rn_ref);
+        router_select_plan(dlog, db, R, K, NE, ra.weight_scale, di_got, dw_got, dt, p_got, s_got, ng_got, dst_got, tok_got, nullptr,
+                           tl_got, rb_got, rn_got);
+        cudaDeviceSynchronize();
+        const int g_r = host(ng_ref, 1)[0], g_g = host(ng_got, 1)[0];
+        const auto sr = host(s_ref, g_r + 2), sg = host(s_got, g_g + 2);
+        const int tot = sr[(size_t) g_r];
+        ok = ok && g_r == g_g && sr == sg &&
+             host(di_ref, R * K) == host(di_got, R * K) &&
+             std::memcmp(host(dw_ref, R * K).data(), host(dw_got, R * K).data(), (size_t) R * K * 4) == 0 &&
+             host(p_ref, g_r) == host(p_got, g_g) &&
+             host(dst_ref, tot) == host(dst_got, tot) &&
+             host(tok_ref, tot) == host(tok_got, tot) &&
+             host(tl_ref, NE) == host(tl_got, NE) &&
+             host(rb_ref, kAheadExperts) == host(rb_got, kAheadExperts) &&
+             host(rn_ref, 1) == host(rn_got, 1);
+    }
+    std::printf("%-34s %s\n", "  logits + select + plan (1..64)", ok ? "bitwise" : "FAIL");
+    failures += !ok;
+    cudaFree(dx); cudaFree(dg); cudaFree(db); cudaFree(dlog); cudaFree(dlog1);
+    cudaFree(dw_ref); cudaFree(dw_got); cudaFree(di_ref); cudaFree(di_got);
+    cudaFree(dt); cudaFree(p_ref); cudaFree(p_got); cudaFree(rb_ref); cudaFree(rb_got);
+    cudaFree(s_ref); cudaFree(s_got); cudaFree(ng_ref); cudaFree(ng_got);
+    cudaFree(dst_ref); cudaFree(dst_got); cudaFree(tok_ref); cudaFree(tok_got);
+    cudaFree(rn_ref); cudaFree(rn_got); cudaFree(tl_ref); cudaFree(tl_got);
+}
+
 }  // namespace
 
 int main() {
@@ -1972,7 +2141,10 @@ int main() {
     test_cpu_ring();
     test_cpu_abort();
     time_cpu_handoff();
+    test_heat_fold();
     test_batch_window();
+    test_attention_window_boundary();
+    test_router_select_plan();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

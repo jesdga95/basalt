@@ -1,4 +1,5 @@
 // src/models/hy4flash/dfly.cpp - the DFly2 drafter on the device: weights, the tap, and the block pass (dfly.hpp).
+#include "basalt/core/device_copy.hpp"
 #include "models/hy4flash/dfly.hpp"
 
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -331,7 +332,7 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             err = "no embedding row for the drafter's mask token";
             return false;
         }
-        cudaMemcpy(&p.bias, w.conf_b, 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(&p.bias, w.conf_b, 4, cudaMemcpyDeviceToHost);
         p.ready = true;
     }
     try {
@@ -547,7 +548,7 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
         const std::string base = dump_ + "/dfly_" + std::to_string(pos) + "_";
         auto put = [&](const std::string& name, const void* dev, size_t bytes) {
             std::vector<uint8_t> h(bytes);
-            cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
+            basalt::core::device_copy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
             if (std::FILE* f = std::fopen((base + name).c_str(), "wb")) {
                 std::fwrite(h.data(), 1, bytes, f);
                 std::fclose(f);

@@ -9,6 +9,7 @@ by its content (the id of row_id) and in the folder of its model's slug, and no 
 """
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -29,8 +30,21 @@ MODELS = ("Qwen3.8-Flash-Next", "Qwen3.8-27B", "DeepSeek-V4.1-Flash", "Hy4-flash
 KV_FORMATS = ("fp16", "int8", "q4_0", "k8v4", "fp8+fp4", "fp8")  # the cache formats the engine reports (DeepSeek --kv fp8 is fp8+fp4)
 
 
+def _reject_constant(token):
+    raise ValueError(f"non-finite JSON constant {token!r}")
+
+
+def loads_strict(text):
+    return json.loads(text, parse_constant=_reject_constant)
+
+
 def is_num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
 
 
 def is_pos(v):
@@ -148,7 +162,7 @@ def canonical_row(row):
     row = ordered(row, ROW_ORDER)
     if isinstance(row, dict) and isinstance(row.get("gpus"), list):
         row["gpus"] = [ordered(g, GPU_ORDER) for g in row["gpus"]]
-    return json.dumps(row, indent=2, ensure_ascii=False) + "\n"
+    return json.dumps(row, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
 
 
 def canonical_preset(preset):
@@ -249,7 +263,7 @@ def list_runs(root):
 def check_file(rel, text, err):
     """Validate one run file's text; returns the row when it parsed to an object."""
     try:
-        row = json.loads(text)
+        row = loads_strict(text)
     except ValueError as e:
         err(f"not valid JSON: {e}")
         return None
@@ -279,7 +293,7 @@ def check_dir(root, fix=False):
         text = read_text(full)
         if fix:
             try:
-                parsed = json.loads(text)
+                parsed = loads_strict(text)
             except ValueError:
                 parsed = None
             if isinstance(parsed, dict) and text != canonical_row(parsed):
@@ -292,7 +306,7 @@ def check_dir(root, fix=False):
     pp = os.path.join(root, PRESET_FILE)
     try:
         text = read_text(pp)
-        data = json.loads(text)
+        data = loads_strict(text)
         if not isinstance(data, dict) or set(data) != {"preset"} or not is_text(data["preset"]):
             problems.append(f"{PRESET_FILE}: must be an object with one key, 'preset', a non-empty string")
         elif text != canonical_preset(data["preset"]):

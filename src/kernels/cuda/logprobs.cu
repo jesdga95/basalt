@@ -3,7 +3,6 @@
 
 #include <cuda_runtime.h>
 
-#include <cfloat>
 #include <cmath>
 
 namespace basalt::kernels {
@@ -46,14 +45,18 @@ __device__ void chunk_stage(const float* __restrict__ logits, int n_vocab, int t
     const int i0 = chunk * kLogprobChunk;
     const int n = min(kLogprobChunk, n_vocab - i0);
     const float* src = logits + (size_t) row * (size_t) n_vocab + i0;
-    float mx = -FLT_MAX;
+    float mx = -INFINITY;
     for (int i = tid; i < n; i += kThreads) { s_x[i] = src[i]; mx = fmaxf(mx, s_x[i]); }
     float bv = mx;
     int bi = 0;
     block_best(bv, bi, s_v, s_i, tid);   // (the max; the ids are not read)
     mx = bv;
     double sum = 0.0;
-    for (int i = tid; i < n; i += kThreads) sum += (double) expf(s_x[i] - mx);
+    if (isfinite(mx)) {
+        for (int i = tid; i < n; i += kThreads) sum += (double) expf(s_x[i] - mx);
+    } else if (mx > 0.0f) {
+        for (int i = tid; i < n; i += kThreads) sum += s_x[i] == mx ? 1.0 : 0.0;
+    }
     for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     if ((tid & 31) == 0) s_d[tid >> 5] = sum;
     __syncthreads();
@@ -64,7 +67,7 @@ __device__ void chunk_stage(const float* __restrict__ logits, int n_vocab, int t
         part[0] = mx;
         reinterpret_cast<double*>(part)[1] = total;
     }
-    float pv = FLT_MAX;
+    float pv = INFINITY;
     int pi = -1;
     for (int j = 0; j < top; ++j) {
         bv = -INFINITY;
@@ -87,31 +90,51 @@ __device__ void merge_stage(const float* __restrict__ logits, int n_vocab, const
     __shared__ float s_v[kWarps];
     __shared__ int s_i[kWarps];
     __shared__ double s_lse;
+    __shared__ double s_inf_lp;
     __shared__ double s_c[(kMaxVocab + kLogprobChunk - 1) / kLogprobChunk];
     const int nc = row_logprobs_chunks(n_vocab);
     const float* parts = scratch + (size_t) row * nc * kPart;
     float* o = out + (size_t) row * kLogprobStride;
-    float bv = -FLT_MAX;
+    float bv = -INFINITY;
     int bi = 0;
     for (int c = tid; c < nc; c += kThreads) bv = fmaxf(bv, parts[(size_t) c * kPart]);
     block_best(bv, bi, s_v, s_i, tid);   // (the max; the ids are not read)
     const float mx = bv;
-    for (int c = tid; c < nc; c += kThreads)   // each chunk's sum rescaled to the row's max, one thread a chunk
-        s_c[c] = reinterpret_cast<const double*>(parts + (size_t) c * kPart)[1] * exp((double) parts[(size_t) c * kPart] - mx);
+    for (int c = tid; c < nc; c += kThreads) {   // each chunk's sum rescaled to the row's max, one thread a chunk
+        const float cmx = parts[(size_t) c * kPart];
+        const double csum = reinterpret_cast<const double*>(parts + (size_t) c * kPart)[1];
+        if (isfinite(mx)) {
+            s_c[c] = isfinite(cmx) ? csum * exp((double) cmx - (double) mx) : 0.0;
+        } else if (mx > 0.0f) {
+            s_c[c] = cmx == mx ? csum : 0.0;
+        } else {
+            s_c[c] = 0.0;
+        }
+    }
     __syncthreads();
     if (tid == 0) {
         double sum = 0.0;
         for (int c = 0; c < nc; ++c) sum += s_c[c];   // in chunk order
-        const double lse = (double) mx + log(sum);
+        const double lse = isfinite(mx) ? ((double) mx + log(sum)) : (mx > 0.0f ? (double) INFINITY : (double) -INFINITY);
+        const double inf_lp = (mx > 0.0f && sum > 0.0) ? (sum > 1.0 ? -log(sum) : 0.0) : (double) -INFINITY;
         s_lse = lse;
+        s_inf_lp = inf_lp;
         const int pick = picks[row];
-        o[0] = pick >= 0 && pick < n_vocab ? (float) ((double) logits[(size_t) row * n_vocab + pick] - lse) : -INFINITY;
+        if (pick >= 0 && pick < n_vocab) {
+            const float lp = logits[(size_t) row * n_vocab + pick];
+            if (isfinite(mx)) o[0] = (float) ((double) lp - lse);
+            else if (mx > 0.0f) o[0] = lp == mx ? (float) inf_lp : -INFINITY;
+            else o[0] = -INFINITY;
+        } else {
+            o[0] = -INFINITY;
+        }
         o[1] = (float) lse;
     }
     __syncthreads();
     const double lse = s_lse;
+    const double inf_lp = s_inf_lp;
     const int nk = nc * top;   // candidates: `top` per chunk (a short last chunk pads with -inf)
-    float pv = FLT_MAX;
+    float pv = INFINITY;
     int pi = -1;
     for (int j = 0; j < top; ++j) {
         bv = -INFINITY;
@@ -126,7 +149,15 @@ __device__ void merge_stage(const float* __restrict__ logits, int n_vocab, const
         if (tid == 0) {
             const bool real = bi < n_vocab;
             reinterpret_cast<int*>(o)[2 + 2 * j] = real ? bi : -1;
-            o[3 + 2 * j] = real ? (float) ((double) bv - lse) : -INFINITY;
+            if (!real) {
+                o[3 + 2 * j] = -INFINITY;
+            } else if (isfinite(mx)) {
+                o[3 + 2 * j] = (float) ((double) bv - lse);
+            } else if (mx > 0.0f) {
+                o[3 + 2 * j] = bv == mx ? (float) inf_lp : -INFINITY;
+            } else {
+                o[3 + 2 * j] = -INFINITY;
+            }
         }
         pv = bv;
         pi = bi;
