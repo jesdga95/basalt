@@ -477,6 +477,29 @@ class ParallelService(unittest.TestCase):
         self.assertIn("BWAIT", [x.split()[0] for x in log])
         self.assertEqual([x.split()[0] for x in log].count("BGEN"), 2, log)
 
+    def test_a_request_without_kv_room_is_not_passed_by_a_newer_one(self):
+        # BWAIT: the second request waits for room beside the first; the third, which arrives while it waits and finds a
+        # free slot, goes after the second, not before it
+        self.start(3, bwait=1)
+        out = {}
+
+        def go(t):
+            out[t] = self.chat(t)["choices"][0]["message"]["content"]
+        texts = ["first question LONGREPLY", "second", "third one, with a longer prompt"]
+        threads = [threading.Thread(target=go, args=(t,)) for t in texts]
+        for th in threads:
+            th.start()
+            time.sleep(0.15)
+        for th in threads:
+            th.join(30)
+        self.assertEqual(out[texts[1]], "ok, done.")
+        self.assertEqual(out[texts[2]], "ok, done.")
+        log = self.log.read_text().splitlines()
+        self.assertIn("BWAIT", [x.split()[0] for x in log])
+        lens = [int(x.split()[2]) for x in log if x.startswith("BGEN")]
+        self.assertEqual(len(lens), 3, log)
+        self.assertLess(lens[1], lens[2], log)
+
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """A long solo prompt read gives way at a chunk boundary to a short request, then continues and is answered."""
         self.start(2)
@@ -1251,6 +1274,7 @@ class RestartRaces(unittest.TestCase):
         e.ctl = threading.Lock()
         e.slot_cv = threading.Condition()
         e.admission = AdmissionQueue()
+        e.slot_ends = 0
         e.batch = 2
         e.max_context = 4096
         e.info = {"slot0_solo": 1}
@@ -1326,6 +1350,7 @@ class RestartRaces(unittest.TestCase):
         e.ctl = threading.Lock()
         e.slot_cv = threading.Condition()
         e.admission = AdmissionQueue()
+        e.slot_ends = 0
         e.batch = 2
         e.max_context = 4096
         e.info = {"slot0_solo": 1}
@@ -1702,6 +1727,7 @@ class ConcurrencyLifecycleResources(unittest.TestCase):
         e.ctl = threading.Lock()
         e.slot_cv = threading.Condition()
         e.admission = AdmissionQueue()
+        e.slot_ends = 0
         e.batch = 2
         e.max_context = 64
         e.info = {"slot0_solo": 1}

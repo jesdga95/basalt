@@ -1305,6 +1305,7 @@ class ProcessEngine:
         solo_slot, run0, run_size, ctl_epoch = None, 0, 0, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
+        place = self.admission.arrive()   # this request's place in the line for KV room
         yields, solo_again = 0, 0
         carry = [0, 0, 0]         # draft counts (accepted, offered) and windows of the runs before the current one
         first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
@@ -1402,17 +1403,23 @@ class ProcessEngine:
                             # prefer the slot holding this prompt's start, else the longest unused
                             refresh = False
                             with self.slot_cv:
-                                if ticket is None:
-                                    ticket = self.admission.join()
                                 while True:
                                     if any(not self.slot_busy[b] and self.slot_held[b] > 0
                                            and (b >= len(epoch) or epoch[b] != self.slot_epoch[b])
                                            for b in self.slot_order):
                                         refresh = True
                                         break
+                                    # a request not yet entitled to ask for room holds no place in the slot line
+                                    if self.admission.room_may_ask(place, self.slot_ends, not any(self.slot_busy)):
+                                        if ticket is None:
+                                            ticket = self.admission.join()
+                                    elif ticket is not None:
+                                        self.admission.leave(ticket)
+                                        ticket = None
                                     cur_meets = meets()
                                     slot = self.pick_slot(cur_meets, size(), session)
-                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size())):
+                                    if (ticket is not None and slot is not None
+                                            and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size()))):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
                                         slot_gen = self.gen
@@ -1505,6 +1512,7 @@ class ProcessEngine:
                             phase = "none"
                             with self.slot_cv:
                                 ends = self.slot_ends
+                                self.admission.room_refused(place, ends)
                                 self.slot_busy[slot] = False
                                 self.slot_cv.notify_all()
                             slot, slot_gen = None, None
@@ -1513,7 +1521,7 @@ class ProcessEngine:
                             beat = time.monotonic()
                             while not cancel.is_set():
                                 with self.slot_cv:
-                                    if self.slot_ends != ends or not any(self.slot_busy):
+                                    if self.admission.room_may_ask(place, self.slot_ends, not any(self.slot_busy)):
                                         break
                                     self.slot_cv.wait(timeout=1.0)
                                 if time.monotonic() - beat >= 10.0:
@@ -1539,10 +1547,11 @@ class ProcessEngine:
                             continue                            # gave way: retry after the shorter request
                         break
                 finally:
-                    if ticket is not None:
-                        with self.slot_cv:
+                    with self.slot_cv:
+                        if ticket is not None:
                             self.admission.leave(ticket)
-                            self.slot_cv.notify_all()
+                        self.admission.room_leave(place)
+                        self.slot_cv.notify_all()
                 self.ctl.release()
                 holding = False
                 if not cont:

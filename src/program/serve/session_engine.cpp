@@ -484,6 +484,13 @@ public:
         return n;
     }
 
+    /// Whether any batch slot runs a request (one that may yet give its room back).
+    bool batch_running() const {
+        for (const BSlot& sl : bs)
+            if (sl.active) return true;
+        return false;
+    }
+
     basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }
     int active_slot() const { return active_; }
     void set_active(int slot) { active_ = slot; }
@@ -891,7 +898,8 @@ Flow SessionRequest::admit_room() {
         std::printf("ERR %s\n", r.message.c_str());
         return Flow::error;
     }
-    if (batch) {
+    // nothing runs that could give room back and the idle conversations are out: the pool can never hold this prompt
+    if (batch && rt_.batch_running()) {
         basalt::log::info("basalt serve", "KV pool: a request of %lld tokens waits for slot %d (%s)", (long long) n, b, r.message.c_str());
         std::printf("BWAIT %d\n", b);
         runtime_.admit_slot = -1;
