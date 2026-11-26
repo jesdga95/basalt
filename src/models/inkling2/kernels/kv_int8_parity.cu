@@ -19,6 +19,8 @@
 
 namespace ink = basalt::models::inkling2;
 constexpr int kKeys100Ki = 100 * 1024;
+// Rows near this depth take all 64 slices, so any smaller slice count slices them differently.
+constexpr int kKeysAllSlices = 130000;
 constexpr int kKeysPartTail = 128 * 1024 - 1000;   // a deep row whose last slice is partly filled
 
 static const char* mma_ring_name(const ink::Int8MmaPlanInfo& info) {
@@ -422,6 +424,8 @@ static bool check_attention_mma(bool reduced) {
         depths.push_back(4096);
         for (const int boundary : {32768, 65536, kKeys100Ki, 131072, 196608, 262144})
             depths.insert(depths.end(), {boundary - 1, boundary, boundary + 1});
+        depths.push_back(kKeysAllSlices);
+        std::sort(depths.begin(), depths.end());
     }
     bool schedules_ok = true;
     bool reported[static_cast<int>(ink::Int8MmaPlan::Direct) + 1] = {};
@@ -600,7 +604,7 @@ static bool check_attention_mma(bool reduced) {
         }
         // Deep rows under the card's slice count and under 64, the most any card takes, against the CPU: each row alone and
         // in every window.
-        if (ok && (depth == kKeys100Ki || depth == 131072)) {
+        if (ok && (depth == kKeysAllSlices || depth == 131072)) {
             const int card = ink::attention_decode_int8_slices();
             double worst_abs[2] = {}, worst_rel[2] = {};
             for (int arm = 0; arm < 2 && ok; ++arm) {
