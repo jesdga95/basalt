@@ -6,7 +6,8 @@
 // A block takes one row (or one row and head, or one stream and row), and no row's arithmetic reads another row's partial
 // sums, so a row's bits do not depend on the rows beside it. A window's convolutions read the rows before them in the
 // window and the ring for the positions before the window, and each row writes its own ring slot: a window of at most
-// kDecodeRows rows touches distinct slots (kDecodeRows + kConv - 1 <= kConvRing).
+// kDecodeRows rows touches distinct slots, and none of the kConv - 1 its rows read before it (kDecodeRows + kConv - 1 <=
+// kConvRing).
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
