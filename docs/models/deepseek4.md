@@ -9,6 +9,8 @@ uses MXFP4 routed experts and Q8_0 for source FP8 linears, so it is not a BF16 0
 The converter, pack validation, serving dialect, and model-local CUDA primitives exist. The pack reader can fetch validated
 BF16 token-embedding rows from the GGUF section on demand. The engine does not yet register
 `deepseek4` as a loadable model: there is no `ModelAdapter`, `LoadedModel`, `ModelSession`, or full transformer forward.
+The final BF16 RMSNorm and logits projection stage is implemented and verified against the real output head, but is not yet
+connected to a session.
 The CPU image planner and patch formatter exist, but the vision transformer/projector execution is not integrated into a
 Basalt session. The attention stage now accepts decode windows of up to eight rows and matches sequential one-row output and
 cache state bitwise. Do not describe this pack as runnable until text decode, image prefill, and serving tests pass.

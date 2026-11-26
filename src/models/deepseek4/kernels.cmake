@@ -1,6 +1,7 @@
 # DeepSeek-V4 kernels and their parity programs. Included only when the deepseek4 model is selected.
 add_library(deepseek4_kernels STATIC
   src/models/deepseek4/attention.cpp
+  src/models/deepseek4/head.cpp
   src/models/deepseek4/layer.cpp
   src/models/deepseek4/shared_expert.cu
   src/models/deepseek4/routed_expert.cu
@@ -70,6 +71,19 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME ds4_attention_step_bench COMMAND ds4_attention_step_parity --bench)
   set_tests_properties(ds4_attention_step_parity PROPERTIES SKIP_RETURN_CODE 77)
   set_tests_properties(ds4_attention_step_bench PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(ds4_logits_parity src/models/deepseek4/logits_parity.cpp)
+  target_include_directories(ds4_logits_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                        ${_gpu_include_directories})
+  target_link_libraries(ds4_logits_parity PRIVATE deepseek4_kernels deepseek4_pack core ${_gpu_runtime_target})
+  if(BASALT_DEEPSEEK4_PACK)
+    basalt_gpu_test(NAME ds4_logits_parity COMMAND ds4_logits_parity "${BASALT_DEEPSEEK4_PACK}")
+    basalt_gpu_test(NAME ds4_logits_bench COMMAND ds4_logits_parity "${BASALT_DEEPSEEK4_PACK}" --bench)
+  else()
+    basalt_gpu_test(NAME ds4_logits_parity COMMAND ds4_logits_parity)
+    basalt_gpu_test(NAME ds4_logits_bench COMMAND ds4_logits_parity --bench)
+  endif()
+  set_tests_properties(ds4_logits_parity ds4_logits_bench PROPERTIES SKIP_RETURN_CODE 77)
 
   add_executable(ds4_ffn_route_parity src/models/deepseek4/ffn_route_parity.cpp)
   target_include_directories(ds4_ffn_route_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
