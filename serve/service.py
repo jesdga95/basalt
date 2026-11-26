@@ -1211,7 +1211,7 @@ class Service:
         """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
-        tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        tail = self.dialect.nothink_lead + force if force and kwargs.get("enable_thinking", True) is False else ""
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):
