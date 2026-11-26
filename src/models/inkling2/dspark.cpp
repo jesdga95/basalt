@@ -1010,6 +1010,7 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };
     max_sessions_ = S;
+    max_dr_rows_ = max_dr_rows;
     max_rows_ = max_rows;
     tap_rows_ = std::max(tap_rows, kSlice);
     tap_ = tap;
@@ -1038,7 +1039,7 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     }
     att_cells_ = std::max(ring_cells(d), full_cells(context));
     att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, CR, kHeads, kHeadDim));
-    // head batch scratch: per-draft-row buffers hold max(16*7, 64*2)=128 rows; per-slot state holds S_all<=64 slots
+    // head batch scratch: per-draft-row buffers hold max_dr_rows rows (a pass of draft()); per-slot state holds S_all slots
     hd_ = f((size_t) max_dr_rows * E);
     hq_ = dev(bk::native_q8_1_bytes(kE, max_dr_rows), ok);
     head_cols_ = dev(dspark_head_base_cols_bytes(max_dr_rows), ok);
@@ -1164,8 +1165,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
     };
     try {
         bk::PdlScope pdl(true);
-        const int max_dr_rows = std::max(max_sessions_ * kDsDrafts, (int) bk::kWindowSegsMax * 2);
-        const int step_B = (B * n_max <= max_dr_rows) ? B : max_sessions_;
+        const int step_B = (B * n_max <= max_dr_rows_) ? B : max_sessions_;
         for (int b0 = 0; b0 < B; b0 += step_B) {
             const int cb = std::min(step_B, B - b0);
             int sub_nmax = 1;
