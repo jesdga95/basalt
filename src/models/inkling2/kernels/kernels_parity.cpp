@@ -2118,7 +2118,8 @@ void test_router_select_plan() {
 }
 
 // l2_fill only reads: the range is unchanged, and the sink holds what the CPU predicts from each thread's fold of its
-// words (unchanged unless a fold equals the kernel's constant), for ranges of one to many strides and several grids.
+// words (unchanged unless a fold equals the kernel's constant), for ranges of one to many strides and several grids; and
+// a range in which every thread's fold is the constant, so all of them store.
 void test_l2_fill() {
     std::printf("l2_fill\n");
     bool ok = true;
@@ -2144,6 +2145,18 @@ void test_l2_fill() {
     }
     std::printf("%-34s %s\n", "  range unchanged, sink as predicted", ok ? "ok" : "FAIL");
     failures += !ok;
+    {
+        std::vector<uint32_t> h(4 * 256 * 3, 0);   // three records a thread at one block: folds of K, 0, 0
+        for (size_t i = 0; i < 256; ++i) h[4 * i] = 0x9e3779b9u;
+        uint32_t* d = dev(h);
+        uint32_t* sink = dev(std::vector<uint32_t>{0});
+        l2_fill(d, h.size() * 4, 1, sink, nullptr);
+        const bool all = cudaDeviceSynchronize() == cudaSuccess && host(sink, 1)[0] == 0x9e3779b9u && host(d, h.size()) == h;
+        std::printf("%-34s %s\n", "  every thread storing", all ? "ok" : "FAIL");
+        failures += !all;
+        cudaFree(sink);
+        cudaFree(d);
+    }
     bool refused = true;
     for (const auto& [bytes, blocks] : {std::pair<uint64_t, int>{0, 1}, {24, 1}, {16, 0}}) {
         try {

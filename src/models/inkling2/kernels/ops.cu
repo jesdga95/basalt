@@ -739,15 +739,16 @@ void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long
     check("moe_cpu_merge");
 }
 
-// Every 16 bytes of [p, p + bytes) read once through L2 (not L1), so the range is resident in L2 when the kernel ends; the
-// loads fold into one word, stored only when it equals a fixed constant, so they are kept.
+// Every 16 bytes of [p, p + bytes) read once through L2 (not L1), so the range has passed through L2 when the kernel ends;
+// later traffic can still evict it. The loads fold into one word per thread, stored (atomically, so any number of threads
+// may) only when it equals a fixed constant, so they are kept.
 __global__ void __launch_bounds__(256) l2_fill_kernel(const uint4* __restrict__ p, uint64_t n, uint32_t* __restrict__ sink) {
     uint32_t acc = 0;
     for (uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t) gridDim.x * blockDim.x) {
         const uint4 w = __ldcg(p + i);
         acc ^= w.x ^ w.y ^ w.z ^ w.w;
     }
-    if (acc == 0x9e3779b9u) sink[0] = acc;
+    if (acc == 0x9e3779b9u) atomicExch(sink, acc);
 }
 
 void l2_fill(const void* p, uint64_t bytes, int blocks, uint32_t* sink, void* stream) {
