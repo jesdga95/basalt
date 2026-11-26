@@ -1166,9 +1166,10 @@ public:
         for (size_t i = 0; i < vc_.size(); ++i) {   // the second card's visits go with its stream
             const VisitCache& c = vc_[i];
             std::vector<core::DeviceRegion>& to = slot_card_[i] ? st.peer_regions : st.regions;
-            if (c.ring) {
-                to.push_back({c.k, kv_bytes_of(c)});
-                to.push_back({c.v, kv_bytes_of(c)});
+            if (c.ring) {   // the cells the positions up to pos + kWindowRows sit in: the ring's first ones until it wraps
+                const size_t cells = (size_t) std::min<int64_t>(c.cap, pos + kWindowRows);
+                to.push_back({c.k, (size_t) kKvHeads * cells * row_bytes()});
+                to.push_back({c.v, (size_t) kKvHeads * cells * row_bytes()});
             }
             to.push_back({c.k_ring, kv_ring});
             to.push_back({c.v_ring, kv_ring});

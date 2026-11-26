@@ -340,7 +340,13 @@ public:
         if (const basalt::model::Result r = session().running_state(pos, false, rs); !r.ok()) return r;
         if (from.size() != rs.bytes()) return {basalt::model::Status::Error, "a checkpoint's running state has the wrong size"};
         std::string e;
-        if (!basalt::core::running_copy_in(rs, from.data(), e)) return {basalt::model::Status::Error, e};
+        const uint8_t* at = from.data() + rs.head.size();
+        if (!ckd.restore({{at, rs.regions}}, (cudaStream_t) rs.stream, e)) return {basalt::model::Status::Error, e};
+        if (!rs.peer_regions.empty()) {
+            const basalt::core::OnDevice on(rs.peer_device);
+            if (!ckd_peer.restore({{at + rs.regions_bytes(), rs.peer_regions}}, (cudaStream_t) rs.peer_stream, e))
+                return {basalt::model::Status::Error, e};
+        }
         return session().running_restored(pos, from.data());
     }
 
