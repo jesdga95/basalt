@@ -264,7 +264,8 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
         if (mode == GpuMode::Peer) {
             if (!gpu_peer_supported(g))
                 return refuse("gpu-mode peer: " + who + " is " + arch_name(g) +
-                              (ada ? "; peer takes sm_89 in a -DPEER_ADA=ON build" : "; peer runs on sm_120 cards"));
+                              (ada ? std::string("; peer takes sm_89 in a -DPEER_ADA=ON build")
+                                   : "; peer runs on " + core::cuda_cc_name() + " cards"));
         } else if (!gpu_main_supported(g)) {
             return refuse("gpu-mode " + mode_text + ": " + who + " is " + arch_name(g) + "; split and tensor run on " + core::cuda_cc_name() + " cards" +
                           (ada ? " (peer takes sm_89 in a -DPEER_ADA=ON build)" : ""));
