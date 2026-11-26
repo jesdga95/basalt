@@ -18,11 +18,11 @@ int main() {
     using namespace basalt::protocol;
 
     // a park reports the RAM tier's figures
-    EXPECT(conversation_line(6, 13314398618ull, 3), "CONV parked=6 bytes=13314398618 evictions=3\n");
-    EXPECT(conversation_line(0, 0, 0), "CONV parked=0 bytes=0 evictions=0\n");
+    EXPECT(conversation_line(6, 13314398618ull, 3, 0), "CONV parked=6 bytes=13314398618 evictions=3 refused=0\n");
+    EXPECT(conversation_line(0, 0, 0, 942), "CONV parked=0 bytes=0 evictions=0 refused=942\n");
     // a restore adds the tokens it returned and its ms
-    EXPECT(conversation_line(5, 12000000000ull, 1, 187342, 912.34), "CONV parked=5 bytes=12000000000 evictions=1 restored=187342 restored_ms=912.3\n");
-    EXPECT(conversation_line(1, 2, 3, 0, 0.0), "CONV parked=1 bytes=2 evictions=3 restored=0 restored_ms=0.0\n");
+    EXPECT(conversation_line(5, 12000000000ull, 1, 2, 187342, 912.34), "CONV parked=5 bytes=12000000000 evictions=1 refused=2 restored=187342 restored_ms=912.3\n");
+    EXPECT(conversation_line(1, 2, 3, 4, 0, 0.0), "CONV parked=1 bytes=2 evictions=3 refused=4 restored=0 restored_ms=0.0\n");
 
     // the context-overflow ERR: fields for the server, the sentence for people
     EXPECT(context_overflow_line(3000, 500, 3200),
