@@ -946,7 +946,9 @@ Flow SessionRequest::read_to(int64_t to) {
         for (next_block_ = 0; next_block_ < blocks_.size() && blocks_[next_block_].at < at;) ++next_block_;
     const int fw = rt_.session().prompt_fold_window();
     if (fw > 1 && to == n - 1 && to > at && to - at <= kWindowReadMax && next_block_ >= blocks_.size() && ppl == nullptr) {
-        if (in_slot && !solo_req) {   // the slot reads it in the batch windows, its turn checkpoint after them
+        // the slot reads it in the batch windows, its turn checkpoint after them; slot 0 too, being the solo session
+        if (batch_first || (runtime_.slot0_solo() && runtime_.admit_slot == 0)) {
+            batch_first = true;
             defer_read = at;
             fold_p0 = at;
             at = to;

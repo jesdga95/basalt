@@ -59,6 +59,7 @@ protected:
     bool slot_swapped{};
     bool slot_bound{};
     bool solo_req{};
+    bool batch_first{};   // the batch windows give this request its first token (it reads in its slot, or slot 0 defers its prompt's tail)
     using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
     bool solo_moved{};
