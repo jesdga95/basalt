@@ -119,6 +119,7 @@ __global__ void __launch_bounds__(kPackThreads) norm_pack_kernel(const X* x, con
 struct Plan {
     const Kernel* k = nullptr;
     int tiles = 0, ks = 1, cps = 0, nchunks = 0, grid = 1;
+    int64_t res = 1;   // resident blocks (not FP8)
 };
 
 std::atomic<int> plan_dev{-1};   // plan_device
@@ -194,6 +195,7 @@ Plan plan_for(const Call& c) {
         return p;
     }
     const int64_t R = resident(*p.k);
+    p.res = R;
     const int cb = c.fmt == Format::Q8 ? p.k->ch : c.fmt == Format::Bf16 ? 2 * p.k->ch : p.k->ch / 2;   // weight bytes per row per chunk
     const double sums = 1.0 + 64.0 / cb;   // an item's fixed cost in chunks: its pipeline turn and its slice's sums
     double best = 1e30;
@@ -275,7 +277,8 @@ void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tic
 
 void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stream) {
     if (T <= 0) return;
-    if (T > kRows) refuse("more rows than a window holds", c);
+    const int groups = (T + kRows - 1) / kRows;
+    if (groups > 1 && c.fmt == Format::F8) refuse("an FP8 product of more rows than a window holds", c);
     if (c.n < 1 || c.n > kMaxMatrices || (c.epi == Epilogue::SwiGLU && (c.n != 2 || c.m[1].rows != c.m[0].rows)))
         refuse("matrices", c);
     if (c.act_out && c.epi != Epilogue::SwiGLU) refuse("bf16 rows out of a product other than SwiGLU", c);
@@ -287,7 +290,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
         if (c.m[i].row_scales && c.fmt != Format::F8) refuse("a scale per row on a matrix other than F8", c);
     }
     const int64_t pr = part_rows(c);
-    if (p.ks > 1 && ((size_t) p.ks * kRows * pr > ws.partial_floats || (size_t) p.tiles > ws.tickets_n))
+    if (p.ks > 1 && ((size_t) groups * p.ks * kRows * pr > ws.partial_floats || (size_t) groups * p.tiles > ws.tickets_n))
         refuse("workspace too small", c);
     const Kernel& k = kernel_for(c, T > 32 ? 8 : T > 16 ? 4 : T > 8 ? 2 : 1);   // 8-column tiles; a row's sums are the same in any
     resident(k);   // its smem allowance
@@ -313,6 +316,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     a.K = c.K;
     a.part_rows = pr;
     a.T = T;
+    a.groups = groups;
     a.tiles = p.tiles;
     a.ks = p.ks;
     a.cps = p.cps;
@@ -322,7 +326,8 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     a.act_out = (uint16_t*) c.act_out;
     a.partial = ws.partial;
     a.tickets = ws.tickets;
-    launch_pdl(k.fn, dim3((unsigned) p.grid), dim3((unsigned) k.threads), (size_t) k.smem,
+    const int grid = groups == 1 ? p.grid : (int) std::min<int64_t>((int64_t) p.tiles * p.ks * groups, p.res);
+    launch_pdl(k.fn, dim3((unsigned) grid), dim3((unsigned) k.threads), (size_t) k.smem,
                (cudaStream_t) stream, a);
     check("window gemm");
 }
