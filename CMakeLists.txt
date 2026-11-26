@@ -960,6 +960,15 @@ if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
   set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
 endif()
 
+# a batch slot stopped by its client holds what the client saw, so the conversation continues without a re-read (same model
+# variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME batch_stop_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_stop_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(batch_stop_test PROPERTIES TIMEOUT 600)
+endif()
+
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE
 # model's geometry (GPU, synthetic, no model; --bench times the window kernel)
 add_executable(route_tail_skip_parity tests/kernels/route_tail_skip_parity.cpp)
