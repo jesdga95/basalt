@@ -57,6 +57,7 @@ REASONING_CLOSE = "\n</think>\n\n"
 # ANSWER_ROOM_MIN_CAP is too small to split and is left as it is.
 ANSWER_ROOM_MIN_CAP = 32
 ANSWER_RESERVE_MIN = 512
+WRAP_SOFT_MAX = 32          # tokens a budget wrap that stops the engine softly may keep past the budget
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
@@ -1455,6 +1456,7 @@ class Service:
             sampling = {**(sampling or {}), GRAMMAR_KEY: dict(
                 spec if isinstance(spec, dict) else {"kind": "text", "calls": bool(tools)}, think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
+        budget_asked = budget           # the request's own budget, before the answer room
         budget_req = sampling
         budget_ready = False
         if self.sampling_defaults:     # the request's own fields win
@@ -1607,7 +1609,7 @@ class Service:
                         live.state = "prompt"
                     prompt, thought = ids, 0            # reasoning tokens so far
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
-                    soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
+                    soft_stops = "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
                     pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
@@ -1621,8 +1623,9 @@ class Service:
                         more = {"stop_soon": soft} if soft is not None else {}
                         # A thinking budget caps the pass itself, so the engine stops on the budget's token and holds
                         # exactly what was kept: the next pass extends its live state instead of reading the overshoot
-                        # again through the prompt path (which rounds differently from decoding).
-                        if thinking and not budget_ready and not isinstance(ids, PromptText):
+                        # again through the prompt path (which rounds differently from decoding). A text prompt the
+                        # engine may clip learns its cap, and so its budget, from the engine's count (below).
+                        if thinking and not budget_ready and not (isinstance(ids, PromptText) and ids.clip):
                             budget = self.answer_budget(budget_req, max_new, budget)
                             budget_ready = True
                         cap = max_new - n
@@ -1634,6 +1637,7 @@ class Service:
                             else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
                         n_pass0 = n
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
+                        over = False                    # the budget was reached in a pass it does not cap: stopping soon
                         looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
@@ -1650,11 +1654,21 @@ class Service:
                                 # comes back as the budget and must not replace the client's cap.
                                 if isinstance(ids, PromptText) and ids.n is not None and not pt_settled:
                                     pt_settled = True
+                                    # the engine checked this pass's cap, which a thinking budget may have lowered:
+                                    # the whole cap must fit before a token goes out, as an id prompt's does
+                                    ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+                                    if not ids.clip and ctx > 0 and ids.n + CTX_SLACK + max_new > ctx:
+                                        raise overflow_error(ids.n, max_new, ctx)
                                     if ids.max_new and ids.max_new < cap:
                                         max_new = min(max_new, n_pass0 + ids.max_new)
+                                        cap = ids.max_new
+                                        if thinking and budget_ready:   # a budget set from the cap the engine cut
+                                            budget, budget_ready = budget_asked, False
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
+                                    # the pass the engine settled ends on the budget only if the budget is past its cap
+                                    capped = bool(budget) and parser.state == "reasoning" and budget - thought >= cap
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
@@ -1716,10 +1730,19 @@ class Service:
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
-                                    # only at a clean point: no held tag or split character; let a budget-capped pass drain its own DONE/BDONE
-                                    if thought >= budget and not parser.buf and not detok.pending() \
+                                    # only at a clean point: no held tag or split character; a pass the budget caps
+                                    # drains to its own DONE/BDONE and wraps after it (below)
+                                    if thought >= budget and not over and not parser.buf and not detok.pending() \
                                             and not (capped and n - n_pass0 >= cap):
-                                        wrap = True
+                                        if capped or soft is None or max_new - n < 2 * WRAP_SOFT_MAX:
+                                            wrap = True
+                                            break
+                                        # the pass goes on past the budget: the engine stops at its own pace and the
+                                        # tokens it still writes are kept, so the next pass extends what it holds
+                                        soft.set()
+                                        over = True
+                                    elif over and thought >= budget + WRAP_SOFT_MAX and not parser.buf and not detok.pending():
+                                        wrap = True     # the engine did not stop soon enough: the answer keeps its room
                                         break
                                 if live is not None:
                                     live.state = "thinking" if parser.state == "reasoning" else "answering"
@@ -1790,7 +1813,8 @@ class Service:
                                 resumed = True
                         if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
-                                wrap = asked = True
+                                wrap = True
+                                asked = not over
                             else:                       # a split tag or character, or the thinking ended meanwhile
                                 resumed = True
                         if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():

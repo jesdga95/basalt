@@ -3245,6 +3245,7 @@ class ThinkingBudget(unittest.TestCase):
         from serve.service import REASONING_CLOSE
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
         self.engine.takes_text = True
+        self.svc.fit_max_tokens = True      # the engine cuts the cap of a prompt that asks it to (clip=1) and refuses others
         original = self.engine.generate
 
         effective_cap = 1024
@@ -3306,7 +3307,7 @@ class ThinkingBudget(unittest.TestCase):
                 self.assertEqual(b["choices"][0]["finish_reason"], "stop")
                 self.assertGreater(b["usage"]["completion_tokens"], 800)
                 self.assertLessEqual(b["usage"]["completion_tokens"], 3000)
-        code, b = self.openai(max_tokens=16384, thinking_budget_tokens=4096)
+        code, b = self.openai(max_tokens=16000, thinking_budget_tokens=4096)   # a cap that fits beside the prompt
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         self.assertGreater(b["usage"]["completion_tokens"], 4096)
