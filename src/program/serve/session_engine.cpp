@@ -409,8 +409,8 @@ public:
         return idle;
     }
     /// Idle conversation `b` (a batch slot, -1: the solo session's) out of VRAM and its cells back to the pool: into the RAM
-    /// tier when RAM admits its capture, else kept only where the disk tier holds it, else dropped (a running request needs
-    /// the room more than an idle one).
+    /// tier outside its budget when RAM admits its capture (ConversationCache::put_slot), else kept only where the disk tier
+    /// holds it, else dropped (a running request needs the room more than an idle one).
     void pool_park(int b) {
         ckd_finish();   // a turn checkpoint's state may still be on its way to the host
         const auto t0 = Clock::now();
@@ -427,7 +427,7 @@ public:
         const uint64_t floor = std::max({(uint64_t) o.conversation_cache_min_free_mib << 20, disk.enabled() ? disk_floor : 0,
                                          basalt::platform::ram_reserve()});
         const bool keep = o.conversation_cache_min_tokens <= 0 || tokens >= o.conversation_cache_min_tokens;
-        bool to_ram = keep && conversations->enabled() && capture_admit(est, floor);
+        bool to_ram = keep && capture_admit(est, floor);
         size_t bytes = 0;
         if (to_ram) {
             basalt::core::SavedConversation image;
@@ -453,7 +453,7 @@ public:
         cks.clear();
         char where[64];
         if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);
-        else std::snprintf(where, sizeof where, "%s", on_disk ? "kept on disk only" : "dropped (no room in RAM)");
+        else std::snprintf(where, sizeof where, "%s", on_disk ? "kept on disk only" : keep ? "dropped (RAM below its floor)" : "dropped (below the token minimum)");
         basalt::log::info("basalt serve", "KV pool: %s's idle conversation of %lld tokens left VRAM %s in %.0f ms; %s", who.c_str(),
                           (long long) tokens, where, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                           sessions_[0]->kv_pool_line().c_str());
