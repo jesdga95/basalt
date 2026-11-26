@@ -142,7 +142,7 @@ public:
     /// final rows, every draft's logits, the drafts) go to dspark.bin there in order, to replay against a reference.
     /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). `backed` > 0: the full layers' caches reserve the context and
     /// back only the cells of the first `backed` positions (and a block past them), growing with the target's (ensure).
-    /// `int8`: the full layers' K and V in the int8 cache format (the target's --kv int8); the rings stay fp16.
+    /// `int8`: the full layers' K and V by the int8 cache's quantization rule (with --kv int8), in the drafter's own dense layout; the rings stay fp16.
     bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
               int64_t backed, bool int8, std::string& err);
     bool on() const { return w_ != nullptr; }
