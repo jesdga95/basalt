@@ -44,4 +44,9 @@ bool image_patches(const basalt::vision::Image& image, const VisionPlan& plan,
 /// Build the N-layout image token types and patch permutation at prompt position `start_pos`.
 bool build_image_block(const VisionPlan& plan, int64_t start_pos, ImageBlock& block, std::string& err);
 
+/// Assemble projected grid rows and learned special rows into the model's final image embedding sequence.
+bool assemble_image_embeddings(const ImageBlock& block, const std::vector<float>& grid_rows, int width,
+                               const float* start, const float* end, const float* pad, const float* newline,
+                               std::vector<float>& rows, std::string& err);
+
 }  // namespace basalt::models::deepseek4

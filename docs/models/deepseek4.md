@@ -30,7 +30,7 @@ This routing contract is distinct from DeepSeek-V4.1's generic top-k router. The
 
 The source uses 14-pixel patches, 3x3 downsampling, a 384-token image budget, 147,456 minimum pixels and an 8:1 landscape cap. Its N-layout interleaves adjacent rows, adds newline and pad token types, and inserts up to three leading pad tokens to align image positions to four. These rules differ from V4.1's ordinary merged-grid image blocks.
 
-`include/basalt/models/deepseek4/vision.hpp` and `src/models/deepseek4/vision/plan.cpp` now implement CPU resize planning, BF16-rounded patch extraction and the N-layout type/permutation reference. The CPU test covers reference dimensions, token budget, alignment and row ordering. The CUDA tower, projector attachment, spatial token embeddings, MRoPE assignment, prompt integration and dynamic memory lifecycle remain unimplemented. The model is not runnable.
+`include/basalt/models/deepseek4/vision.hpp` and `src/models/deepseek4/vision/plan.cpp` now implement CPU resize planning, BF16-rounded patch extraction, N-layout type/permutation and assembly of encoded patch rows with the learned start/end/pad/newline rows. The CPU test covers reference dimensions, token budget, alignment, row ordering and embedding assembly. The CUDA tower, projector attachment, spatial token embeddings, language position assignment, prompt integration and dynamic memory lifecycle remain unimplemented. The model is not runnable.
 
 ## Verification gates
 

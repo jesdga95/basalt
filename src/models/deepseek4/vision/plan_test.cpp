@@ -46,6 +46,16 @@ int main() {
     ok &= expect(block.types[0] == ImageToken::Pad && block.types[2] == ImageToken::Pad &&
                  block.types[3] == ImageToken::Start && block.types[4] == ImageToken::Patch,
                  "alignment pads precede image start and interleaved content");
+    std::vector<float> grid(100 * 2), assembled;
+    for (int i = 0; i < 100; ++i) { grid[2 * i] = (float) i; grid[2 * i + 1] = (float) -i; }
+    const float start[] = {1000.f, 1001.f}, end[] = {2000.f, 2001.f};
+    const float pad[] = {3000.f, 3001.f}, newline[] = {4000.f, 4001.f};
+    ok &= expect(assemble_image_embeddings(block, grid, 2, start, end, pad, newline, assembled, err),
+                 "N-layout image embedding assembly succeeds");
+    ok &= expect(assembled.size() == block.types.size() * 2 && assembled[0] == 3000.f &&
+                 assembled[6] == 1000.f && assembled[8] == 0.f && assembled[10] == 10.f &&
+                 assembled[12] == 1.f && assembled[14] == 11.f && assembled[48] == 4000.f,
+                 "learned special rows and interleaved encoded rows follow the image token types");
 
     VisionPlan odd_grid;
     ok &= expect(plan_image(150, 203, odd_grid, err) && odd_grid.width == 336 && odd_grid.height == 448 &&

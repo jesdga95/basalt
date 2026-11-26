@@ -171,4 +171,33 @@ bool build_image_block(const VisionPlan& plan, int64_t start_pos, ImageBlock& bl
     return true;
 }
 
+bool assemble_image_embeddings(const ImageBlock& block, const std::vector<float>& grid_rows, int width,
+                               const float* start, const float* end, const float* pad, const float* newline,
+                               std::vector<float>& rows, std::string& err) {
+    err.clear();
+    if (width <= 0 || !start || !end || !pad || !newline || block.types.empty() ||
+        grid_rows.size() % (size_t) width != 0 ||
+        std::count(block.types.begin(), block.types.end(), ImageToken::Patch) != (int) block.patch_order.size()) {
+        err = "invalid DeepSeek-V4 image embedding inputs";
+        return false;
+    }
+    const size_t grid_n = grid_rows.size() / (size_t) width;
+    for (int index : block.patch_order)
+        if (index < 0 || (size_t) index >= grid_n) { err = "image patch permutation exceeds encoded grid rows"; return false; }
+    rows.resize(block.types.size() * (size_t) width);
+    size_t patch = 0;
+    for (size_t i = 0; i < block.types.size(); ++i) {
+        const float* src = nullptr;
+        switch (block.types[i]) {
+            case ImageToken::Patch: src = grid_rows.data() + (size_t) block.patch_order[patch++] * width; break;
+            case ImageToken::Start: src = start; break;
+            case ImageToken::End: src = end; break;
+            case ImageToken::Pad: src = pad; break;
+            case ImageToken::Newline: src = newline; break;
+        }
+        std::copy(src, src + width, rows.data() + i * (size_t) width);
+    }
+    return true;
+}
+
 }  // namespace basalt::models::deepseek4
