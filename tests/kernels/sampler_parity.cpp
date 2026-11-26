@@ -1088,6 +1088,127 @@ int drawn_parity() {
                     keep_want, ok ? "" : "  FAIL");
         bad += ok ? 0 : 1;
     }
+    // Wide-path drawn drafts: sorted general path (split=3, top_k=0/top_p=0.95, top_k=100/min_p=0.05) and sort-free
+    // exact fast path (top_k=0, top_p=1.0, min_p=0.0). Use peaked logits so top ids hold >99.9% of full-vocab mass.
+    {
+        std::vector<float> wone((size_t) vocab, -24.0f);
+        for (int i = 0; i < 6; ++i) wone[(size_t) top[i]] = boost[i] + 4.0f;
+        std::vector<float> wl((size_t) rows * vocab);
+        for (int t = 0; t < rows; ++t) std::copy(wone.begin(), wone.end(), wl.begin() + (size_t) t * vocab);
+        float* dwl = nullptr;
+        check(cudaMalloc(&dwl, wl.size() * sizeof(float)), "wide drawn logits");
+        check(cudaMemcpy(dwl, wl.data(), wl.size() * sizeof(float), cudaMemcpyHostToDevice), "wide drawn upload");
+        struct WCase { const char* name; int top_k; float top_p; float min_p; float temp; int split; };
+        const WCase wcases[] = {
+            {"wide split=3 top_k=20 top_p=0.95", 20, 0.95f, 0.0f, 0.9f, 3},
+            {"wide sorted top_k=0 top_p=0.95", 0, 0.95f, 0.0f, 1.0f, 2},
+            {"wide sorted top_k=100 min_p=0.05", 100, 1.0f, 0.05f, 1.0f, 2},
+            {"wide nosort top_k=0 top_p=1.0", 0, 1.0f, 0.0f, 1.0f, 2},
+        };
+        for (const WCase& wc : wcases) {
+            basalt::kernels::SamplerParams p;
+            p.top_k = wc.top_k; p.top_p = wc.top_p; p.min_p = wc.min_p; p.temperature = wc.temp; p.seed = 199;
+            std::vector<int> ids = qid;
+            std::vector<double> pw(ids.size(), 0.0);
+            for (size_t i0 = 0; i0 < ids.size(); i0 += rows) {
+                std::vector<int> qq((size_t) rows, ids[0]);
+                for (int t = 0; t < rows && i0 + t < ids.size(); ++t) qq[(size_t) t] = ids[i0 + t];
+                std::vector<float> pr((size_t) rows);
+                check(cudaMemcpy(dquery, qq.data(), rows * sizeof(int), cudaMemcpyHostToDevice), "wquery");
+                basalt::kernels::sample_tokens_split(wc.split, dwl, rows, vocab, nullptr, 0, p, dout, dquery, rows, dprob, nullptr);
+                check(cudaMemcpy(pr.data(), dprob, rows * sizeof(float), cudaMemcpyDeviceToHost), "wprob");
+                for (int t = 0; t < rows && i0 + t < ids.size(); ++t) pw[i0 + t] = pr[(size_t) t];
+            }
+            double pin = 0, keep_want = 0;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                pin += pw[i];
+                if (i < qp.size()) keep_want += std::min(pw[i], (double) qp[i]);
+            }
+            if (pin < 0.999) { std::printf("drawn %s: ids hold only %.4f of p\n", wc.name, pin); ++bad; continue; }
+            p.q_ids = dq; p.q_p = dqp; p.q_n = Q; p.drafts = dd; p.n_drawn = rows - 1;   // last row is bonus row
+            const int calls = 3000;
+            std::vector<double> hist(ids.size(), 0.0), bhist(ids.size(), 0.0);
+            double kept = 0, other = 0, n = 0, bother = 0, bn = 0;
+            std::vector<int> dr((size_t) rows), out((size_t) rows);
+            for (int c = 0; c < calls; ++c) {
+                for (int t = 0; t < rows; ++t) dr[(size_t) t] = qid[(size_t) qdraw(rng)];
+                check(cudaMemcpy(dd, dr.data(), rows * sizeof(int), cudaMemcpyHostToDevice), "wdrafts");
+                p.counter = (uint64_t) c * rows;
+                basalt::kernels::sample_tokens_split(wc.split, dwl, rows, vocab, nullptr, 0, p, dout, nullptr, 0, nullptr, nullptr);
+                check(cudaMemcpy(out.data(), dout, rows * sizeof(int), cudaMemcpyDeviceToHost), "wout");
+                for (int t = 0; t < rows - 1; ++t) {
+                    n += 1;
+                    kept += out[(size_t) t] == dr[(size_t) t];
+                    const auto it = std::find(ids.begin(), ids.end(), out[(size_t) t]);
+                    if (it == ids.end()) other += 1;
+                    else hist[(size_t) (it - ids.begin())] += 1;
+                }
+                {
+                    bn += 1;
+                    const auto it = std::find(ids.begin(), ids.end(), out[(size_t) (rows - 1)]);
+                    if (it == ids.end()) bother += 1;
+                    else bhist[(size_t) (it - ids.begin())] += 1;
+                }
+            }
+            double tv = other / n, btv = bother / bn;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                tv += std::fabs(hist[i] / n - pw[i]);
+                btv += std::fabs(bhist[i] / bn - pw[i]);
+            }
+            tv *= 0.5; btv *= 0.5;
+            const double keep = kept / n;
+            const bool ok = tv < 0.012 && btv < 0.035 && std::fabs(keep - keep_want) < 0.012 && other == 0;
+            std::printf("drawn: %-34s TV %.4f  bonusTV %.4f  kept %.4f (want %.4f)%s\n", wc.name, tv, btv, keep,
+                        keep_want, ok ? "" : "  FAIL");
+            bad += ok ? 0 : 1;
+        }
+        // Speed check: 8 rows, top_k=0 drawn, sorted vs sort-free (a non-null qprob with n_query 0 keeps the
+        // top_p 1.0 chain on the sorted path).
+        {
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0); cudaEventCreate(&e1);
+            basalt::kernels::SamplerParams p;
+            p.top_k = 0; p.top_p = 0.95f; p.temperature = 1.0f; p.seed = 42;
+            p.q_ids = dq; p.q_p = dqp; p.q_n = Q; p.drafts = dd; p.n_drawn = 7;
+            for (int w = 0; w < 5; ++w) basalt::kernels::sample_tokens(dwl, 8, vocab, nullptr, 0, p, dout, nullptr);
+            cudaDeviceSynchronize();
+            cudaEventRecord(e0);
+            for (int it = 0; it < 50; ++it) {
+                p.counter = (uint64_t) it * 8;
+                basalt::kernels::sample_tokens(dwl, 8, vocab, nullptr, 0, p, dout, nullptr);
+            }
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float sorted95_ms = 0; cudaEventElapsedTime(&sorted95_ms, e0, e1);
+            p.top_p = 1.0f;
+            for (int w = 0; w < 5; ++w)
+                basalt::kernels::sample_tokens_probe(dwl, 8, vocab, nullptr, 0, p, dout, nullptr, 0, dprob, nullptr);
+            cudaDeviceSynchronize();
+            cudaEventRecord(e0);
+            for (int it = 0; it < 50; ++it) {
+                p.counter = (uint64_t) it * 8;
+                basalt::kernels::sample_tokens_probe(dwl, 8, vocab, nullptr, 0, p, dout, nullptr, 0, dprob, nullptr);
+            }
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float sorted_ms = 0; cudaEventElapsedTime(&sorted_ms, e0, e1);
+            for (int w = 0; w < 5; ++w) basalt::kernels::sample_tokens(dwl, 8, vocab, nullptr, 0, p, dout, nullptr);
+            cudaDeviceSynchronize();
+            cudaEventRecord(e0);
+            for (int it = 0; it < 50; ++it) {
+                p.counter = (uint64_t) it * 8;
+                basalt::kernels::sample_tokens(dwl, 8, vocab, nullptr, 0, p, dout, nullptr);
+            }
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float nosort_ms = 0; cudaEventElapsedTime(&nosort_ms, e0, e1);
+            std::printf("  bench: wide sorted drawn (8 rows, n_drawn=7, top_k=0 top_p=0.95): %.1f us/call\n",
+                        1000.0 * sorted95_ms / 50.0);
+            std::printf("  bench: wide sorted drawn (8 rows, n_drawn=7, top_k=0 top_p=1.0): %.1f us/call\n",
+                        1000.0 * sorted_ms / 50.0);
+            std::printf("  bench: wide nosort drawn (8 rows, n_drawn=7, top_k=0 top_p=1.0): %.1f us/call\n",
+                        1000.0 * nosort_ms / 50.0);
+            cudaEventDestroy(e0); cudaEventDestroy(e1);
+        }
+        cudaFree(dwl);
+    }
     cudaFree(dl); cudaFree(dq); cudaFree(dqp); cudaFree(dd); cudaFree(dout); cudaFree(dquery); cudaFree(dprob); cudaFree(dtop);
     return bad;
 }

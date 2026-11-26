@@ -9,7 +9,7 @@
 //
 // `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary (with thread-block clusters and without penalties,
 // `sampler_greedy_cluster_kernel`: the same token from a cluster of 8 CTAs per row).  The sampled chain has these
-// implementations, which pick the same token, bit for bit:
+// implementations, which pick the same token, bit for bit, except where the sort-free drawn-draft path below applies:
 //   - the SORTED SPLIT (top_k <= 32, the engine's): `sampler_sort_kernel` cuts each row into 4,096-logit blocks over
 //     the whole GPU, each finds its first k with bitonic networks, and the row's last block merges the lists and runs
 //     the tail (`sampled_tail_pair`), all in one launch;
@@ -21,8 +21,9 @@
 //     rounds, each over the logits after the previous pick.
 // `sampled_tail_warp` and `sampled_tail_pair` run top_p / min_p / temperature / draw with the same arithmetic.
 // A list longer than 64 (top_k 0 = the whole vocabulary, or top_k > 64) takes the WIDE PATH: each row's penalised
-// logits sorted in the selection order (`sampler_wide_keys_kernel`, a radix sort), then `sampler_wide_tail_kernel`,
-// the same arithmetic over the sorted list.
+// logits sorted in the selection order (`sampler_wide_keys_kernel`, a radix sort), then the same arithmetic over the
+// sorted list.  With drawn drafts and no truncation in force (top_k all, top_p 1, min_p 0) a sort-free path evaluates
+// the same distribution in vocabulary order; its draws need not reproduce the sorted path's token sequence.
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/diag.hpp"
 #include "philox.cuh"
@@ -1258,9 +1259,60 @@ constexpr int kWideRows = 8;           // rows of one pass (their buffers); more
 // a row's scan state between the wide path's launches
 struct WideRow {
     double total1, total2;   // top_p's sum over the list, the temperature pass's over the kept prefix
+    double total_res;        // residual mass sum max(p - q, 0) for drawn drafts
     int cut, below;          // the first entry meeting top_p, the first under min_p's threshold (k: none)
     int n_keep, pick, qpos;  // the kept prefix, the first entry the draw meets, the query's place (INT_MAX: none)
+    int dpos, res_pick;      // draft's place in the kept prefix, residual draw pick (INT_MAX: none)
+    int accepted;            // 1 when the drawn draft was kept (skip residual pass)
+    float mx, s_draft;       // sort-free path: global max logit and draft's penalised logit
 };
+
+// Tiny open-addressed hash table in shared memory for O(1) q(v) lookup (q_n <= 128; load factor <= 0.5).
+constexpr int kWideQHash = 256;
+constexpr int kWideQMask = kWideQHash - 1;
+
+__device__ __forceinline__ void wide_q_hash_build(int* __restrict__ h_id, float* __restrict__ h_p,
+                                                  const int* __restrict__ qi, const float* __restrict__ qp, int q_n) {
+    for (int i = threadIdx.x; i < kWideQHash; i += blockDim.x) {
+        h_id[i] = -1;
+        h_p[i] = 0.0f;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && qi != nullptr && qp != nullptr) {
+        const int lim = q_n < 128 ? q_n : 128;
+        for (int j = 0; j < lim; ++j) {
+            const int id = qi[j];
+            const float pr = qp[j];
+            if (id < 0 || !(pr > 0.0f)) continue;
+            int slot = (int) (((uint32_t) id * 2654435761u) >> 24) & kWideQMask;
+            for (int step = 0; step < kWideQHash; ++step) {
+                const int cur = h_id[slot];
+                if (cur == -1) { h_id[slot] = id; h_p[slot] = pr; break; }
+                if (cur == id) { h_p[slot] += pr; break; }
+                slot = (slot + 1) & kWideQMask;
+            }
+        }
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ double wide_q_lookup(const int* __restrict__ h_id, const float* __restrict__ h_p,
+                                                const int* __restrict__ qi, const float* __restrict__ qp, int q_n, int v) {
+    if (q_n <= 0 || qi == nullptr || qp == nullptr) return 0.0;
+    if (q_n <= 128) {
+        int slot = (int) (((uint32_t) v * 2654435761u) >> 24) & kWideQMask;
+        for (int step = 0; step < kWideQHash; ++step) {
+            const int cur = h_id[slot];
+            if (cur == -1) return 0.0;
+            if (cur == v) return (double) h_p[slot];
+            slot = (slot + 1) & kWideQMask;
+        }
+        return 0.0;
+    }
+    for (int j = 0; j < q_n; ++j)
+        if (qi[j] == v) return (double) qp[j];
+    return 0.0;
+}
 
 __device__ __forceinline__ unsigned wide_key(float x) {
     unsigned u = __float_as_uint(x);
@@ -1284,7 +1336,8 @@ sampler_wide_keys_kernel(const float* __restrict__ logits, int n_vocab, const in
     const int t = blockIdx.y;
     const float* l = logits + (size_t) t * n_vocab;
     const int blo = (int) blockIdx.x * kWideBlockSpan;
-    if (blockIdx.x == 0 && threadIdx.x == 0) st[t] = WideRow{0.0, 0.0, k, k, k, INT_MAX, INT_MAX};
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        st[t] = WideRow{0.0, 0.0, 0.0, k, k, k, INT_MAX, INT_MAX, INT_MAX, INT_MAX, 0, __int_as_float(0xff800000), __int_as_float(0xff800000)};
     const int* hrow = history ? history + (size_t) t * history_len : nullptr;
     int hlen = 0;
     if (hrow) {
@@ -1381,7 +1434,8 @@ sampler_wide_scan_kernel(const double* __restrict__ part, double* __restrict__ p
     pre[(size_t) t * kWideChunks + c] = warp_excl + (lane > 0 ? lane_excl : 0.0);
     if (c == 0) {
         if (pass == 1) st[t].total1 = warp_incl[31];
-        else st[t].total2 = warp_incl[31];
+        else if (pass == 2) st[t].total2 = warp_incl[31];
+        else st[t].total_res = warp_incl[31];
     }
 }
 
@@ -1443,6 +1497,465 @@ __global__ void sampler_wide_out_kernel(const unsigned* __restrict__ keys, const
     out[t0 + t] = live && wide_value(kr[pi]) > ninf ? ids[(size_t) t * n_vocab + pi] : 0;
     if (qprob != nullptr && t0 + t < nq)
         qprob[t0 + t] = live && r.qpos < r.n_keep ? (float) (e[(size_t) t * n_vocab + r.qpos] / r.total2) : 0.0f;
+}
+
+// ---- Wide-path drawn drafts (sorted general path): accept min(1, p(d)/q(d)), else sample residual max(p - q, 0).
+__global__ void __launch_bounds__(32)
+sampler_wide_drawn_find_kernel(const int* __restrict__ ids, int n_vocab, const SamplerParams p, WideRow* __restrict__ st) {
+    const int t = blockIdx.y;
+    if (t >= p.n_drawn) return;
+    const int c = (int) (blockIdx.x * 32 + threadIdx.x);
+    WideRow& r = st[t];
+    const int n = r.n_keep;
+    const int C = (n + kWideChunks - 1) / kWideChunks;
+    const int lo = min(n, c * C), hi = min(n, lo + C);
+    const int d = p.drafts[t];
+    const int* irow = ids + (size_t) t * n_vocab;
+    for (int i = lo; i < hi; ++i)
+        if (irow[i] == d) { r.dpos = i; break; }
+}
+
+__global__ void sampler_wide_drawn_accept_kernel(const unsigned* __restrict__ keys, int n_vocab, int n_rows,
+                                                 const SamplerParams p, const double* __restrict__ e,
+                                                 WideRow* __restrict__ st, int t0, int* __restrict__ out) {
+    const int t = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= n_rows || t >= p.n_drawn) return;
+    WideRow& r = st[t];
+    const float ninf = __int_as_float(0xff800000);
+    const bool live = wide_value(keys[(size_t) t * n_vocab]) > ninf;
+    if (!live || r.n_keep <= 0 || !(r.total2 > 0.0)) { r.accepted = 1; return; }
+    const int d = p.drafts[t];
+    const double pd = r.dpos < r.n_keep ? e[(size_t) t * n_vocab + r.dpos] / r.total2 : 0.0;
+    const int* qi = p.q_ids + (size_t) t * p.q_n;
+    const float* qp = p.q_p + (size_t) t * p.q_n;
+    double qd = 0.0;
+    for (int j = 0; j < p.q_n; ++j)
+        if (qi[j] == d) { qd = (double) qp[j]; break; }
+    const float keep = philox_uniform(p.seed, p.counter + (uint64_t) t, kPhiloxKeep);
+    if (qd > 0.0 && (pd >= qd || (double) keep * qd < pd)) {
+        out[t0 + t] = d;
+        r.accepted = 1;
+    } else {
+        r.accepted = 0;
+    }
+}
+
+__global__ void __launch_bounds__(kWideTermThreads)
+sampler_wide_drawn_res_kernel(const int* __restrict__ ids, int n_vocab, const SamplerParams p,
+                              double* __restrict__ e, double* __restrict__ part, const WideRow* __restrict__ st) {
+    const int t = blockIdx.y;
+    if (t >= p.n_drawn || st[t].accepted) return;
+    __shared__ int h_id[kWideQHash];
+    __shared__ float h_p[kWideQHash];
+    const int* qi = p.q_ids + (size_t) t * p.q_n;
+    const float* qp = p.q_p + (size_t) t * p.q_n;
+    wide_q_hash_build(h_id, h_p, qi, qp, p.q_n);
+    const int c0 = (int) blockIdx.x * kWideTermChunks;
+    const int n = st[t].n_keep;
+    const double inv_tot = 1.0 / st[t].total2;
+    const int* irow = ids + (size_t) t * n_vocab;
+    double* er = e + (size_t) t * n_vocab;
+    const int C = (n + kWideChunks - 1) / kWideChunks;
+    const int lo = min(n, c0 * C), hi = min(n, (c0 + kWideTermChunks) * C);
+    for (int i = lo + (int) threadIdx.x; i < hi; i += kWideTermThreads) {
+        const double pv = er[i] * inv_tot;
+        const double qv = wide_q_lookup(h_id, h_p, qi, qp, p.q_n, irow[i]);
+        er[i] = pv > qv ? pv - qv : 0.0;
+    }
+    __syncthreads();
+    if (threadIdx.x >= kWideTermChunks) return;
+    const int c = c0 + (int) threadIdx.x;
+    const int clo = min(n, c * C), chi = min(n, clo + C);
+    double s = 0.0;
+    for (int i = clo; i < chi; ++i) s += er[i];
+    part[(size_t) t * kWideChunks + c] = s;
+}
+
+__global__ void __launch_bounds__(32)
+sampler_wide_drawn_search_kernel(int n_vocab, const SamplerParams p, const double* __restrict__ e,
+                                 const double* __restrict__ pre, WideRow* __restrict__ st) {
+    const int t = blockIdx.y;
+    if (t >= p.n_drawn || st[t].accepted || !(st[t].total_res > 0.0)) return;
+    const int c = (int) (blockIdx.x * 32 + threadIdx.x);
+    WideRow& r = st[t];
+    const int n = r.n_keep;
+    const int C = (n + kWideChunks - 1) / kWideChunks;
+    const int lo = min(n, c * C), hi = min(n, lo + C);
+    const double* er = e + (size_t) t * n_vocab;
+    const double thr = (double) philox_uniform(p.seed, p.counter + (uint64_t) t) * r.total_res;
+    double cum = pre[(size_t) t * kWideChunks + c];
+    for (int i = lo; i < hi; ++i) {
+        const double rv = er[i];
+        if (rv <= 0.0) continue;
+        cum += rv;
+        if (thr < cum) { atomicMin(&r.res_pick, i); break; }
+    }
+}
+
+__global__ void sampler_wide_drawn_out_kernel(const int* __restrict__ ids, int n_vocab, int n_rows, int n_drawn,
+                                              const double* __restrict__ e, const WideRow* __restrict__ st,
+                                              int t0, int* __restrict__ out) {
+    const int t = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= n_rows || t >= n_drawn) return;
+    const WideRow& r = st[t];
+    if (r.accepted || !(r.total_res > 0.0)) return;
+    if (r.res_pick < r.n_keep) {
+        out[t0 + t] = ids[(size_t) t * n_vocab + r.res_pick];
+    } else {
+        // fp rounding safety: last entry with positive residual mass
+        const double* er = e + (size_t) t * n_vocab;
+        for (int i = r.n_keep - 1; i >= 0; --i) {
+            if (er[i] > 0.0) { out[t0 + t] = ids[(size_t) t * n_vocab + i]; return; }
+        }
+    }
+}
+
+// ---- Sort-free exact wide drawn path (top_k == 0/all, top_p >= 1, min_p <= 0, qprob == nullptr):
+// Avoids radix-sorting 200K logits per row (~850 us -> ~35 us) while remaining 100% exact in double precision.
+__device__ __forceinline__ void wide_nosort_block_bitmap(const int* __restrict__ hrow, int hlen, int n_vocab, int blo,
+                                                         unsigned int* __restrict__ bits, bool use_bits) {
+    if (!use_bits) return;
+    for (int w = threadIdx.x; w < kWideBlockSpan / 32; w += blockDim.x) bits[w] = 0u;
+    __syncthreads();
+    for (int i = threadIdx.x; i < hlen; i += blockDim.x) {
+        const int h = hrow[i];
+        if (h >= 0 && h < n_vocab && h >= blo && h - blo < kWideBlockSpan)
+            atomicOr(&bits[(h - blo) >> 5], 1u << ((h - blo) & 31));
+    }
+    __syncthreads();
+}
+
+__global__ void __launch_bounds__(kWideKeyThreads)
+sampler_wide_nosort_stats_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
+                                 int history_len, const SamplerParams p, double* __restrict__ bmax,
+                                 double* __restrict__ bsum, WideRow* __restrict__ st) {
+    const int t = blockIdx.y;
+    const int bidx = (int) blockIdx.x;
+    const int blo = bidx * kWideBlockSpan;
+    const float* l = logits + (size_t) t * n_vocab;
+    const float ninf = __int_as_float(0xff800000);
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;
+    }
+    __shared__ unsigned int bits[kWideBlockSpan / 32];
+    const bool use_bits = hrow != nullptr && hlen > 0;
+    wide_nosort_block_bitmap(hrow, hlen, n_vocab, blo, bits, use_bits);
+    const int draft = (t < p.n_drawn && p.drafts != nullptr) ? p.drafts[t] : -1;
+    if (bidx == 0 && threadIdx.x == 0 && (draft < 0 || draft >= n_vocab)) st[t].s_draft = ninf;
+    constexpr int kPerT = kWideBlockSpan / kWideKeyThreads;   // 16
+    float s[kPerT];
+    float lm = ninf;
+#pragma unroll
+    for (int j = 0; j < kPerT; ++j) {
+        const int b = threadIdx.x + j * kWideKeyThreads;
+        const int v = blo + b;
+        float x = ninf;
+        if (v < n_vocab) {
+            x = p.logit_bias ? l[v] + p.logit_bias[v] : l[v];
+            if (use_bits && (bits[b >> 5] & (1u << (b & 31)))) x = apply_penalties(x, history_count(hrow, hlen, v), p);
+            if (!(x > ninf)) x = ninf;
+            if (v == draft) st[t].s_draft = x;
+        }
+        s[j] = x;
+        if (x > lm) lm = x;
+    }
+    __shared__ float sm[8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) lm = fmaxf(lm, __shfl_xor_sync(kFullMask, lm, o));
+    if (lane == 0) sm[warp] = lm;
+    __syncthreads();
+    if (warp == 0) {
+        float bm = lane < 8 ? sm[lane] : ninf;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) bm = fmaxf(bm, __shfl_xor_sync(kFullMask, bm, o));
+        if (lane == 0) sm[0] = bm;
+    }
+    __syncthreads();
+    const float bm = sm[0];
+    const float inv_t = 1.0f / p.temperature;
+    const double smx = (double) (bm * inv_t);
+    double sum = 0.0;
+    if (bm > ninf) {
+#pragma unroll
+        for (int j = 0; j < kPerT; ++j)
+            if (s[j] > ninf) sum += exp((double) (s[j] * inv_t) - smx);
+    }
+    __shared__ double sd[8];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(kFullMask, sum, o);
+    if (lane == 0) sd[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double tot = 0.0;
+        for (int w = 0; w < 8; ++w) tot += sd[w];
+        bmax[(size_t) t * kWideChunks + bidx] = (double) bm;
+        bsum[(size_t) t * kWideChunks + bidx] = tot;
+    }
+}
+
+__global__ void __launch_bounds__(128)
+sampler_wide_nosort_accept_kernel(int nb, int n_vocab, const SamplerParams p, const double* __restrict__ bmax,
+                                  const double* __restrict__ bsum, WideRow* __restrict__ st, int t0, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float ninf = __int_as_float(0xff800000);
+    const double* bm = bmax + (size_t) t * kWideChunks;
+    const double* bs = bsum + (size_t) t * kWideChunks;
+    float mx = ninf;
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        const float v = (float) bm[b];
+        if (v > mx) mx = v;
+    }
+    __shared__ float sm[4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, o));
+    if (lane == 0) sm[warp] = mx;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float gmx = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+        sm[0] = gmx;
+    }
+    __syncthreads();
+    mx = sm[0];
+    const float inv_t = 1.0f / p.temperature;
+    const double smx = (double) (mx * inv_t);
+    double tot = 0.0;
+    if (mx > ninf) {
+        for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+            const float v = (float) bm[b];
+            if (v > ninf) tot += bs[b] * exp((double) (v * inv_t) - smx);
+        }
+    }
+    __shared__ double sd[4];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(kFullMask, tot, o);
+    if (lane == 0) sd[warp] = tot;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    const double total2 = sd[0] + sd[1] + sd[2] + sd[3];
+    st[t].mx = mx;
+    st[t].total2 = total2;
+    if (!(mx > ninf) || !(total2 > 0.0)) {
+        out[t0 + t] = 0;
+        st[t].accepted = 1;
+        return;
+    }
+    if (t < p.n_drawn && p.drafts != nullptr) {
+        const int d = p.drafts[t];
+        const float sdraft = st[t].s_draft;
+        const double pd = (d >= 0 && d < n_vocab && sdraft > ninf) ? exp((double) (sdraft * inv_t) - smx) / total2 : 0.0;
+        const int* qi = p.q_ids + (size_t) t * p.q_n;
+        const float* qp = p.q_p + (size_t) t * p.q_n;
+        double qd = 0.0;
+        for (int j = 0; j < p.q_n; ++j)
+            if (qi[j] == d) { qd = (double) qp[j]; break; }
+        const float keep = philox_uniform(p.seed, p.counter + (uint64_t) t, kPhiloxKeep);
+        if (qd > 0.0 && (pd >= qd || (double) keep * qd < pd)) {
+            out[t0 + t] = d;
+            st[t].accepted = 1;
+            return;
+        }
+    }
+    st[t].accepted = 0;
+}
+
+__global__ void __launch_bounds__(kWideKeyThreads)
+sampler_wide_nosort_res_sum_kernel(const float* __restrict__ logits, int n_vocab, int nb, const int* __restrict__ history,
+                                   int history_len, const SamplerParams p, const WideRow* __restrict__ st,
+                                   double* __restrict__ bres) {
+    const int t = blockIdx.y;
+    if (st[t].accepted) return;
+    const int bidx = (int) blockIdx.x;
+    const int blo = bidx * kWideBlockSpan;
+    const float* l = logits + (size_t) t * n_vocab;
+    const float ninf = __int_as_float(0xff800000);
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;
+    }
+    __shared__ unsigned int bits[kWideBlockSpan / 32];
+    const bool use_bits = hrow != nullptr && hlen > 0;
+    wide_nosort_block_bitmap(hrow, hlen, n_vocab, blo, bits, use_bits);
+    __shared__ int h_id[kWideQHash];
+    __shared__ float h_p[kWideQHash];
+    const bool sub_q = t < p.n_drawn && p.q_n > 0;
+    const int* qi = sub_q ? p.q_ids + (size_t) t * p.q_n : nullptr;
+    const float* qp = sub_q ? p.q_p + (size_t) t * p.q_n : nullptr;
+    if (sub_q) wide_q_hash_build(h_id, h_p, qi, qp, p.q_n);
+    const float inv_t = 1.0f / p.temperature;
+    const double smx = (double) (st[t].mx * inv_t);
+    const double inv_tot = 1.0 / st[t].total2;
+    double sum = 0.0;
+    for (int b = threadIdx.x; b < kWideBlockSpan && blo + b < n_vocab; b += blockDim.x) {
+        const int v = blo + b;
+        float x = p.logit_bias ? l[v] + p.logit_bias[v] : l[v];
+        if (use_bits && (bits[b >> 5] & (1u << (b & 31)))) x = apply_penalties(x, history_count(hrow, hlen, v), p);
+        if (!(x > ninf)) continue;
+        const double pv = exp((double) (x * inv_t) - smx) * inv_tot;
+        if (sub_q) {
+            const double qv = wide_q_lookup(h_id, h_p, qi, qp, p.q_n, v);
+            if (pv > qv) sum += pv - qv;
+        } else {
+            sum += pv;
+        }
+    }
+    __shared__ double sd[8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(kFullMask, sum, o);
+    if (lane == 0) sd[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double tot = 0.0;
+        for (int w = 0; w < 8; ++w) tot += sd[w];
+        bres[(size_t) t * nb + bidx] = tot;
+    }
+}
+
+__global__ void __launch_bounds__(kWideKeyThreads)
+sampler_wide_nosort_res_pick_kernel(const float* __restrict__ logits, int n_vocab, int nb,
+                                    const int* __restrict__ history, int history_len, const SamplerParams p,
+                                    const double* __restrict__ bmax, const double* __restrict__ bsum,
+                                    const double* __restrict__ bres, const WideRow* __restrict__ st,
+                                    int t0, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    if (st[t].accepted) return;
+    __shared__ int s_bwin, s_use_p, s_wtid;
+    __shared__ double s_thr, s_pre;
+    const float inv_t = 1.0f / p.temperature;
+    const double smx = (double) (st[t].mx * inv_t);
+    const double inv_tot = 1.0 / st[t].total2;
+    const float ninf = __int_as_float(0xff800000);
+    if (threadIdx.x == 0) {
+        const double* br = bres + (size_t) t * nb;
+        double tot = 0.0;
+        for (int b = 0; b < nb; ++b) tot += br[b];
+        int use_p = !(tot > 0.0) ? 1 : 0;
+        const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+        if (use_p) {
+            const double* bm = bmax + (size_t) t * kWideChunks;
+            const double* bs = bsum + (size_t) t * kWideChunks;
+            const double thr = (double) u * st[t].total2;
+            double cum = 0.0;
+            int win = 0, last_pos = 0;
+            double pre = 0.0, last_pre = 0.0;
+            bool found = false;
+            for (int b = 0; b < nb; ++b) {
+                const float v = (float) bm[b];
+                const double w = v > ninf ? bs[b] * exp((double) (v * inv_t) - smx) : 0.0;
+                if (w > 0.0) { last_pos = b; last_pre = cum; }
+                if (!found && thr < cum + w) { win = b; pre = cum; found = true; break; }
+                cum += w;
+            }
+            s_bwin = found ? win : last_pos;
+            s_pre = found ? pre : last_pre;
+            s_thr = thr;
+        } else {
+            const double thr = (double) u * tot;
+            double cum = 0.0;
+            int win = 0, last_pos = 0;
+            double pre = 0.0, last_pre = 0.0;
+            bool found = false;
+            for (int b = 0; b < nb; ++b) {
+                const double w = br[b];
+                if (w > 0.0) { last_pos = b; last_pre = cum; }
+                if (!found && thr < cum + w) { win = b; pre = cum; found = true; break; }
+                cum += w;
+            }
+            s_bwin = found ? win : last_pos;
+            s_pre = found ? pre : last_pre;
+            s_thr = thr;
+        }
+        s_use_p = use_p;
+    }
+    __syncthreads();
+    const int bwin = s_bwin;
+    const int blo = bwin * kWideBlockSpan;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;
+    }
+    __shared__ unsigned int bits[kWideBlockSpan / 32];
+    const bool use_bits = hrow != nullptr && hlen > 0;
+    wide_nosort_block_bitmap(hrow, hlen, n_vocab, blo, bits, use_bits);
+    __shared__ int h_id[kWideQHash];
+    __shared__ float h_p[kWideQHash];
+    const bool sub_q = !s_use_p && t < p.n_drawn && p.q_n > 0;
+    const int* qi = sub_q ? p.q_ids + (size_t) t * p.q_n : nullptr;
+    const float* qp = sub_q ? p.q_p + (size_t) t * p.q_n : nullptr;
+    if (sub_q) wide_q_hash_build(h_id, h_p, qi, qp, p.q_n);
+    constexpr int kPerT = kWideBlockSpan / kWideKeyThreads;   // 16 contiguous elements per thread
+    double rw[kPerT];
+    double tsum = 0.0;
+    const int b0 = threadIdx.x * kPerT;
+#pragma unroll
+    for (int j = 0; j < kPerT; ++j) {
+        const int b = b0 + j;
+        const int v = blo + b;
+        double w = 0.0;
+        if (v < n_vocab) {
+            float x = p.logit_bias ? l[v] + p.logit_bias[v] : l[v];
+            if (use_bits && (bits[b >> 5] & (1u << (b & 31)))) x = apply_penalties(x, history_count(hrow, hlen, v), p);
+            if (x > ninf) {
+                if (s_use_p) {
+                    w = exp((double) (x * inv_t) - smx);
+                } else {
+                    const double pv = exp((double) (x * inv_t) - smx) * inv_tot;
+                    if (sub_q) {
+                        const double qv = wide_q_lookup(h_id, h_p, qi, qp, p.q_n, v);
+                        w = pv > qv ? pv - qv : 0.0;
+                    } else {
+                        w = pv;
+                    }
+                }
+            }
+        }
+        rw[j] = w;
+        tsum += w;
+    }
+    __shared__ double tsums[kWideKeyThreads];
+    tsums[threadIdx.x] = tsum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double cum = s_pre;
+        const double thr = s_thr;
+        int wtid = 0, last_t = 0;
+        double wpre = cum, last_pre = cum;
+        bool found = false;
+        for (int i = 0; i < kWideKeyThreads; ++i) {
+            if (tsums[i] > 0.0) { last_t = i; last_pre = cum; }
+            if (!found && thr < cum + tsums[i]) { wtid = i; wpre = cum; found = true; break; }
+            cum += tsums[i];
+        }
+        s_wtid = found ? wtid : last_t;
+        s_pre = found ? wpre : last_pre;
+    }
+    __syncthreads();
+    if ((int) threadIdx.x == s_wtid) {
+        double cum = s_pre;
+        const double thr = s_thr;
+        int last_v = 0;
+        for (int j = 0; j < kPerT; ++j) {
+            if (rw[j] > 0.0) {
+                last_v = blo + b0 + j;
+                cum += rw[j];
+                if (thr < cum) { out[t0 + t] = last_v; return; }
+            }
+        }
+        out[t0 + t] = last_v;
+    }
 }
 
 // The wide path's buffers, one set per (device, stream) as `split_scratch`, for kWideRows rows of the vocabulary:
@@ -1556,10 +2069,35 @@ void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* hist
     const cudaStream_t cs = (cudaStream_t) stream;
     const int nb = (n_vocab + kWideBlockSpan - 1) / kWideBlockSpan;
     const bool hist = history != nullptr && history_len > 0 && p.penalty_last_n > 0;
+    const bool nosort_drawn = p.n_drawn > 0 && k == n_vocab && p.top_p >= 1.0f && p.min_p <= 0.0f && qprob == nullptr && nb <= kWideChunks;
     for (int t0 = 0; t0 < n_tokens; t0 += kWideRows) {
         const int R = n_tokens - t0 < kWideRows ? n_tokens - t0 : kWideRows;
         SamplerParams pr = p;
         pr.counter = p.counter + (uint64_t) t0;   // row t0 + t draws Philox(seed, counter + t0 + t)
+        if (p.n_drawn > 0) {
+            const int nd = p.n_drawn - t0;
+            pr.n_drawn = nd > 0 ? (nd < R ? nd : R) : 0;
+            if (pr.n_drawn > 0) {
+                pr.drafts = p.drafts + t0;
+                pr.q_ids = p.q_ids + (size_t) t0 * p.q_n;
+                pr.q_p = p.q_p + (size_t) t0 * p.q_n;
+            }
+        }
+        if (nosort_drawn) {
+            const float* lr = logits + (size_t) t0 * n_vocab;
+            const int* hr = hist ? history + (size_t) t0 * history_len : nullptr;
+            sampler_wide_nosort_stats_kernel<<<dim3((unsigned) nb, (unsigned) R), kWideKeyThreads, 0, cs>>>(
+                lr, n_vocab, hr, history_len, pr, w.pre, w.part, w.rows);
+            sampler_wide_nosort_accept_kernel<<<(unsigned) R, 128, 0, cs>>>(
+                nb, n_vocab, pr, w.pre, w.part, w.rows, t0, out);
+            // Reuse w.terms (R * nb doubles <= R * n_vocab doubles) for per-block residual sums.
+            double* bres = w.terms;
+            sampler_wide_nosort_res_sum_kernel<<<dim3((unsigned) nb, (unsigned) R), kWideKeyThreads, 0, cs>>>(
+                lr, n_vocab, nb, hr, history_len, pr, w.rows, bres);
+            sampler_wide_nosort_res_pick_kernel<<<(unsigned) R, kWideKeyThreads, 0, cs>>>(
+                lr, n_vocab, nb, hr, history_len, pr, w.pre, w.part, bres, w.rows, t0, out);
+            continue;
+        }
         sampler_wide_keys_kernel<<<dim3((unsigned) nb, (unsigned) R), kWideKeyThreads, 0, cs>>>(
             logits + (size_t) t0 * n_vocab, n_vocab, hist ? history + (size_t) t0 * history_len : nullptr, history_len,
             pr, k, w.keys_in, w.ids_in, w.rows);
@@ -1603,6 +2141,14 @@ void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* hist
                                                         query != nullptr && nq > 0 ? query + t0 : nullptr, nq, w.rows);
         sampler_wide_out_kernel<<<1, 32, 0, cs>>>(w.keys, w.ids, n_vocab, R, w.terms, w.rows, t0, out,
                                                   qprob != nullptr ? n_query : 0, qprob);
+        if (pr.n_drawn > 0) {
+            sampler_wide_drawn_find_kernel<<<grid, 32, 0, cs>>>(w.ids, n_vocab, pr, w.rows);
+            sampler_wide_drawn_accept_kernel<<<1, 32, 0, cs>>>(w.keys, n_vocab, R, pr, w.terms, w.rows, t0, out);
+            sampler_wide_drawn_res_kernel<<<tgrid, kWideTermThreads, 0, cs>>>(w.ids, n_vocab, pr, w.terms, w.part, w.rows);
+            sampler_wide_scan_kernel<<<(unsigned) R, kWideChunks, 0, cs>>>(w.part, w.pre, 3, w.rows);
+            sampler_wide_drawn_search_kernel<<<grid, 32, 0, cs>>>(n_vocab, pr, w.terms, w.pre, w.rows);
+            sampler_wide_drawn_out_kernel<<<1, 32, 0, cs>>>(w.ids, n_vocab, R, pr.n_drawn, w.terms, w.rows, t0, out);
+        }
     }
 }
 
@@ -1766,10 +2312,6 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax, &done);
         const dim3 grid((unsigned) n_blocks, (unsigned) n_tokens);
-        if ((k > kSelMax || split == 3) && p.n_drawn > 0) {
-            basalt::log::error("basalt", "sample_tokens: drawn drafts on the wide path (a list of %d)", k);
-            std::exit(1);
-        }
         if (k > kSelMax || split == 3) {
             sample_wide(logits, n_tokens, n_vocab, history, history_len, p, k, out, query, n_query, qprob, stream);
         } else if (scratch == nullptr) {
