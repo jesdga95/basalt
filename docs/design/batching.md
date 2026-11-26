@@ -49,8 +49,9 @@ row counts. A model captures one graph per composition and keeps the most recent
 
 The shared engine schedules; a model only states its cap and its most slots (`ModelAdapter::max_slots`, the segments of one
 window): a start with `--batch` above it is refused, naming the model and the limit. Each round, every busy slot drafts its next window. With no more
-slots than rows one pass serves every slot (`batch_shares`): each takes one row, then each further row goes to the slot whose
-next draft is likeliest kept (the joint of its drafts' calibrated chances), and rows no draft wants go round the slots. A
+slots than rows one pass serves every slot (`batch_confident_shares`, after ingine-batch): each slot verifies its leading drafts
+while the joint of their calibrated chances stays above half the busy share of the slots, at least 2 and at most 4; past the cap
+the least likely drafts beyond each slot's first 2 come off first. A lone slot takes the policy's window (`batch_shares`). A
 drafter that sets its own windows' length (`own_window`: a stop rule in its chain) states no chances to weigh: each window
 takes the rows it would take alone, shared max-min fairly when they do not fit (`batch_fair_shares`: the windows wanting
 least served in full, the others splitting what is left), and the policy only weighs a lookup proposal against its drafts.

@@ -110,23 +110,6 @@ int main() {
                 }
     check(all, "every window lands in exactly one group within the cap");
 
-    using basalt::program::serve::batch_budget;
-    using basalt::program::serve::RoundCost;
-    {
-        RoundCost c;
-        check(batch_budget(64, {0.9, 0.8}, 128, c) == 64, "budget: nothing measured, the anchors alone");
-        c.observe(64, 30.0);
-        check(batch_budget(64, {0.9, 0.8, 0.1}, 128, c) == 67, "budget: past the measured rows a draft goes at their cost");
-        c.observe(128, 60.0);
-        check(batch_budget(64, std::vector<double>(64, 0.9), 128, c) == 64, "budget: rows that cost more than their drafts bring stay out");
-        c = RoundCost{};
-        c.observe(64, 30.0);
-        c.observe(128, 34.0);
-        check(batch_budget(64, std::vector<double>(64, 0.9), 128, c) == 128, "budget: cheap rows of likely drafts all go in");
-        check(batch_budget(64, std::vector<double>(64, 0.01), 128, c) == 64, "budget: unlikely drafts stay out");
-        check(c.at(96) > 30.0 && c.at(96) < 34.0, "cost: between two measured buckets, their line");
-    }
-
     std::printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
 }

@@ -295,13 +295,11 @@ bool Runtime::batch_round() {
         }
         return true;
     }
-    // the windows of a round share the batch's rows.  Drafts with stated chances: the round takes the anchors and the
-    // likeliest drafts, as many as its measured cost by rows says pay (batch_budget), the rows going to the drafts
-    // likeliest kept.  Drafters that set their own length: each window as it would run alone, shared max-min fairly when
+    // the windows of a round share the batch's rows.  Drafts with stated chances: each slot its leading drafts by
+    // batch_confident_shares (one slot: the policy's window).  Drafters that set their own length: each window as it would run alone, shared max-min fairly when
     // they do not fit (a window held to fewer takes its drafts again within its share)
     constexpr int kShortSpecCap = 16;
     constexpr int kLongSpecCap = 96;
-    const Clock::time_point round_t0 = Clock::now();
     const int n_act = (int) act.size();
     const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : cap;
     int spec_cap = cap, per_slot_cap = std::min(cap, slot_cap_by_n);
@@ -388,11 +386,6 @@ bool Runtime::batch_round() {
         stats_lookups_end();
         for (const size_t i : group)
             if (!slot_window_end(act[i], wins[i])) return false;
-    }
-    if (groups.size() == 1 && n_act > 1) {
-        int all_rows = 0;
-        for (const int r : rows) all_rows += r;
-        round_cost.observe(all_rows, std::chrono::duration<double, std::milli>(Clock::now() - round_t0).count());
     }
     return true;
 }
