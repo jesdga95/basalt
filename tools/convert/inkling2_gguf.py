@@ -1,13 +1,16 @@
-"""An inkling2 pack (Inkling 2 Mini) from a BF16, F16, or Q8_0 GGUF (`general.architecture = inkling2_loop`),
-for tools/convert/convert.py.
+"""An inkling2 pack (Inkling 2 Mini) from an inkling2_loop GGUF (`general.architecture = inkling2_loop`): BF16, F16,
+Q8_0, or a mixed-type quantization such as ISTA-DASLab's GSQ-RCO builds (IQ/Q2_0 experts, K-quant attention), for
+tools/convert/convert.py.
 
-  experts             routed experts per layer, [gate | up | down]:
-                        BF16/F16 source: NVFP4 (type 40) blocks + FP32 scale tail {s_gate, s_up, s_down, 0}
-                        Q8_0 source:     Q8_0 (type 8) blocks as stored
+  experts             routed experts per layer, [gate | up | down] (llama.cpp's fused gate_up is gate rows, then up rows):
+                        BF16/F16 source:   NVFP4 (type 40) blocks + FP32 scale tail {s_gate, s_up, s_down, 0}
+                        quantized source:  the GGUF's blocks as stored, each layer in its own gate_up and down types
+                                           (STORED_GATE_UP_TYPES / STORED_DOWN_TYPES), no scale tail
   experts.layout      one `layer gu_type d_type offset blob_bytes` line per layer
   gguf                all other tensors in Basalt's inkling2 names:
-                        attention projections -> Q8_0 (passthrough if Q8_0, else ggml reference rounding from BF16/F16)
-                        token_embd, output    -> BF16 (trimmed to vocab_size_unpadded if present)
+                        attention projections -> Q8_0 (passthrough if Q8_0, else ggml reference rounding of the
+                                                 BF16/F16 values or of the dequantized K-quant/IQ4_XS values)
+                        token_embd, output    -> BF16 (dequantized if quantized; trimmed to vocab_size_unpadded)
                         loop_*_ctrl_*         -> BF16 (rounded from F32/F16 if needed)
                         norms, convs, clips, router, bias, queries -> F32
   vision/mmproj       copied from --mmproj or --sections-from if supplied
@@ -33,7 +36,8 @@ import model_sections as S
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from gguf_reader import GGUFFile, TensorInfo  # noqa: E402
+import ggufq  # noqa: E402
+from gguf_reader import BLOCK_GEOMETRY, GGUFFile, TensorInfo  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import ModelFile, TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 
@@ -42,6 +46,14 @@ TYPE_ID = {"F32": 0, "Q8_0": 8, "BF16": 30, "NVFP4": 40}
 Q8_0 = 8
 NVFP4 = 40
 EXPERTS_PER_JOB = 16
+FLOAT_TYPES = ("F32", "BF16", "F16")
+# Expert encodings copied as stored: the engine's native expert kernels (CUDA kernels::native_expert_layout and the CPU
+# cpu::native_fmt) read them in place, gate/up and down each in its own type. Not Q2_0 gate/up: the CPU's Q2_0 gate/up
+# rows (kernels/cpu/pool.cpp native_gu_range) have no softcapped SwiGLU. Down rows are 1152 wide: 32- or 64-value blocks.
+STORED_GATE_UP_TYPES = frozenset({"Q8_0", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S"})
+STORED_DOWN_TYPES = frozenset({"Q8_0", "Q2_0", "IQ4_NL"})
+# Quantized types tools/ggufq.py dequantizes (dense tensors are rounded from their values to the engine's types).
+DEQUANT_TYPES = frozenset(t.name for t in ggufq.GGMLQuantizationType if t.name not in FLOAT_TYPES)
 
 # Attention projection suffixes (after `blk.N.`) that the inkling2 engine requires in Q8_0.
 Q8_SUFFIXES = frozenset({
@@ -86,19 +98,27 @@ def _read_f32(path: str, offset: int, nbytes: int, type_name: str) -> np.ndarray
         return H.bf16_values(buf)
     if type_name == "F16":
         return np.frombuffer(buf, dtype="<f2").astype(np.float32)
+    if type_name in DEQUANT_TYPES:
+        raw = np.frombuffer(buf, dtype=np.uint8)
+        return ggufq.dequantize(raw, ggufq.GGMLQuantizationType[type_name]).astype(np.float32).reshape(-1)
     raise S.ConvertError(f"unsupported tensor type {type_name} for float read")
+
+
+def _row_bytes(type_name: str, cols: int) -> int:
+    """Bytes of one row of `cols` values in a ggml type."""
+    block_elems, block_bytes = BLOCK_GEOMETRY[type_name]
+    if cols % block_elems:
+        raise S.ConvertError(f"{type_name} width {cols} is not a multiple of {block_elems}")
+    return cols // block_elems * block_bytes
 
 
 def _read_bf16_bytes(path: str, offset: int, nbytes: int, type_name: str) -> bytes:
     if type_name == "BF16":
         return bytes(H.pread(path, offset, nbytes))
-    return _f32_to_bf16(_read_f32(path, offset, nbytes, type_name)).tobytes()
-
-
-def _q8_row_bytes(cols: int) -> int:
-    if cols % 32 != 0:
-        raise S.ConvertError(f"Q8_0 width {cols} is not a multiple of 32")
-    return (cols // 32) * 34
+    # whole blocks at a time (a block dequantizes on its own), so a quantized output head never sits in RAM as F32
+    step = BLOCK_GEOMETRY[type_name][1] * ((64 << 20) // BLOCK_GEOMETRY[type_name][1])
+    return b"".join(_f32_to_bf16(_read_f32(path, offset + o, min(step, nbytes - o), type_name)).tobytes()
+                    for o in range(0, nbytes, step))
 
 
 def _expert_nvfp4_job(args):
@@ -124,11 +144,9 @@ def _expert_nvfp4_job(args):
     return b"".join(out)
 
 
-def _expert_q8_job(args):
-    """Copy Q8_0 experts [e0, e1) of one layer as [gate | up | down] blobs."""
-    gu_path, gu_off, dn_path, dn_off, inter, hidden, e0, e1 = args
-    gu_eb = 2 * inter * _q8_row_bytes(hidden)
-    dn_eb = hidden * _q8_row_bytes(inter)
+def _expert_stored_job(args):
+    """Copy experts [e0, e1) of one layer as stored: [gate | up | down] blobs (gate_up is gate rows, then up rows)."""
+    gu_path, gu_off, gu_eb, dn_path, dn_off, dn_eb, e0, e1 = args
     out = []
     for e in range(e0, e1):
         out.append(bytes(H.pread(gu_path, gu_off + e * gu_eb, gu_eb)))
@@ -233,14 +251,16 @@ def _dst_name(src_name: str) -> str:
 def _target_form(dst_name: str, src_type: str) -> str:
     """Target tensor format inside the pack's `gguf` section."""
     if dst_name in ("token_embd.weight", "output.weight"):
-        if src_type not in ("BF16", "F16", "F32"):
-            raise S.ConvertError(f"{dst_name} is {src_type}; inkling2 requires BF16/F16/F32 embeddings/head")
+        if src_type not in FLOAT_TYPES and src_type not in DEQUANT_TYPES:
+            raise S.ConvertError(f"{dst_name} is {src_type}; inkling2 GGUF conversion supports BF16/F16/F32 or "
+                                 f"{'/'.join(sorted(DEQUANT_TYPES))} embeddings/head (rounded to BF16)")
         return "BF16"
     suffix = re.sub(r"^blk\.\d+\.", "", dst_name)
     if suffix in Q8_SUFFIXES:
-        if src_type not in ("Q8_0", "BF16", "F16", "F32"):
+        if src_type not in FLOAT_TYPES and src_type not in DEQUANT_TYPES:
             raise S.ConvertError(
-                f"{dst_name} is {src_type}; inkling2 dense projections require Q8_0, BF16, F16, or F32")
+                f"{dst_name} is {src_type}; inkling2 dense projections are rounded to Q8_0 from BF16/F16/F32 or "
+                f"{'/'.join(sorted(DEQUANT_TYPES))}")
         return "Q8_0"
     if CTRL_RE.match(suffix):
         if src_type not in ("BF16", "F16", "F32"):
@@ -303,21 +323,41 @@ def build(a, Job, source_paths, export_tokenizer, fingerprint, die) -> None:
     if len(experts_gu) != n_layers or len(experts_dn) != n_layers:
         die(f"expected {n_layers} expert layers, found {len(experts_gu)} gate_up and {len(experts_dn)} down")
     sample_type = experts_gu[0][1].type_name
-    if sample_type == "Q8_0":
-        expert_type = Q8_0
-        expert_blob = 2 * inter * _q8_row_bytes(hidden) + hidden * _q8_row_bytes(inter)
-    elif sample_type in ("BF16", "F16"):
+    nvfp4 = sample_type in ("BF16", "F16")
+    if not nvfp4 and sample_type not in STORED_GATE_UP_TYPES:
+        die(f"blk.0.ffn_gate_up_exps.weight is {sample_type}; inkling2 GGUF conversion supports BF16, F16 "
+            f"(rounded to NVFP4) and {', '.join(sorted(STORED_GATE_UP_TYPES))} (as stored)")
+
+    # per layer: (gate_up type name, down type name, per-expert gate_up bytes, per-expert down bytes)
+    layer_types: list[tuple[str, str, int, int]] = []
+    for l in range(n_layers):
+        gt, dt = experts_gu[l][1].type_name, experts_dn[l][1].type_name
+        if nvfp4:
+            for kind, t in (("gate_up", gt), ("down", dt)):
+                if t != sample_type:
+                    die(f"layer {l} {kind} experts are {t}; a {sample_type} source must be {sample_type} throughout")
+            layer_types.append((gt, dt, 0, 0))
+            continue
+        for kind, t, allowed in (("gate_up", gt, STORED_GATE_UP_TYPES), ("down", dt, STORED_DOWN_TYPES)):
+            if t not in allowed:
+                die(f"layer {l} {kind} experts are {t}; quantized inkling2 {kind} experts must be one of "
+                    f"{', '.join(sorted(allowed))}")
+        try:
+            gu_eb, dn_eb = 2 * inter * _row_bytes(gt, hidden), hidden * _row_bytes(dt, inter)
+        except S.ConvertError as e:
+            die(f"layer {l} experts: {e}")
+        for kind, (_, ti, _), eb in (("gate_up", experts_gu[l], gu_eb), ("down", experts_dn[l], dn_eb)):
+            if ti.expected_bytes() != n_expert * eb:
+                die(f"layer {l} {kind} experts: {ti.expected_bytes()} bytes, expected {n_expert} x {eb}")
+        layer_types.append((gt, dt, gu_eb, dn_eb))
+
+    if nvfp4:
         expert_type = NVFP4
         expert_blob = (2 * inter * S.nvfp4_row_bytes(hidden)
                        + hidden * S.nvfp4_row_bytes(inter)
                        + S.NVFP4_TAIL)
     else:
-        die(f"blk.0.ffn_gate_up_exps.weight is {sample_type}; inkling2 GGUF conversion supports BF16, F16, and Q8_0")
-
-    for l in range(n_layers):
-        for kind, tbl in (("gate_up", experts_gu), ("down", experts_dn)):
-            if tbl[l][1].type_name != sample_type:
-                die(f"layer {l} {kind} experts have mixed type {tbl[l][1].type_name} != {sample_type}")
+        expert_type = experts_gu[0][1].type_id
 
     kv = _map_kv(src_kv, name, expert_type)
     base = ModelFile(a.sections_from) if a.sections_from else None
@@ -341,25 +381,32 @@ def build(a, Job, source_paths, export_tokenizer, fingerprint, die) -> None:
             # 1. experts + experts.layout
             layout_lines = []
             offset = 0
-            total_exp_bytes = n_layers * n_expert * expert_blob
             for l in range(n_layers):
-                layout_lines.append((l, expert_type, expert_type, offset, expert_blob))
-                offset += n_expert * expert_blob
+                gt, dt, gu_eb, dn_eb = layer_types[l]
+                if nvfp4:
+                    layout_lines.append((l, NVFP4, NVFP4, offset, expert_blob))
+                    offset += n_expert * expert_blob
+                else:
+                    gu_ti, dn_ti = experts_gu[l][1], experts_dn[l][1]
+                    layout_lines.append((l, gu_ti.type_id, dn_ti.type_id, offset, gu_eb + dn_eb))
+                    offset += n_expert * (gu_eb + dn_eb)
+            total_exp_bytes = offset
 
             def expert_chunks():
                 with multiprocessing.Pool(workers) as pool:
                     for l in range(n_layers):
                         gu_p, _, gu_off = experts_gu[l]
                         dn_p, _, dn_off = experts_dn[l]
+                        _, _, gu_eb, dn_eb = layer_types[l]
                         tasks = []
                         for e0 in range(0, n_expert, EXPERTS_PER_JOB):
                             e1 = min(e0 + EXPERTS_PER_JOB, n_expert)
-                            if expert_type == NVFP4:
+                            if nvfp4:
                                 tasks.append((gu_p, gu_off, sample_type, dn_p, dn_off, sample_type,
                                               inter, hidden, e0, e1))
                             else:
-                                tasks.append((gu_p, gu_off, dn_p, dn_off, inter, hidden, e0, e1))
-                        fn = _expert_nvfp4_job if expert_type == NVFP4 else _expert_q8_job
+                                tasks.append((gu_p, gu_off, gu_eb, dn_p, dn_off, dn_eb, e0, e1))
+                        fn = _expert_nvfp4_job if nvfp4 else _expert_stored_job
                         for chunk in pool.imap(fn, tasks):
                             if isinstance(chunk, str):
                                 die(f"layer {l}: {chunk}")
@@ -367,7 +414,7 @@ def build(a, Job, source_paths, export_tokenizer, fingerprint, die) -> None:
 
             job.chunks("experts", expert_chunks(), total_exp_bytes)
 
-            if expert_type == NVFP4:
+            if nvfp4:
                 layout_txt = S.nvfp4_layout_text(n_expert, total_exp_bytes, layout_lines)
             else:
                 hdr = f"# experts v6: layer gu_type d_type offset blob_bytes (n_expert {n_expert}, total {total_exp_bytes})\n"
@@ -392,7 +439,7 @@ def build(a, Job, source_paths, export_tokenizer, fingerprint, die) -> None:
                 if dname in ("token_embd.weight", "output.weight") and len(shape) == 2 and shape[1] > unpadded_vocab:
                     # Trim padded vocab rows (GGUF shape is [cols, rows])
                     cols = shape[0]
-                    keep_bytes = cols * unpadded_vocab * (2 if ti.type_name in ("BF16", "F16") else 4)
+                    keep_bytes = unpadded_vocab * _row_bytes(ti.type_name, cols)
                     data = _read_bf16_bytes(pstr, foff, keep_bytes, ti.type_name)
                     shape[1] = unpadded_vocab
                 elif form == "Q8_0":

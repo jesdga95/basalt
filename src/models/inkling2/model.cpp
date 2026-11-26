@@ -9,6 +9,8 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
+#include "basalt/ggml/ggml.h"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
@@ -29,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -76,16 +79,11 @@ constexpr ProjPart kProjParts[] = {
     {"attn_v.weight", kRowV, 1024, false},       {"attn_v_conv_proj.weight", kRowV + kOffTaps, 32, true},
 };
 const char* const kStreamNames[kStreams] = {"q", "k", "v", "ffn"};
-// A blob's stride on the card: whole blocks of its type and 16 bytes, so a kernel can read each expert's blocks in place.
-uint64_t expert_stride(int type, uint64_t blob) {
-    const uint64_t block = type == kTypeQ8_0 ? 34 : type == kTypeNvfp4 ? 36 : type == kTypeMxfp8 ? 132 : 1;
-    uint64_t a = block, b = 16;
-    while (b) {
-        const uint64_t t = a % b;
-        a = b;
-        b = t;
-    }
-    const uint64_t unit = block / a * 16;
+// A blob's stride on the card: whole blocks of its gate/up type and of its down type, and 16 bytes, so a kernel can read
+// each expert's blocks in place (a layer's two types may differ: IQ gate/up over Q2_0 or IQ4_NL down).
+uint64_t expert_stride(int gu_type, int d_type, uint64_t blob) {
+    uint64_t unit = 16;
+    for (int t : {gu_type, d_type}) unit = std::lcm(unit, (uint64_t) ggml_type_size((ggml_type) t));
     return (blob + unit - 1) / unit * unit;
 }
 }  // namespace
@@ -368,10 +366,13 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         }
         // the experts' layout; they load once the context has said how many stay on the card
         const ExpertLayer& el = pack_.experts[(size_t) l];
+        if (!basalt::kernels::native_expert_supported(el.gu_type, el.d_type, g.n_embd, g.n_ff_exp))
+            return fail("layer " + std::to_string(l) + ": no grouped expert kernels for gate/up type " +
+                        std::to_string(el.gu_type) + ", down type " + std::to_string(el.d_type));
         w.gu_type = el.gu_type;
         w.d_type = el.d_type;
         w.blob_bytes = el.blob_bytes;
-        w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
+        w.expert_stride = expert_stride(el.gu_type, el.d_type, el.blob_bytes);
     }
     ldev_ = device_;
     cudaSetDevice(device_);
@@ -702,7 +703,7 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
                                prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
                                2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
                                prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
-        s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense +
+        s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.d_type, el.blob_bytes) + dense +
                           (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8) * n_sess);
     }
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)

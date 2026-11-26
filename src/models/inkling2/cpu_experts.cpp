@@ -4,6 +4,7 @@
 #include "models/inkling2/cpu_expert_drain.hpp"
 
 #include "basalt/core/progress.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -224,6 +225,10 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
         const LayerWeights& w = m.layer(l);
         cpu::NativeFmt f;
         if (!cpu::native_fmt(w.gu_type, w.d_type, g.n_embd, g.n_ff_exp, f, err)) return nullptr;
+        if (cpu::q2_native_kernels(w.gu_type)) {   // the pool's Q2_0 gate/up rows take the plain SwiGLU, not the softcap
+            err = "layer " + std::to_string(l) + ": Q2_0 gate/up experts have no softcapped CPU rows";
+            return nullptr;
+        }
         if (f.bytes > w.blob_bytes) {
             err = "an expert's CPU form is larger than its blob";
             return nullptr;
