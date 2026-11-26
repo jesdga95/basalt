@@ -184,7 +184,7 @@ images a request may name: [image sources](configuration/image-sources.md). An i
 
 ## Video
 
-With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek, Hy4-flash and Inkling 2 Mini do not). A user message names a video as it names an image, from
+With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek, Hy4-flash, Inkling 2 Mini and ERNIE-5.5-Flash do not). A user message names a video as it names an image, from
 the same [sources](configuration/image-sources.md):
 
 | API | Part |
