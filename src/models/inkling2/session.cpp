@@ -1445,6 +1445,11 @@ private:
             controllers(ca, 1, rows, k.stream);
         }
         // the experts
+        const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
+        if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
+            fork_open_ = true;
+            sh_->cpu->rows(l, rows, nrm, k.stream);   // quantized on the host while the router chooses
+        }
         bk::RouterArgs ra;
         ra.n_expert = g_.n_expert;
         ra.n_embd = E;
@@ -1477,11 +1482,7 @@ private:
             moe_plan(ids, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                      k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
         }
-        const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
-        if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
-            fork_open_ = true;
-            sh_->cpu->start(l, rows, nrm, ids, k.stream);
-        }
+        if (on_cpu) sh_->cpu->start(l, rows, ids, k.stream);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;

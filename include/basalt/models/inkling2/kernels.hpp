@@ -187,22 +187,30 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
-/// Doorbell words in mapped host memory, accessed atomically at system scope. The ring's release publishes the choices,
-/// RAM rows and nonzero visit ticket. The host acquires the ring, takes the ticket, clears the ring and computes its rows.
-/// Its release store to `done` publishes those rows with that ticket. The merge acquires only a completion for its visit.
-/// `abort` is sticky: a RAM visit that observes it does not publish, and waiting merges check it periodically.
+/// Doorbell words in mapped host memory, accessed atomically at system scope. The rows' release publishes a visit's MLP
+/// input rows, so the host can quantize them before the choices come; the host clears it when it takes them. The ring's
+/// release publishes the choices and nonzero visit ticket. The host acquires the ring, takes the ticket, clears the ring
+/// and computes its rows. Its release store to `done` publishes those rows with that ticket. The merge acquires only a
+/// completion for its visit. `abort` is sticky: a visit that observes it does not publish, and waiting merges check it
+/// periodically.
 struct CpuBell {
     alignas(64) uint32_t ring;
     uint32_t ticket;
     alignas(64) uint32_t done;
     uint32_t abort;
+    alignas(64) uint32_t rows;
 };
 
+/// Every visit with experts in RAM, before its moe_cpu_ring on the same stream: its `rows` MLP input rows `x` into x_m,
+/// then `rows` raised with `layer` and `rows` (the ring's encoding). Nothing when abort is seen. rows <= kBatchRows.
+void moe_cpu_rows(const float* x, int rows, int layer, float* x_m, CpuBell* bell, void* stream);
+
 /// Each visit with a RAM pair advances the device word `seq` (initialized to zero), even after an abort. A live RAM visit
-/// publishes its choices to ids_m, its RAM rows to x_m, and its ticket before raising `ring` with `layer` and `rows`.
-/// A visit with no RAM pair touches neither `seq` nor mapped host memory. rows <= kDecodeRows, rows * k <= 1024.
-void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
-                  int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream);
+/// publishes its choices to ids_m and its ticket before raising `ring` with `layer` and `rows`; its rows are in x_m from
+/// moe_cpu_rows. A visit with no RAM pair touches neither `seq` nor mapped host memory. rows <= kDecodeRows,
+/// rows * k <= 1024.
+void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, int layer, int32_t* ids_m, CpuBell* bell,
+                  uint32_t* seq, void* stream);
 
 /// The CPU's rows of a window's experts (cpu_experts.hpp): pair p = r * k + slot whose expert is not on the card (blobs[e]
 /// 0) takes row p of `cpu` (mapped host memory, the pool's output) into row p of `output`, and adds its lookup to tally[e]

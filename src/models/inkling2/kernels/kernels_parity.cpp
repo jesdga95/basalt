@@ -1368,7 +1368,8 @@ void test_cpu_ring() {
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
-            moe_cpu_ring(di, rows, K, dt, dx, L, x_md, ids_md, bell_d, seq, st);
+            moe_cpu_rows(dx, rows, L, x_md, bell_d, st);
+            moe_cpu_ring(di, rows, K, dt, L, ids_md, bell_d, seq, st);
             moe_cpu_merge(di, rows, K, dt, out_md, dy, tally, st, bell_d, seq);
             cudaStreamEndCapture(st, &graph);
             cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
@@ -1407,13 +1408,15 @@ void test_cpu_ring() {
                     }
                 }
                 ok &= counts == want;
-                for (int r = 0; r < kDecodeRows; ++r)   // the payload is this replay's, rows and choices, bit for bit
+                for (int r = 0; r < kDecodeRows; ++r)   // the payload is this replay's, every row and the choices, bit for bit
                     for (int c = 0; c < E; ++c) {
                         const float got = x_m[(size_t) r * E + c];
                         uint32_t bits;
                         std::memcpy(&bits, &got, 4);
-                        ok &= grows >> r & 1 ? std::memcmp(&got, &gx[(size_t) r * E + c], 4) == 0 : bits == 0xffffffffu;
+                        ok &= r < rows ? std::memcmp(&got, &gx[(size_t) r * E + c], 4) == 0 : bits == 0xffffffffu;
                     }
+                ok &= bell->rows == (1u | (uint32_t) L << 8 | (uint32_t) rows << 16);   // raised; the test's host leaves it
+                bell->rows = 0;
                 for (int p = 0; p < kDecodeRows * K; ++p) ok &= ids_m[p] == (grows && p < pairs ? gids[(size_t) p] : -1);
 
                 // The merge without a bell takes the same completed host rows without the hand-off.
@@ -1429,7 +1432,8 @@ void test_cpu_ring() {
                         constexpr size_t row_values = (size_t) K * E;
                         poison();
                         cudaMemcpyAsync(dy, before.data(), row_values * sizeof(float), cudaMemcpyHostToDevice, st);
-                        moe_cpu_ring(di + r * K, 1, K, dt, dx + (size_t) r * E, L, x_md, ids_md, bell_d, seq, st);
+                        moe_cpu_rows(dx + (size_t) r * E, 1, L, x_md, bell_d, st);
+                        moe_cpu_ring(di + r * K, 1, K, dt, L, ids_md, bell_d, seq, st);
                         moe_cpu_merge(di + r * K, 1, K, dt, out_md, dy, nullptr, st, bell_d, seq);
                         ok &= cudaStreamSynchronize(st) == cudaSuccess;
                         const auto single = host(dy, row_values);
@@ -1447,9 +1451,12 @@ void test_cpu_ring() {
             ok &= bell->done == (served ? expected : UINT32_MAX) && host(seq, 1)[0] == expected;
             ok &= sv.rings.load() == served;
             if (served) ok &= sv.layer == L && sv.rows == last_rows;
+            if (rows == 1 && mode == 0)
+                std::printf("  moe_cpu_rows %.1f us a call (1 row)\n",
+                            time_us([&] { moe_cpu_rows(dx, 1, L, x_md, bell_d, nullptr); }));
             if (rows == 1 && mode != 2) {
                 std::printf("  moe_cpu_ring %.1f us a call (1 row, %s)\n",
-                            time_us([&] { moe_cpu_ring(di, 1, K, dt, dx, L, x_md, ids_md, bell_d, seq, nullptr); }),
+                            time_us([&] { moe_cpu_ring(di, 1, K, dt, L, ids_md, bell_d, seq, nullptr); }),
                             mode == 0 ? "every expert on the card: no bell" : mode == 1 ? "every pair off the card" : "one pair off the card");
                 bell->ring = 0;
             }
@@ -1506,7 +1513,8 @@ void test_cpu_abort() {
     auto capture = [&](int n, cudaGraph_t& graph, cudaGraphExec_t& exec, LateCompletion* completion = nullptr) {
         cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
         for (int v = 0; v < n; ++v) {
-            moe_cpu_ring(di, rows, K, dt, dx, L, x_md, ids_md, bell_d, seq, st);
+            moe_cpu_rows(dx, rows, L, x_md, bell_d, st);
+            moe_cpu_ring(di, rows, K, dt, L, ids_md, bell_d, seq, st);
             if (completion)
                 cudaLaunchHostFunc(st, +[](void* p) { static_cast<LateCompletion*>(p)->publish(); }, completion);
             moe_cpu_merge(di, rows, K, dt, out_md, dy, tally, st, bell_d, seq);
@@ -1578,7 +1586,7 @@ void test_cpu_abort() {
     abort_bell();
     cudaGraphLaunch(exec, st);
     require_drain("pre-aborted visits");
-    ok &= untouched() && payload_untouched() && bell->ring == 0 && bell->ticket == 0 && bell->done == 0;
+    ok &= untouched() && payload_untouched() && bell->ring == 0 && bell->rows == 0 && bell->ticket == 0 && bell->done == 0;
     ok &= host(seq, 1)[0] == visits;
     // 3. a served window, then the abort: what was taken stays, the next window takes nothing
     reset();
@@ -1799,7 +1807,8 @@ void time_cpu_handoff() {
     auto bell_visit = [&](const unsigned long long* t, int rows) {
         cudaEventRecord(ready, st);
         cudaStreamWaitEvent(side, ready, 0);
-        moe_cpu_ring(di, rows, K, t, dx, 5, x_md, ids_md, bell_d, seq, side);
+        moe_cpu_rows(dx, rows, 5, x_md, bell_d, side);
+        moe_cpu_ring(di, rows, K, t, 5, ids_md, bell_d, seq, side);
         cudaEventRecord(done, side);
         cudaStreamWaitEvent(st, done, 0);
         moe_cpu_merge(di, rows, K, t, out_md, dy, nullptr, st, bell_d, seq);
