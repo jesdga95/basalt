@@ -34,6 +34,7 @@
 #include "models/inkling2/cpu_experts.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/expert_map.hpp"
+#include "models/inkling2/fill_drain.hpp"
 #include "models/inkling2/model.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
@@ -235,6 +236,7 @@ struct Lane {
     cudaStream_t fl_st = nullptr;
     cudaEvent_t fl_ev = nullptr, fl_join = nullptr;
     bool fl_on = false;
+    bool fl_pending = false;   // a fill forked and its join not queued: a call's end waits for it (drain_fills)
     int fl_blocks = 0;
 };
 
@@ -245,7 +247,10 @@ public:
         if (sh_) std::erase(sh_->heat_sessions, this);
         if (stream_) cudaStreamSynchronize(stream_);
         if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
-        drain_fills();
+        if (!drain_fills()) {   // a fill that may still run keeps what it writes: the buffers and the shared scratch
+            (void) new std::shared_ptr<Shared>(sh_);
+            return;
+        }
         if (!m_.wedged() && m_.has_spill() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {
@@ -1507,7 +1512,7 @@ private:
             // the next visit's input projection into L2 on its own side stream, from when the card's experts are done
             // through the merge's wait on the CPU pool; it only reads, and joins with the other side streams
             if (k.fl_blocks > 0 && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card) {
-                k.fl_on = true;   // before anything that can fail, so the join and the drain cover it
+                k.fl_on = k.fl_pending = true;   // before anything that can fail, so the join and the drain cover it
                 if (cudaEventRecord(k.fl_ev, k.stream) != cudaSuccess || cudaStreamWaitEvent(k.fl_st, k.fl_ev, 0) != cudaSuccess)
                     throw std::runtime_error("inkling2: the projection fill's fork failed");
                 l2_fill(m_.layer(g_.visits[(size_t) vi + 1].layer).proj, proj_bytes(), k.fl_blocks, x.fl_sink_, k.fl_st);
@@ -1666,17 +1671,27 @@ private:
     // The bytes of a layer's input projection planes (codes, then scales).
     size_t proj_bytes() const { return (size_t) kProj * (size_t) (g_.n_embd / 32 * 34); }
 
-    // Waits for each card's projection fills: a window that failed before its join can leave one queued, and it writes the
-    // model's shared sink. A card whose window stream is capturing is left alone (the capture's failure path ends it first).
-    cudaError_t drain_fills() {
-        cudaError_t e = cudaSuccess;
+    // Waits for each card's fill whose join was not queued (a window that failed between them), since it writes the
+    // model's shared sink. One that cannot be waited for (fill_drain.hpp) wedges the model: later requests are refused and
+    // the engine ends without the CUDA teardown. False: a fill's completion is unconfirmed.
+    bool drain_fills() noexcept {
+        bool out = true;
         for (Lane& k : lane_) {
-            if (!k.fl_st) continue;
+            if (!k.fl_pending) continue;
             cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-            if (k.stream && (cudaStreamIsCapturing(k.stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone)) continue;
-            if (const cudaError_t s = cudaStreamSynchronize(k.fl_st); s != cudaSuccess && e == cudaSuccess) e = s;
+            const bool query_ok = cudaStreamIsCapturing(k.stream, &cs) == cudaSuccess;
+            if (fill_drain(true, query_ok, cs != cudaStreamCaptureStatusNone) == FillDrain::Wait &&
+                cudaStreamSynchronize(k.fl_st) == cudaSuccess) {
+                k.fl_pending = false;
+                continue;
+            }
+            out = false;
         }
-        return e;
+        if (!out) {
+            m_.wedge();
+            basalt::log::error("basalt inkling2", "a projection fill's completion could not be confirmed; restart the engine");
+        }
+        return out;
     }
 
     // The projection fill's grid on `device`: two blocks a multiprocessor, or 0 when its L2 is smaller than a projection and
@@ -1708,9 +1723,10 @@ private:
         }
         const bool fill = k.fl_on;
         k.ra_on = k.pf_on = k.fl_on = false;
-        if (fill && (cudaEventRecord(k.fl_join, k.fl_st) != cudaSuccess ||
-                     cudaStreamWaitEvent(k.stream, k.fl_join, 0) != cudaSuccess))
+        if (!fill) return;
+        if (cudaEventRecord(k.fl_join, k.fl_st) != cudaSuccess || cudaStreamWaitEvent(k.stream, k.fl_join, 0) != cudaSuccess)
             throw std::runtime_error("inkling2: the projection fill's join failed");
+        k.fl_pending = false;
     }
 
     // The layer split: the window crosses from card `from` to segment `sg`'s card, which waits for it and takes the row
@@ -1847,11 +1863,11 @@ private:
     // After the sync of the window stream that ends a call's windows (`synced`: its status): gives admission up. False:
     // a sync failed or the abort came first, and the call's results are discarded.
     bool complete(cudaError_t synced) {
-        if (const cudaError_t drained = drain_fills(); synced == cudaSuccess) synced = drained;
-        if (!admitted_) return synced == cudaSuccess;
+        const bool fills = drain_fills();   // an unconfirmed fill counts as an unjoined fork
+        if (!admitted_) return synced == cudaSuccess && fills;
         admitted_ = false;
         if (synced == cudaSuccess && lane_[1].stream) synced = cudaStreamSynchronize(lane_[1].stream);
-        const bool joined = !fork_open_;
+        const bool joined = !fork_open_ && fills;
         fork_open_ = false;
         return sh_->cpu->leave(synced, joined) && synced == cudaSuccess && joined;
     }
