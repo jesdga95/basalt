@@ -1050,7 +1050,8 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     latent_ = f((size_t) S_all * kDsRank);
     lat_q_ = dev(bk::native_q8_1_bytes(kDsRank, max_dr_rows), ok);
     head_scr_stride_ = (dspark_head_scratch_bytes((int64_t) V) + 255) & ~(size_t) 255;
-    head_scr_ = dev((size_t) S * head_scr_stride_, ok);
+    head_scr_ = dev((size_t) S_all * head_scr_stride_, ok);
+    lat_cols_ = dev(dspark_head_step_cols_bytes(S_all), ok);
     prev_ = (int32_t*) dev((size_t) S_all * 4, ok);
     w1_row_ = (uint16_t*) dev((size_t) S_all * kDsRank * 2, ok);
     frc_ = f((size_t) S_all * E);
@@ -1240,9 +1241,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
                 dspark_pack_draft_rows(h_, blk, cn, s0, sub_nmax, hd_, st);
             }
             const DsHead head = w.head_args();
-            const size_t hq_row_b = bk::native_q8_1_bytes(kE, 1);
             const size_t lq_row_b = bk::native_q8_1_bytes(kDsRank, 1);
-            const int64_t n_pad = dspark_screen_rows((int64_t) w.n_vocab);
             bk::native_quantize_q8_1(hd_, hq_, kE, cb * sub_nmax, st);
             dspark_head_base_batch(head, hq_, cb, sub_nmax, head_cols_, approx_, st);
             bk::bf16_gemv_fp32_mmvf_cols(hd_, w.w_h, ctx_h_, kE, kDsRnn, cb * sub_nmax, st);
@@ -1253,18 +1252,9 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
                                          i, sub_nmax, cb, latent_ + (size_t) b0 * kDsRank, st);
                 void* lq_step = static_cast<char*>(lat_q_) + (size_t) i * cb * lq_row_b;
                 bk::native_quantize_q8_1(latent_ + (size_t) b0 * kDsRank, lq_step, kDsRank, cb, st);
-                for (int p0 = 0; p0 < cb; p0 += max_sessions_) {
-                    const int cp = std::min(max_sessions_, cb - p0);
-                    dspark_head_pick_batch(head,
-                                           static_cast<const char*>(hq_) + (size_t) p0 * sub_nmax * hq_row_b,
-                                           static_cast<const char*>(lq_step) + (size_t) p0 * lq_row_b,
-                                           approx_ + (size_t) p0 * sub_nmax * n_pad,
-                                           i, sub_nmax, cp, head_scr_, head_scr_stride_,
-                                           prev_ + (b0 + p0),
-                                           ids_d_ + (size_t) (b0 + p0) * kDsBlock,
-                                           conf_d_ + (size_t) (b0 + p0) * kDsBlock,
-                                           w.w1, w1_row_ + (size_t) (b0 + p0) * kDsRank, st);
-                }
+                dspark_head_pick_batch(head, hq_, lq_step, approx_, i, sub_nmax, cb, lat_cols_, head_scr_, head_scr_stride_, prev_ + b0,
+                                       ids_d_ + (size_t) b0 * kDsBlock, conf_d_ + (size_t) b0 * kDsBlock, w.w1,
+                                       w1_row_ + (size_t) b0 * kDsRank, st);
             }
         }
         cudaMemcpyAsync(ids_h_, ids_d_, (size_t) B * kDsBlock * 4, cudaMemcpyDeviceToHost, st);

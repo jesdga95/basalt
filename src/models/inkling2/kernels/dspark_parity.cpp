@@ -555,12 +555,12 @@ void test_split() {
 }
 
 
-// Multi-session batched Markov recurrence + screened head (B = 2, 4, 8), both plain and inside a PdlScope (where four short
+// Multi-session batched Markov recurrence + screened head (B = 2, 4, 8, 64), both plain and inside a PdlScope (where four short
 // recurrence/quantize launches sit between dspark_head_base_batch and dspark_head_pick_batch): every slot's draft ids and
 // confidences must match running that slot's solo recurrence + dspark_head_base + dspark_head_pick path bit for bit.
 void test_head_batch() {
     const int64_t V = kVocab;
-    const int R = kDsDrafts, BMax = 8;
+    const int R = kDsDrafts, BMax = 64;
     const auto head = q8_0_rows(V, E, 1.5e-4f, 913u), fold = q8_0_rows(V, kDsRank, 2e-3f, 5151u);
     const auto fb = randn((size_t) V, 0.5f);
     uint8_t *d_head = dev(head), *d_fold = dev(fold);
@@ -639,6 +639,7 @@ void test_head_batch() {
     uint8_t* b_lq = zeros<uint8_t>((size_t) BMax * R * lrow);
     float* b_approx = zeros<float>((size_t) BMax * R * dspark_screen_rows(V));
     void* b_cols = zeros<uint8_t>(dspark_head_base_cols_bytes(BMax * R));
+    void* b_lc = zeros<uint8_t>(dspark_head_step_cols_bytes(BMax));
     float *b_ch = zeros<float>((size_t) BMax * R * kDsRnn), *b_cf = zeros<float>((size_t) BMax * kDsRnn);
     float *b_st = zeros<float>((size_t) BMax * 2 * kDsRank), *b_lat = zeros<float>((size_t) BMax * kDsRank);
     uint16_t* b_w1r = zeros<uint16_t>((size_t) BMax * kDsRank);
@@ -648,7 +649,7 @@ void test_head_batch() {
 
     bool ok = true;
     for (const bool pdl_on : {false, true}) {
-        for (const int B : {2, 4, 8}) {
+        for (const int B : {2, 4, 8, 64}) {
             cudaMemsetAsync(b_st, 0, (size_t) B * 2 * kDsRank * 4, st);
             cudaMemsetAsync(b_approx, 0x7f, (size_t) B * R * dspark_screen_rows(V) * 4, st);
             cudaMemcpyAsync(b_prev, anchors.data(), (size_t) B * 4, cudaMemcpyHostToDevice, st);
@@ -657,7 +658,9 @@ void test_head_batch() {
                                 kDsRank * 2, cudaMemcpyHostToDevice, st);
             {
                 basalt::kernels::PdlScope pdl(pdl_on, true);
-                basalt::kernels::native_quantize_q8_1(d_hd, b_hq, E, B * R, st);
+                for (int r0 = 0; r0 < B * R; r0 += 128)   // the quantizer takes 128 rows a call
+                    basalt::kernels::native_quantize_q8_1(d_hd + (size_t) r0 * E, b_hq + (size_t) r0 * hrow, E,
+                                                          std::min(128, B * R - r0), st);
                 dspark_head_base_batch(h, b_hq, B, R, b_cols, b_approx, st);
                 basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_hd, d_wh, b_ch, E, kDsRnn, B * R, st);
                 basalt::kernels::bf16_gemv_fp32_mmvf_cols(d_frc, d_wf, b_cf, E, kDsRnn, B, st);
@@ -665,7 +668,7 @@ void test_head_batch() {
                     dspark_markov_step_batch(b_ch, b_cf, d_rb, d_wsp, b_w1r, b_st, i, R, B, b_lat, st);
                     void* lq_step = b_lq + (size_t) i * B * lrow;
                     basalt::kernels::native_quantize_q8_1(b_lat, lq_step, kDsRank, B, st);
-                    dspark_head_pick_batch(h, b_hq, lq_step, b_approx, i, R, B, b_scr, scr_stride,
+                    dspark_head_pick_batch(h, b_hq, lq_step, b_approx, i, R, B, b_lc, b_scr, scr_stride,
                                            b_prev, b_ids, b_conf, d_w1, b_w1r, st);
                 }
             }
@@ -678,7 +681,11 @@ void test_head_batch() {
             }
         }
     }
-    check("batched Markov + head vs solo (B=2,4,8, plain & PDL)", ok);
+    check("batched Markov + head vs solo (B=2,4,8,64, plain & PDL)", ok);
+    std::printf("  head pick batch, one draft of 64 slots: %8.1f us\n", time_us([&] {
+                    dspark_head_pick_batch(h, b_hq, b_lq, b_approx, 0, R, 64, b_lc, b_scr, scr_stride, b_prev, b_ids, b_conf, d_w1,
+                                           b_w1r, st);
+                }));
 
     cudaStreamDestroy(st);
     cudaFree(b_cols);

@@ -140,8 +140,10 @@ void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const floa
                               const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
                               void* stream);
 
+/// The scratch bytes dspark_head_pick_batch's latent columns take for `count` slots.
+size_t dspark_head_step_cols_bytes(int count);
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
-                            int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
-                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
+                            int n_max, int count, void* cols_scratch, void* scratch, size_t scratch_stride, int32_t* prev,
+                            int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
 
 }  // namespace basalt::models::inkling2
