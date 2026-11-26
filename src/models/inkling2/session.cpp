@@ -418,6 +418,9 @@ public:
         pick_ = (int32_t*) alloc(4 * 32, ok);
         if (ok && cudaMallocHost((void**) &pick_h_, 4 * 32) != cudaSuccess) ok = false;
         else if (ok) pinned_.push_back(pick_h_);
+        pick_all_ = (int32_t*) alloc((size_t) kMaxRows * 4, ok);
+        if (ok && cudaMallocHost((void**) &pick_all_h_, (size_t) kMaxRows * 4) != cudaSuccess) ok = false;
+        else if (ok) pinned_.push_back(pick_all_h_);
         if (ok && cudaMallocHost((void**) &io_h_, (size_t) kStage * (2 * call_rows + kSegWords) * 4) != cudaSuccess) ok = false;
         else if (ok) pinned_.push_back(io_h_);
         for (cudaEvent_t& e : stage_ev_)
@@ -611,8 +614,35 @@ protected:
         logits_gen_ = sh_->logits_gen;
         if (r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (h - 1) * V, (size_t) V * 4, cudaMemcpyDeviceToHost, v.stream);
     }
+    // A batch window whose every request draws greedily with no logit bias and no penalty: the leader draws every row of
+    // the window in one launch (a row's pick reads its own logits only, so each segment's picks are its own draw's) and
+    // each session takes its head rows' picks; else each session draws its own.
+    static bool greedy_window(const model::BatchView& v) {
+        for (int i = 0; i < v.n; ++i) {
+            const model::DecodeRequest& r = v.reqs[i];
+            if (static_cast<const Session*>(v.ss[i])->bias_on_) return false;
+            if (!r.sampling) continue;
+            if (!r.sampling->greedy && r.sampling->temperature > 0.f) return false;
+            if (r.sampling->penalty_last_n > 0 && r.history != nullptr && r.history_len > 0) return false;
+        }
+        return true;
+    }
     const int32_t* batch_draw(const model::BatchView& v, int i, std::string& err) override {
-        return draw(v.reqs[i], 0, v.head[i], err, v.stream);
+        if (!greedy_window(v)) return draw(v.reqs[i], 0, v.head[i], err, v.stream);
+        if (!draw_setup(v.reqs[i], 0, v.head[i], err, v.stream)) return nullptr;
+        Session& lead = *static_cast<Session*>(v.ss[0]);
+        if (i == 0) {
+            bk::SamplerParams gp;
+            gp.greedy = true;
+            gp.temperature = 0.f;
+            bk::sample_tokens(blog_, v.w.rows, g_.n_vocab, nullptr, 0, gp, pick_all_, v.stream);
+            if (cudaMemcpyAsync(pick_all_h_, pick_all_, (size_t) v.w.rows * 4, cudaMemcpyDeviceToHost, v.stream) != cudaSuccess) {
+                err = "the pick failed";
+                return nullptr;
+            }
+        }
+        const model::BatchWindow::Seg& sg = v.w.segs[(size_t) i];
+        return lead.pick_all_h_ + (sg.row0 + sg.rows - v.head[i]);
     }
 
 public:
@@ -1949,6 +1979,17 @@ private:
 
     // The draws of the `rows` rows of logits_, queued on `st`; the host array they land in, read once `st` has run.
     const int32_t* draw(const model::DecodeRequest& r, int t0, int rows, std::string& err, cudaStream_t st) {
+        if (!draw_setup(r, t0, rows, err, st)) return nullptr;
+        bk::sample_tokens(logits_, rows, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, pick_, st);
+        if (cudaMemcpyAsync(pick_h_, pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess) {
+            err = "the pick failed";
+            return nullptr;
+        }
+        return pick_h_;
+    }
+    // The sampler's parameters and the penalties' history of the `rows` rows from row t0 of the request's window (the
+    // history queued on `st`), as the session's later draws of those rows read them.
+    bool draw_setup(const model::DecodeRequest& r, int t0, int rows, std::string& err, cudaStream_t st) {
         bk::SamplerParams sp;
         if (r.sampling) sp = *r.sampling;
         else sp.greedy = true;
@@ -1964,19 +2005,14 @@ private:
                 if (!ok) {
                     cudaGetLastError();
                     err = "out of device memory for the sampling history";
-                    return nullptr;
+                    return false;
                 }
                 d_hist_len_ = n;
             }
             cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
         }
         sampling_ = sp;
-        bk::sample_tokens(logits_, rows, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);
-        if (cudaMemcpyAsync(pick_h_, pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess) {
-            err = "the pick failed";
-            return nullptr;
-        }
-        return pick_h_;
+        return true;
     }
 
     InklingModel& m_;
@@ -2039,6 +2075,7 @@ private:
     std::vector<int> elastic_card_;
     int64_t backed_ = 0;
     int32_t *pick_ = nullptr, *pick_h_ = nullptr, *io_h_ = nullptr;
+    int32_t *pick_all_ = nullptr, *pick_all_h_ = nullptr;   // a greedy batch window's picks of every row (the leader's)
     cudaEvent_t stage_ev_[kStage] = {};
     uint64_t stage_n_ = 0;
     std::vector<int32_t> picks_;
