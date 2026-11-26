@@ -1659,6 +1659,9 @@ struct MmaDevice {
     MmaLaunch two_stage_ring, three_stage_ring, one_stage_ping_pong;
     MmaLaunch singleton;
     MmaLaunch register_ring[2][2];   // windows staged through registers: one slab, two slabs; without, with ping-pong V
+    // The plan a window of one slab, of two slabs, takes: its register-staged form with the most blocks a multiprocessor
+    // (ping-pong V on a tie), where that is more than the shared-ring plans of its slab count fit; else none (the rings).
+    MmaLaunch window[2];
 };
 
 void check_mma_probe(cudaError_t error) {
@@ -1709,11 +1712,20 @@ void mma_probe_plans(MmaDevice& device, int per_block, int per_sm, int reserved)
         throw std::runtime_error("inkling2: no resident attention MMA block");
 }
 
+MmaDevice mma_devices[kOptInDevices];
+
+void log_mma_plan(int dev, const MmaDevice& d, const char* geometry, const char* regime, const MmaLaunch& plan,
+                  bool registers = false) {
+    const char* name = registers ? (plan.ping_pong ? "registers-ping-pong" : "registers") :
+                       plan.stages == 0 ? "direct" : plan.ping_pong ? "ping-pong-ring" : "ring";
+    basalt::log::info("basalt inkling2", "INT8 MMA CUDA%d %s/%s plan=%s stages=%d shared=%zuB resident=%d CTAs/SM slots=%d",
+                      dev, geometry, regime, name, plan.stages, plan.shared, plan.resident, d.sms * plan.resident);
+}
+
 const MmaDevice& mma_device(int dev) {
-    static MmaDevice devices[kOptInDevices];
     static std::once_flag probed[kOptInDevices];
     std::call_once(probed[dev], [dev] {
-        MmaDevice& d = devices[dev];
+        MmaDevice& d = mma_devices[dev];
         d.sms = mma_attribute(dev, cudaDevAttrMultiProcessorCount);
         d.l2 = mma_attribute(dev, cudaDevAttrL2CacheSize);
         const int per_block = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerBlockOptin);
@@ -1730,6 +1742,26 @@ const MmaDevice& mma_device(int dev) {
             resident = std::min({resident, per_sm / (shared + reserved), 3});
             d.singleton = {shared, 0, resident, true};
         }
+        if (d.singleton.resident > 0) log_mma_plan(dev, d, "singleton", "all", d.singleton);
+        const char* geometries[] = {"narrow", "one-slab", "two-slab"};
+        for (int g = 0; g < 3; ++g) {
+            log_mma_plan(dev, d, geometries[g], "L2", d.plans[g][0]);
+            log_mma_plan(dev, d, geometries[g], "streaming", d.plans[g][1]);
+        }
+    });
+    return mma_devices[dev];
+}
+
+// mma_device with the register-staged window plans probed and chosen. Probed at a card's first MMA launch, not at load:
+// probing loads their code, which would then sit on the card before the expert placement sizes it.
+const MmaDevice& mma_windows(int dev) {
+    static std::once_flag probed[kOptInDevices];
+    (void) mma_device(dev);
+    std::call_once(probed[dev], [dev] {
+        MmaDevice& d = mma_devices[dev];
+        const int per_block = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerBlockOptin);
+        const int per_sm = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerMultiprocessor);
+        const int reserved = mma_attribute(dev, cudaDevAttrReservedSharedMemoryPerBlock);
         const auto probe_registers = [&](auto kernel, size_t slab_bytes, MmaLaunch (&out)[2]) {
             for (const bool ping_pong : {false, true}) {
                 const size_t bytes = slab_bytes + (ping_pong ? sizeof(MmaVTile) : 0);
@@ -1743,19 +1775,21 @@ const MmaDevice& mma_device(int dev) {
         };
         probe_registers(attn_mma_split_kernel<1, false, false, true>, sizeof(MmaSmem<1>), d.register_ring[0]);
         probe_registers(attn_mma_split_kernel<2, false, false, true>, sizeof(MmaSmem<2>), d.register_ring[1]);
-        const auto log_plan = [&](const char* geometry, const char* regime, const MmaLaunch& plan) {
-            const char* name = plan.stages == 0 ? "direct" : plan.ping_pong ? "ping-pong-ring" : "ring";
-            basalt::log::info("basalt inkling2", "INT8 MMA CUDA%d %s/%s plan=%s stages=%d shared=%zuB resident=%d CTAs/SM slots=%d",
-                              dev, geometry, regime, name, plan.stages, plan.shared, plan.resident, d.sms * plan.resident);
-        };
-        if (d.singleton.resident > 0) log_plan("singleton", "all", d.singleton);
-        const char* geometries[] = {"narrow", "one-slab", "two-slab"};
-        for (int g = 0; g < 3; ++g) {
-            log_plan(geometries[g], "L2", d.plans[g][0]);
-            log_plan(geometries[g], "streaming", d.plans[g][1]);
+        for (int s = 0; s < 2; ++s) {
+            const MmaLaunch& plain = d.register_ring[s][0];
+            const MmaLaunch& pp = d.register_ring[s][1];
+            const MmaLaunch& pick = pp.resident >= plain.resident ? pp : plain;
+            // one slab: the narrow and one-slab rings; two slabs: the two-slab rings (each L2-resident and streaming)
+            int rings = 0;
+            for (int g = s == 0 ? 0 : 2; g <= s + 1; ++g)
+                rings = std::max({rings, d.plans[g][0].resident, d.plans[g][1].resident});
+            if (pick.resident > rings) d.window[s] = pick;
         }
+        const char* geometries[] = {"one-slab", "two-slab"};
+        for (int s = 0; s < 2; ++s)
+            if (d.window[s].resident > 0) log_mma_plan(dev, d, geometries[s], "windows", d.window[s], true);
     });
-    return devices[dev];
+    return mma_devices[dev];
 }
 
 // A row's slices as the shard model sees them: their count and the last one's share of a full slice's keys.
@@ -1985,7 +2019,7 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
                 bk::launch_pdl(attn_split_kernel<false, true, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
                 check("attention_decode/shallow");
             }
-            const MmaDevice& device = mma_device(dev);
+            const MmaDevice& device = mma_windows(dev);
             if (plan == Int8MmaPlan::Direct && device.singleton.resident == 0) return false;
             if (plan == Int8MmaPlan::RegisterRing || plan == Int8MmaPlan::RegisterPingPong) {
                 const bool one = rows * kGroup <= kMmaRows, ping_pong = plan == Int8MmaPlan::RegisterPingPong;
@@ -1997,10 +2031,19 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
                 else
                     launch_mma<2, false, false, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, forced,
                                                       info, shards, shard_count);
-            } else if (!seg_mode && rows == 1 && plan != Int8MmaPlan::NarrowRing && device.singleton.resident > 0)
+            } else if (!seg_mode && rows == 1 && plan != Int8MmaPlan::NarrowRing && plan != Int8MmaPlan::SharedRing &&
+                       device.singleton.resident > 0) {
                 launch_mma<1, true, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, nullptr, info, shards,
                                           shard_count);
-            else if (rows <= 2)
+            } else if (const int slabs = rows * kGroup <= kMmaRows ? 1 : 2;
+                       plan == Int8MmaPlan::Auto && device.window[slabs - 1].resident > 0) {
+                if (slabs == 1)
+                    launch_mma<1, false, false, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device,
+                                                      &device.window[0], info, shards, shard_count);
+                else
+                    launch_mma<2, false, false, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device,
+                                                      &device.window[1], info, shards, shard_count);
+            } else if (rows <= 2)
                 launch_mma<1, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, nullptr, info, shards,
                                     shard_count);
             else if (rows * kGroup <= kMmaRows)
@@ -2036,7 +2079,8 @@ bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, v
         throw std::invalid_argument("inkling2: test needs a full-cache INT8 decode window");
     if (plan != Int8MmaPlan::Auto) {
         const bool singleton_plan = plan == Int8MmaPlan::NarrowRing || plan == Int8MmaPlan::Direct;
-        const bool register_plan = plan == Int8MmaPlan::RegisterRing || plan == Int8MmaPlan::RegisterPingPong;
+        const bool register_plan = plan == Int8MmaPlan::RegisterRing || plan == Int8MmaPlan::RegisterPingPong ||
+                                   plan == Int8MmaPlan::SharedRing;
         if (!mma || (register_plan ? rows < 2 : singleton_plan ? rows != 1 : rows * kGroup <= kMmaRows))
             throw std::invalid_argument("inkling2: forced MMA plan does not match the test window");
     }
