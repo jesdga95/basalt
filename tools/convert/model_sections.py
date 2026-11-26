@@ -200,6 +200,14 @@ def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool
     return "2", data, len(data), rec
 
 
+def _sha256_array(arr: np.ndarray) -> str:
+    h = hashlib.sha256()
+    chunk = 64 << 20
+    for i in range(0, arr.size, chunk):
+        h.update(arr[i:i + chunk])
+    return h.hexdigest()
+
+
 class Dense:
     """The `dense` section: `plan` validates every tensor first, `chunks` streams the pool and fills `rows` and `records`,
         `index_text` is the `dense.index`."""
@@ -246,7 +254,7 @@ class Dense:
             kind, data, dst_bytes, rec = got
             if rec is not None:
                 self.records.append({"name": name, "shard": p.name, **rec,
-                                     "source_sha256": hashlib.sha256(raw.tobytes()).hexdigest()})
+                                     "source_sha256": _sha256_array(raw)})
             self.rows.append([name, "0", kind, str(at), str(len(data)), "0", str(dst_bytes), str(ne0), str(ne1),
                               "0", "0", "1"] + ["0"] * 7)
             yield data
@@ -350,43 +358,82 @@ MTP_Q8 = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", 
           "mlp.shared_expert.down_proj.weight"}
 
 
+_Q2_0_FACTORS = np.linspace(0.5, 1.0, 17, dtype=np.float32)
+
+
 def q2_0(x: np.ndarray) -> np.ndarray:
     """Float32 values in blocks of 64 -> Q2_0 blocks (fp16 d, 16 bytes of 2-bit codes, code = q + 1, four per byte).
         The block scale minimizes squared error over {-1, 0, 1, 2} x d (the ggml reference uses d = max|w| and never the +2 level)."""
-    x = x.reshape(-1, 64).astype(np.float32)
-    amax = np.abs(x).max(axis=1, keepdims=True)
-    best_err = np.full((x.shape[0], 1), np.inf, dtype=np.float32)
-    best_d = np.zeros_like(amax)
-    for f in np.linspace(0.5, 1.0, 17, dtype=np.float32):      # scale search range: amax/2 .. amax
-        d = amax * f
-        inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
-        q = np.clip(np.rint(x * inv), -1, 2)
-        err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
-        better = err < best_err
-        best_err = np.where(better, err, best_err)
-        best_d = np.where(better, d, best_d)
-    d16 = best_d.astype(np.float16)
-    d = d16.astype(np.float32)                                   # quantize against the stored (fp16) scale
-    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
-    codes = (np.clip(np.rint(x * inv), -1, 2) + 1).astype(np.uint8)
-    c = codes.reshape(-1, 16, 4)
-    packed = (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).astype(np.uint8)
-    out = np.empty((x.shape[0], 18), dtype=np.uint8)
-    out[:, :2] = d16.view(np.uint8).reshape(-1, 2)
-    out[:, 2:] = packed
+    x = np.asarray(x, dtype=np.float32).reshape(-1, 64)
+    nb = x.shape[0]
+    if nb == 0:
+        return np.empty(0, dtype=np.uint8)
+    out = np.empty((nb, 18), dtype=np.uint8)
+    step = min(nb, 2048)
+    buf = np.empty((step, 64), dtype=np.float32)
+    d_buf = np.empty((step, 1), dtype=np.float32)
+    err_buf = np.empty((step, 1), dtype=np.float32)
+    zero, one, lo, hi = np.float32(0.0), np.float32(1.0), np.float32(-1.0), np.float32(2.0)
+    for i in range(0, nb, step):
+        j = min(i + step, nb)
+        n = j - i
+        xc, bc, dc, ec = x[i:j], buf[:n], d_buf[:n], err_buf[:n]
+        np.abs(xc, out=bc)
+        amax = bc.max(axis=1, keepdims=True)
+        best_err = np.full((n, 1), np.inf, dtype=np.float32)
+        best_d = np.zeros_like(amax)
+        for f in _Q2_0_FACTORS:                                  # scale search range: amax/2 .. amax
+            np.multiply(amax, f, out=dc)
+            inv = np.where(dc > zero, one / np.where(dc > zero, dc, one), zero)
+            np.multiply(xc, inv, out=bc)
+            np.rint(bc, out=bc)
+            np.clip(bc, lo, hi, out=bc)
+            np.multiply(bc, dc, out=bc)
+            np.subtract(bc, xc, out=bc)
+            np.square(bc, out=bc)
+            bc.sum(axis=1, keepdims=True, out=ec)
+            better = ec < best_err
+            np.copyto(best_err, ec, where=better)
+            np.copyto(best_d, dc, where=better)
+        d16 = best_d.astype(np.float16)
+        dc[:] = d16.astype(np.float32)                           # quantize against the stored (fp16) scale
+        inv = np.where(dc > zero, one / np.where(dc > zero, dc, one), zero)
+        np.multiply(xc, inv, out=bc)
+        np.rint(bc, out=bc)
+        np.clip(bc, lo, hi, out=bc)
+        np.add(bc, one, out=bc)
+        c = bc.astype(np.uint8).reshape(n, 16, 4)
+        out[i:j, :2] = d16.view(np.uint8).reshape(n, 2)
+        out[i:j, 2:] = c[:, :, 0] | (c[:, :, 1] << np.uint8(2)) | (c[:, :, 2] << np.uint8(4)) | (c[:, :, 3] << np.uint8(6))
     return out.reshape(-1)
 
 
 def q8_0(x: np.ndarray) -> bytes:
     """ggml's reference rounding over rows of a float32 array: blocks of 32, fp16 d = amax / 127."""
-    b = x.reshape(-1, 32).astype(np.float32)
-    d = np.abs(b).max(axis=1) / 127.0
-    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0).astype(np.float32)
-    v = b * inv[:, None]
-    q = (np.sign(v) * np.floor(np.abs(v) + 0.5)).astype(np.int8)
-    out = np.empty((b.shape[0], 34), dtype=np.uint8)
-    out[:, :2] = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
-    out[:, 2:] = q.view(np.uint8)
+    b = np.asarray(x, dtype=np.float32).reshape(-1, 32)
+    nb = b.shape[0]
+    if nb == 0:
+        return b""
+    out = np.empty((nb, 34), dtype=np.uint8)
+    step = min(nb, 4096)
+    v = np.empty((step, 32), dtype=np.float32)
+    a = np.empty((step, 32), dtype=np.float32)
+    zero, one, half, c127 = np.float32(0.0), np.float32(1.0), np.float32(0.5), np.float32(127.0)
+    for i in range(0, nb, step):
+        j = min(i + step, nb)
+        n = j - i
+        bc, vc, ac = b[i:j], v[:n], a[:n]
+        np.abs(bc, out=vc)
+        d = vc.max(axis=1) / c127
+        inv = np.where(d > zero, one / np.where(d > zero, d, one), zero).astype(np.float32)
+        np.multiply(bc, inv[:, None], out=vc)
+        np.abs(vc, out=ac)
+        np.add(ac, half, out=ac)
+        np.floor(ac, out=ac)
+        np.sign(vc, out=vc)
+        np.multiply(vc, ac, out=vc)
+        out[i:j, :2] = d.astype(np.float16).view(np.uint8).reshape(n, 2)
+        out[i:j, 2:] = vc.astype(np.int8).view(np.uint8)
     return out.tobytes()
 
 
@@ -395,16 +442,28 @@ def _bf16_to_f32(u16: np.ndarray) -> np.ndarray:
 
 
 def mtp_blob(gu: np.ndarray, dn: np.ndarray) -> bytes:
-    """One expert in the engine's blob layout: gu is its (1280, 40, 18) Q2_0 rows (gate 0..639, up 640..1279), dn its
-        (2560, 10, 18). Gate/up rows interleave (2r = gate r, 2r+1 = up r), then the down rows; codes of all rows in one
-        plane, fp16 scales in another."""
+    """One expert in the engine's blob layout: gu is its (2*ff, h/64, 18) Q2_0 rows (gate 0..ff-1, up ff..2*ff-1),
+        dn its (h, ff/64, 18). Gate/up rows interleave (2r = gate r, 2r+1 = up r), then the down rows; codes of all
+        rows in one plane, fp16 scales in another."""
+    ff, h = gu.shape[0] // 2, dn.shape[0]
     inter = np.empty_like(gu)
-    inter[0::2] = gu[:MTP_FF]
-    inter[1::2] = gu[MTP_FF:]
+    inter[0::2] = gu[:ff]
+    inter[1::2] = gu[ff:]
     out = b"".join([inter[:, :, 2:].tobytes(), dn[:, :, 2:].tobytes(), inter[:, :, :2].tobytes(),
                     dn[:, :, :2].tobytes()])
-    assert len(out) == 3 * (MTP_H * MTP_FF * 18 // 64), len(out)
+    assert len(out) == 3 * (h * ff * 18 // 64), len(out)
     return out
+
+
+def _mtp_expert_job(args):
+    gu_path, dn_path, h, ff, e = args
+    gu_elems = 2 * ff * h
+    dn_elems = h * ff
+    g_u16 = np.fromfile(gu_path, dtype="<u2", count=gu_elems, offset=e * gu_elems * 2)
+    d_u16 = np.fromfile(dn_path, dtype="<u2", count=dn_elems, offset=e * dn_elems * 2)
+    g = q2_0(_bf16_to_f32(g_u16)).reshape(2 * ff, h // 64, 18)
+    d = q2_0(_bf16_to_f32(d_u16)).reshape(h, ff // 64, 18)
+    return mtp_blob(g, d)
 
 
 class Mtp:
@@ -485,17 +544,22 @@ class Mtp:
     def dense_index(self) -> bytes:
         return ("\n".join(self.dense_lines) + "\n").encode("utf-8")
 
-    def expert_chunks(self):
+    @property
+    def expert_bytes(self) -> int:
+        return MTP_NE * 3 * (MTP_H * MTP_FF * 18 // 64)
+
+    def expert_chunks(self, pool=None, depth: int = 16):
         """512 blobs, one per expert; each expert is quantized to Q2_0 on its own, so the memory stays small."""
         gu_t, dn_t = (self.manifest[n] for n in MTP_EXPERTS)
         if gu_t["shape"] != [MTP_NE, 2 * MTP_FF, MTP_H] or dn_t["shape"] != [MTP_NE, MTP_H, MTP_FF]:
             raise ConvertError(f"unexpected drafter expert shapes {gu_t['shape']} {dn_t['shape']}")
-        gu = np.memmap(self.src / gu_t["file"], dtype="<u2", mode="r", shape=tuple(gu_t["shape"]))
-        dn = np.memmap(self.src / dn_t["file"], dtype="<u2", mode="r", shape=tuple(dn_t["shape"]))
-        for e in range(MTP_NE):
-            g = q2_0(_bf16_to_f32(np.asarray(gu[e]))).reshape(2 * MTP_FF, MTP_H // 64, 18)
-            d = q2_0(_bf16_to_f32(np.asarray(dn[e]))).reshape(MTP_H, MTP_FF // 64, 18)
-            yield mtp_blob(g, d)
+        gu_path, dn_path = str(self.src / gu_t["file"]), str(self.src / dn_t["file"])
+        jobs = ((gu_path, dn_path, MTP_H, MTP_FF, e) for e in range(MTP_NE))
+        if pool is not None:
+            yield from bounded_imap(pool, _mtp_expert_job, jobs, depth)
+            return
+        for j in jobs:
+            yield _mtp_expert_job(j)
 
 
 def draft_vocab_bytes(path, n_vocab: int | None = None) -> bytes:
@@ -513,7 +577,7 @@ def draft_vocab_bytes(path, n_vocab: int | None = None) -> bytes:
 PLE_DIM = 160
 
 
-def fp8_e4m3_table() -> np.ndarray:
+def _build_fp8_e4m3_table() -> np.ndarray:
     """All 256 E4M3 (finite-only, bias 7) codes as float32; the two NaN codes are NaN."""
     b = np.arange(256)
     sign = np.where(b >> 7, -1.0, 1.0)
@@ -523,12 +587,22 @@ def fp8_e4m3_table() -> np.ndarray:
     return (sign * v).astype(np.float32)
 
 
+_FP8_E4M3_TABLE = _build_fp8_e4m3_table()
+
+
+def fp8_e4m3_table() -> np.ndarray:
+    """All 256 E4M3 (finite-only, bias 7) codes as float32; the two NaN codes are NaN."""
+    return _FP8_E4M3_TABLE.copy()
+
+
 def fp8_rows_to_q8_0(raw: np.ndarray, scale: float) -> bytes:
     """Rows of PLE_DIM FP8 codes times the tensor's scale -> Q8_0 rows (5 blocks of 34 bytes each)."""
-    x = fp8_e4m3_table()[raw.reshape(-1)] * np.float32(scale)
-    if not np.isfinite(x).all():
+    with np.errstate(invalid="ignore", over="ignore"):
+        lut = _FP8_E4M3_TABLE * np.float32(scale)
+    flat = raw.reshape(-1)
+    if (~np.isfinite(lut))[flat].any():
         raise ConvertError("the FP8 table holds a non-finite value")
-    return q8_0(x)
+    return q8_0(lut[flat])
 
 
 def _ple_job(args):
@@ -743,6 +817,8 @@ def _q6k_job(args):
     pack, off, ne0, row0, rows, st_path, st_off, layout = args
     raw = np.fromfile(pack, dtype=np.uint8, count=rows * ne0 // 32 * 34, offset=off + row0 * ne0 // 32 * 34)
     q8 = q8_0_values(raw).reshape(rows, ne0)
+    if not np.isfinite(q8).all():
+        raise ConvertError("a non-finite value in pack Q8_0 tensor")
     if st_path is None:
         return q6_k(q8), 0.0
     if layout is None:
@@ -755,9 +831,14 @@ def _q6k_job(args):
         else:
             u = mm[row0:row0 + rows][:, gdn_index(ne0, 0)]
     src = _bf16_to_f32(np.ascontiguousarray(u)).reshape(rows, ne0)
+    if not np.isfinite(src).all():
+        raise ConvertError("a non-finite value in BF16 source")
     step = np.abs(src).reshape(-1, 32).max(axis=1) / 127.0
     err = np.abs(q8 - src).reshape(-1, 32).max(axis=1)
-    return q6_k(src), float((err / np.maximum(step, 2e-5)).max())
+    worst = float((err / np.maximum(step, 2e-5)).max())
+    if not math.isfinite(worst):
+        raise ConvertError("a non-finite distance from pack Q8_0")
+    return q6_k(src), worst
 
 
 class DenseQ6K:
@@ -801,7 +882,7 @@ class DenseQ6K:
 
     def chunks(self, name, info, pack, gguf_off, pool):
         for blob, worst in pool.imap(_q6k_job, self.jobs(name, info, pack, gguf_off), chunksize=1):
-            self.worst = max(self.worst, worst)
-            if worst > 1.05:
+            if not (worst <= 1.05):
                 raise ConvertError(f"{name}: the BF16 source is {worst:.2f} Q8_0 steps from the pack's copy")
+            self.worst = max(self.worst, worst)
             yield blob

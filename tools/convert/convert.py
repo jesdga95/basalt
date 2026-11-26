@@ -180,7 +180,10 @@ def add_dspark(a) -> None:
     if not pack.is_file():
         die(f"missing input: {pack}")
     if a.roll_back:
-        undo_append(str(pack), a.undo_dir)
+        try:
+            undo_append(str(pack), a.undo_dir)
+        except (ValueError, OSError) as e:
+            die(str(e))
         print(f"done: {pack} is back to {pack.stat().st_size} bytes")
         return
     dspark = Path(a.dspark)
@@ -310,6 +313,10 @@ class Job:
     def file(self, name, src, offset=0, size=None):
         t = time.time()
         self.w.add_file(name, str(src), offset, size)
+        if self.dry and name in ("dense.index", "mtp/dense.index"):
+            with open(src, "rb") as f:
+                f.seek(offset)
+                self.index[name] = f.read() if size is None else f.read(size)
         self._report(name, self.w.entries[-1][2], time.time() - t)
 
     def chunks(self, name, chunks, size=None):
@@ -478,7 +485,7 @@ def convert(a) -> None:
                         die(f"{name}: its shard holds only the header, and {a.sections_from} has no section of that tensor")
                     off, _ = base.section(section)
                     job.file(section, a.sections_from, off, size)
-                    if w.entries[-1][3] != base.sections[section][2]:
+                    if not dry and w.entries[-1][3] != base.sections[section][2]:
                         die(f"section {section}: the copy's SHA-256 differs from {a.sections_from}'s")
                     copied.append(section)
                 else:
@@ -487,12 +494,13 @@ def convert(a) -> None:
                 own_entries[name] = {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
                                      "bytes": size, "offset": 0, "section": section}
             if base is not None:
+                prefixes = ("vision/", "dspark/") if mtp_gguf is not None else ("mtp/", "vision/", "dspark/")
                 for name in base.names():
-                    if name != "vision/text_vocab" and name.startswith(("mtp/", "vision/", "dspark/")):
+                    if name != "vision/text_vocab" and (name == "dfly" or name.startswith(prefixes)):
                         off, size = base.section(name)
                         job.file(name, a.sections_from, off, size)
-                        if w.entries[-1][3] != base.sections[name][2]:
-                            die(f"section {name}: the copys SHA-256 differs from {a.sections_from}s")
+                        if not dry and w.entries[-1][3] != base.sections[name][2]:
+                            die(f"section {name}: the copy's SHA-256 differs from {a.sections_from}'s")
                         copied.append(name)
                 if "vision/text_vocab" in base.sections:
                     import pack_vision
@@ -512,7 +520,16 @@ def convert(a) -> None:
             if mtp is not None:
                 job.chunks("mtp/dense", mtp.dense_chunks())
                 job.bytes("mtp/dense.index", mtp.dense_index())
-                job.chunks("mtp/experts", mtp.expert_chunks())
+                if dry:
+                    job.chunks("mtp/experts", iter(()), mtp.expert_bytes)
+                else:
+                    import multiprocessing
+                    workers = max(1, min(getattr(a, "workers", 16), S.MTP_NE))
+                    if workers > 1:
+                        with multiprocessing.Pool(workers) as pool:
+                            job.chunks("mtp/experts", mtp.expert_chunks(pool), mtp.expert_bytes)
+                    else:
+                        job.chunks("mtp/experts", mtp.expert_chunks(), mtp.expert_bytes)
                 if draft_vocab is not None:
                     job.bytes("mtp/draft_vocab", draft_vocab)
             if arch.side_sections:
@@ -542,15 +559,16 @@ def convert(a) -> None:
                                for n, _, _, nb, t in tensors}, **own_entries},
                 "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
                 "license": arch.license(kv),
+                **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
                 "mtp": base_meta.get("mtp") if base is not None else None if mtp is None else {"source_sha256": mtp.source_sha256(),
                                                   "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
                                                   "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
                                                             if mtp.tuned else {"tuning": None})},
                 "vision": base_meta.get("vision") if base is not None else None if not vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
-                **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
                 **({"dspark": dspark_record(dspark)} if dspark else {}),
                 **({"dspark": base_meta["dspark"]} if base is not None and "dspark" in base_meta else {}),
+                **({"dfly2": base_meta["dfly2"]} if base is not None and "dfly2" in base_meta else {}),
             }
             if mtp_gguf is not None:
                 meta["mtp"] = {"source": "gguf", "layers": mtp_ids, "format": "as stored in the GGUF",
@@ -560,7 +578,10 @@ def convert(a) -> None:
                                "experts": {"layers": m_experts.layers, "gate_type_id": m_experts.layout[0][1],
                                            "down_type_id": m_experts.layout[0][2], "bytes": m_experts.total}}
             if hf_dir is not None:
+                lic = meta["license"]
                 meta.update(hf_meta)
+                if "license" in hf_meta:
+                    meta["license"] = {**lic, **hf_meta["license"]}
                 meta["sources"] += [{"path": f"hf/{n}", "size": (hf_dir / n).stat().st_size,
                                      "sha256": hashlib.sha256((hf_dir / n).read_bytes()).hexdigest()}
                                     for n in ("config.json", "LICENSE")]
@@ -903,7 +924,7 @@ def main():
         if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark or a.dflash2:
             ap.error("--verify takes --gguf and nothing else")
         import verify_pack
-        sys.exit(0 if verify_pack.verify(a.verify, a.gguf[0], a.workers) else 1)
+        sys.exit(0 if verify_pack.verify(a.verify, a.gguf, a.workers) else 1)
     if not a.out:
         ap.error("--out is required")
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
