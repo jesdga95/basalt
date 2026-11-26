@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,6 +37,24 @@ inline kernels::RouterMixedArgs router_mixed_args(int n_expert, int token_vocab,
     args.bias = bias;
     args.alternate_bias = alternate_bias;
     return args;
+}
+
+/// Scores normalized token rows with the V4 F32 gate matrix, then selects the mixed fixed/hash or biased routes.
+/// `logits` is caller-owned [n_tokens][n_expert] workspace; `ids` and `weights` are [n_tokens][6].
+inline void router_step(const float* x, const float* gate, int n_tokens, int n_embd,
+                        const kernels::RouterMixedArgs& selection, float* logits,
+                        int32_t* ids, float* weights, void* stream) {
+    if (!x || !gate || !logits || !ids || !weights || n_tokens <= 0 || n_embd <= 0 ||
+        selection.n_expert <= 0 || selection.k != 6)
+        throw std::invalid_argument("deepseek4 router step: invalid input or routing geometry");
+    kernels::RouterArgs scoring;
+    scoring.n_expert = selection.n_expert;
+    scoring.n_embd = n_embd;
+    scoring.k = selection.k;
+    scoring.weight_scale = selection.weight_scale;
+    scoring.gate = selection.gate;
+    kernels::router_logits(x, gate, n_tokens, scoring, logits, stream);
+    kernels::router_select_mixed(logits, n_tokens, selection, ids, weights, stream);
 }
 
 /// Builds the host-side selector inputs from token IDs. Text rows in hash-routed layers index `tid2eid`; image IDs use

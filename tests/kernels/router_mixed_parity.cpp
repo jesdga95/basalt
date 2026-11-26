@@ -113,6 +113,36 @@ Output run_table(const std::vector<float>& logits, const std::vector<int32_t>& f
     return out;
 }
 
+Output run_v4_router(const std::vector<float>& x, const std::vector<float>& gate, int n_embd,
+                     const std::vector<int32_t>& fixed_table, const std::vector<int32_t>& fixed_rows,
+                     const std::vector<uint8_t>& fixed_mask, const std::vector<uint8_t>& alternate_mask,
+                     const std::vector<float>& bias, const std::vector<float>& alternate_bias, bool use_model_step) {
+    const int n = (int) fixed_mask.size();
+    Device<float> dx(x.size()), dg(gate.size()), db(bias.size()), da(alternate_bias.size());
+    Device<int32_t> dt(fixed_table.size()), dr(fixed_rows.size()), di((size_t) n * kRoutes);
+    Device<uint8_t> dm(fixed_mask.size()), da_mask(alternate_mask.size());
+    Device<float> dlogits((size_t) n * kExperts), dw((size_t) n * kRoutes);
+    dx.upload(x); dg.upload(gate); db.upload(bias); da.upload(alternate_bias);
+    dt.upload(fixed_table); dr.upload(fixed_rows); dm.upload(fixed_mask); da_mask.upload(alternate_mask);
+
+    const auto args = basalt::models::deepseek4::router_mixed_args(
+        kExperts, (int) (fixed_table.size() / kRoutes), dt.p, dr.p, dm.p, da_mask.p, db.p, da.p);
+    if (use_model_step) {
+        basalt::models::deepseek4::router_step(dx.p, dg.p, n, n_embd, args, dlogits.p, di.p, dw.p, nullptr);
+    } else {
+        basalt::kernels::RouterArgs scoring;
+        scoring.n_expert = kExperts; scoring.n_embd = n_embd; scoring.k = kRoutes;
+        scoring.weight_scale = kScale; scoring.gate = basalt::kernels::RouterGate::SqrtSoftplus;
+        basalt::kernels::router_logits(dx.p, dg.p, n, scoring, dlogits.p, nullptr);
+        basalt::kernels::router_select_mixed(dlogits.p, n, args, di.p, dw.p, nullptr);
+    }
+    check(cudaDeviceSynchronize(), "V4 router step");
+    Output out;
+    out.ids = di.download((size_t) n * kRoutes);
+    out.weights = dw.download((size_t) n * kRoutes);
+    return out;
+}
+
 double score(double x) {
     return std::sqrt(x > 20.0 ? x : std::log1p(std::exp(x)));
 }
@@ -239,6 +269,22 @@ int main() {
         for (int t = 0; t < token_vocab; ++t)
             std::copy_n(fixed_ids.data() + (size_t) t * kRoutes, kRoutes,
                         fixed_table.data() + (size_t) t * kRoutes);
+        constexpr int router_embd = 4096;
+        std::uniform_real_distribution<float> activation(-0.3f, 0.3f), gate_weight(-0.001f, 0.001f);
+        std::vector<float> router_x((size_t) kTokens * router_embd);
+        std::vector<float> router_gate((size_t) kExperts * router_embd);
+        for (float& x : router_x) x = activation(rng);
+        for (float& x : router_gate) x = gate_weight(rng);
+        const Output v4_step = run_v4_router(router_x, router_gate, router_embd, fixed_table, table_rows,
+                                              hash_mask, image_mask, bias, alternate_bias, true);
+        const Output v4_direct = run_v4_router(router_x, router_gate, router_embd, fixed_table, table_rows,
+                                                hash_mask, image_mask, bias, alternate_bias, false);
+        const bool v4_step_equal = v4_step.ids == v4_direct.ids &&
+                                   !std::memcmp(v4_step.weights.data(), v4_direct.weights.data(),
+                                                v4_step.weights.size() * sizeof(float));
+        std::printf("DeepSeek4 routed expert step composition: ids and weights %s\n",
+                    v4_step_equal ? "bitwise" : "DIFFERS");
+        if (!v4_step_equal) return 1;
         const Output table_got = run_table(logits, fixed_table, table_rows, hash_mask, image_mask, {}, alternate_bias);
         const Output table_ref = reference(logits, fixed_ids, hash_mask, image_mask,
                                            std::vector<float>(kExperts, 0.f), alternate_bias);
