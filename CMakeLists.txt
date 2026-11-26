@@ -628,6 +628,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/router.cu
                         src/kernels/cuda/route_tail_skip.cu
                         src/kernels/cuda/row_norm.cu
+                        src/kernels/cuda/sparse_mqa.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BUILD_TESTING)
@@ -637,6 +638,11 @@ if(BUILD_TESTING)
   target_link_libraries(router_mixed_parity PRIVATE kernels warnings ${_gpu_runtime_target})
   basalt_gpu_test(NAME router_mixed_parity COMMAND router_mixed_parity)
   set_tests_properties(router_mixed_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(sparse_mqa_parity tests/kernels/sparse_mqa_parity.cpp)
+  target_include_directories(sparse_mqa_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(sparse_mqa_parity PRIVATE kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME sparse_mqa_parity COMMAND sparse_mqa_parity)
+  set_tests_properties(sparse_mqa_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 if(BASALT_MODEL_QWEN4EXP)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with

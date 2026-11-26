@@ -23,6 +23,7 @@
 // SOFTWARE.
 #include "basalt/models/deepseek41/attn.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
+#include "basalt/kernels/sparse_mqa.hpp"
 #include "basalt/kernels/mqa_chunk.cuh"
 #include "cache_rows.cuh"
 
@@ -113,37 +114,6 @@ __global__ void rope_rows_kernel(float* rows, int n_rows, int row_stride, int ro
 namespace mqa = basalt::kernels::mqa;
 using mqa::NoScales;
 static_assert(mqa::kChunk == kAttnChunk && mqa::kLatent == kAttnHeadDim && mqa::kThreads == kBlockThreads, "the shared chunk stage");
-struct RowF32 {
-    using Raw4 = float4;
-    using Raw2 = float2;
-    using Scales = NoScales;
-    static __device__ __forceinline__ Scales scales(const uint8_t*) { return {}; }
-    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { cvt4(v, k); }
-    static constexpr int kRowBytes = kAttnHeadDim * 4;
-    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const float4*>(r)[i]; }
-    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) { return reinterpret_cast<const float2*>(r)[i]; }
-    static __device__ __forceinline__ void cvt4(const Raw4& v, float k[4]) { k[0] = v.x; k[1] = v.y; k[2] = v.z; k[3] = v.w; }
-    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) { k[0] = v.x; k[1] = v.y; }
-};
-struct RowF16 {
-    using Raw4 = uint2;
-    using Raw2 = uint32_t;
-    using Scales = NoScales;
-    static __device__ __forceinline__ Scales scales(const uint8_t*) { return {}; }
-    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales&, int, float k[4]) { cvt4(v, k); }
-    static constexpr int kRowBytes = kAttnHeadDim * 2;
-    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const uint2*>(r)[i]; }
-    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) { return reinterpret_cast<const uint32_t*>(r)[i]; }
-    static __device__ __forceinline__ void cvt4(const Raw4& v, float k[4]) {
-        const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&v.x));
-        const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&v.y));
-        k[0] = a.x; k[1] = a.y; k[2] = b.x; k[3] = b.y;
-    }
-    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) {
-        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&v));
-        k[0] = f.x; k[1] = f.y;
-    }
-};
 // window rows: the codes, then the group's scale (Raw4's y; above bit 16 of Raw2)
 struct RowFp8 {
     using Raw4 = uint2;
@@ -297,11 +267,25 @@ void sparse_mqa(const MqaArgs& a, float* workspace, void* stream) {
     // window and compressed chunks share one launch
     const LatentType w = a.win_type,
                      c = sparse ? a.comp_type : w == LatentType::Fp8 ? LatentType::Fp4 : w == LatentType::F16 ? LatentType::F16 : LatentType::F32;
-    if (w == LatentType::Fp8 && c == LatentType::Fp4) launch_partial<RowFp8, RowFp4>(a, nw, n_chunks, o_part, ml, s);
-    else if (w == LatentType::F16 && c == LatentType::F16) launch_partial<RowF16, RowF16>(a, nw, n_chunks, o_part, ml, s);
-    else if (w == LatentType::F16 && c == LatentType::F32) launch_partial<RowF16, RowF32>(a, nw, n_chunks, o_part, ml, s);
-    else if (w == LatentType::F32 && c == LatentType::F32) launch_partial<RowF32, RowF32>(a, nw, n_chunks, o_part, ml, s);
-    else throw std::invalid_argument("sparse_mqa: latent types");
+    if (w == LatentType::Fp8 && c == LatentType::Fp4) {
+        launch_partial<RowFp8, RowFp4>(a, nw, n_chunks, o_part, ml, s);
+    } else {
+        const auto row_type = [](LatentType t) {
+            using SharedType = basalt::kernels::MqaRowType;
+            if (t == LatentType::F32) return SharedType::F32;
+            if (t == LatentType::F16) return SharedType::F16;
+            throw std::invalid_argument("sparse_mqa: unsupported shared row type");
+        };
+        basalt::kernels::SparseMqaArgs shared;
+        shared.n_tokens = a.n_tokens; shared.q = a.q; shared.win = a.win; shared.win_type = row_type(w);
+        shared.win_cap = a.win_cap; shared.win_start = a.win_start; shared.win_n = a.win_n;
+        shared.comp = a.comp; shared.comp_type = row_type(c); shared.sel = a.sel; shared.n_sel = a.n_sel;
+        shared.comp_limit = a.comp_limit; shared.sinks = a.sinks; shared.scale = a.scale; shared.pos = a.pos;
+        for (int i = 0; i < kAttnRopeDim / 2; ++i) shared.rope.step[i] = a.rope.step[i];
+        shared.rope.mscale = a.rope.mscale; shared.out = a.out;
+        basalt::kernels::sparse_mqa(shared, workspace, stream);
+        return;
+    }
     mqa_merge_kernel<<<dim3(kAttnHeads, a.n_tokens), 256, 0, s>>>(o_part, ml, n_chunks, a.sinks, a.pos, a.rope, a.out);
     check_launch("mqa_merge");
 }
