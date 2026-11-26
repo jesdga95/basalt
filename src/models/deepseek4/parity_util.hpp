@@ -66,6 +66,27 @@ inline std::vector<float> randn(size_t n, uint32_t seed, float sigma = 1.f, floa
     return values;
 }
 
+inline std::vector<float> yarn_frequencies(int rope_dim, float base, float factor, int original_context,
+                                           float beta_fast, float beta_slow) {
+    const int pairs = rope_dim / 2;
+    const auto correction_dim = [&](float rotations) {
+        return rope_dim * std::log((double) original_context / (rotations * 2.0 * 3.14159265358979323846)) /
+               (2.0 * std::log((double) base));
+    };
+    const int low = std::max(0, (int) std::floor(correction_dim(beta_fast)));
+    int high = std::min(rope_dim - 1, (int) std::ceil(correction_dim(beta_slow)));
+    float ramp_low = (float) low, ramp_high = (float) high;
+    if (ramp_low == ramp_high) ramp_high += 0.001f;
+    std::vector<float> frequencies((size_t) pairs);
+    for (int i = 0; i < pairs; ++i) {
+        const float frequency = std::pow(base, -2.f * i / rope_dim);
+        const float ramp = std::clamp(((float) i - ramp_low) / (ramp_high - ramp_low), 0.f, 1.f);
+        const float smooth = 1.f - ramp;
+        frequencies[(size_t) i] = frequency / factor * (1.f - smooth) + frequency * smooth;
+    }
+    return frequencies;
+}
+
 inline double bench_stream_us(const std::function<void(void*)>& fn, int iters = 100) {
     cudaStream_t stream;
     check(cudaStreamCreate(&stream), "create benchmark stream");

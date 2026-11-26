@@ -118,8 +118,7 @@ bool run_case(int total_tokens, int chunk, uint32_t seed) {
     auto score = ds4test::randn((size_t) total_tokens * Width, seed + 1, .7f);
     auto ape = ds4test::randn((size_t) Ratio * Width, seed + 2, .2f);
     auto norm = ds4test::randn(D, seed + 3, .05f, 1.f);
-    std::vector<float> freq(R / 2);
-    for (int i = 0; i < R / 2; ++i) freq[i] = std::pow(10000.f, -2.f * i / R);
+    const std::vector<float> freq = ds4test::yarn_frequencies(R, 160000.f, 16.f, 65536, 32.f, 1.f);
     std::vector<int32_t> pos(total_tokens);
     for (int i = 0; i < total_tokens; ++i) pos[i] = i;
     const size_t state_count = (size_t) StateRows * Width;

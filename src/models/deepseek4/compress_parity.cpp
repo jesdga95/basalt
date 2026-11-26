@@ -132,8 +132,7 @@ bool run_case(CompressKind kind, int ratio, int total_tokens, int chunk, uint32_
     auto score = ds4test::randn((size_t) total_tokens * width, seed + 1, 0.7f);
     auto ape = ds4test::randn((size_t) ratio * width, seed + 2, 0.2f);
     auto norm = ds4test::randn(D, seed + 3, 0.05f, 1.0f);
-    std::vector<float> freq(R / 2);
-    for (int i = 0; i < R / 2; ++i) freq[i] = std::pow(10000.0f, -2.0f * i / R);
+    const std::vector<float> freq = ds4test::yarn_frequencies(R, 160000.f, 16.f, 65536, 32.f, 1.f);
     std::vector<int32_t> pos(total_tokens);
     for (int i = 0; i < total_tokens; ++i) pos[i] = i;
     const size_t state_count = (size_t) state_rows * width;
@@ -186,8 +185,7 @@ int main() {
     std::vector<int32_t> pos(8);
     for (int i = 0; i < 8; ++i) pos[i] = 120 + i;
     std::vector<float> norm = ds4test::randn(D, 0x616266u, 0.05f, 1.0f);
-    std::vector<float> freq(R / 2);
-    for (int i = 0; i < R / 2; ++i) freq[i] = std::pow(10000.0f, -2.0f * i / R);
+    const std::vector<float> freq = ds4test::yarn_frequencies(R, 160000.f, 16.f, 65536, 32.f, 1.f);
     Dev<float> dkv(kv), dscore(score), dape(ape), dnorm(norm), dfreq(freq);
     Dev<int32_t> dpos(pos), drow(8);
     Dev<float> dstate_kv(128 * width), dstate_score(128 * width), dout(D);
