@@ -883,8 +883,10 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     qr_ = f((size_t) CR * kDf2Q);
     attn_ = f((size_t) CR * kDf2Q);
     act_a_ = dev((size_t) CR * E * sizeof(uint16_t), ok);
-    act_q_ = dev((size_t) CR * kDf2Q * sizeof(uint16_t), ok);
     act_h_ = dev((size_t) CR * ff * sizeof(uint16_t), ok);
+    a4_ = dev(bp::fp4_dense::act_bytes(CR, (int64_t) std::max<size_t>({E, (size_t) kDf2Q, ff})), ok);
+    gs4_ = f((size_t) CR);
+    amax4_ = f((size_t) CR);
     {
         size_t pf = 0, tk = 0;
         ws_need(d, w->n_vocab, pf, tk);
@@ -1025,16 +1027,13 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
             ca.K = kE;
             ca.m[0] = mat(L.conv_a, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
             wg::gemm(ca, act_a_, R, ws_, st);
-            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, blk, B, act_a_, nullptr, st);
+            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, blk, B, act_a_, z_, st);
 
-            wg::Call qkv;
-            qkv.fmt = wg::Format::Nvfp4;
-            qkv.K = kE;
-            qkv.n = 3;
-            qkv.m[0] = mat(L.wq, kDf2Q, sc + 0, q_, kDf2Q);
-            qkv.m[1] = mat(L.wk, kDf2KV, sc + 1, kb_, kDf2KV);
-            qkv.m[2] = mat(L.wv, kDf2KV, sc + 2, vb_, kDf2KV);
-            wg::gemm(qkv, act_a_, R, ws_, st);
+            // the window's products on the FP4 block-scaled tensor cores (W4A4: the drafts only)
+            bp::fp4_dense::quantize(z_, R, kE, kE, a4_, gs4_, st);
+            bp::fp4_dense::product(L.wq, sc + 0, kDf2Q, kE, a4_, gs4_, R, q_, kDf2Q, false, st);
+            bp::fp4_dense::product(L.wk, sc + 1, kDf2KV, kE, a4_, gs4_, R, kb_, kDf2KV, false, st);
+            bp::fp4_dense::product(L.wv, sc + 2, kDf2KV, kE, a4_, gs4_, R, vb_, kDf2KV, false, st);
 
             DsBatchKv kv;
             const int64_t cap = act[0]->cache_[(size_t) l].cap;
@@ -1060,12 +1059,8 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
                 bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, B, att_scr_, max_cells, attn_, st);
             }
 
-            wg::pack(attn_, kDf2Q, kDf2Q, R, act_q_, st);
-            wg::Call o;
-            o.fmt = wg::Format::Nvfp4;
-            o.K = kDf2Q;
-            o.m[0] = mat(L.wo, kE, sc + 3, z_, kE);
-            wg::gemm(o, act_q_, R, ws_, st);
+            bp::fp4_dense::quantize(attn_, R, kDf2Q, kDf2Q, a4_, gs4_, st);
+            bp::fp4_dense::product(L.wo, sc + 3, kE, kDf2Q, a4_, gs4_, R, z_, kE, false, st);
             dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_a, blk, B, x_, L.post_norm, d.rms_eps, act_a_, xn_, st);
 
             wg::Call cf;
@@ -1073,23 +1068,12 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
             cf.K = kE;
             cf.m[0] = mat(L.conv_f, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
             wg::gemm(cf, act_a_, R, ws_, st);
-            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, blk, B, act_a_, nullptr, st);
+            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, blk, B, act_a_, z_, st);
 
-            wg::Call gu;
-            gu.fmt = wg::Format::Nvfp4;
-            gu.K = kE;
-            gu.n = 2;
-            gu.epi = wg::Epilogue::SwiGLU;
-            gu.m[0] = mat(L.gate, d.n_ff, sc + 4, nullptr, d.n_ff);
-            gu.m[1] = mat(L.up, d.n_ff, sc + 5, nullptr, d.n_ff);
-            gu.act_out = act_h_;
-            wg::gemm(gu, act_a_, R, ws_, st);
-
-            wg::Call dn;
-            dn.fmt = wg::Format::Nvfp4;
-            dn.K = d.n_ff;
-            dn.m[0] = mat(L.down, kE, sc + 6, z_, kE);
-            wg::gemm(dn, act_h_, R, ws_, st);
+            bp::fp4_dense::quantize(z_, R, kE, kE, a4_, gs4_, st);
+            bp::fp4_dense::swiglu(L.gate, L.up, sc + 4, sc + 5, d.n_ff, kE, a4_, gs4_, R, (uint16_t*) act_h_, d.n_ff, st, amax4_);
+            bp::fp4_dense::quantize_amax((const uint16_t*) act_h_, amax4_, R, d.n_ff, d.n_ff, a4_, gs4_, st);
+            bp::fp4_dense::product(L.down, sc + 6, kE, d.n_ff, a4_, gs4_, R, z_, kE, false, st);
             if (l + 1 < d.n_layers) {
                 dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_f, blk, B, x_, w.layer[(size_t) l + 1].attn_norm,
                                             d.rms_eps, act_a_, xn_, st);

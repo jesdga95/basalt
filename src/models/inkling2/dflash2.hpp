@@ -195,7 +195,9 @@ private:
     static constexpr int kHeadDrafts = 4;
     float *x_ = nullptr, *xn_ = nullptr, *z_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr;
     float *qr_ = nullptr, *attn_ = nullptr, *att_scr_ = nullptr;
-    void *act_a_ = nullptr, *act_q_ = nullptr, *act_h_ = nullptr;
+    void *act_a_ = nullptr, *act_h_ = nullptr;
+    void* a4_ = nullptr;                            // a draft pass's rows as FP4 activation planes
+    float *gs4_ = nullptr, *amax4_ = nullptr;       // their token scales; the SwiGLU rows' largest values
     basalt::kernels::wgemm::Workspace ws_;
     float *logits_ = nullptr, *g_ = nullptr, *tail_lse_ = nullptr;
     float *hd_ = nullptr, *head_gs_ = nullptr;   // the head's normed draft rows and their FP4 token scales
