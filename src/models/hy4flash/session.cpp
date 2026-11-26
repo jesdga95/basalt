@@ -2513,6 +2513,9 @@ private:
         if (set.empty()) set.assign((size_t) kMaxWindow * g_.n_layers * 3, nullptr);
         cudaGraphExec_t& ex = set[((size_t) (R - 1) * g_.n_layers + l) * 3 + part];
         if (!ex) {
+            // instantiating can wait for the card, and a group whose rows only this thread delivers (experts read from the
+            // file) leaves the card waiting for its word: deliver it first
+            if (pend_.on && pend_.reading && !join_moe(err)) return false;
             if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
                 err = "cannot begin a graph capture";
                 return false;
