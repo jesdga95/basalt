@@ -18,7 +18,7 @@ from serve.util.console import tagged
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 CONFIG_VERSION = 2                          # the config file's "version"; a file without one is this format's first
-PARALLEL_MAX = 8                            # the engine's batch slots
+PARALLEL_MAX = 64                           # the most batch slots; each engine refuses a start above its own
 CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})

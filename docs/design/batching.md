@@ -47,7 +47,8 @@ row counts. A model captures one graph per composition and keeps the most recent
 
 ### Scheduling slots x draft rows
 
-The shared engine schedules; a model only states its cap. Each round, every busy slot drafts its next window. With no more
+The shared engine schedules; a model only states its cap and its most slots (`ModelAdapter::max_slots`, the segments of one
+window): a start with `--batch` above it is refused, naming the model and the limit. Each round, every busy slot drafts its next window. With no more
 slots than rows one pass serves every slot (`batch_shares`): each takes one row, then each further row goes to the slot whose
 next draft is likeliest kept (the joint of its drafts' calibrated chances), and rows no draft wants go round the slots. A
 drafter that sets its own windows' length (`own_window`: a stop rule in its chain) states no chances to weigh: each window
@@ -107,7 +108,7 @@ times the slots plus the shared scratch once, so more slots cost only their cach
 
 Every model batches through the shared driver and the shared rounds: no separate batching path.
 
-- **Qwen3.8-27B** (the dense stack, `src/dense`) is on the driver. A window holds up to 16 rows (`kBatch`); its kernels read
+- **Qwen3.8-27B** (the dense stack, `src/dense`) is on the driver. A window holds up to 32 rows (`kBatch`); its kernels read
   their own segment tables (the attention's `GqaSeg` per segment, GDN's `BatchTable` through `dec_gdn_rec_seg_split`), which
   carry each segment's cache and recurrent-state addresses beside its rows. `batch_reserve` settles a session (the last
   window's GDN commit on its side stream; the driver readies every session before it waits on any, so the commits run side by
@@ -135,7 +136,7 @@ How each model below went onto the driver: its state, the kernels that read it, 
   without one (n = 0) the call is one conversation's, as today.
 - **The fused small-window attention** (1 to 3 rows, one cluster kernel) stays solo-only; a batch takes the prepare, split
   and combine kernels, which give the same bits.
-- **Cap:** 8 rows, the products' column limit (`kDecodeRows`).
+- **Cap:** 128 rows (`kBatchRows`) and 64 slots, the segments one window holds (`kWindowSegsMax`).
 - **On the driver:** `batch_stage` stages every row's token and position, `batch_forward` runs the visits with each
   segment's caches, then the head over every row into the shared batch logits, and commits each session's drafter context
   from its rows of the shared tap; `batch_take` copies a segment's head rows into its session's logits; `batch_draw` samples

@@ -482,6 +482,13 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(self.context(["--parallel", "2", "--max-context", "65536"],
                                       {"engine": {"max-context": 8192}}), 32768)
 
+    def test_parallel_takes_up_to_64(self):
+        a, *_ = parse(["--parallel", "64", "--max-context", "262144"])
+        self.assertEqual(a.parallel, 64)
+        for bad in ("0", "65"):
+            with self.subTest(value=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse(["--parallel", bad])
+
     def test_the_default_is_shared_once_the_engine_names_it(self):
         from serve.config import slot_share
         a, _, file_words, cli_words = parse(["--parallel", "4"])

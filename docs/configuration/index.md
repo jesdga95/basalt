@@ -151,7 +151,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. Flash-Next needs `kv` `int8` for N above 1 (another format stops the start, naming it). With `kv-resident`, each slot keeps only those cells in VRAM. |
+| `parallel` | entry | 1..64 | 1 | Serve N requests at once. Sets the engine's `batch`; a model that batches fewer slots stops the start, naming its limit (Inkling 2 Mini 64, Qwen3.8-27B 32, DeepSeek, Hy4-flash and Flash-Next 8). Flash-Next needs `kv` `int8` for N above 1 (another format stops the start, naming it). With `kv-resident`, each slot keeps only those cells in VRAM. |
 | `slot-full-context` | entry | switch | off | Give every slot the whole `max-context`, at N times the KV. |
 
 ## Conversation cache
