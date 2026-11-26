@@ -68,6 +68,11 @@ as fast as through MMQ.
   numerator drops that scale before the split merge, while the softmax denominator sums the unscaled fp32 probabilities. A
   row's arithmetic is the same alone and in a verify window at the same key count, but not bit-identical to the scalar
   reader, which shallower rows and the sliding-window layers keep.
+- **Slices:** both readers split a full-cache row's keys into slices of whole 128-key passes, sized by the row's own key
+  count, and merge them in fp32 in slice order. The most slices a row takes follows the card's multiprocessor count (the
+  count whose launches end in whole waves, 63 on an 84-SM card, logged at load as `attention slices`), so rows deep enough
+  to reach it round differently in their last bits on cards of different models; on one card, a row's bits do not depend
+  on its window.
 
 ### Cost of the tensor-core INT8 reader
 

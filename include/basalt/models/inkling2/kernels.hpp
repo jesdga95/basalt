@@ -152,8 +152,8 @@ size_t attention_decode_scratch(int rows, int64_t max_keys);
 /// sizes the launch only: a row's keys split in slices fixed by its own key count). `out` may be null when q8 is set.
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream);
 
-/// Initialize the INT8 MMA plans for the current device during model load.
-void attention_decode_int8_init();
+/// Probe the current device's attention plans and set its slice count, during model load.
+void attention_decode_init();
 
 enum class Int8MmaPlan { Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct };
 /// Auto: the shard model; Previous: the halving rule the model falls back to.
