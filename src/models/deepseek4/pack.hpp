@@ -18,7 +18,7 @@ struct Geometry {
     int n_head_kv = 0, router_func = -1, output_embd = 0;
     int idx_heads = 0, idx_dim = 0, idx_top_k = 0;
     bool route_norm = false;
-    float rms_eps = 0.f, hc_eps = 0.f, route_scale = 0.f;
+    float rms_eps = 0.f, hc_eps = 0.f, route_scale = 0.f, swiglu_limit = 10.f;
     float rope_base = 0.f, comp_rope_base = 0.f, yarn_factor = 0.f;
     float yarn_beta_fast = 0.f, yarn_beta_slow = 0.f;
     int64_t context_length = 0;

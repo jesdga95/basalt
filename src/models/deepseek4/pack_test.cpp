@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (g.n_layers != 43 || g.n_embd != 4096 || g.n_vocab != 129280 || g.n_expert != 256 ||
+    if (g.n_layers != 43 || g.n_embd != 4096 || g.n_vocab != 129280 || g.n_expert != 256 || g.swiglu_limit != 10.f ||
         g.n_used != 6 || g.hash_layers != 3 || v.layers != 32 || v.embd != 1024 || v.heads != 16 ||
         v.ffn != 2816 || v.patch != 14 || v.merge != 3 || v.proj != 4096 || v.min_pixels != 147456 ||
         pack.vision.empty()) {

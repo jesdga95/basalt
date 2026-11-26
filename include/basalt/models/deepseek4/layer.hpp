@@ -49,9 +49,34 @@ struct FfnRouteScratch {
     float* weights = nullptr;
 };
 
+struct SharedExpertWeights {
+    int gate_type = -1;
+    int up_type = -1;
+    int down_type = -1;
+    const void* gate = nullptr;
+    const void* up = nullptr;
+    const void* down = nullptr;
+    int n_embd = 0;
+    int n_ff = 0;
+    float swiglu_limit = 0.f;
+};
+
+struct SharedExpertScratch {
+    void* input_q8 = nullptr;
+    void* hidden_q8 = nullptr;
+    float* gate = nullptr;
+    float* up = nullptr;
+    float* hidden = nullptr;
+};
+
 /// Collapses and normalizes [T][4][n_embd] streams, then computes V4's hash/image-aware top-6 FFN routes.
 /// `normalized`, `ids`, and `weights` become the inputs to the shared and routed experts; all storage is caller-owned.
 void prepare_ffn_routes(const float* streams, int n_tokens, const FfnRouteWeights& weights,
                         const FfnRouteScratch& scratch, void* stream);
+
+/// Runs the checkpoint's shared SwiGLU expert on normalized [T][n_embd] rows, T=1..8.
+/// The returned [T][n_embd] output is the unweighted branch added to routed-expert output.
+void shared_expert_step(const float* normalized, int n_tokens, const SharedExpertWeights& weights,
+                        const SharedExpertScratch& scratch, float* output, void* stream);
 
 }  // namespace basalt::models::deepseek4
