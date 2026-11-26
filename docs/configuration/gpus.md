@@ -130,8 +130,10 @@ What such a peer does:
 - It holds experts and computes their rows in every decode window with the standard-CUDA kernels (Q8_1/Q2_0 and the GGUF i-quant
   rows, dp4a arithmetic). It reads its experts' share of a prompt chunk under the slower-card rule (chunks up to 2,559 rows).
 - It does not run the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4 tensor-core expert kernels stay
-  on the Blackwell card, so an NVFP4 pack's FP4 experts are main-card only.
-- Only Flash-Next's peer kernels are built for it; the other models refuse an sm_89 card. Split and tensor need sm_120 cards
+  on the Blackwell card. Hy4-flash's NVFP4 experts run on the peer through the integer NVFP4 rows (the per-16-scale dot of
+  `mmq_nvfp4`); Flash-Next's NVFP4 experts are main-card only.
+- Flash-Next, DeepSeek and Hy4-flash build their peer kernels for it (DeepSeek and Hy4-flash their prompt-share activation too);
+  the 27B and Inkling refuse an sm_89 card. Split and tensor need sm_120 cards
   (`gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on sm_120 cards`).
 
 Three or more cards are community-tested: the path is checked on two cards. Reports from machines with three or four cards are
