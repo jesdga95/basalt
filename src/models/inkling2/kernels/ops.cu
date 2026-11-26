@@ -539,25 +539,41 @@ __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_
     __syncthreads();
     if (stopped) return;
     for (int i = threadIdx.x; i < n; i += kRingThreads) ids_m[i] = ids[i];
-    if (threadIdx.x == 0) bk::doorbell_store_relaxed(&bell->ticket, ticket);
+    if (threadIdx.x == 0) {
+        bk::doorbell_store_relaxed(&bell->ticket, ticket);
+        bk::doorbell_store_relaxed(&bell->ring_rows, seq[1]);
+    }
     __threadfence_system();   // every writer's payload before the barrier, so the release below covers it
     __syncthreads();
     if (threadIdx.x == 0) bk::doorbell_store_release(&bell->ring, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
 }
 
-// The rows go to the host beside the router, so its quantization is done when the choices come.
+// The rows go to the host beside the router, so its quantization is done when the choices come. The buffer is the host's
+// until it acknowledges the publication before, so a visit the host has not finished reading is never overwritten.
 __global__ void __launch_bounds__(kRingThreads) moe_cpu_rows_kernel(const float* __restrict__ x, int rows, int layer, float* x_m,
-                                                                    CpuBell* bell) {
-    __shared__ uint32_t stopped;
-    if (threadIdx.x == 0) stopped = bk::doorbell_load_acquire(&bell->abort);
+                                                                    CpuBell* bell, uint32_t* seq) {
+    __shared__ uint32_t pub;
+    if (threadIdx.x == 0) {
+        const uint32_t prev = seq[1];
+        uint32_t next = prev + 1;
+        if (!next) next = 1;
+        seq[1] = next;
+        // both words in one round trip; the spin only when the host has not acknowledged the publication before
+        const uint32_t stopped = bk::doorbell_load_relaxed(&bell->abort), acked = bk::doorbell_load_relaxed(&bell->rows_ack);
+        bool go = !stopped;
+        if (go && prev && acked != prev) go = bk::doorbell_spin(&bell->rows_ack, prev, &bell->abort, 8);
+        cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
+        pub = go ? next : 0;
+        if (go) bk::doorbell_store_relaxed(&bell->rows_shape, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
+    }
     __syncthreads();
-    if (stopped) return;
+    if (!pub) return;
     constexpr int kVecs = kWidth / 4;
     for (int i = threadIdx.x; i < rows * kVecs; i += kRingThreads)
         reinterpret_cast<float4*>(x_m)[i] = reinterpret_cast<const float4*>(x)[i];
-    __threadfence_system();   // every writer's rows before the barrier, so the release below covers them
+    __threadfence_system();   // every writer's rows and the shape before the barrier, so the release below covers them
     __syncthreads();
-    if (threadIdx.x == 0) bk::doorbell_store_release(&bell->rows, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
+    if (threadIdx.x == 0) bk::doorbell_store_release(&bell->rows, pub);
 }
 
 constexpr int kMergeThreads = 256;
@@ -732,10 +748,10 @@ void heat_fold(const int32_t* ids, const int32_t* layer, int visits, int row_str
     check("heat_fold");
 }
 
-void moe_cpu_rows(const float* x, int rows, int layer, float* x_m, CpuBell* bell, void* stream) {
+void moe_cpu_rows(const float* x, int rows, int layer, float* x_m, CpuBell* bell, uint32_t* seq, void* stream) {
     if (rows <= 0) return;
     if (rows > kBatchRows || layer < 0 || layer > 0xff) throw std::runtime_error("inkling2 moe_cpu_rows: rows or layer");
-    moe_cpu_rows_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(x, rows, layer, x_m, bell);
+    moe_cpu_rows_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(x, rows, layer, x_m, bell, seq);
     check("moe_cpu_rows");
 }
 

@@ -65,7 +65,7 @@ struct CpuExperts::Impl {
     // [kDecodeRows * k][kWidth] from the pool; each with its device address
     CpuBell* bell = nullptr;
     CpuBell* bell_dev = nullptr;
-    uint32_t* seq = nullptr;   // the device-side ticket counter
+    uint32_t* seq = nullptr;   // the device-side counters: the ring's tickets, then the rows' publications
     float* input = nullptr;
     float* input_dev = nullptr;
     int32_t* ids = nullptr;
@@ -168,21 +168,23 @@ struct CpuExperts::Impl {
         if (n) pool->run_split_multi_native(fmt[(size_t) layer], jobs.data(), n);
         if (on_peer && !peer->finish(out, err)) peer_failed(err);
     }
-    // The doorbell's thread: raised rows are taken (cleared) and quantized; a raised bell is taken, its visit computed
-    // (its rows quantized first if they were not yet), then `done` set for the card's merge. It spins while visits come,
-    // naps once none has come for kSpin, and wake() ends a nap.
+    // The doorbell's thread: a new rows publication is quantized, then acknowledged (the buffer goes back to the card); a
+    // raised bell is taken, its visit computed (its rows quantized first if their publication is not the one taken), then
+    // `done` set for the card's merge. It spins while visits come, naps once none has come for kSpin, and wake() ends a nap.
     void serve() {
-        std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done), raised(bell->rows);
+        std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done), raised(bell->rows),
+            shape(bell->rows_shape), acked(bell->rows_ack), ring_rows(bell->ring_rows);
         auto busy = std::chrono::steady_clock::now();
-        uint32_t seen = wakes.load(std::memory_order_relaxed), spins = 0, quantized = 0;
-        // the rows' word, once raised: taken (cleared only if no later visit's raised it again meanwhile) and quantized;
-        // the word they came with is kept for the ring
+        uint32_t seen = wakes.load(std::memory_order_relaxed), spins = 0, taken = 0;
+        // the latest publication, once new: quantized, then acknowledged after the last read of the buffer. The next
+        // publication waits for the acknowledgement, so none is missed or overwritten while it is read.
         auto take_rows = [&] {
-            uint32_t w = raised.load(std::memory_order_acquire);
-            while (w && !raised.compare_exchange_weak(w, 0, std::memory_order_acq_rel, std::memory_order_acquire)) {}
-            if (!w) return false;
+            const uint32_t n = raised.load(std::memory_order_acquire);
+            if (!n || n == taken) return false;
+            const uint32_t w = shape.load(std::memory_order_relaxed);
             quantize((int) (w >> 8 & 0xffu), (int) (w >> 16));
-            quantized = w;
+            taken = n;
+            acked.store(n, std::memory_order_release);
             return true;
         };
         for (;;) {
@@ -192,10 +194,10 @@ struct CpuExperts::Impl {
             }
             if (const uint32_t w = ring.load(std::memory_order_acquire)) {
                 const uint32_t visit = ticket.load(std::memory_order_relaxed);
+                const uint32_t pub = ring_rows.load(std::memory_order_relaxed);
                 ring.store(0, std::memory_order_relaxed);
-                take_rows();   // the ring's release covers its rows' word: rows not seen before the ring are seen now
-                run((int) (w >> 8 & 0xffu), (int) (w >> 16), quantized == w);
-                quantized = 0;
+                take_rows();   // the ring's release covers its rows' publication: one not seen before the ring is seen now
+                run((int) (w >> 8 & 0xffu), (int) (w >> 16), pub != 0 && pub == taken);
                 fin.store(visit, std::memory_order_release);
                 busy = std::chrono::steady_clock::now();
                 continue;
@@ -214,7 +216,8 @@ struct CpuExperts::Impl {
             napping.store(true, std::memory_order_seq_cst);
             nap_cv.wait_for(lk, kNap, [&] {
                 return wakes.load(std::memory_order_seq_cst) != seen || stop.load(std::memory_order_relaxed) ||
-                       ring.load(std::memory_order_acquire) != 0 || raised.load(std::memory_order_acquire) != 0;
+                       ring.load(std::memory_order_acquire) != 0 ||
+                       raised.load(std::memory_order_acquire) != taken;
             });
             napping.store(false, std::memory_order_relaxed);
         }
@@ -275,8 +278,8 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
         cudaHostGetDevicePointer((void**) &p.ids_dev, p.ids, 0) != cudaSuccess ||
         cudaHostAlloc((void**) &p.out, pairs * kWidth * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &p.out_dev, p.out, 0) != cudaSuccess ||
-        cudaMalloc(&p.seq, sizeof(*p.seq)) != cudaSuccess ||
-        cudaMemsetAsync(p.seq, 0, sizeof(*p.seq), p.stream) != cudaSuccess) {
+        cudaMalloc(&p.seq, 2 * sizeof(*p.seq)) != cudaSuccess ||
+        cudaMemsetAsync(p.seq, 0, 2 * sizeof(*p.seq), p.stream) != cudaSuccess) {
         cudaGetLastError();
         err = "cannot set up the CPU experts' buffers";
         return nullptr;
@@ -301,7 +304,7 @@ void CpuExperts::rows(int l, int rows, const float* input, cudaStream_t stream) 
     Impl& p = *impl_;
     must(cudaEventRecord(p.ready, stream), "fork");
     must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
-    moe_cpu_rows(input, rows, l, p.input_dev, p.bell_dev, p.stream);
+    moe_cpu_rows(input, rows, l, p.input_dev, p.bell_dev, p.seq, p.stream);
 }
 
 void CpuExperts::start(int l, int rows, const int32_t* ids, cudaStream_t stream) {
