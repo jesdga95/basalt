@@ -50,7 +50,7 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 // needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
 // driver
 constexpr uint64_t kSharedFixed = 896 * kMiB;
-constexpr uint64_t kSessionFixed = 44 * kMiB;
+constexpr uint64_t kSessionMargin = 12 * kMiB;   // a session's small buffers and the allocator's rounding
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 // a batch window's graph on the main card (its kernel nodes): a batch of slots keeps up to BatchShared::kGraphs of them,
 // instantiated as compositions come, so the plan holds them beside the KV pool
@@ -105,10 +105,15 @@ uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool f
 }  // namespace
 
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut, int card) {
-    uint64_t caches = 0;
-    for (const Visit& v : g.visits)
-        if (g.swa[(size_t) v.layer] && (cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
-    return caches + kSessionFixed;
+    // a visit's window caches, its four convolution rings, and the window's routed ids the copies' ranking keeps
+    uint64_t own = kSessionMargin + 3ull * (uint64_t) g.n_layers * (uint64_t) g.n_expert * 4;
+    for (const Visit& v : g.visits) {
+        if ((cut > 0 && v.layer >= cut ? 1 : 0) != card) continue;
+        if (g.swa[(size_t) v.layer]) own += visit_cache_bytes(g, v.layer, context, fp8, int8);
+        own += (uint64_t) kConvRing * (2ull * kKvHeads * kHeadDim + 2ull * (uint64_t) g.n_embd) * 4;
+        own += (uint64_t) kBatchRows * (uint64_t) g.n_used * 4;
+    }
+    return own;
 }
 
 uint64_t pool_bytes(const Geometry& g, int64_t positions, bool fp8, bool int8, uint64_t gran, int cut, int card) {
@@ -497,6 +502,11 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             // include the margin for tables, maps and driver rounding before deciding whether anything must spill
             const uint64_t want_b = full + kept_on(0) + pool_on(0) + (vmm ? 128 * kMiB : 0);
             const uint64_t short_b = want_b > free_b ? want_b - free_b : 0;
+            basalt::log::info("basalt inkling2", "card plan: %.2f GiB free; experts %.2f GiB, the slots' own %.2f GiB (%.1f MiB each), "
+                              "shared and spare %.2f GiB, the least pool %.2f GiB",
+                              (double) free_b / (double) kGiB, (double) full / (double) kGiB,
+                              (double) (own_on(0) * (uint64_t) n_sess) / (double) kGiB, (double) own_on(0) / (double) kMiB,
+                              (double) (kept_on(0) - own_on(0) * (uint64_t) n_sess) / (double) kGiB, (double) pool_on(0) / (double) kGiB);
             const int64_t keep = req.expert_cache > 0 ? req.expert_cache : -1;
             if (short_b > 0 || keep >= 0) {
                 if (!vmm) return fail("the experts do not fit beside the context and this card has no virtual memory management");

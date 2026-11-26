@@ -223,16 +223,18 @@ model::Result Dflash2Weights::finish(const void* head_q8, const uint16_t* emb, c
         cudaMemcpyAsync(tmp, fc_q8, q8_bytes(kE, (uint64_t) kDf2Targets * kE), cudaMemcpyDeviceToDevice, s);
         dflash2_split_fc_q8(tmp, fc_q8, s);
 
-        {   // the head's planes from a copy padded with zero rows to whole tiles
+        {   // the head's planes from a copy padded with zero rows to whole tiles, in mapped host memory (read once)
             const size_t rb = q8_bytes(1, kE);
             void* padded = nullptr;
-            if (cudaMalloc(&padded, rb * (size_t) head_rows) != cudaSuccess)
-                throw std::runtime_error("out of device memory converting the DFlash 2 head");
-            cudaMemsetAsync(padded, 0, rb * (size_t) head_rows, s);
-            cudaMemcpyAsync(padded, head_q8, rb * (size_t) n_vocab, cudaMemcpyDeviceToDevice, s);
-            bk::nvfp4p::from_q8(padded, head_rows, kE, head_fp4, head_fp4_scale, s);
+            if (cudaHostAlloc(&padded, rb * (size_t) head_rows, cudaHostAllocMapped) != cudaSuccess)
+                throw std::runtime_error("out of host memory converting the DFlash 2 head");
+            std::memset(static_cast<uint8_t*>(padded) + rb * (size_t) n_vocab, 0, rb * (size_t) (head_rows - n_vocab));
+            cudaMemcpyAsync(padded, head_q8, rb * (size_t) n_vocab, cudaMemcpyDeviceToHost, s);
+            void* dpad = nullptr;
+            cudaHostGetDevicePointer(&dpad, padded, 0);
+            bk::nvfp4p::from_q8(dpad, head_rows, kE, head_fp4, head_fp4_scale, s);
             cudaStreamSynchronize(s);
-            cudaFree(padded);
+            cudaFreeHost(padded);
         }
 
         for (Dflash2Layer& L : layer) {
