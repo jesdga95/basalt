@@ -377,8 +377,13 @@ public:
         b.arows = A;
         b.X = f((int64_t) R * 4 * E); b.Xn = f((int64_t) R * 4 * E); b.coef = f((int64_t) R * bk::kHcCoef);
         b.hcws = f((int64_t) bk::hc_plain_workspace_floats(R));
-        b.e = f((int64_t) R * E); b.cur = f((int64_t) R * E); b.xn = f((int64_t) R * E); b.attn = f((int64_t) R * E);
-        b.attn_raw = f((int64_t) A * E); b.mlp = f((int64_t) R * E); b.mlp2 = f((int64_t) R * E);
+        // Three [R, E] buffers cover all eight disjoint row-buffer lifetimes:
+        //   cur  <- e (init only), cur (hc_pre scratch), sh (shared expert out, after hc_pre_rms_norm)
+        //   xn   <- xn (normed attn/ffn in), moe_out (after xn is dead in moe_head), mlp2 (post-norm out)
+        //   attn <- attn (attn out), mlp (ffn out, strictly after attn hc_post)
+        b.cur = f((int64_t) R * E); b.xn = f((int64_t) R * E); b.attn = f((int64_t) R * E);
+        b.e = b.cur; b.mlp = b.attn; b.mlp2 = b.xn;
+        b.attn_raw = f((int64_t) A * E);
         b.qa = f((int64_t) A * g_.q_lora); b.qan = f((int64_t) A * g_.q_lora); b.q = f((int64_t) A * max_heads_ * g_.qk_dim);
         b.kvraw = f((int64_t) A * kRowWidth); b.qabs = f((int64_t) A * max_heads_ * g_.kv_lora);
         b.qcur = f((int64_t) A * max_heads_ * kRowWidth); b.olat = f((int64_t) A * max_heads_ * g_.kv_lora);
@@ -397,7 +402,7 @@ public:
         const int64_t h_n = std::max<int64_t>({(int64_t) A * g_.n_ff, (int64_t) R * g_.n_ff_exp, launch_rows * g_.n_ff_exp});
         b.gu = f(gu_n); b.h = f(h_n);
         b.rlog = f((int64_t) R * g_.n_expert); b.rw = f((int64_t) R * 16); b.ids = (int32_t*) f((int64_t) R * 16);
-        b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
+        b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = b.xn; b.sh = b.cur;
         const int64_t eraw_row = m_.pack().engram.present ? (int64_t) m_.pack().engram.n_cols() * m_.pack().engram.row_values : 0;
         b.erows = f((int64_t) A * g_.n_embd); b.ekv = f((int64_t) A * 5 * E); b.evalid = f(A);
         b.eraw = eraw_row > 0 ? (uint8_t*) f(((int64_t) A * eraw_row + 3) / 4) : nullptr;
@@ -521,6 +526,18 @@ public:
             }
         }
         if (tier_) tier_->lend_all();
+        // Prefer a chunk size that also fits the async expert ring over a larger chunk forced into synchronous per-layer staging.
+        if (ringed) {
+            for (int R = want; R >= kRingRows; R /= 2) {
+                std::string e;
+                if (!make_bufs(big_, R, e)) continue;
+                if (ring_open()) {
+                    use(big_);
+                    return true;
+                }
+                big_.release();
+            }
+        }
         for (int R = want; R >= kMaxWindow; R /= 2)
             if (make_bufs(big_, R, err)) {
                 use(big_);
