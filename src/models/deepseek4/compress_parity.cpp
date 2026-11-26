@@ -26,6 +26,14 @@ float bf16_rn(float value) {
     return std::bit_cast<float>(bits & 0xffff0000u);
 }
 
+uint16_t bf16_bits(float value) {
+    uint32_t bits = std::bit_cast<uint32_t>(value);
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t) (bits >> 16);
+}
+
+float bf16_float(uint16_t value) { return std::bit_cast<float>((uint32_t) value << 16); }
+
 void reference(CompressKind kind, int ratio, int n_tokens, const std::vector<float>& kv,
                const std::vector<float>& score, const std::vector<float>& ape, const std::vector<int32_t>& pos,
                const std::vector<float>& norm, const std::vector<float>& freq, std::vector<float>& state_kv,
@@ -169,6 +177,72 @@ bool run_case(CompressKind kind, int ratio, int total_tokens, int chunk, uint32_
     return out_err.max_abs < 3e-5 && kv_err.max_abs == 0.0 && score_err == 0.0 && rows_ok;
 }
 
+bool run_project_and_compress_case() {
+    constexpr int T = 8, K = 4096, ratio = 4, width = 2 * D;
+    auto x = ds4test::randn((size_t) T * K, 0x70726f6au, 0.25f);
+    auto kv_weights_f = ds4test::randn((size_t) width * K, 0x6b767761u, 0.03f);
+    auto score_weights_f = ds4test::randn((size_t) width * K, 0x73637761u, 0.03f);
+    std::vector<uint16_t> kv_weights(kv_weights_f.size()), score_weights(score_weights_f.size());
+    for (size_t i = 0; i < kv_weights.size(); ++i) {
+        kv_weights[i] = bf16_bits(kv_weights_f[i]);
+        score_weights[i] = bf16_bits(score_weights_f[i]);
+        kv_weights_f[i] = bf16_float(kv_weights[i]);
+        score_weights_f[i] = bf16_float(score_weights[i]);
+    }
+    std::vector<float> ape = ds4test::randn((size_t) ratio * width, 0x617065u, 0.2f);
+    std::vector<float> norm = ds4test::randn(D, 0x6e6f726du, 0.05f, 1.f);
+    const auto freq = ds4test::yarn_frequencies(R, 160000.f, 16.f, 65536, 32.f, 1.f);
+    std::vector<int32_t> pos(T);
+    for (int i = 0; i < T; ++i) pos[i] = i;
+
+    std::vector<float> kv_ref((size_t) T * width), score_ref((size_t) T * width);
+    for (int t = 0; t < T; ++t)
+        for (int n = 0; n < width; ++n) {
+            double kv_sum = 0.0, score_sum = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const double activation = x[(size_t) t * K + k];
+                kv_sum += activation * kv_weights_f[(size_t) n * K + k];
+                score_sum += activation * score_weights_f[(size_t) n * K + k];
+            }
+            kv_ref[(size_t) t * width + n] = (float) kv_sum;
+            score_ref[(size_t) t * width + n] = (float) score_sum;
+        }
+
+    const int state_rows = 2 * ratio;
+    const size_t state_count = (size_t) state_rows * width;
+    std::vector<float> ref_state_kv(state_count, 0.f), ref_state_score(state_count, -INFINITY);
+    std::vector<float> ref_out((size_t) T / ratio * D);
+    std::vector<int32_t> ref_rows(T, -1);
+    reference(CompressKind::Csa, ratio, T, kv_ref, score_ref, ape, pos, norm, freq, ref_state_kv, ref_state_score,
+              ref_out, ref_rows);
+
+    Dev<float> dx(x), dape(ape), dnorm(norm), dfreq(freq);
+    Dev<uint16_t> dkv_weight(kv_weights), dscore_weight(score_weights);
+    Dev<int32_t> dpos(pos), drow(T);
+    Dev<float> dkv_projected((size_t) T * width), dscore_projected((size_t) T * width);
+    Dev<float> dstate_kv(state_count), dstate_score(state_count), dout(ref_out.size());
+    cudaStream_t stream{};
+    ds4test::check(cudaStreamCreate(&stream), "projection test stream");
+    reset_compress_state(CompressKind::Csa, ratio, dstate_kv.p, dstate_score.p, stream);
+    project_and_compress(CompressKind::Csa, ratio, K, T, dx.p, dkv_weight.p, dscore_weight.p, dape.p, dpos.p,
+                         dnorm.p, eps, dfreq.p, dkv_projected.p, dscore_projected.p, dstate_kv.p, dstate_score.p,
+                         dout.p, drow.p, stream);
+    ds4test::check(cudaStreamSynchronize(stream), "project and compress sync");
+    cudaStreamDestroy(stream);
+
+    const auto kv_err = ds4test::compare(dkv_projected.down(), kv_ref);
+    const auto score_err = ds4test::compare(dscore_projected.down(), score_ref);
+    const auto out_err = ds4test::compare(dout.down(), ref_out);
+    const auto state_kv_err = ds4test::compare(dstate_kv.down(), ref_state_kv);
+    const auto state_score_err = max_score_error(dstate_score.down(), ref_state_score);
+    const bool rows_ok = drow.down() == ref_rows;
+    std::printf("BF16 projections -> CSA cache T=%d: kv rel RMS %.3g, score rel RMS %.3g, output max abs %.3g rel RMS %.3g, state kv %.3g, state score %.3g, rows %s\n",
+                T, kv_err.rms_rel, score_err.rms_rel, out_err.max_abs, out_err.rms_rel, state_kv_err.max_abs,
+                state_score_err, rows_ok ? "match" : "MISMATCH");
+    return kv_err.rms_rel < 3e-4 && score_err.rms_rel < 3e-4 && out_err.rms_rel < 5e-4 &&
+           state_kv_err.max_abs < 5e-4 && state_score_err < 5e-4 && rows_ok;
+}
+
 }  // namespace
 
 int main() {
@@ -176,6 +250,7 @@ int main() {
     failures += !run_case(CompressKind::Csa, 4, 8, 8, 0x4c5341u);
     failures += !run_case(CompressKind::Csa, 4, 8, 4, 0x4c5341u);
     failures += !run_case(CompressKind::Hca, 128, 128, 8, 0x484341u);
+    failures += !run_project_and_compress_case();
 
     // One HCA group over a complete ratio-128 window, the larger real geometry.
     const int width = D;
@@ -188,7 +263,8 @@ int main() {
     const std::vector<float> freq = ds4test::yarn_frequencies(R, 160000.f, 16.f, 65536, 32.f, 1.f);
     Dev<float> dkv(kv), dscore(score), dape(ape), dnorm(norm), dfreq(freq);
     Dev<int32_t> dpos(pos), drow(8);
-    Dev<float> dstate_kv(128 * width), dstate_score(128 * width), dout(D);
+    // Positions 120..127 close row 31; preserve the full position-addressed output range.
+    Dev<float> dstate_kv(128 * width), dstate_score(128 * width), dout(32 * D);
     reset_compress_state(CompressKind::Hca, 128, dstate_kv.p, dstate_score.p, nullptr);
     std::vector<float> prefix_kv = ds4test::randn(120 * width, 0x707265u, 0.25f);
     std::vector<float> prefix_score = ds4test::randn(120 * width, 0x707273u, 0.7f);
@@ -197,7 +273,7 @@ int main() {
     all_score.insert(all_score.end(), score.begin(), score.end());
     std::vector<int32_t> all_pos(128);
     for (int i = 0; i < 128; ++i) all_pos[(size_t) i] = i;
-    std::vector<float> ref_kv(128 * width), ref_score(128 * width, -INFINITY), ref_out(D);
+    std::vector<float> ref_kv(128 * width), ref_score(128 * width, -INFINITY), ref_out(32 * D);
     std::vector<int32_t> ref_rows(128, -1);
     reference(CompressKind::Hca, 128, 128, all_kv, all_score, ape, all_pos, norm, freq, ref_kv, ref_score, ref_out,
               ref_rows);

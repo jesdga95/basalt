@@ -1,4 +1,5 @@
 #include "basalt/models/deepseek4/compress.hpp"
+#include "basalt/kernels/dense_ops.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -216,6 +217,22 @@ void compress_projected(CompressKind kind, int ratio, int n_tokens, const float*
     compress_kernel<<<1, kHeadDim, 0, (cudaStream_t) stream>>>(kind, ratio, n_tokens, kv, score, ape, pos, norm_w,
                                                                 rms_eps, rope_freq, state_kv, state_score, out, row_of);
     check_launch("deepseek4 compress_projected");
+}
+
+void project_and_compress(CompressKind kind, int ratio, int n_embd, int n_tokens, const float* x,
+                          const uint16_t* kv_weight, const uint16_t* score_weight, const float* ape,
+                          const int32_t* pos, const float* norm_w, float rms_eps, const float* rope_freq,
+                          float* kv_projected, float* score_projected, float* state_kv, float* state_score,
+                          float* out, int32_t* row_of, void* stream) {
+    const int width = kind == CompressKind::Csa ? 2 * kHeadDim : kHeadDim;
+    if (ratio != expected_ratio(kind) || n_embd < 8 || n_embd % 8 != 0 || n_tokens < 1 || n_tokens > 8 ||
+        !x || !kv_weight || !score_weight || !ape || !pos || !norm_w || !rope_freq || !kv_projected ||
+        !score_projected || !state_kv || !state_score || !out || !row_of || !stream || !(rms_eps > 0.0f))
+        throw std::invalid_argument("deepseek4 project_and_compress: invalid arguments");
+    kernels::bf16_rows_dot(x, kv_weight, kv_projected, n_tokens, width, n_embd, stream);
+    kernels::bf16_rows_dot(x, score_weight, score_projected, n_tokens, width, n_embd, stream);
+    compress_projected(kind, ratio, n_tokens, kv_projected, score_projected, ape, pos, norm_w, rms_eps, rope_freq,
+                       state_kv, state_score, out, row_of, stream);
 }
 
 void reset_compress_state(CompressKind kind, int ratio, float* state_kv, float* state_score, void* stream) {
