@@ -2311,8 +2311,8 @@ template<int N> __device__ __forceinline__ void qc_wait() { asm volatile("cp.asy
 #endif
 __device__ __forceinline__ float qc_out(float v, float softcap) { return softcap > 0.0f ? softcap * tanhf(v * (1.0f / softcap)) : v; }
 
-// steps in flight: a narrow block computes little a step, so it keeps more of K coming
-template<int CT> constexpr int kQcStages = CT <= 2 ? 8 : 3;
+// steps in flight: a narrow block computes little a step, so it keeps more of K coming; a wide one two (two blocks an SM)
+template<int CT> constexpr int kQcStages = CT <= 2 ? 8 : 2;
 constexpr int kQcStride = 144;   // a column's or a row's 4 blocks a step (144 / 128 bytes) in a 144-byte line: 36 words, so
                                  // the 8 lines of a fragment start 4 banks apart
 // a block: RW row tiles of 16 rows times CG column groups of 8 CT columns, a warp each
