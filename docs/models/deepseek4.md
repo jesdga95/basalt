@@ -34,6 +34,8 @@ The source uses 14-pixel patches, 3x3 downsampling, a 384-token image budget, 14
 
 `include/basalt/models/deepseek4/vision.hpp` and `src/models/deepseek4/vision/plan.cpp` now implement CPU resize planning, BF16-rounded patch extraction, N-layout type/permutation and assembly of encoded patch rows with the learned start/end/pad/newline rows. The CPU test covers reference dimensions, token budget, alignment, row ordering and embedding assembly. The CUDA tower, projector attachment, spatial token embeddings, language position assignment, prompt integration and dynamic memory lifecycle remain unimplemented. The model is not runnable.
 
+The V4 reference tower matches V4.1's encoder geometry: 32 layers, width 1024, 16 heads, FFN 2816, patch 14, 2D RoPE theta 10000, and a 3x3 GELU aligner to width 4096. The existing V4.1 CUDA encoder therefore has reusable ViT and aligner math, but its API assembles START/NEWLINE/END rows in row-major order. Refactor that compute into a model-neutral vision encoder that returns projected grid rows; keep V4's N-layout permutation and learned START/END/PAD/NEWLINE assembly in `deepseek4`.
+
 ## Verification gates
 
 - Converter output: all source tensors accounted for; projector and tokenizer metadata retained; pack shape/type checks pass.
