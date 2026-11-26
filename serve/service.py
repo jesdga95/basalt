@@ -1452,8 +1452,8 @@ class Service:
             # the grammar guard lets a reply of blocks think only when the request does: a request without a grammar
             # gets the one that only forbids thinking
             spec = (sampling or {}).get(GRAMMAR_KEY)
-            sampling = {**(sampling or {}), GRAMMAR_KEY: dict(spec if isinstance(spec, dict) else {"kind": "text"},
-                                                              think=False)}
+            sampling = {**(sampling or {}), GRAMMAR_KEY: dict(
+                spec if isinstance(spec, dict) else {"kind": "text", "calls": bool(tools)}, think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
         budget_req = sampling
         budget_ready = False

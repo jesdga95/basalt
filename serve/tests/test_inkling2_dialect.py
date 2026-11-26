@@ -116,7 +116,7 @@ class Controls(unittest.TestCase):
             self.assertEqual(svc.engine.requests[-1][1]["_grammar"], want, thinking)
 
     def test_thinking_off_without_a_grammar_sends_the_one_that_forbids_thinking(self):
-        for thinking, want in ((False, {"kind": "text", "think": False}), (True, None)):
+        for thinking, want in ((False, {"kind": "text", "calls": False, "think": False}), (True, None)):
             svc = service(HEADER + TEXT + "Four." + END)
             list(svc.run(svc.tok.encode("x"), thinking, None, 16, None, threading.Event()))
             self.assertEqual((svc.engine.requests[-1][1] or {}).get("_grammar"), want, thinking)

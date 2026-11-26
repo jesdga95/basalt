@@ -110,11 +110,15 @@ bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t
     // A reply of blocks that may not think, outside a grammar that holds the block structure: the guard only keeps the
     // thinking block from opening.
     ban_think_ = pv_.block_header >= 0 && !rg.think;
+    call_names_ = rg.call_names;
+    must_call_ = rg.must_call;
+    first_mask_.clear();
     after_header_ = n_prompt > 0 && prompt[n_prompt - 1] == pv_.block_header;
     has_grammar_ = (bool) rg.grammar;
     if (!rg.grammar) {
         if (!ban_think_) return true;
         blocks_ = thinking_ = false;
+        text_only_ = !rg.calls && pv_.answer_open >= 0;
         phase_ = Phase::answer;
         on_ = true;
         return true;
@@ -145,9 +149,29 @@ bool Guard::is_end(int32_t token) const {
     return token != pv_.think_close && std::find(ends.begin(), ends.end(), token) != ends.end();
 }
 
+void Guard::build_first_mask() {
+    if (!first_mask_.empty()) return;
+    const size_t n = pv_.vocab->size();
+    first_mask_.assign(n, (uint8_t) 0);
+    for (size_t i = 0; i < n; ++i) {
+        const std::string& b = pv_.vocab->bytes((int32_t) i);
+        if (b.empty()) continue;
+        for (const std::string& name : call_names_)
+            if (name.compare(0, b.size(), b) == 0) { first_mask_[i] = 1; break; }
+    }
+}
+
+// the first token of a block that is not a text block: the start of a tool call's name
+bool Guard::opens_block(int32_t token) {
+    if (text_only_ || call_names_.empty()) return !text_only_;
+    build_first_mask();
+    return token >= 0 && (size_t) token < first_mask_.size() && first_mask_[(size_t) token];
+}
+
 bool Guard::feed(int32_t token) {
     if (ban_think_) {
-        if (after_header_ && token == pv_.think_open) return false;
+        if (token == pv_.think_open) return false;
+        if (after_header_ && !(token == pv_.answer_open && !must_call_) && !opens_block(token)) return false;
         after_header_ = token == pv_.block_header;
         if (!has_grammar_) return true;
     }
@@ -209,7 +233,15 @@ void Guard::mask_bias(const std::vector<float>& user_bias, bool use_cache, std::
     if (ban_think_) {
         if (has_grammar_) st_.fill_mask(*pv_.vocab, mask_, use_cache);
         else mask_.assign(n, (uint8_t) 1);
-        if (after_header_ && pv_.think_open >= 0 && (size_t) pv_.think_open < n) mask_[(size_t) pv_.think_open] = 0;
+        if (after_header_ && (text_only_ || !call_names_.empty())) {
+            mask_.assign(n, (uint8_t) 0);
+            if (!must_call_) allow(pv_.answer_open);
+            if (!text_only_) {
+                build_first_mask();
+                for (size_t i = 0; i < n; ++i) if (first_mask_[i]) mask_[i] = 1;
+            }
+        }
+        if (pv_.think_open >= 0 && (size_t) pv_.think_open < n) mask_[(size_t) pv_.think_open] = 0;
     } else if (blocks_ && thinking_) {
         mask_.assign(n, (uint8_t) 1);
         for (int32_t e : pv_.vocab->end_ids())
