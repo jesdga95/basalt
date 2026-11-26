@@ -2,6 +2,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "models/deepseek4/pack.hpp"
 #include "models/deepseek4/meta.hpp"
+#include "models/deepseek4/context_policy.hpp"
 #include "basalt/vision/mmproj.hpp"
 
 #include <cstdio>
@@ -39,6 +40,13 @@ int main(int argc, char** argv) {
     }
     const auto& g = pack.geo;
     const auto& v = mmproj.hp();
+    const auto cache_plan = basalt::models::deepseek4::ctxp::plan_context(
+        g.context_length, g.context_length, UINT64_MAX, g.compress_ratio);
+    if (!cache_plan.error.empty() || cache_plan.context != g.context_length) {
+        basalt::log::error("deepseek4 pack test", "native cache plan: %s",
+                           cache_plan.error.empty() ? "native context was changed" : cache_plan.error.c_str());
+        return 1;
+    }
     const char* image_rows[] = {"v.token_embd.img_start", "v.token_embd.img_end", "v.token_embd.img_pad", "v.image_newline"};
     for (const char* name : image_rows) {
         const auto* tensor = mmproj.find(name);
@@ -54,8 +62,9 @@ int main(int argc, char** argv) {
         basalt::log::error("deepseek4 pack test", "the opened pack does not have the verified V4 Vision geometry");
         return 1;
     }
-    std::printf("deepseek4 pack ok: %d layers, %d vocab, %zu tensor records; vision %d layers / %d width / %d heads / %d FFN / %d patch / %d merge; section %llu bytes\n",
-                g.n_layers, g.n_vocab, pack.tensors.size(), v.layers, v.embd, v.heads, v.ffn, v.patch, v.merge,
+    std::printf("deepseek4 pack ok: %d layers, %d vocab, %zu tensor records; native cache capacity %.2f GiB; vision %d layers / %d width / %d heads / %d FFN / %d patch / %d merge; section %llu bytes\n",
+                g.n_layers, g.n_vocab, pack.tensors.size(), (double) cache_plan.footprint.total / (1024.0 * 1024.0 * 1024.0),
+                v.layers, v.embd, v.heads, v.ffn, v.patch, v.merge,
                 (unsigned long long) pack.vision.bytes);
     return 0;
 }
