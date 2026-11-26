@@ -315,6 +315,30 @@ inline float e8m0_to_fp32_half(uint8_t x) {
     return f;
 }
 
+inline float ue8m0_to_fp32(uint8_t x) {
+    if (x == 0xFFu) return 0.0f;
+    const uint32_t bits = x == 0u ? 0x00400000u : ((uint32_t) x << 23);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+inline float e4m3_to_fp32(uint8_t b) {
+    const int e = (b >> 3) & 0xF, m = b & 0x7;
+    if (e == 15 && m == 7) return 0.0f;
+    const float v = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + (float) m * 0.125f, e - 7);
+    return (b & 0x80) ? -v : v;
+}
+
+inline void dequantize_mxfp8(const uint8_t* block, float* out) {
+    const uint8_t* d = block;
+    const uint8_t* qs = block + 4;
+    for (int s = 0; s < 4; ++s) {
+        const float sc = ue8m0_to_fp32(d[s]);
+        for (int j = 0; j < 32; ++j) out[32 * s + j] = e4m3_to_fp32(qs[32 * s + j]) * sc;
+    }
+}
+
 inline void dequantize_mxfp4(const uint8_t* block, float* out) {
     const float d = e8m0_to_fp32_half(block[0]);
     const uint8_t* qs = block + 1;

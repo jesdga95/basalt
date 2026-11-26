@@ -1,0 +1,341 @@
+# the vocabulary entries of Inkling 2's tokenizer that its merges cannot build (ignore_merges), and two sentences;
+# per line: the text as a JSON string, a tab, the ids of the official tokenizer.json (Hugging Face tokenizers 0.22.2)
+"chffff"	37812
+"chffffff"	37817
+"Aleksandr"	49919
+"Klebsiella"	53960
+"Rijks"	55562
+"VBORw"	61018
+"AAAANSUh"	61148
+"QIECBAg"	63651
+"vdfbsdfgb"	67926
+"svsfvdfbsdfgb"	67927
+"zijds"	80179
+"szüks"	83316
+"kwargs"	87550
+"więks"	88196
+"szükség"	90239
+"について"	91149
+"anderzijds"	93407
+"swegs"	95585
+"keineswegs"	95867
+"enerzijds"	98875
+"Gebäude"	102057
+"ください"	103413
+"ません"	104703
+"większ"	107857
+"において"	112016
+"yticks"	115881
+"hyväksy"	116021
+"における"	117783
+"hübsch"	120146
+"különleges"	122689
+"ファイル"	124300
+"iseksi"	124696
+"aposent"	126340
+"による"	126594
+"periksa"	127792
+""	130603
+"iseks"	132899
+"krebs"	134231
+"システ"	135578
+"maravillos"	135606
+"してください"	135685
+"サービス"	139133
+"エネル"	139473
+"エネルギー"	140160
+"うるさい"	142014
+"goimports"	142766
+"になる"	144641
+"ufrg"	145069
+"szüksége"	145104
+"Esitek"	145129
+"Ufrg"	145134
+"Appendik"	145135
+"undotb"	145170
+"gnumonk"	145180
+"Dierk"	145203
+"Bldg"	145215
+"hldg"	145232
+"ortodok"	145256
+"nethog"	145275
+"Borcherd"	145298
+"Phantek"	145305
+"javacrumb"	145320
+"trkwk"	145353
+"bmvb"	145376
+"gethonk"	145408
+"fólk"	145423
+"Gramed"	145432
+"hashalg"	145479
+"Freivald"	145493
+"nablavk"	145505
+"KEhg"	145514
+"Noratek"	145515
+"vectordb"	145518
+"adovb"	145520
+"pedrovg"	145559
+"Lourd"	145567
+"Tulek"	145585
+"zvkd"	145604
+"Lemberg"	145616
+"QFzg"	145631
+"dataturk"	145633
+"wwwwd"	145635
+"tshog"	145636
+"appendik"	145675
+"xynb"	145677
+"alusek"	145712
+"hübsche"	145722
+"euromd"	145723
+"Eulek"	145733
+"obslb"	145737
+"Bibliotek"	145750
+"kwrg"	145773
+"procerg"	145784
+"lxyb"	145807
+"sinhrk"	145815
+"ggrk"	145824
+"mpipk"	145837
+"proplyd"	145840
+" États"	158100
+" więks"	165542
+" específicos"	168366
+" keineswegs"	168384
+" behaviors"	169179
+" enerzijds"	169469
+" segundos"	169648
+" específicas"	170247
+" mismas"	170418
+" líneas"	170532
+" focuses"	170730
+" méthodes"	170791
+" estrategias"	170818
+" ejemplos"	170846
+" criterios"	171174
+" Gebäude"	171222
+" welches"	171256
+" compétences"	171606
+" páginas"	172223
+" técnicos"	172600
+" coisas"	172626
+" connaissances"	173297
+" nuestras"	173337
+" colleagues"	174305
+" anderzijds"	174657
+" necesarios"	175113
+" tiempos"	175523
+" Servicios"	175592
+" necesarias"	175733
+" ejercicios"	175793
+" dernières"	176318
+" máquinas"	176628
+" propias"	176767
+" derniers"	177833
+" propriétés"	178552
+" capacidades"	178648
+" estruturas"	179424
+" scientifiques"	179561
+" indivíduos"	180088
+" cuidados"	180190
+" szüks"	180441
+" últimas"	181319
+" fonksiyon"	181325
+" órgãos"	181828
+" indígenas"	182665
+" melhores"	183105
+" obtidos"	183122
+" Hours"	184785
+" BCELoss"	185235
+" auteurs"	185497
+" Pressure"	187098
+" coeficientes"	187276
+" índices"	188947
+" Apenas"	190379
+" Graphics"	192621
+" onlangs"	192624
+" voices"	193067
+" ◦"	193972
+" Collins"	194023
+" kwargs"	194390
+" Inhalts"	194916
+" stones"	195131
+" szükséges"	195726
+" Density"	196502
+" większ"	196883
+" fólk"	197071
+" sherd"	197138
+" Aleksandr"	197147
+" vastusek"	197166
+" Dierk"	197176
+" Esitek"	197186
+" Appendik"	197189
+" teisek"	197202
+" ortodok"	197210
+" uuek"	197214
+" appendik"	197222
+" doorknob"	197223
+" koodek"	197238
+" poolek"	197244
+" Basterd"	197247
+" whelk"	197248
+" Gramed"	197283
+" Lourd"	197288
+" mottog"	197289
+" Geschenk"	197308
+" tshog"	197311
+" Bibliotek"	197316
+" upptog"	197322
+" tèk"	197327
+" stryk"	197338
+" Freivald"	197363
+" plicd"	197367
+" Zwerg"	197387
+" halberd"	197395
+" normaalsek"	197398
+" Bldg"	197418
+" Nirad"	197424
+" proplyd"	197430
+" warthog"	197433
+" funksjonen"	197462
+" ideaalsek"	197464
+" transpordik"	197468
+" gliek"	197470
+" alkyd"	197475
+" dublek"	197486
+" Stilb"	197492
+" sinisek"	197494
+" Vartek"	197495
+" puhuk"	197498
+" ivyk"	197503
+" Batak"	197508
+" nethog"	197511
+" Mugg"	197512
+" ufrg"	197547
+" Rienk"	197549
+" Sierk"	197552
+" pasisek"	197555
+" Schwenk"	197560
+" Lemberg"	197561
+" samarbejd"	197562
+" Tulek"	197567
+" Klerk"	197577
+" Laufrad"	197578
+" bálk"	197597
+" HIdg"	197607
+" Roberd"	197612
+" Gourd"	197615
+" leiak"	197635
+" fråntog"	197637
+" gpsd"	197647
+" sekundik"	197650
+" elementidek"	197652
+" Wormb"	197653
+" bestyrk"	197658
+" Eilk"	197662
+" uutek"	197666
+" toetak"	197667
+" kodusek"	197670
+" Saryk"	197673
+" ekspordik"	197681
+" yonk"	197693
+" unisek"	197704
+" balourd"	197707
+" fiewd"	197717
+" millisek"	197725
+" lasek"	197726
+" pumek"	197727
+" nebelik"	197728
+" Frenk"	197743
+" Masthugg"	197748
+" Whelk"	197754
+" exphb"	197758
+" Dublek"	197762
+" larenk"	197784
+" Strawb"	197790
+" onyk"	197798
+" Rilek"	197813
+" Karasek"	197815
+" Cansd"	197818
+" bstg"	197819
+" sgrog"	197823
+" Warthog"	197827
+" seirek"	197835
+" Foulk"	197845
+" corresond"	197846
+" Kuelb"	197860
+" onnek"	197872
+" Unimog"	197874
+" Bownd"	197890
+" deinceb"	197893
+" hunderd"	197899
+" Lynk"	197908
+" desitek"	197918
+" Alkyd"	197922
+" Hinderk"	197927
+" Gourg"	197930
+" Nutek"	197934
+" dqd"	197938
+" headek"	197940
+" pakenk"	197944
+" nylk"	197946
+" skolek"	197961
+" Doorknob"	197962
+" cgd"	197966
+" materiaalsek"	197967
+" recrod"	197970
+" DAkk"	197972
+" Jefferd"	197975
+" vastasek"	197979
+" Fowk"	197982
+" szüksege"	197987
+" bawd"	197988
+" dramatek"	197989
+" Larenk"	198003
+" Wonk"	198014
+" farenk"	198019
+" küljek"	198022
+" Qutb"	198027
+" Fierg"	198028
+" Sasek"	198037
+" Eulek"	198038
+" Novotek"	198039
+" Ribb"	198054
+" tasasek"	198064
+" tahnk"	198072
+" anthropod"	198087
+" Bartok"	198093
+" Evald"	198101
+" Rushd"	198103
+" kangek"	198108
+" demagog"	198112
+" ultralyd"	198114
+" Grimb"	198115
+" Laugk"	198120
+" sfenk"	198127
+" Lownd"	198135
+" mssg"	198140
+" hldg"	198147
+" Lilek"	198151
+" outrd"	198152
+" aladek"	198154
+" kuulek"	198155
+" Antog"	198167
+" Irek"	198183
+" wengd"	198190
+" Yeerk"	198191
+" Reidg"	198194
+" tulisek"	198195
+" reliond"	198198
+" Fartyg"	198207
+" Verderb"	198211
+" Nethog"	198220
+" Smog"	198223
+" opetuk"	198227
+" fritg"	198233
+" Millisek"	198236
+" Chalyb"	198238
+" Geduld"	198244
+" trutg"	198250
+"def f(*args, **kwargs):\n    return Klebsiella(Aleksandr, zijds)\n"	1719,149983,7,9,70747,11,197033,87550,8,25,198,149862,150583,197264,34164,32894,7,40998,82,3306,11,197703,82,8,198
+"data:image/png;base64,iVBORw0KGgo chffff"	822,25,1537,14,4377,26,1024,68346,11,72,61018,15,146345,850,150346,963,963

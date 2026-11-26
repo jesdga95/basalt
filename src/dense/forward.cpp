@@ -398,6 +398,14 @@ kernels::KvFar stage_far(Model& m, const kernels::KvFar& far_kv, int64_t pos, in
     return m.stage;
 }
 
+// An NVFP4 cache's prompt chunk reads through the int8 kernel: the layer's cells so far rounded to int8 in the model's
+// copy (an int8 cache or an fp16 one as it is).
+kernels::KvInt8 prompt_cells(Model& m, const kernels::KvInt8& q8, int64_t cells, cudaStream_t s) {
+    if (!q8.fp4) return q8;
+    kernels::kv4_to_int8(q8, m.kv8, cells, m.g.n_kv, s);
+    return m.kv8;
+}
+
 // `cells_only`: nothing reads the layer's rows (a chunk's last layer), so only its K and V cells are made: the same k
 // and v products and the same cache write, without the queries, the attention and the output projection.  `far`: a
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
@@ -442,7 +450,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         uint8_t* e4 = (uint8_t*) b.xq;
         float* e4s = prefill::fp8::act_scales(b.xq, T, AQ);
         if (q8.k) {   // BF16 queries and output rows
-            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, q8, b.attn_split, split, read);
+            const kernels::KvInt8 r8 = prompt_cells(m, q8, pos + T, s);
+            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, r8, b.attn_split, split, read);
             if (f8) kernels::attn_gate_e4m3(bf(b.ao), bf(b.qfull), T, g.n_head, e4, e4s, s);
             else kernels::attn_gate_bf16(bf(b.ao), bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         } else {      // an fp16 cache's prompt kernel reads FP32 queries (the gate's BF16 rows reuse their buffer)
@@ -471,7 +480,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     gemm(m, L.v, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, nullptr, q8, far_kv);
-    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split,
+    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, prompt_cells(m, q8, pos + T, s), b.attn_split,
                              kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, pos, T, s));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     chunk_residual(m, L.o, b.ag, AQ, T, s);
@@ -805,16 +814,19 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, in
 
 }  // namespace
 
-namespace {
-
 // The batch window's work on the device, all of it from device inputs (tokens, positions, the segment table), so it can be
 // captured once per composition (the sessions and their row counts) and replayed at any positions.
-void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
+void batch_body(Model& m, const BatchSeg* segs, int S) {
     const Geometry& g = m.g;
     const Weights& w = m.w;
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
     const int H = g.n_embd;
+    int rows = 0, max_n = 1;
+    for (int k = 0; k < S; ++k) {
+        rows += segs[k].T;
+        max_n = std::max(max_n, segs[k].T);
+    }
     {
         kernels::PdlScope pdl(true);
         if (m.lb == 0) embed_rows(m, b.tok, rows, s);
@@ -840,63 +852,45 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
     }
 }
 
-}  // namespace
-
-namespace {
-
-// One card's batch window (forward_batch); `tokens` null on a split's second card.
-bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+void stage_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
-    int rows = 0, max_n = 1;
+    int rows = 0;
     BatchTable tab{};
-    Model::BatchKey key;
     for (int k = 0; k < S; ++k) {
         SessionState& st = *segs[k].st;
         const int T = segs[k].T;
-        key.emplace_back(&st, T);
         st.alt_ready = false;   // the batch recurrence leaves its state to the commit
         tab.pos0[k] = (int32_t) segs[k].pos;
         tab.first[k] = {st.gdn, rows, 0, T, T, k, (int32_t) segs[k].pos};
         tab.sdst[k] = {st.rec_qkv, st.rec_h, st.rec_gate, st.rec_beta};
         rows += T;
-        max_n = std::max(max_n, T);
     }
     const int32_t bounds[2] = {0, rows};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.btab, &tab, sizeof tab, cudaMemcpyHostToDevice, s);
     if (tokens) cudaMemcpyAsync(b.tok, tokens, (size_t) rows * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos, pos3, (size_t) rows * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    for (Model::BatchGraph& bg : m.batch_graphs)
-        if (bg.key == key) {
-            bg.used = ++m.batch_clock;
-            if (cudaGraphLaunch(bg.exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
-            return cuda_ok("dense batch window", err);
-        }
-    // a composition's first window runs as launched, then is captured for the next ones (a layer split's: only captured, as
-    // launch_window's)
-    const bool split = m.hand != nullptr;
-    if (!split) {
-        batch_body(m, segs, S, rows, max_n);
-        if (!cuda_ok("dense batch window", err)) return false;
+}
+
+namespace {
+
+// One card of a layer split's batch window (forward_batch); `tokens` null on the second card. Only captured, as
+// launch_window's: each card's graph by composition in its model's batch.
+bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+    const cudaStream_t s = segs[0].st->stream;
+    stage_batch(m, segs, S, tokens, pos3);
+    model::GraphLru<core::CapturedGraph>::Key key;
+    for (int k = 0; k < S; ++k) key.insert(key.end(), {(uint64_t) (uintptr_t) segs[k].st, (uint64_t) segs[k].T});
+    if (core::CapturedGraph* g = m.batch.graphs.find(key)) {
+        if (!g->launch(s, err)) return false;
+        return cuda_ok("dense batch window", err);
     }
-    cudaGraph_t graph = nullptr;
-    if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) != cudaSuccess) return cuda_ok("dense batch capture", err);
-    batch_body(m, segs, S, rows, max_n);
-    cudaGraphExec_t exec = nullptr;
-    if (cudaStreamEndCapture(s, &graph) != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        return cuda_ok("dense batch capture", err);
-    }
-    cudaGraphDestroy(graph);
-    if (m.batch_graphs.size() >= Model::kBatchGraphs) {   // the least recently used composition goes
-        auto old = std::min_element(m.batch_graphs.begin(), m.batch_graphs.end(),
-                                    [](const Model::BatchGraph& x, const Model::BatchGraph& y) { return x.used < y.used; });
-        cudaGraphExecDestroy(old->exec);
-        m.batch_graphs.erase(old);
-    }
-    m.batch_graphs.push_back({std::move(key), exec, ++m.batch_clock});
-    if (split && cudaGraphLaunch(exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
+    core::CapturedGraph g;
+    if (!g.begin(s, err)) return false;
+    batch_body(m, segs, S);
+    if (!g.end(s, err)) return false;
+    if (!m.batch.graphs.insert(std::move(key), std::move(g)).launch(s, err)) return false;
     return cuda_ok("dense batch window", err);
 }
 

@@ -54,4 +54,28 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);
 
+/// Two-pass scores for the prompt path (the bound and the rule: qsa_two_pass.hpp): a scores row that qsa_block_topk
+/// turns into the ids of qsa_block_scores_tc's row.  Every block is scored once in single-pass TF32, the blocks whose
+/// error bound reaches the query's top-k cut-off are scored again with qsa_block_scores_tc's 3xTF32 arithmetic (bit
+/// for bit), and a query whose bound cannot be settled has its 16-query tile scored again in full.  The kept blocks
+/// hold their single-pass score, so the row is for qsa_block_topk only.  `scratch` (qsa_two_pass_scratch_bytes(nq_cap,
+/// max_blocks), 16-byte aligned) holds the key norms qsa_two_pass_keys wrote for this layer and chunk.  False (nothing
+/// launched): a card where qsa_block_scores_tc does not run, another geometry, nq > nq_cap, too little scratch.
+uint64_t qsa_two_pass_scratch_bytes(int64_t nq_cap, int64_t max_blocks);
+/// Once per layer and chunk, after the indexer appends and before the calls: the norms of the pooled keys [0, n_blocks).
+bool qsa_two_pass_keys(const float* pooled, int64_t n_blocks, int64_t nq_cap, int64_t max_blocks, void* scratch,
+                       uint64_t scratch_bytes, void* stream);
+bool qsa_block_scores_two_pass(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                               int64_t nq, int64_t nq_cap, int64_t max_blocks, const QsaShapes& s, float* scores,
+                               void* scratch, uint64_t scratch_bytes, void* stream, int64_t active_blocks);
+/// A check right after a two-pass call and its qsa_block_topk, against the 3xTF32 row and ids of the same queries
+/// (ref_scores from qsa_block_scores_tc, ref_ids from qsa_block_topk on them): counts the queries whose ids differ,
+/// the scored-again blocks whose score is not the 3xTF32 one bit for bit, and the kept blocks whose single-pass score
+/// lies outside the bound (two_pass::Stat).  False (nothing launched): too many blocks for its shared-memory marks.
+bool qsa_two_pass_check(const float* scores, const int32_t* ids, const float* ref_scores, const int32_t* ref_ids,
+                        const int32_t* steps, int64_t nq, int64_t nq_cap, int64_t max_blocks, int64_t cap,
+                        void* scratch, void* stream);
+/// The counters (two_pass::kStatCount of them, this device), read on `stream` (synchronized); reset: zeroed after.
+bool qsa_two_pass_stats(unsigned long long* out, bool reset, void* stream);
+
 }  // namespace basalt::kernels

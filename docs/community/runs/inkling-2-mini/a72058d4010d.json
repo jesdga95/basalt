@@ -1,0 +1,35 @@
+{
+  "submitter": "LeonG",
+  "date": "2026-11-25",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "Inkling-2-Mini",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 25.5
+    }
+  ],
+  "ram_gib": 184,
+  "cpu": "Intel Core i5-14600KF, 14 cores",
+  "ram_gbps": 70.8,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 4942.2,
+  "prefill_64k_tps": 4114.8,
+  "decode_tps": 147.3,
+  "decode_conv_tps": 142.6,
+  "decode_struct_tps": 150.2,
+  "decode_prose_tps": 133.0,
+  "accept_conv_pct": 66.9,
+  "accept_struct_pct": 97.5,
+  "accept_prose_pct": 48.7,
+  "draft_len_conv": 1.3,
+  "draft_len_struct": 5.2,
+  "draft_len_prose": 1.2,
+  "engine_args": "--gpu 0 --max-context 63233 --kv int8"
+}

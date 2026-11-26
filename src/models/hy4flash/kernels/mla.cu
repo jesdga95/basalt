@@ -87,34 +87,33 @@ __device__ __forceinline__ void store_cell(uint8_t* cache, size_t cell, const fl
 // = w[h * rows + r] . x[t][h] (x at x + t * x_tok + h * x_head), nb Q8_0 blocks a row. The activation is rounded to q8_1 per
 // 32 values, as every other product of the model's Q8_0 weights does: d = amax / 127, codes round half away from zero; a
 // row's blocks add in order, each an exact integer sum times d_w * d. The tile's weights go through shared memory in
-// 16-byte pieces (tr * nb * 34 a multiple of 16). sm: gemv_smem bytes.
-__host__ __device__ constexpr int gemv_smem(int tr, int nb, int n_tok) { return ((tr * nb * 34 + 15) & ~15) + n_tok * nb * 36 + tr * nb * n_tok * 4; }
+// 16-byte pieces (tr * nb * 34 a multiple of 16, at most TB bytes). sm: gemv_smem bytes.
+__host__ __device__ constexpr int gemv_smem(int tr, int nb, int n_tok) {
+    return ((tr * nb * 34 + 15) & ~15) + n_tok * nb * 32 + ((n_tok * nb * 4 + 15) & ~15) + tr * nb * n_tok * 8;
+}
 
-template <int NT>
+template <int NT, int NB, int TB>
 __device__ __forceinline__ void gemv_tile(const uint8_t* __restrict__ w, const float* __restrict__ x, int x_head, int x_tok, int rows,
-                                          int nb, int n_tok, int h, int r0, int tr, float* __restrict__ y, int y_head, int y_tok,
+                                          int n_tok, int h, int r0, int ltr, float* __restrict__ y, int y_head, int y_tok,
                                           unsigned char* sm) {
+    constexpr int nb = NB;
+    const int tr = 1 << ltr;
     const int tid = threadIdx.x, lane = tid & 31, rb = nb * 34;
     uint8_t* ws = sm;
     int8_t* xq = reinterpret_cast<int8_t*>(sm + ((tr * rb + 15) & ~15));
     float* xd = reinterpret_cast<float*>(xq + n_tok * nb * 32);
-    int* isum = reinterpret_cast<int*>(xd + n_tok * nb);   // [row][block][token]
+    float* pd = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(xd) + ((n_tok * nb * 4 + 15) & ~15));   // [token][row][block] d_w * d
+    float* ps = pd + tr * nb * n_tok;                                                                    // ... the integer sum
     const uint4* src = reinterpret_cast<const uint4*>(w + ((size_t) h * rows + r0) * rb);
     uint4* dst = reinterpret_cast<uint4*>(ws);
     const int n16 = tr * rb / 16;
-    // four pieces a thread in flight at once
-    for (int i0 = 0; i0 < n16; i0 += 4 * NT) {
-        uint4 v[4];
+    // every piece of the tile in flight at once; they land while the activation is rounded
+    constexpr int kPieces = (TB / 16 + NT - 1) / NT;
+    uint4 v[kPieces];
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int i = i0 + k * NT + tid;
-            if (i < n16) v[k] = __ldcs(src + i);
-        }
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int i = i0 + k * NT + tid;
-            if (i < n16) dst[i] = v[k];
-        }
+    for (int k = 0; k < kPieces; ++k) {
+        const int i = k * NT + tid;
+        if (i < n16) v[k] = __ldcs(src + i);
     }
     // the activation's q8_1 blocks, a warp each: four blocks' loads in flight before the first is rounded
     for (int p0 = tid >> 5; p0 < n_tok * nb; p0 += 4 * (NT / 32)) {
@@ -135,52 +134,76 @@ __device__ __forceinline__ void gemv_tile(const uint8_t* __restrict__ w, const f
             if (lane == 0) xd[p] = d;
         }
     }
+#pragma unroll
+    for (int k = 0; k < kPieces; ++k) {
+        const int i = k * NT + tid;
+        if (i < n16) dst[i] = v[k];
+    }
     __syncthreads();
-    // the exact integer sums of each (row, block) for every token: a block's codes are read once
+    // each (row, block) for every token: the exact integer sum and d_w * d. A block's codes are read once, as the aligned
+    // words that hold them (an even block's codes start 2 bytes into a word, an odd block's at a word)
     for (int i = tid; i < tr * nb; i += NT) {
-        const uint16_t* blk = reinterpret_cast<const uint16_t*>(ws + i * 34);   // row i / nb, block i % nb; 2-byte aligned
-        const int b = i % nb;
+        const int b = i % nb, odd = i & 1;
+        const uint32_t* wv = reinterpret_cast<const uint32_t*>(ws + ((i * 34 + 2) & ~3));   // the word with the first code
+        uint32_t wd[9];
+#pragma unroll
+        for (int k = 0; k < 9; ++k) wd[k] = wv[k];
+        const uint32_t sh = odd ? 0u : 16u;
         int c[8];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) c[k] = (int) ((uint32_t) blk[1 + 2 * k] | ((uint32_t) blk[2 + 2 * k] << 16));
+        for (int k = 0; k < 8; ++k) c[k] = (int) __funnelshift_r(wd[k], wd[k + 1], sh);
+        const float dw = __half2float(__ushort_as_half((uint16_t) (odd ? wv[-1] >> 16 : wd[0] & 0xffffu)));
         for (int t = 0; t < n_tok; ++t) {
-            const int* xi = reinterpret_cast<const int*>(xq + (t * nb + b) * 32);
+            const int4* xi = reinterpret_cast<const int4*>(xq + (t * nb + b) * 32);
+            const int4 a0 = xi[0], a1 = xi[1];
             int s = 0;
-#pragma unroll
-            for (int k = 0; k < 8; ++k) s = __dp4a(c[k], xi[k], s);
-            isum[i * n_tok + t] = s;
+            s = __dp4a(c[0], a0.x, s);
+            s = __dp4a(c[1], a0.y, s);
+            s = __dp4a(c[2], a0.z, s);
+            s = __dp4a(c[3], a0.w, s);
+            s = __dp4a(c[4], a1.x, s);
+            s = __dp4a(c[5], a1.y, s);
+            s = __dp4a(c[6], a1.z, s);
+            s = __dp4a(c[7], a1.w, s);
+            const int o = (t * tr + i / nb) * nb + b;
+            pd[o] = dw * xd[t * nb + b];
+            ps[o] = (float) s;
         }
     }
     __syncthreads();
     // each (row, token): the blocks in order
     for (int i = tid; i < tr * n_tok; i += NT) {
-        const int t = i / tr, r = i - t * tr;
+        const int t = i >> ltr, r = i & (tr - 1);
+        const float* p = pd + (t * tr + r) * nb;
+        const float* q = ps + (t * tr + r) * nb;
         float acc = 0.f;
-        for (int b = 0; b < nb; ++b) {
-            const float dw = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(ws + (r * nb + b) * 34)));
-            acc = fmaf(dw * xd[t * nb + b], (float) isum[(r * nb + b) * n_tok + t], acc);
-        }
+#pragma unroll
+        for (int b = 0; b < nb; ++b) acc = fmaf(p[b], q[b], acc);
         y[(size_t) t * y_tok + (size_t) h * y_head + r0 + r] = acc;
     }
 }
 
-// Rows of a tile: the largest power of two up to `rows` whose weights fit 18 KB.
-int gemv_rows(int rows, int nb) {
-    int tr = 1;
-    while (tr * 2 <= rows && rows % (tr * 2) == 0 && tr * 2 * nb * 34 <= 18432) tr *= 2;
-    if (tr * nb * 34 % 16) throw std::invalid_argument("hy4flash: a heads product tile is not a multiple of 16 bytes");
-    if (gemv_smem(tr, nb, kAttTok) > 48 * 1024) throw std::invalid_argument("hy4flash: a heads product tile needs too much shared memory");
-    return tr;
+// Rows of a tile for n_tok rows, as their log2: the largest power of two up to `rows` whose weights fit `cap` bytes and whose
+// shared memory fits 48 KB. The tiling does not change a row's result.
+int gemv_rows_log2(int rows, int nb, int n_tok, int cap) {
+    int ltr = 0;
+    const auto fits = [&](int tr) { return tr <= rows && rows % tr == 0 && tr * nb * 34 <= cap && gemv_smem(tr, nb, n_tok) <= 48 * 1024; };
+    while (fits(2 << ltr)) ++ltr;
+    if (((1 << ltr) * nb * 34) % 16) throw std::invalid_argument("hy4flash: a heads product tile is not a multiple of 16 bytes");
+    if (gemv_smem(1 << ltr, nb, n_tok) > 48 * 1024) throw std::invalid_argument("hy4flash: a heads product tile needs too much shared memory");
+    return ltr;
 }
 
-constexpr int kGemvThreads = 256;
-// blockIdx.x = tile + head * tiles
+// The tile bytes of the per-head products: small tiles keep more of a product's tiles in flight at once; the query
+// kernel's blocks are 512 threads (its cache rows need them) and take tiles of 64 rows.
+constexpr int kGemvThreads = 256, kGemvTile = 9216, kQueryTile = 13824;
+// blockIdx.x = tile + head * tiles; NB: the Q8_0 blocks of a row
+template <int NB>
 __global__ void __launch_bounds__(kGemvThreads) heads_gemv_kernel(const uint8_t* __restrict__ w, const float* __restrict__ x, int x_head,
-                                                                  int x_tok, int rows, int nb, int heads, int n_tok, int tr,
-                                                                  float* __restrict__ y) {
+                                                                  int x_tok, int rows, int heads, int n_tok, int ltr, float* __restrict__ y) {
     extern __shared__ __align__(16) unsigned char sm[];
-    const int tiles = rows / tr, h = blockIdx.x / tiles, tile = blockIdx.x - h * tiles;
-    gemv_tile<kGemvThreads>(w, x, x_head, x_tok, rows, nb, n_tok, h, tile * tr, tr, y, rows, heads * rows, sm);
+    const int tiles = rows >> ltr, h = blockIdx.x / tiles, tile = blockIdx.x - h * tiles;
+    gemv_tile<kGemvThreads, NB, kGemvTile>(w, x, x_head, x_tok, rows, n_tok, h, tile << ltr, ltr, y, rows, heads * rows, sm);
 }
 
 // Rotation of consecutive pairs (2i, 2i + 1) by pos * base^(-2i / n_rot).
@@ -259,15 +282,15 @@ __global__ void prepare_kernel(const float* __restrict__ q, const float* __restr
 // A window's query rows and cache rows in one launch: blocks below heads * tiles take a tile of the head's k_b product into
 // the query row's latent part (the first tile also its rope part), the last n_tok blocks the tokens' cache rows. Positions
 // are read from pos[t].
-template <typename C>
+template <typename C, int NB>
 __global__ void __launch_bounds__(kThreads) query_kernel(const uint8_t* __restrict__ w_kb, const float* __restrict__ q, const float* __restrict__ kv_raw,
                                                          const float* __restrict__ kv_norm, MlaArgs a, const int32_t* __restrict__ pos, int n_tok,
-                                                         int ring, int tr, float* __restrict__ qcur, C* __restrict__ cache) {
+                                                         int ring, int ltr, float* __restrict__ qcur, C* __restrict__ cache) {
     extern __shared__ __align__(16) unsigned char sm[];
-    const int W = a.rank + a.rope, Q = a.nope + a.rope, tiles = a.rank / tr, b = blockIdx.x;
+    const int W = a.rank + a.rope, Q = a.nope + a.rope, tiles = a.rank >> ltr, b = blockIdx.x;
     if (b < a.heads * tiles) {
         const int h = b / tiles, tile = b - h * tiles;
-        gemv_tile<kThreads>(w_kb, q, Q, a.heads * Q, a.rank, a.nope / 32, n_tok, h, tile * tr, tr, qcur, W, a.heads * W, sm);
+        gemv_tile<kThreads, NB, kQueryTile>(w_kb, q, Q, a.heads * Q, a.rank, n_tok, h, tile << ltr, ltr, qcur, W, a.heads * W, sm);
         if (tile == 0)
             for (int t = 0; t < n_tok; ++t) query_rope(q, a, pos[t], t, h, qcur);
         return;
@@ -709,10 +732,10 @@ template <typename C>
 void query_impl(const void* w_kb, const float* q, const float* kv_raw, const float* kv_norm, const MlaArgs& a, const int32_t* pos, int n_tok,
                 int ring, float* qcur, C* cache, void* stream) {
     if (n_tok < 1 || n_tok > kAttTok) throw std::invalid_argument("mla_query: 1 to 8 rows");
-    if (a.nope % 32 || ((uintptr_t) w_kb & 15)) throw std::invalid_argument("mla_query: k_b rows of whole blocks, 16-byte aligned");
-    const int nb = a.nope / 32, tr = gemv_rows(a.rank, nb);
-    query_kernel<C><<<a.heads * (a.rank / tr) + n_tok, kThreads, gemv_smem(tr, nb, n_tok), (cudaStream_t) stream>>>(
-        (const uint8_t*) w_kb, q, kv_raw, kv_norm, a, pos, n_tok, ring, tr, qcur, cache);
+    if (a.nope != 192 || ((uintptr_t) w_kb & 15)) throw std::invalid_argument("mla_query: k_b rows of 192, 16-byte aligned");
+    const int nb = a.nope / 32, ltr = gemv_rows_log2(a.rank, nb, n_tok, kQueryTile), tr = 1 << ltr;
+    query_kernel<C, 6><<<a.heads * (a.rank / tr) + n_tok, kThreads, gemv_smem(tr, nb, n_tok), (cudaStream_t) stream>>>(
+        (const uint8_t*) w_kb, q, kv_raw, kv_norm, a, pos, n_tok, ring, ltr, qcur, cache);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
@@ -726,13 +749,13 @@ void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* st
 
 void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok_stride, int heads, int rows, int k, int n_tok,
                      float* y, void* stream) {
-    if (k % 32 || ((uintptr_t) w & 15)) throw std::invalid_argument("q8_0_heads_gemv: rows of whole blocks, 16-byte aligned");
-    const int nb = k / 32, tr = gemv_rows(rows, nb);
+    if ((k != 512 && k != 192) || ((uintptr_t) w & 15)) throw std::invalid_argument("q8_0_heads_gemv: rows of 512 or 192, 16-byte aligned");
+    const int nb = k / 32;
+    const auto kern = nb == 16 ? heads_gemv_kernel<16> : heads_gemv_kernel<6>;   // v_b's rows (the latent), k_b's (the query's nope part)
     for (int t0 = 0; t0 < n_tok; t0 += kAttTok) {
-        const int T = std::min(kAttTok, n_tok - t0);
-        heads_gemv_kernel<<<heads * (rows / tr), kGemvThreads, gemv_smem(tr, nb, T), (cudaStream_t) stream>>>(
-            (const uint8_t*) w, x + (size_t) t0 * x_tok_stride, x_head_stride, x_tok_stride, rows, nb, heads, T, tr,
-            y + (size_t) t0 * heads * rows);
+        const int T = std::min(kAttTok, n_tok - t0), ltr = gemv_rows_log2(rows, nb, T, kGemvTile), tr = 1 << ltr;
+        kern<<<heads * (rows / tr), kGemvThreads, gemv_smem(tr, nb, T), (cudaStream_t) stream>>>(
+            (const uint8_t*) w, x + (size_t) t0 * x_tok_stride, x_head_stride, x_tok_stride, rows, heads, T, ltr, y + (size_t) t0 * heads * rows);
     }
     if (!stream) cudaStreamSynchronize(nullptr);
 }

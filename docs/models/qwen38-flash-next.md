@@ -23,13 +23,21 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   conversation changes ([adaptive tier](../configuration/adaptive.md)).
 - **RAM:** before the RAM copy, the checkpoint blocks of every slot are allocated (page-locked, so a checkpoint saves and
   restores at link speed and a save runs beside the first decode window) and the RAM of the page-locked prompt buffers
-  is held: the PLE rows at the largest chunk, a layer split's hand-offs, and the prompt split's weights, hand-offs and staging.
+  is held: the PLE rows at the largest chunk, a split's hand-offs, and the peer's prompt layers' weights, hand-offs and staging.
   Each buffer takes its held RAM when it is made; what none takes goes back before the top-up. The copy then leaves
   `--ram-reserve-mib` free beside the driver's page tracking (`RAM floor X GiB of N GiB free` when experts stay on the SSD).
   The start's pass fills the main card first; the copy takes its RAM as the pass reads into it and is page-locked once read.
-- **Cards:** every card after the main one is an expert tier, up to three. Matched cards may split the layers instead
-  ([GPUs](../configuration/gpus.md)).
-- **Elastic KV:** with `--max-context` above 32,768 (and not with `--kv-resident`, `--vram-elastic` or a layer split), each session
+- **Cards:** `gpu` names the cards and `gpu-mode` what they do ([GPUs](../configuration/gpus.md)); one card is the default, and the
+  start warns when `gpu` is unset and more are visible.
+  - `peer` (up to four cards): the main card runs every layer; each peer holds experts the main card does not, computes their rows
+    in every decode window and their share of each prompt chunk, and reads a share of the layers of long prompts. A peer faster
+    than the main card also takes a share of each GDN mixer and of the head. With the peer, 64K prefill speed is level with the
+    path before the multi-GPU rework (9,823 against 9,835 tok/s) and the normal peer run scores BF16 KLD 0.06174 against
+    0.06221 on one card, top-1 91.84% against 91.80%.
+  - `split` (up to eight cards): the layers are cut by `gpu-share` (free VRAM by default), each card holding its layers' dense
+    weights, caches and experts; windows overlap on two cards ([GPUs](../configuration/gpus.md#split-mode)).
+  - `tensor` is refused.
+- **Elastic KV:** with `--max-context` above 32,768 (and not with `--kv-resident`, `--vram-elastic` or `gpu-mode split`), each session
   backs its first 32,768 cells at start. More cells come from the expert cache when a request needs them, and go back when it does
   not. An idle conversation's KV moves to RAM after 15 s. The startup line `elastic KV: ...` shows the figures, and
   `elastic KV: about N cells fit in the S sessions ...` gives the ceiling: the cells all sessions can hold before the expert
@@ -41,7 +49,7 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
 - `--prefill auto` reads up to 16,384 tokens per chunk (32,768 for NVFP4). The CPU computes 0.6 of the prompt experts that stream
   (`--prefill-cpu-share`).
 - A fresh part of 64 tokens or fewer goes through decode windows (`--short-read`).
-- With several cards, a long prompt can be read as a pipeline over them ([GPUs](../configuration/gpus.md#long-prompts-across-the-cards)).
+- With `gpu-mode peer`, a long prompt is read as a pipeline over the cards ([GPUs](../configuration/gpus.md#peer-mode)).
 - Prompts beside decoding slots: [running](../running.md#prompts-beside-decoding-slots).
 
 ## Drafting

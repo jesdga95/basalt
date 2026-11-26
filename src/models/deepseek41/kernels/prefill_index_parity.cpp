@@ -225,6 +225,63 @@ void test_indexer(Verdict& v) {
         }
         std::printf("indexer_select_batch mode=%d: %zu of %zu selected ids differ\n", (int) mode, diff, total);
         v.expect(diff * 200 <= total, "indexer_select_batch ids vs decode-width indexer");
+        if (mode == IndexMode::Level2) continue;   // its scores carry the candidate mask, so only the ids are compared
+        // The scores themselves: the batch path (the tensor cores in the fp8 format, idx_score_tc_kernel) against
+        // one-token calls of the decode path (idx_score_kernel), and both against the double-precision scores. Both
+        // workspaces carry [T][32*128] iq, [T][32] iw, then [T][n_comp] scores.
+        const auto kv = unpacked(dik.down(), kIdxDim, idx_row_bytes(g_fmt), Round::Fp4Pow2);
+        const size_t b_head = (size_t) kIdxHeads * kIdxDim + kIdxHeads;
+        const std::vector<float> bf = [] (const std::vector<char>& b) {
+            std::vector<float> f(b.size() / sizeof(float));
+            std::memcpy(f.data(), b.data(), f.size() * sizeof(float));
+            return f;
+        }(wb.down());
+        const size_t d_head = (size_t) kMaxT * b_head;
+        const double w_scale = 1.0 / std::sqrt((double) (kIdxHeads * kIdxDim));
+        Dev<char> w1(indexer_workspace_bytes(n_comp));
+        std::vector<float> batch_s, dec_s;
+        std::vector<double> ref_s;
+        for (int t = 0; t < N; ++t) {
+            IndexerArgs g = a;
+            g.cand_ids = ca.p + (size_t) t * kMaxCandBlocks;
+            g.cand_n = cna.p + t;
+            g.out_ids = ia.p + (size_t) t * kTopK;
+            g.out_n = na.p + t;
+            indexer_select(g, qr.p + (size_t) t * 1280, x.p + (size_t) t * D, dpos.p + t, 1, w1.p, nullptr);
+            check(cudaDeviceSynchronize(), "indexer scores");
+            const std::vector<float> df = [] (const std::vector<char>& b) {
+                std::vector<float> f(b.size() / sizeof(float));
+                std::memcpy(f.data(), b.data(), f.size() * sizeof(float));
+                return f;
+            }(w1.down());
+            const float* q = bf.data() + (size_t) t * kIdxHeads * kIdxDim;
+            const float* iw = bf.data() + (size_t) N * kIdxHeads * kIdxDim + (size_t) t * kIdxHeads;
+            const int nv = (pos[t] + 1) / 2;
+            for (int j = 0; j < nv; ++j) {
+                double s = 0;
+                for (int h = 0; h < kIdxHeads; ++h) {
+                    double d = 0;
+                    for (int c = 0; c < kIdxDim; ++c) d += (double) q[(size_t) h * kIdxDim + c] * kv[(size_t) j * kIdxDim + c];
+                    s += std::max(d, 0.0) * (double) iw[h] * w_scale;
+                }
+                ref_s.push_back(s);
+                batch_s.push_back(bf[(size_t) N * b_head + (size_t) t * n_comp + j]);
+                dec_s.push_back(df[d_head + (size_t) j]);
+            }
+        }
+        const Err eb = compare(batch_s, ref_s), ed = compare(dec_s, ref_s), ebd = compare(dec_s, batch_s);
+        const float big = *std::max_element(batch_s.begin(), batch_s.end());
+        std::printf("  scores (max %.3g): batch vs double rms_rel %.2e (max abs %.2e), decode vs double %.2e (max abs "
+                    "%.2e); batch vs decode max abs %.2e", big, eb.rms_rel, eb.max_abs, ed.rms_rel, ed.max_abs,
+                    ebd.max_abs);
+        std::printf("\n");
+        v.expect(eb.rms_rel < 1e-6 && ed.rms_rel < 1e-6, "indexer scores vs the double reference");
+        // the two paths' queries come from different GEMM shapes, so their last bits differ in either format; what is
+        // asserted is that the tensor-core scores are not further from the reference than the kernel they replace
+        if (packed())
+            v.expect(eb.rms_rel <= 2 * ed.rms_rel, "the tensor-core scores are no further from the reference than idx_score_kernel's");
+        else
+            v.expect(ebd.max_abs <= 2 * ed.max_abs, "the fp16 path's batch scores against the one-token calls");
     }
 }
 

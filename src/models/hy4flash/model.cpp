@@ -1,11 +1,13 @@
 // src/models/hy4flash/model.cpp - loads a Hy4-flash pack: the dense tensors to the main card, the embedding to host memory,
 // the routed experts to RAM.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "models/hy4flash/model.hpp"
 
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/hy4flash/context_policy.hpp"
@@ -25,6 +27,10 @@ constexpr int kTypeBF16 = 30;   // ggml's BF16
 constexpr int kAdmitUses = 2;
 // copies a decode window may claim per row (a window's rows route to mostly different experts)
 constexpr int kClaimsPerRow = 128;
+// tokens after which the lookup counts that choose the main card's victims halve: the experts that recur over hundreds of
+// tokens keep their slots through runs of experts that come once (core::ExpertTierSpec::victim_half_life; a prompt clears
+// the counts, session.cpp)
+constexpr int kVictimHalfLife = 256;
 // The main card's copies by layer (core::ExpertTierSpec::layer_weights) for the 41 layers of 512 experts: the early layers
 // route more widely and miss far more often (layers 0-3 sent 2.3-2.9 experts a token to the CPU at 141 copies each,
 // layers 15, 27 and 31-33 under 0.6). From 768-token plain decode routing traces of one prose and one code prompt
@@ -87,7 +93,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.path = path_;
     s.fd = fd_;
     s.range = pack_.experts_range;
-    s.peer_devices = peer_devices_;
+    s.gpus = gpus_;
     s.diag_tier_ram = flags_.diag_tier_ram;
     s.diag_tier_vram = flags_.diag_tier_vram;
     s.diag_tier_frozen = flags_.diag_tier_frozen;
@@ -103,6 +109,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.expert_profile = flags_.expert_profile;
     s.admit_uses = kAdmitUses;
     s.claims_per_row = kClaimsPerRow;
+    s.victim_half_life = kVictimHalfLife;
     if (s.n_layers == 41 && s.n_expert == 512) s.layer_weights.assign(std::begin(kLayerSlotWeights), std::end(kLayerSlotWeights));
     s.share_max_tokens = 16384;
     s.share_stride = expert_stride();
@@ -166,7 +173,11 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
             d.type = kTypeQ8_0;
             d.bytes = t.shape[0] * t.shape[1] / 32 * 34;
         }
-        if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
+        // the prompt products (MMQ) read the last row of a matrix whose rows are not a multiple of 256 values on to the next
+        // multiple: zeros past the end, so the read stays inside the allocation wherever it lies
+        const uint64_t past = !t.shape.empty() && prefill::mmq::supported(d.type) ? prefill::mmq::read_past_bytes(d.type, (int64_t) t.shape[0]) : 0;
+        if (cudaMalloc(&d.ptr, d.bytes + past) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
+        if (past > 0 && cudaMemset((uint8_t*) d.ptr + d.bytes, 0, past) != cudaSuccess) return {model::Status::Error, "hy4flash: cannot clear the tail of " + name};
         core::LoadItem it;
         it.file = file;
         it.off = t.offset;
@@ -195,7 +206,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     // the context: refused when its caches would take more than half of what the weights leave
     {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         int sparse = 0;
         for (int l = 0; l < g.n_layers; ++l) sparse += !g.swa[(size_t) l];
         const ctxp::Plan p = ctxp::plan_context(req.max_context > 0 ? req.max_context : kDefaultContext, g.context_length,
@@ -215,12 +226,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     // queued in the start's plan
     flags_ = req;
     path_ = path;
-    std::vector<int> peers = req.peer_devices;
-    if (peers.size() > (size_t) kMaxSecondCards) {
-        basalt::log::warn("basalt hy4flash", "%zu second cards given, %d hold experts; later cards idle", peers.size(), kMaxSecondCards);
-        peers.resize((size_t) kMaxSecondCards);
-    }
-    peer_devices_ = std::move(peers);
+    gpus_ = req.gpus;
     planning_ = &reads;
     model::Result r;
     for (int i = 0; r.ok() && i < std::max(req.sessions, 1); ++i) {
@@ -236,7 +242,13 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
 model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, "hy4flash: " + err};
+    if (dfly_) {   // the drafts' head screen, made from the head the reads placed
+        cudaSetDevice(device_);
+        if (!dfly_->pack_screen(nullptr, err)) return {model::Status::Error, "hy4flash: " + err};
+    }
     return {};
 }
+
+model::PeerHooks* Hy4Model::peer() const { return shared_tier_.tier.get(); }
 
 }  // namespace basalt::models::hy4flash

@@ -63,6 +63,13 @@ bool devices_allocate(const std::vector<int>& ordinals, std::string& why);
 // be set up or timed. Uses the device briefly and frees everything before it returns.
 double device_h2d_gbps(int ordinal);
 
+// The SM count a kernel divides its work by where the division changes its bits (a layout or a split picked by the SM
+// count): the planning card's.  A model whose stages run on several cards plans by its main card (plan_sms_device), so a
+// stage on a smaller card computes what the main card would; unset, ordinal's (negative: the current card's).  A grid
+// whose blocks must all be resident at once still sizes itself by the card it runs on.
+void plan_sms_device(int ordinal);
+int plan_sms(int ordinal = -1);
+
 // Throws when there is no CUDA device.  The engine targets one architecture and must say so rather than
 // run slowly on something else: `CMakeLists.txt` refuses to COMPILE for another architecture, and
 // this is the matching check at run time (a binary can be carried to a different machine).

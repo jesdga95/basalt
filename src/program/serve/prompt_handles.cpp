@@ -18,8 +18,21 @@ std::vector<Runtime::SlotMeet> Runtime::slot_meets(const std::vector<int32_t>& p
         const std::vector<int32_t>* h = idle_ids((int) b);
         if (h == nullptr) continue;
         out[b].held = (int64_t) h->size();
-        out[b].match = meet_held(prompt.data(), (int64_t) prompt.size(), h->data(), (int64_t) h->size(),
-                                 !media && text_tokenizer_note.empty(), bytes).held;
+        const int64_t n = (int64_t) prompt.size();
+        const int64_t shared = shared_start(prompt.data(), n, h->data(), (int64_t) h->size());
+        int64_t match = slot_cover(prompt.data(), n, h->data(), (int64_t) h->size(), shared,
+                                   !media && text_tokenizer_note.empty(), bytes);
+        // a checkpoint the prompt continues: the slot's canonical history, past the reply the model wrote in tokens
+        // the client never sends back (its thinking), so the ids part but the bytes of the reply do not.  Counted only
+        // inside what the slot's ids share, so a system prompt both conversations start with names neither.
+        const auto& cks = b == 0 && slot0_solo() && live_ok && !live.empty() ? checks : bs[b].checks;
+        for (const ConvCheckpoint& c : cks) {
+            const int64_t cl = (int64_t) c.ids.size();
+            if (cl > match && cl <= shared && cl < n &&
+                basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), prompt.data()))
+                match = cl;
+        }
+        out[b].match = match;
     }
     return out;
 }

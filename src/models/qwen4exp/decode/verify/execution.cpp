@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "expert_plan.hpp"
@@ -24,7 +25,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <immintrin.h>
 
 namespace basalt::core {
 using namespace verify_detail;
@@ -56,18 +56,24 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 }
 
 // One window through every stage: all of them launch first (a later stage's graph waits on the hand-off flag its
-// predecessor's graph raises), then the host serves each stage's rings in turn.
+// predecessor's graph raises), then the host serves each stage's rings in turn.  Stages that share a card (a split's
+// reference with both on CUDA0, --diag-gpu-same) launch each once the one before has ended: a later stage's wait for
+// the hand-off would hold the card its predecessor's layers need, and the window would never reach its first ring.
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     const std::function<void()> served = std::move(served_hook_);
     served_hook_ = nullptr;
-    for (Verifier* v = this; v != nullptr; v = v->next_)
+    bool one_card = false;
+    for (Verifier* v = this; v != nullptr; v = v->next_) {
         if (v->lb_ > 0 && v->h_flag_ != nullptr) *(volatile uint32_t*) (v->h_flag_ + 12) = 0;
+        one_card = one_card || (v->next_ != nullptr && v->next_->device_ == device_);
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    for (Verifier* v = this; v != nullptr; v = v->next_)
+    for (Verifier* v = this; v != nullptr && !one_card; v = v->next_)
         if (!v->run_begin(T, tokens, pos0, err)) return false;
     void* u = user;
     for (Verifier* v = this; v != nullptr; v = v->next_) {
+        if (one_card && !v->run_begin(T, tokens, pos0, err)) return false;
         if (!v->run_serve(pool, u, err)) return false;
         if (v->next_ == nullptr && served) served();
         if (!v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
@@ -186,7 +192,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         const Clock::time_point tp = Clock::now();
         if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        basalt::platform::store_fence();
         *(volatile uint32_t*) (h_flag_ + 8) = 1;
         ms_host += ms_since(tp);
     }
@@ -200,7 +206,7 @@ bool Verifier::run_serve(PoolMultiFn pool, void* user, std::string& err) {
     for (;;) {
         const int r = serve_poll(pool, user, err);
         if (r != 0) return r > 0;
-        _mm_pause();
+        basalt::platform::cpu_relax();
     }
 }
 
@@ -247,6 +253,7 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             }
             return 0;
         }
+        basalt::platform::load_fence();   // the ring was seen: what it covers is read after it
         fl_.waiting = false;
         const Clock::time_point a = fl_.wait_t0;
         const Clock::time_point b = Clock::now();
@@ -265,7 +272,7 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
                  h_ymiss_, l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        basalt::platform::store_fence();
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -284,7 +291,7 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return -1;
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
+            basalt::platform::store_fence();
             ms_host += ms_since(tp);
         }
         *flag = want;
@@ -321,7 +328,7 @@ bool Verifier::window_intact(std::string& err) {
 // after the window's PLE rows are in h_ple_, and then only waits for the window's end.
 void Verifier::ar_handoff() {
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    _mm_sfence();
+    basalt::platform::store_fence();
     *(volatile uint32_t*) h_flag_ = 1;
     *(volatile uint32_t*) (h_flag_ + 8) = 1;
 }
@@ -361,7 +368,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
         // --wait-stats: the last wstat_every windows' counters
         std::vector<unsigned long long> w((size_t) kDmStatWords);
-        cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
         cudaMemset(dm_->wstat, 0, w.size() * 8);
         const double nw = (double) dm_->wstat_windows;
         basalt::log::raw("basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
@@ -436,7 +443,7 @@ void Verifier::raise_flag_b(void* ctx) {
 
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
-    _mm_sfence();
+    basalt::platform::store_fence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 

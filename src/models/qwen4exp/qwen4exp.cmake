@@ -133,4 +133,4 @@ add_library(model_qwen4exp_prefill STATIC src/models/qwen4exp/prefill/gemm.cu sr
   src/models/qwen4exp/prefill/combine.cpp
   src/models/qwen4exp/prefill/handoff.cpp)
 target_include_directories(model_qwen4exp_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
-target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_engine ${_gpu_blas_target} ${_gpu_runtime_target})
+target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_engine ${_gpu_blas_target} CUDA::cublasLt ${_gpu_runtime_target})

@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/qfn_request.hpp - a Flash-Next request: its state and its phases.
 #pragma once
 
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/request.hpp"
 #include "qfn_state.hpp"
@@ -25,7 +26,7 @@ public:
     int32_t* history_stage() { return runtime_.hist_stage.data(); }
     void upload_history(int T) {
         const basalt::core::OnDevice on_h(runtime_.hist_dev);
-        cudaMemcpy(runtime_.d_hist, runtime_.hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
+        basalt::core::device_copy(runtime_.d_hist, runtime_.hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                    cudaMemcpyHostToDevice);
     }
     void mark_before_run() {
@@ -51,6 +52,7 @@ public:
     bool run_window(int T, int e0, int& TB);
     bool take_held(int T);
     bool window_failed() const { return runtime_.drive.d.failed; }
+    bool window_refused() const { return false; }
     const char* window_error() const {
         return runtime_.drive.d.failed && runtime_.drive.d.fail ? runtime_.drive.d.fail : runtime_.err.c_str();
     }
@@ -123,8 +125,8 @@ private:
     bool batch_fatal{};
     int64_t il_parts{};
     double il_ms{};
-    // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
-    // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
+    // ---- the prompt-time layer split: a part of the prompt longer than a chunk is read across the cards at the start's
+    // fixed cuts (split_part says when it cannot be); the chunk, its head chunk, the stage count and the cuts, or none
     struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
     bool relax_on{};
     bool in_call{};

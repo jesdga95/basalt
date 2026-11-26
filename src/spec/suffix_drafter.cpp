@@ -2,6 +2,7 @@
 #include "basalt/spec/suffix_drafter.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 namespace basalt::spec {
 
@@ -16,7 +17,7 @@ uint64_t mix(uint64_t x) {
 }  // namespace
 
 SuffixDrafter::SuffixDrafter(int min_match, int max_match, size_t capacity_tokens)
-    : min_match_(std::max(3, min_match)), max_match_(std::max(min_match, max_match)) {
+    : min_match_(std::max(3, min_match)), max_match_(std::max(min_match_, max_match)) {
     size_t cap = 1;
     while (cap < capacity_tokens * 2) cap <<= 1;          // load factor <= 0.5 at the nominal capacity
     table_.assign(cap, Slot{});
@@ -30,6 +31,17 @@ void SuffixDrafter::reset() {
     for (const uint32_t d : dirty_) (d & kLongBit ? long_ : table_)[d & ~kLongBit] = Slot{};   // only what was filled
     dirty_.clear();
     last_match_ = 0;
+}
+
+void SuffixDrafter::sync(const int32_t* tokens, size_t n) {
+    last_match_ = 0;
+    const size_t h = hist_.size();
+    if (h <= n && (h == 0 || std::memcmp(hist_.data(), tokens, h * sizeof(int32_t)) == 0)) {
+        if (n > h) append(tokens + h, n - h);
+        return;
+    }
+    reset();
+    if (n > 0) append(tokens, n);
 }
 
 uint64_t SuffixDrafter::key_at(size_t end) const {
@@ -100,6 +112,60 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     int k = 0;
     // The continuation may run into the current suffix (periodic text); reading history up to `cur` is valid.
     for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) out[k++] = hist_[q];
+    return k;
+}
+
+const SuffixDrafter::Slot* SuffixDrafter::find_slot_ro(const std::vector<Slot>& table, uint64_t key) const {
+    for (size_t i = key & mask_, probes = 0; probes <= mask_; i = (i + 1) & mask_, ++probes) {
+        const Slot& s = table[i];
+        if (s.key == key) return &s;
+        if (s.key == 0) return nullptr;
+    }
+    return nullptr;
+}
+
+int SuffixDrafter::propose_after(const int32_t* extra, size_t extra_n, int max_k, int32_t* out, int* match_out) const {
+    if (match_out) *match_out = 0;
+    const size_t base_n = hist_.size(), tot = base_n + extra_n;
+    if (tot < 4 || max_k <= 0) return 0;
+    const size_t cur = tot - 1;
+    const auto at = [&](size_t idx) -> int32_t {
+        return idx < base_n ? hist_[idx] : extra[idx - base_n];
+    };
+    const uint64_t tri_key = [&] {
+        const uint64_t a = (uint32_t) at(cur - 2), b = (uint32_t) at(cur - 1), c = (uint32_t) at(cur);
+        return mix(a * 0x9E3779B97F4A7C15ull ^ mix(b + 0x632BE59BD9B4E019ull) ^ (c << 1)) | 1ull;
+    }();
+    uint64_t lkey = 0;
+    if (tot >= (size_t) LONG_ORDER) {
+        uint64_t h = 0x9E3779B97F4A7C15ull;
+        for (int i = 0; i < LONG_ORDER; ++i) h = mix(h ^ (uint32_t) at(cur - (size_t) i)) + (uint64_t) i;
+        lkey = h | 1ull;
+    }
+    const Slot* slots[2] = {tot >= (size_t) LONG_ORDER ? find_slot_ro(long_, lkey) : nullptr,
+                            find_slot_ro(table_, tri_key)};
+    size_t best_end = 0;
+    int best_len = 0;
+    for (size_t p = cur > 0 ? cur - 1 : 0; p >= base_n && p < cur; --p) {
+        int len = 0;
+        while (len < max_match_ && len <= (int) p && at(p - (size_t) len) == at(cur - (size_t) len)) ++len;
+        if (len > best_len) { best_len = len; best_end = p; }
+        if (p == 0) break;
+    }
+    for (const Slot* s : slots) {
+        if (s == nullptr) continue;
+        for (int w = 0; w < s->n; ++w) {
+            const size_t p = s->pos[w];
+            if (p >= cur) continue;
+            int len = 0;
+            while (len < max_match_ && len <= (int) p && at(p - (size_t) len) == at(cur - (size_t) len)) ++len;
+            if (len > best_len) { best_len = len; best_end = p; }
+        }
+    }
+    if (best_len < min_match_) return 0;
+    if (match_out) *match_out = best_len;
+    int k = 0;
+    for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) out[k++] = at(q);
     return k;
 }
 

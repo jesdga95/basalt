@@ -3,7 +3,10 @@
 // Every projection of a chunk of T tokens is Y[T, N] = X[T, K] . W[N, K]^T with W row-major (the GGUF / pack layout)
 // and FP32 outputs.  Weights are BF16 on the device - either already (the pack's BF16 tensors) or dequantized from
 // their native GGUF blocks into a reusable scratch (`dequant_bf16`) right before the product - and activations are
-// rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
+// rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.  On a card
+// other than the main one (a prompt stage, a split's later stage) each product runs the algorithm cuBLAS picks for it on
+// the main card, through cublasLt: a thin product's split of K follows the card's SMs, and the stage must read a
+// prompt with the main card's bits.
 #pragma once
 
 #include <cstddef>
@@ -59,13 +62,18 @@ public:
     void* stream() const { return stream_; }
 
 private:
+    /// Y = op(W)^T . X in cuBLAS's column-major view, W and X of `type` (CUDA_R_16BF or CUDA_R_16F).
+    void product(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                 float beta, const char* what);
+
     void* handle_ = nullptr;
+    void* lt_ = nullptr;          ///< off the main card: the cublasLt handle the main card's algorithms run through
+    size_t ws_bytes_ = 0;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
     bool external_ = false;
-    void* hipblaslt_state_ = nullptr;
 };
 
 

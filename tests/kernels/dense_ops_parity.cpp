@@ -1,7 +1,8 @@
 // tests/kernels/dense_ops_parity.cpp - the dense stack's element-wise kernels (basalt/kernels/dense_ops.hpp) and the block
-// drafter's windowed attention (gqa_window_attn) against CPU references in double precision, at the Qwen3.8-27B widths
+// drafters' windowed attention (gqa_window_attn) against CPU references in double precision, at the Qwen3.8-27B widths
 // (5120 hidden, 17408 FFN) and its DFlash 2 drafter's (32 x 128 query heads, 8 KV heads, a 2048-cell window, groups of
-// 16 channels, 16 candidates of rank 256).  Prints max abs / rel error per kernel.  Exit 77 without a GPU.
+// 16 channels, 16 candidates of rank 256), and Inkling 2's DSpark window (24 x 128 query heads, 8 KV heads, a block's
+// shared 1,024-position window).  Prints max abs / rel error per kernel.  Exit 77 without a GPU.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/gdn_prompt.hpp"
@@ -269,9 +270,18 @@ int main() {
         if (differ) ++fails;
         report("candidate_path conf", gc, wc, 1e-4);
     }
-    {   // gqa_window_attn at the drafter's shape: 8 non-causal rows over a 2048-cell window in a cyclic cache
-        const int NH = 32, NKV = 8, HD = 128, W = 2048, CAP = W + 256, B = 8;
-        const int64_t pos = 5000;   // rows at 5000..5007; the cache wraps
+    // gqa_window_attn: the DFlash 2 drafter's shape (8 non-causal rows over a 2048-cell window, each row its own), then
+    // Inkling 2's DSpark (24 query heads, every row of the block in the anchor's 1,024-position window); both caches wrap
+    struct WinCase {
+        const char* name;
+        int NH, W, CAP;
+        int64_t pos;
+        bool block;
+    };
+    for (const WinCase& wc : {WinCase{"gqa_window_attn", 32, 2048, 2048 + 256, 5000, false},
+                              WinCase{"gqa_window_attn block", 24, 1025, 1088, 3000, true}}) {
+        const int NH = wc.NH, NKV = 8, HD = 128, W = wc.W, CAP = wc.CAP, B = 8;
+        const int64_t pos = wc.pos;
         std::vector<uint16_t> kc((size_t) CAP * NKV * HD), vc(kc.size());
         for (auto& v : kc) v = basalt::kernels::f16_from_f32(nd(rng));
         for (auto& v : vc) v = basalt::kernels::f16_from_f32(nd(rng));
@@ -281,13 +291,13 @@ int main() {
         float *dout = nullptr, *dscr = nullptr;
         cudaMalloc(&dout, (size_t) B * NH * HD * 4);
         cudaMalloc(&dscr, basalt::kernels::gqa_decode_scratch_floats(CAP, B, NH, HD) * 4);
-        basalt::kernels::gqa_window_attn(dq, dk, dv, NH, NKV, HD, pos, B, pos + B, W, CAP, dscr, CAP, dout, S);
+        basalt::kernels::gqa_window_attn(dq, dk, dv, NH, NKV, HD, pos, B, pos + B, W, CAP, dscr, CAP, dout, S, wc.block);
         auto out = down(dout, (size_t) B * NH * HD);
         std::vector<double> want(out.size());
         for (int t = 0; t < B; ++t)
             for (int h = 0; h < NH; ++h) {
                 const int kvh = h / (NH / NKV);
-                const int64_t lo = pos + t - W + 1, hi = pos + B;
+                const int64_t lo = pos + (wc.block ? 0 : t) - W + 1, hi = pos + B;
                 std::vector<double> s;
                 double mx = -1e300;
                 for (int64_t p = lo; p < hi; ++p) {
@@ -306,7 +316,71 @@ int main() {
                     want[((size_t) t * NH + h) * HD + i] = a / l;
                 }
             }
-        report("gqa_window_attn", out, want, 2e-4);
+        report(wc.name, out, want, 2e-4);
+        cudaFree(dq);
+        cudaFree(dk);
+        cudaFree(dv);
+        cudaFree(dout);
+        cudaFree(dscr);
+    }
+    {   // f32_rows_dot: K % 32 != 0 fallback (K = 48, K % 16 == 0) and T = 1023, 1024, 3072 dispatch boundaries
+        for (const int TR : {65, 1024}) {
+            const int NR = 67, KR = 48;
+            auto x = randn((size_t) TR * KR), w = randn((size_t) NR * KR, 0.2f);
+            float *dx = up(x), *dw = up(w), *dy = nullptr;
+            cudaMalloc(&dy, (size_t) TR * NR * 4);
+            basalt::kernels::f32_rows_dot(dx, dw, dy, TR, NR, KR, S);
+            auto y = down(dy, (size_t) TR * NR);
+            std::vector<double> want(y.size());
+            for (int r = 0; r < TR; ++r)
+                for (int n = 0; n < NR; ++n) {
+                    double acc = 0;
+                    for (int k = 0; k < KR; ++k) acc += (double) x[(size_t) r * KR + k] * w[(size_t) n * KR + k];
+                    want[(size_t) r * NR + n] = acc;
+                }
+            report(TR == 65 ? "f32_rows_dot K=48" : "f32_rows_dot K=48 1K", y, want, 1e-4);
+            cudaFree(dx);
+            cudaFree(dw);
+            cudaFree(dy);
+        }
+        {
+            const int TMAX = 3072, NR = 130, KR = 64;
+            auto x = randn((size_t) TMAX * KR), w = randn((size_t) NR * KR, 0.2f);
+            float *dx = up(x), *dw = up(w), *dy_1023 = nullptr, *dy_1024 = nullptr, *dy_3072 = nullptr;
+            cudaMalloc(&dy_1023, (size_t) 1023 * NR * 4);
+            cudaMalloc(&dy_1024, (size_t) 1024 * NR * 4);
+            cudaMalloc(&dy_3072, (size_t) TMAX * NR * 4);
+            basalt::kernels::f32_rows_dot(dx, dw, dy_1023, 1023, NR, KR, S);
+            basalt::kernels::f32_rows_dot(dx, dw, dy_1024, 1024, NR, KR, S);
+            basalt::kernels::f32_rows_dot(dx, dw, dy_3072, TMAX, NR, KR, S);
+            auto y1023 = down(dy_1023, (size_t) 1023 * NR);
+            auto y1024 = down(dy_1024, (size_t) 1024 * NR);
+            auto y3072 = down(dy_3072, (size_t) TMAX * NR);
+            auto cpu_check = [&](const char* label, const std::vector<float>& yv, const std::vector<int>& rows) {
+                std::vector<double> want;
+                std::vector<float> got;
+                for (const int r : rows)
+                    for (int n = 0; n < NR; ++n) {
+                        double acc = 0;
+                        for (int k = 0; k < KR; ++k) acc += (double) x[(size_t) r * KR + k] * w[(size_t) n * KR + k];
+                        want.push_back(acc);
+                        got.push_back(yv[(size_t) r * NR + n]);
+                    }
+                report(label, got, want, 1e-4);
+            };
+            cpu_check("f32_rows_dot T=1023", y1023, {0, 15, 16, 1008, 1022});
+            cpu_check("f32_rows_dot T=1024", y1024, {0, 31, 32, 992, 1022, 1023});
+            cpu_check("f32_rows_dot T=3072", y3072, {0, 47, 48, 1022, 1023, 1024, 3024, 3071});
+            const bool bit_1023 = std::memcmp(y1023.data(), y3072.data(), y1023.size() * 4) == 0;
+            const bool bit_1024 = std::memcmp(y1024.data(), y3072.data(), y1024.size() * 4) == 0;
+            std::printf("f32_rows_dot tiles    T=1023/1024/3072 %s\n", (bit_1023 && bit_1024) ? "bitwise" : "FAIL");
+            if (!(bit_1023 && bit_1024)) ++fails;
+            cudaFree(dx);
+            cudaFree(dw);
+            cudaFree(dy_1023);
+            cudaFree(dy_1024);
+            cudaFree(dy_3072);
+        }
     }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

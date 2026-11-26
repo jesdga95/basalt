@@ -1037,8 +1037,8 @@ __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p,
         const int first = below ? __ffs(below) - 1 : k;
         if (first < n_keep) n_keep = first;
     }
-    if (p.top_ids != nullptr && lane < p.n_top)
-        p.top_ids[(size_t) t * p.n_top + lane] = lane < n_keep ? ts.id[lane] : -1;
+    if (p.top_ids != nullptr)
+        for (int i = lane; i < p.n_top; i += 32) p.top_ids[(size_t) t * p.n_top + i] = i < n_keep ? ts.id[i] : -1;
     tail_pair_sync();                        // warp 1's terms and prefix sums
     const double sum2 = n_keep > 0 ? ts.pre2[n_keep - 1] : 0.0;
     if (lane < n_keep) ts.e2[lane] = ts.e2[lane] / sum2;
@@ -1713,6 +1713,23 @@ namespace {
 // takes the wide path whatever the split.
 constexpr int kEngineSplit = 2;
 
+void ensure_dynamic_smem(const void* func, int slot, unsigned shmem) {
+    if (shmem <= 32u * 1024u) return;
+    static std::mutex mu;
+    static unsigned raised[2][64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    if (shmem <= raised[slot][dev]) return;
+    if (cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem) == cudaSuccess)
+        raised[slot][dev] = shmem;
+    else
+        (void) cudaGetLastError();
+}
+
 void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return;
@@ -1731,9 +1748,11 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
         // `sampler_greedy_cluster_kernel`.
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        if (!(shmem == 0 && p.logit_bias == nullptr && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+        if (!(shmem == 0 && p.logit_bias == nullptr && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream))) {
+            ensure_dynamic_smem((const void*) sampler_greedy_kernel, 0, shmem);
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, cs>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+        }
     } else {
         // The split top_k over 4,096-logit blocks (61 per row for 248,320 logits).  The one-block kernel when the
         // split cannot run: a wider vocabulary than the merge holds, more than `kSplitMaxRows` rows (the engine
@@ -1754,6 +1773,7 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
         if (k > kSelMax || split == 3) {
             sample_wide(logits, n_tokens, n_vocab, history, history_len, p, k, out, query, n_query, qprob, stream);
         } else if (scratch == nullptr) {
+            ensure_dynamic_smem((const void*) sampler_one_block_kernel, 1, shmem);
             sampler_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, cs>>>(
                 logits, n_vocab, history, history_len, p, out, query, n_query, qprob);
         } else if (split == 2 && k <= kSortSpan) {

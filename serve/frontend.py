@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import threading
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+from jinja2 import nodes
+from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from serve.api.documents import expand_documents, has_document
@@ -24,6 +27,21 @@ from serve.api.documents import expand_documents, has_document
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the messages; a ValueError so the client gets a 400 with its message."""
+
+
+class _Generation(Extension):
+    """transformers' `{% generation %}` block (it marks the assistant's tokens for training masks): its body renders as
+    it is."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.CallBlock(self.call_method("_body"), [], [], body).set_lineno(lineno)
+
+    def _body(self, caller):
+        return caller()
 
 
 class ChatTemplate:
@@ -40,7 +58,8 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                            extensions=["jinja2.ext.loopcontrols", _Generation])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = source
@@ -66,8 +85,9 @@ IMAGE_PARTS = ("image_url", "input_image", "image")
 VIDEO_PARTS = ("video_url", "input_video", "video")
 VIDEO_OPTIONS = ("fps", "max_frames")         # a video part's own sampling, as vLLM takes them
 
-# client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
+# client spellings of a thinking level -> minimal, low, medium, high, max or none; a dialect says what its template takes
+# for each (minimal is thinking off for a template with no such level: Service.thinking_kwargs)
+EFFORT = {"none": None, "off": None, "minimal": "minimal", "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
 
@@ -229,20 +249,160 @@ def literal_tags(controls) -> dict[str, str]:
     return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
 
 
-def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
+def _common_prefix(words: list[str]) -> str:
+    prefix = words[0]
+    for w in words[1:]:
+        while prefix and not w.startswith(prefix):
+            prefix = prefix[:-1]
+        if not prefix:
+            break
+    return prefix
+
+
+def _trie_regex(words: list[str]) -> re.Pattern[str]:
+    """Compile a prefix-factored regex matching any non-empty literal in `words`."""
+    trie: dict = {}
+    for w in words:
+        cur = trie
+        for ch in w:
+            cur = cur.setdefault(ch, {})
+        cur[""] = None
+
+    def emit(node: dict) -> str:
+        if "" in node and len(node) == 1:
+            return ""
+        alts = []
+        for ch, sub in node.items():
+            if ch == "":
+                continue
+            s = ch
+            while len(sub) == 1 and "" not in sub:
+                c2, sub = next(iter(sub.items()))
+                s += c2
+            alts.append(re.escape(s) + emit(sub))
+        if "" in node:
+            return "(?:" + "|".join(alts) + ")?"
+        return alts[0] if len(alts) == 1 else "(?:" + "|".join(alts) + ")"
+
+    return re.compile(emit(trie))
+
+
+def _can_single_pass(items: tuple[tuple[str, str], ...]) -> bool:
+    """True when single-pass regex substitution is guaranteed identical to sequential str.replace for `items`."""
+    tags = [t for t, _ in items]
+    marks = [m for _, m in items]
+    if any(not t for t in tags) or any(not m for m in marks):
+        return False
+    tag_chars = set("".join(tags))
+    if any(ch in tag_chars for m in marks for ch in m):
+        return False
+    # Check whether any tag is a proper substring of another tag.
+    tag_set = set(tags)
+    lens = sorted({len(t) for t in tags})
+    for t in tags:
+        lt = len(t)
+        for l in lens:
+            if l >= lt:
+                break
+            for p in range(lt - l + 1):
+                if t[p:p + l] in tag_set:
+                    return False
+    # Check whether a non-empty proper suffix of one tag equals a proper prefix of a different tag.
+    prefixes: dict[str, int] = {}
+    for idx, t in enumerate(tags):
+        for k in range(1, len(t)):
+            p = t[:k]
+            prefixes[p] = idx if p not in prefixes else -1
+    for idx, t in enumerate(tags):
+        lt = len(t)
+        for k in range(1, lt):
+            owner = prefixes.get(t[k:])
+            if owner is not None and owner != idx:
+                return False
+    return True
+
+
+def _chars_regex(chars: list[str]) -> re.Pattern[str]:
+    """Build a compact character-class regex with contiguous codepoint ranges for single-char marks."""
+    ords = sorted(ord(c) for c in chars)
+    parts: list[str] = []
+    i = 0
+    n = len(ords)
+    while i < n:
+        lo = hi = ords[i]
+        while i + 1 < n and ords[i + 1] == hi + 1:
+            i += 1
+            hi = ords[i]
+        if hi >= lo + 2:
+            parts.append(f"{re.escape(chr(lo))}-{re.escape(chr(hi))}")
+        elif hi == lo + 1:
+            parts.append(re.escape(chr(lo)) + re.escape(chr(hi)))
+        else:
+            parts.append(re.escape(chr(lo)))
+        i += 1
+    return re.compile("[" + "".join(parts) + "]")
+
+
+@functools.lru_cache(maxsize=64)
+def _tag_matcher(items: tuple[tuple[str, str], ...]):
+    if not items:
+        return None, "", True
+    tags = [t for t, _ in items]
+    if any(not t for t in tags):
+        return re.compile("|".join(re.escape(t) for t in tags)), "", False
+    return _trie_regex(tags), _common_prefix(tags), _can_single_pass(items)
+
+
+@functools.lru_cache(maxsize=64)
+def _unmark_matcher(items: tuple[tuple[str, str], ...]):
+    marks = {v: k for k, v in items}
+    if not marks:
+        return marks, None, False
+    keys = list(marks)
+    if all(len(m) == 1 for m in keys):
+        return marks, _chars_regex(keys), all(ord(m) > 127 for m in keys)
+    return marks, re.compile("|".join(map(re.escape, keys))), all(not m.isascii() for m in keys)
+
+
+_LITERAL_MATCHER = _tag_matcher(tuple(LITERAL_TAGS.items()))
+_LITERAL_UNMARK = _unmark_matcher(tuple(LITERAL_TAGS.items()))
+
+
+def _matcher_for(tags: dict[str, str]):
+    return _LITERAL_MATCHER if tags is LITERAL_TAGS else _tag_matcher(tuple(tags.items()))
+
+
+def _mark_with(text: str, tags: dict[str, str], pat, prefix: str, single_pass: bool) -> str:
+    if pat is None or (prefix and prefix not in text):
+        return text
+    if single_pass:
+        return pat.sub(lambda m: tags[m.group(0)], text)
+    if pat.search(text) is None:
+        return text
     for tag, mark in tags.items():
-        text = text.replace(tag, mark)
+        if tag in text:
+            text = text.replace(tag, mark)
     return text
 
 
-def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
+def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
+    pat, prefix, single_pass = _matcher_for(tags)
+    return _mark_with(text, tags, pat, prefix, single_pass)
+
+
+def _mark_deep_with(v, tags: dict[str, str], pat, prefix: str, single_pass: bool):
     if isinstance(v, str):
-        return _mark(v, tags)
+        return _mark_with(v, tags, pat, prefix, single_pass)
     if isinstance(v, dict):
-        return {k: x if _is_source(v, k) else _mark_deep(x, tags) for k, x in v.items()}
+        return {k: x if _is_source(v, k) else _mark_deep_with(x, tags, pat, prefix, single_pass) for k, x in v.items()}
     if isinstance(v, list):
-        return [_mark_deep(x, tags) for x in v]
+        return [_mark_deep_with(x, tags, pat, prefix, single_pass) for x in v]
     return v
+
+
+def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
+    pat, prefix, single_pass = _matcher_for(tags)
+    return _mark_deep_with(v, tags, pat, prefix, single_pass)
 
 
 def _is_source(item: dict, key: str) -> bool:
@@ -251,24 +411,32 @@ def _is_source(item: dict, key: str) -> bool:
     return key == "source" and item.get("type") in ("image", "video")
 
 
-def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
+def _has_tag_with(v, pat, prefix: str) -> bool:
     if isinstance(v, str):
-        return any(tag in v for tag in tags)
+        return (not prefix or prefix in v) and pat.search(v) is not None
     if isinstance(v, dict):
-        return any(_has_tag(x, tags) for k, x in v.items() if not _is_source(v, k))
+        return any(_has_tag_with(x, pat, prefix) for k, x in v.items() if not _is_source(v, k))
     if isinstance(v, list):
-        return any(_has_tag(x, tags) for x in v)
+        return any(_has_tag_with(x, pat, prefix) for x in v)
     return False
+
+
+def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
+    pat, prefix, _ = _matcher_for(tags)
+    if pat is None:
+        return False
+    return _has_tag_with(v, pat, prefix)
 
 
 _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE = "<tool_response>", "</tool_response>"
 
 
-def _keep_tool_result_wrap(content, tags: dict[str, str]):
+def _keep_tool_result_wrap(content, tags: dict[str, str], matcher=None):
     """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the way
     the template does) keeps that outer pair as the markers, since the template tells such a turn from a question by
     exactly that pair; only the text inside is marked. None: not such a message."""
     o, c = _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE
+    pat, prefix, single_pass = matcher if matcher is not None else _matcher_for(tags)
 
     def wrapped(text: str) -> bool:
         body = text.strip()
@@ -277,9 +445,9 @@ def _keep_tool_result_wrap(content, tags: dict[str, str]):
     def wrap(text: str, first: bool, last: bool) -> str:
         i = text.index(o) + len(o) if first else 0
         j = text.rindex(c) if last else len(text)
-        head = _mark(text[:i - len(o)], tags) + o if first else ""
-        tail = c + _mark(text[j + len(c):], tags) if last else ""
-        return head + _mark(text[i:j], tags) + tail
+        head = _mark_with(text[:i - len(o)], tags, pat, prefix, single_pass) + o if first else ""
+        tail = c + _mark_with(text[j + len(c):], tags, pat, prefix, single_pass) if last else ""
+        return head + _mark_with(text[i:j], tags, pat, prefix, single_pass) + tail
 
     if isinstance(content, str):
         return wrap(content, True, True) if wrapped(content) else None
@@ -291,44 +459,54 @@ def _keep_tool_result_wrap(content, tags: dict[str, str]):
         return None          # the pair is split inside a part: mark it all
     if len(content) == 1:
         return [{**content[0], "text": wrap(texts[0], True, True)}]
-    return ([{**content[0], "text": wrap(texts[0], True, False)}] + [_mark_deep(x, tags) for x in content[1:-1]] +
+    return ([{**content[0], "text": wrap(texts[0], True, False)}] +
+            [_mark_deep_with(x, tags, pat, prefix, single_pass) for x in content[1:-1]] +
             [{**content[-1], "text": wrap(texts[-1], False, True)}])
 
 
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """(messages, tools, changed) with literal tags in their text swapped for `tags`' marks; unchanged objects come
     back when there are none. An assistant message opening with a whole <think>...</think> block keeps it."""
-    if not _has_tag(messages, tags) and not _has_tag(tools, tags):
+    tags_m = _matcher_for(tags)
+    pat, prefix, single_pass = tags_m
+    if pat is None or (not _has_tag_with(messages, pat, prefix) and not _has_tag_with(tools, pat, prefix)):
         return messages, tools, False
     out = []
     own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
+    own_m = None
     for m in messages:
         m = dict(m)
         content = m.get("content")
-        mine = own if m.get("role") == "assistant" else tags
+        if m.get("role") == "assistant":
+            if own_m is None:
+                own_m = _matcher_for(own)
+            mine, m_pat, m_pref, m_sp = own, *own_m
+        else:
+            mine, m_pat, m_pref, m_sp = tags, pat, prefix, single_pass
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, mine)
+                m[k] = _mark_deep_with(v, mine, m_pat, m_pref, m_sp)
         if m.get("role") == "user":
-            kept = _keep_tool_result_wrap(content, tags)
+            kept = _keep_tool_result_wrap(content, tags, tags_m)
             if kept is not None:
                 m["content"] = kept
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
-                            _mark(content[j + len("</think>"):], own))
+            m["content"] = (content[:i] + _mark_with(content[i:j], own, m_pat, m_pref, m_sp) + "</think>" +
+                            _mark_with(content[j + len("</think>"):], own, m_pat, m_pref, m_sp))
         out.append(m)
-    return out, _mark_deep(tools, tags), True
+    return out, _mark_deep_with(tools, tags, pat, prefix, single_pass), True
 
 
-_THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
+_THINK_MARK_RE = _LITERAL_UNMARK[1]
 
 
 def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
     """The prompt with marks restored to tag text, and those tags' (start, end) spans to encode as plain text."""
-    marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
-    mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
+    marks, mark_re, all_non_ascii = _LITERAL_UNMARK if tags is LITERAL_TAGS else _unmark_matcher(tuple(tags.items()))
+    if mark_re is None or (all_non_ascii and prompt.isascii()):
+        return prompt, []
     out, spans, pos, n = [], [], 0, 0
     for m in mark_re.finditer(prompt):
         out.append(prompt[pos:m.start()])
@@ -338,6 +516,8 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
         spans.append((n, n + len(tag)))
         n += len(tag)
         pos = m.end()
+    if not spans:
+        return prompt, []
     out.append(prompt[pos:])
     return "".join(out), spans
 
@@ -486,6 +666,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
               **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
     if reasoning.get("enabled") is False:                 # the generic off switch; true is the route's default
         kwargs["enable_thinking"] = False
+    if req.get("enable_thinking") is False:               # the top-level switch (vLLM, DashScope); true is the default
+        kwargs["enable_thinking"] = False
     if "reasoning_effort" in template_kw:
         kwargs.update(effort_kwargs(template_kw["reasoning_effort"]))
     if "enable_thinking" in template_kw and not template_kw["enable_thinking"]:
@@ -601,9 +783,36 @@ FUNC_START = "<function="
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
+def _full_close_end(text: str, at: int) -> int:
+    """For the `</parameter>` at `at`: the index just past the `</function>` and `</tool_call>` that follow it
+    (whitespace between), or -1 when the three are not all there."""
+    s = text[at + len(PARAM_END):].lstrip()
+    if not s.startswith(FUNC_END):
+        return -1
+    s = s[len(FUNC_END):].lstrip()
+    return len(text) - len(s) + len(CALL_END) if s.startswith(CALL_END) else -1
+
+
+def _closes_again(rest: str, final: bool) -> bool | None:
+    """The output after a whole `</parameter></function></tool_call>`: True when it reaches another whole close
+    before any `<tool_call>` opens. The first close was then text inside the value: a string that holds the three
+    tags on their own lines, whose real end comes later. False for a real end (output that ends, prose that never
+    closes, a next call that opens first); None while the output so far cannot tell."""
+    if not rest.strip():
+        return False if final else None
+    opener = rest.find(CALL_START)
+    at = rest.find(PARAM_END)
+    while at >= 0 and (opener < 0 or at < opener):
+        if _full_close_end(rest, at) >= 0:
+            return True
+        at = rest.find(PARAM_END, at + 1)
+    return False if final or opener >= 0 else None
+
+
 def param_end(text: str, final: bool = False, name: str | None = None) -> int:
-    """Find a structural parameter close, keeping quoted calls and a reopened parameter inside its value.
-    -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural close."""
+    """Find a structural parameter close, keeping quoted calls, a reopened parameter and a quoted whole call close
+    inside its value. -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural
+    close."""
     at = text.find(PARAM_END)
     fallback = -1
     while at >= 0:
@@ -616,7 +825,14 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             elif name is None or after[len(PARAM_START):gt].strip() != name:
                 candidate = at
         elif after.startswith(FUNC_END):
-            candidate = at
+            end = _full_close_end(text, at)
+            if end >= 0:
+                again = _closes_again(text[end:], final)
+                candidate = -2 if again is None else (-1 if again else at)
+            else:
+                tail = after[len(FUNC_END):].lstrip()
+                # the </tool_call> may still be arriving: what follows it decides
+                candidate = -2 if not final and (not tail or CALL_END.startswith(tail)) else at
         elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
             candidate = at if final else -2
         if candidate != -1:
@@ -832,7 +1048,10 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
+        # the body stops before its </tool_call>: put it back, so a quoted whole close inside a value is told from
+        # the real one the same way as in the output
+        end = param_end(rest + "\n" + CALL_END, final=True, name=pname.strip())
+        end = end if end < len(rest) else -1
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
@@ -843,18 +1062,250 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
+@functools.lru_cache(maxsize=64)
+def _hold_prefixes(tags: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
+    """Proper non-empty prefixes of `tags`, grouped by their last character and ordered longest first."""
+    buckets: dict[str, set[str]] = {}
+    for tag in tags:
+        for n in range(1, len(tag)):
+            p = tag[:n]
+            buckets.setdefault(p[-1], set()).add(p)
+    return {ch: tuple(sorted(ps, key=len, reverse=True)) for ch, ps in buckets.items()}
+
+
 def hold_back(text: str, tags: tuple[str, ...]) -> int:
     """Length of the longest suffix of `text` that is a proper prefix of one of `tags`: what a streaming parser holds
     back until it knows whether a tag follows."""
-    best = 0
-    for tag in tags:
-        for n in range(1, len(tag)):
-            if text.endswith(tag[:n]):
-                best = max(best, n)
-    return best
+    if not text or not tags:
+        return 0
+    if not isinstance(tags, tuple):
+        tags = tuple(tags)
+    prefixes = _hold_prefixes(tags).get(text[-1])
+    if prefixes is None:
+        return 0
+    for p in prefixes:
+        if text.endswith(p):
+            return len(p)
+    return 0
 
 
-class OutputParser:
+class JsonPrefix:
+    """A JSON value read as it streams. `safe` is the length of the longest prefix read so far that text appended after
+    it closes into valid JSON without inventing a key or a value, and `closer` is that text: a point inside a string
+    (not inside an escape), after a whole value, or right after an opening bracket. A dangling key, colon or comma and a
+    number or literal not yet ended are not such points, so a value cut off there loses them (vLLM #53739). The value's
+    own end is the last point: what follows it is not the value's."""
+
+    _PLAIN = re.compile(r'[^"\\]*')
+    _WORD = re.compile(r"[0-9A-Za-z.+-]*")
+
+    def __init__(self):
+        self.stack: list[str] = []      # the open containers, "{" or "["
+        self.state = "value"            # value, first_key, first_value, key, colon, after, string, escape, unicode, end, bad
+        self.key = False                # the string read is a key
+        self.word = ""                  # a number or literal read so far
+        self.hex = 0                    # digits of a \u escape read
+        self.pos = 0                    # characters read
+        self.safe = 0
+        self.closer = ""
+
+    def _mark(self, at: int, open_string: bool = False) -> None:
+        self.safe = at
+        self.closer = ('"' if open_string else "") + "".join("}" if c == "{" else "]" for c in reversed(self.stack))
+
+    def _after_value(self, at: int) -> None:
+        self.state = "after" if self.stack else "end"
+        self._mark(at)
+
+    def feed(self, text: str) -> None:
+        base, i, n = self.pos, 0, len(text)
+        self.pos += n
+        while i < n and self.state not in ("end", "bad"):
+            c, st = text[i], self.state
+            if st == "string":
+                j = self._PLAIN.match(text, i).end()
+                if j > i:
+                    i = j
+                    if not self.key:
+                        self._mark(base + i, True)
+                elif c == '"':
+                    i += 1
+                    if self.key:
+                        self.state = "colon"
+                    else:
+                        self._after_value(base + i)
+                else:
+                    self.state, i = "escape", i + 1
+                continue
+            if st == "escape":
+                i += 1
+                if c == "u":
+                    self.state, self.hex = "unicode", 0
+                    continue
+                if c not in '"\\/bfnrt':
+                    self.state = "bad"
+                    continue
+                self.state = "string"
+                if not self.key:
+                    self._mark(base + i, True)
+                continue
+            if st == "unicode":
+                if c not in "0123456789abcdefABCDEF":
+                    self.state = "bad"
+                    continue
+                i += 1
+                self.hex += 1
+                if self.hex == 4:
+                    self.state = "string"
+                    if not self.key:
+                        self._mark(base + i, True)
+                continue
+            if st == "word":
+                j = self._WORD.match(text, i).end()
+                self.word += text[i:j]
+                i = j
+                if i < n:               # the word ended: a whole number or literal is a value
+                    try:
+                        json.loads(self.word)
+                        self._after_value(base + i)
+                    except ValueError:
+                        self.state = "bad"
+                continue
+            if c in " \t\r\n":
+                i += 1
+                continue
+            if st in ("value", "first_value"):
+                if st == "first_value" and c == "]":
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                elif c in "{[":
+                    self.stack.append(c)
+                    self.state = "first_key" if c == "{" else "first_value"
+                    self._mark(base + i + 1)
+                elif c == '"':
+                    self.state, self.key = "string", False
+                    self._mark(base + i + 1, True)
+                elif c in "-0123456789tfn":
+                    self.state, self.word = "word", ""
+                    continue
+                else:
+                    self.state = "bad"
+                i += 1
+            elif st in ("first_key", "key"):
+                if st == "first_key" and c == "}":
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                elif c == '"':
+                    self.state, self.key = "string", True
+                else:
+                    self.state = "bad"
+                i += 1
+            elif st == "colon":
+                self.state = "value" if c == ":" else "bad"
+                i += 1
+            else:                       # after a value
+                top = self.stack[-1]
+                if c == ",":
+                    self.state = "key" if top == "{" else "value"
+                elif c == ("}" if top == "{" else "]"):
+                    self.stack.pop()
+                    self._after_value(base + i + 1)
+                else:
+                    self.state = "bad"
+                i += 1
+
+
+class CodeTracker:
+    """What the answer text that has gone out leaves open: a code fence, the current line, the backtick runs of the
+    current paragraph, and whether the current line is inside an indented code block. A tag opening inside code is a
+    quoted example, text."""
+
+    fence, line, par_runs, par_open = "", "", 0, False
+    _prev_blank, _indented = False, False
+
+    def _reset_track(self) -> None:
+        self.fence, self.line, self.par_runs, self.par_open = "", "", 0, False
+        self._prev_blank, self._indented = False, False
+
+    def _snap(self) -> tuple:
+        return (self.fence, self.line, self.par_runs, self.par_open, self._prev_blank, self._indented)
+
+    def _restore(self, snap: tuple) -> None:
+        self.fence, self.line, self.par_runs, self.par_open, self._prev_blank, self._indented = snap
+
+    def _track(self, text: str) -> str:
+        """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, the runs of
+        backticks the current paragraph holds, and whether the run that opened the last one ended its line.
+        Returns the text."""
+        parts = text.split("\n")
+        for k, part in enumerate(parts):
+            if k < len(parts) - 1:
+                line, self.line = self.line + part, ""
+                s = line.lstrip()
+                was_fenced = bool(self.fence)
+                if self.fence:
+                    # CommonMark: a fence closes only against a line of at least as many of the same character as
+                    # opened it, with no trailing non-whitespace text (so ``` inside ```` or ```python cannot close it).
+                    run = len(s) - len(s.lstrip(self.fence[0]))
+                    if run >= len(self.fence) and not s[run:].strip():
+                        self.fence = ""
+                elif s[:3] in ("```", "~~~"):
+                    run = len(s) - len(s.lstrip(s[0]))
+                    if (s[0] * 3) not in s[run:]:
+                        self.fence = s[0] * run
+                elif not s:
+                    self.par_runs, self.par_open = 0, False   # a paragraph ends here
+                else:
+                    # The runs of backticks pair up across the paragraph, and a span stays open only while the run that
+                    # opened it ENDED its line ("wrapped `example"). A run with text after it is a stray character:
+                    # counting every backtick of the paragraph read each later line as inline code and hid a real call.
+                    runs = self._backtick_runs(line)
+                    self.par_runs += runs
+                    if runs:                                  # a line without backticks does not move the last run
+                        self.par_open = line.endswith("`")
+                # An indented (four spaces or a tab) code block starts after a blank line and runs until a line that is
+                # not indented; a call written in one is an example, not a call.
+                if was_fenced or self.fence:
+                    self._prev_blank = self._indented = False
+                elif not s:
+                    self._prev_blank = True
+                elif line.startswith(("    ", "\t")):
+                    self._indented = self._prev_blank or self._indented
+                    self._prev_blank = False
+                else:
+                    self._prev_blank = self._indented = False
+            else:
+                self.line += part
+        return text
+
+    @staticmethod
+    def _backtick_runs(line: str) -> int:
+        """How many runs of backticks the line holds: "a `b` c" has two, "``x``" has two, "``x" has one."""
+        runs, in_run = 0, False
+        for ch in line:
+            if ch == "`":
+                if not in_run:
+                    runs += 1
+                    in_run = True
+            else:
+                in_run = False
+        return runs
+
+    def _in_indented_block(self) -> bool:
+        """The current line is part of an indented code block: four spaces or a tab, after a blank line or another such line."""
+        return (self._prev_blank or self._indented) and self.line.startswith(("    ", "\t"))
+
+    def _in_code(self) -> bool:
+        """The text so far leaves the next character inside a code fence, an indented code block, or inline code."""
+        if self.fence or self._in_indented_block():
+            return True
+        line_runs = self._backtick_runs(self.line)
+        if self.par_runs % 2 == 1 and self.par_open:
+            return line_runs % 2 == 0
+        return line_runs % 2 == 1
+
+
+class OutputParser(CodeTracker):
     """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
@@ -865,33 +1316,12 @@ class OutputParser:
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
-        self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
+        self._reset_track()          # code fence, current line, backtick runs and indented-block state
         self._reset_scan()
 
-    def _track(self, text: str) -> str:
-        """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, and the
-        backticks of the current paragraph. Returns the text."""
-        parts = text.split("\n")
-        for k, part in enumerate(parts):
-            if k < len(parts) - 1:
-                line, self.line = self.line + part, ""
-                s = line.lstrip()
-                if self.fence:
-                    if s.startswith(self.fence * 3):
-                        self.fence = ""
-                elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
-                    self.fence = s[0]
-                elif not s:
-                    self.ticks = 0
-                else:
-                    self.ticks += line.count("`")
-            else:
-                self.line += part
-        return text
-
-    def _in_code(self) -> bool:
-        """The text so far leaves the next character inside a code fence or inline code."""
-        return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+    _call_parts: list[str] | None = None
+    _call_has_end: bool = False
+    _call_tail: str = ""
 
     def _reset_scan(self):
         self.sp = 0                  # consumed part of self.buf (the call body)
@@ -902,6 +1332,25 @@ class OutputParser:
         self.sdeclared = {}
         self.spname = ""
         self.svstart = 0
+        self._call_parts = []
+        self._call_has_end = False
+        self._call_tail = ""
+
+    @property
+    def buf(self) -> str:
+        if self._call_parts:
+            self._buf += "".join(self._call_parts)
+            self._call_parts.clear()
+        return self._buf
+
+    @buf.setter
+    def buf(self, value: str) -> None:
+        self._buf = value
+        if self._call_parts:
+            self._call_parts.clear()
+        if self.state == "call":
+            self._call_has_end = CALL_END in value
+            self._call_tail = value[-(len(CALL_END) - 1):]
 
     def _scan(self, final: bool = False) -> list[Event]:
         """Advance the streaming view of the call body."""
@@ -976,7 +1425,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, final=final, name=self.spname)
+                end = param_end(rest, final=final, name=self.spname) if PARAM_END in rest else -1
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1039,7 +1488,30 @@ class OutputParser:
         return hold_back(text, tags)
 
     def feed(self, delta: str, *, final: bool = False) -> list[Event]:
-        self.buf += delta
+        if self.state == "call":
+            if delta:
+                if not self._call_has_end:
+                    chunk = self._call_tail + delta
+                    if CALL_END in chunk:
+                        self._call_has_end = True
+                    else:
+                        self._call_tail = chunk[-(len(CALL_END) - 1):]
+                if not self.stream_tools and not final:
+                    self._call_parts.append(delta)
+                    if not self._call_has_end:
+                        return []
+                else:
+                    if self._call_parts:
+                        self._buf += "".join(self._call_parts)
+                        self._call_parts.clear()
+                    self._buf += delta
+            elif not self.stream_tools and not final and not self._call_has_end:
+                return []
+        else:
+            if self._call_parts:
+                self._buf += "".join(self._call_parts)
+                self._call_parts.clear()
+            self._buf += delta
         out: list[Event] = []
         while True:
             if self.state == "reasoning":
@@ -1064,7 +1536,7 @@ class OutputParser:
                     out.append(self._reasoning(self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
-                self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
+                self._reset_track()                               # the answer's own text starts here
             elif self.state == "content":
                 if self.lead:                                   # newlines after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -1083,10 +1555,10 @@ class OutputParser:
                         self.buf = self.buf[j:]
                     return out
                 # an opener inside a code fence or inline code is a quoted example: text, decided by the text before it
-                snap = (self.fence, self.line, self.ticks)
+                snap = self._snap()
                 self._track(self.buf[:i])
                 in_code = self._in_code()
-                self.fence, self.line, self.ticks = snap
+                self._restore(snap)
                 if in_code:
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
@@ -1095,22 +1567,31 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self._call_has_end = CALL_END in self._buf
+                self._call_tail = self._buf[-(len(CALL_END) - 1):]
             else:
-                i = call_end(self.buf, final=final)
+                i = call_end(self.buf, final=final) if self._call_has_end else -1
                 if self.stream_tools:
                     if i >= 0:
-                        whole, self.buf = self.buf, self.buf[:i]     # scan only the body
-                        out += self._scan(final=final)
+                        # scan only the call, closed: its </tool_call> tells a quoted close inside a value
+                        whole, self._buf = self.buf, self.buf[:i + len(CALL_END)]
+                        out += self._scan(final=True)
                         out += self._close_scan()
-                        self.buf = whole
+                        self._buf = whole
                     else:
                         out += self._scan(final=final)
                 if i < 0:
                     return out
                 body = self.buf[:i]
-                self.buf = self.buf[i + len(CALL_END):]
+                self._buf = self._buf[i + len(CALL_END):]
                 name = body.strip()[len("<function="):].split(">", 1)[0]
-                call = parse_tool_call(body, self.schemas.get(name))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(name))
+                except ValueError:
+                    out.append(Event("content", CALL_START + body + CALL_END))
+                    self._reset_scan()
+                    self.state, self.lead = "content", True
+                    continue
                 if self.scall is not None:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))
@@ -1123,7 +1604,12 @@ class OutputParser:
         out = self.feed("", final=True)
         if self.state == "call" and self.stream_tools and self.scall is not None:
             if self.ss == "done":               # only </tool_call> is missing
-                out.append(Event("tool_call", call=self.scall))
+                try:
+                    call = parse_tool_call(self.buf, self.schemas.get(self.scall.name))
+                    call.id = self.scall.id
+                except ValueError:
+                    call = self.scall
+                out.append(Event("tool_call", call=call))
             self.buf = ""
             self._reset_scan()
             return out

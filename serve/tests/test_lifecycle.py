@@ -189,5 +189,23 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(self.request("/v1/load", {}, {"Content-Type": "text/plain"})[0], 415)
 
 
+    def test_llama_protocol_load_and_unload_match_the_v1_routes(self):
+        # pi's /llama extension calls POST /models/load and /models/unload; they must behave
+        # exactly like /v1/load and /v1/unload
+        self.assertEqual(self.request("/models/load", {"model": "other-model"})[0], 404)
+        self.assertEqual(self.engine.starts, 0)
+        before = time.time()
+        code, status = self.request("/models/load", {"model": self.svc.model})
+        self.assertEqual(code, 200)
+        self.assertTrue(status["loaded"])
+        self.assertGreaterEqual(self.svc.last_request_at, before)
+        code, status = self.request("/models/unload", {"model": self.svc.model})
+        self.assertEqual(code, 200)
+        self.assertFalse(status["loaded"])
+        self.assertEqual(self.request("/models/load", {}, {"Content-Type": "text/plain"})[0], 415)
+        self.assertEqual(self.request("/models/load", {}, {"Origin": "https://other.example"})[0], 403)
+        self.assertEqual(self.engine.closes, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

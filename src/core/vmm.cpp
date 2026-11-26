@@ -174,14 +174,18 @@ void release_range(uint8_t* va, uint64_t bytes) {
     if (v.ok && va != nullptr && bytes > 0) v.address_free(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);
 }
 
-unsigned long long map(uint8_t* va, uint64_t bytes) {
+unsigned long long map(uint8_t* va, uint64_t bytes, bool* out_of_memory) {
+    if (out_of_memory) *out_of_memory = false;
     const Fns& v = fns();
     if (!v.ok) return 0;
     const int dev = current_device();
     const CUmemAllocationProp prop = device_prop(dev);
     const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
     CUmemGenericAllocationHandle h = 0;
-    if (v.create(&h, (size_t) bytes, &prop, 0) != CUDA_SUCCESS) return 0;
+    if (const CUresult r = v.create(&h, (size_t) bytes, &prop, 0); r != CUDA_SUCCESS) {
+        if (out_of_memory) *out_of_memory = r == CUDA_ERROR_OUT_OF_MEMORY;
+        return 0;
+    }
     if (v.map(p, (size_t) bytes, 0, h, 0) != CUDA_SUCCESS) {
         v.release(h);
         return 0;
@@ -204,6 +208,38 @@ bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     const bool a = v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes) == CUDA_SUCCESS;
     const bool b = v.release((CUmemGenericAllocationHandle) handle) == CUDA_SUCCESS;
     return a && b;
+}
+
+unsigned long long create(uint64_t bytes) {
+    const Fns& v = fns();
+    if (!v.ok) return 0;
+    const CUmemAllocationProp prop = device_prop(current_device());
+    CUmemGenericAllocationHandle h = 0;
+    return v.create(&h, (size_t) bytes, &prop, 0) == CUDA_SUCCESS ? (unsigned long long) h : 0;
+}
+
+bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
+    const Fns& v = fns();
+    if (!v.ok || handle == 0) return false;
+    const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
+    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) return false;
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = current_device();
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (v.set_access(p, (size_t) bytes, &access, 1) == CUDA_SUCCESS) return true;
+    v.unmap(p, (size_t) bytes);
+    return false;
+}
+
+void unmap_only(uint8_t* va, uint64_t bytes) {
+    const Fns& v = fns();
+    if (v.ok && va != nullptr && bytes > 0) v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);
+}
+
+void release(unsigned long long handle) {
+    const Fns& v = fns();
+    if (v.ok && handle != 0) v.release((CUmemGenericAllocationHandle) handle);
 }
 
 }  // namespace basalt::core::vmm

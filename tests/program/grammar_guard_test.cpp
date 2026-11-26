@@ -25,6 +25,27 @@ static const char* kTools =
     R"({"kind":"tools","tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object",)"
     R"("properties":{"flag":{"type":"boolean"}},"required":["flag"]}}}],"tool_choice":"auto"})";
 
+// a reply of blocks: ids 0 { 1 } 2 "a" 3 : 4 1 5 <|message_model|> 6 <|content_thinking|>
+// 7 <|content_text|> 8 <|end_message|> 9 <|content_model_end_sampling|> 10 hello 11 <think>
+static const char* kBlockVocab =
+    "{\"{\": 0, \"}\": 1, \"\\\"a\\\"\": 2, \":\": 3, \"1\": 4, \"<|message_model|>\": 5, \"<|content_thinking|>\": 6, "
+    "\"<|content_text|>\": 7, \"<|end_message|>\": 8, \"<|content_model_end_sampling|>\": 9, \"hello\": 10, \"<think>\": 11}";
+static const char* kBlockTypes = "[1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 1, 4]";
+
+static PackVocab load_blocks() {
+    ReplyForm f;
+    f.header = "<|message_model|>";
+    f.think_open = "<|content_thinking|>";
+    f.think_close = "<|end_message|>";
+    f.answer_open = "<|content_text|>";
+    set_reply_form(f);
+    PackVocab pv;
+    std::string err;
+    CHECK(vocab_from_pack(kBlockVocab, kBlockTypes, 12, {9}, pv, err));
+    set_reply_form(ReplyForm());
+    return pv;
+}
+
 static PackVocab load() {
     PackVocab pv;
     std::string err;
@@ -125,6 +146,71 @@ int main() {
         int32_t tok = -1;
         CHECK(g.redraw({}, d.draw(), d.read(), tok) == Redraw::drawn);
         CHECK(d.masks[0][10] == 0.0f && std::isinf(d.masks[0][12]));
+    }
+    {   // a reply of blocks: thinking blocks pass, the grammar holds the answer block, the ends wait for the value
+        const PackVocab bv = load_blocks();
+        CHECK(bv.block_header == 5 && bv.think_open == 6 && bv.answer_open == 7 && bv.think_close == 8);
+        CHECK(bv.vocab->end_ids().size() == 2);   // the turn's end and the block's end
+        const int64_t prompt[] = {10, 8};          // the user's turn closed
+        Guard g(bv);
+        CHECK(g.begin(jo, prompt, 2, err));
+        const int32_t think[] = {5, 6, 10, 10, 8, 5, 6, 10, 8, 5, 7, 0, 2, 3};
+        CHECK(g.scan(think, 14, 0) == -1);
+        // mid-object: the turn's end and the block's end are refused, and the redraw's mask has neither
+        const int32_t stop[] = {9};
+        CHECK(g.scan(stop, 1, 0) == 0);
+        Draws d{{4}, {}, {}};
+        int32_t tok = -1;
+        CHECK(g.redraw({}, d.draw(), d.read(), tok) == Redraw::drawn && tok == 4);
+        CHECK(std::isinf(d.masks[0][9]) && std::isinf(d.masks[0][8]) && std::isinf(d.masks[0][5]) && d.masks[0][4] == 0.0f);
+        const int32_t end_early[] = {8};
+        CHECK(g.scan(end_early, 1, 0) == 0);
+        Draws d2{{1}, {}, {}};
+        CHECK(g.redraw({}, d2.draw(), d2.read(), tok) == Redraw::drawn && tok == 1);
+        // complete: the block's end, then only the turn's end
+        const int32_t close[] = {8, 9};
+        CHECK(g.scan(close, 2, 0) == -1);
+        Guard h(bv);
+        CHECK(h.begin(jo, prompt, 2, err));
+        const int32_t more[] = {5, 7, 0, 1, 8, 5};
+        CHECK(h.scan(more, 6, 0) == 5);
+    }
+    {   // a reply of blocks: the answer right after the header (no text tag); the turn's end inside thinking is refused
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(jo, nullptr, 0, err));
+        const int32_t bare[] = {5, 0, 1, 8, 9};
+        CHECK(g.scan(bare, 5, 0) == -1);
+        Guard h(bv);
+        CHECK(h.begin(jo, nullptr, 0, err));
+        const int32_t cut[] = {5, 6, 10, 9};
+        CHECK(h.scan(cut, 4, 0) == 3);
+        Draws d{{10}, {}, {}};
+        int32_t tok = -1;
+        CHECK(h.redraw({}, d.draw(), d.read(), tok) == Redraw::drawn);
+        CHECK(std::isinf(d.masks[0][9]) && d.masks[0][8] == 0.0f && d.masks[0][10] == 0.0f);
+        // before a header only a header; after it, a tag or the value's first text
+        Guard k(bv);
+        CHECK(k.begin(jo, nullptr, 0, err));
+        const int32_t text[] = {10};
+        CHECK(k.scan(text, 1, 0) == 0);
+        Draws d3{{5}, {}, {}};
+        CHECK(k.redraw({}, d3.draw(), d3.read(), tok) == Redraw::drawn && tok == 5);
+        CHECK(d3.masks[0][5] == 0.0f && std::isinf(d3.masks[0][0]) && std::isinf(d3.masks[0][6]));
+        const int32_t text2[] = {10};
+        CHECK(k.scan(text2, 1, 0) == 0);
+        Draws d4{{6}, {}, {}};
+        CHECK(k.redraw({}, d4.draw(), d4.read(), tok) == Redraw::drawn && tok == 6);
+        CHECK(d4.masks[0][0] == 0.0f && d4.masks[0][6] == 0.0f && d4.masks[0][7] == 0.0f && std::isinf(d4.masks[0][10]));
+    }
+    {   // "think": false: no thinking block; the header takes the answer
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"json_object","think":false})", nullptr, 0, err));
+        const int32_t think[] = {5, 6};
+        CHECK(g.scan(think, 2, 0) == 1);
+        const int32_t answer[] = {7, 0, 1, 8, 9};
+        CHECK(g.scan(answer, 5, 0) == -1);
     }
     {   // tool_choice none: no grammar, the guard stays off
         Guard g(pv);

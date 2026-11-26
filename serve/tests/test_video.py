@@ -163,6 +163,18 @@ class Refusals(unittest.TestCase):
                 with self.subTest(bad=bad):
                     self.refused(svc, user(dict(VIDEO, **bad)), "fps|max_frames")
 
+    def test_video_request_limit_stops_reading_once_exceeded(self):
+        with tempfile.TemporaryDirectory() as d:
+            vision = FakeVision(d)
+            reads = []
+            vision.read_video = lambda source, allowed=None: (reads.append(source), b"x" * 6)[1]
+            _, svc = service(vision)
+            with mock.patch("serve.service.VIDEO_REQUEST_BYTES", 10):
+                self.refused(svc, user({"type": "video", "source": "a.mp4"},
+                                       {"type": "video", "source": "b.mp4"},
+                                       {"type": "video", "source": "c.mp4"}), "videos are larger than")
+            self.assertEqual(reads, ["a.mp4", "b.mp4"])  # stopped as soon as the cap was crossed; c.mp4 was never read
+
 
 FAKE = r'''
 import sys

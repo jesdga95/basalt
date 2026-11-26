@@ -1,0 +1,120 @@
+name: review
+
+# `/review [effort=low|medium|high] [model=M] [focus]` in a pull request comment by the owner: a model review of the diff, posted as one comment.
+# The diff, the description and the changed files' whole text are read through the API as data; nothing from the
+# pull request is checked out or run.
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  review:
+    if: >-
+      github.event.issue.pull_request
+      && startsWith(github.event.comment.body, '/review')
+      && github.event.comment.user.login == 'jesdga95'
+      && github.event.comment.author_association == 'OWNER'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: write        # approve the pull request's CI runs that wait for a maintainer
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # Comments (and the reaction) are posted as the GitHub App (basalt-code-review-bot) when it is configured; the token
+      # is pull-requests write only. Without the App they fall back to the workflow's own token.
+      - name: Bot token for comments
+        id: bot
+        if: vars.BASALT_REVIEW_APP_CLIENT_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.BASALT_REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BASALT_REVIEW_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+
+      - name: Command check and 👀
+        id: cmd
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token || github.token }}
+          BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          set -euo pipefail
+          first="$(printf '%s' "${BODY}" | head -n1 | awk '{print $1}')"
+          if [ "${first}" != "/review" ]; then echo "go=false" >> "${GITHUB_OUTPUT}"; exit 0; fi
+          echo "go=true" >> "${GITHUB_OUTPUT}"
+          printf '%s' "${BODY}" | sed '1s|^[[:space:]]*/review||' > "${RUNNER_TEMP}/focus.txt"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" -f content=eyes >/dev/null
+
+      # A fork pull request's CI waits for a maintainer's approval ("Approve and run workflows"); /review is that
+      # approval. Only runs of this pull request's head commit that are waiting (action_required) are approved.
+      - name: Approve the pull request's waiting CI runs
+        if: steps.cmd.outputs.go == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          sha="$(gh pr view "${PR}" --repo "${GITHUB_REPOSITORY}" --json headRefOid --jq .headRefOid)"
+          ids="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&status=action_required&per_page=100" --jq '.workflow_runs[].id')"
+          for id in ${ids}; do
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/approve" >/dev/null && echo "approved run ${id}"
+          done
+          [ -n "${ids}" ] || echo "no CI run is waiting for approval"
+
+      - name: Fetch the diff as data
+        if: steps.cmd.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          if ! gh pr diff "${PR}" --repo "${GITHUB_REPOSITORY}" > "${RUNNER_TEMP}/pr.diff"; then
+            : > "${RUNNER_TEMP}/pr.diff"
+            echo "diff_failed=true" >> "${GITHUB_ENV}"
+          fi
+          cat AGENTS.md CONTRIBUTING.md > "${RUNNER_TEMP}/rules.md"
+          gh pr view "${PR}" --repo "${GITHUB_REPOSITORY}" --json title,body --jq '"# " + .title + "\n\n" + (.body // "")' > "${RUNNER_TEMP}/pr.md" || : > "${RUNNER_TEMP}/pr.md"
+          python3 tools/code_review.py --fetch "${GITHUB_REPOSITORY}" "${PR}" "${RUNNER_TEMP}/files.json" || echo '{}' > "${RUNNER_TEMP}/files.json"
+
+      - name: Review
+        if: steps.cmd.outputs.go == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_DEFAULT_MODEL: ${{ vars.LLM_DEFAULT_MODEL }}
+          LLM_REVIEW_MODELS: ${{ vars.LLM_REVIEW_MODELS }}
+          LLM_REVIEW_EFFORT: ${{ vars.LLM_REVIEW_EFFORT }}
+        run: |
+          set -euo pipefail
+          if [ "${diff_failed:-}" = true ]; then
+            printf '<!-- basalt-code-review -->\nThe diff could not be fetched (it may be over the API limit).' > "${RUNNER_TEMP}/review.md"
+          else
+            python3 tools/code_review.py "${RUNNER_TEMP}/pr.diff" "${RUNNER_TEMP}/rules.md" "${RUNNER_TEMP}/review.md" "$(cat "${RUNNER_TEMP}/focus.txt")" "${RUNNER_TEMP}/pr.md" "${RUNNER_TEMP}/files.json"
+          fi
+
+      - name: Post the review
+        if: steps.cmd.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token || github.token }}
+          PR: ${{ github.event.issue.number }}
+        run: gh pr comment "${PR}" --repo "${GITHUB_REPOSITORY}" --body-file "${RUNNER_TEMP}/review.md"
+
+      - name: Remove 👀
+        if: always() && steps.cmd.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token || github.token }}
+          BOT_LOGIN: ${{ steps.bot.outputs.app-slug && format('{0}[bot]', steps.bot.outputs.app-slug) || 'github-actions[bot]' }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          id="$(gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" --jq '.[] | select(.content == "eyes" and .user.login == env.BOT_LOGIN) | .id' | head -n1)"
+          [ -z "${id}" ] || gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions/${id}" >/dev/null || true

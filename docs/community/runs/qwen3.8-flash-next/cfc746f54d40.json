@@ -1,0 +1,40 @@
+{
+  "submitter": "fpoisson",
+  "date": "2026-11-25",
+  "commit": "2729e2288f",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 4500 Blackwell",
+      "vram_gib": 32,
+      "power_w": 200,
+      "pcie": "5.0 x8"
+    },
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "5.0 x8"
+    }
+  ],
+  "ram_gib": 62,
+  "cpu": "AMD Ryzen 7 9850X3D, 8 cores",
+  "ram_gbps": 54.2,
+  "os": "Windows",
+  "quant": "IQ3_XXS",
+  "kv": "int8",
+  "prefill_16k_tps": 3630.0,
+  "prefill_64k_tps": 4335.0,
+  "decode_tps": 327.1,
+  "decode_conv_tps": 218.9,
+  "decode_struct_tps": 400.7,
+  "decode_prose_tps": 193.4,
+  "accept_conv_pct": 65.8,
+  "accept_struct_pct": 97.1,
+  "accept_prose_pct": 62.4,
+  "draft_len_conv": 2.3,
+  "draft_len_struct": 6.6,
+  "draft_len_prose": 2.0,
+  "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+}
