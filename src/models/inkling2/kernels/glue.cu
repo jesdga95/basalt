@@ -566,6 +566,69 @@ __global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows_all) 
     }
 }
 
+// ctrl_up_kernel for a rank known at compile time: a thread holds one of the 2 kWidth rows' weights in registers and
+// forms that row's gate and filter for 2 of the block's 16 rows whole: the 8 parts' chains ctrl_up_kernel's eight lanes
+// form (part p: weights p rank / 8 .. in order), added in its butterfly's tree (a + b is b + a), so the same bits
+// without shuffles; warp w takes rows 2 w and 2 w + 1, lane l output row 32 blockIdx.x + l.
+template <int RANK>
+__global__ void __launch_bounds__(256) ctrl_up_rows_kernel(CtrlArgs a, int rows_all) {
+    constexpr int kParts = 8, kPer = RANK / kParts, kT = 2, kWords = RANK / 2;
+    static_assert(RANK % 16 == 0 && kT * 8 == kDecodeRows, "parts of whole words; 8 warps of kT rows");
+    __shared__ __align__(16) float hs[kDecodeRows][RANK];
+    const int r0 = (int) blockIdx.z * kDecodeRows;
+    const int rows = min(kDecodeRows, rows_all - r0);
+    const int s = blockIdx.y;
+    const int row = blockIdx.x * 32 + (threadIdx.x & 31), t0 = (threadIdx.x >> 5) * kT;
+    uint32_t ug[kWords], uf[kWords];
+    {
+        const uint4* pg = reinterpret_cast<const uint4*>(a.up[s] + (size_t) row * RANK);
+        const uint4* pf = reinterpret_cast<const uint4*>(a.up[s] + (size_t) (row + kWidth) * RANK);
+#pragma unroll
+        for (int i = 0; i < kWords / 4; ++i) {
+            const uint4 g = pg[i], f = pf[i];
+            ug[4 * i] = g.x, ug[4 * i + 1] = g.y, ug[4 * i + 2] = g.z, ug[4 * i + 3] = g.w;
+            uf[4 * i] = f.x, uf[4 * i + 1] = f.y, uf[4 * i + 2] = f.z, uf[4 * i + 3] = f.w;
+        }
+    }
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    const float* hid = a.scratch + ((size_t) s * kBatchRows + r0) * RANK;
+    for (int i = threadIdx.x; i < rows * RANK; i += blockDim.x) hs[i / RANK][i % RANK] = hid[i];
+    __syncthreads();
+    float pg[kT][kParts], pf[kT][kParts];
+#pragma unroll
+    for (int t = 0; t < kT; ++t)
+#pragma unroll
+        for (int p = 0; p < kParts; ++p) pg[t][p] = pf[t][p] = 0.f;
+#pragma unroll
+    for (int p = 0; p < kParts; ++p)
+#pragma unroll
+        for (int k = 0; k < kPer / 2; ++k) {
+            const int w = p * kPer / 2 + k, kk = 2 * w;
+            const float g0 = __uint_as_float(ug[w] << 16), g1 = __uint_as_float(ug[w] & 0xffff0000u);
+            const float f0 = __uint_as_float(uf[w] << 16), f1 = __uint_as_float(uf[w] & 0xffff0000u);
+#pragma unroll
+            for (int t = 0; t < kT; ++t) {
+                const float2 h = *reinterpret_cast<const float2*>(&hs[t0 + t][kk]);
+                pg[t][p] = fmaf(g1, h.y, fmaf(g0, h.x, pg[t][p]));
+                pf[t][p] = fmaf(f1, h.y, fmaf(f0, h.x, pf[t][p]));
+            }
+        }
+    float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank;
+#pragma unroll
+    for (int tt = 0; tt < kT; ++tt) {
+        const int t = t0 + tt;
+        if (t >= rows) break;
+        const float vg = ((pg[tt][0] + pg[tt][1]) + (pg[tt][2] + pg[tt][3])) + ((pg[tt][4] + pg[tt][5]) + (pg[tt][6] + pg[tt][7]));
+        const float vf = ((pf[tt][0] + pf[tt][1]) + (pf[tt][2] + pf[tt][3])) + ((pf[tt][4] + pf[tt][5]) + (pf[tt][6] + pf[tt][7]));
+        float g, f;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(g) : "f"(vg));
+        asm("tanh.approx.f32 %0, %1;" : "=f"(f) : "f"(vf));
+        const size_t idx = (size_t) (r0 + t) * kWidth + row;
+        yb[((size_t) s * kBatchRows + r0 + t) * kWidth + row] = (1.f - f) * a.dest[s][idx] + g * a.msg[s][idx];
+    }
+}
+
 // The norm into q8_1 (stream 0: or the experts' rows) of stream s and row r's blended controller state.
 __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const int r = blockIdx.x, s = blockIdx.y;
@@ -733,7 +796,8 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");
-    bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), (size_t) up_rows * a.rank * 4, s, a, rows);
+    if (a.rank == 64) bk::launch_pdl(ctrl_up_rows_kernel<64>, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), 0, s, a, rows);
+    else bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), (size_t) up_rows * a.rank * 4, s, a, rows);
     check("controllers/up");
     bk::launch_pdl(ctrl_blend_kernel, dim3((unsigned) rows, (unsigned) streams), dim3(kThreads), 0, s, a);
     check("controllers/blend");
