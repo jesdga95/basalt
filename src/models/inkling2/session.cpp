@@ -462,7 +462,9 @@ public:
                           err))
             return false;
         count_backed();
-        if (!m_.flags().kv_pool && !ensure_positions(m_.context(), err)) return false;   // --kv-pool off: the whole context, held
+        // the caches backed at start: with the pool a granule step of each (a short conversation's admission maps nothing,
+        // and a trim keeps it), without it the whole context, held
+        if (!ensure_positions(m_.flags().kv_pool ? kv_floor() : m_.context(), err)) return false;
         if (heat_tally_) sh_->heat_sessions.push_back(this);
         return true;
     }
@@ -994,6 +996,8 @@ public:
     }
     // The positions a grow maps at once: an allocation granule of a full visit's cache.
     int64_t kv_step() const { return std::max<int64_t>(1, (int64_t) (core::vmm::granularity() / cell_bytes())); }
+    // The positions the caches stay backed for from start to end: one grow step (the pool counts one a slot).
+    int64_t kv_floor() const { return std::min<int64_t>(kv_step(), m_.context()); }
     // The device bytes the pooled caches (the visits' and the drafter's) back now, on card `card` or on every card.
     uint64_t backing_on(int card) const {
         uint64_t n = card == 0 ? dspark_.backing_bytes() : 0;   // DSPARK HOOK
@@ -1014,11 +1018,12 @@ public:
     bool trim_to(int64_t keep) {
         if (!m_.flags().kv_pool) return caches_usable();   // --kv-pool off: a slot keeps its whole context
         uint64_t base[2] = {backing_on(0), m_.cards() > 1 ? backing_on(1) : 0};
+        const int64_t backed_keep = std::max(keep, kv_floor());
         for (size_t i = 0; i < elastic_.size(); ++i) {
             const core::OnDevice on(m_.card_device(elastic_card_[i]));
-            elastic_[i]->trim(cell_bytes() * (uint64_t) keep);
+            elastic_[i]->trim(cell_bytes() * (uint64_t) backed_keep);
         }
-        dspark_.trim(keep);
+        dspark_.trim(backed_keep);
         int64_t moved = 0;
         for (int c = 0; c < m_.cards(); ++c) {
             const uint64_t now = backing_on(c);
