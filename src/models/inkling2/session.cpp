@@ -231,7 +231,7 @@ struct Lane {
     bool ra_on = false, pf_on = false;
     int32_t* win_ids = nullptr;                 // [visit][kMaxRows][n_used] the last window's routed ids (with copies)
     // the next visit's input projection into L2 while a visit's merge waits on the CPU pool: its stream, fork and join
-    // events, and its grid (0: the card's L2 cannot hold it beside the guessed experts)
+    // events, and its grid (0: the card's L2 is too small for it beside the guessed experts)
     cudaStream_t fl_st = nullptr;
     cudaEvent_t fl_ev = nullptr, fl_join = nullptr;
     bool fl_on = false;
@@ -1679,8 +1679,9 @@ private:
         return e;
     }
 
-    // The projection fill's grid on `device`: two blocks a multiprocessor, or 0 when its L2 cannot hold a projection beside
-    // the most a visit's guess or read-ahead requests (that many experts' gate and up parts, any layer).
+    // The projection fill's grid on `device`: two blocks a multiprocessor, or 0 when its L2 is smaller than a projection and
+    // the most a visit's guess or read-ahead requests together (that many experts' gate and up parts, any layer). A size
+    // screen only: nothing keeps the filled lines in L2.
     int fill_blocks(int device) const {
         int sms = 0, l2 = 0;
         if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
