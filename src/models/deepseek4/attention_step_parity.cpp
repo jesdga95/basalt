@@ -6,8 +6,10 @@
 
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace ds4test;
@@ -47,14 +49,17 @@ std::vector<uint8_t> q8_matrix(int rows, int cols, uint32_t seed) {
 }
 
 struct TestBuffers {
-    Dev<float> x{Embd}, q_norm{Rank}, kv_norm{512}, sinks{64};
-    Dev<float> q_latent{Rank}, q_heads{HeadsDim}, kv_projected{512}, kv_row{512};
-    Dev<float> mqa_output{HeadsDim}, output_latent{8192}, output{Embd};
-    Dev<float> mqa_workspace{basalt::kernels::sparse_mqa_workspace_floats(1, 0)};
-    Dev<uint8_t> input_q8{basalt::kernels::native_q8_1_bytes(Embd, 1)};
-    Dev<uint8_t> q_latent_q8{basalt::kernels::sparse_mqa_q_scratch_bytes(1, Rank)};
-    Dev<uint8_t> output_q8{basalt::kernels::sparse_mqa_output_scratch_bytes(1)};
-    Dev<int32_t> pos{1}, win_start{1}, win_n{1};
+    static constexpr int Capacity = 8;
+    Dev<float> x{(size_t) Capacity * Embd}, q_norm{Rank}, kv_norm{512}, sinks{64};
+    Dev<float> q_latent{(size_t) Capacity * Rank}, q_heads{(size_t) Capacity * HeadsDim};
+    Dev<float> kv_projected{(size_t) Capacity * 512}, kv_row{(size_t) Capacity * 512};
+    Dev<float> mqa_output{(size_t) Capacity * HeadsDim}, output_latent{(size_t) Capacity * 8192};
+    Dev<float> output{(size_t) Capacity * Embd};
+    Dev<float> mqa_workspace{basalt::kernels::sparse_mqa_workspace_floats(Capacity, 0)};
+    Dev<uint8_t> input_q8{basalt::kernels::native_q8_1_bytes(Embd, Capacity)};
+    Dev<uint8_t> q_latent_q8{basalt::kernels::sparse_mqa_q_scratch_bytes(Capacity, Rank)};
+    Dev<uint8_t> output_q8{basalt::kernels::sparse_mqa_output_scratch_bytes(Capacity)};
+    Dev<int32_t> pos{Capacity}, win_start{Capacity}, win_n{Capacity};
     Dev<float> ring{(size_t) 128 * 512};
 };
 
@@ -67,7 +72,7 @@ void set_ring(TestBuffers& b, const std::vector<float>& ring, int32_t pos, int32
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace basalt::kernels;
     using namespace basalt::models::deepseek4;
     int devices = 0;
@@ -179,10 +184,91 @@ int main() {
     check(cudaStreamSynchronize(stream), "synchronize attention-layer composition");
     const bool layer_output_equal = next_streams.down() == expected_streams.down();
     const bool layer_ring_equal = actual.ring.down() == direct.ring.down();
+
+    // A two-row decode window must produce the same outputs and cache as two ordered one-row calls.
+    constexpr int T = 2;
+    TestBuffers window, sequential;
+    const auto x_window = randn((size_t) T * Embd, 0x4154533b, 0.12f);
+    const auto ring_window = randn((size_t) 128 * 512, 0x4154533c, 0.04f);
+    window.x.up(x_window);
+    sequential.x.up(x_window);
+    window.q_norm.up(q_norm); sequential.q_norm.up(q_norm);
+    window.kv_norm.up(kv_norm); sequential.kv_norm.up(kv_norm);
+    window.sinks.up(sinks); sequential.sinks.up(sinks);
+    window.ring.up(ring_window); sequential.ring.up(ring_window);
+    const std::vector<int32_t> pos_window = {131, 132};
+    const std::vector<int32_t> start_window = {4, 5};
+    const std::vector<int32_t> count_window = {128, 128};
+    window.pos.up(pos_window); window.win_start.up(start_window); window.win_n.up(count_window);
+    weights.q.q_norm = window.q_norm.p;
+    weights.kv_norm = window.kv_norm.p;
+    weights.sinks = window.sinks.p;
+    SparseMqaArgs window_selection = selection;
+    window_selection.n_tokens = T;
+    window_selection.pos = window.pos.p;
+    window_selection.win_start = window.win_start.p;
+    window_selection.win_n = window.win_n.p;
+    AttentionStepScratch window_scratch{window.input_q8.p, window.q_latent.p, window.q_latent_q8.p,
+        window.q_heads.p, window.kv_projected.p, window.kv_row.p, window.mqa_output.p,
+        window.mqa_workspace.p, window.output_q8.p, window.output_latent.p, window.output.p};
+    attention_step(window.x.p, weights, rope, window.ring.p, window_selection, window_scratch, stream);
+
+    // Compare with sequential calls, refreshing each row's positions and causal window bounds.
+    for (int t = 0; t < T; ++t) {
+        sequential.pos.up(std::vector<int32_t>{pos_window[(size_t) t]});
+        sequential.win_start.up(std::vector<int32_t>{start_window[(size_t) t]});
+        sequential.win_n.up(std::vector<int32_t>{count_window[(size_t) t]});
+        weights.q.q_norm = sequential.q_norm.p;
+        weights.kv_norm = sequential.kv_norm.p;
+        weights.sinks = sequential.sinks.p;
+        SparseMqaArgs one = selection;
+        one.n_tokens = 1;
+        one.pos = sequential.pos.p;
+        one.win_start = sequential.win_start.p;
+        one.win_n = sequential.win_n.p;
+        AttentionStepScratch one_scratch{sequential.input_q8.p, sequential.q_latent.p, sequential.q_latent_q8.p,
+            sequential.q_heads.p, sequential.kv_projected.p, sequential.kv_row.p, sequential.mqa_output.p,
+            sequential.mqa_workspace.p, sequential.output_q8.p, sequential.output_latent.p,
+            sequential.output.p + (size_t) t * Embd};
+        attention_step(sequential.x.p + (size_t) t * Embd, weights, rope, sequential.ring.p, one, one_scratch, stream);
+    }
+    check(cudaStreamSynchronize(stream), "synchronize multi-row attention-window parity");
+    const auto window_output = window.output.down();
+    const auto sequential_output = sequential.output.down();
+    const auto window_ring = window.ring.down();
+    const auto sequential_ring = sequential.ring.down();
+    bool window_equal = true;
+    for (size_t i = 0; i < (size_t) T * Embd; ++i) window_equal &= window_output[i] == sequential_output[i];
+    const bool window_ring_equal = window_ring == sequential_ring;
     std::printf("DeepSeek4 attention sublayer composition: streams %s; cache %s; mHC and attention primitives composed\n",
                 layer_output_equal ? "bitwise" : "DIFFERS", layer_ring_equal ? "bitwise" : "DIFFERS");
+    std::printf("DeepSeek4 attention decode window T=2 vs sequential T=1: output %s; ring state %s\n",
+                window_equal ? "bitwise" : "DIFFERS", window_ring_equal ? "bitwise" : "DIFFERS");
     std::printf("DeepSeek4 one-token attention step: output %s; ring state %s; Q8_0 checkpoint geometry %d/%d/%d\n",
                 output_equal ? "bitwise" : "DIFFERS", ring_equal ? "bitwise" : "DIFFERS", Embd, Rank, HeadsDim);
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        constexpr int BenchT = 8;
+        std::vector<int32_t> bench_pos(BenchT), bench_start(BenchT), bench_count(BenchT, 128);
+        for (int t = 0; t < BenchT; ++t) {
+            bench_pos[(size_t) t] = 256 + t;
+            bench_start[(size_t) t] = 129 + t;
+        }
+        window.x.up(randn((size_t) BenchT * Embd, 0x4154533d, 0.12f));
+        window.ring.up(ring_window);
+        window.pos.up(bench_pos); window.win_start.up(bench_start); window.win_n.up(bench_count);
+        window_selection.n_tokens = BenchT;
+        window_scratch.output = window.output.p;
+        const double us = bench_stream_us([&](void* s) {
+            attention_step(window.x.p, weights, rope, window.ring.p, window_selection, window_scratch, s);
+        });
+        // This Q8_0 fixture reads each projection matrix once and 64 heads x 128 rows x 512 floats per query.
+        constexpr uint64_t q8_block_bytes = 34;
+        const uint64_t projection_bytes = (uint64_t) (1024 * Embd + 64 * 512 * 1024 + 512 * Embd +
+                                                        8 * 1024 * Embd + Embd * 8 * 1024) / 32 * q8_block_bytes;
+        const uint64_t attention_bytes = (uint64_t) BenchT * 64 * kSparseMqaWindow * 512 * sizeof(float);
+        bench_line("deepseek4 attention decode window T=8", us,
+                   projection_bytes + attention_bytes);
+    }
     cudaStreamDestroy(stream);
-    return output_equal && ring_equal && layer_output_equal && layer_ring_equal ? 0 : 1;
+    return output_equal && ring_equal && layer_output_equal && layer_ring_equal && window_equal && window_ring_equal ? 0 : 1;
 }

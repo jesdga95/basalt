@@ -18,15 +18,16 @@ void attention_layer_step(const float* streams, const AttentionLayerWeights& wei
                           kernels::SparseMqaArgs selection, const AttentionLayerScratch& scratch,
                           float* next_streams, void* stream) {
     const int n_embd = weights.hc.n_embd;
+    const int n_tokens = selection.n_tokens;
     if (!streams || !next_streams || streams == next_streams || !weights.hc_fn || !weights.hc_scale ||
         !weights.hc_base || !weights.norm || !window_ring || !scratch.hc_workspace || !scratch.coefficients ||
         !scratch.collapsed || !scratch.normalized || !scratch.attention.output || weights.hc.sinkhorn_iters <= 0 ||
-        n_embd <= 0 || weights.attention.q.n_embd != n_embd || selection.n_tokens != 1)
+        n_embd <= 0 || weights.attention.q.n_embd != n_embd || selection.n_tokens <= 0 || selection.n_tokens > 8)
         throw std::invalid_argument("deepseek4 attention layer: invalid weights, state, or workspace");
 
-    kernels::hc_mixes(streams, weights.hc_fn, weights.hc_scale, weights.hc_base, 1, weights.hc,
+    kernels::hc_mixes(streams, weights.hc_fn, weights.hc_scale, weights.hc_base, n_tokens, weights.hc,
                       scratch.hc_workspace, scratch.coefficients, stream);
-    kernels::hc_pre_rms_norm(streams, scratch.coefficients, kernels::kHcCoef, weights.norm, 1, n_embd,
+    kernels::hc_pre_rms_norm(streams, scratch.coefficients, kernels::kHcCoef, weights.norm, n_tokens, n_embd,
                              weights.hc.rms_eps, scratch.collapsed, scratch.normalized, stream);
     attention_step(scratch.normalized, weights.attention, rope, window_ring, selection, scratch.attention, stream);
     kernels::hc_post(scratch.attention.output, streams, scratch.coefficients, kernels::kHcCoef, 1, n_embd,

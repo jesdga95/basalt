@@ -48,9 +48,10 @@ struct AttentionStepScratch {
     float* output = nullptr;
 };
 
-/// One token's attention projection, sliding cache update, sparse MQA and grouped output projection. `selection` supplies
-/// device positions, window bounds and optional preselected compressed rows for the same token; its other inputs are set
-/// from `weights`, `window_ring` and `rope`. Caller owns all device storage.
+/// Runs a 1..8 row decode window through attention projection, sliding-cache update, sparse MQA and grouped output
+/// projection. `selection` supplies per-row device positions, window bounds and optional preselected compressed rows;
+/// its other inputs are set from `weights`, `window_ring` and `rope`. Caller owns all device storage and sizes scratch for
+/// `selection.n_tokens` rows. Cache slots must be unique within the window.
 void attention_step(const float* x, const AttentionStepWeights& weights, const kernels::MqaRopeTable& rope,
                    float* window_ring, kernels::SparseMqaArgs selection, const AttentionStepScratch& scratch,
                    void* stream);

@@ -23,8 +23,8 @@ struct AttentionLayerScratch {
     AttentionStepScratch attention;
 };
 
-/// Runs one V4 attention sublayer for one token. `streams` and `next_streams` are [4][n_embd].
-/// The output does not alias the input; all scratch and cache storage belongs to the caller.
+/// Runs a V4 attention sublayer for a 1..8 row window. `streams` and `next_streams` are [T][4][n_embd].
+/// `selection.n_tokens` is T. The output does not alias the input; all scratch and cache storage belongs to the caller.
 void attention_layer_step(const float* streams, const AttentionLayerWeights& weights, const kernels::MqaRopeTable& rope,
                          float* window_ring, kernels::SparseMqaArgs selection, const AttentionLayerScratch& scratch,
                          float* next_streams, void* stream);

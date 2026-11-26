@@ -67,7 +67,9 @@ if(BUILD_TESTING)
                                                                ${_gpu_include_directories})
   target_link_libraries(ds4_attention_step_parity PRIVATE deepseek4_kernels core ${_gpu_runtime_target})
   basalt_gpu_test(NAME ds4_attention_step_parity COMMAND ds4_attention_step_parity)
+  basalt_gpu_test(NAME ds4_attention_step_bench COMMAND ds4_attention_step_parity --bench)
   set_tests_properties(ds4_attention_step_parity PROPERTIES SKIP_RETURN_CODE 77)
+  set_tests_properties(ds4_attention_step_bench PROPERTIES SKIP_RETURN_CODE 77)
 
   add_executable(ds4_ffn_route_parity src/models/deepseek4/ffn_route_parity.cpp)
   target_include_directories(ds4_ffn_route_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
