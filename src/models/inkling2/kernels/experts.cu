@@ -79,8 +79,8 @@ struct Finish {
 // entry the same bits. MXFP8 rows are twice the bytes: two stages for the wider tiles.
 constexpr int kSmallPairs = 128, kWidePairs = 1024;
 template<int TY, int K> using Small = xt::Cfg<TY, K, 8, 64, 3>;
-template<int TY, int K> using Mid = xt::Cfg<TY, K, 16, 128, TY == xt::kNvfp4 ? 3 : 2>;
-template<int TY, int K> using Wide = xt::Cfg<TY, K, 32, 64, TY == xt::kNvfp4 ? 3 : 2>;
+template<int TY, int K> using Mid = xt::Cfg<TY, K, 16, 128, 2>;
+template<int TY, int K> using Wide = xt::Cfg<TY, K, 32, 64, 2>;
 
 xt::Plan plan_of(const ExpertCall& e) {
     xt::Plan p;
