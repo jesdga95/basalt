@@ -3,11 +3,11 @@
 
 The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-token chunks, second half scored). The
 engine runs as `--serve` with the model plus --ppl-base and --ppl-out; per chunk it reads the first half as a prompt
-and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). It sets --spec 5 and,
-when there are two visible GPUs, --gpu 0,1. `--architecture qwen4exp` also disables adaptive swaps so placement stays
+and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). It sets --spec 5 for models
+with a drafter and --spec 0 for `deepseek4`, whose target pack has no drafter. With two visible GPUs it uses --gpu 0,1. `--architecture qwen4exp` also disables adaptive swaps so placement stays
 fixed. Flags passed after the tool's options replace these defaults.
 
-  python3 tools/ppl_gate.py --model FILE.basalt --architecture qwen4exp|inkling2|other \
+  python3 tools/ppl_gate.py --model FILE.basalt --architecture qwen4exp|deepseek4|inkling2|other \
                              --base base.kld --out DIR [--engine-bin BIN] [--chunks 20] [--t 3]
                              [--gpu 0 ...]
   python3 tools/ppl_gate.py --report DIR/rows.tsv          # summary of a finished run
@@ -141,13 +141,19 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
     return out
 
 
+def architecture_args(architecture: str) -> list[str]:
+    """Architecture-specific quality-gate defaults, before explicit caller overrides."""
+    args = ["--spec", "0" if architecture == "deepseek4" else "5"]
+    if architecture == "qwen4exp":
+        args += ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
+    return args
+
+
 def run(a) -> int:
     n_ctx, n_vocab, n_chunk, chunks = read_base(a.base)
     first = n_ctx // 2
     model_path = Path(a.model)
-    args = ["--model", str(model_path.resolve()), "--spec", "5"]
-    if a.architecture == "qwen4exp":
-        args += ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
+    args = ["--model", str(model_path.resolve()), *architecture_args(a.architecture)]
     args += ["--max-context", "4096"]
     if gpu_count() > 1:
         args += ["--gpu", "0,1", "--gpu-mode", "peer"]   # a model that only splits: add --gpu-mode split
@@ -235,7 +241,7 @@ def run(a) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", help="the .basalt file")
-    ap.add_argument("--architecture", choices=("qwen4exp", "inkling2", "other"),
+    ap.add_argument("--architecture", choices=("qwen4exp", "deepseek4", "inkling2", "other"),
                     help="model architecture; selects architecture-specific measurement controls")
     ap.add_argument("--engine-bin", default=str(ENGINE_BIN) if ENGINE_BIN.is_file() else None,
                     help="the engine binary (default: bin/basalt in the repo)")

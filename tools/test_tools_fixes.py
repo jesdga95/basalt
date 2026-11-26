@@ -251,6 +251,11 @@ class TestGreedyIdentity(unittest.TestCase):
 
 
 class TestPplGate(unittest.TestCase):
+    def test_deepseek4_gate_defaults_to_plain_decode(self):
+        self.assertEqual(ppl.architecture_args("deepseek4"), ["--spec", "0"])
+        self.assertEqual(ppl.architecture_args("qwen4exp"),
+                         ["--spec", "5", "--adapt-swaps", "0", "--peer-adapt-swaps", "0"])
+
     @staticmethod
     def _row(chunk, pos, nll, nllb, kld, same=1, top="10", dlp=0.01):
         return f"{chunk}\t{pos}\t1\t{nll}\t{nllb}\t{kld}\t{same}\t{top}\t{top}\t{dlp}\n"
