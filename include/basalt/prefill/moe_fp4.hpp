@@ -82,6 +82,7 @@ struct Product {
     int64_t blocks = 0;
     const int32_t* dst_ids = nullptr;
     float gate_softcap = 0.0f, up_softcap = 0.0f;
+    float swiglu_limit = 0.0f;   ///< > 0: Hy4's min/max SwiGLU clamp after the tail scales (0: off)
     bool two = false;   ///< the activations as two FP4 terms (quantize's `two`: planes of 2 * w_cols values a row)
 };
 void run(const Product& p, void* stream);

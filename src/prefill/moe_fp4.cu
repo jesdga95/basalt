@@ -363,6 +363,7 @@ struct GemmArgs {
     int n;
     const int32_t* dst_ids;   // FLAT: output row r to dst row dst_ids[r] (null: r)
     float cg, cu;             // FLAT SWIGLU: the softcaps (cg > 0)
+    float lim;                // SWIGLU: Hy4's min/max clamp after the tail scales (0: off)
 };
 
 // The weight row behind B tile row sr of block rb: 128 consecutive rows, or (SWIGLU) the block's 64 gate rows and the
@@ -393,10 +394,11 @@ __device__ __forceinline__ float swiglu_cap(float g, float u, float4 s, float cg
     return __fmul_rn(__fmul_rn(cg * tg, sig), cu * tu) * s.z;
 }
 
-__device__ __forceinline__ float swiglu_tail(float g, float u, float4 s) {
+__device__ __forceinline__ float swiglu_tail(float g, float u, float4 s, float lim) {
     float g1, u1, t, e, d, rc, q, p, h;
     asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(g1) : "f"(g), "f"(s.x));
     asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(u1) : "f"(u), "f"(s.y));
+    if (lim > 0.0f) { g1 = fminf(g1, lim); u1 = fminf(fmaxf(u1, -lim), lim); }
     asm("mul.rn.ftz.f32 %0, %1, 0fBFB8AA3B;" : "=f"(t) : "f"(g1));
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(t));
     asm("add.rn.ftz.f32 %0, %1, 0f3F800000;" : "=f"(d) : "f"(e));
@@ -613,8 +615,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
 #pragma unroll
                 for (int r = 0; r < 2; ++r)
                     *(float2*) (out + 8 * r) =
-                        make_float2(swiglu_tail(__fmul_rn(acc[mt][r][2 * h], g), __fmul_rn(acc[mt][r + 2][2 * h], g), tail),
-                                    swiglu_tail(__fmul_rn(acc[mt][r][2 * h + 1], g), __fmul_rn(acc[mt][r + 2][2 * h + 1], g), tail));
+                        make_float2(swiglu_tail(__fmul_rn(acc[mt][r][2 * h], g), __fmul_rn(acc[mt][r + 2][2 * h], g), tail, a.lim),
+                                    swiglu_tail(__fmul_rn(acc[mt][r][2 * h + 1], g), __fmul_rn(acc[mt][r + 2][2 * h + 1], g), tail, a.lim));
             } else {
                 float* out = a.dst + (row0 + t) * a.ld_dst + rb * kRowsPerBlock + warp_n * 32 + 2 * tig;
 #pragma unroll
@@ -875,8 +877,10 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
     const cudaStream_t s = (cudaStream_t) stream;
     if (two) {
         if (cols == 1152) quantize_kernel<3, false, true><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+        else if (cols == 1536) quantize_kernel<3, false, true><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
         else { basalt::log::error("basalt", "prefill fp4: %lld columns (two terms)", (long long) cols); std::exit(1); }
-    } else if (cols == 2560) quantize_kernel<5, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+    } else if (cols == 1536) quantize_kernel<3, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+    else if (cols == 2560) quantize_kernel<5, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 640) quantize_kernel<2, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 5120) quantize_kernel<10, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 17408) quantize_kernel<34, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
@@ -903,8 +907,10 @@ void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, v
     const cudaStream_t s = (cudaStream_t) stream;
     if (two) {
         if (cols == 2304) quantize_kernel<5, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+        else if (cols == 1536) quantize_kernel<3, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
         else { basalt::log::error("basalt", "prefill fp4: %lld token columns (two terms)", (long long) cols); std::exit(1); }
-    } else if (cols == 2560) quantize_kernel<5, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+    } else if (cols == 1536) quantize_kernel<3, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+    else if (cols == 2560) quantize_kernel<5, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
     else if (cols == 640) quantize_kernel<2, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
     else { basalt::log::error("basalt", "prefill fp4: %lld columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize tokens");
@@ -957,10 +963,10 @@ void run(const Product& p, void* stream) {
         a.tail_off = p.tail_off;
         a.a4s = p.ids ? (const uint8_t*) p.a4 + (size_t) p.tokens * (size_t) ((p.two ? 2 : 1) * p.w_cols / 2) : nullptr;
         a.base = p.base; a.stride = p.stride; a.blk_off = p.blk_off; a.n = p.n; a.dst_ids = p.dst_ids;
-        a.cg = p.gate_softcap; a.cu = p.up_softcap;
+        a.cg = p.gate_softcap; a.cu = p.up_softcap; a.lim = p.swiglu_limit;
         const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) p.blocks, 1);
         if (p.two) {
-            if (p.w_rows % kRows256 == 0) {
+            if (p.w_rows % kRows256 == 0 && p.w_cols != 1536) {
                 const dim3 grid256((unsigned) (p.w_rows / kRows256), (unsigned) p.blocks, 1);
                 if (p.swiglu) launch256<true, true>(a, grid256, (cudaStream_t) stream);
                 else launch256<false, false>(a, grid256, (cudaStream_t) stream);

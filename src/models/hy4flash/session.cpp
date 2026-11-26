@@ -30,6 +30,7 @@
 #include "basalt/prefill/cpu_split.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -108,6 +109,10 @@ struct Bufs {
     int32_t *icells = nullptr, *meta_d = nullptr, *meta_h = nullptr, *ids = nullptr, *pair_map = nullptr, *pair_ident = nullptr,
             *mmq_ident = nullptr;
     void* mmq_xq = nullptr;
+    uint8_t *fp4_a4x = nullptr, *fp4_a4h = nullptr;
+    float* fp4_h = nullptr;
+    float *fp4_gsx = nullptr, *fp4_gsh = nullptr;
+    int32_t *fp4_rel = nullptr, *fp4_toh = nullptr;
     void release() {
         for (void* p : dev) cudaFree(p);
         for (void* p : host) cudaFreeHost(p);
@@ -416,6 +421,16 @@ public:
                 b.mmq_xq = q;
             }
         }
+        {
+            const int L = (int) g_.n_latent, F = (int) g_.n_ff_exp;
+            b.fp4_a4x = (uint8_t*) f((basalt::prefill::fp4::token_bytes(R, L) + 3) / 4);
+            b.fp4_gsx = f(R);
+            b.fp4_a4h = (uint8_t*) f((basalt::prefill::fp4::a4_bytes(kLaunchRows, F, kStageExperts) + 3) / 4);
+            b.fp4_h = f((int64_t) kLaunchRows * F);
+            b.fp4_gsh = f(basalt::prefill::fp4::scale_count(kLaunchRows, kStageExperts));
+            b.fp4_rel = (int32_t*) f(kStageExperts + 1);
+            b.fp4_toh = (int32_t*) f(kStageExperts + 1);
+        }
         if (!ok) {
             b.release();
             cudaGetLastError();   // a smaller try must not find this failed allocation as the last error of its first launch
@@ -441,6 +456,8 @@ public:
         icells_ = b.icells; meta_d_ = b.meta_d; meta_h_ = b.meta_h; gu_ = b.gu; h_ = b.h; rlog_ = b.rlog; rw_ = b.rw; ids_ = b.ids;
         xlat_ = b.xlat; lat_out_ = b.lat_out; moe_out_ = b.moe_out; sh_ = b.sh; erows_ = b.erows; ekv_ = b.ekv; evalid_ = b.evalid;
         pair_rows_ = b.pair_rows; pair_map_ = b.pair_map; pair_ident_ = b.pair_ident; mmq_ident_ = b.mmq_ident; mmq_xq_ = b.mmq_xq;
+        fp4_a4x_ = b.fp4_a4x; fp4_gsx_ = b.fp4_gsx; fp4_a4h_ = b.fp4_a4h; fp4_gsh_ = b.fp4_gsh; fp4_rel_ = b.fp4_rel; fp4_toh_ = b.fp4_toh;
+        fp4_h_ = b.fp4_h;
         h_erows_ = b.h_erows; h_e_ = b.h_e; h_evalid_ = b.h_evalid;
     }
 
@@ -2240,6 +2257,7 @@ private:
     // gate/up product, the clamped SwiGLU and the down product, and a pair's output row is kept for the weighted sum.
     bool moe_prompt(int l, int tl, int R, const kernels::NativeExpertLayout& lay, std::string& err) {
         namespace mmq = basalt::prefill::mmq;
+        namespace fp4 = basalt::prefill::fp4;
         const int K = g_.n_used, L = g_.n_latent, F = g_.n_ff_exp;
         const ExpertLayer& el = m_.pack().experts[(size_t) l];
         if (!mmq::fits(el.gu_type, 2 * F) || !mmq::fits(el.d_type, L)) {
@@ -2249,6 +2267,8 @@ private:
         if (loaded_.insert({el.gu_type, 2 * F}).second) mmq::load(el.gu_type, 2 * F);
         if (loaded_.insert({el.d_type, L}).second) mmq::load(el.d_type, L);
         cudaStream_t st = stream_;
+        const bool fp4_prompt = std::getenv("BASALT_FP4_PROMPT") != nullptr;
+        if (fp4_prompt) fp4::quantize_tokens(xlat_, R, L, L, fp4_a4x_, fp4_gsx_, st, false);
         std::vector<int32_t> hid((size_t) R * K);
         const double t0 = now_ms();
         cudaStreamSynchronize(st);
@@ -2322,6 +2342,28 @@ private:
                           const std::vector<int32_t>& bounds) {
             put_i32(B.tok, tok.data(), tok.size());
             put_i32(B.bounds, bounds.data(), bounds.size());
+            if (fp4_prompt) {
+                fp4::Product gu;
+                for (int q = 0; q < nb; ++q) gu.blob[q] = blobs + (size_t) q * stride_;
+                gu.w_off = 0; gu.w_rows = 2 * (int64_t) F; gu.w_cols = L; gu.n = nb;
+                gu.a4 = fp4_a4x_; gu.gs = fp4_gsx_; gu.ids = B.tok; gu.tokens = R;
+                gu.bounds = B.bounds; gu.swiglu = true; gu.tail_off = lay.bytes - 16;
+                gu.swiglu_limit = g_.clamp_exp[(size_t) l];
+                gu.dst = fp4_h_; gu.ld_dst = F; gu.max_rows = max_rows;
+                fp4::run(gu, st);
+                fp4::rebase(B.bounds, nb, fp4_rel_, st);
+                fp4::plan(fp4_rel_, nb, fp4_toh_, st);
+                fp4::quantize(fp4_h_, nullptr, fp4_rel_, fp4_toh_, nb, fp4_a4h_, fp4_gsh_, F, F, rows, st, false);
+                fp4::Product dn;
+                for (int q = 0; q < nb; ++q) dn.blob[q] = blobs + (size_t) q * stride_;
+                dn.w_off = lay.down_off; dn.w_rows = L; dn.w_cols = F; dn.n = nb;
+                dn.a4 = fp4_a4h_; dn.gs = fp4_gsh_; dn.bounds = fp4_rel_; dn.tile_off = fp4_toh_;
+                dn.max_rows = max_rows; dn.dst = pair_rows_ + (size_t) pos * L; dn.ld_dst = L;
+                fp4::run(dn, st);
+                cudaEventRecord(B.done, st);
+                pos += rows;
+                return;
+            }
             mmq::quantize(xlat_, B.tok, xq1_, el.gu_type, L, L, rows, st);
             mmq::Product p;
             p.w = blobs;
@@ -2999,6 +3041,10 @@ private:
     int32_t* pos_h_ = nullptr;   // its pinned host copy (a window ends synchronized, so the last copy has read it)
     void* attw_ = nullptr;   // the chunked attention's workspace
     int cells_stride_ = 0, rows_ = 0, arows_ = 0, steps_ = 0, max_heads_ = 0;
+    uint8_t *fp4_a4x_ = nullptr, *fp4_a4h_ = nullptr;
+    float* fp4_h_ = nullptr;
+    float *fp4_gsx_ = nullptr, *fp4_gsh_ = nullptr;
+    int32_t *fp4_rel_ = nullptr, *fp4_toh_ = nullptr;
     static constexpr size_t kStageInts = (size_t) 4 << 20;   // the mapped staging of a prompt's small inputs
     int32_t *stage_h_ = nullptr, *stage_d_ = nullptr, *bounds_tab_ = nullptr;
     size_t stage_at_ = 0;
