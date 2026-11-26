@@ -17,12 +17,15 @@
 #include <algorithm>
 #include <iterator>
 #include <numeric>
+#include <string_view>
 
 namespace basalt::models::hy4flash {
 namespace {
 constexpr uint64_t kGiB = 1ull << 30;
+constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;   // ggml's BF16
+constexpr std::string_view kRouterSuffix = "ffn_gate_inp.weight";
 // CPU uses of a missed expert that earn it a slot on the card
 constexpr int kAdmitUses = 2;
 // copies a decode window may claim per row (a window's rows route to mostly different experts)
@@ -173,6 +176,14 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
             d.type = kTypeQ8_0;
             d.bytes = t.shape[0] * t.shape[1] / 32 * 34;
         }
+        // The router's weights are BF16 in the checkpoint and F32 in the pack (low 16 bits are zero): load as BF16
+        // (exact bit-for-bit logits, 123 MiB VRAM saved -> ~32 more expert slots on GPU 0, half router traffic).
+        const bool router_bf16 = t.type == kTypeF32 && name.size() > kRouterSuffix.size() &&
+                                 name.compare(name.size() - kRouterSuffix.size(), kRouterSuffix.size(), kRouterSuffix) == 0;
+        if (router_bf16) {
+            d.type = kTypeBF16;
+            d.bytes = t.bytes / 2;
+        }
         // the prompt products (MMQ) read the last row of a matrix whose rows are not a multiple of 256 values on to the next
         // multiple: zeros past the end, so the read stays inside the allocation wherever it lies
         const uint64_t past = !t.shape.empty() && prefill::mmq::supported(d.type) ? prefill::mmq::read_past_bytes(d.type, (int64_t) t.shape[0]) : 0;
@@ -185,6 +196,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         it.dev = d.ptr;
         it.device = device_;
         if (head_q8) it.conv = core::Conv::Bf16ToQ8_0;
+        if (router_bf16) it.conv = core::Conv::Bf16High;
         reads.add(it);
         dense += d.bytes;
         dev_.emplace(name, std::move(d));

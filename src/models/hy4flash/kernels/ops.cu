@@ -1,14 +1,19 @@
 // src/models/hy4flash/kernels/ops.cu - the sigmoid gate, small products, the stream fill and the Engram apply of
 // Hy4-flash.
+#include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/models/hy4flash/kernels.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace basalt::models::hy4flash {
 namespace {
+namespace bk = basalt::kernels;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -32,6 +37,8 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 __device__ __forceinline__ float sigmoidf(float v) { return 1.f / (1.f + expf(-v)); }
 
 __global__ void mul_sigmoid_kernel(const float* __restrict__ g, float* __restrict__ x, int n) {
+    bk::pdl_launch_dependents();
+    bk::pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= sigmoidf(g[i]);
 }
@@ -230,7 +237,7 @@ __global__ void engram_kernel(const float* __restrict__ kv, const float* __restr
 }  // namespace
 
 void mul_sigmoid(const float* g, float* x, int n, void* stream) {
-    mul_sigmoid_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(g, x, n);
+    bk::launch_pdl(mul_sigmoid_kernel, dim3((unsigned) ((n + 255) / 256)), dim3(256), 0, (cudaStream_t) stream, g, x, n);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
@@ -241,6 +248,8 @@ void f32_gemm_rows(const float* x, const float* w, int rows, int cols, float sca
 }
 
 __global__ void add_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, int n) {
+    bk::pdl_launch_dependents();
+    bk::pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
 }
@@ -253,6 +262,8 @@ template <int E>
 __global__ void __launch_bounds__(512) add_norm_hc_post_kernel(const float* __restrict__ a, const float* __restrict__ b,
                                                                const float* __restrict__ w, float eps, const float* __restrict__ x,
                                                                const float* __restrict__ coef, int coef_stride, float* __restrict__ out) {
+    bk::pdl_launch_dependents();
+    bk::pdl_wait();
     static_assert(E % 512 == 0, "each of the 512 threads takes whole values");
     constexpr int kPer = E / 512, n4 = E / 4;
     __shared__ float red[16];
@@ -306,7 +317,8 @@ void add_norm_hc_post(const float* a, const float* b, const float* w, float eps,
     // a decode window's few rows spread over 4 blocks each (one round of loads a thread, on 4x the SMs); a prompt chunk's rows
     // fill the card already, so a block takes a whole row and the norm is read once a row
     const unsigned slices = n_tokens <= 8 ? 4 : 1;
-    add_norm_hc_post_kernel<3072><<<dim3((unsigned) n_tokens, slices), 512, 0, (cudaStream_t) stream>>>(a, b, w, eps, x, coef, coef_stride, out);
+    bk::launch_pdl(add_norm_hc_post_kernel<3072>, dim3((unsigned) n_tokens, slices), dim3(512), 0, (cudaStream_t) stream,
+                   a, b, w, eps, x, coef, coef_stride, out);
 }
 
 // a sliding-window layer's row spans from the window's first position, read on the card (so a captured graph replays them for any
@@ -326,7 +338,7 @@ void swa_meta(const int32_t* pos0, int R, int window, int arows, int32_t* meta, 
 }
 
 void add_vectors(const float* a, const float* b, float* out, int n, void* stream) {
-    add_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(a, b, out, n);
+    bk::launch_pdl(add_kernel, dim3((unsigned) ((n + 255) / 256)), dim3(256), 0, (cudaStream_t) stream, a, b, out, n);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
@@ -382,6 +394,153 @@ void engram_norm_e4m3(const uint8_t* raw, const float* norm_w, const float* vali
 void engram_apply(const float* kv, const float* kv_b, const float* gate_w, const float* pre_gamma, const float* hc_scale,
                   const float* valid, int n_tok, const EngramArgs& a, float* x, void* stream) {
     engram_kernel<<<dim3(4, n_tok), kEngramThreads, 0, (cudaStream_t) stream>>>(kv, kv_b, gate_w, pre_gamma, hc_scale, valid, a, x);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+namespace {
+struct Q80B {
+    half d;
+    int8_t qs[32];
+};
+struct Q81B {
+    half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q80B) == 34 && sizeof(Q81B) == 36);
+
+struct Q8xArgs {
+    const Q80B* w[kQ8xMats];
+    const Q81B* x[kQ8xMats];
+    float* y[kQ8xMats];
+    int n_out[kQ8xMats];
+    int end[kQ8xMats];
+    int n;
+};
+
+__device__ __forceinline__ int q8x_word_b2(const int8_t* qs, int i) {
+    const auto* p = reinterpret_cast<const uint16_t*>(qs);
+    int v = p[2 * i];
+    v |= p[2 * i + 1] << 16;
+    return v;
+}
+
+template <int NC, int R, int IT>
+__global__ void __launch_bounds__(128) hy4_q8x_kernel(Q8xArgs a) {
+    int m = 0;
+    while (m < a.n - 1 && (int) blockIdx.x >= a.end[m]) ++m;
+    const int bx = (int) blockIdx.x - (m ? a.end[m - 1] : 0);
+    const Q80B* __restrict__ w = a.w[m];
+    const int n_out = a.n_out[m], row0 = bx * R;
+    const int tid = 32 * (int) threadIdx.y + (int) threadIdx.x;
+    const int kbx0 = tid >> 2, kqs = 2 * (tid & 3);
+    constexpr int bpr = IT * 32;
+    int v0[R][IT], v1[R][IT];
+    float d0[R][IT];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, n_out - 1);
+#pragma unroll
+        for (int it = 0; it < IT; ++it) {
+            const Q80B* b = w + (size_t) row * bpr + kbx0 + 32 * it;
+            v0[r][it] = q8x_word_b2(b->qs, kqs);
+            v1[r][it] = q8x_word_b2(b->qs, kqs + 1);
+            d0[r][it] = __half2float(b->d);
+        }
+    }
+    bk::pdl_launch_dependents();
+    bk::pdl_wait();
+    const Q81B* __restrict__ x = a.x[m];
+    float tmp[NC][R];
+#pragma unroll
+    for (int j = 0; j < NC; ++j)
+#pragma unroll
+        for (int r = 0; r < R; ++r) tmp[j][r] = 0.0f;
+#pragma unroll
+    for (int it = 0; it < IT; ++it) {
+        const int kbx = kbx0 + 32 * it;
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            const Q81B* xj = x + (size_t) j * bpr + kbx;
+            const int* u = reinterpret_cast<const int*>(xj->qs);
+            const int u0 = u[kqs], u1 = u[kqs + 1];
+            const float d1 = __low2float(xj->ds);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                int sumi = 0;
+                sumi = DP4A(v0[r][it], u0, sumi);
+                sumi = DP4A(v1[r][it], u1, sumi);
+                tmp[j][r] += d0[r][it] * d1 * float(sumi);
+            }
+        }
+    }
+    __shared__ float part[3][NC * R][32];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NC; ++j)
+#pragma unroll
+            for (int r = 0; r < R; ++r) part[threadIdx.y - 1][j * R + r][threadIdx.x] = tmp[j][r];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+    float* __restrict__ y = a.y[m];
+#pragma unroll
+    for (int j = 0; j < NC; ++j)
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = tmp[j][r];
+#pragma unroll
+            for (int l = 0; l < 3; ++l) v += part[l][j * R + r][threadIdx.x];
+            v = warp_sum(v);
+            if (threadIdx.x == 0 && row0 + r < n_out) y[(size_t) j * n_out + row0 + r] = v;
+        }
+}
+
+constexpr int hy4_q8x_rows(int nc, int it) {
+    const int r = it >= 8 ? 1 : 8 / it;
+    return nc * r <= 16 ? r : (16 / nc > 0 ? 16 / nc : 1);
+}
+
+template <int NC, int IT>
+void hy4_launch_q8x_it(const Q8xArgs& a, int blocks, cudaStream_t s) {
+    bk::launch_pdl(hy4_q8x_kernel<NC, hy4_q8x_rows(NC, IT), IT>, dim3((unsigned) blocks), dim3(32, 4), 0, s, a);
+}
+
+template <int IT>
+void hy4_launch_q8x_nc(Q8xArgs a, const Q8xMat* mats, int n, int ncols, cudaStream_t s) {
+    const int R = hy4_q8x_rows(ncols, IT);
+    int end = 0;
+    for (int i = 0; i < n; ++i) {
+        end += (mats[i].n_out + R - 1) / R;
+        a.end[i] = end;
+    }
+    switch (ncols) {
+    case 1: hy4_launch_q8x_it<1, IT>(a, end, s); break;
+    case 2: hy4_launch_q8x_it<2, IT>(a, end, s); break;
+    case 3: hy4_launch_q8x_it<3, IT>(a, end, s); break;
+    case 4: hy4_launch_q8x_it<4, IT>(a, end, s); break;
+    case 5: hy4_launch_q8x_it<5, IT>(a, end, s); break;
+    case 6: hy4_launch_q8x_it<6, IT>(a, end, s); break;
+    case 7: hy4_launch_q8x_it<7, IT>(a, end, s); break;
+    default: hy4_launch_q8x_it<8, IT>(a, end, s); break;
+    }
+}
+}  // namespace
+
+void q8x_mmvq(const Q8xMat* mats, int n, int n_in, int ncols, void* stream) {
+    if (n < 1 || n > kQ8xMats || ncols < 1 || ncols > 8 || (n_in != 3072 && n_in != 6144))
+        throw std::runtime_error("hy4flash q8x_mmvq: matrices, columns or width");
+    Q8xArgs a{};
+    a.n = n;
+    for (int i = 0; i < n; ++i) {
+        if (mats[i].n_out <= 0) throw std::runtime_error("hy4flash q8x_mmvq: rows");
+        a.w[i] = static_cast<const Q80B*>(mats[i].w);
+        a.x[i] = static_cast<const Q81B*>(mats[i].x);
+        a.y[i] = mats[i].y;
+        a.n_out[i] = mats[i].n_out;
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    if (n_in == 3072) hy4_launch_q8x_nc<3>(a, mats, n, ncols, s);
+    else hy4_launch_q8x_nc<6>(a, mats, n, ncols, s);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
