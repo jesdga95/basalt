@@ -373,16 +373,6 @@ __device__ __forceinline__ void run_finishes(const F& f, const int* s_fin, int n
     for (int i = 0; i < nfin; ++i) f.finish(s_fin[i] >> 8, (s_fin[i] & 255) * kTicketCh, tid, nt);
 }
 
-/// The finish alone, block (segment, kTicketCh channels): for a call whose rows are not all written by its down (some
-/// came from elsewhere after it). Blocks past the segments exit.
-template<class F>
-__global__ void __launch_bounds__(256) finish_kernel(F f, int n_segs) {
-    pdl_wait();
-    pdl_launch_dependents();
-    if ((int) blockIdx.x >= n_segs) return;
-    f.finish((int) blockIdx.x, (int) blockIdx.y * kTicketCh, (int) threadIdx.x, 256);
-}
-
 /// Down: work item blockIdx.x = tile * (n_embd / ROWS) + row block writes rows dst[e] [n_embd] (fp32) of its entries;
 /// with `fin`, then counts them on its segments' tickets and runs the finishes it completes. A programmatic dependent of
 /// gate/up: the plan and the first weights before its wait.

@@ -74,6 +74,48 @@ struct Finish {
     }
 };
 
+// The same finish, a thread a channel through every row of segment s: each row's experts' sum is formed once and kept
+// for the rows after it in the window (finish forms it again for each tap); the same operations in the same order.
+__global__ void __launch_bounds__(256) finish_rows_kernel(Finish f, int n_segs) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    const int s = (int) blockIdx.x, c = (int) blockIdx.y * 256 + (int) threadIdx.x;
+    if (s >= n_segs || c >= kWidth) return;
+    const MoeFinish& a = f.a;
+    int r0, r1;
+    f.span(s, r0, r1);
+    const bk::WindowSegs& at = seg_table(a.seg);
+    float* const ring = at.n > 0 ? a.seg.c[s].m_ring : a.ring;
+    float tap[kConv];
+#pragma unroll
+    for (int j = 0; j < kConv; ++j) tap[j] = a.taps[c * kConv + (kConv - 1 - j)];
+    float xs[kConv] = {};   // xs[j]: row r - j's sum, once the window holds it
+    for (int r = r0; r < r1; ++r) {
+#pragma unroll
+        for (int j = kConv - 1; j > 0; --j) xs[j] = xs[j - 1];
+        float x = 0.f;
+        for (int q = 0; q < a.k; ++q) x = fmaf(a.w[r * a.k + q], __ldcg(a.rows + ((size_t) r * a.k + q) * kWidth + c), x);
+        xs[0] = x;
+        float acc = 0.f;
+#pragma unroll
+        for (int j = 0; j < kConv; ++j) {
+            float xj;
+            if (r - j >= r0) {
+                xj = xs[j];
+            } else {
+                const int p = a.pos[r] - j;
+                xj = p < 0 ? 0.f : ring[(size_t) (p % kConvRing) * kWidth + c];
+            }
+            acc = fmaf(tap[j], xj, acc);
+        }
+        const size_t i = (size_t) r * kWidth + c;
+        const float y = __fmul_rn(acc + x, rsqrtf((float) kConv + 1.f)) + a.resid[i];
+        a.out[i] = y;
+        if (a.tap) a.tap[i] = y;
+        ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x;   // a window's slots: none its rows read before it
+    }
+}
+
 // The tile shapes by the call's pairs: few pairs (a single conversation's window) take 8-entry tiles of 64 rows and
 // three stages; more take 16-entry tiles of 128 rows; a wide batch 32-entry tiles of 64 rows. Every shape gives an
 // entry the same bits. MXFP8 rows are twice the bytes: two stages for the wider tiles.
@@ -168,8 +210,8 @@ Finish finish_of(const ExpertCall& e, const MoeFinish& mf, int rows) {
 void experts_finish(const ExpertCall& e, const MoeFinish& mf, int rows, void* stream) {
     if (rows <= 0 || rows > kBatchRows || mf.k * rows != e.pairs) throw std::runtime_error("inkling2 experts_finish: rows");
     const int n_segs = mf.seg.at.n > 0 ? mf.seg.at.n : mf.seg.n_segs > 0 ? mf.seg.n_segs : 1;
-    bk::launch_pdl(xt::finish_kernel<Finish>, dim3((unsigned) n_segs, kWidth / xt::kTicketCh), dim3(256), 0,
-                   (cudaStream_t) stream, finish_of(e, mf, rows), n_segs);
+    bk::launch_pdl(finish_rows_kernel, dim3((unsigned) n_segs, kWidth / 256), dim3(256), 0, (cudaStream_t) stream,
+                   finish_of(e, mf, rows), n_segs);
     check("experts_finish");
 }
 
