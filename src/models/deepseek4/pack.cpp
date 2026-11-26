@@ -62,15 +62,9 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
     g.yarn_beta_slow = (float) number(member(json, "rope.scaling.yarn_beta_slow"));
 
     const Json* ratios = member(json, "attention.compress_ratios");
-    if (ratios && ratios->is_array()) {
-        for (const Json& value : ratios->items) {
-            const int ratio = integer(&value, -1);
-            if (ratio < 0) {
-                err = "meta.geometry has a non-integer compression ratio";
-                return false;
-            }
-            g.compress_ratio.push_back(ratio);
-        }
+    if (ratios && !parse_compression_ratios(*ratios, g.compress_ratio, err)) {
+        err = "meta.geometry: " + err;
+        return false;
     }
 
     if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv != 1 || g.head_dim <= 0 ||
@@ -284,6 +278,26 @@ bool read_expert_layout(const core::ModelFile& file, int layers, std::vector<Exp
 }
 
 }  // namespace
+
+bool parse_compression_ratios(const core::Json& value, std::vector<int>& ratios, std::string& err) {
+    if (!value.is_array() || value.items.size() != value.count) {
+        err = "compression ratios must be a complete JSON array";
+        return false;
+    }
+    std::vector<int> parsed;
+    parsed.reserve(value.items.size());
+    for (size_t i = 0; i < value.items.size(); ++i) {
+        const int ratio = integer(&value.items[i], -1);
+        if (ratio < 0) {
+            err = "compression ratio at index " + std::to_string(i) + " is not a nonnegative integer";
+            return false;
+        }
+        parsed.push_back(ratio);
+    }
+    ratios = std::move(parsed);
+    err.clear();
+    return true;
+}
 
 bool open_pack(const std::string& path, Pack& pack, std::string& err) {
     if (!pack.file.open(path, err) || !pack.file.load_meta(err)) return false;

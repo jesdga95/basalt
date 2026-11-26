@@ -16,6 +16,11 @@ target_include_directories(deepseek4_pack PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
 target_link_libraries(deepseek4_pack PUBLIC core)
 
 if(BUILD_TESTING)
+  add_executable(ds4_meta_test src/models/deepseek4/meta_test.cpp)
+  target_include_directories(ds4_meta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(ds4_meta_test PRIVATE deepseek4_pack warnings)
+  basalt_cpu_test(NAME ds4_meta_test COMMAND ds4_meta_test)
+
   foreach(_name compress indexer_compress indexer_project indexer_select)
     add_executable(ds4_${_name}_parity src/models/deepseek4/${_name}_parity.cpp)
     target_include_directories(ds4_${_name}_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})

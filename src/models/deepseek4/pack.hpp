@@ -56,4 +56,7 @@ struct Pack {
 /// Opens and validates a `deepseek4` Basalt pack, including the per-layer routed-expert layout.
 bool open_pack(const std::string& path, Pack& pack, std::string& err);
 
+/// Parses a JSON compression schedule without truncating fractional, non-finite, or out-of-range values.
+bool parse_compression_ratios(const core::Json& value, std::vector<int>& ratios, std::string& err);
+
 }  // namespace basalt::models::deepseek4
