@@ -1,6 +1,7 @@
 # DeepSeek-V4 kernels and their parity programs. Included only when the deepseek4 model is selected.
 add_library(deepseek4_kernels STATIC
   src/models/deepseek4/attention.cpp
+  src/models/deepseek4/rope.cpp
   src/models/deepseek4/head.cpp
   src/models/deepseek4/layer.cpp
   src/models/deepseek4/shared_expert.cu
@@ -26,6 +27,11 @@ target_include_directories(deepseek4_model_weights PUBLIC ${CMAKE_CURRENT_SOURCE
 target_link_libraries(deepseek4_model_weights PUBLIC deepseek4_pack kernels core ${_gpu_runtime_target})
 
 if(BUILD_TESTING)
+  add_executable(ds4_rope_test src/models/deepseek4/rope_test.cpp src/models/deepseek4/rope.cpp)
+  target_include_directories(ds4_rope_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(ds4_rope_test PRIVATE warnings)
+  basalt_cpu_test(NAME ds4_rope_test COMMAND ds4_rope_test)
+
   add_executable(ds4_context_policy_test src/models/deepseek4/context_policy_test.cpp)
   target_include_directories(ds4_context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(ds4_context_policy_test PRIVATE warnings)
