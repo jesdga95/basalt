@@ -1862,8 +1862,8 @@ bool launch_q80_mma(const void* weights, const void* x_q8_1, float* y, int n_in,
     return true;
 }
 
-constexpr int MAX_PLANES_NCOLS = 256;
-constexpr int MAX_QUANT_NCOLS = 256;
+constexpr int MAX_PLANES_NCOLS = 320;
+constexpr int MAX_QUANT_NCOLS = 320;
 
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
@@ -1876,7 +1876,7 @@ void validate_planes_shape(int n_in, int ncols, int block_elems = Q8K) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
     if (ncols < 1 || ncols > MAX_PLANES_NCOLS) {
-        throw std::invalid_argument("native planes MMVQ requires 1 <= ncols <= 256 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
+        throw std::invalid_argument("native planes MMVQ requires 1 <= ncols <= " + std::to_string(MAX_PLANES_NCOLS) + " (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
     }
 }
 void validate_quant_shape(int n_in, int ncols, int block_elems = Q8K) {
@@ -1884,7 +1884,7 @@ void validate_quant_shape(int n_in, int ncols, int block_elems = Q8K) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
     if (ncols < 1 || ncols > MAX_QUANT_NCOLS) {
-        throw std::invalid_argument("native q8_1 quantize requires 1 <= ncols <= 256 (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
+        throw std::invalid_argument("native q8_1 quantize requires 1 <= ncols <= " + std::to_string(MAX_QUANT_NCOLS) + " (ncols " + std::to_string(ncols) + ", n_in " + std::to_string(n_in) + ")");
     }
 }
 void validate_pointer(const void* p) {

@@ -26,8 +26,8 @@ constexpr int kExtent = 1024;       ///< distances the relative bias covers (als
 constexpr int kConv = 4;            ///< short convolution taps
 constexpr int kMaxMix = 6;          ///< states one mix reads: the finished blocks and the partial
 constexpr int kDecodeRows = 16;      ///< rows of one conversation's decode window
-constexpr int kBatchRows = 256;      ///< rows of a batched decode window across conversations
-constexpr int kMaxPairs = 2048;      ///< routed (row, expert) pairs of a visit at most
+constexpr int kBatchRows = 320;      ///< rows of a batched decode window across conversations (64 slots x 5)
+constexpr int kMaxPairs = 8 * kBatchRows;   ///< routed (row, expert) pairs of a visit at most
 constexpr int kConvRing = kDecodeRows + kConv - 1;   ///< positions a convolution ring keeps: a window's rows and the 3 before it
 constexpr int kMaxStreams = 4;      ///< loop controllers one call runs side by side
 

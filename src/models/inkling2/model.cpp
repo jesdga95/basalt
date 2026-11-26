@@ -54,7 +54,7 @@ constexpr uint64_t kSessionFixed = 44 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 // a batch window's graph on the main card (its kernel nodes): a batch of slots keeps up to BatchShared::kGraphs of them,
 // instantiated as compositions come, so the plan holds them beside the KV pool
-constexpr uint64_t kBatchGraphBytes = 3 * kMiB;
+constexpr uint64_t kBatchGraphBytes = 5 * kMiB;
 uint64_t batch_graphs_bytes(int n_sess) { return n_sess > 1 ? kBatchGraphBytes * model::BatchShared::kGraphs : 0; }
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
