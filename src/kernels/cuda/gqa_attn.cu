@@ -20,6 +20,7 @@ namespace {
 constexpr int GMAX = 8;               // query heads per KV head
 constexpr int CHUNK = 32;             // cells per decode chunk
 constexpr int kDecSplits = 64;        // a decode row's blocks per KV head (its chunks dealt round robin)
+constexpr int kManySegs = 16;         // segments of a decode launch that fill the card with few splits
 constexpr int HD = 256;              // the prompt kernel's head width
 constexpr float kScaleLog2 = 0.0625f * 1.4426950408889634f;   // 1/sqrt(256) * log2(e)
 constexpr float kNeg = -1e30f;
@@ -577,11 +578,14 @@ template <int HD>
 void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scratch, int n_chunks, float* out, cudaStream_t s,
                  const float* gate_q = nullptr, uint16_t* gated16 = nullptr) {
     const float scale = 1.4426950408889634f / sqrtf((float) HD);
-    const int gx = decode_splits(n_chunks);
+    // many segments fill the card by themselves: a split then takes four chunks at least, and a block both tiles of a
+    // segment's rows, so their keys and values are read once
+    const bool many = segs.n >= kManySegs;
+    const int gx = decode_splits(many ? std::max(1, n_chunks / 4) : n_chunks);
     int tiles_max = 0;
     for (int k = 0; k < segs.n; ++k)
         tiles_max = std::max(tiles_max, ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16);
-    const int ntl = HD == 128 && tiles_max > 1 && n_chunks >= 4 * gx ? 2 : 1;
+    const int ntl = HD == 128 && tiles_max > 1 && (many || n_chunks >= 4 * gx) ? 2 : 1;
     for (int k = 0; k < segs.n; ++k) {
         const int tiles = ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
         segs.tile0[k + 1] = segs.tile0[k] + (tiles + ntl - 1) / ntl;
