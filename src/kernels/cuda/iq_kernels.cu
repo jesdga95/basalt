@@ -3243,6 +3243,53 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 }  // namespace
 
 #ifndef IQ_DEV_ONLY   // host side: another translation unit takes only the device code above
+#include "nvfp4_grouped_mma.cuh"
+
+namespace {
+__global__ void __launch_bounds__(256, 1) native_gu_nvfp4_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                     const int32_t* __restrict__ grp_start,
+                                                                     const int32_t* __restrict__ n_groups,
+                                                                     const int32_t* __restrict__ ent_tok,
+                                                                     const block_q8_1* __restrict__ xq,
+                                                                     NativeExpertLayout L,
+                                                                     float* __restrict__ gate,
+                                                                     float* __restrict__ up) {
+    native_gu_nvfp4_mma_stage(blockIdx, gridDim, (int) threadIdx.x, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up);
+}
+
+template<bool DEP = false>
+__global__ void __launch_bounds__(256, 2) native_down_nvfp4_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                       const int32_t* __restrict__ grp_start,
+                                                                       const int32_t* __restrict__ n_groups,
+                                                                       const int32_t* __restrict__ ent_dst,
+                                                                       const block_q8_1* __restrict__ hq,
+                                                                       NativeExpertLayout L,
+                                                                       float* __restrict__ out) {
+    native_down_nvfp4_mma_stage<DEP>(blockIdx, gridDim, (int) threadIdx.x, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+}
+
+__global__ void __launch_bounds__(256, 2) native_gu_mxfp8_sx8_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                      const int32_t* __restrict__ grp_start,
+                                                                      const int32_t* __restrict__ n_groups,
+                                                                      const int32_t* __restrict__ ent_tok,
+                                                                      const block_q8_1* __restrict__ xq,
+                                                                      NativeExpertLayout L,
+                                                                      float* __restrict__ gate,
+                                                                      float* __restrict__ up) {
+    native_gu_mxfp8_sx8_stage(blockIdx, gridDim, (int) threadIdx.x, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up);
+}
+
+template<bool DEP = false>
+__global__ void __launch_bounds__(256, 3) native_down_mxfp8_sx8_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                        const int32_t* __restrict__ grp_start,
+                                                                        const int32_t* __restrict__ n_groups,
+                                                                        const int32_t* __restrict__ ent_dst,
+                                                                        const block_q8_1* __restrict__ hq,
+                                                                        NativeExpertLayout L,
+                                                                        float* __restrict__ out) {
+    native_down_mxfp8_sx8_stage<DEP>(blockIdx, gridDim, (int) threadIdx.x, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+}
+}  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 int native_grouped_gu2() { return g_gu2; }
@@ -3491,6 +3538,12 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
 #undef GU_MIX_CASE
             default: basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d", L.gu_type, L.up_type); std::exit(1);
         }
+    } else if (!v1 && !g_old_kernels && L.gu_type == 40 && cap_entries >= 160 && L.n_embd == 2304 && L.n_ff % 16 == 0) {
+        const dim3 gm((unsigned) (2 * L.n_ff / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
+        native_gu_nvfp4_mma_kernel<<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    } else if (!v1 && !g_old_kernels && L.gu_type == 46 && cap_entries >= 128 && L.n_embd == 2304) {
+        const dim3 gm((unsigned) ((2 * L.n_ff + kFastMoeRows - 1) / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
+        native_gu_mxfp8_sx8_kernel<<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     } else
     switch (L.gu_type) {
 #define GU_CASE(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1); break;
@@ -3531,7 +3584,15 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     if (g_exp_phase == 1) return;
     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
-    switch (L.d_type) {
+    if (!v1 && !g_old_kernels && L.d_type == 40 && cap_entries >= 160 && L.n_ff == 1152 && L.n_embd % 32 == 0) {
+        const dim3 gm((unsigned) (L.n_embd / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
+        if (chain) launch_dependent(native_down_nvfp4_mma_kernel<true>, gm, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_nvfp4_mma_kernel<false><<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    } else if (!v1 && !g_old_kernels && L.d_type == 46 && cap_entries >= 128 && L.n_ff == 1152) {
+        const dim3 gm((unsigned) ((L.n_embd + kFastMoeRows - 1) / kFastMoeRows), (unsigned) std::min<int64_t>(gy, 192));
+        if (chain) launch_dependent(native_down_mxfp8_sx8_kernel<true>, gm, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_mxfp8_sx8_kernel<false><<<gm, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    } else switch (L.d_type) {
 #define DOWN_CASE(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, chain); break;
         D_FMTS(DOWN_CASE)
 #undef DOWN_CASE

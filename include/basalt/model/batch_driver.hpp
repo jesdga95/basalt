@@ -38,8 +38,10 @@ struct BatchView {
 /// What every session of one model shares for its batch windows: the graphs by composition. A model keeps one beside its
 /// shared forward scratch; sessions that return the same one batch together.
 struct BatchShared {
-    static constexpr size_t kGraphs = 64;
+    static constexpr size_t kGraphs = 128;
+    static constexpr size_t kSeen = 256;
     GraphLru<core::CapturedGraph> graphs{kGraphs};
+    GraphLru<uint8_t> seen{kSeen};
 };
 
 class BatchSession : public ModelSession {
@@ -85,8 +87,13 @@ public:
                 if (open) s.batch_end(std::nullopt);
             }
         } end{*this};
-        for (int i = 0; i < n; ++i)
-            key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
+        if (batch_key_per_seg()) {
+            for (int i = 0; i < n; ++i)
+                key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
+        } else {
+            for (int i = 0; i < n; ++i) key.push_back((uint64_t) (uintptr_t) ss[(size_t) i]);
+            key.push_back((uint64_t) w.rows);
+        }
         BatchShared& sh = batch_shared();
         if (!batch_captured()) {
             if (!batch_forward(v, err)) {
@@ -95,6 +102,9 @@ public:
             }
         } else if (core::CapturedGraph* g = sh.graphs.find(key)) {
             if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
+        } else if (!sh.seen.find(key)) {
+            sh.seen.insert(std::move(key), 1u);
+            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
         } else {
             // a composition's first window runs as launched, then is captured for the next ones: the graph is built while
             // the card runs the window
@@ -171,6 +181,8 @@ protected:
     /// forward (it reads results between launches), so the driver runs it directly every window and the model keeps its
     /// own graphs of the stretches between.
     virtual bool batch_captured() const { return true; }
+    /// False when batch_forward's launches depend only on the total row count (segment boundaries read from device memory).
+    virtual bool batch_key_per_seg() const { return true; }
     /// False while this session holds state its batch path does not cover: the batch's windows run in turn.
     virtual bool batch_ready() const { return true; }
     /// On session i, queued on v.stream: segment i's head rows into its own logits (what row_logprobs, copy_logits and

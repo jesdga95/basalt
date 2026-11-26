@@ -55,13 +55,13 @@ HALF_ONE = struct.pack("<e", 1.0)      # fp16 1.0 = 0x3c00
 def repair_scales(name: str, raw: np.ndarray) -> None:
     """Overwrite every block's fp16 scale with a sane value, in place. IQ*_X* and IQ4_* keep it at offset 0; Q3_K
     after the 32-byte hmask, 64-byte qs and 12 scale bytes; IQ1_M splits it over the high nibbles of the four
-    uint16s at bytes 48..56 (1.0 is nibbles 3, C, 0, 0 on bytes 49, 51, 54, 55)."""
+    little-endian uint16s at bytes 48..56 (1.0 = 0x3C00 is nibbles 0, 0, C, 3 on odd bytes 49, 51, 53, 55)."""
     if name == "Q3_K":
         raw[:, 108:110] = np.frombuffer(HALF_ONE, dtype=np.uint8)
         return
     if name == "IQ1_M":
-        raw[:, 48:56] &= np.uint8(0x0F)            # clear the four scale nibbles
-        for byte, nib in ((49, 0x30), (51, 0xC0), (54, 0x00), (55, 0x00)):
+        raw[:, 49:56:2] &= np.uint8(0x0F)          # clear the four scale nibbles while keeping even-byte sub-scales
+        for byte, nib in ((49, 0x00), (51, 0x00), (53, 0xC0), (55, 0x30)):
             raw[:, byte] |= np.uint8(nib)
         return
     raw[:, 0:2] = np.frombuffer(HALF_ONE, dtype=np.uint8)

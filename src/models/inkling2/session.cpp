@@ -14,6 +14,7 @@
 // The layer split (model.hpp card_of): the second card runs its layers' visits on its own scratch and streams, and a window
 // crosses between the cards where walk.hpp's split_walk says, the row buffers the next card reads going through page-locked
 // RAM (consumer cards have no peer access). The whole window, both cards' launches and the crossings, is one graph.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/elastic_kv.hpp"
@@ -54,10 +55,20 @@ namespace {
 
 namespace bk = basalt::kernels;
 
-constexpr int kMaxRows = kDecodeRows;    // rows of one forward call (a decode window, a step of a prompt)
+constexpr int kWindowRows = kDecodeRows; // rows of one conversation's window (also its ring margin and logits buffer)
+constexpr int kMaxRows = kBatchRows;     // widest batched forward call across conversations
+constexpr int kChunkRead = 16;           // a longer read runs on the prompt path, a shorter one as decode windows
+// with experts in RAM, a read of up to this many tokens runs as decode windows: the prompt path's fixed cost (staging the
+// spilled layers' experts on the card) is more than eight of them
+constexpr int kSpillWindowRead = 64;
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
 constexpr int kStage = 64;               // windows whose tokens and positions are in flight from the pinned ring at once
+constexpr int kSegWords = (sizeof(bk::WindowSegs) + 15) / 4;   // device WindowSegs words staged alongside tokens & positions
+
+int call_rows_of(const InklingModel& m) {
+    return m.sessions() > 1 ? std::min(kMaxRows, m.sessions() * kWindowRows) : kWindowRows;
+}
 
 // The forward scratch: the rows of one call through the layers and the head. Every session of the model runs on the same
 // buffers (Shared below), one call at a time: each call syncs its stream before it returns, and a batch window syncs every
@@ -82,7 +93,8 @@ struct Scratch {
     uint32_t* pf_sink_ = nullptr;               // the prefetch's keep-alive word
     float* lp_ = nullptr;                       // the log probabilities' scratch
     float* blog_ = nullptr;                     // a batch window's logits, every row, before each session takes its own
-    int32_t *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr;   // a call's tokens, then its positions
+    int32_t *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr;   // a call's tokens, positions, and segment table
+    const bk::WindowSegs* at_d_ = nullptr;
     static constexpr int kGuessExperts = 8;     // the experts a window's guess requests a visit (rows x kGuessExperts / rows)
     static constexpr int kGuessRows = 2;        // the widest window guessed (wider ones keep the read-ahead)
 };
@@ -94,15 +106,19 @@ class Session;
 
 struct Shared {
     Scratch x, x1;                          // the first card's scratch, the second card's (the layer split)
+    int max_rows = kWindowRows;
+    uint64_t logits_gen = 0;             // widest forward call this model's sessions run
     float* hand = nullptr;                  // the layer split: page-locked slots of a call's rows crossing between the cards,
     int hand_slots = 0, tap_slot0 = 0;      // the crossings' first, then one per drafter tap
     std::unique_ptr<PromptRunner> prompt;   // PROMPT HOOK
     std::unique_ptr<CpuExperts> cpu;        // with a spill: the RAM experts' rows
+    std::unique_ptr<DsparkBatch> ds_batch;  // DSPARK HOOK: multi-session batched commit & draft
     float* tap = nullptr;                   // DSPARK HOOK: the drafter's features of a call's rows (dspark_tap_bytes)
     model::BatchShared batch;
     std::vector<Session*> heat_sessions;    // with copies: the sessions whose kept rows rank them (a batch counts on its leader)
     std::vector<std::pair<int, void*>> bufs;   // (device, allocation)
     ~Shared() {
+        ds_batch.reset();
         prompt.reset();
         cpu.reset();
         int dev = 0;
@@ -115,6 +131,7 @@ struct Shared {
         if (hand) cudaFreeHost(hand);
     }
     bool init(InklingModel& m, cudaStream_t stream, int max_pulls, std::string& err) {
+        max_rows = call_rows_of(m);
         if (!alloc_scratch(m, x, m.device(), true, err)) return false;
         if (m.cards() > 1) {
             cudaSetDevice(m.card_device(1));
@@ -123,13 +140,18 @@ struct Shared {
             if (!ok) return false;
             tap_slot0 = max_pulls;
             hand_slots = max_pulls + kDsTargets;
-            if (cudaHostAlloc((void**) &hand, (size_t) hand_slots * kMaxRows * m.geo().n_embd * 4, cudaHostAllocPortable) != cudaSuccess) {
+            if (cudaHostAlloc((void**) &hand, (size_t) hand_slots * max_rows * m.geo().n_embd * 4, cudaHostAllocPortable) != cudaSuccess) {
                 cudaGetLastError();
                 err = "cannot pin the layer split's hand-off rows";
                 return false;
             }
         }
         if (!(cpu = CpuExperts::make(m, err)) && !err.empty()) return false;
+        if (m.sessions() > 1 && m.dspark()) {
+            ds_batch = std::make_unique<DsparkBatch>();
+            if (!ds_batch->init(m.dspark(), m.sessions(), max_rows, std::max(max_rows, kPromptChunk), tap, m.context(), err))
+                return false;
+        }
         prompt = make_prompt(m, stream, err);   // PROMPT HOOK
         return prompt != nullptr || err.empty();
     }
@@ -147,7 +169,7 @@ struct Shared {
             return p;
         };
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4); };
-        const int64_t E = g.n_embd, R = kMaxRows;
+        const int64_t E = g.n_embd, R = max_rows;
         const int64_t ctx = m.context();
         // the row buffers of one call, by their roles in the walk
         for (float*& b : x.role_) b = f(R * E);
@@ -159,9 +181,9 @@ struct Shared {
         x.y_ = f(R * kProj);
         x.q_ = f(R * kHeads * kHeadDim); x.r_ = f(R * kHeads * kRel); x.sink_ = f(R * kHeads);
         x.o_ = f(R * E); x.resid_ = f(R * E); x.fin_ = f(R * E);
-        x.att_scr_ = alloc(attention_decode_scratch(kMaxRows, std::max<int64_t>(ctx, g.window)));
-        for (void*& q : x.xq_) q = alloc(bk::native_q8_1_bytes((int) E, kMaxRows));
-        x.xo_ = alloc(bk::native_q8_1_bytes(kOutRows, kMaxRows));
+        x.att_scr_ = alloc(attention_decode_scratch(max_rows, std::max<int64_t>(ctx, g.window)));
+        for (void*& q : x.xq_) q = alloc(bk::native_q8_1_bytes((int) E, max_rows));
+        x.xo_ = alloc(bk::native_q8_1_bytes(kOutRows, max_rows));
         x.rlog_ = f(R * g.n_expert); x.rw_ = f(R * g.n_used); x.ids_ = (int32_t*) alloc((size_t) R * g.n_used * 4);
         const int64_t pairs = R * g.n_used;
         x.ex_ptr_ = (unsigned long long*) alloc((size_t) pairs * 8);
@@ -176,12 +198,13 @@ struct Shared {
         x.gs_log_ = f((int64_t) Scratch::kGuessRows * g.n_expert);
         x.gs_w_ = f(Scratch::kGuessExperts);
         x.pf_sink_ = (uint32_t*) alloc(4);
-        x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxRows, g.n_vocab) + R * (bk::kLogprobStride + 1));
+        x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(max_rows, g.n_vocab) + R * (bk::kLogprobStride + 1));
         x.blog_ = f(R * (int64_t) g.n_vocab);
-        x.io_d_ = (int32_t*) alloc((size_t) 2 * R * 4);
+        x.io_d_ = (int32_t*) alloc((size_t) (2 * R + kSegWords) * 4);
         x.tok_d_ = x.io_d_;
         x.pos_d_ = x.io_d_ + R;
-        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(std::max(kMaxRows, kPromptChunk)));   // DSPARK HOOK
+        x.at_d_ = reinterpret_cast<const bk::WindowSegs*>(x.io_d_ + 2 * R);
+        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(std::max(max_rows, kPromptChunk)));   // DSPARK HOOK
         if (!ok) {
             cudaGetLastError();
             err = "out of device memory for the sessions' scratch";
@@ -292,9 +315,43 @@ public:
         }
         bool ok = true;
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
-        const int64_t E = g_.n_embd, R = kMaxRows;
+        const int64_t E = g_.n_embd;
+        const int call_rows = call_rows_of(m_);
         const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8());
         const int64_t ctx = m_.context();
+        {
+            auto align256 = [](size_t b) { return (std::max<size_t>(b, 16) + 255) & ~(size_t) 255; };
+            size_t need[2] = {0, 0};
+            for (const Visit& v : g_.visits) {
+                const int c = m_.card_of(v.layer);
+                const bool ring = g_.swa[(size_t) v.layer];
+                const int64_t cap = ring ? (int64_t) g_.window + kWindowRows : ctx;
+                if (ring || !m_.elastic()) need[c] += 2 * align256((size_t) kKvHeads * (size_t) cap * row_bytes);
+                need[c] += 2 * align256((size_t) kConvRing * kKvHeads * kHeadDim * 4);
+                need[c] += 2 * align256((size_t) kConvRing * (size_t) E * 4);
+            }
+            const size_t tally_b = align256((size_t) expert_pairs() * 4) +
+                                   align256(g_.visits.size() * kAheadExperts * 8) +
+                                   align256(g_.visits.size() * 4);
+            need[0] += tally_b + align256(4 * 32);
+            if (m_.copies())
+                need[0] += align256((size_t) expert_pairs() * 4) +
+                           align256(g_.visits.size() * (size_t) call_rows * g_.n_used * 4) +
+                           align256(g_.visits.size() * 4);
+            if (lane_[1].stream) need[1] += tally_b;
+            for (int c = 0; c < 2; ++c) {
+                if (!need[c]) continue;
+                const int dev = c == 0 ? m_.device() : lane_[1].device;
+                cudaSetDevice(dev);
+                void* slab = nullptr;
+                if (cudaMalloc(&slab, need[c]) != cudaSuccess) { ok = false; break; }
+                bufs_.emplace_back(dev, slab);
+                arena_dev_[c] = dev;
+                arena_ptr_[c] = static_cast<uint8_t*>(slab);
+                arena_rem_[c] = need[c];
+            }
+            cudaSetDevice(m_.device());
+        }
         int max_slot = 0;
         for (const Visit& v : g_.visits) max_slot = std::max(max_slot, v.slot);
         vc_.assign((size_t) max_slot + 1, VisitCache{});
@@ -304,7 +361,7 @@ public:
             slot_card_[(size_t) v.slot] = m_.card_of(v.layer);
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
-            c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
+            c.cap = c.ring ? (int64_t) g_.window + kWindowRows : ctx;
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
@@ -342,22 +399,22 @@ public:
         ex_tally_ = (uint32_t*) alloc((size_t) expert_pairs() * 4, ok);
         if (m_.copies()) {   // the kept rows' lookups that rank the copies (decode_kept)
             heat_tally_ = (uint32_t*) alloc((size_t) expert_pairs() * 4, ok);
-            win_ids_ = (int32_t*) alloc(g_.visits.size() * (size_t) R * g_.n_used * 4, ok);
+            win_ids_ = (int32_t*) alloc(g_.visits.size() * (size_t) call_rows * g_.n_used * 4, ok);
             visit_layer_ = (int32_t*) alloc(g_.visits.size() * 4, ok);
             std::vector<int32_t> layer;
             for (const Visit& v : g_.visits) layer.push_back(v.layer);
-            if (ok && cudaMemcpy(visit_layer_, layer.data(), layer.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+            if (ok && basalt::core::device_copy(visit_layer_, layer.data(), layer.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
         }
         rec_blobs_ = (unsigned long long*) alloc((size_t) g_.visits.size() * kAheadExperts * 8, ok);
         rec_n_ = (int32_t*) alloc((size_t) g_.visits.size() * 4, ok);
-        logits_ = f(R * (int64_t) g_.n_vocab);
         pick_ = (int32_t*) alloc(4 * 32, ok);
         if (ok && cudaMallocHost((void**) &pick_h_, 4 * 32) != cudaSuccess) ok = false;
         else if (ok) pinned_.push_back(pick_h_);
-        if (ok && cudaMallocHost((void**) &io_h_, (size_t) kStage * 2 * R * 4) != cudaSuccess) ok = false;
+        if (ok && cudaMallocHost((void**) &io_h_, (size_t) kStage * (2 * call_rows + kSegWords) * 4) != cudaSuccess) ok = false;
         else if (ok) pinned_.push_back(io_h_);
         for (cudaEvent_t& e : stage_ev_)
             if (ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) ok = false;
+        arena_rem_[0] = arena_rem_[1] = 0;
         if (!ok) {
             err = "out of device memory for the session";
             return false;
@@ -390,7 +447,7 @@ public:
             err = "the session stream failed during initialization";
             return false;
         }
-        if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(kMaxRows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
+        if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(call_rows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
                           elastic_.empty() ? 0 : core::kElasticKvBase, err))
             return false;
         count_backed();
@@ -415,8 +472,8 @@ public:
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
         hist_.resize((size_t) r.pos);
-        for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
-            const int n = std::min(kMaxRows, r.n_tokens - t0);
+        for (int t0 = 0; t0 < r.n_tokens; t0 += kWindowRows) {
+            const int n = std::min(kWindowRows, r.n_tokens - t0);
             const bool last = t0 + n == r.n_tokens;
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
@@ -436,6 +493,8 @@ public:
             lookups_ += (int64_t) n * g_.n_used * (int64_t) g_.visits.size();
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
             head_rows_ = head;
+            logits_ = head > 0 ? blog_ : nullptr;
+            if (head > 0) logits_gen_ = ++sh_->logits_gen;
             if (!want) continue;
             if (!pick(r, t0, head, err)) return {model::Status::Error, "inkling2: " + err};
             if (r.row_tokens)
@@ -473,13 +532,13 @@ public:
         if (m_.loan_pending()) bound(m_.loan_publish_at());
         if (!elastic_.empty() && m_.promoted() > 0 && backed_ < m_.context())
             bound(backed_ > pos ? backed_ : (pos / kElasticKvStep + 1) * kElasticKvStep);
-        return room == INT64_MAX ? 0 : (int) std::min<int64_t>(room, kMaxRows);
+        return room == INT64_MAX ? 0 : (int) std::min<int64_t>(room, kWindowRows);
     }
 
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
     // session's scratch and stream. Each conversation keeps its caches and rings (the kernels take them per segment), its
     // drafter's context, its logits and its draws; a row gives the bits it gives in its own window.
-    int batch_rows() const override { return kMaxRows; }
+    int batch_rows() const override { return sh_->max_rows; }
 
 protected:
     // the hooks of the shared driver (model/batch_driver.hpp)
@@ -488,6 +547,7 @@ protected:
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_ready() const override { return !m_.wedged(); }
+    bool batch_key_per_seg() const override { return false; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
         if (stale_) {
             err = stale().message;
@@ -499,7 +559,11 @@ protected:
         if (!admit(err)) return false;
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
         if (!drop_stale_read_ahead(err)) return false;
-        key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
+        const bk::WindowSegs wsegs = v.w.device_segs();
+        int max_seg_rows = 1;
+        for (int i = 0; i < wsegs.n; ++i) max_seg_rows = std::max(max_seg_rows, wsegs.row0[i + 1] - wsegs.row0[i]);
+        key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data(), &wsegs));
+        key.push_back((uint64_t) (max_seg_rows * (kHeads / kKvHeads) > 16));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
         if (!check(err)) return false;
@@ -512,6 +576,7 @@ protected:
         return false;
     }
     bool batch_forward(const model::BatchView& v, std::string&) override {
+        ++sh_->logits_gen;
         view_ = &v;
         body(v.w.rows, v.w.rows, full_keys_of(v.w.max_pos, v.w.rows));
         view_ = nullptr;
@@ -532,8 +597,9 @@ protected:
             lead.batch_segs_.push_back({this, sg.row0, sg.rows});
         }
         head_rows_ = h;
-        if (h == 0) return;
-        cudaMemcpyAsync(logits_, blog_ + (size_t) (sg.row0 + sg.rows - h) * V, (size_t) h * V * 4, cudaMemcpyDeviceToDevice, v.stream);
+        if (h == 0) { logits_ = nullptr; return; }
+        logits_ = blog_ + (size_t) (sg.row0 + sg.rows - h) * V;
+        logits_gen_ = sh_->logits_gen;
         if (r.logits) cudaMemcpyAsync(r.logits, logits_ + (size_t) (h - 1) * V, (size_t) V * 4, cudaMemcpyDeviceToHost, v.stream);
     }
     const int32_t* batch_draw(const model::BatchView& v, int i, std::string& err) override {
@@ -545,7 +611,7 @@ public:
         if (stale_ && r.pos > 0) return stale();
         if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
-        const bool staged = sh_->prompt && r.n_tokens > 16;
+        const bool staged = sh_->prompt && r.n_tokens > (m_.has_spill() ? kSpillWindowRead : kChunkRead);
         if (heat_tally_) settle_window(r.pos);
         if (!restart_positions(r.pos == 0 ? r.n_tokens : r.pos + std::max(r.n_tokens, r.total_tokens), r.pos)) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return grow_failed(e);
@@ -570,13 +636,13 @@ public:
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
-        for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
+        for (int t0 = 0; t0 < r.n_tokens; t0 += kWindowRows) {
             if (r.stop && r.stop()) break;
-            const int n = std::min(kMaxRows, r.n_tokens - t0);
+            const int n = std::min(kWindowRows, r.n_tokens - t0);
             if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, 0, err)) return {model::Status::Error, "inkling2: " + err};
             if (heat_tally_) fold_rows(n);
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
-            if (r.progress && ((t0 / kMaxRows) % 64 == 63 || t0 + n == r.n_tokens)) {
+            if (r.progress && ((t0 / kWindowRows) % 64 == 63 || t0 + n == r.n_tokens)) {
                 cudaStreamSynchronize(stream_);
                 r.progress(t0 + n);
             }
@@ -611,7 +677,7 @@ public:
         if (std::string e; !ensure_positions(pos + n_rows, e)) return grow_failed(e);
         hist_.resize((size_t) pos);
         stale_ = true;
-        if (sh_->prompt && n_rows > 16) {
+        if (sh_->prompt && n_rows > kChunkRead) {
             PromptRunner::Prepare prepare;
             if (heat_tally_) prepare = [&] { return recall_loan(pos); };
             const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_, prepare);
@@ -622,8 +688,8 @@ public:
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
-        for (int at = 0; at < n_rows; at += kMaxRows) {
-            const int n = std::min(kMaxRows, n_rows - at);
+        for (int at = 0; at < n_rows; at += kWindowRows) {
+            const int n = std::min(kWindowRows, n_rows - at);
             if (!forward(nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, 0, err)) return {model::Status::Error, "inkling2: " + err};
             if (heat_tally_) fold_rows(n);
             for (int i = 0; i < n; ++i) hist_.push_back(g_.image_token);
@@ -644,7 +710,7 @@ public:
     // a draw of one row again, with the tokens the mask bans
     model::Result resample_row(int row, const float* bias, int32_t& token) override {
         std::string e;
-        if (row < 0 || row >= head_rows_) return {model::Status::Error, "inkling2: the row is not in the last window"};
+        if (!logits_ || logits_gen_ != sh_->logits_gen || row < 0 || row >= head_rows_) return {model::Status::Error, "inkling2: the row is not in the last window"};
         if (!device_bias(d_mask_, bias, e)) return {model::Status::Error, "inkling2: " + e};
         bk::SamplerParams sp = sampling_;
         sp.logit_bias = d_mask_;
@@ -659,7 +725,7 @@ public:
     }
 
     model::Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override {
-        if (row0 < 0 || n < 1 || row0 + n > head_rows_) return {model::Status::Error, "inkling2: the session keeps the last window's logits only"};
+        if (!logits_ || logits_gen_ != sh_->logits_gen || row0 < 0 || n < 1 || row0 + n > head_rows_) return {model::Status::Error, "inkling2: the session keeps the last window's logits only"};
         float* d_out = lp_ + bk::row_logprobs_scratch_floats(n, g_.n_vocab);
         int32_t* d_pick = pick_ + 16;
         cudaMemcpyAsync(d_pick, picks, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
@@ -698,8 +764,8 @@ public:
     }
 
     model::Result copy_logits(int row, float* out) override {
-        if (row < 0 || row >= head_rows_) return {model::Status::Error, "inkling2: no logits for that row"};
-        if (cudaMemcpy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (!logits_ || logits_gen_ != sh_->logits_gen || row < 0 || row >= head_rows_) return {model::Status::Error, "inkling2: no logits for that row"};
+        if (basalt::core::device_copy(out, logits_ + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
             return {model::Status::Error, "inkling2: copying the logits failed"};
         return {};
     }
@@ -710,11 +776,26 @@ public:
     }
 
     // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
-    int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kMaxRows) : 1; }
+    int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kWindowRows) : 1; }
+    bool window_cold() const override { return window_cold_; }
+    int prompt_fold_window() const override { return kWindowRows; }
     bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (m_.wedged()) return wedged();
         return dspark_.draft_begin(anchor, pos, n, stream_);
+    }
+    model::Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
+                              int count) override {
+        if (m_.wedged()) return wedged();
+        if (!sh_->ds_batch || !sh_->ds_batch->on() || count <= 1 || count > bk::kWindowSegsMax)
+            return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        DsparkHook* hooks[bk::kWindowSegsMax] = {};
+        for (int i = 0; i < count; ++i) {
+            Session* s = dynamic_cast<Session*>(peers[i]);
+            if (!s || s->sh_ != sh_) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+            hooks[i] = &s->dspark_;
+        }
+        return sh_->ds_batch->draft(hooks, anchors, pos, n, count, stream_);
     }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
         if (m_.wedged()) return wedged();
@@ -722,8 +803,8 @@ public:
     }
 
     // ---- conversations: the full-attention visits' cells by position (save_cells / restore_cells), the window rings and
-    // the convolutions' rings by checkpoint (running_state). A window ring holds window + kMaxRows positions and a
-    // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
+    // the convolutions' rings by checkpoint (running_state). A window ring holds window + kWindowRows positions and a
+    // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kWindowRows
     // rows past it.
     size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
     static model::Result stale() {
@@ -864,7 +945,7 @@ public:
     void fold_rows(int rows, cudaStream_t st = nullptr, int row0 = 0) {
         win_rows_ = 0;
         if (rows <= 0) return;
-        heat_fold(win_ids_ + (size_t) row0 * g_.n_used, visit_layer_, (int) g_.visits.size(), kMaxRows, rows, g_.n_used,
+        heat_fold(win_ids_ + (size_t) row0 * g_.n_used, visit_layer_, (int) g_.visits.size(), sh_->max_rows, rows, g_.n_used,
                   g_.n_expert, heat_tally_, st ? st : stream_);
         heat_rows_ += rows;
     }
@@ -883,7 +964,7 @@ public:
             Session& o = *owners[i];
             samples[i].resize((size_t) expert_pairs());
             if (cudaStreamSynchronize(o.stream_) != cudaSuccess ||
-                cudaMemcpy(samples[i].data(), o.heat_tally_, samples[i].size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                basalt::core::device_copy(samples[i].data(), o.heat_tally_, samples[i].size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
                 m_.wedge();   // no ranking from a partial sample
                 basalt::log::error("basalt inkling2", "expert lookup counters could not be read; restart the engine");
                 return false;
@@ -987,8 +1068,8 @@ public:
 
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
         if (save && stale_) return stale();
-        if (save && (int64_t) hist_.size() - pos > kMaxRows)
-            return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kMaxRows) + " positions past the checkpoint"};
+        if (save && (int64_t) hist_.size() - pos > kWindowRows)
+            return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kWindowRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "inkling2: a checkpoint past the session's position"};
         const size_t kv_ring = (size_t) kConvRing * kKvHeads * kHeadDim * 4, e_ring = (size_t) kConvRing * g_.n_embd * 4;
         for (size_t i = 0; i < vc_.size(); ++i) {   // the second card's visits go with its stream
@@ -1047,7 +1128,7 @@ public:
             k.v.resize_for_overwrite(run);
             const auto down = [](const void* dev, core::ConversationBuffer& to) {
                 return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                    return basalt::core::device_copy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
                 });
             };
             if (!down(c.k, k.k) || !down(c.v, k.v)) return {model::Status::Error, "inkling2: reading a cache back failed"};
@@ -1071,7 +1152,7 @@ public:
                 return {model::Status::Error, "inkling2: a parked conversation has other caches"};
             const auto up = [&](void* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t at) {
-                    return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                    return basalt::core::device_copy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
                 });
             };
             if (!up(c.k, kv[i].k) || !up(c.v, kv[i].v)) return {model::Status::Error, "inkling2: writing a cache back failed"};
@@ -1130,9 +1211,20 @@ private:
 
     // On the current device.
     void* alloc(size_t bytes, bool& ok) {
-        void* p = nullptr;
+        if (!ok) return nullptr;
         int dev = 0;
-        if (!ok || cudaGetDevice(&dev) != cudaSuccess || cudaMalloc(&p, std::max<size_t>(bytes, 16)) != cudaSuccess) {
+        if (cudaGetDevice(&dev) != cudaSuccess) { ok = false; return nullptr; }
+        const size_t aligned = (std::max<size_t>(bytes, 16) + 255) & ~(size_t) 255;
+        for (int c = 0; c < 2; ++c) {
+            if (arena_rem_[c] >= aligned && arena_dev_[c] == dev) {
+                void* p = arena_ptr_[c];
+                arena_ptr_[c] += aligned;
+                arena_rem_[c] -= aligned;
+                return p;
+            }
+        }
+        void* p = nullptr;
+        if (cudaMalloc(&p, std::max<size_t>(bytes, 16)) != cudaSuccess) {
             ok = false;
             return nullptr;
         }
@@ -1146,7 +1238,7 @@ private:
         std::vector<uint32_t> c(t.size());
         for (const Lane& k : lane_) {
             if (!k.ex_tally) continue;
-            if (cudaMemcpy(c.data(), k.ex_tally, c.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            if (basalt::core::device_copy(c.data(), k.ex_tally, c.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
             for (size_t i = 0; i < t.size(); ++i) t[i] += c[i];
         }
         return true;
@@ -1238,15 +1330,21 @@ private:
         // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
         const bool guess = rows <= kGuessRows;
-        if (guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card) {   // its guess was made on this card
+        const bool has_prev_guess = guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card;
+        // On deep full-attention visits (>= 16K keys = 32..535 MB KV), prefetching before attention_window both contends
+        // with attn_mma_kernel on SMs/DRAM and gets evicted from L2 by the KV sweep; deferring past attention_window lands
+        // the guessed experts into L2 during o_proj + post_attn + router right before MoE reads them.
+        const bool defer_guess = full && full_keys >= 16384;
+        const auto launch_guess_prefetch = [&]() {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.pf_ev, k.stream);
             cudaStreamWaitEvent(k.pf_st, k.pf_ev, 0);
             cudaStreamWaitEvent(k.pf_st, k.gs_ev, 0);
-            expert_prefetch(x.gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts / rows * rows, w.blob_table, (uint64_t) Lx.down_off & ~(uint64_t) 15,
-                            x.pf_sink_, k.pf_st);
+            expert_prefetch(x.gs_ids_ + (size_t) vi * kGuessExperts, kGuessExperts / rows * rows, w.blob_table,
+                            (uint64_t) Lx.down_off & ~(uint64_t) 15, x.pf_sink_, k.pf_st);
             k.pf_on = true;
-        }
+        };
+        if (has_prev_guess && !defer_guess) launch_guess_prefetch();
         // convolutions, clips, caches (the attention prepares them)
         ap.pos = x.pos_d_;
         ap.full = full;
@@ -1286,20 +1384,21 @@ private:
         aa.gate = ap.yq + kOffGate;
         aa.gate_ld = ap.ldq;
         aa.q8 = x.xo_;
-        const Segments seg = segments(v.slot);   // a batch window's: each conversation's caches of this visit
+        const Segments seg = segments(v.slot, card);   // a batch window's: each conversation's caches of this visit
         ap.seg = aa.seg = seg;
         // The previous graph bucket bounds the first consecutive row from below.
-        if (seg.at.n == 0 && full_keys > 1024) {
+        if (seg.at.n == 0 && seg.at_d == nullptr && full_keys > 1024) {
             int64_t previous = full_keys / 2;
             if (rows == 1 && m_.cache_int8() && full_keys == 2 * kMmaDeepMinKeys)
                 previous = kMmaDeepMinKeys - 1;
             aa.min_full_keys = previous + 2 - rows;
         }
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, x.att_scr_, k.stream);
+        if (has_prev_guess && defer_guess) launch_guess_prefetch();
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
-        if (!guess) {
+        if (!guess && rows <= kDecodeRows) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.ra_ev, k.stream);
             cudaStreamWaitEvent(k.ra_st, k.ra_ev, 0);
@@ -1349,8 +1448,8 @@ private:
         const bool guess_next = guess && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card;
         if (guess_next) cudaEventRecord(k.ra_ev, k.stream);   // the MLP input is in
         // the routed ids: a visit's own slot when the session ranks its copies by kept rows (decode_kept), else the scratch
-        int32_t* const ids = k.win_ids ? k.win_ids + (size_t) vi * kMaxRows * g_.n_used : x.ids_;
-        if (g_.n_expert == 128 && rows == 1) {
+        int32_t* const ids = k.win_ids ? k.win_ids + (size_t) vi * sh_->max_rows * g_.n_used : x.ids_;
+        if (g_.n_expert == 128 && rows <= kDecodeRows) {
             bk::router_logits(nrm, w.router, rows, ra, x.rlog_, k.stream);
         } else {
             bk::router(nrm, w.router, w.router_bias, rows, ra, x.rlog_, ids, x.rw_, k.stream);
@@ -1364,7 +1463,7 @@ private:
             cudaEventRecord(k.gs_ev, k.ra_st);
             k.ra_on = true;
         }
-        if (g_.n_expert == 128 && rows == 1) {
+        if (g_.n_expert == 128 && rows <= kDecodeRows) {
             router_select_plan(x.rlog_, w.router_bias, rows, g_.n_used, g_.n_expert, g_.expert_scale, ids, x.rw_,
                                w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                                k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
@@ -1404,11 +1503,14 @@ private:
     float* buf(Buf b) const { return role_[(int) b]; }
 
     // The kernels' segment table of visit cache `slot` in the batch window in flight (none outside one).
-    Segments segments(int slot) const {
+    Segments segments(int slot, int card) const {
         Segments s;
         if (!view_) return s;
-        s.at = view_->w.device_segs();
+        s.at_d = lane_[card].x->at_d_;
+        s.n_segs = view_->n;
+        s.max_seg_rows = 1;
         for (int i = 0; i < view_->n; ++i) {
+            s.max_seg_rows = std::max(s.max_seg_rows, view_->w.segs[(size_t) i].rows);
             const VisitCache& c = static_cast<const Session*>(view_->ss[i])->vc_[(size_t) slot];
             s.c[i] = {c.k, c.v, c.k_ring, c.v_ring, c.a_ring, c.m_ring};
         }
@@ -1440,25 +1542,30 @@ private:
 
     // A call's inputs to the card: its tokens and positions (pos0.., or every row's own in `positions`), its first rows;
     // returns the full visits' launch bound.
-    int64_t stage(const int32_t* tokens, const float* emb, int rows, int64_t pos0, const int32_t* positions) {
+    int64_t stage(const int32_t* tokens, const float* emb, int rows, int64_t pos0, const int32_t* positions,
+                  const bk::WindowSegs* wsegs = nullptr) {
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
-        // the tokens and positions through a ring of pinned slots: a slot is written again once its copy has run
+        const int mr = sh_->max_rows;
+        const int stride = 2 * mr + kSegWords;
+        // the tokens, positions, and segment table through a ring of pinned slots
         const int slot = (int) (stage_n_++ % kStage);
         cudaEventSynchronize(stage_ev_[slot]);
-        int32_t* io = io_h_ + (size_t) slot * 2 * kMaxRows;
+        int32_t* io = io_h_ + (size_t) slot * stride;
         int64_t last = 0;
         for (int i = 0; i < rows; ++i) {
             io[i] = tokens ? tokens[i] : 0;
-            io[kMaxRows + i] = positions ? positions[i] : (int32_t) (pos0 + i);
-            last = std::max<int64_t>(last, io[kMaxRows + i]);
+            io[mr + i] = positions ? positions[i] : (int32_t) (pos0 + i);
+            last = std::max<int64_t>(last, io[mr + i]);
         }
-        cudaMemcpyAsync(io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
+        bk::WindowSegs empty_segs{};
+        std::memcpy(io + 2 * mr, wsegs ? wsegs : &empty_segs, sizeof(bk::WindowSegs));
+        cudaMemcpyAsync(io_d_, io, (size_t) stride * 4, cudaMemcpyHostToDevice, stream_);
         if (Lane& k = lane_[1]; k.stream) {   // the positions to the second card too, after its last window, before this one
             cudaEventRecord(io_ev0_, stream_);
             cudaSetDevice(k.device);
             cudaStreamWaitEvent(k.stream, io_ev0_, 0);
-            cudaMemcpyAsync(k.x->io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, k.stream);
+            cudaMemcpyAsync(k.x->io_d_, io, (size_t) stride * 4, cudaMemcpyHostToDevice, k.stream);
             cudaEventRecord(io_ev1_, k.stream);
             cudaSetDevice(m_.device());
             cudaStreamWaitEvent(stream_, io_ev1_, 0);
@@ -1483,7 +1590,11 @@ private:
         if (!drop_stale_read_ahead(err)) return false;
         const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
-        if (it != graphs_.end()) return it->second.launch(stream_, err);
+        if (it != graphs_.end()) {
+            window_cold_ = false;
+            return it->second.launch(stream_, err);
+        }
+        window_cold_ = true;
         if (direct_.insert(key).second || graphless_.count(key)) {
             body(rows, head, full_keys);
             return true;
@@ -1542,7 +1653,7 @@ private:
     void cross(int from, const Segment& sg, int rows) {
         Lane& a = lane_[from];
         Lane& b = lane_[sg.card];
-        const size_t n = (size_t) rows * g_.n_embd, slot = (size_t) kMaxRows * g_.n_embd;
+        const size_t n = (size_t) rows * g_.n_embd, slot = (size_t) sh_->max_rows * g_.n_embd;
         join_sides(a);
         cudaSetDevice(a.device);
         for (size_t i = 0; i < sg.pull.size(); ++i)
@@ -1559,7 +1670,7 @@ private:
     void tap_across(int t, const float* rows_dev, int rows) {
         Lane& a = lane_[1];
         const size_t n = (size_t) rows * g_.n_embd;
-        float* slot = sh_->hand + (size_t) (sh_->tap_slot0 + t) * kMaxRows * g_.n_embd;
+        float* slot = sh_->hand + (size_t) (sh_->tap_slot0 + t) * sh_->max_rows * g_.n_embd;
         cudaMemcpyAsync(slot, rows_dev, n * 4, cudaMemcpyDeviceToHost, a.stream);
         cudaEventRecord(a.hand, a.stream);
         cudaSetDevice(m_.device());
@@ -1626,18 +1737,34 @@ private:
         hn.norm_out = tapped ? dspark_.tap(kDsTargets - 1) : fin_;
         hn.eps = g_.rms_eps;
         mix_norm(hn, 1, n_fin, stream_);
-        if (tapped && !view_) dspark_.commit(pos_d_, rows, stream_);   // DSPARK HOOK: the rows' context for the drafter
-        if (tapped && view_)   // a batch window's: each conversation's rows of the shared tap into its own drafter's context
-            for (int i = 0; i < view_->n; ++i) {
-                const model::BatchWindow::Seg& sg = view_->w.segs[(size_t) i];
-                static_cast<Session*>(view_->ss[i])->dspark_.commit(pos_d_ + sg.row0, sg.rows, stream_, sg.row0);
+        if (tapped) {   // DSPARK HOOK: fork onto the side stream when the LM head also runs, overlapping both inside the graph
+            cudaStream_t cst = stream_;
+            if (head > 0) {
+                Lane& k0 = lane_[0];
+                join_sides(k0);
+                cudaEventRecord(k0.ra_ev, stream_);
+                cudaStreamWaitEvent(k0.ra_st, k0.ra_ev, 0);
+                k0.ra_on = true;
+                cst = k0.ra_st;
             }
+            if (!view_) {
+                dspark_.commit(pos_d_, rows, cst);
+            } else if (view_->n > 1 && sh_->ds_batch && sh_->ds_batch->on()) {
+                DsparkHook* hooks[bk::kWindowSegsMax] = {};
+                for (int i = 0; i < view_->n; ++i) hooks[i] = &static_cast<Session*>(view_->ss[i])->dspark_;
+                sh_->ds_batch->commit(hooks, view_->n, at_d_, pos_d_, rows, cst);
+            } else {
+                for (int i = 0; i < view_->n; ++i) {
+                    const model::BatchWindow::Seg& sg = view_->w.segs[(size_t) i];
+                    static_cast<Session*>(view_->ss[i])->dspark_.commit(pos_d_ + sg.row0, sg.rows, cst, sg.row0);
+                }
+            }
+        }
         if (head <= 0) return;
         const size_t q8_row = (size_t) E / 32 * 36;   // the head's rows' q8_1 blocks follow the rows before them
-        float* lg = view_ ? blog_ : logits_;          // a batch window's rows go to each session in batch_take
+        float* lg = blog_;                            // solo and batch both write into shared blog_
         bk::native_q8_planes_mmvq(m_.head(), (const uint8_t*) xq_[0] + (size_t) (rows - head - first) * q8_row, lg, E, g_.n_vocab, head,
-                             stream_);
-        softcap(lg, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
+                             stream_, g_.logit_softcap);
     }
 
     // Admission to the CPU experts' windows (CpuExperts::enter): held from before a call's first window until the sync
@@ -1731,7 +1858,7 @@ private:
         sp.logit_bias = bias_on_ ? d_bias_ : nullptr;
         history_len_ = r.history != nullptr ? r.history_len : 0;
         if (history_len_ > 0) {   // the penalties' history of each row of the window
-            const size_t n = (size_t) kMaxRows * history_len_;
+            const size_t n = (size_t) kWindowRows * history_len_;
             if (d_hist_len_ < n) {
                 bool ok = true;
                 d_hist_ = (int32_t*) alloc(n * 4, ok);
@@ -1772,10 +1899,15 @@ private:
     std::set<Shape> direct_;                           // the shapes whose first window has run
     std::set<Shape> graphless_;                        // the shapes whose graph found no device memory: always direct
     uint64_t cpu_ = 0;                                 // the window in flight's layers with experts on the CPU
-    bool admitted_ = false;                            // holds admission to the CPU experts' windows (admit)
+    bool admitted_ = false;
+    bool window_cold_ = false;                            // holds admission to the CPU experts' windows (admit)
     bool fork_open_ = false;                           // a start whose finish has not queued its join
     const model::BatchView* view_ = nullptr;           // the batch window in flight, while batch_forward runs it
-    float* logits_ = nullptr;                // the last window's head rows (row_logprobs, copy_logits, resample_row)
+    float* logits_ = nullptr;                // slice in blog_ of the last window's head rows
+    uint64_t logits_gen_ = 0;
+    int arena_dev_[2] = {-1, -1};
+    uint8_t* arena_ptr_[2] = {nullptr, nullptr};
+    size_t arena_rem_[2] = {0, 0};
     uint32_t* ex_tally_ = nullptr;           // [layer][expert] the card's running count of each expert's lookups
     unsigned long long* rec_blobs_ = nullptr;   // [visit][kAheadExperts] the experts each visit took in the last window
     int32_t* rec_n_ = nullptr;                  // [visit] how many

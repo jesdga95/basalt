@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from serve import server
+from serve.engine.errors import EngineStuck
 from serve.frontend import ChatTemplate
 from serve.parking import ModelCache
 from serve.router import Router
@@ -205,6 +208,134 @@ class Parking(Base):
             e.close = lambda n=n: closed.append(n)
         self.router.stop()
         self.assertEqual(closed, ["B", "A"])
+
+    def test_guard_evicting_target_around_swap_does_not_crash_and_loads_cold(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.assertEqual(self.chat("B")[0], 200)
+        self.assertEqual(self.parked(), ["A"])
+        real_prune = self.router.prune
+        fired = []
+
+        def evict_in_prune():
+            real_prune()
+            if not fired:
+                fired.append(1)
+                with mock.patch("serve.router.available_ram_mib", return_value=1000):
+                    self.router.guard_once()
+
+        self.router.prune = evict_in_prune
+        self.assertEqual(self.chat("A")[0], 200)
+        self.router.prune = real_prune
+        self.assertIn(("evict", "A"), self.events)
+        self.assertEqual(self.events.count(("start", "A")), 2)
+        self.assertIs(self.router.current, self.svcs["A"])
+
+        # A guard check firing during the swap print cannot evict the target once taken under park_lock.
+        self.assertEqual(self.chat("B")[0], 200)
+        self.assertEqual(self.parked(), ["A"])
+        guard_ran = []
+
+        def print_with_guard(*args, **kwargs):
+            text = " ".join(map(str, args))
+            self.out.write(text + "\n")
+            if "swap B -> A" in text and not guard_ran:
+                guard_ran.append(1)
+                with mock.patch("serve.router.available_ram_mib", return_value=1000):
+                    self.router.guard_once()
+
+        with mock.patch("builtins.print", print_with_guard):
+            self.assertEqual(self.chat("A")[0], 200)
+        self.assertEqual(guard_ran, [1])
+        self.assertIn(("wake", "A"), self.events)
+        self.assertEqual(self.events.count(("start", "A")), 2)
+        self.assertIs(self.router.current, self.svcs["A"])
+
+    def test_swap_failure_before_wake_returns_target_to_cache(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.assertEqual(self.chat("B")[0], 200)
+        self.REFUSE = {"B": "RAM: 100 MiB free"}
+        self.engines["B"].unload = mock.Mock(side_effect=EngineStuck("still releasing"))
+        status, _ = self.chat("A")
+        self.assertEqual(status, 503)
+        self.assertIs(self.router.current, self.svcs["B"])
+        self.assertEqual(self.parked(), ["A"])
+        self.assertTrue(self.engines["A"].asleep)
+        rows = {m["id"]: m for m in self.get("/v1/models")[1]["data"]}
+        self.assertEqual(rows["A"]["parked_mib"], 3000)
+
+    def test_unloading_a_parked_model_evicts_it_without_waking_and_keeps_current(self):
+        for path, name in (("/v1/unload", "A"), ("/models/unload", "C")):
+            self.assertEqual(self.chat(name)[0], 200)
+            self.assertEqual(self.chat("B")[0], 200)
+            self.assertEqual(self.parked(), [name])
+            eng = self.engines[name]
+            eng.unload = mock.Mock(side_effect=AssertionError("unload must not resume a parked model"))
+            eng.close = mock.Mock(side_effect=AssertionError("close must not resume a parked model"))
+            status, body = self.post(path, {"model": name})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["status"], "unloaded")
+            self.assertIn(("evict", name), self.events)
+            eng.unload.assert_not_called()
+            eng.close.assert_not_called()
+            self.assertEqual(self.parked(), [])
+            rows = {m["id"]: m for m in self.get("/v1/models")[1]["data"]}
+            self.assertIsNone(rows[name]["parked_mib"])
+            self.assertEqual(rows[name]["status"]["value"], "unloaded")
+            self.assertIs(self.router.current, self.svcs["B"])
+            self.assertTrue(self.engines["B"].up)
+        self.assertEqual(self.chat("B")[0], 200)
+
+    def test_unloading_the_active_model_clears_current(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.assertEqual(self.chat("B")[0], 200)
+        self.assertIs(self.router.current, self.svcs["B"])
+        status, body = self.post("/v1/unload", {"model": "B"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["status"], "unloaded")
+        self.assertFalse(self.engines["B"].up)
+        self.assertIsNone(self.router.current)
+        self.assertEqual(self.parked(), ["A"])
+        status, body = self.post("/v1/unload", {"model": "B"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["status"], "not loaded")
+        self.assertEqual(self.chat("C")[0], 200)
+        self.assertIs(self.router.current, self.svcs["C"])
+        self.assertEqual(self.events.count(("end", "B")), 1)
+        status, body = self.post("/unload", {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["status"], "unloaded")
+        self.assertIsNone(self.router.current)
+
+    def test_idle_unload_on_a_parked_model_respects_idle_for_and_evicts(self):
+        self.assertEqual(self.chat("A")[0], 200)
+        self.assertEqual(self.chat("B")[0], 200)
+        self.engines["A"].unload = mock.Mock(side_effect=AssertionError("unload must not resume a parked model"))
+        self.engines["A"].close = mock.Mock(side_effect=AssertionError("close must not resume a parked model"))
+        self.svcs["A"].last_request_at = time.time()
+        self.assertEqual(self.router.unload(self.svcs["A"], idle_for=60), "busy")
+        self.assertEqual(self.parked(), ["A"])
+        self.svcs["A"].last_request_at = time.time() - 120
+        self.assertEqual(self.router.unload(self.svcs["A"], idle_for=60), "unloaded")
+        self.assertIn(("evict", "A"), self.events)
+        self.engines["A"].unload.assert_not_called()
+        self.engines["A"].close.assert_not_called()
+        self.assertEqual(self.parked(), [])
+        self.assertIs(self.router.current, self.svcs["B"])
+        self.assertIn("unparked A: idle 60 s", self.out.getvalue())
+
+        # Service.start_idle_unload with router.unload as unloader evicts a parked model in the background.
+        self.assertEqual(self.chat("C")[0], 200)
+        self.assertEqual(self.chat("B")[0], 200)
+        self.engines["C"].unload = mock.Mock(side_effect=AssertionError("unload must not resume a parked model"))
+        self.engines["C"].close = mock.Mock(side_effect=AssertionError("close must not resume a parked model"))
+        self.svcs["C"].idle_unload_s = 1
+        self.svcs["C"].last_request_at = time.time() - 10
+        self.svcs["C"].start_idle_unload(unloader=lambda idle_for=None: self.router.unload(self.svcs["C"], idle_for=idle_for))
+        self.wait_until(lambda: ("evict", "C") in self.events)
+        self.engines["C"].unload.assert_not_called()
+        self.engines["C"].close.assert_not_called()
+        self.assertEqual(self.parked(), [])
+        self.assertIs(self.router.current, self.svcs["B"])
 
 
 class Off(Base):

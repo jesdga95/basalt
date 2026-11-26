@@ -186,6 +186,7 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
             cp16z(scale_s + threadIdx.x * 4, p.a_scale + t, min(max(p.ntok - t, 0), 4) * 4);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncwarp();
         }
         const bool add = BF16 && p.epi == (int) Epilogue::AddBf16;
         const int fetch_at = max(first, p.k_tiles - FETCH_STAGES);

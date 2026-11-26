@@ -1,9 +1,12 @@
 # basalt: a local inference engine for one NVIDIA GPU.
 cmake_minimum_required(VERSION 3.24)
+# The compute capability defaults by target architecture (120 on x86-64, 121 on Arm64), which is known only after
+# project(): cmake/target_arch.cmake sets it there when the caller named none.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  set(_basalt_cuda_arch_default ON)
 endif()
 project(basalt VERSION 0.5.7 LANGUAGES C CXX CUDA)
+include(cmake/target_arch.cmake)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -43,12 +46,7 @@ find_package(CUDAToolkit REQUIRED)
 # Main kernels (NVFP4 tensor cores, TMA, Blackwell instructions) compile for sm_120 only.
 # When PEER_ADA is enabled, peer kernels (Q8_1/Q2_0 expert rows, standard CUDA) additionally compile
 # for sm_89 (Ada) so a non-Blackwell card can serve as the expert tier.
-foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
-  string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only (peer-arch kernels are compiled separately below)")
-  endif()
-endforeach()
+# cmake/target_arch.cmake has checked CMAKE_CUDA_ARCHITECTURES: one capability, 12.0 or 12.1 (BASALT_CUDA_CC).
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
   message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: basalt needs CUDA 13.0 or newer")
 endif()
@@ -83,7 +81,7 @@ endif()
 # The `warnings` and `platform` targets, one file shared with the standalone `tools/vision` configuration.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/platform.cmake)
 
-# BASALT_MODELS: which models this build contains (all of them by default).
+# BASALT_MODELS: which models this build contains (required).
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/models.cmake)
 
 # The application manifest, for every program that names a file path in its command line. Windows decodes argv and
@@ -244,7 +242,6 @@ if(BUILD_TESTING)
   add_executable(hy4flash_vision_test src/models/hy4flash/vision_test.cpp src/models/hy4flash/vision.cpp)
   target_include_directories(hy4flash_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(hy4flash_vision_test PRIVATE vision_core warnings)
-  basalt_gpu_test(NAME hy4_encoder_parity COMMAND hy4_encoder_parity)
   basalt_cpu_test(NAME hy4flash_vision_test COMMAND hy4flash_vision_test ${CMAKE_CURRENT_SOURCE_DIR}/assets/basalt-lockup-light.png)
   add_executable(hy4flash_pretok_test src/models/hy4flash/pretok_test.cpp src/models/hy4flash/pretok_hy4.cpp)
   target_include_directories(hy4flash_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
@@ -276,7 +273,7 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME inkling2_kv_int8_parity COMMAND inkling2_kv_int8_parity)
   add_executable(inkling2_dspark_parity src/models/inkling2/kernels/dspark_parity.cpp)
   target_include_directories(inkling2_dspark_parity PRIVATE ${_gpu_include_directories})
-  target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels ${_gpu_runtime_target})
+  target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2_dspark_parity COMMAND inkling2_dspark_parity)
   add_executable(inkling2_prompt_parity src/models/inkling2/kernels/prompt_parity.cpp)
   target_include_directories(inkling2_prompt_parity PRIVATE ${_gpu_include_directories})
@@ -307,6 +304,9 @@ if(BUILD_TESTING)
   add_executable(inkling2_copy_heat_test src/models/inkling2/copy_heat_test.cpp)
   target_include_directories(inkling2_copy_heat_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_cpu_test(NAME inkling2_copy_heat_test COMMAND inkling2_copy_heat_test)
+  add_executable(inkling2_wide_chunk_test src/models/inkling2/wide_chunk_test.cpp)
+  target_include_directories(inkling2_wide_chunk_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_cpu_test(NAME inkling2_wide_chunk_test COMMAND inkling2_wide_chunk_test)
   add_executable(inkling2_expert_map_test src/models/inkling2/expert_map_test.cpp)
   target_include_directories(inkling2_expert_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_cpu_test(NAME inkling2_expert_map_test COMMAND inkling2_expert_map_test)
@@ -684,6 +684,10 @@ if(BUILD_TESTING)
   add_executable(conversation_cache_test tests/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   basalt_cpu_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+  # the RAM copy's pack bound beside the adaptive swaps' free places (header-only sizing, no GPU, no file)
+  add_executable(resident_pack_room_test tests/core/resident_pack_room_test.cpp)
+  target_include_directories(resident_pack_room_test PRIVATE include)
+  basalt_cpu_test(NAME resident_pack_room_test COMMAND resident_pack_room_test)
   # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
   # allocator and the OS memory query, and nothing from the GPU runtime.
   add_executable(conversation_memory_test tests/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
@@ -864,6 +868,9 @@ if(BUILD_TESTING)
   add_executable(vision_resize_test tests/vision/preprocess_test.cpp)
   target_link_libraries(vision_resize_test PRIVATE vision_core warnings)
   basalt_cpu_test(NAME vision_resize_test COMMAND vision_resize_test)
+  if(BASALT_MODEL_HY4FLASH)
+    basalt_gpu_test(NAME hy4_encoder_parity COMMAND hy4_encoder_parity)
+  endif()
   basalt_gpu_test(NAME cls_encoder_parity COMMAND cls_encoder_parity)
   # FFmpeg found at run time, or the reason it is not (any machine: CI has no FFmpeg)
   add_executable(ffmpeg_load_test tests/vision/ffmpeg_load_test.cpp)
@@ -900,7 +907,7 @@ target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_DEVICE="$<TARGET_FILE:basalt-device>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
   BASALT_BENCH_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-  BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+  BASALT_BENCH_BUILD_TYPE="$<CONFIG>"
   BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
 
 # basalt-probe: starts the engine, measures its rates and cold decode speed, prints a report
@@ -914,35 +921,43 @@ target_compile_definitions(basalt-probe PRIVATE
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench")
 
 if(BUILD_TESTING)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
 # closing the engine's stdin mid-request stops it (runs the real engine on a model pack:
 # -DBASALT_STDIN_STOP_MODEL=<pack>, with python3)
 if(BASALT_STDIN_STOP_MODEL AND Python3_Interpreter_FOUND)
-  add_test(NAME stdin_stop_test
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/stdin_stop_test.py
-                   $<TARGET_FILE:basalt> ${BASALT_STDIN_STOP_MODEL} ${CMAKE_CURRENT_SOURCE_DIR}/data/bench/conv.ids
-                   ${BASALT_STDIN_STOP_ARGS})
-  set_property(TEST stdin_stop_test APPEND PROPERTY LABELS gpu)
+  basalt_gpu_test(NAME stdin_stop_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/stdin_stop_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_STDIN_STOP_MODEL} ${CMAKE_CURRENT_SOURCE_DIR}/data/bench/conv.ids
+                          ${BASALT_STDIN_STOP_ARGS})
   set_tests_properties(stdin_stop_test PROPERTIES TIMEOUT 600)
 endif()
 
 # the engine enforces a request grammar on what it samples (runs the real engine on a model pack:
 # -DBASALT_GRAMMAR_MODEL=<pack>, with python3)
 if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
-  add_test(NAME grammar_engine_test
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_engine_test.py
-                   $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_ARGS})
-  set_property(TEST grammar_engine_test APPEND PROPERTY LABELS gpu)
+  basalt_gpu_test(NAME grammar_engine_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_engine_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_ARGS})
   set_tests_properties(grammar_engine_test PROPERTIES TIMEOUT 900)
 endif()
 
 # grammar requests under --batch: each slot held to its own grammar (starts the server on a model pack, same
 # -DBASALT_GRAMMAR_MODEL, with python3; -DBASALT_GRAMMAR_BATCH_ARGS=<server args>)
 if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
-  add_test(NAME grammar_batch_test
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_batch_test.py
-                   $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_BATCH_ARGS})
-  set_property(TEST grammar_batch_test APPEND PROPERTY LABELS gpu)
+  basalt_gpu_test(NAME grammar_batch_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_batch_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_BATCH_ARGS})
   set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
+endif()
+
+# speculative multi-slot batch identity (`--serve --batch 2..64 --spec 8` vs `--batch 1`, cold + warm replay;
+# configure with -DBASALT_BATCH_IDENTITY_MODEL=/path/to/model.basalt and optional -DBASALT_BATCH_IDENTITY_ARGS=...)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME batch_spec_identity_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_spec_identity_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
 endif()
 
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE
@@ -977,7 +992,7 @@ basalt_gpu_test(NAME window_gemm_two_gpu COMMAND window_gemm_two_gpu)
 set_tests_properties(window_gemm_two_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # the FP8 and FP4 codes as bf16x2 (narrow_bf16.cuh): the direct cvt (CUDA 13.2+) and the f16 route, every input
 add_executable(narrow_bf16_parity tests/kernels/narrow_bf16_parity.cu)
-set_target_properties(narrow_bf16_parity PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(narrow_bf16_parity PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
 target_include_directories(narrow_bf16_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(narrow_bf16_parity PRIVATE ${_gpu_runtime_target})
 basalt_gpu_test(NAME narrow_bf16_parity COMMAND narrow_bf16_parity)
@@ -1004,7 +1019,6 @@ basalt_embed_manifest(iq_parity)
 # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
-find_package(Python3 COMPONENTS Interpreter QUIET)
 
 # writing a community run file under docs/community/runs: formatting cases, and a byte comparison with
 # tools/check_benchmarks.py (python3)
@@ -1062,9 +1076,14 @@ else()
   if(Python3_Interpreter_FOUND)
     list(APPEND _iq_candidates ${Python3_EXECUTABLE})
   endif()
-  list(APPEND _iq_candidates "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python"
-                              /usr/bin/python3
-                              python3)
+  if(WIN32)
+    list(APPEND _iq_candidates "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe"
+                                python)
+  else()
+    list(APPEND _iq_candidates "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python"
+                                /usr/bin/python3
+                                python3)
+  endif()
 endif()
 foreach(_cand IN LISTS _iq_candidates)
   if(_cand STREQUAL "")
@@ -1811,6 +1830,11 @@ set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIO
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
 target_link_libraries(kernels_cpu PUBLIC ggml_quants)
+if(BASALT_ARM64)
+  basalt_arm64_kernels_cpu()   # the NEON kernels in place of the x86 ones (cmake/arm64.cmake)
+  # deferred to the end of this file, when every target and test exists: the x86 kernels' own tests are not built
+  cmake_language(DEFER CALL basalt_arm64_disable avx_bench iq_avx2_test iq_avx512_test nvfp4_cpu_rows_test router_dot_parity)
+endif()
 if(BUILD_TESTING)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
   add_executable(router_dot_parity tests/kernels/cpu/router_dot_parity.cpp)
@@ -1850,7 +1874,7 @@ target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_moe_fused)
 endif()
 # a prompt chunk's products against FP8 E4M3 weights on the FP8 tensor cores (W8A8)
 add_library(prefill_fp8 STATIC src/prefill/fp8_gemm.cu)
-set_target_properties(prefill_fp8 PROPERTIES CUDA_ARCHITECTURES 120a-real)   # the block-scaled mma
+set_target_properties(prefill_fp8 PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})   # the block-scaled mma
 target_include_directories(prefill_fp8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_fp8 PUBLIC core ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -1873,15 +1897,15 @@ endif()
 # a decode window's products against FP8 and NVFP4 matrices (the NVFP4 codes convert with sm_120a instructions)
 add_library(window_gemm STATIC src/kernels/cuda/window_gemm.cu src/kernels/cuda/window_gemm_f8.cu
                                src/kernels/cuda/window_gemm_nvfp4.cu)
-set_target_properties(window_gemm PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(window_gemm PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
 target_include_directories(window_gemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(window_gemm PUBLIC core ${_gpu_runtime_target})
 add_library(prefill_fp4 STATIC src/prefill/moe_fp4.cu src/prefill/fp4_dense.cu)
-set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
 target_include_directories(prefill_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_fp4 PUBLIC mmq ${_gpu_runtime_target})
 add_library(prefill_mxfp8 STATIC src/prefill/moe_mxfp8.cu)
-set_target_properties(prefill_mxfp8 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(prefill_mxfp8 PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
 target_include_directories(prefill_mxfp8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_mxfp8 PUBLIC core ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -1891,7 +1915,7 @@ if(BUILD_TESTING)
   set_tests_properties(moe_mxfp8_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 add_library(prefill_q8 STATIC src/prefill/q8_gemm.cu)
-set_target_properties(prefill_q8 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(prefill_q8 PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
 target_include_directories(prefill_q8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_q8 PUBLIC core ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -1987,7 +2011,7 @@ if(BUILD_TESTING)
   set_tests_properties(fp4_dense_tma_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the SwiGLU epilogue's branch-free SiLU quotient against the plain expression on every float (built as the product is)
   add_executable(silu_parity tests/kernels/silu_parity.cu)
-  set_target_properties(silu_parity PROPERTIES CUDA_ARCHITECTURES 120a-real)
+  set_target_properties(silu_parity PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
   target_include_directories(silu_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(silu_parity PRIVATE ${_gpu_runtime_target})
   basalt_gpu_test(NAME silu_parity COMMAND silu_parity)
@@ -2103,7 +2127,11 @@ if(BUILD_TESTING)
   add_executable(mxfp8_cpu_rows_test tests/kernels/cpu/mxfp8_cpu_rows_test.cpp)
   target_link_libraries(mxfp8_cpu_rows_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME mxfp8_cpu_rows_test COMMAND mxfp8_cpu_rows_test)
-  set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+  if(BASALT_ARM64)
+    set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;neon")
+  else()
+    set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+  endif()
 
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
 

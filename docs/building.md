@@ -17,8 +17,8 @@ The build fetches nothing. The ggml and llama.cpp parts Basalt uses (quantizatio
 
 ## Building only some models
 
-`-DBASALT_MODELS=<ids>` is a semicolon list of architecture ids, or `all` (the default), which builds every model and follows the
-models a later version adds. A model left out is not compiled at
+`-DBASALT_MODELS=<ids>` is a semicolon list of architecture ids, or `all`, which builds every model and follows the
+models a later version adds. The option is required: a configure that leaves it out stops and says so. A model left out is not compiled at
 all: its C++ and CUDA sources, its kernels and its tests are skipped, which is most of the build time for DeepSeek.
 
 | Model | Id |
@@ -38,10 +38,10 @@ cmake -S . -B build -DBASALT_MODELS=inkling2                  # Inkling 2 Mini o
 cmake -S . -B build "-DBASALT_MODELS=qwen4exp;deepseek41"     # two of them; quote the semicolon
 ```
 
-An unknown id or an empty list stops the configure and names the valid ids. A pack of a model the build left out fails at load with
+An unknown id, an empty value or no value stops the configure and names the valid ids. A pack of a model the build left out fails at load with
 `architecture is 'deepseek41', a Basalt model this build left out (built with BASALT_MODELS=qwen4exp); rebuild with cmake
 -DBASALT_MODELS="qwen4exp;deepseek41;qwen35" to load it`. The value is kept in the build folder's cache: to change it, pass the option again (`-DBASALT_MODELS=all` goes back to every
-model). A folder configured by 0.4 holds that version's default list, `qwen4exp;deepseek41;qwen35`; the configure reads it as `all`.
+model).
 
 ## Tests
 

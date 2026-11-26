@@ -226,6 +226,90 @@ __global__ void __launch_bounds__(32 * RT_W) bf16_rows_dot_tiles_kernel(const fl
 // y[t][n] = sum_k x[t][k] w[n][k] in fp32: a block of 128 threads per 32 rows x 64 outputs, K in steps of 16 through shared
 // memory (both tiles k-major), each thread 4 rows x 4 outputs. Every output sums its products in k order, so a row's result
 // does not depend on the rows beside it.
+// Bitwise-identical 3-stage cp.async f32_rows_dot: loads row-major K=32 stages directly via 16B cp.async.cg (1 barrier/stage),
+// reads strided rows (stride 36 floats == 4 banks mod 32 -> conflict-free LDS.128), and accumulates fmaf in exact k=0..K-1 order.
+template <int BT, int BN, int BK, int ST, int THR_T, int THR_N, int MIN_BLK>
+__global__ void __launch_bounds__(THR_T * THR_N, MIN_BLK)
+f32_rows_dot_cpasync_kernel(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
+                            int64_t T, int64_t N, int64_t K) {
+    constexpr int LD = BK + 4;
+    constexpr int RT = BT / THR_T, RN = BN / THR_N;
+    constexpr int NTHR = THR_T * THR_N;
+    __shared__ __align__(16) float xs[ST][BT][LD];
+    __shared__ __align__(16) float ws[ST][BN][LD];
+
+    const int tid = threadIdx.x;
+    const int tr = tid / THR_N, tc = tid % THR_N;
+    const int64_t t0 = (int64_t) blockIdx.x * BT, n0 = (int64_t) blockIdx.y * BN;
+    const int n_stages = (int) (K / BK);
+
+    const auto issue_stage = [&](int s, int stg) {
+        const int64_t k0 = (int64_t) stg * BK;
+#pragma unroll
+        for (int q = tid; q < BT * (BK / 4); q += NTHR) {
+            const int r = q / (BK / 4), k4 = (q % (BK / 4)) * 4;
+            rt_cp16(&xs[s][r][k4], x + min(t0 + r, T - 1) * K + k0 + k4);
+        }
+#pragma unroll
+        for (int q = tid; q < BN * (BK / 4); q += NTHR) {
+            const int r = q / (BK / 4), k4 = (q % (BK / 4)) * 4;
+            rt_cp16(&ws[s][r][k4], w + min(n0 + r, N - 1) * K + k0 + k4);
+        }
+    };
+
+    const int preload = min(ST - 1, n_stages);
+    for (int stg = 0; stg < preload; ++stg) {
+        issue_stage(stg, stg);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+
+    float acc[RT][RN] = {};
+    for (int stg = 0; stg < n_stages; ++stg) {
+        const int cur = stg % ST;
+        const int rem_after = min(ST - 2, (n_stages - 1) - stg);
+        if (rem_after == 2) asm volatile("cp.async.wait_group 2;" ::: "memory");
+        else if (rem_after == 1) asm volatile("cp.async.wait_group 1;" ::: "memory");
+        else asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+
+        if (stg + (ST - 1) < n_stages) {
+            const int nxt = (stg + ST - 1) % ST;
+            issue_stage(nxt, stg + ST - 1);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+
+#pragma unroll
+        for (int k4 = 0; k4 < BK; k4 += 4) {
+            float4 av[RT], bv[RN];
+#pragma unroll
+            for (int i = 0; i < RT; ++i) av[i] = *reinterpret_cast<const float4*>(&xs[cur][tr + i * THR_T][k4]);
+#pragma unroll
+            for (int j = 0; j < RN; ++j) bv[j] = *reinterpret_cast<const float4*>(&ws[cur][tc + j * THR_N][k4]);
+#pragma unroll
+            for (int i = 0; i < RT; ++i)
+#pragma unroll
+                for (int j = 0; j < RN; ++j) {
+                    acc[i][j] = fmaf(av[i].x, bv[j].x, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].y, bv[j].y, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].z, bv[j].z, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].w, bv[j].w, acc[i][j]);
+                }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        const int64_t t = t0 + tr + i * THR_T;
+        if (t < T) {
+#pragma unroll
+            for (int j = 0; j < RN; ++j) {
+                const int64_t n = n0 + tc + j * THR_N;
+                if (n < N) y[t * N + n] = acc[i][j];
+            }
+        }
+    }
+}
+
 constexpr int FD_T = 32, FD_N = 64, FD_K = 16;
 __global__ void __launch_bounds__(128) f32_rows_dot_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                                            float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
@@ -527,7 +611,7 @@ __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int str
     __syncthreads();
     for (int p = 0; p < n; ++p) {
         const float* row = lp_rows + (size_t) p * stride;
-        ph[r] = __uint_as_float((uint32_t) pred[(size_t) prev_s * rank + r] << 16) * h[(size_t) p * rank + r];
+        ph[r] = prev_s >= 0 ? __uint_as_float((uint32_t) pred[(size_t) prev_s * rank + r] << 16) * h[(size_t) p * rank + r] : 0.0f;
         __syncthreads();
         for (int k = warp; k < top; k += warps) {
             const int32_t cand = __float_as_int(row[2 + 2 * k]);
@@ -536,38 +620,64 @@ __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int str
                 for (int i = lane; i < rank; i += 32) v += ph[i] * __uint_as_float((uint32_t) succ[(size_t) cand * rank + i] << 16);
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-            if (lane == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + v : -1e30f;
+            if (lane == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + v : -INFINITY;
         }
         __syncthreads();
         if (r == 0) {
-            int best = 0;
-            for (int k = 1; k < top; ++k)
-                if (score[k] > score[best]) best = k;
-            float z = 0.0f;
-            for (int k = 0; k < top; ++k) z += expf(score[k] - score[best]);
-            int pick = best;
-            if (draw.temperature > 0.0f) {
-                const float inv_t = 1.0f / draw.temperature;
-                float zt = 0.0f;
-                for (int k = 0; k < top; ++k) zt += expf((score[k] - score[best]) * inv_t);
-                const float u = philox_uniform(draw.seed, (uint64_t) (draw.pos0 + p), kPhiloxDraft) * zt;
-                float cum = 0.0f;
-                bool found = false;
-                for (int k = 0; k < top; ++k) {
-                    const float e = expf((score[k] - score[best]) * inv_t);
-                    if (draw.q_p) draw.q_p[(size_t) p * top + k] = e / zt;
-                    cum += e;
-                    if (!found && u < cum) { pick = k; found = true; }
-                }
-            } else if (draw.q_p) {
-                for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = k == best ? 1.0f : 0.0f;
+            int best = -1;
+            int first_valid = -1;
+            float best_s = -INFINITY;
+            for (int k = 0; k < top; ++k) {
+                const int32_t ck = __float_as_int(row[2 + 2 * k]);
+                if (ck < 0) continue;
+                if (first_valid < 0) first_valid = k;
+                if (!isnan(score[k]) && (best < 0 || score[k] > best_s)) { best = k; best_s = score[k]; }
             }
             if (draw.q_ids)
                 for (int k = 0; k < top; ++k) draw.q_ids[(size_t) p * top + k] = __float_as_int(row[2 + 2 * k]);
-            const int32_t id = __float_as_int(row[2 + 2 * pick]);
-            ids[p] = id;
-            conf[p] = 1.0f / z;
-            prev_s = id;
+            if (first_valid < 0) {
+                if (draw.q_p)
+                    for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = 0.0f;
+                ids[p] = 0;
+                conf[p] = 0.0f;
+                prev_s = -1;
+            } else {
+                if (best < 0) best = first_valid;
+                const bool finite_best = isfinite(best_s);
+                float z = 0.0f;
+                if (finite_best) {
+                    for (int k = 0; k < top; ++k)
+                        if (score[k] > -INFINITY) z += expf(score[k] - best_s);
+                } else {
+                    z = 1.0f;
+                }
+                int pick = best;
+                if (draw.temperature > 0.0f && finite_best) {
+                    const float inv_t = 1.0f / draw.temperature;
+                    float zt = 0.0f;
+                    for (int k = 0; k < top; ++k) {
+                        if (score[k] > -INFINITY)
+                            zt += (score[k] == best_s) ? 1.0f : expf((score[k] - best_s) * inv_t);
+                    }
+                    const float u = philox_uniform(draw.seed, (uint64_t) (draw.pos0 + p), kPhiloxDraft) * zt;
+                    float cum = 0.0f;
+                    bool found = false;
+                    for (int k = 0; k < top; ++k) {
+                        const float e = score[k] > -INFINITY
+                                            ? ((score[k] == best_s) ? 1.0f : expf((score[k] - best_s) * inv_t))
+                                            : 0.0f;
+                        if (draw.q_p) draw.q_p[(size_t) p * top + k] = e / zt;
+                        cum += e;
+                        if (!found && e > 0.0f && u < cum) { pick = k; found = true; }
+                    }
+                } else if (draw.q_p) {
+                    for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = k == best ? 1.0f : 0.0f;
+                }
+                const int32_t id = __float_as_int(row[2 + 2 * pick]);
+                ids[p] = id;
+                conf[p] = z > 0.0f ? 1.0f / z : 0.0f;
+                prev_s = id;
+            }
         }
         __syncthreads();
     }
@@ -727,8 +837,21 @@ void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64
 void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
     if (T <= 0) return;
     if (K % FD_K != 0) { basalt::log::error("basalt", "f32_rows_dot: K %lld", (long long) K); std::exit(1); }
-    f32_rows_dot_kernel<<<dim3((unsigned) ((T + FD_T - 1) / FD_T), (unsigned) ((N + FD_N - 1) / FD_N)), 128, 0,
-                          (cudaStream_t) stream>>>(x, w, y, T, N, K);
+    if (K % 32 == 0 && (((uintptr_t) x | (uintptr_t) w) & 15) == 0) {
+        if (T < 1024) {
+            f32_rows_dot_cpasync_kernel<16, 32, 32, 3, 8, 8, 6>
+                <<<dim3((unsigned) ((T + 15) / 16), (unsigned) ((N + 31) / 32)), 64, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        } else if (T < 3072) {
+            f32_rows_dot_cpasync_kernel<32, 64, 32, 3, 8, 16, 3>
+                <<<dim3((unsigned) ((T + 31) / 32), (unsigned) ((N + 63) / 64)), 128, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        } else {
+            f32_rows_dot_cpasync_kernel<48, 64, 16, 4, 8, 16, 3>
+                <<<dim3((unsigned) ((T + 47) / 48), (unsigned) ((N + 63) / 64)), 128, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        }
+    } else {
+        f32_rows_dot_kernel<<<dim3((unsigned) ((T + FD_T - 1) / FD_T), (unsigned) ((N + FD_N - 1) / FD_N)), 128, 0,
+                              (cudaStream_t) stream>>>(x, w, y, T, N, K);
+    }
     check("f32_rows_dot");
 }
 
@@ -830,7 +953,7 @@ void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* ba
 void candidate_path(const float* lp_rows, int stride, int top, const float* h, const uint16_t* pred, const uint16_t* succ,
                     int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, const CandidateDraw& draw, void* stream) {
     if (n <= 0) return;
-    if (top > 64 || rank % 32 || rank > 1024) {
+    if (top <= 0 || top > 64 || rank <= 0 || rank % 32 || rank > 1024) {
         basalt::log::error("basalt", "candidate_path: %d candidates of rank %d", top, rank);
         std::exit(1);
     }

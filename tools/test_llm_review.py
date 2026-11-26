@@ -193,6 +193,11 @@ class CodeReview(unittest.TestCase):
         with mock.patch.object(cr, "CHUNK_TOKENS", 7000):
             body = cr.review(big, "", "", chat_fn=lambda c, m, max_tokens, effort=None: next(fails), cfg={})
         self.assertIn("**Verdict: Needs additional review**", body)
+        self.assertIn("parts could not be reviewed.", body)
+        with mock.patch.object(cr, "CHUNK_TOKENS", 7000):
+            all_fail = cr.review(big, "", "", chat_fn=lambda c, m, max_tokens, effort=None: "oops", cfg={})
+        self.assertIn("The review could not run", all_fail)
+        self.assertNotIn("parts could not be reviewed.", all_fail)
 
     def test_no_findings_is_one_line_and_focus_is_passed(self):
         sent = []

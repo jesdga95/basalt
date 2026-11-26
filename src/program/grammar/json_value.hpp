@@ -66,17 +66,23 @@ struct JsonValue {
     }
     std::string number_text() const {
         if (is_integer()) {
-            if (s.size() < 19) return std::to_string(std::strtoll(s.c_str(), nullptr, 10));
-            if (s[0] != '-') {
-                unsigned long long u = std::strtoull(s.c_str(), nullptr, 10);
-                if (u != ULLONG_MAX) return std::to_string(u);
+            char* endp = nullptr;
+            if (s.size() < 19) {
+                errno = 0;
+                long long i = std::strtoll(s.c_str(), &endp, 10);
+                if (errno == 0 && endp == s.c_str() + s.size()) return std::to_string(i);
+            } else if (s[0] != '-') {
+                errno = 0;
+                unsigned long long u = std::strtoull(s.c_str(), &endp, 10);
+                if (errno == 0 && endp == s.c_str() + s.size()) return std::to_string(u);
             } else {
                 errno = 0;
-                long long i = std::strtoll(s.c_str(), nullptr, 10);
-                if (errno == 0) return std::to_string(i);
+                long long i = std::strtoll(s.c_str(), &endp, 10);
+                if (errno == 0 && endp == s.c_str() + s.size()) return std::to_string(i);
             }
         }
         double d = std::strtod(s.c_str(), nullptr);
+        if (!std::isfinite(d)) return s.empty() ? "0" : s;
         if (d == 0) return std::signbit(d) ? "-0.0" : "0.0";
         char buf[64];
         int prec = 0;
@@ -87,6 +93,7 @@ struct JsonValue {
         // digits and decimal exponent from d.ddde+XX
         std::string mant(buf), digits;
         size_t epos = mant.find('e');
+        if (epos == std::string::npos) return s.empty() ? "0" : s;
         int exp10 = std::atoi(mant.c_str() + epos + 1);
         for (size_t i = 0; i < epos; ++i) if (mant[i] != '.') digits += mant[i];
         while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
@@ -266,8 +273,24 @@ private:
         if (lit("null")) { v.type = JsonValue::Type::Null; return true; }
         if (c == '-' || (c >= '0' && c <= '9')) {
             const char* s = p;
-            ++p;
-            while (p < end && ((*p >= '0' && *p <= '9') || *p == '.' || *p == 'e' || *p == 'E' || *p == '+' || *p == '-')) ++p;
+            if (*p == '-') ++p;
+            if (p >= end || *p < '0' || *p > '9') return fail("bad number");
+            if (*p == '0') {
+                ++p;
+            } else {
+                while (p < end && *p >= '0' && *p <= '9') ++p;
+            }
+            if (p < end && *p == '.') {
+                ++p;
+                if (p >= end || *p < '0' || *p > '9') return fail("bad number");
+                while (p < end && *p >= '0' && *p <= '9') ++p;
+            }
+            if (p < end && (*p == 'e' || *p == 'E')) {
+                ++p;
+                if (p < end && (*p == '+' || *p == '-')) ++p;
+                if (p >= end || *p < '0' || *p > '9') return fail("bad number");
+                while (p < end && *p >= '0' && *p <= '9') ++p;
+            }
             v.type = JsonValue::Type::Number;
             v.s.assign(s, p);
             return true;

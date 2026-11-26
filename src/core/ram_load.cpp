@@ -1,6 +1,7 @@
 // src/core/ram_load.cpp - the RAM tier's memory: allocation, pinning and registration.
 #include "basalt/core/ram_load.hpp"
 #include "basalt/core/vmm.hpp"
+#include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -92,8 +93,10 @@ RamPin pin_ram_bounded(void* base, uint64_t bytes, uint64_t lock_bytes, const st
     const unsigned flags = cudaHostRegisterPortable | (mapped ? cudaHostRegisterMapped : 0u);
     const auto register_range = [&](uint64_t off, uint64_t n, const uint8_t*& alias) {
         void* at = (uint8_t*) base + off;
+        const char* operation = "cudaHostRegister";
         cudaError_t e = cudaHostRegister(at, (size_t) n, flags);
         if (e == cudaSuccess && device) {
+            operation = "cudaHostGetDevicePointer";
             void* d = nullptr;
             e = cudaHostGetDevicePointer(&d, at, 0);
             if (e == cudaSuccess && d == nullptr) e = cudaErrorInvalidValue;
@@ -102,6 +105,9 @@ RamPin pin_ram_bounded(void* base, uint64_t bytes, uint64_t lock_bytes, const st
         }
         if (e == cudaSuccess) return true;
         p.refused = cudaGetErrorString(e);
+        if (off != 0 || n != bytes)
+            basalt::log::warn("RAM registration", "%s at %llu MiB for %llu MiB: %d (%s)", operation,
+                (unsigned long long) (off >> 20), (unsigned long long) (n >> 20), (int) e, p.refused.c_str());
         (void) cudaGetLastError();
         return false;
     };
@@ -124,6 +130,7 @@ RamPin pin_ram_bounded(void* base, uint64_t bytes, uint64_t lock_bytes, const st
             ++p.slices;
         }
         if (device && !p.slice_devices.empty()) *device = p.slice_devices.front();
+        if (p.registered_bytes == bytes) p.refused.clear();
     }
     if (!bytes) p.refused = "over the pin budget";
     if (p.registered_bytes < lock_bytes) {
@@ -138,7 +145,7 @@ RamPin pin_ram_bounded(void* base, uint64_t bytes, uint64_t lock_bytes, const st
 
 RamPin pin_ram(void* base, uint64_t register_bytes, uint64_t lock_bytes, const std::vector<uint64_t>& bounds, bool mapped,
                const uint8_t** device) {
-    if constexpr (platform::kBoundHostRegistration)
+    if (platform::kBoundHostRegistration || bounds.size() >= 2)
         return pin_ram_bounded(base, register_bytes, lock_bytes, bounds, mapped, device);
     RamPin p;
     const unsigned flags = cudaHostRegisterPortable | (mapped ? cudaHostRegisterMapped : 0u);
@@ -170,31 +177,7 @@ RamPin pin_ram(void* base, uint64_t register_bytes, uint64_t lock_bytes, const s
     p.refused = cudaGetErrorString(e);
     // read here: an error left set would be reported by the next unrelated call that checks
     (void) cudaGetLastError();
-    if (bounds.size() < 2) {
-        lock_rest(0);
-        return p;
-    }
-    // Pin slice by slice from the start, stopping below the shared-memory budget rather than at the driver's refusal.
-    p.sliced = true;
-    std::string why;
-    uint64_t seg = 0;
-    if (platform::pin_budget(seg, why) && seg < register_bytes) {
-        p.capped = true;
-        p.cap = seg;
-        p.cap_why = std::move(why);
-    }
-    for (size_t i = 0; i + 1 < bounds.size(); ++i) {
-        const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
-        if (p.capped && (off > p.cap || n > p.cap - off)) break;
-        if (cudaHostRegister((uint8_t*) base + off, (size_t) n, flags) != cudaSuccess) {
-            (void) cudaGetLastError();
-            break;
-        }
-        p.slice_starts.push_back(off);
-        p.registered_bytes = off + n;
-        ++p.slices;
-    }
-    if (p.registered_bytes < lock_bytes) lock_rest(p.registered_bytes);
+    lock_rest(0);
     return p;
 }
 

@@ -1,5 +1,7 @@
 // src/models/inkling2/model.cpp - loads an Inkling 2 pack: every weight to the main card (with the layer split the later
 // layers' to the second), the embedding to mapped host memory, then the context sized from what the weights leave.
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "models/inkling2/model.hpp"
 
 #include "basalt/core/elastic_kv.hpp"
@@ -18,6 +20,7 @@
 #include "models/inkling2/loan_layout.hpp"
 #include "models/inkling2/prompt.hpp"
 #include "models/inkling2/walk.hpp"
+#include "models/inkling2/wide_chunk.hpp"
 
 #include <cuda_runtime.h>
 
@@ -44,12 +47,21 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 // what the sessions share once (the forward's row buffers and expert scratch, the batch windows' logits), what each one
 // needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
 // driver
-constexpr uint64_t kSharedFixed = 768 * kMiB;
-constexpr uint64_t kSessionFixed = 96 * kMiB;
+constexpr uint64_t kSharedFixed = 896 * kMiB;
+constexpr uint64_t kSessionFixed = 44 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
 constexpr uint64_t kLateRoom = 256 * kMiB;
+
+// A log line that cannot be written (out of host memory) is left out: the placement step it reports stands.
+template <class F>
+void quiet(F&& f) noexcept {
+    try {
+        f();
+    } catch (...) {
+    }
+}
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
 struct ProjPart {
@@ -90,11 +102,11 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
     uint64_t caches = 0;
     for (const Visit& v : g.visits)
         if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
-    return caches + kSessionFixed + (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
+    return caches + kSessionFixed;
 }
 
 uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
+    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
 }
 
 InklingModel::InklingModel() = default;
@@ -375,9 +387,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     uint64_t vision_modules = 0;
     if (req.vision) {
         size_t before = 0, after = 0, total_b = 0;
-        cudaMemGetInfo(&before, &total_b);
+        basalt::core::gpu_mem_info(&before, &total_b);
         if (!vis_.stage(pack_.vision, g.n_embd, err)) return fail("vision: " + err);
-        cudaMemGetInfo(&after, &total_b);
+        basalt::core::gpu_mem_info(&after, &total_b);
         vision_modules = std::min<uint64_t>(before > after ? before - after : 0, kCardSpare / 4);
         vis_.set_lender({[this](uint64_t bytes, std::string& e) { return lend_room(bytes, e); }, [this] { refill(); }});
         basalt::log::info("basalt inkling2", "image encoder: %.2f GiB staged in page-locked RAM, 0 GiB of the card kept for it (its "
@@ -392,7 +404,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
-        const uint64_t spare = kCardSpare - vision_modules;   // [vision]
+        // the spare the sessions are sized against: the asked reserve (--vram-reserve-mib, the card's own otherwise),
+        // less what the image encoder staged on the card (its kernels' modules, capped at a quarter of the card's spare)
+        const uint64_t spare_base = spare_ ? spare_ : kCardSpare;
+        const uint64_t spare = spare_base > vision_modules ? spare_base - vision_modules : 0;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
@@ -404,7 +419,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             for (int c = 0; c < 2; ++c) {
                 cudaSetDevice(card_device(c));
                 size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
+                basalt::core::gpu_mem_info(&fb, &tb);
                 const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) +
                                        (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
                                       (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
@@ -422,7 +437,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
         {
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::gpu_mem_info(&free_b, &total_b);
             std::vector<uint64_t> stride;
             for (const LayerWeights& w : layers_) stride.push_back(w.expert_stride);
             const bool vmm = core::vmm::supported();
@@ -463,7 +478,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                             for (int e = 0; e < g.n_expert; ++e)
                                 if (!on_card(l, e)) spill_order_.emplace_back(l, e);
                     elastic_ = keep < 0 && want > core::kElasticKvBase;
-                    heat_.start((size_t) g.n_layers * g.n_expert, g.n_expert, spill_order_);
+                    std::vector<int> visits((size_t) g.n_layers, 0);
+                    for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
+                    heat_.start((size_t) g.n_layers * g.n_expert, g.n_expert, spill_order_, visits);
                     uint64_t ram = 0;
                     for (int l = 0; l < g.n_layers; ++l) ram += (uint64_t) spill_.n_spill[(size_t) l] * stride[(size_t) l];
                     basalt::log::info("basalt inkling2",
@@ -485,7 +502,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             if (model::Result r = load_experts(reads, file, experts); !r.ok()) return r;
         }
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const uint64_t avail = free_b > spare + shared ? (free_b - spare - shared) / n_sess : 0;
         const uint64_t need = bytes_at(want);
         if (need > avail) {
@@ -642,16 +659,16 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
             for (int e = 0; e < g.n_expert; ++e)
                 if (peer_held(l, e)) by_slot[(size_t) e] = -1;
             int32_t* map = reinterpret_cast<int32_t*>(device_buf((uint64_t) g.n_expert * 4));
-            if (!map || cudaMemcpy(map, by_slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+            if (!map || basalt::core::device_copy(map, by_slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
                 return fail("out of device memory loading layer " + std::to_string(l) + "'s expert slots");
             w.slot_map = map;
             int32_t* full = reinterpret_cast<int32_t*>(device_buf((uint64_t) g.n_expert * 4));
-            if (!full || cudaMemcpy(full, slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+            if (!full || basalt::core::device_copy(full, slot.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice) != cudaSuccess)
                 return fail("out of device memory loading layer " + std::to_string(l) + "'s expert slots");
             w.slot_full = full;
         }
         if (!(w.blob_table = reinterpret_cast<unsigned long long*>(device_buf(table.size() * 8))) ||
-            cudaMemcpy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
+            basalt::core::device_copy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
             return fail("out of device memory loading layer " + std::to_string(l) + "'s expert table");
     }
     cudaSetDevice(device_);
@@ -694,7 +711,7 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
     for (const model::GpuCards::Card& card : c.cards) {
         cudaSetDevice(card.device);
         size_t free_b = 0, total_b = 0;
-        s.room.push_back(cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b : 0);
+        s.room.push_back(basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess ? free_b : 0);
     }
     cudaSetDevice(device_);
     return s;
@@ -794,7 +811,7 @@ bool InklingModel::peer_place(const model::PeerPlacement& p, std::string& err) {
                 peer_->admit(l, e, peer_slot_[(size_t) l * ne + e]);
             }
         void* d = nullptr;
-        if (cudaMalloc(&d, (size_t) ne * 4) != cudaSuccess || cudaMemcpy(d, map.data(), (size_t) ne * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMalloc(&d, (size_t) ne * 4) != cudaSuccess || basalt::core::device_copy(d, map.data(), (size_t) ne * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
             cudaSetDevice(device_);
             err = "gpu-mode peer: out of device memory for the expert maps";
             return false;
@@ -849,9 +866,9 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
                 if (card_of(l) != c) continue;
                 LayerWeights& w = layers_[(size_t) l];
                 kernels::wgemm::q8_planes(w.proj, kProj, E, tmp, nullptr);
-                cudaMemcpy(w.proj, tmp, proj_b, cudaMemcpyDeviceToDevice);
+                basalt::core::device_copy(w.proj, tmp, proj_b, cudaMemcpyDeviceToDevice);
                 kernels::wgemm::q8_planes(w.out, E, 3072, tmp, nullptr);
-                cudaMemcpy(w.out, tmp, out_b, cudaMemcpyDeviceToDevice);
+                basalt::core::device_copy(w.out, tmp, out_b, cudaMemcpyDeviceToDevice);
                 const uint16_t* proj_sc = reinterpret_cast<const uint16_t*>(w.proj + (size_t) kProj * (size_t) E);
                 prefill::q8::transpose_scales(proj_sc, kProjQ, E, w.proj_q_sc_t, nullptr);
                 prefill::q8::transpose_scales(proj_sc + (size_t) kRowK * nb_e, kProjKV, E, w.proj_k_sc_t, nullptr);
@@ -874,16 +891,27 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
         if (cudaMalloc(&tmp, head_b) != cudaSuccess)
             return {model::Status::Error, "inkling2: out of device memory converting lm_head to q8_planes"};
         kernels::wgemm::q8_planes(head_, V, E, tmp, nullptr);
-        cudaMemcpy(head_, tmp, head_b, cudaMemcpyDeviceToDevice);
+        basalt::core::device_copy(head_, tmp, head_b, cudaMemcpyDeviceToDevice);
         cudaDeviceSynchronize();
         cudaFree(tmp);
     }
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
+    // the asked reserve, after the whole load (the planes converted, the drafter folded, the sessions prepared): a load
+    // that leaves less than the flag asks is refused rather than served at a smaller reserve, so a --vram-reserve-mib
+    // that cannot be met is never silently served
+    if (spare_) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < spare_) {
+            return {model::Status::Error,
+                    "inkling2: --vram-reserve-mib " + std::to_string(spare_ / kMiB) + " MiB cannot be met after loading: only " +
+                        std::to_string(free_b / kMiB) + " MiB free; lower --max-context or --spec, or use a bigger card"};
+        }
+    }
     if (copies()) {   // the sessions' buffers are in place (an elastic spill's caches back only their base): the RAM experts
                       // come back while the card has room beyond its spare
         size_t was_b = 0, free_b = 0, total_b = 0;
-        cudaMemGetInfo(&was_b, &total_b);
+        basalt::core::gpu_mem_info(&was_b, &total_b);
         sync_room();
         const int64_t before = card_copies();
         const uint64_t moved = promote(held_free(kCardSpare));
@@ -892,7 +920,7 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
             log_copy_change("startup failed", before);
             return {model::Status::Error, "inkling2: expert copy placement failed"};
         }
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         if (elastic_)
             basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB), %.0f -> %.0f MiB "
                               "free; they go back to RAM, the least routed first, as a conversation's caches grow",
@@ -943,7 +971,7 @@ uint64_t InklingModel::late_room() const { return spare_ ? kLateRoom : 0; }
 
 void InklingModel::sync_room() {
     size_t free_b = 0, total_b = 0;
-    room_ = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? (int64_t) free_b : 0;
+    room_ = basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess ? (int64_t) free_b : 0;
 }
 
 std::vector<size_t> InklingModel::copy_candidates() const {
@@ -982,7 +1010,7 @@ bool InklingModel::join_placement() {
 bool InklingModel::publish_copy(size_t pair, const void* ptr) {
     const size_t ne = geo().n_expert, l = pair / ne, e = pair % ne;
     const unsigned long long addr = ptr ? (unsigned long long) ptr : 0;
-    if (cudaMemcpy(layers_[l].blob_table + e, &addr, sizeof(addr), cudaMemcpyHostToDevice) == cudaSuccess) return true;
+    if (basalt::core::device_copy(layers_[l].blob_table + e, &addr, sizeof(addr), cudaMemcpyHostToDevice) == cudaSuccess) return true;
     wedge();
     basalt::log::error("basalt inkling2", "an expert copy table update failed; restart the engine");
     return false;
@@ -990,6 +1018,11 @@ bool InklingModel::publish_copy(size_t pair, const void* ptr) {
 
 uint64_t InklingModel::promote(uint64_t keep_free) {
     if (copies_retired_ || wedged() || (size_t) promoted() == spill_order_.size()) return 0;
+    return promote_pairs(by_score_desc(heat_, copy_candidates()), keep_free + late_room());
+}
+
+uint64_t InklingModel::promote_pairs(const std::vector<size_t>& pairs, uint64_t keep_free) {
+    if (copies_retired_ || wedged() || pairs.empty()) return 0;
     if (!copy_range()) {   // no address range for the copies (with virtual memory management): placement leaves its rule
         map_short_ = copy_lay_.gran != 0;
         return 0;
@@ -998,8 +1031,7 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
     const size_t ne = geo().n_expert;
     const uint64_t gran = copy_lay_.gran;
     uint64_t moved = 0;
-    keep_free += late_room();
-    for (const size_t pair : by_score_desc(heat_, copy_candidates())) {
+    for (const size_t pair : pairs) {
         const uint64_t stride = copy_stride(pair);
         const uint64_t start = copy_lay_.end.empty() ? 0 : CopyLayout::aligned(copy_lay_.end.back());
         const uint64_t mapped = (uint64_t) copy_maps_.size() * gran, end = start + stride;
@@ -1025,7 +1057,7 @@ uint64_t InklingModel::promote(uint64_t keep_free) {
             break;
         }
         uint8_t* ptr = copies_va_ + start;
-        if (cudaMemcpy(ptr, copy_source(pair), stride, cudaMemcpyDefault) != cudaSuccess) {
+        if (basalt::core::device_copy(ptr, copy_source(pair), stride, cudaMemcpyDefault) != cudaSuccess) {
             wedge();
             basalt::log::error("basalt inkling2", "an expert copy upload failed; restart the engine");
             return moved;
@@ -1055,7 +1087,7 @@ void InklingModel::log_copy_change(const char* event, int64_t before, uint64_t t
     const int64_t after = card_copies();
     if (before == after && !always && !wedged()) return;
     size_t free_b = 0, total_b = 0;
-    const std::string free_mib = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess
+    const std::string free_mib = basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess
         ? std::to_string(free_b / kMiB) : "unknown";
     const auto log = warning || wedged() ? basalt::log::warn : basalt::log::info;
     // which experts have a copy, paid or loaned, as one number: equal runs log equal sets
@@ -1198,7 +1230,7 @@ bool InklingModel::demote(uint64_t bytes, uint64_t& freed) {
         if (dst != copy_[pair]) {
             // Device copies cannot overlap; the original RAM blob is still available.
             const bool overlaps = dst + stride > static_cast<uint8_t*>(copy_[pair]);
-            if (cudaMemcpy(dst, overlaps ? copy_source(pair) : copy_[pair], stride, cudaMemcpyDefault) != cudaSuccess) {
+            if (basalt::core::device_copy(dst, overlaps ? copy_source(pair) : copy_[pair], stride, cudaMemcpyDefault) != cudaSuccess) {
                 wedge();
                 basalt::log::error("basalt inkling2", "expert copy compaction failed; restart the engine");
                 return false;
@@ -1232,7 +1264,7 @@ int InklingModel::rebalance(int max_swaps) {
         uint8_t* ptr = static_cast<uint8_t*>(copy_[swap.out]);
         const auto at = std::lower_bound(copy_lay_.at.begin(), copy_lay_.at.end(), (uint64_t) (ptr - copies_va_));
         if (!publish_copy(swap.out, nullptr)) break;
-        if (cudaMemcpy(ptr, copy_source(swap.in), copy_stride(swap.in), cudaMemcpyDefault) != cudaSuccess) {
+        if (basalt::core::device_copy(ptr, copy_source(swap.in), copy_stride(swap.in), cudaMemcpyDefault) != cudaSuccess) {
             wedge();
             basalt::log::error("basalt inkling2", "an expert copy swap failed; restart the engine");
             break;
@@ -1462,6 +1494,47 @@ bool InklingModel::recall_loan(void* stream, const std::string& event) {
     return true;
 }
 
+Take InklingModel::take_room(uint64_t bytes) {
+    wide_out_.clear();
+    if (!copies() || lent_ || wedged() || loaned() > 0) return Take::Refused;
+    const uint64_t paid = (uint64_t) copy_maps_.size() * copy_lay_.gran;
+    if (paid < bytes) return Take::Refused;
+    // the bookkeeping first, in rank order (the order the copies come back in): nothing allocates once a copy moves
+    const std::vector<size_t> held = by_score_desc(heat_, copy_slots_);
+    std::vector<uint8_t> kept(copy_.size(), 0);
+    wide_out_.reserve(held.size());
+    const int64_t before = card_copies();
+    const uint64_t room0 = room();
+    uint64_t freed = 0;
+    if (!demote(bytes, freed)) return Take::Failed;
+    left_out(held, copy_slots_, kept, wide_out_);
+    quiet([&] { log_copy_change("prompt wide chunk", before, bytes); });
+    if (room() < room0 + bytes)   // short of the count: the copies come back as they were
+        return give_room(0) ? Take::Refused : Take::Failed;
+    room_ -= (int64_t) bytes;
+    return Take::Taken;
+}
+
+bool InklingModel::give_room(uint64_t bytes) noexcept {
+    room_ += (int64_t) bytes;
+    if (wedged()) return false;
+    if (wide_out_.empty()) return true;
+    const int64_t before = card_copies();
+    bool back = false;
+    try {   // the copies' vectors keep the capacity the copies had, so their return allocates nothing
+        promote_pairs(wide_out_, 0);
+        back = restored(wide_out_, [&](size_t pair) { return copy_[pair] != nullptr; }, !wedged());
+    } catch (...) {
+        back = false;
+    }
+    wide_out_.clear();
+    quiet([&] {
+        note_shortage("prompt wide chunk back");
+        log_copy_change("prompt wide chunk back", before, 0, false, !back);
+    });
+    return back;
+}
+
 // [vision] ENC runs between requests and windows: once every stream is idle, nothing reads the experts until refill.
 bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -1474,7 +1547,7 @@ bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
     const uint64_t room0 = room();
     const uint64_t want = bytes + std::min<uint64_t>(held_free(kCardSpare), std::max<uint64_t>(room0, kCardSpare));
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
+    basalt::core::gpu_mem_info(&free_b, &total_b);
     if (has_spill_ && room0 < want && promoted() > 0) {
         const int64_t before = promoted();
         const int64_t before_total = card_copies();
@@ -1487,13 +1560,13 @@ bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
             err = "the expert copies could not go back to RAM for the image encoder";
             return false;
         }
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
     }
     for (size_t i = ranges_.size(); i-- > 0 && free_b < want;) {
         Range& r = ranges_[i];
         if (!r.handle) continue;
         std::unique_ptr<uint8_t[]> keep(new (std::nothrow) uint8_t[r.own]);
-        if (!keep || cudaMemcpy(keep.get(), r.va, r.own, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (!keep || basalt::core::device_copy(keep.get(), r.va, r.own, cudaMemcpyDeviceToHost) != cudaSuccess) {
             err = "no RAM for the experts the image encoder borrows from";
             break;
         }
@@ -1503,7 +1576,7 @@ bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
         }
         r.handle = 0;
         lent_ranges_.push_back({i, std::move(keep)});
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
     }
     lend_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (free_b >= want) return true;
@@ -1520,7 +1593,7 @@ void InklingModel::refill() {
     for (auto it = lent_ranges_.rbegin(); it != lent_ranges_.rend(); ++it) {
         Range& r = ranges_[it->range];
         if (!(r.handle = core::vmm::map(r.va, r.own)) ||
-            cudaMemcpy(r.va, it->bytes.get(), r.own, cudaMemcpyHostToDevice) != cudaSuccess) {
+            basalt::core::device_copy(r.va, it->bytes.get(), r.own, cudaMemcpyHostToDevice) != cudaSuccess) {
             // nothing may run on these experts now: the card is out of memory it just had
             basalt::log::error("basalt inkling2", "the experts lent to the image encoder cannot come back to the card");
             std::abort();

@@ -1,0 +1,32 @@
+#include "ggml_mxfp8_neon.inc"
+
+static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+    [GGML_TYPE_Q2_0]    = {NULL, ggml_vec_dot_q2_0_q8_0, GGML_TYPE_Q8_0, 1},
+    [GGML_TYPE_Q5_0]    = {NULL, ggml_vec_dot_q5_0_q8_0, GGML_TYPE_Q8_0, 1},
+    [GGML_TYPE_Q5_1]    = {NULL, ggml_vec_dot_q5_1_q8_1, GGML_TYPE_Q8_1, 1},
+    [GGML_TYPE_Q8_0]    = {quantize_row_q8_0, ggml_vec_dot_q8_0_q8_0, GGML_TYPE_Q8_0, 1},
+    [GGML_TYPE_Q8_1]    = {quantize_row_q8_1, NULL, GGML_TYPE_Q8_1, 1},
+    [GGML_TYPE_Q2_K]    = {NULL, ggml_vec_dot_q2_K_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_Q3_K]    = {NULL, ggml_vec_dot_q3_K_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_Q4_K]    = {NULL, ggml_vec_dot_q4_K_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_Q5_K]    = {NULL, ggml_vec_dot_q5_K_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_Q6_K]    = {NULL, ggml_vec_dot_q6_K_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_Q8_K]    = {quantize_row_q8_K, NULL, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ2_XXS] = {NULL, ggml_vec_dot_iq2_xxs_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ2_XS]  = {NULL, ggml_vec_dot_iq2_xs_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ3_XXS] = {NULL, ggml_vec_dot_iq3_xxs_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ4_NL]  = {NULL, ggml_vec_dot_iq4_nl_q8_0, GGML_TYPE_Q8_0, 1},
+    [GGML_TYPE_IQ3_S]   = {NULL, ggml_vec_dot_iq3_s_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ2_S]   = {NULL, ggml_vec_dot_iq2_s_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ4_XS]  = {NULL, ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ1_S]   = {NULL, ggml_vec_dot_iq1_s_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ1_M]   = {NULL, ggml_vec_dot_iq1_m_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_NVFP4]   = {NULL, ggml_vec_dot_nvfp4_q8_0, GGML_TYPE_Q8_0, 1},
+    [GGML_TYPE_MXFP8]   = {NULL, ggml_vec_dot_mxfp8_q8_0, GGML_TYPE_Q8_0, 1},
+};
+
+const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
+    if ((int) type < 0 || (int) type >= GGML_TYPE_COUNT) return NULL;
+    const struct ggml_type_traits_cpu * t = &type_traits_cpu[type];
+    return t->from_float != NULL || t->vec_dot != NULL ? t : NULL;
+}

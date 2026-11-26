@@ -62,7 +62,8 @@ struct DsparkLayer {
     void *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;            ///< NVFP4 planes (Q8_0 until finish())
     void *gate = nullptr, *up = nullptr, *down = nullptr;                        ///< NVFP4 planes (Q8_0 until finish())
     float* fp4_scale = nullptr;                                                  ///< the planes' FP32 scales [7]: q k v o gate up down
-    void *k_ctx = nullptr, *v_ctx = nullptr;                                     ///< Q8_0
+    void *k_ctx = nullptr, *v_ctx = nullptr;                                     ///< Q8_0 (prompt MMQ)
+    void *k_ctx_p = nullptr, *v_ctx_p = nullptr;                                 ///< Q8 planes (1..32-row decode commit)
     float *attn_norm = nullptr, *post_norm = nullptr, *dflare_norm = nullptr;    ///< [width]
     float *q_norm = nullptr, *k_norm = nullptr, *k_ctx_norm = nullptr;           ///< [head width]
     bool local = false;
@@ -96,7 +97,20 @@ public:
     const uint16_t* embedding = nullptr; ///< the target's BF16 embedding rows
     const float* embed_norm = nullptr;
 
+    struct SharedScratch {
+        int64_t att_cells = 0;
+        float *mix = nullptr, *kb = nullptr, *vb = nullptr;
+        int32_t *pos3 = nullptr, *ring_bounds = nullptr, *pos3b = nullptr;
+        void *act = nullptr, *act_a = nullptr, *act_h = nullptr;
+        float *x = nullptr, *q = nullptr, *qr = nullptr, *attn = nullptr, *h = nullptr, *att_scr = nullptr;
+        basalt::kernels::wgemm::Workspace ws;
+        float *approx = nullptr, *ctx_h = nullptr, *ctx_f = nullptr;
+        void *hq = nullptr, *lat_q = nullptr, *head_scr = nullptr;
+    };
+    const SharedScratch* ensure_shared_scratch(int64_t context, std::string& err) const;
+
 private:
+    mutable SharedScratch shared_scr_;
     friend model::Result dspark_plan(const Pack&, core::LoadPlan&, int, int, std::unique_ptr<DsparkWeights>&);
     void* dev(size_t bytes, bool& ok);
     void* mapped(size_t bytes, bool& ok);   ///< mapped host memory; the device's pointer to it
@@ -115,6 +129,8 @@ uint64_t dspark_session_bytes(const Pack& pack, int64_t context);
 /// The tap of `tap_rows` rows: the target's features of a call's rows, which every session's commit reads (one shared).
 uint64_t dspark_tap_bytes(int tap_rows);
 
+class DsparkBatch;
+
 /// What a session holds of the drafter: the tap the target fills, the drafter's caches and scratch, and the calls the session
 /// forwards. Without a drafter every call does nothing and draft_begin says the model has none.
 class DsparkHook {
@@ -128,10 +144,19 @@ public:
     bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
               int64_t backed, std::string& err);
     bool on() const { return w_ != nullptr; }
+    bool dumping() const { return dump_ != nullptr; }
     /// The tap slot visit `visit` fills with its input rows, or -1.
     int slot_of_visit(int visit) const;
     /// Slot k's rows (fp32, kWidth each, contiguous): slots 0..2 the visits' inputs, slot 3 the final normed state.
     float* tap(int slot) const { return tap_ + (size_t) slot * tap_rows_ * kWidth; }
+    /// The tap's base and rows. A prompt read with a wider chunk points the drafter at a tap of its own while it runs, then
+    /// back.
+    float* tap_base() const { return tap_; }
+    int tap_rows() const { return tap_rows_; }
+    void use_tap(float* tap, int rows) {
+        tap_ = tap;
+        tap_rows_ = rows;
+    }
     /// Caller-owned chunk buffers reused by commit_prompt() (no extra device allocation).
     struct PromptScratch {
         float* mix = nullptr;         ///< [3][rows][kWidth]
@@ -183,6 +208,7 @@ public:
     bool restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream);
 
 private:
+    friend class DsparkBatch;
     struct Cache {
         uint16_t *k = nullptr, *v = nullptr;   ///< fp16 [cap][kv heads][head width], position p at cell p % cap
         int64_t cap = 0;
@@ -194,6 +220,8 @@ private:
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
+    uint8_t* slab_ptr_ = nullptr;
+    size_t slab_rem_ = 0;
     std::vector<Cache> cache_;
     std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V when elastic
     int64_t backed_cells_ = 0;              ///< cells every full layer's cache backs
@@ -231,6 +259,8 @@ private:
     // the host's record: positions [lo_, hi_) have their context in the caches; a block is in flight
     int64_t lo_ = 0, hi_ = 0;
     int pending_ = 0;
+    DsparkBatch* batch_owner_ = nullptr;
+    int batch_slot_ = -1;
     // --diag-dump
     std::FILE* dump_ = nullptr;
     int dumped_ = 0;
@@ -238,6 +268,46 @@ private:
     int64_t dump_drafts_ = 0, dump_differ_ = 0;   ///< drafts dumped, and those whose pick is not the exact head's
     int64_t block_pos_ = 0;
     int32_t block_anchor_ = 0;
+};
+
+/// Shared multi-session DSpark scratch for batched commit_batch (inside target decode_batch) and draft_batch.
+class DsparkBatch {
+public:
+    ~DsparkBatch();
+    bool init(const DsparkWeights* w, int max_sessions, int max_rows, int tap_rows, float* tap, int64_t context, std::string& err);
+    bool on() const { return w_ != nullptr; }
+    void commit(DsparkHook* const* hooks, int n_seg, const basalt::kernels::WindowSegs* at_d, const int32_t* pos_d, int rows,
+                void* stream);
+    model::Result draft(DsparkHook* const* hooks, const int32_t* anchors, const int64_t* pos, const int* n, int count,
+                        void* stream);
+    model::Result take(int slot, int pending, int32_t* ids, float* conf, int max_n, int& n);
+
+private:
+    void* dev(size_t bytes, bool& ok);
+    const DsparkWeights* w_ = nullptr;
+    std::vector<void*> allocs_, pinned_;
+    int max_sessions_ = 0, max_rows_ = 0, tap_rows_ = 0;
+    int64_t att_cells_ = 0;
+    float* tap_ = nullptr;
+    // commit_batch scratch [max_rows]
+    float *c_mix_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
+    void* c_act_ = nullptr;
+    // block chunk scratch [kChunkSlots * kDsBlock <= 32]
+    static constexpr int kChunkSlots = 8;
+    static constexpr int kMaxDraftSessions = 16;
+    float *x_ = nullptr, *h_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr, *qr_ = nullptr, *attn_ = nullptr;
+    float* att_scr_ = nullptr;
+    void *act_a_ = nullptr, *act_h_ = nullptr;
+    basalt::kernels::wgemm::Workspace ws_;
+    // head batch scratch [max_sessions]
+    float *hd_ = nullptr, *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
+    float *frc_ = nullptr, *conf_d_ = nullptr, *conf_h_ = nullptr;
+    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
+    size_t head_scr_stride_ = 0;
+    int32_t *prev_ = nullptr, *ids_d_ = nullptr, *ids_h_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
+    uint16_t* w1_row_ = nullptr;
+    void* sync_stream_ = nullptr;
+    bool synced_ = true;
 };
 
 /// The flags an Inkling 2 start takes for speculative decoding: --spec N, --draft-log FILE. False when `a` is neither.

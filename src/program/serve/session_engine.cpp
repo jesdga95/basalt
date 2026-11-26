@@ -1,4 +1,5 @@
 // src/program/serve/session_engine.cpp - the shared server over a model's ModelSession: one token per window.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "session_engine.hpp"
 
 #include "batch_plan.hpp"
@@ -199,6 +200,7 @@ public:
         const auto spill = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
             if (at_exit) disk.flush();   // one image in RAM at a time
             const int64_t positions = (int64_t) ids.size();
+            if (!disk.fits(session().running_bytes() + session().cells_bytes(positions))) return;   // no copy the writer drops
             if (!capture_admit(session().running_bytes() + session().cells_bytes(positions), floor)) {
                 basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM admission)", ids.size());
                 return;
@@ -292,6 +294,7 @@ public:
         for (const ConvCheckpoint& c : checks) estimate += c.bytes();
         const bool ram_room = !to_disk && conversations->make_room(estimate, held);
         if (!to_disk && !ram_room && disk_wants) to_disk = true;
+        if (to_disk && !disk.fits(estimate)) return true;   // a full disk: no copy off the card that the writer drops
         if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
         const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk.enabled() ? disk_floor : 0);
         if (!capture_admit(estimate, floor)) {
@@ -405,7 +408,7 @@ public:
 private:
     bool memory_reply(long long reserve, int64_t slots, std::string* reply) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         char line[160];
         char held[48] = "";   // a session with no cache names no slots
         if (slots >= 0) std::snprintf(held, sizeof held, " expert_slots=%lld", (long long) slots);
@@ -440,13 +443,12 @@ public:
     void decode_state_begin() {
         draws_ = 0;
         n_draft_ = 0;
+        hybrid_drafts_ = false;
         drafts_.assign((size_t) max_window(), 0);
         conf_.assign((size_t) max_window(), 0.0f);
         sbuf_.assign((size_t) max_window(), 0);
-        if (rt_.sfx) {
-            rt_.sfx->reset();
-            for (int64_t t : ids) rt_.sfx->append((int32_t) t);
-        }
+        if (rt_.sfx && (!in_slot || solo_req))
+            rt_.sfx->sync(ids32.data(), ids32.size());
     }
     void decode_stats_begin() {
         counts0_ = rt_.session().expert_counts();
@@ -475,7 +477,8 @@ public:
         if (most < 2) return;
         const int k = rt_.sfx->propose(most - 1, sbuf_.data());
         sfx_match = rt_.sfx->last_match();
-        if (k <= 0 || (n_draft_ > 0 && sbuf_[0] != drafts_[0])) return;
+        const bool allow_override = sfx_match >= basalt::spec::SuffixDrafter::LONG_ORDER && (n_draft_ == 0 || conf_[0] < 0.85f);
+        if (k <= 0 || (n_draft_ > 0 && sbuf_[0] != drafts_[0] && !allow_override)) return;
         const basalt::spec::DraftPolicy::Pick pk = rt_.policy->choose_window(conf_.data(), n_draft_, k, sfx_match);
         if (pk.lookup) {
             T = std::min(pk.t, most);
@@ -484,11 +487,11 @@ public:
     }
     void fill_drafts(int T, bool from_sfx) {
         for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf_[(size_t) i - 1] : drafts_[(size_t) i - 1];
-        own_drafts_ = !from_sfx;
+        own_drafts_ = !from_sfx && !hybrid_drafts_;
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
-        history_.resize((size_t) max_window() * hist_n);
+        history_.resize((size_t) std::max<int64_t>({(int64_t) max_window(), (int64_t) rt_.session().prompt_fold_window(), n - fold_p0}) * hist_n);
         return history_.data();
     }
     void upload_history(int) {}
@@ -498,10 +501,12 @@ public:
         d.tokens = window.data();
         d.n_tokens = T;
         d.pos = p;
+        const bool tail_only = e0 == T - 1 && T > 1 && req_logprobs < 0 && (gguard == nullptr || !gguard->on()) && ppl == nullptr;
         d.drawn_drafts = own_drafts_ && e0 == 0 && ppl == nullptr && T > 1;
-        (T > 1 ? d.row_tokens : d.next_token) = outv.data();
+        if (tail_only) d.next_token = &outv[(size_t) e0];
+        else (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
-        d.history = hist_n > 0 ? history_.data() : nullptr;
+        d.history = hist_n > 0 ? history_.data() + (tail_only ? (size_t) e0 * hist_n : 0) : nullptr;
         d.history_len = hist_n;
         req_sp.counter = draws_;
         const basalt::model::Result r = rt_.session().decode_window(d);
@@ -553,9 +558,20 @@ public:
     void count_round() {}
     // The next window's drafts start before this window's tokens go out, which run in their shadow.
     template <class After>
-    bool draft_next(int T, int a, int, int, bool, bool, bool will_draft, After& after_launch) {
+    bool draft_next(int T, int a, int e0, int, bool, bool, bool will_draft, After& after_launch) {
         n_draft_ = 0;
+        hybrid_drafts_ = false;
         if (!will_draft || max_window() < 2) return true;
+        // Skip launching the GPU drafter when prompt lookup already has a long high-confidence exact match at the new tail.
+        if (rt_.sfx && ppl == nullptr && a >= e0) {
+            int pre_match = 0;
+            const int pre_k = rt_.sfx->propose_after(outv.data() + e0, (size_t) (a - e0 + 1), max_window() - 1, sbuf_.data(), &pre_match);
+            if (pre_match >= 2 * basalt::spec::SuffixDrafter::LONG_ORDER && pre_k >= basalt::spec::SuffixDrafter::LONG_ORDER &&
+                rt_.policy->lookup_rate(pre_match) >= 0.90) {
+                after_launch();
+                return true;
+            }
+        }
         const int n = drafts_ahead(T, max_window());
         if (basalt::model::Result r = rt_.session().draft_begin(outv[(size_t) a], p + a + 1, n); !r.ok()) {
             if (r.status == basalt::model::Status::NotImplemented) return true;
@@ -570,6 +586,23 @@ public:
             runtime_.err = r.message;
             return false;
         }
+        // Hybrid drafter -> suffix continuation: when confident drafts re-enter verbatim prompt text after an edit,
+        // extend the window up to max_window() - 1 using the suffix index.
+        if (rt_.sfx && ppl == nullptr && n_draft_ >= 4 && n_draft_ < max_window() - 1) {
+            double joint = 1.0;
+            for (int i = 0; i < n_draft_; ++i) joint *= (double) conf_[(size_t) i];
+            if (joint >= 0.60) {
+                int tail_match = 0;
+                const int ext = rt_.sfx->propose_after(drafts_.data(), (size_t) n_draft_, max_window() - 1 - n_draft_,
+                                                       drafts_.data() + n_draft_, &tail_match);
+                if (ext > 0 && tail_match >= 6) {
+                    const float q = (float) rt_.policy->lookup_rate(tail_match);
+                    for (int j = 0; j < ext; ++j) conf_[(size_t) (n_draft_ + j)] = q;
+                    n_draft_ += ext;
+                    hybrid_drafts_ = true;
+                }
+            }
+        }
         return true;
     }
     bool draft_fatal() const { return false; }
@@ -582,7 +615,7 @@ public:
     }
     void observe_policy(bool from_sfx, int T, int a, int sfx_match, Clock::time_point round0) {
         if (ppl != nullptr) return;   // a quality gate's windows are forced, not drafted
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+        const double ms = rt_.session().window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
         if (from_sfx) rt_.policy->observe(true, T, a, sfx_match, ms);
         else rt_.policy->observe_window(window_conf_.data(), T, a, ms);
     }
@@ -615,9 +648,10 @@ private:
     // a slot's prompt lookup history: the conversation, then the token its first window feeds
     void slot_init(BSlot& sl) override {
         if (!rt_.lookup_on()) return;
-        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
-                                                               (size_t) runtime_.o.max_context + 4096);
-        for (int32_t t : runtime_.live) sl.sfx->append(t);
+        if (!sl.sfx)
+            sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
+                                                                   (size_t) runtime_.o.max_context + 4096);
+        sl.sfx->sync(runtime_.live.data(), runtime_.live.size());
         sl.sfx->append(x);
     }
     Flow restore_image() override {
@@ -669,7 +703,8 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
-    bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
+    bool own_drafts_ = false;
+    bool hybrid_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
@@ -730,7 +765,14 @@ Flow SessionRequest::prepare_image() {
 Flow SessionRequest::read_to(int64_t to) {
     if (at == read_from)
         for (next_block_ = 0; next_block_ < blocks_.size() && blocks_[next_block_].at < at;) ++next_block_;
-    while (at < to) {
+    int64_t fold_tail = 0;
+    const int fw = rt_.session().prompt_fold_window();
+    if (fw > 1 && to == n - 1 && !part_checkpoint(to) && next_block_ >= blocks_.size() && (!in_slot || solo_req) &&
+        ppl == nullptr && to > at && to - at < fw) {
+        fold_tail = to - at;
+    }
+    const int64_t pre_to = to - fold_tail;
+    while (at < pre_to) {
         const bool image = next_block_ < blocks_.size() && blocks_[next_block_].at == at;
         basalt::model::Result r;
         if (image) {
@@ -738,7 +780,7 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
-            const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
+            const int64_t end = next_block_ < blocks_.size() ? std::min(pre_to, blocks_[next_block_].at) : pre_to;
             basalt::model::PrefillRequest pr;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
@@ -747,7 +789,11 @@ Flow SessionRequest::read_to(int64_t to) {
             pr.rows_after = to - end;
             pr.more = end < n - 1;
             const int64_t base = at;
-            pr.progress = [this, base](int k) { progress_line("PP", base + k); basalt::core::progress_beat(); };
+            pr.progress = [this, base](int k) {
+                runtime_.pp_reached = std::max(runtime_.pp_reached, base + k);
+                progress_line("PP", base + k);
+                basalt::core::progress_beat();
+            };
             pr.live = [this, base](int k) {
                 basalt::core::progress_beat();
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -757,7 +803,7 @@ Flow SessionRequest::read_to(int64_t to) {
             };
             pr.stop = [this] { return runtime_.halted(); };
             r = rt_.session().prefill_chunk(pr);
-            at = end;
+            if (!runtime_.halted()) at = end;
         }
         if (r.status == basalt::model::Status::Refused) {   // no room for this prompt: the engine serves on
             basalt::log::warn("basalt serve", "%s", r.message.c_str());
@@ -771,7 +817,12 @@ Flow SessionRequest::read_to(int64_t to) {
             return Flow::error;
         }
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
+        runtime_.pp_reached = std::max(runtime_.pp_reached, at);
         progress_line("PP", at);
+    }
+    if (fold_tail > 0) {
+        fold_p0 = pre_to;
+        at = to;
     }
     if (part_checkpoint(to) &&
         !rt_.checkpoint_at(to, to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd, ids)) {

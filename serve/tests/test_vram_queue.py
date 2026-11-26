@@ -4,7 +4,9 @@ import http.client
 import json
 import threading
 import unittest
+from unittest import mock
 
+from serve.engine.errors import EngineDied
 from serve.tests.test_concurrency import Slots
 
 
@@ -96,3 +98,59 @@ class VramQueue(Slots):
         self.assertIsNone(self.get("/v1/status")["vram"]["pending"])
         self.chat("slow")                                # the request wakes it
         self.assertEqual(self.seen, [3000])
+
+    def test_worker_failure_re_raises_instead_of_returning_ok(self):
+        # If the background worker grabs and fails our queued resize before vram() re-checks vram_queued,
+        # vram() must re-raise that failure (400/503), never return HTTP 200 "ok".
+        for exc, code in ((ValueError("VRAM: --vram-elastic is off"), 400), (EngineDied("engine died"), 503)):
+            with self.subTest(code=code):
+                self.svc.vram_applied = {"reserve_mib": 1024, "at": 1}
+                real_apply = self.svc._apply_vram
+
+                def fail_vram(_reserve_mib, exc=exc):
+                    raise exc
+
+                def raced_apply(wait):
+                    if wait == 0:
+                        # Simulate _vram_worker winning the race and failing the queued job while vram() skipped it.
+                        try:
+                            real_apply(0.1)
+                        except (ValueError, EngineDied):
+                            pass
+                        return None
+                    return real_apply(wait)
+
+                with mock.patch.object(self.engine, "vram", fail_vram), \
+                        mock.patch.object(self.svc, "_apply_vram", raced_apply):
+                    status, body = self.vram({"reserve_mib": 2048})
+                self.assertEqual(status, code, body)
+                self.assertIn(str(exc), body["error"]["message"])
+                self.assertEqual(self.svc.vram_state()["error"], str(exc))
+
+    def test_worker_success_returns_its_result(self):
+        real_apply = self.svc._apply_vram
+        self.engine.asleep = True
+
+        def raced_apply(wait):
+            if wait == 0:
+                real_apply(0.1)
+                return None
+            return real_apply(wait)
+
+        with mock.patch.object(self.svc, "_apply_vram", raced_apply):
+            status, body = self.vram({"reserve_mib": 3333})
+        self.assertEqual((status, body["status"], body["reserve_mib"]), (200, "asleep", 3333))
+
+    def test_apply_vram_defers_while_service_status_is_busy(self):
+        with self.svc.status_lock:
+            self.svc.status["busy"] = True
+        try:
+            with self.svc.vram_cv:
+                self.svc.vram_queued = {"reserve_mib": 4096}
+            self.assertIsNone(self.svc._apply_vram(0))
+            self.assertEqual(self.seen, [])
+        finally:
+            with self.svc.vram_cv:
+                self.svc.vram_queued = None
+            with self.svc.status_lock:
+                self.svc.status["busy"] = False

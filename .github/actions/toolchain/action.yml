@@ -16,7 +16,9 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+        # the toolkit's Arm64 Linux packages are NVIDIA's "sbsa" repository
+        repo=x86_64; [ "$(uname -m)" = aarch64 ] && repo=sbsa
+        wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/$repo/cuda-keyring_1.1-1_all.deb"
         sudo dpkg -i cuda-keyring_1.1-1_all.deb
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends ninja-build \
@@ -43,7 +45,7 @@ runs:
       with:
         key: ${{ inputs.cache-key }}-${{ hashFiles('CMakeLists.txt') }}
         restore-keys: ${{ inputs.cache-key }}-
-        max-size: 1G
+        max-size: 2G
         # only main, the nightly run and releases save: a pull request restores main's cache and saves none, so pull
         # requests can't fill the repository's cache quota and evict the caches every build restores from
         save: ${{ github.event_name != 'pull_request' }}

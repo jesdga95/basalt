@@ -18,6 +18,7 @@
 // --bench: per card, the whole layer and each share's slice as CUDA graphs over eight layers' distinct weights, in
 // microseconds per layer.
 #include "basalt/artifact/dequant.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
 #include "basalt/kernels/gdn_window.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
@@ -163,7 +164,8 @@ template<typename V>
 V* upload(const std::vector<V>& h) {
     V* d = nullptr;
     CK(cudaMalloc(&d, h.size() * sizeof(V) + 64));
-    CK(cudaMemcpy(d, h.data(), h.size() * sizeof(V), cudaMemcpyHostToDevice));
+    // device_copy: on an integrated GPU a copy from pageable memory lands after cudaMemcpy returns
+    CK(basalt::core::device_copy(d, h.data(), h.size() * sizeof(V), cudaMemcpyHostToDevice));
     return d;
 }
 template<typename V>

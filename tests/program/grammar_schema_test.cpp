@@ -479,6 +479,185 @@ static void test_json_args() {
     set_tool_form(saved);
 }
 
+static void test_schema_regressions() {
+    std::string err;
+
+    // R8-10: pattern_to_rule multi-byte UTF-8, escape/quote quantifier binding, lazy quantifiers, bounds validation
+    {
+        auto u2 = build(std::string(R"({"type":"string","pattern":"^)") + "\xC3\xA9" + R"(+$"})");
+        CHECK(u2 && ok(u2, std::string("\"") + "\xC3\xA9" + "\"") &&
+              ok(u2, std::string("\"") + "\xC3\xA9\xC3\xA9\xC3\xA9" + "\"") &&
+              !ok(u2, "\"\"") && !pre(u2, "\"a"));
+        auto u3 = build(std::string(R"({"type":"string","pattern":"^)") + "\xE4\xB8\xAD" + R"({2,3}$"})");
+        CHECK(u3 && ok(u3, std::string("\"") + "\xE4\xB8\xAD\xE4\xB8\xAD" + "\"") &&
+              ok(u3, std::string("\"") + "\xE4\xB8\xAD\xE4\xB8\xAD\xE4\xB8\xAD" + "\"") &&
+              !ok(u3, std::string("\"") + "\xE4\xB8\xAD" + "\"") &&
+              !ok(u3, std::string("\"") + "\xE4\xB8\xAD\xE4\xB8\xAD\xE4\xB8\xAD\xE4\xB8\xAD" + "\""));
+
+        auto esc = build(R"({"type":"string","pattern":"^foo\\.+$"})");
+        CHECK(esc && ok(esc, "\"foo.\"") && ok(esc, "\"foo...\"") && !ok(esc, "\"foo.foo.\"") && !ok(esc, "\"foo\""));
+
+        auto qt = build(R"({"type":"string","pattern":"^a\"+$"})");
+        CHECK(qt && ok(qt, "\"a\"\"") && ok(qt, "\"a\"\"\"") && !ok(qt, "\"a\"a\"\""));
+
+        auto lp = build(R"({"type":"string","pattern":"^a+?$"})");
+        CHECK(lp && ok(lp, "\"a\"") && ok(lp, "\"aaa\"") && !ok(lp, "\"\""));
+        auto lb = build(R"({"type":"string","pattern":"^a{2,4}?$"})");
+        CHECK(lb && ok(lb, "\"aa\"") && ok(lb, "\"aaaa\"") && !ok(lb, "\"\"") && !ok(lb, "\"a\"") && !ok(lb, "\"aaaaa\""));
+        auto ls = build(R"({"type":"string","pattern":"^a*?$"})");
+        CHECK(ls && ok(ls, "\"\"") && ok(ls, "\"aa\""));
+        auto lq = build(R"({"type":"string","pattern":"^a??$"})");
+        CHECK(lq && ok(lq, "\"\"") && ok(lq, "\"a\"") && !ok(lq, "\"aa\""));
+
+        // Negative/malformed curly bounds degrade safely; inverted bounds and stacked quantifiers fail cleanly
+        auto neg = build(R"({"type":"string","pattern":"^a{-1,3}$"})");
+        CHECK(neg && ok(neg, "\"any\""));
+        auto open_min = build(R"({"type":"string","pattern":"^a{,3}$"})");
+        CHECK(open_min && ok(open_min, "\"any\""));
+        CHECK(json_schema_to_gbnf(R"({"type":"string","pattern":"^a{5,2}$"})", err).empty() && !err.empty());
+        CHECK(json_schema_to_gbnf(R"({"type":"string","pattern":"^a++$"})", err).empty() && !err.empty());
+        CHECK(json_schema_to_gbnf(R"({"type":"string","pattern":"^a???$"})", err).empty() && !err.empty());
+    }
+
+    // R8-11 & R2C-2: visit_all_of cyclic $ref, prop.required, duplicate keys, single-branch & non-object allOf
+    {
+        CHECK(json_schema_to_gbnf(R"({"$defs":{"a":{"$ref":"#/$defs/a"}},"allOf":[{"$ref":"#/$defs/a"}]})", err).empty() && !err.empty());
+        CHECK(json_schema_to_gbnf(R"({"$defs":{"a":{"$ref":"#/$defs/b"},"b":{"$ref":"#/$defs/a"}},"allOf":[{"$ref":"#/$defs/a"},{"type":"object","properties":{"x":{"type":"integer"}}}]})", err).empty() && !err.empty());
+        CHECK(json_schema_to_gbnf(R"({"$defs":{"a":{"allOf":[{"$ref":"#/$defs/a"}]}},"$ref":"#/$defs/a"})", err).empty() && !err.empty());
+
+        auto req_opt = build(R"({"allOf":[{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"}},"required":["a"]},{"type":"object","properties":{"c":{"type":"boolean"}}}]})");
+        CHECK(req_opt && ok(req_opt, R"({"a":"hi"})") && ok(req_opt, R"({"a":"hi","b":1,"c":true})") && !ok(req_opt, "{}"));
+
+        auto dedup = build(R"({"allOf":[{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]},{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}]})");
+        CHECK(dedup && ok(dedup, R"({"a":1})") && !ok(dedup, R"({"a":1,"a":2})"));
+
+        // Pydantic single-branch allOf wrapper over non-object and recursive object
+        auto wrap_s = build(R"({"allOf":[{"$ref":"#/$defs/s"}],"$defs":{"s":{"type":"string","minLength":2}}})");
+        CHECK(wrap_s && ok(wrap_s, "\"ab\"") && !ok(wrap_s, "\"a\"") && !ok(wrap_s, "{}"));
+
+        auto wrap_rec = build(R"({"$defs":{"Node":{"type":"object","properties":{"v":{"type":"integer"},"next":{"allOf":[{"$ref":"#/$defs/Node"}]}},"required":["v"]}},"$ref":"#/$defs/Node"})");
+        CHECK(wrap_rec && ok(wrap_rec, R"({"v":1})") && ok(wrap_rec, R"({"v":1,"next":{"v":2}})"));
+
+        // Multi-branch non-object allOf
+        auto str_all = build(R"({"allOf":[{"type":"string"},{"minLength":2}]})");
+        CHECK(str_all && ok(str_all, "\"ab\"") && !ok(str_all, "\"a\"") && !ok(str_all, "{}"));
+        auto int_all = build(R"({"allOf":[{"type":"integer","minimum":5},{"type":"integer","maximum":10}]})");
+        CHECK(int_all && ok(int_all, "5") && ok(int_all, "10") && !ok(int_all, "4") && !ok(int_all, "11") && !ok(int_all, "{}"));
+        CHECK(json_schema_to_gbnf(R"({"allOf":[{"enum":["a"]},{"enum":["b"]}]})", err).empty() && !err.empty());
+    }
+
+    // R2C-1: number_text overflow, ULLONG_MAX, and malformed JSON numbers
+    {
+        auto inf_pos = build(R"({"const":1e309})");
+        CHECK(inf_pos && ok(inf_pos, "1e309"));
+        auto inf_neg = build(R"({"const":-1e309})");
+        CHECK(inf_neg && ok(inf_neg, "-1e309"));
+        auto umax = build(R"({"const":18446744073709551615})");
+        CHECK(umax && ok(umax, "18446744073709551615"));
+        for (const char* bad_num : {R"({"const":-})", R"({"const":01})", R"({"const":1.})", R"({"const":1e+})", R"({"const":1--2})"}) {
+            CHECK(json_schema_to_gbnf(bad_num, err).empty() && !err.empty());
+        }
+    }
+
+    // R2C-3: 16+ digit integer bounds, leading zeros, INT64_MIN safety, inverted bounds
+    {
+        auto big_min = build(R"({"type":"integer","minimum":2000000000000000})");
+        CHECK(big_min && ok(big_min, "2000000000000000") && ok(big_min, "10000000000000000") && !ok(big_min, "1999999999999999"));
+
+        auto min100 = build(R"({"type":"integer","minimum":100})");
+        CHECK(min100 && ok(min100, "100") && ok(min100, "105") && ok(min100, "1000") && !ok(min100, "10") && !ok(min100, "19") && !ok(min100, "99"));
+
+        auto min105 = build(R"({"type":"integer","minimum":105})");
+        CHECK(min105 && ok(min105, "105") && ok(min105, "110") && ok(min105, "1000") && !ok(min105, "15") && !ok(min105, "104"));
+
+        auto min215 = build(R"({"type":"integer","minimum":215})");
+        CHECK(min215 && ok(min215, "215") && ok(min215, "2000") && !ok(min215, "214") && !ok(min215, "209"));
+
+        auto min_i64p1 = build(R"({"type":"integer","minimum":-9223372036854775807})");
+        CHECK(min_i64p1 && ok(min_i64p1, "-9223372036854775807") && ok(min_i64p1, "0") && !ok(min_i64p1, "-9223372036854775808"));
+
+        auto max_i64min = build(R"({"type":"integer","maximum":-9223372036854775808})");
+        CHECK(max_i64min && ok(max_i64min, "-9223372036854775808") && !ok(max_i64min, "-9223372036854775807"));
+
+        CHECK(json_schema_to_gbnf(R"({"type":"integer","minimum":10,"maximum":5})", err).empty() && !err.empty());
+        CHECK(json_schema_to_gbnf(R"({"type":"string","minLength":5,"maxLength":2})", err).empty() && !err.empty());
+        CHECK(json_schema_to_gbnf(R"({"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":1})", err).empty() && !err.empty());
+    }
+
+    // R2C-4: not_strings escaping, proper prefixes, control bytes, empty-only key
+    {
+        auto pref = build(R"({"type":"object","properties":{"name":{"type":"string"}},"additionalProperties":{"type":"integer"}})");
+        CHECK(pref && ok(pref, R"({"n":1})") && ok(pref, R"({"na":2})") && ok(pref, R"({"nam":3})") && ok(pref, R"({"names":4})") &&
+              !ok(pref, R"({"name":5})") && ok(pref, R"({"name":"ok","na":1})"));
+        // Reject raw control bytes and invalid escapes in additional keys; accept valid JSON escapes
+        const std::string raw_nl = "{\"x\ny\":1}";
+        const std::string bad_esc = "{\"x\\zy\":1}";
+        const std::string good_esc = "{\"x\\ny\":1}";
+        CHECK(pref && !ok(pref, raw_nl) && !ok(pref, bad_esc) && ok(pref, good_esc));
+
+        auto meta = build(R"({"type":"object","properties":{"a]b":{"type":"string"},"a-b":{"type":"string"},"^k":{"type":"string"},"a\\b":{"type":"string"},"a\"b":{"type":"string"}},"additionalProperties":{"type":"integer"}})");
+        const std::string k_tab = "{\"a\\tb\":1}";
+        const std::string k_bs = "{\"a\\\\b\":1}";
+        const std::string k_qt = "{\"a\\\"b\":1}";
+        CHECK(meta && ok(meta, R"({"a":1})") && ok(meta, R"({"a]":1})") && ok(meta, R"({"a-":1})") && ok(meta, R"({"^":1})") &&
+              ok(meta, R"({"a_b":1})") && ok(meta, k_tab) &&
+              !ok(meta, R"({"a]b":1})") && !ok(meta, R"({"a-b":1})") && !ok(meta, R"({"^k":1})") &&
+              !ok(meta, k_bs) && !ok(meta, k_qt));
+
+        auto empty_only = build(R"({"type":"object","properties":{"obj":{"type":"object","properties":{"":{"type":"integer"}},"additionalProperties":{"type":"string"}}},"required":["obj"]})");
+        CHECK(empty_only && ok(empty_only, R"({"obj":{"":1,"k":"v"}})") && !ok(empty_only, R"({"obj":{"":"v"}})"));
+    }
+
+    // R2C-5: resolve_ref aliasing, multi-tool $defs isolation, deref stoul overflow, tool_call_gbnf dedup, "*" sentinel
+    {
+        auto alias = build(R"({"$defs":{"user_id":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]},"user-id":{"type":"object","properties":{"s":{"type":"string"}},"required":["s"]}},"type":"object","properties":{"a":{"$ref":"#/$defs/user_id"},"b":{"$ref":"#/$defs/user-id"}},"required":["a","b"]})");
+        CHECK(alias && ok(alias, R"({"a":{"n":1},"b":{"s":"x"}})") && !ok(alias, R"({"a":{"n":1},"b":{"n":2}})"));
+
+        auto non_ascii = build(std::string(R"({"$defs":{")") + "\xE5\x90\x8D" + R"(":{"type":"object","properties":{"s":{"type":"string"}},"required":["s"]},")" +
+                               "\xE5\xB9\xB4" + R"(":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}},"type":"object","properties":{"a":{"$ref":"#/$defs/)" +
+                               "\xE5\x90\x8D" + R"("},"b":{"$ref":"#/$defs/)" + "\xE5\xB9\xB4" + R"("}},"required":["a","b"]})");
+        CHECK(non_ascii && ok(non_ascii, R"({"a":{"s":"x"},"b":{"n":1}})") && !ok(non_ascii, R"({"a":{"s":"x"},"b":{"s":"y"}})"));
+
+        // Two tools with colliding #/$defs/item names must not alias across documents
+        ToolForm saved = tool_form();
+        ToolForm jf;
+        jf.call_open = "<c>";
+        jf.fn_mid = ":";
+        jf.fn_close = "";
+        jf.call_close = "</c>";
+        jf.json_args = true;
+        set_tool_form(jf);
+        std::string tg = tool_call_gbnf(R"([
+            {"name":"t1","parameters":{"$defs":{"item":{"type":"object","properties":{"s":{"type":"string"}},"required":["s"]}},"type":"object","properties":{"x":{"$ref":"#/$defs/item"}},"required":["x"]}},
+            {"name":"t2","parameters":{"$defs":{"item":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}},"type":"object","properties":{"x":{"$ref":"#/$defs/item"}},"required":["x"]}}
+        ])", ToolGrammarOptions{}, err);
+        set_tool_form(saved);
+        auto tgg = Grammar::parse(tg, err);
+        CHECK(tgg && ok(tgg, R"(<c>t1:{"x":{"s":"ok"}}</c>)") && ok(tgg, R"(<c>t2:{"x":{"n":7}}</c>)") &&
+              !ok(tgg, R"(<c>t2:{"x":{"s":"bad"}}</c>)"));
+
+        // Overflowing array index in $ref must not throw uncaught std::out_of_range
+        err.clear();
+        std::string big_ref = tool_call_gbnf(R"([{"name":"f","parameters":{"items":[{"type":"string"}],"type":"object","properties":{"p":{"$ref":"#/items/999999999999999999999999999"}}}}])",
+                                             ToolGrammarOptions{}, err);
+        CHECK(!big_ref.empty() && err.empty());
+
+        // Tool parameter named "req1" must not collide with fn0-req1 permutation rule
+        std::string req_col = tool_call_gbnf(R"([{"name":"f","parameters":{"type":"object","properties":{"req1":{"type":"integer"},"b":{"type":"integer"}},"required":["req1","b"]}}])",
+                                             ToolGrammarOptions{}, err);
+        auto rg = Grammar::parse(req_col, err);
+        CHECK(rg && ok(rg, "<tool_call>\n<function=f>\n<parameter=b>\n2\n</parameter>\n<parameter=req1>\n1\n</parameter>\n</function>\n</tool_call>"));
+
+        // Property literally named "*" must not collide with additionalProperties sentinel
+        auto star_only = build(R"({"type":"object","properties":{"*":{"type":"integer"}},"additionalProperties":false})");
+        CHECK(star_only && ok(star_only, R"({"*":1})") && !ok(star_only, R"({"*":1,"*":2})"));
+
+        auto star_req_addl = build(R"({"type":"object","properties":{"*":{"type":"integer"}},"required":["*"],"additionalProperties":{"type":"string"}})");
+        CHECK(star_req_addl && ok(star_req_addl, R"({"*":1})") && ok(star_req_addl, R"({"*":1,"k":"v"})") &&
+              !ok(star_req_addl, R"({"*":"v"})") && !ok(star_req_addl, R"({"*":1,"*":"v"})"));
+    }
+}
+
 int main() {
     set_test_tool_form();
     test_json_args();
@@ -494,6 +673,7 @@ int main() {
     test_control_escapes();
     test_multibyte_text_end();
     test_boolean_schemas();
+    test_schema_regressions();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");
     return 0;

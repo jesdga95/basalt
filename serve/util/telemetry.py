@@ -17,15 +17,17 @@ HISTORY = 60
 
 
 # ------------------------------------------------------------------------------------------------ NVML
-class _Nvml:
-    class Util(ctypes.Structure):
-        _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+_nvml_lock = threading.Lock()
+_nvml_lib = None
+_nvml_ready = False
 
-    class Mem(ctypes.Structure):
-        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
-    def __init__(self, index=0):
-        self.lib = self.dev = None
+def _load_nvml():
+    """Load and initialize the NVML shared library once per process; None when unavailable."""
+    global _nvml_lib, _nvml_ready
+    with _nvml_lock:
+        if _nvml_ready:
+            return _nvml_lib
         names = ["libnvidia-ml.so.1", "libnvidia-ml.so"]
         if sys.platform == "win32":
             # Windows ships NVML as nvml.dll (System32); the .so names never load there, which left
@@ -34,19 +36,41 @@ class _Nvml:
             nvml_dll = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "nvml.dll")
             if os.path.exists(nvml_dll):
                 names.insert(0, nvml_dll)
+        lib = None
         for n in names:
             try:
-                self.lib = ctypes.CDLL(n)
+                lib = ctypes.CDLL(n)
                 break
             except OSError:
                 continue
+        if lib is None:
+            _nvml_ready = True
+            return None
+        try:
+            init = getattr(lib, "nvmlInit_v2", None) or lib.nvmlInit
+            if init() != 0:
+                return None                             # transient init failure: may retry later
+        except (AttributeError, OSError):
+            _nvml_ready = True
+            return None
+        _nvml_lib = lib
+        _nvml_ready = True
+        return lib
+
+
+class _Nvml:
+    class Util(ctypes.Structure):
+        _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+    class Mem(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+    def __init__(self, index=0):
+        self.lib = _load_nvml()
+        self.dev = None
         if self.lib is None:
             return
         try:
-            init = getattr(self.lib, "nvmlInit_v2", None) or self.lib.nvmlInit
-            if init() != 0:
-                self.lib = None
-                return
             h = ctypes.c_void_p()
             get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
             if get(ctypes.c_uint(index), ctypes.byref(h)) != 0:
@@ -172,9 +196,13 @@ def gpu_reader(index=0):
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.path.exists("/proc/cpuinfo"):
-        for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
-            if line.startswith("model name"):
-                return line.split(":", 1)[1].strip()
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as fp:
+                for line in fp:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
     return platform.processor() or None
 
 
@@ -186,9 +214,10 @@ class _CpuRamFallback:
 
     def _times(self):
         try:
-            f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+            with open("/proc/stat", encoding="ascii", errors="replace") as fp:
+                f = [int(x) for x in fp.readline().split()[1:]]
             return f[3] + f[4], sum(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError, IndexError):
             return None
 
     def cpu(self):
@@ -201,11 +230,12 @@ class _CpuRamFallback:
     @staticmethod
     def ram():
         try:
-            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+            with open("/proc/meminfo", encoding="ascii", errors="replace") as fp:
+                info = dict(line.split(":", 1) for line in fp if ":" in line)
             total = int(info["MemTotal"].split()[0]) * 1024
             avail = int(info["MemAvailable"].split()[0]) * 1024
             return total - avail, total
-        except (OSError, KeyError, ValueError):
+        except (OSError, KeyError, ValueError, IndexError):
             return None, None
 
 
@@ -268,11 +298,13 @@ class Telemetry:
             c = self.ps.disk_io_counters()
         except (OSError, RuntimeError):
             return None
-        t = time.time()
+        if c is None:
+            return None
+        t = time.monotonic()
         prev, self._disk_prev = self._disk_prev, (t, c.read_bytes)
         if prev is None or t <= prev[0]:
             return None
-        return (c.read_bytes - prev[1]) / (t - prev[0]) / 2**20
+        return max(0.0, (c.read_bytes - prev[1]) / (t - prev[0]) / 2**20)
 
     def sample(self):
         s = {"gpus": []}

@@ -194,6 +194,44 @@ class Responses(unittest.TestCase):
         adelta = [e for e in events if e["type"] == "response.function_call_arguments.delta"][0]
         self.assertEqual([x["token"] for x in adelta["logprobs"]], ["<call", "args"])
 
+    def test_responses_flushes_residual_content_and_reasoning_logprobs(self):
+        # Residual tokens held back at close() (reasoning -> message transition and end-of-stream)
+        asm = Assembler({logprobs.REQUEST_KEY: 0}, "m", 3, {}, False)
+        events = asm.start()
+        asm.logprob("reasoning", lp("hm"))
+        events += asm.feed(Event("reasoning", "hm"))
+        asm.logprob("reasoning", lp("..."))               # trailing reasoning token without another delta
+        asm.logprob("content", lp("Hi"))
+        events += asm.feed(Event("content", "Hi"))
+        asm.logprob("content", lp("!"))                   # trailing answer token held back at end-of-stream
+        events += asm.finish({"finish": "stop", "completion_tokens": 4})
+        r_deltas = [e for e in events if e["type"] == "response.reasoning_text.delta"]
+        t_deltas = [e for e in events if e["type"] == "response.output_text.delta"]
+        self.assertEqual([x["token"] for e in r_deltas for x in e["logprobs"]], ["hm", "..."])
+        self.assertEqual([x["token"] for e in t_deltas for x in e["logprobs"]], ["Hi", "!"])
+        t_done = [e for e in events if e["type"] == "response.output_text.done"][0]
+        self.assertEqual([x["token"] for x in t_done["logprobs"]], ["Hi", "!"])
+        rs, msg = events[-1]["response"]["output"]
+        self.assertEqual([x["token"] for x in rs["logprobs"]], ["hm", "..."])
+        self.assertEqual([x["token"] for x in msg["content"][0]["logprobs"]], ["Hi", "!"])
+
+        # Residual tokens arriving after items already closed (before finish()) attach to last matching item
+        asm2 = Assembler({logprobs.REQUEST_KEY: 0}, "m", 3, {}, False)
+        events2 = asm2.start()
+        asm2.logprob("reasoning", lp("r1"))
+        events2 += asm2.feed(Event("reasoning", "r1"))
+        asm2.logprob("content", lp("c1"))
+        events2 += asm2.feed(Event("content", "c1"))
+        call = ToolCall("read", {})
+        events2 += asm2.feed(Event("tool_call", call=call))
+        asm2.logprob("reasoning", lp("r2"))
+        asm2.logprob("content", lp("c2"))
+        events2 += asm2.finish({"finish": "stop", "completion_tokens": 4})
+        out2 = events2[-1]["response"]["output"]
+        self.assertEqual([x["token"] for x in out2[0]["logprobs"]], ["r1", "r2"])
+        self.assertEqual([x["token"] for x in out2[1]["content"][0]["logprobs"]], ["c1", "c2"])
+        self.assertEqual((asm2.lps, asm2.lps_reasoning), ([], []))
+
 
 class Api(unittest.TestCase):
     start = test_parallel.ParallelService.start

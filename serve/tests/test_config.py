@@ -131,6 +131,33 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
 
+    def test_model_entry_boolean_false_overrides_engine_true(self):
+        p = conf({
+            "version": 2,
+            "engine": {
+                "fit-max-tokens": True,
+                "slot-full-context": True,
+                "grammar": True,
+                "resident-experts": True,
+                "route-tail-skip": 7,
+            },
+            "models": [
+                {"model": "a.basalt", "parallel": 2, "max-context": 8192},
+                {"model": "b.basalt", "parallel": 2, "max-context": 8192,
+                 "fit-max-tokens": False, "slot-full-context": False, "grammar": False,
+                 "resident-experts": False, "route-tail-skip": False},
+            ],
+        })
+        (a, _, afile, _), (b, _, bfile, _) = model_settings(build_parser(), ["--config", p])
+        self.assertTrue((a.fit_max_tokens, a.slot_full_context, a.grammar) == (True, True, True))
+        self.assertEqual(flag_value(afile, "--max-context"), "8192")
+        self.assertIn("--resident-experts", afile)
+        self.assertEqual(flag_value(afile, "--route-tail-skip"), "7")
+        self.assertEqual((b.fit_max_tokens, b.slot_full_context, b.grammar), (False, False, False))
+        self.assertEqual(flag_value(bfile, "--max-context"), "4096")
+        self.assertNotIn("--resident-experts", bfile)
+        self.assertNotIn("--route-tail-skip", bfile)
+
     def test_the_ram_reserve(self):
         p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
         for _, _, words, _ in model_settings(build_parser(), ["--config", p]):
@@ -398,6 +425,19 @@ class SamplingOptions(unittest.TestCase):
         a = parse(["--top-k", "0", "--seed", "0", "--presence-penalty", "-0.5", "--penalty-last-n", "4096"])[0]
         self.assertEqual(a.sampling_launch, {"top_k": 0, "seed": 0, "presence_penalty": -0.5, "penalty_last_n": 4096})
         self.assertEqual(parse(["--top-k", "1000"])[0].sampling_launch, {"top_k": 1000})
+
+    def test_seed_keeps_full_64bit_precision(self):
+        from serve.config import checked_sampling
+        for exact in (2 ** 53 + 1, 2 ** 64 - 1, -(2 ** 63)):
+            a = parse(["--seed", str(exact)])[0]
+            self.assertEqual(a.seed, exact)
+            self.assertIsInstance(a.seed, int)
+            checked_sampling({"seed": exact})
+        for huge in (2 ** 64, -(2 ** 63) - 1, 10 ** 400):
+            with self.assertRaises(SystemExit, msg=str(huge)):
+                parse(["--seed", str(huge)])
+            with self.assertRaises(ValueError, msg=str(huge)):
+                checked_sampling({"seed": huge})
 
     def test_the_model_file_check_is_the_same(self):
         with self.assertRaisesRegex(SystemExit, "sampling.top_k=-5"):

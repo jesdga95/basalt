@@ -48,6 +48,10 @@ Each request ends with one `done` line:
 - `end`: `stop`, `length`, `cancelled`, `disconnect` or `error`.
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
+### Request timing fields
+
+The API's `timings` object and the matching `done`-line values are request-level wall-clock totals, not single-window CUDA timings. `prompt_ms` covers prompt reading; `decode_ms` covers decoding after prompt setup, including host time and gaps between decode windows or engine passes that belong to the request. A request that moves between solo and batch execution accumulates the applicable parts, so compare these fields with other request-level measurements. Use the engine log or `basalt-bench` window metrics when you need a per-window or kernel-oriented rate.
+
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
 taken from the file); `[server] engine log: PATH` names it at start. A log of 10 MiB or more moves to `engine.log.1` at the
 next start. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage
@@ -57,7 +61,15 @@ read the vision projector inside it.
 
 ## The stats page
 
-The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`. The top of the page always shows:
+The server's address serves a page. Its figures arrive as one combined snapshot over `/api/state/stream`, once per
+second and on observed request, queue or model state changes (checked every 100 ms); a shared publisher serves all
+clients without per-client snapshot queues, and reconnecting clients receive its latest snapshot. This is a combined
+view, not a transaction across all engine and router state; `/metrics`, `/slots` and `/api/logs` remain JSON endpoints
+for external clients. Each SSE endpoint permits up to eight concurrent clients. The Logs tab receives live console
+lines from `/api/logs/stream`, reconnects from its last cursor, and reports server restarts or lines lost from the
+bounded buffer. Both log endpoints require the API key when one is configured; the page sends it in the Authorization
+header. The top of the page always shows:
+
 
 - Decode and prefill: the live rate with a 60 s chart; when idle, the last request's decode and the last prompt read of at least 512
   new tokens (a cached follow-up has no meaningful read rate). The decode number's tooltip has the best decode and the conversation
@@ -145,6 +157,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
   repeats it and the stats page adds an SSD tier and turns its Experts heading amber.
 - The disk tier keeps its floor a GiB above the reserve.
 - `--resident-budget-gib` that would leave less than the floor is refused with the largest safe value.
+- The automatic RAM copy leaves the adaptive swaps' free places room beside the experts, so they need no setting of
+  their own. An explicit `--resident-budget-gib` within the places' own size of the RAM room gives back the coldest
+  experts for them: an evicted expert with nowhere to go is not evicted at all, and the tier moves nothing.
 
 ## Vision: `--vision`
 

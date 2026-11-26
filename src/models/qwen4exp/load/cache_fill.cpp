@@ -1,3 +1,4 @@
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -46,7 +47,7 @@ int cache_fill(Context& context) {
     // what one peer card can hold of experts: its free memory less its tier's buffers and reserve
     auto card_room = [&](int dev, int cur) -> uint64_t {
         size_t pfree = 0, ptotal = 0;
-        if (cudaSetDevice(dev) != cudaSuccess || cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) return 0;
+        if (cudaSetDevice(dev) != cudaSuccess || basalt::core::gpu_mem_info(&pfree, &ptotal) != cudaSuccess) return 0;
         const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                  (dev == o.peer_device ? peer_prompt_bytes() : 0) +
                                  basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
@@ -156,7 +157,7 @@ int cache_fill(Context& context) {
         const basalt::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            basalt::core::gpu_mem_info(&fb, &tb);
             basalt::log::info("basalt generate", "layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB",
                          st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
         }

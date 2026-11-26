@@ -40,6 +40,7 @@
 //    Every comparison still passed at any sane tolerance, the spare key landing 0.4 f32 ulp away; only a
 //    BIT-EXACT assertion plus a full-precision probe of the intermediate found it.  That is the strongest
 //    argument in this file for keeping both.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
@@ -549,7 +550,7 @@ int32_t* step_scratch() {
 
 void step_upload_raw(const int32_t* h_step) {
     int32_t* d = step_scratch();
-    if (cudaMemcpy(d, h_step, qsa_step_bytes(), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (basalt::core::device_copy(d, h_step, qsa_step_bytes(), cudaMemcpyHostToDevice) != cudaSuccess) {
         basalt::log::error("basalt", "qsa: step upload: cudaMemcpy failed");
         std::exit(1);
     }

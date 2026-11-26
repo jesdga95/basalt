@@ -1,0 +1,36 @@
+{
+  "submitter": "RecklessactN",
+  "date": "2026-11-25",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 28.7
+    }
+  ],
+  "ram_gib": 62,
+  "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+  "ram_gbps": 90.2,
+  "os": "Linux",
+  "quant": "IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 1078.2,
+  "prefill_64k_tps": 1601.0,
+  "decode_tps": 152.4,
+  "decode_conv_tps": 93.5,
+  "decode_struct_tps": 192.2,
+  "decode_prose_tps": 88.5,
+  "accept_conv_pct": 71.1,
+  "accept_struct_pct": 94.3,
+  "accept_prose_pct": 65.4,
+  "draft_len_conv": 2.1,
+  "draft_len_struct": 6.7,
+  "draft_len_prose": 1.7,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "ISTA GSQ-RCO IQ3_S, self-converted with tools/convert; MTP + drafter from the UD-IQ3_XXS pack. NAS with apps running. Served with prefill 4096: 64k ~1,810 tok/s on varied text."
+}

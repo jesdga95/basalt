@@ -28,6 +28,7 @@ struct SlotWin {
     const char* fin = nullptr;
     int want = 0;
     bool drafting = false;
+    bool solo = true;
 };
 
 // The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, or as its drafter's
@@ -192,9 +193,11 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             std::printf("ERR %s\n", r.message.c_str());
             return false;
         }
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
-        if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
-        else bpolicy->observe_window(w.chance, T, a, ms);
+        if (w.solo) {
+            const double ms = s.window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
+            if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
+            else bpolicy->observe_window(w.chance, T, a, ms);
+        }
     }
     if (fin != nullptr) {
         std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
@@ -239,16 +242,24 @@ bool Runtime::batch_round() {
     // the windows of a round share the batch's rows.  Drafts with stated chances: with no more slots than rows one pass
     // serves all, the rows going to the drafts likeliest kept.  Drafters that set their own length: each window as it would
     // run alone, shared max-min fairly when they do not fit (a window held to fewer takes its drafts again within its share)
+    constexpr int kShortSpecCap = 16;
+    constexpr int kLongSpecCap = 96;
     const int n_act = (int) act.size();
+    int64_t max_pos = 0;
+    for (int i = 0; i < n_act; ++i) max_pos = std::max(max_pos, bs[(size_t) act[(size_t) i]].p);
+    const int spec_cap = max_pos >= 4096 ? std::min(cap, kLongSpecCap) : std::min(cap, kShortSpecCap);
+    const int row_cap = std::min(cap, std::max(n_act, spec_cap));
+    const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : row_cap;
+    const int per_slot_cap = std::min(row_cap, slot_cap_by_n);
     std::vector<SlotWin> wins(act.size());
     std::vector<int> rows(act.size());
     const BSlot& s0 = bs[(size_t) act[0]];
     if (slot_session(act[0]).own_window(s0.dprob, s0.n_dr) > 0) {
         for (int i = 0; i < n_act; ++i) {
-            slot_window_begin(act[(size_t) i], wins[(size_t) i], cap);
+            slot_window_begin(act[(size_t) i], wins[(size_t) i], per_slot_cap);
             rows[(size_t) i] = wins[(size_t) i].T;
         }
-        const std::vector<int> share = batch_fair_shares(rows, cap);
+        const std::vector<int> share = batch_fair_shares(rows, row_cap);
         for (int i = 0; i < n_act; ++i)
             if (share[(size_t) i] < rows[(size_t) i]) {
                 slot_window_begin(act[(size_t) i], wins[(size_t) i], share[(size_t) i]);
@@ -259,11 +270,12 @@ bool Runtime::batch_round() {
         for (int i = 0; i < n_act; ++i) {
             const BSlot& sl = bs[(size_t) act[(size_t) i]];
             double all = 1.0;
-            for (int k = 0; k < sl.n_dr; ++k) joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
+            const int max_k = std::min(sl.n_dr, std::max(0, per_slot_cap - 1));
+            for (int k = 0; k < max_k; ++k) joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
         }
-        const std::vector<int> share = batch_shares(joint, cap);
+        const std::vector<int> share = batch_shares(joint, row_cap);
         for (int i = 0; i < n_act; ++i) {
-            slot_window_begin(act[(size_t) i], wins[(size_t) i], share[(size_t) i]);
+            slot_window_begin(act[(size_t) i], wins[(size_t) i], std::min(share[(size_t) i], per_slot_cap));
             rows[(size_t) i] = wins[(size_t) i].T;
         }
     }
@@ -288,10 +300,11 @@ bool Runtime::batch_round() {
         std::vector<int> dn;
         for (const size_t i : group) {
             wins[i].round0 = t0;
+            wins[i].solo = group.size() == 1;
             if (!slot_window_accept(act[i], wins[i])) return false;
             kept.push_back(wins[i].kept);
-            // a full batch gives each slot one row next round: drafts could not be verified, so do not draft them
-            if (n_act >= cap) wins[i].want = 0;
+            // bound drafted tokens to what a slot's share of the batch window can verify next round
+            wins[i].want = std::min(wins[i].want, std::min(per_slot_cap - 1, std::max(0, (spec_cap + n_act - 1) / n_act - 1)));
             if (wins[i].want > 0) {
                 const BSlot& sl = bs[(size_t) act[i]];
                 ds.push_back(&slot_session(act[i]));

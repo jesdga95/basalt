@@ -6,6 +6,7 @@
 // experts and a share of the RAM ones, read over its own link, beside the main card (prefill::PeerShare); in a short chunk
 // the CPU also takes RAM experts with few rows. Their rows join the main card's before the weighted sum. Shared: the dense
 // matvec over columns of up to eight tokens.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
 
@@ -166,7 +167,7 @@ public:
         if (ahead_) return routed_ahead(il, T, x, ids, w, out, st, err);
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
-        cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= g_.n_expert) {
@@ -520,7 +521,7 @@ private:
         s.cpu_at = at;
         for (size_t i = 0; i < s.pair.size(); ++i) map_h_[(size_t) s.pair[i]] = (int32_t) (at + (int64_t) i);
         if (rows == 0) return true;
-        if (cudaMemcpy(hx_, x, (size_t) T * n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (basalt::core::device_copy(hx_, x, (size_t) T * n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
             err = "deepseek41: reading a short read's activations failed";
             return false;
         }
@@ -728,7 +729,7 @@ private:
         }
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
-        cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<std::vector<int32_t>> by((size_t) NE);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= NE) {

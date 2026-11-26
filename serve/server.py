@@ -78,6 +78,14 @@ def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str]
     return (on, origin) if origin else None
 
 
+def url_host(host: str) -> str:
+    """Format a bind host for an http:// URL: map wildcard addresses to loopback and bracket IPv6 literals."""
+    here = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    if ":" in here and not (here.startswith("[") and here.endswith("]")):
+        return f"[{here}]"
+    return here
+
+
 def open_when_ready(svc, url, now=False, opener=None):
     """Open the page once, after the first weights load; at once when no load is under way (mock, lazy)."""
     if opener is None:
@@ -267,8 +275,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             if mode == "dynamic":
                 vision = EngineVision(cfg["vision"])
             else:
-                vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                env=vision_env(env, mode), start=not multi)
+                vision = Vision(cfg["vision"], log=cfg.get("log"), env=vision_env(env, mode), start=not multi)
         if a.lazy and not multi:
             print(tagged("model", "unloaded, the first request loads it"), flush=True)
         has_grammar = known is not None and "--grammar" in known
@@ -471,7 +478,7 @@ def main() -> int:
             s.totals_path = tp
             s.load_totals(pricing_cli)
     httpd = serve(router, host=a.host, port=a.port)
-    here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
+    here = url_host(a.host)
 
     def announcer(s: Service, m):
         first_load, said_video = [True], [False]
@@ -501,7 +508,7 @@ def main() -> int:
     if router.cache is not None:
         router.start_guard()
     for s, m in zip(services, (x[0] for x in settings)):
-        s.start_idle_unload()
+        s.start_idle_unload(unloader=lambda idle_for=None, s=s: router.unload(s, idle_for=idle_for))
         s.start_idle_sleep(announce=not shared_sleep, name=s.model if multi else None)
         s.on_loaded = announcer(s, m)
 
@@ -515,7 +522,7 @@ def main() -> int:
         # reachable from other devices: print the addresses
         ips = lan_addresses()
         for ip in ips:
-            print(tagged("network", f"http://{ip}:{a.port}/v1"), flush=True)
+            print(tagged("network", f"http://{url_host(ip)}:{a.port}/v1"), flush=True)
         if not ips:
             print(tagged("network", f"port={a.port}"), flush=True)
         if exposed_without_key(a.host, svc.api_key):
@@ -526,8 +533,7 @@ def main() -> int:
         else:
             svc.start_load()                            # the page and the API are up; requests wait for the load
     if a.open:
-        open_when_ready(svc, f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/",
-                        now=bool(a.mock_engine or a.lazy))
+        open_when_ready(svc, f"http://{here}:{a.port}/", now=bool(a.mock_engine or a.lazy))
     # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)   # one stop: a later TERM must not cut the engine's QUIT short
