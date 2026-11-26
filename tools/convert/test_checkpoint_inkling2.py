@@ -353,5 +353,90 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(t["mm.2.weight"].shape, [128, H])   # [in, out] in ggml's order: the text width out
 
 
+class DFlash2ConvertTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        d = Path(cls.tmp.name) / "ckpt"
+        df = Path(cls.tmp.name) / "dflash2"
+        d.mkdir()
+        df.mkdir()
+        cls.fx = Fixture(d)
+        rng = np.random.default_rng(11)
+        cls.dv, dtens = {}, {}
+        groups = H // 16
+        for n, shape in (("fc.weight", (H, 2 * H)), ("hidden_norm.weight", (H,)), ("norm.weight", (H,)),
+                         ("candidate_selector.hidden_projection.weight", (MRANK, H)),
+                         ("candidate_selector.predecessor_codebook", (VOCAB, MRANK)),
+                         ("candidate_selector.successor_codebook", (VOCAB, MRANK)),
+                         ("layers.0.input_layernorm.weight", (H,)), ("layers.0.post_attention_layernorm.weight", (H,)),
+                         ("layers.0.self_attn.q_proj.weight", (4 * HD, H)), ("layers.0.self_attn.k_proj.weight", (NKV * HD, H)),
+                         ("layers.0.self_attn.v_proj.weight", (NKV * HD, H)), ("layers.0.self_attn.o_proj.weight", (H, 4 * HD)),
+                         ("layers.0.self_attn.q_norm.weight", (HD,)), ("layers.0.self_attn.k_norm.weight", (HD,)),
+                         ("layers.0.mlp.gate_proj.weight", (MFF, H)), ("layers.0.mlp.up_proj.weight", (MFF, H)),
+                         ("layers.0.mlp.down_proj.weight", (H, MFF)),
+                         ("layers.0.attention_conv.base_kernel", (2, 2, H)),
+                         ("layers.0.attention_conv.kernel_projection.weight", (4 * groups, H)),
+                         ("layers.0.mlp_conv.base_kernel", (2, 2, H)),
+                         ("layers.0.mlp_conv.kernel_projection.weight", (4 * groups, H))):
+            x = (rng.integers(-64, 64, size=shape) / 64).astype(np.float32)
+            cls.dv[n] = x
+            dtens[n] = ("BF16", shape, (x.view(np.uint32) >> 16).astype("<u2").tobytes())
+        write_safetensors(df / "model.safetensors", dtens)
+        (df / "config.json").write_text(json.dumps({
+            "architectures": ["DFlash2DraftModel"], "hidden_size": H, "intermediate_size": MFF, "num_hidden_layers": 1,
+            "num_attention_heads": 4, "num_key_value_heads": NKV, "head_dim": HD, "rms_norm_eps": 1e-6, "is_causal": False,
+            "layer_types": ["sliding_attention"], "sliding_window": 2048, "vocab_size": VOCAB, "attention_bias": False,
+            "hidden_act": "silu", "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+            "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2, "final_logit_softcapping": 30.0,
+                              "mask_token_id": len(TOKENS) - 1, "selector_rank": MRANK,
+                              "selector_softcap_mode": "after_correction", "selector_top_k": 16, "target_layer_ids": [1, 4]},
+        }))
+        cls.out = Path(cls.tmp.name) / "dflash2.basalt"
+        r = subprocess.run([sys.executable, str(HERE / "checkpoint_inkling2.py"), "--checkpoint", str(d),
+                            "--dflash2", str(df), "--out", str(cls.out), "--workers", "2"], capture_output=True, text=True)
+        if r.returncode:
+            raise AssertionError(r.stdout + r.stderr)
+        cls.mf = ModelFile(str(cls.out))
+        cls.meta = json.loads(cls.mf.read("meta"))
+        cls.gguf = cls.mf.read("gguf")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def tensor(self, name):
+        t = self.meta["tensors"][name]
+        return t, self.gguf[t["offset"]:t["offset"] + t["bytes"]]
+
+    def test_dflash2_replaces_dspark(self):
+        kv = self.meta["gguf_kv"]
+        self.assertIsNone(self.meta["dspark"])
+        self.assertIn("dflash2", self.meta)
+        self.assertFalse(any(k.startswith("inkling2.dspark.") for k in kv))
+        self.assertFalse(any(k.startswith("dspark.") for k in self.meta["tensors"]))
+        self.assertNotIn("mtp.safetensors", [s["path"] for s in self.meta["sources"]])
+        self.assertEqual(kv["inkling2.dflash2.block_count"], 1)
+        self.assertEqual(kv["inkling2.dflash2.target_layers"], [1, 4])
+        self.assertEqual(kv["inkling2.dflash2.sliding_window"], 2048)
+        self.assertEqual(kv["inkling2.dflash2.attention.head_count"], 4)
+        self.assertEqual(kv["inkling2.dflash2.conv_group"], 16)
+
+    def test_dflash2_tensors_and_vocab_trim(self):
+        t, raw = self.tensor("dflash2.fc.weight")
+        self.assertEqual((t["type"], t["shape"]), ("Q8_0", [2 * H, H]))
+        x = self.dv["fc.weight"]
+        self.assertLess(np.abs(q8_values(raw, x.shape[0], x.shape[1]) - x).max(), np.abs(x).max() / 127 + 1e-6)
+        t, raw = self.tensor("dflash2.blk.0.attn_conv.base")
+        self.assertEqual((t["type"], t["shape"]), ("F32", [H, 2, 2]))
+        np.testing.assert_array_equal(np.frombuffer(raw, "<f4").reshape(2, 2, H), self.dv["layers.0.attention_conv.base_kernel"])
+        for name, src in (("dflash2.selector.pred", "candidate_selector.predecessor_codebook"),
+                          ("dflash2.selector.succ", "candidate_selector.successor_codebook")):
+            t, raw = self.tensor(name)
+            self.assertEqual((t["type"], t["shape"]), ("BF16", [MRANK, len(TOKENS)]))
+            got = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32).reshape(len(TOKENS), MRANK)
+            np.testing.assert_array_equal(got, self.dv[src][:len(TOKENS)])
+
+
 if __name__ == "__main__":
     unittest.main()

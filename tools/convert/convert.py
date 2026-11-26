@@ -13,6 +13,7 @@
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--head nvfp4] [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --checkpoint INKLING2_DIR --out MODEL.basalt [--dflash2 DFLASH2_DIR] [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -69,6 +70,12 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
   --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
   --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
                      to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
+
+From an Inkling 2 checkpoint (no --sections-from; tools/convert/checkpoint_inkling2.py)
+  --checkpoint DIR   Thinking Machines' Inkling 2 checkpoint (NVFP4 / MXFP8 experts, BF16 dense projections and vision
+                     tower, mtp.safetensors beside the shards)
+  --dflash2 DIR      a DFlash 2 block drafter for Inkling 2 (incoai/Inkling-2-Mini-DFlash2), embedded as dflash2.*
+                     tensors in place of dspark.*
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -870,6 +877,8 @@ def main():
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
                     "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
+    ap.add_argument("--dflash2", metavar="DIR", help="with an inkling2 --checkpoint: a DFlash 2 block drafter "
+                    "(DFlash2DraftModel safetensors and config.json) embedded as dflash2.* tensors in place of dspark.*")
     ap.add_argument("--head", choices=("fp8", "nvfp4"),
                     help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
                          "(default) or to NVFP4")
@@ -878,7 +887,7 @@ def main():
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
     if a.into or a.roll_back or a.undo_dir:
-        if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k:
+        if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k or a.dflash2:
             ap.error("--into takes --undo-dir and one of --dspark, --dfly or --roll-back, and nothing else")
         if a.dfly:
             from dfly_attach import add_dfly
@@ -891,7 +900,7 @@ def main():
     if a.dense_q6k and not a.nvfp4:
         ap.error("--dense-q6k needs --nvfp4")
     if a.verify:
-        if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark:
+        if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark or a.dflash2:
             ap.error("--verify takes --gguf and nothing else")
         import verify_pack
         sys.exit(0 if verify_pack.verify(a.verify, a.gguf[0], a.workers) else 1)
@@ -900,12 +909,12 @@ def main():
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
         ap.error("--dspark goes with --gguf")
     if a.requant_dense_q6k:
-        if a.sections_from or a.gguf or a.dense_q8_0 or a.dry_run:
+        if a.sections_from or a.gguf or a.dense_q8_0 or a.dry_run or a.dflash2:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
     if a.sections_from and a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.dry_run:
+        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.dry_run or a.dflash2:
             ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
                      "--stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
@@ -917,20 +926,26 @@ def main():
     if a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards \
                 or a.dry_run:
-            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --workers and --force")
+            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --dflash2, --head, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")
+        if a.dflash2 and not Path(a.dflash2).is_dir():
+            ap.error(f"missing input: {a.dflash2}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
         if checkpoint_model_type(Path(a.checkpoint)) == "inkling2_loop":
             if a.drafter or a.head:
-                ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 carries its drafter")
+                ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 uses --dflash2 or its built-in drafter")
             import checkpoint_inkling2 as I
             I.build(a, Job, fingerprint, die)
             return
+        if a.dflash2:
+            ap.error("--dflash2 goes with an inkling2 checkpoint; use --drafter for qwen35")
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return
+    if a.dflash2:
+        ap.error("--dflash2 needs --checkpoint")
     if a.dense_q8_0 or a.stream_shards:
         ap.error("--dense-q8-0 and --stream-shards need --checkpoint and --sections-from")
     if not a.gguf:
