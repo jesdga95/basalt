@@ -552,18 +552,20 @@ __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_
 // until it acknowledges the publication before, so a visit the host has not finished reading is never overwritten.
 __global__ void __launch_bounds__(kRingThreads) moe_cpu_rows_kernel(const float* __restrict__ x, int rows, int layer, float* x_m,
                                                                     CpuBell* bell, uint32_t* seq) {
-    __shared__ uint32_t pub;
+    // The host's last read of the buffer happens before its release of rows_ack, which happens before the acquire of it
+    // here (or the spin's acquire fence), which the barriers order before this block's writes to the buffer.
+    __shared__ uint32_t pub, stopped, acked, prev;
+    if (threadIdx.x == 0) stopped = bk::doorbell_load_acquire(&bell->abort);   // three warps, in parallel
+    if (threadIdx.x == 32) acked = bk::doorbell_load_acquire(&bell->rows_ack);
+    if (threadIdx.x == 64) {
+        prev = seq[1];
+        seq[1] = prev + 1 ? prev + 1 : 1;
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
-        const uint32_t prev = seq[1];
-        uint32_t next = prev + 1;
-        if (!next) next = 1;
-        seq[1] = next;
-        // both words in one round trip; the spin only when the host has not acknowledged the publication before
-        const uint32_t stopped = bk::doorbell_load_relaxed(&bell->abort), acked = bk::doorbell_load_relaxed(&bell->rows_ack);
         bool go = !stopped;
         if (go && prev && acked != prev) go = bk::doorbell_spin(&bell->rows_ack, prev, &bell->abort, 8);
-        cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
-        pub = go ? next : 0;
+        pub = go ? (prev + 1 ? prev + 1 : 1) : 0;
         if (go) bk::doorbell_store_relaxed(&bell->rows_shape, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
     }
     __syncthreads();
