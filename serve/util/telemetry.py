@@ -65,6 +65,10 @@ class _Nvml:
     class Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
+    class MemV2(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint), ("total", ctypes.c_ulonglong), ("reserved", ctypes.c_ulonglong),
+                    ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
     def __init__(self, index=0):
         self.lib = _load_nvml()
         self.dev = None
@@ -159,12 +163,23 @@ class _Nvml:
                 out["util"] = u.gpu
         except (AttributeError, OSError):
             pass
-        m = self.Mem()
-        try:
-            if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
-                out["mem_used"], out["mem_total"] = m.used, m.total
-        except (AttributeError, OSError):
-            pass
+        mem_ok = False
+        fn_v2 = getattr(self.lib, "nvmlDeviceGetMemoryInfo_v2", None)
+        if fn_v2 is not None:
+            m2 = self.MemV2(version=ctypes.sizeof(self.MemV2) | (2 << 24))
+            try:
+                if fn_v2(self.dev, ctypes.byref(m2)) == 0:
+                    out["mem_used"], out["mem_total"] = m2.used, m2.total
+                    mem_ok = True
+            except (AttributeError, OSError):
+                pass
+        if not mem_ok:
+            m = self.Mem()
+            try:
+                if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
+                    out["mem_used"], out["mem_total"] = m.used, m.total
+            except (AttributeError, OSError):
+                pass
         out["temp"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))          # NVML_TEMPERATURE_GPU
         mw = self._uint("nvmlDeviceGetPowerUsage")
         out["power"] = mw / 1000.0 if mw is not None else None

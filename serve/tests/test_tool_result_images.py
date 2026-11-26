@@ -212,20 +212,15 @@ class Placement(Base):
                                    dialect.result_close)
 
     def test_results_sent_out_of_call_order(self):
-        # OpenAI and Responses restore the call order; Anthropic's results keep the order sent. Either way the
-        # pictures go to the markers in prompt order.
+        # OpenAI, Responses and Anthropic restore the call order, and the pictures go to the markers in prompt order.
         for dialect, api, path, build in CASES:
             with self.subTest(dialect=dialect.name, api=api):
                 post, engine, vision = self.serve(dialect)
                 status, raw = post(path, build({"b": [text("RB"), image(B)], "a": [text("RA"), image(A)]}))
                 self.assertEqual(status, 200, raw)
                 prompt = self.view(dialect, engine.requests[-1][0])
-                if api == "anthropic":
-                    self.assertEqual(vision.got, [PNG + b"B", PNG + b"A"])
-                    self.assertInOrder(prompt, "RB", "[3]", "RA", "[2]")
-                else:
-                    self.assertEqual(vision.got, [PNG + b"A", PNG + b"B"])
-                    self.assertInOrder(prompt, "RA", "[2]", "RB", "[3]")
+                self.assertEqual(vision.got, [PNG + b"A", PNG + b"B"])
+                self.assertInOrder(prompt, "RA", "[2]", "RB", "[3]")
 
     def test_a_user_image_beside_a_result_image(self):
         for dialect, api, path, build in CASES:

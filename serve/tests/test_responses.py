@@ -335,6 +335,63 @@ class OverHttp(Server):
         self.assertIn("/v1/responses", self.svc.v1_status()["dialects"])
         self.assertEqual(self.svc.history[-1]["path"], "/v1/responses")
 
+    def test_non_streaming_cancel_after_delta_does_not_crash(self):
+        import socket
+        import threading
+        import time
+        from serve.api.responses import Assembler, collect
+        from serve.frontend import Event
+
+        # Unit check: collect() tracks the latest event with a "response" key even when truncated after a delta.
+        asm = Assembler({"input": "hi"}, "basalt", 4, {}, False)
+        evts = asm.start() + asm.feed(Event("content", "partial"))
+        res = collect(evts)
+        self.assertIsInstance(res, dict)
+        self.assertEqual(res["status"], "in_progress")
+        self.assertIsNone(collect([]))
+
+        # HTTP check: non-streaming POST /v1/responses cancelled mid-generation after emitting a delta must not raise KeyError.
+        first_tok = threading.Event()
+        unblock = threading.Event()
+        orig_gen = self.engine.generate
+
+        def slow_gen(ids, max_new, sampling, cancel, embeddings=None, session=None, **kw):
+            for t in self.tok.encode("</think>\n\nHello"):
+                yield t
+            first_tok.set()
+            while not cancel.is_set() and not unblock.is_set():
+                time.sleep(0.01)
+                yield None
+
+        self.engine.generate = slow_gen
+        errors = []
+        orig_handle_error = self.httpd.handle_error
+
+        def capture_error(req, addr):
+            errors.append(sys.exc_info()[1])
+            orig_handle_error(req, addr)
+
+        self.httpd.handle_error = capture_error
+        try:
+            body = json.dumps({"model": "basalt", "input": "hi"}).encode()
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            s.sendall(f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                      f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            self.assertTrue(first_tok.wait(5))
+            s.close()
+            # Wait for the handler to finish cleaning up, then verify zero KeyError and a working follow-up request.
+            deadline = time.monotonic() + 5
+            while self.svc.status.get("busy") and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(errors, [])
+        finally:
+            unblock.set()
+            self.engine.generate = orig_gen
+            self.httpd.handle_error = orig_handle_error
+        code, r = self.post({"model": "basalt", "input": "after cancel"})
+        self.assertEqual(code, 200)
+        self.assertEqual(r["status"], "completed")
+
 
 class ToolRoundTrip(Server):
     script = [CALL, ANSWER]

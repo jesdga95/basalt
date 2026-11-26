@@ -77,8 +77,18 @@ def _text_of(content) -> str:
         return ""
     if isinstance(content, str):
         return content
-    return "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") in
-                   ("text", "input_text", None))
+    if isinstance(content, dict):
+        content = [content]
+    elif not isinstance(content, list):
+        raise ValueError("content must be a string, list, or object")
+    out = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") in ("text", "input_text", None):
+            text = part.get("text")
+            if text is not None and not isinstance(text, str):
+                raise ValueError("content text must be a string")
+            out.append(text or "")
+    return "".join(out)
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
@@ -198,6 +208,8 @@ def _parts_of(content):
     of text, image and video items. Documents become their text and page images first."""
     if isinstance(content, dict):
         content = [content]
+    elif content is not None and not isinstance(content, (str, list)):
+        raise ValueError("content must be a string, list, or object")
     if has_document(content):
         content = expand_documents(content)
     if not _has_image(content):
@@ -211,7 +223,10 @@ def _parts_of(content):
         elif part.get("type") in VIDEO_PARTS:
             items.append(_video_item(part))
         elif part.get("type") in ("text", "input_text", None) and "text" in part:
-            items.append({"type": "text", "text": part.get("text", "")})
+            text = part.get("text")
+            if text is not None and not isinstance(text, str):
+                raise ValueError("content text must be a string")
+            items.append({"type": "text", "text": text or ""})
     return items
 
 
@@ -634,23 +649,36 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     messages = []
     for m in _object_list(req.get("messages"), "messages"):
         role = m.get("role")
+        if not isinstance(role, str) or not role:
+            raise ValueError("each message must have a string role")
         if role == "developer":
             role = "system"
         out = {"role": role, "content": _parts_of(m.get("content"))}
         if role == "tool":
             out["_call_id"] = m.get("tool_call_id")
-        if m.get("reasoning_content"):
-            out["reasoning_content"] = m["reasoning_content"]
+        rc = m.get("reasoning_content")
+        if rc is not None:
+            if not isinstance(rc, str):
+                raise ValueError("reasoning_content must be a string")
+            if rc:
+                out["reasoning_content"] = rc
         if m.get("tool_calls"):
             calls = []
             for c in _object_list(m["tool_calls"], "tool_calls"):
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
+                name = fn.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("each tool call must have a string function name")
                 args = fn.get("arguments")
                 if isinstance(args, str):               # the template needs a mapping
                     args = json.loads(args) if args.strip() else {}
-                calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}, "_call_id": c.get("id")})
+                if args is None:
+                    args = {}
+                elif not isinstance(args, dict):
+                    args = {"arguments": args}
+                calls.append({"function": {"name": name, "arguments": args}, "_call_id": c.get("id")})
             out["tool_calls"] = calls
         messages.append(out)
     _order_chat_tool_results(messages)
@@ -661,7 +689,11 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     # Responses-style "reasoning": {"effort": ...}, and last the level a reasoning_budget implies
     # (-1: the highest, N: as Anthropic's budget_tokens)
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    template_kw = req.get("chat_template_kwargs") or {}
+    template_kw = req.get("chat_template_kwargs")
+    if template_kw is None:
+        template_kw = {}
+    elif not isinstance(template_kw, dict):
+        raise ValueError("chat_template_kwargs must be an object")
     kwargs = {**llama_budget(req.get("reasoning_budget")),
               **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
     if reasoning.get("enabled") is False:                 # the generic off switch; true is the route's default
@@ -714,29 +746,53 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         system = _parts_of(system)
         messages.append({"role": "system", "content": pin_billing_stamp(system) if isinstance(system, str) else system})
     for m in _object_list(req.get("messages"), "messages"):
+        role = m.get("role")
+        if not isinstance(role, str) or not role:
+            raise ValueError("each message must have a string role")
         content = m.get("content")
         if isinstance(content, str):
-            messages.append({"role": m["role"], "content": content})
+            messages.append({"role": role, "content": content})
             continue
+        if content is None:
+            content = []
+        elif isinstance(content, dict):
+            content = [content]
+        elif not isinstance(content, list):
+            raise ValueError("message content must be a string, list, or object")
         parts, reasoning, calls = [], [], []
-        for block in content or []:
+        for block in content:
+            if not isinstance(block, dict):
+                raise ValueError("message content blocks must be objects")
             kind = block.get("type")
             if kind in ("text", "input_text", None) or kind in IMAGE_PARTS or kind in VIDEO_PARTS or kind == "document":
                 parts.append(block)
             elif kind == "thinking":
-                reasoning.append(block.get("thinking", ""))
+                thought = block.get("thinking")
+                if thought is not None and not isinstance(thought, str):
+                    raise ValueError("thinking block must have a string thinking field")
+                reasoning.append(thought or "")
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
+                name = block.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("tool_use block must have a string name")
+                args = block.get("input")
+                if args is None:
+                    args = {}
+                elif not isinstance(args, dict):
+                    args = {"arguments": args}
+                calls.append({"function": {"name": name, "arguments": args}, "_call_id": block.get("id")})
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+                messages.append({"role": "tool", "content": _parts_of(block.get("content")),
+                                 "_call_id": block.get("tool_use_id")})
         if parts or calls or reasoning:
-            out = {"role": m["role"], "content": _parts_of(parts)}
+            out = {"role": role, "content": _parts_of(parts)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
-    tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
+    _order_chat_tool_results(messages)
+    tools = [{"name": t["name"], "description": t.get("description") or "", "parameters": t.get("input_schema") or {}}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
     # "thinking": {"type": "disabled" | "enabled", "budget_tokens"} and "output_config": {"effort"}
@@ -809,15 +865,15 @@ def _closes_again(rest: str, final: bool) -> bool | None:
     return False if final or opener >= 0 else None
 
 
-def param_end(text: str, final: bool = False, name: str | None = None) -> int:
-    """Find a structural parameter close, keeping quoted calls, a reopened parameter and a quoted whole call close
-    inside its value. -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural
-    close."""
+def _param_end_info(text: str, final: bool = False, name: str | None = None) -> tuple[int, bool]:
+    """Like param_end, also returning whether a -2 result can only resolve on a future tag (<tool_call>,
+    </tool_call>, or </parameter>) or final=True."""
     at = text.find(PARAM_END)
     fallback = -1
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
         candidate = -1
+        wait_tags = False
         if after.startswith(PARAM_START):
             gt = after.find(">")
             if gt < 0:
@@ -828,7 +884,11 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             end = _full_close_end(text, at)
             if end >= 0:
                 again = _closes_again(text[end:], final)
-                candidate = -2 if again is None else (-1 if again else at)
+                if again is None:
+                    candidate = -2
+                    wait_tags = True
+                else:
+                    candidate = -1 if again else at
             else:
                 tail = after[len(FUNC_END):].lstrip()
                 # the </tool_call> may still be arriving: what follows it decides
@@ -837,12 +897,21 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             candidate = at if final else -2
         if candidate != -1:
             if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
-                return candidate
+                return candidate, wait_tags
             if fallback < 0:
                 fallback = at
         at = text.find(PARAM_END, at + 1)
     # An unclosed quoted function must not hide the enclosing call at end of output.
-    return fallback if final else (-2 if fallback >= 0 else -1)
+    if final:
+        return fallback, False
+    return (-2, True) if fallback >= 0 else (-1, False)
+
+
+def param_end(text: str, final: bool = False, name: str | None = None) -> int:
+    """Find a structural parameter close, keeping quoted calls, a reopened parameter and a quoted whole call close
+    inside its value. -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural
+    close."""
+    return _param_end_info(text, final=final, name=name)[0]
 
 
 def call_end(text: str, final: bool = False) -> int:
@@ -931,11 +1000,14 @@ def forced_call(tool_choice, tools: list[dict] | None, opening=None) -> tuple[li
 
 
 def _text_kinds(schema) -> tuple[bool, bool]:
-    """(text, null) for a parameter schema: whether the grammar lets the model write it as raw text (type "string",
-    a type list naming "string", or an anyOf/oneOf/one-branch allOf of plain strings and null), and whether null is
-    one of its types."""
+    """(text, null) for a parameter schema: whether the grammar lets the model write it as raw text (an all-string
+    enum, type "string", a type list naming "string", or an anyOf/oneOf/one-branch allOf of plain strings and null),
+    and whether null is one of its types."""
     if not isinstance(schema, dict):
         return False, False
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return all(isinstance(v, str) for v in enum), False
     t = schema.get("type")
     if isinstance(t, str):
         return t == "string", t == "null"
@@ -1321,7 +1393,13 @@ class OutputParser(CodeTracker):
 
     _call_parts: list[str] | None = None
     _call_has_end: bool = False
+    _call_check: bool = False
     _call_tail: str = ""
+    _call_open_tail: str = ""
+    _scan_tail: str | None = None
+    _param_has_end: bool = False
+    _param_wait_tags: bool = False
+    _param_tail: str = ""
 
     def _reset_scan(self):
         self.sp = 0                  # consumed part of self.buf (the call body)
@@ -1334,7 +1412,13 @@ class OutputParser(CodeTracker):
         self.svstart = 0
         self._call_parts = []
         self._call_has_end = False
+        self._call_check = False
         self._call_tail = ""
+        self._call_open_tail = ""
+        self._scan_tail = None
+        self._param_has_end = False
+        self._param_wait_tags = False
+        self._param_tail = ""
 
     @property
     def buf(self) -> str:
@@ -1350,18 +1434,29 @@ class OutputParser(CodeTracker):
             self._call_parts.clear()
         if self.state == "call":
             self._call_has_end = CALL_END in value
+            self._call_check = self._call_has_end
             self._call_tail = value[-(len(CALL_END) - 1):]
+            self._call_open_tail = value[-(len(CALL_START) - 1):]
+            self._scan_tail = None
+            rem = value[self.sp:]
+            self._param_has_end = PARAM_END in rem
+            self._param_wait_tags = False
+            self._param_tail = rem[-(len(PARAM_END) - 1):]
 
     def _scan(self, final: bool = False) -> list[Event]:
         """Advance the streaming view of the call body."""
+        if not final and self._param_wait_tags:
+            return []
         out = []
 
         def args(s):
             if s:
                 out.append(Event("tool_args", s, call=self.scall))
         while True:
-            rest = self.buf[self.sp:]
+            if self.ss == "done":
+                return out
             if self.ss == "name":
+                rest = self._scan_tail if self._scan_tail is not None else self.buf[self.sp:]
                 a = rest.find("<function=")
                 b = rest.find(">", a + 10) if a >= 0 else -1
                 if b < 0:
@@ -1373,9 +1468,14 @@ class OutputParser(CodeTracker):
                 args("{")
                 self.sp += b + 1
                 self.ss = "between"
+                if self._scan_tail is not None:
+                    self._scan_tail = rest[b + 1:]
             elif self.ss == "between":
+                rest = self._scan_tail if self._scan_tail is not None else self.buf[self.sp:]
                 stripped = rest.lstrip()
                 self.sp += len(rest) - len(stripped)
+                if self._scan_tail is not None:
+                    self._scan_tail = stripped
                 if stripped.startswith("<parameter="):
                     b = stripped.find(">")
                     if b < 0:
@@ -1385,19 +1485,53 @@ class OutputParser(CodeTracker):
                     self.sfirst = False
                     self.sp += b + 1
                     self.spname = pname
+                    after_hdr = stripped[b + 1:]
                     text, null = _text_kinds(self.sdeclared.get(pname))
                     if text and not null:
                         args('"')
                         self.ss, self.sval_started = "str", False
+                        self._param_has_end = False
+                        self._param_wait_tags = False
+                        self._scan_tail = after_hdr
                     else:
                         self.ss = "raw"
+                        self._scan_tail = None
+                        self._param_has_end = PARAM_END in after_hdr
+                        self._param_wait_tags = False
+                        self._param_tail = after_hdr[-(len(PARAM_END) - 1):]
                 elif stripped.startswith("</function>"):
                     args("}")
                     self.sp += len("</function>")
                     self.ss = "done"
+                    self._scan_tail = None
+                    self._param_has_end = False
+                    self._param_wait_tags = False
+                    self._param_tail = ""
                 else:
                     return out          # a tag still arriving: wait
             elif self.ss == "str":
+                if not final and self._scan_tail is not None and not self._param_has_end:
+                    rest = self._scan_tail
+                    if not self.sval_started:
+                        if not rest:
+                            return out
+                        if rest[0] == "\n":          # the leading newline is not part of the value
+                            self.sp += 1
+                            rest = rest[1:]
+                        self.sval_started = True
+                        self.svstart = self.sp
+                    if PARAM_END not in rest:
+                        safe = len(rest) - self._hold(rest, (PARAM_END,))
+                        if safe > 0 and rest[safe - 1] == "\n":   # maybe the newline before </parameter>
+                            safe -= 1
+                        if safe > 0:
+                            args(json.dumps(rest[:safe])[1:-1])
+                            self.sp += safe
+                            rest = rest[safe:]
+                        self._scan_tail = rest
+                        return out
+                buf = self.buf
+                rest = buf[self.sp:]
                 if not self.sval_started:
                     if not rest:
                         return out
@@ -1406,7 +1540,8 @@ class OutputParser(CodeTracker):
                         rest = rest[1:]
                     self.sval_started = True
                     self.svstart = self.sp
-                end = param_end(self.buf[self.svstart:], final=final, name=self.spname) if PARAM_END in rest else -1
+                end, wait_tags = (_param_end_info(buf[self.svstart:], final=final, name=self.spname)
+                                  if PARAM_END in rest else (-1, False))
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
@@ -1415,6 +1550,9 @@ class OutputParser(CodeTracker):
                     args(json.dumps(value)[1:-1] + '"')
                     self.sp += end + len(PARAM_END)
                     self.ss = "between"
+                    self._param_has_end = False
+                    self._param_wait_tags = False
+                    self._scan_tail = buf[self.sp:]
                     continue
                 # an undecided </parameter> is held from its start
                 safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
@@ -1423,10 +1561,28 @@ class OutputParser(CodeTracker):
                 if safe > 0:
                     args(json.dumps(rest[:safe])[1:-1])
                     self.sp += safe
+                rem = buf[self.sp:]
+                self._param_has_end = PARAM_END in rem
+                self._param_wait_tags = bool(not final and end == -2 and wait_tags)
+                self._param_tail = rem[-(len(PARAM_END) - 1):]
+                self._scan_tail = None if self._param_has_end else rem
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, final=final, name=self.spname) if PARAM_END in rest else -1
+                if not final and not self._param_has_end:
+                    return out
+                buf = self.buf
+                rest = buf[self.sp:]
+                end, wait_tags = (_param_end_info(rest, final=final, name=self.spname)
+                                  if PARAM_END in rest else (-1, False))
                 if end < 0:
+                    if not final:
+                        if end == -1:
+                            self._param_has_end = False
+                            self._param_wait_tags = False
+                            self._param_tail = rest[-(len(PARAM_END) - 1):]
+                        elif wait_tags:
+                            self._param_wait_tags = True
+                            self._param_tail = rest[-(len(PARAM_END) - 1):]
                     return out
                 value = rest[:end]
                 if value.startswith("\n"):
@@ -1436,6 +1592,9 @@ class OutputParser(CodeTracker):
                 args(json.dumps(_decode_param(value, self.sdeclared.get(self.spname)), ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
+                self._param_has_end = False
+                self._param_wait_tags = False
+                self._scan_tail = buf[self.sp:]
             else:
                 return out
 
@@ -1490,22 +1649,36 @@ class OutputParser(CodeTracker):
     def feed(self, delta: str, *, final: bool = False) -> list[Event]:
         if self.state == "call":
             if delta:
-                if not self._call_has_end:
-                    chunk = self._call_tail + delta
-                    if CALL_END in chunk:
-                        self._call_has_end = True
-                    else:
-                        self._call_tail = chunk[-(len(CALL_END) - 1):]
-                if not self.stream_tools and not final:
-                    self._call_parts.append(delta)
-                    if not self._call_has_end:
-                        return []
-                else:
-                    if self._call_parts:
-                        self._buf += "".join(self._call_parts)
-                        self._call_parts.clear()
-                    self._buf += delta
-            elif not self.stream_tools and not final and not self._call_has_end:
+                chunk_end = self._call_tail + delta
+                got_call_end = CALL_END in chunk_end
+                if got_call_end:
+                    self._call_has_end = True
+                    self._call_check = True
+                self._call_tail = chunk_end[-(len(CALL_END) - 1):]
+                chunk_open = self._call_open_tail + delta
+                got_call_start = CALL_START in chunk_open
+                if self._call_has_end and got_call_start:
+                    self._call_check = True
+                self._call_open_tail = chunk_open[-(len(CALL_START) - 1):]
+                self._call_parts.append(delta)
+                if self.stream_tools:
+                    if self._param_wait_tags:
+                        pchunk = self._param_tail + delta
+                        got_param_end = PARAM_END in pchunk
+                        self._param_tail = pchunk[-(len(PARAM_END) - 1):]
+                        if got_param_end or got_call_end or got_call_start:
+                            self._param_wait_tags = False
+                    elif self.ss == "raw":
+                        if not self._param_has_end:
+                            pchunk = self._param_tail + delta
+                            if PARAM_END in pchunk:
+                                self._param_has_end = True
+                            self._param_tail = pchunk[-(len(PARAM_END) - 1):]
+                    elif self._scan_tail is not None:
+                        self._scan_tail += delta
+                if not self.stream_tools and not final and not self._call_check:
+                    return []
+            elif not self.stream_tools and not final and not self._call_check:
                 return []
         else:
             if self._call_parts:
@@ -1568,13 +1741,22 @@ class OutputParser(CodeTracker):
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
                 self._call_has_end = CALL_END in self._buf
+                self._call_check = self._call_has_end
                 self._call_tail = self._buf[-(len(CALL_END) - 1):]
+                self._call_open_tail = self._buf[-(len(CALL_START) - 1):]
+                self._scan_tail = self._buf
             else:
-                i = call_end(self.buf, final=final) if self._call_has_end else -1
+                i = call_end(self.buf, final=final) if self._call_has_end and (final or self._call_check) else -1
+                if i < 0 and not final:
+                    self._call_check = False
                 if self.stream_tools:
                     if i >= 0:
                         # scan only the call, closed: its </tool_call> tells a quoted close inside a value
-                        whole, self._buf = self.buf, self.buf[:i + len(CALL_END)]
+                        whole = self.buf
+                        self._buf = whole[:i + len(CALL_END)]
+                        self._scan_tail = None
+                        self._param_has_end = True
+                        self._param_wait_tags = False
                         out += self._scan(final=True)
                         out += self._close_scan()
                         self._buf = whole

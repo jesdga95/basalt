@@ -20,7 +20,9 @@ const shortGpu = s => String(s || "").replace(/^NVIDIA\s+/i, "").replace(/^GeFor
 const shortCpu = s => String(s || "").replace(/\((R|TM)\)/gi, "").replace(/\s+\d+-Core Processor$/i, "")
   .replace(/\s+CPU\s+@.*$/i, "").replace(/\s+Processor$/i, "").replace(/\s+/g, " ").trim();
 
-let apiKey = sessionStorage.getItem("basalt.key") || "";
+const storeGet = k => { try { return sessionStorage.getItem(k); } catch (_) { return null; } };
+const storeSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch (_) { /* private mode */ } };
+let apiKey = storeGet("basalt.key") || "";
 let M = null;          // the last combined state snapshot
 
 /* ---- fields the page draws once the server sends them. Each is read only through ahead(); until it arrives, its panel is
@@ -278,10 +280,10 @@ function drawWeights(eng) {
 /* ---- tabs: Requests | Slots | Hardware | Logs (keys 1-4 and L; #tab=req|slots|hw|logs opens one) ---- */
 const TABS = ["req", "slots", "hw", "logs"];
 const fromHash = (/tab=(\w+)/.exec(location.hash) || [])[1];
-let tab = (t => TABS.includes(t) ? t : "req")(fromHash || sessionStorage.getItem("basalt.tab3"));
+let tab = (t => TABS.includes(t) ? t : "req")(fromHash || storeGet("basalt.tab3"));
 function setTab(t) {
   if (!TABS.includes(t)) return;
-  tab = t; try { sessionStorage.setItem("basalt.tab3", tab); } catch (err) { /* private mode */ }
+  tab = t; storeSet("basalt.tab3", tab);
   draw(); drawPanes();
 }
 $("#tabs").addEventListener("click", e => { const b = e.target.closest("button[data-t]"); if (b) setTab(b.dataset.t); });
@@ -619,7 +621,7 @@ function drawHw(hw, st, hist, eng) {
     : G.length <= 2 ? `<div class="gpus rich n${G.length}">${G.map(g => gpuRich(g, H[g.index] || {}, title(g), G.length === 1 ? "one" : "two")).join("")}</div>`
     : `<div class="gpus n${G.length}">${G.map(g => sbGpu(g, H[g.index] || {}, title(g), named[g.index], gpuFoot(g))).join("")}</div>`;
   const R = hw.ram_parts, T = hw.ram_total || 1, dh = hw.disk_hist, bw = ahead(hw, "ram_bw_gbs"), commit = eng.commit;
-  const ccd = (hw.cpu_ccd || []).map((v, i) => `<div class="ccd"><span>CCD ${i}</span>${bar(v / 100)}<b>${Math.round(v)}%</b></div>`).join("");
+  const ccd = (hw.cpu_ccd || []).map((v, i) => `<div class="ccd"><span>CCD ${i}</span>${bar(num(v) ? v / 100 : 0)}<b>${num(v) ? `${Math.round(v)}%` : "-"}</b></div>`).join("");
   const ram = R ? labelledBar([["Experts", "var(--t-cpu)", R.experts], ["Cache", "var(--fg-3)", R.page_cache], ["Other", "var(--raised)", R.other],
     ["Free", "var(--basalt-800)", Math.max(0, T - hw.ram_used - R.page_cache)]], T, 340) : bar(num(hw.ram_total) ? hw.ram_used / T : 0);
   const disk = dh ? `<div class="dsk">${spark(tail(dh), nice(Math.max(10, ...dh.filter(num))))}</div>` : "<span></span>";
@@ -939,12 +941,12 @@ const connectLogs = stream(() => "api/logs/stream" + (lastLog === null ? "" :
   const fresh = (data.lines || []).filter(line => lastLog === null || line.id > lastLog);
   append(fresh);
   lastLog = data.next;
-  if (!logCount) clearLog("No log lines yet.");
+  if (!logCount && !reset) clearLog("No log lines yet.");
   if (reset && !fresh.length && !data.dropped) draw();
 }, state => text($("#log-status"), { connecting: "Connecting", locked: "API key required",
   live: "Live", offline: "Disconnected; retrying" }[state]));
 $("#auth").onsubmit = e => {
-  e.preventDefault(); apiKey = $("#key").value.trim(); sessionStorage.setItem("basalt.key", apiKey);
+  e.preventDefault(); apiKey = $("#key").value.trim(); storeSet("basalt.key", apiKey);
   connectState(); connectLogs();
 };
 

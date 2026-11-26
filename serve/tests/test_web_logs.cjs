@@ -74,4 +74,18 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8"
   };`, ctx);
 assert.deepEqual(JSON.parse(JSON.stringify(ctx.emptyState)), { logCount: 0, warnCount: 0, placeholder: ["No log lines yet."] });
 assert.deepEqual(JSON.parse(JSON.stringify(ctx.loadedState)), { logCount: 3, warnCount: 2, classes: ["", "warn", "err"], tickerLvl: "err" });
+
+// Verify app.js tolerates restricted sessionStorage (private mode / sandboxed iframe).
+const restrictedCtx = {
+  ...ctx,
+  sessionStorage: {
+    getItem() { throw new Error("SecurityError"); },
+    setItem() { throw new Error("SecurityError"); },
+  },
+};
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8") + `
+  setTab("logs");
+  globalThis.restrictedTab = tab;`, restrictedCtx);
+assert.equal(restrictedCtx.restrictedTab, "logs");
+
 console.log("Log SSE parser and web log handler: passed");

@@ -634,10 +634,10 @@ class Assembler:
         return self.event("response.failed", response=self.snapshot())
 
 
-def collect(events) -> dict:
-    """The non-streaming answer: the final response object."""
+def collect(events) -> dict | None:
+    """The non-streaming answer: the latest response object in `events` (None if none was emitted)."""
     last = None
     for e in events:
-        if e is not None:
-            last = e
-    return last["response"]
+        if isinstance(e, dict) and "response" in e:
+            last = e["response"]
+    return last

@@ -113,13 +113,14 @@ class Router:
             return {"from": s["from"], "to": s["svc"].model, "phase": s["phase"],
                     "elapsed_s": round(time.time() - s["since"], 1), "waiting": len(self.queue)}
 
-    def metrics(self, svc, include_slots: bool = False) -> dict:
-        """GET /metrics for `svc`, with the requests waiting for any model's turn and every model's row."""
+    def metrics(self, svc, include_slots: bool = False, own_queue: bool = False) -> dict:
+        """GET /metrics for `svc`, with the requests waiting for any model's turn (or only `svc`'s when `own_queue` is
+        true) and every model's row."""
         m = svc.metrics(include_slots=True) if include_slots else svc.metrics()
         now = time.time()
         with self.cv:
             waiting = [{"api": None, "model": t.svc.model, "prompt_tokens": None, "waited_s": round(now - t.at, 1)}
-                       for t in self.queue if t.holds]
+                       for t in self.queue if t.holds and (not own_queue or t.svc is svc)]
         m["live"]["queued"] += len(waiting)
         m["live"]["queue"] = m["live"]["queue"] + waiting
         return {**m, "models": self.models(), "swap": self.swap_status()}

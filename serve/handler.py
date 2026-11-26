@@ -431,7 +431,7 @@ def make_handler(target: Service | Router):
                                 return
                         else:
                             svcs = list(router.services) if hasattr(router, "services") else [router.shown()]
-                        entries = [(router.metrics(s), s.prom_snapshot()) for s in svcs]
+                        entries = [(router.metrics(s, own_queue=True), s.prom_snapshot()) for s in svcs]
                         body = render_prometheus(entries).encode("utf-8")
                         self.send_response(200)
                         self.send_header("Content-Type", PROM_CT)
@@ -909,7 +909,19 @@ def make_handler(target: Service | Router):
                 except ValueError as e:                      # the engine refused the request
                     err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
                     return self._json(err.status, err.body())
-                return self._json(200, result)
+                finally:
+                    try:
+                        items.close()
+                    finally:
+                        generation.close()
+                if result is None:
+                    return
+                try:
+                    return self._json(200, result)
+                except ConnectionError:
+                    if not cancel.is_set():
+                        raise
+                    return
             last = time.monotonic()
 
             def send(e):

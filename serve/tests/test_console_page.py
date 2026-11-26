@@ -547,5 +547,61 @@ ctx.run().then(o => process.stdout.write(JSON.stringify(o)));
         self.assertEqual(o["afterEmptyReset"], {
             "status": "Live", "retries": 1, "logCount": 0, "warnCount": 0,
             "lastLog": 0, "logInstance": "s2", "tickerText": "", "tickerLvl": "",
-            "placeholder": ["No log lines yet."],
+            "placeholder": ["The server restarted."],
         })
+
+    def test_three_slot_grid_storage_guard_and_null_ccd(self):
+        self.assertIn(".scards.n3, .scards.n4", APP_CSS)
+        self.assertIn(".scards.n2, .scards.n3, .scards.n4", APP_CSS)
+        if not NODE:
+            self.skipTest("needs node")
+        script = r"""
+const fs = require("fs"), vm = require("vm"), { TextDecoder } = require("util");
+const els = new Map();
+const makeEl = () => {
+  const n = {
+    children: [], dataset: {}, style: {}, textContent: "", innerHTML: "", title: "", hidden: false, value: "k1",
+    classList: { toggle() {}, add() {}, remove() {} },
+    addEventListener() {}, setAttribute() {}, removeAttribute() {}, hasAttribute: () => false,
+    querySelector: () => null, querySelectorAll: () => [],
+    append(...xs) { this.children.push(...xs); }, replaceChildren(...xs) { this.children = xs; },
+    get firstElementChild() { return this.children[0] || { style: {} }; },
+    get lastElementChild() { return this.children[this.children.length - 1] || { title: "" }; },
+  };
+  return n;
+};
+const getEl = sel => { if (!els.has(sel)) els.set(sel, makeEl()); return els.get(sel); };
+const throwingStorage = {
+  getItem() { throw new Error("SecurityError"); },
+  setItem() { throw new Error("SecurityError"); },
+};
+const ctx = {
+  document: { querySelector: getEl, addEventListener() {}, createElement: makeEl, hidden: false },
+  sessionStorage: throwingStorage, location: { hash: "", host: "localhost" },
+  fetch: () => new Promise(() => {}), ResizeObserver: class { observe() {} }, matchMedia: () => ({ matches: true }),
+  requestAnimationFrame() {}, setTimeout() { return 1; }, clearTimeout() {}, performance: { now: () => 0 },
+  devicePixelRatio: 1, window: { addEventListener() {} }, console,
+  AbortController: class { constructor() { this.signal = { aborted: false }; } abort() { this.signal.aborted = true; } },
+  TextDecoder,
+};
+vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8") + "\n" + fs.readFileSync(process.argv[3], "utf8") + `
+  setTab("hw");
+  $("#auth").onsubmit({ preventDefault() {} });
+  drawHw({ gpus: [], cpu: 25, cpu_ccd: [42.4, null, 0], ram_used: 1, ram_total: 2 }, { gpus: [], cpu_name: "Test" }, { gpus: [] }, {});
+  globalThis.out = { tab, apiKey, hwHtml: $("#p-hw").innerHTML };`, ctx);
+process.stdout.write(JSON.stringify(ctx.out));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(script)
+        self.addCleanup(os.unlink, f.name)
+        r = subprocess.run([NODE, f.name, str(ROOT / "serve" / "web" / "logs.js"), str(ROOT / "serve" / "web" / "app.js")],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        o = json.loads(r.stdout)
+        self.assertEqual((o["tab"], o["apiKey"]), ("hw", "k1"))
+        self.assertIn("<span>CCD 0</span>", o["hwHtml"])
+        self.assertIn("<b>42%</b>", o["hwHtml"])
+        self.assertIn("<span>CCD 1</span>", o["hwHtml"])
+        self.assertIn("<b>-</b>", o["hwHtml"])
+        self.assertIn("<span>CCD 2</span>", o["hwHtml"])
+        self.assertIn("<b>0%</b>", o["hwHtml"])

@@ -230,6 +230,30 @@ class MultiModelAndAuthMetrics(unittest.TestCase):
         status, _, _ = self.get("/metrics?format=prometheus&model=NoSuch", hdrs)
         self.assertEqual(status, 404)
 
+    def test_multi_model_waiting_queue_is_not_double_counted(self):
+        router = self.httpd.router
+        svc_a, svc_b = router.services
+        hdrs = {"Authorization": "Bearer secret-key"}
+        # Simulate two requests queued for ModelB while ModelA is current.
+        from serve.router import Turn
+        with router.cv:
+            router.current = svc_a
+            t1, t2 = Turn(svc_b), Turn(svc_b)
+            router.queue.extend([t1, t2])
+        try:
+            status, _, text = self.get("/metrics?format=prometheus", hdrs)
+            self.assertEqual(status, 200)
+            assert_valid_prometheus(self, text)
+            self.assertIn('basalt_requests_waiting{model_name="ModelA"} 0', text)
+            self.assertIn('basalt_requests_waiting{model_name="ModelB"} 2', text)
+            # JSON /metrics still reports the router-wide queue on the shown model for the WebUI.
+            status, _, raw = self.get("/metrics", hdrs)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)["live"]["queued"], 2)
+        finally:
+            with router.cv:
+                router.queue.clear()
+
 
 class SpillAndTelemetry(unittest.TestCase):
     def test_prometheus_renders_dict_spill(self):
@@ -256,6 +280,63 @@ class SpillAndTelemetry(unittest.TestCase):
         t.ps = SimpleNamespace(disk_io_counters=lambda: None)
         t._disk_prev = None
         self.assertIsNone(t._disk())
+
+    def test_nvml_prefers_memory_info_v2_and_falls_back_to_v1(self):
+        import ctypes
+        from serve.util.telemetry import _Nvml
+
+        expected_ver = ctypes.sizeof(_Nvml.MemV2) | (2 << 24)
+        self.assertEqual(ctypes.sizeof(_Nvml.MemV2), 40)
+
+        # 1) v2 exported and succeeds -> uses m2.used (excluding driver-reserved) and does not call v1.
+        seen = {}
+
+        class LibV2:
+            def nvmlDeviceGetMemoryInfo_v2(self, dev, ref):
+                seen["version"] = ref._obj.version
+                ref._obj.total = 32 << 30
+                ref._obj.reserved = 550 << 20
+                ref._obj.used = 20 << 30
+                ref._obj.free = ref._obj.total - ref._obj.reserved - ref._obj.used
+                return 0
+
+            def nvmlDeviceGetMemoryInfo(self, dev, ref):
+                seen["v1_called"] = True
+                return 0
+
+        nv = _Nvml.__new__(_Nvml)
+        nv.lib, nv.dev = LibV2(), ctypes.c_void_p(1)
+        r = nv.read()
+        self.assertEqual(seen.get("version"), expected_ver)
+        self.assertNotIn("v1_called", seen)
+        self.assertEqual((r["mem_used"], r["mem_total"]), (20 << 30, 32 << 30))
+
+        # 2) v2 returns error -> falls back to v1 cleanly.
+        class LibV2Fail:
+            def nvmlDeviceGetMemoryInfo_v2(self, dev, ref):
+                return 3
+
+            def nvmlDeviceGetMemoryInfo(self, dev, ref):
+                ref._obj.total = 24 << 30
+                ref._obj.used = 12 << 30
+                ref._obj.free = 12 << 30
+                return 0
+
+        nv.lib = LibV2Fail()
+        r = nv.read()
+        self.assertEqual((r["mem_used"], r["mem_total"]), (12 << 30, 24 << 30))
+
+        # 3) v2 missing -> falls back to v1 cleanly.
+        class LibV1Only:
+            def nvmlDeviceGetMemoryInfo(self, dev, ref):
+                ref._obj.total = 16 << 30
+                ref._obj.used = 8 << 30
+                ref._obj.free = 8 << 30
+                return 0
+
+        nv.lib = LibV1Only()
+        r = nv.read()
+        self.assertEqual((r["mem_used"], r["mem_total"]), (8 << 30, 16 << 30))
 
 
 if __name__ == "__main__":
