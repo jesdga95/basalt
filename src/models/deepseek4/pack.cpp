@@ -384,4 +384,38 @@ bool open_pack(const std::string& path, Pack& pack, std::string& err) {
     return true;
 }
 
+bool load_hash_route_table(const Pack& pack, int layer, std::vector<int32_t>& ids, std::string& err) {
+    const Geometry& g = pack.geo;
+    if (layer < 0 || layer >= g.hash_layers || g.n_vocab <= 0 || g.n_used != 6) {
+        err = "deepseek4 hash route table: invalid layer or routing geometry";
+        return false;
+    }
+    const std::string name = "blk." + std::to_string(layer) + ".ffn_gate_tid2eid.weight";
+    const TensorRef* tensor = pack.find(name);
+    const core::FileRange gguf = pack.file.range("gguf");
+    constexpr uint64_t row_bytes = 6 * sizeof(int32_t);
+    const uint64_t bytes = (uint64_t) g.n_vocab * row_bytes;
+    if (!tensor || tensor->type != 26 || tensor->shape != std::vector<uint64_t>{6, (uint64_t) g.n_vocab} ||
+        tensor->bytes != bytes || tensor->offset < gguf.offset ||
+        tensor->offset - gguf.offset > gguf.bytes || bytes > gguf.bytes - (tensor->offset - gguf.offset) ||
+        bytes > (uint64_t) std::numeric_limits<size_t>::max()) {
+        err = "deepseek4 hash route table: invalid tensor bounds or shape for layer " + std::to_string(layer);
+        return false;
+    }
+    std::vector<int32_t> loaded((size_t) g.n_vocab * 6);
+    if (!core::read_range_at(gguf, tensor->offset - gguf.offset, loaded.data(), bytes, err)) {
+        err = "deepseek4 hash route table: " + err;
+        return false;
+    }
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        if (loaded[i] < 0 || loaded[i] >= g.n_expert) {
+            err = "deepseek4 hash route table: expert id out of range at flat entry " + std::to_string(i);
+            return false;
+        }
+    }
+    ids = std::move(loaded);
+    err.clear();
+    return true;
+}
+
 }  // namespace basalt::models::deepseek4

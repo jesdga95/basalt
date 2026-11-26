@@ -81,6 +81,31 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    std::vector<int32_t> route_ids;
+    for (int layer = 0; layer < g.hash_layers; ++layer) {
+        if (!basalt::models::deepseek4::load_hash_route_table(pack, layer, route_ids, err) ||
+            route_ids.size() != (size_t) g.n_vocab * 6) {
+            basalt::log::error("deepseek4 pack test", "hash route table %d: %s", layer,
+                               err.empty() ? "unexpected table size" : err.c_str());
+            return 1;
+        }
+        for (const int token : {0, 1, g.n_vocab - 1}) {
+            for (int slot = 0; slot < 6; ++slot) {
+                const int32_t expert = route_ids[(size_t) token * 6 + slot];
+                if (expert < 0 || expert >= g.n_expert) {
+                    basalt::log::error("deepseek4 pack test", "hash route table %d has invalid sampled expert id", layer);
+                    return 1;
+                }
+                for (int earlier = 0; earlier < slot; ++earlier) {
+                    if (expert == route_ids[(size_t) token * 6 + earlier]) {
+                        basalt::log::error("deepseek4 pack test", "hash route table %d duplicates an expert at token %d",
+                                           layer, token);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
     const char* image_rows[] = {"v.token_embd.img_start", "v.token_embd.img_end", "v.token_embd.img_pad", "v.image_newline"};
     for (const char* name : image_rows) {
         const auto* tensor = mmproj.find(name);

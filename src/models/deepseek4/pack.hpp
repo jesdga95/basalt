@@ -56,6 +56,8 @@ struct Pack {
 /// Opens and validates a `deepseek4` Basalt pack, including the per-layer routed-expert layout.
 bool open_pack(const std::string& path, Pack& pack, std::string& err);
 bool validate_supported_geometry(const Geometry& geometry, std::string& err);
+/// Read one validated six-expert token-to-expert table into host memory for the model session.
+bool load_hash_route_table(const Pack& pack, int layer, std::vector<int32_t>& ids, std::string& err);
 
 /// Parses a JSON compression schedule without truncating fractional, non-finite, or out-of-range values.
 bool parse_compression_ratios(const core::Json& value, std::vector<int>& ratios, std::string& err);
