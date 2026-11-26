@@ -1,5 +1,7 @@
 #include "basalt/log.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 #include "models/deepseek4/pack.hpp"
+#include "models/deepseek4/meta.hpp"
 #include "basalt/vision/mmproj.hpp"
 
 #include <cstdio>
@@ -13,6 +15,21 @@ int main(int argc, char** argv) {
     std::string err;
     if (!basalt::models::deepseek4::open_pack(argv[1], pack, err)) {
         basalt::log::error("deepseek4 pack test", "%s", err.c_str());
+        return 1;
+    }
+    if (!pack.file.register_gguf_view(err)) {
+        basalt::log::error("deepseek4 pack test", "GGUF metadata view: %s", err.c_str());
+        return 1;
+    }
+    basalt::GgufFile gguf(argv[1]);
+    if (!(err = basalt::models::deepseek4::validate_meta(gguf)).empty()) {
+        basalt::log::error("deepseek4 pack test", "adapter metadata validation: %s", err.c_str());
+        return 1;
+    }
+    const auto desc = basalt::models::deepseek4::describe_meta(gguf);
+    if (desc.arch != "deepseek4" || desc.n_layers != pack.geo.n_layers || desc.n_embd != pack.geo.n_embd ||
+        desc.n_vocab != pack.geo.n_vocab || desc.context_length != pack.geo.context_length) {
+        basalt::log::error("deepseek4 pack test", "adapter description differs from the validated pack geometry");
         return 1;
     }
     basalt::vision::Mmproj mmproj;
