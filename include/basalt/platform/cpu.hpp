@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace basalt::platform {
@@ -46,6 +47,12 @@ std::string arm_cpu_name(const std::string& cpuinfo);
 /// The logical processors that share each last-level (L3) cache, one group per cache in the OS's order: an AMD CCD, or an
 /// Intel die. Processors are named as above. Empty when the OS does not say.
 std::vector<std::vector<int>> cpu_l3_groups();
+
+/// Pins `th` to the listed logical processors. False on failure or where the OS does not expose per-set pinning.
+bool pin_thread_to_cpus(std::thread& th, const std::vector<int>& cpus);
+
+/// The logical processor the calling thread is running on, or -1 when unknown.
+int current_cpu();
 
 /// Arm64: whether the CPU, as the OS reports it, has the Armv8.2 dot product (sdot / udot), which every NEON kernel
 /// of the engine uses. False on x86-64.

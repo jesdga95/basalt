@@ -45,7 +45,9 @@ struct ExpertTierSpec {
     struct Layer {
         int gu_type = 0, d_type = 0;
         uint64_t offset = 0, blob_bytes = 0;
-        float clamp = 0;   ///< the SwiGLU clamp of the layer's experts (0: none)
+        float clamp = 0;          ///< the SwiGLU clamp of the layer's experts (0: none)
+        float gate_softcap = 0;   ///< > 0: SiTU-GLU softcap on gate (cg * tanh(g/cg) * sigmoid(g))
+        float up_softcap = 0;     ///< > 0: SiTU-GLU softcap on up (cu * tanh(u/cu))
     };
     std::string area;   ///< log area, "basalt <model>"
     std::string name;   ///< the model's name in refusals
@@ -74,6 +76,10 @@ struct ExpertTierSpec {
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
     int claims_per_row = 0;
+    /// With victim_half_life: an admitted expert is promoted only when its lookup count is at least this much above its
+    /// victim's (a promotion moves two experts' bytes through RAM, the victim out and the expert in, so swapping two
+    /// experts about as hot costs more reads than it saves); 0: every admitted expert, the way the first model ran them.
+    int admit_margin = 0;
     /// Tokens after which the lookup counts that pick the main card's victims halve; 0: the slot used longest ago gives way,
     /// the way the first model ran them. With N, the slot whose expert was looked up least lately gives way (every lookup
     /// counts, hits too, and the counts halve every N tokens), the one used longest ago among equals: an expert that recurs
@@ -208,6 +214,10 @@ public:
     /// go out whole and land.
     void mark_gap(cudaStream_t main);
     void pump(int layer, int pieces);
+    /// `layer`'s queued copies (promotions, second card moves) go out whole once `ev` (an event of any card) is reached:
+    /// a model whose windows read the places from tables of their own, which keep the experts where they were until
+    /// the copies land, issues them behind the layer's experts in the next window and lands them (settle) after it.
+    void issue_after(int layer, cudaEvent_t ev);
     static constexpr int kAllPieces = 1 << 20;
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (core::policy::bus_count) into the VRAM tier; those
     /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. With a
@@ -230,6 +240,9 @@ public:
         const uint8_t* pinned = nullptr;
     };
     Source locate(int layer, int e) const;
+    /// The host bytes of (layer, e): its pinned RAM place, else the mapped file when the file holds experts; null when
+    /// neither has it (it is on a card).
+    const uint8_t* host_blob(int layer, int e) const;
     /// The first second card (null without any): for "is there a second card" questions; per-layer work takes peer_for.
     core::PeerExperts* peer() const { return peers_.empty() ? nullptr : peers_[0].get(); }
     /// The second card that holds `layer`'s second-card homes (each card owns a block of layers), or null.
