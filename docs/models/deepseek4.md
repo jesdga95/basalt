@@ -29,9 +29,9 @@ cache state bitwise. Do not describe this pack as runnable until text decode, im
 - `src/models/deepseek4/vision/` owns V4 image-grid planning and patch ordering. Shared `src/vision/` owns image decode
   and reusable preprocessing primitives. Model-specific CUDA tower/projector operations belong under
   `src/models/deepseek4/` unless another model can use the exact same tensor contract.
-- `src/models/deepseek4/tokenizer/pretok_deepseek4.cpp` implements the checkpoint tokenizer's numeric, CJK, and text
-  boundaries in a model-local target; `ds4_tokenizer_test` covers those boundaries. The adapter still needs to connect it to
-  the pack tokenizer metadata.
+- `src/program/tokenizer/pretok_joyai.cpp` implements the pack's `tokenizer.ggml.pre=joyai-llm` boundaries. The
+  DeepSeek4 wrapper and the existing DeepSeek4.1 wrapper share this tokenizer; `ds4_tokenizer_test` covers its numeric,
+  CJK, and text splits. The adapter still needs to connect it to the pack tokenizer metadata.
 - `serve/models/deepseek4.py` owns prompt rendering, image placeholders, stop/reasoning/tool parsing. Shared `serve/`
   code remains architecture-agnostic.
 

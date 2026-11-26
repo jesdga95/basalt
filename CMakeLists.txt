@@ -898,7 +898,8 @@ target_link_libraries(grammar PRIVATE warnings)
 
 # the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
 add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp
-            src/program/tokenizer/unicode_flags.cpp src/program/tokenizer/pretok_qwen35.cpp)
+            src/program/tokenizer/unicode_flags.cpp src/program/tokenizer/pretok_qwen35.cpp
+            src/program/tokenizer/pretok_joyai.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
 if(BASALT_MODEL_DEEPSEEK4)
@@ -911,7 +912,8 @@ if(BUILD_TESTING)
   add_executable(tokenizer_test tests/program/tokenizer_test.cpp src/program/tokenizer/bpe.cpp
                  src/program/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp)
   if(BASALT_MODEL_DEEPSEEK41)
-    target_sources(tokenizer_test PRIVATE src/models/deepseek41/tokenizer/pretok_joyai.cpp)
+    target_sources(tokenizer_test PRIVATE src/models/deepseek41/tokenizer/pretok_joyai.cpp
+                                          src/program/tokenizer/pretok_joyai.cpp)
     target_compile_definitions(tokenizer_test PRIVATE BASALT_MODEL_DEEPSEEK41)
   endif()
   target_include_directories(tokenizer_test PRIVATE include src src/program/tokenizer)
