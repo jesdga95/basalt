@@ -401,6 +401,20 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
     }
 }
 
+// One level of warp_sum's butterfly (mask M) over a lane's L values, keeping half: the lane with bit M set keeps the upper
+// half, its partner the lower, each adding the other's copy (a + b is b + a: warp_sum's bits for every value it keeps).
+template <int L, int M, int N>
+__device__ __forceinline__ void butterfly_halve(float (&v)[N], int lane) {
+    static_assert(L % 2 == 0 && L <= N);
+    const bool up = lane & M;
+#pragma unroll
+    for (int i = 0; i < L / 2; ++i) {
+        const float lo = v[i], hi = v[i + L / 2];
+        const float send = up ? lo : hi, keep = up ? hi : lo;
+        v[i] = keep + __shfl_xor_sync(0xffffffffu, send, M);
+    }
+}
+
 // ctrl_down_kernel's sums for a wide window: block (o0 / O, s, r0 / RMAX) holds its O outputs' weights in shared memory, so
 // a window's inputs are read once for O outputs instead of 2 (the inputs, not the dots, bound the wide windows). Each lane,
 // warp and output adds the same products in the same order as ctrl_down_kernel: the same bits.
@@ -426,6 +440,68 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_wide_kernel(CtrlArg
     constexpr int kIn = 9;
     constexpr int kPass = RMAX < 4 ? RMAX : 4;
     static_assert(kSlice / 2 == 32 * kIn, "a lane's pairs are one batch");
+    if constexpr (RMAX == 16) {
+        if (rows == RMAX) {
+            // every row present: the same chains unpredicated, row t's O dots and its square sum at v[t (O + 1)..], then
+            // warp_sum's levels 16, 8, 4, 2 each keeping half the values (one row's in the end, row bits 3..0 = lane bits
+            // 4..1) and level 1 whole
+            constexpr int V = O + 1;
+            float v[RMAX * V];
+#pragma unroll
+            for (int i = 0; i < RMAX * V; ++i) v[i] = 0.f;
+#pragma unroll
+            for (int h = 0; h < RMAX; h += kPass) {
+                float2 x[kIn][kPass];
+#pragma unroll
+                for (int b = 0; b < kIn; ++b)
+#pragma unroll
+                    for (int t = 0; t < kPass; ++t) x[b][t] = reinterpret_cast<const float2*>(in + (size_t) (h + t) * kWidth + c0)[lane + 32 * b];
+#pragma unroll
+                for (int b = 0; b < kIn; ++b) {
+#pragma unroll
+                    for (int t = 0; t < kPass; ++t)
+                        v[(h + t) * V + O] = fmaf(x[b][t].y, x[b][t].y, fmaf(x[b][t].x, x[b][t].x, v[(h + t) * V + O]));
+#pragma unroll
+                    for (int j = 0; j < O; ++j) {
+                        const uint32_t u = wr[(size_t) j * kWidth + lane + 32 * b];
+                        const float w0 = __uint_as_float(u << 16), w1 = __uint_as_float(u & 0xffff0000u);
+#pragma unroll
+                        for (int t = 0; t < kPass; ++t)
+                            v[(h + t) * V + j] = fmaf(w1, x[b][t].y, fmaf(w0, x[b][t].x, v[(h + t) * V + j]));
+                    }
+                }
+            }
+            butterfly_halve<RMAX * V, 16>(v, lane);
+            butterfly_halve<RMAX * V / 2, 8>(v, lane);
+            butterfly_halve<RMAX * V / 4, 4>(v, lane);
+            butterfly_halve<RMAX * V / 8, 2>(v, lane);
+#pragma unroll
+            for (int i = 0; i < V; ++i) v[i] += __shfl_xor_sync(0xffffffffu, v[i], 1);
+            if (!(lane & 1)) {
+                const int t = (lane & 16 ? 8 : 0) + (lane & 8 ? 4 : 0) + (lane & 4 ? 2 : 0) + (lane & 2 ? 1 : 0);
+#pragma unroll
+                for (int j = 0; j < O; ++j) {
+                    part[w][j][t][0] = v[j];
+                    part[w][j][t][1] = v[O];
+                }
+            }
+            __syncthreads();
+            for (int i = threadIdx.x; i < rows * O; i += kDownWarps * 32) {
+                const int t = i % rows, j = i / rows;
+                float dd = 0.f, sd = 0.f, dm = 0.f, sm = 0.f;
+#pragma unroll
+                for (int k = 0; k < kDownWarps / 2; ++k) {
+                    dd += part[k][j][t][0];
+                    sd += part[k][j][t][1];
+                    dm += part[kDownWarps / 2 + k][j][t][0];
+                    sm += part[kDownWarps / 2 + k][j][t][1];
+                }
+                a.scratch[((size_t) s * kBatchRows + r0 + t) * a.rank + o0 + j] =
+                    dd * rsqrtf(sd / (float) kWidth + 1e-6f) + dm * rsqrtf(sm / (float) kWidth + 1e-6f);
+            }
+            return;
+        }
+    }
     float dot[O][RMAX], sq[RMAX];
 #pragma unroll
     for (int t = 0; t < RMAX; ++t) {
