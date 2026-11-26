@@ -252,14 +252,14 @@ endif()
 
 if(BASALT_MODEL_INKLING2)
 add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu
-  src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/attn_prompt.cu
-  src/models/inkling2/kernels/prompt_ops.cu)
+  src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/dflash2.cu
+  src/models/inkling2/kernels/attn_prompt.cu src/models/inkling2/kernels/prompt_ops.cu)
 target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
   src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
   src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp
-  src/models/inkling2/dspark.cpp src/models/inkling2/spill.cpp src/models/inkling2/cpu_experts.cpp)
+  src/models/inkling2/dspark.cpp src/models/inkling2/dflash2.cpp src/models/inkling2/spill.cpp src/models/inkling2/cpu_experts.cpp)
 target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_inkling2 PUBLIC model tokenizer engine_session inkling2_kernels tiers kernels kernels_cpu window_gemm mmq prefill_fp4 prefill_mxfp8 prefill_q8 core vision_cuda ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -275,6 +275,10 @@ if(BUILD_TESTING)
   target_include_directories(inkling2_dspark_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2_dspark_parity COMMAND inkling2_dspark_parity)
+  add_executable(inkling2_dflash2_parity src/models/inkling2/kernels/dflash2_parity.cpp)
+  target_include_directories(inkling2_dflash2_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(inkling2_dflash2_parity PRIVATE inkling2_kernels kernels window_gemm ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_dflash2_parity COMMAND inkling2_dflash2_parity)
   add_executable(inkling2_prompt_parity src/models/inkling2/kernels/prompt_parity.cpp)
   target_include_directories(inkling2_prompt_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2_prompt_parity PRIVATE inkling2_kernels kernels mmq prefill_q8 window_gemm prefill_fp4 ggml_quants ${_gpu_runtime_target})
@@ -319,6 +323,12 @@ if(BUILD_TESTING)
   add_executable(inkling2_vision_parity src/models/inkling2/vision_parity.cpp src/models/inkling2/vision.cpp)
   target_include_directories(inkling2_vision_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(inkling2_vision_parity PRIVATE vision_cuda)
+  # parked conversation round-trip: save_cells / restore_cells + running_state / running_restored + drafter window
+  # (Inkling 2 pack: argument or BASALT_INKLING2_PACK; skipped without one)
+  add_executable(inkling2_checkpoint_round_trip tests/models/inkling2/checkpoint_round_trip.cpp)
+  target_link_libraries(inkling2_checkpoint_round_trip PRIVATE model_inkling2 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_checkpoint_round_trip COMMAND inkling2_checkpoint_round_trip)
+  set_tests_properties(inkling2_checkpoint_round_trip PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 endif()
 
@@ -436,6 +446,12 @@ if(BUILD_TESTING)
   target_include_directories(batch_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
   target_link_libraries(batch_window_test PRIVATE warnings)
   basalt_cpu_test(NAME batch_window_test COMMAND batch_window_test)
+  # a composition's graph that finds no device memory: the batch goes on without it (GPU)
+  add_executable(batch_graph_memory_test tests/model/batch_graph_memory_test.cu)
+  target_include_directories(batch_graph_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(batch_graph_memory_test PRIVATE core ${_gpu_runtime_target})
+  basalt_gpu_test(NAME batch_graph_memory_test COMMAND batch_graph_memory_test)
+  set_tests_properties(batch_graph_memory_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   # the real adapters, through the program's registration (needs the CUDA runtime, not a GPU's work)
   add_executable(adapter_builtin_test tests/model/adapter_builtin_test.cpp)
   target_link_libraries(adapter_builtin_test PRIVATE models)
@@ -958,6 +974,31 @@ if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
                   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_spec_identity_test.py
                           $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
   set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
+endif()
+
+# a batch slot stopped by its client holds what the client saw, so the conversation continues without a re-read (same model
+# variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME batch_stop_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_stop_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(batch_stop_test PROPERTIES TIMEOUT 600)
+endif()
+
+# a pass that continues a reply takes no turn checkpoint inside it (same model variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME reply_checkpoint_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/reply_checkpoint_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(reply_checkpoint_test PROPERTIES TIMEOUT 600)
+endif()
+
+# a reply read again (a run that continues it, no prompt cache) keeps the bits its decode wrote (same model variable as above)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME reply_read_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/reply_read_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_tests_properties(reply_read_test PROPERTIES TIMEOUT 600)
 endif()
 
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE

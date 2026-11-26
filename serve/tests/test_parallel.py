@@ -16,6 +16,7 @@ from unittest import mock
 from serve.frontend import ChatTemplate
 from serve.engine.process import ProcessEngine
 from serve.handler import serve
+from serve.prompt import REPLY_KEY
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -1435,6 +1436,38 @@ class RestartRaces(unittest.TestCase):
         self.assertEqual(passes[0], 5)
         self.assertGreaterEqual(len(passes), 2)
         self.assertIn("final answer", "".join(ev.text for ev in events if ev.kind == "content"))
+
+    def test_continuation_pass_tells_the_engine_where_the_reply_begins(self):
+        """A pass that continues the reply (the thinking budget closed) names the first prompt's length, so the engine takes
+        no turn checkpoint inside the reply: it would push the turn boundary the chat's next turn needs out of a chain of one."""
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja")
+        seen = []
+
+        class Engine:
+            max_context = 4096
+            last = None
+
+            def generate(self, prompt, max_new, sampling, cancel, session=None, **kw):
+                seen.append((len(prompt), dict(sampling or {}).get(REPLY_KEY)))
+                if len(seen) == 1:
+                    yield from b"a" * max_new
+                else:
+                    yield from b"final answer"
+                    yield 257
+
+        svc = Service(Engine(), tok, tpl)
+        ids = svc.encode_prompt([{"role": "user", "content": "hi"}], None, {"enable_thinking": True})
+        list(svc.run(ids, True, None, 64, {"temperature": 0.0, "reasoning_budget_tokens": 5}, threading.Event()))
+        self.assertEqual(seen[0], (len(ids), None))
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertTrue(all(reply == len(ids) for _, reply in seen[1:]), seen)
+        self.assertGreater(seen[1][0], len(ids))
+
+    def test_reply_key_reaches_the_engine_line(self):
+        from serve.engine.process import ProcessEngine
+        self.assertIn(" reply=37", ProcessEngine.sampling_keys({REPLY_KEY: 37}))
+        self.assertNotIn("reply=", ProcessEngine.sampling_keys({}))
 
 
 class ConcurrencyLifecycleResources(unittest.TestCase):

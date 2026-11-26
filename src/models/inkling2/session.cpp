@@ -611,7 +611,7 @@ public:
         if (stale_ && r.pos > 0) return stale();
         if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
-        const bool staged = sh_->prompt && r.n_tokens > (m_.has_spill() ? kSpillWindowRead : kChunkRead);
+        const bool staged = sh_->prompt && !r.reply && r.n_tokens > (m_.has_spill() ? kSpillWindowRead : kChunkRead);
         if (heat_tally_) settle_window(r.pos);
         if (!restart_positions(r.pos == 0 ? r.n_tokens : r.pos + std::max(r.n_tokens, r.total_tokens), r.pos)) return wedged();
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return grow_failed(e);
@@ -639,7 +639,7 @@ public:
         for (int t0 = 0; t0 < r.n_tokens; t0 += kWindowRows) {
             if (r.stop && r.stop()) break;
             const int n = std::min(kWindowRows, r.n_tokens - t0);
-            if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, 0, err)) return {model::Status::Error, "inkling2: " + err};
+            if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, 0, err, false)) return {model::Status::Error, "inkling2: " + err};
             if (heat_tally_) fold_rows(n);
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
             if (r.progress && ((t0 / kWindowRows) % 64 == 63 || t0 + n == r.n_tokens)) {
@@ -1071,6 +1071,9 @@ public:
         if (save && (int64_t) hist_.size() - pos > kWindowRows)
             return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kWindowRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "inkling2: a checkpoint past the session's position"};
+        st.head.clear();
+        st.regions.clear();
+        st.peer_regions.clear();
         const size_t kv_ring = (size_t) kConvRing * kKvHeads * kHeadDim * 4, e_ring = (size_t) kConvRing * g_.n_embd * 4;
         for (size_t i = 0; i < vc_.size(); ++i) {   // the second card's visits go with its stream
             const VisitCache& c = vc_[i];
@@ -1084,7 +1087,7 @@ public:
             to.push_back({c.a_ring, e_ring});
             to.push_back({c.m_ring, e_ring});
         }
-        dspark_.running_regions(st);   // DSPARK HOOK
+        dspark_.running_state(pos, save, st);   // DSPARK HOOK
         st.stream = stream_;
         if (lane_[1].stream) {
             st.peer_stream = lane_[1].stream;
@@ -1093,7 +1096,9 @@ public:
         return {};
     }
 
-    model::Result running_restored(int64_t pos, const uint8_t*) override {
+    model::Result running_restored(int64_t pos, const uint8_t* head) override {
+        if (!dspark_.running_restored(pos, head))
+            return {model::Status::Error, "inkling2: restoring the drafter's state failed"};
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         stale_ = false;   // the rings are the checkpoint's again
         return {};
@@ -1160,6 +1165,7 @@ public:
         }
         if (dspark_.on() && !dspark_.restore_cells(kv, i, positions, stream_))   // DSPARK HOOK
             return {model::Status::Error, "inkling2: a parked conversation has no drafter cells"};
+        if (i != kv.size()) return {model::Status::Error, "inkling2: a parked conversation has other caches"};
         return {};
     }
 
@@ -1519,14 +1525,16 @@ private:
 
     // The forward of `rows` rows at positions pos0.. (tokens, or host embedding rows when `emb` is set, which must stay
     // as they are until the window's sync); then the head over the last `head` rows (0: none).
-    bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
+    // `graphed` false: the window runs direct, with no graph captured for its shape (a prompt's read, whose shapes the decode
+    // never takes, would fill the card's spare with graphs).
+    bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err, bool graphed = true) {
         if (sh_->cpu && sh_->cpu->stopped()) {
             err = "the CPU experts were stopped";
             return false;
         }
         cpu_ = cpu_layers();
         if (cpu_) sh_->cpu->wake();
-        if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err) || !check(err)) return false;
+        if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err, graphed) || !check(err)) return false;
         dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
         return true;
     }
@@ -1586,8 +1594,13 @@ private:
 
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
     // window (its first runs direct, outside a capture).
-    bool layers(int rows, int head, int64_t full_keys, std::string& err) {
+    bool layers(int rows, int head, int64_t full_keys, std::string& err, bool graphed = true) {
         if (!drop_stale_read_ahead(err)) return false;
+        if (!graphed) {
+            window_cold_ = true;
+            body(rows, head, full_keys);
+            return true;
+        }
         const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
         if (it != graphs_.end()) {

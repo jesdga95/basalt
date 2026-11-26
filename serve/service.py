@@ -20,7 +20,7 @@ from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
-from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
+from serve.prompt import CTX_SLACK, REPLY_KEY, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
@@ -1211,7 +1211,7 @@ class Service:
         """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
-        tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        tail = self.dialect.nothink_lead + force if force and kwargs.get("enable_thinking", True) is False else ""
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):
@@ -1448,9 +1448,12 @@ class Service:
         (serve/api/logprobs.py)."""
         if live is not None:
             live.thinking = bool(thinking)
-        if not thinking and self.dialect.thinks_in_blocks and isinstance((sampling or {}).get(GRAMMAR_KEY), dict):
-            # the grammar guard lets a reply of blocks think only when the request does
-            sampling = {**sampling, GRAMMAR_KEY: dict(sampling[GRAMMAR_KEY], think=False)}
+        if not thinking and self.dialect.thinks_in_blocks and self.grammar_engine:
+            # the grammar guard lets a reply of blocks think only when the request does: a request without a grammar
+            # gets the one that only forbids thinking
+            spec = (sampling or {}).get(GRAMMAR_KEY)
+            sampling = {**(sampling or {}), GRAMMAR_KEY: dict(
+                spec if isinstance(spec, dict) else {"kind": "text", "calls": bool(tools)}, think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
         budget_req = sampling
         budget_ready = False
@@ -1608,6 +1611,7 @@ class Service:
                     closed_early = False                # the thinking was already closed once
                     pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
+                    reply_at = None                     # the prompt's token count where this reply's own tokens begin (once a pass continues it)
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -1843,6 +1847,9 @@ class Service:
                             break
                         base_len = len(prompt.ids()) if isinstance(prompt, PromptText) else len(prompt)
                         prompt = prompt + seg + extra
+                        # the engine takes no turn checkpoint inside the reply this prompt now carries
+                        reply_at = base_len if reply_at is None else reply_at
+                        sampling = {**(sampling or {}), REPLY_KEY: reply_at}
                         if has_grammar:
                             if resumed:
                                 gprompt0 = gprompt0 if gprompt0 is not None else base_len
