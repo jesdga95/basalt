@@ -77,6 +77,20 @@ int main() {
     check(!basalt::models::deepseek4::validate_compression_ratios(&schedule, 2).empty(),
           "inconsistent GGUF array item type must be refused");
 
+    basalt::models::deepseek4::Geometry geometry;
+    geometry.n_layers = 43; geometry.n_embd = 4096; geometry.n_head = 64; geometry.n_head_kv = 1;
+    geometry.head_dim = 512; geometry.rope_dim = 64; geometry.q_lora = 1024; geometry.window = 128;
+    geometry.o_groups = 8; geometry.o_lora = 1024; geometry.n_expert = 256; geometry.n_used = 6;
+    geometry.n_ff_exp = 2048; geometry.n_shared = 1; geometry.hc_mult = 4; geometry.sinkhorn_iters = 20;
+    geometry.hash_layers = 3; geometry.router_func = 4; geometry.route_norm = true; geometry.route_scale = 1.5f;
+    geometry.output_embd = 16384; geometry.idx_heads = 64; geometry.idx_dim = 128; geometry.idx_top_k = 512;
+    geometry.context_length = 1048576; geometry.yarn_factor = 16.f; geometry.yarn_orig_ctx = 65536;
+    geometry.yarn_beta_fast = 32.f; geometry.yarn_beta_slow = 1.f; geometry.rope_base = 10000.f;
+    geometry.comp_rope_base = 160000.f;
+    check(basalt::models::deepseek4::validate_supported_geometry(geometry, err), "supported V4-0731 geometry");
+    geometry.n_head = 32;
+    check(!basalt::models::deepseek4::validate_supported_geometry(geometry, err), "unsupported V4 head count must be refused");
+
     if (failures) return 1;
     std::puts("deepseek4 metadata validation: ok");
     return 0;

@@ -98,7 +98,7 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
         }
     }
     g.compress_ratio.resize((size_t) g.n_layers);
-    return true;
+    return validate_supported_geometry(g, err);
 }
 
 bool tensor_shape(const Pack& pack, const std::string& name, std::initializer_list<uint64_t> shape, int type = -1) {
@@ -278,6 +278,21 @@ bool read_expert_layout(const core::ModelFile& file, int layers, std::vector<Exp
 }
 
 }  // namespace
+
+bool validate_supported_geometry(const Geometry& g, std::string& err) {
+    if (g.n_layers != 43 || g.n_embd != 4096 || g.n_head != 64 || g.n_head_kv != 1 || g.head_dim != 512 ||
+        g.rope_dim != 64 || g.q_lora != 1024 || g.window != 128 || g.o_groups != 8 || g.o_lora != 1024 ||
+        g.n_expert != 256 || g.n_used != 6 || g.n_ff_exp != 2048 || g.n_shared != 1 || g.hc_mult != 4 ||
+        g.sinkhorn_iters != 20 || g.hash_layers != 3 || g.router_func != 4 || !g.route_norm ||
+        g.route_scale != 1.5f || g.output_embd != 16384 || g.idx_heads != 64 || g.idx_dim != 128 ||
+        g.idx_top_k != 512 || g.context_length != 1048576 || g.yarn_factor != 16.f || g.yarn_orig_ctx != 65536 ||
+        g.yarn_beta_fast != 32.f || g.yarn_beta_slow != 1.f || g.rope_base != 10000.f || g.comp_rope_base != 160000.f) {
+        err = "meta.geometry is outside the supported DeepSeek-V4-0731 geometry";
+        return false;
+    }
+    err.clear();
+    return true;
+}
 
 bool parse_compression_ratios(const core::Json& value, std::vector<int>& ratios, std::string& err) {
     if (!value.is_array() || value.items.size() != value.count) {
