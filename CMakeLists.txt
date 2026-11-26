@@ -250,6 +250,10 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_ERNIE55)
+  include(src/models/ernie55/ernie55.cmake)
+endif()
+
 if(BASALT_MODEL_INKLING2)
 add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu
   src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/dflash2.cu
