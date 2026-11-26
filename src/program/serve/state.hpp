@@ -253,7 +253,9 @@ public:
         bool media = false;   ///< its pictures are placed by the request that reads it: a held conversation meets it only as an exact prefix
     };
     std::map<uint64_t, HeldPrompt> prompts{};
-    static constexpr size_t kPromptsMax = 64;
+    /// Prompts held at once at most: past it the oldest goes (a request that never freed its prompt). Every slot's request
+    /// holds one and may hold its continuation's beside it, and queued requests hold theirs.
+    size_t prompts_cap() const { return 64 + 4 * bs.size(); }
     /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
     const std::vector<int32_t>* idle_ids(int b) const;
     struct SlotMeet {

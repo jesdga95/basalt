@@ -40,7 +40,7 @@ std::vector<Runtime::SlotMeet> Runtime::slot_meets(const std::vector<int32_t>& p
 uint64_t Runtime::hold_prompt(HeldPrompt&& p) {
     std::lock_guard<std::mutex> lk(gent_mu);
     const uint64_t handle = ++gent_seq;
-    while (prompts.size() >= kPromptsMax) prompts.erase(prompts.begin());   // a request that never freed its prompt
+    while (prompts.size() >= prompts_cap()) prompts.erase(prompts.begin());   // a request that never freed its prompt
     prompts[handle] = std::move(p);
     return handle;
 }
