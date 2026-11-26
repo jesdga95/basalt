@@ -608,7 +608,8 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         const int32_t* r1 = res_.data() + l * n_expert_;
         for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
             if (r1[e] >= 0) {
-                if (!hold_[(size_t) (l * n_expert_ + e)]) vict.emplace_back(u[e], e);
+                // A second copy serves no extra routes while another tier covers this expert.
+                if (!hold_[(size_t) (l * n_expert_ + e)]) vict.emplace_back(r0[e] >= 0 ? -1.0f : u[e], e);
             }
             else if (r0[e] < 0 && u[e] >= 2.0f && (inflight.empty() || !inflight[(size_t) (l * n_expert_ + e)])) cand.emplace_back(u[e], e);
         }
@@ -675,17 +676,21 @@ bool PeerExperts::reassign(int64_t layer, int32_t in, int64_t lout, int32_t out,
     const int32_t slot = res_[i_in];
     hold_[i_in] = 0;
     if (slot < 0) return true;
-    res_[i_in] = kNotResident;                 // the primary computes it from now on
+    for (const auto& p : pending_)
+        if (p.second == slot) { res_[i_in] = kNotResident; return true; }   // a refill already owns the bytes
+    // Keep the old bytes mapped until a refill actually takes the slot. If the primary also
+    // holds them, adapt can reuse that copy for a different expert on its next round.
     if (res_[i_out] >= 0 || blob == nullptr) return true;
     for (const auto& p : pending_)
-        if (p.second == slot) return true;
+        if ((size_t) p.first == i_out) return true;
     for (const Evict& x : evicting_)
-        if (x.slot == slot) return true;
+        if ((x.layer == lout && x.in == out) || x.slot == slot) return true;   // issue_pending retires its victim
     const auto& lay = basalt::kernels::cpu::expert_layout();
     On on(device_);
     if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(lout), cudaMemcpyHostToDevice,
                             refill_), "reassign", err))
         return false;
+    res_[i_in] = kNotResident;
     pending_.emplace_back((int32_t) i_out, slot);
     ++swaps_;
     return ck(cudaEventRecord(refill_ev_, refill_), "reassign event", err);
