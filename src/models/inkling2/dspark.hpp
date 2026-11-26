@@ -130,9 +130,12 @@ private:
 /// when it has one this engine does not run.
 model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DsparkWeights>& out);
 
-/// The device bytes a session's drafter takes for `context` positions with a tap of `tap_rows` rows (0 without a drafter).
-/// A session's drafter bytes (its caches and its steps' scratch), the shared tap aside.
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context);
+/// The device bytes a session's drafter holds of its own (its rings and its steps' scratch; 0 without a drafter), the shared
+/// tap and its full layers' caches aside.
+uint64_t dspark_session_bytes(const Pack& pack);
+/// The KV pool bytes the drafter's full layers of one session take at `positions` positions, each cache's allocation
+/// granules of `gran` bytes counted whole (0 for a drafter without per-position cells).
+uint64_t dspark_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran);
 /// The tap of `tap_rows` rows: the target's features of a call's rows, which every session's commit reads (one shared).
 uint64_t dspark_tap_bytes(int tap_rows);
 
@@ -147,10 +150,10 @@ public:
     /// `w` null: no drafter. `context` the session's positions; `tap_rows` the most rows one forward fills the tap with.
     /// `dump` (--diag-dump's directory, may be empty): every committed run's features and the first blocks' outputs (their
     /// final rows, every draft's logits, the drafts) go to dspark.bin there in order, to replay against a reference.
-    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). `backed` > 0: the full layers' caches reserve the context and
-    /// back only the cells of the first `backed` positions (and a block past them), growing with the target's (ensure).
+    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). The full layers' caches reserve the context and back
+    /// nothing at start, growing with the target's (ensure).
     bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
-              int64_t backed, std::string& err);
+              std::string& err);
     bool on() const { return w_ != nullptr || df2_ != nullptr; }
     bool dumping() const { return dump_ != nullptr; }
     /// The tap slot visit `visit` fills with its input rows, or -1.
@@ -187,8 +190,8 @@ public:
     void running_state(int64_t pos, bool save, core::RunningState& st) const;
     bool running_restored(int64_t pos, const uint8_t* head);
     size_t cells_bytes(int64_t positions) const;
-    /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
-    /// positions and a block past them; trim gives back what lies past them.
+    /// The full layers' caches: the device bytes ensure(positions) maps, backing the cells of `positions` positions and a block
+    /// past them; trim gives back what lies past them.
     uint64_t grow_bytes(int64_t positions) const;
     bool ensure(int64_t positions, std::string& err);
     void trim(int64_t positions);
@@ -230,7 +233,7 @@ private:
     uint8_t* slab_ptr_ = nullptr;
     size_t slab_rem_ = 0;
     std::vector<Cache> cache_;
-    std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V when elastic
+    std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V
     int64_t backed_cells_ = 0;              ///< cells every full layer's cache backs
     std::vector<int> slot_;                 ///< by visit
     int tap_rows_ = 0;

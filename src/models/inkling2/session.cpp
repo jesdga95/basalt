@@ -17,8 +17,10 @@
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/elastic_array.hpp"
-#include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/graph.hpp"
+#include "basalt/core/kv_pool.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/core/vmm.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -326,7 +328,7 @@ public:
                 const int c = m_.card_of(v.layer);
                 const bool ring = g_.swa[(size_t) v.layer];
                 const int64_t cap = visit_cells(ring, (int64_t) g_.window, ctx);
-                if (ring || !m_.elastic()) need[c] += 2 * align256((size_t) kKvHeads * (size_t) cap * row_bytes);
+                if (ring) need[c] += 2 * align256((size_t) kKvHeads * (size_t) cap * row_bytes);
                 need[c] += 2 * align256((size_t) kConvRing * kKvHeads * kHeadDim * 4);
                 need[c] += 2 * align256((size_t) kConvRing * (size_t) E * 4);
             }
@@ -363,12 +365,13 @@ public:
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = visit_cells(c.ring, (int64_t) g_.window, ctx);
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
-            if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
+            if (!c.ring) {   // the range of the whole context reserved, backed from the card's KV pool as the conversation grows
                 for (int j = 0; j < 2; ++j) {
                     auto a = std::make_unique<core::ElasticArray>();
-                    if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
+                    if (ok && !a->open(bytes, err, 1)) ok = false;
                     (j ? c.v : c.k) = a->data();
                     elastic_.push_back(std::move(a));
+                    elastic_card_.push_back(slot_card_[(size_t) v.slot]);
                 }
             } else {
                 c.k = alloc(bytes, ok);
@@ -448,7 +451,7 @@ public:
             return false;
         }
         if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(call_rows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
-                          elastic_.empty() ? 0 : core::kElasticKvBase, err))
+                          err))
             return false;
         count_backed();
         if (heat_tally_) sh_->heat_sessions.push_back(this);
@@ -530,8 +533,8 @@ public:
         };
         if (rebalances() && next_rebalance_ >= 0) bound(next_rebalance_after(pos));
         if (m_.loan_pending()) bound(m_.loan_publish_at());
-        if (!elastic_.empty() && m_.promoted() > 0 && backed_ < m_.context())
-            bound(backed_ > pos ? backed_ : (pos / kElasticKvStep + 1) * kElasticKvStep);
+        if (m_.promoted() > 0 && backed_ < m_.context())
+            bound(backed_ > pos ? backed_ : (pos / kv_step() + 1) * kv_step());
         return room == INT64_MAX ? 0 : (int) std::min<int64_t>(room, kWindowRows);
     }
 
@@ -829,13 +832,13 @@ public:
     void count_backed() {
         backed_ = m_.context();
         for (const auto& a : elastic_) backed_ = std::min(backed_, (int64_t) (a->backed() / cell_bytes()));
-        if (dspark_.on() && !elastic_.empty()) backed_ = std::min(backed_, std::max<int64_t>(0, dspark_.backed_cells() - kDsBlock));
+        if (dspark_.on()) backed_ = std::min(backed_, std::max<int64_t>(0, dspark_.backed_cells() - kDsBlock));
     }
 
-    // The elastic KV: before a run reaches `positions`, the full visits' caches and the drafter's full layers back them (in
-    // steps of kElasticKvStep cells), and when the card has no room the RAM experts' card copies go back to RAM first, the
-    // lowest ranked first. False when even without any copy there is no room.
-    static constexpr int64_t kElasticKvStep = 8192;
+    // The KV pool: before a run reaches `positions`, the full visits' caches and the drafter's full layers back them from
+    // their card's pool (in steps of an allocation granule of the visits' caches), and when the card has no room the RAM
+    // experts' card copies go back to RAM first, the lowest ranked first. False when the pool is short (nothing changes
+    // then), or when even without any copy the card has no room.
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
     // The copies' placement changes at positions the token stream fixes (window_limit): a rebalance every kRebalanceRows
     // positions of a turn, the prompt loan kLoanLagRows positions after the turn's first window (its uploads overlap the
@@ -863,12 +866,36 @@ public:
         return {m_.wedged() ? model::Status::Error : model::Status::Refused, "inkling2: " + err};
     }
     bool ensure_positions(int64_t positions, std::string& err) {
-        if (elastic_.empty() || positions <= backed_) return true;
-        const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
+        if (positions <= backed_) return true;
+        const int64_t target = std::min<int64_t>(m_.context(), (positions + kv_step() - 1) / kv_step() * kv_step());
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
         uint64_t grow = grow_bytes(target);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
         const int64_t at = backed_;
+        // the pool first: a short pool changes nothing
+        uint64_t taken[2] = {}, base[2] = {};
+        for (int c = 0; c < m_.cards(); ++c) {
+            base[c] = backing_on(c);
+            taken[c] = grow_on(c, target);
+            if (!m_.kv_pool(c).take(taken[c])) {
+                for (int k = 0; k < c; ++k) m_.kv_pool(k).give(taken[k]);
+                err = "the KV pool has no room for " + std::to_string(target) + " positions in this slot (" +
+                      std::to_string(m_.kv_pool(c).free() >> 20) + " MiB free, " + std::to_string(taken[c] >> 20) + " MiB needed)";
+                return false;
+            }
+        }
+        // what the maps did not take goes back to the pool, however they end
+        struct Settle {
+            Session& s;
+            const uint64_t* taken;
+            const uint64_t* base;
+            ~Settle() {
+                for (int c = 0; c < s.m_.cards(); ++c) {
+                    const uint64_t got = s.backing_on(c) - base[c];
+                    if (got < taken[c]) s.m_.kv_pool(c).give(taken[c] - got);
+                }
+            }
+        } settle{*this, taken, base};
         // the copies go back until the grow leaves the reserve free by the counted room (the caches take the reserve itself
         // only once no copy is left: the reserve is the copies' target, not a floor the caches stop at)
         const int64_t before = m_.card_copies();
@@ -891,11 +918,13 @@ public:
         uint64_t backing0 = backing_bytes();
         bool out_of_memory = false;   // the failure was the device lacking the memory, nothing left half done
         const auto map = [&] {
-            for (auto& a : elastic_)
-                if (!a->ensure(bytes, 0, err)) {
-                    out_of_memory = a->out_of_memory();
+            for (size_t i = 0; i < elastic_.size(); ++i) {
+                const core::OnDevice on(m_.card_device(elastic_card_[i]));
+                if (!elastic_[i]->ensure(bytes, 0, err)) {
+                    out_of_memory = elastic_[i]->out_of_memory();
                     return false;
                 }
+            }
             if (dspark_.ensure(target, err)) return true;   // DSPARK HOOK
             out_of_memory = dspark_.out_of_memory();
             return false;
@@ -927,17 +956,42 @@ public:
         err = "the caches do not back the requested positions";
         return false;
     }
-    // The device bytes the elastic caches (the visits' and the drafter's) back now.
-    uint64_t backing_bytes() const {
-        uint64_t n = dspark_.backing_bytes();   // DSPARK HOOK
-        for (const auto& a : elastic_) n += a->backed();
+    // The positions a grow maps at once: an allocation granule of a full visit's cache.
+    int64_t kv_step() const { return std::max<int64_t>(1, (int64_t) (core::vmm::granularity() / cell_bytes())); }
+    // The device bytes the pooled caches (the visits' and the drafter's) back now, on card `card` or on every card.
+    uint64_t backing_on(int card) const {
+        uint64_t n = card == 0 ? dspark_.backing_bytes() : 0;   // DSPARK HOOK
+        for (size_t i = 0; i < elastic_.size(); ++i)
+            if (elastic_card_[i] == card) n += elastic_[i]->backed();
         return n;
     }
+    uint64_t backing_bytes() const { return backing_on(0) + (m_.cards() > 1 ? backing_on(1) : 0); }
     // The device bytes the caches map to back `positions` positions (ensure_positions), the allocation rounding included.
-    uint64_t grow_bytes(int64_t positions) const {
-        uint64_t n = dspark_.grow_bytes(positions);   // DSPARK HOOK
-        for (const auto& a : elastic_) n += a->growth(cell_bytes() * (uint64_t) positions);
+    uint64_t grow_on(int card, int64_t positions) const {
+        uint64_t n = card == 0 ? dspark_.grow_bytes(positions) : 0;   // DSPARK HOOK
+        for (size_t i = 0; i < elastic_.size(); ++i)
+            if (elastic_card_[i] == card) n += elastic_[i]->growth(cell_bytes() * (uint64_t) positions);
         return n;
+    }
+    uint64_t grow_bytes(int64_t positions) const { return grow_on(0, positions) + (m_.cards() > 1 ? grow_on(1, positions) : 0); }
+    // The caches give their pools back what lies past `keep` positions.
+    bool trim_to(int64_t keep) {
+        uint64_t base[2] = {backing_on(0), m_.cards() > 1 ? backing_on(1) : 0};
+        for (size_t i = 0; i < elastic_.size(); ++i) {
+            const core::OnDevice on(m_.card_device(elastic_card_[i]));
+            elastic_[i]->trim(cell_bytes() * (uint64_t) keep);
+        }
+        dspark_.trim(keep);
+        int64_t moved = 0;
+        for (int c = 0; c < m_.cards(); ++c) {
+            const uint64_t now = backing_on(c);
+            if (now < base[c]) m_.kv_pool(c).give(base[c] - now);
+            moved += (int64_t) now - (int64_t) base[c];
+        }
+        m_.account(moved);
+        count_backed();
+        if ((int64_t) hist_.size() > keep) hist_.resize((size_t) keep);
+        return caches_usable();
     }
 
     // ---- the copies' ranking: the lookups of the rows the windows keep (decode_kept), and of prompt rows read through the
@@ -1036,18 +1090,10 @@ public:
     // caches back (resume_trims): the caches give back the cells past what the prompt needs (never below the base), and the
     // RAM experts come back to the card while it has room. Any other resume leaves both as they are.
     bool restart_positions(int64_t positions, int64_t at) {
-        if (elastic_.empty()) return true;
-        const int64_t keep = kept_positions(positions, kElasticKvStep, core::kElasticKvBase, m_.context());
+        const int64_t keep = kept_positions(positions, kv_step(), kv_step(), m_.context());
         if (at > 0 && !resume_trims(keep, backed_)) return true;
         if (!feed_heat()) return false;
-        if (keep < backed_) {
-            const uint64_t backing0 = backing_bytes();
-            for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
-            dspark_.trim(keep);
-            m_.account((int64_t) backing_bytes() - (int64_t) backing0);
-            count_backed();
-            if (!caches_usable()) return false;
-        }
+        if (keep < backed_ && !trim_to(keep)) return false;
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             const int64_t before = m_.card_copies();
             const uint64_t grow = grow_bytes(keep);
@@ -1170,9 +1216,29 @@ public:
     }
 
     int64_t kv_bytes() const override {
-        int64_t n = 0;
-        for (const VisitCache& c : vc_) n += 2 * (int64_t) kv_bytes_of(c);
+        int64_t n = (int64_t) backing_bytes();
+        for (const VisitCache& c : vc_)
+            if (c.ring) n += 2 * (int64_t) kv_bytes_of(c);
         return n;
+    }
+
+    // ---- the KV pool (model/adapter.hpp)
+    model::Result kv_back(int64_t positions) override {
+        if (m_.wedged()) return wedged();
+        if (positions > m_.context()) return {model::Status::Refused, "inkling2: positions past the context"};
+        if (std::string e; !ensure_positions(positions, e)) return grow_failed(e);
+        return {};
+    }
+    void kv_trim(int64_t positions) override {
+        if (positions < backed_) trim_to(kept_positions(positions, kv_step(), 0, m_.context()));
+    }
+    std::string kv_pool_line() const override {
+        char line[200];
+        const core::KvPool& p = m_.kv_pool(0);
+        std::snprintf(line, sizeof line, "KV pool %.0f of %.0f MiB free, this slot backs %lld positions (%.0f MiB)",
+                      (double) p.free() / 1048576.0, (double) p.budget() / 1048576.0, (long long) backed_,
+                      (double) backing_bytes() / 1048576.0);
+        return line;
     }
 
     // ---- the console's experts: a lookup is a hit when its expert is on a GPU (the main card or the peer). With every expert
@@ -1948,8 +2014,9 @@ private:
     SettledShare hits_;                         // the lookups by where they were served (settle_hits)
     ResidentExpertMap map_;
     int64_t lookups_ = 0;                    // decode's routed lookups so far
-    // the elastic KV (model.hpp elastic()): the full visits' caches back their first backed_ cells
+    // the full visits' caches, each on its visit's card (elastic_card_), back their first backed_ cells from the card's KV pool
     std::vector<std::unique_ptr<core::ElasticArray>> elastic_;
+    std::vector<int> elastic_card_;
     int64_t backed_ = 0;
     int32_t *pick_ = nullptr, *pick_h_ = nullptr, *io_h_ = nullptr;
     cudaEvent_t stage_ev_[kStage] = {};

@@ -317,14 +317,24 @@ DsHead DsparkWeights::head_args() const {
 
 uint64_t dspark_tap_bytes(int tap_rows) { return 4ull * (uint64_t) std::max(tap_rows, kSlice) * kE * 4; }
 
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
+uint64_t dspark_session_bytes(const Pack& pack) {
     if (pack.dflash2.present) return dflash2_session_bytes(pack);
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE;
     uint64_t n = (kFrRing * E + 3 * kDsRank + E + kDsBlock) * 4 + 1024;
     for (int l = 0; l < d.n_layers; ++l)
-        n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
+        if (d.swa[(size_t) l]) n += 2ull * (uint64_t) ring_cells(d) * kKV * 2;
+    return n;
+}
+
+uint64_t dspark_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran) {
+    const DsparkGeometry& d = pack.dspark;
+    if (pack.dflash2.present || !d.present) return 0;
+    const uint64_t cells = (uint64_t) full_cells(positions) * kKV * 2;
+    uint64_t n = 0;
+    for (int l = 0; l < d.n_layers; ++l)
+        if (!d.swa[(size_t) l]) n += 2 * ((cells + gran - 1) / gran * gran);
     return n;
 }
 
@@ -422,7 +432,7 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
 }
 
 bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
-                      int64_t backed, std::string& err) {
+                      std::string& err) {
     if (!w) return true;
     if (w->df2) {
         tap_rows_ = std::max(tap_rows, kSlice);
@@ -442,10 +452,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
                       align256(4) + align256(kDsBlock * 4) + align256(kDsBlock * 4);
         for (int l = 0; l < d.n_layers; ++l) {
             const bool ring = d.swa[(size_t) l];
-            if (ring || backed <= 0) {
-                const int64_t cap = ring ? ring_cells(d) : full_cells(context);
-                need += 2 * align256((size_t) cap * kKV * 2);
-            }
+            if (ring) need += 2 * align256((size_t) ring_cells(d) * kKV * 2);
         }
         if (!dump.empty()) need += align256((size_t) kDsDrafts * (size_t) w->n_vocab * 4);
         void* slab = nullptr;
@@ -475,12 +482,10 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
         Cache& c = cache_[(size_t) l];
         c.ring = d.swa[(size_t) l];
         c.cap = c.ring ? ring_cells(d) : full_cells(context);
-        if (!c.ring && backed > 0) {   // the range reserved, the first positions' cells backed
+        if (!c.ring) {   // the range reserved, backed as the target's caches grow
             for (int j = 0; j < 2; ++j) {
                 auto a = std::make_unique<core::ElasticArray>();
-                if (ok && (!a->open((uint64_t) c.cap * kKV * 2, err) ||
-                           !a->ensure((uint64_t) std::min(c.cap, full_cells(backed)) * kKV * 2, 0, err)))
-                    ok = false;
+                if (ok && !a->open((uint64_t) c.cap * kKV * 2, err, 1)) ok = false;
                 (j ? c.v : c.k) = (uint16_t*) a->data();
                 full_.push_back(std::move(a));
             }
@@ -914,7 +919,8 @@ bool DsparkHook::ensure(int64_t positions, std::string& err) {
 
 void DsparkHook::trim(int64_t positions) {
     if (df2_) return;
-    for (const auto& a : full_) a->trim((uint64_t) full_cells(positions) * kKV * 2);
+    const uint64_t keep = positions > 0 ? (uint64_t) full_cells(positions) * kKV * 2 : 0;   // none once the conversation left
+    for (const auto& a : full_) a->trim(keep);
     count_backed();
 }
 

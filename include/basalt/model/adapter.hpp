@@ -264,6 +264,14 @@ public:
     }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
+    /// The shared KV pool (core/kv_pool.hpp): a session that backs its per-position cells from one pool as its conversation
+    /// grows reaches the whole context while the pool has room. Backs the cells of `positions` positions: Refused, with
+    /// nothing changed, when the pool is short. A session whose caches are its own, sized at start, has them already.
+    virtual Result kv_back(int64_t positions) { (void) positions; return {}; }
+    /// Gives the pool back the cells past `positions` (0: the conversation left the card).
+    virtual void kv_trim(int64_t positions) { (void) positions; }
+    /// The pool's figures for the log, empty without a pool: its bytes, what is free and what this session backs.
+    virtual std::string kv_pool_line() const { return {}; }
     /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below
     /// the slots a prompt chunk needs; -1 without an elastic KV.
     virtual int64_t kv_ceiling() { return -1; }

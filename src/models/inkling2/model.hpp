@@ -4,6 +4,7 @@
 // holds the later layers' weights, experts and caches instead (cards(), card_of()).
 #pragma once
 
+#include "basalt/core/kv_pool.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/model/adapter.hpp"
@@ -92,6 +93,9 @@ public:
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
+    /// Card `card`'s KV pool: the full visits' cells of every session on it (the drafter's full layers on the main card).
+    core::KvPool& kv_pool(int card) { return kv_pool_[card]; }
+    const core::KvPool& kv_pool(int card) const { return kv_pool_[card]; }
     bool cache_int8() const { return int8_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests
     /// and windows, so nothing reads the experts while it holds their memory (lend_room).
@@ -269,6 +273,7 @@ private:
     int ldev_ = 0;                           ///< the card the weights being planned load to
     bool fp8_ = false, int8_ = false;
     int64_t ctx_ = kDefaultContext;
+    core::KvPool kv_pool_[2];
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
     std::weak_ptr<void> shared_;
@@ -360,9 +365,12 @@ private:
 /// A session over `model`; null with `err` set.
 std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::string& err);
 
-/// The device bytes a session takes for `context` positions in the selected KV cache format, its drafter aside, on card
-/// `card` of a split at `cut` (0: one card, every visit).
+/// The device bytes a session holds of its own for `context` positions in the selected KV cache format, its drafter aside,
+/// on card `card` of a split at `cut` (0: one card, every visit): the sliding-window visits' rings and its fixed buffers.
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut = 0, int card = 0);
+/// The KV pool bytes of card `card` the full visits' caches of one session take at `positions` positions, the drafter aside,
+/// each cache's allocation granules of `gran` bytes counted whole.
+uint64_t pool_bytes(const Geometry& g, int64_t positions, bool fp8, bool int8, uint64_t gran, int cut = 0, int card = 0);
 /// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
 /// first card's).
 uint64_t shared_bytes(const Geometry& g, bool drafter);
