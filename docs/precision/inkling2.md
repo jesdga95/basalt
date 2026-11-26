@@ -208,9 +208,10 @@ The previous INT8 row-writer parity matched the CPU reference for 257 rows of wi
 
 ## Drafting
 
-The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output
-with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
-2,405-token prompt checked).
+The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. In the checks
+run with the drafter's K/V in fp16 (prose, struct and conversation, after short and 16K-token prompts, and a 2,405-token
+prompt), greedy output with drafting equalled plain greedy output: an observation for those configurations, not a
+guarantee.
 
 With `--kv int8` the drafter's full layer keeps its K/V in int8 too (2.06 KiB a position instead of 4 KiB). That changes
 which tokens it drafts, and the VRAM it frees goes to experts, so the expert placement moves (at `--max-context 262144` on a
