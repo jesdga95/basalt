@@ -76,13 +76,14 @@ bool run() {
     indexer_select(dq.p, dw.p, dk.p, N, Start, 4, chunk_out.p, chunk_n.p, workspace.p, workspace_bytes, nullptr);
     auto first_ids = chunk_out.down();
     auto first_counts = chunk_n.down();
-    std::copy(first_ids.begin(), first_ids.end(), chunk_ids.begin());
+    std::copy_n(first_ids.begin(), (size_t) 4 * kIndexerTopK, chunk_ids.begin());
     std::copy_n(first_counts.begin(), 4, chunk_counts.begin());
     indexer_select(dq.p + (size_t) 4 * kIndexerHeads * kIndexerDim, dw.p + (size_t) 4 * kIndexerHeads,
                    dk.p, N, Start + 4, 4, chunk_out.p, chunk_n.p, workspace.p, workspace_bytes, nullptr);
     const auto second_ids = chunk_out.down();
     const auto second_counts = chunk_n.down();
-    std::copy(second_ids.begin(), second_ids.end(), chunk_ids.begin() + (size_t) 4 * kIndexerTopK);
+    std::copy_n(second_ids.begin(), (size_t) 4 * kIndexerTopK,
+                chunk_ids.begin() + (size_t) 4 * kIndexerTopK);
     std::copy_n(second_counts.begin(), 4, chunk_counts.begin() + 4);
     const bool chunk_ok = chunk_ids == ids && chunk_counts == counts;
     std::printf("DS4 indexer select chunking: %s\n", chunk_ok ? "match" : "MISMATCH");
