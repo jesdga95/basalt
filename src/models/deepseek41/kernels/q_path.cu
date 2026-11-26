@@ -20,56 +20,35 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/q8_1_fm.cuh"
+#include "basalt/kernels/sparse_mqa.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
-
-#include <cuda_runtime.h>
-
-#include <stdexcept>
 
 namespace basalt::models::deepseek41 {
 namespace {
 
-// y = x * rsqrt(mean(x^2) + eps) * w, in place, one block per row, and y's q8_1 blocks (n is a multiple of 32: a warp
-// holds whole blocks).
-__global__ void __launch_bounds__(256) rms_norm_rows_kernel(float* x, const float* w, int n, float eps,
-                                                            kernels::Q81Fm* xq) {
-    float* row = x + (size_t) blockIdx.x * n;
-    float ss = 0.f;
-    for (int i = threadIdx.x; i < n; i += 256) ss = fmaf(row[i], row[i], ss);
-#pragma unroll
-    for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-    __shared__ float part[8];
-    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
-    __syncthreads();
-    float tot = 0.f;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) tot += part[i];
-    const float scale = rsqrtf(tot / (float) n + eps);
-    for (int i = threadIdx.x; i < n; i += 256) {
-        const float y = row[i] * scale * w[i];
-        row[i] = y;
-        kernels::q8_1_store_fm(y, xq, ((size_t) blockIdx.x * n + i) / 32, threadIdx.x & 31);
-    }
+kernels::SparseMqaQWeights shared_q_weights(const QPathWeights& w) {
+    return {w.wq_a, w.wq_a_type, w.q_norm, w.wq_b, w.wq_b_type, w.rms_eps, w.n_embd, w.q_rank};
+}
+
+kernels::MqaRopeTable shared_rope(const RopeTable& r) {
+    kernels::MqaRopeTable out{};
+    for (int i = 0; i < kAttnRopeDim / 2; ++i) out.step[i] = r.step[i];
+    out.mscale = r.mscale;
+    return out;
 }
 
 }  // namespace
 
-size_t q_path_scratch_bytes(int n_tokens) { return kernels::native_q8_1_bytes(kAttnQRank, n_tokens); }
+size_t q_path_scratch_bytes(int n_tokens) { return q_path_scratch_bytes(n_tokens, kAttnQRank); }
+size_t q_path_scratch_bytes(int n_tokens, int q_rank) { return kernels::sparse_mqa_q_scratch_bytes(n_tokens, q_rank); }
 
 void q_latent(const void* x_q8_1, const QPathWeights& w, int n_tokens, float* qr, void* qr_q8_1, void* stream) {
-    if (n_tokens < 1 || n_tokens > kAttnMaxTokens) throw std::invalid_argument("q_latent: n_tokens");
-    kernels::native_mmvq(w.wq_a_type, w.wq_a, x_q8_1, qr, kAttnEmbd, kAttnQRank, n_tokens, stream);
-    rms_norm_rows_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(qr, w.q_norm, kAttnQRank, w.rms_eps,
-                                                                       static_cast<kernels::Q81Fm*>(qr_q8_1));
+    kernels::sparse_mqa_q_latent(x_q8_1, shared_q_weights(w), n_tokens, qr, qr_q8_1, stream);
 }
 
 void q_heads(const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope, const void* qr_q8_1,
              float* q, void* stream) {
-    if (n_tokens < 1 || n_tokens > kAttnMaxTokens) throw std::invalid_argument("q_heads: n_tokens");
-    kernels::native_mmvq(w.wq_b_type, w.wq_b, qr_q8_1, q, kAttnQRank, kAttnHeads * kAttnHeadDim, n_tokens, stream);
-    rope_rows(q, n_tokens * kAttnHeads, kAttnHeadDim, kAttnHeads, pos, rope, false, stream);
+    kernels::sparse_mqa_q_heads(shared_q_weights(w), n_tokens, pos, shared_rope(rope), qr_q8_1, q, stream);
 }
 
 void q_path(const void* x_q8_1, const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope,

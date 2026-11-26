@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/sparse_mqa.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
 #include "attn_out_grouped.hpp"
 
@@ -41,22 +42,15 @@ size_t attn_out_scratch_floats(int n_tokens) { return (size_t) n_tokens * kAttnO
 void attn_out(const float* attn, const AttnOutWeights& w, int n_tokens, void* xq_scratch, float* oa_scratch,
               float* out, void* stream) {
     if (n_tokens < 1 || n_tokens > kAttnMaxTokens) throw std::invalid_argument("attn_out: n_tokens");
-    // the T x 64 x 512 result is T * 8 contiguous columns of 4096
+    // Keep the tuned grouped fast path when available; the shared implementation covers every native MMVQ format.
     kernels::native_quantize_q8_1(attn, xq_scratch, kAttnHeads * kAttnHeadDim, n_tokens, stream);
     if (!wo_a_grouped(w.wo_a_type, w.wo_a, xq_scratch, oa_scratch, n_tokens, stream)) {
-        const size_t col_q8 = kernels::native_q8_1_bytes(kAttnGroupIn, 1);
-        const size_t group_w = kernels::native_mmvq_weight_bytes(w.wo_a_type, kAttnGroupIn, kAttnOutRank);
-        for (int t = 0; t < n_tokens; ++t) {
-            for (int g = 0; g < kAttnGroups; ++g) {
-                kernels::native_mmvq(w.wo_a_type, (const char*) w.wo_a + (size_t) g * group_w,
-                                     (const char*) xq_scratch + (size_t) (t * kAttnGroups + g) * col_q8,
-                                     oa_scratch + (size_t) t * kAttnOutWidth + (size_t) g * kAttnOutRank, kAttnGroupIn,
-                                     kAttnOutRank, 1, stream);
-            }
-        }
+        kernels::sparse_mqa_output_q8(w.wo_a_type, w.wo_a, w.wo_b_type, w.wo_b, w.n_embd, n_tokens,
+                                      xq_scratch, oa_scratch, out, stream);
+        return;
     }
     kernels::native_quantize_q8_1(oa_scratch, xq_scratch, kAttnOutWidth, n_tokens, stream);
-    kernels::native_mmvq(w.wo_b_type, w.wo_b, xq_scratch, out, kAttnOutWidth, kAttnEmbd, n_tokens, stream);
+    kernels::native_mmvq(w.wo_b_type, w.wo_b, xq_scratch, out, kAttnOutWidth, w.n_embd, n_tokens, stream);
 }
 
 }  // namespace basalt::models::deepseek41

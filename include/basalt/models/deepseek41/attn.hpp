@@ -65,10 +65,13 @@ struct QPathWeights {
     const void* wq_b;                                  ///< [32768 rows][1280]
     int wq_b_type;
     float rms_eps = 1e-20f;
+    int n_embd = kAttnEmbd;
+    int q_rank = kAttnQRank;
 };
 
-/// Bytes of qr's q8_1 rows for n_tokens.
+/// Bytes of qr's q8_1 rows for n_tokens; the overload accepts a model's query rank.
 size_t q_path_scratch_bytes(int n_tokens);
+size_t q_path_scratch_bytes(int n_tokens, int q_rank);
 
 /// qr = rms_norm(wq_a . x) * q_norm; q = rope(wq_b . qr). `qr_q8_1` holds q_path_scratch_bytes; `pos` is the
 /// device array of the T absolute token positions.
@@ -122,6 +125,7 @@ struct AttnOutWeights {
     int wo_a_type;
     const void* wo_b;                                  ///< [5120 rows][8192]
     int wo_b_type;
+    int n_embd = kAttnEmbd;
 };
 
 size_t attn_out_scratch_bytes(int n_tokens);
