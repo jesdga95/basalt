@@ -152,8 +152,8 @@ size_t attention_decode_scratch(int rows, int64_t max_keys);
 /// sizes the launch only: a row's keys split in slices fixed by its own key count). `out` may be null when q8 is set.
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream);
 
-/// Probe the current device's attention plans and set its slice count, during model load.
-void attention_decode_init();
+/// Initialize the INT8 MMA plans and the INT8 slice count for the current device during model load.
+void attention_decode_int8_init();
 
 enum class Int8MmaPlan { Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct };
 /// Auto: the shard model; Previous: the halving rule the model falls back to.
@@ -175,7 +175,8 @@ bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, v
 int attention_decode_int8_test_min_keys();
 /// The current device's INT8 slice count: the most slices a full-cache INT8 row takes (FP16 and E4M3 rows take 64).
 int attention_decode_int8_slices();
-/// Parity entry point: set the current device's INT8 slice count, within the rule's range.
+/// Parity only: set the current device's INT8 slice count, within the rule's range. Call it only with no attention work in
+/// flight on the device and no captured graph that will replay, and set the card's own count back before serving.
 void attention_decode_int8_test_set_slices(int slices);
 
 /// out[r] = attn[r] * sigmoid(yq[r][kOffGate..]), the attention output gated by its own row's gate projection.

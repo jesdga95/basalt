@@ -1919,7 +1919,7 @@ void launch_mma(const AttnArgs& a, int rows, int min_keys, int64_t max_keys, int
 
 }  // namespace
 
-void attention_decode_init() { (void) mma_device(opt_in_device()); }
+void attention_decode_int8_init() { (void) mma_device(opt_in_device()); }
 
 // Only full-cache INT8 has an MMA reader. Its cutoff is a property of the row, not the padded launch bound.
 static bool mma_decode(const AttnArgs& a, int rows, int64_t max_keys) {

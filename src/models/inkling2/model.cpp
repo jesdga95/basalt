@@ -849,11 +849,13 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
                 cudaSetDevice(device_);
                 return {model::Status::Error, std::string("inkling2: cannot select the layer's device: ") + cudaGetErrorString(error)};
             }
-            try {
-                attention_decode_init();
-            } catch (const std::runtime_error& error) {
-                cudaSetDevice(device_);
-                return {model::Status::Error, error.what()};
+            if (int8_) {
+                try {
+                    attention_decode_int8_init();
+                } catch (const std::runtime_error& error) {
+                    cudaSetDevice(device_);
+                    return {model::Status::Error, error.what()};
+                }
             }
             void* tmp = nullptr;
             if (cudaMalloc(&tmp, std::max(proj_b, out_b)) != cudaSuccess) {
