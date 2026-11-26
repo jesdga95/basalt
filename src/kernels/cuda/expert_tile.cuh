@@ -87,24 +87,27 @@ __device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], 
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-// two E2M1 codes (the low byte, the first in its low nibble) as an f16 pair, exactly
-__device__ __forceinline__ uint32_t e2m1x2_f16x2(uint32_t w) {
-    uint32_t d;
-    asm("{ .reg .b8 t; cvt.u8.u32 t, %1; cvt.rn.f16x2.e2m1x2 %0, t; }" : "=r"(d) : "r"(w));
-    return d;
+// the four bytes of a word as four f16 pairs of E2M1 codes, exactly: byte j (first code in its low nibble) as d[j] (the
+// conversions read the bytes in place, no shifts)
+__device__ __forceinline__ void e2m1x8_f16x2(uint32_t w, uint32_t (&d)[4]) {
+    asm("{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, %4;\n"
+        " cvt.rn.f16x2.e2m1x2 %0, b0; cvt.rn.f16x2.e2m1x2 %1, b1; cvt.rn.f16x2.e2m1x2 %2, b2; cvt.rn.f16x2.e2m1x2 %3, b3; }"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(w));
 }
-// two E4M3 codes (the low 16 bits) as an f16 pair, exactly
-__device__ __forceinline__ uint32_t e4m3x2_f16x2(uint32_t w) {
-    uint32_t d;
-    asm("{ .reg .b16 t; cvt.u16.u32 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(d) : "r"(w));
-    return d;
+// the two halves of a word as two f16 pairs of E4M3 codes, exactly (read in place)
+__device__ __forceinline__ void e4m3x4_f16x2(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    asm("{ .reg .b16 h0, h1; mov.b32 {h0, h1}, %2; cvt.rn.f16x2.e4m3x2 %0, h0; cvt.rn.f16x2.e4m3x2 %1, h1; }"
+        : "=r"(lo), "=r"(hi) : "r"(w));
 }
 // NVFP4's UE4M3 sub-block scale, whole, in both halves of an f16 pair (bit 7 ignored, 0x7F as 0): the value the other
 // NVFP4 kernels use (ggml halves it and doubles the codes)
+// Branch free: the byte converts in both halves, its magnitude kept (bit 7 is E4M3's sign), and 0x7F's NaN becomes 0 in
+// the max with 0 (max takes the other operand of a NaN).
 __device__ __forceinline__ uint32_t ue4m3_f16x2(uint32_t x) {
-    const uint32_t v = x & 0x7Fu;
-    const uint32_t h = v == 0x7Fu ? 0u : e4m3x2_f16x2(v) & 0xFFFFu;
-    return h | h << 16;
+    uint32_t d;
+    asm("{ .reg .b32 r, z; .reg .b16 t; prmt.b32 r, %1, 0, 0x4400; cvt.u16.u32 t, r; cvt.rn.f16x2.e4m3x2 %0, t;"
+        " and.b32 %0, %0, 0x7FFF7FFF; mov.b32 z, 0; max.f16x2 %0, %0, z; }" : "=r"(d) : "r"(x));
+    return d;
 }
 // MXFP8's UE8M0 block scale (0xFF as 0, 0 as 2^-127)
 __device__ __forceinline__ float ue8m0_f32(uint32_t u) {
@@ -130,10 +133,13 @@ __device__ __forceinline__ void decode_row(const uint8_t* row, int o, int h, int
         const uint32_t s2 = ue4m3_f16x2(blk[c]);
         const uint32_t u0 = *reinterpret_cast<const uint32_t*>(blk + 4 + 8 * c);
         const uint32_t u1 = *reinterpret_cast<const uint32_t*>(blk + 8 + 8 * c);
+        uint32_t d0[4], d1[4];
+        e2m1x8_f16x2(u0, d0);
+        e2m1x8_f16x2(u1, d1);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            p[j] = hmul2_u(e2m1x2_f16x2(u0 >> (8 * j)), s2);
-            p[4 + j] = hmul2_u(e2m1x2_f16x2(u1 >> (8 * j)), s2);
+            p[j] = hmul2_u(d0[j], s2);
+            p[4 + j] = hmul2_u(d1[j], s2);
         }
     } else {   // the chunk is one block: 4 scale bytes, then 128 codes; this thread's 16 in 32-value block 2 h + c / 2
         const uint8_t* blk = row + o;
@@ -142,14 +148,13 @@ __device__ __forceinline__ void decode_row(const uint8_t* row, int o, int h, int
         const uint32_t w0 = q[0], w1 = q[1], w2 = q[2], w3 = q[3];
         const uint32_t x01 = __byte_perm(w0, w2, 0x5140), x23 = __byte_perm(w0, w2, 0x7362);
         const uint32_t x45 = __byte_perm(w1, w3, 0x5140), x67 = __byte_perm(w1, w3, 0x7362);
-        p[0] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x01), s);
-        p[1] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x01 >> 16), s);
-        p[2] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x23), s);
-        p[3] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x23 >> 16), s);
-        p[4] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x45), s);
-        p[5] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x45 >> 16), s);
-        p[6] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x67), s);
-        p[7] = f16x2_scaled_bf16x2(e4m3x2_f16x2(x67 >> 16), s);
+        uint32_t h[8];
+        e4m3x4_f16x2(x01, h[0], h[1]);
+        e4m3x4_f16x2(x23, h[2], h[3]);
+        e4m3x4_f16x2(x45, h[4], h[5]);
+        e4m3x4_f16x2(x67, h[6], h[7]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) p[j] = f16x2_scaled_bf16x2(h[j], s);
     }
 }
 
