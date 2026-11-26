@@ -2470,11 +2470,11 @@ void launch_q8p_chain_as(Q8Planes w, const SegArgs& a, int tiles, int n_in, int 
 }
 
 // The segments' (up to 3) rows for ncols columns, in the order above: 4 rows a block up to 3 columns, 32 x 8 up to 8,
-// 32 x 16 up to 16, else 64 x 64
+// 32 x 16 up to 16, else 128 x 64 (the columns' activations read once for twice the rows)
 void launch_q8p_chain(Q8Planes w, const int* row0, const int* n_out, const Q81Block* const* x, float* const* y, int n_seg, int n_in,
                       int ncols, cudaStream_t s, float softcap) {
     if (n_in % 256 != 0) throw std::invalid_argument("native MMVQ: Q8_0 planes need K a multiple of 256");
-    const int rows = ncols <= 3 ? 4 : ncols <= 16 ? 32 : 64;
+    const int rows = ncols <= 3 ? 4 : ncols <= 16 ? 32 : 128;
     SegArgs a{};
     int end = 0;
     for (int i = 0; i < 3; ++i) {
@@ -2496,7 +2496,7 @@ void launch_q8p_chain(Q8Planes w, const int* row0, const int* n_out, const Q81Bl
     } else if (ncols <= 8) {
         launch_q8p_chain_as<1, 1, 2>(w, a, end, n_in, ncols, s, softcap);
     } else if (ncols <= 16) launch_q8p_chain_as<2, 1, 2>(w, a, end, n_in, ncols, s, softcap);
-    else launch_q8p_chain_as<4, 2, 4>(w, a, end, n_in, ncols, s, softcap);
+    else launch_q8p_chain_as<4, 2, 8>(w, a, end, n_in, ncols, s, softcap);
 }
 
 }  // namespace
