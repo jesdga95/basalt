@@ -2306,23 +2306,30 @@ __device__ __forceinline__ void qc_copy16(void* dst, const void* src) {
 __device__ __forceinline__ void qc_copy8(void* dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src) : "memory");
 }
+// four 8 x 16-byte matrices of shared memory, lane L naming row L % 8 of matrix L / 8: an m16n8k32 int8 A fragment
+__device__ __forceinline__ void qc_ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"((unsigned) __cvta_generic_to_shared(p)));
+}
 __device__ __forceinline__ void qc_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template<int N> __device__ __forceinline__ void qc_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
 #endif
 __device__ __forceinline__ float qc_out(float v, float softcap) { return softcap > 0.0f ? softcap * tanhf(v * (1.0f / softcap)) : v; }
 
 // steps in flight: a narrow block computes little a step, so it keeps more of K coming; a wide one two (two blocks an SM)
-template<int CT> constexpr int kQcStages = CT <= 2 ? 8 : 2;
+template<int CT, int CG> constexpr int kQcStages = CT * CG <= 2 ? 8 : 2;
 constexpr int kQcStride = 144;   // a column's or a row's 4 blocks a step (144 / 128 bytes) in a 144-byte line: 36 words, so
                                  // the 8 lines of a fragment start 4 banks apart
-// a block: RW row tiles of 16 rows times CG column groups of 8 CT columns, a warp each
+// a block: RW row tiles of 16 rows times CG column groups of 8 CT columns, a warp each MT row tiles of a column group
+// (a column's activations read once for MT tiles)
 template<int CT, int CG, int RW> constexpr int kQcStageBytes = (8 * CT * CG + 16 * RW) * kQcStride + 16 * RW * 8;
-template<int CT, int CG, int RW> constexpr int kQcSmemBytes = kQcStages<CT> * kQcStageBytes<CT, CG, RW>;
+template<int CT, int CG, int RW> constexpr int kQcSmemBytes = kQcStages<CT, CG> * kQcStageBytes<CT, CG, RW>;
 
-template<int CT, int CG, int RW>
-__global__ void __launch_bounds__(32 * CG * RW) native_q8p_chain_kernel(Q8Planes w, SegArgs a, int n_in, int ncols, float softcap) {
+template<int CT, int CG, int RW, int MT>
+__global__ void __launch_bounds__(32 * CG * RW / MT) native_q8p_chain_kernel(Q8Planes w, SegArgs a, int n_in, int ncols, float softcap) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    constexpr int NS = kQcStages<CT>, ROWS = 16 * RW, COLS = 8 * CT * CG, SB = kQcStageBytes<CT, CG, RW>, NT = 32 * CG * RW;
+    constexpr int NS = kQcStages<CT, CG>, ROWS = 16 * RW, COLS = 8 * CT * CG, SB = kQcStageBytes<CT, CG, RW>, NT = 32 * CG * RW / MT;
     extern __shared__ __align__(128) uint8_t qc_smem[];
     const SegPick p = seg_pick(a, int(blockIdx.y));
     const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -2357,8 +2364,8 @@ __global__ void __launch_bounds__(32 * CG * RW) native_q8p_chain_kernel(Q8Planes
         if (j < steps) request(j, j, true);
         qc_commit();
     }
-    const int rt = wp % RW, ch = wp / RW;
-    float acc[4][CT][4] = {};   // [chain]
+    const int rt = wp % (RW / MT), ch = wp / (RW / MT);   // row tiles MT rt .. MT rt + MT - 1
+    float acc[4][MT][CT][4] = {};   // [chain]
     for (int st = 0; st < steps; ++st) {
         const uint8_t* sm = qc_smem + (st % NS) * SB;
         qc_wait<NS - 1>();
@@ -2366,13 +2373,25 @@ __global__ void __launch_bounds__(32 * CG * RW) native_q8p_chain_kernel(Q8Planes
         const uint8_t* xs = sm;
         const uint8_t* wsm = sm + COLS * kQcStride;
         const half* scs = reinterpret_cast<const half*>(sm + (COLS + ROWS) * kQcStride);
+        // the rows' 4 scales of the step in one 8-byte read each; the codes by ldmatrix (matrices: rows 0-7 and 8-15 of
+        // the tile, bytes 0-15 then 16-31 of the block: a0, a1, a2, a3)
+        uint2 sga[MT], sgb[MT];
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            sga[mi] = *reinterpret_cast<const uint2*>(scs + (16 * (MT * rt + mi) + g) * 4);
+            sgb[mi] = *reinterpret_cast<const uint2*>(scs + (16 * (MT * rt + mi) + g + 8) * 4);
+        }
+        const uint8_t* wl = wsm + (16 * MT * rt + (lane & 7) + ((lane >> 3) & 1) * 8) * kQcStride + (lane >> 4) * 16;
 #pragma unroll
         for (int kb = 0; kb < 4; ++kb) {
-            const uint8_t* wa = wsm + (16 * rt + g) * kQcStride + kb * 32 + 4 * t;
-            const uint8_t* wb = wa + 8 * kQcStride;
-            const uint32_t a0 = *reinterpret_cast<const uint32_t*>(wa), a2 = *reinterpret_cast<const uint32_t*>(wa + 16);
-            const uint32_t a1 = *reinterpret_cast<const uint32_t*>(wb), a3 = *reinterpret_cast<const uint32_t*>(wb + 16);
-            const float da = __half2float(scs[(16 * rt + g) * 4 + kb]), db = __half2float(scs[(16 * rt + g + 8) * 4 + kb]);
+            uint32_t a0[MT], a1[MT], a2[MT], a3[MT];
+            float da[MT], db[MT];
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                qc_ldsm_x4(a0[mi], a1[mi], a2[mi], a3[mi], wl + mi * 16 * kQcStride + kb * 32);
+                da[mi] = __half2float(reinterpret_cast<const half*>(&sga[mi])[kb]);
+                db[mi] = __half2float(reinterpret_cast<const half*>(&sgb[mi])[kb]);
+            }
 #pragma unroll
             for (int ct = 0; ct < CT; ++ct) {
                 const int cb = 8 * CT * ch + 8 * ct;
@@ -2380,12 +2399,15 @@ __global__ void __launch_bounds__(32 * CG * RW) native_q8p_chain_kernel(Q8Planes
                 const uint32_t b0 = *reinterpret_cast<const uint32_t*>(xg), b1 = *reinterpret_cast<const uint32_t*>(xg + 16);
                 const float dx0 = __low2float(*reinterpret_cast<const half2*>(xs + (cb + 2 * t) * kQcStride + kb * 36));
                 const float dx1 = __low2float(*reinterpret_cast<const half2*>(xs + (cb + 2 * t + 1) * kQcStride + kb * 36));
-                int d[4];
-                qc_mma(d, a0, a1, a2, a3, b0, b1);
-                acc[kb][ct][0] = fmaf(__fmul_rn(da, dx0), float(d[0]), acc[kb][ct][0]);
-                acc[kb][ct][1] = fmaf(__fmul_rn(da, dx1), float(d[1]), acc[kb][ct][1]);
-                acc[kb][ct][2] = fmaf(__fmul_rn(db, dx0), float(d[2]), acc[kb][ct][2]);
-                acc[kb][ct][3] = fmaf(__fmul_rn(db, dx1), float(d[3]), acc[kb][ct][3]);
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    int d[4];
+                    qc_mma(d, a0[mi], a1[mi], a2[mi], a3[mi], b0, b1);
+                    acc[kb][mi][ct][0] = fmaf(__fmul_rn(da[mi], dx0), float(d[0]), acc[kb][mi][ct][0]);
+                    acc[kb][mi][ct][1] = fmaf(__fmul_rn(da[mi], dx1), float(d[1]), acc[kb][mi][ct][1]);
+                    acc[kb][mi][ct][2] = fmaf(__fmul_rn(db[mi], dx0), float(d[2]), acc[kb][mi][ct][2]);
+                    acc[kb][mi][ct][3] = fmaf(__fmul_rn(db[mi], dx1), float(d[3]), acc[kb][mi][ct][3]);
+                }
             }
         }
         __syncthreads();
@@ -2396,13 +2418,16 @@ __global__ void __launch_bounds__(32 * CG * RW) native_q8p_chain_kernel(Q8Planes
         qc_commit();
     }
 #pragma unroll
+    for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
     for (int ct = 0; ct < CT; ++ct)
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
-            const int row = row0 + 16 * rt + g + 8 * (q >> 1), col = 8 * CT * ch + 8 * ct + 2 * t + (q & 1);
+            const int row = row0 + 16 * (MT * rt + mi) + g + 8 * (q >> 1), col = 8 * CT * ch + 8 * ct + 2 * t + (q & 1);
             if (row < p.n_out && col < nc)
-                p.y[(size_t) (c0 + col) * p.n_out + row] =
-                    qc_out(__fadd_rn(__fadd_rn(acc[0][ct][q], acc[1][ct][q]), __fadd_rn(acc[2][ct][q], acc[3][ct][q])), softcap);
+                p.y[(size_t) (c0 + col) * p.n_out + row] = qc_out(
+                    __fadd_rn(__fadd_rn(acc[0][mi][ct][q], acc[1][mi][ct][q]), __fadd_rn(acc[2][mi][ct][q], acc[3][mi][ct][q])),
+                    softcap);
         }
 #elif defined(__CUDA_ARCH__)
     __trap();
@@ -2454,23 +2479,23 @@ __global__ void __launch_bounds__(128) native_q8p_chain_gemv_kernel(Q8Planes w, 
     }
 }
 
-template<int CT, int CG, int RW>
+template<int CT, int CG, int RW, int MT>
 void launch_q8p_chain_as(Q8Planes w, const SegArgs& a, int tiles, int n_in, int ncols, cudaStream_t s, float softcap) {
     static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
     int dev = 0;
     cudaGetDevice(&dev);
     if (!raised[dev].load(std::memory_order_acquire)) {
-        if (cudaFuncSetAttribute(native_q8p_chain_kernel<CT, CG, RW>, cudaFuncAttributeMaxDynamicSharedMemorySize, kQcSmemBytes<CT, CG, RW>) != cudaSuccess)
+        if (cudaFuncSetAttribute(native_q8p_chain_kernel<CT, CG, RW, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kQcSmemBytes<CT, CG, RW>) != cudaSuccess)
             throw std::runtime_error("native MMVQ: shared-memory opt-in failed");
         raised[dev].store(true, std::memory_order_release);
     }
     constexpr int COLS = 8 * CT * CG;
-    launch_pdl(native_q8p_chain_kernel<CT, CG, RW>, dim3(unsigned((ncols + COLS - 1) / COLS), unsigned(tiles)), dim3(32 * CG * RW),
+    launch_pdl(native_q8p_chain_kernel<CT, CG, RW, MT>, dim3(unsigned((ncols + COLS - 1) / COLS), unsigned(tiles)), dim3(32 * CG * RW / MT),
                kQcSmemBytes<CT, CG, RW>, s, w, a, n_in, ncols, softcap);
 }
 
 // The segments' (up to 3) rows for ncols columns, in the order above: 4 rows a block up to 3 columns, 32 x 8 up to 8,
-// 32 x 16 up to 16, else 128 x 64 (the columns' activations read once for twice the rows)
+// 32 x 16 up to 16, else 128 x 64 (the columns' activations read once for twice the rows, a warp 32 rows x 16 columns)
 void launch_q8p_chain(Q8Planes w, const int* row0, const int* n_out, const Q81Block* const* x, float* const* y, int n_seg, int n_in,
                       int ncols, cudaStream_t s, float softcap) {
     if (n_in % 256 != 0) throw std::invalid_argument("native MMVQ: Q8_0 planes need K a multiple of 256");
@@ -2494,9 +2519,9 @@ void launch_q8p_chain(Q8Planes w, const int* row0, const int* n_out, const Q81Bl
         default: launch_pdl(native_q8p_chain_gemv_kernel<3>, dim3(unsigned(end)), dim3(128), 0, s, w, a, n_in, softcap); break;
         }
     } else if (ncols <= 8) {
-        launch_q8p_chain_as<1, 1, 2>(w, a, end, n_in, ncols, s, softcap);
-    } else if (ncols <= 16) launch_q8p_chain_as<2, 1, 2>(w, a, end, n_in, ncols, s, softcap);
-    else launch_q8p_chain_as<4, 2, 8>(w, a, end, n_in, ncols, s, softcap);
+        launch_q8p_chain_as<1, 1, 2, 1>(w, a, end, n_in, ncols, s, softcap);
+    } else if (ncols <= 16) launch_q8p_chain_as<2, 1, 2, 1>(w, a, end, n_in, ncols, s, softcap);
+    else launch_q8p_chain_as<2, 4, 8, 2>(w, a, end, n_in, ncols, s, softcap);
 }
 
 }  // namespace
