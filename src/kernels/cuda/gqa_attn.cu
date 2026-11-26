@@ -56,7 +56,7 @@ __device__ __forceinline__ bool kv_far(const KvFar& f, int64_t& c) {
 // The windows one launch takes: segment k is rows [row0[k], row0[k + 1]) of q, the partials and the output, its 16-row
 // tiles of (row, head) pairs [tile0[k], tile0[k + 1]) of the grid, with its own cache and range.  Each block and each
 // merged row computes exactly what a launch of its segment alone would.
-constexpr int kMaxSegs = 32;
+constexpr int kMaxSegs = kWindowSegsMax;
 struct DecSegs {
     int n = 1;
     int row0[kMaxSegs + 1] = {};
@@ -67,6 +67,7 @@ struct DecSegs {
     KvFar far_kv[kMaxSegs] = {};
     Range r[kMaxSegs];
 };
+static_assert(sizeof(DecSegs) <= 32764, "the segments fit a launch's parameters");
 __device__ __forceinline__ int seg_of(const int* first, int n, int i) {
     int k = 0;
     while (k + 1 < n && i >= first[k + 1]) ++k;
@@ -1346,7 +1347,7 @@ void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, co
     d.n = n_seg;
     for (int k = 0; k < n_seg; ++k) {
         const GqaWindowSeg& g = segs[k];
-        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.window <= 0 || g.hi < g.pos0 + g.T) {
+        if (g.T < 1 || g.window <= 0 || g.hi < g.pos0 + g.T) {
             basalt::log::error("basalt", "gqa_window_attn_segs: invalid segment");
             std::exit(1);
         }

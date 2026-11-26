@@ -174,16 +174,15 @@ private:
     void *c_tap_bf16_ = nullptr, *c_act_ = nullptr;
     float *c_raw_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
 
-    // block scratch for every slot's whole block; the head takes up to kHeadDrafts draft rows a slot a pass; the
-    // attention up to kAttnSegs slots a launch
+    // block scratch for every slot's whole block; the head takes up to kHeadDrafts draft rows a slot a pass
     static constexpr int kHeadDrafts = 4;
-    static constexpr int kAttnSegs = 32;
     float *x_ = nullptr, *xn_ = nullptr, *z_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr;
     float *qr_ = nullptr, *attn_ = nullptr, *att_scr_ = nullptr;
     void *act_a_ = nullptr, *act_q_ = nullptr, *act_h_ = nullptr;
     basalt::kernels::wgemm::Workspace ws_;
     float *logits_ = nullptr, *g_ = nullptr, *tail_lse_ = nullptr;
-    void *hq_ = nullptr, *top_scr_ = nullptr;
+    float *hd_ = nullptr, *head_gs_ = nullptr;   // the head's normed draft rows and their FP4 token scales
+    void *hq_ = nullptr, *top_scr_ = nullptr, *head_act_ = nullptr;
     int32_t *cand_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     int32_t *ids_d_ = nullptr, *ids_h_ = nullptr;
     float *conf_d_ = nullptr, *conf_h_ = nullptr;

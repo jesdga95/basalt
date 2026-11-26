@@ -15,6 +15,8 @@
 //                     summed in fp16 per 32-cell tile.  Online softmax and the output in fp32.
 #pragma once
 
+#include "basalt/kernels/window_segs.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -91,6 +93,9 @@ struct GqaWindowSeg {
     int64_t cap = 0;
     bool block = false;
 };
+/// gqa_window_attn for up to kWindowSegsMax segments of any rows in one launch (segment k's rows after segment k - 1's in
+/// q and out), each row what its segment alone gives; `scratch` holds gqa_decode_scratch_floats(scratch_cells, the rows of
+/// every segment, n_head, head_dim).
 void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWindowSeg* segs, int n_seg,
                           float* scratch, int64_t scratch_cells, float* out, void* stream);
 /// The device whose SM count plans the int8 prompt attention's launch (its key splits, so its rounding); -1 (the default):

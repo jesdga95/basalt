@@ -9,6 +9,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/window_gemm.hpp"
+#include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/dflash2_kernels.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
@@ -26,6 +27,7 @@ namespace basalt::models::inkling2 {
 namespace {
 
 namespace bk = basalt::kernels;
+namespace bp = basalt::prefill;
 
 constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
@@ -823,9 +825,16 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
         ws_.tickets_n = tk;
     }
     att_cells_ = ring_cells(d);
-    att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, bk::kGqaMaxWindow, kDf2Heads, kDf2HeadDim));
+    att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, CR, kDf2Heads, kDf2HeadDim));
 
+    if (!w->head_fp4) {
+        err = "the batched DFlash 2 drafter needs the head as NVFP4 planes (a vocabulary of whole 128-row tiles)";
+        return false;
+    }
     logits_ = f((size_t) CD * (size_t) w->n_vocab);
+    hd_ = f((size_t) CD * E);
+    head_gs_ = f((size_t) CD);
+    head_act_ = dev(bp::fp4_dense::act_bytes(CD, kE), ok);
     g_ = f((size_t) CD * kDf2Rank);
     tail_lse_ = f((size_t) CD * 2);
     hq_ = dev(bk::native_q8_1_bytes(kE, CD), ok);
@@ -939,9 +948,6 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
         for (int b = 0; b < B; ++b) n_max = std::max(n_max, act_n[b]);
         const int blk = n_max + 1;
         const int R = B * blk;
-        // the attention takes up to kGqaMaxWindow rows of at most kAttnSegs slots a launch
-        const int att_slots = std::min(kAttnSegs, bk::kGqaMaxWindow / blk);
-
         dflash2_block_inputs_batch(w.embedding, meta_d_, w.embed_norm, w.target_eps, w.mask, blk, B, x_, st);
         wg::norm_pack(x_, w.layer[0].attn_norm, d.rms_eps, kE, R, act_a_, xn_, st);
         for (int l = 0; l < d.n_layers; ++l) {
@@ -971,22 +977,20 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
             }
             dflash2_block_qk_prep_batch(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, d.rope_base, meta_d_, blk, B, qr_, kv,
                                         cap, st);
-            for (int s0 = 0; s0 < B; s0 += att_slots) {
-                const int cn = std::min(att_slots, B - s0);
-                bk::GqaWindowSeg gsegs[kAttnSegs] = {};
+            {   // every slot's block in one launch
+                bk::GqaWindowSeg gsegs[bk::kWindowSegsMax] = {};
                 int64_t max_cells = 0;
-                for (int c = 0; c < cn; ++c) {
-                    const Dflash2Hook::Cache& cc = act[s0 + c]->cache_[(size_t) l];
-                    const int64_t p0 = act_pos[s0 + c];
+                for (int c = 0; c < B; ++c) {
+                    const Dflash2Hook::Cache& cc = act[c]->cache_[(size_t) l];
+                    const int64_t p0 = act_pos[c];
                     int64_t win = d.window;
                     bool block_win = false;
-                    window_range(d, p0, act[s0 + c]->lo_, win, block_win);
+                    window_range(d, p0, act[c]->lo_, win, block_win);
                     const int64_t cells = p0 + blk - std::max<int64_t>(0, p0 - win + 1) + 64;
                     max_cells = std::max(max_cells, std::min(att_cells_, cells));
                     gsegs[c] = {cc.k, cc.v, p0, blk, p0 + blk, win, cc.cap, block_win};
                 }
-                bk::gqa_window_attn_segs(qr_ + (size_t) s0 * blk * kDf2Q, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, cn,
-                                         att_scr_, max_cells, attn_ + (size_t) s0 * blk * kDf2Q, st);
+                bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, B, att_scr_, max_cells, attn_, st);
             }
 
             wg::pack(attn_, kDf2Q, kDf2Q, R, act_q_, st);
@@ -1032,12 +1036,12 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
         for (int s0 = 0; s0 < B; s0 += head_slots) {
             const int cn = std::min(head_slots, B - s0);
             const int D_rows = cn * n_max;
-            dflash2_norm_draft_pack(x_ + (size_t) s0 * blk * kE, w.norm, d.rms_eps, blk, cn, n_max, act_a_, hq_, nullptr, st);
-            wg::Call hc;
-            hc.fmt = w.head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8;
-            hc.K = kE;
-            hc.m[0] = mat(w.head_fp4 ? w.head_fp4 : w.head, w.n_vocab, w.head_fp4_scale, logits_, w.n_vocab);
-            wg::gemm(hc, act_a_, D_rows, ws_, st);
+            dflash2_norm_draft_pack(x_ + (size_t) s0 * blk * kE, w.norm, d.rms_eps, blk, cn, n_max, act_a_, hq_, hd_, st);
+            // the 200K-row screen on the FP4 block-scaled tensor cores (the rows as NVFP4 with a scale a row); the top
+            // candidates are rescored on the Q8 head by dflash2_top16
+            bp::fp4_dense::quantize(hd_, D_rows, kE, kE, head_act_, head_gs_, st);
+            bp::fp4_dense::product(w.head_fp4, w.head_fp4_scale, w.n_vocab, kE, head_act_, head_gs_, D_rows, logits_, w.n_vocab,
+                                   false, st);
 
             wg::Call sc_call;
             sc_call.fmt = wg::Format::Bf16;
