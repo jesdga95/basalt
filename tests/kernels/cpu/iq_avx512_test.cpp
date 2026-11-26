@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -169,6 +170,76 @@ int main(int argc, char** argv) {
         bad += tok_diff != 0;
         if (max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for type %d (dot rows)\n", type); ++bad; }
         if (max_gu > 1e-4) { std::printf("REFERENCE ERROR too large for type %d (gate/up rows)\n", type); ++bad; }
+    }
+    // ---- multi-token bounds (nt <= 0 no-op, nt = 9, 13 chunking bitwise vs nt = 1) and Q8_K zero/NaN edge cases
+    {
+        constexpr int kBigT = 13, kRows = 16;
+        std::mt19937 rng(913);
+        for (const Frozen& fz : kFrozen) {
+            const int type = fz.type;
+            cpu::NativeFmt f;
+            std::string err;
+            if (!cpu::native_fmt(type, 20, H, FF, f, err)) return 1;
+            std::vector<uint8_t> blob(2 * f.up_off);
+            fill(blob, type, 500 + (uint64_t) type, 0);
+            for (int nt : {0, -1}) {
+                cpu::iq512_gu_rows(type, blob.data(), f.gu_row, f.up_off, H, nullptr, nt, nullptr, 0, kRows);
+                cpu::iq512_rows(type, blob.data(), f.gu_row, H, nullptr, nt, nullptr, 0, kRows);
+            }
+            std::vector<std::vector<uint8_t>> act(kBigT, std::vector<uint8_t>(cpu::kNativeActBytes));
+            std::vector<float> x(H);
+            const void* ap[kBigT];
+            for (int t = 0; t < kBigT; ++t) {
+                for (float& v : x) v = (float) ((int) (rng() % 2001) - 1000) / 400.f;
+                cpu::native_quant_act(f, x.data(), act[(size_t) t].data());
+                ap[t] = act[(size_t) t].data();
+            }
+            std::vector<std::vector<float>> ref_gu(kBigT, std::vector<float>(kRows)), ref_d(kBigT, std::vector<float>(kRows));
+            for (int t = 0; t < kBigT; ++t) {
+                float* fg[1] = {ref_gu[(size_t) t].data()};
+                float* fd[1] = {ref_d[(size_t) t].data()};
+                cpu::iq512_gu_rows(type, blob.data(), f.gu_row, f.up_off, H, ap + t, 1, fg, 0, kRows);
+                cpu::iq512_rows(type, blob.data(), f.gu_row, H, ap + t, 1, fd, 0, kRows);
+            }
+            for (int nt : {9, 13}) {
+                std::vector<std::vector<float>> g(nt, std::vector<float>(kRows, -123.f)), d(nt, std::vector<float>(kRows, -123.f));
+                float *gp[kBigT], *dp[kBigT];
+                for (int t = 0; t < nt; ++t) { gp[t] = g[(size_t) t].data(); dp[t] = d[(size_t) t].data(); }
+                cpu::iq512_gu_rows(type, blob.data(), f.gu_row, f.up_off, H, ap, nt, gp, 0, kRows);
+                cpu::iq512_rows(type, blob.data(), f.gu_row, H, ap, nt, dp, 0, kRows);
+                for (int t = 0; t < nt; ++t) {
+                    if (std::memcmp(gp[t], ref_gu[(size_t) t].data(), kRows * 4) != 0 ||
+                        std::memcmp(dp[t], ref_d[(size_t) t].data(), kRows * 4) != 0) {
+                        std::printf("MISMATCH avx512 type %d nt %d token %d\n", type, nt, t);
+                        ++bad;
+                    }
+                }
+            }
+        }
+        uint8_t blk[292];
+        float zeros[256] = {};
+        std::memset(blk, 0xA5, sizeof blk);
+        cpu::quantize_q8_K_avx512(zeros, blk, 256);
+        uint8_t zero_blk[292] = {};
+        if (std::memcmp(blk, zero_blk, sizeof blk) != 0) {
+            std::printf("Q8_K avx512 all-zero block left non-zero bytes\n");
+            ++bad;
+        }
+        for (int lane : {0, 1, 15, 16, 127, 128, 255}) {
+            for (float fill_v : {0.0f, 1.0f}) {
+                float x[256];
+                for (float& v : x) v = fill_v;
+                x[lane] = std::numeric_limits<float>::quiet_NaN();
+                std::memset(blk, 0xA5, sizeof blk);
+                cpu::quantize_q8_K_avx512(x, blk, 256);
+                float d = 0.0f;
+                std::memcpy(&d, blk, 4);
+                if (!std::isnan(d)) {
+                    std::printf("Q8_K avx512 NaN lane %d (fill %g) produced d=%g\n", lane, fill_v, d);
+                    ++bad;
+                }
+            }
+        }
     }
     std::printf("iq_avx512_test: %s\n", bad ? "FAIL" : "PASS");
 
