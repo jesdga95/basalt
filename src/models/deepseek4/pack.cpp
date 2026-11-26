@@ -64,7 +64,8 @@ bool read_geometry(const Json& json, Geometry& g, std::string& err) {
         g.idx_top_k <= 0 || g.output_embd <= 0 || !g.route_norm || g.context_length <= 0 || g.rms_eps <= 0.f ||
         g.hc_eps <= 0.f || g.rope_base <= 0.f || g.comp_rope_base <= 0.f || g.yarn_factor < 1.f ||
         g.yarn_orig_ctx <= 0 || g.yarn_beta_fast <= 0.f || g.yarn_beta_slow <= 0.f || g.n_used != 6 ||
-        g.hash_layers != 3 || g.route_scale != 1.5f) {
+        g.hash_layers != 3 || g.router_func != 4 || g.route_scale != 1.5f ||
+        g.output_embd != (int64_t) g.n_embd * g.hc_mult) {
         err = "meta.geometry is incomplete or outside the supported DeepSeek-V4 geometry";
         return false;
     }
@@ -107,27 +108,47 @@ bool validate_tensor_layout(const Pack& pack, std::string& err) {
     }
     for (int layer = 0; layer < g.n_layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
-        if (!pack.find(prefix + "attn_q_a.weight") || !pack.find(prefix + "attn_q_b.weight") ||
-            !pack.find(prefix + "attn_kv.weight") || !pack.find(prefix + "attn_output_a.weight") ||
-            !pack.find(prefix + "attn_output_b.weight") || !pack.find(prefix + "ffn_gate_inp.weight") ||
-            !pack.find(prefix + "ffn_gate_shexp.weight") || !pack.find(prefix + "ffn_up_shexp.weight") ||
-            !pack.find(prefix + "ffn_down_shexp.weight") || !pack.find(prefix + "hc_attn_base.weight") ||
-            !pack.find(prefix + "hc_attn_fn.weight") || !pack.find(prefix + "hc_ffn_base.weight") ||
-            !pack.find(prefix + "hc_ffn_fn.weight")) {
-            err = "layer " + std::to_string(layer) + " is missing a required attention, expert, or hyper-connection tensor";
+        const auto has_shape = [&](const char* suffix, std::initializer_list<uint64_t> shape, int type = -1) {
+            return tensor_shape(pack, prefix + suffix, shape, type);
+        };
+        if (!has_shape("attn_q_a.weight", {(uint64_t) g.n_embd, (uint64_t) g.q_lora}) ||
+            !has_shape("attn_q_a_norm.weight", {(uint64_t) g.q_lora}, 0) ||
+            !has_shape("attn_q_b.weight", {(uint64_t) g.q_lora, (uint64_t) g.n_head * g.head_dim}) ||
+            !has_shape("attn_kv.weight", {(uint64_t) g.n_embd, (uint64_t) g.head_dim}) ||
+            !has_shape("attn_kv_a_norm.weight", {(uint64_t) g.head_dim}, 0) ||
+            !has_shape("attn_sinks.weight", {(uint64_t) g.n_head}, 0) ||
+            !has_shape("attn_output_a.weight", {(uint64_t) g.n_head * g.head_dim / g.o_groups,
+                                                 (uint64_t) g.o_groups * g.o_lora}) ||
+            !has_shape("attn_output_b.weight", {(uint64_t) g.o_groups * g.o_lora, (uint64_t) g.n_embd}) ||
+            !has_shape("attn_norm.weight", {(uint64_t) g.n_embd}, 0) ||
+            !has_shape("ffn_norm.weight", {(uint64_t) g.n_embd}, 0) ||
+            !has_shape("ffn_gate_inp.weight", {(uint64_t) g.n_embd, (uint64_t) g.n_expert}, 30) ||
+            !has_shape("ffn_gate_shexp.weight", {(uint64_t) g.n_embd, (uint64_t) g.n_ff_exp}) ||
+            !has_shape("ffn_up_shexp.weight", {(uint64_t) g.n_embd, (uint64_t) g.n_ff_exp}) ||
+            !has_shape("ffn_down_shexp.weight", {(uint64_t) g.n_ff_exp, (uint64_t) g.n_embd}) ||
+            !has_shape("exp_probs_b_vl.bias", {(uint64_t) g.n_expert}, 0) ||
+            !has_shape("hc_attn_base.weight", {24}, 0) ||
+            !has_shape("hc_attn_fn.weight", {(uint64_t) g.output_embd, 24}, 0) ||
+            !has_shape("hc_attn_scale.weight", {3}, 0) || !has_shape("hc_ffn_base.weight", {24}, 0) ||
+            !has_shape("hc_ffn_fn.weight", {(uint64_t) g.output_embd, 24}, 0) ||
+            !has_shape("hc_ffn_scale.weight", {3}, 0) ||
+            (layer >= g.hash_layers && !has_shape("exp_probs_b.bias", {(uint64_t) g.n_expert}, 0))) {
+            err = "layer " + std::to_string(layer) + " has a missing tensor or unsupported attention, expert, or mHC shape/type";
             return false;
         }
         const int ratio = g.compress_ratio[(size_t) layer];
         if (ratio == 4) {
-            if (!tensor_shape(pack, prefix + "attn_compressor_ape.weight", {1024, 4}, 0) ||
-                !tensor_shape(pack, prefix + "attn_compressor_norm.weight", {512}, 0) ||
-                !tensor_shape(pack, prefix + "attn_compressor_gate.weight", {4096, 1024}, 30) ||
-                !tensor_shape(pack, prefix + "attn_compressor_kv.weight", {4096, 1024}, 30) ||
-                !tensor_shape(pack, prefix + "indexer_compressor_ape.weight", {256, 4}, 0) ||
-                !tensor_shape(pack, prefix + "indexer_compressor_norm.weight", {128}, 0) ||
-                !tensor_shape(pack, prefix + "indexer_compressor_gate.weight", {4096, 256}, 30) ||
-                !tensor_shape(pack, prefix + "indexer_compressor_kv.weight", {4096, 256}, 30) ||
-                !pack.find(prefix + "indexer.proj.weight") || !pack.find(prefix + "indexer.attn_q_b.weight")) {
+            if (!tensor_shape(pack, prefix + "attn_compressor_ape.weight", {(uint64_t) 2 * g.head_dim, 4}, 0) ||
+                !tensor_shape(pack, prefix + "attn_compressor_norm.weight", {(uint64_t) g.head_dim}, 0) ||
+                !tensor_shape(pack, prefix + "attn_compressor_gate.weight", {(uint64_t) g.n_embd, (uint64_t) 2 * g.head_dim}, 30) ||
+                !tensor_shape(pack, prefix + "attn_compressor_kv.weight", {(uint64_t) g.n_embd, (uint64_t) 2 * g.head_dim}, 30) ||
+                !tensor_shape(pack, prefix + "indexer_compressor_ape.weight", {(uint64_t) 2 * g.idx_dim, 4}, 0) ||
+                !tensor_shape(pack, prefix + "indexer_compressor_norm.weight", {(uint64_t) g.idx_dim}, 0) ||
+                !tensor_shape(pack, prefix + "indexer_compressor_gate.weight", {(uint64_t) g.n_embd, (uint64_t) 2 * g.idx_dim}, 30) ||
+                !tensor_shape(pack, prefix + "indexer_compressor_kv.weight", {(uint64_t) g.n_embd, (uint64_t) 2 * g.idx_dim}, 30) ||
+                !tensor_shape(pack, prefix + "indexer.proj.weight", {(uint64_t) g.n_embd, (uint64_t) g.idx_heads}, 30) ||
+                !tensor_shape(pack, prefix + "indexer.attn_q_b.weight", {(uint64_t) g.q_lora,
+                                                                           (uint64_t) g.idx_heads * g.idx_dim}, 8)) {
                 err = "layer " + std::to_string(layer) + " has invalid or missing CSA tensors";
                 return false;
             }

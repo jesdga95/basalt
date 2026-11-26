@@ -28,7 +28,7 @@ inline std::string validate_meta(const GgufFile& file) {
     const MetaValue* norm = file.get("deepseek4.expert_weights_norm");
     if (!norm || norm->type != MetaType::BOOL || norm->u != 1 ||
         key_num(file, "expert_used_count") != 6 || key_num(file, "hash_layer_count") != 3 ||
-        key_num(file, "expert_weights_scale") != 1.5)
+        key_num(file, "expert_gating_func") != 4 || key_num(file, "expert_weights_scale") != 1.5)
         return "deepseek4 routing metadata is outside the supported top-6 hash-routing contract";
 
     const int layers = (int) key_num(file, "block_count");
