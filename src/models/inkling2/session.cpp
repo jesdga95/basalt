@@ -55,6 +55,15 @@ namespace {
 
 namespace bk = basalt::kernels;
 
+// A card with less L2 than this loses more to the guessed experts' prefetch (it evicts the core layers' attention and
+// projection working set from L2) than the prefetch saves; such a card leaves the guess out.
+constexpr int kGuessPrefetchMinL2 = 64 << 20;
+
+bool guess_prefetch_fits(int device) {
+    int l2 = 0;
+    return cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) == cudaSuccess && l2 >= kGuessPrefetchMinL2;
+}
+
 constexpr int kWindowRows = kDecodeRows; // rows of one conversation's window (also its ring margin and logits buffer)
 constexpr int kMaxRows = kBatchRows;     // widest batched forward call across conversations
 constexpr int kChunkRead = 16;           // a longer read runs on the prompt path, a shorter one as decode windows
@@ -226,6 +235,7 @@ struct Lane {
     unsigned long long* rec_blobs = nullptr;    // [visit][kAheadExperts] the experts each visit took in the last window
     int32_t* rec_n = nullptr;                   // [visit] how many
     bool ra_on = false, pf_on = false;
+    bool guess_pf = false;                      // the card guesses the next visit's experts into L2 (guess_prefetch_fits)
     int32_t* win_ids = nullptr;                 // [visit][kMaxRows][n_used] the last window's routed ids (with copies)
 };
 
@@ -300,6 +310,7 @@ public:
         if (m_.cards() > 1) {
             Lane& k = lane_[1];
             k.device = m_.card_device(1);
+            k.guess_pf = guess_prefetch_fits(k.device);
             cudaSetDevice(k.device);
             bool sok = cudaStreamCreateWithFlags(&k.stream, cudaStreamNonBlocking) == cudaSuccess &&
                        cudaStreamCreateWithFlags(&k.ra_st, cudaStreamNonBlocking) == cudaSuccess &&
@@ -432,6 +443,7 @@ public:
         lane_[0] = Lane{m_.device(), &sh_->x, stream_, ra_st_, pf_st_, ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_, hand0_, ex_tally_,
                         rec_blobs_, rec_n_};
         lane_[0].win_ids = win_ids_;
+        lane_[0].guess_pf = guess_prefetch_fits(lane_[0].device);
         lane_[1].x = &sh_->x1;
         for (const VisitCache& c : vc_) {
             if (slot_card_[(size_t) (&c - vc_.data())] != 0) continue;
@@ -1336,7 +1348,7 @@ private:
         // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
         const bool guess = rows <= kGuessRows;
-        const bool has_prev_guess = guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card;
+        const bool has_prev_guess = guess && k.guess_pf && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card;
         // On deep full-attention visits (>= 16K keys = 32..535 MB KV), prefetching before attention_window both contends
         // with attn_mma_kernel on SMs/DRAM and gets evicted from L2 by the KV sweep; deferring past attention_window lands
         // the guessed experts into L2 during o_proj + post_attn + router right before MoE reads them.
@@ -1451,7 +1463,7 @@ private:
         ra.k = g_.n_used;
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
-        const bool guess_next = guess && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card;
+        const bool guess_next = guess && k.guess_pf && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card;
         if (guess_next) cudaEventRecord(k.ra_ev, k.stream);   // the MLP input is in
         // the routed ids: a visit's own slot when the session ranks its copies by kept rows (decode_kept), else the scratch
         int32_t* const ids = k.win_ids ? k.win_ids + (size_t) vi * sh_->max_rows * g_.n_used : x.ids_;
