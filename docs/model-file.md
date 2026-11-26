@@ -23,8 +23,8 @@ without the official tuned drafter is slower than the official file.
 ## DeepSeek pack
 
 - `dense`: F32 and BF16 tensors. `gguf`: quantized non-expert tensors. `experts`: routed experts per layer.
-- `engram`: the Engram table alone (IQ4_NL rows of 144 bytes, Q5_K rows of 176, or MXFP4 rows of 136 in the NVFP4 pack),
-  2 MiB aligned.
+- `engram`: the Engram table alone (IQ4_NL rows of 144 bytes, Q5_K rows of 176, Q6_K rows of 210, MXFP4 rows of 136
+  in the NVFP4 pack, or MXFP8 rows of 264: type 43, one E8M0 scale then 32 E4M3 codes per 32 values), 2 MiB aligned.
 - `vision/mmproj`: present only when built with `--mmproj`; the engine and `basalt-vision --model FILE.basalt` read it in place.
 - `dspark/gguf`: DeepSeek's DSpark drafter. Attach it to an existing pack without copying weights:
 

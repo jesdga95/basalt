@@ -85,18 +85,21 @@ def check_split(files) -> None:
 class SourceModel:
     """All shards of one model: name -> (GGUFFile, TensorInfo, shard path), in file order."""
 
-    def __init__(self, paths, described=frozenset()):
-        """`described`: tensors whose shard may stop after its header; their names land in `short`."""
+    def __init__(self, paths, described=frozenset(), size_of=None):
+        """`described`: tensors whose shard may stop after its header; their names land in `short`.
+            `size_of(name, tensor)`: the bytes the tensor occupies (default: the GGUF block geometry), which for an
+            Engram table of type 43 (264 bytes a 256-value row) is not what the geometry says."""
         self.paths = [pathlib.Path(p) for p in paths]
         self.files = [GGUFFile(p) for p in self.paths]
         self.sizes = [p.stat().st_size for p in self.paths]
         check_split(self.files)
+        self.size_of = size_of or (lambda name, t: t.expected_bytes())
         self._maps: dict[pathlib.Path, np.ndarray] = {}
         self.where: dict[str, tuple] = {}
         self.short: set[str] = set()
         for p, g, size in zip(self.paths, self.files, self.sizes):
             for t in g.tensors:
-                n = t.expected_bytes()
+                n = self.size_of(t.name, t)
                 if n is not None and g.data_start + t.offset + n > size and t.name in described:
                     self.short.add(t.name)
                 elif n is None or g.data_start + t.offset + n > size:
@@ -106,16 +109,20 @@ class SourceModel:
                 self.where[t.name] = (g, t, p)
 
     def bytes(self, name: str) -> np.ndarray:
+        return self.bytes_len(name, self.size_of(name, self.where[name][1]))
+
+    def bytes_len(self, name: str, n: int) -> np.ndarray:
+        """The tensor's raw bytes, the first `n` of them (a row type larger than the GGUF's block geometry)."""
         g, t, p = self.where[name]
         if p not in self._maps:
             self._maps[p] = np.memmap(p, dtype=np.uint8, mode="r")
         a = g.data_start + t.offset
-        return self._maps[p][a:a + t.expected_bytes()]
+        return self._maps[p][a:a + n]
 
     def abs_range(self, name: str):
         """(shard path, absolute offset, size) of a tensor's bytes."""
         g, t, p = self.where[name]
-        return p, g.data_start + t.offset, t.expected_bytes()
+        return p, g.data_start + t.offset, self.size_of(name, t)
 
 
 def is_expert(name: str) -> bool:

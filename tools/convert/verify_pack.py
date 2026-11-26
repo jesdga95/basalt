@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import model_sections as S  # noqa: E402
 from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile  # noqa: E402
+import arch as A  # noqa: E402
 
 CHUNK = 64 << 20
 ROLES = ("gate", "up", "down")
@@ -75,8 +76,15 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
 
     m = ModelFile(pack)
     meta = json.loads(m.read("meta"))
+    arch = A.for_architecture(meta.get("arch") or meta.get("gguf_kv", {}).get("general.architecture"))
     paths = S.expand_shards(Path(first_gguf))
-    src = S.SourceModel(paths, frozenset())
+    # A pack built with --sections-from may carry an own-section tensor whose source shard stops after its header;
+    # that absence is described, and those tensors' bytes are reported rather than compared. Only the sections the
+    # build recorded as copied may be short: without that record (a build that did not use --sections-from) a short
+    # own section is truncation.
+    copied = frozenset(meta.get("sections_from", {}).get("copied", ()))
+    own = frozenset(name for name, section in arch.own_sections.items() if section in copied)
+    src = S.SourceModel(paths, own, size_of=lambda name, t: arch.own_section_bytes(name, t))
     file_map = np.memmap(pack, dtype=np.uint8, mode="r")
     print(f"{pack}: {len(m.names())} sections, {Path(pack).stat().st_size} bytes; source {len(paths)} GGUFs, {len(src.where)} tensors")
 
@@ -148,7 +156,7 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
     kind["3"] = "F32"                  # stored as F32 in dense; the loader narrows to F16
     for name, loc in ((n, l) for n, ls in where.items() for l in ls):
         g, t, p = src.where[name]
-        nb = t.expected_bytes()
+        nb = arch.own_section_bytes(name, t)
         if loc[0] in ("dense", "mtp/dense"):
             _, off, ln, k = loc
             if ln != nb or kind.get(k) != t.type_name:
@@ -177,21 +185,27 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
         return sha(sec[off:off + n])
 
     def one(name):
-        a = sha(src.bytes(name))
+        if name in src.short:    # the shard stops after its header: the section was copied from --sections-from
+            return name, None
+        t = src.where[name][1]
+        a = sha(src.bytes_len(name, src.size_of(name, t)))
         return name, all(a == pack_bytes_hash(name, loc) for loc in where[name])
 
     todo = [n for n in where if n in src.where]
     done = 0
-    mism = []
+    mism, skipped = [], []
     with ThreadPoolExecutor(12) as ex:
         for name, ok in ex.map(one, todo):
             done += 1
-            if not ok:
+            if ok is None:
+                skipped.append(name)
+                print(f"  {name}: copied from --sections-from; bytes not compared", flush=True)
+            elif not ok:
                 mism.append(name)
                 bad(f"{name}: bytes differ from the source")
             if done % 200 == 0:
-                print(f"  {done}/{len(todo)} tensors compared", flush=True)
-    print(f"tensors: {len(todo)} compared, {len(mism)} differ")
+                print(f"  {done}/{len(todo)} tensors checked", flush=True)
+    print(f"tensors: {len(todo)} checked, {len(mism)} differ, {len(skipped)} copied from --sections-from")
 
     # summary by role
     role = defaultdict(lambda: [0, 0])
@@ -202,11 +216,12 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
             if loc[0] == "gguf":
                 key = "gguf (" + t.type_name + ")"
             role[key][0] += 1
-            role[key][1] += t.expected_bytes()
+            role[key][1] += arch.own_section_bytes(name, t)
     print("by section:")
     for k, (n, b) in sorted(role.items()):
         print(f"  {k:<28} {n:>5} tensors {b / (1 << 30):>10.3f} GiB")
-    print(f"  source: {len(src.where)} tensors, {sum(t.expected_bytes() for _, t, _ in src.where.values()) / (1 << 30):.3f} GiB;"
+    print(f"  source: {len(src.where)} tensors, "
+          f"{sum(arch.own_section_bytes(name, t) for name, (_, t, _) in src.where.items()) / (1 << 30):.3f} GiB;"
           f" located {len(where)} (float tensors are in the dense pool and in gguf)")
 
     # what the engine reads from the metadata and the tokenizer
