@@ -97,6 +97,7 @@ private:
     model::LoadRequest flags_;
     std::string path_;
     std::vector<uint8_t> embd_;
+    uint32_t embd_type_ = 0;
     std::string diag_dump_;
     std::unique_ptr<ngram::PleReader> engram_;
     int device_ = 0, fd_ = -1;
