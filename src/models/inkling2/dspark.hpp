@@ -105,6 +105,7 @@ public:
     const float* embed_norm = nullptr;
 
     struct SharedScratch {
+        bool ready = false;
         int64_t att_cells = 0;
         float *mix = nullptr, *kb = nullptr, *vb = nullptr;
         int32_t *pos3 = nullptr, *ring_bounds = nullptr, *pos3b = nullptr;
@@ -131,7 +132,10 @@ private:
 /// when it has one this engine does not run.
 model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DsparkWeights>& out);
 
-/// The device bytes a session's drafter takes for `context` positions with a tap of `tap_rows` rows (0 without a drafter).
+/// The device bytes a drafter's weights take on the main card (0 without a drafter).
+uint64_t dspark_weight_bytes(const Pack& pack);
+/// The device bytes shared across sessions for the drafter on the main card: tap, shared scratch, and batch scratch.
+uint64_t dspark_shared_bytes(const Pack& pack, int64_t context, int sessions, int tap_rows);
 /// A session's drafter bytes (its caches and its steps' scratch), the shared tap aside.
 uint64_t dspark_session_bytes(const Pack& pack, int64_t context);
 /// The tap of `tap_rows` rows: the target's features of a call's rows, which every session's commit reads (one shared).
@@ -299,7 +303,7 @@ private:
     int device_ = -1;
     std::unique_ptr<Dflash2Batch> df2_;
     std::vector<void*> allocs_, pinned_;
-    int max_sessions_ = 0, max_rows_ = 0, tap_rows_ = 0;
+    int max_sessions_ = 0, max_all_sessions_ = 0, max_dr_rows_ = 0, max_rows_ = 0, tap_rows_ = 0;
     int64_t att_cells_ = 0;
     float* tap_ = nullptr;
     // commit_batch scratch [max_rows]

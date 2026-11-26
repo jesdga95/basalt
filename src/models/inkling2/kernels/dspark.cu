@@ -224,7 +224,10 @@ struct Q81 {
 };
 static_assert(sizeof(Q81) == 36, "ggml's block_q8_1");
 
-__device__ __forceinline__ float capf(float x, float cap) { return cap * tanhf(x / cap); }
+__device__ __forceinline__ float capf(float x, float cap) {
+    if (cap <= 0.f) return x;
+    return cap * tanhf(x / cap);
+}
 
 // The token of copy row r over `tiles` tiles.
 __host__ __device__ __forceinline__ int64_t token_of(int64_t r, int64_t tiles) { return (r & 31) * tiles + (r >> 5); }

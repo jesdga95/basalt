@@ -88,6 +88,8 @@ private:
 };
 
 model::Result dflash2_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<Dflash2Weights>& out);
+uint64_t dflash2_weight_bytes(const Pack& pack);
+uint64_t dflash2_shared_bytes(const Pack& pack, int sessions);
 uint64_t dflash2_session_bytes(const Pack& pack);
 
 class Dflash2Batch;

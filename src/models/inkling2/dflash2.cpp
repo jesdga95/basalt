@@ -253,6 +253,75 @@ model::Result Dflash2Weights::finish(const void* head_q8, const uint16_t* emb, c
     return {};
 }
 
+uint64_t dflash2_weight_bytes(const Pack& pack) {
+    const Dflash2Geometry& d = pack.dflash2;
+    const Geometry& g = pack.geo;
+    if (!d.present || d.n_layers <= 0 || d.n_ff <= 0 || g.n_vocab <= 0) return 0;
+    const uint64_t ff = (uint64_t) d.n_ff;
+    const uint64_t V = (uint64_t) g.n_vocab;
+    uint64_t n = 0;
+    n += 2 * q8_bytes(kE, (uint64_t) kDf2Targets * kE);
+    n += 3ull * kE * 4;
+    n += (uint64_t) kDf2Rank * kE * 2;
+    n += 2 * V * kDf2Rank * 2;
+    const uint64_t per_layer =
+        q8_bytes(kDf2Q, kE) + 2 * q8_bytes(kDf2KV, kE) + 2 * (uint64_t) bk::nvfp4p::bytes(kDf2KV, kE) +
+        q8_bytes(kE, kDf2Q) + 2 * q8_bytes(ff, kE) + q8_bytes(kE, ff) +
+        2 * q8_bytes(kDf2Dyn, kE) + 2ull * 4 * kE * 4 + 2ull * kE * 4 +
+        2ull * kDf2HeadDim * 4 + (uint64_t) kFp4Mats * 4;
+    n += (uint64_t) d.n_layers * per_layer;
+    if (bk::nvfp4p::fits(g.n_vocab, kE)) n += (uint64_t) bk::nvfp4p::bytes(g.n_vocab, kE) + 16;
+    return n;
+}
+
+uint64_t dflash2_shared_bytes(const Pack& pack, int sessions) {
+    const Dflash2Geometry& d = pack.dflash2;
+    const Geometry& g = pack.geo;
+    if (!d.present || d.n_layers <= 0 || d.n_ff <= 0 || d.window <= 0 || g.n_vocab <= 0) return 0;
+    const int64_t cells = ring_cells(d);
+    const uint64_t E = kE, V = (uint64_t) g.n_vocab, ff = (uint64_t) d.n_ff;
+    const uint64_t R = kDf2Block, D = kDf2Drafts;
+    const uint64_t CR_solo = std::max<uint64_t>(R, kSoloCommitMax);
+    const bool head_fp4 = bk::nvfp4p::fits(g.n_vocab, kE);
+    size_t pf = 0, tk = 0;
+    ws_need(d, g.n_vocab, head_fp4, pf, tk);
+    auto f = [](uint64_t count) { return std::max<uint64_t>(count * 4, 16); };
+    uint64_t n = 0;
+    n += std::max<uint64_t>(bk::wgemm::act_bytes((int64_t) kDf2Targets * kE), 16);
+    n += f(CR_solo * E) + 2 * f(CR_solo * kDf2KV) + f(2);
+    n += 3 * f(R * E) + f(R * kDf2Dyn) + 3 * f(R * kDf2Q);
+    n += std::max<uint64_t>(bk::wgemm::act_bytes(kE), 16) + std::max<uint64_t>(bk::wgemm::act_bytes(kDf2Q), 16) +
+         std::max<uint64_t>(bk::wgemm::act_bytes((int64_t) ff), 16);
+    n += f(std::max<size_t>(pf, 1)) + f(std::max<size_t>(tk, 1));
+    n += f(bk::gqa_decode_scratch_floats(cells, kDf2Block, kDf2Heads, kDf2HeadDim));
+    n += f(D * V) + f(D * kDf2Rank) + f(D * 2);
+    n += std::max<uint64_t>(bk::native_q8_1_bytes(kE, (int) D), 16);
+    n += std::max<uint64_t>(dflash2_top16_scratch_bytes((int) D, g.n_vocab), 16);
+    n += f(D * 2 * kDf2TopK);
+    if (sessions > 1) {
+        const int max_rows = std::min(kBatchRows, sessions * kDecodeRows);
+        const int S_all = std::min(sessions, (int) bk::kWindowSegsMax);
+        const uint64_t CR = 8 * kDf2Block;
+        const uint64_t CD = 8 * kDf2Drafts;
+        n += std::max<uint64_t>(bk::wgemm::act_bytes((int64_t) kDf2Targets * kE), 16);
+        n += f((uint64_t) bk::wgemm::kRows * E);
+        n += std::max<uint64_t>(
+            std::max<uint64_t>(bk::wgemm::act_bytes(kE), (uint64_t) (max_rows + bk::wgemm::kRows) * E * sizeof(uint16_t)), 16);
+        n += 2 * f((uint64_t) max_rows * kDf2KV);
+        n += 3 * f(CR * E) + f(CR * kDf2Dyn) + 3 * f(CR * kDf2Q) + 2 * f(CR * kDf2KV);
+        n += std::max<uint64_t>(bk::wgemm::act_bytes(kE), 16) + std::max<uint64_t>(bk::wgemm::act_bytes(kDf2Q), 16) +
+             std::max<uint64_t>(bk::wgemm::act_bytes((int64_t) ff), 16);
+        n += f(std::max<size_t>(pf, 1)) + f(std::max<size_t>(tk, 1));
+        n += f(bk::gqa_decode_scratch_floats(cells, (int) CR, kDf2Heads, kDf2HeadDim));
+        n += f(CD * V) + f(CD * kDf2Rank) + f(CD * 2);
+        n += std::max<uint64_t>(bk::native_q8_1_bytes(kE, (int) CD), 16);
+        n += std::max<uint64_t>(dflash2_top16_scratch_bytes((int) CD, g.n_vocab), 16);
+        n += f(CD * 2 * kDf2TopK);
+        n += f((uint64_t) S_all * 2) + 2 * f((uint64_t) S_all * kDf2Block);
+    }
+    return n;
+}
+
 uint64_t dflash2_session_bytes(const Pack& pack) {
     const Dflash2Geometry& d = pack.dflash2;
     if (!d.present) return 0;

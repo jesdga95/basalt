@@ -345,6 +345,7 @@ private:
     };
     std::vector<LentRange> lent_ranges_;
     int64_t lend_copies_ = 0;   ///< card copies demoted for the encoder
+    uint64_t lend_keep_ = 0;    ///< counted room before the first lend since the last refill (0: none)
     std::vector<size_t> wide_out_;   ///< the copies a long read's wider chunk sent back (take_room), until give_room
     // gpu-mode peer: the second card's experts, layer by layer in expert order in one cache (peer_first_ the layer's first slot)
     std::unique_ptr<core::PeerExperts> peer_;
@@ -363,8 +364,8 @@ std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::stri
 /// The device bytes a session takes for `context` positions in the selected KV cache format, its drafter aside, on card
 /// `card` of a split at `cut` (0: one card, every visit).
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut = 0, int card = 0);
-/// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
-/// first card's).
-uint64_t shared_bytes(const Geometry& g, bool drafter);
+/// The device bytes every session shares once on a card: the forward's scratch, the prompt path, and (on the first card)
+/// the drafter's tap and shared scratch.
+uint64_t shared_bytes(const Pack& pack, int64_t context, int sessions, bool first, bool drafter);
 
 }  // namespace basalt::models::inkling2

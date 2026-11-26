@@ -1042,7 +1042,7 @@ void moe_combine(const float* out, const float* w, int rows, int k, float* y, vo
 }
 
 void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream) {
-    if (rows <= 0 || n <= 0) return;
+    if (rows <= 0 || n <= 0 || cap <= 0.f) return;
     bk::launch_pdl(softcap_kernel, dim3(256, (unsigned) rows), dim3(256), 0, (cudaStream_t) stream, x, n, ld, cap);
     check("softcap");
 }

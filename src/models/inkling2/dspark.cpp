@@ -334,12 +334,89 @@ DsHead DsparkWeights::head_args() const {
 
 uint64_t dspark_tap_bytes(int tap_rows) { return 4ull * (uint64_t) std::max(tap_rows, kSlice) * kE * 4; }
 
+uint64_t dspark_weight_bytes(const Pack& pack) {
+    if (pack.dflash2.present) return dflash2_weight_bytes(pack);
+    const DsparkGeometry& d = pack.dspark;
+    const Geometry& g = pack.geo;
+    if (!d.present || d.n_layers <= 0 || d.n_ff <= 0 || g.n_vocab <= 0) return 0;
+    const uint64_t ff = (uint64_t) d.n_ff;
+    const uint64_t V = (uint64_t) g.n_vocab;
+    const uint64_t per_layer =
+        q8_bytes(kQ, kE) + q8_bytes(kKV, kE) + q8_bytes(kKV, kE) + q8_bytes(kE, kQ) +
+        4 * q8_bytes(kKV, kE) + 2 * q8_bytes(ff, kE) + q8_bytes(kE, ff) +
+        3ull * kE * 4 + 3ull * kHeadDim * 4 + (uint64_t) kFp4Mats * 4;
+    uint64_t n = (uint64_t) d.n_layers * per_layer;
+    n += (uint64_t) kDsMixes * kDsTargets * 4;
+    n += 4ull * kE * 4;
+    n += (uint64_t) kDsRnn * (2 * kDsRank + 2 * kE) * 2;
+    n += (uint64_t) kDsRnn * 4;
+    n += (uint64_t) kE * kDsRank * 2;
+    n += (uint64_t) kDsRnn * 2 * kDsRank * 2;
+    n += 2ull * (uint64_t) kDsRnn * kE * 2;
+    n += q8_bytes(V, kDsRank);
+    n += V * 4;
+    n += (uint64_t) dspark_screen_rows(g.n_vocab) * 4;
+    n += (uint64_t) dspark_screen_bytes(kE, g.n_vocab);
+    n += (uint64_t) dspark_screen_bytes(kDsRank, g.n_vocab);
+    return n;
+}
+
+uint64_t dspark_shared_bytes(const Pack& pack, int64_t context, int sessions, int tap_rows) {
+    if (pack.dflash2.present) return dspark_tap_bytes(tap_rows) + dflash2_shared_bytes(pack, sessions);
+    const DsparkGeometry& d = pack.dspark;
+    const Geometry& g = pack.geo;
+    if (!d.present || d.n_layers <= 0 || d.n_ff <= 0 || d.window <= 0 || g.n_vocab <= 0) return 0;
+    const uint64_t E = kE, V = (uint64_t) g.n_vocab, ff = (uint64_t) d.n_ff, R = kDsBlock;
+    const int64_t att_cells = std::max(ring_cells(d), full_cells(context));
+    size_t pf = 0, tk = 0;
+    ws_need(d, pf, tk);
+    auto f = [](uint64_t count) { return std::max<uint64_t>(count * 4, 16); };
+    uint64_t n = dspark_tap_bytes(tap_rows);
+    // DsparkWeights::SharedScratch
+    n += f(3 * kSlice * E) + f(kSlice * 3) + f(2) + 2 * f(kSlice * kKV);
+    n += std::max<uint64_t>(bk::native_q8_1_bytes(kE, kSlice), 16);
+    n += 2 * f(R * E) + 3 * f(R * kQ);
+    n += std::max<uint64_t>(bk::wgemm::act_bytes(kQ), 16) + std::max<uint64_t>(bk::wgemm::act_bytes((int64_t) ff), 16);
+    n += f(std::max<size_t>(pf, 1)) + f(std::max<size_t>(tk, 1)) + f(R * 3);
+    n += f((uint64_t) kDsDrafts * (uint64_t) dspark_screen_rows((int64_t) V));
+    n += std::max<uint64_t>(bk::native_q8_1_bytes(kE, kDsDrafts), 16);
+    n += f((uint64_t) kDsDrafts * kDsRnn) + f(kDsRnn);
+    n += std::max<uint64_t>(bk::native_q8_1_bytes(kDsRank, kDsDrafts), 16);
+    n += std::max<uint64_t>(dspark_head_scratch_bytes((int64_t) V), 16);
+    n += f(bk::gqa_decode_scratch_floats(att_cells, kDsBlock, kHeads, kHeadDim));
+    if (sessions > 1) {
+        // DsparkBatch
+        const int max_rows = std::min(kBatchRows, sessions * kDecodeRows);
+        const int S = std::min(sessions, 16);
+        const int S_all = std::max(S, std::min(sessions, (int) bk::kWindowSegsMax));
+        const int max_dr_rows = std::max(S * kDsDrafts, S_all * 2);
+        const uint64_t CR = 64;
+        n += f(3ull * (uint64_t) max_rows * E) + 2 * f((uint64_t) max_rows * kKV);
+        n += std::max<uint64_t>(bk::native_q8_1_bytes(kE, max_rows), 16);
+        n += 2 * f(CR * E) + 3 * f(CR * kQ) + 2 * f(CR * kKV);
+        n += std::max<uint64_t>(bk::wgemm::act_bytes(kQ), 16) + std::max<uint64_t>(bk::wgemm::act_bytes((int64_t) ff), 16);
+        n += f(std::max<size_t>(pf, 1)) + f(std::max<size_t>(tk, 1));
+        n += f(bk::gqa_decode_scratch_floats(att_cells, (int) CR, kHeads, kHeadDim));
+        n += f((uint64_t) max_dr_rows * E);
+        n += std::max<uint64_t>(bk::native_q8_1_bytes(kE, max_dr_rows), 16);
+        n += f((uint64_t) max_dr_rows * (uint64_t) dspark_screen_rows((int64_t) V));
+        n += f((uint64_t) max_dr_rows * kDsRnn) + f((uint64_t) S_all * kDsRnn);
+        n += f((uint64_t) S_all * 2 * kDsRank) + f((uint64_t) S_all * kDsRank);
+        n += std::max<uint64_t>(bk::native_q8_1_bytes(kDsRank, max_dr_rows), 16);
+        const uint64_t stride = (dspark_head_scratch_bytes((int64_t) V) + 255) & ~(uint64_t) 255;
+        n += (uint64_t) S * stride;
+        n += f((uint64_t) S_all) + std::max<uint64_t>((uint64_t) S_all * kDsRank * 2, 16) + f((uint64_t) S_all * E);
+        n += 2 * f((uint64_t) S_all * kDsBlock) + f((uint64_t) S_all * 2);
+    }
+    return n;
+}
+
 uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
     if (pack.dflash2.present) return dflash2_session_bytes(pack);
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE;
-    uint64_t n = (kFrRing * E + 3 * kDsRank + E + kDsBlock) * 4 + 1024;
+    uint64_t n = (kFrRing * E + 3 * kDsRank + E + kDsBlock) * 4 + 4096;
     for (int l = 0; l < d.n_layers; ++l)
         n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
     return n;
@@ -349,55 +426,67 @@ const DsparkWeights::SharedScratch* DsparkWeights::ensure_shared_scratch(int64_t
     auto* self = const_cast<DsparkWeights*>(this);
     SharedScratch& s = self->shared_scr_;
     const int64_t want_cells = std::max(ring_cells(geo), full_cells(context));
-    if (s.mix != nullptr && s.att_cells >= want_cells) return &s;
+    if (s.ready && s.att_cells >= want_cells) return &s;
+    const core::OnDevice on_dev(device_);
     const size_t E = kE, V = (size_t) n_vocab, ff = (size_t) geo.n_ff, R = kDsBlock;
+    const size_t allocs0 = self->allocs_.size();
+    const uint64_t bytes0 = self->bytes_;
+    SharedScratch next = s;
     bool ok = true;
     auto alloc_z = [&](size_t bytes) -> void* {
         void* p = self->dev(bytes, ok);
         if (p) cudaMemset(p, 0, std::max<size_t>(bytes, 16));
         return p;
     };
-    auto f = [&](size_t n) { return (float*) alloc_z(n * 4); };
-    if (s.mix == nullptr) {
-        s.mix = f(3 * kSlice * E);
-        s.pos3 = (int32_t*) alloc_z(kSlice * 3 * 4);
-        s.ring_bounds = (int32_t*) alloc_z(2 * 4);
+    auto f = [&](size_t count) { return (float*) alloc_z(count * 4); };
+    if (!next.ready) {
+        next.mix = f(3 * kSlice * E);
+        next.pos3 = (int32_t*) alloc_z(kSlice * 3 * 4);
+        next.ring_bounds = (int32_t*) alloc_z(2 * 4);
         if (ok) {
             const int32_t rb[2] = {0, (int32_t) ring_cells(geo)};
-            if (basalt::core::device_copy(s.ring_bounds, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+            if (basalt::core::device_copy(next.ring_bounds, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
         }
-        s.kb = f(kSlice * kKV);
-        s.vb = f(kSlice * kKV);
-        s.act = alloc_z(bk::native_q8_1_bytes(kE, kSlice));
-        s.x = f(R * E);
-        s.h = f(R * E);
-        s.q = f(R * kQ);
-        s.qr = f(R * kQ);
-        s.attn = f(R * kQ);
-        s.act_a = alloc_z(bk::wgemm::act_bytes(kQ));
-        s.act_h = alloc_z(bk::wgemm::act_bytes((int64_t) ff));
+        next.kb = f(kSlice * kKV);
+        next.vb = f(kSlice * kKV);
+        next.act = alloc_z(bk::native_q8_1_bytes(kE, kSlice));
+        next.x = f(R * E);
+        next.h = f(R * E);
+        next.q = f(R * kQ);
+        next.qr = f(R * kQ);
+        next.attn = f(R * kQ);
+        next.act_a = alloc_z(bk::wgemm::act_bytes(kQ));
+        next.act_h = alloc_z(bk::wgemm::act_bytes((int64_t) ff));
         size_t pf = 0, tk = 0;
         ws_need(geo, pf, tk);
-        s.ws.partial = f(std::max<size_t>(pf, 1));
-        s.ws.tickets = (int32_t*) alloc_z(std::max<size_t>(tk, 1) * 4);
-        s.ws.partial_floats = pf;
-        s.ws.tickets_n = tk;
-        s.pos3b = (int32_t*) alloc_z(R * 3 * 4);
-        s.approx = f((size_t) kDsDrafts * dspark_screen_rows((int64_t) V));
-        s.hq = alloc_z(bk::native_q8_1_bytes(kE, kDsDrafts));
-        s.ctx_h = f((size_t) kDsDrafts * kDsRnn);
-        s.ctx_f = f(kDsRnn);
-        s.lat_q = alloc_z(bk::native_q8_1_bytes(kDsRank, kDsDrafts));
-        s.head_scr = alloc_z(dspark_head_scratch_bytes((int64_t) V));
+        next.ws.partial = f(std::max<size_t>(pf, 1));
+        next.ws.tickets = (int32_t*) alloc_z(std::max<size_t>(tk, 1) * 4);
+        next.ws.partial_floats = pf;
+        next.ws.tickets_n = tk;
+        next.pos3b = (int32_t*) alloc_z(R * 3 * 4);
+        next.approx = f((size_t) kDsDrafts * dspark_screen_rows((int64_t) V));
+        next.hq = alloc_z(bk::native_q8_1_bytes(kE, kDsDrafts));
+        next.ctx_h = f((size_t) kDsDrafts * kDsRnn);
+        next.ctx_f = f(kDsRnn);
+        next.lat_q = alloc_z(bk::native_q8_1_bytes(kDsRank, kDsDrafts));
+        next.head_scr = alloc_z(dspark_head_scratch_bytes((int64_t) V));
     }
-    if (ok && s.att_cells < want_cells) {
-        s.att_scr = f(bk::gqa_decode_scratch_floats(want_cells, kDsBlock, kHeads, kHeadDim));
-        if (ok) s.att_cells = want_cells;
+    if (ok && next.att_cells < want_cells) {
+        next.att_scr = f(bk::gqa_decode_scratch_floats(want_cells, kDsBlock, kHeads, kHeadDim));
+        if (ok) next.att_cells = want_cells;
     }
     if (!ok) {
+        while (self->allocs_.size() > allocs0) {
+            cudaFree(self->allocs_.back());
+            self->allocs_.pop_back();
+        }
+        self->bytes_ = bytes0;
+        (void) cudaGetLastError();
         err = "out of device memory for the shared drafter scratch";
         return nullptr;
     }
+    next.ready = true;
+    s = next;
     return &s;
 }
 
@@ -460,7 +549,8 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     {
         auto align256 = [](size_t b) { return (std::max<size_t>(b, 16) + 255) & ~(size_t) 255; };
         size_t need = align256(kFrRing * E * 4) + align256(2 * kDsRank * 4) + align256(kDsRank * 4) +
-                      align256(4) + align256(kDsBlock * 4) + align256(kDsBlock * 4);
+                      align256(4) + align256(kDsRank * 2) + align256(kDsBlock * 4) + align256(kDsBlock * 4) +
+                      align256(E * 4) + align256(2 * 4);
         for (int l = 0; l < d.n_layers; ++l) {
             const bool ring = d.swa[(size_t) l];
             if (ring || backed <= 0) {
@@ -762,7 +852,14 @@ bool DsparkHook::stage_graph(int k, int n, void* stream) {
             (void) cudaGetLastError();
             return false;
         }
-        stage(k, n, stream);
+        try {
+            stage(k, n, stream);
+        } catch (...) {
+            cudaStreamEndCapture(st, &graph);
+            if (graph) cudaGraphDestroy(graph);
+            (void) cudaGetLastError();
+            throw;
+        }
         const cudaError_t ce = cudaStreamEndCapture(st, &graph);
         const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&g, graph, 0) : ce;
         if (graph) cudaGraphDestroy(graph);
@@ -1062,6 +1159,8 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };
     max_sessions_ = S;
+    max_all_sessions_ = S_all;
+    max_dr_rows_ = max_dr_rows;
     max_rows_ = max_rows;
     tap_rows_ = std::max(tap_rows, kSlice);
     tap_ = tap;
@@ -1171,7 +1270,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
     }
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     if (count <= 0) return {};
-    if (count > (int) bk::kWindowSegsMax) {
+    if (count > max_all_sessions_) {
         for (int i = 0; i < count; ++i)
             if (model::Result r = hooks[i]->draft_begin(anchors[i], pos[i], n[i], stream); !r.ok()) return r;
         return {};
@@ -1216,8 +1315,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
     };
     try {
         bk::PdlScope pdl(true);
-        const int max_dr_rows = std::max(max_sessions_ * kDsDrafts, (int) bk::kWindowSegsMax * 2);
-        const int step_B = (B * n_max <= max_dr_rows) ? B : max_sessions_;
+        const int step_B = (B * n_max <= max_dr_rows_) ? B : max_sessions_;
         for (int b0 = 0; b0 < B; b0 += step_B) {
             const int cb = std::min(step_B, B - b0);
             int sub_nmax = 1;

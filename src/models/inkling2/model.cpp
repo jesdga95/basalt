@@ -13,6 +13,9 @@
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/logprobs.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -45,12 +48,11 @@ constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
 constexpr int kTypeMxfp8 = 46;
 constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 row of the hidden width
-// what the sessions share once (the forward's row buffers and expert scratch, the batch windows' logits), what each one
-// needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
-// driver
-constexpr uint64_t kSharedFixed = 896 * kMiB;
+// what each session needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the
+// kernels' modules and the driver
 constexpr uint64_t kSessionFixed = 44 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
+constexpr uint64_t kElasticKeep = 512 * kMiB;
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
 constexpr uint64_t kLateRoom = 256 * kMiB;
@@ -111,6 +113,45 @@ uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool f
     const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);
     return per_pos * (g.swa[(size_t) layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
 }
+// Exact device bytes allocated by Shared::alloc_scratch() on one card (session.cpp).
+uint64_t scratch_bytes(const Geometry& g, int64_t context, int sessions, bool first) {
+    const int call_rows = sessions > 1 ? std::min(kBatchRows, sessions * kDecodeRows) : kDecodeRows;
+    const uint64_t E = (uint64_t) g.n_embd, R = (uint64_t) call_rows, pairs = R * (uint64_t) g.n_used;
+    const uint64_t core = (uint64_t) (g.loop_end - g.loop_start);
+    const uint64_t visits = (uint64_t) g.visits.size();
+    constexpr int kOutRows = kHeads * kHeadDim;
+    constexpr uint64_t kGuessRows = 2, kGuessExperts = 8;
+    const uint64_t seg_words = (sizeof(kernels::WindowSegs) + 15) / 4;
+    auto f = [](uint64_t count) { return std::max<uint64_t>(count * 4, 16); };
+    uint64_t n = 0;
+    n += (uint64_t) kBufs * f(R * E);                                          // role_
+    n += f(R * E);                                                              // emb_
+    n += f(3 * R * E);                                                          // mix_
+    n += f(core * kStreams * R * E);                                            // msg_
+    n += f((uint64_t) ctrl_scratch_floats(g.gate_rank));                        // ctrl_scr_
+    n += f(R * E);                                                              // nrm_
+    n += f(R * kProj);                                                          // y_
+    n += f(R * kHeads * kHeadDim) + f(R * kHeads * kRel) + f(R * kHeads);       // q_, r_, sink_
+    n += 3 * f(R * E);                                                          // o_, resid_, fin_
+    n += std::max<uint64_t>(attention_decode_scratch(call_rows, std::max<int64_t>(context, g.window)), 16);
+    n += 3 * std::max<uint64_t>(kernels::native_q8_1_bytes((int) E, call_rows), 16);
+    n += std::max<uint64_t>(kernels::native_q8_1_bytes(kOutRows, call_rows), 16);
+    n += f(R * (uint64_t) g.n_expert) + 2 * f(R * (uint64_t) g.n_used);         // rlog_, rw_, ids_
+    n += std::max<uint64_t>(pairs * 8, 16);                                     // ex_ptr_
+    n += f(pairs + 2) + 16 + 2 * f(pairs);                                      // ex_start_, ex_ng_, ex_dst_, ex_tok_
+    n += std::max<uint64_t>(kernels::native_expert_scratch_bytes((int64_t) pairs, g.n_ff_exp), 16);
+    n += f(pairs * E);                                                          // ex_rows_
+    n += f(visits * kGuessRows * E);                                            // nrm1_
+    n += f(visits * kGuessExperts);                                             // gs_ids_
+    n += f(kGuessRows * (uint64_t) g.n_expert) + f(kGuessExperts) + 16;         // gs_log_, gs_w_, pf_sink_
+    if (first) {
+        n += f((uint64_t) kernels::row_logprobs_scratch_floats(call_rows, g.n_vocab) +
+               R * (uint64_t) (kernels::kLogprobStride + 1));                   // lp_
+        n += f(R * (uint64_t) g.n_vocab);                                       // blog_
+    }
+    n += f(2 * R + seg_words);                                                  // io_d_
+    return n;
+}
 }  // namespace
 
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut, int card) {
@@ -120,8 +161,11 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
     return caches + kSessionFixed;
 }
 
-uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
+uint64_t shared_bytes(const Pack& pack, int64_t context, int sessions, bool first, bool drafter) {
+    const Geometry& g = pack.geo;
+    const int call_rows = sessions > 1 ? std::min(kBatchRows, sessions * kDecodeRows) : kDecodeRows;
+    return scratch_bytes(g, context, sessions, first) + prompt_bytes(g) +
+           (first && drafter ? dspark_shared_bytes(pack, context, sessions, std::max(call_rows, kPromptChunk)) : 0);
 }
 
 InklingModel::InklingModel() = default;
@@ -437,7 +481,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
-        const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
+        const uint64_t shared = shared_bytes(pack_, want, (int) n_sess, true, dspark_ != nullptr);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
             if (req.expert_cache > 0) return fail("--expert-cache takes one card; the layer split keeps every expert on its card");
             if (model::Result r = load_experts(reads, file, experts); !r.ok()) return r;
@@ -447,7 +491,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 basalt::core::gpu_mem_info(&fb, &tb);
                 const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) +
                                        (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
-                                      (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
+                                      (c == 0 ? shared + spare : shared_bytes(pack_, want, (int) n_sess, false, false) + spare_base);
                 if (need > fb) {
                     cudaSetDevice(device_);
                     return fail("the layer split at layer " + std::to_string(cut_) + ": card " + std::to_string(card_device(c)) +
@@ -733,9 +777,13 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
         s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense +
                           (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8) * n_sess);
     }
+    const uint64_t spare_base = spare_ ? spare_ : kCardSpare;
+    const bool drafter = req.spec >= 2 && (pack_.dspark.present || pack_.dflash2.present);
+    const uint64_t drafter_w = drafter ? dspark_weight_bytes(pack_) : 0;
+    const uint64_t drafter_s = drafter ? dspark_session_bytes(pack_, want) * n_sess : 0;
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
-    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
-               kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
+    s.fixed = {spare_base + shared_bytes(pack_, want, (int) n_sess, true, drafter) + slot_rest * n_sess + drafter_w + drafter_s,
+               spare_base + shared_bytes(pack_, want, (int) n_sess, false, false) + slot_rest * n_sess};
     for (const model::GpuCards::Card& card : c.cards) {
         const core::OnDevice on_card(card.device);
         size_t free_b = 0, total_b = 0;
@@ -1572,7 +1620,8 @@ bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
     // the region beside the card's spare and the reserve the card holds now (a reserve it could not meet stays unmet)
     // (the copies go by the counted room, the layers below by the card's own free memory: those come back byte for byte)
     const uint64_t room0 = room();
-    const uint64_t want = bytes + std::min<uint64_t>(held_free(kCardSpare), std::max<uint64_t>(room0, kCardSpare));
+    if (lend_keep_ == 0) lend_keep_ = std::max<uint64_t>(room0, 1);
+    const uint64_t want = bytes + std::min<uint64_t>(held_free(kElasticKeep), std::max<uint64_t>(room0, kElasticKeep));
     size_t free_b = 0, total_b = 0;
     basalt::core::gpu_mem_info(&free_b, &total_b);
     if (has_spill_ && room0 < want && promoted() > 0) {
@@ -1632,7 +1681,15 @@ void InklingModel::refill() {
     const int64_t before = copies() ? promoted() : 0;
     if (copies() && !lent_) {
         const int64_t before_total = card_copies();
-        promote(held_free(kCardSpare));
+        // back to the room the card had before the lend (a grow may have left less than the start spare), never below
+        // the reserve a VRAM request holds; subtract late_room() because promote() adds it
+        uint64_t keep = held_free(kElasticKeep);
+        if (lend_keep_) {
+            const uint64_t late = late_room();
+            const uint64_t prior = lend_keep_ > late ? lend_keep_ - late : 0;
+            keep = std::max(prior, reserve_);
+        }
+        promote(keep);
         note_shortage("image encoder refill");
         log_copy_change("image encoder refill", before_total);
     }
@@ -1643,6 +1700,7 @@ void InklingModel::refill() {
                           (long long) lend_copies_, layers, (double) back / (double) kGiB, lend_ms_, ms, (long long) (promoted() - before));
     lend_ms_ = 0;
     lend_copies_ = 0;
+    lend_keep_ = 0;
 }
 
 }  // namespace basalt::models::inkling2
