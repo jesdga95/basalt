@@ -1440,7 +1440,7 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None,
-            live=None) -> Iterator[tuple[str, object]]:
+            live=None, stream_tools: bool = True) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare). `live` (serve.live.LiveRequest): the state
         this updates, and the answer-now signal that closes the thinking at its next clean point. A request with
@@ -1462,10 +1462,11 @@ class Service:
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
-        parser = self.dialect.parser(thinking, tools, stream_tools=True)
+        parser = self.dialect.parser(thinking, tools, stream_tools=stream_tools)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         lp_channels = LogprobChannels(thinking) if (sampling or {}).get(LOGPROBS_KEY) is not None else None
         thinking_n = 0                                 # tokens written while thinking
+        answered = False                               # any content or tool event emitted (for block-structured dialects)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
@@ -1629,7 +1630,9 @@ class Service:
                             budget = self.answer_budget(budget_req, max_new, budget)
                             budget_ready = True
                         cap = max_new - n
-                        capped = bool(budget) and parser.state == "reasoning" and budget - thought < cap
+                        may_think = parser.state == "reasoning" or (
+                            self.dialect.thinks_in_blocks and parser.state == "between" and thought == 0 and not answered)
+                        capped = bool(budget) and may_think and budget - thought < cap
                         if capped:
                             cap = max(1, budget - thought)
                         gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
@@ -1684,6 +1687,11 @@ class Service:
                                         n -= 1              # the end token is not part of the reply
                                         ended_thinking = True
                                         break
+                                    if (force and self.dialect.thinks_in_blocks and not parser.buf
+                                            and not detok.pending() and parser.state in ("between", "content")):
+                                        n -= 1              # the end token is not part of the reply
+                                        opens = True
+                                        break
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -1699,6 +1707,8 @@ class Service:
                                 tail = (tail + piece)[-2:]
                                 state0 = parser.state
                                 evs = cut(parser.feed(piece))
+                                if not answered and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                                    answered = True
                                 if lp_channels is not None:
                                     lp = logprob_entry(self.tok, t) if getattr(t, "lp", None) is not None else None
                                     for item in lp_channels.token(lp, state0, parser.state, evs):
@@ -1745,7 +1755,9 @@ class Service:
                                         wrap = True     # the engine did not stop soon enough: the answer keeps its room
                                         break
                                 if live is not None:
-                                    live.state = "thinking" if parser.state == "reasoning" else "answering"
+                                    live.state = "thinking" if (
+                                        parser.state == "reasoning"
+                                        or (thinking and parser.state == "between" and not answered)) else "answering"
                                     if live.answer_now.is_set() and parser.state == "reasoning":
                                         if soft is not None:
                                             soft.set()      # the close follows the engine's last token
@@ -1755,7 +1767,10 @@ class Service:
                                 if force:
                                     if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
                                         force = None    # the model is writing a call of its own
-                                    elif parser.state == "content" and not parser.buf and not detok.pending():
+                                    elif ((parser.state == "content"
+                                           or (self.dialect.thinks_in_blocks and state0 == "reasoning"
+                                               and parser.state == "between"))
+                                          and not parser.buf and not detok.pending()):
                                         opens = True    # at a clean point right after the thinking
                                         break
                             else:
@@ -1822,9 +1837,15 @@ class Service:
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
                         forced_here = bool(force) and (ended_thinking or wrap)
+                        close_n = 0
                         if ended_thinking:
                             closed_early = True
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            if self.dialect.thinks_in_blocks and force:
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 finish = "stop"
@@ -1832,7 +1853,12 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            if self.dialect.thinks_in_blocks and force:
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
@@ -1846,10 +1872,15 @@ class Service:
                             extra = []
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
-                            # before a call
-                            text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
+                            # before a call (or after closing an open block on a block-structured dialect)
+                            if self.dialect.thinks_in_blocks and parser.state == "content":
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
+                                extra = self.tok.encode(text, parse_special=True)
                             force = None
-                            extra = self.tok.encode(text, parse_special=True)
                             if max_new - n - len(extra) < 1:
                                 break                   # no room for the call: "length"
                         for t in extra:
@@ -1858,6 +1889,8 @@ class Service:
                             thinking_n += parser.state == "reasoning"
                             state0 = parser.state
                             evs = cut(parser.feed(detok.push(t)))
+                            if not answered and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                                answered = True
                             if lp_channels is not None:       # written by the server: no entry of its own
                                 for item in lp_channels.token(None, state0, parser.state, evs):
                                     yield "logprobs", item
@@ -1865,7 +1898,9 @@ class Service:
                             for ev in evs:
                                 yield "event", ev
                         if live is not None:
-                            live.state = "thinking" if parser.state == "reasoning" else "answering"
+                            live.state = "thinking" if (
+                                parser.state == "reasoning"
+                                or (thinking and parser.state == "between" and not answered)) else "answering"
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
@@ -1878,7 +1913,7 @@ class Service:
                             if resumed:
                                 gprompt0 = gprompt0 if gprompt0 is not None else base_len
                             elif opens or forced_here:
-                                gprompt0 = base_len + len(seg)
+                                gprompt0 = base_len + len(seg) + close_n
                             else:
                                 gprompt0 = None
                             if gprompt0 is not None and 0 < gprompt0 < len(prompt):
@@ -1978,6 +2013,8 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         last_evs = cut(parser.finish())
+        if stops is not None and stops.hit is not None and finish == "length":
+            finish = "stop"
         if lp_channels is not None:
             if stops is not None and stops.hit is not None:
                 lp_channels.pending.clear()             # the stop string's tokens: not in the answer
