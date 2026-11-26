@@ -1,6 +1,7 @@
 #include "basalt/models/deepseek4/compress.hpp"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -35,6 +36,25 @@ __device__ float block_sum(float value, float* warp_sums) {
     return sum;
 }
 
+__device__ float block_max(float value, float* warp_maxima) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    __syncthreads();
+    if (lane == 0) warp_maxima[warp] = value;
+    __syncthreads();
+    value = threadIdx.x < warps ? warp_maxima[threadIdx.x] : 0.f;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
+    if (threadIdx.x == 0) warp_maxima[0] = value;
+    __syncthreads();
+    value = warp_maxima[0];
+    __syncthreads();
+    return value;
+}
+
 __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float position, float frequency) {
     float sine, cosine;
     sincosf(position * frequency, &sine, &cosine);
@@ -50,6 +70,7 @@ __global__ void compress_kernel(CompressKind kind, int ratio, int n_tokens, cons
                                 int32_t* row_of) {
     __shared__ float values[kHeadDim];
     __shared__ float warp_sums[32];
+    __shared__ float fp8_scales[(kHeadDim - kRopeDim) / 64];
     __shared__ int32_t row_index;
     const int c = threadIdx.x;
     const int width = kind == CompressKind::Csa ? 2 * kHeadDim : kHeadDim;
@@ -137,6 +158,29 @@ __global__ void compress_kernel(CompressKind kind, int ratio, int n_tokens, cons
             float x1 = values[kHeadDim - kRopeDim + pair * 2 + 1];
             rotate_pair(x0, x1, (float) source_start, rope_freq[pair]);
             normalized = __bfloat162float(__float2bfloat16_rn((c & 1) ? x1 : x0));
+        }
+        values[c] = normalized;
+        __syncthreads();
+        constexpr int kFp8Width = kHeadDim - kRopeDim;
+        constexpr int kFp8Groups = kFp8Width / 64;
+        for (int group = 0; group < kFp8Groups; ++group) {
+            const float local = c >= group * 64 && c < (group + 1) * 64 ? fabsf(values[c]) : 0.f;
+            const float amax = block_max(local, warp_sums);
+            if (c == 0) {
+                const float scaled = fmaxf(amax, 1e-4f) * (1.f / 448.f);
+                const uint32_t bits = __float_as_uint(scaled);
+                int exponent = (int) ((bits >> 23) & 0xffu) - 127 + ((bits & 0x7fffffu) != 0u);
+                fp8_scales[group] = __uint_as_float((uint32_t) (exponent + 127) << 23);
+            }
+            __syncthreads();
+        }
+        if (c < kFp8Width) {
+            const float scale = fp8_scales[c / 64];
+            const float q = fminf(448.f, fmaxf(-448.f, values[c] / scale));
+            const float dequantized = (float) __nv_fp8_e4m3(q) * scale;
+            normalized = __bfloat162float(__float2bfloat16_rn(dequantized));
+        } else {
+            normalized = values[c];
         }
         out[(size_t) row_index * kHeadDim + c] = normalized;
         __syncthreads();

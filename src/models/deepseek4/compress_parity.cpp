@@ -1,6 +1,8 @@
 #include "basalt/models/deepseek4/compress.hpp"
 #include "test_util.hpp"
 
+#include <cuda_fp8.h>
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -92,6 +94,19 @@ void reference(CompressKind kind, int ratio, int n_tokens, const std::vector<flo
             const double x0 = normalized[c], x1 = normalized[c + 1];
             normalized[c] = bf16_rn((float) (x0 * cosine - x1 * sine));
             normalized[c + 1] = bf16_rn((float) (x0 * sine + x1 * cosine));
+        }
+        for (int group = 0; group < (D - R) / 64; ++group) {
+            float amax = 1e-4f;
+            for (int c = group * 64; c < (group + 1) * 64; ++c)
+                amax = std::max(amax, std::fabs((float) normalized[c]));
+            const float scaled = amax * (1.f / 448.f);
+            int exponent = std::ilogb(scaled);
+            if (std::scalbn(1.f, exponent) != scaled) ++exponent;
+            const float scale = std::scalbn(1.f, exponent);
+            for (int c = group * 64; c < (group + 1) * 64; ++c) {
+                const float q = std::clamp((float) normalized[c] / scale, -448.f, 448.f);
+                normalized[c] = bf16_rn((float) __nv_fp8_e4m3(q) * scale);
+            }
         }
         for (int c = 0; c < D; ++c) out[(size_t) row * D + c] = (float) normalized[c];
     }
