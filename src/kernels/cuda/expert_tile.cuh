@@ -446,26 +446,33 @@ __global__ void __launch_bounds__(C::NT, 2) down_kernel(Plan P, NativeExpertLayo
         default: if constexpr (C::TT >= 32) run(std::integral_constant<int, 4>{}); break;
     }
     if (!fin) return;
-    // the tickets: the item's entries are in row order, so its segments come as runs
+    // the tickets, a lane an entry of warp 0 (TT <= 32): the item's entries are in row order, so its segments come as
+    // runs; each run's first lane counts it
+    static_assert(C::TT <= 32, "an item's entries fit a warp");
     __threadfence();
     __syncthreads();
-    if (tid == 0) {
-        s_nfin = 0;
-        for (int e = 0; e < n;) {
-            const int s = f.seg(P.tok[e0 + e]);
-            int m = 1;
-            while (e + m < n && f.seg(P.tok[e0 + e + m]) == s) ++m;
-            const int tgt = f.target(s);
+    if (tid < 32) {
+        const int lane = tid;
+        const int sg = lane < n ? f.seg(P.tok[e0 + lane]) : -1;
+        const int before = __shfl_up_sync(0xffffffffu, sg, 1);
+        const bool head = lane < n && (lane == 0 || before != sg);
+        const unsigned heads = __ballot_sync(0xffffffffu, head);
+        if (lane == 0) s_nfin = 0;
+        __syncwarp();
+        if (head) {
+            const unsigned later = heads & ~((2u << lane) - 1u);
+            const int m = (later ? __ffs((int) later) - 1 : n) - lane;
+            const int tgt = f.target(sg);
             for (int cb = n0 / kTicketCh; cb < (n0 + C::ROWS) / kTicketCh; ++cb) {
-                const int old = atomicAdd(&f.tickets[s * ncb + cb], m);
+                const int old = atomicAdd(&f.tickets[sg * ncb + cb], m);
                 if (old + m == tgt) {
-                    f.tickets[s * ncb + cb] = 0;
-                    s_fin[s_nfin++] = s << 8 | cb;
+                    f.tickets[sg * ncb + cb] = 0;
+                    s_fin[atomicAdd(&s_nfin, 1)] = sg << 8 | cb;
                 }
             }
-            e += m;
         }
-        if (s_nfin) __threadfence();
+        __syncwarp();
+        if (lane == 0 && s_nfin) __threadfence();
     }
     __syncthreads();
     const int nf = s_nfin;
