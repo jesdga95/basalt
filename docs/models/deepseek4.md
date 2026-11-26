@@ -18,13 +18,13 @@ The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted f
 
 V4 uses a per-layer compression schedule, including sliding attention, ratio-4 CSA, and ratio-128 HCA layers. CSA has overlapping candidate windows and separate key/value and score lanes; HCA uses a non-overlapping long window. Both require the learned APE contribution and their own normalization/RoPE behavior. The indexer has a separate compressor and supplies the selected positions used by attention. Cache state, row identity, sequence boundaries and chunk continuation must be explicit in the V4 session.
 
-`src/models/deepseek4/compress.cu` currently provides only a parity-tested compression primitive. It is not connected to pack loading, the indexer, cache allocation or attention and does not establish runnable model support. Its parity and microbench are prerequisites for integration, not acceptance gates by themselves.
+`src/models/deepseek4/compress.cu` currently provides a compression primitive with an accompanying parity harness. The harness compiles, but CUDA parity and its microbench have not been run in this worktree. The primitive is not connected to pack loading, the indexer, cache allocation or attention and does not establish runnable model support.
 
 ## MoE routing
 
 The source computes gate logits in FP32, applies `sqrt(softplus(logit))`, and scales normalized selected weights by 1.5. Layers 0–2 use `tid2eid` to choose the fixed top-6 experts for ordinary text tokens, but still derive their weights from those experts' current gate scores. Later layers choose top-6 from the gate scores plus the learned selection bias. Selection bias affects expert choice only; it is excluded from the routed weights. Image-token IDs (IDs at or above the text vocabulary size) use score-based top-6 with `bias_vl`, including in the hash-routed layers. The shared expert runs alongside these six routed experts.
 
-This routing contract is distinct from DeepSeek-V4.1's generic top-k router. Reuse its FP32 gate-logit kernel, then use a V4-specific selector for fixed hash IDs and image-token selection; keep weight gathering and normalization consistent with the source. Validate IDs and table bounds before dispatch.
+This routing contract is distinct from DeepSeek-V4.1's generic top-k router. The V4 route-row helper marks ordinary text rows for hash lookup in layers 0–2 and image-token rows for alternate-bias selection in every layer. The shared mixed router gathers fixed IDs from the token-indexed table and normalizes the selected unbiased scores. This route path is not yet connected to a V4 session; validate token IDs and table bounds before dispatch.
 
 ## Vision path
 

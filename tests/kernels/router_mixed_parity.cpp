@@ -1,4 +1,5 @@
 #include "basalt/kernels/router.hpp"
+#include "basalt/models/deepseek4/router.hpp"
 
 #include <cuda_runtime.h>
 
@@ -201,16 +202,45 @@ int main() {
         if (id_errors || max_abs > 2e-6 || max_rel > 2e-5 || got.ids[(size_t) 7 * kRoutes] != 3 ||
             got.ids[(size_t) 7 * kRoutes + 1] != 17) return 1;
 
-        std::vector<int32_t> table_rows(kTokens), fixed_table(fixed_ids.size());
-        std::vector<uint8_t> image_mask(kTokens);
-        for (int t = 0; t < kTokens; ++t) {
-            table_rows[(size_t) t] = kTokens - 1 - t;
-            image_mask[(size_t) t] = !fixed_mask[(size_t) t];
-            std::copy_n(fixed_ids.data() + (size_t) t * kRoutes, kRoutes,
-                        fixed_table.data() + (size_t) table_rows[(size_t) t] * kRoutes);
+        const int token_vocab = kTokens / 2;
+        std::vector<int32_t> token_ids(kTokens);
+        for (int t = 0; t < kTokens; ++t) token_ids[(size_t) t] = t;
+        basalt::models::deepseek4::RouteRows route_rows;
+        std::string route_error;
+        if (!basalt::models::deepseek4::build_route_rows(token_ids.data(), kTokens, token_vocab, 2, 43, 3,
+                                                         route_rows, route_error)) {
+            std::fprintf(stderr, "V4 hash route plan: %s\n", route_error.c_str());
+            return 1;
         }
-        const Output table_got = run_table(logits, fixed_table, table_rows, fixed_mask, image_mask, {}, alternate_bias);
-        const Output table_ref = reference(logits, fixed_ids, fixed_mask, image_mask,
+        basalt::models::deepseek4::RouteRows score_rows;
+        if (!basalt::models::deepseek4::build_route_rows(token_ids.data(), kTokens, token_vocab, 3, 43, 3,
+                                                         score_rows, route_error) ||
+            std::any_of(score_rows.fixed_mask.begin(), score_rows.fixed_mask.end(), [](uint8_t x) { return x != 0; }) ||
+            score_rows.alternate_mask != route_rows.alternate_mask) {
+            std::fprintf(stderr, "V4 score route plan: %s\n", route_error.c_str());
+            return 1;
+        }
+        const int32_t invalid_token = -1;
+        if (basalt::models::deepseek4::build_route_rows(&invalid_token, 1, token_vocab, 2, 43, 3,
+                                                        score_rows, route_error)) {
+            std::fprintf(stderr, "V4 route plan accepted a negative token id\n");
+            return 1;
+        }
+        for (int t = 0; t < kTokens; ++t) {
+            const bool text = t < token_vocab;
+            if (route_rows.fixed_rows[(size_t) t] != (text ? t : 0) ||
+                route_rows.fixed_mask[(size_t) t] != (uint8_t) text ||
+                route_rows.alternate_mask[(size_t) t] != (uint8_t) !text) return 1;
+        }
+        const std::vector<int32_t>& table_rows = route_rows.fixed_rows;
+        const std::vector<uint8_t>& hash_mask = route_rows.fixed_mask;
+        const std::vector<uint8_t>& image_mask = route_rows.alternate_mask;
+        std::vector<int32_t> fixed_table((size_t) token_vocab * kRoutes);
+        for (int t = 0; t < token_vocab; ++t)
+            std::copy_n(fixed_ids.data() + (size_t) t * kRoutes, kRoutes,
+                        fixed_table.data() + (size_t) t * kRoutes);
+        const Output table_got = run_table(logits, fixed_table, table_rows, hash_mask, image_mask, {}, alternate_bias);
+        const Output table_ref = reference(logits, fixed_ids, hash_mask, image_mask,
                                            std::vector<float>(kExperts, 0.f), alternate_bias);
         int table_id_errors = 0;
         double table_max_abs = 0.0, table_max_rel = 0.0;
@@ -262,7 +292,7 @@ int main() {
         da.upload(alternate_bias);
         basalt::kernels::RouterMixedArgs args;
         args.n_expert = kExperts; args.k = kRoutes; args.weight_scale = kScale;
-        args.fixed_table = dt.p; args.fixed_rows = dr.p; args.fixed_table_rows = kTokens;
+        args.fixed_table = dt.p; args.fixed_rows = dr.p; args.fixed_table_rows = (int) (fixed_table.size() / kRoutes);
         args.fixed_mask = dm.p; args.alternate_mask = dx.p;
         args.bias = nullptr; args.alternate_bias = da.p;
         cudaEvent_t begin{}, end{};
