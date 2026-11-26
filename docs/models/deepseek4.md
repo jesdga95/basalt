@@ -18,7 +18,7 @@ The target checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`, converted f
 
 V4 uses a per-layer compression schedule, including sliding attention, ratio-4 CSA, and ratio-128 HCA layers. CSA has overlapping candidate windows and separate key/value and score lanes; HCA uses a non-overlapping long window. Both require the learned APE contribution and their own normalization/RoPE behavior. The indexer has a separate compressor and supplies the selected positions used by attention. Cache state, row identity, sequence boundaries and chunk continuation must be explicit in the V4 session.
 
-`src/models/deepseek4/compress.cu` currently provides a compression primitive with an accompanying parity harness. The harness compiles, but CUDA parity and its microbench have not been run in this worktree. The primitive is not connected to pack loading, the indexer, cache allocation or attention and does not establish runnable model support.
+`compress.cu` implements projected CSA/HCA pooling, BF16/RoPE rounding, and the source's FP8 cache simulation. `indexer_compress.cu` implements the separate 128-wide ratio-4 path with BF16, Hadamard, and FP4 round trips. `indexer_select.cu` scores visible compressed keys and selects the top 512 with per-token causal limits. Their parity/benchmark harnesses compile and link, but have not run on the GPU. None of these kernels is connected to pack loading, attention projections, cache allocation, or a V4 session, so the model is not runnable yet.
 
 ## MoE routing
 
