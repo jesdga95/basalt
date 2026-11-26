@@ -103,7 +103,7 @@ class Budget:
         self.assertEqual(code, 200, b)
         self.assertEqual(self.engine.caps[0], 20)
         msg = b["choices"][0]["message"]
-        close = self.case.dialect.reasoning_close
+        close = self.case.dialect.reasoning_wrap_up or self.case.dialect.reasoning_close   # a budget cut writes the wrap-up
         self.assertEqual(msg["reasoning_content"], THOUGHT[:20] + close.split(self.case.close.strip())[0])
         self.assertEqual(msg["content"], ANSWER)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")

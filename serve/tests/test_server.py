@@ -3080,16 +3080,16 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(self.svc.history[-1]["prompt_ms"], TimedThinkingEngine.READ)
 
     def test_the_budget_wraps_up_the_thinking(self):
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         code, b = self.openai(reasoning_budget_tokens=20)
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
-        wrap = REASONING_CLOSE.split("</think>")[0]
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
         self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap)
         self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         first, second = self.engine.prompts
-        extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
         self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)   # a prefix + more
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
@@ -3171,22 +3171,22 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_answer_room_wraps_up_long_thinking_without_a_budget(self):
         """From max_tokens 1024 on, thinking with no budget keeps the answer a quarter of the cap: 1024 - 512."""
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4               # 736 reasoning tokens, more than the 512
         code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
-        self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_WRAP_UP.split("</think>")[0])
         self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
 
     def test_answer_room_cuts_a_budget_at_or_near_max_tokens(self):
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
         code, b = self.openai(max_tokens=1024, reasoning_budget_tokens=1000)
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
-        self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_WRAP_UP.split("</think>")[0])
         self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
 
     def test_answer_room_zero_reserves_nothing(self):
@@ -3197,14 +3197,14 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
 
     def test_answer_room_auto_halves_small_caps_without_a_budget(self):
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
         for cap in (200, 400, 700):
             with self.subTest(cap=cap):
                 code, b = self.openai(max_tokens=cap)
                 self.assertEqual(code, 200, b)
                 msg = b["choices"][0]["message"]
-                self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:cap // 2] + REASONING_CLOSE.split("</think>")[0])
+                self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:cap // 2] + REASONING_WRAP_UP.split("</think>")[0])
                 self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
 
     def test_answer_room_fixed_reserve_lets_the_model_think_more(self):
@@ -3226,7 +3226,7 @@ class ThinkingBudget(unittest.TestCase):
                 self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
 
     def test_answer_room_keeps_smaller_budgets_and_clamps_server_defaults(self):
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
         for default, fields, expected in ((0, {"reasoning_budget_tokens": 100}, 100),
                                           (100, {}, 100), (1000, {}, 512),
@@ -3236,13 +3236,13 @@ class ThinkingBudget(unittest.TestCase):
                 code, b = self.openai(max_tokens=1024, **fields)
                 self.assertEqual(code, 200, b)
                 self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
-                                 self.engine.THOUGHT[:expected] + REASONING_CLOSE.split("</think>")[0])
+                                 self.engine.THOUGHT[:expected] + REASONING_WRAP_UP.split("</think>")[0])
                 self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
                 self.assertLessEqual(b["usage"]["completion_tokens"], 1024)
 
     def test_answer_room_uses_the_engine_clipped_cap(self):
         from serve.prompt import PromptText
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
         self.engine.takes_text = True
         original = self.engine.generate
@@ -3262,14 +3262,14 @@ class ThinkingBudget(unittest.TestCase):
         code, b = self.openai(max_tokens=8192)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
-                         self.engine.THOUGHT[:512] + REASONING_CLOSE.split("</think>")[0])
+                         self.engine.THOUGHT[:512] + REASONING_WRAP_UP.split("</think>")[0])
         self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
         self.assertLessEqual(b["usage"]["completion_tokens"], 1024)
         effective_cap = 400
         code, b = self.openai(max_tokens=8192)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
-                         self.engine.THOUGHT[:200] + REASONING_CLOSE.split("</think>")[0])
+                         self.engine.THOUGHT[:200] + REASONING_WRAP_UP.split("</think>")[0])
         self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
 
     def _pt_engine(self):
@@ -3341,15 +3341,15 @@ class ThinkingBudget(unittest.TestCase):
                     self.assertGreater(b["usage"]["output_tokens"], 800)
 
     def test_answer_room_reserves_a_quarter_of_an_8192_token_cap(self):
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         self.engine.max_context = 16384
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40
         code, b = self.openai(max_tokens=8192)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
-                         self.engine.THOUGHT[:6144] + REASONING_CLOSE.split("</think>")[0])
+                         self.engine.THOUGHT[:6144] + REASONING_WRAP_UP.split("</think>")[0])
         self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
-        extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
         self.assertEqual(b["usage"]["completion_tokens"], 6144 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
 
     def test_answer_room_on_both_apis_streaming_and_nonstreaming(self):
@@ -3383,7 +3383,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
 
     def test_anthropic_stream(self):
-        from serve.service import REASONING_CLOSE
+        from serve.service import REASONING_WRAP_UP
         code, raw = self.post("/v1/messages", {"model": "basalt", "max_tokens": 400, "stream": True,
                                                "reasoning_budget_tokens": 30,
                                                "messages": [{"role": "user", "content": "2+2?"}]})
@@ -3391,13 +3391,13 @@ class ThinkingBudget(unittest.TestCase):
         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
         thinking = "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
         text = "".join(e["delta"].get("text", "") for e in evs if e["type"] == "content_block_delta")
-        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + REASONING_WRAP_UP.split("</think>")[0])
         self.assertEqual(text, ThinkingEngine.ANSWER)
         self.assertEqual(evs[-2]["delta"]["stop_reason"], "end_turn")
 
     def test_thinking_budget_tokens_is_the_same_budget(self):
-        from serve.service import REASONING_CLOSE
-        wrap = REASONING_CLOSE.split("</think>")[0]
+        from serve.service import REASONING_WRAP_UP
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
         code, b = self.openai(thinking_budget_tokens=20)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap)
@@ -3430,8 +3430,8 @@ class ThinkingBudget(unittest.TestCase):
         return "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
 
     def test_anthropics_budget_tokens_is_the_same_budget(self):
-        from serve.service import REASONING_CLOSE
-        wrap = REASONING_CLOSE.split("</think>")[0]
+        from serve.service import REASONING_WRAP_UP
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
         body = {"model": "basalt", "max_tokens": 400, "stream": True,
                 "messages": [{"role": "user", "content": "2+2?"}]}
         code, raw = self.post("/v1/messages", {**body, "thinking": {"type": "enabled", "budget_tokens": 30}})
