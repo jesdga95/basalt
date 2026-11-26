@@ -2,12 +2,12 @@
 // over the last kExtent positions, and a per-query sink logit sits in the softmax's denominator.
 //
 // A row's keys split in slices whose size comes from the row's own key count alone (whole tiles of the block's four warps, at
-// most the card's slice count, slices.hpp), so a row's bits do not depend on the other rows of its call or on the launch's
-// bound. A block takes one row, one key/value head (its three query heads) and one slice; each warp walks its tiles of 32 keys
-// with a lane a key: the lane loads and scores its key in registers, stages V in shared memory, then sums four output
-// channels. For deep INT8 reads, a block instead shares its slice's K/V tiles across consecutive rows of the same
-// conversation. Both paths merge a row's slices with its sink, gate the heads and round to the output projection's q8_1
-// blocks.
+// most the card's slice count for an INT8 cache, slices.hpp, at most kMaxSplits for the others), so a row's bits do not depend
+// on the other rows of its call or on the launch's bound. A block takes one row, one key/value head (its three query heads)
+// and one slice; each warp walks its tiles of 32 keys with a lane a key: the lane loads and scores its key in registers,
+// stages V in shared memory, then sums four output channels. For deep INT8 reads, a block instead shares its slice's K/V tiles
+// across consecutive rows of the same conversation. Both paths merge a row's slices with its sink, gate the heads and round to
+// the output projection's q8_1 blocks.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/log.hpp"
@@ -66,7 +66,8 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
-// The card's slice count (slices.hpp), set once when its attention plans are probed (mma_device).
+// The card's slice count for INT8 caches (slices.hpp), set once when its attention plans are probed (mma_device). FP16 and
+// E4M3 caches keep kMaxSplits.
 __constant__ int c_slices = kMaxSplits;
 
 // The keys a slice of a row with n keys covers: whole passes of the block, at most `slices` slices.
@@ -189,7 +190,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
     if constexpr (SkipDeep) {
         if (n >= kMmaMinKeys) return;
     }
-    const int span = span_of(n, c_slices);
+    const int span = span_of(n, INT8 ? c_slices : kMaxSplits);
     if (s * span >= n) return;   // past this row's slices
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
@@ -1270,7 +1271,8 @@ __global__ void __launch_bounds__(32) attn_combine_kernel(AttnArgs a, int z, int
             aa = fmaf(a0, sm_f[i], aa);
         }
     } else {
-        const int splits = mma_z > 0 ? min(mma_z, (n + 63) / 64) : (n + span_of(n, c_slices) - 1) / span_of(n, c_slices);
+        const int span = span_of(n, a.int8 ? c_slices : kMaxSplits);
+        const int splits = mma_z > 0 ? min(mma_z, (n + 63) / 64) : (n + span - 1) / span;
         float mlane = t;
         for (int s = lane; s < splits; s += 32) {
             const float2 ml = *reinterpret_cast<const float2*>(part_ml + (base + s) * 2);
@@ -1362,7 +1364,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // the window, and the weights
     int p, lo, n;
     row_keys(a, r, p, lo, n);
-    const int span = span_of(n, c_slices), splits = (n + span - 1) / span;
+    const int span = span_of(n, INT8 ? c_slices : kMaxSplits), splits = (n + span - 1) / span;
     const bool active = s < splits;
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     const int p0 = a.pos[0];   // the window's first position: keys from it on are the window's rows (consecutive positions)
@@ -1661,7 +1663,7 @@ struct MmaLaunch {
 
 struct MmaDevice {
     int sms = 0, l2 = 0;
-    int slices = kMaxSplits;   // a row's most slices on this card (slices.hpp), the same for every plan and reader
+    int slices = kMaxSplits;   // an INT8 row's most slices on this card (slices.hpp), the same for every plan and reader
     MmaLaunch plans[3][2];  // narrow, one slab, two slabs; L2-resident/streaming
     MmaLaunch two_stage_ring, three_stage_ring, one_stage_ping_pong;
     MmaLaunch singleton;
@@ -1929,7 +1931,7 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
                                     int shard_count = 0) {
     if (rows <= 0) return true;
     cudaStream_t s = (cudaStream_t) stream;
-    const int z = launch_splits(max_keys, mma_device(opt_in_device()).slices);
+    const int z = launch_splits(max_keys, a.int8 ? mma_device(opt_in_device()).slices : kMaxSplits);
     float* part_ml = static_cast<float*>(scratch);
     float* part_acc = part_ml + (size_t) rows * kHeads * z * 2;
     static bool attr[kOptInDevices] = {};   // the opt-in is per device: a layer split launches these on two cards
