@@ -11,6 +11,7 @@
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "window_plan.hpp"
 #include "attn_mma.cuh"
 #include "prep.cuh"
 
@@ -20,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 #include <stdexcept>
@@ -1752,44 +1754,62 @@ const MmaDevice& mma_device(int dev) {
     return mma_devices[dev];
 }
 
-// mma_device with the register-staged window plans probed and chosen. Probed at a card's first MMA launch, not at load:
-// probing loads their code, which would then sit on the card before the expert placement sizes it.
-const MmaDevice& mma_windows(int dev) {
+// The register-staged window plans, probed and chosen once per card (window_plan.hpp). Probed at the card's first call
+// that can take them, not at load: probing loads their code, which would otherwise sit on the card while the expert
+// placement sizes it. Not under capture (loading code then is not allowed): such a call takes the rings. An optional probe
+// that runs out of memory leaves the rings serving; any other error throws. True: d.register_ring and d.window are set.
+std::atomic<bool> mma_windows_probed[kOptInDevices];
+
+bool mma_windows(int dev, cudaStream_t stream) {
+    if (mma_windows_probed[dev].load(std::memory_order_acquire)) return true;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    check_mma_probe(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return false;
     static std::once_flag probed[kOptInDevices];
-    (void) mma_device(dev);
     std::call_once(probed[dev], [dev] {
         MmaDevice& d = mma_devices[dev];
         const int per_block = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerBlockOptin);
         const int per_sm = mma_attribute(dev, cudaDevAttrMaxSharedMemoryPerMultiprocessor);
         const int reserved = mma_attribute(dev, cudaDevAttrReservedSharedMemoryPerBlock);
+        MmaLaunch found[2][2] = {};
+        // false: a probe ran out of memory (loading the kernel's code); anything else throws
         const auto probe_registers = [&](auto kernel, size_t slab_bytes, MmaLaunch (&out)[2]) {
             for (const bool ping_pong : {false, true}) {
                 const size_t bytes = slab_bytes + (ping_pong ? sizeof(MmaVTile) : 0);
                 if (bytes > (size_t) per_block) continue;
-                check_mma_probe(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes));
                 int resident = 0;
-                check_mma_probe(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, kWarps * 32, bytes));
-                resident = std::min(resident, per_sm / ((int) bytes + reserved));
-                out[ping_pong] = {bytes, 0, resident, ping_pong};
+                cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes);
+                if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, kWarps * 32, bytes);
+                if (e == cudaErrorMemoryAllocation) {
+                    cudaGetLastError();
+                    return false;
+                }
+                check_mma_probe(e);
+                out[ping_pong] = {bytes, 0, std::min(resident, per_sm / ((int) bytes + reserved)), ping_pong};
             }
+            return true;
         };
-        probe_registers(attn_mma_split_kernel<1, false, false, true>, sizeof(MmaSmem<1>), d.register_ring[0]);
-        probe_registers(attn_mma_split_kernel<2, false, false, true>, sizeof(MmaSmem<2>), d.register_ring[1]);
+        const bool ok = probe_registers(attn_mma_split_kernel<1, false, false, true>, sizeof(MmaSmem<1>), found[0]) &&
+                        probe_registers(attn_mma_split_kernel<2, false, false, true>, sizeof(MmaSmem<2>), found[1]);
+        if (!ok)
+            basalt::log::warn("basalt inkling2",
+                              "INT8 MMA CUDA%d windows: the register plans could not be loaded; the rings serve", dev);
+        const char* geometries[] = {"one-slab", "two-slab"};
         for (int s = 0; s < 2; ++s) {
-            const MmaLaunch& plain = d.register_ring[s][0];
-            const MmaLaunch& pp = d.register_ring[s][1];
-            const MmaLaunch& pick = pp.resident >= plain.resident ? pp : plain;
+            if (ok) d.register_ring[s][0] = found[s][0], d.register_ring[s][1] = found[s][1];
             // one slab: the narrow and one-slab rings; two slabs: the two-slab rings (each L2-resident and streaming)
             int rings = 0;
             for (int g = s == 0 ? 0 : 2; g <= s + 1; ++g)
                 rings = std::max({rings, d.plans[g][0].resident, d.plans[g][1].resident});
-            if (pick.resident > rings) d.window[s] = pick;
+            const WindowPlan plan = window_plan(ok, found[s][0].resident, found[s][1].resident, rings);
+            if (plan != WindowPlan::Rings) {
+                d.window[s] = found[s][plan == WindowPlan::RegistersPingPong];
+                log_mma_plan(dev, d, geometries[s], "windows", d.window[s], true);
+            }
         }
-        const char* geometries[] = {"one-slab", "two-slab"};
-        for (int s = 0; s < 2; ++s)
-            if (d.window[s].resident > 0) log_mma_plan(dev, d, geometries[s], "windows", d.window[s], true);
+        mma_windows_probed[dev].store(true, std::memory_order_release);
     });
-    return mma_devices[dev];
+    return mma_windows_probed[dev].load(std::memory_order_acquire);
 }
 
 // A row's slices as the shard model sees them: their count and the last one's share of a full slice's keys.
@@ -1936,6 +1956,7 @@ void launch_mma(const AttnArgs& a, int rows, int min_keys, int64_t max_keys, int
     const auto& pdl = bk::pdl_state();
     const int prime_span = Narrow && !Direct && pdl.on && pdl.plain == 0 && a.seg.at.n == 0 && a.seg.at_d == nullptr &&
                            a.min_full_keys >= min_keys && max_keys <= a.cap ? span_of((int) a.min_full_keys) : 0;
+    if (info) info->prime_span = prime_span;
     const dim3 grid(segments, kKvHeads, shards);
     bk::launch_pdl(attn_mma_split_kernel<Slabs, Narrow, Direct, Registers>, grid, dim3(kWarps * 32), plan.shared, stream,
                    a, rows, min_keys, z, plan.stages, plan.ping_pong, prime_span, part_ml, part_acc);
@@ -2015,13 +2036,19 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
     } else {
         const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
         if (mma) {
+            const MmaDevice& device = mma_device(dev);
+            const bool direct = !seg_mode && rows == 1 && plan != Int8MmaPlan::NarrowRing && plan != Int8MmaPlan::SharedRing &&
+                                device.singleton.resident > 0;
+            const bool forced_registers = plan == Int8MmaPlan::RegisterRing || plan == Int8MmaPlan::RegisterPingPong;
+            // before any of the call's kernels is queued
+            const bool windows = (forced_registers || (plan == Int8MmaPlan::Auto && !direct)) && mma_windows(dev, s);
             if (scalar_prefix) {
                 bk::launch_pdl(attn_split_kernel<false, true, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
                 check("attention_decode/shallow");
             }
-            const MmaDevice& device = mma_windows(dev);
             if (plan == Int8MmaPlan::Direct && device.singleton.resident == 0) return false;
-            if (plan == Int8MmaPlan::RegisterRing || plan == Int8MmaPlan::RegisterPingPong) {
+            if (forced_registers) {
+                if (!windows) return false;
                 const bool one = rows * kGroup <= kMmaRows, ping_pong = plan == Int8MmaPlan::RegisterPingPong;
                 const MmaLaunch* forced = &device.register_ring[one ? 0 : 1][ping_pong];
                 if (forced->resident == 0) return false;
@@ -2031,12 +2058,11 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
                 else
                     launch_mma<2, false, false, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, forced,
                                                       info, shards, shard_count);
-            } else if (!seg_mode && rows == 1 && plan != Int8MmaPlan::NarrowRing && plan != Int8MmaPlan::SharedRing &&
-                       device.singleton.resident > 0) {
+            } else if (direct) {
                 launch_mma<1, true, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, nullptr, info, shards,
                                           shard_count);
             } else if (const int slabs = rows * kGroup <= kMmaRows ? 1 : 2;
-                       plan == Int8MmaPlan::Auto && device.window[slabs - 1].resident > 0) {
+                       windows && plan == Int8MmaPlan::Auto && device.window[slabs - 1].resident > 0) {
                 if (slabs == 1)
                     launch_mma<1, false, false, true>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device,
                                                       &device.window[0], info, shards, shard_count);

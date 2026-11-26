@@ -169,6 +169,7 @@ struct Int8MmaPlanInfo {
     int shards = 0, blocks = 0, slots = 0;
     int busy = 0;       ///< the blocks that hold a slice of the row at max_keys
     double units = 0.;  ///< that row's modeled time in slice times of one block
+    int prime_span = 0; ///< keys a block copies before the preparation's wait (0: no priming)
 };
 
 /// Parity and microbenchmark entry point. Returns false if a forced MMA plan cannot run on this device. shard_count > 0
