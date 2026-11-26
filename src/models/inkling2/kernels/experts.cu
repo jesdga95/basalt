@@ -117,12 +117,13 @@ __global__ void __launch_bounds__(256) finish_rows_kernel(Finish f, int n_segs) 
 }
 
 // The tile shapes by the call's pairs: few pairs (a single conversation's window) take 8-entry tiles of 64 rows and
-// three stages; more take 16-entry tiles of 128 rows; a wide batch 32-entry tiles of 64 rows. Every shape gives an
-// entry the same bits. MXFP8 rows are twice the bytes: two stages for the wider tiles.
+// three stages; more take 16-entry tiles of 128 rows; a wide batch 32-entry tiles of 128 rows NVFP4 (an item reads its
+// entries' activations once for twice the weight rows), 64 MXFP8. Every shape gives an entry the same bits. MXFP8 rows
+// are twice the bytes: two stages for the wider tiles.
 constexpr int kSmallPairs = 128, kWidePairs = 1024;
 template<int TY, int K> using Small = xt::Cfg<TY, K, 8, 64, 3>;
 template<int TY, int K> using Mid = xt::Cfg<TY, K, 16, 128, 2>;
-template<int TY, int K> using Wide = xt::Cfg<TY, K, 32, 64, 2>;
+template<int TY, int K> using Wide = xt::Cfg<TY, K, 32, TY == xt::kNvfp4 ? 128 : 64, 2>;
 
 xt::Plan plan_of(const ExpertCall& e) {
     xt::Plan p;
