@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -20,6 +21,13 @@ namespace fp4 = basalt::prefill::fp4;
 namespace np = basalt::kernels::nvfp4p;
 
 namespace {
+
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "fp4_dense_tma_test: CUDA error (%s): %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 constexpr double kE2m1[8] = {0, 0.5, 1, 1.5, 2, 3, 4, 6};
 double code_value(int c) { return (c & 8 ? -1.0 : 1.0) * kE2m1[c & 7]; }
@@ -67,9 +75,9 @@ std::vector<float> decode_act(const std::vector<uint8_t>& act, int64_t T, int64_
 }
 
 template <class T> T* dev_copy(const std::vector<T>& v) {
-    T* d;
-    cudaMalloc(&d, v.size() * sizeof(T));
-    cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice);
+    T* d = nullptr;
+    ck(cudaMalloc(&d, v.size() * sizeof(T)), "cudaMalloc");
+    ck(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "cudaMemcpy H2D");
     return d;
 }
 // BF16 bits to float (exact)
@@ -84,7 +92,7 @@ std::vector<float> from_bf16(const std::vector<uint16_t>& h) {
 
 template <class T> std::vector<T> host_copy(const T* d, size_t n) {
     std::vector<T> v(n);
-    cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    ck(cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
     return v;
 }
 
@@ -136,12 +144,12 @@ int main(int argc, char** argv) {
     void* act;
     float *gs, *y, *y2, *y1;
     uint16_t* yh;
-    cudaMalloc(&act, fd::act_bytes(T, K));
-    cudaMalloc(&gs, T * 4);
-    cudaMalloc(&y, (size_t) T * R * 4);
-    cudaMalloc(&y2, (size_t) T * R * 4);
-    cudaMalloc(&y1, (size_t) R * 4);
-    cudaMalloc(&yh, (size_t) T * R * 2);
+    ck(cudaMalloc(&act, fd::act_bytes(T, K)), "malloc act");
+    ck(cudaMalloc(&gs, T * 4), "malloc gs");
+    ck(cudaMalloc(&y, (size_t) T * R * 4), "malloc y");
+    ck(cudaMalloc(&y2, (size_t) T * R * 4), "malloc y2");
+    ck(cudaMalloc(&y1, (size_t) R * 4), "malloc y1");
+    ck(cudaMalloc(&yh, (size_t) T * R * 2), "malloc yh");
 
     fd::quantize(dx, T, K, K, act, gs, nullptr);
     fd::product(dwg, dsc, R, K, act, gs, T, y, R, false, nullptr);
@@ -159,7 +167,7 @@ int main(int argc, char** argv) {
     const bool launch_err = cudaDeviceSynchronize() != cudaSuccess;
 
     fd::quantize(dx, T, K, K, act, gs, nullptr);
-    cudaDeviceSynchronize();
+    ck(cudaDeviceSynchronize(), "sync quantize");
     const auto actb = host_copy((const uint8_t*) act, fd::act_bytes(T, K));
     const auto gsh = host_copy(gs, T);
     const auto xd = decode_act(actb, T, K);
@@ -169,29 +177,42 @@ int main(int argc, char** argv) {
     const auto hres = host_copy(dres, (size_t) T * R);
 
     double worst_plain = 0, worst_add = 0, worst_sw = 0, worst_q = 0;
-    for (int64_t t = 0; t < T; ++t)
+    bool all_finite = true;
+    for (int64_t t = 0; t < T; ++t) {
+        all_finite &= std::isfinite(gsh[(size_t) t]);
         for (int64_t i = 0; i < R; ++i) {
             const size_t o = (size_t) t * R + i;
+            all_finite &= std::isfinite(hy[o]) && std::isfinite(hres[o]) && std::isfinite(hh[o]);
             const double g = (double) gsh[t] * sg, u = (double) gsh[t] * su;
             const double den = (double) gsh[t] * sg * rg.abs[o] + 1e-30;
-            worst_plain = std::max(worst_plain, std::fabs(hy[o] - g * rg.sum[o]) / den);
-            worst_add = std::max(worst_add, std::fabs(hres[o] - (res[o] + g * rg.sum[o])) / den);
+            const double ep = std::fabs(hy[o] - g * rg.sum[o]) / den;
+            const double ea = std::fabs(hres[o] - (res[o] + g * rg.sum[o])) / den;
             const double gv = g * rg.sum[o], uv = u * ru.sum[o];
             const double ref = gv / (1.0 + std::exp(-gv)) * uv;
             const double gb = g * rg.abs[o], ub = u * ru.abs[o];
             // the bounds of the products' rounding, plus BF16's half step of the output
             const double tol = 1.1 * gb * std::fabs(uv) + std::fabs(gv / (1.0 + std::exp(-gv))) * ub + std::fabs(ref) / 256.0 + 1e-30;
-            worst_sw = std::max(worst_sw, std::fabs(hh[o] - ref) / tol);
+            const double es = std::fabs(hh[o] - ref) / tol;
+            all_finite &= std::isfinite(ep) && std::isfinite(ea) && std::isfinite(es);
+            if (std::isfinite(ep)) worst_plain = std::max(worst_plain, ep);
+            if (std::isfinite(ea)) worst_add = std::max(worst_add, ea);
+            if (std::isfinite(es)) worst_sw = std::max(worst_sw, es);
         }
+    }
     // the quantizer: each token's scale is amax / (6 * 448) and the decoded row is within the FP4 grid's reach of x
     for (int64_t t = 0; t < T; ++t) {
         double amax = 0, err = 0;
         for (int64_t k = 0; k < K; ++k) {
+            const float xdv = xd[(size_t) t * K + k];
+            all_finite &= std::isfinite(xdv);
             amax = std::max(amax, (double) std::fabs(x[(size_t) t * K + k]));
-            err = std::max(err, std::fabs(x[(size_t) t * K + k] - (double) gsh[t] * xd[(size_t) t * K + k]));
+            err = std::max(err, std::fabs(x[(size_t) t * K + k] - (double) gsh[t] * xdv));
         }
-        worst_q = std::max(worst_q, std::fabs(gsh[t] - amax / (6.0 * 448.0)) / (amax / (6.0 * 448.0)));
-        worst_q = std::max(worst_q, err / amax / 0.25);   // half a step of 2 .. 3 spacing near the top, with the scale's rounding
+        const double eq1 = std::fabs(gsh[t] - amax / (6.0 * 448.0)) / (amax / (6.0 * 448.0));
+        const double eq2 = err / amax / 0.25;
+        all_finite &= std::isfinite(eq1) && std::isfinite(eq2);
+        if (std::isfinite(eq1)) worst_q = std::max(worst_q, eq1);
+        if (std::isfinite(eq2)) worst_q = std::max(worst_q, eq2);   // half a step of 2 .. 3 spacing near the top, with the scale's rounding
     }
     // the norm in the quantizer: its codes and token scales are quantize()'s of its own normed rows
     bool norm_same = false;
@@ -201,14 +222,17 @@ int main(int argc, char** argv) {
         float* dnw = dev_copy(nw);
         float *dxn, *gs2;
         void* act2;
-        cudaMalloc(&dxn, (size_t) T * K * 4);
-        cudaMalloc(&gs2, T * 4);
-        cudaMalloc(&act2, fd::act_bytes(T, K));
+        ck(cudaMalloc(&dxn, (size_t) T * K * 4), "malloc dxn");
+        ck(cudaMalloc(&gs2, T * 4), "malloc gs2");
+        ck(cudaMalloc(&act2, fd::act_bytes(T, K)), "malloc act2");
         fd::rms_norm_quantize(dx, dnw, 1e-6f, T, K, act, gs, dxn, nullptr);
         fd::quantize(dxn, T, K, K, act2, gs2, nullptr);
-        cudaDeviceSynchronize();
-        norm_same = host_copy((const uint8_t*) act, fd::act_bytes(T, K)) == host_copy((const uint8_t*) act2, fd::act_bytes(T, K)) &&
-                    host_copy(gs, T) == host_copy(gs2, T);
+        ck(cudaDeviceSynchronize(), "sync norm_quantize");
+        const auto gs_h = host_copy(gs, T), gs2_h = host_copy(gs2, T);
+        bool gs_fin = true;
+        for (float v : gs_h) gs_fin &= std::isfinite(v);
+        norm_same = gs_fin && host_copy((const uint8_t*) act, fd::act_bytes(T, K)) == host_copy((const uint8_t*) act2, fd::act_bytes(T, K)) &&
+                    gs_h == gs2_h;
         std::printf("fp4 dense rms_norm_quantize: codes and scales %s\n", norm_same ? "bitwise quantize's of its normed rows" : "DIFFER");
     }
     // SwiGLU's per-token amax: quantize_amax of its output gives quantize's codes and scales, reading the rows once
@@ -216,25 +240,29 @@ int main(int argc, char** argv) {
     {
         float *hmax, *gs3, *gs4;
         void *a3, *a4;
-        cudaMalloc(&hmax, T * 4);
-        cudaMalloc(&gs3, T * 4);
-        cudaMalloc(&gs4, T * 4);
-        cudaMalloc(&a3, fd::act_bytes(T, R));
-        cudaMalloc(&a4, fd::act_bytes(T, R));
+        ck(cudaMalloc(&hmax, T * 4), "malloc hmax");
+        ck(cudaMalloc(&gs3, T * 4), "malloc gs3");
+        ck(cudaMalloc(&gs4, T * 4), "malloc gs4");
+        ck(cudaMalloc(&a3, fd::act_bytes(T, R)), "malloc a3");
+        ck(cudaMalloc(&a4, fd::act_bytes(T, R)), "malloc a4");
         fd::quantize(dx, T, K, K, act, gs, nullptr);
         fd::swiglu(dwg, dwu, dsc, dsc + 1, R, K, act, gs, T, yh, R, nullptr, hmax);
-        cudaDeviceSynchronize();
+        ck(cudaDeviceSynchronize(), "sync swiglu amax");
         float* yf = dev_copy(from_bf16(host_copy(yh, (size_t) T * R)));   // the same values as FP32 rows
         fd::quantize(yf, T, R, R, a3, gs3, nullptr);
         fd::quantize_amax(yh, hmax, T, R, R, a4, gs4, nullptr);
-        cudaDeviceSynchronize();
-        amax_same = host_copy((const uint8_t*) a3, fd::act_bytes(T, R)) == host_copy((const uint8_t*) a4, fd::act_bytes(T, R)) &&
-                    host_copy(gs3, T) == host_copy(gs4, T);
+        ck(cudaDeviceSynchronize(), "sync quantize_amax");
+        const auto gs3_h = host_copy(gs3, T), gs4_h = host_copy(gs4, T);
+        bool gs3_fin = true;
+        for (float v : gs3_h) gs3_fin &= std::isfinite(v);
+        amax_same = gs3_fin && host_copy((const uint8_t*) a3, fd::act_bytes(T, R)) == host_copy((const uint8_t*) a4, fd::act_bytes(T, R)) &&
+                    gs3_h == gs4_h;
         std::printf("fp4 dense swiglu amax + quantize_amax: %s\n", amax_same ? "bitwise quantize's" : "DIFFER");
     }
     const bool same = std::memcmp(hy.data(), hy2.data(), (size_t) T2 * R * 4) == 0;
     const bool same1 = std::memcmp(hy.data(), hy1.data(), (size_t) R * 4) == 0;
-    const bool ok = !launch_err && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1.0 && worst_q < 1.0 && same && same1 && norm_same && amax_same;
+    const bool cuda_ok = cudaGetLastError() == cudaSuccess;
+    const bool ok = !launch_err && cuda_ok && all_finite && worst_plain < 1e-5 && worst_add < 1e-5 && worst_sw < 1.0 && worst_q < 1.0 && same && same1 && norm_same && amax_same;
     std::printf("fp4 dense tma [%lld x %lld] x %lld tokens: plain max err %.3g, add %.3g, swiglu %.3g (x sum|wx|), quantizer %.3g; "
                 "rows bitwise at 1, 1000, 1100 tokens: %s%s\n",
                 (long long) R, (long long) K, (long long) T, worst_plain, worst_add, worst_sw, worst_q,

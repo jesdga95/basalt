@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -18,6 +19,12 @@
 namespace mx = basalt::prefill::mxfp8;
 
 namespace {
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "moe_mxfp8_test: CUDA error (%s): %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 double e4m3_d(uint8_t b) {
     int e = (b >> 3) & 0xF, m = b & 0x7;
     if (e == 15 && m == 7) return 0.0;
@@ -140,16 +147,16 @@ int main(int argc, char** argv) {
 
     uint8_t* dw; float *dx, *dout; uint16_t* dh16; void *da_x, *da_h;
     int32_t *db, *dids, *ddst, *dtile, *dblk;
-    cudaMalloc(&dw, hw.size()); cudaMemcpy(dw, hw.data(), hw.size(), cudaMemcpyHostToDevice);
-    cudaMalloc(&dx, hx.size() * 4); cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
-    cudaMalloc(&dh16, (size_t) pairs * F * 2);
-    cudaMalloc(&dout, (size_t) pairs * E * 4);
-    cudaMalloc(&da_x, mx::act_bytes(tokens, E));
-    cudaMalloc(&da_h, mx::act_bytes(pairs, F));
-    cudaMalloc(&db, 4 * 4); cudaMemcpy(db, hb.data(), 16, cudaMemcpyHostToDevice);
-    cudaMalloc(&dids, pairs * 4); cudaMemcpy(dids, hids.data(), pairs * 4, cudaMemcpyHostToDevice);
-    cudaMalloc(&ddst, pairs * 4); cudaMemcpy(ddst, hdst.data(), pairs * 4, cudaMemcpyHostToDevice);
-    cudaMalloc(&dtile, 16); cudaMalloc(&dblk, 16);
+    ck(cudaMalloc(&dw, hw.size()), "malloc dw"); ck(cudaMemcpy(dw, hw.data(), hw.size(), cudaMemcpyHostToDevice), "copy dw");
+    ck(cudaMalloc(&dx, hx.size() * 4), "malloc dx"); ck(cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice), "copy dx");
+    ck(cudaMalloc(&dh16, (size_t) pairs * F * 2), "malloc dh16");
+    ck(cudaMalloc(&dout, (size_t) pairs * E * 4), "malloc dout");
+    ck(cudaMalloc(&da_x, mx::act_bytes(tokens, E)), "malloc da_x");
+    ck(cudaMalloc(&da_h, mx::act_bytes(pairs, F)), "malloc da_h");
+    ck(cudaMalloc(&db, 4 * 4), "malloc db"); ck(cudaMemcpy(db, hb.data(), 16, cudaMemcpyHostToDevice), "copy db");
+    ck(cudaMalloc(&dids, pairs * 4), "malloc dids"); ck(cudaMemcpy(dids, hids.data(), pairs * 4, cudaMemcpyHostToDevice), "copy dids");
+    ck(cudaMalloc(&ddst, pairs * 4), "malloc ddst"); ck(cudaMemcpy(ddst, hdst.data(), pairs * 4, cudaMemcpyHostToDevice), "copy ddst");
+    ck(cudaMalloc(&dtile, 16), "malloc dtile"); ck(cudaMalloc(&dblk, 16), "malloc dblk");
 
     mx::plan_blocks(db, n, dblk, nullptr);
     mx::quantize_tokens(dx, tokens, E, E, da_x, nullptr);
@@ -166,6 +173,7 @@ int main(int argc, char** argv) {
     dn.act = da_h; dn.act_rows = pairs; dn.bounds = db; dn.blk_off = dblk; dn.blocks = mx::max_blocks(pairs, n);
     dn.dst_ids = ddst; dn.dst = dout; dn.ld_dst = E; dn.swiglu = false;
     mx::run(dn, nullptr);
+    ck(cudaDeviceSynchronize(), "sync parity");
 
     // Read back quantized activations and outputs and compare against double-precision CPU reference on the exact same MXFP8 codes
     const size_t ax_bytes = mx::act_bytes(tokens, E);
@@ -173,10 +181,10 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> hax(ax_bytes), hah(ah_bytes);
     std::vector<uint16_t> hh16((size_t) pairs * F);
     std::vector<float> hout((size_t) pairs * E);
-    cudaMemcpy(hax.data(), da_x, ax_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(hah.data(), da_h, ah_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(hh16.data(), dh16, hh16.size() * 2, cudaMemcpyDeviceToHost);
-    cudaMemcpy(hout.data(), dout, hout.size() * 4, cudaMemcpyDeviceToHost);
+    ck(cudaMemcpy(hax.data(), da_x, ax_bytes, cudaMemcpyDeviceToHost), "copy hax");
+    ck(cudaMemcpy(hah.data(), da_h, ah_bytes, cudaMemcpyDeviceToHost), "copy hah");
+    ck(cudaMemcpy(hh16.data(), dh16, hh16.size() * 2, cudaMemcpyDeviceToHost), "copy hh16");
+    ck(cudaMemcpy(hout.data(), dout, hout.size() * 4, cudaMemcpyDeviceToHost), "copy hout");
 
     const size_t ax_soff = ((size_t) tokens * E + 15) & ~(size_t) 15;
     const size_t ah_soff = ((size_t) pairs * F + 15) & ~(size_t) 15;
@@ -195,6 +203,7 @@ int main(int argc, char** argv) {
     };
 
     double max_h_err = 0.0, max_d_err = 0.0;
+    int non_finite = 0;
     for (int j = 0; j < n; ++j) {
         const uint8_t* w_gu = hw.data() + j * stride;
         const uint8_t* w_dn = w_gu + gu_bytes;
@@ -209,7 +218,8 @@ int main(int argc, char** argv) {
                 const double ref_h = (15.0 * std::tanh(g / 15.0)) * (1.0 / (1.0 + std::exp(-g))) * (15.0 * std::tanh(u / 15.0));
                 const double got_h = h2d(hh16[(size_t) i * F + r]);
                 const double err = std::abs(got_h - ref_h) / std::max(1.0, std::abs(ref_h));
-                max_h_err = std::max(max_h_err, err);
+                if (!std::isfinite(got_h) || !std::isfinite(err)) ++non_finite;
+                else max_h_err = std::max(max_h_err, err);
             }
             const int out_r = hdst[i];
             for (int r = 0; r < E; ++r) {
@@ -217,12 +227,14 @@ int main(int argc, char** argv) {
                                              reinterpret_cast<const block_mxfp8*>(w_dn) + r * row_blks_dn, F);
                 const double got_d = (double) hout[(size_t) out_r * E + r];
                 const double err = std::abs(got_d - ref_d) / std::max(1.0, std::abs(ref_d));
-                max_d_err = std::max(max_d_err, err);
+                if (!std::isfinite(got_d) || !std::isfinite(err)) ++non_finite;
+                else max_d_err = std::max(max_d_err, err);
             }
         }
     }
-    std::printf("moe_mxfp8 parity: max_h_rel=%.3e (fp16), max_down_rel=%.3e (fp32)\n", max_h_err, max_d_err);
-    if (max_h_err > 2e-3 || max_d_err > 2e-5) {
+    ck(cudaGetLastError(), "final");
+    std::printf("moe_mxfp8 parity: max_h_rel=%.3e (fp16), max_down_rel=%.3e (fp32), non_finite=%d\n", max_h_err, max_d_err, non_finite);
+    if (non_finite > 0 || !std::isfinite(max_h_err) || !std::isfinite(max_d_err) || max_h_err > 2e-3 || max_d_err > 2e-5) {
         std::printf("FAIL parity!\n");
         return 1;
     }

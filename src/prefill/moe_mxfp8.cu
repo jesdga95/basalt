@@ -312,9 +312,9 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
 
     const int base_m = warp_m * 64 + group;
     if constexpr (SWIGLU) {
-        const bool sc = a.gate_softcap > 0.0f;
+        const bool scg = a.gate_softcap > 0.0f, scu = a.up_softcap > 0.0f;
         const float cg = a.gate_softcap, cu = a.up_softcap;
-        const float inv_cg = sc ? 1.0f / cg : 0.0f, inv_cu = sc ? 1.0f / cu : 0.0f;
+        const float inv_cg = scg ? 1.0f / cg : 0.0f, inv_cu = scu ? 1.0f / cu : 0.0f;
 #pragma unroll
         for (int mt = 0; mt < 4; ++mt) {
 #pragma unroll
@@ -327,14 +327,12 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                     const int col = rb * 64 + warp_n * 16 + r * 8 + 2 * tig;
                     const float g0 = acc[mt][r][2 * h], g1 = acc[mt][r][2 * h + 1];
                     const float u0 = acc[mt][r + 2][2 * h], u1 = acc[mt][r + 2][2 * h + 1];
-                    float v0, v1;
-                    if (sc) {
-                        v0 = __fmul_rn(__fmul_rn(cg * fast_tanh(g0 * inv_cg), fast_sigmoid(g0)), cu * fast_tanh(u0 * inv_cu));
-                        v1 = __fmul_rn(__fmul_rn(cg * fast_tanh(g1 * inv_cg), fast_sigmoid(g1)), cu * fast_tanh(u1 * inv_cu));
-                    } else {
-                        v0 = __fmul_rn(__fmul_rn(g0, fast_sigmoid(g0)), u0);
-                        v1 = __fmul_rn(__fmul_rn(g1, fast_sigmoid(g1)), u1);
-                    }
+                    const float gc0 = scg ? cg * fast_tanh(g0 * inv_cg) : g0;
+                    const float gc1 = scg ? cg * fast_tanh(g1 * inv_cg) : g1;
+                    const float uc0 = scu ? cu * fast_tanh(u0 * inv_cu) : u0;
+                    const float uc1 = scu ? cu * fast_tanh(u1 * inv_cu) : u1;
+                    const float v0 = __fmul_rn(__fmul_rn(gc0, fast_sigmoid(g0)), uc0);
+                    const float v1 = __fmul_rn(__fmul_rn(gc1, fast_sigmoid(g1)), uc1);
                     if (a.dst_f16)
                         *reinterpret_cast<__half2*>(a.dst_f16 + out_row * a.ld_dst + col) = __floats2half2_rn(v0, v1);
                     else

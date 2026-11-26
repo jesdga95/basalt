@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
@@ -199,7 +200,8 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     const float g = amax * (1.0f / (6.0f * 448.0f));
     if (lane == 0) gs[pos] = g;
-    const float inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
+    const float raw_inv_g = g > 0.0f ? 1.0f / g : 0.0f;
+    const float inv_g = isfinite(raw_inv_g) ? raw_inv_g : 0.0f;
     uint8_t* tbase = a4 + tile * ((int64_t) nkt * kAStage);
 #pragma unroll
     for (int i = 0; i < NBL; ++i) {
@@ -207,7 +209,9 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
         if (b >= nb) continue;
         const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(bm[i] * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
         const float sd = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
-        const float inv = sd > 0.0f ? 1.0f / (sd * g) : 0.0f;
+        const float sd_g = sd * g;
+        const float raw_inv = sd_g > 0.0f ? 1.0f / sd_g : 0.0f;
+        const float inv = isfinite(raw_inv) ? raw_inv : 0.0f;
         const float4* p = (const float4*) (xr + 16 * b);
         uint32_t w[2] = {0, 0};
         if constexpr (TWO) {
@@ -219,11 +223,14 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
             }
             e2m1_block(x, inv, w);
             {   // the second term: the residual, its own E4M3 scale per 16 (largest |value| to 6)
-                const float m2 = e2m1_residual(x, w, sd * g);
+                const float m2 = e2m1_residual(x, w, sd_g);
                 const __nv_fp8_storage_t sb2 = __nv_cvt_float_to_fp8(m2 * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
                 const float sd2 = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb2, __NV_E4M3)));
+                const float sd2_g = sd2 * g;
+                const float raw_inv2 = sd2_g > 0.0f ? 1.0f / sd2_g : 0.0f;
+                const float inv2 = isfinite(raw_inv2) ? raw_inv2 : 0.0f;
                 uint32_t w2[2];
-                e2m1_block(x, sd2 > 0.0f ? 1.0f / (sd2 * g) : 0.0f, w2);
+                e2m1_block(x, inv2, w2);
                 // logical block (2 kt + t) * 8 + b % 8 of 2 nb
                 const int b1 = (b / 8) * 16 + (b % 8), b2 = b1 + 8;
                 if (TOKENS) {
@@ -317,7 +324,8 @@ __global__ void quantize_f16_kernel(const uint16_t* __restrict__ x, const int32_
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     const float g = amax * (1.0f / (6.0f * 448.0f));
     if (lane == 0) gs[pos] = g;
-    const float inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
+    const float raw_inv_g = g > 0.0f ? 1.0f / g : 0.0f;
+    const float inv_g = isfinite(raw_inv_g) ? raw_inv_g : 0.0f;
     uint8_t* tbase = a4 + tile * ((int64_t) nkt * kAStage);
 #pragma unroll
     for (int i = 0; i < NBL; ++i) {
@@ -325,14 +333,19 @@ __global__ void quantize_f16_kernel(const uint16_t* __restrict__ x, const int32_
         if (b >= nb) continue;
         const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(bm[i] * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
         const float sd = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
-        const float inv = sd > 0.0f ? 1.0f / (sd * g) : 0.0f;
+        const float sd_g = sd * g;
+        const float raw_inv = sd_g > 0.0f ? 1.0f / sd_g : 0.0f;
+        const float inv = isfinite(raw_inv) ? raw_inv : 0.0f;
         uint32_t w[2] = {0, 0};
         e2m1_block(xv[i], inv, w);
-        const float m2 = e2m1_residual(xv[i], w, sd * g);
+        const float m2 = e2m1_residual(xv[i], w, sd_g);
         const __nv_fp8_storage_t sb2 = __nv_cvt_float_to_fp8(m2 * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
         const float sd2 = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb2, __NV_E4M3)));
+        const float sd2_g = sd2 * g;
+        const float raw_inv2 = sd2_g > 0.0f ? 1.0f / sd2_g : 0.0f;
+        const float inv2 = isfinite(raw_inv2) ? raw_inv2 : 0.0f;
         uint32_t w2[2];
-        e2m1_block(xv[i], sd2 > 0.0f ? 1.0f / (sd2 * g) : 0.0f, w2);
+        e2m1_block(xv[i], inv2, w2);
         const int lb = (b % 8) * 8;
         uint8_t* k1 = tbase + (int64_t) (2 * (b / 8)) * kAStage;
         uint8_t* k2 = k1 + kAStage;
@@ -362,7 +375,7 @@ struct GemmArgs {
     const int32_t* blk_off;
     int n;
     const int32_t* dst_ids;   // FLAT: output row r to dst row dst_ids[r] (null: r)
-    float cg, cu;             // FLAT SWIGLU: the softcaps (cg > 0)
+    float cg, cu;             // FLAT SWIGLU: the softcaps (each applied when > 0)
 };
 
 // The weight row behind B tile row sr of block rb: 128 consecutive rows, or (SWIGLU) the block's 64 gate rows and the
@@ -380,17 +393,28 @@ template <bool SWIGLU> __device__ __forceinline__ int b_tile_row(int warp_n, int
 // mmq::swiglu's tail-scaled SwiGLU in the instructions of its fast-math build (FTZ products, ex2 and rcp
 // approximations, the division as a reciprocal product), so h is the same bits
 // mmq::swiglu's softcapped form: (cg tanh(g / cg)) sigmoid(g) (cu tanh(u / cu)) s_down, g and u tail-scaled
+// (either softcap <= 0 leaves that branch uncapped)
 __device__ __forceinline__ float swiglu_cap(float g, float u, float4 s, float cg, float cu, float inv_cg, float inv_cu) {
     g *= s.x;
     u *= s.y;
-    float tg, tu, t, e, d, sig;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(tg) : "f"(g * inv_cg));
-    asm("tanh.approx.f32 %0, %1;" : "=f"(tu) : "f"(u * inv_cu));
+    float gc = g;
+    if (cg > 0.0f) {
+        float tg;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(tg) : "f"(g * inv_cg));
+        gc = cg * tg;
+    }
+    float uc = u;
+    if (cu > 0.0f) {
+        float tu;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(tu) : "f"(u * inv_cu));
+        uc = cu * tu;
+    }
+    float t, e, d, sig;
     asm("mul.rn.ftz.f32 %0, %1, 0fBFB8AA3B;" : "=f"(t) : "f"(g));
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(t));
     asm("add.rn.ftz.f32 %0, %1, 0f3F800000;" : "=f"(d) : "f"(e));
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sig) : "f"(d));
-    return __fmul_rn(__fmul_rn(cg * tg, sig), cu * tu) * s.z;
+    return __fmul_rn(__fmul_rn(gc, sig), uc) * s.z;
 }
 
 __device__ __forceinline__ float swiglu_tail(float g, float u, float4 s) {
@@ -947,8 +971,8 @@ template <bool GATHER, bool SWIGLU> void launch256(const GemmArgs& a, dim3 grid,
 void run(const Product& p, void* stream) {
     if (p.base) {   // a layer's experts in one launch
         if (p.n <= 0 || p.blocks <= 0) return;
-        if ((p.ids != nullptr) != p.swiglu || !p.blk_off || p.gate_softcap <= 0.0f) {
-            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off, softcaps, and token rows with the SwiGLU");
+        if ((p.ids != nullptr) != p.swiglu || !p.blk_off) {
+            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off and token rows with the SwiGLU");
             std::exit(1);
         }
         GemmArgs a{};

@@ -269,11 +269,12 @@ void run_f16(const Pair& p, const Geo& geo, basalt::prefill::Gemm& gemm, F16Bufs
     }
 }
 // X in sorted-row order, FP16 (the prompt path's Xs)
-void upload_xs(const std::vector<float>& x, const Routing& r, F16Bufs& b) {
+void upload_xs(const std::vector<float>& x, const Routing& r, F16Bufs& b, cudaStream_t s) {
     std::vector<ggml_fp16_t> h(r.src.size() * N);
     for (size_t i = 0; i < r.src.size(); ++i)
         for (int k = 0; k < N; ++k) h[i * N + k] = ggml_fp32_to_fp16(x[(size_t) r.src[i] * N + k]);
-    ck(cudaMemcpy(b.xs.p, h.data(), h.size() * 2, cudaMemcpyHostToDevice), "xs");
+    ck(cudaMemcpyAsync(b.xs.p, h.data(), h.size() * 2, cudaMemcpyHostToDevice, s), "xs");
+    ck(cudaStreamSynchronize(s), "xs sync");
 }
 
 struct Err {
@@ -331,7 +332,7 @@ void run_pair(const Pair& p, bool outliers, cudaStream_t s) {
         host[(size_t) e] = make_blob(p, geo, rng);
         dev.push_back(std::make_unique<Dev>(geo.bytes + 64));
         uint8_t* q = dev.back()->as<uint8_t>();   // the FP16 path's dequantizers need aligned blobs
-        ck(cudaMemcpy(q, host[(size_t) e].data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
+        ck(cudaMemcpyAsync(q, host[(size_t) e].data(), geo.bytes, cudaMemcpyHostToDevice, s), "blob");
         blob[(size_t) e] = q;
     }
     const std::vector<float> x = make_x(T, rng, 5, outliers);
@@ -344,8 +345,8 @@ void run_pair(const Pair& p, bool outliers, cudaStream_t s) {
                 outliers ? "with outliers" : "plain", T, used, maxr);
 
     Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
-    ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
-    ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
+    ck(cudaMemcpyAsync(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice, s), "x");
+    ck(cudaMemcpyAsync(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice, s), "src");
     mmq::Context ctx;
     MmqBufs mb(p, rows, E);
     run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
@@ -359,7 +360,7 @@ void run_pair(const Pair& p, bool outliers, cudaStream_t s) {
         std::string err;
         if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
         F16Bufs fb(rows);
-        upload_xs(x, r, fb);
+        upload_xs(x, r, fb, s);
         run_f16(p, geo, gemm, fb, r, blob, s);
         ck(cudaStreamSynchronize(s), "f16");
         y_f16 = download(fb.dm, (size_t) rows * N);
@@ -436,8 +437,8 @@ void run_pair(const Pair& p, bool outliers, cudaStream_t s) {
             const Routing r1 = sort_rows(ids1, E);
             const int64_t rows1 = (int64_t) Tn * K;
             Dev x1d(x1.size() * 4), s1d((size_t) rows1 * 4);
-            ck(cudaMemcpy(x1d.p, x1.data(), x1.size() * 4, cudaMemcpyHostToDevice), "x1");
-            ck(cudaMemcpy(s1d.p, r1.src.data(), r1.src.size() * 4, cudaMemcpyHostToDevice), "src1");
+            ck(cudaMemcpyAsync(x1d.p, x1.data(), x1.size() * 4, cudaMemcpyHostToDevice, s), "x1");
+            ck(cudaMemcpyAsync(s1d.p, r1.src.data(), r1.src.size() * 4, cudaMemcpyHostToDevice, s), "src1");
             MmqBufs mb1(p, rows1, E);
             run_mmq(p, geo, ctx, mb1, r1, x1d.as<float>(), s1d.as<int32_t>(), blob, rows1, s);
             ck(cudaStreamSynchronize(s), "mmq alone");
@@ -495,11 +496,12 @@ void bench_pair(const Pair& p, cudaStream_t s) {
     // the experts at a fixed stride (the "direct" layout), each blob 256-byte aligned
     const size_t stride = (geo.bytes + 255) / 256 * 256;
     Dev blobs(stride * E + 4096);
-    ck(cudaMemset(blobs.p, 0, stride * E + 4096), "zero");
+    ck(cudaMemsetAsync(blobs.p, 0, stride * E + 4096, s), "zero");
     std::vector<const uint8_t*> blob((size_t) E);
     for (int e = 0; e < E; ++e) {
         const std::vector<uint8_t> h = make_blob(p, geo, rng);
-        ck(cudaMemcpy(blobs.as<uint8_t>() + (size_t) e * stride, h.data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
+        ck(cudaMemcpyAsync(blobs.as<uint8_t>() + (size_t) e * stride, h.data(), geo.bytes, cudaMemcpyHostToDevice, s), "blob");
+        ck(cudaStreamSynchronize(s), "blob sync");
         blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride;
     }
     const bool f16 = has_f16(p);
@@ -521,11 +523,11 @@ void bench_pair(const Pair& p, cudaStream_t s) {
         const int64_t rows = (int64_t) T * K;
         std::vector<float> x = make_x(T, rng, -1, false);
         Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
-        ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
-        ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
+        ck(cudaMemcpyAsync(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice, s), "x");
+        ck(cudaMemcpyAsync(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice, s), "src");
         MmqBufs mb(p, rows, E);
         F16Bufs fb(f16 ? rows : 1);
-        if (f16) upload_xs(x, r, fb);
+        if (f16) upload_xs(x, r, fb, s);
         const int reps = 21;
         const double t_f16 = f16 ? time_ms([&] { run_f16(p, geo, gemm, fb, r, blob, s); }, s, reps) : 0.0;
         const double t_mmq = time_ms([&] {

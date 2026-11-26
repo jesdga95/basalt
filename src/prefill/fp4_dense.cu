@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -551,7 +552,8 @@ __global__ void quantize_kernel(const In* __restrict__ x, uint8_t* __restrict__ 
     }
     const float g = amax * (1.0f / (6.0f * 448.0f));
     if (lane == 0) gs[r] = g;
-    const float inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
+    const float raw_inv_g = g > 0.0f ? 1.0f / g : 0.0f;
+    const float inv_g = isfinite(raw_inv_g) ? raw_inv_g : 0.0f;
     for (int b = lane; b < nb; b += 32) {
         float v[16];
         float m = 0.0f;
@@ -563,7 +565,9 @@ __global__ void quantize_kernel(const In* __restrict__ x, uint8_t* __restrict__ 
         }
         const __nv_fp8_storage_t sb = __nv_cvt_float_to_fp8(m * inv_g * (1.0f / 6.0f), __NV_SATFINITE, __NV_E4M3);
         const float sd = __half2float(__half(__nv_cvt_fp8_to_halfraw(sb, __NV_E4M3)));
-        const float inv = sd > 0.0f ? 1.0f / (sd * g) : 0.0f;
+        const float sd_g = sd * g;
+        const float raw_inv = sd_g > 0.0f ? 1.0f / sd_g : 0.0f;
+        const float inv = isfinite(raw_inv) ? raw_inv : 0.0f;
         uint32_t w[2] = {0, 0};
 #pragma unroll
         for (int j = 0; j < 8; ++j) {

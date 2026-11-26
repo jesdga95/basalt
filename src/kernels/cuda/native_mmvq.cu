@@ -1362,17 +1362,24 @@ __global__ void native_q6_k_staged_kernel(const Q6KBlock* __restrict__ w, const 
 
 // The device's SM count, per device.
 int device_sms() {
-    static int known[64] = {};
+    static std::atomic<int> known[64];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
         (void) cudaGetLastError();
         return 0;
     }
-    if (known[dev] == 0 && cudaDeviceGetAttribute(&known[dev], cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
-        (void) cudaGetLastError();
-        known[dev] = -1;
+    int v = known[dev].load(std::memory_order_acquire);
+    if (v == 0) {
+        int sms = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms > 0) {
+            v = sms;
+        } else {
+            (void) cudaGetLastError();
+            v = -1;
+        }
+        known[dev].store(v, std::memory_order_release);
     }
-    return known[dev] > 0 ? known[dev] : 0;
+    return v > 0 ? v : 0;
 }
 
 // Rows shorter than kStagedMaxBlocks blocks, at least kStagedRowsPerSm per SM. Each warp takes kStagedRowsPerWarp rows:
@@ -1694,13 +1701,14 @@ std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs native_iq4_xs_mma_kernel (int8 MMA, with
 // device code for it in this build), else 0; per device
 int mmvq_mma_sms() {
-    static int known[64] = {};   // 0 unknown, -1 no, else the SM count
+    static std::atomic<int> known[64];   // 0 unknown, -1 no, else the SM count
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
         (void) cudaGetLastError();
         return 0;
     }
-    if (known[dev] == 0) {
+    int v = known[dev].load(std::memory_order_acquire);
+    if (v == 0) {
         int major = 0, sms = 0;
         cudaFuncAttributes f1{}, f2{};
         const bool q = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
@@ -1708,10 +1716,11 @@ int mmvq_mma_sms() {
                        cudaFuncGetAttributes(&f1, native_iq4_xs_mma_kernel<1>) == cudaSuccess &&
                        cudaFuncGetAttributes(&f2, native_iq4_xs_mma_kernel<2>) == cudaSuccess;
         if (!q) (void) cudaGetLastError();
-        known[dev] = q && major >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
-                         ? sms : -1;
+        v = q && major >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
+                ? sms : -1;
+        known[dev].store(v, std::memory_order_release);
     }
-    return known[dev] > 0 ? known[dev] : 0;
+    return v > 0 ? v : 0;
 }
 // 32 rows per block while that still gives every SM a block, else 16
 void launch_iq4_xs_mma(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int sms,

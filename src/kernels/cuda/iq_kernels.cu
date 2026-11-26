@@ -3078,18 +3078,20 @@ thread_local int t_gu_mma_hint = 0;
 bool gu_mma_usable(const NativeExpertLayout& L) {
     if (L.n_embd <= 0 || L.n_embd % 512 != 0 || L.n_ff % kGmRows != 0 || gu_mma_smem(L.n_embd) > 48 * 1024)
         return false;
-    static int ok[64] = {};   // per device: 0 unknown, 1 yes, 2 no
+    static std::atomic<int> ok[64];   // per device: 0 unknown, 1 yes, 2 no
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-    if (ok[dev] == 0) {
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    int v = ok[dev].load(std::memory_order_acquire);
+    if (v == 0) {
         int major = 0;
         cudaFuncAttributes fa{};
         const bool q1 = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
         const bool q2 = q1 && cudaFuncGetAttributes(&fa, native_gu_mma_kernel) == cudaSuccess;
-        if (!q1 || !q2) cudaGetLastError();
-        ok[dev] = q2 && major >= 8 && fa.ptxVersion >= 80 ? 1 : 2;
+        if (!q1 || !q2) (void) cudaGetLastError();
+        v = q2 && major >= 8 && fa.ptxVersion >= 80 ? 1 : 2;
+        ok[dev].store(v, std::memory_order_release);
     }
-    return ok[dev] == 1;
+    return v == 1;
 }
 // iq_mmvq's IQ3_S calls of 2..8 columns with n_in % 512 == 0 on mmvq_iq3s_mma_kernel where the device runs it (the
 // same bits); iq_set_mmvq_mma turns it on for tests.
@@ -3100,21 +3102,23 @@ std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs mmvq_iq3s_mma_kernel (int8 MMA with device code for it in this build),
 // else 0; per device
 int mmvq_mma_sms() {
-    static int known[64] = {};   // 0 unknown, -1 no, else the SM count
+    static std::atomic<int> known[64];   // 0 unknown, -1 no, else the SM count
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
-    if (known[dev] == 0) {
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return 0; }
+    int v = known[dev].load(std::memory_order_acquire);
+    if (v == 0) {
         int major = 0, sms = 0;
         cudaFuncAttributes f1{}, f2{};
         const bool q = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess &&
                        cudaFuncGetAttributes(&f1, mmvq_iq3s_mma_kernel<1>) == cudaSuccess &&
                        cudaFuncGetAttributes(&f2, mmvq_iq3s_mma_kernel<2>) == cudaSuccess;
-        if (!q) cudaGetLastError();
-        known[dev] = q && major >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
-                         ? sms : -1;
+        if (!q) (void) cudaGetLastError();
+        v = q && major >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
+                ? sms : -1;
+        known[dev].store(v, std::memory_order_release);
     }
-    return known[dev] > 0 ? known[dev] : 0;
+    return v > 0 ? v : 0;
 }
 // The single-matrix mmvq (128-thread blocks, one per 4 rows) does not stage the tables: the 2-8 KB per block cost
 // more than it saved there, while the grouped expert kernels gain (bitwise the same either way).
@@ -3494,7 +3498,9 @@ __global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const 
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
         const float g = gate[i], u = up[i];
-        const float h = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
+        const float gc = cg > 0.0f ? cg * tanhf(g / cg) : g;
+        const float uc = cu > 0.0f ? cu * tanhf(u / cu) : u;
+        const float h = __fmul_rn(__fmul_rn(gc, 1.0f / (1.0f + expf(-g))), uc);
         q8_1_store(h, hq, i);
     }
 }
@@ -3607,7 +3613,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
-    if (L.gate_softcap > 0.0f)
+    if (L.gate_softcap > 0.0f || L.up_softcap > 0.0f)
         grouped_impl<Act::Softcap>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
                                    scratch, out, stream, grid_groups, 0.0f);
     else if (L.swiglu_limit > 0.0f)

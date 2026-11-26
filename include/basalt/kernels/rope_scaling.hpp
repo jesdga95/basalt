@@ -164,12 +164,24 @@ inline const char* rope_scaling_invalid(const RopeScaling& s) {
         return "the frequency scale must be finite and positive (0 = 1/factor)";
     const double fs = s.freq_scale();
     if (!std::isfinite(fs) || fs <= 0.0) return "the resolved frequency scale must be a finite positive value";
+    const float fsf = (float) fs;
+    if (!std::isfinite(fsf) || fsf <= 0.0f || !std::isfinite(1.0f / fsf))
+        return "the resolved frequency scale must be a finite positive float32 value";
     if (!std::isfinite(s.orig_ctx) || s.orig_ctx < 1.0) return "the original (trained) context must be finite and > 0";
     if (!std::isfinite(s.ext_factor) || s.ext_factor < 0.0) return "the YaRN ext factor must be finite and >= 0";
+    const float extf = (float) s.ext_factor;
+    if (!std::isfinite(extf) || extf < 0.0f || (s.ext_factor > 0.0 && extf == 0.0f))
+        return "the YaRN ext factor must be a finite float32 value >= 0";
     if (!std::isfinite(s.attn_factor) || s.attn_factor <= 0.0) return "the attention factor must be finite and > 0";
+    const float attnf = (float) s.attn_factor;
+    if (!std::isfinite(attnf) || attnf <= 0.0f) return "the attention factor must be a finite float32 value > 0";
     if (!std::isfinite(s.beta_fast) || s.beta_fast <= 0.0 || !std::isfinite(s.beta_slow) || s.beta_slow <= 0.0)
         return "the YaRN betas must be finite and > 0";
-    if (!std::isfinite(s.mscale()) || s.mscale() <= 0.0) return "the resolved magnitude correction must be finite and > 0";
+    const double ms = s.mscale();
+    if (!std::isfinite(ms) || ms <= 0.0) return "the resolved magnitude correction must be finite and > 0";
+    const float msf = extf != 0.0f ? attnf * (1.0f + 0.1f * std::log(1.0f / fsf)) : attnf;
+    if (!std::isfinite(msf) || msf <= 0.0f)
+        return "the resolved magnitude correction must be a finite float32 value > 0";
     return nullptr;
 }
 
