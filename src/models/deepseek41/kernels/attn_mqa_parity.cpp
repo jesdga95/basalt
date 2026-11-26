@@ -6,6 +6,7 @@
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "test_util.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 using namespace basalt::models::deepseek41;
@@ -91,16 +92,26 @@ std::vector<uint8_t> device_rows(std::vector<float>& v, LatentType type) {
     return b;
 }
 
+float bf16_round(float x) {
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
+void round_bf16(std::vector<float>& values) {
+    for (float& x : values) x = bf16_round(x);
+}
+
 struct Result {
     double max_abs, rms_rel;
     bool token_independent;
 };
 
-Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
+// Isolate the source MQA boundary: BF16-valued queries/rows enter, and attention output is rounded to BF16.
+Result run(const Case& c, uint32_t seed, bool bench, const char* name, bool bf16_io = false) {
     auto q = dstest::randn((size_t) c.T * 64 * 512, seed, 0.6f);
     auto win = dstest::randn((size_t) c.win_cap * 512, seed + 1, 1.0f);
     auto comp = dstest::randn((size_t) c.n_comp * 512, seed + 2, 1.0f);
     auto sinks = dstest::randn(64, seed + 3, 1.0f);
+    if (bf16_io) { round_bf16(q); round_bf16(win); round_bf16(comp); }
     const auto wrows = device_rows(win, c.wt), crows = device_rows(comp, c.ct);
     std::mt19937 g(seed + 4);
     std::vector<int32_t> sel((size_t) c.T * std::max(c.n_sel, 1)), limit(c.T), wstart(c.T), pos(c.T), wn(c.win_n);
@@ -115,7 +126,9 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
         }
     }
     const RopeTable rope = rope_table_compressed();
-    const auto ref = reference(c, q, win, comp, sel, limit, wstart, sinks, pos, rope);
+    auto ref = reference(c, q, win, comp, sel, limit, wstart, sinks, pos, rope);
+    if (bf16_io)
+        for (double& x : ref) x = bf16_round((float) x);
 
     Dev<uint8_t> wdev(wrows), cdev(crows), wf((size_t) win.size() * 4), cf((size_t) comp.size() * 4);
     dstest::check(basalt::core::device_copy(wf.p, win.data(), win.size() * 4, cudaMemcpyHostToDevice), "up");
@@ -132,7 +145,8 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
     cudaStreamCreate(&s);
     sparse_mqa(a, dws.p, s);
     dstest::check(cudaStreamSynchronize(s), "run");
-    const auto got = dout.down();
+    auto got = dout.down();
+    if (bf16_io) round_bf16(got);
     const auto e = dstest::compare(got, ref, 1e-2);
     // the same values as fp32 rows give the same bits
     bool same_f32 = true;
@@ -157,7 +171,8 @@ Result run(const Case& c, uint32_t seed, bool bench, const char* name) {
         b.out = o1.p;
         sparse_mqa(b, dws.p, s);
         dstest::check(cudaStreamSynchronize(s), "run1");
-        const auto v = o1.down();
+        auto v = o1.down();
+        if (bf16_io) round_bf16(v);
         same = std::memcmp(v.data(), got.data() + (size_t) t * 64 * 512, v.size() * sizeof(float)) == 0;
     }
     if (bench) {
@@ -203,6 +218,8 @@ int main() {
         v.expect(res.rms_rel < 2e-6, r.name);
         v.expect(res.token_independent, "token independence, packed rows equal fp32 rows");
     }
+    const auto bf16_boundary = run(rows[1].c, 6, false, "BF16 input/output MQA", true);
+    v.expect(bf16_boundary.rms_rel < 2e-6 && bf16_boundary.token_independent, "BF16 input/output MQA parity");
     run(rows[0].c, 7, true, "mqa T1 sel512 win128 f32");
     run(rows[1].c, 8, true, "mqa T4 sel512 win128 f32");
     Case h = rows[2].c; h.T = 1; h.win_n = {128};
