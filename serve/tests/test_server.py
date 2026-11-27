@@ -2785,10 +2785,20 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(last["timings"]["cache_n"], ClockedEngine.REUSED)
 
     def test_anthropic(self):
-        u = self.chat("/v1/messages")["usage"]
+        b = self.chat("/v1/messages")
+        u, t = b["usage"], b["timings"]
         self.assertEqual(u["cache_read_input_tokens"], ClockedEngine.REUSED)
         self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], len(self.engine.last_prompt))
         self.assertGreater(u["output_tokens"], 0)
+        self.assertEqual(t["cache_n"], ClockedEngine.REUSED)
+        self.assertEqual(t["prompt_n"] + t["cache_n"], u["input_tokens"] + u["cache_read_input_tokens"])
+        self.assertEqual(t["predicted_n"], u["output_tokens"])
+        self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+
+    def test_anthropic_stream(self):
+        delta = next(e for e in self.chat("/v1/messages", stream=True) if e["type"] == "message_delta")
+        self.assertEqual(delta["usage"]["cache_read_input_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(delta["timings"]["cache_n"], ClockedEngine.REUSED)
 
     def test_v1_status(self):
         self.chat("/v1/chat/completions")
