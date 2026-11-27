@@ -3,6 +3,7 @@
 #include "basalt/models/gemma4/kernels.hpp"
 
 #include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/doorbell.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_fm.cuh"
 
@@ -164,6 +165,65 @@ __global__ void softcap_kernel(float* __restrict__ x, int64_t n, float cap) {
         x[i] = cap * tanhf(x[i] * inv);
 }
 
+constexpr int kRingThreads = 256;
+
+// One block: the rows with a pair off the card, then (when any) the ticket, the choices, those rows' inputs and the ring.
+__global__ void __launch_bounds__(kRingThreads) moe_ring_kernel(const int32_t* __restrict__ ids, int rows, int k,
+                                                                const unsigned long long* __restrict__ tab,
+                                                                const float* __restrict__ xr, const float* __restrict__ w,
+                                                                int width, int layer, float* x_m, int32_t* ids_m, MoeBell* bell,
+                                                                uint32_t* seq) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    __shared__ uint32_t off_rows, stopped;
+    const int n = rows * k;
+    if (threadIdx.x == 0) off_rows = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += kRingThreads) {
+        const int e = ids[i];
+        if (e >= 0 && !tab[e]) atomicOr(&off_rows, 1u << (i / k));
+    }
+    __syncthreads();
+    const uint32_t m = off_rows;
+    if (!m) return;
+    uint32_t ticket = 0;
+    if (threadIdx.x == 0) {
+        ticket = *seq + 1;
+        if (!ticket) ticket = 1;
+        *seq = ticket;
+        stopped = bk::doorbell_load_acquire(&bell->abort);
+    }
+    __syncthreads();
+    if (stopped) return;
+    for (int i = threadIdx.x; i < n; i += kRingThreads) ids_m[i] = ids[i];
+    for (int r = 0; r < rows; ++r)
+        if (m >> r & 1)
+            for (int c = threadIdx.x; c < width; c += kRingThreads) x_m[(size_t) r * width + c] = xr[(size_t) r * width + c] * w[c];
+    if (threadIdx.x == 0) bk::doorbell_store_relaxed(&bell->ticket, ticket);
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) bk::doorbell_store_release(&bell->ring, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
+}
+
+constexpr int kMergeThreads = 256;
+
+// Block p: a pair off the card takes row p of the host's rows once its ticket is done; the card's pairs stay.
+__global__ void __launch_bounds__(kMergeThreads) moe_merge_kernel(const int32_t* __restrict__ ids,
+                                                                  const unsigned long long* __restrict__ tab,
+                                                                  const float* host_rows, float* __restrict__ out, int width,
+                                                                  MoeBell* bell, const uint32_t* seq) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    const int p = blockIdx.x, e = ids[p];
+    if (e < 0 || tab[e]) return;
+    __shared__ uint32_t taken;
+    if (threadIdx.x == 0) taken = bk::doorbell_spin(&bell->done, *seq, &bell->abort, 8);
+    __syncthreads();
+    if (!taken) return;
+    float* o = out + (size_t) p * width;
+    for (int c = threadIdx.x; c < width; c += kMergeThreads) o[c] = __ldcv(host_rows + (size_t) p * width + c);
+}
+
 }  // namespace
 
 void embed_rows(const uint16_t* table, const int32_t* tokens, int rows, int width, float scale, float* out, void* stream) {
@@ -213,6 +273,25 @@ void softcap(float* x, int64_t n, float cap, void* stream) {
     if (n <= 0) return;
     bk::launch_pdl(softcap_kernel, dim3(1024), dim3(256), 0, (cudaStream_t) stream, x, n, cap);
     check("softcap");
+}
+
+void moe_ring(const int32_t* ids, int rows, int k, const unsigned long long* tab, const float* xr, const float* w, int width,
+              int layer, float* x_m, int32_t* ids_m, MoeBell* bell, uint32_t* seq, void* stream) {
+    if (rows <= 0) return;
+    if (rows > kRows || rows * k > kMoePairs || layer < 0 || layer > 0xff)
+        throw std::invalid_argument("gemma4 moe_ring: rows, pairs or layer");
+    bk::launch_pdl(moe_ring_kernel, dim3(1), dim3(kRingThreads), 0, (cudaStream_t) stream, ids, rows, k, tab, xr, w, width, layer,
+                   x_m, ids_m, bell, seq);
+    check("moe_ring");
+}
+
+void moe_merge(const int32_t* ids, int rows, int k, const unsigned long long* tab, const float* host_rows, float* out, int width,
+               MoeBell* bell, const uint32_t* seq, void* stream) {
+    if (rows <= 0) return;
+    if (rows * k > kMoePairs) throw std::invalid_argument("gemma4 moe_merge: pairs");
+    bk::launch_pdl(moe_merge_kernel, dim3((unsigned) (rows * k)), dim3(kMergeThreads), 0, (cudaStream_t) stream, ids, tab, host_rows,
+                   out, width, bell, seq);
+    check("moe_merge");
 }
 
 }  // namespace basalt::models::gemma4

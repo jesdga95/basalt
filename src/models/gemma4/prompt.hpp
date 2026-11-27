@@ -32,6 +32,11 @@ public:
     /// has their room.
     void park();
     bool unpark(std::string& err);
+    /// Before a call's chunks (or picture), with experts: the experts' tables as the tier places them, the ones off the
+    /// card in a staging that each layer's RAM experts are copied into while the layer before the one before it runs; `end`
+    /// gives the staging back.
+    bool begin(cudaStream_t st, std::string& err);
+    void end();
     /// The device bytes init takes for a model of geometry `g`, MLP width `n_ff_pad` (NVFP4 or FP8), `context` positions and
     /// caches of `kv`; `mxfp8`: some layer's experts are MXFP8 (their buffers are carved too).
     static uint64_t bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv, bool mxfp8);
@@ -49,6 +54,8 @@ private:
     void layers(int rows, int64_t pos0, bool span, const std::vector<SegKv>& caches, cudaStream_t st);
     struct Carve;
     void layout(Carve& c, const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv, bool mxfp8);
+    // layer l's RAM experts into staging buffer l % 2, once the layer that read it last is done
+    void issue(int l);
 
     const Gemma4Model* m_ = nullptr;
     void* base_ = nullptr;
@@ -73,6 +80,19 @@ private:
     float* h_ = nullptr;                                                      // the experts' H [C k][n_ff_exp]
     float* ex_ = nullptr;                                                     // the experts' outputs [C k][E]
     void *k16_ = nullptr, *v16_ = nullptr;   // a full layer's keys (and an E4M3 cache's values) as fp16, [context][n_kv][hd]
+    unsigned long long* tabs_ = nullptr;    // [layer][n_expert] each expert's blob for the products: its card slot or its staging
+    // the staging of the experts off the card (begin .. end): two buffers of the most a layer has, a copy stream, and per
+    // layer its RAM experts (staging index, host blob, bytes)
+    struct Staged {
+        int k;
+        const uint8_t* host;
+        uint64_t bytes;
+    };
+    std::vector<std::vector<Staged>> ram_;
+    uint8_t* staging_ = nullptr;
+    int stage_n_ = 0;                        // experts a buffer holds
+    cudaStream_t copy_ = nullptr;
+    cudaEvent_t copied_[2] = {}, done_[2] = {};
 };
 
 }  // namespace basalt::models::gemma4

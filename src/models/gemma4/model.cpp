@@ -1,11 +1,14 @@
-// src/models/gemma4/model.cpp - loads a Gemma 4 pack: every weight to the main card, the embedding to mapped host memory,
-// then the context sized from what the weights leave.
+// src/models/gemma4/model.cpp - loads a Gemma 4 pack: the dense weights to the main card, the embedding to mapped host
+// memory, the context sized from what they leave, then the routed experts to core::ExpertTier, which keeps on the card as
+// many as the rest of it holds and the others in RAM.
 #include "models/gemma4/model.hpp"
 
+#include "models/gemma4/experts.hpp"
 #include "models/gemma4/prompt.hpp"
 
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
+#include "basalt/core/expert_tier.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
@@ -34,7 +37,6 @@ constexpr int kTypeNvfp4Planes = 45;
 // modules and the driver
 constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
-constexpr uint64_t kExpertSlack = 4096;   // zeroed bytes after a layer's last blob (the kernels' last loads)
 
 uint64_t layer_cache_bytes(const Geometry& g, int l, int64_t context, KvType kv) {
     const LayerShape s = g.shape(l);
@@ -85,7 +87,76 @@ uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64
 
 Gemma4Model::Gemma4Model() = default;
 
+ExpertRoom Gemma4Model::expert_room() const {
+    ExpertRoom r;
+    for (const ExpertLayer& el : pack_.experts) {
+        const uint64_t slot = (el.blob_bytes + 255) / 256 * 256;   // the tier's slots are 256-byte aligned
+        r.one_each += slot;
+        r.slot = std::max(r.slot, slot);
+    }
+    return r;
+}
+
+// The homes a layer, h, leave the room of a prompt's staging of the other n_expert - h experts in two layers' buffers:
+// h one_each + 2 (n_expert - h) slot <= what the context leaves. The tier sizes its homes from the same room, so it holds
+// at least h a layer and the staging fits once its copies beside the homes give way (shrink).
+bool Gemma4Model::open_tier(const model::LoadRequest& req, uint64_t need, uint64_t free_b, core::LoadPlan& reads, std::string& err) {
+    const Geometry& g = pack_.geo;
+    const ExpertRoom room = expert_room();
+    const uint64_t left = free_b > need ? free_b - need : 0, all = 2 * (uint64_t) g.n_expert * room.slot;
+    int64_t h = left > all && room.one_each > 2 * room.slot ? (int64_t) ((left - all) / (room.one_each - 2 * room.slot)) : 0;
+    h = std::min<int64_t>(h, g.n_expert);
+    stage_experts_ = (int) (g.n_expert - h);
+    stage_slot_ = room.slot;
+    core::ExpertTierSpec s;
+    s.area = "basalt gemma4";
+    s.name = "gemma4";
+    s.n_layers = g.n_layers;
+    s.n_expert = g.n_expert;
+    s.top_k = g.n_used;
+    s.n_embd = g.n_embd;
+    s.n_ff = g.n_ff_exp;
+    for (const ExpertLayer& el : pack_.experts) {
+        core::ExpertTierSpec::Layer lay;
+        lay.gu_type = el.gu_type;
+        lay.d_type = el.d_type;
+        lay.offset = el.offset;
+        lay.blob_bytes = el.blob_bytes;
+        lay.gelu = true;
+        s.layers.push_back(lay);
+    }
+    s.path = req.paths.front();
+    s.fd = fd_;
+    s.range = pack_.experts_range;
+    s.gpus = req.gpus;
+    s.diag_tier_ram = req.diag_tier_ram;
+    s.diag_tier_vram = req.diag_tier_vram;
+    s.diag_tier_frozen = req.diag_tier_frozen;
+    s.vram_reserve_mib = 0;   // the card's spare is in `need`
+    s.expert_cache = req.expert_cache;
+    s.resident_budget = req.resident_budget;
+    s.pool_workers = req.pool_workers;
+    s.pool_affinity = req.pool_affinity;
+    s.pool_affinity_given = req.pool_affinity_given;
+    s.expert_profile = req.expert_profile;
+    if (cudaHostAlloc((void**) &tier_rows_, (size_t) kMoePairs * g.n_embd * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) !=
+        cudaSuccess) {
+        cudaGetLastError();
+        tier_rows_ = nullptr;
+        err = "cannot pin the experts' host rows";
+        return false;
+    }
+    tier_ = std::make_unique<core::ExpertTier>(std::move(s));
+    core::ExpertTier::Reserve res;
+    res.copies = res.homes = need + 2 * (uint64_t) stage_experts_ * room.slot;
+    res.beside_homes = need;
+    return tier_->open(res, tier_rows_, reads, err);
+}
+
 Gemma4Model::~Gemma4Model() {
+    experts_.reset();   // its thread first, then the tier it reads
+    tier_.reset();
+    if (tier_rows_) cudaFreeHost(tier_rows_);
     for (void* p : dev_) cudaFree(p);
     if (embd_host_) cudaFreeHost(embd_host_);
     if (fd_ >= 0) platform::close_fd(fd_);
@@ -228,7 +299,6 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
             return fail("an NVFP4 MLP whose widths are not multiples of 256");
     }
 
-    uint64_t experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
     for (int l = 0; l < g.n_layers; ++l) {
         LayerWeights& w = layers_[(size_t) l];
@@ -265,25 +335,6 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         w.gu_type = el.gu_type;
         w.d_type = el.d_type;
         w.blob_bytes = el.blob_bytes;
-        w.expert_stride = basalt::kernels::native_expert_stride(el.gu_type, el.blob_bytes);
-        const uint64_t layer_b = (uint64_t) g.n_expert * w.expert_stride + kExpertSlack;
-        if (!(w.experts = (uint8_t*) device_buf(layer_b)) || !(w.blob_table = (unsigned long long*) device_buf((uint64_t) g.n_expert * 8)))
-            return fail("out of device memory loading the experts of layer " + std::to_string(l));
-        cudaMemset(w.experts, 0, layer_b);
-        std::vector<unsigned long long> table((size_t) g.n_expert);
-        for (int e = 0; e < g.n_expert; ++e) {
-            core::LoadItem it;
-            it.file = file;
-            it.off = pack_.experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
-            it.bytes = el.blob_bytes;
-            it.dev = w.experts + (uint64_t) e * w.expert_stride;
-            it.device = device_;
-            reads.add(it);
-            table[(size_t) e] = (unsigned long long) (uintptr_t) it.dev;
-        }
-        if (core::device_copy(w.blob_table, table.data(), table.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess)
-            return fail("cannot write the blob table of layer " + std::to_string(l));
-        experts += layer_b;
     }
 
     // the assistant drafter, when the pack has one and the verify window drafts
@@ -348,24 +399,35 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
     card_spare_ = req.vram_reserve_mib > 0 ? (uint64_t) req.vram_reserve_mib * kMiB : kCardSpare;
     const uint64_t spare = card_spare_ + vision_room;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
+    // the experts' least: top-k slots in every layer and a prompt's staging of every expert (two layers' worth)
+    const ExpertRoom room = expert_room();
+    const uint64_t least = g.moe() ? (uint64_t) g.n_used * room.one_each + 2 * (uint64_t) g.n_expert * room.slot : 0;
     const uint64_t need = session_bytes(g, want, kv_) * n_sess + shared_bytes(g, n_ff_pad_, mlp_nvfp4_, want, kv_, mxfp8_experts_) + spare;
-    if (need > free_b) {
+    if (need + least > free_b) {
         const uint64_t per = (session_bytes(g, 2, kv_) - session_bytes(g, 1, kv_)) * n_sess +
                              shared_bytes(g, n_ff_pad_, mlp_nvfp4_, 2, kv_, mxfp8_experts_) -
                              shared_bytes(g, n_ff_pad_, mlp_nvfp4_, 1, kv_, mxfp8_experts_);
-        const uint64_t base = session_bytes(g, 0, kv_) * n_sess + shared_bytes(g, n_ff_pad_, mlp_nvfp4_, 0, kv_, mxfp8_experts_) + spare;
+        const uint64_t base = session_bytes(g, 0, kv_) * n_sess + shared_bytes(g, n_ff_pad_, mlp_nvfp4_, 0, kv_, mxfp8_experts_) + spare + least;
         const int64_t fits = free_b > base ? (int64_t) ((free_b - base) / per) : 0;
-        return fail("--max-context " + std::to_string(want) + " needs " + std::to_string(need >> 20) + " MiB beside the weights, " +
-                    std::to_string(free_b >> 20) + " MiB are free: at most about " + std::to_string(fits) +
+        return fail("--max-context " + std::to_string(want) + " needs " + std::to_string((need + least) >> 20) +
+                    " MiB beside the weights, " + std::to_string(free_b >> 20) + " MiB are free: at most about " + std::to_string(fits) +
                     " positions fit (a smaller --max-context, --kv fp8 or fewer --batch slots)");
     }
     ctx_ = want;
+    uint64_t experts = 0;
+    if (g.moe()) {   // the tier: the card's experts beside what the context needs, the rest in RAM
+        if (!open_tier(req, need, free_b, reads, err)) return fail(err);
+        for (const core::ExpertTier::CardSlots& c : tier_->slots_by_card()) experts += c.bytes;
+    }
     int n_mx = 0;
     for (const ExpertLayer& el : pack_.experts) n_mx += el.gu_type == kTypeMxfp8;
     const std::string fmt = n_mx == 0 ? "NVFP4" : n_mx == (int) pack_.experts.size() ? "MXFP8"
                                                 : "NVFP4, MXFP8 at " + std::to_string(n_mx) + " layers";
-    char ex[96] = "";
-    if (g.moe()) std::snprintf(ex, sizeof ex, ", experts %.2f GiB (%s)", (double) experts / (double) kGiB, fmt.c_str());
+    char ex[160] = "";
+    if (g.moe())
+        std::snprintf(ex, sizeof ex, ", experts (%s) %.2f GiB on the card (%lld of %d a layer), %.2f GiB in RAM", fmt.c_str(),
+                      (double) experts / (double) kGiB, (long long) (tier_->gpu_slots() / g.n_layers), g.n_expert,
+                      (double) tier_->ram_bytes() / (double) kGiB);
     basalt::log::info("basalt gemma4", "weights: projections and head %.2f GiB (%s)%s, embedding %.2f GiB in RAM; context "
                       "%lld x %llu sessions, %s KV",
                       (double) weight_bytes_ / (double) kGiB, mlp_nvfp4_ ? "FP8, the MLP NVFP4" : "FP8", ex,
@@ -375,6 +437,11 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
 }
 
 model::Result Gemma4Model::attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
+    if (tier_) {
+        std::string err;
+        if (!tier_->attach(err) || !(experts_ = TierExperts::make(*this, *tier_, tier_rows_, err)))
+            return {model::Status::Error, "gemma4: " + err};
+    }
     for (int i = 0; i < std::max(req.sessions, 1); ++i) {
         std::string err;
         auto s = make_session(*this, err);

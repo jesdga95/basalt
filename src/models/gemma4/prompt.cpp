@@ -10,6 +10,7 @@
 #include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mxfp8.hpp"
+#include "models/gemma4/experts.hpp"
 #include "models/gemma4/model.hpp"
 
 #include <algorithm>
@@ -58,6 +59,7 @@ void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, bool mlp_nvfp4, 
     v16_ = one && kv == KvType::F8 ? c.take<uint16_t>((size_t) context * one) : nullptr;
     if (!g.moe()) return;
     const size_t NE = (size_t) g.n_expert, P = C * (size_t) g.n_used, Fe = (size_t) g.n_ff_exp;
+    tabs_ = c.take<unsigned long long>((size_t) g.n_layers * NE);
     rlog_ = c.take<float>(C * NE), rw_ = c.take<float>(P), ids_ = c.take<int32_t>(P);
     bounds_ = c.take<int32_t>(NE + 1), tile_off_ = c.take<int32_t>(NE + 1), blk_off_ = c.take<int32_t>(NE + 1);
     tok_ = c.take<int32_t>(P), dst_ = c.take<int32_t>(P), exp_ = c.take<int32_t>(P);
@@ -81,6 +83,10 @@ uint64_t PromptPath::bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, 
 }
 
 PromptPath::~PromptPath() {
+    end();
+    for (cudaEvent_t e : {copied_[0], copied_[1], done_[0], done_[1]})
+        if (e) cudaEventDestroy(e);
+    if (copy_) cudaStreamDestroy(copy_);
     if (staged_) cudaEventDestroy(staged_);
     if (io_h_) cudaFreeHost(io_h_);
     if (base_) cudaFree(base_);
@@ -89,7 +95,12 @@ PromptPath::~PromptPath() {
 bool PromptPath::init(const Gemma4Model& m, std::string& err) {
     m_ = &m;
     if (cudaMallocHost((void**) &io_h_, 2 * (size_t) kChunk * 4) != cudaSuccess ||
-        cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming) != cudaSuccess) {
+        cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&copied_[0], cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&copied_[1], cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&done_[0], cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&done_[1], cudaEventDisableTiming) != cudaSuccess) {
         cudaGetLastError();
         err = "out of memory for the prompt path\x27s staging";
         return false;
@@ -118,6 +129,77 @@ bool PromptPath::unpark(std::string& err) {
     layout(c, m.geo(), m.n_ff_pad(), m.mlp_nvfp4(), m.context(), m.kv_type(), m.mxfp8_experts());
     if (h16_) cudaMemset(h16_, 0, (size_t) kChunk * m.geo().n_used * ((m.geo().n_ff_exp + 127) / 128 * 128) * 2);   // the pad columns stay zero
     return true;
+}
+
+bool PromptPath::begin(cudaStream_t st, std::string& err) {
+    const Gemma4Model& m = *m_;
+    const Geometry& g = m.geo();
+    core::ExpertTier* tier = m.tier();
+    if (!tier) return true;
+    if (!m.experts()->prompt_begin(st, err)) return false;
+    const int NE = g.n_expert;
+    ram_.assign((size_t) g.n_layers, {});
+    int most = 0;
+    for (int l = 0; l < g.n_layers; ++l) {
+        int n = 0;
+        for (int e = 0; e < NE; ++e) n += tier->locate(l, e).dev == nullptr;
+        most = std::max(most, n);
+    }
+    if (most > 0) {   // the copies beside the homes give the staging its room
+        if (most > m.stage_experts()) {
+            err = "the prompt's staging holds " + std::to_string(m.stage_experts()) + " experts a layer, a layer has " +
+                  std::to_string(most) + " off the card";
+            return false;
+        }
+        tier->shrink();
+        stage_n_ = most;
+        // zeroed bytes after the last blob: the products' last loads read past it
+        const size_t bytes = 2 * (size_t) most * m.stage_slot() + 4096;
+        if (cudaMalloc((void**) &staging_, bytes) != cudaSuccess || cudaMemset(staging_, 0, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            staging_ = nullptr;
+            tier->grow();
+            err = "no device memory for the prompt's staging of the experts off the card (" + std::to_string(bytes >> 20) + " MiB)";
+            return false;
+        }
+    }
+    std::vector<unsigned long long> tab((size_t) g.n_layers * NE);
+    for (int l = 0; l < g.n_layers; ++l) {
+        int k = 0;
+        for (int e = 0; e < NE; ++e) {
+            const core::ExpertTier::Source s = tier->locate(l, e);
+            if (s.dev) {
+                tab[(size_t) l * NE + e] = (unsigned long long) s.dev;
+                continue;
+            }
+            tab[(size_t) l * NE + e] = (unsigned long long) (staging_ + ((size_t) (l & 1) * stage_n_ + k) * m.stage_slot());
+            ram_[(size_t) l].push_back({k++, tier->host_blob(l, e), m.layer(l).blob_bytes});
+        }
+    }
+    if (cudaMemcpyAsync(tabs_, tab.data(), tab.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice, st) != cudaSuccess ||
+        cudaStreamSynchronize(st) != cudaSuccess) {
+        cudaGetLastError();
+        err = "cannot write the prompt's expert tables";
+        return false;
+    }
+    return true;
+}
+
+void PromptPath::end() {
+    if (!staging_) return;
+    cudaStreamSynchronize(copy_);
+    cudaFree(staging_);
+    staging_ = nullptr;
+    stage_n_ = 0;
+    m_->tier()->grow();
+}
+
+void PromptPath::issue(int l) {
+    const int b = l & 1;
+    cudaStreamWaitEvent(copy_, done_[b], 0);
+    for (const Staged& x : ram_[(size_t) l])
+        cudaMemcpyAsync(staging_ + ((size_t) b * stage_n_ + x.k) * m_->stage_slot(), x.host, x.bytes, cudaMemcpyHostToDevice, copy_);
+    cudaEventRecord(copied_[b], copy_);
 }
 
 void PromptPath::stage(const int32_t* tokens, int rows, int64_t pos0, cudaStream_t st) {
@@ -151,6 +233,8 @@ void PromptPath::layers(int rows, int64_t pos0, bool span, const std::vector<Seg
     const int64_t F = m.n_ff_pad();
     const float eps = g.rms_eps;
     const int32_t* pos = io_ + kChunk;
+    if (staging_)
+        for (int l = 0; l < std::min(2, g.n_layers); ++l) issue(l);
     for (int l = 0; l < g.n_layers; ++l) {
         const LayerWeights& w = m.layer(l);
         const LayerShape& s = w.sh;
@@ -208,13 +292,15 @@ void PromptPath::layers(int rows, int64_t pos0, bool span, const std::vector<Seg
             bk::router_select(rlog_, nullptr, rows, ra, ids_, rw_, st);
             bk::rms_norm_rows(x_, w.pre_ffw2, rows, E, eps, xn_, st);
             bk::moe_sort(ids_, rows, k, NE, sort_scr_, bounds_, tok_, dst_, exp_, st);
+            const unsigned long long* blobs = tabs_ + (size_t) l * NE;
+            if (staging_) cudaStreamWaitEvent(st, copied_[l & 1], 0);
             const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, Fe);
             if (w.gu_type == kTypeMxfp8) {   // E4M3 activations per 32 values; H rounded to fp16 between the products
                 const int64_t Fk = (Fe + 127) / 128 * 128;   // the down rows' padded width: H's columns past Fe stay zero
                 mx8::plan_blocks(bounds_, NE, mx_blk_, st);
                 mx8::quantize_tokens(xn_, rows, E, E, mxx_, st);
                 mx8::Product gu;
-                gu.base = w.experts, gu.stride = w.expert_stride, gu.w_off = 0, gu.w_rows = 2 * Fe, gu.w_cols = E, gu.n = NE;
+                gu.blobs = blobs, gu.w_off = 0, gu.w_rows = 2 * Fe, gu.w_cols = E, gu.n = NE;
                 gu.act = mxx_, gu.act_rows = rows, gu.bounds = bounds_, gu.blk_off = mx_blk_, gu.blocks = mx8::max_blocks(P, NE);
                 gu.ids = tok_, gu.dst_f16 = h16_, gu.ld_dst = Fk, gu.swiglu = true, gu.gelu = true;
                 mx8::run(gu, st);
@@ -227,7 +313,7 @@ void PromptPath::layers(int rows, int64_t pos0, bool span, const std::vector<Seg
                 fp4::plan_blocks(bounds_, NE, tile_off_, blk_off_, st);
                 fp4::quantize_tokens(xn_, rows, E, E, a4x_, gsx_, st, true);
                 fp4::Product up;
-                up.base = w.experts, up.stride = w.expert_stride, up.blk_off = blk_off_, up.blocks = fp4::max_blocks(P, NE), up.n = NE;
+                up.blobs = blobs, up.blk_off = blk_off_, up.blocks = fp4::max_blocks(P, NE), up.n = NE;
                 up.w_rows = 2 * Fe, up.w_cols = E, up.a4 = a4x_, up.gs = gsx_, up.bounds = bounds_, up.ids = tok_, up.tokens = rows;
                 up.swiglu = true, up.gelu = true, up.tail_off = L.bytes - 16, up.dst = h_, up.ld_dst = Fe, up.two = true;
                 fp4::run(up, st);
@@ -236,6 +322,10 @@ void PromptPath::layers(int rows, int64_t pos0, bool span, const std::vector<Seg
                 dn.swiglu = false, dn.gelu = false, dn.ids = nullptr, dn.w_off = L.down_off, dn.w_rows = E, dn.w_cols = Fe;
                 dn.a4 = a4h_, dn.gs = gsh_, dn.tile_off = tile_off_, dn.dst = ex_, dn.dst_ids = dst_, dn.ld_dst = E;
                 fp4::run(dn, st);
+            }
+            if (staging_) {   // the buffer is free for the layer after the next
+                cudaEventRecord(done_[l & 1], st);
+                if (l + 2 < g.n_layers) issue(l + 2);
             }
             fe.experts = ex_, fe.weights = rw_, fe.k = k, fe.n1 = w.post_ffw1, fe.n2 = w.post_ffw2;
         }

@@ -153,6 +153,28 @@ struct FfnEnd {
     float* xn = nullptr;
 };
 void ffn_end(const FfnEnd& f, int rows, int width, void* stream);
+
+// ---- the experts off the card (experts.hpp): the decode window's hand-off to the host through mapped memory
+
+/// The hand-off's words (mapped host memory): `ring` is 1 | layer << 8 | rows << 16 once a layer's rows and choices are
+/// out, `ticket` its sequence number; the host sets `done` to the ticket once the rows of the pairs off the card are in;
+/// `abort` (non-zero) releases every wait.
+struct MoeBell {
+    alignas(64) uint32_t ring;
+    uint32_t ticket;
+    alignas(64) uint32_t done;
+    uint32_t abort;
+};
+constexpr int kMoePairs = 128;   ///< a window's (row, slot) pairs at most
+/// When a pair's expert is off the card (tab[e] == 0): advances `seq` (device), publishes the choices to ids_m and the
+/// experts' inputs xr[r] * w of the rows with such a pair to x_m (width floats each, mapped), then the ticket and the ring.
+/// rows <= kRows, rows * k <= kMoePairs.
+void moe_ring(const int32_t* ids, int rows, int k, const unsigned long long* tab, const float* xr, const float* w, int width,
+              int layer, float* x_m, int32_t* ids_m, MoeBell* bell, uint32_t* seq, void* stream);
+/// Pair p off the card takes row p of `host_rows` (mapped) into row p of `out` once the bell's done matches `seq`; the
+/// card's pairs stay.
+void moe_merge(const int32_t* ids, int rows, int k, const unsigned long long* tab, const float* host_rows, float* out, int width,
+               MoeBell* bell, const uint32_t* seq, void* stream);
 /// x = cap * tanh(x / cap), n values.
 void softcap(float* x, int64_t n, float cap, void* stream);
 

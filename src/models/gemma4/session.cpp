@@ -20,6 +20,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/models/gemma4/kernels.hpp"
+#include "models/gemma4/experts.hpp"
 #include "models/gemma4/model.hpp"
 #include "models/gemma4/prompt.hpp"
 
@@ -258,7 +259,8 @@ protected:
         }
         return true;
     }
-    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string&) override {
+    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
+        if (TierExperts* ex = m_.experts(); ex && !ex->begin_window(v.stream, err)) return false;
         key.push_back((uint64_t) stage(v.w.tokens.data(), v.w.rows, 0, v.w.positions.data()));
         return true;
     }
@@ -269,6 +271,10 @@ protected:
         return true;
     }
     void batch_take(const model::BatchView& v, int i) override {
+        if (TierExperts* ex = m_.experts(); ex && i == 0) {   // once a window, after its launch
+            ex->issue_copies();
+            ex->end_window(v.w.rows, v.stream);
+        }
         const model::DecodeRequest& r = v.reqs[i];
         const model::BatchWindow::Seg& sg = v.w.segs[(size_t) i];
         const int h = v.head[i];
@@ -297,6 +303,11 @@ public:
         stale_ = true;   // until the rows are in (an error or an exception leaves it set)
         std::string err;
         if (r.n_tokens > kRows) {   // the prompt path, chunk by chunk
+            if (!sh_->prompt.begin(stream_, err)) return {model::Status::Error, "gemma4: " + err};
+            struct End {
+                PromptPath& p;
+                ~End() { p.end(); }
+            } end{sh_->prompt};
             try {
                 for (int t0 = 0; t0 < r.n_tokens; t0 += kChunk) {
                     if (r.stop && r.stop()) break;
@@ -352,6 +363,12 @@ public:
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "gemma4: the prompt runs past the context"};
         hist_.resize((size_t) std::min<int64_t>(pos, (int64_t) hist_.size()));
         stale_ = true;   // until the rows are in
+        std::string berr;
+        if (!sh_->prompt.begin(stream_, berr)) return {model::Status::Error, "gemma4: " + berr};
+        struct End {
+            PromptPath& p;
+            ~End() { p.end(); }
+        } end{sh_->prompt};
         try {
             sh_->prompt.picture(rows, n_rows, pos, caches_, stream_);
         } catch (const std::exception& e) {
@@ -619,6 +636,17 @@ private:
     }
 
     bool forward(const int32_t* tokens, int rows, int64_t pos0, int head, std::string& err) {
+        TierExperts* ex = m_.experts();
+        if (ex && !ex->begin_window(stream_, err)) return false;
+        const bool ok = launch_window(tokens, rows, pos0, head, err);
+        if (ex) {
+            ex->issue_copies();
+            ex->end_window(rows, stream_);
+        }
+        return ok && (!ex || !ex->failed(err));
+    }
+
+    bool launch_window(const int32_t* tokens, int rows, int64_t pos0, int head, std::string& err) {
         const int64_t keys = stage(tokens, rows, pos0, nullptr);
         lookups_ += (int64_t) rows * g_.n_used * g_.n_layers;
         const uint64_t key = ((uint64_t) keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows;
@@ -733,12 +761,16 @@ private:
                 bk::RouterArgs ra;
                 ra.n_expert = g_.n_expert, ra.n_embd = E, ra.k = g_.n_used, ra.weight_scale = 1.f, ra.gate = bk::RouterGate::Softmax;
                 bk::router(x.xr, w.router, nullptr, rows, ra, x.rlog, x.ids, x.rw, stream_);
-                bk::moe_plan(x.ids, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr, x.ex_start, x.ex_ng, x.ex_dst, x.ex_tok, stream_);
+                TierExperts& ex = *m_.experts();
+                const bool off = ex.off_card();
+                if (off) ex.ring(l, rows, x.xr, w.pre_ffw2, x.ids, stream_);
+                bk::moe_plan(x.ids, rows, g_.n_used, g_.n_expert, ex.tab(l), x.ex_ptr, x.ex_start, x.ex_ng, x.ex_dst, x.ex_tok, stream_);
                 bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
                 L.gelu = true;
                 const int pairs = rows * g_.n_used;
                 bk::native_expert_grouped(L, x.ex_ptr, x.ex_start, x.ex_ng, x.ex_dst, x.ex_tok, std::min(pairs, g_.n_expert), pairs,
                                           x.xq, x.ex_scr, x.ex_rows, stream_);
+                if (off) ex.merge(l, rows, x.ids, x.ex_rows, stream_);
                 fe.experts = x.ex_rows, fe.weights = x.rw, fe.k = g_.n_used, fe.n1 = w.post_ffw1, fe.n2 = w.post_ffw2;
             }
             if (l + 1 < g_.n_layers) {   // the next layer's attention input, or the final norm

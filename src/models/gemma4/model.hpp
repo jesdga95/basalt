@@ -3,6 +3,7 @@
 // scale per row), the token embedding in mapped host memory.
 #pragma once
 
+#include "basalt/core/expert_tier.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/batch_driver.hpp"
@@ -36,13 +37,16 @@ struct LayerWeights {
     const float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *post_attn = nullptr;
     const float *ffn_norm = nullptr, *post_ffw = nullptr, *scalar = nullptr;
     Mat q, k, v, o, gate, up, down;       ///< v empty on a layer whose keys are its values; the MLP's three FP8 or NVFP4
-    // the experts (a layer with experts)
+    // the experts (a layer with experts; core::ExpertTier keeps their blobs, experts.hpp their tables)
     const float *post_ffw1 = nullptr, *post_ffw2 = nullptr, *pre_ffw2 = nullptr;
     const float* router = nullptr;        ///< F32 [n_expert][n_embd], its input scale folded in
-    uint8_t* experts = nullptr;           ///< n_expert blobs, expert e's at experts + e * expert_stride
-    size_t blob_bytes = 0, expert_stride = 0;
+    size_t blob_bytes = 0;
     int gu_type = 0, d_type = 0;
-    unsigned long long* blob_table = nullptr;   ///< device [n_expert]: each expert's blob address
+};
+
+/// The room of the tier's slots: one in every layer, and the largest (256-byte aligned, as the tier lays them out).
+struct ExpertRoom {
+    uint64_t one_each = 0, slot = 0;
 };
 
 /// One layer of the assistant drafter: its queries read the keys and values of the model's last layer of its kind
@@ -67,6 +71,7 @@ struct DrafterWeights {
 };
 
 class PromptPath;
+class TierExperts;
 
 class Gemma4Model final : public model::LoadedModel {
 public:
@@ -101,6 +106,13 @@ public:
     /// [vision] The sessions' prompt path (session.cpp's shared scratch registers it, null once it is gone): its buffers are
     /// the room the image encoder borrows.
     void set_prompt(PromptPath* p) const { prompt_ = p; }
+    /// The routed experts' placement (null for a dense model) and their tables and hand-off (experts.hpp).
+    core::ExpertTier* tier() const { return tier_.get(); }
+    TierExperts* experts() const { return experts_.get(); }
+    /// A prompt's staging of the experts off the card: the experts a layer's buffer holds (0: every expert is on the card)
+    /// and the bytes of each.
+    int stage_experts() const { return stage_experts_; }
+    uint64_t stage_slot() const { return stage_slot_; }
 
 private:
     bool mxfp8_experts_ = false;
@@ -110,6 +122,13 @@ private:
     mutable PromptPath* prompt_ = nullptr;
     bool parked_ = false;
     uint64_t card_spare_ = 0;   ///< the free VRAM the plan keeps beside the caches
+    ExpertRoom expert_room() const;
+    bool open_tier(const model::LoadRequest& req, uint64_t need, uint64_t free_b, core::LoadPlan& reads, std::string& err);
+    std::unique_ptr<core::ExpertTier> tier_;
+    std::unique_ptr<TierExperts> experts_;
+    float* tier_rows_ = nullptr;   ///< mapped [kMoePairs][n_embd]: the host's expert rows
+    int stage_experts_ = 0;
+    uint64_t stage_slot_ = 0;
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err);
     /// An FP8 matrix, or with `nvfp4` an NVFP4-planes one; its bytes added to `bytes`.
     bool mat(const std::string& name, int64_t rows, int64_t K, core::LoadPlan& reads, int file, Mat& m, std::string& err,
