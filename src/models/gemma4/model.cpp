@@ -315,9 +315,13 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
                     " positions fit (a smaller --max-context, --kv fp8 or fewer --batch slots)");
     }
     ctx_ = want;
-    basalt::log::info("basalt gemma4", "weights: dense %.2f GiB (FP8), experts %.2f GiB (NVFP4), embedding %.2f GiB in RAM; "
+    int n_mx = 0;
+    for (const ExpertLayer& el : pack_.experts) n_mx += el.gu_type == kTypeMxfp8;
+    const std::string fmt = n_mx == 0 ? "NVFP4" : n_mx == (int) pack_.experts.size() ? "MXFP8"
+                                                : "NVFP4, MXFP8 at " + std::to_string(n_mx) + " layers";
+    basalt::log::info("basalt gemma4", "weights: dense %.2f GiB (FP8), experts %.2f GiB (%s), embedding %.2f GiB in RAM; "
                       "context %lld x %llu sessions, %s KV",
-                      (double) dense / (double) kGiB, (double) experts / (double) kGiB, (double) V * E * 2 / (double) kGiB,
+                      (double) dense / (double) kGiB, (double) experts / (double) kGiB, fmt.c_str(), (double) V * E * 2 / (double) kGiB,
                       (long long) ctx_, (unsigned long long) n_sess, kv_ == KvType::F8 ? "fp8" : "fp16");
     return {};
 }
