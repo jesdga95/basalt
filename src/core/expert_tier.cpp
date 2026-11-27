@@ -1496,6 +1496,15 @@ bool ExpertTier::reclaim(std::string& err, bool restore_lent) {
         if (restore_lent) restore(false);
         return true;
     }
+    if (lent_per_layer_ == 0 && per_layer_ > 0 && per_layer_ < planned_per_layer_) {
+        uint64_t free_b = 0, total_b = 0;
+        std::string why;
+        if (core::device_memory(-1, free_b, total_b, why)) {
+            const uint64_t avail = free_b + (uint64_t) cache_.mapped_bytes();
+            const int64_t could = core::policy::reclaim_slots(avail, reserve_, free_floor_, one_each_, planned_per_layer_);
+            if (could > per_layer_) lend_all();
+        }
+    }
     if (lent_per_layer_ == 0) return true;
     const int64_t want = std::max(lent_per_layer_, planned_per_layer_);
     uint64_t free_b = 0, total_b = 0;
