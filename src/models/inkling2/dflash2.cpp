@@ -367,8 +367,8 @@ bool Dflash2Hook::init(const Dflash2Weights* w, const Geometry& g, int64_t conte
     slot_.assign(g.visits.size(), -1);
     for (int k = 0; k + 1 < kDf2Targets; ++k) slot_[(size_t) d.targets[(size_t) k]] = k;
 
-    // the rings: each reserves its whole range and backs it from the KV pool as the conversation grows (a granule at
-    // start, kept)
+    // the rings: each reserves its whole range and backs it from the KV pool as the conversation grows (the session's
+    // first grow takes a granule of each from the pool, and a trim keeps it)
     const int64_t cap = ring_cells(d);
     ring_ = cap;
     const size_t ring_b = (size_t) cap * kDf2KV * 2;
@@ -383,7 +383,6 @@ bool Dflash2Hook::init(const Dflash2Weights* w, const Geometry& g, int64_t conte
             rings_.push_back(std::move(a));
         }
     }
-    if (ok && !ensure(1, err)) return false;
 
     meta_d_ = (int32_t*) dev(2 * 4, ok);
     ids_d_ = (int32_t*) dev(kDf2Block * 4, ok);
