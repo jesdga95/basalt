@@ -19,23 +19,33 @@ const ExpertLayout& expert_layout() { return g_layout; }
 
 int cpu_isa_cap() { return 3; }   // no cap
 
+namespace {
+// F, DQ, BW, VL, VNNI and BMI2 (the i-quant rows' sign masks), and VBMI when asked for.
+bool avx512_probe(bool vbmi) {
+    if (cpu_isa_cap() < 3) return false;
+    unsigned r[4] = {0, 0, 0, 0};
+    auto cpuid = [&](unsigned leaf, unsigned sub) { platform::cpuid(leaf, sub, r); };
+    cpuid(0, 0);
+    if (r[0] < 7) return false;
+    cpuid(1, 0);
+    if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
+    const unsigned long long xcr0 = platform::xgetbv0();
+    if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
+    cpuid(7, 0);
+    const unsigned ebx = r[1], ecx = r[2];
+    const bool base = ((ebx >> 16) & 1u) && ((ebx >> 17) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) &&
+                      ((ecx >> 11) & 1u) && ((ebx >> 8) & 1u);
+    return base && (!vbmi || ((ecx >> 1) & 1u));
+}
+}  // namespace
+
 bool cpu_avx512_ok() {
-    static const bool ok = [] {
-        if (cpu_isa_cap() < 3) return false;
-        unsigned r[4] = {0, 0, 0, 0};
-        auto cpuid = [&](unsigned leaf, unsigned sub) { platform::cpuid(leaf, sub, r); };
-        cpuid(0, 0);
-        if (r[0] < 7) return false;
-        cpuid(1, 0);
-        if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
-        const unsigned long long xcr0 = platform::xgetbv0();
-        if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
-        cpuid(7, 0);
-        const unsigned ebx = r[1], ecx = r[2];
-        // F, BW, VL, VNNI, VBMI, and BMI2 (the i-quant rows' sign masks)
-        return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u) &&
-               ((ebx >> 8) & 1u);
-    }();
+    static const bool ok = avx512_probe(false);
+    return ok;
+}
+
+bool cpu_avx512_vbmi_ok() {
+    static const bool ok = avx512_probe(true);
     return ok;
 }
 
@@ -135,7 +145,7 @@ void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* co
         q2_0_gguf_rows_multi_neon(w, row_bytes, nblocks, a, nt, out, r0, r1);
         return;
     }
-    if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    if (cpu_avx512_vbmi_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
@@ -144,7 +154,7 @@ void act_quant_any(const float* x, int n, ActQ& a) {
         act_quant_q8_1_neon(x, n, a);
         return;
     }
-    if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
+    if (cpu_avx512_vbmi_ok()) act_quant_q8_1(x, n, a);
     else act_quant_q8_1_avx2(x, n, a);
 }
 

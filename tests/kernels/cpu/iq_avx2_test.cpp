@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     const bool vnni = cpu::cpu_avxvnni_ok();
-    const bool avx512 = cpu::cpu_avx512_ok();
+    const bool avx512 = cpu::cpu_avx512_vbmi_ok();   // the Q2_0 rows and quantizer compared below are the VBMI build
     std::printf("iq_avx2_test: %s, AVX-VNNI %s\n", cpu::cpu_name().c_str(), vnni ? "yes" : "no (base build only)");
     int bad = 0, compared = 0;
     std::mt19937 rng(11);

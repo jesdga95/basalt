@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
     }
     {   // Q2_0 down
         const size_t drow = d_row(42), dbytes = drow * NH;
-        ops.push_back({"Q2_0 down", "avx512", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::q2_0_gguf_rows_multi(b, drow, NFF / 64, ph1, NT, out, r0, r1); }, dbytes});
+        if (cpu::cpu_avx512_vbmi_ok()) ops.push_back({"Q2_0 down", "avx512", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::q2_0_gguf_rows_multi(b, drow, NFF / 64, ph1, NT, out, r0, r1); }, dbytes});
         ops.push_back({"Q2_0 down", "avx2", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::q2_0_gguf_rows_multi_avx2(b, drow, NFF / 64, ph1, NT, out, r0, r1); }, dbytes});
     }
 
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
         cpu::ActQ aq;
         std::printf("q8_1 quantize  640   avx2 %.2f us   avx512 %.2f us\n",
                     time_us([&] { cpu::act_quant_q8_1_avx2(hs[0].data(), NFF, aq); }),
-                    time_512([&] { cpu::act_quant_q8_1(hs[0].data(), NFF, aq); }));
+                    cpu::cpu_avx512_vbmi_ok() ? time_us([&] { cpu::act_quant_q8_1(hs[0].data(), NFF, aq); }) : NAN);
     }
 
     std::vector<uint8_t> proto;
