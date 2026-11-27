@@ -28,6 +28,7 @@
 #include "basalt/platform/memory.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/peer_share.hpp"
+#include "basalt/program/expert_spill.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -766,6 +767,49 @@ public:
     }
 
     int64_t kv_bytes() const override { return kv_bytes_; }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        const auto& t = m_.shared_tier().tier;
+        if (!t) return false;
+        t->expert_map(total, homes, routed);
+        return true;
+    }
+
+    std::string info_words() const override {
+        const std::string kv = m_.cache_fp8() ? "kv=fp8" : "kv=fp16";
+        const auto& t = m_.shared_tier().tier;
+        return t ? "expert_slots=" + std::to_string(t->gpu_slots()) + " expert_slots_primary=" +
+                       std::to_string(t->slots()) + " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " +
+                       kv + " " + program::spill_words(t->spill())
+                 : kv + " " + program::spill_words({});
+    }
+
+    model::Result set_low_memory(bool low, int64_t& expert_slots) override {
+        std::string e;
+        const auto& t = m_.shared_tier().tier;
+        if (!t) return {model::Status::Error, "ernie55: the expert tier is not open"};
+        cudaStreamSynchronize(stream_);
+        if (low) {
+            t->lend_all();
+        } else {
+            if (!t->reclaim(e, /*restore_lent=*/true)) return {model::Status::Error, "ernie55: " + e};
+            t->grow();
+        }
+        placement_dirty_ = true;
+        expert_slots = t->gpu_slots();
+        return {};
+    }
+
+    model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        std::string e;
+        const auto& t = m_.shared_tier().tier;
+        if (!t) return {model::Status::Error, "ernie55: the expert tier is not open"};
+        cudaStreamSynchronize(stream_);
+        if (!t->replan(mib, e)) return {model::Status::Error, "ernie55: " + e};
+        placement_dirty_ = true;
+        expert_slots = t->gpu_slots();
+        return {};
+    }
 
 private:
     const DevTensor* req_t(const std::string& name, std::string& err) const {
