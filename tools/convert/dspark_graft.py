@@ -184,7 +184,7 @@ def graft(mtp: Path, config: Path, pack: Path, undo_dir: Path) -> None:
         meta["dspark"] = {"source": mtp.name, "form": "BF16 as stored, F32 where the engine reads F32",
                           "section": SECTION}
         for s in meta.get("sources", []):
-            if s.get("path") == mtp.name:
+            if isinstance(s, dict) and s.get("path") == mtp.name:
                 break
         else:
             meta.setdefault("sources", []).append(source_record(mtp))

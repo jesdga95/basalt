@@ -65,7 +65,7 @@ def write_pack(path: pathlib.Path, n_vocab: int = N_VOCAB) -> bytes:
         "gguf_kv": {"tokenizer.ggml.tokens": [f"t{i}" for i in range(n_vocab)]},
         "tensors": {"token_embd.weight": {"type": "BF16", "type_id": 30, "shape": [8, n_vocab],
                                           "bytes": 16 * n_vocab, "offset": 0}},
-        "sources": [],
+        "sources": ["an older fingerprint string, as the GGUF converter writes"],
     }
     w.add_bytes("meta", json.dumps(meta).encode("utf-8"))
     w.close()
