@@ -526,9 +526,11 @@ public:
             }
         }
         if (tier_) tier_->lend_all();
-        // Prefer a chunk size that also fits the async expert ring over a larger chunk forced into synchronous per-layer staging.
-        if (ringed) {
-            for (int R = want; R >= kRingRows; R /= 2) {
+        // Prefer a large ringed chunk (>= 8192 rows) over an unringed larger chunk, without shrinking to tiny chunks
+        // whose repeated ring copies cost more than per-layer staging.
+        const int min_ring_chunk = std::max(kRingRows, 8192);
+        if (ringed && want >= min_ring_chunk) {
+            for (int R = want; R >= min_ring_chunk; R /= 2) {
                 std::string e;
                 if (!make_bufs(big_, R, e)) continue;
                 if (ring_open()) {
