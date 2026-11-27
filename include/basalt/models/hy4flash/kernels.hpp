@@ -85,6 +85,18 @@ void mla_query(const void* w_kb, const float* q, const float* kv_raw, const floa
 /// for h <= heads (each head an "expert" of an MMQ product).
 void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream);
 
+/// One Q8_0 matrix of a multi-matrix decode launch (`q8x_mmvq`): same bits as kernels::native_q8_0_mmvq.
+constexpr int kQ8xMats = 4;
+struct Q8xMat {
+    const void* w = nullptr;
+    const void* x = nullptr;
+    float* y = nullptr;
+    int n_out = 0;
+};
+/// Up to kQ8xMats Q8_0 matrices of the same width `n_in` (3072 or 6144) in one PDL launch (ncols 1..8),
+/// bit-for-bit identical to calling kernels::native_q8_0_mmvq on each matrix.
+void q8x_mmvq(const Q8xMat* mats, int n, int n_in, int ncols, void* stream);
+
 /// x[i] *= sigmoid(g[i]).
 void mul_sigmoid(const float* g, float* x, int n, void* stream);
 
