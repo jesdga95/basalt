@@ -166,6 +166,23 @@ model::ModelSession::ExpertCounts GlmSession::expert_counts() const {
     return {t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
 }
 
+std::vector<model::ModelSession::CardExperts> GlmSession::experts_by_card() const {
+    // One line per card the tier keeps a card arena on: the main card and, with `--gpu-mode peer`, each second card.
+    // The drafter's tier keeps arenas of its own and is not folded in, as in the deepseek41 and hy4flash sessions,
+    // which report the one tier their sessions have.
+    std::vector<CardExperts> out;
+    if (core::ExpertTier* t = model_.tier())
+        for (const core::ExpertTier::CardSlots& c : t->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+    return out;
+}
+
+bool GlmSession::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+    core::ExpertTier* t = model_.tier();
+    if (t == nullptr) return false;
+    t->expert_map(total, homes, routed);
+    return true;
+}
+
 model::Result GlmSession::draft_begin(int32_t anchor, int64_t pos, int n) {
     draft_ready_ = false;
     if (max_window() < 2 || n < 1) return {};

@@ -64,6 +64,11 @@ public:
     /// line's expert split and for the `DONE` line a client counts decode experts from (`tools/ppl_gate.py`). The
     /// inherited answer is zeros, which reads as a request that touched no experts.
     ExpertCounts expert_counts() const override;
+    /// The experts each card holds now, for the console `stats` command's per-card lines: the main tier's arenas, the
+    /// drafter's tier left out as it is in `expert_counts`.
+    std::vector<CardExperts> experts_by_card() const override;
+    /// Where each routed expert lives now, for that command's expert-map line.
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override;
 
 private:
     /// How many tokens a window can carry in the device memory free right now: the plan's chunk for that much memory,
