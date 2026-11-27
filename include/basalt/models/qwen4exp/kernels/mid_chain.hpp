@@ -3,6 +3,9 @@
 // qkv + z projections -> recurrence -> output projection, the same operations (and bits) as dense_tc_pair,
 // dec_gdn_rec and dense_tc in sequence.  It runs between the layer's two hc reads (which stay hc_fused_read): its input
 // is the first read's q8_1 rows and mixed output, its result the output projection's `bo`, which the second read adds.
+// Its output projection adds a row in dense_tc_one's order (Q8_0: the two-warp-group chunks'), dense_tc's bits only
+// where dense_tc takes that kernel for the shape (mid_chain_out_exact); elsewhere the chain stops after the recurrence
+// (`out` false) and the projection runs as dense_tc, so a solo window and a batch window give a row the same bits.
 // One CTA per SM (a device with fewer than 170 SMs runs fewer, each taking more tiles and heads); the phases hand over through counters in global memory.  The kernel needs every CTA resident, so it
 // must be launched with the stream drained of kernels that wait on later work (it is a programmatic dependent of the
 // first read and the second read is its dependent).  A hand-off wait that passes its bound sets the abort word and
@@ -27,6 +30,8 @@ struct MidChainArgs {
     int ord = 0;                     ///< launch ordinal within the graph (0 = the first: it zeroes the hand-off counters first)
     int ctas = 0;                    ///< bench/test: a grid smaller than the device's (0: one CTA per SM, at most 170)
     bool pair_only = false;          ///< bench: stop after the projection pair
+    bool out = true;                 ///< the output projection in the chain; false: the chain ends with rec.yq, `bo` is
+                                     ///< the caller's (dense_tc after the chain)
     unsigned long long* stamps = nullptr;   ///< bench: [ord][kMidStampCtas][kMidStampPts] phase times (null: no stamping)
 };
 constexpr int kMidStampCtas = 170, kMidStampPts = 24;
@@ -37,6 +42,8 @@ void mid_chain_init();
 bool mid_chain_supported(const MidChainArgs& a);
 // the pair ring's slot count for a type triple (always even)
 int mid_chain_ring_slots(int type_q, int type_z, int type_o);
+/// Whether the chain's output projection has dense_tc's bits for this output weight on the current device.
+bool mid_chain_out_exact(int type_o, const void* wo);
 /// Enqueue the layer's middle on `stream`.  Aborts on invalid arguments.
 void mid_chain(const MidChainArgs& a, void* stream);
 

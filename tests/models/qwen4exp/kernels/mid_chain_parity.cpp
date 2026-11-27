@@ -15,6 +15,7 @@
 // longer, its waits give up at the bound and set the abort word (wait_abort.hpp) instead of trapping, the resident CTAs
 // leave, the last one runs on an SM they free, the launch ends cleanly, and the next launch is bitwise again.  The mid_chain_hold build has a short bound for this.
 #include "basalt/kernels/gdn_window.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
@@ -203,6 +204,7 @@ int main(int argc, char** argv) {
         a.ctas = grid;
         a.T = T; a.xq = b.xq1; a.wq = w.wq; a.wz = w.wz; a.wo = w.wo; a.type_q = w.tq; a.type_z = w.tz; a.type_o = w.to;
         a.rec = w.rec; a.rec.yq = alias ? b.xq1 : b.yq; a.bo = b.bo2;
+        a.out = K::mid_chain_out_exact(w.to, w.wo);
         return a;
     };
     auto reset = [&] {
@@ -214,7 +216,13 @@ int main(int argc, char** argv) {
         CK(cudaMemset(b.yq, 0, XQ_BYTES));
     };
     int mid_ord = 0;
-    // the chain around the middle, in a PDL scope: read 0, the middle (the three kernels, or mid_chain), read 1 + router
+    // the output projection as the verify window has it (dense_proj): dense_tc where it takes the shape, else native_mmvq
+    auto out_proj = [&](const Layer& w, const void* yq, int T, cudaStream_t s) {
+        if (K::dense_tc_supported(w.to, NO_IN, 2560, w.wo)) K::dense_tc(w.to, w.wo, yq, b.bo2, NO_IN, 2560, T, s);
+        else K::native_mmvq(w.to, w.wo, yq, b.bo2, NO_IN, 2560, T, s);
+    };
+    // the chain around the middle, in a PDL scope: read 0, the middle (the three kernels, or mid_chain, followed by the
+    // output projection where the chain's would not have its bits), read 1 + router
     auto run = [&](const Layer& w, int T, bool alias, bool mid, cudaStream_t s) {
         K::PdlScope ps(true, false);
         K::DecRecArgs ra = w.rec;
@@ -223,12 +231,18 @@ int main(int argc, char** argv) {
         if (mid) {
             K::MidChainArgs a = mid_args(w, T, alias);
             a.ord = mid_ord++;
-            K::PdlScope pm(true, a.ord == 0);
-            K::mid_chain(a, s);
+            {
+                K::PdlScope pm(true, a.ord == 0);
+                K::mid_chain(a, s);
+            }
+            if (!a.out) {
+                K::PdlScope po(false);
+                out_proj(w, ra.yq, T, s);
+            }
         } else {
             K::dense_tc_pair(w.tq, w.wq, b.qkv, NQ, w.tz, w.wz, b.z, NZ, b.xq1, N, T, s);
             K::dec_gdn_rec(ra, T, s);
-            K::dense_tc(w.to, w.wo, ra.yq, b.bo2, NO_IN, 2560, T, s);
+            out_proj(w, ra.yq, T, s);
         }
         K::hc_fused_read(hcargs(1, T), s);
     };
@@ -254,7 +268,6 @@ int main(int argc, char** argv) {
     int dev = 0, sms = 0;
     CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-    const bool big = sms >= 160;   // the output projection has its one-tile kernel
     int bad = 0;
     auto ref_names_n = [](size_t n) { return n + 1; };
 
@@ -343,17 +356,11 @@ int main(int argc, char** argv) {
             std::vector<std::vector<std::vector<uint8_t>>> got(TM + 1);
             size_t tot = 0;
             std::vector<size_t> perk(outs.size() + 2, 0);
-            // the reference: today's kernels on the device's grid; a smaller grid, or a device whose output projection is not
-            // the one-tile kernel's, takes the mid chain on the device's grid (a tile's bits do not depend on its CTA).  A
-            // device without the one-tile output projection has another reduction order there: its comparison with today's
-            // kernels covers what comes before the output projection, the CPU reference below the projection itself.
-            const bool unf = gr == 0 && (big || w.to != 21);
-            std::vector<bool> use(outs.size() + 2, true);
-            if (unf && !big)
-                for (size_t k = 0; k < outs.size(); ++k) {
-                    const std::string nm = outs[k].name;
-                    use[k] = nm == "mixed1" || nm == "qkv" || nm == "z" || nm == "h" || nm == "gate" || nm == "beta" || nm == "y";
-                }
+            // the reference: today's kernels on the device's grid, every output (where the chain's own output projection
+            // would round differently it leaves the projection to them); a smaller grid takes the mid chain on the device's
+            // grid (a tile's bits do not depend on its CTA)
+            const bool unf = gr == 0;
+            const std::vector<bool> use(outs.size() + 2, true);
             for (int T = 1; T <= TM; ++T) {
                 reset();
                 if (unf) run(w, T, alias, false, s);
@@ -461,8 +468,14 @@ int main(int argc, char** argv) {
                 } else if (m == kMid || m == kMidPair) {
                     K::MidChainArgs a = mid_args(w, T, true);
                     a.ord = idx; a.pair_only = m == kMidPair;
-                    K::PdlScope pm(true, idx == 0);
-                    K::mid_chain(a, st);
+                    {
+                        K::PdlScope pm(true, idx == 0);
+                        K::mid_chain(a, st);
+                    }
+                    if (m == kMid && !a.out) {   // as the verify window runs it
+                        K::PdlScope po(false);
+                        out_proj(w, b.xq1, T, st);
+                    }
                 }
                 K::hc_fused_read(hcargs(1, T), st);
             };

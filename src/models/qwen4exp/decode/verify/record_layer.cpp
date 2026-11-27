@@ -154,6 +154,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             ra.gate = v_.gate_L_ + (size_t) gi * MT * HV; ra.beta = v_.beta_L_ + (size_t) gi * MT * HV; ra.yq = v_.xq_;
             ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
             ma.bo = v_.bo_;
+            ma.out = mid_chain_out_exact(ma.type_o, ma.wo);
             mid_ok = mid_chain_supported(ma);
         }
     }
@@ -199,9 +200,17 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     }
     if (mid_ok) {
         // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
-        PdlScope ps(pdl, mid_ord == 0);
-        ma.ord = mid_ord++;
-        mid_chain(ma, cs);
+        {
+            PdlScope ps(pdl, mid_ord == 0);
+            ma.ord = mid_ord++;
+            mid_chain(ma, cs);
+        }
+        // where the chain's output projection would not have dense_tc's bits, dense_tc after it (a plain launch:
+        // the chain needs every SM until it ends)
+        if (!ma.out) {
+            PdlScope po(false);
+            dense_proj(4, ma.type_o, ma.wo, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
+        }
     }
     float* xm = v_.mixed_;
     try {

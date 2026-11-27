@@ -49,6 +49,7 @@ struct MP {
     unsigned* cnt;                       // [2][NCTR] hand-off counters, then the arrival ticket
     unsigned par;                        // the counter set of this launch
     int pair_only;                       // bench: stop after the pair
+    int out;                             // the output projection in the chain (0: it ends at the recurrence's q8_1)
     TmaDesc stm;                         // rec state [S rows][R_HV * S], box S x S
     unsigned long long* stamps;          // bench: [launch][CTA][point] phase times
     int lay;                             // bench: the launch's index in the stamp buffer
@@ -129,7 +130,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
     const bool rec_role = b >= rec0;
     const int n_heads = rec_role ? (R_HV - (b - rec0) + rec_n - 1) / rec_n : 0;
     constexpr int O_TILES = O_NOUT / 16;
-    const int n_out = b < O_TILES ? (O_TILES - b + G - 1) / G : 0;
+    const int n_out = p.out != 0 && b < O_TILES ? (O_TILES - b + G - 1) / G : 0;
     const bool out_role = n_out > 0;
     // the weights do not depend on the first read: the CTA's first pair tiles and the rec head's state and conv history
     // are requested before the grid dependency wait
@@ -606,6 +607,11 @@ void mid_chain_init() {
 
 int mid_chain_ring_slots(int type_q, int type_z, int type_o) { return make_geo(type_q, type_z, type_o, 4).ns; }
 
+// the out phase adds a row as dense_tc_one does (Q8_0: as the two-warp-group 1024-value chunks)
+bool mid_chain_out_exact(int type_o, const void* wo) {
+    return dense_tc_layout(type_o, O_NIN, O_NOUT, wo) == (type_o == 8 ? DenseTcLayout::split2 : DenseTcLayout::one);
+}
+
 bool mid_chain_supported(const MidChainArgs& a) {
     const MidDev& d = mid_dev();
     return d.ok && a.ctas >= 0 && a.ctas <= d.ctas && (a.ctas == 0 || a.ctas >= kMidMinCtas) && a.T >= 1 && a.T <= kMidChainMaxT && types_ok(a) &&
@@ -635,6 +641,7 @@ void mid_chain(const MidChainArgs& a, void* stream) {
     p.abv = d.abv;
     p.cnt = d.cnt;
     p.pair_only = a.pair_only ? 1 : 0;
+    p.out = a.out ? 1 : 0;
     p.stamps = a.stamps;
     p.lay = a.ord;
     CUtensorMap stm_map;
