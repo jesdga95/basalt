@@ -1469,6 +1469,21 @@ struct WideBuffers {
     cudaEvent_t done;       // recorded on the caller's stream after the pass
 };
 
+// A set's bytes for `n_vocab` entries; `temp`: one sort's storage (256-byte rounded). 0 when the sort cannot size itself.
+size_t wide_set_bytes(int n_vocab, size_t& temp) {
+    temp = 0;
+    if (cub::DeviceRadixSort::SortPairs(nullptr, temp, (const unsigned*) nullptr, (unsigned*) nullptr, (const int*) nullptr,
+                                        (int*) nullptr, n_vocab, 0, 32) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    temp = (temp + 255) / 256 * 256;
+    const size_t chunks = (size_t) kWideRows * kWideChunks * sizeof(double);
+    const size_t state = ((size_t) kWideRows * sizeof(WideRow) + 255) / 256 * 256;
+    const size_t row = (size_t) kWideRows * n_vocab * 4;
+    return 4 * row + 2 * chunks + state + temp * kWideRows;
+}
+
 bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
     struct Slot {
         int device;
@@ -1512,16 +1527,9 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
     const size_t state = ((size_t) kWideRows * sizeof(WideRow) + 255) / 256 * 256;
     if (slot->n_vocab < n_vocab) {
         size_t temp = 0;
-        if (cub::DeviceRadixSort::SortPairs(nullptr, temp, (const unsigned*) nullptr, (unsigned*) nullptr,
-                                            (const int*) nullptr, (int*) nullptr, n_vocab, 0, 32,
-                                            (cudaStream_t) stream) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return false;
-        }
-        const size_t row = (size_t) kWideRows * n_vocab * 4;
-        temp = (temp + 255) / 256 * 256;
+        const size_t bytes = wide_set_bytes(n_vocab, temp);
         void* base = nullptr;
-        if (stream_capturing(stream) || cudaMalloc(&base, 4 * row + 2 * chunks + state + temp * kWideRows) != cudaSuccess) {
+        if (bytes == 0 || stream_capturing(stream) || cudaMalloc(&base, bytes) != cudaSuccess) {
             (void) cudaGetLastError();
             return false;
         }
@@ -1625,6 +1633,11 @@ void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* hist
 }
 
 }  // namespace
+
+size_t sampler_wide_bytes(int n_vocab) {
+    size_t temp = 0;
+    return n_vocab > 0 ? wide_set_bytes(n_vocab, temp) : 0;
+}
 
 bool sampler_wide_reserve(int n_vocab, void* stream) {
     WideBuffers w{};
