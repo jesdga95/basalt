@@ -196,8 +196,19 @@ class Http(unittest.TestCase):
         self.assertEqual(self.svc.waiting, {})
 
     def test_the_removed_endpoints_are_gone(self):
-        for path in ("/api/requests", "/api-monitor", "/settings", "/config", "/mcp"):
+        for path in ("/api/requests", "/settings", "/config", "/mcp"):
             self.assertEqual(self.call(path)[0], 404, path)
+
+    def test_api_monitor_shell_and_empty_trace(self):
+        with urllib.request.urlopen(self.base + "/api-monitor", timeout=10) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"monitor.js", r.read())          # the page is inert without the API, hence no auth
+        status, body = self.call("/api/monitor")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(body["requests"], list)       # always on: no switch and no off state
+        self.assertNotIn("enabled", body)
+        self.assertNotIn("api_monitor", self.call("/health")[1])
+        self.assertEqual(self.call("/api/monitor?id=deadbeef0000")[0], 404)
 
     # --- /api/logs
     def state_event(self, response):

@@ -421,6 +421,14 @@ def make_handler(target: Service | Router):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path == "/api-monitor":                      # the page is inert without the data, so it needs no key
+                body = (ROOT / "serve" / "web" / "monitor.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path == "/api/monitor":
                 if not self._authorized():
                     return self._json(401, {"error": {"message": "unauthorized"}})
