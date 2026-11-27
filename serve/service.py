@@ -345,6 +345,10 @@ class Service:
             self._wake()
         if self.loaded() and not self._vision_down():
             return
+        if self.loaded() and self._vision_down():
+            print("[server] restarting the vision encoder", flush=True)
+            self.vision.restart()
+            return
         if self.before_load:
             cmd = self.before_load
             print(f"[server] before_load: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
@@ -1292,7 +1296,7 @@ class Service:
         try:
             # encode under the fifo: the encoder and a running engine must not use the GPU together
             with self.fifo:
-                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                if getattr(self.vision, "in_engine", False) or self._vision_down():
                     self.ensure_loaded()
                 try:
                     if not videos:
