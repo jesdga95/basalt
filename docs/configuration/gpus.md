@@ -45,6 +45,7 @@ the shares, and checks the model's modes without loading it.
 | [Hy4-flash](../models/hy4-flash.md#cards) | up to 4 cards: experts, a block of layers each | refused | refused |
 | [Qwen3.8-27B](../models/qwen38-27b.md#cards) | 2 cards: the last layers of long prompts | 2 cards | refused |
 | [Inkling 2 Mini](../models/inkling2.md#two-cards) | 2 cards: the experts that spill from the main card | 2 cards | refused |
+| [GLM-5.3-Flash](../models/glm-5-3-flash.md#two-cards) | 2 cards: experts, a block of layers sized to the peer's room; an sm_89 peer with `-DPEER_ADA=ON` | refused | refused |
 
 A mode a model refuses is an error that names the modes it runs, for example `gpu-mode split: Hy4-flash does not run it; it runs
 peer`. More cards than a mode takes is refused with the most it takes. One mode per run.
@@ -66,12 +67,15 @@ with `use gpu 0`.
 
 ## Peer mode
 
-- **Experts (Flash-Next, DeepSeek, Hy4-flash, Inkling).** Each peer holds experts the main card does not and computes their rows in
+- **Experts (Flash-Next, DeepSeek, Hy4-flash, Inkling, GLM-5.3-Flash).** Each peer holds experts the main card does not and computes their rows in
   every decode window, following the conversation like the main card's cache. The rows are the main card's kernels' rows, so where an
-  expert sits does not change them. Flash-Next and Inkling deal the experts one by one, hottest first; DeepSeek and Hy4-flash give each
-  peer a contiguous block of layers, sized to its room.
+  expert sits does not change them. Flash-Next and Inkling deal the experts one by one, hottest first; DeepSeek, Hy4-flash and
+  GLM-5.3-Flash give each peer a contiguous block of layers, sized to its room - for one GLM peer that is the whole model, holding as
+  many experts of every layer as its VRAM pays for (`expert homes of 288 per layer: main card 0, second card 49, RAM 239`).
 - **Prompt rows.** A peer also computes its experts' share of each prompt chunk: any chunk on a peer as fast as the main card, chunks
-  up to 2,559 rows on a slower one (a slower card costs a longer chunk more than the experts it saves the main card's link).
+  up to 2,559 rows on a slower one (a slower card costs a longer chunk more than the experts it saves the main card's link). A model
+  whose session reads no prompt stages has no share to take, and its peer computes expert rows only - GLM-5.3-Flash is that model, and
+  it asks for no prompt-staging buffers at all.
 - **Prompt layers (Flash-Next, Qwen3.8-27B).** A long fresh part of a prompt is read as a pipeline over the cards while no other
   conversation decodes: the main card reads the first layers of a chunk and hands it on, a peer reads the next layers while the cards
   before it read the next chunks, and the main card reads the last chunk whole. Decode never uses the stage.
@@ -93,6 +97,10 @@ Measured, from the ledger's rows:
 - **Inkling 2 Mini:** a peer helps only when experts spill beyond what the main card's elastic copies cover. At default settings one
   card is fastest up to 1M tokens, and a peer is refused when the main card holds every expert
   ([Inkling](../models/inkling2.md#two-cards)).
+- **GLM-5.3-Flash:** over the perplexity gate's real text a GeForce RTX 4070 Ti SUPER peer took 51.6% of the main tier's expert lookups
+  and ran the gate 28% faster (422.4 against 586.5 s), with perplexity inside the tier's own run-to-run band - 5.5328 against 5.5217,
+  where two one-card runs of the same rows agree on 92.55% of the picks. With the tier frozen, so the peer computes only the experts it
+  holds, a decode run is 12.5% faster ([GLM-5.3-Flash](../models/glm-5-3-flash.md#two-cards)).
 - **Rounding:** a peer's prompt reads differ from one card's at summation-order rounding, about 0.01 KLD on `--diag-gpu-check`, the
   same as any reordering of the experts' sum. `--diag-main-card-bits` makes Flash-Next's other cards compute the main card's bits,
   and the prompt stages are then bitwise ([diagnostics](diagnostics.md)).
