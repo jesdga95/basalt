@@ -51,7 +51,8 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 - **Waits:** while a decode layer's expert sum waits for the CPU's and a peer's rows, the main card's memory is idle
   once its own experts are done. It then reads the next layer's attention gate and output products (the head after the last
   layer) into its L2, up to 56 MB, and stops when the rows are in; those products then read L2 instead of memory.
-- **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
+- **Engram table:** read by row from the pack by default (`--ple-io direct`), so it takes no RAM of its own; `--ple-io ram` maps
+  and locks it in RAM at start (or touches it into the OS page cache when locking is refused) before the expert tier is sized.
 - **Context:** `--max-context` from 1,024 up to 1,048,576, default 8,192. The 12 sparse layers keep a row of every position;
   the window layers' rings do not grow.
 - **Cache precision:** `--kv fp16` (default) keeps the rows in fp16; `--kv fp8` stores vLLM's 656-byte FP8 row

@@ -99,6 +99,9 @@ struct ExpertTierSpec {
         std::function<bool(int, std::string&)> set_ring;        ///< the pinned ring of file reads, `ring_pieces` experts
         std::function<void()> ram_only;                         ///< no expert is left in the file
     } host;
+    /// Bytes the model keeps in the OS file cache (such as an unlocked `--ple-io ram` n-gram table) that
+    /// `host_available_memory` still counts as available; subtracted when sizing the RAM expert tier.
+    uint64_t host_cache_keep = 0;
     int ring_pieces = 0;
     uint64_t share_stride = 0;   ///< bytes between experts in a second card's prompt staging (the largest layer's)
     int share_max_tokens = 0;    ///< most tokens of a prompt chunk

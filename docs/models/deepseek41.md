@@ -38,6 +38,8 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   the homes and the copies are planned exactly as with `--vision off`. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
   the RAM to free.
+- **Engram table:** read by row from the pack by default (`--ple-io direct`), so it takes no RAM of its own; `--ple-io ram` maps
+  and locks it in RAM at start (or touches it into the OS page cache when locking is refused) before the expert tier is sized.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
 - **Experts in the file:** with experts left in the file, the RAM tier is also a cache of it. A decode step that routes to a file
   expert reads it whole into the place of the layer's pinned expert used longest ago, around the OS file cache, while the CPU

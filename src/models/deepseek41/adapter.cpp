@@ -83,6 +83,7 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--ple-io") o.ple_io = args.next("--ple-io");
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
@@ -99,6 +100,10 @@ public:
         if (!ctxp::cache_format(o.kv, fmt)) {
             basalt::log::error("basalt deepseek41", "--kv %s: DeepSeek's caches are fp8 (the default: FP8 window rows, FP4 "
                                "compressed rows and index keys) or fp16", o.kv.c_str());
+            return 2;
+        }
+        if (o.ple_io != "direct" && o.ple_io != "ram") {
+            basalt::log::error("basalt deepseek41", "--ple-io %s: direct (the default) or ram", o.ple_io.c_str());
             return 2;
         }
         if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {

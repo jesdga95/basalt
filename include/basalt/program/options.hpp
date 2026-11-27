@@ -53,6 +53,9 @@ struct CommonOptions {
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
+    /// --ple-io direct|ram: how the n-gram table is read (direct = unbuffered SSD reads, ram = memory-mapped in RAM),
+    /// for the models with an n-gram table
+    std::string ple_io = "direct";
     int diag_rows = 0;
     /// --diag-gpu-cut N: diagnostic, a two-card split's second card from layer N on, whatever the shares give (0: off)
     int diag_gpu_cut = 0;

@@ -67,9 +67,13 @@ bool pin_budget(uint64_t& limit, std::string& why, const char* luid = nullptr,
 #if defined(_WIN32)
 inline constexpr bool kBoundHostRegistration = true;
 inline constexpr bool kPreferHostVmm = true;
+/// Whether clean, unlocked pages of a mapped file stay counted in `host_available_memory`: false on Windows (the
+/// working set deducts them from `ullAvailPhys` once touched), true on Linux (clean page cache stays in `MemAvailable`).
+inline constexpr bool kMappedFileCountedAvailable = false;
 #else
 inline constexpr bool kBoundHostRegistration = false;
 inline constexpr bool kPreferHostVmm = false;
+inline constexpr bool kMappedFileCountedAvailable = true;
 #endif
 uint64_t system_page_size();
 inline uint64_t pin_reserve(uint64_t budget) { return budget / 20 > (1ull << 30) ? budget / 20 : (1ull << 30); }

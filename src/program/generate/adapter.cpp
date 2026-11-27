@@ -404,6 +404,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.draft_experts = o.draft_experts;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
+        lreq.ple_io = o.ple_io;
         lreq.rope = o.rope;
         lreq.route = o.route;
         lreq.kv_resident = o.kv_resident;
