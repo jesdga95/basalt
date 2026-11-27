@@ -1,7 +1,7 @@
 // Parity of the packed cache rows (cache_rows.cuh): the device writers against the CPU packing byte for byte on random
 // rows and the edge cases (ties, saturation, tiny and zero groups, -0); the readers against the CPU decode bit for bit;
 // and the index-key query rounding.
-#include "cache_rows.hpp"
+#include "basalt/models/deepseek4/cache_rows.hpp"
 #include "cache_rows.cuh"
 #include "cache_rows_ref.hpp"
 

@@ -167,3 +167,19 @@ llama-perplexity -m DeepSeek-V4-Flash-Vision-Exp-source-precision.gguf -f wikite
 ```
 
 The completed run took 13.07 minutes.
+
+## KV cache formats (2026-11-27)
+
+The session caches now have a selectable row precision: `--kv fp8` (default) stores window rows as E4M3 codes with a
+power-of-two (UE8M0) scale per 32, compressor output rows as E2M1 codes with an E4M3 scale per 16, and CSA index keys
+as E2M1 codes with a UE8M0 scale per 32. These are the reference's `act_quant` and `fp4_act_quant` roundings from the
+Maya/Strata import; the indexer rounds its queries with the same E2M1/2^k scheme before scoring. `--kv fp16` keeps plain
+half rows. Sparse MQA decodes packed rows exactly (score keys by group scale, PV values by row group scale, masked rows as
+zeros). `ds4_cache_rows_parity` checks both writers and readers against a CPU packing byte for byte, and
+`ds4_attention_step_parity` compares an Fp8 window against the F32 ring (max abs 0.102 on its random fixture).
+
+Planned cache reserve on the `-hchead` pack, from the printed `cache reserve` at start: 65,536 tokens = 0.13 GiB packed /
+0.44 GiB fp16; 1,048,576 tokens = 1.88 GiB packed / 6.74 GiB fp16. Prose decode at 64k and 1M with
+`--resident-budget-gib 120 --expert-cache 512 --spec 0` ran at 21-22 tok/s in both layouts, within the run-to-run spread.
+A Wikitext KLD gate against the converted checkpoint was not run: no matching `--kld-base` file is present on this host,
+so the packed cache's quality delta is not yet measured.

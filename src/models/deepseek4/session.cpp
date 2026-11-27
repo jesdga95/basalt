@@ -1119,13 +1119,13 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                         selection.n_sel = kernels::kSparseMqaTopK;
                         selection.sel = selected_ids_;
                         selection.comp = cache.attention->data();
-                        selection.comp_type = kernels::MqaRowType::F32;
+                        selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
                         selection.comp_limit = comp_limit_;
                     }
                 } else {
                     selection.n_sel = visible;
                     selection.comp = cache.attention->data();
-                    selection.comp_type = kernels::MqaRowType::F32;
+                    selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
                     if (visible > 0) {
                         std::vector<int32_t> ids((size_t) n_tokens * visible);
                         for (int t = 0; t < n_tokens; ++t)
@@ -1582,12 +1582,12 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                             sel.n_sel = kernels::kSparseMqaTopK;
                             sel.sel = tile_sel_ids + (size_t) sub * kernels::kSparseMqaTopK;
                             sel.comp = cache.attention->data();
-                            sel.comp_type = kernels::MqaRowType::F32;
+                            sel.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
                             sel.comp_limit = chunk_comp_limit + g_row;
                         } else if (ratio != 4 && visible > 0) {
                             sel.n_sel = hca_max_visible;
                             sel.comp = cache.attention->data();
-                            sel.comp_type = kernels::MqaRowType::F32;
+                            sel.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
                             sel.sel = hca_ids;
                             sel.comp_limit = chunk_comp_limit + g_row;
                         }
