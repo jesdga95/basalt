@@ -165,7 +165,7 @@ int check_codes(const Isa& isa) {
         a[pos / 32].qs[pos % 32] = 1;
         for (auto& pp : prep) isa.prep(n, a.data(), pp.data());
         for (const int nt : {1, 2, 5, 8})
-            for (const auto rr : {std::pair<int, int>{0, R}, {1, R}, {0, 1}, {3, R}}) {
+            for (const auto& rr : {std::pair<int, int>{0, R}, {1, R}, {0, 1}, {3, R}}) {
                 const float* pp[8];
                 float* op[8];
                 std::vector<std::vector<float>> out(nt, std::vector<float>(R, -1.f));
@@ -208,7 +208,7 @@ int check_ranges(const Isa& isa, int n, int mode) {
     }
     int bad = 0;
     for (int nt = 1; nt <= 8; ++nt)
-        for (const auto rr : {std::pair<int, int>{0, R}, {1, R - 1}, {3, 4}, {0, 1}, {2, R}}) {
+        for (const auto& rr : {std::pair<int, int>{0, R}, {1, R - 1}, {3, 4}, {0, 1}, {2, R}}) {
             const float* pp[8];
             float* op[8];
             std::vector<std::vector<float>> out(nt, std::vector<float>(R, -1.f));
