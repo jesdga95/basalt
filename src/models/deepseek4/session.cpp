@@ -5,6 +5,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/sparse_mqa.hpp"
 #include "basalt/core/elastic_array.hpp"
@@ -868,10 +869,12 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                     }
                     if (!ensure_cache(*cache.indexer, (uint64_t) visible * 128 * sizeof(float))) return false;
 
-                    kernels::bf16_rows_dot(attn_normed_, static_cast<const uint16_t*>(index_kv->ptr), indexer_kv_,
-                                           n_tokens, 256, geo_.n_embd, stream_);
-                    kernels::bf16_rows_dot(attn_normed_, static_cast<const uint16_t*>(index_gate->ptr), indexer_score_,
-                                           n_tokens, 256, geo_.n_embd, stream_);
+                    kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
+                                                       static_cast<const uint16_t*>(index_kv->ptr), indexer_kv_,
+                                                       256, geo_.n_embd, 256, n_tokens, stream_);
+                    kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
+                                                       static_cast<const uint16_t*>(index_gate->ptr), indexer_score_,
+                                                       256, geo_.n_embd, 256, n_tokens, stream_);
                     indexer_compress_projected(n_tokens, indexer_kv_, indexer_score_, static_cast<const float*>(index_ape->ptr),
                         positions_, static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
                         cache.indexer_state_kv, cache.indexer_state_score,
