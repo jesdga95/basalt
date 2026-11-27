@@ -11,6 +11,7 @@
 // Nothing here knows a tokenizer, a model or an OS.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -58,6 +59,18 @@ public:
     uint32_t root() const { return root_; }
     size_t rule_count() const { return rule_start_.size(); }
 
+    /// Character equivalence class of `cp`: code points in the same class match the same grammar elements.
+    uint32_t char_class(uint32_t cp) const {
+        if (cp < 128) return ascii_cls_[cp];
+        if (wide_bp_.empty()) return wide_base_;
+        return wide_base_ + (uint32_t) (std::upper_bound(wide_bp_.begin(), wide_bp_.end(), cp) - wide_bp_.begin());
+    }
+    const uint16_t* ascii_classes() const { return ascii_cls_; }
+    uint32_t wide_base() const { return wide_base_; }
+    bool wide_uniform() const { return wide_bp_.empty(); }
+    uint32_t class_count() const { return n_classes_; }
+    uint32_t class_rep(uint32_t cls) const { return class_rep_[cls]; }
+
 private:
     friend class GrammarParser;
     static std::shared_ptr<const Grammar> make(const std::vector<std::vector<Element>>& rules,
@@ -66,6 +79,11 @@ private:
     std::vector<uint32_t> rule_start_;
     std::map<std::string, uint32_t> symbols_;
     uint32_t root_ = 0;
+    uint16_t ascii_cls_[128] = {};
+    std::vector<uint32_t> wide_bp_;
+    std::vector<uint32_t> class_rep_;
+    uint32_t wide_base_ = 0;
+    uint32_t n_classes_ = 0;
 };
 
 /// The vocabulary as a byte trie, built once and shared by every state.
@@ -83,16 +101,17 @@ public:
 private:
     friend class GrammarState;
     uint64_t id_ = 0;
+    // Compact DFS-preorder trie node (12 bytes): living subtrees scan sequentially; pruned subtrees jump to `skip`.
     struct Node {
-        uint32_t first_child = 0;   ///< 0: none (node 0 is the root and is never a child)
-        uint32_t next_sibling = 0;
+        uint32_t skip = 0;          ///< index of the first node after this subtree
         int32_t first_token = -1;   ///< tokens whose bytes end here, chained through next_token_
-        uint8_t byte = 0;
+        uint32_t depth_byte = 0;    ///< (depth << 8) | incoming byte
     };
     std::vector<std::string> bytes_;
     std::vector<int32_t> end_ids_;
     std::vector<Node> nodes_;
     std::vector<int32_t> next_token_;
+    uint32_t max_depth_ = 0;
 };
 
 /// When a lazy state starts enforcing.
@@ -119,7 +138,7 @@ public:
     /// The output so far is a complete sentence (an end token is allowed). True while inactive.
     bool accepting() const;
     /// No continuation exists.
-    bool dead() const { return active_ && stacks_.empty(); }
+    bool dead() const { return active_ && set_id_ == 0; }
 
     /// Advances over a token's bytes. False, with the state unchanged, if the bytes leave the language. `token_id`
     /// is checked against the trigger tokens while inactive, and against <[id]> references while active.
@@ -149,18 +168,17 @@ private:
         uint32_t value = 0;
         int n_remain = 0;
     };
-    bool feed(const std::string_view& bytes, std::vector<uint32_t>& stacks, Utf8& u) const;
-    bool advance(std::vector<uint32_t>& stacks, Utf8& u, std::string_view bytes, int32_t token_id) const;
-    std::vector<uint32_t> root_stacks() const;
+    bool feed(const std::string_view& bytes, int32_t& set_id, Utf8& u) const;
+    bool advance(int32_t& set_id, Utf8& u, std::string_view bytes, int32_t token_id) const;
+    int32_t root_set() const;
     bool fire(size_t from, bool by_token, int32_t token_id, std::string_view bytes);
-    void walk(const Vocab& v, uint32_t node, const std::vector<uint32_t>& stacks, const Utf8& u,
-              std::vector<uint8_t>& out) const;
+    void walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std::vector<uint8_t>& out) const;
 
     std::shared_ptr<const Grammar> g_;
     std::shared_ptr<Arena> arena_;
     Triggers triggers_;
     bool active_ = true;
-    std::vector<uint32_t> stacks_;   ///< interned stack ids, sorted; 0 is the empty (finished) stack
+    int32_t set_id_ = 0;             ///< interned stack-set id in arena_; 0 is the empty set
     Utf8 utf8_;
     std::shared_ptr<const PatternSet> patterns_;
     std::string tail_;               ///< inactive: the last bytes seen (all of them with patterns)

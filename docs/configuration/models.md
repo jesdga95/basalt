@@ -9,7 +9,7 @@ and starts the next, or [parks](#parking-models-in-ram) it.
   "engine": { "conversation-cache-disk-mib": 32768, "idle-sleep": 300, "vram-reserve-mib": 500 },
   "models": [
     { "alias": "Flash-Next", "model": "flash-next.basalt", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144, "parallel": 4,
-      "slot-full-context": true, "vision": "dynamic" },
+      "vision": "dynamic" },
     { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "all", "gpu-mode": "peer", "max-context": 1048576, "vision": "dynamic" }
   ],
   "server": { "host": "127.0.0.1", "port": 8080 }
@@ -20,7 +20,7 @@ and starts the next, or [parks](#parking-models-in-ram) it.
 - `engine`: applies to every model that takes it. An entry's own value wins.
 - `server`: shared by the whole server: `host`, `port`, `allowed-host`, `cors-origin`, `image-url-host`, `image-dir`,
   `image-remote-only`, `max-payload-mib`, `model-cache-mib`, `lazy`, `open`, `debug`, `request-lines`.
-- An entry takes engine flags and these server options: `gpu`, `vision`, `parallel`, `slot-full-context`, `idle-sleep`,
+- An entry takes engine flags and these server options: `gpu`, `vision`, `parallel`, `kv-pool`, `idle-sleep`,
   `idle-unload`, `min-free-vram-mib`, `fit-max-tokens`, `grammar`, `video-max-tokens`, the reasoning settings and the sampling
   defaults.
 - `version` is `2`. A file in the old shape (no `models`) is refused.

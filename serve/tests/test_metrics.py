@@ -196,8 +196,19 @@ class Http(unittest.TestCase):
         self.assertEqual(self.svc.waiting, {})
 
     def test_the_removed_endpoints_are_gone(self):
-        for path in ("/api/requests", "/api-monitor", "/settings", "/config", "/mcp"):
+        for path in ("/api/requests", "/settings", "/config", "/mcp"):
             self.assertEqual(self.call(path)[0], 404, path)
+
+    def test_api_monitor_shell_and_empty_trace(self):
+        with urllib.request.urlopen(self.base + "/api-monitor", timeout=10) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"monitor.js", r.read())          # the page is inert without the API, hence no auth
+        status, body = self.call("/api/monitor")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(body["requests"], list)       # always on: no switch and no off state
+        self.assertNotIn("enabled", body)
+        self.assertNotIn("api_monitor", self.call("/health")[1])
+        self.assertEqual(self.call("/api/monitor?id=deadbeef0000")[0], 404)
 
     # --- /api/logs
     def state_event(self, response):
@@ -494,6 +505,79 @@ class PerGpu(unittest.TestCase):
         nv.lib = object()
         self.assertIsNone(nv.cuda_version())
         self.assertIsNone(nv.driver_version())
+
+    def test_nvml_initializes_once_across_repeated_instantiations(self):
+        from unittest import mock
+        from serve.util import vram
+
+        calls = {"init": 0, "handle": 0}
+
+        class FakeLib:
+            def nvmlInit_v2(self):
+                calls["init"] += 1
+                return 0
+
+            def nvmlDeviceGetHandleByIndex_v2(self, idx, ref):
+                calls["handle"] += 1
+                if idx.value < 2:
+                    ref._obj.value = idx.value + 1
+                    return 0
+                return 6
+
+        saved = (telemetry._nvml_lib, telemetry._nvml_ready)
+        telemetry._nvml_lib, telemetry._nvml_ready = None, False
+        try:
+            with mock.patch.object(ctypes, "CDLL", return_value=FakeLib()) as cdll:
+                self.assertTrue(telemetry._Nvml(0).ok())
+                self.assertTrue(telemetry._Nvml(1).ok())
+                self.assertEqual(vram.gpu_count(), 2)
+                self.assertEqual(cdll.call_count, 1)
+                self.assertEqual(calls["init"], 1)
+                self.assertGreaterEqual(calls["handle"], 4)
+        finally:
+            telemetry._nvml_lib, telemetry._nvml_ready = saved
+
+    def test_disk_uses_monotonic_clock_and_clamps_counter_wrap(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        tel = Telemetry.__new__(Telemetry)
+        readings = iter([SimpleNamespace(read_bytes=10 << 20),
+                         SimpleNamespace(read_bytes=14 << 20),
+                         SimpleNamespace(read_bytes=2 << 20)])
+        tel.ps = SimpleNamespace(disk_io_counters=lambda: next(readings))
+        tel._disk_prev = None
+        mono = iter([100.0, 102.0, 104.0])
+        with mock.patch.object(telemetry.time, "monotonic", lambda: next(mono)), \
+                mock.patch.object(telemetry.time, "time", side_effect=[1000.0, 900.0, 800.0]):
+            self.assertIsNone(tel._disk())
+            self.assertAlmostEqual(tel._disk(), 2.0, places=3)
+            self.assertEqual(tel._disk(), 0.0)
+
+    def test_proc_fallbacks_close_file_handles(self):
+        import builtins
+        import io
+        from unittest import mock
+
+        opened = []
+
+        def fake_open(path, *args, **kwargs):
+            content = {
+                "/proc/cpuinfo": "model name\t: Test CPU\n",
+                "/proc/stat": "cpu  10 20 30 40 50 0 0 0\n",
+                "/proc/meminfo": "MemTotal: 1000 kB\nMemAvailable: 400 kB\n",
+            }[path]
+            fp = io.StringIO(content)
+            opened.append((path, fp))
+            return fp
+
+        with mock.patch.object(os.path, "exists", lambda p: p == "/proc/cpuinfo"), \
+                mock.patch.object(builtins, "open", fake_open):
+            self.assertEqual(telemetry._cpu_name(), "Test CPU")
+            fb = telemetry._CpuRamFallback()
+            self.assertEqual(fb.ram(), (600 * 1024, 1000 * 1024))
+        self.assertEqual([p for p, _ in opened], ["/proc/cpuinfo", "/proc/stat", "/proc/meminfo"])
+        self.assertTrue(all(fp.closed for _, fp in opened))
 
 
 class EngineStderr(unittest.TestCase):

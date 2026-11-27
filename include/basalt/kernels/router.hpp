@@ -34,6 +34,12 @@ void router_logits(const float* x, const float* gate, int n_tokens, const Router
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
             int32_t* ids, float* weights, void* stream);
 
+/// Same as `router_logits` / `router` with BF16 gate weights (exact bit-for-bit match to fp32 weights whose low 16 bits
+/// are zero, at half the VRAM and half the memory traffic).
+void router_logits_bf16(const float* x, const uint16_t* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream);
+void router_bf16(const float* x, const uint16_t* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
+                 int32_t* ids, float* weights, void* stream);
+
 /// router's choice from logits computed another way (a prompt chunk's scores as one product): the same selection and
 /// weights `router` makes from the same logits.
 void router_select(const float* logits, const float* bias, int n_tokens, const RouterArgs& a, int32_t* ids, float* weights,

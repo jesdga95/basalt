@@ -249,14 +249,13 @@ int sessions(Context& context) {
 
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
-    // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
+    // Recommend, never force: a setup the engine cannot batch is said and batching left off - the
     // engine still starts and serves one request at a time.
     std::vector<std::vector<SlotSession>> bslot_ss;
     std::vector<int64_t> slot_cap;   // each batch slot's context (cells)
     uint64_t slot_kv_cuda0 = 0;      // the batch slots' sessions on CUDA0 beyond the solo one: VRAM the expert cache does not get
     bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
-        const int cap = basalt::kernels::kVerifyMaxT;
         // one slot of a KV format batch windows cannot read is no slot: requests run one at a time, as without --batch
         const char* off = !o.serve ? "it needs --serve" : o.batch < 1 ? "it needs 1 or more slots"
                         : o.batch == 1 && !cli::kv_batch_refusal(o.kv, 2).empty() ? "one slot runs batch windows only with --kv int8"
@@ -264,10 +263,6 @@ int sessions(Context& context) {
         if (off != nullptr) {
             basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
             o.batch = 0;
-        } else if (o.batch > cap) {
-            basalt::log::warn("basalt generate", "--batch %d: a batch window holds at most %d rows, so %d "
-                                 "slots", o.batch, cap, cap);
-            o.batch = cap;
         }
     }
     if (o.batch > 0) {

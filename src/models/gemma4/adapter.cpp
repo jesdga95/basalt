@@ -5,6 +5,7 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/models/gemma4/kernels.hpp"
 #include "basalt/program/options.hpp"
 #include "models/gemma4/meta.hpp"
 #include "models/gemma4/model.hpp"
@@ -59,6 +60,8 @@ public:
     }
     // one card holds every weight; a second card has nothing to take yet
     program::GpuModes gpu_modes() const override { return {0, 0, 0}; }
+    // each slot's window takes at least one row of a batch window; each slot keeps its own caches
+    int max_slots() const override { return kRows; }
     const char* model_name() const override { return "Gemma-4-26B-A4B"; }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, FP8 dense
 

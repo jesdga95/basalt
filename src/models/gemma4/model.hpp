@@ -134,7 +134,7 @@ std::unique_ptr<model::ModelSession> make_session(Gemma4Model& model, std::strin
 /// chunk's rows, a full layer's cells), its logits and graphs.
 uint64_t session_bytes(const Geometry& g, int64_t context, KvType kv);
 /// The device bytes every session shares once on the card: the forward's scratch and the prompt path's.
-uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv);
+uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv, bool mxfp8);
 /// The split-K workspace of the decode window's NVFP4 MLP products (floats of partial sums, tickets); 0 for FP8.
 void mlp_workspace(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, size_t& partial, size_t& tickets);
 

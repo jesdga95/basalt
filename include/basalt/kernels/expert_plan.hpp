@@ -9,11 +9,13 @@
 namespace basalt::kernels {
 
 constexpr int kPlanAhead = 8;   ///< the groups of a call moe_plan records (rec_blobs, rec_n) for a read-ahead
+constexpr int kPlanMaxPairs = 4096;   ///< the (row, slot) pairs one moe_plan call takes at most
 
 /// The grouped expert kernel's plan from the router's choices: group g is an expert on the card (its blob at blobs[e], a
 /// device address; 0 when it is not on the card) and its entries are the (row, slot) pairs that chose it, in row order;
 /// an entry writes row r * k + slot of the output. A pair whose expert is not on the card is left out (the caller
-/// supplies its row). ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= 1024, n_expert <= 256.
+/// supplies its row). ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= kPlanMaxPairs,
+/// n_expert <= 256.
 /// With `tally` [n_expert], each expert on the card adds its pairs to its entry (the console's expert map); with
 /// `rec_blobs` [kPlanAhead] and `rec_n`, the first groups' blobs are recorded. A programmatic dependent (pdl.hpp).
 void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,

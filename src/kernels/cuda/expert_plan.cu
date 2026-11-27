@@ -1,5 +1,6 @@
 // src/kernels/cuda/expert_plan.cu - moe_plan and moe_sort (basalt/kernels/expert_plan.hpp).
 #include "basalt/kernels/expert_plan.hpp"
+#include "basalt/kernels/expert_plan.cuh"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
@@ -17,7 +18,7 @@ void check(const char* what) {
 
 // One block of kPlanThreads, a thread an expert: the (row, slot) pairs counted by expert (the experts on the card); every
 // warp scans its experts' counts at once and adds the warps' before it, giving each used expert its group and first entry;
-// each pair then takes its place in its group from the pairs before it that chose the same expert (the rows' order). The
+// each pair then takes its place in its group after the pairs before it that chose the same expert (plan_entries). The
 // blob table (constant) is staged in shared memory before pdl_wait, the pairs' choices after it.
 constexpr int kPlanThreads = 256;
 __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* __restrict__ ids, int n, int n_expert,
@@ -31,7 +32,8 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
     unsigned long long* gblob = smb + n_expert;                    // [n_expert]: group g's blob
     int32_t* count = reinterpret_cast<int32_t*>(smb + 2 * n_expert);   // [n_expert]
     int32_t* first = count + n_expert;                             // [n_expert]: the expert's first entry
-    int32_t* sid = first + n_expert;                               // [n]: the pairs' experts
+    int32_t* wcnt = first + n_expert;                              // [kPlanThreads / 32][n_expert]: plan_entries' counts
+    int32_t* sid = wcnt + kPlanThreads / 32 * n_expert;            // [n]: the pairs' experts
     __shared__ int wsum[kPlanThreads / 32][2];                     // each warp's entries and groups
     __shared__ int groups;
     const int e = threadIdx.x, w = e >> 5, lane = e & 31;
@@ -39,6 +41,7 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
         blob[e] = blobs[e];
         count[e] = 0;
     }
+    for (int j = e; j < kPlanThreads / 32 * n_expert; j += kPlanThreads) wcnt[j] = 0;
     pdl_wait();
     pdl_launch_dependents();
     __syncthreads();
@@ -88,15 +91,7 @@ __global__ void __launch_bounds__(kPlanThreads) moe_plan_kernel(const int32_t* _
     }
     if (tally && c)   // a reduction (its result unused), so no thread waits on the load a plain add would make
         atomicAdd(&tally[e], (uint32_t) c);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const int x = sid[i];
-        if (!blob[x]) continue;
-        int before = 0;
-        for (int j = 0; j < i; ++j) before += sid[j] == x;
-        const int p = first[x] + before;
-        dst[p] = i;
-        tok[p] = i / k;
-    }
+    plan_entries<kPlanThreads>(sid, n, k, n_expert, blob, first, wcnt, dst, tok);
 }
 
 // ---- moe_sort: a stable counting sort of a prompt chunk's (row, slot) pairs by expert
@@ -183,10 +178,10 @@ void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned 
               unsigned long long* rec_blobs, int32_t* rec_n) {
     const int n = rows * k;
     if (n <= 0) return;
-    if (n > 1024) throw std::runtime_error("moe_plan: more than 1024 pairs");
+    if (n > kPlanMaxPairs) throw std::runtime_error("moe_plan: more pairs than kPlanMaxPairs");
     if (n_expert > kPlanThreads) throw std::runtime_error("moe_plan: more experts than a block's threads");
     launch_pdl(moe_plan_kernel, dim3(1), dim3(kPlanThreads),
-               (size_t) n_expert * (2 * sizeof(unsigned long long) + 2 * sizeof(int32_t)) + (size_t) n * sizeof(int32_t),
+               (size_t) n_expert * (2 * sizeof(unsigned long long) + (2 + kPlanThreads / 32) * sizeof(int32_t)) + (size_t) n * sizeof(int32_t),
                (cudaStream_t) stream, ids, n, n_expert, blobs, ptr, start, n_groups, dst, tok, k, tally, rec_blobs, rec_n);
     check("moe_plan");
 }

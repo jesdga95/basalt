@@ -18,6 +18,7 @@
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
+#include "basalt/kernels/cpu/mxfp4_avx2.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -1574,6 +1575,151 @@ int check_mxfp4(int gu, int seed) {
                 const double usn = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
                 std::printf("down %d tokens one thread: %s %.0f us (%.2f GB/s) vs ggml %.0f us (%.2f GB/s)\n",
                             NT2, simd_n[i], usn, dbytes / usn / 1e3, usg, dbytes / usg / 1e3);
+            }
+        }
+    }
+    // (4) MXFP4 gate/up + MXFP4 down with SiTU-GLU softcap (4.0, 25.0) at ERNIE 5.5's 2048 x 2048 latent geometry
+    {
+        constexpr int64_t HE = 2048, FE = 2048;
+        cpu::NativeFmt fe;
+        std::string er;
+        if (!cpu::native_fmt(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, HE, FE, fe, er)) {
+            std::printf("mxfp4/mxfp4: %s\n", er.c_str());
+            ++failures;
+        } else {
+            fe.gate_softcap = 4.0f;
+            fe.up_softcap = 25.0f;
+            std::mt19937 rng(1200 + seed);
+            std::normal_distribution<float> nd(0.f, 1.f);
+            std::vector<uint8_t> blob(fe.bytes);
+            for (auto& b : blob) b = (uint8_t) rng();
+            for (size_t off : {(size_t) 0, fe.up_off, fe.down_off})
+                for (int64_t r = 0; r < HE; ++r)
+                    for (int64_t blk = 0; blk < FE / 32; ++blk)
+                        blob[off + (size_t) r * fe.gu_row + (size_t) blk * 17] = (uint8_t) (117 + rng() % 8);
+            const int NT2 = 2;
+            std::vector<float> x((size_t) NT2 * HE);
+            for (auto& v : x) v = nd(rng);
+            std::vector<std::vector<uint8_t>> act(NT2, std::vector<uint8_t>(cpu::kNativeActBytes));
+            std::vector<std::vector<uint8_t>> hq(NT2, std::vector<uint8_t>(cpu::kNativeHBytes));
+            std::vector<std::vector<float>> ff(NT2, std::vector<float>(FE));
+            std::vector<float> got((size_t) NT2 * HE), ref((size_t) NT2 * HE), ref_q((size_t) NT2 * HE);
+            const void* a[NT2];
+            const void* hp[NT2];
+            float* ffp[NT2];
+            float* op[NT2];
+            for (int k = 0; k < NT2; ++k) {
+                cpu::native_quant_act(fe, x.data() + (size_t) k * HE, act[k].data());
+                a[k] = act[k].data();
+                ffp[k] = ff[k].data();
+                hp[k] = hq[k].data();
+                op[k] = got.data() + (size_t) k * HE;
+            }
+            cpu::native_gu_rows(fe, blob.data(), a, NT2, ffp, 0, (int) FE);
+            for (int k = 0; k < NT2; ++k) cpu::native_quant_h(fe, ff[k].data(), hq[k].data());
+            cpu::native_down_rows(fe, blob.data(), hp, NT2, op, 0, (int) HE);
+            std::vector<float> G((size_t) FE * HE), U((size_t) FE * HE), D((size_t) HE * FE);
+            for (int64_t r = 0; r < FE; ++r) {
+                tm->to_float(blob.data() + (size_t) r * fe.gu_row, G.data() + (size_t) r * HE, HE);
+                tm->to_float(blob.data() + fe.up_off + (size_t) r * fe.up_row, U.data() + (size_t) r * HE, HE);
+                tm->to_float(blob.data() + fe.down_off + (size_t) r * fe.d_row, D.data() + (size_t) r * FE, FE);
+            }
+            std::vector<float> hd((size_t) FE);
+            for (int k = 0; k < NT2; ++k) {
+                std::vector<float> h(FE);
+                for (int64_t r = 0; r < FE; ++r) {
+                    double g = 0, u = 0;
+                    for (int64_t i = 0; i < HE; ++i) {
+                        g += (double) G[(size_t) r * HE + i] * x[(size_t) k * HE + i];
+                        u += (double) U[(size_t) r * HE + i] * x[(size_t) k * HE + i];
+                    }
+                    const double sg = (4.0 * std::tanh(g / 4.0)) * (1.0 / (1.0 + std::exp(-g)));
+                    const double su = 25.0 * std::tanh(u / 25.0);
+                    h[r] = (float) (sg * su);
+                }
+                for (int64_t r = 0; r < HE; ++r) {
+                    double o = 0;
+                    for (int64_t i = 0; i < FE; ++i) o += (double) D[(size_t) r * FE + i] * h[i];
+                    ref[(size_t) k * HE + r] = (float) o;
+                }
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(hq[k].data(), hd.data(), FE);
+                for (int64_t r = 0; r < HE; ++r) {
+                    double o = 0;
+                    for (int64_t i = 0; i < FE; ++i) o += (double) D[(size_t) r * FE + i] * hd[i];
+                    ref_q[(size_t) k * HE + r] = (float) o;
+                }
+            }
+            const double e = rel(got, ref), eq = rel(got, ref_q);
+            const bool ok = e < 3e-2 && eq < 1e-5 && std::isfinite(e);
+            std::printf("mxfp4/mxfp4 (situ 4/25) at %lld x %lld blob %8zu  cpu rel %.2e max abs %.2e (down vs its own q8_0 h: "
+                        "rel %.2e max abs %.2e)  %s\n",
+                        (long long) HE, (long long) FE, fe.bytes, e, maxabs(got, ref), eq, maxabs(got, ref_q),
+                        ok ? "ok" : "FAIL");
+            if (!ok) ++failures;
+
+            // Bitwise multi-token parity: mxfp4_256_{gu,down}_rows_{base,vnni} at nt = 1..8 vs single-token ggml dot
+            if (basalt::kernels::cpu::cpu_avx2_ok()) {
+                const int max_t = 8;
+                std::vector<uint8_t> acts((size_t) max_t * fe.act_bytes);
+                const void* ap[max_t];
+                for (int t = 0; t < max_t; ++t) {
+                    std::vector<float> xt((size_t) HE);
+                    for (int i = 0; i < HE; ++i) xt[(size_t) i] = 0.25f * std::sin(0.017f * (t * 97 + i));
+                    basalt::kernels::cpu::native_quant_act(fe, xt.data(), acts.data() + (size_t) t * fe.act_bytes);
+                    ap[t] = acts.data() + (size_t) t * fe.act_bytes;
+                }
+                const basalt::kernels::cpu::SwiGlu glu{0.f, 4.f, 25.f};
+                const auto* tr = ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
+                std::vector<float> ref_gu((size_t) max_t * FE), ref_dn((size_t) max_t * HE);
+                for (int r = 0; r < FE; ++r) {
+                    const uint8_t* gr = blob.data() + (size_t) r * fe.gu_row;
+                    const uint8_t* ur = blob.data() + fe.up_off + (size_t) r * fe.gu_row;
+                    for (int t = 0; t < max_t; ++t) {
+                        float g = 0.f, u = 0.f;
+                        tr->vec_dot((int) HE, &g, 0, gr, 0, ap[t], 0, 1);
+                        tr->vec_dot((int) HE, &u, 0, ur, 0, ap[t], 0, 1);
+                        ref_gu[(size_t) t * FE + r] = basalt::kernels::cpu::swiglu(glu, g, u);
+                    }
+                }
+                for (int r = 0; r < HE; ++r) {
+                    const uint8_t* dr = blob.data() + fe.down_off + (size_t) r * fe.d_row;
+                    for (int t = 0; t < max_t; ++t) {
+                        float v = 0.f;
+                        tr->vec_dot((int) FE, &v, 0, dr, 0, ap[t], 0, 1);
+                        ref_dn[(size_t) t * HE + r] = v;
+                    }
+                }
+                for (int nt : {1, 2, 3, 5, 7, 8}) {
+                    std::vector<float> g_base((size_t) nt * FE), d_base((size_t) nt * HE);
+                    float *gp[max_t], *dp[max_t];
+                    for (int t = 0; t < nt; ++t) {
+                        gp[t] = g_base.data() + (size_t) t * FE;
+                        dp[t] = d_base.data() + (size_t) t * HE;
+                    }
+                    basalt::kernels::cpu::mxfp4_256_gu_rows_base(blob.data(), fe.gu_row, fe.up_off, (int) HE, glu, ap, nt,
+                                                                 gp, 0, (int) FE);
+                    basalt::kernels::cpu::mxfp4_256_down_rows_base(blob.data() + fe.down_off, fe.d_row, (int) FE, ap, nt,
+                                                                   dp, 0, (int) HE);
+                    const bool b_ok = std::memcmp(g_base.data(), ref_gu.data(), (size_t) nt * FE * 4) == 0 &&
+                                      std::memcmp(d_base.data(), ref_dn.data(), (size_t) nt * HE * 4) == 0;
+                    bool v_ok = true;
+                    if (basalt::kernels::cpu::cpu_avxvnni_ok()) {
+                        std::vector<float> g_vnni((size_t) nt * FE), d_vnni((size_t) nt * HE);
+                        for (int t = 0; t < nt; ++t) {
+                            gp[t] = g_vnni.data() + (size_t) t * FE;
+                            dp[t] = d_vnni.data() + (size_t) t * HE;
+                        }
+                        basalt::kernels::cpu::mxfp4_256_gu_rows_vnni(blob.data(), fe.gu_row, fe.up_off, (int) HE, glu, ap,
+                                                                     nt, gp, 0, (int) FE);
+                        basalt::kernels::cpu::mxfp4_256_down_rows_vnni(blob.data() + fe.down_off, fe.d_row, (int) FE, ap,
+                                                                       nt, dp, 0, (int) HE);
+                        v_ok = std::memcmp(g_vnni.data(), ref_gu.data(), (size_t) nt * FE * 4) == 0 &&
+                               std::memcmp(d_vnni.data(), ref_dn.data(), (size_t) nt * HE * 4) == 0;
+                    }
+                    std::printf("mxfp4_256 multi-token nt=%d: base=%s vnni=%s (bitwise vs ggml)\n",
+                                nt, b_ok ? "ok" : "FAIL", v_ok ? "ok" : "FAIL");
+                    if (!b_ok || !v_ok) ++failures;
+                }
             }
         }
     }

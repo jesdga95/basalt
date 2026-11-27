@@ -9,9 +9,15 @@ show the load: `load.percent` and `load.gib`, the GiB placed so far in one figur
 
 ## Concurrent requests: `--parallel N`
 
-`--parallel N` (1 to 8) serves N requests at once in batch slots. Further requests wait in arrival order. `--max-context` is shared:
-each slot holds `max-context / N` tokens (`--parallel 4 --max-context 262144` gives four slots of 65,536). A request longer than its slot
-is refused with a 400 that names the length; the start log's `slots` line shows the context each slot gets. `--slot-full-context` gives every slot the whole `--max-context`, at N times the KV cache.
+`--parallel N` (1 to 64) serves N requests at once in batch slots. Further requests wait in arrival order. Every slot can reach the
+whole `--max-context`; a request longer than that is refused with a 400 that names the length. A model with a KV pool (Inkling 2 Mini)
+backs every slot's cells from one pool as its conversation grows, so one long agent session can hold most of it while short requests run
+beside it; the start log's `KV pool` line states its size and the positions it holds. When the pool runs short, idle conversations
+move to the conversation cache first (the longest idle first), then a new request waits for a running one to end, and a running slot
+that cannot grow sits out until there is room; only when every running slot waits does the newest one end with an error that says so
+(its conversation stays, so asking again continues it). Any other model gives each slot the whole context's cache, so N slots take N
+times its KV; lower `--max-context` when they do not fit. `--no-kv-pool` (config `"kv-pool": false`) gives every slot of a model
+with a KV pool its own KV for the whole `--max-context` too, fixed at start: no slot waits for room or parks, at N times the KV.
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 
@@ -54,7 +60,9 @@ The API's `timings` object and the matching `done`-line values are request-level
 
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
 taken from the file); `[server] engine log: PATH` names it at start. A log of 10 MiB or more moves to `engine.log.1` at the
-next start. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage
+next start. Each line starts with the local time the server received it, `MM-DD HH:MM:SS`. When RAM admission closes, the engine says so once
+at warn level with the free RAM, the amount it needed and which tier closed, and again when it opens, with the count of refusals; the
+stats page and `/metrics` (`basalt_conversation_parking_refused_total`) carry the count since startup. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage
 it was in) and the server's warning quotes it with the exit status. The folder also holds the conversation
 cache. Nothing is unpacked from the model file: the server reads the tokenizer from its sections, and the engine and `basalt-vision`
 read the vision projector inside it.
@@ -85,7 +93,7 @@ header. The top of the page always shows:
 Under it, four tabs (keys `1` to `4`, `L` for the logs, or `#tab=req|slots|hw|logs` in the address):
 
 - Requests: the queue, the recent requests, tokens per request, the last request, the best since the server started, the
-  conversation cache (`conversation`: `parked`, `bytes`, `evictions`, `restored`, `restored_ms`) and the totals (`totals`).
+  conversation cache (`conversation`: `parked`, `bytes`, `evictions`, `refused`, `restored`, `restored_ms`) and the totals (`totals`).
 - Slots: a card per slot with its current request, or for an idle slot its last one, its context and its drafting; past four
   slots, compact rows. With no model loaded the cards stay, empty.
 - Hardware: each card's load, power, temperature, VRAM and PCIe traffic, and the CPU, RAM, disk reads, experts in VRAM, driver and
@@ -151,8 +159,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
   tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
   those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
-  for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
-  memory pressure). `--ram-reserve-mib 0` turns the guard off.
+  for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or half the reserve when smaller,
+  or below the reserve under memory pressure). `--ram-reserve-mib 0` turns the guard off.
 - Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
   repeats it and the stats page adds an SSD tier and turns its Experts heading amber.
 - The disk tier keeps its floor a GiB above the reserve.
@@ -183,7 +191,7 @@ images a request may name: [image sources](configuration/image-sources.md). An i
 
 ## Video
 
-With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek, Hy4-flash, Inkling 2 Mini and Gemma 4 do not). A user message names a video as it names an image, from
+With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek, Hy4-flash, Inkling 2 Mini, ERNIE-5.5-Flash and Gemma 4 do not). A user message names a video as it names an image, from
 the same [sources](configuration/image-sources.md):
 
 | API | Part |

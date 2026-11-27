@@ -1,4 +1,5 @@
 // src/program/serve/request_finish.cpp - request complete operations.
+#include "prompt_parts.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -15,6 +16,32 @@ void Request::report_expert_counts(const DoneCounts& dc) const {
                       (long long) (dc.lookups + dc.offloaded));
     basalt::log::info("basalt serve", "decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s",
                       100.0 * (double) dc.hits / (double) dc.lookups, (long long) dc.hits, (long long) dc.lookups, off);
+}
+
+bool Request::leave_in_slot() {
+    if (!slot_swapped && !slot_bound) return true;
+    bool ok = true;
+    if (slot_bound) {
+        slot_bound = false;
+        ok = slot_leave();
+    }
+    if (slot_swapped) {
+        slot_swapped = false;
+        runtime_.solo_out = nullptr;
+        runtime_.live = std::move(solo_book.live);
+        runtime_.live_imgs = std::move(solo_book.live_imgs);
+        runtime_.live_ok = solo_book.live_ok;
+        runtime_.cvec_cached = solo_book.cvec;
+        runtime_.checks = std::move(solo_book.checks);
+        if (solo_moved) {   // its cells went to this request (hold_slot)
+            runtime_.live.clear();
+            runtime_.live_imgs.clear();
+            runtime_.live_ok = false;
+            runtime_.checks.clear();
+        }
+        runtime_.solo_draft_back(!solo_moved);
+    }
+    return ok;
 }
 
 Flow Request::complete() {
@@ -53,7 +80,7 @@ Flow Request::complete() {
         const uint64_t rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
         const uint64_t own = rss > runtime_.ready_rss ? rss - runtime_.ready_rss : 0;
         const uint64_t drop = runtime_.ready_avail > avail ? runtime_.ready_avail - avail : 0;
-        const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::kRamHardFloor,
+        const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::ram_hard_floor(floor),
                                                                    stalls, drop > own ? drop - own : 0, own);
         basalt::log::error("basalt", "%s", msg.c_str());
         std::printf("ERR %s\n", msg.c_str());
@@ -73,12 +100,12 @@ Flow Request::complete() {
         return Flow::error;
     }
     if (runtime_.admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
-        bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) runtime_.live.size() == p
+        bool cont = ram_out ? false : batch_first ? !cancelled && (int64_t) runtime_.live.size() == p
                             : !cancelled && produced_n == 1 && runtime_.admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                               (int64_t) runtime_.live.size() == p;
         const auto tc0 = Clock::now();
         // the draft layer's cell for the prompt's last token (it pairs with the first generated one), then its K/V
-        if (cont && !in_slot && !admit_draft()) {
+        if (cont && !batch_first && !admit_draft()) {
             basalt::log::error("basalt serve", "batch admission failed: %s", runtime_.err.c_str());
             cont = false;
         }
@@ -97,13 +124,19 @@ Flow Request::complete() {
             if (runtime_.slot0_solo() && runtime_.admit_slot == 0) runtime_.live_ok = false;   // the batch windows move the state on
             slot_set_sampling(runtime_.admit_slot);   // the request's own sampling, row by row
             BSlot& sl = runtime_.bs[(size_t) runtime_.admit_slot];
+            auto sfx = std::move(sl.sfx);
             sl = BSlot{};
+            sl.sfx = std::move(sfx);
             sl.active = true;
             sl.pen_n = req_sp.penalty_last_n;
             slot_init(sl);
             sl.x = x;
             sl.p = p;
-            sl.produced = in_slot ? 0 : 1;
+            if (defer_read >= 0) {   // the slot reads the rest of the prompt in its windows, then takes the turn checkpoint
+                sl.pend.assign(ids32.begin() + defer_read + 1, ids32.begin() + n);
+                sl.pend_check = part_checkpoint(n - 1);
+            }
+            sl.produced = batch_first ? 0 : 1;
             sl.max_new = runtime_.admit_max_new;
             sl.t0 = Clock::now();
             sl.ids = runtime_.live;
@@ -113,20 +146,16 @@ Flow Request::complete() {
                             sl.guard = std::move(gguard);   // the request's grammar, already past the tokens the request decoded here
             // the slot keeps its conversation's longest checkpoint (its next turn) and its shortest (the
             // system prompt, which other requests may share)
-            const ConvCheckpoint *best = nullptr, *root = nullptr;
-            for (const ConvCheckpoint& c : runtime_.checks)
-                if (c.ids.size() < runtime_.live.size() &&
-                    basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), runtime_.live.data())) {
-                    if (best == nullptr || c.ids.size() > best->ids.size()) best = &c;
-                    if (root == nullptr || c.ids.size() < root->ids.size()) root = &c;
-                }
-            if (root != nullptr && root != best) sl.checks.push_back(*root);
-            if (best != nullptr) sl.checks.push_back(*best);
+            select_slot_checkpoints(runtime_.checks, runtime_.live,
+                                    [](const int32_t* a, size_t n_ids, const int32_t* b) {
+                                        return basalt::core::conversation_ids_equal(a, n_ids, b);
+                                    },
+                                    sl.checks);
             basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", runtime_.admit_slot,
                          (long long) runtime_.live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
         }
         if (!ram_out)   // (after ERR the server reads no BADM)
-            std::printf("BADM %d %d\n", runtime_.admit_slot, cont ? (in_slot ? 2 : 1) : 0);   // 2: no token yet
+            std::printf("BADM %d %d\n", runtime_.admit_slot, cont ? (batch_first ? 2 : 1) : 0);   // 2: no token yet
         std::fflush(stdout);
         runtime_.admit_slot = -1;
     }
@@ -134,7 +163,9 @@ Flow Request::complete() {
         slot_state_back(slot_b);
         if (yielded_at < 0) {   // (a read that gave way was parked in the slot already)
             BSlot& sb = runtime_.bs[(size_t) slot_b];
+            auto sfx = std::move(sb.sfx);
             sb = BSlot{};
+            sb.sfx = std::move(sfx);
             sb.ids = runtime_.live;
             sb.cvec = runtime_.cvec_cached;
             sb.imgs = runtime_.live_imgs;
@@ -148,23 +179,10 @@ Flow Request::complete() {
         }
     }
     if (in_slot) {   // the solo session and its bookkeeping again
-        if (!slot_leave()) {
+        if (!leave_in_slot()) {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        runtime_.solo_out = nullptr;
-        runtime_.live = std::move(solo_book.live);
-        runtime_.live_imgs = std::move(solo_book.live_imgs);
-        runtime_.live_ok = solo_book.live_ok;
-        runtime_.cvec_cached = solo_book.cvec;
-        runtime_.checks = std::move(solo_book.checks);
-        if (solo_moved) {   // its cells went to this request (hold_slot)
-            runtime_.live.clear();
-            runtime_.live_imgs.clear();
-            runtime_.live_ok = false;
-            runtime_.checks.clear();
-        }
-        runtime_.solo_draft_back(!solo_moved);
     } else {
         runtime_.solo_idle_busy = runtime_.busy_now();
     }

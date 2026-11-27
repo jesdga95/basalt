@@ -190,6 +190,10 @@ static void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRIC
     }
 }
 
+static inline float q8_1_finite_c(float v) {
+    return fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v;
+}
+
 static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK8_1 == 0);
     const int nb = k / QK8_1;
@@ -203,6 +207,18 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         __m256 v3 = _mm256_loadu_ps( x + 24 );
         x += 32;
 
+        // Preserve NaN in any lane (x86 vmaxps drops a NaN in its first operand).
+        const __m256 nan_mask = _mm256_or_ps(
+            _mm256_cmp_ps( v0, v1, _CMP_UNORD_Q ),
+            _mm256_cmp_ps( v2, v3, _CMP_UNORD_Q ) );
+        if (_mm256_movemask_ps(nan_mask) != 0) {
+            const float qnan = fp32_from_bits(0x7fc00000u);
+            y[i].d = GGML_CPU_FP32_TO_FP16(qnan);
+            y[i].s = GGML_CPU_FP32_TO_FP16(qnan);
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            continue;
+        }
+
         // Compute max(abs(e)) for the block
         const __m256 signBit = _mm256_set1_ps( -0.0f );
         __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
@@ -215,10 +231,13 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
         const float max_scalar = _mm_cvtss_f32( max4 );
 
-        // Quantize these floats
-        const float d = max_scalar / 127.f;
+        // Quantize these floats, keeping fp16 scale and sum finite (matching q8_1_finite.hpp on GPU)
+        const float raw_d = max_scalar / 127.f;
+        const int d_clamped = raw_d > 65504.0f;
+        const float d = d_clamped ? 65504.0f : raw_d;
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
-        const float id = ( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f;
+        float id = d_clamped ? (1.0f / 65504.0f) : (( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f);
+        if (!isfinite(id)) id = 0.0f;
         const __m256 mul = _mm256_set1_ps( id );
 
         // Apply the multiplier
@@ -233,6 +252,15 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         v2 = _mm256_round_ps( v2, _MM_ROUND_NEAREST );
         v3 = _mm256_round_ps( v3, _MM_ROUND_NEAREST );
 
+        if (d_clamped) {
+            const __m256 q_min = _mm256_set1_ps( -127.0f );
+            const __m256 q_max = _mm256_set1_ps(  127.0f );
+            v0 = _mm256_min_ps( _mm256_max_ps( v0, q_min ), q_max );
+            v1 = _mm256_min_ps( _mm256_max_ps( v1, q_min ), q_max );
+            v2 = _mm256_min_ps( _mm256_max_ps( v2, q_min ), q_max );
+            v3 = _mm256_min_ps( _mm256_max_ps( v3, q_min ), q_max );
+        }
+
         // Convert floats to integers
         __m256i i0 = _mm256_cvtps_epi32( v0 );
         __m256i i1 = _mm256_cvtps_epi32( v1 );
@@ -240,7 +268,8 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         __m256i i3 = _mm256_cvtps_epi32( v3 );
 
         // Compute the sum of the quants and set y[i].s
-        y[i].s = GGML_CPU_FP32_TO_FP16(d * hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3))));
+        const float sum_f = d * (float) hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
+        y[i].s = GGML_CPU_FP32_TO_FP16(q8_1_finite_c(sum_f));
 
         // Convert int32 to int16
         i0 = _mm256_packs_epi32( i0, i1 );	// 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
@@ -2020,14 +2049,15 @@ static inline void mxfp8_blocks(const block_mxfp8 * const * xr, int nr, int nb, 
 
 #else
 
-static inline __m256i mxfp8_fp16_bits(__m256i w) {
-    return _mm256_or_si256(_mm256_and_si256(_mm256_slli_epi16(w, 8), _mm256_set1_epi16((short) 0x8000)),
-                           _mm256_and_si256(_mm256_slli_epi16(w, 7), _mm256_set1_epi16(0x3F80)));
+// 16 codes -> their fp16 bits: the sign-extended code shifted left by 7 has the sign in bit 15, a copy of it in bit 14
+// and the seven low bits in bits 7 to 13; clearing bit 14 leaves the pattern above
+static inline __m256i mxfp8_fp16_bits(__m128i wc) {
+    return _mm256_and_si256(_mm256_slli_epi16(_mm256_cvtepi8_epi16(wc), 7), _mm256_set1_epi16((short) 0xBF80));
 }
 
 // two steps of 8 weights each (a step is 8 bytes = 2 sub-blocks x 4 elements) from 16 bytes of codes
 static inline void mxfp8_decode2(__m128i wc, __m256 * w) {
-    const __m256i h = mxfp8_fp16_bits(_mm256_cvtepu8_epi16(wc));
+    const __m256i h = mxfp8_fp16_bits(wc);
     w[0] = _mm256_cvtph_ps(_mm256_castsi256_si128(h));
     w[1] = _mm256_cvtph_ps(_mm256_extracti128_si256(h, 1));
 }
@@ -2058,6 +2088,15 @@ static inline __m256i mxfp8_clear_nan(__m256i c) {
     return _mm256_andnot_si256(_mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(c, low7), low7), low7), c);
 }
 
+// one chain's lane sums (sub-blocks 2pr and 2pr + 1 of block q) -> their two terms: (l0 + l1) + (l2 + l3) in each group
+// of four lanes, the 2^8, then (fp16 scale * UE8M0 scale) * sum as one vector product
+static inline void mxfp8_terms(__m256 acc, const float * q, int pr, __m128 ue2, float * term) {
+    acc = _mm256_add_ps(acc, _mm256_shuffle_ps(acc, acc, 0xB1));
+    acc = _mm256_mul_ps(_mm256_add_ps(acc, _mm256_shuffle_ps(acc, acc, 0x4E)), _mm256_set1_ps(256.0f));
+    const __m128 dv = _mm_unpacklo_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    _mm_storeu_ps(term, _mm_mul_ps(_mm_mul_ps(_mm_castsi128_ps(_mm_loadl_epi64((const __m128i *) (q + 128 + 2 * pr))), ue2), dv));
+}
+
 // `nt` tokens' sums over `nb` blocks of `nr` weight rows (at most MXFP8_MAX_ROWS), added to sumf[r][t].  The rows go
 // through a block together: a token's sum is one chain of adds, four dependent ones a block, so the rows'
 // independent chains fill each other's latency.
@@ -2079,16 +2118,52 @@ static inline void mxfp8_blocks(const block_mxfp8 * const * xr, int nr, int nb, 
                     const float * q = p[t] + (size_t) ib * MXFP8_PREP_BLOCK;
                     __m256 acc = _mm256_fmadd_ps(w[0], _mm256_loadu_ps(q + 64 * pr), _mm256_setzero_ps());
                     for (int k = 1; k < 8; ++k) acc = _mm256_fmadd_ps(w[k], _mm256_loadu_ps(q + 64 * pr + 8 * k), acc);
-                    // (l0 + l1) + (l2 + l3) in each group of four lanes, then the 2^8
-                    acc = _mm256_add_ps(acc, _mm256_shuffle_ps(acc, acc, 0xB1));
-                    acc = _mm256_mul_ps(_mm256_add_ps(acc, _mm256_shuffle_ps(acc, acc, 0x4E)), _mm256_set1_ps(256.0f));
-                    // (fp16 scale * UE8M0 scale) * sum of the two sub-blocks as one vector product, then added to the row sum in order
-                    const __m128 dv = _mm_unpacklo_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
                     float term[4];
-                    _mm_storeu_ps(term, _mm_mul_ps(_mm_mul_ps(_mm_castsi128_ps(_mm_loadl_epi64((const __m128i *) (q + 128 + 2 * pr))), ue2), dv));
+                    mxfp8_terms(acc, q, pr, ue2, term);
                     sumf[r][t] = (sumf[r][t] + term[0]) + term[1];
                 }
             }
+        }
+    }
+}
+
+// One token's sums over `nb` blocks of `nr` (1 or 2) rows, added to sumf[r]: each row's two half-blocks are separate
+// chains, so 2 * nr chains run side by side and each weight vector is decoded right before its FMA.  A chain is
+// mxfp8_blocks' chain (the same operations in the same order), and the terms add to the row sum in sub-block order.
+#define MXFP8_ROWS_ONE 2
+static inline void mxfp8_blocks_one(const block_mxfp8 * const * xr, int nr, int nb, const float * p, float * sumf) {
+    const int nc = 2 * nr;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * q = p + (size_t) ib * MXFP8_PREP_BLOCK;
+        __m256i wl[2 * MXFP8_ROWS_ONE], wh[2 * MXFP8_ROWS_ONE];
+        __m256 acc[2 * MXFP8_ROWS_ONE];
+        for (int c = 0; c < nc; ++c) {
+            const uint8_t * qs = xr[c >> 1][ib].qs + 64 * (c & 1);
+            const __m256i wa = mxfp8_clear_nan(_mm256_loadu_si256((const __m256i *) qs));
+            const __m256i wb = mxfp8_clear_nan(_mm256_loadu_si256((const __m256i *) (qs + 32)));
+            wl[c] = _mm256_unpacklo_epi32(wa, wb);
+            wh[c] = _mm256_unpackhi_epi32(wa, wb);
+        }
+        // the low and high lanes of the unpacked codes hold steps 0-1, 2-3 (wl, wh) and 4-5, 6-7 (wl, wh)
+        for (int j = 0; j < 4; ++j) {
+            for (int c = 0; c < nc; ++c) {
+                const __m256i src = (j & 1) ? wh[c] : wl[c];
+                const __m256i h = mxfp8_fp16_bits(j < 2 ? _mm256_castsi256_si128(src) : _mm256_extracti128_si256(src, 1));
+                const float * qc = q + 64 * (c & 1) + 16 * j;
+                const __m256 w0 = _mm256_cvtph_ps(_mm256_castsi256_si128(h)), w1 = _mm256_cvtph_ps(_mm256_extracti128_si256(h, 1));
+                acc[c] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(qc), j == 0 ? _mm256_setzero_ps() : acc[c]);
+                acc[c] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(qc + 8), acc[c]);
+            }
+        }
+        for (int r = 0; r < nr; ++r) {
+            const block_mxfp8 * x = xr[r] + ib;
+            float t0[4], t1[4];
+            mxfp8_terms(acc[2 * r], q, 0, _mm_setr_ps(mxfp8_ue8m0_to_fp32(x->d[0]), mxfp8_ue8m0_to_fp32(x->d[1]), 0.0f, 0.0f), t0);
+            mxfp8_terms(acc[2 * r + 1], q, 1, _mm_setr_ps(mxfp8_ue8m0_to_fp32(x->d[2]), mxfp8_ue8m0_to_fp32(x->d[3]), 0.0f, 0.0f), t1);
+            float s = sumf[r];
+            s = (s + t0[0]) + t0[1];
+            s = (s + t1[0]) + t1[1];
+            sumf[r] = s;
         }
     }
 }
@@ -2107,6 +2182,24 @@ void ggml_mxfp8_q8_0_prep(int n, const void * GGML_RESTRICT vy, float * GGML_RES
 void ggml_mxfp8_q8_0_rows(int n, const void * GGML_RESTRICT vw, size_t stride, const float * const * prep, int nt, float * const * out, int r0, int r1);
 void ggml_mxfp8_q8_0_rows(int n, const void * GGML_RESTRICT vw, size_t stride, const float * const * prep, int nt, float * const * out, int r0, int r1) {
     assert(n % QK_MXFP8 == 0 && nt <= MXFP8_MAX_TOK);
+#ifdef MXFP8_ROWS_ONE
+    if (nt == 1) {   // one token: rows two at a time through the side-by-side chains
+        for (int r = r0; r < r1; r += MXFP8_ROWS_ONE) {
+            const block_mxfp8 * xr[MXFP8_ROWS_ONE];
+            float sumf[MXFP8_ROWS_ONE] = {0};
+            xr[0] = (const block_mxfp8 *) ((const uint8_t *) vw + (size_t) r * stride);
+            if (r + 1 < r1) {
+                xr[1] = (const block_mxfp8 *) ((const uint8_t *) vw + (size_t) (r + 1) * stride);
+                mxfp8_blocks_one(xr, 2, n / QK_MXFP8, prep[0], sumf);
+                out[0][r + 1] = sumf[1];
+            } else {
+                mxfp8_blocks_one(xr, 1, n / QK_MXFP8, prep[0], sumf);
+            }
+            out[0][r] = sumf[0];
+        }
+        return;
+    }
+#endif
     for (int r = r0; r < r1; r += MXFP8_MAX_ROWS) {
         const int nr = r1 - r < MXFP8_MAX_ROWS ? r1 - r : MXFP8_MAX_ROWS;
         const block_mxfp8 * xr[MXFP8_MAX_ROWS];

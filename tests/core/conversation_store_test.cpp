@@ -611,6 +611,178 @@ int main() {
             for (const auto& f : pool_left) basalt::platform::remove_file(dir3 + "/" + f.name);
         basalt::platform::remove_file(dir3);
     }
+    {
+        // Stale Match::index TOCTOU: erasing an earlier entry shifts indices in entries_.
+        // 1) A match on a surviving entry must still resolve to that entry (not its shifted neighbor).
+        // 2) A match on a dropped/superseded entry must miss cleanly without loading or deleting its shifted neighbor.
+        const std::string dir4 = dir + "-toctou";
+        std::string err;
+        ConversationStore st;
+        st.set_row_cells(4);
+        CHECK(st.open(dir4, id, 1ull << 30, err));
+        auto seq = [](int32_t base, size_t n) {
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = base + (int32_t) i;
+            return v;
+        };
+        const std::vector<int32_t> a = seq(10000, 500), b = seq(20000, 500), c = seq(30000, 500);
+        const SavedConversation sa = chat(a, {{200, Src::kRoot}, {500, Src::kTurnEnd}}),
+                                sb = chat(b, {{200, Src::kRoot}, {500, Src::kTurnEnd}}),
+                                sc = chat(c, {{200, Src::kRoot}, {500, Src::kTurnEnd}});
+        CHECK(st.put(SavedConversation(sa), 1ull << 30));
+        CHECK(st.put(SavedConversation(sb), 1ull << 30));
+        CHECK(st.put(SavedConversation(sc), 1ull << 30));
+        st.flush();
+
+        std::vector<int32_t> pa = a, pb = b;
+        pa.push_back(-1);
+        pb.push_back(-1);
+        const auto ma = st.best(pa.data(), pa.size(), {}, true);
+        const auto mb = st.best(pb.data(), pb.size(), {}, true);
+        CHECK(ma.tokens == 500 && mb.tokens == 500);
+
+        // Supersede A (drops entry 0, shifting B and C down by 1).
+        std::vector<int32_t> a2 = a;
+        for (int i = 0; i < 100; ++i) a2.push_back(90000 + i);
+        SavedConversation sa2 = chat(a2, {{200, Src::kRoot}, {500, Src::kTurnEnd}, {600, Src::kTurnEnd}});
+        CHECK(st.put(std::move(sa2), 1ull << 30));
+        st.flush();
+
+        // Surviving match B must load B (not C, which now sits at B's old index).
+        SavedConversation got_b;
+        CHECK(st.load_bytes(mb) > 0);
+        CHECK(st.load(mb, got_b, err));
+        CHECK(got_b.live.ids == b && same_state(got_b.live, sb.checkpoints[1]));
+
+        // Stale match A (superseded) must return false without loading B or deleting B from disk.
+        const size_t dropped_before = st.stats().dropped;
+        SavedConversation got_a;
+        CHECK(st.load_bytes(ma) == 0);
+        CHECK(!st.load(ma, got_a, err));
+        CHECK(st.stats().dropped == dropped_before);
+
+        // Also test mismatched-length neighbor: previously load() hit "no state at the match" and deleted neighbor.
+        const std::vector<int32_t> d = seq(40000, 520), e = seq(50000, 700);
+        const SavedConversation sd = chat(d, {{200, Src::kRoot}, {520, Src::kTurnEnd}}),
+                                se = chat(e, {{300, Src::kRoot}, {700, Src::kTurnEnd}});
+        CHECK(st.put(SavedConversation(sd), 1ull << 30));
+        CHECK(st.put(SavedConversation(se), 1ull << 30));
+        st.flush();
+        std::vector<int32_t> pd = d, pe = e;
+        pd.push_back(-1);
+        pe.push_back(-1);
+        const auto md = st.best(pd.data(), pd.size(), {}, true);
+        CHECK(md.tokens == 520);
+        std::vector<int32_t> d2 = d;
+        for (int i = 0; i < 80; ++i) d2.push_back(95000 + i);
+        CHECK(st.put(chat(d2, {{200, Src::kRoot}, {520, Src::kTurnEnd}, {600, Src::kTurnEnd}}), 1ull << 30));
+        st.flush();
+        const size_t dropped_before2 = st.stats().dropped;
+        SavedConversation got_d;
+        CHECK(!st.load(md, got_d, err));
+        CHECK(st.stats().dropped == dropped_before2);
+        const auto me = st.best(pe.data(), pe.size(), {}, true);
+        SavedConversation got_e;
+        CHECK(me.tokens == 700 && st.load(me, got_e, err) && got_e.live.ids == e);
+        remove_dir(dir4);
+    }
+    {
+        // Hybrid pooled-only (ratio=128) + per-position (k/v, no pooled rows) layout:
+        // verifies multi-block writes, cuts on exact 4096-cell block boundaries, queued & reopened loads.
+        const std::string dir5 = dir + "-hybrid";
+        remove_dir(dir5);
+        constexpr int64_t kRatio = 128, kHcaRow = 528, kDsaRow = 592, kIdxRow = 72;
+        std::vector<int32_t> hids(13000);   // > 8192 + kLiveSlack (4096) so the live tail is stored too
+        for (size_t i = 0; i < hids.size(); ++i) hids[i] = (int32_t) (i * 31 + 7);
+        SavedConversation hsrc;
+        hsrc.live = state(hids, hids.size());
+        for (size_t ck : {size_t(2048), size_t(4096), size_t(5000), size_t(8192)})
+            hsrc.checkpoints.push_back(state(hids, ck));
+        hsrc.checkpoints[0].source = ConversationCheckpoint::kRoot;
+        // Layer 0: HCA compressed cache (pooled-only, k/v empty)
+        {
+            ConversationKv k;
+            k.format = 1;
+            k.page_size = 1;
+            k.cells = (int64_t) hids.size();
+            k.heads = 1;
+            k.head_dim = 512;
+            k.idx_dim = 512;
+            k.pooled_rows = k.cells / kRatio + 1;
+            fill(k.pooled, (size_t) (k.pooled_rows * kHcaRow));
+            hsrc.kv.push_back(std::move(k));
+        }
+        // Layer 1: DSA latent + indexer cache (k/v per position, pooled_rows = 0)
+        {
+            ConversationKv k;
+            k.format = 1;
+            k.page_size = 1;
+            k.cells = (int64_t) hids.size();
+            k.heads = 1;
+            k.head_dim = 576;
+            k.idx_dim = 128;
+            k.pooled_rows = 0;
+            fill(k.k, (size_t) (k.cells * kDsaRow));
+            fill(k.v, (size_t) (k.cells * kIdxRow));
+            hsrc.kv.push_back(std::move(k));
+        }
+        auto check_hybrid = [&](const SavedConversation& got, int64_t at, const ConversationCheckpoint& want) {
+            CHECK((int64_t) got.live.ids.size() == at && same_state(got.live, want));
+            CHECK(got.kv.size() == 2);
+            if (got.kv.size() != 2) return;
+            const ConversationKv& hca = got.kv[0];
+            const int64_t rows = at / kRatio + 1;
+            CHECK(hca.format == 1 && hca.page_size == 1 && hca.cells == at && hca.pooled_rows == rows);
+            CHECK(hca.k.size() == 0 && hca.v.size() == 0 && hca.pooled.size() == (size_t) (rows * kHcaRow));
+            CHECK(prefix_of(hca.pooled, hsrc.kv[0].pooled));
+            const ConversationKv& dsa = got.kv[1];
+            CHECK(dsa.format == 1 && dsa.page_size == 1 && dsa.cells == at && dsa.pooled_rows == 0);
+            CHECK(dsa.k.size() == (size_t) (at * kDsaRow) && dsa.v.size() == (size_t) (at * kIdxRow) && dsa.pooled.size() == 0);
+            CHECK(prefix_of(dsa.k, hsrc.kv[1].k) && prefix_of(dsa.v, hsrc.kv[1].v));
+        };
+        {
+            ConversationStore st;
+            st.set_row_cells(kRatio);
+            std::string err;
+            CHECK(st.open(dir5, 99, 1ull << 30, err));
+            CHECK(st.put(SavedConversation(hsrc), 1ull << 30));
+            // Queued RAM cut at 5000
+            std::vector<int32_t> p5(hids.begin(), hids.begin() + 6000);
+            p5.push_back(-9);
+            auto m5 = st.best(p5.data(), p5.size(), {}, true);
+            CHECK(m5.tokens == 5000);
+            SavedConversation got;
+            CHECK(st.load(m5, got, err));
+            check_hybrid(got, 5000, hsrc.checkpoints[2]);
+            st.flush();
+            CHECK(st.stats().written == 1);
+            // Disk cuts at 4096 (block edge), 5000 (mid-block), 8192 (second block edge)
+            for (const auto& [cut_at, ck_idx] : std::vector<std::pair<int64_t, size_t>>{{4096, 1}, {5000, 2}, {8192, 3}}) {
+                std::vector<int32_t> pc(hids.begin(), hids.begin() + (size_t) cut_at + 100);
+                pc.push_back(-9);
+                auto mc = st.best(pc.data(), pc.size(), {}, true);
+                CHECK(mc.tokens == cut_at);
+                SavedConversation gc;
+                CHECK(st.load(mc, gc, err));
+                check_hybrid(gc, cut_at, hsrc.checkpoints[ck_idx]);
+            }
+        }
+        {
+            // Reopen store and load full 13000-token live conversation (3 blocks + tail) from disk
+            ConversationStore st;
+            st.set_row_cells(kRatio);
+            std::string err;
+            CHECK(st.open(dir5, 99, 1ull << 30, err));
+            std::vector<int32_t> pf = hids;
+            pf.push_back(-9);
+            auto mf = st.best(pf.data(), pf.size(), {}, true);
+            CHECK(mf.tokens == 13000);
+            SavedConversation gf;
+            CHECK(st.load(mf, gf, err));
+            check_hybrid(gf, 13000, hsrc.live);
+        }
+        remove_dir(dir5);
+    }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))
         for (const auto& f : left) basalt::platform::remove_file(dir + "/" + f.name);

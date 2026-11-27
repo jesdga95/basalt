@@ -12,11 +12,13 @@ from pathlib import Path
 from unittest import mock
 
 from serve.engine.process import ProcessEngine, log_unparsed
+from serve.util.loglevel import STAMP, WARN, LevelReader
 
 TRAP = "mkb_hang: layer 34 never rang (k_mid wait timed out)"
 FAKE = r'''
 import sys
 print("trap before ready: boot", flush=True)
+print("basalt serve: warning: conversation cache: parking refused", file=sys.stderr, flush=True)
 print("INFO engine=fake", flush=True)
 print("READY 4096 stop", flush=True)
 for raw in sys.stdin:
@@ -49,9 +51,24 @@ class UnparsedStdout(unittest.TestCase):
                 self.assertNotIn(protocol, lines)
             self.assertNotIn(TRAP, out.getvalue())                                # no terminal noise
 
+    def test_the_engines_stderr_lines_reach_the_log_with_their_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            script, log = Path(d) / "fake_engine.py", Path(d) / "engine.log"
+            script.write_text(FAKE, encoding="utf-8")
+            real = subprocess.Popen
+            with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+                    subprocess, "Popen", lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+                engine = ProcessEngine("basalt", [], log=str(log))
+                self.addCleanup(engine.close)
+            engine.close()
+            line = next(x for x in log.read_text(encoding="utf-8").splitlines() if "parking refused" in x)
+            self.assertRegex(line, STAMP.pattern + r"basalt serve: warning: conversation cache: parking refused$")
+            self.assertEqual(LevelReader().read(line), WARN)                      # the level reads through the stamp
+
     def test_the_helper_skips_protocol_and_blank_lines_and_a_missing_log(self):
         buf = io.StringIO()
-        for line in ("T 5\n", "DONE 1 2 3 4 stop\n", "ERR x\n", "BT 0 1\n", "auto flags: a 1\n", "\n", "  \n"):
+        for line in ("T 5\n", "DONE 1 2 3 4 stop\n", "ERR x\n", "BT 0 1\n", "PROMPT 1 128\n",
+                     "PROMPT ERR bad\n", "PMATCH 1 64:64 0:0\n", "auto flags: a 1\n", "\n", "  \n"):
             log_unparsed(line, buf)
         self.assertEqual(buf.getvalue(), "")
         log_unparsed("trap", buf)

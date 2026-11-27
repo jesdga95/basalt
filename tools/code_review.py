@@ -252,7 +252,7 @@ def review(diff, rules, focus, chat_fn=None, cfg=None, effort="medium", context=
         body += "".join(f"**Product decision:** {d}\n\n" for d in decisions[:3])
         body += ("Findings, most important first:\n\n" + "\n".join(lines)) if lines else "No findings."
         body = body.replace("\n\n\n\n", "\n\n")
-    if failed and lines:
+    if 0 < failed < len(chunks):
         body += f"\n\n{failed} of {len(chunks)} parts could not be reviewed."
     if full_left:
         body += "\n\nSeen as a diff only (too large to send whole): " + ", ".join(f"`{p}`" for p in full_left[:10])

@@ -4,8 +4,8 @@
 
 Each binary runs as `--serve` with BASE plus any flags after `--` (which replace BASE values). The bench fixtures'
 prompts (conv, struct, prose: comma-separated token ids per line; the model's own folder of them when the fixtures have
-one, as basalt-bench picks) run at temperature 0 and every token is compared. Adaptive swaps are off for a model that
-takes them (the engine's --gpu-plan answers) so placement cannot drift; pin the main card's tier too (`-- --expert-cache
+one, as basalt-bench picks) run at temperature 0 and every token is compared.
+For qwen4exp packs, adaptive swaps are off so placement cannot drift; pin the main card's tier too (`-- --expert-cache
 N`) when the builds' VRAM use differs, since auto-sized tiers change rounding. A second card's tier holds what fits:
 check that its expert count ("peer GPU 1: N experts" in both logs) matches.
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import subprocess
 import sys
 import tempfile
@@ -22,18 +23,28 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from model_file import ModelFile  # noqa: E402
 
 PROMPTS = ("conv", "struct", "prose")
 # flags after `--` replace these
 BASE = ["--spec", "7", "--max-context", "8192"]
-# the placement pins, for a model whose engine takes them
 PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
 
 
-def plan(engine_bin: str, args: list[str]) -> dict | None:
-    """The engine's --gpu-plan answer for these flags, or None when it refuses them."""
-    r = subprocess.run([engine_bin, *args, "--gpu-plan"], capture_output=True, text=True, timeout=60)
-    return json.loads(r.stdout) if r.returncode == 0 else None
+def model_arch(model_path: str) -> str | None:
+    """Read general.architecture from a .basalt pack's meta section (None when unreadable or absent)."""
+    try:
+        mf = ModelFile(model_path, versions=(1, 2))
+        meta = json.loads(mf.read("meta"))
+    except (OSError, ValueError, KeyError, struct.error):
+        return None
+    return (meta.get("gguf_kv") or {}).get("general.architecture")
+
+
+def build_args(model_path: str, extra: list[str]) -> list[str]:
+    """Engine args for `model_path`: qwen4exp-only adaptive-swap pinning is added only for qwen4exp packs."""
+    pinned = PINNED if model_arch(model_path) == "qwen4exp" else []
+    return set_args(["--model", model_path, *BASE], pinned + extra)
 
 
 def set_args(args: list[str], extra: list[str]) -> list[str]:
@@ -88,14 +99,24 @@ def run(label: str, engine_bin: str, args: list[str], prompts: list[str], tokens
     except (BrokenPipeError, subprocess.TimeoutExpired):
         return None
     finally:
+        for pipe in (proc.stdin, proc.stdout):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
         if proc.poll() is None:
             proc.terminate()
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         err.close()
 
 
-def main() -> int:
-    argv = sys.argv[1:]
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
     extra: list[str] = []
     if "--" in argv:
         k = argv.index("--")
@@ -109,16 +130,10 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=300)
     a = ap.parse_args(argv)
 
-    model_args = ["--model", a.model]
-    answer = plan(a.ref, model_args)
-    if answer is None:
-        print(f"greedy_identity: {a.ref} cannot plan {a.model}", file=sys.stderr)
-        return 2
     fixtures = Path(a.fixtures)
-    if (fixtures / answer["arch"]).is_dir():
-        fixtures = fixtures / answer["arch"]
-    pinned = PINNED if plan(a.ref, model_args + PINNED) is not None else []
-
+    arch = model_arch(a.model)
+    if arch and (fixtures / arch).is_dir():
+        fixtures = fixtures / arch
     prompts = []
     for name in PROMPTS:
         path = fixtures / f"{name}.ids"
@@ -126,7 +141,7 @@ def main() -> int:
             print(f"greedy_identity: {path} is missing", file=sys.stderr)
             return 2
         prompts.append(path.read_text().strip())
-    args = set_args([*model_args, *BASE], pinned + extra)
+    args = build_args(a.model, extra)
 
     logs = Path(tempfile.mkdtemp(prefix="greedy-identity-"))
     results = {}

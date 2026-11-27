@@ -50,8 +50,7 @@ Flow Request::prepare_prompt() {
     bad = false;
     for (int64_t t : ids) bad = bad || t < 0 || t >= runtime_.n_vocab;
     if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); return Flow::next; }
-
-    return Flow::proceed;
+    return admit_room();
 }
 
 }  // namespace basalt::program::serve

@@ -76,6 +76,8 @@ uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64
     const uint64_t rowbuf = R * (4 * E + 3 * qmax + 3 * (uint64_t) n_ff_pad) * 4;
     const uint64_t experts = g.moe() ? R * (uint64_t) g.n_used * (E * 4 + (uint64_t) g.n_ff_exp * 16) + (64ull << 20) : 0;
     const uint64_t attn = attn_scratch_floats(kRows, g.n_head, std::max(g.hd_swa, g.hd_full)) * 4;
+    size_t ws_p = 0, ws_t = 0;
+    mlp_workspace(g, n_ff_pad, mlp_nvfp4, ws_p, ws_t);
     return rowbuf + experts + attn + (ws_p + ws_t) * 4 + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB +
            PromptPath::bytes(g, n_ff_pad, mlp_nvfp4, context, kv, mxfp8);
 }

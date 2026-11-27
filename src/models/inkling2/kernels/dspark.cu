@@ -112,13 +112,11 @@ __device__ __forceinline__ void block_inputs_stage(int t, const uint16_t* __rest
     const int32_t anchor = meta[0], pos0 = meta[1];
     float* row = x + (int64_t) t * kWidth;
     if (pos3 && threadIdx.x < 3) pos3[t * 3 + threadIdx.x] = pos0 + t;
-    if (t == 1) {   // the Markov head's start
+    if (t == 1) {   // the Markov head's start and context (a block has at least one mask)
         if (threadIdx.x == 0) *prev = anchor;
         for (int i = threadIdx.x; i < kDsRank; i += kThreads) state[i] = 0.f;
         if (threadIdx.x < kDsRank / 8)
             reinterpret_cast<uint4*>(w1_row)[threadIdx.x] = reinterpret_cast<const uint4*>(w1 + (int64_t) anchor * kDsRank)[threadIdx.x];
-    }
-    if (t == 2) {
         const float* src = fr + (int64_t) ((pos0 - 1) % fr_cap) * kWidth;
 #pragma unroll
         for (int i = 0; i < kPer; ++i) fr_out[threadIdx.x + i * kThreads] = src[threadIdx.x + i * kThreads];
@@ -766,6 +764,43 @@ __device__ __forceinline__ float block_sum_128(float v, float* red) {
     return s;
 }
 
+// Thread d of a kHeadDim-thread block writes dim d of a cell's K and V row of one head: fp16, or with `ks` set the int8
+// cache's rule (attn_qk_prepare's: per 64 values, scale amax / 127 stored fp16, codes rounded to nearest against the stored
+// scale; a group is two warps). Every thread of the block calls it.
+__device__ __forceinline__ void store_kv_row(int64_t row, int d, float k, float v, uint16_t* kc, uint16_t* vc, uint16_t* ks,
+                                             uint16_t* vs) {
+    const int64_t at = row * kHeadDim + d;
+    if (!ks) {
+        reinterpret_cast<__half*>(kc)[at] = __float2half_rn(k);
+        reinterpret_cast<__half*>(vc)[at] = __float2half_rn(v);
+        return;
+    }
+    __shared__ float mk[kHeadDim / 32], mv[kHeadDim / 32];
+    float ak = fabsf(k), av = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        ak = fmaxf(ak, __shfl_xor_sync(0xffffffffu, ak, o));
+        av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, o));
+    }
+    if ((d & 31) == 0) {
+        mk[d >> 5] = ak;
+        mv[d >> 5] = av;
+    }
+    __syncthreads();
+    const int w0 = (d >> 5) & ~1;
+    ak = fmaxf(mk[w0], mk[w0 + 1]);
+    av = fmaxf(mv[w0], mv[w0 + 1]);
+    const __half hk = __float2half_rn(ak / 127.0f), hv = __float2half_rn(av / 127.0f);
+    const float sk = __half2float(hk), sv = __half2float(hv);
+    const float qk = sk > 0.0f ? rintf(k / sk) : 0.0f, qv = sv > 0.0f ? rintf(v / sv) : 0.0f;
+    reinterpret_cast<int8_t*>(kc)[at] = (int8_t) fmaxf(-127.0f, fminf(127.0f, qk));
+    reinterpret_cast<int8_t*>(vc)[at] = (int8_t) fmaxf(-127.0f, fminf(127.0f, qv));
+    if ((d & 63) == 0) {
+        ks[row * (kHeadDim / 64) + d / 64] = __half_as_ushort(hk);
+        vs[row * (kHeadDim / 64) + d / 64] = __half_as_ushort(hv);
+    }
+}
+
 __global__ void __launch_bounds__(kThreads) mix_batch_kernel(const float* tap, int64_t tap_stride, DsMixArgs a,
                                                              float* __restrict__ out, int64_t out_stride,
                                                              const int32_t* pos, DsCommitSegs segs, int fr_cap) {
@@ -797,9 +832,8 @@ __global__ void __launch_bounds__(kHeadDim) kv_commit_batch_kernel(const float* 
     y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     const int sk = segs.at_d ? basalt::kernels::seg_of(*segs.at_d, t) : 0;
     const int64_t cell = cap > 0 ? (int64_t) p % cap : (int64_t) p;
-    const int64_t at = (cell * kKvHeads + head) * kHeadDim + d;
-    reinterpret_cast<__half*>(segs.k[sk])[at] = __float2half_rn(y);
-    reinterpret_cast<__half*>(segs.v[sk])[at] = __float2half_rn(vb[((int64_t) t * kKvHeads + head) * kHeadDim + d]);
+    store_kv_row(cell * kKvHeads + head, d, y, vb[((int64_t) t * kKvHeads + head) * kHeadDim + d], segs.k[sk], segs.v[sk],
+                 segs.ks[sk], segs.vs[sk]);
 }
 
 __global__ void __launch_bounds__(kThreads) block_inputs_batch_kernel(const uint16_t* __restrict__ emb,
@@ -847,9 +881,8 @@ __global__ void __launch_bounds__(kHeadDim) block_qk_prep_batch_kernel(const flo
         return;
     }
     const int64_t cell = cap > 0 ? (int64_t) p % cap : (int64_t) p;
-    const int64_t at = (cell * kKvHeads + head) * kHeadDim + d;
-    reinterpret_cast<__half*>(kv.k[b])[at] = __float2half_rn(y);
-    reinterpret_cast<__half*>(kv.v[b])[at] = __float2half_rn(vb[((int64_t) row * kKvHeads + head) * kHeadDim + d]);
+    store_kv_row(cell * kKvHeads + head, d, y, vb[((int64_t) row * kKvHeads + head) * kHeadDim + d], kv.k[b], kv.v[b], kv.ks[b],
+                 kv.vs[b]);
 }
 
 __global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* h_chunk, int block, int slot0,
@@ -862,38 +895,183 @@ __global__ void __launch_bounds__(256) pack_draft_rows_kernel(const float* h_chu
     for (int j = threadIdx.x; j < kWidth / 4; j += 256) dst[j] = src[j];
 }
 
-// Reads the 2-bit head screen once into registers and scores all `count` sessions' `n_max` draft rows.
-__global__ void __launch_bounds__(128) head_base_batch_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
-                                                              const Q81* x, int count, int n_max,
-                                                              int64_t n_pad, float* __restrict__ approx) {
-    constexpr int kNw4 = kWidth / 64, NW = kNw4 / 4;
-    __shared__ __align__(16) int xi[kDsDrafts][kWidth / 4];
-    __shared__ float xs[kDsDrafts][kHeadNb], xdd[kDsDrafts][kHeadNb];
-    __shared__ float red[kDsDrafts][4][32];
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int64_t tile = blockIdx.x;
-    const size_t base = ((size_t) tile * kNw4 + warp * NW) * 32 + lane;
-    uint4 w[NW];
-    uint32_t s[NW];
-#pragma unroll
-    for (int j = 0; j < NW; ++j) {
-        w[j] = __ldcs(wq + base + (size_t) j * 32);
-        s[j] = __ldcs(sc + base + (size_t) j * 32);
-    }
+// A copy's columns (q8_1 rows of NB blocks) in the layout the tensor-core screens read: for group g and column c,
+// the eight code words in the order a B fragment's thread t takes them (words t and 4 + t), and for a column pair the scales
+// {d, d', 1.5 s, 1.5 s'} (s = d times the code sum, screen_x's terms). Columns past `cols` up to the next kMmaCols are zeros.
+template <int NB>
+__global__ void __launch_bounds__(256) screen_cols_kernel(const Q81* __restrict__ x, int cols, int cols_pad,
+                                                          int* __restrict__ xq, float* __restrict__ xm) {
     pdl_wait();
-    const int64_t row = tile * 32 + lane;
-    for (int b = 0; b < count; ++b) {
-        if (b > 0) __syncthreads();
-        const Q81* xb = x + (size_t) b * n_max * kHeadNb;
-        for (int r = 0; r < n_max; ++r) screen_x(xb + (size_t) r * kHeadNb, kHeadNb, xi[r], xs[r], xdd[r], tid, 128);
-        __syncthreads();
+    const int i = (int) blockIdx.x * 256 + threadIdx.x;
+    if (i >= NB * cols_pad) return;
+    const int g = i / cols_pad, c = i - g * cols_pad;
+    int q[8] = {};
+    float d = 0.f, s15 = 0.f;
+    if (c < cols) {
+        const Q81& b = x[(size_t) c * NB + g];
+        const int* qs = reinterpret_cast<const int*>(b.qs);
+        int sum = 0;
 #pragma unroll
-        for (int r = 0; r < kDsDrafts; ++r)
-            if (r < n_max) red[r][warp][lane] = screen_acc<NW>(w, s, warp * NW, xi[r], xs[r], xdd[r]);
+        for (int k = 0; k < 8; ++k) {
+            q[k] = qs[k];
+            sum = __dp4a(0x01010101, q[k], sum);
+        }
+        d = __low2float(b.ds);
+        s15 = __fmul_rn(__fmul_rn(d, (float) sum), 1.5f);
+    }
+    int4* dq = reinterpret_cast<int4*>(xq + (size_t) i * 8);
+    dq[0] = make_int4(q[0], q[4], q[1], q[5]);
+    dq[1] = make_int4(q[2], q[6], q[3], q[7]);
+    float* dm = xm + ((size_t) g * (cols_pad / 2) + c / 2) * 4 + (c & 1);
+    dm[0] = d;
+    dm[2] = s15;
+}
+
+__device__ __forceinline__ void screen_mma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+
+__device__ __forceinline__ void cp16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src)
+                 : "memory");
+}
+
+// head_base_kernel's scores for any number of columns on int8 tensor cores, bit for bit: a group's integer dot (its 32 2-bit levels times the
+// column's codes) is exact in int32 whichever instruction computes it, so mma.sync m16n8k32 takes it for 16 copy rows x 8
+// columns. A word's levels at shift 2 t are a B fragment thread t's codes (screen_acc pairs them so), so lane t's A
+// registers are the words shifted by 2 t. The float terms follow screen_acc's order: each quarter of the row (18 groups,
+// one reference warp's) is summed from zero in group order as fma(scale, fma(d, P, -1.5 s), acc), and the quarters are
+// added in warp order. A block takes four tiles (128 copy rows, a warp 16 of them) against every column, kMmaCols columns
+// at a time; a step is one word of the rows (two groups): the rows' words and scales and the columns' codes and scales
+// for it are copied into a ring of shared memory kMmaStages - 1 steps ahead.
+constexpr int kMmaTiles = 4;
+constexpr int kMmaThreads = 32 * 2 * kMmaTiles;
+constexpr int kMmaCols = 32;
+constexpr int kMmaStages = 4;
+struct MmaStage {
+    uint4 w[kMmaTiles][32];             // the rows' word of the step
+    uint32_t s[kMmaTiles][32];          // their two groups' scales
+    int q[2][kMmaCols * 8];             // the columns' codes (screen_cols_kernel's order), a group each
+    float4 m[2][kMmaCols / 2];          // the columns' scales
+};
+constexpr int kMmaPieces = (int) sizeof(MmaStage) / 16;
+constexpr int kMmaCopies = (kMmaPieces + kMmaThreads - 1) / kMmaThreads;   // a thread's 16-byte copies of a stage
+
+__global__ void __launch_bounds__(kMmaThreads, 2) head_base_mma_kernel(const uint4* __restrict__ wq,
+                                                                       const uint32_t* __restrict__ sc,
+                                                                       const int* __restrict__ xq,
+                                                                       const float4* __restrict__ xm, int cols,
+                                                                       int cols_pad, int64_t n_tiles, int64_t n_pad,
+                                                                       float* __restrict__ approx) {
+    constexpr int kNw4 = kWidth / 64, kQuarter = kNw4 / 4;
+    constexpr int kW = kMmaTiles * 32, kS = kMmaTiles * 8, kQ = 2 * kMmaCols * 2;   // pieces: words, scales, codes
+    __shared__ MmaStage ring[kMmaStages];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const int64_t tile0 = (int64_t) blockIdx.x * kMmaTiles;
+    const int n_here = (int) (n_tiles - tile0 < kMmaTiles ? n_tiles - tile0 : kMmaTiles);
+    const int steps = cols_pad / kMmaCols * kNw4;
+    // this thread's pieces of a stage (16-byte copies): its k-th piece of step s (word w4 of chunk c) is copied from
+    // src[k] + w4 * w_step[k] + c * c_step[k] (the rows' parts are constant data, the columns' are not)
+    const char* src[kMmaCopies];
+    int w_step[kMmaCopies], c_step[kMmaCopies];
+#pragma unroll
+    for (int k = 0; k < kMmaCopies; ++k) {
+        const int p = tid + k * kMmaThreads;
+        if (p < kW) {
+            const int t = min(p >> 5, n_here - 1);
+            src[k] = reinterpret_cast<const char*>(wq + (size_t) (tile0 + t) * kNw4 * 32 + (p & 31));
+            w_step[k] = 32 * 16, c_step[k] = 0;
+        } else if (p < kW + kS) {
+            const int i = p - kW, t = min(i >> 3, n_here - 1);
+            src[k] = reinterpret_cast<const char*>(sc + (size_t) (tile0 + t) * kNw4 * 32 + (i & 7) * 4);
+            w_step[k] = 32 * 4, c_step[k] = 0;
+        } else if (p < kW + kS + kQ) {
+            const int i = p - kW - kS, h = i / (kQ / 2), j = i - h * (kQ / 2);
+            src[k] = reinterpret_cast<const char*>(xq + (size_t) h * cols_pad * 8 + j * 4);
+            w_step[k] = 2 * cols_pad * 32, c_step[k] = kMmaCols * 32;
+        } else {
+            const int i = p - kW - kS - kQ, h = i / (kMmaCols / 2), j = i - h * (kMmaCols / 2);
+            src[k] = reinterpret_cast<const char*>(xm + (size_t) h * (cols_pad / 2) + (p < kMmaPieces ? j : 0));
+            w_step[k] = cols_pad * 16, c_step[k] = kMmaCols * 8;
+        }
+    }
+    auto stage = [&](int s) {
+        if (s < steps) {
+            char* dst = reinterpret_cast<char*>(&ring[s % kMmaStages]);
+            const int w4 = s % kNw4, c = s / kNw4;
+#pragma unroll
+            for (int k = 0; k < kMmaCopies; ++k)
+                if (tid + k * kMmaThreads < kMmaPieces)
+                    cp16(dst + (tid + k * kMmaThreads) * 16, src[k] + w4 * w_step[k] + c * c_step[k]);
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    };
+    pdl_wait();
+#pragma unroll
+    for (int s = 0; s < kMmaStages - 1; ++s) stage(s);
+    const int tl = warp >> 1, l0 = (warp & 1) * 16 + gid, sh = 2 * tig;
+    const int64_t row0 = (tile0 + tl) * 32 + l0;
+    const bool live = tl < n_here;
+    float acc[kMmaCols / 8][4], tot[kMmaCols / 8][4];
+    for (int s = 0; s < steps; ++s) {
+        const int w4 = s % kNw4;
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kMmaStages - 2) : "memory");
         __syncthreads();
-        float* apb = approx + (size_t) b * n_max * n_pad;
-        for (int r = warp; r < n_max; r += 4)
-            apb[r * n_pad + row] = red[r][0][lane] + red[r][1][lane] + red[r][2][lane] + red[r][3][lane];
+        stage(s + kMmaStages - 1);
+        if (w4 == 0) {
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[t][e] = 0.f, tot[t][e] = 0.f;
+        }
+        const MmaStage& st = ring[s % kMmaStages];
+        const uint4 wa = st.w[tl][l0], wb = st.w[tl][l0 + 8];
+        const uint32_t sa = st.s[tl][l0], sb = st.s[tl][l0 + 8];
+        const uint32_t va[4] = {wa.x, wa.y, wa.z, wa.w}, vb[4] = {wb.x, wb.y, wb.z, wb.w};
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const uint32_t a[4] = {(va[2 * hh] >> sh) & 0x03030303u, (vb[2 * hh] >> sh) & 0x03030303u,
+                                   (va[2 * hh + 1] >> sh) & 0x03030303u, (vb[2 * hh + 1] >> sh) & 0x03030303u};
+            const float sga = __half2float(__ushort_as_half((unsigned short) (hh ? (sa >> 16) : (sa & 0xffff))));
+            const float sgb = __half2float(__ushort_as_half((unsigned short) (hh ? (sb >> 16) : (sb & 0xffff))));
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t) {
+                const int2 bq = *reinterpret_cast<const int2*>(&st.q[hh][(t * 8 + gid) * 8 + 2 * tig]);
+                const float4 m = st.m[hh][t * 4 + tig];
+                int p[4];
+                screen_mma(p, a, (uint32_t) bq.x, (uint32_t) bq.y);
+                acc[t][0] = __fmaf_rn(sga, __fmaf_rn(m.x, (float) p[0], -m.z), acc[t][0]);
+                acc[t][1] = __fmaf_rn(sga, __fmaf_rn(m.y, (float) p[1], -m.w), acc[t][1]);
+                acc[t][2] = __fmaf_rn(sgb, __fmaf_rn(m.x, (float) p[2], -m.z), acc[t][2]);
+                acc[t][3] = __fmaf_rn(sgb, __fmaf_rn(m.y, (float) p[3], -m.w), acc[t][3]);
+            }
+        }
+        if (w4 % kQuarter == kQuarter - 1) {
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    tot[t][e] = w4 < kQuarter ? acc[t][e] : __fadd_rn(tot[t][e], acc[t][e]);
+                    acc[t][e] = 0.f;
+                }
+        }
+        if (w4 == kNw4 - 1 && live) {
+            const int c0 = s / kNw4 * kMmaCols;
+#pragma unroll
+            for (int t = 0; t < kMmaCols / 8; ++t) {
+                const int c = c0 + t * 8 + 2 * tig;
+                if (c < cols) {
+                    approx[(size_t) c * n_pad + row0] = tot[t][0];
+                    approx[(size_t) c * n_pad + row0 + 8] = tot[t][2];
+                }
+                if (c + 1 < cols) {
+                    approx[(size_t) (c + 1) * n_pad + row0] = tot[t][1];
+                    approx[(size_t) (c + 1) * n_pad + row0 + 8] = tot[t][3];
+                }
+            }
+        }
     }
 }
 
@@ -913,61 +1091,134 @@ __global__ void __launch_bounds__(kStepWarps * 32) markov_step_batch_kernel(cons
                       w1_row + (size_t) b * kDsRank, st_in, st_out, latent + (size_t) b * kDsRank, xs);
 }
 
-__global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(const uint4* __restrict__ wq,
-                                                                              const uint32_t* __restrict__ sc,
-                                                                              const Q81* lat_step,
-                                                                              const float* approx,
-                                                                              const float* __restrict__ fold_bp, float cap,
-                                                                              int64_t n_rows, int n_tiles, int step_i,
-                                                                              int n_max, int64_t n_pad,
-                                                                              uint8_t* __restrict__ scratch,
-                                                                              size_t scratch_stride) {
+// head_step_batch's scores and tile summaries for every slot of a call at once, bit for bit: the fold copy's group dots
+// on int8 tensor cores (as head_base_mma_kernel: exact int32, then screen_acc's float terms in group order), the score
+// capf(approx + dot + bias, cap) into shared memory, then a warp per tile takes each slot's softmax partial and best kPer
+// rows with head_step_kernel's code. A block takes kStepTiles tiles (a warp 16 rows) and the slots' latents
+// (screen_cols_kernel's layout); the copy is read once for all the slots.
+constexpr int kStepTiles = 2;
+constexpr int kStepThreads = 32 * 2 * kStepTiles;
+constexpr int kStepSlotsMax = 64;
+struct StepSmem {
+    float v[kStepTiles][kStepSlotsMax][32];
+};
+__global__ void __launch_bounds__(kStepThreads) head_step_mma_kernel(const uint4* __restrict__ wq, const uint32_t* __restrict__ sc,
+                                                                     const int* xq, const float4* xm, const float* approx,
+                                                                     const float* __restrict__ fold_bp, float cap, int64_t n_rows,
+                                                                     int n_tiles, int step_i, int n_max, int64_t n_pad, int count,
+                                                                     uint8_t* __restrict__ scratch, size_t scratch_stride) {
     constexpr int kNw4 = kDsRank / 64;
-    __shared__ __align__(16) int xi[kDsRank / 4];
-    __shared__ float xs[kFoldNb], xdd[kFoldNb];
-    const int tid = threadIdx.x, lane = tid & 31, b = (int) blockIdx.y;
-    const int tile = (int) blockIdx.x * kTilesPerBlock + (tid >> 5);
-    const int64_t row = (int64_t) tile * 32 + lane;
-    const bool live = tile < n_tiles, real = live && token_of(row, n_tiles) < n_rows;
-    uint4 w[kNw4];
-    uint32_t s[kNw4];
-    float fb = 0.f;
+    extern __shared__ __align__(16) uint8_t step_smem[];
+    StepSmem& sm = *reinterpret_cast<StepSmem*>(step_smem);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const int tile0 = (int) blockIdx.x * kStepTiles, tl = warp >> 1, tile = tile0 + tl;
+    const int l0 = (warp & 1) * 16 + gid, sh = 2 * tig;
+    const bool live = tile < n_tiles;
+    uint4 wa[kNw4], wb[kNw4];
+    uint32_t sa[kNw4], sb[kNw4];
 #pragma unroll
-    for (int j = 0; j < kNw4; ++j) {
-        const size_t at = ((size_t) (live ? tile : 0) * kNw4 + j) * 32 + lane;
-        w[j] = __ldcs(wq + at);
-        s[j] = __ldcs(sc + at);
+    for (int j = 0; j < kNw4; ++j) {   // constant data: read before the wait
+        const size_t at = ((size_t) (live ? tile : 0) * kNw4 + j) * 32 + l0;
+        wa[j] = __ldcs(wq + at);
+        wb[j] = __ldcs(wq + at + 8);
+        sa[j] = __ldcs(sc + at);
+        sb[j] = __ldcs(sc + at + 8);
     }
-    if (live) fb = __ldg(fold_bp + row);
+    const int64_t row0 = (int64_t) tile * 32 + l0;
+    const float fba = live ? __ldg(fold_bp + row0) : 0.f, fbb = live ? __ldg(fold_bp + row0 + 8) : 0.f;
+    const bool reala = live && token_of(row0, n_tiles) < n_rows, realb = live && token_of(row0 + 8, n_tiles) < n_rows;
     pdl_wait();
     pdl_launch_dependents();
-    screen_x(lat_step + (size_t) b * kFoldNb, kFoldNb, xi, xs, xdd, tid, 32 * kTilesPerBlock);
-    __syncthreads();
-    if (!live) return;
-    float2* cand = reinterpret_cast<float2*>(scratch + (size_t) b * scratch_stride);
-    float2* part = cand + (size_t) n_tiles * px::kPer;
-    const float* ap = approx + ((size_t) b * n_max + step_i) * n_pad;
+    const int cols8 = (count + 7) / 8 * 8;
     const float ninf = __int_as_float(0xff800000);
-    float v = ninf;
-    if (real) v = capf(ap[row] + screen_acc<kNw4>(w, s, 0, xi, xs, xdd) + fb, cap);
-    float m = v;
+    for (int t = 0; t < cols8 / 8; ++t) {
+        float ap[4];   // the head terms, requested before the dots
 #pragma unroll
-    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    float e = v > ninf ? __expf(v - m) : 0.0f;
-#pragma unroll
-    for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
-    if (lane == 0) part[tile] = make_float2(m, e);
-    for (int k = 0; k < px::kPer; ++k) {
-        float bv = v;
-        int bi = lane;
-#pragma unroll
-        for (int o = 16; o; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        for (int e = 0; e < 4; ++e) {
+            const int c = t * 8 + 2 * tig + (e & 1);
+            const bool hi = e >= 2;
+            ap[e] = c < count && (hi ? realb : reala) ? approx[((size_t) c * n_max + step_i) * n_pad + row0 + (hi ? 8 : 0)] : 0.f;
         }
-        if (lane == 0) cand[tile * px::kPer + k] = make_float2(bv, __int_as_float(tile * 32 + bi));
-        if (lane == bi) v = ninf;
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int j = 0; j < kNw4; ++j) {
+            const uint32_t va[4] = {wa[j].x, wa[j].y, wa[j].z, wa[j].w}, vb[4] = {wb[j].x, wb[j].y, wb[j].z, wb[j].w};
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh) {
+                const int g = 2 * j + hh;
+                const uint32_t a[4] = {(va[2 * hh] >> sh) & 0x03030303u, (vb[2 * hh] >> sh) & 0x03030303u,
+                                       (va[2 * hh + 1] >> sh) & 0x03030303u, (vb[2 * hh + 1] >> sh) & 0x03030303u};
+                const float sga = __half2float(__ushort_as_half((unsigned short) (hh ? (sa[j] >> 16) : (sa[j] & 0xffff))));
+                const float sgb = __half2float(__ushort_as_half((unsigned short) (hh ? (sb[j] >> 16) : (sb[j] & 0xffff))));
+                const int2 bq = __ldg(reinterpret_cast<const int2*>(xq + ((size_t) g * cols8 + t * 8 + gid) * 8) + tig);
+                const float4 m = __ldg(xm + (size_t) g * (cols8 / 2) + t * 4 + tig);
+                int p[4];
+                screen_mma(p, a, (uint32_t) bq.x, (uint32_t) bq.y);
+                acc[0] = __fmaf_rn(sga, __fmaf_rn(m.x, (float) p[0], -m.z), acc[0]);
+                acc[1] = __fmaf_rn(sga, __fmaf_rn(m.y, (float) p[1], -m.w), acc[1]);
+                acc[2] = __fmaf_rn(sgb, __fmaf_rn(m.x, (float) p[2], -m.z), acc[2]);
+                acc[3] = __fmaf_rn(sgb, __fmaf_rn(m.y, (float) p[3], -m.w), acc[3]);
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int c = t * 8 + 2 * tig + (e & 1);
+            const bool hi = e >= 2;
+            if (c < count) {
+                float v = ninf;
+                if (hi ? realb : reala) v = capf(ap[e] + acc[e] + (hi ? fbb : fba), cap);
+                sm.v[tl][c][l0 + (hi ? 8 : 0)] = v;
+            }
+        }
+    }
+    __syncthreads();
+    // a warp per tile and half the slots, kSumm slots at a time side by side: head_step_kernel's warp code (lane = row)
+    constexpr int kSumm = 4;
+    const int ptile = tile0 + tl;
+    if (ptile >= n_tiles) return;
+    const int half = (count + 1) / 2, b0 = (warp & 1) * half, b1 = min(count, b0 + half);
+    for (int bs = b0; bs < b1; bs += kSumm) {
+        float v[kSumm], m[kSumm], e[kSumm];
+#pragma unroll
+        for (int u = 0; u < kSumm; ++u) v[u] = bs + u < b1 ? sm.v[tl][bs + u][lane] : ninf;
+#pragma unroll
+        for (int u = 0; u < kSumm; ++u) m[u] = v[u];
+#pragma unroll
+        for (int o = 16; o; o >>= 1)
+#pragma unroll
+            for (int u = 0; u < kSumm; ++u) m[u] = fmaxf(m[u], __shfl_xor_sync(0xffffffffu, m[u], o));
+#pragma unroll
+        for (int u = 0; u < kSumm; ++u) e[u] = v[u] > ninf ? __expf(v[u] - m[u]) : 0.0f;
+#pragma unroll
+        for (int o = 16; o; o >>= 1)
+#pragma unroll
+            for (int u = 0; u < kSumm; ++u) e[u] += __shfl_xor_sync(0xffffffffu, e[u], o);
+#pragma unroll
+        for (int u = 0; u < kSumm; ++u)
+            if (lane == 0 && bs + u < b1)
+                reinterpret_cast<float2*>(scratch + (size_t) (bs + u) * scratch_stride)[(size_t) n_tiles * px::kPer + ptile] =
+                    make_float2(m[u], e[u]);
+        for (int k = 0; k < px::kPer; ++k) {
+            float bv[kSumm];
+            int bi[kSumm];
+#pragma unroll
+            for (int u = 0; u < kSumm; ++u) bv[u] = v[u], bi[u] = lane;
+#pragma unroll
+            for (int o = 16; o; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < kSumm; ++u) {
+                    const float ov = __shfl_xor_sync(0xffffffffu, bv[u], o);
+                    const int oi = __shfl_xor_sync(0xffffffffu, bi[u], o);
+                    if (ov > bv[u] || (ov == bv[u] && oi < bi[u])) { bv[u] = ov; bi[u] = oi; }
+                }
+#pragma unroll
+            for (int u = 0; u < kSumm; ++u) {
+                if (lane == 0 && bs + u < b1)
+                    reinterpret_cast<float2*>(scratch + (size_t) (bs + u) * scratch_stride)[ptile * px::kPer + k] =
+                        make_float2(bv[u], __int_as_float(ptile * 32 + bi[u]));
+                if (lane == bi[u]) v[u] = ninf;
+            }
+        }
     }
 }
 
@@ -1063,11 +1314,24 @@ void dspark_pack_draft_rows(const float* h_chunk, int block, int count_chunk, in
     check("pack draft rows");
 }
 
-void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, float* approx, void* stream) {
+size_t dspark_head_base_cols_bytes(int cols) {
+    const size_t cols_pad = (size_t) (cols + kMmaCols - 1) / kMmaCols * kMmaCols;
+    return cols_pad * kHeadNb * (8 * sizeof(int) + 2 * sizeof(float));
+}
+
+void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, void* cols_scratch, float* approx,
+                            void* stream) {
     if (count <= 0 || n_max < 1 || n_max > kDsDrafts) return;
-    launch_pdl(head_base_batch_kernel, dim3((unsigned) px::tiles(h.n_vocab)), dim3(128), 0, (cudaStream_t) stream,
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int cols = count * n_max, cols_pad = (cols + kMmaCols - 1) / kMmaCols * kMmaCols;
+    int* xq = (int*) cols_scratch;
+    float* xm = (float*) (xq + (size_t) cols_pad * kHeadNb * 8);
+    launch_pdl(screen_cols_kernel<kHeadNb>, dim3((unsigned) ((kHeadNb * cols_pad + 255) / 256)), dim3(256), 0, s, (const Q81*) hq, cols,
+               cols_pad, xq, xm);
+    const int64_t n_tiles = px::tiles(h.n_vocab);
+    launch_pdl(head_base_mma_kernel, dim3((unsigned) ((n_tiles + kMmaTiles - 1) / kMmaTiles)), dim3(kMmaThreads), 0, s,
                (const uint4*) h.head_sc, (const uint32_t*) px::scales(const_cast<void*>(h.head_sc), h.n_vocab, kWidth),
-               (const Q81*) hq, count, n_max, dspark_screen_rows(h.n_vocab), approx);
+               (const int*) xq, (const float4*) xm, cols, cols_pad, n_tiles, dspark_screen_rows(h.n_vocab), approx);
     check("head base batch");
 }
 
@@ -1080,17 +1344,34 @@ void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const floa
     check("Markov step batch");
 }
 
+size_t dspark_head_step_cols_bytes(int count) {
+    return (size_t) (count + 7) / 8 * 8 * kFoldNb * (8 * sizeof(int) + 2 * sizeof(float));
+}
+
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
-                            int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
-                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
+                            int n_max, int count, void* cols_scratch, void* scratch, size_t scratch_stride, int32_t* prev,
+                            int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
     if (count <= 0) return;
+    if (count > kStepSlotsMax) throw std::runtime_error("inkling2 dspark head pick batch: more slots than a call takes");
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
     const int64_t n_pad = dspark_screen_rows(h.n_vocab);
-    launch_pdl(head_step_batch_kernel, dim3((unsigned) ((tiles + kTilesPerBlock - 1) / kTilesPerBlock), (unsigned) count),
-               dim3(32 * kTilesPerBlock), 0, s, (const uint4*) h.fold_sc,
-               (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank), (const Q81*) latq_step,
-               approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad, (uint8_t*) scratch, scratch_stride);
+    static bool smem_set[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (!smem_set[dev] && cudaFuncSetAttribute(head_step_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               (int) sizeof(StepSmem)) != cudaSuccess)
+        throw std::runtime_error("inkling2 dspark head pick batch: shared memory");
+    smem_set[dev] = true;
+    const int cols8 = (count + 7) / 8 * 8;
+    int* xq = (int*) cols_scratch;
+    float* xm = (float*) (xq + (size_t) cols8 * kFoldNb * 8);
+    launch_pdl(screen_cols_kernel<kFoldNb>, dim3((unsigned) ((kFoldNb * cols8 + 255) / 256)), dim3(256), 0, s, (const Q81*) latq_step,
+               count, cols8, xq, xm);
+    launch_pdl(head_step_mma_kernel, dim3((unsigned) ((tiles + kStepTiles - 1) / kStepTiles)), dim3(kStepThreads), sizeof(StepSmem), s,
+               (const uint4*) h.fold_sc, (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank),
+               (const int*) xq, (const float4*) xm, approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad, count, (uint8_t*) scratch,
+               scratch_stride);
     launch_pdl(head_final_batch_kernel, dim3((unsigned) count), dim3(512), 0, s, h, (const Q81*) hq, (const Q81*) latq_step,
                tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row);
     check("head pick batch");

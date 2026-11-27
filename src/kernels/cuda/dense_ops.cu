@@ -611,7 +611,7 @@ __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int str
     __syncthreads();
     for (int p = 0; p < n; ++p) {
         const float* row = lp_rows + (size_t) p * stride;
-        ph[r] = __uint_as_float((uint32_t) pred[(size_t) prev_s * rank + r] << 16) * h[(size_t) p * rank + r];
+        ph[r] = prev_s >= 0 ? __uint_as_float((uint32_t) pred[(size_t) prev_s * rank + r] << 16) * h[(size_t) p * rank + r] : 0.0f;
         __syncthreads();
         for (int k = warp; k < top; k += warps) {
             const int32_t cand = __float_as_int(row[2 + 2 * k]);
@@ -620,38 +620,64 @@ __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int str
                 for (int i = lane; i < rank; i += 32) v += ph[i] * __uint_as_float((uint32_t) succ[(size_t) cand * rank + i] << 16);
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-            if (lane == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + v : -1e30f;
+            if (lane == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + v : -INFINITY;
         }
         __syncthreads();
         if (r == 0) {
-            int best = 0;
-            for (int k = 1; k < top; ++k)
-                if (score[k] > score[best]) best = k;
-            float z = 0.0f;
-            for (int k = 0; k < top; ++k) z += expf(score[k] - score[best]);
-            int pick = best;
-            if (draw.temperature > 0.0f) {
-                const float inv_t = 1.0f / draw.temperature;
-                float zt = 0.0f;
-                for (int k = 0; k < top; ++k) zt += expf((score[k] - score[best]) * inv_t);
-                const float u = philox_uniform(draw.seed, (uint64_t) (draw.pos0 + p), kPhiloxDraft) * zt;
-                float cum = 0.0f;
-                bool found = false;
-                for (int k = 0; k < top; ++k) {
-                    const float e = expf((score[k] - score[best]) * inv_t);
-                    if (draw.q_p) draw.q_p[(size_t) p * top + k] = e / zt;
-                    cum += e;
-                    if (!found && u < cum) { pick = k; found = true; }
-                }
-            } else if (draw.q_p) {
-                for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = k == best ? 1.0f : 0.0f;
+            int best = -1;
+            int first_valid = -1;
+            float best_s = -INFINITY;
+            for (int k = 0; k < top; ++k) {
+                const int32_t ck = __float_as_int(row[2 + 2 * k]);
+                if (ck < 0) continue;
+                if (first_valid < 0) first_valid = k;
+                if (!isnan(score[k]) && (best < 0 || score[k] > best_s)) { best = k; best_s = score[k]; }
             }
             if (draw.q_ids)
                 for (int k = 0; k < top; ++k) draw.q_ids[(size_t) p * top + k] = __float_as_int(row[2 + 2 * k]);
-            const int32_t id = __float_as_int(row[2 + 2 * pick]);
-            ids[p] = id;
-            conf[p] = 1.0f / z;
-            prev_s = id;
+            if (first_valid < 0) {
+                if (draw.q_p)
+                    for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = 0.0f;
+                ids[p] = 0;
+                conf[p] = 0.0f;
+                prev_s = -1;
+            } else {
+                if (best < 0) best = first_valid;
+                const bool finite_best = isfinite(best_s);
+                float z = 0.0f;
+                if (finite_best) {
+                    for (int k = 0; k < top; ++k)
+                        if (score[k] > -INFINITY) z += expf(score[k] - best_s);
+                } else {
+                    z = 1.0f;
+                }
+                int pick = best;
+                if (draw.temperature > 0.0f && finite_best) {
+                    const float inv_t = 1.0f / draw.temperature;
+                    float zt = 0.0f;
+                    for (int k = 0; k < top; ++k) {
+                        if (score[k] > -INFINITY)
+                            zt += (score[k] == best_s) ? 1.0f : expf((score[k] - best_s) * inv_t);
+                    }
+                    const float u = philox_uniform(draw.seed, (uint64_t) (draw.pos0 + p), kPhiloxDraft) * zt;
+                    float cum = 0.0f;
+                    bool found = false;
+                    for (int k = 0; k < top; ++k) {
+                        const float e = score[k] > -INFINITY
+                                            ? ((score[k] == best_s) ? 1.0f : expf((score[k] - best_s) * inv_t))
+                                            : 0.0f;
+                        if (draw.q_p) draw.q_p[(size_t) p * top + k] = e / zt;
+                        cum += e;
+                        if (!found && e > 0.0f && u < cum) { pick = k; found = true; }
+                    }
+                } else if (draw.q_p) {
+                    for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = k == best ? 1.0f : 0.0f;
+                }
+                const int32_t id = __float_as_int(row[2 + 2 * pick]);
+                ids[p] = id;
+                conf[p] = z > 0.0f ? 1.0f / z : 0.0f;
+                prev_s = id;
+            }
         }
         __syncthreads();
     }
@@ -927,7 +953,7 @@ void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* ba
 void candidate_path(const float* lp_rows, int stride, int top, const float* h, const uint16_t* pred, const uint16_t* succ,
                     int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, const CandidateDraw& draw, void* stream) {
     if (n <= 0) return;
-    if (top > 64 || rank % 32 || rank > 1024) {
+    if (top <= 0 || top > 64 || rank <= 0 || rank % 32 || rank > 1024) {
         basalt::log::error("basalt", "candidate_path: %d candidates of rank %d", top, rank);
         std::exit(1);
     }

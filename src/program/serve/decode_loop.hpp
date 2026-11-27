@@ -22,8 +22,9 @@ Flow Request::decode_loop(B& b) {
     draft_offered = 0;
     draft_accepted = 0;
     windows = 0;
-    window = std::vector<int32_t>((size_t) b.max_window());
-    outv = std::vector<int32_t>((size_t) b.max_window());
+    const size_t win_cap = (size_t) std::max<int64_t>(b.max_window(), n - fold_p0);
+    window = std::vector<int32_t>(win_cap);
+    outv = std::vector<int32_t>(win_cap);
     consumed.reserve((size_t) (n + max_new + b.max_window()));
     for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
     finish = "length";
@@ -35,7 +36,7 @@ Flow Request::decode_loop(B& b) {
     const std::vector<int64_t>& eos_ids = runtime_.o.eos_ids;
     std::vector<float> lp_rows;             // logprobs=K: the picks' rows (row_logprobs)
     std::vector<std::string> lp_fields;     // and each pick's P line fields, sent ahead of its T line
-    while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
+    while (!cancelled && produced_n < max_new && !batch_first) {   // (a batch slot's first token comes from the batch window)
         int T = 1;
         if constexpr (kSpec) T = b.draft_window();
         if (first_window) T = (int) (n - fold_p0);

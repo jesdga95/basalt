@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Basalt requests</title>
+<link rel="icon" href="web/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="web/favicon-32.png" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="web/apple-touch-icon.png" sizes="180x180">
+<link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="web/app.css">
+<script defer src="web/monitor.js"></script>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Basalt</span></div>
+  <div class="crumb">
+    <span class="crumb-sep" aria-hidden="true">/</span>
+    <span class="model">Requests</span>
+  </div>
+  <span class="grow"></span>
+  <span class="where" id="host"></span>
+  <button type="button" class="unload quiet" id="clear">Clear all</button>
+  <a class="unload link" href="/">Back to Basalt</a>
+</header>
+
+<form class="auth" id="auth" hidden>
+  <label for="key">API key</label>
+  <input id="key" type="password" autocomplete="off" placeholder="Required by this server">
+  <button>Connect</button>
+</form>
+
+<main>
+  <div class="mon">
+    <section class="mon-idx" aria-label="Requests">
+      <input id="search" type="search" autocomplete="off" aria-label="Filter requests" placeholder="Filter by id, path or model">
+      <div class="tog" id="mfilter" role="group" aria-label="Show">
+        <button type="button" data-f="all" aria-pressed="true">All <em id="n-all"></em></button><span aria-hidden="true">·</span><button type="button" data-f="active" aria-pressed="false">Active <em id="n-active"></em></button><span aria-hidden="true">·</span><button type="button" data-f="error" aria-pressed="false">Errors <em id="n-error"></em></button>
+      </div>
+      <div class="mon-list" id="rows" role="listbox" aria-label="Requests"></div>
+    </section>
+
+    <article class="mon-read" id="read" aria-label="Request">
+      <div class="mon-none" id="empty"></div>
+      <div class="mon-page" id="sel" hidden>
+        <div class="mon-col">
+          <button type="button" class="mon-back" id="back">Requests</button>
+          <div class="mon-kick" id="d-kick"></div>
+          <nav class="tabs" aria-label="Request content">
+            <div id="mtabs" role="tablist"></div>
+            <span class="grow"></span>
+            <button type="button" class="jump" id="copy">Copy</button>
+          </nav>
+          <div id="d-body"></div>
+          <p class="mon-colo" id="d-colo"></p>
+        </div>
+        <dl class="mon-side" id="d-side"></dl>
+      </div>
+    </article>
+  </div>
+</main>
+
+<footer class="tail">
+  <span class="grow" id="foot">Connecting</span>
+  <span class="tot mon-keys"><b>j</b> <b>k</b> move · <b>1</b>–<b>4</b> tabs · <b>c</b> copy</span>
+</footer>
+
+</body>
+</html>

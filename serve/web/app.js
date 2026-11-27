@@ -112,7 +112,7 @@ function drawTotals(t) {
   $("#totals").onclick = () => openPricing();
 }
 
-/* ---- the heat scale: 0..400 tok/s and up; only the colour of the live decode number uses it ---- */
+/* ---- the heat scale: 0..400 tok/s and up; only the colour of the live decode and prefill numbers uses it ---- */
 const HEAT = [[0, [42, 51, 60]], [.30, [90, 42, 30]], [.48, [184, 64, 26]], [.64, [242, 102, 43]], [.82, [255, 181, 71]], [1, [255, 241, 214]]];
 function heatAt(t) {
   t = clamp(t, 0, 1);
@@ -161,6 +161,7 @@ function drawHero(live, hist, reqs, best, slots, total) {
   html($("#pre-k"), `Prefill${!livePre && lastPre != null ? `<span>${rp === reqs[0] ? "last request" : "last read"}</span>` : ""}`);
   html($("#pre-v"), num(pre) ? `${fmt(pre)}<small>tok/s</small>` : "-");
   $("#pre-v").classList.toggle("idle", !livePre);
+  $("#pre-v").style.color = livePre ? heatAt(Math.max(.56, clamp(pre / heatTop(bp && bp.tok_s, pre), 0, 1))) : "";
   const pa = tail(hist.prefill_tok_s_mean).map(v => v > 0 ? v : v === 0 ? 0 : null);
   html($("#pre-chart"), miniChart(pa, livePre ? "var(--accent)" : "var(--fg-2)", "rgba(154,164,173,.08)", pre));
   const lp = r && num(r.prompt_tokens) ? `${fmt(r.prompt_tokens)} tok${num(r.prompt_ms) ? ` in ${(r.prompt_ms / 1000).toFixed(2)} s` : ""}` : "";
@@ -514,9 +515,12 @@ function lastList(reqs, best) {
     + (bp ? `<div title="${esc(bp.id)}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}${bp.recent ? ", the fastest of the recent requests" : ""}"><dt>Prefill</dt><dd>${fmt(bp.tok_s)} tok/s</dd></div>` : kv("Prefill", "-")) + `</dl>`;
 }
 function cacheList(conv, live) {
-  return cached(conv, live) ? `<h3>Conversation cache</h3><dl class="kv">${kv("Cached", `${conv.parked} chat${conv.parked === 1 ? "" : "s"} · ${gib(conv.bytes)} GiB`)}`
-    + (num(conv.evictions) ? kv("Evicted to make room", fmt(conv.evictions)) : "")
-    + (num(conv.restored) ? kv("Last restore", `${fmt(conv.restored)} tok${num(conv.restored_ms) ? ` in ${Math.round(conv.restored_ms)} ms` : ""}`) : "") + `</dl>` : "";
+  const up = !["unloaded", "asleep", "loading"].includes(live.state) && conv, refused = up && num(conv.refused) && conv.refused > 0;
+  if (!cached(conv, live) && !refused) return "";
+  return `<h3>Conversation cache</h3><dl class="kv">${cached(conv, live) ? kv("Cached", `${conv.parked} chat${conv.parked === 1 ? "" : "s"} · ${gib(conv.bytes)} GiB`) : ""}`
+    + (num(conv.evictions) && cached(conv, live) ? kv("Evicted to make room", fmt(conv.evictions)) : "")
+    + (refused ? kv("Parking refused", fmt(conv.refused)) : "")
+    + (num(conv.restored) && cached(conv, live) ? kv("Last restore", `${fmt(conv.restored)} tok${num(conv.restored_ms) ? ` in ${Math.round(conv.restored_ms)} ms` : ""}`) : "") + `</dl>`;
 }
 function sessionList(t) {
   const n = t && num(t.requests) ? t : null;
@@ -662,10 +666,12 @@ function control(path, id) {
 function settle(models, fresh) {
   if (!pending) return;
   const m = models.find(x => x.id === pending.id), v = m ? m.status.value : null;
-  if ((pending.path === "v1/unload" ? v !== "loaded" : v === "loading" || v === "loaded") || (fresh && pending.ok)) pending = null;
+  if ((pending.path === "v1/unload" ? v !== "loaded" : v === "loading" || (v === "loaded" && !m.asleep)) || (fresh && pending.ok)) pending = null;
 }
 function unloadView(models, live) {
-  const m = models.find(x => x.status.value === "loaded");
+  if (live.state === "loading") return { hidden: true };
+  const m = models.find(x => x.status.value === "loaded" && !x.asleep)
+    || models.find(x => x.status.value === "loaded" && x.parked_mib == null);
   if (!m) return { hidden: true };
   if (pending) return { hidden: false, id: m.id, disabled: true, label: pending.path === "v1/unload" ? ACT["v1/unload"][0] : "Unload", title: "" };
   const busy = live.state === "reading" || live.state === "generating" || live.queued > 0;
@@ -712,7 +718,7 @@ function drawModels(models, shown) {
   const focused = pop.contains(document.activeElement) ? document.activeElement.dataset.v : null;
   pop.replaceChildren(...models.map(m => {
     const b = document.createElement("button"); b.type = "button"; b.setAttribute("role", "menuitemradio");
-    const v = m.status.value, go = v === "unloaded" || v === "failed";
+    const v = m.status.value, go = v === "unloaded" || v === "failed" || (v === "loaded" && !!m.asleep);
     b.className = go ? "opt go" : "opt"; b.dataset.v = m.id; b.disabled = busy;
     b.setAttribute("aria-checked", String(m.id === name));
     const n = document.createElement("b"), w = document.createElement("span");
@@ -803,7 +809,7 @@ function draw() {
   const name = (live.state || "idle")[0].toUpperCase() + (live.state || "idle").slice(1);
   const ld = live.state === "loading" ? live.load || {} : null, weights = ld && ld.kind !== "wake";
   const models = M.models || [];
-  const none = models.length > 0 && !models.some(m => m.status.value === "loaded" || m.status.value === "loading");
+  const none = models.length > 0 && !models.some(m => (m.status.value === "loaded" && m.parked_mib == null) || m.status.value === "loading");
   const [sw, swTip] = stateWord(live, name);
   $("#state").title = swTip;
   if (failed && Date.now() > failed.until) failed = null;
@@ -853,10 +859,11 @@ function lineEl(e) {
   return d;
 }
 function append(lines) {
+  if (!lines || !lines.length) return;
   logEl.querySelector(".empty")?.remove();
   logEl.append(...lines.map(lineEl));
   while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
-  logCount += lines.length; warnCount += lines.filter(l => l.lvl === "warn" || l.lvl === "error").length;
+  logCount += lines.length; warnCount += lines.filter(l => l.lvl === "warn" || l.lvl === "err").length;
   const z = lines[lines.length - 1];
   text($("#ticker-t"), `${clock(z.t * 1000)}  ${srcTag(z.src)}  ${shortLog(z.msg)}`);
   $("#ticker").dataset.lvl = z.lvl;
@@ -875,6 +882,7 @@ function clearLog(note) {
   logCount = 0; warnCount = 0;
   const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
   text($("#ticker-t"), "");
+  $("#ticker").dataset.lvl = "";
 }
 
 /* ---- streamed state and logs ---- */
@@ -926,14 +934,17 @@ const connectState = stream(() => "api/state/stream", data => {
 let lastLog = null, logInstance = null;
 const connectLogs = stream(() => "api/logs/stream" + (lastLog === null ? "" :
   `?after=${lastLog}&instance=${encodeURIComponent(logInstance)}`), data => {
-  if (data.reset || (logInstance !== null && logInstance !== data.instance_id)) {
+  const reset = data.reset || (logInstance !== null && logInstance !== data.instance_id);
+  if (reset) {
     clearLog("The server restarted."); lastLog = null;
   }
   logInstance = data.instance_id;
   if (data.dropped) append([{ t: Date.now() / 1000, src: "srv", lvl: "warn", msg: "Some log lines were dropped from the server buffer." }]);
-  append(data.lines.filter(line => lastLog === null || line.id > lastLog));
+  const fresh = (data.lines || []).filter(line => lastLog === null || line.id > lastLog);
+  append(fresh);
   lastLog = data.next;
   if (!logCount) clearLog("No log lines yet.");
+  if (reset && !fresh.length && !data.dropped) draw();
 }, state => text($("#log-status"), { connecting: "Connecting", locked: "API key required",
   live: "Live", offline: "Disconnected; retrying" }[state]));
 $("#auth").onsubmit = e => {

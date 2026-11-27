@@ -7,6 +7,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "unicode_flags.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
@@ -28,6 +29,8 @@ public:
     std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const override {
         return run_engine(static_cast<Options&>(o), cards);
     }
+
+    int max_slots() const override { return kernels::kVerifyMaxT; }   // rows of a batch window
 
     // peer: the main card, kDmMaxX peers with their own rings and one more; split: one stage per card (SplitDrive)
     program::GpuModes gpu_modes() const override { return {kernels::kDmMaxX + 2, engine_local::SplitDrive::kMax, 0, true}; }
