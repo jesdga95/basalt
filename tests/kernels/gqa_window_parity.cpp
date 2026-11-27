@@ -225,6 +225,56 @@ int main(int argc, char** argv) {
     const unsigned long long frozen = 0x966f4088b1f5f753ull;   // the one-tile kernel's
     std::printf("gqa_window_attn hash: %016llx (bits against the frozen hash: %s)\n", hash, hash == frozen ? "identical" : "DIFFERENT");
     if (hash != frozen) ++fails;
+    // one launch of 64 segments of 5 rows (a batched drafter's blocks at 64 slots, past the 32 segments and 64 rows a
+    // launch once took) against each segment alone, bitwise; half in the ring, half in the full cache's windows
+    {
+        constexpr int NSEG = basalt::kernels::kWindowSegsMax, T = 5;
+        std::vector<float> sq((size_t) NSEG * T * NH * HD);
+        for (auto& x : sq) x = 2.0f * draw(rng);
+        float* dsq = dev<float>(sq.size());
+        float* dso = dev<float>(sq.size());
+        float* done = dev<float>((size_t) T * NH * HD);
+        ck(cudaMemcpy(dsq, sq.data(), sq.size() * 4, cudaMemcpyHostToDevice), "copy");
+        float* sscr = dev<float>(basalt::kernels::gqa_decode_scratch_floats(ring_cap, NSEG * T, NH, HD));
+        basalt::kernels::GqaWindowSeg segs[NSEG];
+        for (int k = 0; k < NSEG; ++k) {
+            const bool in_ring = k % 2;
+            const Cache& c = in_ring ? ring : full;
+            const int64_t pos = 2000 + 37 * k;
+            segs[k] = {c.dk, c.dv, pos, T, pos + T, ring_window, c.cap, true};
+        }
+        const int64_t scells = ring_window + T + 64;
+        basalt::kernels::gqa_window_attn_segs(dsq, NH, NKV, HD, segs, NSEG, sscr, scells, dso, S);
+        ck(cudaStreamSynchronize(S), "segments attention");
+        std::vector<float> all(sq.size()), one((size_t) T * NH * HD);
+        ck(cudaMemcpy(all.data(), dso, all.size() * 4, cudaMemcpyDeviceToHost), "copy");
+        int seg_diff = 0;
+        for (int k = 0; k < NSEG; ++k) {
+            const basalt::kernels::GqaWindowSeg& g = segs[k];
+            basalt::kernels::gqa_window_attn(dsq + (size_t) k * T * NH * HD, g.k_cache, g.v_cache, NH, NKV, HD, g.pos0, T, g.hi, g.window,
+                                             g.cap, sscr, scells, done, S, true);
+            ck(cudaStreamSynchronize(S), "window attention");
+            ck(cudaMemcpy(one.data(), done, one.size() * 4, cudaMemcpyDeviceToHost), "copy");
+            if (std::memcmp(one.data(), &all[(size_t) k * T * NH * HD], one.size() * 4)) ++seg_diff;
+        }
+        std::printf("gqa_window_attn_segs: %d segments of %d rows in one launch = each alone: %s (%d differ)\n", NSEG, T,
+                    seg_diff ? "NO" : "yes", seg_diff);
+        if (seg_diff) ++fails;
+        if (bench) {
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            cudaEventRecord(e0, S);
+            for (int i = 0; i < 100; ++i)
+                basalt::kernels::gqa_window_attn_segs(dsq, NH, NKV, HD, segs, NSEG, sscr, scells, dso, S);
+            cudaEventRecord(e1, S);
+            ck(cudaEventSynchronize(e1), "bench");
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            std::printf("bench: window attention, %d segments x %d rows in one launch: %.1f us\n", NSEG, T, 1e3 * ms / 100);
+        }
+        cudaFree(dsq); cudaFree(dso); cudaFree(done); cudaFree(sscr);
+    }
 
     // the int8 cache: the same cases on the full and ring caches quantized; each output bitwise the fp16 path's on the
     // decoded cache, near the CPU reference on it, and the same at every width

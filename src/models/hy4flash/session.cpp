@@ -24,6 +24,7 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
@@ -71,10 +72,9 @@ constexpr int kAttRows = 2048;                 // rows of one attention step ins
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
 constexpr int kMmqTile = 128;                  // the widest column tile of an MMQ product
 constexpr int kLaunchRows = 32768;              // most (row, expert) pairs of one prompt launch
-constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
 constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
-constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
+constexpr uint64_t kModuleRoom = 4ull << 27;   // kernel modules + graphs still to load when the tier opens (512 MiB)
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
 constexpr int kLookupK = core::ExpertTier::kMaxK;
 constexpr int kTypeNvfp4 = 40;                 // ggml's NVFP4: blobs end in the FP32 scales {s_gate, s_up, s_down, 0}
@@ -506,6 +506,7 @@ public:
             want = std::min(want, cap);
         }
         const bool ringed = total >= kRingRows && tier_ && !ring_;
+        const int rcap = ringed ? ring_target_cap(want) : 0;
         // a bounded lend: the tier gives up only the slots the chunk's buffers and the ring need, and the rest keep their experts
         // (the ring stages those card to card, and the first turn after the prompt finds them); all of them when that is not enough
         if (tier_ && tier_->partial_lend()) {
@@ -513,11 +514,11 @@ public:
             uint64_t need = 0;
             std::string e;
             make_bufs(probe, want, e, &need);
-            if (ringed) need += expert_ring_bytes();
+            if (ringed) need += expert_ring_bytes(rcap);
             if ((tier_->lend(need) && make_bufs(big_, want, e)) ||
                 (tier_->lend(need + kExpertLendSegment) && make_bufs(big_, want, e))) {
-                if (!ringed || ring_open() ||
-                    (tier_->lend(expert_ring_bytes() + kExpertLendSegment) && ring_open())) {
+                if (!ringed || ring_open(rcap, false) ||
+                    (tier_->lend(expert_ring_bytes(rcap) + kExpertLendSegment) && ring_open(rcap, false))) {
                     use(big_);
                     return true;
                 }
@@ -532,7 +533,7 @@ public:
             for (int R = want; R >= min_ring_chunk; R /= 2) {
                 std::string e;
                 if (!make_bufs(big_, R, e)) continue;
-                if (ring_open()) {
+                if (ring_open(ring_target_cap(R), false)) {
                     use(big_);
                     return true;
                 }
@@ -542,9 +543,9 @@ public:
         for (int R = want; R >= kMaxWindow; R /= 2)
             if (make_bufs(big_, R, err)) {
                 use(big_);
-                if (ringed && !ring_open())
+                if (ringed && !ring_open(ring_target_cap(R), true))
                     basalt::log::info("basalt hy4flash", "cannot open the expert ring (%.1f GB): the prompt stages its experts per layer",
-                                      (double) expert_ring_bytes() / 1e9);
+                                      (double) expert_ring_bytes(ring_target_cap(R)) / 1e9);
                 return true;
             }
         if (tier_) {
@@ -1417,10 +1418,22 @@ private:
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
         if (phases & kQuery) {
             quant_n(R);
-            gemm_n(T(l, "attn_q_a.weight"), qa_, g_.q_lora, R);
-            bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
-            gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
-            gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
+            const DevTensor* wqa = T(l, "attn_q_a.weight");
+            const DevTensor* wkv = T(l, "attn_kv_a_mqa.weight");
+            if (R <= kMaxWindow && E == 3072 && wqa->type == 8 && wkv->type == 8) {
+                const Q8xMat mats[2] = {
+                    {wqa->ptr, xq_n_, qa_, g_.q_lora},
+                    {wkv->ptr, xq_n_, kvraw_, rank + g_.rope_dim},
+                };
+                q8x_mmvq(mats, 2, E, R, stream_);
+                bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
+                gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
+            } else {
+                gemm_n(wqa, qa_, g_.q_lora, R);
+                bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
+                gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
+                gemm_n(wkv, kvraw_, rank + g_.rope_dim, R);
+            }
         }
         if (!(phases & (kCells | kOutput | kAttend))) return true;
         // the cells each row attends
@@ -1667,8 +1680,11 @@ private:
     // its router: all of a layer's experts are copied into one of two slots of the ring while the layer before it computes.
     static constexpr int kRingRows = 1024;
     static constexpr int kShortChunk = 1024;  // the largest chunk of a short prompt, which keeps the card's expert slots
+    static constexpr int kRingMinExperts = 64;
     bool lent_ = false;                       // the open prompt lent the tier's slots
     uint8_t* ring_ = nullptr;
+    int ring_cap_ = 0;                        // experts per ring slot (<= g_.n_expert)
+    std::vector<int32_t> ring_pos_[2];        // [slot][expert] -> packed slot index in ring_, or -1
     cudaEvent_t ring_copied_[2] = {nullptr, nullptr}, ring_done_[2] = {nullptr, nullptr};
     int ring_layer_[2] = {-1, -1};
     std::thread ring_thr_[2];
@@ -1685,19 +1701,46 @@ private:
         }
         return past;
     }
-    size_t expert_ring_bytes() const { return 2 * (size_t) g_.n_expert * stride_ + expert_past(); }
-    bool ring_open() {
-        if (cudaMalloc((void**) &ring_, expert_ring_bytes()) != cudaSuccess) {
+    size_t expert_ring_bytes(int cap) const { return 2 * (size_t) cap * stride_ + expert_past(); }
+    size_t expert_ring_bytes() const { return expert_ring_bytes(g_.n_expert); }
+    int ring_target_cap(int R) const {
+        if (!tier_ || !tier_->share_for(0)) return g_.n_expert;
+        const std::vector<uint8_t> away = away_of(0, std::vector<int64_t>((size_t) g_.n_expert, std::max<int64_t>(1, (int64_t) R * g_.n_used / g_.n_expert)), R);
+        int local = 0;
+        for (uint8_t a : away) local += !a;
+        return std::clamp(local + kStageExperts, kRingMinExperts, g_.n_expert);
+    }
+    bool ring_open(int want_cap = 0, bool allow_shrink = false) {
+        const size_t past = expert_past();
+        int cap = std::clamp(want_cap > 0 ? want_cap : g_.n_expert, kRingMinExperts, g_.n_expert);
+        if (cudaMalloc((void**) &ring_, expert_ring_bytes(cap)) != cudaSuccess) {
             cudaGetLastError();
             ring_ = nullptr;
-            return false;
+            if (!allow_shrink) return false;
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+            const uint64_t floor = (tier_ ? tier_->free_floor() : 0) + (64ull << 20);
+            if (free_b <= floor + past || stride_ == 0) return false;
+            int fit = (int) ((free_b - floor - past) / (2 * stride_));
+            fit = std::min(fit, cap) / kStageExperts * kStageExperts;
+            while (fit >= kRingMinExperts) {
+                if (cudaMalloc((void**) &ring_, expert_ring_bytes(fit)) == cudaSuccess) {
+                    cap = fit;
+                    break;
+                }
+                cudaGetLastError();
+                ring_ = nullptr;
+                fit -= kStageExperts;
+            }
+            if (!ring_) return false;
         }
-        if (cudaMemset((uint8_t*) ring_ + 2 * (size_t) g_.n_expert * stride_, 0, expert_past()) != cudaSuccess) {
+        if (cudaMemset((uint8_t*) ring_ + 2 * (size_t) cap * stride_, 0, past) != cudaSuccess) {
             cudaGetLastError();
             cudaFree(ring_);
             ring_ = nullptr;
             return false;
         }
+        ring_cap_ = cap;
         for (int i = 0; i < 2; ++i) {
             if (cudaEventCreateWithFlags(&ring_copied_[i], cudaEventDisableTiming) != cudaSuccess ||
                 cudaEventCreateWithFlags(&ring_done_[i], cudaEventDisableTiming) != cudaSuccess ||
@@ -1708,6 +1751,9 @@ private:
             }
         }
         ring_layer_[0] = ring_layer_[1] = -1;
+        if (ring_cap_ < g_.n_expert)
+            basalt::log::info("basalt hy4flash", "expert ring: %d of %d experts per layer (%.2f GiB)",
+                              ring_cap_, g_.n_expert, (double) expert_ring_bytes(ring_cap_) / 1073741824.0);
         return true;
     }
     void ring_join() {
@@ -1721,33 +1767,38 @@ private:
         cudaStreamSynchronize(stream_);
         cudaFree(ring_);
         ring_ = nullptr;
+        ring_cap_ = 0;
+        ring_pos_[0].clear();
+        ring_pos_[1].clear();
         for (int i = 0; i < 2; ++i) {
             if (ring_copied_[i]) cudaEventDestroy(ring_copied_[i]);
             if (ring_done_[i]) cudaEventDestroy(ring_done_[i]);
             ring_copied_[i] = ring_done_[i] = nullptr;
         }
     }
-    // All the experts of tier layer `tl` into its slot, on the copy stream once the layer that used the slot is done.
+    // The main card's experts of tier layer `tl` packed into its slot, on the copy stream once the layer that used the slot is done.
     bool ring_copy(int tl) {
         const int slot = tl & 1;
         const ExpertLayer& el = m_.pack().experts[(size_t) (tl + g_.n_dense)];
-        uint8_t* base = ring_ + (size_t) slot * g_.n_expert * stride_;
+        uint8_t* base = ring_ + (size_t) slot * (size_t) ring_cap_ * stride_;
+        std::vector<int32_t>& pos = ring_pos_[slot];
+        pos.assign((size_t) g_.n_expert, -1);
         cudaStreamWaitEvent(copy_, ring_done_[slot], 0);
         // runs of experts in RAM at an even spacing go in one strided copy
         const std::vector<uint8_t>* away = (size_t) tl < away_.size() && !away_[(size_t) tl].empty() ? &away_[(size_t) tl] : nullptr;
         auto gone = [&](int x) { return away && (*away)[(size_t) x]; };   // the second card computes it
-        int e = 0;
-        while (e < g_.n_expert) {
+        int e = 0, p = 0;
+        while (e < g_.n_expert && p < ring_cap_) {
             if (gone(e)) {
                 ++e;
                 continue;
             }
             const core::ExpertTier::Source src = tier_->locate(tl, e);
-            uint8_t* dst = base + stride_ * (size_t) e;
+            uint8_t* dst = base + stride_ * (size_t) p;
             if (src.pinned) {
                 int n = 1;
                 ptrdiff_t gap = 0;
-                while (e + n < g_.n_expert) {
+                while (e + n < g_.n_expert && p + n < ring_cap_) {
                     if (gone(e + n)) break;
                     const core::ExpertTier::Source nx = tier_->locate(tl, e + n);
                     if (!nx.pinned) break;
@@ -1762,13 +1813,17 @@ private:
                 } else {
                     cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
                 }
+                for (int j = 0; j < n; ++j) pos[(size_t) (e + j)] = p + j;
                 e += n;
+                p += n;
                 continue;
             }
             if (src.dev) cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
             else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, copy_);
             else return false;
+            pos[(size_t) e] = p;
             ++e;
+            ++p;
         }
         cudaEventRecord(ring_copied_[slot], copy_);
         return true;
@@ -2335,7 +2390,11 @@ private:
             ra.held = lossy_->held_tabs(l - g_.n_dense);
             ra.prior = lossy_->route_prior();
         }
-        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        const DevTensor* gate = T(l, "ffn_gate_inp.weight");
+        if (gate->type == 30)
+            bk::router_bf16(xn_, (const uint16_t*) gate->ptr, F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        else
+            bk::router(xn_, (const float*) gate->ptr, F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
         if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
@@ -2344,8 +2403,18 @@ private:
         gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
         if (!prompt) publish(0, std::min(kMaxWindow, R));
         float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
-        gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
-        gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
+        const DevTensor* wsg = T(l, "ffn_gate_shexp.weight");
+        const DevTensor* wsu = T(l, "ffn_up_shexp.weight");
+        if (R <= kMaxWindow && E == 3072 && wsg->type == 8 && wsu->type == 8) {
+            const Q8xMat mats[2] = {
+                {wsg->ptr, xq_n_, sg, g_.n_ff_exp},
+                {wsu->ptr, xq_n_, su, g_.n_ff_exp},
+            };
+            q8x_mmvq(mats, 2, E, R, stream_);
+        } else {
+            gemm_n(wsg, sg, g_.n_ff_exp, R);
+            gemm_n(wsu, su, g_.n_ff_exp, R);
+        }
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, stream_);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
     }
@@ -2370,7 +2439,10 @@ private:
                 err = "cannot begin a graph capture";
                 return false;
             }
-            body();
+            {
+                bk::PdlScope pdl(true, /*first_plain=*/true);
+                body();
+            }
             cudaGraph_t g = nullptr;
             const cudaError_t ce = cudaStreamEndCapture(stream_, &g);
             const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&ex, g, 0) : ce;
@@ -2637,40 +2709,51 @@ private:
         if (ringed) {
             const int slot = tl & 1;
             cudaStreamWaitEvent(st, ring_copied_[slot], 0);
-            const uint8_t* base = ring_ + (size_t) slot * g_.n_expert * stride_;
-            for (size_t b0 = 0; b0 < used.size();) {
-                const int e0 = used[b0];
+            const uint8_t* base = ring_ + (size_t) slot * (size_t) ring_cap_ * stride_;
+            const std::vector<int32_t>& rpos = ring_pos_[slot];
+            std::vector<int> in_ring, rest;
+            in_ring.reserve(used.size());
+            for (int e : used) {
+                if ((size_t) e < rpos.size() && rpos[(size_t) e] >= 0) in_ring.push_back(e);
+                else rest.push_back(e);
+            }
+            for (size_t b0 = 0; b0 < in_ring.size();) {
+                const int p0 = rpos[(size_t) in_ring[b0]];
                 size_t b1 = b0;
                 int64_t rows = 0, max_rows = 0;
-                while (b1 < used.size() && used[b1] < e0 + kStageExperts) {
-                    const int64_t c = by_count(used[b1]);
+                while (b1 < in_ring.size() && rpos[(size_t) in_ring[b1]] < p0 + kStageExperts) {
+                    const int64_t c = by_count(in_ring[b1]);
                     if (b1 > b0 && rows + c > kLaunchRows) break;
                     rows += c;
                     max_rows = std::max(max_rows, c);
                     ++b1;
                 }
-                const int nb = used[b1 - 1] - e0 + 1;
+                const int nb = rpos[(size_t) in_ring[b1 - 1]] - p0 + 1;
                 tok_buf_.clear();
                 bounds_buf_.clear();
                 bounds_buf_.push_back(0);
-                for (int e = e0; e < e0 + nb; ++e) {
-                    if (!away.empty() && away[(size_t) e]) {   // the second card's: no rows here
-                        bounds_buf_.push_back((int32_t) tok_buf_.size());
-                        continue;
-                    }
-                    const int32_t i0 = by_off_[(size_t) e], i1 = by_off_[(size_t) e + 1];
-                    for (int32_t idx = i0; idx < i1; ++idx) {
-                        const int32_t p = by_pairs_[(size_t) idx];
-                        map_h_[(size_t) p] = (int32_t) (pos + (int64_t) tok_buf_.size());
-                        tok_buf_.push_back(p / K);
+                size_t cur = b0;
+                for (int q = 0; q < nb; ++q) {
+                    if (cur < b1 && rpos[(size_t) in_ring[cur]] == p0 + q) {
+                        const int e = in_ring[cur];
+                        const int32_t i0 = by_off_[(size_t) e], i1 = by_off_[(size_t) e + 1];
+                        for (int32_t idx = i0; idx < i1; ++idx) {
+                            const int32_t p = by_pairs_[(size_t) idx];
+                            map_h_[(size_t) p] = (int32_t) (pos + (int64_t) tok_buf_.size());
+                            tok_buf_.push_back(p / K);
+                        }
+                        ++cur;
                     }
                     bounds_buf_.push_back((int32_t) tok_buf_.size());
                 }
-                launch(stage_[launch_++ & 1], base + (size_t) e0 * stride_, nb, rows, max_rows, tok_buf_, bounds_buf_);
+                launch(stage_[launch_++ & 1], base + (size_t) p0 * stride_, nb, rows, max_rows, tok_buf_, bounds_buf_);
                 b0 = b1;
             }
             cudaEventRecord(ring_done_[slot], st);
-        } else
+            used = std::move(rest);
+            // ensure the next layer's ring_copy thread finished queuing onto copy_ before staging any overflow
+            if (!used.empty() && ring_thr_[slot ^ 1].joinable()) ring_thr_[slot ^ 1].join();
+        }
         for (size_t b0 = 0; b0 < used.size();) {
             int nb = 0;
             int64_t rows = 0, max_rows = 0;
@@ -2773,10 +2856,16 @@ private:
     static constexpr uint64_t kReadAheadBytes = 56ull << 20;
     void read_ahead(int l, uint32_t word, cudaStream_t st) {
         if (ra_.empty()) {   // every layer's ranges, once
+            // Cap read-ahead to 7/12 of the card's L2 cache (56 MiB on a 96 MiB 5090, 28 MiB on a 48 MiB 5070 Ti)
+            // so the tail of the prefetch does not evict its own head or active KV/expert lines.
+            int l2 = 0;
+            uint64_t cap = kReadAheadBytes;
+            if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, m_.device()) == cudaSuccess && l2 > 0)
+                cap = std::min<uint64_t>(kReadAheadBytes, ((uint64_t) l2 * 7 / 12) & ~15ull);
             ra_.resize((size_t) g_.n_layers);
             for (int k = 0; k < g_.n_layers; ++k) {
                 L2Ranges& r = ra_[(size_t) k];
-                uint64_t left = kReadAheadBytes;
+                uint64_t left = cap;
                 int n = 0;
                 const auto add = [&](const DevTensor* t) {
                     if (t == nullptr || n == kL2Ranges || ((uintptr_t) t->ptr & 15) != 0) return;

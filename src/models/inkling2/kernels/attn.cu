@@ -1969,7 +1969,7 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
         const int slots64 = sms_of[dev] * (bm == 16 ? 3 : 2);
         const int64_t act_splits = std::min<int64_t>(mma_z, std::max<int64_t>(1, (max_keys + 63) / 64));
         const bool half_kv = (a.window == 0) && ((int64_t) (nseg * tiles_per_seg) * kKvHeads * act_splits > slots64) &&
-                             (max_keys > 4096 || nseg > 1);
+                             max_keys > 4096;
         const dim3 grid((unsigned) (nseg * tiles_per_seg), kKvHeads, (unsigned) mma_z);
         if (bm == 32) {
             if (half_kv) {

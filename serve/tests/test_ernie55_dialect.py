@@ -222,6 +222,39 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(json.loads(streamed[0]), {"expr": "hel"})
 
+    def test_reopened_and_stray_think_tags_never_leak(self):
+        # Redundant opening <ernie:think> inside reasoning, reopened <ernie:think> in content, and stray </ernie:think>.
+        cases = [
+            (True, f"{THINK}thought 1{THINK_END}part 1{THINK}thought 2{THINK_END}part 2{THINK_END}",
+             "thought 1thought 2", "part 1part 2"),
+            (False, f"pre{THINK}hidden thought{THINK_END}post{THINK_END}",
+             "hidden thought", "prepost"),
+            (True, f"r1{THINK_END}c1{CALL}\n<invoke name=\"calc\"><parameter name=\"expr\">1</parameter></invoke>\n{CALL_END}{THINK}r2{THINK_END}c2",
+             "r1r2", "c1c2"),
+            # Malformed tool-call opener followed by a think block must parse identically across any split boundary.
+            (False, f"{CALL}not-a-call{THINK}hidden{THINK_END}after",
+             "hidden", f"{CALL}not-a-callafter"),
+            (False, f"{CALL}<invoke name=\"broken\"{THINK}hidden{THINK_END}after",
+             "hidden", f"{CALL}<invoke name=\"broken\"after"),
+        ]
+        for thinking, text, exp_r, exp_c in cases:
+            for step in (1, 2, 3, 7, 1000):
+                with self.subTest(thinking=thinking, step=step, exp_r=exp_r):
+                    cuts = list(range(step, len(text), step))
+                    r, c, _, _ = parse(text, thinking=thinking, cuts=cuts, tools=self.TOOLS)
+                    self.assertEqual(r, exp_r)
+                    self.assertEqual(c, exp_c)
+                    self.assertNotIn(THINK, r + c)
+                    self.assertNotIn(THINK_END, r + c)
+
+        # Explicit split vs. unsplit comparison right after the malformed call prefix.
+        malformed = f"{CALL}not-a-call{THINK}hidden{THINK_END}after"
+        split_at = len(f"{CALL}not-a-call")
+        r_one, c_one, _, _ = parse(malformed, thinking=False, cuts=[], tools=self.TOOLS)
+        r_two, c_two, _, _ = parse(malformed, thinking=False, cuts=[split_at], tools=self.TOOLS)
+        self.assertEqual((r_one, c_one), ("hidden", f"{CALL}not-a-callafter"))
+        self.assertEqual((r_one, c_one), (r_two, c_two))
+
 
 class DialectAndServiceTests(unittest.TestCase):
     def test_registry_and_properties(self):

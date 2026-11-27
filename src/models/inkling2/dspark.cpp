@@ -320,14 +320,28 @@ DsHead DsparkWeights::head_args() const {
 
 uint64_t dspark_tap_bytes(int tap_rows) { return 4ull * (uint64_t) std::max(tap_rows, kSlice) * kE * 4; }
 
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context, bool int8) {
+uint64_t dspark_session_bytes(const Pack& pack) {
     if (pack.dflash2.present) return dflash2_session_bytes(pack);
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE;
     uint64_t n = (kFrRing * E + 3 * kDsRank + E + kDsBlock) * 4 + 1024;
-    for (int l = 0; l < d.n_layers; ++l)   // the caches: the rings fp16 K and V, the full layers fp16 or int8
-        n += d.swa[(size_t) l] ? 2ull * (uint64_t) ring_cells(d) * kKV * 2 : (uint64_t) full_cells(context) * full_cell_bytes(int8);
+    for (int l = 0; l < d.n_layers; ++l)
+        if (d.swa[(size_t) l]) n += 2ull * (uint64_t) ring_cells(d) * kKV * 2;
+    return n;
+}
+
+uint64_t dspark_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran, bool int8) {
+    if (pack.dflash2.present) return dflash2_pool_bytes(pack, positions, gran);
+    const DsparkGeometry& d = pack.dspark;
+    if (!d.present) return 0;
+    // a full layer's arrays: fp16 K and V, or int8 K and V codes and their scales (DsparkHook::init)
+    const uint64_t cells = (uint64_t) full_cells(positions);
+    const auto whole = [&](uint64_t b) { return (b + gran - 1) / gran * gran; };
+    const uint64_t layer = int8 ? 2 * (whole(cells * kKV) + whole(cells * kKvScaleBytes)) : 2 * whole(cells * kKV * 2);
+    uint64_t n = 0;
+    for (int l = 0; l < d.n_layers; ++l)
+        if (!d.swa[(size_t) l]) n += layer;
     return n;
 }
 
@@ -425,7 +439,7 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
 }
 
 bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
-                      int64_t backed, bool int8, std::string& err) {
+                      bool int8, std::string& err) {
     if (!w) return true;
     if (w->df2) {
         tap_rows_ = std::max(tap_rows, kSlice);
@@ -445,11 +459,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
                       align256(4) + align256(kDsBlock * 4) + align256(kDsBlock * 4);
         for (int l = 0; l < d.n_layers; ++l) {
             const bool ring = d.swa[(size_t) l];
-            if (ring || backed <= 0) {
-                const int64_t cap = ring ? ring_cells(d) : full_cells(context);
-                if (int8 && !ring) need += 2 * align256((size_t) cap * kKV) + 2 * align256((size_t) cap * kKvScaleBytes);
-                else need += 2 * align256((size_t) cap * kKV * 2);
-            }
+            if (ring) need += 2 * align256((size_t) ring_cells(d) * kKV * 2);
         }
         if (!dump.empty()) need += align256((size_t) kDsDrafts * (size_t) w->n_vocab * 4);
         void* slab = nullptr;
@@ -481,18 +491,16 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
         c.ring = d.swa[(size_t) l];
         c.cap = c.ring ? ring_cells(d) : full_cells(context);
         const bool q8 = int8 && !c.ring;
-        // K and V, or the int8 codes and their scales; with `backed`, the range reserved and the first positions' cells backed
+        // K and V, or the int8 codes and their scales; a full layer's range reserved, backed as the target's caches grow
         const uint64_t cell[4] = {q8 ? (uint64_t) kKV : 2ull * kKV, q8 ? (uint64_t) kKV : 2ull * kKV, kKvScaleBytes, kKvScaleBytes};
         void* buf[4] = {};
         for (int j = 0; j < (q8 ? 4 : 2); ++j) {
-            if (c.ring || backed <= 0) {
+            if (c.ring) {
                 buf[j] = dev((size_t) c.cap * cell[j], ok);
                 continue;
             }
             auto a = std::make_unique<core::ElasticArray>();
-            if (ok && (!a->open((uint64_t) c.cap * cell[j], err) ||
-                       !a->ensure((uint64_t) std::min(c.cap, full_cells(backed)) * cell[j], 0, err)))
-                ok = false;
+            if (ok && !a->open((uint64_t) c.cap * cell[j], err, 1)) ok = false;
             buf[j] = a->data();
             full_.push_back(std::move(a));
             full_cell_.push_back(cell[j]);
@@ -918,16 +926,19 @@ void DsparkHook::count_backed() {
         backed_cells_ = std::min<int64_t>(backed_cells_, (int64_t) (full_[i]->backed() / full_cell_[i]));
 }
 
-uint64_t DsparkHook::grow_bytes(int64_t positions) const {
-    if (df2_) return 0;
+uint64_t DsparkHook::grow_bytes(int64_t target, int64_t positions) const {
+    if (df2_) return df2_->grow_bytes(positions);
+    positions = target;
     uint64_t n = 0;
     const uint64_t cells = (uint64_t) std::min(full_cells(context_), full_cells(positions));
     for (size_t i = 0; i < full_.size(); ++i) n += full_[i]->growth(cells * full_cell_[i]);
     return n;
 }
 
-bool DsparkHook::ensure(int64_t positions, std::string& err) {
-    if (df2_ || full_.empty() || full_cells(positions) <= backed_cells_) return true;
+bool DsparkHook::ensure(int64_t target, int64_t positions, std::string& err) {
+    if (df2_) return df2_->ensure(positions, err);
+    positions = target;
+    if (full_.empty() || full_cells(positions) <= backed_cells_) return true;
     const uint64_t cells = (uint64_t) std::min(full_cells(context_), full_cells(positions));
     for (size_t i = 0; i < full_.size(); ++i)
         if (!full_[i]->ensure(cells * full_cell_[i], 0, err)) {
@@ -938,9 +949,31 @@ bool DsparkHook::ensure(int64_t positions, std::string& err) {
     return true;
 }
 
+bool DsparkHook::usable() const {
+    if (df2_ && !df2_->usable()) return false;
+    for (const auto& a : full_)
+        if (!a->usable()) return false;
+    return true;
+}
+bool DsparkHook::out_of_memory() const {
+    if (df2_ && df2_->out_of_memory()) return true;
+    for (const auto& a : full_)
+        if (a->out_of_memory()) return true;
+    return false;
+}
+uint64_t DsparkHook::backing_bytes() const {
+    uint64_t n = df2_ ? df2_->backing_bytes() : 0;
+    for (const auto& a : full_) n += a->backed();
+    return n;
+}
+
 void DsparkHook::trim(int64_t positions) {
-    if (df2_) return;
-    for (size_t i = 0; i < full_.size(); ++i) full_[i]->trim((uint64_t) full_cells(positions) * full_cell_[i]);
+    if (df2_) {
+        df2_->trim(positions);
+        return;
+    }
+    const uint64_t cells = positions > 0 ? (uint64_t) full_cells(positions) : 0;   // none once the conversation left
+    for (size_t i = 0; i < full_.size(); ++i) full_[i]->trim(cells * full_cell_[i]);
     count_backed();
 }
 
@@ -1039,11 +1072,12 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     const size_t E = kE, V = (size_t) w->n_vocab, ff = (size_t) d.n_ff;
     const int S = std::min(max_sessions, kMaxDraftSessions);
     const int S_all = std::max(S, std::min(max_sessions, (int) bk::kWindowSegsMax));
-    const int max_dr_rows = std::max(S * kDsDrafts, S_all * 2);
+    const int max_dr_rows = std::max(S * kDsDrafts, S_all * kBatchDrafts);
     const int CR = 64;
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };
     max_sessions_ = S;
+    max_dr_rows_ = max_dr_rows;
     max_rows_ = max_rows;
     tap_rows_ = std::max(tap_rows, kSlice);
     tap_ = tap;
@@ -1072,9 +1106,10 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     }
     att_cells_ = std::max(ring_cells(d), full_cells(context));
     att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, CR, kHeads, kHeadDim));
-    // head batch scratch: per-draft-row buffers hold max(16*7, 64*2)=128 rows; per-slot state holds S_all<=64 slots
+    // head batch scratch: per-draft-row buffers hold max_dr_rows rows (a pass of draft()); per-slot state holds S_all slots
     hd_ = f((size_t) max_dr_rows * E);
     hq_ = dev(bk::native_q8_1_bytes(kE, max_dr_rows), ok);
+    head_cols_ = dev(dspark_head_base_cols_bytes(max_dr_rows), ok);
     approx_ = f((size_t) max_dr_rows * dspark_screen_rows((int64_t) V));
     ctx_h_ = f((size_t) max_dr_rows * kDsRnn);
     ctx_f_ = f((size_t) S_all * kDsRnn);
@@ -1082,7 +1117,8 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     latent_ = f((size_t) S_all * kDsRank);
     lat_q_ = dev(bk::native_q8_1_bytes(kDsRank, max_dr_rows), ok);
     head_scr_stride_ = (dspark_head_scratch_bytes((int64_t) V) + 255) & ~(size_t) 255;
-    head_scr_ = dev((size_t) S * head_scr_stride_, ok);
+    head_scr_ = dev((size_t) S_all * head_scr_stride_, ok);
+    lat_cols_ = dev(dspark_head_step_cols_bytes(S_all), ok);
     prev_ = (int32_t*) dev((size_t) S_all * 4, ok);
     w1_row_ = (uint16_t*) dev((size_t) S_all * kDsRank * 2, ok);
     frc_ = f((size_t) S_all * E);
@@ -1194,14 +1230,15 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
     };
     try {
         bk::PdlScope pdl(true);
-        const int max_dr_rows = std::max(max_sessions_ * kDsDrafts, (int) bk::kWindowSegsMax * 2);
-        const int step_B = (B * n_max <= max_dr_rows) ? B : max_sessions_;
+        const int step_B = (B * n_max <= max_dr_rows_) ? B : max_sessions_;
         for (int b0 = 0; b0 < B; b0 += step_B) {
             const int cb = std::min(step_B, B - b0);
             int sub_nmax = 1;
             for (int i = 0; i < cb; ++i) sub_nmax = std::max(sub_nmax, act_n[b0 + i]);
-            const int blk = kDsBlock;
-            const int chunk_slots = std::min(cb, kChunkSlots);
+            // a block of the anchor and as many masks as drafts are wanted: its attention sees only these rows (the drafts
+            // then differ from a whole block's), and a chunk holds as many blocks as its rows take
+            const int blk = sub_nmax + 1;
+            const int chunk_slots = std::min(cb, kChunkSlots * kDsBlock / blk);
             for (int s0 = 0; s0 < cb; s0 += chunk_slots) {
                 const int cn = std::min(chunk_slots, cb - s0);
                 const int R = cn * blk;
@@ -1267,11 +1304,9 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
                 dspark_pack_draft_rows(h_, blk, cn, s0, sub_nmax, hd_, st);
             }
             const DsHead head = w.head_args();
-            const size_t hq_row_b = bk::native_q8_1_bytes(kE, 1);
             const size_t lq_row_b = bk::native_q8_1_bytes(kDsRank, 1);
-            const int64_t n_pad = dspark_screen_rows((int64_t) w.n_vocab);
             bk::native_quantize_q8_1(hd_, hq_, kE, cb * sub_nmax, st);
-            dspark_head_base_batch(head, hq_, cb, sub_nmax, approx_, st);
+            dspark_head_base_batch(head, hq_, cb, sub_nmax, head_cols_, approx_, st);
             bk::bf16_gemv_fp32_mmvf_cols(hd_, w.w_h, ctx_h_, kE, kDsRnn, cb * sub_nmax, st);
             bk::bf16_gemv_fp32_mmvf_cols(frc_ + (size_t) b0 * kE, w.w_f, ctx_f_ + (size_t) b0 * kDsRnn, kE, kDsRnn, cb, st);
             for (int i = 0; i < sub_nmax; ++i) {
@@ -1280,18 +1315,9 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
                                          i, sub_nmax, cb, latent_ + (size_t) b0 * kDsRank, st);
                 void* lq_step = static_cast<char*>(lat_q_) + (size_t) i * cb * lq_row_b;
                 bk::native_quantize_q8_1(latent_ + (size_t) b0 * kDsRank, lq_step, kDsRank, cb, st);
-                for (int p0 = 0; p0 < cb; p0 += max_sessions_) {
-                    const int cp = std::min(max_sessions_, cb - p0);
-                    dspark_head_pick_batch(head,
-                                           static_cast<const char*>(hq_) + (size_t) p0 * sub_nmax * hq_row_b,
-                                           static_cast<const char*>(lq_step) + (size_t) p0 * lq_row_b,
-                                           approx_ + (size_t) p0 * sub_nmax * n_pad,
-                                           i, sub_nmax, cp, head_scr_, head_scr_stride_,
-                                           prev_ + (b0 + p0),
-                                           ids_d_ + (size_t) (b0 + p0) * kDsBlock,
-                                           conf_d_ + (size_t) (b0 + p0) * kDsBlock,
-                                           w.w1, w1_row_ + (size_t) (b0 + p0) * kDsRank, st);
-                }
+                dspark_head_pick_batch(head, hq_, lq_step, approx_, i, sub_nmax, cb, lat_cols_, head_scr_, head_scr_stride_, prev_ + b0,
+                                       ids_d_ + (size_t) b0 * kDsBlock, conf_d_ + (size_t) b0 * kDsBlock, w.w1,
+                                       w1_row_ + (size_t) b0 * kDsRank, st);
             }
         }
         cudaMemcpyAsync(ids_h_, ids_d_, (size_t) B * kDsBlock * 4, cudaMemcpyDeviceToHost, st);

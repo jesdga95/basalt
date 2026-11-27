@@ -27,6 +27,7 @@ from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQ
 from serve.api.grammar import grammar_spec, unenforced
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobChannels, entry as logprob_entry
 from serve.config import GRAMMAR_DEFAULT
+from serve.monitor import Monitor
 
 
 def meminfo_mib(field: str) -> int | None:
@@ -159,6 +160,7 @@ class Service:
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self.monitor = Monitor(self)
         self.live_lock = threading.Lock()               # one combined live line per LIVE_EVERY_S, whichever request is first
         self.live_at = 0.0
         # GPU sharing, all off by default: idle unload seconds, min free VRAM to load, a command run before loading
@@ -1811,9 +1813,12 @@ class Service:
                                 st["decoded"] = (st.get("decoded") or 0) + int(run_last.get("generated") or 0)
                                 st["passes"] = (st.get("passes") or 0) + 1
                                 timed_last = run_last
-                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
-                            finish = "error"          # the engine ended the request itself: the grammar allowed no token
-                            err = "the grammar allowed no token to continue the reply; the engine log has the state"
+                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") in ("error", "room"):
+                            finish = "error"          # the engine ended the request itself
+                            err = ("the KV pool had no room for this conversation to grow while every running request "
+                                   "waited for room; the conversation is kept, so asking again continues it"
+                                   if run_last.get("finish") == "room" else
+                                   "the grammar allowed no token to continue the reply; the engine log has the state")
                             print(f"[server] error: engine reported {err}", flush=True)
                             raise EngineError(err)
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \

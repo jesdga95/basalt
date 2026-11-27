@@ -5,6 +5,7 @@
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q80_screen.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/hy4flash/dfly_kernels.hpp"
@@ -383,12 +384,24 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             if (p.env.fp8) dfly_gather_rows_fp8((const uint8_t*) cache[i], cells, nctx, p.ctx, st);
             else dfly_gather_rows((const uint16_t*) cache[i], cells, nctx, kDflyRowWidth, p.ctx, st);
 
+            {
+            bk::PdlScope pdl(true, /*first_plain=*/true);
             bk::rms_norm_rows(p.X, L.in_ln, p.xn, R, E, d.rms_eps, st);
             bk::native_quantize_q8_1(p.xn, p.in_q8, E, R, st);   // q_a, kv_a and the gate read it
-            p.mmq(L.q_a, p.in_q8, p.qa, E, d.q_lora, R, st);
-            bk::rms_norm_rows(p.qa, L.q_a_ln, p.qan, R, d.q_lora, d.rms_eps, st);
-            p.mm(L.q_b, p.qan, d.q_lora, p.q, H * QW, d.q_lora, H * QW, R, st);
-            p.mmq(L.kv_a, p.in_q8, p.kvraw, E, kDflyRowWidth, R, st);
+            if (E == 3072) {
+                const Q8xMat mats[2] = {
+                    {L.q_a, p.in_q8, p.qa, d.q_lora},
+                    {L.kv_a, p.in_q8, p.kvraw, kDflyRowWidth},
+                };
+                q8x_mmvq(mats, 2, E, R, st);
+                bk::rms_norm_rows(p.qa, L.q_a_ln, p.qan, R, d.q_lora, d.rms_eps, st);
+                p.mm(L.q_b, p.qan, d.q_lora, p.q, H * QW, d.q_lora, H * QW, R, st);
+            } else {
+                p.mmq(L.q_a, p.in_q8, p.qa, E, d.q_lora, R, st);
+                bk::rms_norm_rows(p.qa, L.q_a_ln, p.qan, R, d.q_lora, d.rms_eps, st);
+                p.mm(L.q_b, p.qan, d.q_lora, p.q, H * QW, d.q_lora, H * QW, R, st);
+                p.mmq(L.kv_a, p.in_q8, p.kvraw, E, kDflyRowWidth, R, st);
+            }
             dfly_absorb_k(L.kv_b, p.q, H * QW, QW, R, H, p.qabs, st);
             // the block's rows land after the selected ones, turned by their rotary positions: position rp + r of this base is
             // row nctx + r of ctx
@@ -416,6 +429,7 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
             bk::swiglu_scaled(p.g, p.u, nullptr, nullptr, p.h, R, d.ffn, d.ffn, st);
             p.mm(L.mlp_down, p.h, d.ffn, p.mlp, E, d.ffn, E, R, st, true);
             add_vectors(p.X1, p.mlp, p.X, R * E, st);
+            }
         }
         bk::rms_norm_rows(p.X, w.final_norm, p.z, R, E, d.rms_eps, st);
     } catch (const std::exception& e) {
@@ -468,15 +482,26 @@ bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std:
             cudaMemcpyAsync(p.pe, p.h_pe, (size_t) E * 4, cudaMemcpyHostToDevice, st);
             // Hidden-Correction: h' = h + down(silu(gate(c)) * up(c)), c = hidden_norm(h) :: embed_norm(embed(previous))
             const float* zrow = p.z + (size_t) (j + 1) * E;
+            {
+            bk::PdlScope pdl(true, /*first_plain=*/true);
             bk::rms_norm_rows(zrow, w.hc_hidden_norm, p.cat, 1, E, d.rms_eps, st, 2 * E);
             bk::rms_norm_rows(p.pe, w.hc_embed_norm, p.cat + E, 1, E, d.rms_eps, st, 2 * E);
             bk::native_quantize_q8_1(p.cat, p.in_q8, 2 * E, 1, st);   // the gate and up read it
-            p.mmq(w.hc_gate, p.in_q8, p.hg, 2 * E, d.hc_ffn, 1, st);
-            p.mmq(w.hc_up, p.in_q8, p.hu, 2 * E, d.hc_ffn, 1, st);
+            if (2 * E == 6144) {
+                const Q8xMat mats[2] = {
+                    {w.hc_gate, p.in_q8, p.hg, d.hc_ffn},
+                    {w.hc_up, p.in_q8, p.hu, d.hc_ffn},
+                };
+                q8x_mmvq(mats, 2, 2 * E, 1, st);
+            } else {
+                p.mmq(w.hc_gate, p.in_q8, p.hg, 2 * E, d.hc_ffn, 1, st);
+                p.mmq(w.hc_up, p.in_q8, p.hu, 2 * E, d.hc_ffn, 1, st);
+            }
             bk::swiglu_scaled(p.hg, p.hu, nullptr, nullptr, p.hh, 1, d.hc_ffn, d.hc_ffn, st);
             p.mm(w.hc_down, p.hh, d.hc_ffn, p.hd, E, d.hc_ffn, E, 1, st);
             add_vectors(zrow, p.hd, p.hcout, E, st);
             f32_gemm_rows(p.hcout, w.conf_w, 1, E, 1.0f, 1, p.craw, st);
+            }
             cudaMemcpyAsync(p.h_conf, p.craw, 4, cudaMemcpyDeviceToHost, st);
             if (need) {
                 if (!synced()) return false;

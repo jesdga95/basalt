@@ -15,14 +15,18 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 #include <numeric>
+#include <string_view>
 
 namespace basalt::models::hy4flash {
 namespace {
 constexpr uint64_t kGiB = 1ull << 30;
+constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;   // ggml's BF16
+constexpr std::string_view kRouterSuffix = "ffn_gate_inp.weight";
 // CPU uses of a missed expert that earn it a slot on the card
 constexpr int kAdmitUses = 2;
 // copies a decode window may claim per row (a window's rows route to mostly different experts)
@@ -114,12 +118,16 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.share_max_tokens = 16384;
     s.share_stride = expert_stride();
     s.lend_segment = kExpertLendSegment;
+    s.host.bytes = [this] { return engram_ ? engram_->ram_bytes() : 0; };
+    s.host_cache_keep = engram_ ? engram_->ram_bytes() : 0;
     return s;
 }
 
 model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& reads,
                              std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     if (req.paths.empty()) return {model::Status::Error, "hy4flash: no model path"};
+    if (!req.ple_io.empty() && req.ple_io != "direct" && req.ple_io != "ram")
+        return {model::Status::Error, "hy4flash: --ple-io " + req.ple_io + ": direct or ram"};
     std::string err;
     const std::string& path = req.paths.front();
     if (!open_pack(path, pack_, err)) return {model::Status::Error, "hy4flash: " + err};
@@ -173,6 +181,14 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
             d.type = kTypeQ8_0;
             d.bytes = t.shape[0] * t.shape[1] / 32 * 34;
         }
+        // The router's weights are BF16 in the checkpoint and F32 in the pack (low 16 bits are zero): load as BF16
+        // (exact bit-for-bit logits, 123 MiB VRAM saved -> ~32 more expert slots on GPU 0, half router traffic).
+        const bool router_bf16 = t.type == kTypeF32 && name.size() > kRouterSuffix.size() &&
+                                 name.compare(name.size() - kRouterSuffix.size(), kRouterSuffix.size(), kRouterSuffix) == 0;
+        if (router_bf16) {
+            d.type = kTypeBF16;
+            d.bytes = t.bytes / 2;
+        }
         // the prompt products (MMQ) read the last row of a matrix whose rows are not a multiple of 256 values on to the next
         // multiple: zeros past the end, so the read stays inside the allocation wherever it lies
         const uint64_t past = !t.shape.empty() && prefill::mmq::supported(d.type) ? prefill::mmq::read_past_bytes(d.type, (int64_t) t.shape[0]) : 0;
@@ -185,6 +201,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         it.dev = d.ptr;
         it.device = device_;
         if (head_q8) it.conv = core::Conv::Bf16ToQ8_0;
+        if (router_bf16) it.conv = core::Conv::Bf16High;
         reads.add(it);
         dense += d.bytes;
         dev_.emplace(name, std::move(d));
@@ -220,8 +237,14 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes))
+        // Map now so tier_spec() reserves its RAM; lock/touch in attach() after the expert tier's reads finish so
+        // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
+        if (req.ple_io == "ram") {
+            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false))
+                return {model::Status::Error, "hy4flash: " + err};
+        } else if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes)) {
             return {model::Status::Error, "hy4flash: " + err};
+        }
     }
     // the sessions first, then the expert tier, sized from what they leave and opened by the first session; its reads are
     // queued in the start's plan
@@ -246,6 +269,14 @@ model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::uniqu
     if (dfly_) {   // the drafts' head screen, made from the head the reads placed
         cudaSetDevice(device_);
         if (!dfly_->pack_screen(nullptr, err)) return {model::Status::Error, "hy4flash: " + err};
+    }
+    if (engram_ && engram_->ram_bytes() > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        engram_->lock_ram();
+        basalt::log::info("basalt hy4flash", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
+                          (double) engram_->ram_bytes() / (double) kGiB,
+                          engram_->locked() ? "locked in RAM" : "loaded (not locked)",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     return {};
 }

@@ -218,31 +218,36 @@ class Ernie55Parser:
         self.call = None
 
     def _reasoning(self, out: list) -> bool:
-        end, calls = self.buf.find(THINK_END), self.buf.find(CALL)
-        if end >= 0 and (calls < 0 or end < calls):
-            if end:
-                out.append(Event("reasoning", self.buf[:end]))
-            self.buf, self.state = self.buf[end + len(THINK_END):], "content"
+        marks = [(i, tag) for tag in (THINK, THINK_END, CALL) if (i := self.buf.find(tag)) >= 0]
+        if marks:
+            i, tag = min(marks, key=lambda x: x[0])
+            if i:
+                out.append(Event("reasoning", self.buf[:i]))
+            self.buf = self.buf[i + len(tag):]
+            if tag == THINK_END:
+                self.state = "content"
+            elif tag == CALL:
+                self.state = "call"
             return True
-        if calls >= 0:
-            if calls:
-                out.append(Event("reasoning", self.buf[:calls]))
-            self.buf, self.state = self.buf[calls + len(CALL):], "call"
-            return True
-        keep = frontend.hold_back(self.buf, (THINK_END, CALL))
+        keep = frontend.hold_back(self.buf, (THINK, THINK_END, CALL))
         if len(self.buf) > keep:
             out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
         return False
 
     def _content(self, out: list) -> bool:
-        calls = self.buf.find(CALL)
-        if calls >= 0:
-            if calls:
-                out.append(Event("content", self.buf[:calls]))
-            self.buf, self.state = self.buf[calls + len(CALL):], "call"
+        marks = [(i, tag) for tag in (THINK, THINK_END, CALL) if (i := self.buf.find(tag)) >= 0]
+        if marks:
+            i, tag = min(marks, key=lambda x: x[0])
+            if i:
+                out.append(Event("content", self.buf[:i]))
+            self.buf = self.buf[i + len(tag):]
+            if tag == THINK:
+                self.state = "reasoning"
+            elif tag == CALL:
+                self.state = "call"
             return True
-        keep = frontend.hold_back(self.buf, (CALL,))
+        keep = frontend.hold_back(self.buf, (THINK, THINK_END, CALL))
         if len(self.buf) > keep:
             out.append(Event("content", self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
@@ -268,10 +273,10 @@ class Ernie55Parser:
                 or INVOKE_START.startswith(s)
                 or (s.startswith(INVOKE_START) and ">" not in s)
             ):
-                self.buf, self.state, self.calls_seen = CALL + self.buf, "content", True
+                out.append(Event("content", CALL))
+                self.state, self.calls_seen = "content", True
                 self.sub = "between"
-                out.append(Event("content", self.buf))
-                self.buf = ""
+                return True
             return False
 
         if self.sub == "invoke":

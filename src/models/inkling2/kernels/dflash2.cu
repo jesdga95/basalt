@@ -468,7 +468,7 @@ __device__ __forceinline__ float q8p_dot(const void* __restrict__ planes, int64_
 
 // Stage 1: grid (rows, chunks), 256 threads = 8 warps. Each warp extracts its exact Top-16 via pure warp shuffles (0 CTA
 // barriers), then 128 threads rank the 128 warp winners in parallel (1 barrier), while computing chunk softcapped LSE.
-__global__ void __launch_bounds__(256) top16_part_kernel(const float* logits, int n_vocab, float cap,
+__global__ void __launch_bounds__(256) top16_part_kernel(const float* logits, int n_vocab, int64_t ld, float cap,
                                                          float2* part, float2* part_lse) {
     __shared__ float w_val[8 * kDf2TopK];
     __shared__ int w_id[8 * kDf2TopK];
@@ -477,7 +477,7 @@ __global__ void __launch_bounds__(256) top16_part_kernel(const float* logits, in
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int r = (int) blockIdx.x, chunk = (int) blockIdx.y;
     const int c0 = chunk * kTopChunk;
-    const float* row = logits + (int64_t) r * n_vocab;
+    const float* row = logits + (int64_t) r * ld;
 
     pdl_wait();
     float vals[16];
@@ -900,14 +900,14 @@ size_t dflash2_top16_scratch_bytes(int max_rows, int n_vocab) {
 }
 
 void dflash2_top16(const float* logits, const void* head_q8, bool head_planes, const void* hq, int rows, int n_vocab,
-                   float cap, void* scratch, int32_t* cand_out, float* tail_lse_out, void* stream) {
+                   int64_t ld, float cap, void* scratch, int32_t* cand_out, float* tail_lse_out, void* stream) {
     if (rows <= 0) return;
     const int chunks = (n_vocab + kTopChunk - 1) / kTopChunk;
     if (chunks > 64) throw std::runtime_error("inkling2 dflash2 top16: vocabulary exceeds 64 * 4096");
     auto* part = static_cast<float2*>(scratch);
     float2* part_lse = tail_lse_out ? part + (size_t) rows * chunks * kDf2TopK : nullptr;
     launch_pdl(top16_part_kernel, dim3((unsigned) rows, (unsigned) chunks), dim3(256), 0, (cudaStream_t) stream, logits,
-               n_vocab, cap, part, part_lse);
+               n_vocab, ld, cap, part, part_lse);
     launch_pdl(top16_rescore_kernel, dim3((unsigned) rows), dim3(512), 0, (cudaStream_t) stream, part, part_lse, chunks,
                head_q8, head_planes, static_cast<const Q81*>(hq), n_vocab, cap, cand_out, tail_lse_out);
     if (!stream) cudaDeviceSynchronize();

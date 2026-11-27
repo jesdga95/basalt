@@ -61,7 +61,7 @@ int main() {
     };
     {
         const std::vector<int32_t> live = {1, 2, 3, 4, 5};
-        const std::vector<FakeCk> checks = {
+        std::vector<FakeCk> checks = {
             {{1, 2}, {}},
             {{1, 2, 3, 4, 5}, {}},        // turn checkpoint at live.size() == n - 1
             {{1, 2, 3, 4, 5, 6}, {}},     // longer than live: ignored
@@ -71,14 +71,17 @@ int main() {
         basalt::program::serve::select_slot_checkpoints(checks, live, eq, kept);
         check(kept.size() == 2 && kept[0].ids.size() == 2 && kept[1].ids.size() == 5,
               "in_slot admission keeps both root and turn checkpoint at live.size()");
+        check(checks.size() == 2 && checks[0].ids.size() == 6 && checks[1].ids.size() == 3,
+              "the kept checkpoints leave the chain (moved, not copied); the others stay in order");
     }
     {
         const std::vector<int32_t> live = {1, 2, 3, 4, 5};
-        const std::vector<FakeCk> checks = {{{1, 2, 3, 4, 5}, {}}};
+        std::vector<FakeCk> checks = {{{1, 2, 3, 4, 5}, {}}};
         std::vector<FakeCk> kept;
         basalt::program::serve::select_slot_checkpoints(checks, live, eq, kept);
         check(kept.size() == 1 && kept[0].ids.size() == 5,
               "single turn checkpoint at live.size() is kept once without root duplication");
+        check(checks.empty(), "a lone kept checkpoint leaves the chain once");
     }
     {
         std::vector<FakeCk> dst = {{{1, 2}, {}}, {{1, 2, 3, 4}, {}}};

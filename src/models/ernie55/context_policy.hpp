@@ -52,4 +52,26 @@ inline Plan plan_context(int64_t asked, int64_t max_pos, uint64_t free_vram, int
     return p;
 }
 
+struct TierReserve {
+    uint64_t copies = 0;        ///< beside slots that are all copies (a long prompt lends them)
+    uint64_t homes = 0;         ///< beside permanent VRAM homes (cannot be lent during a prompt)
+    uint64_t beside_homes = 0;  ///< beside homes + ext copies (shrunk during a prompt)
+    uint64_t modules = 0;       ///< CUDA / MMQ modules loaded on first prompt
+};
+
+constexpr uint64_t kCopiesReserveBytes = 512ull << 20;
+constexpr uint64_t kBesideHomesReserveBytes = 512ull << 20;
+constexpr uint64_t kModuleRoomBytes = 7ull << 27;
+
+/// Computes ExpertTier VRAM reserves so cards holding permanent VRAM homes (`homes_.main > 0`) always leave
+/// enough free VRAM for prompt MMQ staging, MMQ stream-k headroom, and first-prompt module loads.
+inline TierReserve plan_tier_reserve(uint64_t home_prompt_bytes, uint64_t mmq_headroom_bytes) {
+    TierReserve r;
+    r.copies = kCopiesReserveBytes;
+    r.beside_homes = kBesideHomesReserveBytes;
+    r.modules = kModuleRoomBytes;
+    r.homes = home_prompt_bytes + mmq_headroom_bytes + kModuleRoomBytes;
+    return r;
+}
+
 }  // namespace basalt::models::ernie55::ctxp

@@ -24,20 +24,26 @@ inline int64_t root_boundary(const std::vector<int64_t>& ids, int64_t below, int
     return -1;
 }
 
-/// The checkpoints a batch slot keeps at admission: the conversation's shortest (the system prompt, which other
-/// requests may share) and longest (its next turn).  Includes a checkpoint whose length equals `live.size()`, which is
-/// where `in_slot` admissions leave `live` when the turn checkpoint sits at `n - 1` before any decode step runs.
+/// The checkpoints a batch slot keeps at admission, moved out of `checks`: the conversation's shortest (the system prompt,
+/// which other requests may share) and longest (its next turn).  Includes a checkpoint whose length equals `live.size()`,
+/// which is where `in_slot` admissions leave `live` when the turn checkpoint sits at `n - 1` before any decode step runs.
+/// Moved, not copied: a checkpoint is the model's whole running state, and the admission waits for its copy.
 template <class Checkpoint, class IdsEqual>
-void select_slot_checkpoints(const std::vector<Checkpoint>& checks, const std::vector<int32_t>& live,
-                             IdsEqual ids_equal, std::vector<Checkpoint>& out) {
-    const Checkpoint *best = nullptr, *root = nullptr;
-    for (const Checkpoint& c : checks)
+void select_slot_checkpoints(std::vector<Checkpoint>& checks, const std::vector<int32_t>& live, IdsEqual ids_equal,
+                             std::vector<Checkpoint>& out) {
+    size_t best = checks.size(), root = checks.size();
+    for (size_t i = 0; i < checks.size(); ++i) {
+        const Checkpoint& c = checks[i];
         if (!c.ids.empty() && c.ids.size() <= live.size() && ids_equal(c.ids.data(), c.ids.size(), live.data())) {
-            if (best == nullptr || c.ids.size() > best->ids.size()) best = &c;
-            if (root == nullptr || c.ids.size() < root->ids.size()) root = &c;
+            if (best == checks.size() || c.ids.size() > checks[best].ids.size()) best = i;
+            if (root == checks.size() || c.ids.size() < checks[root].ids.size()) root = i;
         }
-    if (root != nullptr && root != best) out.push_back(*root);
-    if (best != nullptr) out.push_back(*best);
+    }
+    if (best == checks.size()) return;
+    if (root != best) out.push_back(std::move(checks[root]));
+    out.push_back(std::move(checks[best]));
+    checks.erase(checks.begin() + (std::ptrdiff_t) std::max(root, best));   // the later one first: the earlier stays put
+    if (root != best) checks.erase(checks.begin() + (std::ptrdiff_t) std::min(root, best));
 }
 
 /// Moves an idle slot's checkpoints back into the solo chain without duplicating checkpoints already held there.

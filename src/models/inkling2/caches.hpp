@@ -3,9 +3,18 @@
 // convolutions' inputs.
 #pragma once
 
+#include "basalt/models/inkling2/kernels.hpp"
+
+#include <algorithm>
 #include <cstdint>
 
 namespace basalt::models::inkling2 {
+
+/// The cells of a visit's cache for `context` positions: a sliding-window visit's ring holds its window (the whole context
+/// when that is shorter) and a window's rows past it, a full visit a cell per position.
+inline int64_t visit_cells(bool ring, int64_t window, int64_t context) {
+    return ring ? std::min(window, context) + kDecodeRows : context;
+}
 
 struct VisitCache {
     void* k = nullptr;                   ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16 or unit-scale E4M3
