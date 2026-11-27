@@ -1670,8 +1670,9 @@ class Service:
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
-                                    # the pass the engine settled ends on the budget only if the budget is past its cap
-                                    capped = bool(budget) and parser.state == "reasoning" and budget - thought >= cap
+                                    # the pass the engine settled ends on the budget only if the budget is past its cap;
+                                    # a block dialect is still "between" before its thinking block opens (same rule as may_think)
+                                    capped = bool(budget) and may_think and budget - thought >= cap
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
