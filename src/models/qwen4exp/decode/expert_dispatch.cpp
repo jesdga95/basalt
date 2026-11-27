@@ -228,7 +228,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             else if (native)
                 native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
             else
-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
