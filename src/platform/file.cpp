@@ -17,6 +17,7 @@
 #include <fcntl.h>    // _O_RDONLY, _O_BINARY
 #include <io.h>       // _wopen, _waccess, _close, _fileno, _get_osfhandle
 #include <sys/stat.h>  // _S_IREAD, _S_IWRITE
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 #else
@@ -68,16 +69,42 @@ std::string to_utf8(const wchar_t* w) {
 }
 
 namespace {
-std::mutex direct_mu;
-std::unordered_set<int> direct_fds;
+constexpr int kFastFdCap = 8192;
+std::atomic<uint64_t> overlapped_bits[kFastFdCap / 64]{};
+std::mutex overlapped_mu;
+std::unordered_set<int> overlapped_overflow;
+
+// Reusable manual-reset event per thread for synchronous overlapped ReadFile calls; ReadFile resets it on each call.
+struct ThreadEvent {
+    HANDLE h = nullptr;
+    ~ThreadEvent() {
+        if (h != nullptr) CloseHandle(h);
+    }
+    HANDLE get() {
+        if (h == nullptr) h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        return h;
+    }
+};
+thread_local ThreadEvent tls_read_event;
+
+bool is_overlapped_fd(int fd) {
+    if (fd >= 0 && fd < kFastFdCap)
+        return ((overlapped_bits[fd >> 6].load(std::memory_order_acquire) >> (fd & 63)) & 1ull) != 0;
+    std::lock_guard<std::mutex> lock(overlapped_mu);
+    return overlapped_overflow.count(fd) != 0;
+}
 
 /// The CRT owns the handle once it has a descriptor. Reads on these handles each use their own event and offset.
-int direct_descriptor(HANDLE h) {
+int overlapped_descriptor(HANDLE h) {
     if (h == INVALID_HANDLE_VALUE) return -1;
     const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDONLY | _O_BINARY);
     if (fd < 0) { CloseHandle(h); return -1; }
-    std::lock_guard<std::mutex> lock(direct_mu);
-    direct_fds.insert(fd);
+    if (fd < kFastFdCap) {
+        overlapped_bits[fd >> 6].fetch_or(1ull << (fd & 63), std::memory_order_release);
+    } else {
+        std::lock_guard<std::mutex> lock(overlapped_mu);
+        overlapped_overflow.insert(fd);
+    }
     return fd;
 }
 
@@ -103,14 +130,18 @@ std::FILE* open_file_utf8(const std::string& path, const std::string& mode) {
 }
 
 int open_fd_utf8(const std::string& path) {
-    return _wopen(to_wide_path(path).c_str(), _O_RDONLY | _O_BINARY);
+    return overlapped_descriptor(CreateFileW(to_wide_path(path).c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr));
 }
 
 void close_fd(int fd) {
     if (fd < 0) return;
-    {
-        std::lock_guard<std::mutex> lock(direct_mu);
-        direct_fds.erase(fd);
+    if (fd < kFastFdCap) {
+        overlapped_bits[fd >> 6].fetch_and(~(1ull << (fd & 63)), std::memory_order_release);
+    } else {
+        std::lock_guard<std::mutex> lock(overlapped_mu);
+        overlapped_overflow.erase(fd);
     }
     _close(fd);
 }
@@ -156,29 +187,24 @@ std::string temp_dir() {
 
 int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
     if (fd < 0) return -1;   // asking the CRT for a negative descriptor's handle stops the process here
-    bool direct = false;
-    {
-        std::lock_guard<std::mutex> lock(direct_mu);
-        direct = direct_fds.count(fd) != 0;
-    }
+    const bool overlapped = is_overlapped_fd(fd);
     const HANDLE shared = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    const HANDLE h = direct ? shared : read_handle(shared);
+    const HANDLE h = overlapped ? shared : read_handle(shared);
     if (h == INVALID_HANDLE_VALUE) return -1;
     const DWORD want = (DWORD) (n < (size_t) (1ull << 30) ? n : (size_t) (1ull << 30));
     OVERLAPPED ov{};
     ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
     ov.OffsetHigh = (DWORD) (off >> 32);
-    if (direct) {
-        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (overlapped) {
+        ov.hEvent = tls_read_event.get();
         if (ov.hEvent == nullptr) return -1;
     }
     struct Close {
-        HANDLE own, event;
+        HANDLE own;
         ~Close() {
-            if (event != nullptr) CloseHandle(event);
             if (own != INVALID_HANDLE_VALUE) CloseHandle(own);
         }
-    } close{h != shared ? h : INVALID_HANDLE_VALUE, ov.hEvent};
+    } close{h != shared ? h : INVALID_HANDLE_VALUE};
     DWORD got = 0;
     if (!ReadFile(h, dst, want, &got, &ov)) {
         const DWORD e = GetLastError();
@@ -221,12 +247,12 @@ void advise_dontneed(int fd, uint64_t off, uint64_t bytes) {
 int open_unbuffered(int fd) {
     if (fd < 0) return -1;
     const HANDLE original = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    return direct_descriptor(ReOpenFile(original, GENERIC_READ,
+    return overlapped_descriptor(ReOpenFile(original, GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED));
 }
 
 int open_unbuffered(const std::string& path) {
-    return direct_descriptor(CreateFileW(to_wide_path(path).c_str(), GENERIC_READ,
+    return overlapped_descriptor(CreateFileW(to_wide_path(path).c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr));
 }
