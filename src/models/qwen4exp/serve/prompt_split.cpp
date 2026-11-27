@@ -236,6 +236,10 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
     const bool ck_on = runtime_.o.prompt_cache > 0 && runtime_.o.prompt_cache_every > 0;
     int64_t ck_next = runtime_.pp_next_check;
     std::map<int64_t, ConvCheckpoint> ck_main;
+    // Periodic checkpoints wait here until state_back() copies the stages' KV cache back to the main session;
+    // publishing them earlier would leave checkpoints in runtime_.checks whose upper-layer KV is missing if the
+    // read is cancelled or fails mid-split.
+    std::vector<std::pair<int64_t, ConvCheckpoint>> pending_cks;
     runtime_.sp.on_stage_chunk = [&](int64_t done, std::string& ce) -> bool {
         main_done = done;
         if (!ck_on || done < ck_next) return true;
@@ -336,11 +340,13 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
             }
         }
         std::string se;
-        if (!whole[0].ids.empty() &&
-            (!basalt::core::conversation_checkpoint_save_layers(whole[0], last.ss, runtime_.g, last.l0, last.l1, se) ||
-             !runtime_.checkpoint_at(p0 + T, &whole))) {
-            ce = "saving a conversation checkpoint failed" + (se.empty() ? runtime_.ckpt_why : ": " + se);
-            return false;
+        if (!whole[0].ids.empty()) {
+            if (!basalt::core::conversation_checkpoint_save_layers(whole[0], last.ss, runtime_.g, last.l0, last.l1, se)) {
+                ce = "saving a conversation checkpoint failed" + (se.empty() ? runtime_.ckpt_why : ": " + se);
+                return false;
+            }
+            pending_cks.emplace_back(p0 + T, std::move(whole[0]));
+            while ((int) pending_cks.size() > runtime_.o.prompt_cache) pending_cks.erase(pending_cks.begin());
         }
         // its last chunk before the kept one: every stage is done with its own
         if (p0 + T >= c_cut.load() && !state_back(p0 + T, ce)) return false;
@@ -370,6 +376,18 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
             (given ? ", it came back at " + std::to_string(given_at) : std::string(", it never came back")) +
             "; " + std::to_string(n_tok) + " tokens in chunks of " + std::to_string(chunk) + ", head " +
             std::to_string(head) + ")";
+    }
+    if (ok && given) {
+        for (auto& [pos, ck] : pending_cks) {
+            if (pos > given_at) continue;
+            std::vector<ConvCheckpoint> whole(1);
+            whole[0] = std::move(ck);
+            if (!runtime_.checkpoint_at(pos, &whole)) {
+                ok = false;
+                e = "saving a conversation checkpoint failed" + runtime_.ckpt_why;
+                break;
+            }
+        }
     }
     // KV streaming: the stages wrote their layers' host copies, so a block resident before may be stale
     if (given && runtime_.g.n_qsa_layers() > 0 && runtime_.rsp->qsa_states[runtime_.rsp->qsa_primary()].kv_mode == 1) {
