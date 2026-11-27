@@ -1,12 +1,13 @@
 // src/models/inkling2/kernels/attn.cu - Inkling 2's decode attention: a query head's scores take a per-query relative bias
 // over the last kExtent positions, and a per-query sink logit sits in the softmax's denominator.
 //
-// A row's keys split in slices whose size comes from the row's own key count alone (whole tiles of the block's four warps,
-// at most kMaxSplits slices), so a row's bits do not depend on the other rows of its call or on the launch's bound. A block
-// takes one row, one key/value head (its three query heads) and one slice; each warp walks its tiles of 32 keys with a lane
-// a key: the lane loads and scores its key in registers, stages V in shared memory, then sums four output channels.
-// For deep INT8 reads, a block instead shares its slice's K/V tiles across consecutive rows of the same conversation.
-// Both paths merge a row's slices with its sink, gate the heads and round to the output projection's q8_1 blocks.
+// A row's keys split in slices whose size comes from the row's own key count alone (whole tiles of the block's four warps, at
+// most the card's slice count for an INT8 cache, slices.hpp, at most kMaxSplits for the others), so a row's bits do not depend
+// on the other rows of its call or on the launch's bound. A block takes one row, one key/value head (its three query heads)
+// and one slice; each warp walks its tiles of 32 keys with a lane a key: the lane loads and scores its key in registers,
+// stages V in shared memory, then sums four output channels. For deep INT8 reads, a block instead shares its slice's K/V tiles
+// across consecutive rows of the same conversation. Both paths merge a row's slices with its sink, gate the heads and round to
+// the output projection's q8_1 blocks.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/log.hpp"
@@ -14,6 +15,7 @@
 #include "window_plan.hpp"
 #include "attn_mma.cuh"
 #include "prep.cuh"
+#include "slices.hpp"
 
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
@@ -27,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <vector>
 
 namespace basalt::models::inkling2 {
 namespace {
@@ -37,7 +40,9 @@ constexpr int kWarps = 4;
 constexpr int kTile = 32;
 constexpr int kUnit = kWarps * kTile;        // keys of one pass of the block's warps
 constexpr int kGroup = kHeads / kKvHeads;    // 3 query heads a key/value head
+// the most slices a row takes (scratch, tables); a card's own count (slices.hpp, MmaDevice::slices) is at most this
 constexpr int kMaxSplits = 64;
+constexpr int kRegisterResident = 3;   // the register-staged window plans' blocks a multiprocessor (their launch bound)
 constexpr int kWindowMmaSplits = 32;
 constexpr int kMmaMinKeys = kMmaDeepMinKeys;
 constexpr bool kMmaSingleton = true;  // a deep row uses the same arithmetic alone and in a verify window
@@ -64,9 +69,13 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
-// The keys a slice of a row with n keys covers: whole passes of the block, at most kMaxSplits slices.
-__host__ __device__ __forceinline__ int span_of(int n) {
-    const int units = (n + kUnit * kMaxSplits - 1) / (kUnit * kMaxSplits);
+// The card's slice count for INT8 caches (slices.hpp), set once when its attention plans are probed (mma_device). FP16 and
+// E4M3 caches keep kMaxSplits.
+__constant__ int c_slices = kMaxSplits;
+
+// The keys a slice of a row with n keys covers: whole passes of the block, at most `slices` slices.
+__host__ __device__ __forceinline__ int span_of(int n, int slices) {
+    const int units = (n + kUnit * slices - 1) / (kUnit * slices);
     return (units > 1 ? units : 1) * kUnit;
 }
 
@@ -184,7 +193,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
     if constexpr (SkipDeep) {
         if (n >= kMmaMinKeys) return;
     }
-    const int span = span_of(n);
+    const int span = span_of(n, INT8 ? c_slices : kMaxSplits);
     if (s * span >= n) return;   // past this row's slices
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
@@ -1143,7 +1152,7 @@ __device__ __forceinline__ void attn_mma_slice(const AttnArgs& a, int first, int
 // Registers: a window's tiles go through each thread's registers, as the direct plan's do, instead of a shared raw-copy
 // ring, so a block needs only the slice's tiles in shared memory (and three can share a multiprocessor).
 template <int MaxSlabs, bool Narrow, bool Direct = false, bool Registers = false>
-__global__ void __launch_bounds__(kWarps * 32, Registers ? 3 : 2) attn_mma_split_kernel(AttnArgs a, int rows, int min_keys, int z,
+__global__ void __launch_bounds__(kWarps * 32, Registers ? kRegisterResident : 2) attn_mma_split_kernel(AttnArgs a, int rows, int min_keys, int z,
                                                                        int stages, bool ping_pong, int prime_span,
                                                                        float* part_ml, float* part_acc) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -1172,7 +1181,7 @@ __global__ void __launch_bounds__(kWarps * 32, Registers ? 3 : 2) attn_mma_split
     if constexpr (Direct) {
         const int n = a.pos[begin] + 1;
         if (n < min_keys) return;
-        const int span = span_of(n), splits = (n + span - 1) / span;
+        const int span = span_of(n, c_slices), splits = (n + span - 1) / span;
         auto& sm = *reinterpret_cast<MmaSmem<1>*>(smem_raw);
         for (int s = blockIdx.z; s < splits; s += gridDim.z) {
             const int lo = s * span, hi = min(n, lo + span);
@@ -1183,7 +1192,7 @@ __global__ void __launch_bounds__(kWarps * 32, Registers ? 3 : 2) attn_mma_split
     for (int s = blockIdx.z; s < z; s += gridDim.z) {
         // Partition at a span or a tail tile boundary so a row takes the same steps in every window.
         for (int first = begin; first < end;) {
-            const int n = a.pos[first] + 1, span = span_of(n), lo = s * span;
+            const int n = a.pos[first] + 1, span = span_of(n, c_slices), lo = s * span;
             if (n < min_keys || lo >= n) {
                 ++first;
                 continue;
@@ -1193,7 +1202,9 @@ __global__ void __launch_bounds__(kWarps * 32, Registers ? 3 : 2) attn_mma_split
             int last = first + 1;
             for (; last < end && (last - first + 1) * kGroup <= MaxSlabs * kMmaRows; ++last) {
                 const int next = a.pos[last] + 1, next_hi = min(next, lo + span);
-                if (next < min_keys || next <= lo || span_of(next) != span || (next_hi + kTile - 1) / kTile != tiles || (last - first + 1) * kGroup > MaxSlabs * kMmaRows) break;
+                if (next < min_keys || next <= lo || span_of(next, c_slices) != span || (next_hi + kTile - 1) / kTile != tiles ||
+                    (last - first + 1) * kGroup > MaxSlabs * kMmaRows)
+                    break;
                 hi = max(hi, next_hi);
             }
             const bool primed = primed_tile == lo && hi >= lo + kTile;
@@ -1266,7 +1277,8 @@ __global__ void __launch_bounds__(32) attn_combine_kernel(AttnArgs a, int z, int
             aa = fmaf(a0, sm_f[i], aa);
         }
     } else {
-        const int splits = mma_z > 0 ? min(mma_z, (n + 63) / 64) : (n + span_of(n) - 1) / span_of(n);
+        const int span = span_of(n, a.int8 ? c_slices : kMaxSplits);
+        const int splits = mma_z > 0 ? min(mma_z, (n + 63) / 64) : (n + span - 1) / span;
         float mlane = t;
         for (int s = lane; s < splits; s += 32) {
             const float2 ml = *reinterpret_cast<const float2*>(part_ml + (base + s) * 2);
@@ -1358,7 +1370,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // the window, and the weights
     int p, lo, n;
     row_keys(a, r, p, lo, n);
-    const int span = span_of(n), splits = (n + span - 1) / span;
+    const int span = span_of(n, INT8 ? c_slices : kMaxSplits), splits = (n + span - 1) / span;
     const bool active = s < splits;
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     const int p0 = a.pos[0];   // the window's first position: keys from it on are the window's rows (consecutive positions)
@@ -1630,8 +1642,8 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;" ::: "memory");
 }
 
-int launch_splits(int64_t max_keys) {
-    return (int) std::min<int64_t>(kMaxSplits, std::max<int64_t>(kWindowMmaSplits, (max_keys + 63) / 64));
+int launch_splits(int64_t max_keys, int slices) {
+    return (int) std::min<int64_t>(slices, std::max<int64_t>(kWindowMmaSplits, (max_keys + 63) / 64));
 }
 
 }  // namespace
@@ -1643,7 +1655,7 @@ int opt_in_device() {
 }
 
 size_t attention_decode_scratch(int rows, int64_t max_keys) {
-    const size_t slots = (size_t) rows * kHeads * (size_t) launch_splits(max_keys);
+    const size_t slots = (size_t) rows * kHeads * (size_t) launch_splits(max_keys, kMaxSplits);   // any card's count
     return slots * (2 + kHeadDim) * sizeof(float);
 }
 
@@ -1657,6 +1669,7 @@ struct MmaLaunch {
 
 struct MmaDevice {
     int sms = 0, l2 = 0;
+    int slices = kMaxSplits;   // an INT8 row's most slices on this card (slices.hpp), the same for every plan and reader
     MmaLaunch plans[3][2];  // narrow, one slab, two slabs; L2-resident/streaming
     MmaLaunch two_stage_ring, three_stage_ring, one_stage_ping_pong;
     MmaLaunch singleton;
@@ -1744,6 +1757,18 @@ const MmaDevice& mma_device(int dev) {
             resident = std::min({resident, per_sm / (shared + reserved), 3});
             d.singleton = {shared, 0, resident, true};
         }
+        // one slice count for every plan, so a row's slices do not depend on its window's width; the register plans,
+        // probed at the first call they can serve, count with their launch bound
+        std::vector<int> resident = {kRegisterResident};
+        for (const MmaLaunch& plan : {d.plans[0][1], d.plans[1][1], d.plans[2][1], d.singleton})
+            if (plan.resident > 0 && std::find(resident.begin(), resident.end(), plan.resident) == resident.end())
+                resident.push_back(plan.resident);
+        std::sort(resident.begin(), resident.end());
+        d.slices = slice_count(d.sms, resident, kKvHeads, kWindowMmaSplits, kMaxSplits);
+        check_mma_probe(cudaMemcpyToSymbol(c_slices, &d.slices, sizeof(int)));
+        std::string per;
+        for (const int r : resident) per += (per.empty() ? "" : "/") + std::to_string(r);
+        basalt::log::info("basalt inkling2", "attention slices %d (SMs %d, resident %s)", d.slices, d.sms, per.c_str());
         if (d.singleton.resident > 0) log_mma_plan(dev, d, "singleton", "all", d.singleton);
         const char* geometries[] = {"narrow", "one-slab", "two-slab"};
         for (int g = 0; g < 3; ++g) {
@@ -1818,8 +1843,8 @@ struct SliceShape {
     double last = 0.;
 };
 
-SliceShape slice_shape(int64_t n) {
-    const int span = span_of((int) n), splits = (int) ((n + span - 1) / span);
+SliceShape slice_shape(int64_t n, int slices) {
+    const int span = span_of((int) n, slices), splits = (int) ((n + span - 1) / span);
     return {splits, (double) (n - (int64_t) (splits - 1) * span) / span};
 }
 
@@ -1864,23 +1889,23 @@ double mma_makespan(int shards, SliceShape row, int blocks_per_shard, int slots)
 
 // The fewest slices a row of `fewest` keys or more can have, below a larger slice size: within one slice size the count
 // grows with the keys, and the first count of each larger size grows with it.
-int least_splits(int64_t fewest) {
-    const int64_t size = (int64_t) kUnit * kMaxSplits;
-    return std::min(slice_shape(fewest).splits, slice_shape((fewest + size - 1) / size * size + 1).splits);
+int least_splits(int64_t fewest, int slices) {
+    const int64_t size = (int64_t) kUnit * slices;
+    return std::min(slice_shape(fewest, slices).splits, slice_shape((fewest + size - 1) / size * size + 1, slices).splits);
 }
 
 // The shard count for rows of `fewest` to `widest` keys. Another count replaces `previous` only where the model rates it
 // no slower on every shape the rows can take and faster on one; where the model cannot tell, `previous` stays. The model
 // is a heuristic: the device can rank two counts it ties, or even orders, the other way.
-int mma_shards(int z, int64_t fewest, int64_t widest, int blocks_per_shard, int slots, int previous) {
+int mma_shards(int z, int64_t fewest, int64_t widest, int blocks_per_shard, int slots, int previous, int slices) {
     // Rows of one slice size take the widest row's shape. A range across slice sizes (a padded launch bound, the graph
     // bucket's, where only the bound is known) holds rows of any slice count from its fewest up to z, each taken as full.
     SliceShape shapes[kMaxSplits];
     int count = 0;
-    if (span_of((int) fewest) == span_of((int) widest)) {
-        shapes[count++] = slice_shape(widest);
+    if (span_of((int) fewest, slices) == span_of((int) widest, slices)) {
+        shapes[count++] = slice_shape(widest, slices);
     } else {
-        for (int splits = least_splits(fewest); splits <= z; ++splits) shapes[count++] = {splits, 1.};
+        for (int splits = least_splits(fewest, slices); splits <= z; ++splits) shapes[count++] = {splits, 1.};
     }
     constexpr double kEps = 1e-6;
     double base[kMaxSplits];
@@ -1908,24 +1933,26 @@ int mma_shards(int z, int64_t fewest, int64_t widest, int blocks_per_shard, int 
 
 // mma_shards for a launch: computed once per distinct input and then only looked up. Rows of one slice size are keyed by
 // the widest row, a range across slice sizes by its fewest slice count (with z, the shapes it spans).
-int mma_shards_cached(int z, int64_t fewest, int64_t widest, int blocks_per_shard, int slots, int previous) {
+int mma_shards_cached(int z, int64_t fewest, int64_t widest, int blocks_per_shard, int slots, int previous, int slices) {
     struct Entry {
-        int z, blocks, slots, previous;
+        int z, blocks, slots, previous, slices;
         int64_t shape;
         int shards;
     };
     static std::mutex lock;
     static Entry entries[64];
     static int used = 0, next = 0;
-    const int64_t shape = span_of((int) fewest) == span_of((int) widest) ? widest : -(int64_t) least_splits(fewest);
+    const int64_t shape =
+        span_of((int) fewest, slices) == span_of((int) widest, slices) ? widest : -(int64_t) least_splits(fewest, slices);
     std::lock_guard<std::mutex> hold(lock);
     for (int i = 0; i < used; ++i) {
         const Entry& e = entries[i];
-        if (e.z == z && e.blocks == blocks_per_shard && e.slots == slots && e.previous == previous && e.shape == shape)
+        if (e.z == z && e.blocks == blocks_per_shard && e.slots == slots && e.previous == previous && e.slices == slices &&
+            e.shape == shape)
             return e.shards;
     }
-    const int shards = mma_shards(z, fewest, widest, blocks_per_shard, slots, previous);
-    entries[next] = {z, blocks_per_shard, slots, previous, shape, shards};
+    const int shards = mma_shards(z, fewest, widest, blocks_per_shard, slots, previous, slices);
+    entries[next] = {z, blocks_per_shard, slots, previous, slices, shape, shards};
     next = (next + 1) % 64;
     used = std::max(used, next == 0 ? 64 : next);
     return shards;
@@ -1947,15 +1974,15 @@ void launch_mma(const AttnArgs& a, int rows, int min_keys, int64_t max_keys, int
     while (previous % 2 == 0 && previous / 2 * blocks_per_shard >= wave_floor) previous /= 2;
     const int64_t fewest = std::min(max_keys, std::max({a.min_full_keys, (int64_t) min_keys, (int64_t) 1}));
     const int shards = shard_count > 0 ? std::min(shard_count, z) : shard_rule == Int8MmaShards::Previous ? previous :
-                       mma_shards_cached(z, fewest, max_keys, blocks_per_shard, slots, previous);
+                       mma_shards_cached(z, fewest, max_keys, blocks_per_shard, slots, previous, device.slices);
     if (info) {
-        const SliceShape widest = slice_shape(max_keys);
+        const SliceShape widest = slice_shape(max_keys, device.slices);
         *info = {plan.shared, plan.stages, plan.resident, plan.ping_pong, shards, shards * blocks_per_shard, slots,
                  std::min(shards, widest.splits) * blocks_per_shard, mma_makespan(shards, widest, blocks_per_shard, slots)};
     }
     const auto& pdl = bk::pdl_state();
     const int prime_span = Narrow && !Direct && pdl.on && pdl.plain == 0 && a.seg.at.n == 0 && a.seg.at_d == nullptr &&
-                           a.min_full_keys >= min_keys && max_keys <= a.cap ? span_of((int) a.min_full_keys) : 0;
+                           a.min_full_keys >= min_keys && max_keys <= a.cap ? span_of((int) a.min_full_keys, device.slices) : 0;
     if (info) info->prime_span = prime_span;
     const dim3 grid(segments, kKvHeads, shards);
     bk::launch_pdl(attn_mma_split_kernel<Slabs, Narrow, Direct, Registers>, grid, dim3(kWarps * 32), plan.shared, stream,
@@ -1978,7 +2005,7 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
                                     int shard_count = 0) {
     if (rows <= 0) return true;
     cudaStream_t s = (cudaStream_t) stream;
-    const int z = launch_splits(max_keys);
+    const int z = launch_splits(max_keys, a.int8 ? mma_device(opt_in_device()).slices : kMaxSplits);
     float* part_ml = static_cast<float*>(scratch);
     float* part_acc = part_ml + (size_t) rows * kHeads * z * 2;
     static bool attr[kOptInDevices] = {};   // the opt-in is per device: a layer split launches these on two cards
@@ -2118,6 +2145,17 @@ bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, v
 
 int attention_decode_int8_test_min_keys() { return kMmaMinKeys; }
 
+int attention_decode_int8_slices() { return mma_device(opt_in_device()).slices; }
+
+void attention_decode_int8_test_set_slices(int slices) {
+    if (slices < kWindowMmaSplits || slices > kMaxSplits) throw std::invalid_argument("inkling2: test slice count out of range");
+    const int dev = opt_in_device();
+    (void) mma_device(dev);   // probed first, so the probe does not reset the count
+    MmaDevice& d = mma_devices[dev];
+    d.slices = slices;
+    check_mma_probe(cudaMemcpyToSymbol(c_slices, &d.slices, sizeof(int)));
+}
+
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
     const int fused_splits = (int) std::max<int64_t>(1, (max_keys + kUnit - 1) / kUnit);
@@ -2132,6 +2170,7 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
     // while the products' small blocks still fit beside one; 3 rows, two blocks an SM, so the 3 x 8 x 8 blocks take one wave
     static size_t smem_of[kOptInDevices] = {};   // per device, as above
     const int dev = opt_in_device();
+    (void) mma_device(dev);   // the card's slice count
     size_t& smem = smem_of[dev];
     if (!smem) {
         int per_sm = 0, reserved = 0;

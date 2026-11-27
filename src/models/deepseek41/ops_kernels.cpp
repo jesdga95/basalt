@@ -750,7 +750,7 @@ public:
             }
         core::ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
-        const int n_fetched = tier_->fetch(il, lk);
+        const int n_fetched = tier_->fetch(il, lk, use);
         // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
         // experts it fetched over its own link are planned beside the ones it holds
         if (peer) {

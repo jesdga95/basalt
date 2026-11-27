@@ -719,6 +719,43 @@ class Qwen35RefusalTest(unittest.TestCase):
                           VOCAB, None, 0))
             self.assertIsInstance(bad, str)
 
+    def test_bf16_mlp_weight_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            fx = Fixture(d)
+            k = "model.language_model.layers.0.mlp.gate_proj.weight"
+            base = k[:-len(".weight")]
+            for side in (".weight_scale", ".weight_scale_2", ".input_scale"):
+                fx.tens.pop(base + side, None)
+            fx.bf(k, (FF, H))
+            write_safetensors(d / "model-00001-of-00001.safetensors", fx.tens)
+            with self.assertRaisesRegex(S.ConvertError, "NVFP4 codes are U8"):
+                Q.Plan(C.Checkpoint(d))
+
+    def test_scalar_base_model_and_single_nvfp4_decode(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            d = t / "ck"
+            d.mkdir()
+            Fixture(d, ct=True)
+            # Scalar YAML base_model (not a list) must resolve to repo name, not its first letter "Q".
+            (d / "README.md").write_text("---\nlicense: apache-2.0\nbase_model: Qwen/Qwen3.8-27B\n---\n")
+            out = t / "scalar.basalt"
+            r = subprocess.run([sys.executable, str(HERE / "convert.py"), "--checkpoint", str(d), "--out", str(out),
+                                "--workers", "2"], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            meta = json.loads(ModelFile(str(out)).read("meta"))
+            self.assertEqual(meta["name"], "Qwen3.8-27B NVFP4")
+
+            # float_bytes() on packed NVFP4 BF16 target (in_proj_a) must decode nvfp4_values only once.
+            plan = Q.Plan(C.Checkpoint(d))
+            orig = plan.nvfp4_values
+            with mock.patch.object(plan, "nvfp4_values", side_effect=orig) as spy:
+                got = plan.float_bytes("blk.0.ssm_alpha.weight")
+            self.assertEqual(spy.call_count, 1)
+            self.assertEqual(got, Q.bf16_round(orig("blk.0.ssm_alpha.weight", reorder=True)).tobytes())
+
 
 if __name__ == "__main__":
     unittest.main()

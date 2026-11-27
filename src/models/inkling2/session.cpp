@@ -55,6 +55,15 @@ namespace {
 
 namespace bk = basalt::kernels;
 
+// A card with less L2 than this loses more to the guessed experts' prefetch (it evicts the core layers' attention and
+// projection working set from L2) than the prefetch saves; such a card leaves the guess out.
+constexpr int kGuessPrefetchMinL2 = 64 << 20;
+
+bool guess_prefetch_fits(int device) {
+    int l2 = 0;
+    return cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) == cudaSuccess && l2 >= kGuessPrefetchMinL2;
+}
+
 constexpr int kWindowRows = kDecodeRows; // rows of one conversation's window (also its ring margin and logits buffer)
 constexpr int kMaxRows = kBatchRows;     // widest batched forward call across conversations
 constexpr int kChunkRead = 16;           // a longer read runs on the prompt path, a shorter one as decode windows
@@ -226,6 +235,7 @@ struct Lane {
     unsigned long long* rec_blobs = nullptr;    // [visit][kAheadExperts] the experts each visit took in the last window
     int32_t* rec_n = nullptr;                   // [visit] how many
     bool ra_on = false, pf_on = false;
+    bool guess_pf = false;                      // the card guesses the next visit's experts into L2 (guess_prefetch_fits)
     int32_t* win_ids = nullptr;                 // [visit][kMaxRows][n_used] the last window's routed ids (with copies)
 };
 
@@ -300,6 +310,7 @@ public:
         if (m_.cards() > 1) {
             Lane& k = lane_[1];
             k.device = m_.card_device(1);
+            k.guess_pf = guess_prefetch_fits(k.device);
             cudaSetDevice(k.device);
             bool sok = cudaStreamCreateWithFlags(&k.stream, cudaStreamNonBlocking) == cudaSuccess &&
                        cudaStreamCreateWithFlags(&k.ra_st, cudaStreamNonBlocking) == cudaSuccess &&
@@ -432,6 +443,7 @@ public:
         lane_[0] = Lane{m_.device(), &sh_->x, stream_, ra_st_, pf_st_, ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_, hand0_, ex_tally_,
                         rec_blobs_, rec_n_};
         lane_[0].win_ids = win_ids_;
+        lane_[0].guess_pf = guess_prefetch_fits(lane_[0].device);
         lane_[1].x = &sh_->x1;
         for (const VisitCache& c : vc_) {
             if (slot_card_[(size_t) (&c - vc_.data())] != 0) continue;
@@ -448,7 +460,7 @@ public:
             return false;
         }
         if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(call_rows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
-                          elastic_.empty() ? 0 : core::kElasticKvBase, err))
+                          elastic_.empty() ? 0 : core::kElasticKvBase, m_.cache_int8(), err))
             return false;
         count_backed();
         if (heat_tally_) sh_->heat_sessions.push_back(this);
@@ -639,7 +651,7 @@ public:
         for (int t0 = 0; t0 < r.n_tokens; t0 += kWindowRows) {
             if (r.stop && r.stop()) break;
             const int n = std::min(kWindowRows, r.n_tokens - t0);
-            if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, 0, err)) return {model::Status::Error, "inkling2: " + err};
+            if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, 0, err, false)) return {model::Status::Error, "inkling2: " + err};
             if (heat_tally_) fold_rows(n);
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
             if (r.progress && ((t0 / kWindowRows) % 64 == 63 || t0 + n == r.n_tokens)) {
@@ -1071,6 +1083,9 @@ public:
         if (save && (int64_t) hist_.size() - pos > kWindowRows)
             return {model::Status::Error, "inkling2: the rings have moved on more than " + std::to_string(kWindowRows) + " positions past the checkpoint"};
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "inkling2: a checkpoint past the session's position"};
+        st.head.clear();
+        st.regions.clear();
+        st.peer_regions.clear();
         const size_t kv_ring = (size_t) kConvRing * kKvHeads * kHeadDim * 4, e_ring = (size_t) kConvRing * g_.n_embd * 4;
         for (size_t i = 0; i < vc_.size(); ++i) {   // the second card's visits go with its stream
             const VisitCache& c = vc_[i];
@@ -1084,7 +1099,7 @@ public:
             to.push_back({c.a_ring, e_ring});
             to.push_back({c.m_ring, e_ring});
         }
-        dspark_.running_regions(st);   // DSPARK HOOK
+        dspark_.running_state(pos, save, st);   // DSPARK HOOK
         st.stream = stream_;
         if (lane_[1].stream) {
             st.peer_stream = lane_[1].stream;
@@ -1093,7 +1108,9 @@ public:
         return {};
     }
 
-    model::Result running_restored(int64_t pos, const uint8_t*) override {
+    model::Result running_restored(int64_t pos, const uint8_t* head) override {
+        if (!dspark_.running_restored(pos, head))
+            return {model::Status::Error, "inkling2: restoring the drafter's state failed"};
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         stale_ = false;   // the rings are the checkpoint's again
         return {};
@@ -1160,6 +1177,7 @@ public:
         }
         if (dspark_.on() && !dspark_.restore_cells(kv, i, positions, stream_))   // DSPARK HOOK
             return {model::Status::Error, "inkling2: a parked conversation has no drafter cells"};
+        if (i != kv.size()) return {model::Status::Error, "inkling2: a parked conversation has other caches"};
         return {};
     }
 
@@ -1330,7 +1348,7 @@ private:
         // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
         const bool guess = rows <= kGuessRows;
-        const bool has_prev_guess = guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card;
+        const bool has_prev_guess = guess && k.guess_pf && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card;
         // On deep full-attention visits (>= 16K keys = 32..535 MB KV), prefetching before attention_window both contends
         // with attn_mma_kernel on SMs/DRAM and gets evicted from L2 by the KV sweep; deferring past attention_window lands
         // the guessed experts into L2 during o_proj + post_attn + router right before MoE reads them.
@@ -1439,13 +1457,18 @@ private:
             controllers(ca, 1, rows, k.stream);
         }
         // the experts
+        const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
+        if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
+            fork_open_ = true;
+            sh_->cpu->rows(l, rows, nrm, k.stream);   // quantized on the host while the router chooses
+        }
         bk::RouterArgs ra;
         ra.n_expert = g_.n_expert;
         ra.n_embd = E;
         ra.k = g_.n_used;
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
-        const bool guess_next = guess && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card;
+        const bool guess_next = guess && k.guess_pf && vi + 1 < (int) g_.visits.size() && m_.card_of(g_.visits[(size_t) vi + 1].layer) == card;
         if (guess_next) cudaEventRecord(k.ra_ev, k.stream);   // the MLP input is in
         // the routed ids: a visit's own slot when the session ranks its copies by kept rows (decode_kept), else the scratch
         int32_t* const ids = k.win_ids ? k.win_ids + (size_t) vi * sh_->max_rows * g_.n_used : x.ids_;
@@ -1471,11 +1494,7 @@ private:
             moe_plan(ids, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                      k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
         }
-        const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
-        if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
-            fork_open_ = true;
-            sh_->cpu->start(l, rows, nrm, ids, k.stream);
-        }
+        if (on_cpu) sh_->cpu->start(l, rows, ids, k.stream);
         bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
         L.gate_softcap = g_.gate_softcap;
         L.up_softcap = g_.up_softcap;
@@ -1519,14 +1538,16 @@ private:
 
     // The forward of `rows` rows at positions pos0.. (tokens, or host embedding rows when `emb` is set, which must stay
     // as they are until the window's sync); then the head over the last `head` rows (0: none).
-    bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err) {
+    // `graphed` false: the window runs direct, with no graph captured for its shape (a prompt's read, whose shapes the decode
+    // never takes, would fill the card's spare with graphs).
+    bool forward(const int32_t* tokens, const float* emb, int rows, int64_t pos0, int head, std::string& err, bool graphed = true) {
         if (sh_->cpu && sh_->cpu->stopped()) {
             err = "the CPU experts were stopped";
             return false;
         }
         cpu_ = cpu_layers();
         if (cpu_) sh_->cpu->wake();
-        if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err) || !check(err)) return false;
+        if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err, graphed) || !check(err)) return false;
         dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
         return true;
     }
@@ -1586,8 +1607,13 @@ private:
 
     // The layers and the head of a window of `rows` rows: replayed from its shape's graph, captured on the shape's second
     // window (its first runs direct, outside a capture).
-    bool layers(int rows, int head, int64_t full_keys, std::string& err) {
+    bool layers(int rows, int head, int64_t full_keys, std::string& err, bool graphed = true) {
         if (!drop_stale_read_ahead(err)) return false;
+        if (!graphed) {
+            window_cold_ = true;
+            body(rows, head, full_keys);
+            return true;
+        }
         const Shape key{cpu_, ((uint64_t) full_keys << 16) | ((uint64_t) head << 8) | (uint64_t) rows};
         auto it = graphs_.find(key);
         if (it != graphs_.end()) {

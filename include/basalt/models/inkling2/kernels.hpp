@@ -152,7 +152,7 @@ size_t attention_decode_scratch(int rows, int64_t max_keys);
 /// sizes the launch only: a row's keys split in slices fixed by its own key count). `out` may be null when q8 is set.
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream);
 
-/// Initialize the INT8 MMA plans for the current device during model load.
+/// Initialize the INT8 MMA plans and the INT8 slice count for the current device during model load.
 void attention_decode_int8_init();
 
 /// RegisterRing, RegisterPingPong: a window's tiles staged through registers, without and with a second V tile; SharedRing:
@@ -178,6 +178,11 @@ bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, v
                                 bool mma, Int8MmaPlan plan = Int8MmaPlan::Auto, Int8MmaPlanInfo* info = nullptr,
                                 Int8MmaShards shards = Int8MmaShards::Auto, int shard_count = 0);
 int attention_decode_int8_test_min_keys();
+/// The current device's INT8 slice count: the most slices a full-cache INT8 row takes (FP16 and E4M3 rows take 64).
+int attention_decode_int8_slices();
+/// Parity only: set the current device's INT8 slice count, within the rule's range. Call it only with no attention work in
+/// flight on the device and no captured graph that will replay, and set the card's own count back before serving.
+void attention_decode_int8_test_set_slices(int slices);
 
 /// out[r] = attn[r] * sigmoid(yq[r][kOffGate..]), the attention output gated by its own row's gate projection.
 void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream, int64_t yq_ld = kProjQ);
@@ -192,22 +197,36 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
-/// Doorbell words in mapped host memory, accessed atomically at system scope. The ring's release publishes the choices,
-/// RAM rows and nonzero visit ticket. The host acquires the ring, takes the ticket, clears the ring and computes its rows.
-/// Its release store to `done` publishes those rows with that ticket. The merge acquires only a completion for its visit.
-/// `abort` is sticky: a RAM visit that observes it does not publish, and waiting merges check it periodically.
+/// Doorbell words in mapped host memory, accessed atomically at system scope. The rows' release publishes a visit's MLP
+/// input rows and their shape under a nonzero publication number, so the host can quantize them before the choices come;
+/// `rows_ack` (the host's release, after its last read of them) hands the buffer back, and the next publication waits for
+/// it. The ring's release publishes the choices, the nonzero visit ticket and the publication its rows came in. The host
+/// acquires the ring, takes the ticket, clears the ring and computes its rows. Its release store to `done` publishes those
+/// rows with that ticket. The merge acquires only a completion for its visit. `abort` is sticky: a visit that observes it
+/// does not publish, and waiting merges and publications check it periodically.
 struct CpuBell {
     alignas(64) uint32_t ring;
     uint32_t ticket;
+    uint32_t ring_rows;
     alignas(64) uint32_t done;
     uint32_t abort;
+    uint32_t rows_ack;
+    alignas(64) uint32_t rows;
+    uint32_t rows_shape;
 };
 
-/// Each visit with a RAM pair advances the device word `seq` (initialized to zero), even after an abort. A live RAM visit
-/// publishes its choices to ids_m, its RAM rows to x_m, and its ticket before raising `ring` with `layer` and `rows`.
-/// A visit with no RAM pair touches neither `seq` nor mapped host memory. rows <= kDecodeRows, rows * k <= 1024.
-void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
-                  int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream);
+/// Every visit with experts in RAM, before its moe_cpu_ring on the same stream: the next publication number from seq[1],
+/// a wait for the host's acknowledgement of the one before, its `rows` MLP input rows `x` into x_m, then `rows_shape`
+/// (the ring's encoding of `layer` and `rows`) and `rows` raised to that number. Nothing when abort is seen.
+/// rows <= kBatchRows.
+void moe_cpu_rows(const float* x, int rows, int layer, float* x_m, CpuBell* bell, uint32_t* seq, void* stream);
+
+/// `seq`: two device words, initialized to zero: seq[0] the ring's tickets, seq[1] moe_cpu_rows' publications. Each visit
+/// with a RAM pair advances seq[0], even after an abort. A live RAM visit publishes its choices to ids_m, its ticket and
+/// its rows' publication (seq[1]; its moe_cpu_rows comes first on the stream) before raising `ring` with `layer` and
+/// `rows`. A visit with no RAM pair touches neither seq[0] nor mapped host memory. rows <= kDecodeRows, rows * k <= 1024.
+void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, int layer, int32_t* ids_m, CpuBell* bell,
+                  uint32_t* seq, void* stream);
 
 /// The CPU's rows of a window's experts (cpu_experts.hpp): pair p = r * k + slot whose expert is not on the card (blobs[e]
 /// 0) takes row p of `cpu` (mapped host memory, the pool's output) into row p of `output`, and adds its lookup to tally[e]

@@ -25,7 +25,7 @@ class PageContract(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = MockEngine(tok, "Hi.")
-        self.engine.conversation = {"parked": 2, "bytes": 5, "evictions": 1, "restored": 9, "restored_ms": 1.5}
+        self.engine.conversation = {"parked": 2, "bytes": 5, "evictions": 1, "refused": 3, "restored": 9, "restored_ms": 1.5}
         self.svc = Service(self.engine, tok, ChatTemplate.from_file(TEMPLATE))
         self.m = self.svc.metrics()
 

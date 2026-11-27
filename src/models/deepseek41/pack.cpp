@@ -188,7 +188,7 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         const size_t want = engram_row_bytes(e.type, e.row_values);   // the whole row: blocks of 32 values, or of 256
         if (want == 0 || e.row_bytes != (uint32_t) want) {
             err = path + ": the Engram rows are type " + std::to_string(e.type) + " of " + std::to_string(e.row_bytes) +
-                  " bytes; IQ4_NL, Q5_K and MXFP4 rows are read";
+                  " bytes; IQ4_NL, Q5_K, Q6_K, MXFP4 and MXFP8 rows are read";
             return false;
         }
         for (double d : numbers(ej->get("ple.layers"))) e.layers.push_back((int) d);

@@ -2,9 +2,16 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
+namespace basalt::model {
+class ModelAdapter;
+}
+
 namespace basalt::models::inkling2 {
+
+std::unique_ptr<model::ModelAdapter> make_adapter();
 
 /// The inkling2 pre-tokenizer (OpenAI's o200k split): `ends` gets where each piece of the text ends.
 void pretok_inkling2(const char* text, size_t size, std::vector<size_t>& ends);

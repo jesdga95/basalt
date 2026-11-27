@@ -170,6 +170,20 @@ class Ranges(FetchCase):
         self.assertEqual(M.verify(str(self.out)), ["mtp.a"])
         self.assertEqual(M.verify(str(self.out / "nothing")), [])
 
+    def test_only_preserves_existing_manifest_entries(self):
+        mirror = Mirror()
+        with mock.patch.object(M.urllib.request, "urlopen", mirror), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            M.fetch(str(self.out), "mtp.a")
+            M.fetch(str(self.out), "mtp.b")
+        manifest = json.loads((self.out / "mtp-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual({r["name"]: r["sha256"] for r in manifest}, HASHES)
+        with mock.patch.object(M.urllib.request, "urlopen", mirror), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            M.fetch(str(self.out), "mtp.a")
+        manifest2 = json.loads((self.out / "mtp-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual({r["name"]: r["sha256"] for r in manifest2}, HASHES)
+
 
 class Pinned(unittest.TestCase):
     def test_every_tensor_has_a_hash(self):

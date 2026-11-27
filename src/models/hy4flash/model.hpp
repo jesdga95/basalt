@@ -108,7 +108,7 @@ private:
     int64_t ctx_ = kDefaultContext;
 };
 
-/// A session over `model`; null with `err` set.
-std::unique_ptr<model::ModelSession> make_session(Hy4Model& model, std::string& err);
+/// A session over `model`; null with `err` set. `secondary` starts dormant (0 physical VRAM for rings/KV/drafter until used).
+std::unique_ptr<model::ModelSession> make_session(Hy4Model& model, std::string& err, bool secondary = false);
 
 }  // namespace basalt::models::hy4flash

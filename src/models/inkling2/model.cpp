@@ -410,7 +410,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = spare_base > vision_modules ? spare_base - vision_modules : 0;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
+            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c, int8_) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
@@ -421,7 +421,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 size_t fb = 0, tb = 0;
                 basalt::core::gpu_mem_info(&fb, &tb);
                 const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) +
-                                       (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
+                                       (c == 0 && dspark_ ? dspark_session_bytes(pack_, want, int8_) : 0)) * n_sess +
                                       (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
                 if (need > fb) {
                     cudaSetDevice(device_);

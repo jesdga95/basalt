@@ -28,7 +28,7 @@ converter.
 | Norms, attention-residual queries, router, biases, convolution taps, relative tables, clip scales | F32 | as stored |
 | Loop controllers | BF16 | as stored |
 | Vision encoder and projector | BF16 | as stored |
-| DSpark drafter | BF16 in the file; projections rounded to Q8_0 as they load | drafting only: cannot change output |
+| DSpark drafter | BF16 in the file; projections rounded to Q8_0 as they load; its full layer's K/V fp16, int8 with `--kv int8` (the target's int8 quantization rule, its own dense layout), its window layers' rings fp16 | drafting only; the target verifies every token. Its cache size feeds the expert placement ([Drafting](#drafting)) |
 
 The release marks NVFP4 activation quantization as required (its own serving runs W4A4); transformers and llama.cpp run
 dequantized weights, and so does the reference.
@@ -68,10 +68,18 @@ as fast as through MMQ.
   numerator drops that scale before the split merge, while the softmax denominator sums the unscaled fp32 probabilities. A
   row's arithmetic is the same alone and in a verify window at the same key count, but not bit-identical to the scalar
   reader, which shallower rows and the sliding-window layers keep.
+- **Slices:** both INT8 readers split a full-cache row's keys into slices of whole 128-key passes, sized by the row's own
+  key count, and merge them in fp32 in slice order. The most slices an INT8 row takes follows the card's multiprocessor
+  count (the count whose launches end in whole waves, 63 on an 84-SM card, logged at load as `attention slices`). A row
+  of more than 128 keys a slice at that count can take larger slices than at 64: at 63, exactly the rows that would take
+  64 slices; at a smaller count, more rows. Moving the slice boundaries changes the fp32 merge order and, in the
+  tensor-core reader, the running maximum a tile's probabilities are taken against before they round to fp16, so such a
+  row can round differently from a card with another count. On one card, a row's bits do not depend on its window. FP16
+  and FP8 caches take at most 64 slices on every card.
 
 ### Cost of the tensor-core INT8 reader
 
-The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16`, `--kv fp8` and shallower INT8 rows run the scalar reader unchanged.
+The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16` and `--kv fp8` keep their own tensor-core reader and shallower INT8 rows the scalar reader, unchanged.
 
 Two measurements against the scalar INT8 reader of the same build, with the same weights and forced tokens (and the same expert placement, except where a row says otherwise).
 
@@ -208,9 +216,18 @@ The previous INT8 row-writer parity matched the CPU reference for 257 rows of wi
 
 ## Drafting
 
-The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output
-with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
-2,405-token prompt checked).
+The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. In the checks
+run with the drafter's K/V in fp16 (prose, struct and conversation, after short and 16K-token prompts, and a 2,405-token
+prompt), greedy output with drafting equalled plain greedy output: an observation for those configurations, not a
+guarantee.
+
+With `--kv int8` the drafter's full layer keeps its K/V in int8 too (2.06 KiB a position instead of 4 KiB). That changes
+which tokens it drafts, and the VRAM it frees goes to experts, so the expert placement moves (at `--max-context 262144` on a
+16 GB card, 2,124 experts in RAM instead of 2,236). The target still verifies every token, but served output is not that of
+an fp16 drafter: greedy decodes after 32K and 131K prompts part from the fp16 drafter's at tokens 71 and 40, and the BF16
+gate over 20 chunks moves mean KLD 0.00300 -> 0.00357 (+0.00056 +/- 0.00039), PPL +0.05% and top-1 +0.02 points, with 5
+rows carrying almost all of the KLD change. These runs differ in placement and drafter cache at once, so they do not say
+which of the two moves the output.
 
 The prompt attention and the FP4 experts round a row the same at any chunk width (the parity test checks both, the experts
 in an 8,192-row chunk against a 256-row one); Q8_0 experts through MMQ do not, since MMQ splits K by the chunk. The
