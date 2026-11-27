@@ -3,6 +3,7 @@
 
 #include "basalt/kernels/head_proxy.cuh"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -160,11 +161,19 @@ __global__ void __launch_bounds__(kThreads) block_inputs_kernel(const uint16_t* 
 constexpr int kStepWarps = 32;                     // a warp per recurrence index
 constexpr int kStepBlocks = kDsRank / kStepWarps;  // 8
 
+struct Q81 {
+    half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q81) == 36, "ggml's block_q8_1");
+
 // Block b: recurrence indices 32 b .. 32 b + 31, each with its gate, candidate and latent rows.
+// When lat_q8 != nullptr, also quantizes this block's 32 latent values directly into Q81 block b (matching native_quantize_q8_1).
 __device__ __forceinline__ void markov_step_stage(int b, const float* __restrict__ ctx_h, const float* __restrict__ ctx_f,
                                                   const float* __restrict__ bias, const uint16_t* __restrict__ w_sp,
                                                   const uint16_t* __restrict__ w1_row, const float* __restrict__ state_in,
-                                                  float* __restrict__ state_out, float* __restrict__ latent, float* xs) {
+                                                  float* __restrict__ state_out, float* __restrict__ latent, float* xs,
+                                                  Q81* __restrict__ lat_q8, float* s_lat) {
     for (int i = threadIdx.x; i < 2 * kDsRank; i += kStepWarps * 32)
         xs[i] = i < kDsRank ? state_in[i] : bf16f(w1_row[i - kDsRank]);
     __syncthreads();
@@ -186,7 +195,20 @@ __device__ __forceinline__ void markov_step_stage(int b, const float* __restrict
     if (lane == 0) {
         const float gate = 1.f / (1.f + expf(-raw[0]));
         state_out[j] = gate * xs[j] + (1.f - gate) * tanhf(raw[1]);
-        latent[j] = tanhf(raw[2]);
+        const float lv = tanhf(raw[2]);
+        if (latent) latent[j] = lv;
+        if (lat_q8) s_lat[w] = lv;
+    }
+    if (lat_q8) {
+        __syncthreads();
+        if (w == 0) {
+            const float xi = s_lat[lane];
+            const float amax = warp_max(fabsf(xi));
+            const float sum = warp_sum(xi);
+            const float d = basalt::kernels::q8_1_finite(amax / 127.0f);
+            lat_q8[b].qs[lane] = basalt::kernels::q8_1_quant(xi, d, amax);
+            if (lane == 0) lat_q8[b].ds = basalt::kernels::q8_1_ds(d, sum);
+        }
     }
 }
 
@@ -194,9 +216,10 @@ __global__ void __launch_bounds__(kStepWarps * 32) markov_step_kernel(const floa
                                                                       const float* __restrict__ bias, const uint16_t* __restrict__ w_sp,
                                                                       const uint16_t* __restrict__ w1_row,
                                                                       const float* __restrict__ state_in, float* __restrict__ state_out,
-                                                                      float* __restrict__ latent) {
+                                                                      float* __restrict__ latent, Q81* __restrict__ lat_q8) {
     __shared__ float xs[2 * kDsRank];
-    markov_step_stage((int) blockIdx.x, ctx_h, ctx_f, bias, w_sp, w1_row, state_in, state_out, latent, xs);
+    __shared__ float s_lat[32];
+    markov_step_stage((int) blockIdx.x, ctx_h, ctx_f, bias, w_sp, w1_row, state_in, state_out, latent, xs, lat_q8, s_lat);
 }
 
 // ---- the head, screened ------------------------------------------------------------------------------------------------
@@ -217,12 +240,6 @@ constexpr int kHeadNb = kWidth / 32;    // 72 q8_1 blocks of a row
 constexpr int kFoldNb = kDsRank / 32;   // 8
 constexpr int kFoldRow = kFoldNb * kQ8Block;
 constexpr int kTilesPerBlock = 4;       // the fold pass: a warp per tile of 32 rows
-
-struct Q81 {
-    half2 ds;
-    int8_t qs[32];
-};
-static_assert(sizeof(Q81) == 36, "ggml's block_q8_1");
 
 __device__ __forceinline__ float capf(float x, float cap) { return cap * tanhf(x / cap); }
 
@@ -268,13 +285,52 @@ __device__ __forceinline__ float q8p_dot(const void* __restrict__ planes, int64_
     return warp_sum(s);
 }
 
-// Row v's exact logit (every lane gets it).
+// Row v's exact logit (every lane gets it). When h.fold == nullptr, xh holds the combined vector h + out_w * lat + out_b.
 __device__ __forceinline__ float exact_logit(const DsHead& h, int64_t v, const Q81* xh, const Q81* xl, int lane) {
     const float a = h.head_planes
                         ? q8p_dot(h.head, h.n_vocab, v, xh, kHeadNb, lane)
                         : q80_dot(static_cast<const uint8_t*>(h.head) + v * kQ8Row, xh, kHeadNb, lane);
+    if (!h.fold) return capf(a, h.cap);
     const float b = q80_dot(static_cast<const uint8_t*>(h.fold) + v * kFoldRow, xl, kFoldNb, lane);
     return capf(a + b + h.fold_b[v], h.cap);
+}
+
+// Combines hd_row[e] + out_b[e] + sum_k out_w[e][k] * latent[k] and quantizes directly into Q8_1 block blockIdx.x.
+// Grid: (kHeadNb, count), Block: 256 threads (8 warps; each warp handles 4 consecutive rows with 1 coalesced uint4/lane).
+__global__ void __launch_bounds__(256) combine_h_kernel(const float* __restrict__ hd, const float* __restrict__ latent,
+                                                        const uint16_t* __restrict__ out_w, const float* __restrict__ out_b,
+                                                        int step_i, int n_max, Q81* __restrict__ h_eff_q8) {
+    __shared__ float s_lat[kDsRank];
+    __shared__ float s_val[32];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int blk = (int) blockIdx.x;
+    const int b = (int) blockIdx.y;
+    s_lat[tid] = latent[(int64_t) b * kDsRank + tid];
+    __syncthreads();
+    const float* hd_b = hd + ((int64_t) b * n_max + step_i) * kWidth;
+    const int e0 = blk * 32 + warp * 4;
+    const int k0 = lane * 8;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int e = e0 + j;
+        const uint4 w4 = reinterpret_cast<const uint4*>(out_w + (int64_t) e * kDsRank)[lane];
+        float acc = __uint_as_float(w4.x << 16) * s_lat[k0 + 0] + __uint_as_float(w4.x & 0xffff0000u) * s_lat[k0 + 1];
+        acc += __uint_as_float(w4.y << 16) * s_lat[k0 + 2] + __uint_as_float(w4.y & 0xffff0000u) * s_lat[k0 + 3];
+        acc += __uint_as_float(w4.z << 16) * s_lat[k0 + 4] + __uint_as_float(w4.z & 0xffff0000u) * s_lat[k0 + 5];
+        acc += __uint_as_float(w4.w << 16) * s_lat[k0 + 6] + __uint_as_float(w4.w & 0xffff0000u) * s_lat[k0 + 7];
+        const float dot = warp_sum(acc);
+        if (lane == 0) s_val[warp * 4 + j] = hd_b[e] + out_b[e] + dot;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float xi = s_val[lane];
+        const float amax = warp_max(fabsf(xi));
+        const float sum = warp_sum(xi);
+        const float d = basalt::kernels::q8_1_finite(amax / 127.0f);
+        Q81* dst = h_eff_q8 + (int64_t) b * kHeadNb + blk;
+        dst->qs[lane] = basalt::kernels::q8_1_quant(xi, d, amax);
+        if (lane == 0) dst->ds = basalt::kernels::q8_1_ds(d, sum);
+    }
 }
 
 // One thread per 32-weight group of a copy row: its token's group into the 2-bit copy (q80_screen.cu's packing).
@@ -421,10 +477,11 @@ __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_kernel(const ui
     }
 }
 
-// The activations of draft i's exact logits into shared memory: block row i + 1's q8_1 row and the latent's.
+// The activations of draft i's exact logits into shared memory: block row i + 1's q8_1 row (or combined h_eff), and the latent's when needed.
 __device__ __forceinline__ void exact_x(const Q81* __restrict__ xh_g, const Q81* __restrict__ xl_g, Q81* xh, Q81* xl, int tid,
                                         int nthreads) {
-    for (int k = tid; k < (kHeadNb + kFoldNb) * 9; k += nthreads) {   // nine words a block
+    const int n_blk = xl_g ? (kHeadNb + kFoldNb) : kHeadNb;
+    for (int k = tid; k < n_blk * 9; k += nthreads) {   // nine words a block
         const int b = k / 9, j = k % 9;
         const int* src = reinterpret_cast<const int*>(b < kHeadNb ? xh_g + b : xl_g + (b - kHeadNb));
         int* dst = reinterpret_cast<int*>(b < kHeadNb ? xh + b : xl + (b - kHeadNb));
@@ -499,7 +556,8 @@ __device__ __forceinline__ int collect_tiles(px::Final& f, int n_tiles, const fl
 
 // One block: the rows near the best approximate logit scored exactly (a warp per row); the exact best is draft i:
 // *prev = ids[i] = it, conf[i] = its probability (the tiles' softmax sums with the rescored rows made exact), w1_row = its
-// row of w1: each rescored row's is read (host memory) while the row is scored, the pick's then copied out.
+// single winning row of w1 (read once after the pick instead of over-reading all rescored rows from mapped host memory
+// over PCIe).
 constexpr int kW1Words = kDsRank * 2 / 16;   // uint4 of a w1 row: a lane each
 static_assert(kW1Words == 32, "a w1 row is a warp's uint4");
 __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __restrict__ xh_g, const Q81* __restrict__ xl_g,
@@ -509,7 +567,6 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
                                                          uint16_t* __restrict__ w1_row) {
     __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
     __shared__ px::Final f;
-    __shared__ uint4 wr[px::kMaxCand][kW1Words];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     pdl_wait();
     if (tid == 0) f.cnt = 0;
@@ -522,7 +579,6 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     }
     for (int c = warp; c < n; c += 16) {   // by token from here: the pick's tie goes to the lower token
         const int64_t tok = token_of(f.list[c], n_tiles);
-        wr[c][lane] = reinterpret_cast<const uint4*>(w1 + tok * kDsRank)[lane];
         const float y = exact_logit(h, tok, xh, xl, lane);
         if (lane == 0) {
             f.ex[c] = y;
@@ -534,8 +590,7 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     __syncthreads();
     const int pick = *prev;
     if (tid == 0) ids[i] = pick;
-    for (int c = warp; c < n; c += 16)
-        if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_row)[lane] = wr[c][lane];
+    if (warp == 0) reinterpret_cast<uint4*>(w1_row)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) pick * kDsRank)[lane];
 }
 
 // by_row[r] = by_token[token_of(r)] (0 past the vocabulary).
@@ -665,9 +720,9 @@ void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const f
 }
 
 void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1_row,
-                        const float* state_in, float* state_out, float* latent, void* stream) {
+                        const float* state_in, float* state_out, float* latent, void* stream, void* lat_q8) {
     markov_step_kernel<<<kStepBlocks, kStepWarps * 32, 0, (cudaStream_t) stream>>>(ctx_h, ctx_f, bias, w_sp, w1_row, state_in,
-                                                                                    state_out, latent);
+                                                                                    state_out, latent, static_cast<Q81*>(lat_q8));
     check("Markov step");
 }
 
@@ -706,8 +761,24 @@ void dspark_head_base(const DsHead& h, const void* hq, int rows, float* approx, 
     check("head base");
 }
 
+void dspark_combine_h(const float* hd_row, const float* latent, const uint16_t* out_w, const float* out_b,
+                      void* h_eff_q8, void* stream) {
+    combine_h_kernel<<<dim3(kHeadNb, 1), 256, 0, (cudaStream_t) stream>>>(
+        hd_row, latent, out_w, out_b, 0, 1, static_cast<Q81*>(h_eff_q8));
+    check("combine h");
+}
+
+void dspark_combine_h_batch(const float* hd, const float* latent, const uint16_t* out_w, const float* out_b,
+                            int step_i, int n_max, int count, void* h_eff_q8, void* stream) {
+    if (count <= 0) return;
+    combine_h_kernel<<<dim3(kHeadNb, (unsigned) count), 256, 0, (cudaStream_t) stream>>>(
+        hd, latent, out_w, out_b, step_i, n_max, static_cast<Q81*>(h_eff_q8));
+    check("combine h batch");
+}
+
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
-                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
+                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
+                      const void* h_eff_q) {
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
     float2* cand = (float2*) scratch;
@@ -716,14 +787,16 @@ void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const f
                (const uint4*) h.fold_sc, (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank),
                (const Q81*) latq, approx + (size_t) i * dspark_screen_rows(h.n_vocab), h.fold_bp, h.cap, h.n_vocab, tiles, cand,
                part);
-    launch_pdl(head_final_kernel, dim3(1), dim3(512), 0, s, h, (const Q81*) hq + (size_t) i * kHeadNb, (const Q81*) latq, tiles,
+    const Q81* xh_exact = (h_eff_q != nullptr) ? static_cast<const Q81*>(h_eff_q) : ((const Q81*) hq + (size_t) i * kHeadNb);
+    const Q81* xl_exact = h.fold ? (const Q81*) latq : nullptr;
+    launch_pdl(head_final_kernel, dim3(1), dim3(512), 0, s, h, xh_exact, xl_exact, tiles,
                (const float2*) cand, (const float2*) part, prev, ids, conf, i, w1, w1_row);
     check("head pick");
 }
 
 void dspark_head_exact(const DsHead& h, const void* hq, const void* latq, int i, float* logits, void* stream) {
     head_exact_kernel<<<(unsigned) ((h.n_vocab + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
-        h, (const Q81*) hq + (size_t) i * kHeadNb, (const Q81*) latq, logits);
+        h, (const Q81*) hq + (size_t) i * kHeadNb, h.fold ? (const Q81*) latq : nullptr, logits);
     check("head exact");
 }
 
@@ -903,14 +976,17 @@ __global__ void __launch_bounds__(kStepWarps * 32) markov_step_batch_kernel(cons
                                                                             const uint16_t* __restrict__ w_sp,
                                                                             const uint16_t* w1_row,
                                                                             float* state, int step_i,
-                                                                            int n_max, float* __restrict__ latent) {
+                                                                            int n_max, float* __restrict__ latent,
+                                                                            Q81* __restrict__ lat_q8) {
     pdl_wait();
     __shared__ float xs[2 * kDsRank];
+    __shared__ float s_lat[32];
     const int blk = (int) blockIdx.x, b = (int) blockIdx.y;
     const float* st_in = state + ((size_t) b * 2 + (step_i & 1)) * kDsRank;
     float* st_out = state + ((size_t) b * 2 + ((step_i + 1) & 1)) * kDsRank;
     markov_step_stage(blk, ctx_h + ((size_t) b * n_max + step_i) * kDsRnn, ctx_f + (size_t) b * kDsRnn, bias, w_sp,
-                      w1_row + (size_t) b * kDsRank, st_in, st_out, latent + (size_t) b * kDsRank, xs);
+                      w1_row + (size_t) b * kDsRank, st_in, st_out, latent ? latent + (size_t) b * kDsRank : nullptr, xs,
+                      lat_q8 ? lat_q8 + (size_t) b * kFoldNb : nullptr, s_lat);
 }
 
 __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(const uint4* __restrict__ wq,
@@ -977,16 +1053,16 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
                                                                size_t scratch_stride, int32_t* __restrict__ prev,
                                                                int32_t* __restrict__ ids, float* __restrict__ conf,
                                                                const uint16_t* __restrict__ w1,
-                                                               uint16_t* __restrict__ w1_row) {
+                                                               uint16_t* __restrict__ w1_row,
+                                                               const Q81* __restrict__ h_eff_step) {
     __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
     __shared__ px::Final f;
-    __shared__ uint4 wr[px::kMaxCand][kW1Words];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = (int) blockIdx.x;
     pdl_wait();
     pdl_launch_dependents();
     if (tid == 0) f.cnt = 0;
-    const Q81* xh_g = hq + ((size_t) b * n_max + step_i) * kHeadNb;
-    const Q81* xl_g = lat_step + (size_t) b * kFoldNb;
+    const Q81* xh_g = h_eff_step ? (h_eff_step + (size_t) b * kHeadNb) : (hq + ((size_t) b * n_max + step_i) * kHeadNb);
+    const Q81* xl_g = h.fold ? (lat_step + (size_t) b * kFoldNb) : nullptr;
     exact_x(xh_g, xl_g, xh, xl, tid, 512);
     const float2* cand = reinterpret_cast<const float2*>(scratch + (size_t) b * scratch_stride);
     const float2* part = cand + (size_t) n_tiles * px::kPer;
@@ -1002,7 +1078,6 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
     }
     for (int c = warp; c < n; c += 16) {
         const int64_t tok = token_of(f.list[c], n_tiles);
-        wr[c][lane] = reinterpret_cast<const uint4*>(w1 + tok * kDsRank)[lane];
         const float y = exact_logit(h, tok, xh, xl, lane);
         if (lane == 0) {
             f.ex[c] = y;
@@ -1014,8 +1089,7 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
     __syncthreads();
     const int pick = *prev_b;
     if (tid == 0) ids_b[step_i] = pick;
-    for (int c = warp; c < n; c += 16)
-        if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_b)[lane] = wr[c][lane];
+    if (warp == 0) reinterpret_cast<uint4*>(w1_b)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) pick * kDsRank)[lane];
 }
 
 }  // namespace
@@ -1073,16 +1147,17 @@ void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_ma
 
 void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
                               const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
-                              void* stream) {
+                              void* stream, void* lat_q8) {
     if (count <= 0) return;
     launch_pdl(markov_step_batch_kernel, dim3(kStepBlocks, (unsigned) count), dim3(kStepWarps * 32), 0, (cudaStream_t) stream,
-               ctx_h, ctx_f, bias, w_sp, w1_row, state, step_i, n_max, latent);
+               ctx_h, ctx_f, bias, w_sp, w1_row, state, step_i, n_max, latent, static_cast<Q81*>(lat_q8));
     check("Markov step batch");
 }
 
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
                             int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
-                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream) {
+                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
+                            const void* h_eff_q_step) {
     if (count <= 0) return;
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
@@ -1092,7 +1167,8 @@ void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_st
                (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank), (const Q81*) latq_step,
                approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad, (uint8_t*) scratch, scratch_stride);
     launch_pdl(head_final_batch_kernel, dim3((unsigned) count), dim3(512), 0, s, h, (const Q81*) hq, (const Q81*) latq_step,
-               tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row);
+               tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row,
+               static_cast<const Q81*>(h_eff_q_step));
     check("head pick batch");
 }
 

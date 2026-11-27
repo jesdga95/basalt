@@ -66,8 +66,8 @@ struct DsparkLayer {
     void *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;            ///< NVFP4 planes (Q8_0 until finish())
     void *gate = nullptr, *up = nullptr, *down = nullptr;                        ///< NVFP4 planes (Q8_0 until finish())
     float* fp4_scale = nullptr;                                                  ///< the planes' FP32 scales [7]: q k v o gate up down
-    void *k_ctx = nullptr, *v_ctx = nullptr;                                     ///< Q8_0 (prompt MMQ)
-    void *k_ctx_p = nullptr, *v_ctx_p = nullptr;                                 ///< Q8 planes (1..32-row decode commit)
+    void *k_ctx_p = nullptr, *v_ctx_p = nullptr;                                 ///< Q8 planes (decode commit & prefill::q8)
+    uint16_t *k_ctx_sc_t = nullptr, *v_ctx_sc_t = nullptr;                       ///< transposed fp16 scales for prefill::q8
     float *attn_norm = nullptr, *post_norm = nullptr, *dflare_norm = nullptr;    ///< [width]
     float *q_norm = nullptr, *k_norm = nullptr, *k_ctx_norm = nullptr;           ///< [head width]
     bool local = false;
@@ -112,7 +112,7 @@ public:
         float *x = nullptr, *q = nullptr, *qr = nullptr, *attn = nullptr, *h = nullptr, *att_scr = nullptr;
         basalt::kernels::wgemm::Workspace ws;
         float *approx = nullptr, *ctx_h = nullptr, *ctx_f = nullptr;
-        void *hq = nullptr, *lat_q = nullptr, *head_scr = nullptr;
+        void *hq = nullptr, *lat_q = nullptr, *h_eff_q = nullptr, *head_scr = nullptr;
     };
     const SharedScratch* ensure_shared_scratch(int64_t context, std::string& err) const;
 
@@ -251,7 +251,7 @@ private:
     int64_t att_cells_ = 0;
     // head
     float *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
-    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;   ///< q8_1 draft rows and latents [kDsDrafts], the screen's scratch
+    void *hq_ = nullptr, *lat_q_ = nullptr, *h_eff_q_ = nullptr, *head_scr_ = nullptr;   ///< q8_1 draft rows, latents, combined h_eff, screen scratch
     int32_t *prev_ = nullptr, *ids_d_ = nullptr;
     uint16_t* w1_row_ = nullptr;            ///< the previous draft's row of the Markov head's w1 (host memory), on the card
     float* conf_d_ = nullptr;
@@ -311,7 +311,7 @@ private:
     // head batch scratch [max_sessions]
     float *hd_ = nullptr, *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
     float *frc_ = nullptr, *conf_d_ = nullptr, *conf_h_ = nullptr;
-    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
+    void *hq_ = nullptr, *lat_q_ = nullptr, *h_eff_q_ = nullptr, *head_scr_ = nullptr;
     size_t head_scr_stride_ = 0;
     int32_t *prev_ = nullptr, *ids_d_ = nullptr, *ids_h_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     uint16_t* w1_row_ = nullptr;
