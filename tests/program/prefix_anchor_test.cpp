@@ -9,6 +9,7 @@
 
 using basalt::program::serve::HeldMeet;
 using basalt::program::serve::meet_held;
+using basalt::program::serve::respell_before_media;
 using basalt::program::serve::respell_fits;
 using basalt::program::serve::shared_start;
 using basalt::program::serve::slot_cover;
@@ -46,6 +47,18 @@ int main() {
         Ids out;
         splice_held(held.data(), m, prompt.data(), (int64_t) prompt.size(), out);
         check(out == Ids({10, 11, 1, 2, 4, 5, 6}), "the prompt becomes the held ids, then its own tokens from the boundary");
+    }
+    {
+        // The reply's text is respelled, then an image is added later in the prompt.
+        const Ids held = {10, 11, 1, 2}, prompt = {10, 11, 3, 4, 5, 12, 6};
+        const HeldMeet m = meet(prompt, held);
+        check(m.held == 4 && m.resume == 3 && m.respelled(), "a held text reply meets before the later image");
+        check(respell_before_media(m, 5) && respell_before_media(m, 3) && respell_before_media(m, -1),
+              "an image at or after the resume boundary does not block respelling");
+        check(!respell_before_media(m, 2), "an image before the resume boundary blocks respelling");
+        Ids out;
+        splice_held(held.data(), m, prompt.data(), (int64_t) prompt.size(), out);
+        check(out == Ids({10, 11, 1, 2, 4, 5, 12, 6}), "respelling preserves the later image and the text after it");
     }
     {   // two tokens of the model's one newline pair against the tokenizer's one token
         const Ids held = {10, 5, 5}, prompt = {10, 7, 6};
