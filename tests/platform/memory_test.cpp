@@ -579,6 +579,32 @@ int stop_message_cases() {
         std::printf("ram stop %-50s -> %s%s\n", c.what, m.c_str(), ok ? "" : "   <-- WRONG");
         fail |= !ok;
     }
+    // Small explicit reserve (--ram-reserve-mib 1024): hard floor scales to floor / 2 (512 MiB) so Low -> Critical
+    // keeps a grace window and stop messages distinguish the guard from the scaled hard floor.
+    {
+        const uint64_t f0 = 0, f512 = 512ull << 20, f1024 = 1024ull << 20, f2048 = 2048ull << 20, f3072 = 3072ull << 20;
+        const bool scales = ram_hard_floor(f0) == 0 && ram_hard_floor(f512) == (256ull << 20) &&
+                            ram_hard_floor(f1024) == (512ull << 20) && ram_hard_floor(f2048) == kRamHardFloor &&
+                            ram_hard_floor(f3072) == kRamHardFloor;
+        std::printf("ram hard floor scaling                                      -> %s\n", scales ? "ok" : "   <-- WRONG");
+        fail |= !scales;
+
+        const uint64_t small_hard = ram_hard_floor(f1024);
+        const bool grace_ok =
+            ram_level(700ull << 20, f1024, small_hard, none, 0) == RamLevel::Low &&
+            ram_level(700ull << 20, f1024, small_hard, calm, 30000) == RamLevel::Low &&
+            ram_level(700ull << 20, f1024, small_hard, none, kRamSustainedMs) == RamLevel::Critical &&
+            ram_level(400ull << 20, f1024, small_hard, none, 0) == RamLevel::Critical;
+        std::printf("ram level --ram-reserve-mib 1024 grace window               -> %s\n", grace_ok ? "ok" : "   <-- WRONG");
+        fail |= !grace_ok;
+
+        const std::string m_low = ram_stop_message(700ull << 20, f1024, small_hard, none, 0, 0);
+        const std::string m_hard = ram_stop_message(400ull << 20, f1024, small_hard, none, 0, 0);
+        const bool msgs_ok = m_low.find("RAM low (700 MiB free < 1024 MiB guard)") != std::string::npos &&
+                             m_hard.find("RAM critical (400 MiB free < 512 MiB hard floor)") != std::string::npos;
+        std::printf("ram stop --ram-reserve-mib 1024 messages                    -> %s\n", msgs_ok ? "ok" : "   <-- WRONG");
+        fail |= !msgs_ok;
+    }
     return fail;
 }
 // The size lock_resident is exercised with: the full 256 MiB where the locked-memory limit allows it, otherwise half

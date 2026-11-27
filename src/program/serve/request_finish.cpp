@@ -80,7 +80,7 @@ Flow Request::complete() {
         const uint64_t rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
         const uint64_t own = rss > runtime_.ready_rss ? rss - runtime_.ready_rss : 0;
         const uint64_t drop = runtime_.ready_avail > avail ? runtime_.ready_avail - avail : 0;
-        const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::kRamHardFloor,
+        const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::ram_hard_floor(floor),
                                                                    stalls, drop > own ? drop - own : 0, own);
         basalt::log::error("basalt", "%s", msg.c_str());
         std::printf("ERR %s\n", msg.c_str());
