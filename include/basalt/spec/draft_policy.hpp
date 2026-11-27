@@ -34,10 +34,15 @@ class DraftPolicy {
 public:
     static constexpr int kMaxT = 16;
     static constexpr int kBuckets = 4;
+    static constexpr int kRegimes = 3;      // 0: greedy/low temp (<=0.35), 1: medium (<=0.75), 2: high-temp stochastic (>0.75)
+    static constexpr int kPosGroups = 3;    // 0: draft 0, 1: draft 1, 2: draft >= 2
 
     /// `timed` false: round times are not read, every round costs the prior shape of its size, so the picks follow the
     /// drafts' outcomes alone (the same tokens give the same windows on every run).
     explicit DraftPolicy(int max_t, double margin = 0.03, bool timed = true);
+    /// Selects the temperature/sampling calibration regime (0=greedy/low, 1=medium, 2=high-temp stochastic).
+    void set_regime(int regime);
+    int regime() const { return regime_; }
 
     struct Pick {
         bool lookup = false;
@@ -61,14 +66,16 @@ public:
     void observe_window(const float* chance, int t, int accepted, double round_ms);
 
     double lookup_rate(int match) const;   // current q for a match length
-    double chance_rate(float chance) const;   // current q for a draft stated at `chance`
+    double chance_rate(float chance, int pos = 0) const;   // current q for a draft stated at `chance` at draft position `pos`
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
 private:
     static constexpr int kChanceBins = 9;
     static int bucket(int match);
     static int chance_bin(float chance);
-    double best_rate() const;              // the highest q any stated chance gets
+    static int pos_group(int pos);
+    double chance_rate_bin(int b, double c, int pos) const;
+    double best_rate(int pos = 0) const;   // the highest q any stated chance gets at draft position `pos`
     bool unmeasured(int t) const;          // a size measured too few times, or too long ago, to trust its cost
     bool recent(int t) const;              // measured within the last rounds
     double base(int t) const;              // a size's cost relative to the scale, measured or inferred
@@ -80,13 +87,15 @@ private:
     int max_t_;
     double margin_;
     bool timed_;
+    int regime_ = 0;
     double scale_ = 0.0;                                   // round ms = scale x base(size)
     std::array<double, kMaxT + 1> base_{}, base_n_{};      // by window size; rounds behind it
     std::array<long, kMaxT + 1> seen_{};                   // the round each size was last measured
     long round_ = 0;
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
-    std::array<double, kChanceBins> c_ok_{}, c_n_{};       // drafter drafts accepted / tested, by stated chance, decayed
+    std::array<std::array<double, kChanceBins>, kRegimes> p_ok_{}, p_n_{};                     // pooled per (regime, bin)
+    std::array<std::array<std::array<double, kChanceBins>, kPosGroups>, kRegimes> c_ok_{}, c_n_{};  // per (regime, pos_group, bin)
 };
 
 }  // namespace basalt::spec
