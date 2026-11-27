@@ -47,6 +47,12 @@ public:
         return form;
     }
 
+    // the routing order of the experts and the drafter's ranking of each stage's experts
+    std::vector<std::string> shipped_profiles(const std::string& key) const override {
+        if (key != "deepseek4-43x256") return {};
+        return {key + ".prof", key + "-dspark.prof"};
+    }
+
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_deepseek4}; }
     program::GpuModes gpu_modes() const override { return {}; }
     int max_slots() const override { return 8; }
@@ -62,6 +68,8 @@ public:
             if (o.spec < 0 || o.spec > 8) code = 2;
         } else if (a == "--spec-oracle") {
             o.spec_oracle = args.next("--spec-oracle");
+        } else if (a == "--draft-experts") {
+            o.draft_experts = std::atoi(args.next("--draft-experts"));
         } else if (a == "--draft-log") {
             basalt::core::diagnostics().draft_log = args.next("--draft-log");
         } else if (a == "--diag-rows") {
@@ -87,6 +95,11 @@ public:
         if (o.spec >= 2 && o.spec_oracle.empty() && !drafter) {
             basalt::log::warn("basalt deepseek4", "--spec %d off: the pack has no dspark section", o.spec);
             o.spec = 0;
+        }
+        if (o.draft_experts < 0 || o.draft_experts > 256 || o.draft_experts % 32 != 0) {
+            basalt::log::error("basalt deepseek4", "--draft-experts %d: 32, 64, 96, 128, 160, 192, 224 or 256, or 0 for all",
+                               o.draft_experts);
+            return 2;
         }
         const bool meta = opened && file.load_meta(err);
         const core::Json* kv = meta ? file.meta().get("gguf_kv") : nullptr;

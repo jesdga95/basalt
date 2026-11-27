@@ -95,7 +95,14 @@ model::Result DsModel::plan(const model::LoadRequest& request, core::LoadPlan& r
 
     if (weights_.pack().dspark.present && request.spec >= 2) {
         const int file_handle = reads.file(request.paths.front());
-        dspark_ = DsparkDrafter::plan_load(*this, file_handle, reads, std::max(request.sessions, 1), err);
+        // the ranking that says which experts each stage keeps ships beside the expert profiles
+        const Geometry& dg = weights_.pack().geo;
+        const std::string ranking = request.profile_dir.empty()
+            ? std::string()
+            : request.profile_dir + "/deepseek4-" + std::to_string(dg.n_layers) + "x" +
+                  std::to_string(dg.n_expert) + "-dspark.prof";
+        dspark_ = DsparkDrafter::plan_load(*this, file_handle, reads, std::max(request.sessions, 1),
+                                           ranking, request.draft_experts, err);
         if (!dspark_) return failure(err);
     }
 

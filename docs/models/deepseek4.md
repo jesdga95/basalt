@@ -37,6 +37,18 @@ restore, and restarting at position zero. `BatchSession` is registered with the 
 expert routing currently selects its sequential fallback; this verifies API identity semantics, not parallel batch speed.
 The single available RTX 5090 leaves multi-GPU peer identity untested.
 
+## Drafting
+
+When the pack carries the DSpark drafter, decode drafts by default in windows of up to 6 rows (the last accepted token
+plus five drafts; `--spec 0` turns it off). The drafter's three stages keep their 32 most routed MXFP4 experts on the card
+(`--draft-experts`, 32 to 256 in steps of 32, or 0 for all; ranked by `data/profiles/deepseek4-43x256-dspark.prof`), and
+their block and Markov head run as two CUDA graphs captured once per row count. A verify window's target features become
+the stages' latents beside the window on a low-priority stream; only the accepted rows are committed into its rings.
+The expert placement itself starts from `data/profiles/deepseek4-43x256.prof`. Both shipped files rank each expert by the
+L2 norm of its router gate row — a placement prior built from the checkpoint, not measured routing heat; a run that
+measures heat can replace them. Greedy output is unchanged by drafting: the same 12 tokens came from `--spec 0` and
+`--spec 6` on a tokenizer-derived prompt, and the verifier's picks matched the plain draws.
+
 ## Architecture and ownership
 
 - `tools/convert/arch/deepseek4.py` maps GGUF metadata and tensors into the Basalt pack; conversion also takes the matching

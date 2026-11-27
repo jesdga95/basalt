@@ -91,6 +91,7 @@ public:
         if (h_expert_ids_) cudaFreeHost(h_expert_ids_);
         if (h_expert_seq_) cudaFreeHost(h_expert_seq_);
         if (h_route_meta_) cudaFreeHost(h_route_meta_);
+        if (feat_ev_) cudaEventDestroy(feat_ev_);
         if (h_initial_) cudaFreeHost(h_initial_);
     }
 
@@ -228,7 +229,8 @@ public:
                 err = "deepseek4: more sessions than dspark windows";
                 return false;
             }
-            if (!dev(d_feat_, (size_t) kDsparkWindow * drafter_->feature_floats())) {
+            if (!dev(d_feat_, (size_t) kDsparkWindow * drafter_->feature_floats()) ||
+                cudaEventCreateWithFlags(&feat_ev_, cudaEventDisableTiming) != cudaSuccess) {
                 err = "deepseek4: cannot allocate dspark feature tap buffer";
                 return false;
             }
@@ -249,7 +251,13 @@ public:
         if (!drafter_) return {model::Status::NotImplemented, "deepseek4: no dspark drafter loaded"};
         if (feat_rows_ > 0 && feat_pos0_ >= 0) {
             const int take = std::min(feat_rows_, (int) std::max<int64_t>(0, pos - feat_pos0_));
-            if (!inject_features(feat_pos0_, take)) return {model::Status::Error, err_};
+            bool committed = false;
+            if (take > 0 && feat_staged_) {
+                committed = drafter_->commit(dwin_, feat_pos0_, take, err_);
+                if (committed) feat_staged_ = false;
+            }
+            if (take > 0 && !committed && !inject_features(feat_pos0_, take))
+                return {model::Status::Error, err_};
             feat_rows_ = 0;
         }
         drafter_->forget_from(dwin_, pos);
@@ -259,13 +267,14 @@ public:
             return {};
         }
         const int want = std::clamp(n, 1, lim);
-        if (!drafter_->draft(dwin_, anchor, pos, want, stream_, last_draft_, err_))
+        if (!drafter_->draft_begin(dwin_, anchor, pos, want, stream_, err_))
             return {model::Status::Error, err_};
         return {};
     }
 
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek4: no dspark drafter loaded"};
+        if (!drafter_->draft_end(last_draft_, err_)) return {model::Status::Error, err_};
         n = std::min(max_n, last_draft_.n);
         std::copy(last_draft_.token, last_draft_.token + n, ids);
         std::copy(last_draft_.conf, last_draft_.conf + n, conf);
@@ -282,6 +291,7 @@ public:
         if (r.pos + r.n_tokens > model_.context())
             return {model::Status::Refused, "deepseek4: request exceeds the loaded context"};
 
+        if (!commit_staged(r.pos)) return {model::Status::Error, err_};
         last_window_rows_ = 0;
         retained_logits_rows_ = r.retain_logits_rows ? r.n_tokens : 0;
         sampling_given_ = r.sampling != nullptr;
@@ -322,6 +332,7 @@ public:
                     std::to_string(r.pos) + ", history=" + std::to_string(tokens_.size()) + ")"};
         if (r.pos + r.n_tokens > model_.context())
             return {model::Status::Refused, "deepseek4: prompt exceeds the loaded context"};
+        if (!commit_staged(r.pos)) return {model::Status::Error, err_};
         last_window_rows_ = 0;
         if (r.n_tokens <= kExpertWindow && model_.diag_rows() <= 0) {
             if (!forward_rows(r.tokens, r.n_tokens, r.pos)) return {model::Status::Error, err_};
@@ -538,7 +549,11 @@ public:
         retained_logits_rows_ = 0;
         feat_rows_ = 0;
         feat_pos0_ = -1;
-        if (drafter_) drafter_->forget_from(dwin_, pos);
+        feat_staged_ = false;
+        if (drafter_) {
+            drafter_->reset(dwin_);
+            drafter_->forget_from(dwin_, pos);
+        }
         return {};
     }
 
@@ -640,7 +655,11 @@ public:
         retained_logits_rows_ = 0;
         feat_rows_ = 0;
         feat_pos0_ = -1;
-        if (drafter_) drafter_->forget_from(dwin_, 0);
+        feat_staged_ = false;
+        if (drafter_) {
+            drafter_->reset(dwin_);
+            drafter_->forget_from(dwin_, 0);
+        }
         return {};
     }
 
@@ -763,7 +782,11 @@ private:
         retained_logits_rows_ = 0;
         feat_rows_ = 0;
         feat_pos0_ = -1;
-        if (drafter_) drafter_->forget_from(dwin_, 0);
+        feat_staged_ = false;
+        if (drafter_) {
+            drafter_->reset(dwin_);
+            drafter_->forget_from(dwin_, 0);
+        }
         return sync();
     }
 
@@ -826,6 +849,18 @@ private:
         return true;
     }
 
+    // A staged verify window whose rows the conversation keeps goes into the drafter's rings before the next window
+    // stages its own (the prompt's last rows, when no draft ran between the two).
+    bool commit_staged(int64_t pos) {
+        if (!feat_staged_ || !drafter_ || feat_rows_ <= 0 || feat_pos0_ < 0) return true;
+        const int take = (int) std::clamp<int64_t>(pos - feat_pos0_, 0, feat_rows_);
+        const bool ok = take <= 0 || drafter_->commit(dwin_, feat_pos0_, take, err_);
+        feat_staged_ = false;
+        feat_rows_ = 0;
+        feat_pos0_ = -1;
+        return ok;
+    }
+
     kernels::SamplerParams draw_params(int row) const {
         kernels::SamplerParams p =
             sampling_given_ ? sampling_ : kernels::SamplerParams{.temperature = 0.f, .greedy = true};
@@ -877,6 +912,8 @@ private:
     float* d_feat_ = nullptr;
     int64_t feat_pos0_ = -1;
     int feat_rows_ = 0;
+    bool feat_staged_ = false;
+    cudaEvent_t feat_ev_ = nullptr;
     float* lp_buf_ = nullptr;       // row_logprobs: its scratch, a row of kLogprobStride floats, then the picks
     float* sample_bias_ = nullptr;  // resample_row's bias, apart from the one set_logit_bias holds
     float *normalized_ = nullptr, *hc_workspace_ = nullptr, *attn_coef_ = nullptr, *ffn_coef_ = nullptr;
@@ -1159,6 +1196,16 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                 feat_rows_ = n_tokens;
             }
         }
+    }
+
+    if (drafter_ && feat_rows_ > 0 && feat_pos0_ >= 0) {
+        // the stages' latents of this window are made beside the head, from the features the layer taps left
+        if (cudaEventRecord(feat_ev_, stream_) != cudaSuccess ||
+            !drafter_->stage(dwin_, feat_pos0_, feat_rows_, d_feat_, feat_ev_, err_)) {
+            if (err_.empty()) err_ = "deepseek4: cannot stage the drafter's features";
+            return false;
+        }
+        feat_staged_ = true;
     }
 
     HeadWeights head;
