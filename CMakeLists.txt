@@ -2164,6 +2164,8 @@ if(BUILD_TESTING)
     basalt_cpu_test(NAME native_expert_parity_cpu_${_name} COMMAND native_expert_parity --cpu-synthetic ${_pair})
   endforeach()
   basalt_gpu_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
+  # Gemma 4's GELU experts, NVFP4 and MXFP8 (the padded down), CPU tier and GPU against a double reference
+  basalt_gpu_test(NAME native_expert_parity_gemma4 COMMAND native_expert_parity --gemma4)
   # the AVX-512 Q8_K activation quantizer bit for bit against ggml's reference
   basalt_cpu_test(NAME native_expert_parity_q8k_quant COMMAND native_expert_parity --q8k-quant)
   # MXFP4 down experts at the deepseek41 geometry: dequantizer, the AVX-2/AVX-512 dots and one native expert
