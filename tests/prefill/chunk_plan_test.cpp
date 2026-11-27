@@ -32,6 +32,22 @@ int main() {
         CHECK(room(4, 4096, 16128) == 2 * 4096 + 2 * (16128 - 4096));
         CHECK(room(2, 4096, 2048) == 4096);
     }
+    // a finite draft window can span more than two small chunks: both hand-off buffers retain the rows before them
+    {
+        CHECK(split_hand_rows(10240, 32832) == 16416);
+        CHECK(split_hand_rows(32768, 32832) == 32768);
+        CHECK(split_hand_rows(10240, 0) == 10240);
+        CHECK(split_hand_rows(10240, 32833) == 16417);
+        for (const int64_t cap : {4096, 10240, 14848, 16384, 32768}) {
+            for (const int64_t tokens : {10241, 20481, 32769, 65535, 239895, 262143, 524287}) {
+                const auto [chunk, head] = one_card_chunks(tokens, cap, true, 16384);
+                const auto chunks = chunk_list(tokens, chunk, head);
+                const int64_t wanted = std::max<int64_t>(0, std::min<int64_t>(tokens, 32832) - chunks.back());
+                const int64_t hand = split_hand_rows(chunk, 32832);
+                CHECK(split_draft_room(chunks, chunk, hand) >= wanted);
+            }
+        }
+    }
     // a split read's chunks are the prompt path's: the main card keeps its last chunk, and the stages' state comes back
     // once the last stage has read the chunk before it, so the planned last chunk must start where the prompt path's
     // does, for every part length and cap (deep parts on smaller cards take caps just above the head chunk)

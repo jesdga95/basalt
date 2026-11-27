@@ -9,6 +9,11 @@
 
 namespace basalt::prefill {
 
+/// Rows per hand-off buffer to retain a finite draft window across two buffers; zero means no finite window.
+inline int64_t split_hand_rows(int64_t chunk, int64_t draft_window) {
+    return std::max(chunk, draft_window / 2 + draft_window % 2);
+}
+
 /// The rows of the last card's output a split read can hold for the draft layer before the kept last chunk: the last
 /// two chunks handed on stay in the two hand-off buffers they came in, and earlier ones go past `chunk` rows in either
 /// buffer of `hand_rows` rows, which no chunk writes.  `chunks`: the part's chunk sizes, the kept last one included.
