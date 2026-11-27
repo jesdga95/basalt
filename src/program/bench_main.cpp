@@ -950,6 +950,8 @@ int main(int argc, char** argv) {
             set_arg(args, "--max-context", std::to_string(basalt::program::kDefaultContext));
         }
     }
+    if (!do_perf && do_quality && !has_arg(args, "--prompt-cache"))
+        set_arg(args, "--prompt-cache", "0");
     if (!community_kv.empty()) set_arg(args, "--kv", community_kv);
     if (o.print_command) {
         std::printf("%s --serve", engine_bin.c_str());
@@ -1227,6 +1229,7 @@ int main(int argc, char** argv) {
             } else {
                 std::vector<std::string> qa = base_args;
                 if (!user_max_context) set_arg(qa, "--max-context", std::to_string(o.quality_max_context));
+                if (!has_arg(qa, "--prompt-cache")) set_arg(qa, "--prompt-cache", "0");
                 const std::string rows_path = (fs::path(work) / "quality_rows.txt").string();
                 basalt::platform::remove_file(rows_path);
                 set_arg(qa, "--ppl-out", rows_path);

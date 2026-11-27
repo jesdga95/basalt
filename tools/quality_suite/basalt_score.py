@@ -23,7 +23,7 @@ rows = os.path.join(a.out, "rows.txt")
 if os.path.exists(rows): os.remove(rows)
 log = open(os.path.join(a.out, "engine.log"), "w")
 eng = subprocess.Popen([a.engine, "--serve", "--model", a.pack, "--gpu", a.gpu, "--max-context", str(a.max_context),
-                        "--ppl-out", rows], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
+                        "--prompt-cache", "0", "--ppl-out", rows], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
 for line in eng.stdout:
     if line.startswith("READY"): break
 else: sys.exit("engine exited before READY; see " + log.name)

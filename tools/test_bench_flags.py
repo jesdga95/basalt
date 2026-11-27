@@ -166,6 +166,9 @@ class BenchFlags(unittest.TestCase):
         # --quality requires a reference file path and defaults --max-context to 5120
         cmd = self.command("--quality", "ref.safetensors")
         self.assertEqual(cmd[cmd.index("--max-context") + 1], "5120")
+        self.assertEqual(cmd[cmd.index("--prompt-cache") + 1], "0")
+        cmd = self.command("--quality", "ref.safetensors", "--", "--prompt-cache", "2")
+        self.assertEqual(cmd[cmd.index("--prompt-cache") + 1], "2")
         cmd = self.command("--quality", "ref.safetensors", "--quality-max-context", "8192")
         self.assertEqual(cmd[cmd.index("--max-context") + 1], "8192")
         cmd = self.command("--quality", "ref.safetensors", "--", "--max-context", "16384")
