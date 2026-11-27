@@ -1,7 +1,7 @@
 # How quality is measured
 
 Basalt scores a model against a full-precision reference on the same text, through the decode path that generates tokens. Both
-models use this method. Their numbers: [Qwen3.8-Flash-Next](qwen38-flash-next.md) and [DeepSeek-V4.1-Flash](deepseek41.md).
+models use this method. Instruction-tuned models are also scored on chat conversations by the [quality suite](quality-suite.md). Their numbers: [Qwen3.8-Flash-Next](qwen38-flash-next.md) and [DeepSeek-V4.1-Flash](deepseek41.md).
 
 ## The gate
 

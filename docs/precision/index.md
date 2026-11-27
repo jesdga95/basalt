@@ -13,3 +13,5 @@ Each model has one page for what it computes in and what each rounding costs. Th
 - [ERNIE-5.5-Flash](ernie55.md): weights, stages, the HCA/MLA-DSA attention caches, drafting and the lossy routing flags.
 - [How quality is measured](quality.md): the gate, the BF16 references, the lossy routing flags, greedy identity and reproduction
   commands.
+- [Quality suite](quality-suite.md): scoring instruction-tuned models on chat conversations against a stored BF16 reference
+  (assistant rows, conversation-bootstrap error bars, paired A/B, the smoke slice).
