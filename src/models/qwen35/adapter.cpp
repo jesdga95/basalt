@@ -816,3 +816,9 @@ std::unique_ptr<model::ModelAdapter> make_adapter() { return std::make_unique<Ad
 std::unique_ptr<model::ModelAdapter> make_moe_adapter() { return std::make_unique<Adapter>(true); }
 
 }  // namespace basalt::models::qwen35
+
+// The routed-expert variant is the same adapter and layers with a routed-expert FFN, so it is registered from this library
+// as its own architecture id; the composition root finds it as basalt::models::qwen35moe::make_adapter().
+namespace basalt::models::qwen35moe {
+std::unique_ptr<model::ModelAdapter> make_adapter() { return qwen35::make_moe_adapter(); }
+}  // namespace basalt::models::qwen35moe

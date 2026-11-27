@@ -46,10 +46,14 @@ inline std::string validate_meta(const GgufFile& g) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
     if (arch->s != "qwen35" && arch->s != "qwen35moe") return "architecture is '" + arch->s + "', this adapter requires 'qwen35' or 'qwen35moe'";
-    for (const char* k : is_moe(g) ? std::initializer_list<const char*>{"expert_count", "expert_used_count", "expert_feed_forward_length",
-                                                                         "expert_shared_feed_forward_length"}
-                                   : std::initializer_list<const char*>{"feed_forward_length"})
-        if (key_u(g, k) == 0) return std::string("missing or zero ") + (is_moe(g) ? "qwen35moe." : "qwen35.") + k;
+    static constexpr const char* kMoeKeys[] = {"expert_count", "expert_used_count", "expert_feed_forward_length",
+                                               "expert_shared_feed_forward_length"};
+    static constexpr const char* kDenseKeys[] = {"feed_forward_length"};
+    const bool moe = is_moe(g);
+    for (const char* k : kMoeKeys)
+        if (moe && key_u(g, k) == 0) return std::string("missing or zero qwen35moe.") + k;
+    for (const char* k : kDenseKeys)
+        if (!moe && key_u(g, k) == 0) return std::string("missing or zero qwen35.") + k;
     for (const char* k : {"block_count", "embedding_length", "attention.head_count",
                           "attention.head_count_kv", "attention.key_length", "rope.dimension_count", "ssm.state_size",
                           "ssm.group_count", "ssm.time_step_rank", "ssm.conv_kernel", "full_attention_interval"})

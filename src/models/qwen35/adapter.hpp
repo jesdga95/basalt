@@ -7,6 +7,6 @@
 
 namespace basalt::models::qwen35 {
 std::unique_ptr<model::ModelAdapter> make_adapter();
-/// The routed-expert variant (`qwen35moe`: the same hybrid layers with a routed-expert FFN), registered by models/qwen35moe.
+/// The routed-expert variant (`qwen35moe`: the same hybrid layers with a routed-expert FFN), registered as `qwen35moe` from this library.
 std::unique_ptr<model::ModelAdapter> make_moe_adapter();
 }  // namespace basalt::models::qwen35

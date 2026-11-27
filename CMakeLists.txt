@@ -391,10 +391,9 @@ endif()
 endif()
 
 if(BASALT_MODEL_QWEN35MOE)
-# qwen35moe: the dense stack's routed-expert layers, through the qwen35 adapter's code
-add_library(model_qwen35moe STATIC src/models/qwen35moe/adapter.cpp)
-target_include_directories(model_qwen35moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(model_qwen35moe PUBLIC model_qwen35 model)
+# qwen35moe: the dense stack's routed-expert layers, registered from the qwen35 library (one adapter, two architecture ids)
+add_library(model_qwen35moe INTERFACE)
+target_link_libraries(model_qwen35moe INTERFACE model_qwen35)
 endif()
 
 # The composition root links the built models and sees their ids (BASALT_MODEL_<ARCH>) and the registration list.
