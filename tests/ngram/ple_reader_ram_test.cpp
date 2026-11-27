@@ -2,7 +2,6 @@
 // byte-for-byte parity with Direct reads across misaligned rows, straddles, duplicates, out-of-range
 // zero-fill, empty tickets, concurrent issue/collect, mode switching, RAM accounting and error paths.
 #include "basalt/ngram/ple_reader.hpp"
-#include "basalt/platform/memory.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -17,7 +16,6 @@
 #include <vector>
 
 namespace ng = basalt::ngram;
-namespace pf = basalt::platform;
 
 namespace {
 
@@ -104,7 +102,8 @@ void test_row_size(const std::filesystem::path& dir, uint32_t rb) {
     CHECK(rd.is_open(), "rb=%u: direct is_open", rb);
     CHECK(!rd.locked(), "rb=%u: direct !locked", rb);
     CHECK(rd.ram_bytes() == 0, "rb=%u: direct ram_bytes == 0", rb);
-    CHECK(rd.cache_ram_bytes() == 0, "rb=%u: direct cache_ram_bytes == 0", rb);
+    rd.lock_ram();   // no-op in direct mode
+    CHECK(!rd.locked(), "rb=%u: direct lock_ram no-op", rb);
     std::vector<uint8_t> direct_bytes;
     check_batch(rd, probe, n_rows, rb, &direct_bytes, "direct");
 
@@ -115,16 +114,9 @@ void test_row_size(const std::filesystem::path& dir, uint32_t rb) {
         CHECK(rd.ram_bytes() == expected_bytes, "rb=%u lock=%d: ram_bytes=%llu want=%llu", rb, (int) lock,
               (unsigned long long) rd.ram_bytes(), (unsigned long long) expected_bytes);
         if (!lock) {
-            CHECK(!rd.locked(), "rb=%u: lock=false must report !locked", rb);
-            const uint64_t want_cache = pf::kMappedFileCountedAvailable ? expected_bytes : 0;
-            CHECK(rd.cache_ram_bytes() == want_cache, "rb=%u: lock=false cache_ram_bytes=%llu want=%llu", rb,
-                  (unsigned long long) rd.cache_ram_bytes(), (unsigned long long) want_cache);
-        } else if (rd.locked()) {
-            CHECK(rd.cache_ram_bytes() == 0, "rb=%u: locked table must report cache_ram_bytes == 0", rb);
-        } else {
-            const uint64_t cap = pf::kMappedFileCountedAvailable ? expected_bytes : 0;
-            CHECK(rd.cache_ram_bytes() <= cap, "rb=%u: unlocked table cache_ram_bytes=%llu > %llu", rb,
-                  (unsigned long long) rd.cache_ram_bytes(), (unsigned long long) cap);
+            CHECK(!rd.locked(), "rb=%u: lock=false must report !locked before lock_ram()", rb);
+            // Deferred lock_ram() (the attach() path after expert-tier reads finish).
+            rd.lock_ram();
         }
 
         // Keep-alive calls are safe no-ops in RAM mode.
@@ -184,11 +176,11 @@ void test_row_size(const std::filesystem::path& dir, uint32_t rb) {
 
     // Reopen in Direct mode directly from RAM mode without explicit close().
     CHECK(rd.open(spath, kHeader, n_rows, 8, 64, err, rb), "rb=%u: direct reopen: %s", rb, err.c_str());
-    CHECK(rd.ram_bytes() == 0 && rd.cache_ram_bytes() == 0 && !rd.locked(), "rb=%u: direct reopen state", rb);
+    CHECK(rd.ram_bytes() == 0 && !rd.locked(), "rb=%u: direct reopen state", rb);
     check_batch(rd, probe, n_rows, rb, nullptr, "direct reopen");
 
     rd.close();
-    CHECK(!rd.is_open() && rd.ram_bytes() == 0 && rd.cache_ram_bytes() == 0 && !rd.locked(), "rb=%u: closed state", rb);
+    CHECK(!rd.is_open() && rd.ram_bytes() == 0 && !rd.locked(), "rb=%u: closed state", rb);
 }
 
 void test_errors(const std::filesystem::path& dir) {

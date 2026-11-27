@@ -116,7 +116,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.share_stride = expert_stride();
     s.lend_segment = kExpertLendSegment;
     s.host.bytes = [this] { return engram_ ? engram_->ram_bytes() : 0; };
-    s.host_cache_keep = engram_ ? engram_->cache_ram_bytes() : 0;
+    s.host_cache_keep = engram_ ? engram_->ram_bytes() : 0;
     return s;
 }
 
@@ -224,14 +224,11 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
+        // Map now so tier_spec() reserves its RAM; lock/touch in attach() after the expert tier's reads finish so
+        // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
         if (req.ple_io == "ram") {
-            const auto t0 = std::chrono::steady_clock::now();
-            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/true))
+            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false))
                 return {model::Status::Error, "hy4flash: " + err};
-            basalt::log::info("basalt hy4flash", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
-                              (double) engram_->ram_bytes() / (double) kGiB,
-                              engram_->locked() ? "locked in RAM" : "loaded (not locked)",
-                              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         } else if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 16, err, e.row_bytes)) {
             return {model::Status::Error, "hy4flash: " + err};
         }
@@ -259,6 +256,14 @@ model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::uniqu
     if (dfly_) {   // the drafts' head screen, made from the head the reads placed
         cudaSetDevice(device_);
         if (!dfly_->pack_screen(nullptr, err)) return {model::Status::Error, "hy4flash: " + err};
+    }
+    if (engram_ && engram_->ram_bytes() > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        engram_->lock_ram();
+        basalt::log::info("basalt hy4flash", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
+                          (double) engram_->ram_bytes() / (double) kGiB,
+                          engram_->locked() ? "locked in RAM" : "loaded (not locked)",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     return {};
 }

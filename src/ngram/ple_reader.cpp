@@ -109,7 +109,6 @@ struct PleReader::Impl {
     const uint8_t* mapped_data = nullptr;
     bool ram_mode = false;
     bool locked = false;
-    uint64_t locked_bytes = 0;
     uint64_t table_offset = 0;
     uint64_t n_rows = 0;
     uint32_t row_bytes = ROW_BYTES;
@@ -400,37 +399,40 @@ bool PleReader::open_ram(const std::string& path, uint64_t table_offset, uint64_
     m.row_bytes = row_bytes;
     m.ram_mode = true;
     m.locked = false;
-    m.locked_bytes = 0;
     m.error.clear();
     reset_stats();
-    if (lock && need > 0) {
-        const uint64_t page = platform::system_page_size() ? platform::system_page_size() : (uint64_t) PAGE;
-        const uintptr_t a0 = (uintptr_t) m.mapped_data & ~(uintptr_t) (page - 1);
-        const uintptr_t a1 = (uintptr_t) m.mapped_data + (uintptr_t) need;
-        const uint64_t span = (uint64_t) (a1 - a0);
-        // Lock the table's pages in RAM; where the OS refuses (low ulimit -l or working-set quota), touch every page
-        // so the table lands in the OS page cache ahead of the first request.
-        core::LoadProgress prog("ngram", span);
-        uint64_t reported = 0;
-        const platform::LockResult lr = platform::lock_view(
-            (void*) a0, span, [&](uint64_t done) { prog.add(done - reported); reported = done; });
-        m.locked = lr.ok && lr.locked_bytes >= span;
-        m.locked_bytes = std::min<uint64_t>(lr.locked_bytes, need);
-        if (!m.locked) {
-            basalt::log::warn("basalt", "PLE table lock incomplete (%s): touching its pages instead", lr.note.c_str());
-            volatile uint32_t sink = 0;
-            for (uintptr_t p = a0 + (uintptr_t) reported; p < a1; p += page) {
-                sink = sink + *(const volatile uint8_t*) p;
-                if (((p - a0) & ((256u << 20) - 1)) == 0) {
-                    const uint64_t pos = (uint64_t) (p - a0);
-                    if (pos > reported) { prog.add(pos - reported); reported = pos; }
-                }
-            }
-            (void) sink;
-        }
-        prog.finish();
-    }
+    if (lock) lock_ram();
     return true;
+}
+
+void PleReader::lock_ram() {
+    Impl& m = *impl_;
+    const uint64_t need = ram_bytes();
+    if (!m.ram_mode || m.mapped_data == nullptr || need == 0) return;
+    const uint64_t page = platform::system_page_size() ? platform::system_page_size() : (uint64_t) PAGE;
+    const uintptr_t a0 = (uintptr_t) m.mapped_data & ~(uintptr_t) (page - 1);
+    const uintptr_t a1 = (uintptr_t) m.mapped_data + (uintptr_t) need;
+    const uint64_t span = (uint64_t) (a1 - a0);
+    // Lock the table's pages in RAM; where the OS refuses (low ulimit -l or working-set quota), touch every page
+    // so the table lands in the OS page cache ahead of the first request.
+    core::LoadProgress prog("ngram", span);
+    uint64_t reported = 0;
+    const platform::LockResult lr = platform::lock_view(
+        (void*) a0, span, [&](uint64_t done) { prog.add(done - reported); reported = done; });
+    m.locked = lr.ok && lr.locked_bytes >= span;
+    if (!m.locked) {
+        basalt::log::warn("basalt", "PLE table lock incomplete (%s): touching its pages instead", lr.note.c_str());
+        volatile uint32_t sink = 0;
+        for (uintptr_t p = a0 + (uintptr_t) reported; p < a1; p += page) {
+            sink = sink + *(const volatile uint8_t*) p;
+            if (((p - a0) & ((256u << 20) - 1)) == 0) {
+                const uint64_t pos = (uint64_t) (p - a0);
+                if (pos > reported) { prog.add(pos - reported); reported = pos; }
+            }
+        }
+        (void) sink;
+    }
+    prog.finish();
 }
 
 void PleReader::close() {
@@ -461,7 +463,6 @@ void PleReader::close() {
     m.mapped_data = nullptr;
     m.ram_mode = false;
     m.locked = false;
-    m.locked_bytes = 0;
     m.n_rows = 0;
     DirectFile::free_aligned(m.slab);
     m.slab = nullptr;
@@ -481,11 +482,6 @@ bool PleReader::is_open() const { return impl_->ram_mode || impl_->file.is_open(
 uint32_t PleReader::row_bytes() const { return impl_->row_bytes; }
 bool PleReader::locked() const { return impl_->locked; }
 uint64_t PleReader::ram_bytes() const { return impl_->ram_mode ? impl_->n_rows * (uint64_t) impl_->row_bytes : 0; }
-uint64_t PleReader::cache_ram_bytes() const {
-    if (!impl_->ram_mode || !platform::kMappedFileCountedAvailable) return 0;
-    const uint64_t total = ram_bytes();
-    return total > impl_->locked_bytes ? total - impl_->locked_bytes : 0;
-}
 
 PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_raw) {
     Impl& m = *impl_;

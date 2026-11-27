@@ -102,13 +102,10 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, bool ple_ram, 
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
+        // Map now so tier_spec() reserves its RAM; lock/touch in attach() after the expert tier's reads finish so
+        // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
         if (ple_ram) {
-            const auto t0 = std::chrono::steady_clock::now();
-            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/true)) return false;
-            basalt::log::info("basalt deepseek41", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
-                              (double) engram_->ram_bytes() / (1024.0 * 1024.0 * 1024.0),
-                              engram_->locked() ? "locked in RAM" : "loaded (not locked)",
-                              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false)) return false;
         } else if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) {
             return false;
         }
@@ -174,7 +171,7 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     s.host.bytes = [this] { return prompt_host_.bytes() + (engram_ ? engram_->ram_bytes() : 0); };
     s.host.set_ring = [this](int pieces, std::string& err) { return prompt_host_.set_ring(pieces, err); };
     s.host.ram_only = [this] { warm_token_table(); };
-    s.host_cache_keep = engram_ ? engram_->cache_ram_bytes() : 0;
+    s.host_cache_keep = engram_ ? engram_->ram_bytes() : 0;
     return s;
 }
 
@@ -295,6 +292,14 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
 model::Result DsModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, err};
+    if (engram_ && engram_->ram_bytes() > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        engram_->lock_ram();
+        basalt::log::info("basalt deepseek41", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
+                          (double) engram_->ram_bytes() / (1024.0 * 1024.0 * 1024.0),
+                          engram_->locked() ? "locked in RAM" : "loaded (not locked)",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     return {};
 }
 

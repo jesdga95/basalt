@@ -62,20 +62,20 @@ public:
     bool open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
               uint64_t cache_rows, std::string& err, uint32_t row_bytes = ROW_BYTES);
     /// Opens the table through a read-only memory map (`--ple-io ram`) instead of unbuffered SSD reads. With `lock`
-    /// true, tries to lock the table's pages in RAM and touches any remainder into the OS page cache if locking is
-    /// refused or incomplete. `issue` copies rows straight from the map and `collect` returns at once.
+    /// true, calls `lock_ram()` immediately; with `lock` false, maps the range so callers can account for `ram_bytes()`
+    /// while sizing other host tiers and call `lock_ram()` afterwards. `issue` copies straight from the map.
     bool open_ram(const std::string& path, uint64_t table_offset, uint64_t n_rows, std::string& err,
                   uint32_t row_bytes = ROW_BYTES, bool lock = true);
+    /// Locks every page of the RAM-mapped table via `platform::lock_view` (reporting progress under `ngram`), and
+    /// touches any remaining pages into the OS page cache if locking is refused or incomplete. No-op in direct mode.
+    void lock_ram();
     uint32_t row_bytes() const;
     void close();
     bool is_open() const;
-    /// Whether `open_ram` locked every page of the table in RAM. False in direct mode or when locking was incomplete.
+    /// Whether `lock_ram` locked every page of the table in RAM. False in direct mode or when locking was incomplete.
     bool locked() const;
     /// Table bytes held in RAM by `open_ram` (0 in direct mode or when closed).
     uint64_t ram_bytes() const;
-    /// Table bytes held in unlocked page cache by `open_ram` that `platform::host_available_memory` still counts as
-    /// available (0 in direct mode, when locked, or on platforms whose available-memory reading already deducts them).
-    uint64_t cache_ram_bytes() const;
 
     /// Start fetching `n` rows; row i's raw bytes land at `out_raw + row_bytes * i`. `out_raw` must stay valid
     /// until `collect` returns. Out-of-range rows produce zero bytes (the mmap path's behaviour).
