@@ -13,6 +13,7 @@
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -124,8 +125,9 @@ uint64_t pool_bytes(const Geometry& g, int64_t positions, bool fp8, bool int8, u
     return n;
 }
 
-uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
+uint64_t shared_bytes(const Geometry& g, bool drafter, bool head) {
+    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0) +   // PROMPT, DSPARK HOOKS
+           (head ? kernels::sampler_wide_bytes((int) g.n_vocab) : 0);
 }
 
 InklingModel::InklingModel() = default;
@@ -445,10 +447,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         };
         // a position's bytes in card c's pool, granules aside
         const auto per_on = [&](int c) { return one_on(c, 2, 1) - one_on(c, 1, 1); };
-        const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
+        const uint64_t shared = shared_bytes(g, dspark_ != nullptr, true);
         // what card c keeps beside its pool: the sessions' own buffers, what they share and the spare
         const auto kept_on = [&](int c) {
-            return own_on(c) * (uint64_t) n_sess + (c == 0 ? shared + batch_graphs_bytes(n_sess) + spare : shared_bytes(g, false) + kCardSpare);
+            return own_on(c) * (uint64_t) n_sess + (c == 0 ? shared + batch_graphs_bytes(n_sess) + spare : shared_bytes(g, false, false) + kCardSpare);
         };
         const auto size_pool = [&](int c, uint64_t free_b) -> model::Result {
             const uint64_t kept = kept_on(c);
@@ -559,6 +561,11 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         if (model::Result r = size_pool(0, free_b); !r.ok()) return r;
         ctx_ = want;
         }
+        // the sampler's list for a request without a top-k limit (top_k 0 or above 64), counted in the first card's shared
+        // bytes: made now, so no request allocates it beside a full pool
+        if (!kernels::sampler_wide_reserve((int) g.n_vocab, nullptr))
+            return fail("out of device memory for the sampler's list (" + std::to_string(kernels::sampler_wide_bytes((int) g.n_vocab) >> 20) +
+                        " MiB)");
         for (int c = 0; c < cards(); ++c)
             if (!req.kv_pool)
                 basalt::log::info("basalt inkling2", "KV%s: each of the %d slot%s holds its own %lld positions (--kv-pool off)",
@@ -771,8 +778,8 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
         s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense + (uint64_t) visits[(size_t) l] * kv);
     }
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
-    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + batch_graphs_bytes(n_sess) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
-               kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
+    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2, true) + batch_graphs_bytes(n_sess) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
+               kCardSpare + shared_bytes(g, false, false) + slot_rest * n_sess};
     for (const model::GpuCards::Card& card : c.cards) {
         cudaSetDevice(card.device);
         size_t free_b = 0, total_b = 0;

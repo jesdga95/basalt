@@ -372,7 +372,7 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
 /// each cache's allocation granules of `gran` bytes counted whole.
 uint64_t pool_bytes(const Geometry& g, int64_t positions, bool fp8, bool int8, uint64_t gran, int cut = 0, int card = 0);
 /// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
-/// first card's).
-uint64_t shared_bytes(const Geometry& g, bool drafter);
+/// first card's) and, on the card that draws (`head`), the sampler's list for a request without a top-k limit.
+uint64_t shared_bytes(const Geometry& g, bool drafter, bool head);
 
 }  // namespace basalt::models::inkling2
