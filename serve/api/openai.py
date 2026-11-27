@@ -64,7 +64,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live,
+                           stream_tools=bool(req.get("stream"))):
         if reading and kind != "ping":
             reading = False                        # the first answer: the read is over
             c = progress_chunk(final=True)
@@ -136,8 +137,10 @@ def openai_collect(chunks) -> dict:
             continue
         if "logprobs" in c["choices"][0]:
             part = c["choices"][0]["logprobs"]
-            lps = (lps or []) + part["content"]
-            lps_reasoning += part.get("reasoning_content") or []
+            if lps is None:
+                lps = []
+            lps.extend(part["content"])
+            lps_reasoning.extend(part.get("reasoning_content") or [])
             for t in part.get("tool_calls") or []:
                 lps_tools.setdefault(t["index"], []).extend(t["content"])
         d = c["choices"][0]["delta"]
@@ -152,17 +155,24 @@ def openai_collect(chunks) -> dict:
             cur["function"]["arguments"] += fn.get("arguments") or ""
         last = c
     calls = [by_index[i] for i in sorted(by_index)]
-    if last["choices"][0]["finish_reason"] != "tool_calls":
+    finish = last["choices"][0].get("finish_reason") if last is not None else "stop"
+    if finish != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside
     msg = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
+    if last is None:
+        return {"id": "", "object": "chat.completion", "created": 0, "model": "",
+                "choices": [{"index": 0, "message": msg, "finish_reason": "stop",
+                             **({"logprobs": logprobs_part(lps, lps_reasoning, lps_tools)} if lps is not None else {})}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+    usage = last["usage"] if "usage" in last else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
-           "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"],
+           "choices": [{"index": 0, "message": msg, "finish_reason": finish or "stop",
                         **({"logprobs": logprobs_part(lps, lps_reasoning, lps_tools)} if lps is not None else {})}],
-           "usage": last["usage"]}
+           "usage": usage}
     if last.get("timings"):
         out["timings"] = last["timings"]
     return out

@@ -79,9 +79,9 @@ bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n
     return true;
 }
 
-// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0), 170 (Q8_0), 320 (BF16) and 176 (a Q5_K
-// deepseek41 Engram row) are run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific,
-// so a second row size is the correctness evidence for the generic path.
+// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0), 120 (Q5_1), 170 (Q8_0), 320 (BF16)
+// and 176 (a Q5_K deepseek41 Engram row) are run too, through the exact same generic row_bytes path -- nothing here
+// is IQ4_NL-specific, so a second row size is the correctness evidence for the generic path.
 int selftest(const std::string& dir, uint32_t rb) {
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
@@ -347,6 +347,50 @@ int q8_decode_check() {
     return bad ? 1 : 0;
 }
 
+// A Q5_1 PLE row (5 blocks of {fp16 d, fp16 m, 4-byte qh, 16-byte qs}) decoded by the shared dequantizer against
+// a plain reference that assembles each code and the min term by hand, on random rows with finite d and m.
+// The code is 0..31 (no -16 offset) and the value is d * code + m; qh[j]'s bits are the high bits of element j and
+// element j+16, the split-half nibble layout.
+int q5_1_decode_check() {
+    std::mt19937 rng(13);
+    int bad = 0;
+    for (int t = 0; t < 2000; ++t) {
+        uint8_t row[k::PLE_ROW_BYTES_Q5_1];
+        for (auto& b : row) b = (uint8_t) rng();
+        for (int b = 0; b < k::PLE_HEAD_DIM / 32; ++b) {   // finite scales and mins only
+            const uint16_t d = (uint16_t) (0x2400 + (rng() % 0x1800));
+            const uint16_t m = (uint16_t) (0x2400 + (rng() % 0x1800));
+            std::memcpy(row + b * 24, &d, 2);
+            std::memcpy(row + b * 24 + 2, &m, 2);
+        }
+        float got[k::PLE_HEAD_DIM];
+        for (int b = 0; b < k::PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_1(row + b * 24, got + b * 32);
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            const uint8_t* blk = row + (i / 32) * 24;
+            uint16_t hd, hm;
+            std::memcpy(&hd, blk, 2);
+            std::memcpy(&hm, blk + 2, 2);
+            const int e = (hd >> 10) & 31, man = hd & 1023;
+            const float d = (e == 0 ? std::ldexp((float) man, -24) : std::ldexp((float) (man + 1024), e - 25)) *
+                            ((hd & 0x8000) ? -1.0f : 1.0f);
+            const int em = (hm >> 10) & 31, mm = hm & 1023;
+            const float m = (em == 0 ? std::ldexp((float) mm, -24) : std::ldexp((float) (mm + 1024), em - 25)) *
+                            ((hm & 0x8000) ? -1.0f : 1.0f);
+            const int j = i % 32;
+            const uint8_t* qh = blk + 4;
+            const uint8_t* qs = blk + 8;
+            const uint32_t h = (uint32_t) qh[0] | ((uint32_t) qh[1] << 8) | ((uint32_t) qh[2] << 16) |
+                               ((uint32_t) qh[3] << 24);
+            const int hi = j < 16 ? (int) (qs[j] & 0x0F) | (int) (((h >> j) & 1u) << 4)
+                                  : (int) (qs[j - 16] >> 4) | (int) (((h >> j) & 1u) << 4);
+            const float want = (float) hi * d + m;
+            if (got[i] != want) ++bad;
+        }
+    }
+    std::printf("Q5_1 PLE row decode: %s\n", bad ? "FAILED" : "OK");
+    return bad ? 1 : 0;
+}
+
 template <class T> void put(std::vector<uint8_t>& b, T v) {
     const auto n = b.size();
     b.resize(n + sizeof(T));
@@ -469,18 +513,20 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS]\n"); return 2; }
     }
     if (self) {
-        // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0), 170 (Q8_0), 320 (BF16) and 176 (a Q5_K
-        // deepseek41 Engram row) through the same generic row_bytes path -- see the comment on selftest().
+        // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0), 120 (Q5_1), 170 (Q8_0), 320 (BF16) and 176
+        // (a Q5_K deepseek41 Engram row) through the same generic row_bytes path -- see the comment on selftest().
         const int r90 = selftest(dir, ng::ROW_BYTES);
         const int r110 = selftest(dir, k::PLE_ROW_BYTES_Q5_0);
+        const int r120 = selftest(dir, k::PLE_ROW_BYTES_Q5_1);
         const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
         const int r320 = selftest(dir, k::PLE_ROW_BYTES_BF16);
         const int r176 = selftest(dir, 176);
         const int q8 = q8_decode_check();
+        const int q5_1 = q5_1_decode_check();
         const int bf16 = bf16_decode_check();
         const int warm = warm_rows_check(dir);
-        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : r320 != 0 ? r320 : r176 != 0 ? r176
-               : q8 != 0 ? q8 : bf16 != 0 ? bf16 : warm;
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r120 != 0 ? r120 : r170 != 0 ? r170 : r320 != 0 ? r320
+               : r176 != 0 ? r176 : q8 != 0 ? q8 : q5_1 != 0 ? q5_1 : bf16 != 0 ? bf16 : warm;
     }
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");

@@ -69,6 +69,9 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch == "deepseek41":
         from serve.models.deepseek41 import DeepSeek41
         return DeepSeek41()
+    if arch == "ernie55":
+        from serve.models.ernie55 import Ernie55
+        return Ernie55()
     if arch in ("hy4flash", "hy_v4_flash"):
         from serve.models.hy4flash import Hy4Flash
         return Hy4Flash()

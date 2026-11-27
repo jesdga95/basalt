@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
+STAMP_FORMAT = "%m-%d %H:%M:%S "       # what the server puts before each engine line it writes to engine.log
+STAMP = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d ")
 INFO, WARN, ERR = "info", "warn", "err"
 _NAMES = {"warning": WARN, "error": ERR}
 ENGINE = re.compile(r"(?P<tag>basalt(?:-[a-z]+)?(?: [\w-]+)*):(?: (?P<lvl>warning|error):)? (?P<text>.*)", re.S)
@@ -22,6 +24,12 @@ LEGACY = re.compile(r"basalt (?P<lvl>warning|error): (?P<text>.*)", re.S)
 SERVER = re.compile(r"\[server\] (?:(?P<lvl>warning|error)(?:: | {2,}))?")
 TRACEBACK = "Traceback (most recent call last):"
 CHAINED = ("During handling of the above exception", "The above exception was the direct cause")
+
+
+def unstamp(line: str) -> str:
+    """The line without the time the server put before it in engine.log; a line without one comes back as it is."""
+    m = STAMP.match(line)
+    return line if m is None else line[m.end():]
 
 
 class EngineLine(NamedTuple):
@@ -32,6 +40,7 @@ class EngineLine(NamedTuple):
 
 def engine_line(line: str) -> EngineLine | None:
     """The parts of an engine log line, or None when the line is not one."""
+    line = unstamp(line)
     m = LEGACY.fullmatch(line)
     if m:
         return EngineLine("basalt", _NAMES[m["lvl"]], m["text"])
@@ -54,6 +63,7 @@ class LevelReader:
         self._in_traceback = False
 
     def read(self, line: str) -> str:
+        line = unstamp(line)
         if line.startswith(TRACEBACK):
             self._in_traceback = True
             return ERR

@@ -102,16 +102,17 @@ def tools_from_openai_format(tools):
 
 def _split_tool_name(name: str, namespace: Optional[str] = None) -> Tuple[Optional[str], str]:
     """Split a qualified name and validate any explicit namespace."""
+    if not isinstance(name, str):
+        raise ValueError(f"Tool name must be a string, not {name!r}")
     prefix, separator, bare_name = name.partition("::")
     if separator:
-        assert namespace in (None, prefix), (
-            f"Conflicting tool namespaces: {namespace} != {prefix}"
-        )
+        if namespace not in (None, prefix):
+            raise ValueError(f"Conflicting tool namespaces: {namespace} != {prefix}")
         namespace, name = prefix, bare_name
-    assert "::" not in name, f"Tool name must not contain '::': {name}"
-    assert namespace is None or "::" not in namespace, (
-        f"Tool namespace must not contain '::': {namespace}"
-    )
+    if "::" in name:
+        raise ValueError(f"Tool name must not contain '::': {name}")
+    if namespace is not None and "::" in namespace:
+        raise ValueError(f"Tool namespace must not contain '::': {namespace}")
     return namespace, name
 
 
@@ -463,12 +464,11 @@ def render_reasoning_effort(
     """Render the V4.1 numeric reasoning effort prefix (thinking mode, index 0 only)."""
     if effort is None:
         effort = DEFAULT_REASONING_EFFORT
-    assert (
-        type(effort) is int and 1 <= effort <= 100
-    ) or effort in REASONING_EFFORT_MAPPINGS, (
-        "Invalid reasoning effort for deepseek_v41: "
-        f"{effort}, should be int within [1,100] or {list(REASONING_EFFORT_MAPPINGS)}"
-    )
+    if not ((type(effort) is int and 1 <= effort <= 100) or effort in REASONING_EFFORT_MAPPINGS):
+        raise ValueError(
+            "Invalid reasoning effort for deepseek_v41: "
+            f"{effort}, should be int within [1,100] or {list(REASONING_EFFORT_MAPPINGS)}"
+        )
     if type(effort) is str:
         effort = REASONING_EFFORT_MAPPINGS[effort]
     if index == 0 and thinking_mode == "thinking":
@@ -594,8 +594,10 @@ def render_message(
     """
     Render a single message at the given index into its V4.1 encoded string form.
     """
-    assert 0 <= index < len(messages)
-    assert thinking_mode in ["chat", "thinking"], f"Invalid thinking_mode `{thinking_mode}`"
+    if not (0 <= index < len(messages)):
+        raise ValueError(f"Message index out of range: {index}")
+    if thinking_mode not in ["chat", "thinking"]:
+        raise ValueError(f"Invalid thinking_mode `{thinking_mode}`")
 
     msg = messages[index]
     last_user_idx = find_last_user_index(messages)
@@ -640,14 +642,14 @@ def render_message(
             for block in content_blocks:
                 block_type = block.get("type")
                 if block_type == "text":
-                    parts.append(block.get("text", ""))
+                    parts.append(block.get("text") or "")
                 elif block_type == "tool_result":
                     tool_content = block.get("content", "")
                     if isinstance(tool_content, list):
                         text_parts = []
                         for b in tool_content:
                             if b.get("type") == "text":
-                                text_parts.append(b.get("text", ""))
+                                text_parts.append(b.get("text") or "")
                             else:
                                 text_parts.append(f"[Unsupported {b.get('type')}]")
                         tool_content = "\n\n".join(text_parts)
@@ -662,7 +664,7 @@ def render_message(
         prompt += LATEST_REMINDER_SP_TOKEN + latest_reminder_msg_template.format(content=content)
 
     elif role == "tool":
-        raise NotImplementedError("deepseek_v41 merges tool messages into user; please preprocess with merge_tool_messages()")
+        raise ValueError("deepseek_v41 merges tool messages into user; please preprocess with merge_tool_messages()")
 
     elif role == "assistant":
         thinking_part = ""
@@ -709,7 +711,7 @@ def render_message(
                 tool_calls=tc_content,
             )
     else:
-        raise NotImplementedError(f"Unknown role: {role}")
+        raise ValueError(f"Unknown role: {role}")
 
     # Append transition tokens based on what follows
     if index + 1 < len(messages) and messages[index + 1].get("role") not in ["assistant", "latest_reminder"]:
@@ -718,7 +720,8 @@ def render_message(
     task = messages[index].get("task")
     if task is not None:
         # Task special token for internal classification tasks
-        assert task in VALID_TASKS, f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}"
+        if task not in VALID_TASKS:
+            raise ValueError(f"Invalid task: '{task}'. Valid tasks are: {list(VALID_TASKS)}")
         task_sp_token = DS_TASK_SP_TOKENS[task]
 
         if task != "action":

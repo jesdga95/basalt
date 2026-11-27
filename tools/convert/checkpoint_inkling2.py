@@ -12,7 +12,9 @@ official checkpoint, for tools/convert/convert.py.
                         (their padded rows past the vocabulary dropped), the loop controllers BF16 as stored, norms,
                         block-residual and message queries, router, its bias, convolution taps, relative-bias tables
                         and clip scales F32 (exact); the DSpark drafter's tensors (`mtp.safetensors`) as `dspark.*`,
-                        BF16 and F32 as stored
+                        BF16 and F32 as stored, or with `--dflash2 DIR` a DFlash 2 block drafter (`DFlash2DraftModel`)
+                        embedded in its place as `dflash2.*` (projections Q8_0 from BF16, norms and conv base kernels
+                        F32, selector BF16 with padded vocabulary rows dropped)
   vision/mmproj       the vision tower as llama.cpp's clip GGUF (projector inkling2v), BF16 / F32 as stored
   tokenizer/*, meta   from config.json, generation_config.json, the tokenizer files and the model card
 
@@ -120,6 +122,31 @@ DRAFTER_GLOBAL = {
     "markov_head.hidden_out.weight": ("markov.out.weight", "BF16"),
     "markov_head.hidden_out.bias": ("markov.out.bias", "F32"),
     "markov_head.dflare_norm.weight": ("markov.dflare_norm.weight", "F32"),
+}
+DFLASH2_LAYER = {
+    "input_layernorm.weight": ("attn_norm.weight", "F32"),
+    "post_attention_layernorm.weight": ("post_attention_norm.weight", "F32"),
+    "self_attn.q_proj.weight": ("attn_q.weight", "Q8"),
+    "self_attn.k_proj.weight": ("attn_k.weight", "Q8"),
+    "self_attn.v_proj.weight": ("attn_v.weight", "Q8"),
+    "self_attn.o_proj.weight": ("attn_output.weight", "Q8"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "F32"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "F32"),
+    "mlp.gate_proj.weight": ("ffn_gate.weight", "Q8"),
+    "mlp.up_proj.weight": ("ffn_up.weight", "Q8"),
+    "mlp.down_proj.weight": ("ffn_down.weight", "Q8"),
+    "attention_conv.base_kernel": ("attn_conv.base", "F32"),
+    "attention_conv.kernel_projection.weight": ("attn_conv.weight", "Q8"),
+    "mlp_conv.base_kernel": ("ffn_conv.base", "F32"),
+    "mlp_conv.kernel_projection.weight": ("ffn_conv.weight", "Q8"),
+}
+DFLASH2_GLOBAL = {
+    "fc.weight": ("fc.weight", "Q8"),
+    "hidden_norm.weight": ("hidden_norm.weight", "F32"),
+    "norm.weight": ("norm.weight", "F32"),
+    "candidate_selector.hidden_projection.weight": ("selector.hidden.weight", "BF16"),
+    "candidate_selector.predecessor_codebook": ("selector.pred", "BF16"),
+    "candidate_selector.successor_codebook": ("selector.succ", "BF16"),
 }
 VISION_BLOCK = {
     "ln_1.weight": ("ln1.weight", "F32"), "ln_1.bias": ("ln1.bias", "F32"),
@@ -283,9 +310,10 @@ def _expert_blobs(kind, src, h, ff, e0, n) -> bytes:
 class Plan:
     """The pack's `gguf` tensors in checkpoint order (the language model, then the drafter), each with how it is made."""
 
-    def __init__(self, ck: C.Checkpoint):
+    def __init__(self, ck: C.Checkpoint, skip_dspark: bool = False):
         tc = ck.text
         self.ck = ck
+        self.skip_dspark = skip_dspark
         if ck.config.get("model_type") != "inkling2_loop" or tc.get("model_type") != "inkling2_loop_text":
             raise S.ConvertError(f"config.json: model_type {ck.config.get('model_type')} / {tc.get('model_type')}, "
                                  "expected inkling2_loop / inkling2_loop_text")
@@ -351,16 +379,17 @@ class Plan:
         for i in range(n_core):
             name = f"blk.{self.core[0] + i}.loop_msg_query.weight"
             self.tensors[name] = Tensor(name, "F32", None, "stack", [self.h, 4])
-        for k in sorted((k for k in ck.t if k.startswith("mtp.")), key=lambda k: ck.t[k][1]):
-            _, _, dt, shape, _ = ck.t[k]
-            m = re.fullmatch(r"mtp\.layers\.(\d+)\.(.+)", k)
-            rule = DRAFTER_LAYER.get(m.group(2)) if m else DRAFTER_GLOBAL.get(k[len("mtp."):])
-            if rule is None:
-                raise S.ConvertError(f"mtp.safetensors: {k[len('mtp.'):]} has no counterpart")
-            gname = "dspark." + (f"blk.{m.group(1)}.{rule[0]}" if m else rule[0])
-            how = "vocab" if k == "mtp.markov_head.markov_w1.weight" else "id"
-            ne = [shape[1], self.n_vocab] if how == "vocab" else list(reversed(shape))
-            self._add(gname, rule[1], k, how, ne, dt)
+        if not self.skip_dspark:
+            for k in sorted((k for k in ck.t if k.startswith("mtp.")), key=lambda k: ck.t[k][1]):
+                _, _, dt, shape, _ = ck.t[k]
+                m = re.fullmatch(r"mtp\.layers\.(\d+)\.(.+)", k)
+                rule = DRAFTER_LAYER.get(m.group(2)) if m else DRAFTER_GLOBAL.get(k[len("mtp."):])
+                if rule is None:
+                    raise S.ConvertError(f"mtp.safetensors: {k[len('mtp.'):]} has no counterpart")
+                gname = "dspark." + (f"blk.{m.group(1)}.{rule[0]}" if m else rule[0])
+                how = "vocab" if k == "mtp.markov_head.markov_w1.weight" else "id"
+                ne = [shape[1], self.n_vocab] if how == "vocab" else list(reversed(shape))
+                self._add(gname, rule[1], k, how, ne, dt)
         self._check_complete(tc)
 
     def _add(self, gname, form, src, how, ne, dt):
@@ -392,7 +421,7 @@ class Plan:
         missing = [n for n in need if n not in self.tensors]
         if missing:
             raise S.ConvertError(f"the checkpoint lacks {len(missing)} tensors the engine reads: " + ", ".join(missing[:8]))
-        mc = self.ck.config.get("mtp_config") or {}
+        mc = None if self.skip_dspark else (self.ck.config.get("mtp_config") or {})
         if mc:
             n = int(mc["num_hidden_layers"])
             dneed = ["dspark." + r[0] for r in DRAFTER_GLOBAL.values()]
@@ -452,8 +481,135 @@ def _job(args):
     return S.q8_0(x) if np.isfinite(x).all() else "a non-finite value"
 
 
+# ------------------------------------------------------------------ the block drafter (DFlash 2)
+class Dflash2:
+    """A DFlash 2 block drafter (DFlash2DraftModel safetensors and config.json) embedded in place of `dspark.*` as
+    `dflash2.*`: projections Q8_0 from BF16, norms and conv base kernels F32, selector BF16 with padded vocabulary rows
+    dropped."""
+
+    def __init__(self, d, ck: C.Checkpoint):
+        self.dir = pathlib.Path(d)
+        cfg = self.dir / "config.json"
+        if not cfg.is_file():
+            raise S.ConvertError(f"{cfg} not found")
+        self.config = json.loads(cfg.read_text(encoding="utf-8"))
+        if self.config.get("architectures") != ["DFlash2DraftModel"]:
+            raise S.ConvertError(f"{self.dir}: not a DFlash2DraftModel")
+        tc, dc = ck.text, self.config.get("dflash_config") or {}
+        self.n_vocab = int(tc["unpadded_vocab_size"])
+        H = int(self.config["hidden_size"])
+        if H != int(tc["hidden_size"]) or int(self.config["vocab_size"]) != int(tc["vocab_size"]):
+            raise S.ConvertError(f"{self.dir}: the drafter's width or vocabulary differs from the model's")
+        loop = tc["loop_config"]
+        n_layers = int(tc["num_hidden_layers"])
+        c0, c1, passes = int(loop["core_start"]), int(loop["core_end"]), int(loop["num_passes"])
+        n_visits = c0 + passes * (c1 - c0) + (n_layers - c1)
+        targets = [int(x) for x in dc.get("target_layer_ids") or []]
+        if not targets or targets != sorted(set(targets)) or targets[0] < 0 or targets[-1] != n_visits:
+            raise S.ConvertError(f"{self.dir}: target_layer_ids {targets} must be sorted, unique, and end at visit {n_visits}")
+        if self.config.get("is_causal") is not False or set(self.config.get("layer_types", [])) != {"sliding_attention"}:
+            raise S.ConvertError(f"{self.dir}: only the non-causal sliding-window drafter is converted")
+        if self.config.get("attention_bias") or self.config.get("hidden_act", "silu") != "silu":
+            raise S.ConvertError(f"{self.dir}: attention biases or non-SiLU activations are not supported")
+        if int(dc.get("conv_kernel_size", 0)) != 2 or dc.get("selector_softcap_mode", "after_correction") != "after_correction":
+            raise S.ConvertError(f"{self.dir}: expected conv_kernel_size 2 and selector_softcap_mode 'after_correction'")
+        if int(dc["mask_token_id"]) < 0 or int(dc["mask_token_id"]) >= self.n_vocab:
+            raise S.ConvertError(f"{self.dir}: mask_token_id {dc['mask_token_id']} outside unpadded vocabulary {self.n_vocab}")
+        self.files = sorted(self.dir.glob("*.safetensors"))
+        if not self.files:
+            raise S.ConvertError(f"{self.dir}: no safetensors files")
+        self.t: dict[str, tuple] = {}
+        for f in self.files:
+            head, base = S.read_safetensors_header(f)
+            for k, v in sorted(((k, v) for k, v in head.items() if k != "__metadata__"), key=lambda kv: kv[1]["data_offsets"][0]):
+                if k in self.t:
+                    raise S.ConvertError(f"{f.name}: duplicate tensor {k}")
+                a_, b_ = v["data_offsets"]
+                self.t[k] = (f, base + a_, v["dtype"], list(v["shape"]), b_ - a_)
+        self.tensors: dict[str, Tensor] = {}
+        for k, (_, _, dt, shape, _) in self.t.items():
+            m = re.fullmatch(r"layers\.(\d+)\.(.+)", k)
+            rule = DFLASH2_LAYER.get(m.group(2)) if m else DFLASH2_GLOBAL.get(k)
+            if rule is None:
+                raise S.ConvertError(f"{self.dir}: drafter tensor {k} has no counterpart")
+            if dt != "BF16":
+                raise S.ConvertError(f"{k} is {dt}, expected BF16")
+            if k == "fc.weight" and shape != [H, H * len(targets)]:
+                raise S.ConvertError(f"{self.dir}: fc.weight is {shape}, expected {[H, H * len(targets)]}")
+            how = "vocab" if k in ("candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook") else "id"
+            if how == "vocab" and shape[0] < self.n_vocab:
+                raise S.ConvertError(f"{k} has {shape[0]} rows, fewer than the vocabulary's {self.n_vocab}")
+            ne = [shape[1], self.n_vocab] if how == "vocab" else list(reversed(shape))
+            if rule[1] == "Q8" and (len(ne) != 2 or ne[0] % 32):
+                raise S.ConvertError(f"{k}: rows of {ne[0]} values cannot be Q8_0")
+            name = "dflash2." + (f"blk.{m.group(1)}.{rule[0]}" if m else rule[0])
+            self.tensors[name] = Tensor(name, rule[1], k, how, ne)
+        n_dl = int(self.config["num_hidden_layers"])
+        need = ["dflash2." + r[0] for r in DFLASH2_GLOBAL.values()]
+        need += [f"dflash2.blk.{l}.{r[0]}" for l in range(n_dl) for r in DFLASH2_LAYER.values()]
+        missing = [x for x in need if x not in self.tensors]
+        if missing:
+            raise S.ConvertError(f"{self.dir} lacks " + ", ".join(missing[:8]))
+
+    def kv(self) -> dict:
+        c, dc = self.config, self.config["dflash_config"]
+        D = ARCH + ".dflash2."
+        rope = c.get("rope_parameters") or {}
+        theta = rope.get("rope_theta", c.get("rope_theta"))
+        cap = dc.get("final_logit_softcapping")
+        return {
+            D + "block_count": int(c["num_hidden_layers"]),
+            D + "block_size": int(dc["block_size"]),
+            D + "mask_token_id": int(dc["mask_token_id"]),
+            D + "target_layers": [int(x) for x in dc["target_layer_ids"]],
+            D + "conv_kernel": int(dc["conv_kernel_size"]),
+            D + "conv_group": int(dc["conv_group_size"]),
+            D + "selector_rank": int(dc["selector_rank"]),
+            D + "selector_top_k": int(dc["selector_top_k"]),
+            D + "logit_softcap": C.f32(0.0 if cap is None else cap),
+            D + "sliding_window": int(c["sliding_window"]),
+            D + "attention.head_count": int(c["num_attention_heads"]),
+            D + "attention.head_count_kv": int(c["num_key_value_heads"]),
+            D + "attention.key_length": int(c["head_dim"]),
+            D + "feed_forward_length": int(c["intermediate_size"]),
+            D + "rope.freq_base": C.f32(theta),
+            D + "attention.layer_norm_rms_epsilon": C.f32(c["rms_norm_eps"]),
+        }
+
+    def values(self, name) -> np.ndarray:
+        t = self.tensors[name]
+        f, off, _, shape, n = self.t[t.src]
+        u = np.fromfile(f, dtype="<u2", count=n // 2, offset=off)
+        x = S._bf16_to_f32(u).reshape(shape)
+        if t.how == "vocab":
+            x = x[:self.n_vocab]
+        return np.ascontiguousarray(x, dtype=np.float32)
+
+    def float_bytes(self, name) -> bytes:
+        t = self.tensors[name]
+        x = self.values(name)
+        if not np.isfinite(x).all():
+            raise S.ConvertError(f"{name} has a non-finite value")
+        if t.type_name == "F32":
+            return x.astype("<f4").tobytes()
+        f, off, _, shape, n = self.t[t.src]
+        keep = self.n_vocab * shape[1] * 2 if t.how == "vocab" else n
+        return np.fromfile(f, dtype=np.uint8, count=keep, offset=off).tobytes()
+
+    def chunks(self, name, pool, depth: int = 64):
+        t = self.tensors[name]
+        f, off, _, _, _ = self.t[t.src]
+        ne0, ne1 = t.ne
+        step = max(1, ROWS_PER_JOB // ne0)
+        jobs = (("q8", str(f), off, ne0, r, min(step, ne1 - r)) for r in range(0, ne1, step))
+        for b in S.bounded_imap(pool, _job, jobs, depth):
+            if isinstance(b, str):
+                raise S.ConvertError(f"{name}: {b}")
+            yield b
+
+
 # ------------------------------------------------------------------ metadata
-def model_kv(ck: C.Checkpoint, name: str | None) -> dict:
+def model_kv(ck: C.Checkpoint, name: str | None, dflash2: Dflash2 | None = None) -> dict:
     c, tc = ck.config, ck.text
     A = ARCH + "."
     d = ck.dir
@@ -512,8 +668,10 @@ def model_kv(ck: C.Checkpoint, name: str | None) -> dict:
         "general.file_type": 40,
         "general.quantization_version": 2,
     })
-    mc = c.get("mtp_config") or {}
-    if mc:
+    mc = None if dflash2 is not None else (c.get("mtp_config") or {})
+    if dflash2 is not None:
+        kv.update(dflash2.kv())
+    elif mc:
         D = A + "dspark."
         kv.update({
             D + "block_count": int(mc["num_hidden_layers"]),
@@ -585,18 +743,23 @@ LICENSE = {"apache-2.0": "Apache License 2.0"}
 
 
 def build(a, Job, fingerprint, die) -> None:
+    def source_entry(p):
+        return {"path": p.name, "size": p.stat().st_size, "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)}
+
     import os
     import tokenizer
     out = pathlib.Path(a.out)
     partial = pathlib.Path(str(out) + ".partial")
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
+    dflash2_dir = getattr(a, "dflash2", None)
     try:
         ck = C.Checkpoint(a.checkpoint, side={"mtp.safetensors": "mtp."})
-        plan = Plan(ck)
+        dflash2 = Dflash2(dflash2_dir, ck) if dflash2_dir else None
+        plan = Plan(ck, skip_dspark=dflash2 is not None)
         experts = Experts(ck)
         name = a.name or "Inkling 2 Mini"
-        kv = model_kv(ck, name)
+        kv = model_kv(ck, name, dflash2=dflash2)
     except S.ConvertError as e:
         die(str(e))
     partial.unlink(missing_ok=True)
@@ -616,29 +779,36 @@ def build(a, Job, fingerprint, die) -> None:
             for n, info in plan.tensors.items():
                 parts.append(Stream(info.expected_bytes(), plan.chunks(n, pool)) if info.type_name == "Q8_0" else plan.float_bytes(n))
                 names.append(n)
+            for n, info in (dflash2.tensors.items() if dflash2 else []):
+                parts.append(Stream(info.expected_bytes(), dflash2.chunks(n, pool)) if info.type_name == "Q8_0" else dflash2.float_bytes(n))
+                names.append(n)
             offs = w.add_parts("gguf", parts, TENSOR_ALIGN)
             job._report("gguf", w.entries[-1][2], time.time() - t)
             mp = pathlib.Path(tmp) / "mmproj.gguf"
             mmproj(ck, mp, name)
             job.file("vision/mmproj", mp)
             tens = {}
+            every = dict(plan.tensors, **(dflash2.tensors if dflash2 else {}))
             for n, off in zip(names, offs):
-                t_ = plan.tensors[n]
+                t_ = every[n]
                 tens[n] = {"type": t_.type_name, "type_id": t_.type_id, "shape": [int(d) for d in t_.ne],
                            "bytes": t_.expected_bytes(), "offset": off}
             lic = kv.get("general.license", "")
-            mx = [l for l, kind, _, _, _ in experts.layers if kind == "q8_0"]
+            mx = [l for l, kind, _, _, _ in experts.layers if kind == "mxfp8"]
+            src_files = [p for p in ck.files if not (dflash2 and p.name == "mtp.safetensors")] + (dflash2.files if dflash2 else [])
             meta = {
                 "format": "basalt", "version": 2, "name": name, "arch": ARCH,
                 "converter": {"tool": "tools/convert/convert.py"},
-                "sources": [{"path": p.name, "size": p.stat().st_size,
-                             "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck.files],
+                "sources": [source_entry(p) for p in src_files],
                 "gguf_kv": kv,
                 "tensors": tens,
                 "license": {"name": LICENSE.get(lic, lic)},
                 "hf_config": ck.config,
                 "vision": {"projector": "inkling2v", "source": "the checkpoint's BF16 vision tower"},
-                "dspark": {"source": "mtp.safetensors", "form": "BF16 and F32 as stored"} if ck.config.get("mtp_config") else None,
+                "dspark": {"source": "mtp.safetensors", "form": "BF16 and F32 as stored"} if (not dflash2 and ck.config.get("mtp_config")) else None,
+                **({"dflash2": {"source": pathlib.Path(dflash2_dir).name, "files": [source_entry(p) for p in dflash2.files],
+                                "form": "projections Q8_0 from BF16, norms and conv base kernels F32, selector BF16 (padded vocabulary rows dropped)"}}
+                   if dflash2 else {}),
                 "checkpoint": {
                     "dir": pathlib.Path(a.checkpoint).name,
                     "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
@@ -647,7 +817,7 @@ def build(a, Job, fingerprint, die) -> None:
                     **({"experts_mxfp8": "layers " + ", ".join(map(str, mx)) + ": native MXFP8 (type 46: 4 UE8M0 scales + "
                                          "128 E4M3 codes per 132-byte block, codes and scales as stored)"} if mx else {}),
                     "bf16_projections": "Q8_0 (ggml reference rounding)",
-                    "transforms": {k: METHODS[k] for k in sorted({t_.how for t_ in plan.tensors.values()})}},
+                    "transforms": {k: METHODS[k] for k in sorted({t_.how for t_ in every.values()})}},
             }
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
@@ -663,3 +833,21 @@ def build(a, Job, fingerprint, die) -> None:
             partial.unlink(missing_ok=True)
     os.replace(partial, out)
     print(f"done: {len(job.rows)} sections, {out.stat().st_size / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
+
+
+if __name__ == "__main__":
+    import argparse
+    import convert as _conv
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--checkpoint", required=True, metavar="DIR", help="Thinking Machines' Inkling 2 checkpoint directory")
+    ap.add_argument("--dflash2", metavar="DIR", help="DFlash2DraftModel directory embedded as dflash2.* in place of dspark.*")
+    ap.add_argument("--out", required=True, help="the .basalt file to write")
+    ap.add_argument("--name")
+    ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--force", action="store_true")
+    a = ap.parse_args()
+    if not pathlib.Path(a.checkpoint).is_dir():
+        _conv.die(f"missing input: {a.checkpoint}")
+    if a.dflash2 and not pathlib.Path(a.dflash2).is_dir():
+        _conv.die(f"missing input: {a.dflash2}")
+    build(a, _conv.Job, _conv.fingerprint, _conv.die)

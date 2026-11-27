@@ -192,6 +192,12 @@ struct EngramArgs {
     float eps = 1.1920929e-07f;   ///< of the gate's two norms (the stream and the key) and the value's: FP32's machine epsilon
 };
 
+/// Dequantizes packed F8_E4M3 Engram rows `raw` [n_tok][n_cols][W] on the device, applies per-(row, col) RMSNorm
+/// (eps = 1.1920929e-07f) and per-element scale `norm_w` [n_cols][W] and row validity mask `valid` [n_tok], writing
+/// fp32 `out` [n_tok][n_cols][W] bit-for-bit identically to the host loop.
+void engram_norm_e4m3(const uint8_t* raw, const float* norm_w, const float* valid, int n_tok, int n_cols, int W,
+                      float* out, void* stream);
+
 /// The Engram step on the four streams x[t][4][n] of n_tok rows, in place. kv: the fused projection [t][5][n] (four keys, one value)
 /// before its bias kv_b [5][n]; gate_w and hc_scale [4][n]; pre_gamma [n]. valid[t]: 0 leaves row t as it is.
 /// gate_i = sigmoid(copysign(sqrt(max(|d_i|, 1e-6)), d_i)), d_i = sum_j rms(x_i)[j] rms(key_i)[j] gate_w[i][j] / sqrt(n);

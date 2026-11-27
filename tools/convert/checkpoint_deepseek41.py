@@ -26,15 +26,20 @@ import multiprocessing
 import os
 import pathlib
 import re
+import sys
 import tempfile
 import time
 
 import numpy as np
 
-import ggufq
-import model_sections as S
-from checkpoint import _expert_job, bounded_imap
-from model_file import TENSOR_ALIGN, ModelFile, ModelWriter
+HERE = pathlib.Path(__file__).resolve().parent
+for _p in (str(HERE.parent), str(HERE)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import ggufq  # noqa: E402
+import model_sections as S  # noqa: E402
+from checkpoint import _expert_job, bounded_imap  # noqa: E402
+from model_file import TENSOR_ALIGN, ModelFile, ModelWriter  # noqa: E402
 
 MXFP4 = 39
 ENGRAM_ROW = 256
@@ -103,49 +108,79 @@ def mxfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
     E8M0 scales [rows, 8]) as ggml MXFP4 rows: per 32 values the scale byte, then 16 bytes whose low nibble is value j
     and high nibble value j + 16."""
     rows = codes.shape[0]
-    v = np.empty((rows, ENGRAM_ROW), np.uint8)
-    v[:, 0::2] = codes & 15
-    v[:, 1::2] = codes >> 4
-    v = v.reshape(rows, ENGRAM_ROW // 32, 2, 16)
-    out = np.empty((rows, ENGRAM_ROW // 32, 17), np.uint8)
+    nb = ENGRAM_ROW // 32
+    c64 = np.ascontiguousarray(codes, dtype=np.uint8).view(np.uint64).reshape(rows, nb, 2)
+    lo, hi = c64[..., 0], c64[..., 1]
+    ev = (lo & np.uint64(0x0F0F0F0F0F0F0F0F)) | ((hi & np.uint64(0x0F0F0F0F0F0F0F0F)) << np.uint64(4))
+    od = ((lo >> np.uint64(4)) & np.uint64(0x0F0F0F0F0F0F0F0F)) | (hi & np.uint64(0xF0F0F0F0F0F0F0F0))
+    out = np.empty((rows, nb, 17), np.uint8)
     out[..., 0] = scales
-    out[..., 1:] = v[:, :, 0, :] | (v[:, :, 1, :] << 4)
+    q = out[..., 1:].reshape(rows, nb, 8, 2)
+    q[..., 0] = ev.view(np.uint8).reshape(rows, nb, 8)
+    q[..., 1] = od.view(np.uint8).reshape(rows, nb, 8)
     return out.reshape(-1)
 
 
 MXFP4_VALUES = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], np.float32)
+MXFP4_CODES = MXFP4_VALUES * np.float32(2)     # the engine's kvalues_fp4: e2m1 doubled, against the halved scale
 
 
 def mxfp4_values(rows: np.ndarray) -> np.ndarray:
-    """ggml MXFP4 rows (17-byte blocks, ENGRAM_ROW values a row) as f32 [rows, ENGRAM_ROW]."""
+    """ggml MXFP4 rows (17-byte blocks, ENGRAM_ROW values a row) as f32 [rows, ENGRAM_ROW], decoded as the engine's
+    dequantize_mxfp4: the e2m1 values doubled and e8m0_to_fp32_half's 2^(s - 128), so a scale byte 255 is 2^127, not
+    inf."""
     b = rows.reshape(-1, ENGRAM_ROW // 32, 17)
-    d = np.ldexp(np.float32(1), b[..., 0].astype(np.int32) - 127).astype(np.float32)[..., None]
-    q = b[..., 1:]
-    v = np.concatenate([MXFP4_VALUES[q & 15], MXFP4_VALUES[q >> 4]], axis=-1) * d
+    with np.errstate(over="ignore"):
+        d = np.ldexp(np.float32(1), b[..., 0].astype(np.int32) - 128).astype(np.float32)[..., None]
+        q = b[..., 1:]
+        v = np.concatenate([MXFP4_CODES[q & 15], MXFP4_CODES[q >> 4]], axis=-1) * d
     return v.reshape(-1, ENGRAM_ROW)
 
 
+def e4m3_scaled_values(raw: np.ndarray) -> np.ndarray:
+    """ggml type 43 as the Engram table stores it (33 bytes a 32-value block: one E8M0 scale, then 32 E4M3 codes) as f32
+    values, decoded as engram_rows.hpp reads them (the reserved E4M3 patterns and an E8M0 0xFF scale are 0, not NaN)."""
+    b = raw.reshape(-1, 33)
+    with np.errstate(over="ignore"):
+        d = np.ldexp(np.float32(1), b[:, 0].astype(np.int32) - 127).astype(np.float32)
+    d[b[:, 0] == 255] = 0.0
+    return (np.nan_to_num(E4M3[b[:, 1:]], nan=0.0) * d[:, None]).reshape(-1)
+
+
+def pack_values(type_name: str, raw: np.ndarray) -> np.ndarray:
+    """The values of a pack tensor stored as `type_name`, float32: MXFP4 (39) and type 43 (F8_E4M3_RAW) are BASE's
+    Engram row types, which ggufq has no decoder for; every other name is ggufq's."""
+    if type_name == "MXFP4":
+        return mxfp4_values(raw).reshape(-1)
+    if type_name == "F8_E4M3_RAW":
+        return e4m3_scaled_values(raw)
+    try:
+        return ggufq.dequantize(raw, ggufq.GGMLQuantizationType[type_name]).astype(np.float32)
+    except KeyError:
+        raise S.ConvertError(f"no decoder for {type_name}")
+
+
 def _engram_job(args):
-    path, w_off, s_off, r0, n = args
-    codes = np.fromfile(path, np.uint8, n * 128, offset=w_off + r0 * 128).reshape(n, 128)
-    scales = np.fromfile(path, np.uint8, n * 8, offset=s_off + r0 * 8).reshape(n, 8)
+    w_path, w_off, s_path, s_off, r0, n = args
+    codes = np.fromfile(w_path, np.uint8, n * 128, offset=w_off + r0 * 128).reshape(n, 128)
+    scales = np.fromfile(s_path, np.uint8, n * 8, offset=s_off + r0 * 8).reshape(n, 8)
     if (scales == 255).any():
-        return f"{pathlib.Path(path).name}: an Engram scale is NaN"
+        return f"{pathlib.Path(s_path).name}: an Engram scale is NaN"
     return mxfp4_rows(codes, scales).tobytes()
 
 
 def _dense_job(args):
     """Rows [r0, r0 + n) of a 2-D BF16 or FP8 tensor [R, C] as `how` makes them."""
-    path, w_off, dt, c, s_off, how, r0, n = args
+    w_path, w_off, dt, c, s_path, s_off, how, r0, n = args
     try:
         if dt == "F8_E4M3":
-            codes = np.fromfile(path, np.uint8, n * c, offset=w_off + r0 * c).reshape(n, c)
+            codes = np.fromfile(w_path, np.uint8, n * c, offset=w_off + r0 * c).reshape(n, c)
             sc_cols = (c + 31) // 32
             b0, b1 = r0 // 32, (r0 + n + 31) // 32
-            sc = np.fromfile(path, np.uint8, (b1 - b0) * sc_cols, offset=s_off + b0 * sc_cols).reshape(b1 - b0, sc_cols)
+            sc = np.fromfile(s_path, np.uint8, (b1 - b0) * sc_cols, offset=s_off + b0 * sc_cols).reshape(b1 - b0, sc_cols)
             x = fp8_values(codes, sc, r0 - b0 * 32)
         else:
-            x = S._bf16_to_f32(np.fromfile(path, "<u2", n * c, offset=w_off + r0 * c * 2)).reshape(n, c)
+            x = S._bf16_to_f32(np.fromfile(w_path, "<u2", n * c, offset=w_off + r0 * c * 2)).reshape(n, c)
     except S.ConvertError as e:
         return str(e)
     if not np.isfinite(x).all():
@@ -232,19 +267,21 @@ class Plan:
         if files != sorted(files) or len(set(files)) != len(files):
             raise S.ConvertError("each layer's experts are read from a shard of their own, in file order")
         self.tensors: dict[str, tuple] = {}     # GGUF name -> (how, source names)
-        self.engram: list[tuple[int, str]] = []  # (layer, shard), in layer order
+        engram_w: dict[int, str] = {}
+        engram_s: dict[int, str] = {}
         need = set(files)
         base_t = base_meta["tensors"]
         unknown = []
         gate: dict[int, list[str]] = {}
         for name, f in ck.where.items():
-            if SKIP.match(name) or EXPERT_RE.match(name) or name.endswith(".scale") and name[:-6] + ".weight" in ck.where:
+            if SKIP.match(name) or EXPERT_RE.match(name):
                 continue
             m = ENGRAM_RE.match(name)
             if m:
-                if m.group(2) == "weight":
-                    self.engram.append((int(m.group(1)), f))
+                (engram_w if m.group(2) == "weight" else engram_s)[int(m.group(1))] = f
                 need.add(f)
+                continue
+            if name.endswith(".scale") and name[:-6] + ".weight" in ck.where:
                 continue
             m = re.match(r"^layers\.(\d+)\.(.+)$", name)
             if m and m.group(2) in ENGRAM_GATE:
@@ -258,7 +295,11 @@ class Plan:
                 continue
             self.tensors[gname] = ("src", [name])
             need.add(f)
+            if name.endswith(".weight") and name[:-7] + ".scale" in ck.where:
+                need.add(ck.where[name[:-7] + ".scale"])
         for l, names in gate.items():
+            if len(names) != 2:
+                raise S.ConvertError(f"layer {l}: incomplete engram gate weights {names}")
             self.tensors[f"blk.{l}.engram_gate.weight"] = ("gate_product", sorted(names, key=lambda n: n.endswith("k_weight")))
         if unknown:
             raise S.ConvertError("checkpoint tensors with no GGUF counterpart: " + ", ".join(sorted(unknown)[:8]))
@@ -266,7 +307,9 @@ class Plan:
         extra = sorted(set(self.tensors) - set(base_t))
         if missing or extra:
             raise S.ConvertError(f"the checkpoint's tensors differ from BASE's: missing {missing[:8]}, extra {extra[:8]}")
-        self.engram.sort()
+        if set(engram_w) != set(engram_s):
+            raise S.ConvertError("an Engram layer lacks its weight or scale tensor")
+        self.engram: list[tuple[int, str]] = sorted((l, max(engram_w[l], engram_s[l])) for l in engram_w)
         if [l for l, _ in self.engram] != list(base_meta["engram"]["ple.layers"]):
             raise S.ConvertError(f"the checkpoint's Engram layers {[l for l, _ in self.engram]} are not BASE's")
         self.files = sorted(need)
@@ -274,6 +317,29 @@ class Plan:
         self.before, self.after = self.files[:last + 1], self.files[last + 1:]
         if any(f in self.before for _, f in self.engram):
             raise S.ConvertError("an Engram table comes before the last layer's experts in file order")
+        order = {f: i for i, f in enumerate(self.files)}
+        last_use = dict(order)
+        self.tensor_shard: dict[str, str] = {}
+        for gname, (how, srcs) in self.tensors.items():
+            if how != "src":
+                continue
+            w = srcs[0]
+            f_w = ck.where[w]
+            s = w[:-7] + ".scale"
+            if w.endswith(".weight") and s in ck.where:
+                f_s = ck.where[s]
+                trig = max(f_w, f_s)
+                self.tensor_shard[gname] = trig
+                last_use[f_w] = max(last_use[f_w], order[trig])
+                last_use[f_s] = max(last_use[f_s], order[trig])
+            else:
+                self.tensor_shard[gname] = f_w
+        for l, trig in self.engram:
+            for shard in (engram_w[l], engram_s[l]):
+                last_use[shard] = max(last_use[shard], order[trig])
+        self.release_at: dict[str, list[str]] = {}
+        for u, idx in last_use.items():
+            self.release_at.setdefault(self.files[idx], []).append(u)
 
     def layout(self):
         return [(l, S.NVFP4, S.NVFP4, l * self.blob * self.n_expert, self.blob) for l in range(self.n_layers)]
@@ -297,19 +363,26 @@ class Converter:
         self.plan = Plan(self.ck, base_meta)
         self.spool = pathlib.Path(tempfile.mkdtemp(prefix="ds41-dense-"))
         self.out: dict[str, tuple[str, int, str]] = {}   # GGUF name -> (spool file, bytes, stored type)
+        self.half: dict[str, np.ndarray] = {}            # cross-shard gate_product halves waiting on their partner
         self.records: list[dict] = []
 
     # ---------------------------------------------------------------- the other tensors
     def spool_shard(self, f: str):
-        """Every non-expert tensor of shard `f` the plan takes, converted, into the spool."""
+        """Every non-expert tensor ready at shard `f`, converted into the spool."""
         for gname, (how, srcs) in self.plan.tensors.items():
-            if self.ck.where[srcs[0]] != f or gname in self.out:
+            if gname in self.out:
                 continue
             bt = self.base_meta["tensors"][gname]
             if how == "gate_product":
-                q, k = (self.ck_values(n) for n in srcs)
-                x = (q * k).astype("<f4")
-                self.put(gname, x.tobytes(), "F32", how, srcs, list(reversed(q.shape)))
+                for n in srcs:
+                    if self.ck.where[n] == f and n not in self.half:
+                        self.half[n] = self.ck_values(n)
+                if all(n in self.half for n in srcs):
+                    q, k = self.half.pop(srcs[0]), self.half.pop(srcs[1])
+                    x = (q * k).astype("<f4")
+                    self.put(gname, x.tobytes(), "F32", how, srcs, list(reversed(q.shape)))
+                continue
+            if self.plan.tensor_shard[gname] != f:
                 continue
             path, off, dt, shape, _ = self.ck.t(srcs[0])
             if list(reversed(shape)) != [int(d) for d in bt["shape"]]:
@@ -322,12 +395,17 @@ class Converter:
                     raise S.ConvertError(f"{srcs[0]}: a {len(shape)}-D tensor that BASE keeps as {ty}")
                 self.put(gname, data, ty, method, srcs, list(reversed(shape)))
                 continue
-            s_off = self.ck.t(srcs[0][:-7] + ".scale")[1] if dt == "F8_E4M3" else 0
             if dt == "F8_E4M3":
-                self.ck.need(srcs[0][:-7] + ".scale", "F8_E8M0", [(shape[0] + 31) // 32, (shape[1] + 31) // 32])
-            elif dt != "BF16":
+                s_name = srcs[0][:-7] + ".scale"
+                if s_name not in self.ck.where:
+                    raise S.ConvertError(f"{srcs[0]} is F8_E4M3 and has no {s_name}")
+                self.ck.need(s_name, "F8_E8M0", [(shape[0] + 31) // 32, (shape[1] + 31) // 32])
+                s_path, s_off = self.ck.t(s_name)[:2]
+            elif dt == "BF16":
+                s_path, s_off = "", 0
+            else:
                 raise S.ConvertError(f"{srcs[0]} is {dt}")
-            jobs = [(path, off, dt, shape[1], s_off, method, r, min(ROWS_PER_JOB, shape[0] - r))
+            jobs = [(path, off, dt, shape[1], s_path, s_off, method, r, min(ROWS_PER_JOB, shape[0] - r))
                     for r in range(0, shape[0], ROWS_PER_JOB)]
             p = self.spool / gname
             n = 0
@@ -365,7 +443,7 @@ class Converter:
         ne0 = int(bt["shape"][0])
         n = bt["bytes"] if rows is None else bt["bytes"] // int(np.prod(bt["shape"][1:] or [1])) * rows
         raw = np.fromfile(self.base.path, np.uint8, n, offset=off + bt["offset"])
-        return ggufq.dequantize(raw, ggufq.GGMLQuantizationType[bt["type"]]).astype(np.float32).reshape(-1, ne0)
+        return pack_values(bt["type"], raw).reshape(-1, ne0)
 
     def check(self, gname):
         """The converted tensor against BASE's of the same name: a layout or naming error shows as a large distance."""
@@ -374,7 +452,7 @@ class Converter:
         ne0 = int(bt["shape"][0])
         rows = min(int(np.prod(bt["shape"][1:] or [1])), 4096)
         raw = np.fromfile(p, np.uint8, min(n, n // int(np.prod(bt["shape"][1:] or [1])) * rows))
-        mine = ggufq.dequantize(raw, ggufq.GGMLQuantizationType[ty]).astype(np.float64).reshape(-1, ne0)
+        mine = pack_values(ty, raw).astype(np.float64).reshape(-1, ne0)
         theirs = self.base_values(gname, rows).astype(np.float64)
         d = float(np.sqrt(((mine - theirs) ** 2).sum() / max((theirs ** 2).sum(), 1e-30)))
         if not d < CHECK_RMS:
@@ -406,7 +484,8 @@ class Converter:
                         raise S.ConvertError(f"layer {l}: {b}")
                     yield b
                 print(f"  layer {l} experts written", flush=True)
-            ck.release(f)
+            for u in P.release_at.get(f, ()):
+                ck.release(u)
 
     def engram_chunks(self):
         P, ck = self.plan, self.ck
@@ -416,36 +495,41 @@ class Converter:
             self.spool_shard(f)
             for l in [l for l, lf in P.engram if lf == f]:
                 w, s = f"layers.{l}.engram.embed.weight", f"layers.{l}.engram.embed.scale"
-                path, w_off, dt, shape, _ = ck.t(w)
+                w_path, w_off, dt, shape, _ = ck.t(w)
                 rows = shape[0]
                 ck.need(w, "U8", (rows, ENGRAM_ROW // 2))
                 ck.need(s, "F8_E8M0", (rows, ENGRAM_ROW // 32))
-                s_off = ck.t(s)[1]
-                self.check_engram(path, w_off, s_off, rows, sum(sizes))
-                jobs = ((path, w_off, s_off, r, min(ENGRAM_ROWS_PER_JOB, rows - r)) for r in range(0, rows, ENGRAM_ROWS_PER_JOB))
+                s_path, s_off = ck.t(s)[:2]
+                self.check_engram(w_path, w_off, s_path, s_off, rows, sum(sizes))
+                jobs = ((w_path, w_off, s_path, s_off, r, min(ENGRAM_ROWS_PER_JOB, rows - r))
+                        for r in range(0, rows, ENGRAM_ROWS_PER_JOB))
                 for b in bounded_imap(self.pool, _engram_job, jobs, 8):
                     if isinstance(b, str):
                         raise S.ConvertError(b)
                     yield b
                 sizes.append(rows)
                 print(f"  layer {l} Engram table written ({rows} rows)", flush=True)
-            ck.release(f)
+            for u in P.release_at.get(f, ()):
+                ck.release(u)
         self.engram_rows = sizes
 
-    def check_engram(self, path, w_off, s_off, rows, first):
+    def check_engram(self, w_path, w_off, s_path, s_off, rows, first):
         """Rows of the table spread over it against BASE's rows of the same ids."""
         e = self.base_meta["engram"]
         off, _ = self.base.section(e["section"])
         ids = np.linspace(0, rows - 1, 64).astype(np.int64)
         mine, theirs = [], []
         for r in ids:
-            mine.append(mxfp4_values(np.frombuffer(_engram_job((path, w_off, s_off, int(r), 1)), np.uint8))[0])
+            got = _engram_job((w_path, w_off, s_path, s_off, int(r), 1))
+            if isinstance(got, str):
+                raise S.ConvertError(got)
+            mine.append(mxfp4_values(np.frombuffer(got, np.uint8))[0])
             raw = np.fromfile(self.base.path, np.uint8, e["row_bytes"], offset=off + (first + int(r)) * e["row_bytes"])
-            theirs.append(ggufq.dequantize(raw, ggufq.GGMLQuantizationType[e["type"]]).astype(np.float32))
+            theirs.append(pack_values(e["type"], raw))
         m, t = np.array(mine, np.float64), np.array(theirs, np.float64)
         d = float(np.sqrt(((m - t) ** 2).sum() / max((t ** 2).sum(), 1e-30)))
         if not d < 0.3:
-            raise S.ConvertError(f"the Engram rows of {pathlib.Path(path).name} are {d:.3f} relative RMS from BASE's; a layout error")
+            raise S.ConvertError(f"the Engram rows of {pathlib.Path(w_path).name} are {d:.3f} relative RMS from BASE's; a layout error")
         print(f"  Engram rows vs BASE's: {d:.4f} relative RMS", flush=True)
         self.engram_check = round(d, 5)
 

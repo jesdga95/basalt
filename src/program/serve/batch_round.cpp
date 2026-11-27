@@ -199,17 +199,20 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             else bpolicy->observe_window(w.chance, T, a, ms);
         }
     }
-    if (fin != nullptr) {
-        std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
-                    std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
-        sl.active = false;
-        sl.cached = o.prompt_cache > 0;
-        sl.idle_busy = busy_now();
-        sl.guard.reset();
-    }
+    if (fin != nullptr) end_slot(b, fin);
     std::fflush(stdout);
     return true;
+}
+
+void Runtime::end_slot(int b, const char* fin) {
+    BSlot& sl = bs[(size_t) b];
+    std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
+                std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
+                (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
+    sl.active = false;
+    sl.cached = o.prompt_cache > 0;
+    sl.idle_busy = busy_now();
+    sl.guard.reset();
 }
 
 // One window of every ready active slot.  A model that does not batch decodes them one session at a time: the slot's drafts
@@ -219,8 +222,16 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
 // slot then finishes as above.
 bool Runtime::batch_round() {
     std::vector<int> act;
-    for (int b = 0; b < (int) bs.size(); ++b)
+    for (int b = 0; b < (int) bs.size(); ++b) {
+        // a stopped request ends before another window feeds a token: the solo loop ends at the window boundary the same
+        // way, so what the slot keeps is the tokens its client saw (the client continues the conversation from there)
+        if (bs[(size_t) b].active && bs[(size_t) b].stop) {
+            end_slot(b, "cancel");
+            std::fflush(stdout);
+            continue;
+        }
         if (bs[(size_t) b].active && slot_ready(b)) act.push_back(b);
+    }
     if (act.empty()) return true;
     const auto failed = [&](const std::string& m) {
         std::printf("ERR %s\n", m.c_str());

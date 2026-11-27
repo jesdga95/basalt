@@ -165,6 +165,8 @@ def append_section(path: str, name: str, src: str, new_meta: bytes, undo_dir: st
     m = ModelFile(path)
     if name in m.sections or len(name.encode()) >= 64:
         raise ValueError(f"{path}: cannot add a section named {name}")
+    if not os.path.isfile(src):
+        raise FileNotFoundError(src)
     with open(path, "r+b") as f:
         head = f.read(HEADER_BYTES)
         magic, version, n, file_bytes, reserved = HEADER.unpack_from(head, 0)
@@ -183,29 +185,45 @@ def append_section(path: str, name: str, src: str, new_meta: bytes, undo_dir: st
             u.write(m.read("meta"))
             _sync(u)
 
-        off = _align(file_bytes)
-        f.seek(file_bytes)
-        _write_zeros(f, off - file_bytes)
-        h = hashlib.sha256()
-        size = 0
-        with open(src, "rb") as s:
-            while b := s.read(COPY_CHUNK):
-                h.update(b)
-                f.write(b)
-                size += len(b)
-        meta_off = _align(off + size)
-        _write_zeros(f, meta_off - (off + size))
-        f.write(new_meta)
-        end = meta_off + len(new_meta)
-        _sync(f)
+        committed = False
+        header_touched = False
+        try:
+            off = _align(file_bytes)
+            f.seek(file_bytes)
+            _write_zeros(f, off - file_bytes)
+            h = hashlib.sha256()
+            size = 0
+            with open(src, "rb") as s:
+                while b := s.read(COPY_CHUNK):
+                    h.update(b)
+                    f.write(b)
+                    size += len(b)
+            meta_off = _align(off + size)
+            _write_zeros(f, meta_off - (off + size))
+            f.write(new_meta)
+            end = meta_off + len(new_meta)
+            _sync(f)
 
-        table = [(k, v[0], v[1], v[2]) for k, v in m.sections.items() if k != "meta"]
-        table += [(name, off, size, h.digest()), ("meta", meta_off, len(new_meta), hashlib.sha256(new_meta).digest())]
-        new_head = HEADER.pack(magic, version, len(table), end, reserved)
-        new_head += b"".join(ENTRY.pack(k.encode(), o, b, d, b"\0" * 16) for k, o, b, d in table)
-        f.seek(0)
-        f.write(new_head + b"\0" * (HEADER_BYTES - len(new_head)))
-        _sync(f)
+            table = [(k, v[0], v[1], v[2]) for k, v in m.sections.items() if k != "meta"]
+            table += [(name, off, size, h.digest()), ("meta", meta_off, len(new_meta), hashlib.sha256(new_meta).digest())]
+            new_head = HEADER.pack(magic, version, len(table), end, reserved)
+            new_head += b"".join(ENTRY.pack(k.encode(), o, b, d, b"\0" * 16) for k, o, b, d in table)
+            header_touched = True
+            f.seek(0)
+            f.write(new_head + b"\0" * (HEADER_BYTES - len(new_head)))
+            _sync(f)
+            committed = True
+        except BaseException:
+            if not committed:
+                try:
+                    if header_touched:
+                        f.seek(0)
+                        f.write(head)
+                    f.truncate(file_bytes)
+                    _sync(f)
+                except OSError:
+                    pass
+            raise
 
         f.seek(old_off)
         _write_zeros(f, old_size)
@@ -218,14 +236,29 @@ def undo_append(path: str, undo_dir: str) -> None:
         head = u.read()
     with open(os.path.join(undo_dir, "meta.bin"), "rb") as u:
         old_meta = u.read()
-    _, _, n, file_bytes, _ = HEADER.unpack_from(head, 0)
-    old_off = None
-    for i in range(n):
-        name, off, _, _, _ = ENTRY.unpack_from(head, HEADER.size + i * ENTRY.size)
-        if name.rstrip(b"\0") == b"meta":
-            old_off = off
-    if old_off is None or len(head) != HEADER_BYTES:
+    if len(head) != HEADER_BYTES:
         raise ValueError(f"{undo_dir}: not what append_section kept")
+    magic, version, n, file_bytes, _ = HEADER.unpack_from(head, 0)
+    if magic != MAGIC or version != VERSION or n > MAX_SECTIONS:
+        raise ValueError(f"{undo_dir}: not what append_section kept")
+    old_sections: dict[str, tuple[int, int, bytes]] = {}
+    for i in range(n):
+        raw_name, off, size, digest, _ = ENTRY.unpack_from(head, HEADER.size + i * ENTRY.size)
+        old_sections[raw_name.rstrip(b"\0").decode()] = (off, size, digest)
+    if "meta" not in old_sections:
+        raise ValueError(f"{undo_dir}: not what append_section kept")
+    old_off, old_size, old_digest = old_sections["meta"]
+    if old_off + old_size > file_bytes or len(old_meta) != old_size or hashlib.sha256(old_meta).digest() != old_digest:
+        raise ValueError(f"{undo_dir}: meta.bin does not match header.bin")
+    cur = ModelFile(path)
+    for k, v in old_sections.items():
+        if k != "meta" and cur.sections.get(k) != v:
+            raise ValueError(f"{path}: does not match {undo_dir} (section {k})")
+    if cur.sections != old_sections:
+        if len(cur.sections) != len(old_sections) + 1 or "meta" not in cur.sections or cur.section("meta")[0] < file_bytes:
+            raise ValueError(f"{path}: does not match {undo_dir}")
+    if os.path.getsize(path) < file_bytes:
+        raise ValueError(f"{path}: shorter than {undo_dir}'s recorded size ({file_bytes})")
     with open(path, "r+b") as f:
         f.seek(old_off)
         f.write(old_meta)
