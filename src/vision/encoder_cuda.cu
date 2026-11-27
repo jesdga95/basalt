@@ -110,8 +110,13 @@ struct CudaEncoder::Impl {
     PixelNorm norm{};
     // The pooled tower (a file with mm.input_projection.weight): a picture on whole cells of k x k patches, column and row
     // position tables, RMS norms around attention and a gated MLP, q, k and v normed per head, 2D rotary positions, each cell
-    // pooled to one row, standardised, then one product into the text model's width
+    // pooled to one row, standardised, then one product into the text model's width. Its layers stay in page-locked RAM and
+    // stream through two device slots, each copied in while the layer before it runs: the region holds the weights before the
+    // layers, two layers and the work buffers
     bool pool = false;
+    size_t o_layers = 0, layer_bytes = 0;      // the layers' first byte in the image, one layer's bytes
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t copied[2] = {}, done[2] = {};  // a slot's layer is in; the layer in a slot is spent
     int K = 2;             // patches a merged (pooled) token's side
     int tables = 0;        // rows of each position table
     float theta = 0.f;     // the rotary base
@@ -164,7 +169,12 @@ struct CudaEncoder::Impl {
         release_image();
         if (blas) cublasDestroy(blas);
         if (stream) cudaStreamDestroy(stream);
+        if (copy_stream) cudaStreamDestroy(copy_stream);
+        for (cudaEvent_t ev : {copied[0], copied[1], done[0], done[1]})
+            if (ev) cudaEventDestroy(ev);
     }
+    // the weight bytes the device region holds: the pooled tower's head and two layer slots, else the whole image
+    size_t dev_weights() const { return pool ? o_layers + 2 * layer_bytes : wbytes; }
     void release_image() {
         if (!image) return;
         if (image_pinned) {
@@ -225,9 +235,17 @@ struct CudaEncoder::Impl {
             return false;
         }
         if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess || cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS ||
-            cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) {
+            cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS ||
+            cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&copied[0], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&copied[1], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&done[0], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&done[1], cudaEventDisableTiming) != cudaSuccess) {
             if (blas) { cublasDestroy(blas); blas = nullptr; }
             if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+            if (copy_stream) { cudaStreamDestroy(copy_stream); copy_stream = nullptr; }
+            for (cudaEvent_t* ev : {&copied[0], &copied[1], &done[0], &done[1]})
+                if (*ev) { cudaEventDestroy(*ev); *ev = nullptr; }
             (void) cudaGetLastError();
             e = "cannot create the encoder's stream and product handle";
             return false;
@@ -502,6 +520,7 @@ struct CudaEncoder::Impl {
         o_stdb = take((size_t) E * 4);
         o_stds = take((size_t) E * 4);
         o_wm2 = take((size_t) E * proj * 2);
+        o_layers = cur;
         LO.assign(layers, {});
         for (LayerOff& y : LO) {
             y.ln1w = take(E * 4); y.apost = take(E * 4); y.ln2w = take(E * 4); y.fpost = take(E * 4);
@@ -509,6 +528,8 @@ struct CudaEncoder::Impl {
             y.wqkv = take((size_t) 3 * E * E * 2); y.wo = take((size_t) E * E * 2);
             y.wup = take((size_t) 2 * F * E * 2); y.wdown = take((size_t) E * F * 2);
         }
+        layer_bytes = (cur - o_layers) / (size_t) layers;
+        pinned = true;   // the layers stream from here
         wbytes = cur;
         release_image();
         if (pinned) {
@@ -565,7 +586,7 @@ struct CudaEncoder::Impl {
     }
 
     size_t arena_bytes(int max_tokens) const {
-        return max_tokens > 0 && max_tokens <= INT_MAX / (K * K) ? wbytes + work((size_t) max_tokens * K * K).total() : 0;
+        return max_tokens > 0 && max_tokens <= INT_MAX / (K * K) ? dev_weights() + work((size_t) max_tokens * K * K).total() : 0;
     }
 
     bool attach(void* base, size_t bytes, int max_tokens, std::string& e) {
@@ -574,7 +595,7 @@ struct CudaEncoder::Impl {
         if (!create(e)) return false;
         const int new_nmax = max_tokens * K * K;
         const Work w = work((size_t) new_nmax);
-        if (bytes < wbytes + w.total()) { e = "the encoder's device region is too small"; return false; }
+        if (bytes < dev_weights() + w.total()) { e = "the encoder's device region is too small"; return false; }
         const basalt::core::OnDevice od(device);
         struct AttachGuard {
             Impl* self;
@@ -600,9 +621,12 @@ struct CudaEncoder::Impl {
         wm0 = (__nv_bfloat16*) at(o_wm0); wm2 = (__nv_bfloat16*) at(o_wm2);
         wpatch16 = (__nv_bfloat16*) at(o_wpatch16); clsrow = (float*) at(o_cls);
         stdb = (float*) at(o_stdb); stds = (float*) at(o_stds);
-        L.resize(layers);
-        for (int l = 0; l < layers; ++l) {
-            const LayerOff& o = LO[l];
+        L.resize(pool ? 2 : layers);   // the pooled tower's two slots, laid out as its first layer
+        for (int l = 0; l < (int) L.size(); ++l) {
+            LayerOff o = LO[pool ? 0 : l];
+            if (pool)
+                for (size_t* f : {&o.ln1w, &o.apost, &o.ln2w, &o.fpost, &o.qn, &o.kn, &o.wqkv, &o.wo, &o.wup, &o.wdown})
+                    *f += (size_t) l * layer_bytes;
             Layer& y = L[l];
             y.ln1w = (float*) at(o.ln1w); y.ln1b = (float*) at(o.ln1b); y.ln2w = (float*) at(o.ln2w); y.ln2b = (float*) at(o.ln2b);
             y.bqkv = (float*) at(o.bqkv); y.bo = (float*) at(o.bo); y.bup = (float*) at(o.bup); y.bdown = (float*) at(o.bdown);
@@ -611,7 +635,7 @@ struct CudaEncoder::Impl {
             y.ls1 = (float*) at(o.ls1); y.ls2 = (float*) at(o.ls2);
             y.apost = (float*) at(o.apost); y.fpost = (float*) at(o.fpost); y.qn = (float*) at(o.qn); y.kn = (float*) at(o.kn);
         }
-        size_t cur = wbytes;
+        size_t cur = dev_weights();
         auto next = [&](size_t n) { uint8_t* p = at(cur); cur += n; return p; };
         d_patches = (float*) next(w.patches); x = (float*) next(w.x); g = (float*) next(w.g);
         act = (__nv_bfloat16*) next(w.act); rope = (float*) next(w.rope);
@@ -619,7 +643,7 @@ struct CudaEncoder::Impl {
         d_out = (float*) next(w.out);
         uint8_t* ws = next(w.blas);
         CB(cublasSetWorkspace(blas, ws, w.blas));
-        CK(cudaMemcpyAsync(arena, image, wbytes, cudaMemcpyHostToDevice, stream));
+        CK(cudaMemcpyAsync(arena, image, pool ? o_layers : wbytes, cudaMemcpyHostToDevice, stream));
         // the padding columns of q, k, v stay zero for good: the kernels write columns 0..71 only
         if (DP != D) {
             CK(cudaMemsetAsync(qh, 0, (size_t) H * nmax * DP * sizeof(__half), stream));
@@ -665,7 +689,7 @@ struct CudaEncoder::Impl {
             return false;
         }
         own = base;
-        release_image();   // the weights are on the device
+        if (!pool) release_image();   // the weights are on the device (the pooled tower's layers stream from the image)
         return true;
     }
     void* own = nullptr;   // the arena `init` allocated
@@ -858,8 +882,19 @@ struct CudaEncoder::Impl {
         if (!host_tap("embed", x, (size_t) n * E, false)) return false;
         launch_rope_pool(rope, n, gx, K, theta, stream);
         const float scale_log2 = 1.4426950408889634f;   // unscaled scores
+        // layer l into slot l % 2 once the layer before it there is spent
+        auto issue = [&](int l) {
+            const int sl = l & 1;
+            CK(cudaStreamWaitEvent(copy_stream, done[sl], 0));
+            CK(cudaMemcpyAsync(L[sl].ln1w, image + o_layers + (size_t) l * layer_bytes, layer_bytes, cudaMemcpyHostToDevice, copy_stream));
+            CK(cudaEventRecord(copied[sl], copy_stream));
+            return true;
+        };
+        for (int l = 0; l < std::min(layers, 2); ++l)
+            if (!issue(l)) return false;
         for (int l = 0; l < layers; ++l) {
-            const Layer& y = L[l];
+            const Layer& y = L[l & 1];
+            CK(cudaStreamWaitEvent(stream, copied[l & 1], 0));
             launch_rmsnorm(x, y.ln1w, act, n, eps, stream);
             if (!gemm_bf16(act, y.wqkv, g, n, 3 * E, E)) return false;
             launch_qkv_normed(g, y.qn, y.kn, rope, qh, kh, vh, n, eps, stream);
@@ -871,6 +906,8 @@ struct CudaEncoder::Impl {
             launch_gelu_gate(g, act, n, F, stream);
             if (!gemm_bf16(act, y.wdown, g, n, E, F)) return false;
             launch_norm_residual(x, g, y.fpost, n, eps, stream);
+            CK(cudaEventRecord(done[l & 1], stream));
+            if (l + 2 < layers && !issue(l + 2)) return false;
             if (!host_tap("layer_out." + std::to_string(l), x, (size_t) n * E, false)) return false;
         }
         launch_pool_finish(x, stdb, stds, act, m, K, eps, stream);
