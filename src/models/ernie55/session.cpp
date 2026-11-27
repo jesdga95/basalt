@@ -49,6 +49,7 @@ namespace {
 constexpr int kMaxDecodeWindow = 8;
 constexpr int kAttRows = 128;          ///< attention & dense-layer slice width (bounds attention scratch VRAM)
 constexpr int kMaxPromptChunk = 8192;  ///< max prompt MoE chunk width (amortizes 512-expert PCIe streaming)
+constexpr int kHomePromptChunk = 2048; ///< prompt MMQ chunk guaranteed beside permanent VRAM homes (`homes_.main > 0`)
 constexpr int kStageExperts = 16;      ///< MXFP4 experts per GPU-0 double-buffered staging slot
 constexpr int kIdxKeyTile = 4096;      ///< BF16 Tensor-Core Lightning Indexer key tile width
 constexpr uint64_t kL2Prefetch = 56ull << 20;   ///< next-layer weight budget prefetched into L2 while waiting on host
@@ -365,11 +366,16 @@ public:
             return {model::Status::Error, err};
 
         auto tier = std::make_shared<core::ExpertTier>(m_.tier_spec());
+        PromptBufs probe;
+        uint64_t home_prompt = 0;
+        std::string pe;
+        make_prompt_bufs(probe, kHomePromptChunk, pe, &home_prompt);
+        const ctxp::TierReserve tr = ctxp::plan_tier_reserve(home_prompt, kMmqHeadroom);
         core::ExpertTier::Reserve res;
-        res.copies = 512ull << 20;
-        res.homes = 256ull << 20;
-        res.beside_homes = 256ull << 20;
-        res.modules = 128ull << 20;
+        res.copies = tr.copies;
+        res.homes = tr.homes;
+        res.beside_homes = tr.beside_homes;
+        res.modules = tr.modules;
         core::LoadPlan* lp = m_.planning();
         core::LoadPlan local_lp;
         if (!tier->open(res, st.h_rows, lp ? *lp : local_lp, err)) return {model::Status::Error, err};
@@ -952,11 +958,23 @@ private:
             tier->lend_all();
             lent_ = true;
         }
+        size_t avail_b = 0, total_b = 0;
+        const bool have_mem = cudaMemGetInfo(&avail_b, &total_b) == cudaSuccess;
         for (int R = want; R >= kMaxDecodeWindow * 2; R /= 2) {
+            if (have_mem && m_.flags().diag_rows <= 0) {
+                PromptBufs probe;
+                uint64_t need = 0;
+                std::string pe;
+                make_prompt_bufs(probe, R, pe, &need);
+                if (need + kMmqHeadroom > avail_b) {
+                    err = "no room for MMQ beside the prompt chunk R=" + std::to_string(R);
+                    continue;
+                }
+            }
             if (make_prompt_bufs(big_, R, err)) {
                 // MMQ allocates its stream-k buffers on its first launches: a chunk that left the card no room for
                 // them ended the engine
-                size_t free_b = 0, total_b = 0;
+                size_t free_b = 0;
                 if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= kMmqHeadroom) return true;
                 big_.release();
                 err = "no room for MMQ beside the prompt chunk R=" + std::to_string(R);
