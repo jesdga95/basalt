@@ -39,6 +39,7 @@ public:
 
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_deepseek4}; }
     program::GpuModes gpu_modes() const override { return {}; }
+    int max_slots() const override { return 8; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         if (a == "--diag-rows") {
