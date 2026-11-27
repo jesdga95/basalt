@@ -3,6 +3,7 @@
 
 #include "basalt/core/model_file.hpp"
 #include "basalt/vision/encoder_cuda.hpp"
+#include "basalt/vision/encoder_region.hpp"
 #include "models/gemma4/vision.hpp"
 
 #include <cstddef>
@@ -14,8 +15,9 @@
 namespace basalt::models::gemma4 {
 
 /// --vision (dynamic): the projector of the pack's `vision/mmproj` section staged once in page-locked RAM. It holds no VRAM
-/// at rest: a request's pictures get one device region (the weights and the work buffers for the largest picture), from the
-/// room the model keeps free for it, and `release` gives it back.
+/// at rest: a request's pictures get one device region (the weights before the tower's layers, two layers streamed through
+/// it and the work buffers for the largest picture), its room lent by the model (the lender, vision::RegionLender), and
+/// `release` gives the region back and the lender its room.
 class ImageEncoder {
 public:
     ImageEncoder();
@@ -28,21 +30,23 @@ public:
     /// the caches are sized.
     bool stage(const core::FileRange& section, int n_embd, int max_cells, std::string& err);
     bool staged() const { return enc_ != nullptr; }
+    /// The model's lender, set once after `stage` (the warm-up's region takes free memory, before the caches are sized).
+    void set_lender(vision::RegionLender lender) { region_.set_lender(std::move(lender)); }
     size_t weights_bytes() const;
     /// The device bytes of the region a request's pictures take.
     size_t region_bytes() const;
 
     /// A picture file's rows [cells][n_embd] (the cells in raster order); opens the region when none is open.
     bool encode(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, std::string& err);
-    /// The region goes back to the driver.
-    void release();
+    /// The region goes back to the driver and its room to the lender.
+    void release() { region_.release(); }
 
 private:
     bool run(const vision::Image& src, const std::vector<uint8_t>& alpha, const ImagePlan& plan, std::vector<float>& rows,
              std::string& err);
 
     std::unique_ptr<vision::CudaEncoder> enc_;
-    void* region_ = nullptr;
+    vision::EncoderRegion region_;   ///< after enc_: dropped before it
     int patch_ = 0, k_ = 0, max_cells_ = 0;
 };
 

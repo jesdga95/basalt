@@ -3,12 +3,10 @@
 
 #include "basalt/vision/mmproj.hpp"
 
-#include <cuda_runtime.h>
-
 namespace basalt::models::gemma4 {
 
 ImageEncoder::ImageEncoder() = default;
-ImageEncoder::~ImageEncoder() { release(); }
+ImageEncoder::~ImageEncoder() = default;
 
 size_t ImageEncoder::weights_bytes() const { return enc_ ? enc_->weights_bytes() : 0; }
 size_t ImageEncoder::region_bytes() const { return enc_ ? enc_->arena_bytes(max_cells_) : 0; }
@@ -32,33 +30,14 @@ bool ImageEncoder::stage(const core::FileRange& section, int n_embd, int max_cel
     ImagePlan plan;
     std::vector<float> rows;
     const bool ok = plan_image(gray.w, gray.h, patch_, k_, max_cells_, plan, err) && run(gray, {}, plan, rows, err);
-    release();
+    region_.drop();
     if (!ok) enc_.reset();
     return ok;
 }
 
-void ImageEncoder::release() {
-    if (!region_) return;
-    enc_->detach();
-    cudaFree(region_);
-    region_ = nullptr;
-}
-
 bool ImageEncoder::run(const vision::Image& src, const std::vector<uint8_t>& alpha, const ImagePlan& plan,
                        std::vector<float>& rows, std::string& err) {
-    if (!region_) {
-        const size_t bytes = enc_->arena_bytes(max_cells_);
-        if (cudaMalloc(&region_, bytes) != cudaSuccess) {
-            cudaGetLastError();
-            region_ = nullptr;
-            err = "no device memory for the image encoder (" + std::to_string((unsigned long long) (bytes >> 20)) + " MiB)";
-            return false;
-        }
-        if (!enc_->attach(region_, bytes, max_cells_, err)) {
-            release();
-            return false;
-        }
-    }
+    if (region_.tokens() == 0 && !region_.open(*enc_, max_cells_, err)) return false;
     vision::Image prepared;   // the decoded picture is what the encoder reads unless it has alpha or is resized: no copy then
     if (!alpha.empty() || plan.resized) prepared = encoder_input(src, alpha, plan);
     if (!enc_->encode_padded(prepared.rgb.empty() ? src : prepared, rows)) {
