@@ -35,7 +35,7 @@ void Prefill::Run::Chunk::copy_ahead(int64_t L) {
         const int32_t c = m.guess_rows[(size_t) e];
         if (c <= basalt::kernels::cpu::MAXT || m.host_res[(size_t) L * m.g->n_expert + e] >= 0) continue;
         if (ppc && ppc->peer && ppc->peer->has(L, e)) continue;
-        if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(L, e)) continue;
+        if (m.ring_tier(L, e) != nullptr) continue;
         if (!m.src->pinned(L, e)) continue;
         want.emplace_back(-c, e);
     }

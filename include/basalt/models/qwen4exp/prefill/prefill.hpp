@@ -138,6 +138,8 @@ public:
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);
+    /// --peer-exclusive on more tier cards: the experts only one of `tiers` holds are copied from that card the same way.
+    void set_ring_more(const std::vector<core::PeerExperts*>& tiers);
     /// A stage on another card than the main one: an expert with no pinned host copy that the cache on `device` holds
     /// (`res`: n_layers x n_expert slot or -1, read at every chunk) is copied from that card through host staging into
     /// the ring.  Null `res`: none.

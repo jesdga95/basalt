@@ -19,6 +19,7 @@ int resident_load(Context& context) {
     auto& kv_tail_slots = *context.kv_tail_slots;
     auto& cache_fill_bytes = *context.cache_fill_bytes;
     auto& peer = *context.peer;
+    auto& xpeers = *context.xpeers;
     auto& measure_pinned_share = context.measure_pinned_share;
     auto& lend_pct_for_share = context.lend_pct_for_share;
     auto& auto_lend_pct = *context.auto_lend_pct;
@@ -153,8 +154,12 @@ int resident_load(Context& context) {
             return 1;
         }
     }
-    // the peer's swaps keep their experts in RAM or on a GPU, never only in the file
-    if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) peer.set_exclusive(&src);
+    // the peers' swaps keep their experts in RAM or on a GPU, never only in the file
+    if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) {
+        peer.set_exclusive(&src);
+        for (auto& x : xpeers)
+            if (x->valid()) x->set_exclusive(&src);
+    }
     return prompt_split(context);
 }
 

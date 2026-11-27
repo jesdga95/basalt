@@ -62,8 +62,8 @@ bool Prefill::Run::Chunk::start_stream() {
                 if (ppc && ppc->peer && ppc->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                 int job = -1;
                 const uint8_t* b = nullptr;
-                if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)) {   // no host copy: from the peer
-                    seq.push_back({(int32_t) l, e, nullptr, -1, m.ring_peer->slot_ptr(l, e)});
+                if (core::PeerExperts* t = m.ring_tier(l, e)) {   // no host copy: from the tier card holding it
+                    seq.push_back({(int32_t) l, e, nullptr, -1, t->slot_ptr(l, e), t->device()});
                     continue;
                 }
                 if (const uint8_t* rp = remote_blob(l, e)) {   // no pinned host copy: from the other card's cache
@@ -88,6 +88,10 @@ bool Prefill::Run::Chunk::start_stream() {
     }
     chunk_stager_done.st = stream_all ? m.stager.get() : nullptr;
     peer_async = remote_device >= 0 && m.peer_stage.setup(remote_device, (size_t) MAXBLOB());
+    for (size_t i = 0; i < m.ring_more.size(); ++i) {
+        if (m.more_stage.size() <= i) m.more_stage.push_back(std::make_unique<PeerStage>());
+        m.more_stage[i]->setup(m.ring_more[i]->device(), (size_t) MAXBLOB());   // not set up: a direct copy between the cards
+    }
     if (threaded_issue) {
         issuer = std::thread([this] {
             const core::OnDevice od(m.device);
@@ -111,8 +115,7 @@ bool Prefill::Run::Chunk::start_stream() {
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (!skip) {
                     if (en.pdev != nullptr) {
-                        if (peer_async) m.peer_stage.copy(m.stage_dev[sl], en.pdev, bytes, m.copy);
-                        else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, remote_device, bytes, m.copy);
+                        m.card_copy(m.stage_dev[sl], en.pdev, en.card >= 0 ? en.card : remote_device, bytes, peer_async);
                         ++iss_dma;
                     } else if (en.job < 0) {
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);

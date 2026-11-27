@@ -56,7 +56,7 @@ void Prefill::Run::Chunk::Experts::Group::cpu_select() {
         for (int32_t e = 0; e < m.g->n_expert; ++e) {
             const int32_t c = m.cnt[(size_t) e];
             if (c == 0 || (m.cache && m.cache->slot_of(l, e) >= 0) || (!on_peer.empty() && on_peer[(size_t) e]) ||
-                (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)))
+                m.ring_tier(l, e) != nullptr)
                 continue;
             ++n_stream;
             int fd = -1;

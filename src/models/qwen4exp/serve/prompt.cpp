@@ -501,7 +501,12 @@ int QfnRuntime::init_prompt() {
                                  "context, or read prompts in smaller chunks (--prefill 512)");
         return 1;
     }
-    if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
+    if (peer.valid() && o.peer_exclusive) {
+        sp.set_ring_peer(&peer);
+        std::vector<basalt::core::PeerExperts*> more;
+        for (auto& x : xpeers) more.push_back(x.get());
+        sp.set_ring_more(more);
+    }
     if (peer.valid()) {
         if (!sp.set_peer(&peer, err)) {   // the routed-only chunks' rows, up to kPeerSlowRows
             basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());

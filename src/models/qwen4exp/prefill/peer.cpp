@@ -23,6 +23,12 @@ void Prefill::set_ring_peer(core::PeerExperts* peer) {
     impl_->ring_peer = peer != nullptr && peer->valid() ? peer : nullptr;
 }
 
+void Prefill::set_ring_more(const std::vector<core::PeerExperts*>& tiers) {
+    impl_->ring_more.clear();
+    for (core::PeerExperts* x : tiers)
+        if (x != nullptr && x->valid()) impl_->ring_more.push_back(x);
+}
+
 void Prefill::set_ring_remote(const int32_t* res, const core::ExpertCache* cache, int device) {
     const bool on = res != nullptr && cache != nullptr && device >= 0;
     impl_->remote_res = on ? res : nullptr;

@@ -9,6 +9,7 @@ struct StreamEntry {
     const uint8_t* blob;
     int job;
     const uint8_t* pdev;
+    int card = -1;   // the card `pdev` is on (-1: the ring's other card)
 };
 
 class PinnedCopyDecision {

@@ -25,8 +25,7 @@ const uint8_t* Prefill::Run::Chunk::Experts::Group::other_card(int32_t e) {
     // memory into a staging slot; so is one set_ring_remote's card holds without a pinned host copy.
     // The blob on the other card, or null.
     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) return nullptr;
-    if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e))
-        return m.ring_peer->slot_ptr(l, e);
+    if (core::PeerExperts* t = m.ring_tier(l, e)) return t->slot_ptr(l, e);
     return remote_blob(l, e);
 }
 
@@ -70,9 +69,9 @@ bool Prefill::Run::Chunk::Experts::Group::stage_one(size_t j) {
     if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
     if (via != nullptr) {
         if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-        if (peer_async) m.peer_stage.copy(m.stage_dev[sl], via, (size_t) lay.blob_bytes(l), m.copy);
-        else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, via, remote_device,
-                                 (size_t) lay.blob_bytes(l), m.copy);
+        const core::PeerExperts* t = m.ring_tier(l, e);
+        m.card_copy(m.stage_dev[sl], via, t != nullptr ? t->device() : remote_device, (size_t) lay.blob_bytes(l),
+                    peer_async);
         ++owner.stats_.experts_dma;
     } else if (pinned) {
         // DMA straight from the page-locked arena: the copy stream only waits for the slot
@@ -109,7 +108,8 @@ bool Prefill::Run::Chunk::Experts::Group::walk() {
             if (stage_of[j] < 0) {
                 ++owner.stats_.experts_resident;
                 const int32_t rs = m.host_res ? m.host_res[(size_t) l * m.g->n_expert + e] : -1;
-                const uint8_t* bd = rs >= 0 && m.cache ? m.cache->device_slot(rs) : m.ring_peer->slot_ptr(l, e);
+                core::PeerExperts* const t = m.ring_tier(l, e);
+                const uint8_t* bd = rs >= 0 && m.cache ? m.cache->device_slot(rs) : (t ? t : m.ring_peer)->slot_ptr(l, e);
                 if (!compute(j, bd, -1)) return false;
             } else {
                 cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);

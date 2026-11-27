@@ -134,6 +134,23 @@ struct Prefill::Impl {
     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
     bool peer_share = true;                  // set_peer_share
     core::PeerExperts* ring_peer = nullptr;  // --peer-exclusive: experts held only there are copied from its memory
+    std::vector<core::PeerExperts*> ring_more;           // the further exclusive tiers (set_ring_more)
+    std::vector<std::unique_ptr<PeerStage>> more_stage;  // their host-staged copies, one per tier
+    // the exclusive tier that alone holds (l, e), or null
+    core::PeerExperts* ring_tier(int64_t l, int64_t e) const {
+        if (ring_peer && ring_peer->exclusive() && ring_peer->has(l, e)) return ring_peer;
+        for (core::PeerExperts* x : ring_more)
+            if (x->exclusive() && x->has(l, e)) return x;
+        return nullptr;
+    }
+    // a blob on card `dev` into `dst` on this card, behind the copy stream's earlier work: through that card's host
+    // stage when it has one (`main_stage`: peer_stage is set up for it), else a direct copy between the cards
+    void card_copy(void* dst, const uint8_t* blob, int dev, size_t bytes, bool main_stage) {
+        if (main_stage && peer_stage.ok && peer_stage.dev == dev) { peer_stage.copy(dst, blob, bytes, copy); return; }
+        for (auto& st : more_stage)
+            if (st && st->ok && st->dev == dev) { st->copy(dst, blob, bytes, copy); return; }
+        cudaMemcpyPeerAsync(dst, device, blob, dev, bytes, copy);
+    }
     // set_ring_remote: another card's cache, read for the experts without a pinned host copy
     const int32_t* remote_res = nullptr;
     const core::ExpertCache* remote_cache = nullptr;

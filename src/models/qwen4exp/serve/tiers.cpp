@@ -108,6 +108,8 @@ bool QfnRuntime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) 
     auto tier = [&](size_t i) -> basalt::core::PeerExperts& { return i == 0 ? peer : *xpeers[i - 1]; };
     for (size_t t = 0; t < nt; ++t) {
         if (!tier(t).valid()) continue;
+        // an exclusive tier after the first keeps its start-up placement: its victims would need RAM places too
+        if (t > 0 && tier(t).exclusive()) continue;
         std::vector<int32_t> seen = r0;
         for (size_t u = 0; u < nt; ++u) {
             if (u == t || !tier(u).valid()) continue;
@@ -373,6 +375,9 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
     std::set<size_t> taken;   // the round's victims
     for (const Swap& s : swaps) taken.insert((size_t) s.lout * g.n_expert + s.out);
     auto plan = [&](Swap s) -> bool {
+        // an expert only a later exclusive tier holds stays there: it has no RAM copy to come from
+        for (const auto& xpe : xpeers)
+            if (xpe->valid() && xpe->exclusive() && xpe->has(s.layer, s.in)) return true;
         // an expert only the peer holds is copied from its VRAM; it needs a RAM place for the one it replaces
         const bool p2p = peer_excl && peer.has(s.layer, s.in) && !src.has_resident(s.layer, s.in);
         if (p2p && src.has_resident(s.layer, s.out)) {
