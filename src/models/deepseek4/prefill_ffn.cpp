@@ -406,10 +406,43 @@ private:
 
 }  // namespace
 
+size_t prefill_ffn_bytes(const ModelWeights& weights, int row_cap) {
+    const Geometry& g = weights.geo();
+    const size_t cap = (size_t) std::max(row_cap, 1);
+    size_t blob_cap = 0, gu_cap = 0, down_cap = 0;
+    for (const ExpertLayer& e : weights.pack().experts) {
+        blob_cap = std::max(blob_cap, (size_t) e.bytes);
+        gu_cap = std::max(gu_cap, mmq::gu_slot_bytes(e.gate_up_type, e.gate_up_type, g.n_ff_exp, g.n_embd));
+        down_cap = std::max(down_cap, mmq::matrix_bytes(e.down_type, g.n_embd, g.n_ff_exp));
+    }
+    const size_t route_cap = cap * 6;
+    const size_t stage_stride = (blob_cap + 15) & ~size_t(15);
+    return stage_stride * kGroup + gu_cap * (size_t) g.n_expert + down_cap * (size_t) g.n_expert +
+           mmq::q8_bytes((int64_t) route_cap, g.n_embd) + mmq::q8_bytes((int64_t) route_cap, g.n_ff_exp) +
+           route_cap * 2 * (size_t) g.n_ff_exp * sizeof(float) + route_cap * (size_t) g.n_ff_exp * sizeof(float) +
+           route_cap * (size_t) g.n_embd * sizeof(float) + route_cap * sizeof(int32_t) * 2 +
+           ((size_t) g.n_expert + 1) * sizeof(int32_t) * 2 +
+           mmq::q8_bytes((int64_t) cap, g.n_embd) + mmq::q8_bytes((int64_t) cap, g.n_ff_exp) +
+           cap * (size_t) g.n_ff_exp * sizeof(float) * 3 + 2 * sizeof(int32_t) + cap * sizeof(int32_t);
+}
+
+uint64_t prompt_room_bytes(const ModelWeights& weights, int64_t context, int cap) {
+    const Geometry& g = weights.geo();
+    const uint64_t n = (uint64_t) g.n_embd, c = (uint64_t) std::max(cap, 1);
+    const uint64_t tiles = 2 * 128 * 64 * 512 * 8 + 2 * 128 * 1024 * 4 + 2 * 128 * 256 * 4 +
+                           128 * 1024 * 4 + 2 * 128 * 64 * 128 * 4 + 128 * 64 * 4 * 2 + 128 * 32 * 4 +
+                           128 * 512 * 4;
+    const uint64_t rows = c * (8 * n + (uint64_t) g.n_expert + 4 * n + 2 * (uint64_t) g.n_used + 2 * 1024 +
+                               2 * 512 + 16 + 16 * 4) * sizeof(float) +
+                          c * 6 * sizeof(int32_t) + c * sizeof(uint32_t) * 4;
+    const uint64_t hca = 8 * ((uint64_t) std::max<int64_t>(1, context / 16 + 1)) * sizeof(int32_t);
+    return prefill_ffn_bytes(weights, cap) + rows + tiles + hca;
+}
+
 std::unique_ptr<PrefillFfn> make_prefill_ffn(ModelWeights& weights, core::ExpertTier& tier, int row_cap,
                                               std::string& err) {
-    if (row_cap < 1 || row_cap > 8192) {
-        err = "deepseek4: prompt MMQ row capacity must be in [1, 8192]";
+    if (row_cap < 1 || row_cap > 16384) {
+        err = "deepseek4: prompt MMQ row capacity must be in [1, 16384]";
         return nullptr;
     }
     auto result = std::make_unique<Impl>(weights, tier, row_cap);

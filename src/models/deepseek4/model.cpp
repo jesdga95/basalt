@@ -4,6 +4,7 @@
 #include "basalt/log.hpp"
 #include "models/deepseek4/context_policy.hpp"
 #include "models/deepseek4/dspark.hpp"
+#include "models/deepseek4/prefill_ffn.hpp"
 
 #include <cuda_runtime.h>
 
@@ -43,6 +44,8 @@ model::Result DsModel::ensure_tier() {
     // The image encoder's cuBLAS handle takes host memory when created (the handle and its first products), so it opens
     // before the tier reads the free RAM: the RAM expert tier is sized from what is left after it.
     if (request_.vision) spec.host.open = [this](std::string& open_err) { return vision_blas_.open(open_err); };
+    // every expert resident in RAM: read the token table in before the first token asks for a row
+    spec.host.ram_only = [this] { weights_.warm_token_table(); };
     auto tier = std::make_shared<core::ExpertTier>(std::move(spec));
     core::ExpertTier::Reserve reserve;
     const ctxp::Footprint footprint = ctxp::cache_footprint(context_, g.compress_ratio);
@@ -73,8 +76,20 @@ model::Result DsModel::ensure_tier() {
             return failure("pinned expert mapping reserve overflows");
     }
 
-    reserve.homes = gpu_keep;
-    reserve.copies = gpu_keep;
+    // A prompt reads beside the tier: homes leave a long read's room free, and the copies too; a short read fits beside
+    // the homes' arena in the slot reserve.
+    const int long_cap = (int) std::min<int64_t>(kMaxChunk, context_);
+    const uint64_t short_room = prompt_room_bytes(weights_, context_, std::min(kShortChunk, long_cap)) + kShortMargin;
+    // The tier leaves the prompt's room free beside its homes and its copies: a short read fits it whole, a long one
+    // lends the copies and takes a full chunk up to the context.
+    const uint64_t home_room = prompt_room_bytes(weights_, context_, std::min(8192, long_cap)) + kLongMargin;
+    const uint64_t copies_room = prompt_room_bytes(weights_, context_, long_cap) + kLongMargin;
+    uint64_t homes_keep = 0, copies_keep = 0;
+    if (!ctxp::add(gpu_keep, home_room, homes_keep) || !ctxp::add(gpu_keep, copies_room, copies_keep))
+        return failure("prompt room reserve overflows");
+    reserve.homes = homes_keep;
+    reserve.copies = copies_keep;
+    reserve.beside_homes = short_room;
     reserve.modules = kModuleRoom;
     if (!tier->open(reserve, h_expert_rows_, *planning_, err)) return failure(err);
     tier_ = std::move(tier);

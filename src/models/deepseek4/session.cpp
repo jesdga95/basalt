@@ -334,6 +334,17 @@ public:
             return {model::Status::Refused, "deepseek4: prompt exceeds the loaded context"};
         if (!commit_staged(r.pos)) return {model::Status::Error, err_};
         last_window_rows_ = 0;
+        const int plan = std::max(r.total_tokens, r.n_tokens);
+        if (plan <= kStepPrompt && model_.diag_rows() <= 0) {
+            // a few tokens: decode steps beat a chunk's expert staging and tier copies
+            for (int i = 0; i < r.n_tokens; ++i) {
+                if (!forward_rows(r.tokens + i, 1, r.pos + i)) return {model::Status::Error, err_};
+                tokens_.push_back(r.tokens[i]);
+                if (r.progress) r.progress(i + 1);
+            }
+            if (!sync()) return {model::Status::Error, err_};
+            return {};
+        }
         if (r.n_tokens <= kExpertWindow && model_.diag_rows() <= 0) {
             if (!forward_rows(r.tokens, r.n_tokens, r.pos)) return {model::Status::Error, err_};
             tokens_.insert(tokens_.end(), r.tokens, r.tokens + r.n_tokens);
@@ -900,6 +911,8 @@ private:
     std::string err_;
     bool has_bias_ = false;
     std::unique_ptr<basalt::vision::Mmproj> vision_mmproj_;
+    std::unique_ptr<PrefillFfn> short_ffn_;   // a short read's staged expert buffers, kept for the next short read
+    int short_ffn_cap_ = 0;
     std::unique_ptr<basalt::vision::TransformerEncoder> vision_encoder_;
     bool vision_borrowed_ = false;
     bool vision_lent_ = false;
@@ -1235,20 +1248,29 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         return false;
     }
 
-    // The prompt workspaces temporarily use the VRAM occupied by expert copies.  Destroy them before
-    // reclaiming those slots so the tier can restore its planned placement after the full prompt.
+    // A short read (up to kShortPrompt tokens) fits beside the tier's copies and leaves them in place: no lend, no
+    // restore. A long one takes the copies' VRAM and gives it back when its workspaces are freed.
+    const bool short_read = total_tokens <= kShortPrompt;
+    if (!short_read) {
+        short_ffn_.reset();
+        short_ffn_cap_ = 0;
+    }
     tier->settle();
-    tier->shrink();
-    tier->lend_all();
+    if (!short_read) {
+        tier->shrink();
+        tier->lend_all();
+    }
     struct TierRestore {
         core::ExpertTier* tier;
+        bool active;
         ~TierRestore() {
+            if (!active) return;
             std::string err;
             if (!tier->reclaim(err, true))
                 basalt::log::warn("basalt deepseek4", "VRAM expert tier stays reduced after prompt: %s", err.c_str());
             tier->grow();
         }
-    } restore{tier};
+    } restore{tier, !short_read};
     struct DeviceBuffers {
         std::vector<void*> allocations;
         void clear() {
@@ -1270,7 +1292,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
     const size_t n = (size_t) geo_.n_embd;
     const size_t stream_row = 4 * n;
     constexpr int kAttnTile = 128;
-    int cap = std::min(model_.diag_rows() > 0 ? model_.diag_rows() : 8192, total_tokens);
+    int cap = std::min(model_.diag_rows() > 0 ? model_.diag_rows() : (short_read ? kShortChunk : kMaxChunk), total_tokens);
     float *current = nullptr, *attended = nullptr, *coefficients = nullptr, *collapsed = nullptr,
           *normalized = nullptr, *hc_workspace = nullptr, *logits = nullptr, *route_weights = nullptr,
           *shared = nullptr, *routed = nullptr, *chunk_q_latent = nullptr, *chunk_kv_proj = nullptr,
@@ -1282,12 +1304,13 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
             *chunk_win_n = nullptr, *chunk_comp_limit = nullptr, *tile_comp_row = nullptr, *hca_ids = nullptr,
             *tile_sel_ids = nullptr, *tile_sel_cnt = nullptr;
     uint8_t *fixed_mask = nullptr, *alternate_mask = nullptr;
-    std::unique_ptr<PrefillFfn> prompt_ffn;
+    std::unique_ptr<PrefillFfn> local_ffn;
+    PrefillFfn* prompt_ffn = nullptr;
     const int hca_max_visible = std::max(1, (int) ((pos + total_tokens) / 16));
 
     for (;;) {
         buffers.clear();
-        prompt_ffn.reset();
+        local_ffn.reset();
         const size_t state_bytes = (size_t) cap * stream_row * sizeof(float);
         const int tile_cap = std::min(kAttnTile, cap);
         current = static_cast<float*>(alloc(state_bytes));
@@ -1337,17 +1360,29 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                              tile_comp_row && hca_ids && chunk_pos && chunk_win_start && chunk_win_n &&
                              chunk_comp_limit;
         if (bufs_ok) {
-            std::string ffn_err;
-            prompt_ffn = make_prefill_ffn(model_.weights(), *tier, cap, ffn_err);
+            if (short_read && short_ffn_ && short_ffn_cap_ >= cap) {
+                prompt_ffn = short_ffn_.get();
+            } else {
+                std::string ffn_err;
+                local_ffn = make_prefill_ffn(model_.weights(), *tier, cap, ffn_err);
+                if (local_ffn) {
+                    prompt_ffn = local_ffn.get();
+                    if (short_read) {
+                        short_ffn_ = std::move(local_ffn);
+                        short_ffn_cap_ = cap;
+                    }
+                } else {
+                    cudaGetLastError();
+                    err_ = ffn_err;
+                }
+            }
             if (prompt_ffn) break;
-            cudaGetLastError();
-            err_ = ffn_err;
         }
-        if (model_.diag_rows() > 0 || cap <= 1024) {
+        if (model_.diag_rows() > 0 || cap <= kMinChunk) {
             if (err_.empty()) err_ = "deepseek4: out of device memory for the chunked prompt workspaces";
             return false;
         }
-        cap = std::max(1024, cap / 2);
+        cap = std::max(kMinChunk, cap / 2);
     }
 
     {

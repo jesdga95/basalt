@@ -41,6 +41,8 @@ public:
     bool ffn_layer_weights(int layer, FfnRouteWeights& route, SharedExpertWeights& shared, std::string& err) const;
     bool head_weights(HeadWeights& weights, std::string& err) const;
     bool embedding_row(int32_t token, std::vector<float>& row, std::string& err) const;
+    /// Ask the OS to read the token table in: no first-token page fault once every expert is resident in RAM.
+    void warm_token_table() const;
     bool hash_route_table(int layer, std::vector<int32_t>& ids, std::string& err) const;
     /// Read one validated expert blob from the pack into caller-owned staging memory.
     bool read_expert_blob(int layer, int expert, void* dst, size_t bytes, std::string& err) const;

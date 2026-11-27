@@ -1,5 +1,7 @@
 #include "models/deepseek4/model_weights.hpp"
 
+#include "basalt/platform/memory.hpp"
+
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -282,6 +284,11 @@ bool ModelWeights::head_weights(HeadWeights& weights, std::string& err) const {
 
 bool ModelWeights::embedding_row(int32_t token, std::vector<float>& row, std::string& err) const {
     return read_embedding_row(pack_, token, row, err);
+}
+
+void ModelWeights::warm_token_table() const {
+    if (const TensorRef* t = pack_.find("token_embd.weight"))
+        if (fd_ >= 0) platform::advise_willneed(fd_, t->offset, t->bytes);
 }
 
 bool ModelWeights::hash_route_table(int layer, std::vector<int32_t>& ids, std::string& err) const {

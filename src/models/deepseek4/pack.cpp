@@ -1,5 +1,7 @@
 #include "models/deepseek4/pack.hpp"
 
+#include "basalt/artifact/dequant.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -460,20 +462,32 @@ bool read_embedding_row(const Pack& pack, int32_t token, std::vector<float>& row
     const Geometry& g = pack.geo;
     const TensorRef* tensor = pack.find("token_embd.weight");
     const core::FileRange gguf = pack.file.range("gguf");
-    if (!tensor || tensor->type != 30 || tensor->shape != std::vector<uint64_t>{(uint64_t) g.n_embd, (uint64_t) g.n_vocab} ||
+    if (!tensor || tensor->shape != std::vector<uint64_t>{(uint64_t) g.n_embd, (uint64_t) g.n_vocab} ||
         g.n_embd <= 0 || g.n_vocab <= 0 || token < 0 || token >= g.n_vocab || gguf.empty()) {
         err = "deepseek4 token embedding: invalid tensor, token id, or GGUF section";
         return false;
     }
     const uint64_t n_embd = (uint64_t) g.n_embd;
-    if (n_embd > std::numeric_limits<uint64_t>::max() / (uint64_t) g.n_vocab / 2) {
-        err = "deepseek4 token embedding: tensor size overflows";
-        return false;
+    // rows the table stores whole: BF16, or a quantized row of whole blocks
+    uint64_t row_bytes = 0, block_elems = 0, block_bytes = 0;
+    switch (tensor->type) {
+        case 30: row_bytes = n_embd * sizeof(uint16_t); break;
+        case 8: block_elems = 32; block_bytes = 34; break;     // Q8_0
+        case 13: block_elems = 256; block_bytes = 176; break;  // Q5_K
+        case 14: block_elems = 256; block_bytes = 210; break;  // Q6_K
+        default:
+            err = "deepseek4 token embedding: unsupported tensor type " + std::to_string(tensor->type);
+            return false;
     }
-    const uint64_t row_bytes = n_embd * sizeof(uint16_t);
-    const uint64_t tensor_bytes = row_bytes * (uint64_t) g.n_vocab;
-    if (tensor->bytes != tensor_bytes || tensor->offset < gguf.offset ||
-        tensor->offset - gguf.offset > gguf.bytes || tensor_bytes > gguf.bytes - (tensor->offset - gguf.offset) ||
+    if (block_elems) {
+        if (n_embd % block_elems != 0) {
+            err = "deepseek4 token embedding: the width is not whole quantization blocks";
+            return false;
+        }
+        row_bytes = n_embd / block_elems * block_bytes;
+    }
+    if (tensor->bytes != row_bytes * (uint64_t) g.n_vocab || tensor->offset < gguf.offset ||
+        tensor->offset - gguf.offset > gguf.bytes || tensor->bytes > gguf.bytes - (tensor->offset - gguf.offset) ||
         (uint64_t) token > std::numeric_limits<uint64_t>::max() / row_bytes) {
         err = "deepseek4 token embedding: invalid tensor bounds";
         return false;
@@ -485,9 +499,19 @@ bool read_embedding_row(const Pack& pack, int32_t token, std::vector<float>& row
         return false;
     }
     std::vector<float> decoded((size_t) n_embd);
-    for (size_t i = 0; i < decoded.size(); ++i) {
-        const uint32_t bits = ((uint32_t) bytes[2 * i] | ((uint32_t) bytes[2 * i + 1] << 8)) << 16;
-        std::memcpy(&decoded[i], &bits, sizeof(bits));
+    if (tensor->type == 30) {
+        for (size_t i = 0; i < decoded.size(); ++i) {
+            const uint32_t bits = ((uint32_t) bytes[2 * i] | ((uint32_t) bytes[2 * i + 1] << 8)) << 16;
+            std::memcpy(&decoded[i], &bits, sizeof(bits));
+        }
+    } else {
+        for (uint64_t b = 0; b < n_embd / block_elems; ++b) {
+            const uint8_t* block = bytes.data() + b * block_bytes;
+            float* out = decoded.data() + b * block_elems;
+            if (tensor->type == 8) dequantize_q8_0(block, out);
+            else if (tensor->type == 13) dequantize_q5_K(block, out);
+            else dequantize_q6_K(block, out);
+        }
     }
     row = std::move(decoded);
     err.clear();
