@@ -91,6 +91,7 @@ private:
     std::vector<std::vector<Staged>> ram_;
     uint8_t* staging_ = nullptr;
     int stage_n_ = 0;                        // experts a buffer holds
+    bool began_ = false;                     // begin ran (end gives the copies beside the homes back)
     cudaStream_t copy_ = nullptr;
     cudaEvent_t copied_[2] = {}, done_[2] = {};
 };

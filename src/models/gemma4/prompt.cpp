@@ -137,6 +137,10 @@ bool PromptPath::begin(cudaStream_t st, std::string& err) {
     core::ExpertTier* tier = m.tier();
     if (!tier) return true;
     if (!m.experts()->prompt_begin(st, err)) return false;
+    // every copy lands (the promotions the last window queued too); with experts off the card, the copies beside the
+    // homes give the staging its room
+    if (m.stage_experts() > 0) tier->shrink();
+    tier->settle();
     const int NE = g.n_expert;
     ram_.assign((size_t) g.n_layers, {});
     int most = 0;
@@ -145,24 +149,25 @@ bool PromptPath::begin(cudaStream_t st, std::string& err) {
         for (int e = 0; e < NE; ++e) n += tier->locate(l, e).dev == nullptr;
         most = std::max(most, n);
     }
-    if (most > 0) {   // the copies beside the homes give the staging its room
-        if (most > m.stage_experts()) {
-            err = "the prompt's staging holds " + std::to_string(m.stage_experts()) + " experts a layer, a layer has " +
-                  std::to_string(most) + " off the card";
-            return false;
-        }
-        tier->shrink();
+    if (most > m.stage_experts()) {
+        if (m.stage_experts() > 0) tier->grow();
+        err = "the prompt's staging holds " + std::to_string(m.stage_experts()) + " experts a layer, a layer has " +
+              std::to_string(most) + " off the card";
+        return false;
+    }
+    if (most > 0) {
         stage_n_ = most;
         // zeroed bytes after the last blob: the products' last loads read past it
         const size_t bytes = 2 * (size_t) most * m.stage_slot() + 4096;
         if (cudaMalloc((void**) &staging_, bytes) != cudaSuccess || cudaMemset(staging_, 0, bytes) != cudaSuccess) {
             cudaGetLastError();
             staging_ = nullptr;
-            tier->grow();
+            if (m.stage_experts() > 0) tier->grow();
             err = "no device memory for the prompt's staging of the experts off the card (" + std::to_string(bytes >> 20) + " MiB)";
             return false;
         }
     }
+    began_ = true;
     std::vector<unsigned long long> tab((size_t) g.n_layers * NE);
     for (int l = 0; l < g.n_layers; ++l) {
         int k = 0;
@@ -186,12 +191,15 @@ bool PromptPath::begin(cudaStream_t st, std::string& err) {
 }
 
 void PromptPath::end() {
-    if (!staging_) return;
-    cudaStreamSynchronize(copy_);
-    cudaFree(staging_);
-    staging_ = nullptr;
-    stage_n_ = 0;
-    m_->tier()->grow();
+    if (!began_) return;
+    began_ = false;
+    if (staging_) {
+        cudaStreamSynchronize(copy_);
+        cudaFree(staging_);
+        staging_ = nullptr;
+        stage_n_ = 0;
+    }
+    if (m_->stage_experts() > 0) m_->tier()->grow();
 }
 
 void PromptPath::issue(int l) {
