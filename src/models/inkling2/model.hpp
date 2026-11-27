@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::models::inkling2 {
@@ -127,6 +128,10 @@ public:
     /// One warning when the last promote found less free memory than counted: placement then follows a fresh reading of
     /// the card, not the requests alone.
     void note_shortage(const std::string& where);
+    /// A cache grow the card refused although the pool counted room: true for the first refusal of an episode (the caller
+    /// warns once), false while the episode lasts; a grow that maps without a refusal ends it.
+    bool grow_short() { return !std::exchange(grow_short_, true); }
+    void grow_mapped() { grow_short_ = false; }
     /// Sends the lowest-ranked copies back until at least `bytes` are freed (their entries go back to 0, the CPU computes
     /// them again), packs the rest to the front and returns whole granules. `freed`: the bytes given back. False when a
     /// table or copy update could not be confirmed: the placement is then wedged.
@@ -315,6 +320,7 @@ private:
     uint64_t promote_pairs(const std::vector<size_t>& pairs, uint64_t keep_free);
     int64_t room_ = 0;   ///< room(): may run below 0 when the caches grow past what placement counted
     bool map_short_ = false;   ///< a promote could not map a page it counted (note_shortage)
+    bool grow_short_ = false;  ///< a cache grow found the card short and none has mapped cleanly since (grow_short)
     uint8_t* copies_va_ = nullptr;
     CopyLayout copy_lay_;
     uint64_t copy_reserved_ = 0;

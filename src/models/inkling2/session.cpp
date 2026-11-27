@@ -968,12 +968,14 @@ public:
             return false;
         };
         bool mapped = map();
+        if (mapped) m_.grow_mapped();
         if (!mapped && out_of_memory && caches_usable()) {
             // The card has less free memory than placement counted (another program, or graphs and modules past the spare
             // took it). As without the count: read the card again, send copies back for the grow and try once more. From
-            // here placement depends on that reading, which the line says.
-            basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage at position %lld (%s)",
-                              (long long) at, err.c_str());
+            // here placement depends on that reading, which the line says once for each episode of refusals.
+            if (m_.grow_short())
+                basalt::log::warn("basalt inkling2", "elastic spill: placement changed by a memory shortage at position %lld (%s)",
+                                  (long long) at, err.c_str());
             m_.sync_room();
             backing0 = backing_bytes();   // the reading includes what the first try mapped
             grow = grow_bytes(target, positions);    // and the retry needs only what it left
