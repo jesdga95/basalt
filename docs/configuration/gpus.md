@@ -45,6 +45,7 @@ the shares, and checks the model's modes without loading it.
 | [Hy4-flash](../models/hy4-flash.md#cards) | up to 4 cards: experts, a block of layers each | refused | refused |
 | [Qwen3.8-27B](../models/qwen38-27b.md#cards) | 2 cards: the last layers of long prompts | 2 cards | refused |
 | [Inkling 2 Mini](../models/inkling2.md#two-cards) | 2 cards: the experts that spill from the main card | 2 cards | refused |
+| [ERNIE-5.5-Flash](../models/ernie55.md#cards) | up to 4 cards: experts, a block of layers each | refused | refused |
 | [GLM-5.3-Flash](../models/glm-5-3-flash.md#two-cards) | 2 cards: experts, a block of layers sized to the peer's room; an sm_89 peer with `-DPEER_ADA=ON` | refused | refused |
 
 A mode a model refuses is an error that names the modes it runs, for example `gpu-mode split: Hy4-flash does not run it; it runs
@@ -67,9 +68,9 @@ with `use gpu 0`.
 
 ## Peer mode
 
-- **Experts (Flash-Next, DeepSeek, Hy4-flash, Inkling, GLM-5.3-Flash).** Each peer holds experts the main card does not and computes their rows in
+- **Experts (Flash-Next, DeepSeek, Hy4-flash, Inkling, ERNIE-5.5, GLM-5.3-Flash).** Each peer holds experts the main card does not and computes their rows in
   every decode window, following the conversation like the main card's cache. The rows are the main card's kernels' rows, so where an
-  expert sits does not change them. Flash-Next and Inkling deal the experts one by one, hottest first; DeepSeek, Hy4-flash and
+  expert sits does not change them. Flash-Next and Inkling deal the experts one by one, hottest first; DeepSeek, Hy4-flash, ERNIE-5.5 and
   GLM-5.3-Flash give each peer a contiguous block of layers, sized to its room - for one GLM peer that is the whole model, holding as
   many experts of every layer as its VRAM pays for (`expert homes of 288 per layer: main card 0, second card 49, RAM 239`).
 - **Prompt rows.** A peer also computes its experts' share of each prompt chunk: any chunk on a peer as fast as the main card, chunks

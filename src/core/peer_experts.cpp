@@ -342,7 +342,9 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         return false;
     }
     const auto& f = lay.fmt[(size_t) layer];
-    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
+    auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
+    L.gate_softcap = f.gate_softcap;
+    L.up_softcap = f.up_softcap;
     return launch_layout(layer, L, x, ids, n_tok, k, kind, err, out);
 }
 
@@ -394,7 +396,8 @@ namespace {
 /// Whether two layouts run the same grouped kernels.
 bool same_kernels(const basalt::kernels::NativeExpertLayout& a, const basalt::kernels::NativeExpertLayout& b) {
     return a.gu_type == b.gu_type && a.up_type == b.up_type && a.d_type == b.d_type && a.n_embd == b.n_embd &&
-           a.n_ff == b.n_ff && (a.swiglu_limit > 0.0f) == (b.swiglu_limit > 0.0f);
+           a.n_ff == b.n_ff && (a.swiglu_limit > 0.0f) == (b.swiglu_limit > 0.0f) &&
+           (a.gate_softcap > 0.0f) == (b.gate_softcap > 0.0f);
 }
 
 }  // namespace
@@ -474,6 +477,12 @@ const uint8_t* PeerExperts::fetch(int64_t expert, const uint8_t* src, uint64_t b
     cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, fetch_);
     cudaEventRecord(fetch_ev_, fetch_);
     return dst;
+}
+
+bool PeerExperts::fetched(int64_t expert) const {
+    for (int s = 0; s < scratch_used_; ++s)
+        if (scratch_[(size_t) s] == expert) return true;
+    return false;
 }
 
 bool PeerExperts::plan_fetched(const int32_t* ids, int64_t n, const int32_t* kind, std::string& err) {

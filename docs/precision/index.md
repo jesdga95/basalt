@@ -10,6 +10,7 @@ Each model has one page for what it computes in and what each rounding costs. Th
   routing flags.
 - [Inkling 2 Mini](inkling2.md): weights, stages, the attention caches and quality against its reference (the release with
   its experts dequantized to BF16, not a true BF16 model).
+- [ERNIE-5.5-Flash](ernie55.md): weights, stages, the HCA/MLA-DSA attention caches, drafting and the lossy routing flags.
 - GLM-5.3-Flash ([parity](../models/glm-5-3-flash.md#parity)): what it computes in and what each rounding costs, in its
   guide rather than a page of its own - the gate has no BF16 base for this model, so quality is scored against
   llama.cpp reading the same IQ1_S bytes, and the tensor audit of the pack sits beside it.

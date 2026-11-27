@@ -27,11 +27,13 @@ int main() {
         }
     bad += !native_expert_supported(GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, kNEmbd, kNFf);
     ++pairs;
-    std::printf("pack gate/up x down pairs at %lld x %lld: %d pairs, %s\n", (long long) kNEmbd, (long long) kNFf, pairs,
-                bad ? "FAIL" : "all taken");
-    // MXFP4 has down kernels only: refused as gate/up with every down type, its own included
+    bad += !native_expert_supported(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, 2048, 2048);
+    ++pairs;
+    std::printf("pack gate/up x down pairs at %lld x %lld (plus MXFP4 2048 x 2048): %d pairs, %s\n", (long long) kNEmbd,
+                (long long) kNFf, pairs, bad ? "FAIL" : "all taken");
+    // IQ4_NL has down kernels only: refused as gate/up with every down type
     int bad2 = 0;
-    for (int d : down) bad2 += native_expert_supported(GGML_TYPE_MXFP4, d, kNEmbd, kNFf);
-    std::printf("MXFP4 as gate/up: %s\n", bad2 ? "FAIL" : "refused");
+    for (int d : down) bad2 += native_expert_supported(GGML_TYPE_IQ4_NL, d, kNEmbd, kNFf);
+    std::printf("IQ4_NL as gate/up: %s\n", bad2 ? "FAIL" : "refused");
     return bad || bad2 ? 1 : 0;
 }

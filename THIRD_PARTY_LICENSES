@@ -397,6 +397,18 @@ proposed tokens), the gated attention and the GDN output gate. Licensed under th
 reproduced above.
 
 ================================================================================
+ERNIE-5.5-Flash-Preview (https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview,
+https://github.com/baidu/vLLM-ERNIE), Apache License 2.0
+Copyright (c) 2026 Baidu. All Rights Reserved.
+================================================================================
+
+The ERNIE-5.5-Flash runtime (src/models/ernie55/), converter (tools/convert/checkpoint_ernie55.py,
+tools/convert/dspark_ernie55_attach.py) and chat/tool dialect (serve/models/ernie55.py) follow Baidu's
+ERNIE-5.5-Flash-Preview reference architecture, prompt encoding/decoding protocol (encoding_ernie.py,
+decoding_ernie.py) and vLLM-ERNIE reference kernels as the reference design, not its code. Licensed under
+the Apache License, Version 2.0, reproduced above.
+
+================================================================================
 DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in
 serve/models/deepseek41_encoding.py
 ================================================================================
