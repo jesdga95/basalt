@@ -1730,8 +1730,8 @@ int check_mxfp4(int gu, int seed) {
 // Gemma 4's experts at its geometry (2816 wide, 704 inner, the GELU gate in tanh form): NVFP4 (the scale tail) and MXFP8
 // (the down rows padded with zero columns to 768, whole 128-value blocks), each three ways: a double expert on
 // ggml's to_float weights and unrounded activations, the CPU tier (native_gu_rows / native_down_rows, Q8_0 activations)
-// and the GPU's grouped kernels (q8_1 activations). The CPU and the GPU differ from the reference and from each other
-// by their activation rounding only.
+// and the GPU's grouped kernels (q8_1 activations). Each differs from the reference by its activation rounding (about
+// 1e-2 relative); the two round alike and differ from each other by far less.
 int check_gemma4(cudaStream_t s) {
     namespace K = basalt::kernels;
     constexpr int64_t GE = 2816, GF = 704;
@@ -1868,7 +1868,9 @@ int check_gemma4(cudaStream_t s) {
             }
         }
         const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-        const bool ok = ec < 1e-2 && eg < 1e-2 && ecg < 1e-2;
+        // each path against the reference: its activation rounding (Q8_0 or q8_1 per 32 values, then H again), about 1e-2
+        // here; the two paths against each other: the same roundings, so far closer
+        const bool ok = ec < 3e-2 && eg < 3e-2 && ecg < 1e-4;
         std::printf("gemma4 %s/%s gelu %lldx%lld (down %lld): cpu vs ref rel %.2e, gpu vs ref %.2e, cpu vs gpu %.2e  %s\n", name,
                     name, (long long) GE, (long long) GF, (long long) FK, ec, eg, ecg, ok ? "ok" : "FAIL");
         failures += !ok;
