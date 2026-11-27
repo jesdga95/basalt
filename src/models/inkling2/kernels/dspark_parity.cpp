@@ -1,7 +1,8 @@
 // src/models/inkling2/kernels/dspark_parity.cpp - the DSpark drafter's kernels against plain CPU references (double
 // accumulation) at the drafter's geometry: the target features' mixes (and a row's bits alone), the block's inputs, the
 // Markov recurrence, the screened head over the whole vocabulary (against its exact rows, its tie rule), the head folds and
-// the recurrence's split. Each is timed. Exit 77 without a GPU.
+// the recurrence's split (each timed), and the cache writes into the int8 cache against their fp16 writes. Exit 77 without
+// a GPU.
 #include "basalt/core/device_copy.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -746,6 +747,93 @@ void test_head_base_batch() {
     cudaStreamDestroy(st);
 }
 
+// The cache writes of the commit (dspark_kv_commit_batch) and the block (dspark_block_qk_prep_batch) into the int8 cache
+// against their fp16 writes of the same rows: the same cells written and no other, each scale the fp16 of its 64 values'
+// amax / 127 and each code within half a step of the value (the fp16 write's value: its own rounding added).
+void check_int8_rows(const char* what, const std::vector<uint16_t>& k16, const std::vector<uint16_t>& v16, const std::vector<int8_t>& k8,
+                     const std::vector<int8_t>& v8, const std::vector<uint16_t>& ks, const std::vector<uint16_t>& vs) {
+    int bad = 0, rows = 0;
+    double worst = 0;
+    const auto f16 = [](uint16_t h) { return __half2float(__ushort_as_half(h)); };
+    for (size_t g = 0; g < ks.size(); ++g) {
+        for (int t = 0; t < 2; ++t) {
+            const std::vector<uint16_t>& x16 = t ? v16 : k16;
+            const std::vector<int8_t>& x8 = t ? v8 : k8;
+            const float sc = f16((t ? vs : ks)[g]);
+            float amax = 0;
+            bool written16 = false, written8 = sc != 0;
+            for (int i = 0; i < 64; ++i) {
+                amax = std::max(amax, std::fabs(f16(x16[g * 64 + i])));
+                written16 = written16 || x16[g * 64 + i] != 0;
+                written8 = written8 || x8[g * 64 + i] != 0;
+            }
+            if (written16 != written8) { ++bad; continue; }
+            if (!written16) continue;
+            ++rows;
+            const float want = amax / 127.0f;   // from the fp16 values: the scale of the fp32 values within their rounding
+            if (std::fabs(sc - want) > want * 2e-3f) ++bad;
+            for (int i = 0; i < 64; ++i) {
+                const float x = f16(x16[g * 64 + i]), e = std::fabs((float) x8[g * 64 + i] * sc - x);
+                worst = std::max(worst, (double) (e / sc));
+                if (e > 0.5f * sc + std::fabs(x) * 1e-3f + 1e-7f) ++bad;
+            }
+        }
+    }
+    std::printf("%s int8: %d groups of 64, max |code x scale - fp16 value| %.3f of a step%s\n", what, rows, worst, bad ? "  FAIL" : "");
+    if (bad || rows == 0) ++failures;
+}
+
+void test_kv_int8() {
+    constexpr int KV = kKvHeads * kHeadDim, R = 8, B = 2;
+    constexpr int64_t cap = 4096;
+    const std::vector<float> kb = randn((size_t) B * kBlock * KV), vb = randn((size_t) B * kBlock * KV, 0.7f);
+    const std::vector<float> q = randn((size_t) B * kBlock * kHeads * kHeadDim), qn = randn(kHeadDim, 0.1f, 1.0f),
+                             kn = randn(kHeadDim, 0.1f, 1.0f);
+    std::vector<int32_t> pos(R);
+    for (int t = 0; t < R; ++t) pos[(size_t) t] = 1000 + 517 * t;   // cells far apart, two wrapped past cap
+    const std::vector<int32_t> meta = {11, 300, 12, 3990};          // the block: two sessions at positions 300 and 3990 (wraps)
+    float *dkb = dev(kb), *dvb = dev(vb), *dq = dev(q), *dqn = dev(qn), *dkn = dev(kn);
+    int32_t *dpos = dev(pos), *dmeta = dev(meta);
+    float* dqo = zeros<float>(q.size());
+    const size_t cells = (size_t) cap * KV, scales = (size_t) cap * kKvHeads * (kHeadDim / 64);
+    for (int which = 0; which < 2; ++which) {   // the commit, then the block
+        std::vector<uint16_t*> k16(B), v16(B), ks(B), vs(B);
+        std::vector<int8_t*> k8(B), v8(B);
+        DsCommitSegs s16, s8;
+        DsBatchKv b16, b8;
+        for (int b = 0; b < B; ++b) {
+            k16[(size_t) b] = zeros<uint16_t>(cells);
+            v16[(size_t) b] = zeros<uint16_t>(cells);
+            k8[(size_t) b] = zeros<int8_t>(cells);
+            v8[(size_t) b] = zeros<int8_t>(cells);
+            ks[(size_t) b] = zeros<uint16_t>(scales);
+            vs[(size_t) b] = zeros<uint16_t>(scales);
+            s16.k[b] = b16.k[b] = k16[(size_t) b];
+            s16.v[b] = b16.v[b] = v16[(size_t) b];
+            s8.k[b] = b8.k[b] = (uint16_t*) k8[(size_t) b];
+            s8.v[b] = b8.v[b] = (uint16_t*) v8[(size_t) b];
+            s8.ks[b] = b8.ks[b] = ks[(size_t) b];
+            s8.vs[b] = b8.vs[b] = vs[(size_t) b];
+        }
+        if (which == 0) {
+            dspark_kv_commit_batch(dkb, dvb, dkn, 1e-6f, 1e6f, dpos, R, s16, cap, nullptr);
+            dspark_kv_commit_batch(dkb, dvb, dkn, 1e-6f, 1e6f, dpos, R, s8, cap, nullptr);
+        } else {
+            dspark_block_qk_prep_batch(dq, dkb, dvb, dqn, dkn, 1e-6f, 1e6f, dmeta, kBlock, B, dqo, b16, cap, nullptr);
+            dspark_block_qk_prep_batch(dq, dkb, dvb, dqn, dkn, 1e-6f, 1e6f, dmeta, kBlock, B, dqo, b8, cap, nullptr);
+        }
+        for (int b = 0; b < (which == 0 ? 1 : B); ++b)
+            check_int8_rows(which == 0 ? "kv commit" : "block qk prep", host(k16[(size_t) b], cells), host(v16[(size_t) b], cells),
+                            host(k8[(size_t) b], cells), host(v8[(size_t) b], cells), host(ks[(size_t) b], scales),
+                            host(vs[(size_t) b], scales));
+        for (int b = 0; b < B; ++b) {
+            cudaFree(k16[(size_t) b]); cudaFree(v16[(size_t) b]); cudaFree(k8[(size_t) b]); cudaFree(v8[(size_t) b]);
+            cudaFree(ks[(size_t) b]); cudaFree(vs[(size_t) b]);
+        }
+    }
+    cudaFree(dkb); cudaFree(dvb); cudaFree(dq); cudaFree(dqn); cudaFree(dkn); cudaFree(dpos); cudaFree(dmeta); cudaFree(dqo);
+}
+
 }  // namespace
 
 int main() {
@@ -762,6 +850,7 @@ int main() {
     test_split();
     test_head_batch();
     test_head_base_batch();
+    test_kv_int8();
     std::printf("inkling2_dspark_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

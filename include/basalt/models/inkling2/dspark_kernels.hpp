@@ -96,20 +96,26 @@ void dspark_split_rnn(const uint16_t* w, uint16_t* w_sp, uint16_t* w_h, uint16_t
 
 // ---- batched multi-session commit & draft kernels -----------------------------------------------------------------------
 
+/// A segment's cache: fp16 `k` and `v` [cell][kv head][head width], or, with `ks` set, the int8 cache (gqa_attn.hpp
+/// KvInt8: `k` and `v` its codes, `ks` and `vs` its fp16 scales, one per 64 values).
 struct DsCommitSegs {
     const basalt::kernels::WindowSegs* at_d = nullptr;
     float* fr[basalt::kernels::kWindowSegsMax] = {};
     uint16_t* k[basalt::kernels::kWindowSegsMax] = {};
     uint16_t* v[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* ks[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* vs[basalt::kernels::kWindowSegsMax] = {};
 };
 
 struct DsBatchFr {
     const float* fr[basalt::kernels::kWindowSegsMax] = {};
 };
 
-struct DsBatchKv {
+struct DsBatchKv {   ///< as DsCommitSegs' caches
     uint16_t* k[basalt::kernels::kWindowSegsMax] = {};
     uint16_t* v[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* ks[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* vs[basalt::kernels::kWindowSegsMax] = {};
 };
 
 void dspark_mix_batch(const float* tap, int64_t tap_stride, int rows, const DsMixArgs& a, float* out, int64_t out_stride,

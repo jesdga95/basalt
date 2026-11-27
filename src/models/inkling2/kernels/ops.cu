@@ -543,8 +543,7 @@ constexpr int kRingThreads = 256;
 constexpr int kRingWords = (kBatchRows + 63) / 64;
 static_assert(kRingWords <= 32, "a visit's rows' mask words fit a warp");
 __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_t* __restrict__ ids, int rows, int k,
-                                                                    const unsigned long long* __restrict__ blobs,
-                                                                    const float* __restrict__ x, int layer, float* x_m,
+                                                                    const unsigned long long* __restrict__ blobs, int layer,
                                                                     int32_t* ids_m, CpuBell* bell, uint32_t* seq) {
     __shared__ unsigned long long ram_rows[kRingWords];
     __shared__ uint32_t stopped;
@@ -572,15 +571,43 @@ __global__ void __launch_bounds__(kRingThreads) moe_cpu_ring_kernel(const int32_
     __syncthreads();
     if (stopped) return;
     for (int i = threadIdx.x; i < n; i += kRingThreads) ids_m[i] = ids[i];
-    constexpr int kVecs = kWidth / 4;
-    for (int r = 0; r < rows; ++r)
-        if ((ram_rows[r >> 6] >> (r & 63)) & 1ull)
-            for (int c = threadIdx.x; c < kVecs; c += kRingThreads)
-                reinterpret_cast<float4*>(x_m)[(size_t) r * kVecs + c] = reinterpret_cast<const float4*>(x)[(size_t) r * kVecs + c];
-    if (threadIdx.x == 0) bk::doorbell_store_relaxed(&bell->ticket, ticket);
+    if (threadIdx.x == 0) {
+        bk::doorbell_store_relaxed(&bell->ticket, ticket);
+        bk::doorbell_store_relaxed(&bell->ring_rows, seq[1]);
+    }
     __threadfence_system();   // every writer's payload before the barrier, so the release below covers it
     __syncthreads();
     if (threadIdx.x == 0) bk::doorbell_store_release(&bell->ring, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
+}
+
+// The rows go to the host beside the router, so its quantization is done when the choices come. The buffer is the host's
+// until it acknowledges the publication before, so a visit the host has not finished reading is never overwritten.
+__global__ void __launch_bounds__(kRingThreads) moe_cpu_rows_kernel(const float* __restrict__ x, int rows, int layer, float* x_m,
+                                                                    CpuBell* bell, uint32_t* seq) {
+    // The host's last read of the buffer happens before its release of rows_ack, which happens before the acquire of it
+    // here (or the spin's acquire fence), which the barriers order before this block's writes to the buffer.
+    __shared__ uint32_t pub, stopped, acked, prev;
+    if (threadIdx.x == 0) stopped = bk::doorbell_load_acquire(&bell->abort);   // three warps, in parallel
+    if (threadIdx.x == 32) acked = bk::doorbell_load_acquire(&bell->rows_ack);
+    if (threadIdx.x == 64) {
+        prev = seq[1];
+        seq[1] = prev + 1 ? prev + 1 : 1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bool go = !stopped;
+        if (go && prev && acked != prev) go = bk::doorbell_spin(&bell->rows_ack, prev, &bell->abort, 8);
+        pub = go ? (prev + 1 ? prev + 1 : 1) : 0;
+        if (go) bk::doorbell_store_relaxed(&bell->rows_shape, 1u | (uint32_t) layer << 8 | (uint32_t) rows << 16);
+    }
+    __syncthreads();
+    if (!pub) return;
+    constexpr int kVecs = kWidth / 4;
+    for (int i = threadIdx.x; i < rows * kVecs; i += kRingThreads)
+        reinterpret_cast<float4*>(x_m)[i] = reinterpret_cast<const float4*>(x)[i];
+    __threadfence_system();   // every writer's rows and the shape before the barrier, so the release below covers them
+    __syncthreads();
+    if (threadIdx.x == 0) bk::doorbell_store_release(&bell->rows, pub);
 }
 
 constexpr int kMergeThreads = 256;
@@ -755,12 +782,19 @@ void heat_fold(const int32_t* ids, const int32_t* layer, int visits, int row_str
     check("heat_fold");
 }
 
-void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
-                  int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream) {
+void moe_cpu_rows(const float* x, int rows, int layer, float* x_m, CpuBell* bell, uint32_t* seq, void* stream) {
+    if (rows <= 0) return;
+    if (rows > kBatchRows || layer < 0 || layer > 0xff) throw std::runtime_error("inkling2 moe_cpu_rows: rows or layer");
+    moe_cpu_rows_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(x, rows, layer, x_m, bell, seq);
+    check("moe_cpu_rows");
+}
+
+void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, int layer, int32_t* ids_m, CpuBell* bell,
+                  uint32_t* seq, void* stream) {
     if (rows <= 0) return;
     if (rows > kBatchRows || rows * k > kMaxPairs || layer < 0 || layer > 0xff)
         throw std::runtime_error("inkling2 moe_cpu_ring: rows, pairs or layer");
-    moe_cpu_ring_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(ids, rows, k, blobs, x, layer, x_m, ids_m, bell, seq);
+    moe_cpu_ring_kernel<<<1, kRingThreads, 0, (cudaStream_t) stream>>>(ids, rows, k, blobs, layer, ids_m, bell, seq);
     check("moe_cpu_ring");
 }
 

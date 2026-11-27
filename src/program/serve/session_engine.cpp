@@ -16,6 +16,7 @@
 #include "basalt/vision/ffmpeg_api.hpp"
 #include "basalt/vision/video.hpp"
 
+#include <algorithm>
 #include <iterator>
 #include <sstream>
 
@@ -228,7 +229,152 @@ public:
         if (at_exit) disk.flush();
         return written;
     }
-    bool park_idle_engine(std::string&) override { return false; }
+
+    // Idle sessions holding elastic KV past their start base, oldest-idle first (batch slot >= 0, or -1 for solo).
+    std::vector<std::pair<double, int>> idle_slots(int exclude_session, bool any) const {
+        std::vector<std::pair<double, int>> idle;
+        const double now = busy_now();
+        auto holds = [&](int idx, double since) {
+            return idx != exclude_session && (any || now - since >= kParkAfterBusy) &&
+                   sessions_[(size_t) idx]->kv_above_base();
+        };
+        const bool solo = solo_out != nullptr ? solo_out->live_ok && !solo_out->live.empty()
+                                              : !solo_busy && live_ok && !live.empty();
+        for (int b = 0; b < (int) bs.size(); ++b) {
+            const BSlot& sl = bs[(size_t) b];
+            if (b == 0 && slot0_solo() && !sl.cached && (solo || solo_busy)) continue;
+            if (!sl.active && !sl.partial && b != park_keep && holds(b, sl.idle_busy))
+                idle.emplace_back(sl.idle_busy, b);
+        }
+        if (solo && !(slot0_solo() && !bs.empty() && (bs[0].cached || bs[0].active || park_keep == 0)) &&
+            holds(0, solo_idle_busy))
+            idle.emplace_back(solo_idle_busy, -1);
+        std::sort(idle.begin(), idle.end());
+        return idle;
+    }
+
+    // Move an idle elastic-KV session's conversation out of VRAM (to RAM, or disk if already stored) and trim its KV to base.
+    bool park_idle_slot(int b) {
+        ckd_finish();
+        const int idx = b >= 0 ? b : 0;
+        const int prev_active = active_;
+        struct RestoreActive {
+            SessionRuntime* rt;
+            int prev;
+            ~RestoreActive() { rt->set_active(prev); }
+        } guard{this, prev_active};
+        set_active(idx);
+
+        std::vector<int32_t>& ids = b >= 0 ? bs[(size_t) b].ids : solo_out != nullptr ? solo_out->live : live;
+        std::vector<ImgKey>& imgs = b >= 0 ? bs[(size_t) b].imgs : solo_out != nullptr ? solo_out->live_imgs : live_imgs;
+        std::vector<ConvCheckpoint>& cks = b >= 0 ? bs[(size_t) b].checks : solo_out != nullptr ? solo_out->checks : checks;
+        const bool cvec = b >= 0 ? bs[(size_t) b].cvec : solo_out != nullptr ? solo_out->cvec : cvec_cached;
+        const std::string who = b >= 0 ? "slot " + std::to_string(b) : std::string("the solo session");
+        const auto t0 = Clock::now();
+
+        const bool has_conv = b >= 0 ? (bs[(size_t) b].cached && !ids.empty()) : !ids.empty();
+        const int64_t positions = has_conv ? (int64_t) ids.size() : 0;
+        const size_t cell_est = has_conv ? (session().running_bytes() + session().cells_bytes(positions) +
+                                ids.size() * sizeof(int32_t) + imgs.size() * sizeof(ImgKey)) : 0;
+        const uint64_t floor = std::max({(uint64_t) o.conversation_cache_min_free_mib << 20,
+                                         disk.enabled() ? disk_floor : 0, basalt::platform::ram_reserve()});
+        const bool keep = has_conv && (o.conversation_cache_min_tokens <= 0 || positions >= o.conversation_cache_min_tokens);
+        const bool to_ram = keep && conversations->enabled() && capture_admit(cell_est, floor);
+        const bool on_disk = keep && !to_ram && disk.enabled() && positions >= disk_min_tokens() &&
+                             disk_has(ids, imgs, cks, cvec);
+        if (!to_ram && !on_disk && keep) {
+            double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;
+            const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
+            if (noted != since)
+                basalt::log::info("basalt serve", "%s's idle conversation stays in VRAM: %zu MiB do not fit in RAM above "
+                                  "the %llu MiB floor", who.c_str(), cell_est >> 20, (unsigned long long) (floor >> 20));
+            noted = since;
+            return false;
+        }
+
+        size_t bytes = 0;
+        if (to_ram) {
+            try {
+                basalt::core::SavedConversation image;
+                const std::vector<ConvCheckpoint> none;
+                std::string se;
+                if (!capture(image, ids, imgs, none, cvec, se)) {
+                    basalt::log::warn("basalt serve", "%s's idle conversation stays in VRAM (%s)", who.c_str(), se.c_str());
+                    return false;
+                }
+                if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), 0, floor)) {
+                    basalt::log::info("basalt serve", "%s's idle conversation stays in VRAM: RAM below the %llu MiB floor "
+                                      "after its capture", who.c_str(), (unsigned long long) (floor >> 20));
+                    return false;
+                }
+                image.checkpoints = std::move(cks);
+                bytes = image.bytes();
+                conversations->put_slot(std::move(image), std::max<size_t>(bs.size(), 1));
+                for (auto& sc : conversations->take_spilled())
+                    if (!disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec)) disk.put(std::move(sc), kDiskQueueCap);
+            } catch (const std::bad_alloc&) {
+                basalt::log::warn("basalt serve", "%s's idle conversation stays in VRAM: allocation failed", who.c_str());
+                return false;
+            }
+        }
+
+        if (b >= 0) bs[(size_t) b].cached = false;
+        else if (solo_out != nullptr) solo_out->live_ok = false;
+        else live_ok = false;
+        ids.clear();
+        imgs.clear();
+        cks.clear();
+
+        const int64_t freed = session().trim_kv(0);
+        char where[64];
+        if (!has_conv) std::snprintf(where, sizeof where, "uncached");
+        else if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);
+        else if (on_disk) std::snprintf(where, sizeof where, "kept on disk only");
+        else std::snprintf(where, sizeof where, "dropped, below the %d token minimum", o.conversation_cache_min_tokens);
+        basalt::log::info("basalt serve", "%s's idle conversation, %lld tokens, %s in %.0f ms: %lld KV cells back",
+                          who.c_str(), (long long) positions, where,
+                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) freed);
+        return freed > 0;
+    }
+
+    void park_idle_for(int exclude_session, int64_t kv_need) {
+        if (kv_need <= 0) return;
+        while (true) {
+            const int64_t ceil = sessions_[(size_t) exclude_session]->kv_ceiling();
+            if (ceil < 0 || kv_need <= ceil) break;
+            const auto cand = idle_slots(exclude_session, /*any=*/true);
+            bool parked = false;
+            for (const auto& it : cand) {
+                if (park_idle_slot(it.second)) {
+                    kv_ceiling_note();
+                    parked = true;
+                    break;
+                }
+            }
+            if (!parked) break;
+        }
+    }
+
+    bool park_idle_engine(std::string&) override {
+        const auto cand = idle_slots(-1, /*any=*/false);
+        if (cand.empty()) return false;
+        const auto slots_now = [&]() -> int64_t {
+            const auto cards = sessions_[0]->experts_by_card();
+            return cards.empty() ? -1 : cards[0].slots;
+        };
+        const int64_t before = slots_now();
+        for (const auto& it : cand) {
+            if (park_idle_slot(it.second)) {
+                const int64_t after = slots_now();
+                if (before >= 0 && after >= 0)
+                    basalt::log::info("basalt serve", "idle: the expert cache %lld -> %lld slots",
+                                      (long long) before, (long long) after);
+                kv_ceiling_note();
+                return true;
+            }
+        }
+        return false;
+    }
     // a model with an elastic KV: its ceiling as an INFO line whenever it moves (the server reports it in /v1/status)
     int64_t kv_ceiling_sent_ = -1;
     void kv_ceiling_note() override {
@@ -734,7 +880,16 @@ private:
     Flow prepare_image() override;
     Flow admit_room() override;
     Flow decode() override { return decode_loop(*this); }
-    bool release_room() override { return true; }
+    Flow make_room() override {
+        const int64_t kv_need = std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0);
+        runtime_.park_keep = slot_source;
+        rt_.park_idle_for(rt_.active_slot(), kv_need);
+        return Flow::proceed;
+    }
+    bool release_room() override {
+        if (rt_.session().trim_kv(n + 4096) > 0) rt_.kv_ceiling_note();
+        return true;
+    }
     bool checkpoint_mount(const ConvCheckpoint& c) override {
         const basalt::model::Result r = rt_.restore_running_from(c.state_a, (int64_t) c.ids.size());
         if (!r.ok()) runtime_.err = r.message;

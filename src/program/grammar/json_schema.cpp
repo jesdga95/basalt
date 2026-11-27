@@ -49,8 +49,11 @@ class Builder {
         const JsonValue& value = *schema.get(key);
         if (value.is_integer()) return value.as_int();
         if (value.type != Type::Number) fail(path, key + " must be a number");
-        double d = value.as_double();
-        return (int64_t) (round_up ? std::ceil(d) : std::floor(d));
+        double d = round_up ? std::ceil(value.as_double()) : std::floor(value.as_double());
+        // out-of-range doubles saturate: a cast would be undefined
+        if (!(d > -9.2e18)) return INT64_MIN;
+        if (!(d < 9.2e18)) return INT64_MAX;
+        return (int64_t) d;
     }
 
     static SchemaNode::Format get_format(const JsonValue& schema, const std::string& path) {
@@ -325,7 +328,12 @@ class Builder {
         }
         if (type_name == "array") return build_array(schema, path);
         if (type_name == "integer") return build_integer(schema, path);
-        if (type_name == "number") return simple(SchemaNode::Number);
+        if (type_name == "number") {
+            // bounds kept as integers: the number rule ignores them, an allOf with an integer branch uses them
+            auto node = build_integer(schema, path);
+            node->kind = SchemaNode::Number;
+            return node;
+        }
         if (type_name == "boolean") return simple(SchemaNode::Boolean);
         if (type_name == "null") return simple(SchemaNode::Null);
         fail(path, "unrecognized type " + type_name);

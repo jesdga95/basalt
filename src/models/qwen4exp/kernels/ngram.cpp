@@ -103,7 +103,7 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16 };
+enum class PleFormat { IQ4_NL, Q5_0, Q5_1, Q8_0, BF16 };
 
 struct PleTable::Impl {
     GgufFile* file = nullptr;
@@ -134,6 +134,9 @@ struct PleTable::Impl {
         switch (fmt) {
         case PleFormat::Q5_0:
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
+            break;
+        case PleFormat::Q5_1:
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_1(row + (size_t) b * 24, out160 + b * 32);
             break;
         case PleFormat::Q8_0:
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q8_0(row + (size_t) b * 34, out160 + b * 32);
@@ -180,18 +183,20 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL, Q5_0, Q8_0 or BF16 rows
+    // IQ4_NL, Q5_0, Q5_1, Q8_0 or BF16 rows
     if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
     else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
+    else if (std::strcmp(t->type_name(), "Q5_1") == 0) impl_->fmt = PleFormat::Q5_1;
     else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
     else if (std::strcmp(t->type_name(), "BF16") == 0) impl_->fmt = PleFormat::BF16;
     else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0 or BF16";
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q5_1, Q8_0 or BF16";
         close();
         return false;
     }
     impl_->rb = impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
               : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0
+              : impl_->fmt == PleFormat::Q5_1 ? PLE_ROW_BYTES_Q5_1
               : impl_->fmt == PleFormat::BF16 ? PLE_ROW_BYTES_BF16 : PLE_ROW_BYTES;
     // PleReader's row_bytes is a runtime parameter: every format's rows go through the same generic path
     // (ple_reader_test --selftest covers straddling, caching, in-flight tickets, keep-alive).
@@ -314,6 +319,7 @@ bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
     return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0"
+           : impl_->fmt == PleFormat::Q5_1 ? "Q5_1"
            : impl_->fmt == PleFormat::BF16 ? "BF16" : "IQ4_NL";
 }
 PleIo PleTable::mode() const { return impl_->mode; }

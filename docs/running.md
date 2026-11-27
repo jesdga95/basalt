@@ -159,8 +159,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
   tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
   those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
-  for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
-  memory pressure). `--ram-reserve-mib 0` turns the guard off.
+  for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or half the reserve when smaller,
+  or below the reserve under memory pressure). `--ram-reserve-mib 0` turns the guard off.
 - Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
   repeats it and the stats page adds an SSD tier and turns its Experts heading amber.
 - The disk tier keeps its floor a GiB above the reserve.

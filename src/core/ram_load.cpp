@@ -197,7 +197,10 @@ uint64_t ram_padded(uint64_t bytes) {
 }
 
 uint8_t* alloc_ram(uint64_t bytes) {
-    return (uint8_t*) platform::alloc_aligned((size_t) ram_padded(bytes), 2ull << 20);
+    const uint64_t padded = ram_padded(bytes);
+    auto* p = (uint8_t*) platform::alloc_aligned((size_t) padded, 2ull << 20);
+    if (p != nullptr) platform::advise_hugepages(p, padded);
+    return p;
 }
 
 RamAllocation::~RamAllocation() { reset(); }

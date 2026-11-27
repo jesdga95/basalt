@@ -147,6 +147,48 @@ __global__ void fill_kernel(const float* __restrict__ e, int n, float* __restric
     for (int s = 0; s < 4; ++s) x[((size_t) t * 4 + s) * n + i] = v;
 }
 
+__device__ __forceinline__ float e4m3_code_to_f32(uint8_t b) {
+    const int e = (b >> 3) & 15, m = b & 7;
+    if (e == 15 && m == 7) return __int_as_float(0x7fc00000);
+    const float v = e ? ldexpf(1.f + (float) m * 0.125f, e - 7) : ldexpf((float) m, -9);
+    return (b & 0x80) ? -v : v;
+}
+
+constexpr int kEngramNormWarps = 4;
+constexpr int kEngramNormMaxW = 128;
+
+// One warp per (token, col) row of W <= 128 F8_E4M3 codes: coalesced byte loads and float stores, exact sequential
+// sum-of-squares on lane 0 (bit-for-bit identical to the host loop).
+__global__ void __launch_bounds__(kEngramNormWarps * 32)
+engram_norm_e4m3_kernel(const uint8_t* __restrict__ raw, const float* __restrict__ norm_w,
+                        const float* __restrict__ valid_rows, int n_tok, int n_cols, int W, float* __restrict__ out) {
+    __shared__ float lut[256];
+    __shared__ float sbuf[kEngramNormWarps][kEngramNormMaxW];
+    for (int i = threadIdx.x; i < 256; i += kEngramNormWarps * 32) lut[i] = e4m3_code_to_f32((uint8_t) i);
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pair = (int) blockIdx.x * kEngramNormWarps + warp;
+    if (pair >= n_tok * n_cols) return;
+    const int t = pair / n_cols, c = pair - t * n_cols;
+    const uint8_t* src = raw + (size_t) pair * W;
+    for (int d = lane; d < W; d += 32) sbuf[warp][d] = lut[src[d]];
+    __syncwarp();
+    float r = 0.f;
+    if (lane == 0) {
+        float ss = 0.f;
+        for (int d = 0; d < W; ++d) {
+            const float v = sbuf[warp][d];
+            ss = __fadd_rn(ss, __fmul_rn(v, v));
+        }
+        r = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, (float) W), 1.1920929e-07f)));
+    }
+    r = __shfl_sync(0xffffffffu, r, 0);
+    const float valid = valid_rows[t];
+    const float* nr = norm_w + (size_t) c * W;
+    float* dst = out + (size_t) pair * W;
+    for (int d = lane; d < W; d += 32) dst[d] = __fmul_rn(__fmul_rn(__fmul_rn(sbuf[warp][d], r), nr[d]), valid);
+}
+
 constexpr int kEngramThreads = 256;
 
 // A block per stream.
@@ -324,6 +366,16 @@ void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, 
 
 void fill_streams(const float* e, int n, int n_tok, float* x, void* stream) {
     fill_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(e, n, x);
+    if (!stream) cudaStreamSynchronize(nullptr);
+}
+
+void engram_norm_e4m3(const uint8_t* raw, const float* norm_w, const float* valid, int n_tok, int n_cols, int W,
+                      float* out, void* stream) {
+    if (W < 1 || W > kEngramNormMaxW) throw std::invalid_argument("engram_norm_e4m3: W");
+    const int pairs = n_tok * n_cols;
+    if (pairs <= 0) return;
+    const int blocks = (pairs + kEngramNormWarps - 1) / kEngramNormWarps;
+    engram_norm_e4m3_kernel<<<blocks, kEngramNormWarps * 32, 0, (cudaStream_t) stream>>>(raw, norm_w, valid, n_tok, n_cols, W, out);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

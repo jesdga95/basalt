@@ -1150,7 +1150,7 @@ void ExpertTier::pump(int layer, int pieces) {
     if (layer >= 0) land(layer);
 }
 
-int ExpertTier::fetch(int layer, Lookup& lk) {
+int ExpertTier::fetch(int layer, Lookup& lk, const Use* use) {
     // with the RAM tier caching the file the bus stays with the reads and the promotions
     if (s_.diag_tier_frozen || reads_.is_open()) return 0;
     int np = 0, nf = 0;
@@ -1165,9 +1165,20 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     core::PeerExperts* pc = peer_for(layer);   // this layer's second card: it computes the experts it fetches
     int far = pc ? std::min(core::policy::peer_bus_count(np, nf), pc->scratch_free()) : 0;
     const uint64_t bytes = s_.layers[(size_t) layer].blob_bytes;
+    // Pick eligible RAM misses to fetch over PCIe. When per-expert token counts are available (speculative/batch
+    // decode window), prioritize experts shared by more tokens so one PCIe transfer serves all of them on the GPU
+    // instead of repeating CPU compute across tokens.
+    int order[kMaxK];
+    int n_ord = 0;
+    for (int i = lk.k - 1; i >= 0; --i) {
+        if (lk.dev[i] || lk.peer[i] || !eligible(i)) continue;   // pinned sources only
+        order[n_ord++] = i;
+    }
+    if (use && n_ord > 1)
+        std::stable_sort(order, order + n_ord, [&](int a, int b) { return use[a].nt > use[b].nt; });
     int started = 0;
-    for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
-        if (lk.dev[i] || !eligible(i)) continue;   // pinned sources only
+    for (int idx = 0; idx < n_ord && left > 0; ++idx) {
+        const int i = order[idx];
         --left;
         const int32_t slot = far > 0 ? claim(layer, lk.experts[i], lk.host[i], copy_stream_, false, false, /*later=*/true)
                                      : claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
@@ -1484,6 +1495,15 @@ bool ExpertTier::reclaim(std::string& err, bool restore_lent) {
                               ok ? "" : ": ", e.c_str());
         if (restore_lent) restore(false);
         return true;
+    }
+    if (lent_per_layer_ == 0 && per_layer_ > 0 && per_layer_ < planned_per_layer_) {
+        uint64_t free_b = 0, total_b = 0;
+        std::string why;
+        if (core::device_memory(-1, free_b, total_b, why)) {
+            const uint64_t avail = free_b + (uint64_t) cache_.mapped_bytes();
+            const int64_t could = core::policy::reclaim_slots(avail, reserve_, free_floor_, one_each_, planned_per_layer_);
+            if (could > per_layer_) lend_all();
+        }
     }
     if (lent_per_layer_ == 0) return true;
     const int64_t want = std::max(lent_per_layer_, planned_per_layer_);

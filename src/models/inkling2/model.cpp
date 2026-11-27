@@ -438,7 +438,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const auto own_on = [&](int c) { return session_bytes(g, want, fp8_, int8_, cut_, c) + (c == 0 && dspark_ ? dspark_session_bytes(pack_) : 0); };
         // a pool of `positions` positions of one session (its granules rounded as `round` says)
         const auto one_on = [&](int c, int64_t positions, uint64_t round) {
-            return pool_bytes(g, positions, fp8_, int8_, round, cut_, c) + (c == 0 && dspark_ ? dspark_pool_bytes(pack_, positions, round) : 0);
+            return pool_bytes(g, positions, fp8_, int8_, round, cut_, c) + (c == 0 && dspark_ ? dspark_pool_bytes(pack_, positions, round, int8_) : 0);
         };
         // the least pool: every session at its first granule (the pool takes what is left after the experts; a conversation
         // that outgrows it waits for room or is refused); with --kv-pool off every session holds the whole context
