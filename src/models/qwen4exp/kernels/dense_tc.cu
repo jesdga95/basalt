@@ -1084,9 +1084,17 @@ void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int
 // fit in shared memory and the weights are 16-byte aligned; else 16-row tiles in 512-value chunks, and where those
 // leave SMs idle, two warp groups per tile taking alternate 512-value halves of 1024.
 template<int TYPE>
+DenseTcLayout layout_of(const void* w, int n_in, int n_out) {
+    if (one_ok<TYPE>(w, n_in, n_out)) return DenseTcLayout::one;
+    if (TYPE == 21) return DenseTcLayout::none;   // IQ3_S takes only the one-tile path
+    if (((uintptr_t) w & 15) == 0 && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) return DenseTcLayout::tile;
+    return n_in % 1024 == 0 && (n_out + 15) / 16 < sm_count() ? DenseTcLayout::split2 : DenseTcLayout::split1;
+}
+
+template<int TYPE>
 void launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
-    const bool aligned = ((uintptr_t) w & 15) == 0;
-    if (one_ok<TYPE>(w, n_in, n_out)) {
+    const DenseTcLayout l = layout_of<TYPE>(w, n_in, n_out);
+    if (l == DenseTcLayout::one) {
         launch_one<TYPE, 24>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
@@ -1094,13 +1102,9 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
         basalt::log::error("basalt", "dense_tc: IQ3_S n_in %d n_out %d needs the one-tile path", n_in, n_out);
         std::exit(1);
     } else {
-    if (aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
-        launch_tile<TYPE>(w, x, y, n_in, n_out, ncols, s);
-        return;
-    }
-    const bool few = (n_out + 15) / 16 < sm_count();
-    if (n_in % 1024 == 0 && few) launch_s<TYPE, 3, 1, 2>(w, x, y, n_in, n_out, ncols, s);
-    else launch_s<TYPE, 3, 1, 1>(w, x, y, n_in, n_out, ncols, s);
+        if (l == DenseTcLayout::tile) launch_tile<TYPE>(w, x, y, n_in, n_out, ncols, s);
+        else if (l == DenseTcLayout::split2) launch_s<TYPE, 3, 1, 2>(w, x, y, n_in, n_out, ncols, s);
+        else launch_s<TYPE, 3, 1, 1>(w, x, y, n_in, n_out, ncols, s);
     }
 }
 
@@ -1120,6 +1124,20 @@ bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
 bool dense_tc_type_on(int t) noexcept {
     constexpr int m = 255;   // Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0, Q8_0
     return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : t == 21 ? 16 : t == 11 ? 32 : t == 42 ? 64 : t == 8 ? 128 : 0)) != 0;
+}
+
+DenseTcLayout dense_tc_layout(int type, int n_in, int n_out, const void* w) noexcept {
+    if (!dense_tc_supported(type, n_in, n_out, w) || !dense_tc_type_on(type)) return DenseTcLayout::none;
+    switch (type) {
+        case 12: return layout_of<12>(w, n_in, n_out);
+        case 13: return layout_of<13>(w, n_in, n_out);
+        case 14: return layout_of<14>(w, n_in, n_out);
+        case 21: return layout_of<21>(w, n_in, n_out);
+        case 11: return layout_of<11>(w, n_in, n_out);
+        case 42: return layout_of<42>(w, n_in, n_out);
+        case 8: return layout_of<8>(w, n_in, n_out);
+        default: return layout_of<23>(w, n_in, n_out);
+    }
 }
 
 void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {

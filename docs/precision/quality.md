@@ -90,6 +90,18 @@ bin/basalt --serve --model MODEL.basalt {--spec 0 | --spec 7} --expert-cache N -
 
 After `READY`, `GEN 256 temperature=0 ID,ID,...` on stdin returns `T ID` lines and ends with `DONE`; `QUIT` ends the session. `LH` hash lines on stderr. Compare per position, matching rows by position.
 
+Batch slots against solo requests, one build: each fixture prompt solo, alone in every slot, and all prompts together
+with the prompt-to-slot order rotated, token by token against the solo run (drafting off):
+
+```sh
+python3 tools/greedy_identity.py --slots bin/basalt --model PACK.basalt -- --expert-cache N --kv int8
+```
+
+A row's bits do not depend on its slot, its place in the window or the window's width, solo or batched. What can differ
+is the prompt read: a solo request reads a part of up to `--short-read` tokens through decode windows, a slot reads it
+batched, and the two are different computations ([prefill](qwen38-flash-next.md#prefill)). The check therefore runs
+with `--short-read 0`.
+
 ## Reproduce the reference
 
 Flash-Next base (the model does not fit in RAM and VRAM, so the experts stream from disk):

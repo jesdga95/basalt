@@ -60,7 +60,9 @@ which experts sit where changes the last bits. Pin `--adapt-swaps 0 --peer-adapt
 ### Prefill
 
 Prefill is a different computation from decode: fp16 and BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts. The gate
-scores the decode path.
+scores the decode path. A solo request reads a part of up to `--short-read` tokens (64) through decode windows; a batch slot reads
+every part batched, so a short prompt rounds differently solo and in a slot (about 1e-3 relative in the GDN state). Decode rows
+themselves have the same bits solo and batched ([greedy identity](quality.md#greedy-identity)).
 
 | Path | Format | Rounding |
 |---|---|---|

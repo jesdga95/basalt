@@ -29,6 +29,13 @@ bool dense_tc_supported(int ggml_type, int n_in, int n_out, const void* weights)
 void dense_tc(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
               void* stream);
 
+/// The kernel dense_tc takes for a shape, which fixes the order a row's sum is added in (a fused kernel that reproduces
+/// one of them, as the mid chain's output projection does, has these bits only where dense_tc takes that one): one, a
+/// block per 16-row tile; tile, whole tiles two at a time in shared memory; split2 / split1, 512-value chunks over two
+/// warp groups or one; none, dense_tc does not take the shape.
+enum class DenseTcLayout { none, one, tile, split2, split1 };
+DenseTcLayout dense_tc_layout(int ggml_type, int n_in, int n_out, const void* weights) noexcept;
+
 /// Two projections of one input in one launch (whole 16-row tiles, the first matrix's then the second's; types as
 /// above plus IQ3_S): each output is bitwise the same for every ncols and column.
 bool dense_tc_pair_supported(int type0, int type1, int n_in) noexcept;
