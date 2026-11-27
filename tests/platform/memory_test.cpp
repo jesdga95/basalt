@@ -626,12 +626,55 @@ uint64_t lock_test_bytes(bool& reduced) {
     return half >= 16 * page ? half : 0;
 #endif
 }
+// The transparent-hugepage hint on aligned, small, unaligned and null ranges. Whether the OS actually promotes pages
+// depends on kernel policy and is not what the seam promises, so this asserts every shape returns without faulting
+// and leaves bytes intact.
+int hugepages_hint_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    constexpr uint64_t kHuge = 2ull << 20;
+    constexpr uint64_t kBytes = 2 * kHuge;
+
+    advise_hugepages(nullptr, kHuge);
+    std::printf("hugepages hint %-54s -> returned\n", "null pointer");
+
+    std::vector<uint8_t> small(4096, 0x5a);
+    advise_hugepages(small.data(), 0);
+    advise_hugepages(small.data(), small.size());
+    advise_hugepages(small.data(), kHuge - 1);
+    bool small_ok = true;
+    for (uint8_t b : small) small_ok &= b == 0x5a;
+    std::printf("hugepages hint %-54s -> %s%s\n", "small ranges (< 2 MiB)", small_ok ? "bytes intact" : "bytes CHANGED",
+                small_ok ? "" : "   <-- WRONG");
+    fail |= !small_ok;
+
+    auto* buf = (uint8_t*) alloc_aligned((size_t) kBytes, (size_t) kHuge);
+    if (buf == nullptr) {
+        std::printf("hugepages hint %-54s   <-- alloc_aligned failed\n", "4 MiB aligned allocation");
+        return fail | 1;
+    }
+    // Hint before first touch, matching alloc_ram, then verify data survives a second hint and an unaligned interior hint.
+    advise_hugepages(buf, kBytes);
+    for (uint64_t i = 0; i < kBytes; i += 4096) buf[i] = (uint8_t) ((i >> 12) * 17u + 3u);
+    buf[kBytes - 1] = 0xc3;
+    advise_hugepages(buf, kBytes);
+    advise_hugepages(buf + 123, kHuge);
+    bool intact = buf[kBytes - 1] == 0xc3;
+    for (uint64_t i = 0; i < kBytes; i += 4096)
+        intact &= buf[i] == (uint8_t) ((i >> 12) * 17u + 3u);
+    std::printf("hugepages hint %-54s -> %s%s\n", "4 MiB 2 MiB-aligned range", intact ? "bytes intact" : "bytes CHANGED",
+                intact ? "" : "   <-- WRONG");
+    fail |= !intact;
+    free_aligned(buf);
+    return fail;
+}
 }  // namespace
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_reserve_cases() | read_ahead_cases() | drop_view_cases() |
                     guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | ram_level_cases() |
-                    admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases();
+                    admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases() |
+                    hugepages_hint_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {

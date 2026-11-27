@@ -34,6 +34,10 @@ void* alloc_aligned(size_t bytes, size_t alignment);
 /// The matching release for `alloc_aligned`. A null is fine.
 void free_aligned(void* p);
 
+/// Hints to the OS to back [p, p + bytes) with transparent huge pages when available (MADV_HUGEPAGE on Linux;
+/// no-op on Windows). A hint, never an error; null pointers and ranges smaller than 2 MiB are ignored.
+void advise_hugepages(void* p, uint64_t bytes);
+
 /// Asks the OS to give back what it holds for [off, off + bytes) of a mapped file view that starts at `base` and is
 /// `view_bytes` long: the range widened to whole pages, because those are what can be given back, and clipped to the
 /// view. False when the OS refused or the range leaves the view. Windows takes the pages out of the process's working
