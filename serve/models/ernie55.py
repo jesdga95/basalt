@@ -273,10 +273,10 @@ class Ernie55Parser:
                 or INVOKE_START.startswith(s)
                 or (s.startswith(INVOKE_START) and ">" not in s)
             ):
-                self.buf, self.state, self.calls_seen = CALL + self.buf, "content", True
+                out.append(Event("content", CALL))
+                self.state, self.calls_seen = "content", True
                 self.sub = "between"
-                out.append(Event("content", self.buf))
-                self.buf = ""
+                return True
             return False
 
         if self.sub == "invoke":

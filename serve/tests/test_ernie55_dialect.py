@@ -231,6 +231,11 @@ class ParserTests(unittest.TestCase):
              "hidden thought", "prepost"),
             (True, f"r1{THINK_END}c1{CALL}\n<invoke name=\"calc\"><parameter name=\"expr\">1</parameter></invoke>\n{CALL_END}{THINK}r2{THINK_END}c2",
              "r1r2", "c1c2"),
+            # Malformed tool-call opener followed by a think block must parse identically across any split boundary.
+            (False, f"{CALL}not-a-call{THINK}hidden{THINK_END}after",
+             "hidden", f"{CALL}not-a-callafter"),
+            (False, f"{CALL}<invoke name=\"broken\"{THINK}hidden{THINK_END}after",
+             "hidden", f"{CALL}<invoke name=\"broken\"after"),
         ]
         for thinking, text, exp_r, exp_c in cases:
             for step in (1, 2, 3, 7, 1000):
@@ -241,6 +246,14 @@ class ParserTests(unittest.TestCase):
                     self.assertEqual(c, exp_c)
                     self.assertNotIn(THINK, r + c)
                     self.assertNotIn(THINK_END, r + c)
+
+        # Explicit split vs. unsplit comparison right after the malformed call prefix.
+        malformed = f"{CALL}not-a-call{THINK}hidden{THINK_END}after"
+        split_at = len(f"{CALL}not-a-call")
+        r_one, c_one, _, _ = parse(malformed, thinking=False, cuts=[], tools=self.TOOLS)
+        r_two, c_two, _, _ = parse(malformed, thinking=False, cuts=[split_at], tools=self.TOOLS)
+        self.assertEqual((r_one, c_one), ("hidden", f"{CALL}not-a-callafter"))
+        self.assertEqual((r_one, c_one), (r_two, c_two))
 
 
 class DialectAndServiceTests(unittest.TestCase):

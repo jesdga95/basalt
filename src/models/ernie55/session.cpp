@@ -788,7 +788,8 @@ public:
         std::string e;
         const auto& t = m_.shared_tier().tier;
         if (!t) return {model::Status::Error, "ernie55: the expert tier is not open"};
-        cudaStreamSynchronize(stream_);
+        if (const cudaError_t se = cudaStreamSynchronize(stream_); se != cudaSuccess)
+            return {model::Status::Error, std::string("ernie55: cudaStreamSynchronize: ") + cudaGetErrorString(se)};
         if (low) {
             t->lend_all();
         } else {
@@ -804,7 +805,8 @@ public:
         std::string e;
         const auto& t = m_.shared_tier().tier;
         if (!t) return {model::Status::Error, "ernie55: the expert tier is not open"};
-        cudaStreamSynchronize(stream_);
+        if (const cudaError_t se = cudaStreamSynchronize(stream_); se != cudaSuccess)
+            return {model::Status::Error, std::string("ernie55: cudaStreamSynchronize: ") + cudaGetErrorString(se)};
         if (!t->replan(mib, e)) return {model::Status::Error, "ernie55: " + e};
         placement_dirty_ = true;
         expert_slots = t->gpu_slots();
@@ -1002,23 +1004,11 @@ private:
             tier->lend_all();
             lent_ = true;
         }
-        size_t avail_b = 0, total_b = 0;
-        const bool have_mem = cudaMemGetInfo(&avail_b, &total_b) == cudaSuccess;
         for (int R = want; R >= kMaxDecodeWindow * 2; R /= 2) {
-            if (have_mem && m_.flags().diag_rows <= 0) {
-                PromptBufs probe;
-                uint64_t need = 0;
-                std::string pe;
-                make_prompt_bufs(probe, R, pe, &need);
-                if (need + kMmqHeadroom > avail_b) {
-                    err = "no room for MMQ beside the prompt chunk R=" + std::to_string(R);
-                    continue;
-                }
-            }
             if (make_prompt_bufs(big_, R, err)) {
                 // MMQ allocates its stream-k buffers on its first launches: a chunk that left the card no room for
                 // them ended the engine
-                size_t free_b = 0;
+                size_t free_b = 0, total_b = 0;
                 if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= kMmqHeadroom) return true;
                 big_.release();
                 err = "no room for MMQ beside the prompt chunk R=" + std::to_string(R);
