@@ -3391,6 +3391,18 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     return L;
 }
 
+uint64_t native_expert_stride(int type, uint64_t blob) {
+    const uint64_t block = type == 8 ? 34 : type == 40 ? 36 : type == 46 ? 132 : 1;   // Q8_0, NVFP4, MXFP8
+    uint64_t a = block, b = 16;
+    while (b) {
+        const uint64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    const uint64_t unit = block / a * 16;
+    return (blob + unit - 1) / unit * unit;
+}
+
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);

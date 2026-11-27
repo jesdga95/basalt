@@ -73,6 +73,10 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 /// whose up type differs (`up_type`, -1: the same) is covered only for the mixes the kernels are built for.
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1) noexcept;
 
+/// A blob's stride on the card: `blob` bytes rounded up to whole blocks of its `type` (Q8_0, NVFP4, MXFP8) and 16 bytes,
+/// so a kernel reads each expert's blocks in place.
+uint64_t native_expert_stride(int type, uint64_t blob);
+
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 

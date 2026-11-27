@@ -7,6 +7,7 @@
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/loader.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 
@@ -29,12 +30,6 @@ constexpr int kTypeF8 = 44;
 constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 constexpr uint64_t kExpertSlack = 4096;   // zeroed bytes after a layer's last blob (the kernels' last loads)
-
-// A blob's stride on the card: whole NVFP4 blocks (36 bytes) and 16 bytes, so a kernel reads each expert's blocks in place.
-uint64_t expert_stride(uint64_t blob) {
-    constexpr uint64_t unit = 144;   // lcm(36, 16)
-    return (blob + unit - 1) / unit * unit;
-}
 
 uint64_t layer_cache_bytes(const Geometry& g, int l, int64_t context, KvType kv) {
     const LayerShape s = g.shape(l);
@@ -223,7 +218,7 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         w.gu_type = el.gu_type;
         w.d_type = el.d_type;
         w.blob_bytes = el.blob_bytes;
-        w.expert_stride = expert_stride(el.blob_bytes);
+        w.expert_stride = basalt::kernels::native_expert_stride(el.gu_type, el.blob_bytes);
         const uint64_t layer_b = (uint64_t) g.n_expert * w.expert_stride + kExpertSlack;
         if (!(w.experts = (uint8_t*) device_buf(layer_b)) || !(w.blob_table = (unsigned long long*) device_buf((uint64_t) g.n_expert * 8)))
             return fail("out of device memory loading the experts of layer " + std::to_string(l));
