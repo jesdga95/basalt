@@ -182,6 +182,9 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// The rows a teacher-forced verify window (ppl= / score=) may hold, including all rows copy_logits() can read;
+    /// defaults to max_window().
+    virtual int max_verify_window() const { return max_window(); }
     /// True when the last decode_window ran uncaptured or instantiated a new CUDA graph.
     virtual bool window_cold() const { return false; }
     virtual int prompt_fold_window() const { return 1; }

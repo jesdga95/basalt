@@ -698,6 +698,7 @@ public:
         }
     }
     int max_window() const { return rt_.session().max_window(); }
+    int max_verify_window() const { return std::max({1, rt_.session().max_window(), rt_.session().max_verify_window()}); }
     int draft_window() {
         const int T = rt_.policy->window(conf_.data(), n_draft_);
         return (int) std::max<int64_t>(1, std::min<int64_t>(T, most_rows()));
@@ -742,7 +743,7 @@ public:
         return 1;
     }
     int32_t* history_stage() {
-        history_.resize((size_t) std::max<int64_t>({(int64_t) max_window(), (int64_t) rt_.session().prompt_fold_window(), n - fold_p0}) * hist_n);
+        history_.resize((size_t) std::max<int64_t>({(int64_t) max_verify_window(), (int64_t) rt_.session().prompt_fold_window(), n - fold_p0}) * hist_n);
         return history_.data();
     }
     void upload_history(int) {}
@@ -1033,7 +1034,8 @@ bool SessionRuntime::next_batch_window() {
 // ends.
 Flow SessionRequest::admit_room() {
     const int b = runtime_.solo_slot >= 0 ? runtime_.solo_slot : runtime_.admit_slot >= 0 ? runtime_.admit_slot : 0;
-    const int64_t want = std::min<int64_t>(n + max_window(), runtime_.o.max_context);
+    const int cap = ppl != nullptr ? max_verify_window() : max_window();
+    const int64_t want = std::min<int64_t>(n + cap, runtime_.o.max_context);
     const bool batch = runtime_.admit_slot >= 0;
     basalt::model::Result r;
     if (batch && rt_.pool_waiting() > 0) r = {basalt::model::Status::Refused, "running slots wait for room"};
@@ -1056,8 +1058,7 @@ Flow SessionRequest::admit_room() {
 
 // Each run of pad tokens takes the next picture's rows from the request's embeddings file.
 Flow SessionRequest::prepare_image() {
-    // a session keeps one row of logits, so the gate scores one row per window
-    if (const Flow flow = begin_quality_gate(runtime_.o.ppl_base, runtime_.o.ppl_out, 1); flow != Flow::proceed) return flow;
+    if (const Flow flow = begin_quality_gate(runtime_.o.ppl_base, runtime_.o.ppl_out, max_verify_window()); flow != Flow::proceed) return flow;
     if (!geni) return Flow::proceed;
     std::string bad;
     std::ifstream ef(emb_path, std::ios::binary);
