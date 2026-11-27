@@ -253,7 +253,7 @@ struct Options {
 
 void usage(const std::string& engine) {
     std::printf(
-        "basalt-bench - the standard benchmark: decode fixtures, prefill depths, optional quality gate\n"
+        "basalt-bench - the standard benchmark: decode fixtures, prefill depths, optional wikitext KLD gate\n"
         "\n"
         "usage: basalt-bench --model FILE.basalt [options] [-- ENGINE ARGS...]\n"
         "\n"
@@ -263,11 +263,11 @@ void usage(const std::string& engine) {
         "  -p LIST            prefill depths in tokens (16384,32768,65536,131072; 32k style also accepted)\n"
         "  -r N               repetitions of the whole set (default 1); with N > 1 the table shows mean +- stddev\n"
         "                     and the first repetition is the cold one\n"
-        "  --quality [N]      the quality gate on N chunks (default 20): PPL / KLD / top-1 against --kld-base,\n"
+        "  --quality [N]      the wikitext KLD gate on N chunks (default 20): PPL / KLD / top-1 against --kld-base,\n"
         "                     through the decode path, adaptation off, --spec 5. Alone it runs\n"
         "                     only the gate; with -p / -t it runs after them\n"
-        "  --kld-base FILE    llama.cpp KL-divergence base for the quality gate\n"
-        "  --quality-t T      tokens per verify window in the quality gate (default 3)\n"
+        "  --kld-base FILE    llama.cpp KL-divergence base for the wikitext KLD gate\n"
+        "  --quality-t T      tokens per verify window in the wikitext KLD gate (default 3)\n"
         "  --seed N           sampling seed (N >= 1) sent with every decode request, so the sampled fixtures\n"
         "                     (conv, prose) give the same text on every run; without it each request is seeded\n"
         "                     from the clock\n"

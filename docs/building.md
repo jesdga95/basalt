@@ -6,7 +6,7 @@ The build commands are in the [README](../README.md). Windows: [platforms](platf
 
 - `src/`, `include/`: the engine (`basalt`, `basalt-bench`, `basalt-probe`, `basalt-vision`).
 - `serve/`: the Python server with the OpenAI and Anthropic API and the stats page.
-- `tools/`: the converter (`tools/convert/convert.py`), the `.basalt` reader (`model_file.py`), the quality gate (`ppl_gate.py`), the
+- `tools/`: the converter (`tools/convert/convert.py`), the `.basalt` reader (`model_file.py`), the quality suite (`quality_suite/`), the wikitext KLD gate (`ppl_gate.py`), the
   greedy-identity check and the tokenizer.
 - `tests/`: parity and unit tests. `data/`: expert profiles (`data/profiles`) and benchmark fixtures (`data/bench`).
 

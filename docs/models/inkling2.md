@@ -133,7 +133,7 @@ small or held back (a desktop, another process).
     At 1M tokens, where the elastic copies bring all 1,938 spilled experts back, one card reads 8,992 tok/s and decodes 365, 650 and
     313 (conversation, struct, prose) and the peer 8,895 and 357, 645 and 311: the peer buys nothing there.
   - Quality: with the experts on the peer the BF16 KLD is level with the CPU's (`--expert-cache 1500`: 0.00440 and 97.25% top-1
-    against 0.00444 and 97.15% on one card, 100 chunks). A peer's prompt differs from a resident card's at summation-order rounding
+    against 0.00444 and 97.15% on one card, 100 chunks of wikitext KLD). A peer's prompt differs from a resident card's at summation-order rounding
     (about 0.01 KLD on `--diag-gpu-check`, the same as reordering any expert sum); its decode rows are exact, and with every spilled
     expert copied back it is bitwise one card.
 - **Split:** the second card runs the layers from the cut on, with their experts, caches and rings; the first runs the rest, the
