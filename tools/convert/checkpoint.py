@@ -339,13 +339,13 @@ class Tensor:
         return {"F32": 4 * n, "F16": 2 * n, "BF16": 2 * n, "Q8_0": n // 32 * 34, "Q6_K": n // 256 * 210}[self.type_name]
 
 
-def _index(how: str, n: int, first: int) -> np.ndarray | None:
+def _index(how: str, n: int, first: int, v_heads: int = S.GDN_V_HEADS) -> np.ndarray | None:
     if how in ("heads", "negexp"):
-        return S.gdn_block_source()
+        return S.gdn_block_source(v_heads)
     if how in ("vrows", "gconv"):
-        return S.gdn_index(n, first)
+        return S.gdn_index(n, first, v_heads)
     if how in ("zrows", "vcols"):
-        return S.gdn_index(n, 0)
+        return S.gdn_index(n, 0, v_heads)
     return None
 
 

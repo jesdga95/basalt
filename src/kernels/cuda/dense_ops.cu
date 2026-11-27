@@ -368,14 +368,15 @@ __global__ void __launch_bounds__(128) f32_rows_dot_kernel(const float* __restri
 // Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES - its
 // bf16_gdn_gating_proj_gemm_mma fuses the same gating into the a/b projection's epilogue over a split K.
 constexpr int GP_AHEAD = 1;   // K / GP_S must be a multiple of 32 GP_AHEAD
-constexpr int GP_HV = 48, GP_S = 8, GP_TT = 64, GP_LD = 2 * GP_HV + 8, GP_NF = 2 * GP_HV / 8;
-// In: FP32 x (two BF16 terms) or BF16 x (exact: one term)
-template <class In>
+constexpr int GP_S = 8, GP_TT = 64;
+// In: FP32 x (two BF16 terms) or BF16 x (exact: one term); GP_HV the value heads (48 or 32)
+template <class In, int GP_HV>
 __global__ void __cluster_dims__(1, 1, GP_S) __launch_bounds__(128)
     gdn_gating_proj_kernel(const In* __restrict__ x, const uint16_t* __restrict__ w, const float* __restrict__ dt,
                            const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta, int64_t T,
                            int64_t K) {
     namespace cg = cooperative_groups;
+    constexpr int GP_LD = 2 * GP_HV + 8, GP_NF = 2 * GP_HV / 8;
     __shared__ __align__(16) float part[GP_TT * GP_LD];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     const int rank = blockIdx.z;
@@ -858,23 +859,26 @@ void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N
 void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
                      int64_t T, int64_t HV, int64_t K, void* stream) {
     if (T <= 0) return;
-    if (HV != GP_HV || K % (32 * GP_AHEAD * GP_S) != 0) {
+    if ((HV != 48 && HV != 32) || K % (32 * GP_AHEAD * GP_S) != 0) {
         basalt::log::error("basalt", "gdn_gating_proj: HV %lld K %lld", (long long) HV, (long long) K);
         std::exit(1);
     }
-    gdn_gating_proj_kernel<float><<<dim3((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
-        x, w_ab, dt, ssm_a, gate, beta, T, K);
+    const dim3 grid((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S);
+    if (HV == 32) gdn_gating_proj_kernel<float, 32><<<grid, 128, 0, (cudaStream_t) stream>>>(x, w_ab, dt, ssm_a, gate, beta, T, K);
+    else gdn_gating_proj_kernel<float, 48><<<grid, 128, 0, (cudaStream_t) stream>>>(x, w_ab, dt, ssm_a, gate, beta, T, K);
     check("gdn_gating_proj");
 }
 void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
                      int64_t T, int64_t HV, int64_t K, void* stream) {
     if (T <= 0) return;
-    if (HV != GP_HV || K % (32 * GP_AHEAD * GP_S) != 0) {
+    if ((HV != 48 && HV != 32) || K % (32 * GP_AHEAD * GP_S) != 0) {
         basalt::log::error("basalt", "gdn_gating_proj: HV %lld K %lld", (long long) HV, (long long) K);
         std::exit(1);
     }
-    gdn_gating_proj_kernel<__nv_bfloat16><<<dim3((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x), w_ab, dt, ssm_a, gate, beta, T, K);
+    const dim3 grid((unsigned) ((T + GP_TT - 1) / GP_TT), 1, GP_S);
+    const auto* xb = reinterpret_cast<const __nv_bfloat16*>(x);
+    if (HV == 32) gdn_gating_proj_kernel<__nv_bfloat16, 32><<<grid, 128, 0, (cudaStream_t) stream>>>(xb, w_ab, dt, ssm_a, gate, beta, T, K);
+    else gdn_gating_proj_kernel<__nv_bfloat16, 48><<<grid, 128, 0, (cudaStream_t) stream>>>(xb, w_ab, dt, ssm_a, gate, beta, T, K);
     check("gdn_gating_proj");
 }
 

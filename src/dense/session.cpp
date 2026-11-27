@@ -160,11 +160,24 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         err = "clearing the recurrent state failed";
         return false;
     }
+    if (mtp && st.dlogits) {   // the drafter scores the head's first rows only: its logits row is -inf beyond them
+        const int64_t nv = mtp_vocab(m);
+        if (nv < g.n_vocab) {
+            const std::vector<float> none((size_t) (g.n_vocab - nv), -INFINITY);
+            if (cudaMemcpyAsync(st.dlogits + nv, none.data(), none.size() * sizeof(float), cudaMemcpyHostToDevice, st.stream) != cudaSuccess ||
+                cudaStreamSynchronize(st.stream) != cudaSuccess) {
+                err = "setting the drafter's logits failed";
+                return false;
+            }
+        }
+    }
     return cudaStreamSynchronize(st.stream) == cudaSuccess;
 }
 
 // What init_state made, on the current device (the arena frees itself).
 void free_state(SessionState& st) {
+    for (cudaGraphExec_t& e : st.mtp_wg)
+        if (e) cudaGraphExecDestroy(e);
     for (auto& per_buffer : st.wg)
         for (cudaGraphExec_t& e : per_buffer)
             if (e) cudaGraphExecDestroy(e);
@@ -233,17 +246,25 @@ public:
         }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
         if (Result s = settle(pos); !s.ok()) return s;
+        if (Result r = draft_chain(anchor, pos, n, st_.stream); !r.ok()) return r;
+        // sessions drafting one at a time share the model's window scratch on their own streams: finish before the next begins
+        if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        return {};
+    }
+
+    // The MTP chain of n drafts after `anchor` (the token at `pos`), queued on `s`.
+    Result draft_chain(int32_t anchor, int64_t pos, int n, cudaStream_t s) {
         if (st_.tail_cell != pos - 1) return fail(m_.o.arch + ": the drafter has no row before position " + std::to_string((long long) pos));
         n = std::clamp(n, 1, max_window() - 1);
         if (pos + n > m_.o.max_context) n = (int) std::max<int64_t>(1, m_.o.max_context - pos);
         std::string err;
-        cudaMemcpyAsync(st_.win_tok, &anchor, sizeof(int32_t), cudaMemcpyHostToDevice, st_.stream);
+        cudaMemcpyAsync(st_.win_tok, &anchor, sizeof(int32_t), cudaMemcpyHostToDevice, s);
         const float* hid = st_.tail;
         const int32_t* tok = st_.win_tok;
         for (int k = 0; k < n; ++k) {
             float* out = st_.chain + (size_t) (k & 1) * g_.n_embd;
             float* lp = st_.lp + (size_t) k * kernels::kLogprobStride;
-            if (!mtp_window(m_, st_, hid, tok, 1, pos - 1 + k, out, lp, err)) return fail(err);
+            if (!mtp_step(m_, st_, k, hid, tok, pos - 1 + k, out, lp, err, s)) return fail(err);
             hid = out;
             tok = reinterpret_cast<const int32_t*>(lp + 2);
         }
@@ -252,11 +273,39 @@ public:
         return {};
     }
 
+    // Several sessions' MTP chains back to back on the first one's stream (they share the model's window scratch): each other
+    // session's stream hands over what its chain reads, and waits for the chains before its draft_end reads its own.
+    Result draft_batch_mtp(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n, int count) {
+        if (count <= 1 || m_.split) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        std::vector<Session*> ss((size_t) count);
+        for (int i = 0; i < count; ++i) {
+            ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
+            if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        }
+        for (int i = 0; i < count; ++i)
+            if (!ss[(size_t) i]->done_ && cudaEventCreateWithFlags(&ss[(size_t) i]->done_, cudaEventDisableTiming) != cudaSuccess)
+                return fail(m_.o.arch + ": no event");
+        // each session's settle (the drafter's history through the shared scratch) starts after the previous one's
+        for (int i = 0; i < count; ++i) {
+            if (i > 0) cudaStreamWaitEvent(ss[(size_t) i]->st_.stream, ss[(size_t) i - 1]->done_, 0);
+            if (Result r = ss[(size_t) i]->settle(pos[i]); !r.ok()) return r;
+            cudaEventRecord(ss[(size_t) i]->done_, ss[(size_t) i]->st_.stream);
+        }
+        const cudaStream_t s0 = ss[0]->st_.stream;
+        cudaStreamWaitEvent(s0, ss[(size_t) count - 1]->done_, 0);
+        for (int i = 0; i < count; ++i)
+            if (Result r = ss[(size_t) i]->draft_chain(anchors[i], pos[i], n[i], s0); !r.ok()) return r;
+        cudaEventRecord(ss[0]->done_, s0);
+        for (int i = 1; i < count; ++i) cudaStreamWaitEvent(ss[(size_t) i]->st_.stream, ss[0]->done_, 0);
+        return {};
+    }
+
     // The block drafter for several sessions in passes of as many blocks as a batch window holds: each session is settled
     // on its own stream (one after another: they share the window scratch), the passes run on the first one's stream, and
     // the others' streams wait for them before their draft_end reads.
     Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                        int count) override {
+        if (drafter_) return draft_batch_mtp(peers, anchors, pos, n, count);
         if (count <= 1 || !block_ || 2 * m_.w.dflash.block > kBatch) return ModelSession::draft_batch(peers, anchors, pos, n, count);
         std::vector<Session*> ss((size_t) count);
         for (int i = 0; i < count; ++i) {

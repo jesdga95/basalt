@@ -5,6 +5,7 @@
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
+#include "basalt/kernels/moe_ffn.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -305,11 +306,76 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);
 }
 
+// The routed-expert FFN's second half for T rows whose normed FP32 rows are xn and whose shared expert's output is `shared`
+// [T][hidden]: the router picks the experts, which run in tiles of kMoeTile rows, and their sum and the gated shared expert
+// join the BF16 residual.
+void moe_apply(Model& m, const Layer& L, uint16_t* resid, const float* xn, const float* shared, int T, cudaStream_t s) {
+    namespace mmq = prefill::mmq;
+    const Geometry& g = m.g;
+    MoeScratch& ms = m.moe;
+    const int H = g.n_embd, E = g.moe_experts, K = g.moe_used, F = g.moe_ff, ld = E + 1;
+    const kernels::moe::Experts ex{L.experts, kernels::moe::blob_bytes(H, F), E, H, F};
+    for (int t0 = 0; t0 < T; t0 += kMoeTile) {
+        const int n = std::min(kMoeTile, T - t0);
+        const float* x = xn + (size_t) t0 * H;
+        if (n >= kMoeGrouped) kernels::bf16_rows_dot(x, L.router, ms.logits, n, ld, H, s);   // a chunk: the tensor-core projection
+        else kernels::moe::router(x, L.router, n, H, ld, ms.logits, ld, s);
+        kernels::moe::top_k(ms.logits, ld, n, E, K, ms.idx, ms.wgt, s);
+        if (ms.grouped && n >= kMoeGrouped) {   // a chunk: the pairs by expert through two MMQ products
+            const int pairs = n * K;
+            kernels::moe::group(ms.idx, n, K, E, ms.bounds, ms.tok, ms.dst, ms.exp, s);
+            mmq::quantize(x, ms.tok, ms.mx, kTypeNvfp4Blocks, H, H, pairs, s);
+            mmq::Product p;
+            p.w = L.experts;
+            p.type = kTypeNvfp4Blocks;
+            p.w_rows = 2 * F;
+            p.w_cols = H;
+            p.expert_bytes = ex.blob;
+            p.n = E;
+            p.xq = ms.mx;
+            p.bounds = ms.bounds;
+            p.ids = ms.ident;
+            p.total_rows = pairs;
+            p.max_rows = n;
+            p.opt_rows = (pairs + E - 1) / E;
+            p.dst = ms.gu;
+            p.ld_dst = 2 * F;
+            m.mmq->run(p, s);
+            // each NVFP4 blob ends in its {s_gate, s_up, s_down, 0}: the SwiGLU applies them (s_down too, so the down
+            // product's rows carry it)
+            mmq::SwigluForm form;
+            form.row_expert = ms.exp;
+            form.tail_stride = ex.blob;
+            mmq::swiglu(ms.gu, ms.h, pairs, F, false, s, (const float*) (L.experts + kernels::moe::tail_offset(H, F)), nullptr, 0, form);
+            mmq::quantize(ms.h, nullptr, ms.mx, kTypeNvfp4Blocks, F, F, pairs, s);
+            mmq::Product d = p;
+            d.w = L.experts + 2 * (size_t) F * ((size_t) H / 64 * 36);
+            d.w_rows = H;
+            d.w_cols = F;
+            d.ids = ms.dst;
+            d.dst = ms.y;
+            d.ld_dst = H;
+            m.mmq->run(d, s);
+        } else {
+            kernels::moe::quantize(x, n, H, ms.xq, ms.xs, s);
+            kernels::moe::gate_up(ex, ms.xq, ms.xs, ms.idx, n, K, ms.h, s);
+            kernels::moe::down(ex, ms.h, ms.idx, n, K, ms.y, s);
+        }
+        kernels::moe::combine(resid + (size_t) t0 * H, ms.y, ms.wgt, ms.logits + E, ld, shared + (size_t) t0 * H, n, K, H, s);
+    }
+}
+
 void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.ffn_norm, b.xn, L.gate.type, H, T, g.eps, s);
+    if (g.moe_experts > 0) {   // the shared expert's product into tmp, then the routed experts and the gated sum
+        prod_swiglu(m, L.gate, L.up, b.xn, xq, b.h, T, s);
+        prod(m, L.down, wact(m, b.h, L.down.type, g.n_ff, T, s), b.tmp, T, s);
+        moe_apply(m, L, b.x, b.xn, b.tmp, T, s);
+        return;
+    }
     if (on_wg(L.down.type)) {   // h straight into the down product's bf16 rows
         prod_swiglu(m, L.gate, L.up, b.xn, xq, nullptr, T, s, b.hq);
         prod_add(m, L.down, b.hq, b.x, T, s);
@@ -507,15 +573,15 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
             prefill::fp4_dense::product_bf16(L.z.w, L.z.scale, L.z.rows, H, b.a4, b.gs, T, bf(b.z), L.z.rows, s);
         }
         kernels::gdn_gating_proj(bf(b.xn), L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
-        kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s);
+        kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s, HV);
         if (f8) {
             kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD));
+                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD), nullptr, nullptr, HV);
             chunk_residual_f8(m, L.out, T, s);
             return;
         }
         kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                     nullptr, nullptr, bf(b.yn), b.hmax);
+                                     nullptr, nullptr, bf(b.yn), b.hmax, HV);
         chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, s);
         return;
     }
@@ -527,8 +593,8 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         gemm(m, L.z, b.z, T, s);
     }
     kernels::gdn_gating_proj(b.xn, L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
-    kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s);
-    kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn);
+    kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s, HV);
+    kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn, nullptr, nullptr, HV);
     chunk_residual(m, L.out, b.yn, VD, T, s);
 }
 
@@ -537,6 +603,19 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
+    if (g.moe_experts > 0) {   // the shared expert's product into tmp, then the routed experts and the gated sum
+        kernels::rms_norm_rows(residual(b), L.ffn_norm, b.xn, T, H, g.eps, s);
+        chunk_act(m, b.xn, L.gate.type, H, T, s);
+        gemm(m, L.gate, b.g, T, s);
+        if (L.up.type != L.gate.type) chunk_act(m, b.xn, L.up.type, H, T, s);
+        gemm(m, L.up, b.u, T, s);
+        kernels::swiglu_scaled(b.g, b.u, L.gate.scale, L.up.scale, b.h, T, g.n_ff, g.n_ff, s);
+        chunk_act(m, b.h, L.down.type, g.n_ff, T, s);
+        gemm(m, L.down, b.tmp, T, s);
+        if (L.down.scale) kernels::scale_values(b.tmp, L.down.scale, (int64_t) T * H, s);
+        moe_apply(m, L, residual(b), b.xn, b.tmp, T, s);
+        return;
+    }
     if (L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes) {
         // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
         // added by down's; H is BF16 (in b.h's buffer), read once by its quantizer
@@ -657,7 +736,7 @@ void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t 
 // captured once per row count and replayed at any position.
 void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     const Geometry& g = m.g;
-    const Weights& w = m.w;
+    const Weights& w = m.wd;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int H = g.n_embd;
@@ -818,7 +897,6 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, in
 // captured once per composition (the sessions and their row counts) and replayed at any positions.
 void batch_body(Model& m, const BatchSeg* segs, int S) {
     const Geometry& g = m.g;
-    const Weights& w = m.w;
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
     const int H = g.n_embd;
@@ -827,6 +905,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S) {
         rows += segs[k].T;
         max_n = std::max(max_n, segs[k].T);
     }
+    const Weights& w = m.wd;
     {
         kernels::PdlScope pdl(true);
         if (m.lb == 0) embed_rows(m, b.tok, rows, s);
@@ -1193,19 +1272,25 @@ bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok,
     return cuda_ok("drafter history", err);
 }
 
-bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out,
-                float* lp_row, std::string& err) {
-    const Geometry& g = m.g;
-    const Mtp& d = m.w.mtp;
+namespace {
+// the drafter window's row bounds, first cell and positions to the device
+void mtp_upload(Model& m, SessionState& st, int n, int64_t c0, cudaStream_t s) {
     WindowScratch& b = m.ws;
-    const cudaStream_t s = st.stream;
-    const int H = g.n_embd;
     std::vector<int32_t> p3;
     text_positions(p3, n, c0, st.rope_delta);
     const int32_t bounds[2] = {0, n}, first[2] = {(int32_t) c0, 0};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos0, first, sizeof first, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+}
+
+// the drafter window's kernels, from device inputs only (the uploads above, `hid` and `tok`)
+void mtp_body(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out, float* lp_row,
+              cudaStream_t s) {
+    const Geometry& g = m.g;
+    const Mtp& d = m.wd.mtp;
+    WindowScratch& b = m.ws;
+    const int H = g.n_embd;
     kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, tok, n, H, b.tmp, s);
     mtp_input(m, b.tmp, hid, b.cat, n, s);
     prod(m, d.fc, wact(m, b.cat, d.fc.type, 2 * H, n, s), b.tmp, n, s);
@@ -1213,13 +1298,47 @@ bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok
     win_attn(m, d.layer, st.mtp_kc, st.mtp_vc, n, c0, s);
     if (out) {
         win_ffn(m, d.layer, n, s);
-        // the head's rows (scaled), of which the last is read
-        prod(m, m.w.head, wnorm(m, b.x, d.norm, b.xn, m.w.head.type, H, n, g.eps, s), b.hl, n, s);
+        // the head's first rows (scaled), of which the last is read: the drafter's pick is a proposal, so it scores fewer rows
+        const int64_t nv = mtp_vocab(m);
+        Linear head = m.w.head;
+        head.rows = nv;
+        prod(m, head, wnorm(m, b.x, d.norm, b.xn, head.type, H, n, g.eps, s), b.hl, n, s);
         cudaMemcpyAsync(out, b.xn, (size_t) n * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
-        cudaMemcpyAsync(st.dlogits, b.hl + (size_t) (n - 1) * g.n_vocab, (size_t) g.n_vocab * sizeof(float),
-                        cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(st.dlogits, b.hl + (size_t) (n - 1) * nv, (size_t) nv * sizeof(float), cudaMemcpyDeviceToDevice, s);
         kernels::row_logprobs(st.dlogits, 1, g.n_vocab, tok + n - 1, 1, lp_row, b.lp_scratch, s);
     }
+}
+}  // namespace
+
+bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out,
+                float* lp_row, std::string& err, cudaStream_t stream) {
+    const cudaStream_t s = stream ? stream : st.stream;
+    mtp_upload(m, st, n, c0, s);
+    mtp_body(m, st, hid, tok, n, c0, out, lp_row, s);
+    return cuda_ok("drafter", err);
+}
+
+bool mtp_step(Model& m, SessionState& st, int k, const float* hid, const int32_t* tok, int64_t c0, float* out, float* lp_row,
+              std::string& err, cudaStream_t stream) {
+    const cudaStream_t s = stream ? stream : st.stream;
+    mtp_upload(m, st, 1, c0, s);
+    cudaGraphExec_t& ge = st.mtp_wg[k];
+    if (ge) {
+        if (cudaGraphLaunch(ge, s) != cudaSuccess) return cuda_ok("drafter graph", err) && false;
+        return cuda_ok("drafter", err);
+    }
+    // the first run goes as launched (kernels load lazily), then the step is captured for the next ones
+    mtp_body(m, st, hid, tok, 1, c0, out, lp_row, s);
+    if (!cuda_ok("drafter", err)) return false;
+    cudaGraph_t graph = nullptr;
+    if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) != cudaSuccess) return cuda_ok("drafter capture", err);
+    mtp_body(m, st, hid, tok, 1, c0, out, lp_row, s);
+    if (cudaStreamEndCapture(s, &graph) != cudaSuccess || cudaGraphInstantiate(&ge, graph, 0) != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        ge = nullptr;
+        return cuda_ok("drafter capture", err);
+    }
+    cudaGraphDestroy(graph);
     return cuda_ok("drafter", err);
 }
 
