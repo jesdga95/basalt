@@ -4,7 +4,6 @@
 #include "basalt/platform/system.hpp"
 
 #include <charconv>
-#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -31,6 +30,8 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
 }
 
 std::optional<uint64_t> conversation_available_memory() {
+    basalt::platform::HostMemory m;
+    if (basalt::platform::host_available_memory(m)) return m.available;
     const std::string path = basalt::platform::meminfo_path();
     if (path.empty()) {
         // No memory accounting file here: take the platform probe's available-RAM reading, in bytes. It reports 0
@@ -39,9 +40,7 @@ std::optional<uint64_t> conversation_available_memory() {
         if (avail == 0) return {};
         return avail;
     }
-    std::ifstream meminfo(path);
-    if (!meminfo) return {};
-    return conversation_mem_available(meminfo);
+    return {};
 }
 
 Admission conversation_admission(bool guard_ok, uint64_t guard_floor, std::optional<uint64_t> available,
