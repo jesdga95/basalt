@@ -64,7 +64,9 @@ Basalt is a local inference engine for NVIDIA Blackwell GPUs. Every rule below e
   5. Once merged, the row appears on the [runs page](https://basalt.jgulfo.com/community/).
 - Any Blackwell (sm_120) machine with spare hours helps; bigger setups help most: 96 GB+ VRAM (single large cards or multi-GPU), quad- or octa-channel DDR5.
 - A few hours of remote access to a machine speeds up development.
-- Or sponsor the project through GitHub Sponsors (the repository's Sponsor button): it pays for tokens for agentic development and for time on different hardware to test on.
+- Or sponsor this fork through GitHub Sponsors (the repository's Sponsor button): it pays for Ada test hardware,
+  compute and the CUDA 13 builds behind the rtx40 releases. To support the upstream engine itself, sponsor
+  [jesdga95/basalt](https://github.com/sponsors/jesdga95) instead.
 
 ## License
 

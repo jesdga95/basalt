@@ -20,10 +20,11 @@ on an NVIDIA Blackwell GPU (sm_120) - or, in this fork, an Ada GPU (sm_89, RTX 4
 **Help wanted:** spare Blackwell compute for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
 
 <p align="center">
-  <a href="https://github.com/sponsors/jesdga95"><img src="assets/donate/github.svg" height="44" alt="Sponsor on GitHub"></a>
-  <a href="https://ko-fi.com/jesdga"><img src="assets/donate/kofi.svg" height="44" alt="Support on Ko-fi"></a>
-  <a href="https://paypal.me/jesdga"><img src="assets/donate/paypal.svg" height="44" alt="Donate on PayPal"></a>
+  <a href="https://github.com/sponsors/FahadAlAlawi"><img src="assets/donate/github.svg" height="44" alt="Sponsor this fork on GitHub"></a>
 </p>
+<p align="center"><em>Sponsoring here funds the Ada test hardware, compute and CUDA 13 builds behind each rtx40 release.
+The engine itself is <a href="https://github.com/jesdga95/basalt">jesdga95's project</a> — to support Basalt rather than this
+port, sponsor it <a href="https://github.com/sponsors/jesdga95">upstream</a>.</em></p>
 
 ## Requirements
 
@@ -116,8 +117,9 @@ How a request names a video, and the limits: [video](docs/running.md#video).
   [Unsloth](https://huggingface.co/unsloth)'s GGUFs; [NVIDIA](https://huggingface.co/nvidia)'s NVFP4 checkpoints;
   [QUASAR-QAT](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)'s NVFP4 27B (Apache-2.0); [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)'s DFlash 2 drafter.
 
-Thank you to everyone who has [contributed](https://github.com/jesdga95/basalt/graphs/contributors) or
-[sponsored](https://github.com/sponsors/jesdga95) the project.
+Basalt upstream is maintained by [jesdga95](https://github.com/jesdga95); thank you to everyone who has
+[contributed to](https://github.com/jesdga95/basalt/graphs/contributors) or
+[sponsored](https://github.com/jesdga95) it. This fork is maintained by [Fahad AlAlawi](https://github.com/FahadAlAlawi).
 
 ## License
 
