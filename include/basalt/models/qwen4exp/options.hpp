@@ -90,7 +90,7 @@ struct Options : CommonOptions {
     /// place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
     bool adapt_every_given = false;   // --adapt-every on the command line
-    bool peer_exclusive_given = false;   // --peer-exclusive on the command line
+    bool peer_exclusive_given = false;   // --peer-exclusive or --no-peer-exclusive on the command line
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
