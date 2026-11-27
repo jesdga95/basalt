@@ -70,7 +70,10 @@ class Deepseek4Parser(DsmlParser):
 
 class DeepSeek4(Dialect):
     name = "deepseek4"
-    caps = {"supports_tool_calls": True, "supports_parallel_tool_calls": True}
+    # the encoder: DSML tools, a leading or mid-conversation system message, and `drop_thinking` (off keeps earlier
+    # turns' thinking); its reasoning effort is the fixed low prompt, not a template argument
+    caps = {"supports_tool_calls": True, "supports_parallel_tool_calls": True, "supports_reasoning_effort": False,
+            "supports_system_role": True, "supports_preserve_reasoning": True}
     in_engine_vision = True
     image_pad = enc.IMAGE_PLACEHOLDER
     image_start = ""
@@ -84,6 +87,13 @@ class DeepSeek4(Dialect):
 
     def parser(self, thinking, tools, stream_tools=True):
         return Deepseek4Parser(thinking=thinking, tools=tools, stream_tools=stream_tools)
+
+    def template_kwargs(self, kwargs):
+        if "preserve_reasoning" not in kwargs:
+            return kwargs
+        out = dict(kwargs)
+        out["drop_thinking"] = not out.pop("preserve_reasoning")
+        return out
 
     def literal_tags(self, controls):
         tags = {**frontend.literal_tags(controls), DSML: DSML_MARK}

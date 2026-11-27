@@ -43,6 +43,11 @@ int main() {
 #else
     expect("deepseek41", false);
 #endif
+#ifdef BASALT_MODEL_DEEPSEEK4
+    expect("deepseek4", true);
+#else
+    expect("deepseek4", false);
+#endif
 #ifdef BASALT_MODEL_QWEN35
     expect("qwen35", true);
 #else
@@ -60,6 +65,11 @@ int main() {
     expect("inkling2", true);
 #else
     expect("inkling2", false);
+#endif
+#ifdef BASALT_MODEL_ERNIE55
+    expect("ernie55", true);
+#else
+    expect("ernie55", false);
 #endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
@@ -95,7 +105,8 @@ int main() {
     }
     // the routing flags of every mixture-of-experts model: the bare prior is the model's own; the tail skip needs the pack's
     // experts per token, so without a pack it is refused
-    for (const auto& [arch, bare] : {std::pair<const char*, const char*>{"deepseek41", "0.1"}, {"hy4flash", "0.01"}}) {
+    for (const auto& [arch, bare] : {std::pair<const char*, const char*>{"deepseek41", "0.1"}, {"deepseek4", "0.1"},
+                                     {"hy4flash", "0.01"}}) {
         const model::ModelAdapter* m = model::find_adapter(arch);
         if (m == nullptr) continue;
         const auto p = lossy_of(*m, {"--route-prior"});
@@ -108,6 +119,19 @@ int main() {
         model::FlagArgs args((int) argv.size(), argv.data(), i);
         check(m->parse_flag(argv[1], args, *o, code) && code == 0 && o->route.tail_skip == 3, "--route-tail-skip 3 is taken");
         check(m->finish_flags(*o).value_or(0) == 2, "--route-tail-skip without the pack's experts per token is refused");
+    }
+    if (const model::ModelAdapter* d4 = model::find_adapter("deepseek4")) {
+        const auto o = d4->make_options();
+        check(!d4->finish_flags(*o) && o->spec == 0, "deepseek4 without a pack takes no drafter window");
+        check(std::string(d4->model_name()) == "DeepSeek-V4-Flash-Vision-Exp" && std::string(d4->community_kv()).empty(),
+              "deepseek4 names its community row and takes no cache-format flag");
+        std::vector<std::string> words = {"basalt", "--spec-oracle", "oracle.txt"};
+        std::vector<char*> argv;
+        for (auto& w : words) argv.push_back(w.data());
+        int i = 1, code = 0;
+        model::FlagArgs args((int) argv.size(), argv.data(), i);
+        check(d4->parse_flag(argv[1], args, *o, code) && code == 0 && o->spec_oracle == "oracle.txt",
+              "deepseek4 takes --spec-oracle");
     }
     if (const model::ModelAdapter* d = model::find_adapter("qwen35")) {
         const auto o = d->make_options();

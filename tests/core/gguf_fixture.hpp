@@ -18,14 +18,19 @@ namespace fixture {
 
 struct Kv {
     std::string key;
-    uint32_t type = 8;         ///< GGUF value type: 8 string, 2 u16, 4 u32, 5 i32
+    uint32_t type = 8;         ///< GGUF value type: 8 string, 2 u16, 4 u32, 5 i32, 6 f32, 7 bool, 9 u32 array
     std::string s;
     uint64_t u = 0;
+    double f = 0;
+    std::vector<uint32_t> arr;
 };
-inline Kv str(const std::string& k, const std::string& v) { return Kv{k, 8, v, 0}; }
-inline Kv u16(const std::string& k, uint64_t v) { return Kv{k, 2, {}, v}; }
-inline Kv i32(const std::string& k, uint64_t v) { return Kv{k, 5, {}, v}; }
-inline Kv u32(const std::string& k, uint64_t v) { return Kv{k, 4, {}, v}; }
+inline Kv str(const std::string& k, const std::string& v) { return Kv{k, 8, v, 0, 0.0, {}}; }
+inline Kv u16(const std::string& k, uint64_t v) { return Kv{k, 2, {}, v, 0.0, {}}; }
+inline Kv i32(const std::string& k, uint64_t v) { return Kv{k, 5, {}, v, 0.0, {}}; }
+inline Kv u32(const std::string& k, uint64_t v) { return Kv{k, 4, {}, v, 0.0, {}}; }
+inline Kv f32(const std::string& k, double v) { return Kv{k, 6, {}, 0, v, {}}; }
+inline Kv boolean(const std::string& k, bool v) { return Kv{k, 7, {}, v ? 1ull : 0ull, 0.0, {}}; }
+inline Kv u32_array(const std::string& k, const std::vector<uint32_t>& v) { return Kv{k, 9, {}, 0, 0.0, v}; }
 
 struct Tensor {
     std::string name;
@@ -65,6 +70,9 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
         if (k.type == 8) puts(k.s);
         else if (k.type == 2) { const uint16_t v = (uint16_t) k.u; put(&v, 2); }
         else if (k.type == 4 || k.type == 5) { const uint32_t v = (uint32_t) k.u; put(&v, 4); }
+        else if (k.type == 6) { const float v = (float) k.f; put(&v, 4); }
+        else if (k.type == 7) { const uint8_t v = k.u ? 1 : 0; put(&v, 1); }
+        else if (k.type == 9) { put32(4); put64(k.arr.size()); for (uint32_t v : k.arr) put32(v); }
         else throw std::runtime_error("fixture: unsupported metadata type");
     }
     Written w;

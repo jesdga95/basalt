@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 BENCH = Path(__file__).resolve().parent.parent / "data" / "bench"
-# DeepSeek-V4.1 chat mode (thinking off): BOS, <User>, the text, <Assistant>, </think>; no end-of-sentence token
+# DeepSeek-V4/V4.1 chat mode (thinking off): BOS, <User>, the text, <Assistant>, </think>; no end-of-sentence token
 DEEPSEEK_BOS, DEEPSEEK_USER, DEEPSEEK_ASSISTANT, DEEPSEEK_THINK_END, DEEPSEEK_EOS = 0, 128803, 128804, 128822, 1
 
 
@@ -24,12 +24,14 @@ class Fixtures(unittest.TestCase):
                     self.assertTrue(all(i >= 0 for i in ids(d / f"{name}.ids")))
 
     def test_deepseek_fixtures_end_at_the_generation_header(self):
-        for name in ("conv", "struct", "prose"):
-            with self.subTest(fixture=name):
-                t = ids(BENCH / "deepseek41" / f"{name}.ids")
-                self.assertEqual(t[:2], [DEEPSEEK_BOS, DEEPSEEK_USER])
-                self.assertEqual(t[-2:], [DEEPSEEK_ASSISTANT, DEEPSEEK_THINK_END])
-                self.assertNotIn(DEEPSEEK_EOS, t)
+        # V4 and V4.1 share the joyai-llm vocabulary: the BOS, <User>, <Assistant> and </think> ids are the same
+        for arch in ("deepseek4", "deepseek41"):
+            for name in ("conv", "struct", "prose"):
+                with self.subTest(arch=arch, fixture=name):
+                    t = ids(BENCH / arch / f"{name}.ids")
+                    self.assertEqual(t[:2], [DEEPSEEK_BOS, DEEPSEEK_USER])
+                    self.assertEqual(t[-2:], [DEEPSEEK_ASSISTANT, DEEPSEEK_THINK_END])
+                    self.assertNotIn(DEEPSEEK_EOS, t)
 
 
 if __name__ == "__main__":

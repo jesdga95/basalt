@@ -3,6 +3,7 @@
 #pragma once
 
 #include "basalt/model/adapter.hpp"
+#include "models/deepseek4/meta.hpp"
 #include "models/deepseek41/meta.hpp"
 #include "models/qwen4exp/meta.hpp"
 
@@ -37,6 +38,8 @@ inline void register_meta_adapters() {
         model::register_adapter(std::make_unique<MetaAdapter>("qwen4exp", models::qwen4exp::validate_meta, models::qwen4exp::describe_meta));
     if (model::find_adapter("deepseek41") == nullptr)
         model::register_adapter(std::make_unique<MetaAdapter>("deepseek41", models::deepseek41::validate_meta, models::deepseek41::describe_meta));
+    if (model::find_adapter("deepseek4") == nullptr)
+        model::register_adapter(std::make_unique<MetaAdapter>("deepseek4", models::deepseek4::validate_meta, models::deepseek4::describe_meta));
 }
 
 }  // namespace basalt::test

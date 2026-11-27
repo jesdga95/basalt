@@ -8,10 +8,13 @@
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/sparse_mqa.hpp"
+#include "basalt/kernels/logprobs.hpp"
 #include "basalt/core/elastic_array.hpp"
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/program/probe_rates.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "basalt/models/deepseek4/compress.hpp"
 #include "basalt/models/deepseek4/indexer.hpp"
 #include "basalt/models/deepseek4/layer.hpp"
@@ -133,7 +136,10 @@ public:
                     dev(compress_rope_freq_, 32) &&
                   dev(sampled_, 1) && dev(expert_input_q8_, kernels::native_q8_1_bytes(geo_.n_embd, kExpertWindow)) &&
                   dev(expert_scratch_, kernels::native_expert_scratch_bytes(kExpertWindowRoutes, geo_.n_ff_exp)) &&
-                   dev(expert_plan_, sizeof(ExpertPlan)) && dev(logit_bias_, (size_t) geo_.n_vocab);
+                   dev(expert_plan_, sizeof(ExpertPlan)) && dev(logit_bias_, (size_t) geo_.n_vocab) &&
+                  dev(sample_bias_, (size_t) geo_.n_vocab) &&
+                  dev(lp_buf_, kernels::row_logprobs_scratch_floats(kExpertWindow, (int) geo_.n_vocab) +
+                                  (size_t) kExpertWindow * (kernels::kLogprobStride + 1));
         if (!ok) return false;
         positions_ = position_meta_;
         win_start_ = position_meta_ + rows;
@@ -222,7 +228,7 @@ public:
                 err = "deepseek4: more sessions than dspark windows";
                 return false;
             }
-            if (!dev(d_feat_, (size_t) kExpertWindow * drafter_->feature_floats())) {
+            if (!dev(d_feat_, (size_t) kDsparkWindow * drafter_->feature_floats())) {
                 err = "deepseek4: cannot allocate dspark feature tap buffer";
                 return false;
             }
@@ -243,8 +249,7 @@ public:
         if (!drafter_) return {model::Status::NotImplemented, "deepseek4: no dspark drafter loaded"};
         if (feat_rows_ > 0 && feat_pos0_ >= 0) {
             const int take = std::min(feat_rows_, (int) std::max<int64_t>(0, pos - feat_pos0_));
-            if (take > 0 && !drafter_->inject_device(dwin_, feat_pos0_, take, d_feat_, stream_, err_))
-                return {model::Status::Error, err_};
+            if (!inject_features(feat_pos0_, take)) return {model::Status::Error, err_};
             feat_rows_ = 0;
         }
         drafter_->forget_from(dwin_, pos);
@@ -277,19 +282,23 @@ public:
         if (r.pos + r.n_tokens > model_.context())
             return {model::Status::Refused, "deepseek4: request exceeds the loaded context"};
 
+        last_window_rows_ = 0;
         retained_logits_rows_ = r.retain_logits_rows ? r.n_tokens : 0;
+        sampling_given_ = r.sampling != nullptr;
+        if (sampling_given_) sampling_ = *r.sampling;
+        history_len_ = r.history ? r.history_len : 0;
+        history_.clear();
+        if (history_len_ > 0) history_.assign(r.history, r.history + (size_t) r.n_tokens * (size_t) history_len_);
         if (!forward_rows(r.tokens, r.n_tokens, r.pos)) return {model::Status::Error, err_};
+        last_window_rows_ = r.n_tokens;
         if (r.retain_logits_rows && cudaMemcpyAsync(retained_logits_, final_logits_,
                 (size_t) r.n_tokens * geo_.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
             return {model::Status::Error, "deepseek4: cannot retain decode logits rows"};
         tokens_.insert(tokens_.end(), r.tokens, r.tokens + r.n_tokens);
         if (r.row_tokens) {
             for (int t = 0; t < r.n_tokens; ++t) {
-                kernels::SamplerParams params = r.sampling ? *r.sampling : kernels::SamplerParams{.temperature = 0.f, .greedy = true};
-                params.counter += (uint64_t) t;
-                const int* history = r.history ? r.history + (size_t) t * r.history_len : nullptr;
                 kernels::sample_tokens(final_logits_ + (size_t) t * geo_.n_vocab, 1, geo_.n_vocab,
-                                       history, r.history_len, params, sampled_, stream_);
+                                       history_row(t), history_len_, draw_params(t), sampled_, stream_);
                 int32_t picked = -1;
                 if (!copy_to_host(&picked, sampled_, sizeof(picked))) return {model::Status::Error, err_};
                 r.row_tokens[t] = picked;
@@ -299,9 +308,8 @@ public:
         if (r.logits && !copy_to_host(r.logits, last_logits, (size_t) geo_.n_vocab * sizeof(float)))
             return {model::Status::Error, err_};
         if (r.next_token) {
-            kernels::SamplerParams params = r.sampling ? *r.sampling : kernels::SamplerParams{.temperature = 0.f, .greedy = true};
-            const int* history = r.history ? r.history + (size_t) (r.n_tokens - 1) * r.history_len : nullptr;
-            kernels::sample_tokens(last_logits, 1, geo_.n_vocab, history, r.history_len, params, sampled_, stream_);
+            kernels::sample_tokens(last_logits, 1, geo_.n_vocab, history_row(r.n_tokens - 1), history_len_,
+                                   draw_params(r.n_tokens - 1), sampled_, stream_);
             if (!copy_to_host(r.next_token, sampled_, sizeof(*r.next_token))) return {model::Status::Error, err_};
         } else if (!sync()) return {model::Status::Error, err_};
         return {};
@@ -314,6 +322,7 @@ public:
                     std::to_string(r.pos) + ", history=" + std::to_string(tokens_.size()) + ")"};
         if (r.pos + r.n_tokens > model_.context())
             return {model::Status::Refused, "deepseek4: prompt exceeds the loaded context"};
+        last_window_rows_ = 0;
         if (r.n_tokens <= kExpertWindow && model_.diag_rows() <= 0) {
             if (!forward_rows(r.tokens, r.n_tokens, r.pos)) return {model::Status::Error, err_};
             tokens_.insert(tokens_.end(), r.tokens, r.tokens + r.n_tokens);
@@ -415,6 +424,7 @@ public:
             return {model::Status::Error, "deepseek4: invalid or nonconsecutive image rows"};
         if (pos + n_rows > model_.context())
             return {model::Status::Refused, "deepseek4: image prompt exceeds the loaded context"};
+        last_window_rows_ = 0;
         std::vector<int32_t> tokens((size_t) n_rows, geo_.n_vocab);
         if (!prefill_rows(tokens.data(), n_rows, pos, rows))
             return {model::Status::Error, err_};
@@ -434,15 +444,18 @@ public:
     }
 
     model::Result resample_row(int row, const float* bias, int32_t& token) override {
-        if (row != 0 || tokens_.empty()) return {model::Status::Refused, "deepseek4: no decoded row to resample"};
-        if (bias && cudaMemcpyAsync(logit_bias_, bias, (size_t) geo_.n_vocab * sizeof(float),
-                                    cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-            return {model::Status::Error, "deepseek4: cannot upload the sampling bias"};
-        kernels::SamplerParams params;
-        params.temperature = 0.f;
-        params.greedy = true;
-        params.logit_bias = bias ? logit_bias_ : (has_bias_ ? logit_bias_ : nullptr);
-        kernels::sample_tokens(final_logits_, 1, geo_.n_vocab, nullptr, 0, params, sampled_, stream_);
+        if (row < 0 || row >= last_window_rows_)
+            return {model::Status::Refused, "deepseek4: no decoded row to resample"};
+        kernels::SamplerParams params = draw_params(row);
+        if (bias) {
+            // its own buffer: the bias set_logit_bias holds stays in force for the session's own draws
+            if (cudaMemcpyAsync(sample_bias_, bias, (size_t) geo_.n_vocab * sizeof(float),
+                                cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+                return {model::Status::Error, "deepseek4: cannot upload the sampling bias"};
+            params.logit_bias = sample_bias_;
+        }
+        kernels::sample_tokens(final_logits_ + (size_t) row * geo_.n_vocab, 1, geo_.n_vocab,
+                               history_row(row), history_len_, params, sampled_, stream_);
         if (!copy_to_host(&token, sampled_, sizeof(token))) return {model::Status::Error, err_};
         return {};
     }
@@ -456,6 +469,23 @@ public:
         return copy_to_host(out, source, (size_t) geo_.n_vocab * sizeof(float))
             ? model::Result{}
             : model::Result{model::Status::Error, "deepseek4: " + err_};
+    }
+
+    model::Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) override {
+        if (n <= 0 || row0 < 0 || row0 + n > last_window_rows_ || !picks || !out)
+            return {model::Status::Error, "deepseek4: row_logprobs rows are outside the last decode window"};
+        if (top < 0 || top > kernels::kLogprobMaxTop)
+            return {model::Status::Error, "deepseek4: row_logprobs top is outside the kernel's range"};
+        float* d_out = lp_buf_ + kernels::row_logprobs_scratch_floats(kExpertWindow, (int) geo_.n_vocab);
+        int32_t* d_picks = reinterpret_cast<int32_t*>(d_out + (size_t) kExpertWindow * kernels::kLogprobStride);
+        if (cudaMemcpyAsync(d_picks, picks, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return {model::Status::Error, "deepseek4: row_logprobs picks copy failed"};
+        kernels::row_logprobs(final_logits_ + (size_t) row0 * geo_.n_vocab, n, (int) geo_.n_vocab, d_picks, top, d_out,
+                              lp_buf_, stream_);
+        if (cudaMemcpyAsync(out, d_out, (size_t) n * kernels::kLogprobStride * sizeof(float), cudaMemcpyDeviceToHost,
+                            stream_) != cudaSuccess || !sync())
+            return {model::Status::Error, "deepseek4: row_logprobs failed"};
+        return {};
     }
 
     // Checkpoints keep the state which cannot be reconstructed by replaying the positional compressed rows:
@@ -504,6 +534,11 @@ public:
             return {model::Status::Error, "deepseek4: restored checkpoint position is outside the session history"};
         tokens_.resize((size_t) pos);
         has_bias_ = false;
+        last_window_rows_ = 0;
+        retained_logits_rows_ = 0;
+        feat_rows_ = 0;
+        feat_pos0_ = -1;
+        if (drafter_) drafter_->forget_from(dwin_, pos);
         return {};
     }
 
@@ -600,8 +635,17 @@ public:
                 return {model::Status::Error, "deepseek4: compressed cache restore copy failed"};
         }
         if (index != kv.size()) return {model::Status::Error, "deepseek4: parked conversation has unexpected cache layers"};
-        return sync() ? model::Result{} : model::Result{model::Status::Error, "deepseek4: " + err_};
+        if (!sync()) return {model::Status::Error, "deepseek4: " + err_};
+        last_window_rows_ = 0;
+        retained_logits_rows_ = 0;
+        feat_rows_ = 0;
+        feat_pos0_ = -1;
+        if (drafter_) drafter_->forget_from(dwin_, 0);
+        return {};
     }
+
+    // The prompt workspaces are allocated and freed inside prefill_rows; nothing is kept past a prompt.
+    void end_prompt() override { last_window_rows_ = 0; }
 
     model::Result set_history(const int32_t* tokens, int64_t n) override {
         if (n < 0 || (n > 0 && !tokens) || n > model_.context())
@@ -625,6 +669,47 @@ public:
         }
         expert_slots = tier->gpu_slots();
         return {};
+    }
+
+    model::Result probe_env(program::ProbeEnv& env) override {
+        core::ExpertTier* tier = model_.tier();
+        if (!tier) return {model::Status::Error, "deepseek4: no expert tier"};
+        if (!sync()) return {model::Status::Error, "deepseek4: " + err_};
+        tier->probe_env(env);
+        return {};
+    }
+
+    // A read of a few thousand tokens streams every expert over the bus.
+    int64_t disk_min_tokens() const override { return 2048; }
+
+    ExpertCounts expert_counts() const override {
+        const core::ExpertTier* tier = model_.tier();
+        return tier ? ExpertCounts{tier->hits(), tier->lookups(), tier->offloaded(), tier->file_lookups()}
+                    : ExpertCounts{};
+    }
+
+    std::vector<CardExperts> experts_by_card() const override {
+        std::vector<CardExperts> out;
+        if (const core::ExpertTier* tier = model_.tier())
+            for (const core::ExpertTier::CardSlots& card : tier->slots_by_card())
+                out.push_back({card.device, card.slots, card.bytes});
+        return out;
+    }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        core::ExpertTier* tier = model_.tier();
+        if (!tier) return false;
+        tier->expert_map(total, homes, routed);
+        return true;
+    }
+
+    std::string info_words() const override {
+        const core::ExpertTier* tier = model_.tier();
+        const std::string kv = "kv=fp32";   // window rows, compressed rows and index keys are F32
+        return tier ? "expert_slots=" + std::to_string(tier->gpu_slots()) + " expert_slots_primary=" +
+                          std::to_string(tier->slots()) + " ram_experts_mib=" + std::to_string(tier->ram_bytes() >> 20) +
+                          " " + kv + " " + program::spill_words(tier->spill())
+                    : kv;
     }
 
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
@@ -674,6 +759,8 @@ private:
             if (ratio == 4) reset_indexer_compress_state(c.indexer_state_kv, c.indexer_state_score, stream_);
         }
         tokens_.clear();
+        last_window_rows_ = 0;
+        retained_logits_rows_ = 0;
         feat_rows_ = 0;
         feat_pos0_ = -1;
         if (drafter_) drafter_->forget_from(dwin_, 0);
@@ -729,6 +816,28 @@ private:
         return false;
     }
 
+    bool inject_features(int64_t pos0, int n_rows) {
+        const size_t stride = (size_t) drafter_->feature_floats();
+        for (int at = 0; at < n_rows; at += kExpertWindow) {
+            const int rows = std::min(kExpertWindow, n_rows - at);
+            if (!drafter_->inject_device(dwin_, pos0 + at, rows, d_feat_ + (size_t) at * stride, stream_, err_))
+                return false;
+        }
+        return true;
+    }
+
+    kernels::SamplerParams draw_params(int row) const {
+        kernels::SamplerParams p =
+            sampling_given_ ? sampling_ : kernels::SamplerParams{.temperature = 0.f, .greedy = true};
+        p.counter += (uint64_t) row;
+        if (has_bias_) p.logit_bias = logit_bias_;
+        return p;
+    }
+
+    const int32_t* history_row(int row) const {
+        return history_len_ > 0 ? history_.data() + (size_t) row * (size_t) history_len_ : nullptr;
+    }
+
     bool copy_to_host(void* dst, const void* src, size_t bytes) {
         if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream_) != cudaSuccess) {
             err_ = "CUDA device-to-host copy failed";
@@ -769,6 +878,8 @@ private:
     float* d_feat_ = nullptr;
     int64_t feat_pos0_ = -1;
     int feat_rows_ = 0;
+    float* lp_buf_ = nullptr;       // row_logprobs: its scratch, a row of kLogprobStride floats, then the picks
+    float* sample_bias_ = nullptr;  // resample_row's bias, apart from the one set_logit_bias holds
     float *normalized_ = nullptr, *hc_workspace_ = nullptr, *attn_coef_ = nullptr, *ffn_coef_ = nullptr;
     float *collapsed_ = nullptr, *attn_normed_ = nullptr, *ffn_normed_ = nullptr;
     void *attn_q8_ = nullptr, *q_latent_q8_ = nullptr, *attn_out_q8_ = nullptr;
@@ -792,6 +903,11 @@ private:
     float *head_hc_workspace_ = nullptr, *head_coef_ = nullptr, *head_collapsed_ = nullptr, *head_normed_ = nullptr;
     float *retained_logits_ = nullptr;
     int retained_logits_rows_ = 0;
+    int last_window_rows_ = 0;           // rows of the last decode window that resample_row and row_logprobs address
+    kernels::SamplerParams sampling_{};  // the last decode window's draw, its history rows and its counter
+    bool sampling_given_ = false;
+    std::vector<int32_t> history_;
+    int history_len_ = 0;
     float* h_initial_ = nullptr;
     float *h_expert_input_ = nullptr, *h_expert_rows_ = nullptr;
     float* d_expert_rows_ = nullptr;
@@ -1238,6 +1354,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
             return fail_cuda("prompt attention positions upload");
 
         tier->begin_token(T);
+        bool tapped = false;   // the drafter took this chunk's last rows
         for (int layer = 0; layer < geo_.n_layers; ++layer) {
             AttentionLayerWeights attention;
             if (!model_.weights().attention_layer_weights(layer, attention, err_)) {
@@ -1449,6 +1566,20 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                 err_ = std::string("deepseek4 prompt FFN routes: ") + e.what();
                 return false;
             }
+            // The drafter's window is the prompt's tail: the same collapsed rows a decode window taps.
+            if (drafter_ && offset + T == total_tokens) {
+                const int slot = drafter_->feature_slot(layer);
+                if (slot >= 0) {
+                    const int tap = std::min(T, kDsparkWindow);
+                    const size_t stride = (size_t) drafter_->feature_floats();
+                    for (int t = 0; t < tap; ++t)
+                        if (cudaMemcpyAsync(d_feat_ + (size_t) t * stride + (size_t) slot * n,
+                                            collapsed + (size_t) (T - tap + t) * n, n * sizeof(float),
+                                            cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
+                            return fail_cuda("dspark prompt feature tap");
+                    tapped = true;
+                }
+            }
             if (!prompt_ffn->shared(layer, T, normalized, shared, stream_, err_) ||
                 !prompt_ffn->routed(layer, T, normalized, route_ids, route_weights, routed, stream_, err_)) return false;
             try {
@@ -1460,6 +1591,12 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
             std::swap(current, attended);
         }
 
+        if (tapped) {
+            const int tap = std::min(T, kDsparkWindow);
+            if (!inject_features(pos + offset + T - tap, tap)) return false;
+            feat_rows_ = 0;
+            feat_pos0_ = -1;
+        }
         if (offset + T == total_tokens) {
             HeadWeights head;
             if (!model_.weights().head_weights(head, err_)) {
