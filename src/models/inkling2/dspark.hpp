@@ -44,6 +44,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -66,8 +67,8 @@ struct DsparkLayer {
     void *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;            ///< NVFP4 planes (Q8_0 until finish())
     void *gate = nullptr, *up = nullptr, *down = nullptr;                        ///< NVFP4 planes (Q8_0 until finish())
     float* fp4_scale = nullptr;                                                  ///< the planes' FP32 scales [7]: q k v o gate up down
-    void *k_ctx = nullptr, *v_ctx = nullptr;                                     ///< Q8_0 (prompt MMQ)
-    void *k_ctx_p = nullptr, *v_ctx_p = nullptr;                                 ///< Q8 planes (1..32-row decode commit)
+    void *k_ctx_p = nullptr, *v_ctx_p = nullptr;                                 ///< Q8 planes (decode commit & prefill::q8)
+    uint16_t *k_ctx_sc_t = nullptr, *v_ctx_sc_t = nullptr;                       ///< transposed fp16 scales for prefill::q8
     float *attn_norm = nullptr, *post_norm = nullptr, *dflare_norm = nullptr;    ///< [width]
     float *q_norm = nullptr, *k_norm = nullptr, *k_ctx_norm = nullptr;           ///< [head width]
     bool local = false;
@@ -112,7 +113,7 @@ public:
         float *x = nullptr, *q = nullptr, *qr = nullptr, *attn = nullptr, *h = nullptr, *att_scr = nullptr;
         basalt::kernels::wgemm::Workspace ws;
         float *approx = nullptr, *ctx_h = nullptr, *ctx_f = nullptr;
-        void *hq = nullptr, *lat_q = nullptr, *head_scr = nullptr;
+        void *hq = nullptr, *lat_q = nullptr, *h_eff_q = nullptr, *head_scr = nullptr;
     };
     const SharedScratch* ensure_shared_scratch(int64_t context, std::string& err) const;
 
@@ -180,8 +181,21 @@ public:
     void commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::mmq::Context& mmq, const PromptScratch& s, void* stream);
     /// The host's record of the same rows (outside a captured forward).
     void note(int64_t pos0, int rows);
-    model::Result draft_begin(int32_t anchor, int64_t pos, int n, void* stream);
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n, void* stream, const DsDrawMeta* draw = nullptr);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed& need, void* stream);
+    /// Longest prefix [0..k) of `drafts[0..n)` that matches the last completed stochastic draft block.
+    int drawn_prefix(const int32_t* drafts, int n) const {
+        if (!drawn_active_ || n <= 0 || drawn_n_ <= 0 || !ids_h_) return 0;
+        const int lim = std::min(n, drawn_n_);
+        int k = 0;
+        while (k < lim && ids_h_[k] == drafts[k]) ++k;
+        return k;
+    }
+    /// Whether the last completed solo draft block was drawn stochastically and matches `drafts[0..n)`.
+    bool drawn_ready(const int32_t* drafts, int n) const { return n > 0 && drawn_prefix(drafts, n) == n; }
+    const int32_t* ids_dev() const { return ids_d_; }
+    const int32_t* q_ids_dev() const { return q_ids_d_; }
+    const float* q_p_dev() const { return q_p_d_; }
     /// Conversations: the sliding-window layers' rings are running state, the full layers' cells go with the target's.
     size_t running_bytes() const;
     void running_state(int64_t pos, bool save, core::RunningState& st) const;
@@ -224,6 +238,8 @@ private:
     void count_backed();                    ///< backed_cells_ from the elastic caches
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
+    void stage_tail(int i0, int n_end, void* stream);
+    bool stage_tail_graph(int i0, int n_end, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::unique_ptr<Dflash2Hook> df2_;
     std::vector<void*> allocs_, pinned_;
@@ -251,16 +267,22 @@ private:
     int64_t att_cells_ = 0;
     // head
     float *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
-    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;   ///< q8_1 draft rows and latents [kDsDrafts], the screen's scratch
+    void *hq_ = nullptr, *lat_q_ = nullptr, *h_eff_q_ = nullptr, *head_scr_ = nullptr;   ///< q8_1 draft rows, latents, combined h_eff, screen scratch
     int32_t *prev_ = nullptr, *ids_d_ = nullptr;
     uint16_t* w1_row_ = nullptr;            ///< the previous draft's row of the Markov head's w1 (host memory), on the card
     float* conf_d_ = nullptr;
     int32_t* ids_h_ = nullptr;
     // the block's stages as graphs: the layers' (by layer), the last with the head (by drafts)
     int32_t *meta_h_ = nullptr, *meta_d_ = nullptr;   ///< {anchor, position} of the block, pinned and on the device
+    DsDrawMeta *draw_meta_h_ = nullptr, *draw_meta_d_ = nullptr;   ///< per-block stochastic draft params, pinned and on device
+    int32_t* q_ids_d_ = nullptr;            ///< [kDsDrafts][kDsQMax] proposal token ids for stochastic verification
+    float* q_p_d_ = nullptr;                ///< [kDsDrafts][kDsQMax] proposal probabilities for stochastic verification
+    bool drawn_active_ = false;
+    int drawn_n_ = 0;
     float* frc_ = nullptr;                  ///< the Markov head's context of the block (block inputs copy it)
     cudaGraphExec_t g_stage_[kDsMaxLayers] = {};
     cudaGraphExec_t g_head_[kDsBlock] = {};
+    cudaGraphExec_t g_head_tail_[kDsBlock] = {};
     bool graphs_ = true;
     float* conf_h_ = nullptr;
     // the host's record: positions [lo_, hi_) have their context in the caches; a block is in flight
@@ -311,7 +333,7 @@ private:
     // head batch scratch [max_sessions]
     float *hd_ = nullptr, *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
     float *frc_ = nullptr, *conf_d_ = nullptr, *conf_h_ = nullptr;
-    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
+    void *hq_ = nullptr, *lat_q_ = nullptr, *h_eff_q_ = nullptr, *head_scr_ = nullptr;
     size_t head_scr_stride_ = 0;
     int32_t *prev_ = nullptr, *ids_d_ = nullptr, *ids_h_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     uint16_t* w1_row_ = nullptr;

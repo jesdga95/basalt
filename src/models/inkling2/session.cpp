@@ -149,7 +149,7 @@ struct Shared {
         if (!(cpu = CpuExperts::make(m, err)) && !err.empty()) return false;
         if (m.sessions() > 1 && m.dspark()) {
             ds_batch = std::make_unique<DsparkBatch>();
-            if (!ds_batch->init(m.dspark(), m.sessions(), max_rows, std::max(max_rows, kPromptChunk), tap, m.context(), err))
+            if (!ds_batch->init(m.dspark(), m.sessions(), max_rows, max_rows, tap, m.context(), err))
                 return false;
         }
         prompt = make_prompt(m, stream, err);   // PROMPT HOOK
@@ -204,7 +204,7 @@ struct Shared {
         x.tok_d_ = x.io_d_;
         x.pos_d_ = x.io_d_ + R;
         x.at_d_ = reinterpret_cast<const bk::WindowSegs*>(x.io_d_ + 2 * R);
-        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(std::max(max_rows, kPromptChunk)));   // DSPARK HOOK
+        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(max_rows));   // DSPARK HOOK (prompt tap lives in Prompt::Bufs loan arena)
         if (!ok) {
             cudaGetLastError();
             err = "out of device memory for the sessions' scratch";
@@ -447,7 +447,7 @@ public:
             err = "the session stream failed during initialization";
             return false;
         }
-        if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(call_rows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
+        if (!dspark_.init(m_.dspark(), g_, m_.context(), call_rows, sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
                           elastic_.empty() ? 0 : core::kElasticKvBase, err))
             return false;
         count_backed();
@@ -782,7 +782,18 @@ public:
     bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (m_.wedged()) return wedged();
-        return dspark_.draft_begin(anchor, pos, n, stream_);
+        DsDrawMeta dm{};
+        if (has_sampling_ && !sampling_.greedy && sampling_.temperature > 0.0f && sampling_.draw_drafts) {
+            dm.anchor = anchor;
+            dm.pos = (int32_t) pos;
+            dm.top_k = sampling_.top_k;
+            dm.min_keep = sampling_.min_keep;
+            dm.temperature = sampling_.temperature;
+            dm.top_p = sampling_.top_p;
+            dm.min_p = sampling_.min_p;
+            dm.seed = sampling_.seed;
+        }
+        return dspark_.draft_begin(anchor, pos, n, stream_, dm.temperature > 0.0f ? &dm : nullptr);
     }
     model::Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                               int count) override {
@@ -1885,6 +1896,18 @@ private:
             cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
         }
         sampling_ = sp;
+        has_sampling_ = true;
+        const int drawn_n = (r.drawn_drafts && t0 == 0 && rows > 1 && !sp.greedy && sp.temperature > 0.0f && sp.draw_drafts)
+                                ? dspark_.drawn_prefix(r.tokens + 1, rows - 1)
+                                : 0;
+        const bool use_drawn = drawn_n > 0;
+        if (use_drawn) {
+            sp.drafts = dspark_.ids_dev();
+            sp.q_ids = dspark_.q_ids_dev();
+            sp.q_p = dspark_.q_p_dev();
+            sp.q_n = kDsQMax;
+            sp.n_drawn = drawn_n;
+        }
         bk::sample_tokens(logits_, rows, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, pick_, st);
         if (cudaMemcpyAsync(pick_h_, pick_, (size_t) rows * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess) {
             err = "the pick failed";
@@ -1963,6 +1986,7 @@ private:
     size_t d_hist_len_ = 0;
     int history_len_ = 0;
     bk::SamplerParams sampling_;
+    bool has_sampling_ = false;
     int head_rows_ = 0;
 };
 

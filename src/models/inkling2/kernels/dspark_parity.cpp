@@ -256,7 +256,22 @@ void test_markov_step() {
     }
     report("Markov step (state)", out, ref_s, 2e-5);
     report("Markov step (latent)", lat, ref_l, 2e-5);
-    const double us = time_us([&] { dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1 + (size_t) prev * kDsRank, d_state, d_out, d_lat, nullptr); });
+    // Verify fused q8_1 output matches native_quantize_q8_1(latent) closely (and bitwise on codes/scales).
+    const size_t q8b = basalt::kernels::native_q8_1_bytes(kDsRank, 1);
+    void* d_lq_fused = zeros<uint8_t>(q8b);
+    void* d_lq_ref = zeros<uint8_t>(q8b);
+    cudaStream_t qs = nullptr;
+    cudaStreamCreate(&qs);
+    dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1 + (size_t) prev * kDsRank, d_state, d_out, d_lat, qs, d_lq_fused);
+    basalt::kernels::native_quantize_q8_1(d_lat, d_lq_ref, kDsRank, 1, qs);
+    cudaStreamSynchronize(qs);
+    cudaStreamDestroy(qs);
+    const auto h_fused = host<uint8_t>((const uint8_t*) d_lq_fused, q8b);
+    const auto h_ref = host<uint8_t>((const uint8_t*) d_lq_ref, q8b);
+    check("Markov step (fused q8_1)", h_fused == h_ref);
+    cudaFree(d_lq_fused);
+    cudaFree(d_lq_ref);
+    const double us = time_us([&] { dspark_markov_step(d_ch, d_cf, d_b, d_wsp, d_w1 + (size_t) prev * kDsRank, d_state, d_out, d_lat, nullptr, nullptr); });
     timing("Markov step", us, (double) kDsRnn * 2 * kDsRank * 2 + 3.0 * kDsRnn * 4);
 }
 
@@ -479,6 +494,61 @@ void test_head() {
         for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1, d_w1r, nullptr);
     });
     timing("head, a block of 7 drafts", us, (double) dspark_screen_bytes(E, V) + R * (double) dspark_screen_bytes(kDsRank, V));
+    // timing with real mapped host w1 (PCIe) and stochastic draw mode
+    {
+        uint16_t* h_w1 = nullptr;
+        uint16_t* d_w1_mapped = nullptr;
+        cudaHostAlloc((void**) &h_w1, w1.size() * 2, cudaHostAllocMapped | cudaHostAllocPortable);
+        std::memcpy(h_w1, w1.data(), w1.size() * 2);
+        cudaHostGetDevicePointer((void**) &d_w1_mapped, h_w1, 0);
+        DsDrawMeta dm_h{};
+        dm_h.pos = 100;
+        dm_h.temperature = 1.0f;
+        dm_h.top_k = 0;
+        dm_h.top_p = 1.0f;
+        dm_h.min_p = 0.0f;
+        dm_h.min_keep = 1;
+        dm_h.seed = 424242ull;
+        DsDrawMeta* d_dm = nullptr;
+        cudaMalloc(&d_dm, sizeof(DsDrawMeta));
+        cudaMemcpy(d_dm, &dm_h, sizeof(DsDrawMeta), cudaMemcpyHostToDevice);
+        int32_t* d_qids = zeros<int32_t>((size_t) R * kDsQMax);
+        float* d_qp = zeros<float>((size_t) R * kDsQMax);
+        dspark_head_base(h, d_hq, R, d_approx, nullptr);
+        for (int i = 0; i < R; ++i)
+            dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1_mapped, d_w1r, nullptr,
+                             nullptr, d_dm, d_qids + (size_t) i * kDsQMax, d_qp + (size_t) i * kDsQMax);
+        const auto dids = host(d_ids, R);
+        const auto dcf = host(d_conf, R);
+        const auto hqids = host(d_qids, (size_t) R * kDsQMax);
+        const auto hqp = host(d_qp, (size_t) R * kDsQMax);
+        bool draw_ok = std::memcmp(host(d_w1r, kDsRank).data(), w1.data() + (size_t) dids[R - 1] * kDsRank, kDsRank * 2) == 0;
+        for (int i = 0; i < R && draw_ok; ++i) {
+            double qs = 0.0;
+            bool in_q = false;
+            for (int j = 0; j < kDsQMax; ++j) {
+                const int id = hqids[(size_t) i * kDsQMax + j];
+                const float pr = hqp[(size_t) i * kDsQMax + j];
+                if (id >= 0) {
+                    qs += (double) pr;
+                    if (id == dids[i] && pr > 0.0f) in_q = true;
+                    for (int k = 0; k < j; ++k)
+                        if (hqids[(size_t) i * kDsQMax + k] == id) draw_ok = false;   // distinct ids
+                }
+            }
+            if (!in_q || std::fabs(qs - 1.0) > 1e-4 || !(dcf[i] >= 0.0f && dcf[i] <= 1.001f)) draw_ok = false;
+        }
+        check("head: stochastic draw + q export + mapped w1", draw_ok);
+        double us_m = time_us([&] {
+            dspark_head_base(h, d_hq, R, d_approx, nullptr);
+            for (int i = 0; i < R; ++i)
+                dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1_mapped, d_w1r, nullptr,
+                                 nullptr, d_dm, d_qids + (size_t) i * kDsQMax, d_qp + (size_t) i * kDsQMax);
+        });
+        timing("head, 7 drafts (mapped w1, drawn)", us_m, (double) dspark_screen_bytes(E, V) + R * (double) dspark_screen_bytes(kDsRank, V));
+        cudaFree(d_dm); cudaFree(d_qids); cudaFree(d_qp);
+        cudaFreeHost(h_w1);
+    }
 }
 
 void test_fold() {
@@ -688,9 +758,96 @@ void test_head_batch() {
     cudaFree(d_hd); cudaFree(d_frc);
 }
 
+void test_combine_h() {
+    const int B = 4, R = 3;
+    const auto hd = randn((size_t) B * R * E, 1.5f);
+    const auto lat = randn((size_t) B * kDsRank, 0.8f);
+    const auto ow = bf16s(randn((size_t) E * kDsRank, 0.05f));
+    const auto ob = randn(E, 0.1f);
+    float *d_hd = dev(hd), *d_lat = dev(lat), *d_ob = dev(ob);
+    uint16_t* d_ow = dev(ow);
+    const size_t qrow = basalt::kernels::native_q8_1_bytes(E, 1);
+    uint8_t* d_q_solo = zeros<uint8_t>(qrow);
+    uint8_t* d_q_batch = zeros<uint8_t>((size_t) B * qrow);
+    uint8_t* d_q_ref = zeros<uint8_t>(qrow);
+
+    cudaStream_t qs = nullptr;
+    cudaStreamCreate(&qs);
+    // Reference on CPU: hd + out_w * lat + out_b, quantized via native_quantize_q8_1
+    bool all_ok = true;
+    const int step_i = 1;
+    dspark_combine_h_batch(d_hd, d_lat, d_ow, d_ob, step_i, R, B, d_q_batch, qs);
+    const auto h_batch = host(d_q_batch, (size_t) B * qrow);
+    for (int b = 0; b < B; ++b) {
+        dspark_combine_h(d_hd + ((size_t) b * R + step_i) * E, d_lat + (size_t) b * kDsRank, d_ow, d_ob, d_q_solo, qs);
+        const auto h_solo = host(d_q_solo, qrow);
+        if (std::memcmp(h_solo.data(), h_batch.data() + (size_t) b * qrow, qrow) != 0) all_ok = false;
+
+        std::vector<float> ref(E, 0.f);
+        for (int e = 0; e < E; ++e) {
+            double acc = 0.0;
+            for (int k = 0; k < kDsRank; ++k) acc += (double) from_bf16(ow[(size_t) e * kDsRank + k]) * (double) lat[(size_t) b * kDsRank + k];
+            ref[e] = (float) (acc + (double) hd[((size_t) b * R + step_i) * E + e] + (double) ob[e]);
+        }
+        float* d_ref = dev(ref);
+        basalt::kernels::native_quantize_q8_1(d_ref, d_q_ref, E, 1, qs);
+        const auto h_ref = host(d_q_ref, qrow);
+        cudaFree(d_ref);
+        // Check dequantized values match within 1 Q8_1 step + fp32/bf16 rounding
+        for (int blk = 0; blk < E / 32; ++blk) {
+            __half h1, h2;
+            std::memcpy(&h1, &h_solo[blk * 36], 2);
+            std::memcpy(&h2, &h_ref[blk * 36], 2);
+            const float d1 = __half2float(h1), d2 = __half2float(h2);
+            for (int j = 0; j < 32; ++j) {
+                const float v1 = d1 * (float) (int8_t) h_solo[blk * 36 + 4 + j];
+                const float v2 = d2 * (float) (int8_t) h_ref[blk * 36 + 4 + j];
+                if (std::fabs(v1 - v2) > std::max(2.0f * d2, 1e-4f)) all_ok = false;
+            }
+        }
+    }
+    cudaStreamDestroy(qs);
+    check("dspark combine_h solo/batch == ref", all_ok);
+    const double us = time_us([&] { dspark_combine_h(d_hd, d_lat, d_ow, d_ob, d_q_solo, nullptr); });
+    timing("combine_h (1 draft)", us, (double) E * kDsRank * 2 + E * 8);
+
+    // Also verify exact_logit with h.fold == nullptr matches head.(h + out_w*lat + out_b)
+    const int64_t V = 4096;
+    const auto head = q8_0_rows(V, E, 1.5e-4f, 777u);
+    uint8_t* d_head = dev(head);
+    float* d_logits = zeros<float>((size_t) V);
+    DsHead h{};
+    h.head = d_head;
+    h.fold = nullptr;
+    h.n_vocab = V;
+    h.cap = 30.f;
+    dspark_combine_h(d_hd, d_lat, d_ow, d_ob, d_q_solo, nullptr);
+    dspark_head_exact(h, d_q_solo, nullptr, 0, d_logits, nullptr);
+    const auto got_l = host(d_logits, (size_t) V);
+    const auto h_q = host(d_q_solo, qrow);
+    std::vector<double> ref_l((size_t) V, 0.0);
+    for (int64_t v = 0; v < V; ++v) {
+        double dot = 0.0;
+        for (int blk = 0; blk < E / 32; ++blk) {
+            __half d8;
+            std::memcpy(&d8, &h_q[blk * 36], 2);
+            const double ds = __half2float(d8);
+            for (int j = 0; j < 32; ++j)
+                dot += q8_value(head.data(), E, v, blk * 32 + j) * ds * (double) (int8_t) h_q[blk * 36 + 4 + j];
+        }
+        ref_l[(size_t) v] = 30.0 * std::tanh(dot / 30.0);
+    }
+    report("head_exact (fold==null, h_eff)", got_l, ref_l, 2e-4);
+
+    cudaFree(d_hd); cudaFree(d_lat); cudaFree(d_ob); cudaFree(d_ow);
+    cudaFree(d_q_solo); cudaFree(d_q_batch); cudaFree(d_q_ref);
+    cudaFree(d_head); cudaFree(d_logits);
+}
+
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("no GPU\n");
@@ -703,6 +860,7 @@ int main() {
     test_fold();
     test_split();
     test_head_batch();
+    test_combine_h();
     std::printf("inkling2_dspark_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

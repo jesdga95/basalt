@@ -43,7 +43,7 @@ public:
 /// chunk fills the tap (up to kPromptChunk rows) and commits its rows' context, as a decode window does.
 std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, void* stream, std::string& err);
 
-/// The device bytes of the prompt path (one for every session).
-uint64_t prompt_bytes(const Geometry& g);
+/// The device bytes of the prompt path (one for every session, including its loaned DSpark prompt tap when `drafter` is on).
+uint64_t prompt_bytes(const Geometry& g, bool drafter = false);
 
 }  // namespace basalt::models::inkling2

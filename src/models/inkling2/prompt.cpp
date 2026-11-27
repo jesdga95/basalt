@@ -77,10 +77,11 @@ struct Bufs {
     int32_t *ids = nullptr, *bounds = nullptr, *tok = nullptr, *dst = nullptr, *exp = nullptr;
     void* sort_scr = nullptr;
     void *k_stage = nullptr, *v_stage = nullptr;
+    float* tap = nullptr;        // DSpark prompt tap [4][chunk][E], carved inside the lane's arena (before ident)
     int32_t *pos = nullptr, *tokd = nullptr, *ident = nullptr, *dbounds = nullptr;
 };
 
-void carve(Carve& c, Bufs& b, const Geometry& g, int chunk) {
+void carve(Carve& c, Bufs& b, const Geometry& g, int chunk, bool has_tap = false) {
     const size_t E = (size_t) g.n_embd, R = (size_t) chunk, P = R * (size_t) g.n_used;
     for (float*& p : b.role) p = c.take<float>(R * E);
     b.resid = c.take<float>(R * E);
@@ -129,6 +130,7 @@ void carve(Carve& c, Bufs& b, const Geometry& g, int chunk) {
     const size_t stage = (size_t) kKvHeads * R * row_bytes;   // staging must fit the widest cache format
     b.k_stage = c.take<uint8_t>(stage);
     b.v_stage = c.take<uint8_t>(stage);
+    b.tap = has_tap ? c.take<float>(4 * R * E) : nullptr;
     b.pos = c.take<int32_t>(R);
     b.tokd = c.take<int32_t>(R);
     b.ident = c.take<int32_t>(P);
@@ -271,7 +273,7 @@ public:
     void carve_lane() {
         Carve c;
         c.base = static_cast<uint8_t*>(lane().mem);
-        carve(c, b(), g_, chunk_);
+        carve(c, b(), g_, chunk_, cur_ == 0 && m_.dspark() != nullptr);
         mmq::iota(b().ident, (int64_t) chunk_ * g_.n_used, strm());
         // the sorted entries past the ones a chunk fills (pairs another card computes are left out) read as row 0 of expert 0
         const size_t pair_bytes = (size_t) chunk_ * g_.n_used * 4;
@@ -281,8 +283,8 @@ public:
     }
 
     // A read of more than kPromptChunk rows takes kWidePromptChunk-row chunks when the card's copies make room for the rest
-    // of the arena and the drafter's wider tap (the counted room, so the choice follows the requests). Before the first
-    // chunk, after the prompt loan came back; false leaves the read at kPromptChunk rows.
+    // of the arena (including the wider drafter tap inside wide_va_). Before the first chunk, after the prompt loan came back;
+    // false leaves the read at kPromptChunk rows.
     struct WideOps {
         Prompt& p;
         bool short_ = false;   // the card had less free memory than counted
@@ -301,35 +303,14 @@ public:
             p.wide_h_ = 0;
             return true;
         }
-        WideStep tap_on() {
-            const cudaError_t e = cudaMalloc((void**) &p.wide_tap_, dspark_tap_bytes(kWidePromptChunk));
-            if (e != cudaSuccess) {
-                cudaGetLastError();
-                p.wide_tap_ = nullptr;
-                short_ = e == cudaErrorMemoryAllocation;
-                return short_ ? WideStep::Short : WideStep::Broken;
-            }
-            p.narrow_tap_ = p.ds_->tap_base();
-            p.narrow_tap_rows_ = p.ds_->tap_rows();
-            p.ds_->use_tap(p.wide_tap_, kWidePromptChunk);
-            return WideStep::Done;
-        }
-        bool tap_off() {   // the drafter reads its own tap again; the wide one stays owned when its release fails
-            p.ds_->use_tap(p.narrow_tap_, p.narrow_tap_rows_);
-            if (cudaFree(p.wide_tap_) != cudaSuccess) {
-                cudaGetLastError();
-                return false;
-            }
-            p.wide_tap_ = nullptr;
-            return true;
-        }
+        WideStep tap_on() { return WideStep::Done; }
+        bool tap_off() { return true; }
     };
     WideOpen widen(int n) {
         if (!wide_va_ || n <= kPromptChunk || chunk_ != kPromptChunk || m_.loaned() > 0) return WideOpen::Narrow;
-        const bool tap = ds_->on();
-        const uint64_t extra = wide_bytes_ - narrow_bytes_ + (tap ? dspark_tap_bytes(kWidePromptChunk) : 0);
+        const uint64_t extra = wide_bytes_ - narrow_bytes_;
         wide_ops_.short_ = false;
-        const WideOpen w = wide_.open(extra, tap);
+        const WideOpen w = wide_.open(extra, false);
         if (wide_.stuck()) {
             m_.wedge();
             basalt::log::error("basalt inkling2", "the wide prompt chunk's memory could not be released; restart the engine");
@@ -372,14 +353,15 @@ public:
 
     // The current card's chunk buffers and products.
     bool init_lane(std::string& err) {
+        const bool has_tap = cur_ == 0 && m_.dspark() != nullptr;
         Carve c;
-        carve(c, b(), g_, chunk_);
+        carve(c, b(), g_, chunk_, has_tap);
         if (cur_ == 0 && wide_possible()) {
             // the arena in a range of the wide chunk's size, backed as far as the chunk of kPromptChunk rows needs; a long
             // read backs the rest while it runs
             Carve w;
             Bufs wb;
-            carve(w, wb, g_, kWidePromptChunk);
+            carve(w, wb, g_, kWidePromptChunk, has_tap);
             const uint64_t gran = core::vmm::granularity();
             narrow_bytes_ = (c.at + gran - 1) / gran * gran;
             wide_bytes_ = (w.at + gran - 1) / gran * gran;
@@ -493,6 +475,14 @@ private:
     // exception) runs out its streams first (drain), then a wide read gives its memory back (narrow).
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
                       std::vector<int32_t>& hist, int32_t pad, const Prepare& prepare) {
+        struct TapBind {   // restores the decode tap after streams drain and narrow() completes
+            Prompt* p;
+            float* orig = nullptr;
+            int orig_rows = 0;
+            ~TapBind() {
+                if (orig) p->ds_->use_tap(orig, orig_rows);
+            }
+        } tap_bind{this};
         struct Narrow {   // a read that ends any other way: after the drain, and only what the drain confirmed
             Prompt* p;
             ~Narrow() { (void) p->narrow(p->drained_); }
@@ -514,6 +504,11 @@ private:
         if (go && std::exchange(recarve_, false)) carve_lane();
         if (go && widen(n) == WideOpen::Failed)
             return {model::Status::Error, "inkling2: the copies a long prompt read borrowed from could not be put back"};
+        if (go && ds_->on() && lane_[0].b.tap) {
+            tap_bind.orig = ds_->tap_base();
+            tap_bind.orig_rows = ds_->tap_rows();
+            ds_->use_tap(lane_[0].b.tap, chunk_);
+        }
         const int chunks = (n + chunk_ - 1) / chunk_;
         const int per = (n + chunks - 1) / chunks;
         for (int t0 = 0; go && t0 < n; t0 += per, ++k) {
@@ -1041,8 +1036,6 @@ private:
     uint8_t* wide_va_ = nullptr;
     uint64_t narrow_bytes_ = 0, wide_bytes_ = 0;
     unsigned long long narrow_h_ = 0, wide_h_ = 0;
-    float *wide_tap_ = nullptr, *narrow_tap_ = nullptr;
-    int narrow_tap_rows_ = 0;
     bool wide_short_ = false;
     bool drained_ = false;   // the last failed read's streams were run out (drain)
     bool recarve_ = false;   // a wide read whose copies did not all return left its buffers laid out wide
@@ -1078,10 +1071,10 @@ std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, void* stream, std::st
     return p;
 }
 
-uint64_t prompt_bytes(const Geometry& g) {
+uint64_t prompt_bytes(const Geometry& g, bool drafter) {
     Carve c;
     Bufs b;
-    carve(c, b, g, kPromptChunk);
+    carve(c, b, g, kPromptChunk, drafter);
     return (uint64_t) c.at + kMmqSpare;
 }
 

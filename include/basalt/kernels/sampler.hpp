@@ -36,8 +36,8 @@ struct SamplerParams {
     // Drawn drafts (speculative sampling), device arrays: rows t < n_drawn carry the draft drafts[t] (the token after
     // row t), drawn from the proposal q_p[t][j] over the ids q_ids[t][j], j < q_n.  Such a row keeps its draft with
     // probability min(1, p(d) / q(d)) and otherwise draws from max(p - q, 0) renormalized: its token has the row's
-    // distribution p exactly and is the draft whenever the draft is kept.  The sampled path's narrow lists only (64 or
-    // fewer); the greedy path ignores them.
+    // distribution p exactly and is the draft whenever the draft is kept.  The sampled path handles them on narrow and
+    // wide lists; the greedy path ignores them.
     // The request lets its drafter draw drafts for the rows above.  The reply then has the model's distribution, but which
     // tokens come out depends on the windows the draft policy picked, so a request that fixes its seed (a reproducible
     // reply) leaves this off and its drafts are kept only where the row's own draw is the draft.
@@ -73,7 +73,7 @@ void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const i
 // sample_tokens_probe on a chosen implementation of the sampled path's split, for sampler_parity: 0 the two-launch
 // split, 1 the one-launch split with argmax rounds, 2 the one-launch split with bitonic networks (the engine's), 3 the
 // wide path (sorted rows; the engine's for a list longer than 64).  All pick the same token and give the same
-// probabilities, bit for bit.
+// probabilities, bit for bit, except the sort-free wide drawn-draft path, which scans in vocabulary order.
 void sample_tokens_split(int split, const float* logits, int n_tokens, int n_vocab, const int* history,
                          int history_len, const SamplerParams& p, int* out, const int* query, int n_query, float* qprob,
                          void* stream);
