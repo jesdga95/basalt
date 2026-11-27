@@ -383,16 +383,23 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
 
     // [vision] the image encoder staged before the context is sized; it keeps none of the card: a request's pictures borrow
     // their region from the prompt path's buffers (lend_room) and give it back (refill). Only what those do not cover of
-    // the region stays free beside the caches.
-    uint64_t vision_room = 0;
+    // the region stays free beside the caches. What staging leaves on the card (the encoder's kernels, stream and product
+    // handle) comes out of the card's spare, which is there for the kernels' modules.
+    uint64_t vision_room = 0, vision_modules = 0;
     if (req.vision) {
+        size_t before = 0, after = 0, total = 0;
+        basalt::core::gpu_mem_info(&before, &total);
         if (!vis_.stage(pack_.vision, g.n_embd, g.image_cells, err)) return fail("vision: " + err);
+        basalt::core::gpu_mem_info(&after, &total);
+        vision_modules = std::min<uint64_t>(before > after ? before - after : 0, kCardSpare / 4);
         const uint64_t region = vis_.region_bytes(), lent = PromptPath::bytes(g, n_ff_pad_, mlp_nvfp4_, want, kv_, mxfp8_experts_);
         vision_room = region > lent ? region - lent : 0;
         vis_.set_lender({[this](uint64_t bytes, std::string& e) { return lend_room(bytes, e); }, [this] { refill(); }});
-        basalt::log::info("basalt gemma4", "image encoder: %.2f GiB staged in page-locked RAM, a request's pictures take %.2f GiB "
-                          "of the card while they are read, lent by the prompt path's buffers (%.2f GiB)",
-                          (double) vis_.weights_bytes() / (double) kGiB, (double) region / (double) kGiB, (double) lent / (double) kGiB);
+        basalt::log::info("basalt gemma4", "image encoder: %.2f GiB staged in page-locked RAM (its kernels' %.0f MiB inside the "
+                          "card's spare), a request's pictures take %.2f GiB of the card while they are read, lent by the prompt "
+                          "path's buffers (%.2f GiB)",
+                          (double) vis_.weights_bytes() / (double) kGiB, (double) vision_modules / (double) kMiB,
+                          (double) region / (double) kGiB, (double) lent / (double) kGiB);
     }
 
     // the context: what the weights leave, less the card's spare
@@ -400,7 +407,8 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
     size_t free_b = 0, total_b = 0;
     basalt::core::gpu_mem_info(&free_b, &total_b);
-    card_spare_ = req.vram_reserve_mib > 0 ? (uint64_t) req.vram_reserve_mib * kMiB : kCardSpare;
+    const uint64_t asked = req.vram_reserve_mib > 0 ? (uint64_t) req.vram_reserve_mib * kMiB : kCardSpare;
+    card_spare_ = asked > vision_modules ? asked - vision_modules : 0;   // [vision]
     const uint64_t spare = card_spare_ + vision_room;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
     // the experts' least: top-k slots in every layer and a prompt's staging of every expert (two layers' worth)
