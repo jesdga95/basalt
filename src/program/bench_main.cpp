@@ -16,6 +16,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <random>
 #include <sstream>
@@ -581,13 +582,20 @@ void summarize_rows(const std::string& path, Quality& q) {
     std::vector<double> nll, nllb, kld, dlp;
     long long same = 0;
     std::vector<long long> chunk_ids;
+    bool kld_finite = true;
+    bool kld_nan = false;
     while (std::getline(f, line)) {
         std::vector<std::string> c = split(line, '\t');
         if (c.size() < 10) continue;
         chunk_ids.push_back(std::atoll(c[0].c_str()));
         nll.push_back(std::atof(c[3].c_str()));
         nllb.push_back(std::atof(c[4].c_str()));
-        kld.push_back(std::atof(c[5].c_str()));
+        const double kv = std::atof(c[5].c_str());
+        if (!std::isfinite(kv)) {
+            kld_finite = false;
+            if (std::isnan(kv)) kld_nan = true;
+        }
+        kld.push_back(kv);
         same += std::atoll(c[6].c_str());
         dlp.push_back(std::atof(c[9].c_str()));
     }
@@ -599,17 +607,25 @@ void summarize_rows(const std::string& path, Quality& q) {
     double mn = 0, mb = 0, sq = 0, mk = 0, md = 0;
     for (size_t i = 0; i < n; ++i) { mn += nll[i]; mb += nllb[i]; sq += nll[i] * nll[i]; mk += kld[i]; md += dlp[i]; }
     mn /= (double) n; mb /= (double) n; mk /= (double) n; md /= (double) n;
-    const double se = std::sqrt(std::max(0.0, sq / (double) n - mn * mn) / (double) std::max<size_t>(1, n - 1));
+    const double var = sq / (double) n - mn * mn;
+    const double se = std::isnan(var) ? var : std::sqrt(std::max(0.0, var) / (double) std::max<size_t>(1, n - 1));
     q.ppl = std::exp(mn);
     q.ppl_err = q.ppl * se;
     q.base_ppl = std::exp(mb);
     q.ln_ratio = mn - mb;
-    std::sort(kld.begin(), kld.end());
-    auto pct = [&](double p) { return kld[std::min(n - 1, (size_t) std::llround(p * (double) (n - 1)))]; };
     q.kld_mean = mk;
-    q.kld_median = pct(0.5);
-    q.kld_p99 = pct(0.99);
-    q.kld_max = kld.back();
+    if (kld_finite || !kld_nan) {
+        std::sort(kld.begin(), kld.end());
+        auto pct = [&](double p) { return kld[std::min(n - 1, (size_t) std::llround(p * (double) (n - 1)))]; };
+        q.kld_median = pct(0.5);
+        q.kld_p99 = pct(0.99);
+        q.kld_max = kld.back();
+    } else {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        q.kld_median = nan;
+        q.kld_p99 = nan;
+        q.kld_max = nan;
+    }
     q.top1_pct = 100.0 * (double) same / (double) n;
     q.dlogp = md;
     q.ran = true;
@@ -759,9 +775,10 @@ int main(int argc, char** argv) {
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
+    const std::string model_path = o.model.empty() ? arg_value(args, "--model") : o.model;
     // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
     std::string gpu_value;
-    if (!o.model.empty()) {
+    if (!model_path.empty()) {
         std::string gerr;
         std::vector<basalt::program::GpuCard> used;
         // a community run takes the user's cards and mode like any other, and its row records them in engine_args
@@ -795,7 +812,7 @@ int main(int argc, char** argv) {
             extra.push_back(kv.first);
             extra.push_back(kv.second);
         }
-        std::vector<std::string> plan_args = probe_args(fs::absolute(o.model).string(), {});
+        std::vector<std::string> plan_args = probe_args(fs::absolute(model_path).string(), {});
         merge_args(plan_args, extra);
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
@@ -817,8 +834,8 @@ int main(int argc, char** argv) {
     if (o.fixtures.empty() || o.community) {   // the model's own fixtures, when it has them; the community row's model name
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
-        const std::string abs_model = fs::absolute(o.model).string();
-        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, probe_args(abs_model, {}), plan_log, answer);
+        const std::string abs_model = model_path.empty() ? std::string() : fs::absolute(model_path).string();
+        const int asked = abs_model.empty() ? 0 : engine_plan(engine_bin, probe_args(abs_model, {}), plan_log, answer);
         if (o.community) {
             community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
             community_arch = basalt::program::plan_field(answer, "arch");
@@ -836,10 +853,10 @@ int main(int argc, char** argv) {
         if (o.fixtures.empty()) o.fixtures = fixtures_for(fixtures_default(), answer);
     }
     std::vector<std::string> quality_flags;
-    if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
+    if (do_quality && !model_path.empty()) {   // what the gate starts this model with, and the window it scores
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id()) + ".log";
-        const int asked = engine_plan(engine_bin, probe_args(fs::absolute(o.model).string(), {"--ppl-base", o.kld_base}), plan_log, answer);
+        const int asked = engine_plan(engine_bin, probe_args(fs::absolute(model_path).string(), {"--ppl-base", o.kld_base}), plan_log, answer);
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
         if (asked != 0) {
@@ -1048,6 +1065,12 @@ int main(int argc, char** argv) {
             while (std::getline(lg, l))
                 if (l.find("peer GPU") != std::string::npos && l.find("experts") != std::string::npos) peer_line = l;
         }
+        const std::string eng_primary_bus = eng.info.count("gpus") ? eng.info["gpus"].substr(0, eng.info["gpus"].find(',')) : std::string();
+        auto snap_primary = [&]() {
+            Nvml::Snap s;
+            if (!eng_primary_bus.empty() && nvml.snap_bus(eng_primary_bus, s)) return s;
+            return nvml.snap(0);
+        };
         for (int run = 1; run <= o.reps && !failed; ++run) {
             for (size_t i = 0; i < 3 && !failed; ++i) {
                 if (std::find(sess.decode.begin(), sess.decode.end(), kDecode[i].name) == sess.decode.end()) continue;
@@ -1059,7 +1082,7 @@ int main(int argc, char** argv) {
                     failed = true;
                     break;
                 }
-                const Nvml::Snap s = nvml.snap(0);
+                const Nvml::Snap s = snap_primary();
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
                 ++n_requests;
@@ -1090,7 +1113,7 @@ int main(int argc, char** argv) {
                     failed = true;
                     break;
                 }
-                const Nvml::Snap s = nvml.snap(0);
+                const Nvml::Snap s = snap_primary();
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
                 ++n_requests;
