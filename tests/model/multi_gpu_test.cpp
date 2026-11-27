@@ -208,16 +208,39 @@ int main() {
         // prompt stages: bandwidth 1792:448 gives the RTX 5060 Ti the last fifth of 48 layers; gpu-share moves it; a stage
         // stays within the layers its weights may hold, and every card reads one layer at least
         GpuCards c = two(GpuMode::Peer);
-        CHECK(stage_cuts(c, 48, 2) == std::vector<int>({0, 38}));
-        CHECK(stage_cuts(c, 64, 44) == std::vector<int>({0, 51}));
+        CHECK(stage_cuts(c, 48, 2, ShareUse::Stages) == std::vector<int>({0, 38}));
+        CHECK(stage_cuts(c, 64, 44, ShareUse::Stages) == std::vector<int>({0, 51}));
         c.given = {0.5, 0.5};
-        CHECK(stage_cuts(c, 48, 2) == std::vector<int>({0, 24}));
-        CHECK(stage_cuts(c, 64, 44) == std::vector<int>({0, 44}));
+        CHECK(stage_cuts(c, 48, 2, ShareUse::Stages) == std::vector<int>({0, 24}));
+        CHECK(stage_cuts(c, 64, 44, ShareUse::Stages) == std::vector<int>({0, 44}));
         c.given = {0.999, 0.001};
-        CHECK(stage_cuts(c, 48, 2) == std::vector<int>({0, 47}));
+        CHECK(stage_cuts(c, 48, 2, ShareUse::Stages) == std::vector<int>({0, 47}));
         c.cards.push_back(c.cards[1]);
         c.given = {0.5, 0.25, 0.25};
-        CHECK(stage_cuts(c, 48, 2) == std::vector<int>({0, 24, 36}));
+        CHECK(stage_cuts(c, 48, 2, ShareUse::Stages) == std::vector<int>({0, 24, 36}));
+    }
+    {
+        // streamed stages: a peer keeps at most its link's share. PCIe 5.0 x16 and x8 (2:1) leave the 5060 Ti its
+        // bandwidth fifth; two alike cards on 4.0 x8 and 3.0 x4 give the peer the link's fifth, not half; a link not
+        // known, or a stage that holds its weights, follows the bandwidth; gpu-share wins
+        GpuCards c = two(GpuMode::Peer);
+        c.cards[0].link_bytes = 16 * 3.938e9;
+        c.cards[1].link_bytes = 8 * 3.938e9;
+        CHECK(stage_cuts(c, 48, 2, ShareUse::StreamedStages) == std::vector<int>({0, 38}));
+        CHECK_EQ(shares_for(c, ShareUse::StreamedStages).from, "bandwidth");
+        c.cards[0].info.mem_gbps = c.cards[1].info.mem_gbps = 448;
+        c.cards[0].link_bytes = 8 * 1.969e9;
+        c.cards[1].link_bytes = 4 * 0.985e9;
+        CHECK(stage_cuts(c, 48, 2, ShareUse::StreamedStages) == std::vector<int>({0, 38}));
+        const Shares s = shares_for(c, ShareUse::StreamedStages);
+        CHECK(near(s.of[0] + s.of[1], 1.0) && s.of[1] < 0.21 && s.of[1] > 0.19);
+        CHECK_EQ(s.from, "bandwidth, links");
+        CHECK(stage_cuts(c, 48, 2, ShareUse::Stages) == std::vector<int>({0, 24}));
+        c.cards[1].link_bytes = 0;
+        CHECK(stage_cuts(c, 48, 2, ShareUse::StreamedStages) == std::vector<int>({0, 24}));
+        c.cards[1].link_bytes = 4 * 0.985e9;
+        c.given = {0.5, 0.5};
+        CHECK(stage_cuts(c, 48, 2, ShareUse::StreamedStages) == std::vector<int>({0, 24}));
     }
 
     // ---- peer hooks: the deal by layer block, one by one, the stages, the refusals and each card's part
@@ -272,6 +295,29 @@ int main() {
         CHECK_EQ(err, "gpu-mode peer: GPU 1 (RTX 5060 Ti) would hold nothing: the main card holds every expert; use gpu 0");
     }
     {
+        // a stage's part names its layers and the shares, always: the one the cut follows, the PCIe link's and the VRAM
+        // bandwidth's. Two alike cards on 4.0 x8 and 3.0 x4: a streamed stage follows the link, one that holds its
+        // weights the bandwidth, and gpu-share wins over both
+        GpuCards c = two(GpuMode::Peer);
+        c.cards[0].info.mem_gbps = c.cards[1].info.mem_gbps = 448;
+        c.cards[0].link_bytes = 8 * 1.969e9;
+        c.cards[1].link_bytes = 4 * 0.985e9;
+        PeerSpec s;
+        s.stage_layers = 48;
+        s.stage_lo = 2;
+        s.stage_streams = true;
+        std::string err;
+        PeerPlacement p = deal_peers(c, s, {0, 0}, err);
+        CHECK(err.empty());
+        CHECK_EQ(peer_part(p, 1, 48), "prompt layers 38-47: 10 layers, share 0.20 (PCIe link 0.20, VRAM bandwidth 0.50)");
+        s.stage_streams = false;
+        p = deal_peers(c, s, {0, 0}, err);
+        CHECK_EQ(peer_part(p, 1, 48), "prompt layers 24-47: 24 layers, share 0.50 (PCIe link 0.20, VRAM bandwidth 0.50)");
+        c.given = {0.75, 0.25};
+        p = deal_peers(c, s, {0, 0}, err);
+        CHECK_EQ(peer_part(p, 1, 48), "prompt layers 36-47: 12 layers, share 0.25 (PCIe link 0.20, VRAM bandwidth 0.50)");
+    }
+    {
         // the driver: every peer card opened, then the rooms, the deal and the placement; each card's part after; stages
         FakePeer f;
         f.rooms = {0, 50 + 3 * 1000};
@@ -286,7 +332,8 @@ int main() {
         CHECK(f.peer_open(two(GpuMode::Peer), err) && err.empty() && f.placed && f.opened == std::vector<int>({1}));
         CHECK(f.got.homes == 3 && f.got.stage_first == std::vector<int>({0, 38}));
         CHECK_EQ(f.peer_report(0), "dense, KV");
-        CHECK_EQ(f.peer_report(1), "30 experts, layers 0-9, prompt layers 38-47");
+        CHECK_EQ(f.peer_report(1), "30 experts, layers 0-9, prompt layers 38-47: 10 layers, share 0.20 (PCIe link -, VRAM "
+                                   "bandwidth 0.20)");
         // one card, or another mode: nothing opens
         FakePeer one;
         GpuCards solo = two(GpuMode::One);
@@ -340,8 +387,10 @@ int main() {
     // ---- the start lines
     {
         GpuCards c = two(GpuMode::Peer);
-        CHECK_EQ(gpu_start_line(c), "gpus: peer; RTX 5090 (nvidia-smi 0) main, share 0.80; RTX 5060 Ti (nvidia-smi 1) peer, share 0.20 "
-                                    "(bandwidth)");
+        CHECK_EQ(gpu_start_line(c), "gpus: peer; RTX 5090 (nvidia-smi 0) main; RTX 5060 Ti (nvidia-smi 1) peer");
+        c.given = {0.75, 0.25};
+        CHECK_EQ(gpu_start_line(c), "gpus: peer; RTX 5090 (nvidia-smi 0) main, share 0.75; RTX 5060 Ti (nvidia-smi 1) peer, share 0.25 "
+                                    "(gpu-share)");
         c.mode = GpuMode::Split;
         c.given = {0.75, 0.25};
         CHECK_EQ(gpu_start_line(c), "gpus: split; RTX 5090 (nvidia-smi 0) main, share 0.75; RTX 5060 Ti (nvidia-smi 1) split, share 0.25 "

@@ -65,7 +65,15 @@ PeerPlacement deal_peers(const GpuCards& c, const PeerSpec& s, const std::vector
                 return p;
             }
     }
-    if (s.stage_layers > 0) p.stage_first = stage_cuts(c, s.stage_layers, s.stage_lo);
+    if (s.stage_layers > 0) {
+        const ShareUse use = s.stage_streams ? ShareUse::StreamedStages : ShareUse::Stages;
+        p.stage_first = stage_cuts(c, s.stage_layers, s.stage_lo, use);
+        p.stage_share = shares_for(c, use).of;
+        GpuCards rates = c;   // the two rates' own shares, whatever gpu-share gives
+        rates.given.clear();
+        p.stage_bandwidth = shares_for(rates, ShareUse::Stages).of;
+        p.stage_link = link_shares(c);
+    }
     return p;
 }
 
@@ -82,7 +90,17 @@ std::string peer_part(const PeerPlacement& p, size_t card, int stage_layers) {
     }
     if (card > 0 && card < p.stage_first.size()) {
         const int e = card + 1 < p.stage_first.size() ? p.stage_first[card + 1] : stage_layers;
-        part += (part.empty() ? "" : ", ") + std::string("prompt layers ") + std::to_string(p.stage_first[card]) + "-" + std::to_string(e - 1);
+        const auto share = [&](const std::vector<double>& v) {
+            if (card >= v.size()) return std::string("-");
+            char s[16];
+            std::snprintf(s, sizeof s, "%.2f", v[card]);
+            return std::string(s);
+        };
+        char t[192];
+        std::snprintf(t, sizeof t, "prompt layers %d-%d: %d layers, share %s (PCIe link %s, VRAM bandwidth %s)",
+                      p.stage_first[card], e - 1, e - p.stage_first[card], share(p.stage_share).c_str(),
+                      share(p.stage_link).c_str(), share(p.stage_bandwidth).c_str());
+        part += (part.empty() ? "" : ", ") + std::string(t);
     }
     return part;
 }

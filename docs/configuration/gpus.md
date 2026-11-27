@@ -24,7 +24,7 @@ in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
   valid forms in the message ([upgrading](../changelog/0.5.7.md#upgrading)).
 
 ```
-gpus: peer; RTX 5090 (nvidia-smi 0) main, share 0.80; RTX 5060 Ti (nvidia-smi 1) peer, share 0.20 (bandwidth)
+gpus: peer; RTX 5090 (nvidia-smi 0) main; RTX 5060 Ti (nvidia-smi 1) peer
 ```
 
 The start prints this line before the load and each card's part after it. `--gpu-plan` prints the choice as JSON, with the mode and
@@ -58,7 +58,7 @@ Shares are normalized to sum to 1 and stay fixed for the run. What a share divid
 | --- | --- | --- |
 | split | each card's bytes: its layers' weights plus their KV and state at the context and slots; the cut is the layer nearest the shares | free VRAM at start |
 | peer, experts | the experts the main card does not hold, dealt hottest first to the peers; the main card fills first | free VRAM of the peers |
-| peer, prompt layers | the layers of a long prompt's chunk: the main card reads the first part, each card the next by share | memory bandwidth |
+| peer, prompt layers | the layers of a long prompt's chunk: the main card reads the first part, each card the next by share | memory bandwidth; on Flash-Next, whose stages stream their experts over each card's PCIe link, a peer at most its link's share |
 | peer, the main card's hot share | only with `gpu-share`: Flash-Next interleaves the hottest experts between the main card and a peer by share | off: the main card keeps the hottest |
 
 A part that does not fit its card is refused with the numbers (what it needs, what is free); lower that card's `gpu-share`,

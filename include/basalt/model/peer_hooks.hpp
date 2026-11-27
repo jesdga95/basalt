@@ -34,6 +34,9 @@ struct PeerSpec {
     bool main_holds_all = false;    ///< Blocks: the main card holds every expert, why a peer dealt nothing is refused
     /// A long prompt's chunk read in stages: a stage reads within layers [stage_lo, stage_layers); 0: no stages.
     int stage_layers = 0, stage_lo = 0;
+    /// A stage streams its layers' weights over its card's link every chunk, so the links cap the stages' shares
+    /// (ShareUse::StreamedStages); else they hold them on the card (ShareUse::Stages).
+    bool stage_streams = false;
 };
 
 /// What the driver dealt, indexed by card as GpuCards::cards is (0 = the main card).
@@ -44,6 +47,9 @@ struct PeerPlacement {
     std::vector<int64_t> held;      ///< expert deal: per card, the experts it holds
     std::vector<uint64_t> bytes;    ///< expert deal: per card, their bytes
     std::vector<int> stage_first;   ///< stages: card i reads [stage_first[i], stage_first[i + 1]) of a chunk's layers
+    std::vector<double> stage_share;      ///< stages: per card, the share the cut follows
+    std::vector<double> stage_link;       ///< stages: per card, its share by PCIe link (empty: a link not known)
+    std::vector<double> stage_bandwidth;  ///< stages: per card, its share by VRAM bandwidth
 };
 
 /// The deal of what `s` divides over the peers of `c`, within each peer's `room` (bytes, per card; the main card's unused)

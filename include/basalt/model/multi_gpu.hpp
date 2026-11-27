@@ -22,6 +22,7 @@ struct GpuCards {
         int index = 0;                  ///< the number the user types for it in gpu
         std::string label;              ///< "GPU 1 (RTX 5060 Ti)", that number and the name
         uint64_t free = 0;              ///< bytes free at start, before any load
+        double link_bytes = 0;          ///< its PCIe link, bytes per second (core::device_rates); 0 when unknown
     };
     program::GpuMode mode = program::GpuMode::One;
     std::vector<Card> cards;
@@ -37,15 +38,21 @@ enum class ShareUse {
     Split,      ///< a split's layer bytes: free VRAM at start
     Experts,    ///< a peer's experts outside the main card: free VRAM at start
     Stages,     ///< a peer's prompt stages, the layers of a chunk: memory bandwidth
+    /// prompt stages that stream their layers' weights over each card's link every chunk: memory bandwidth, each peer
+    /// at most its link's share
+    StreamedStages,
 };
 
 struct Shares {
     std::vector<double> of;             ///< one per card, summing to 1
-    std::string from;                   ///< "gpu-share", "free VRAM", "bandwidth" or "equal" (nothing known)
+    std::string from;                   ///< "gpu-share", "free VRAM", "bandwidth", "bandwidth, links" or "equal"
 };
 
 /// The shares of `use` for the cards.
 Shares shares_for(const GpuCards& c, ShareUse use);
+
+/// Each card's share by its PCIe link (Card::link_bytes), summing to 1; empty when a card's link is not known.
+std::vector<double> link_shares(const GpuCards& c);
 
 /// The shares of the cards after the main one, summing to 1 among them.
 std::vector<double> peer_shares(const GpuCards& c, ShareUse use);
@@ -83,15 +90,17 @@ std::vector<int> deal_experts(const std::vector<uint64_t>& bytes, const std::vec
 /// card holds every expert").
 std::string peer_holds_nothing(const GpuCards& c, size_t card, const std::string& why);
 
-/// A long prompt's chunk over the cards by the Stages shares: the main card reads layers [0, first[1]), card i layers
-/// [first[i], first[i + 1]), the last up to `n_layers`. A stage reads within [lo, n_layers), the layers its weights may
-/// hold, and every card reads one layer at least.
-std::vector<int> stage_cuts(const GpuCards& c, int n_layers, int lo);
+/// A long prompt's chunk over the cards by the shares of `use` (Stages or StreamedStages): the main card reads layers
+/// [0, first[1]), card i layers [first[i], first[i + 1]), the last up to `n_layers`. A stage reads within [lo, n_layers),
+/// the layers its weights may hold, and every card reads one layer at least.
+std::vector<int> stage_cuts(const GpuCards& c, int n_layers, int lo, ShareUse use);
 
 // ---- the start lines
 
-/// Before the load: "gpus: peer; RTX 5090 (nvidia-smi 0) main, share 0.80; RTX 5060 Ti (nvidia-smi 1) peer, share 0.20
-/// (bandwidth)"; one card: "gpus: RTX 5090 (nvidia-smi 0)". Peer shows the Stages shares, split the Split shares.
+/// Before the load: "gpus: split; RTX 5090 (nvidia-smi 0) main, share 0.75; RTX 5060 Ti (nvidia-smi 1) split, share 0.25
+/// (free VRAM)"; one card: "gpus: RTX 5090 (nvidia-smi 0)". Split shows the Split shares; peer only gpu-share's
+/// ("gpus: peer; RTX 5090 (nvidia-smi 0) main; RTX 5060 Ti (nvidia-smi 1) peer" without it: the model's part after the load
+/// shows its cut).
 std::string gpu_start_line(const GpuCards& c);
 
 /// After the load, from each card's part as its model reports it: "gpus: RTX 5090 dense, KV, ...; RTX 5060 Ti ...".
