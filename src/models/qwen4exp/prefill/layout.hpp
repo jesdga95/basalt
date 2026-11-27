@@ -63,6 +63,10 @@ constexpr int64_t FP4_MIN_TOKENS = 1024;
 // The peer card takes the rows of routed-only chunks up to this size, no more: past it a slower peer's share binds the
 // chunk.
 constexpr int64_t kPeerSlowRows = 2559;
+// An NVFP4 pack on a peer without FP4 tensor cores (sm_89): the peer computes its experts with MMQ's integer
+// per-16-scale dot, and past this size its share binds the chunk.  On an RTX 5090 with an RTX 4080 peer the share is
+// x1.26 at 256 tokens, x1.13 at 512, x1.00 at 768 and x0.85 at 1,000 against the main card alone.
+constexpr int64_t kPeerNoFp4Rows = 767;
 constexpr size_t al256(size_t v) { return (v + 255) & ~(size_t) 255; }
 
 struct Fp4Ptrs {

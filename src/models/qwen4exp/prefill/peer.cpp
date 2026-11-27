@@ -63,24 +63,31 @@ static PeerShare::Dims share_dims(int64_t Tp, int64_t G, const MmqPlan& mp) {
     return d;
 }
 
-// The longest routed-only chunk the peer takes for chunks of up to `chunk` tokens.
-static int64_t peer_tokens(int64_t chunk) { return std::min<int64_t>({chunk, kPeerSlowRows, stream_all_min() - 1}); }
+// The longest routed-only chunk peer card `dev` takes for chunks of up to `chunk` tokens: an NVFP4 pack's share on a
+// card without FP4 tensor cores stops at kPeerNoFp4Rows, the main card's FP4 path being the faster past it.
+static int64_t peer_tokens(int64_t chunk, int dev) {
+    int major = 0;
+    const bool no_fp4 = fp4_pack() && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        major < 10;
+    return std::min<int64_t>({chunk, no_fp4 ? kPeerNoFp4Rows : kPeerSlowRows, stream_all_min() - 1});
+}
 
-uint64_t Prefill::peer_bytes(int64_t chunk) {
+uint64_t Prefill::peer_bytes(int64_t chunk, int peer_dev) {
     if (!mmq_plan().any) return 0;
-    const int64_t Tp = peer_tokens(chunk);
+    const int64_t Tp = peer_tokens(chunk, peer_dev);
     return PeerShare::peer_bytes(share_dims(Tp, Tp, mmq_plan()));
 }
 
 bool Prefill::set_peer(core::PeerExperts* peer, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
-    // The peer takes the rows of the routed-only chunks (below stream_all_min()) up to kPeerSlowRows tokens: the
-    // activations and result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.
+    // The peer takes the rows of the routed-only chunks (below stream_all_min()) up to kPeerSlowRows tokens
+    // (kPeerNoFp4Rows for an NVFP4 pack on a card without FP4 tensor cores): the activations and result rows cross
+    // through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
-    pp->T_max = peer_tokens(m.T_max);
+    pp->T_max = peer_tokens(m.T_max, peer->device());
     pp->G = pp->T_max;   // one expert never has more rows than the chunk has tokens
     pp->cap_rows = pp->T_max * K;
     int prim = 0;

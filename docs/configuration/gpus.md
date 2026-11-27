@@ -128,10 +128,15 @@ One older architecture can be built for the peer's kernels: sm_89 (Ada), beside 
 flag (off by default to keep build times down). Without it, or for any other pre-Blackwell card, the card is refused at the start.
 What such a peer does:
 
-- It holds experts and computes their rows in every decode window with the standard-CUDA kernels (Q8_1/Q2_0 and the GGUF i-quant
-  rows, dp4a arithmetic). It reads its experts' share of a prompt chunk under the slower-card rule (chunks up to 2,559 rows).
+- It holds experts and computes their rows in every decode window with the standard-CUDA kernels (Q8_1/Q2_0, NVFP4 and the GGUF
+  i-quant rows, dp4a arithmetic). It reads its experts' share of a prompt chunk under the slower-card rule (chunks up to 2,559 rows).
+- An NVFP4 pack's experts run there too: in decode on the NVFP4 rows, in a prompt chunk on `mmq_nvfp4`'s integer per-16-scale dot.
+  From 1,024 rows the main card reads its NVFP4 experts on the FP4 tensor cores, so beside it the peer's share binds a chunk sooner:
+  Flash-Next's peer takes chunks up to 767 rows (RTX 5090 with an RTX 4080 peer: x1.36 at 512 rows; with 2,559 rows the share
+  was x0.85 at 1,000 rows and x0.69 at 2,048).
+- Flash-Next's two-stage verify head gives the peer its share of the vocabulary (`q80p_vhead`), as on an sm_120 peer.
 - It does not run the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4 tensor-core expert kernels stay
-  on the Blackwell card, so an NVFP4 pack's FP4 experts are main-card only.
+  on the Blackwell card.
 - Only Flash-Next's peer kernels are built for it; the other models refuse an sm_89 card. Split and tensor need sm_120 cards
   (`gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on sm_120 cards`).
 

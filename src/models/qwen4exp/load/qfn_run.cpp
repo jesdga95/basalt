@@ -1,6 +1,10 @@
 // The whole start of a Flash-Next engine, in order: its stack frames hold the resources while the server runs.
+#include <cuda_runtime.h>
+
 #include "basalt/core/diag.hpp"
+#include "basalt/core/cuda_cc.hpp"
 #include "basalt/core/device.hpp"
+#include "basalt/core/prompt_stage.hpp"
 #include "basalt/core/shipped_profiles.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -76,6 +80,20 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // the prompt-time layer split over the expert tier cards (PromptStage), every card a stage; with --batch a read splits
     // only while no slot decodes
     bool split_want = o.serve && o.peer_device >= 1;
+    // a stage reads its layers with the prompt kernels of the main card: a PEER_ADA build has an older card's kernels only for
+    // the expert tier, so such a peer holds experts and no prompt layers
+    for (const int d : o.peer_devices) {
+        int major = 0, minor = 0;
+        if (split_want && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess &&
+            !basalt::core::cuda_cc_is_ours(major, minor)) {
+            basalt::core::log_prompt_split_off("basalt generate", "CUDA" + std::to_string(d) + " is sm_" +
+                                                                      std::to_string(major * 10 + minor) +
+                                                                      ", the prompt layers' kernels are " +
+                                                                      basalt::core::cuda_cc_name() + " only");
+            split_want = false;
+        }
+    }
     basalt::core::PeerExperts::set_min_scratch((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(basalt::kernels::cpu::MAXT * 10, basalt::kernels::cpu::H, basalt::kernels::cpu::FF));
     basalt::core::set_peer_portable(o.peer_device >= 1 || split_mode);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_disk_mib > 0 && o.conversation_cache_dir.empty()) {
