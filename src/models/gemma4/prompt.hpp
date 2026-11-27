@@ -27,6 +27,11 @@ class PromptPath {
 public:
     ~PromptPath();
     bool init(const Gemma4Model& m, std::string& err);
+    /// [vision] The buffers go back to the driver while a request's pictures are read (no chunk runs then: ENC comes between
+    /// calls, each of which syncs its stream), and come back before the next chunk; `unpark` fails when the card no longer
+    /// has their room.
+    void park();
+    bool unpark(std::string& err);
     /// The device bytes init takes for a model of geometry `g`, MLP width `n_ff_pad` (NVFP4 or FP8), `context` positions and
     /// caches of `kv`; `mxfp8`: some layer's experts are MXFP8 (their buffers are carved too).
     static uint64_t bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv, bool mxfp8);

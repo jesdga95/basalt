@@ -88,11 +88,29 @@ PromptPath::~PromptPath() {
 
 bool PromptPath::init(const Gemma4Model& m, std::string& err) {
     m_ = &m;
-    Carve c;
-    layout(c, m.geo(), m.n_ff_pad(), m.mlp_nvfp4(), m.context(), m.kv_type(), m.mxfp8_experts());
-    if (cudaMalloc(&base_, c.at) != cudaSuccess || cudaMallocHost((void**) &io_h_, 2 * (size_t) kChunk * 4) != cudaSuccess ||
+    if (cudaMallocHost((void**) &io_h_, 2 * (size_t) kChunk * 4) != cudaSuccess ||
         cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming) != cudaSuccess) {
         cudaGetLastError();
+        err = "out of memory for the prompt path\x27s staging";
+        return false;
+    }
+    return unpark(err);
+}
+
+void PromptPath::park() {
+    if (!base_) return;
+    cudaFree(base_);
+    base_ = nullptr;
+}
+
+bool PromptPath::unpark(std::string& err) {
+    if (base_) return true;
+    const Gemma4Model& m = *m_;
+    Carve c;
+    layout(c, m.geo(), m.n_ff_pad(), m.mlp_nvfp4(), m.context(), m.kv_type(), m.mxfp8_experts());
+    if (cudaMalloc(&base_, c.at) != cudaSuccess) {
+        cudaGetLastError();
+        base_ = nullptr;
         err = "out of memory for the prompt path\x27s buffers";
         return false;
     }

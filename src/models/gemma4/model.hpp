@@ -66,6 +66,8 @@ struct DrafterWeights {
     std::vector<DrafterLayer> layers;
 };
 
+class PromptPath;
+
 class Gemma4Model final : public model::LoadedModel {
 public:
     Gemma4Model();
@@ -96,9 +98,18 @@ public:
     std::weak_ptr<void>& shared() { return shared_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
     ImageEncoder& encoder() const { return vis_; }
+    /// [vision] The sessions' prompt path (session.cpp's shared scratch registers it, null once it is gone): its buffers are
+    /// the room the image encoder borrows.
+    void set_prompt(PromptPath* p) const { prompt_ = p; }
 
 private:
     bool mxfp8_experts_ = false;
+    // [vision] the image encoder's lender: the prompt path's buffers go back to the driver while pictures are read
+    bool lend_room(uint64_t bytes, std::string& err);
+    void refill();
+    mutable PromptPath* prompt_ = nullptr;
+    bool parked_ = false;
+    uint64_t card_spare_ = 0;   ///< the free VRAM the plan keeps beside the caches
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err);
     /// An FP8 matrix, or with `nvfp4` an NVFP4-planes one; its bytes added to `bytes`.
     bool mat(const std::string& name, int64_t rows, int64_t K, core::LoadPlan& reads, int file, Mat& m, std::string& err,

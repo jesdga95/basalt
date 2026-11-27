@@ -62,8 +62,10 @@ struct Shared {
     int32_t* io = nullptr;                                                              // tokens [R], positions [R]
     model::BatchShared batch;
     PromptPath prompt;
+    const Gemma4Model* owner = nullptr;   // registered the prompt path as the image encoder's lender
     std::vector<void*> bufs;
     ~Shared() {
+        if (owner) owner->set_prompt(nullptr);
         for (void* p : bufs) cudaFree(p);
     }
     bool init(const Gemma4Model& m, std::string& err) {
@@ -117,7 +119,10 @@ struct Shared {
             err = "out of device memory for the forward's scratch";
             return false;
         }
-        return prompt.init(m, err);
+        if (!prompt.init(m, err)) return false;
+        owner = &m;
+        m.set_prompt(&prompt);
+        return true;
     }
     template <class F>
     void g_alloc(F& f, int64_t R, int64_t FF) {
