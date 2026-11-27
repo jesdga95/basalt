@@ -56,6 +56,7 @@ public:
             slot_sampling.resize((size_t) o.batch);
         }
         conversations.emplace((size_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots);
+        conversations->set_slot_pin(o.conversation_cache_slot_pin);
         if (o.conversation_cache_disk_mib > 0) {
             const auto t0 = Clock::now();
             std::string text = "basalt conversation state " + model_.desc().arch + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
@@ -64,6 +65,7 @@ public:
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;
             disk.set_row_cells(session().disk_row_cells());
+            disk.set_fifo(o.conversation_cache_disk_fifo);   // before the open: the start's own eviction uses it
             if (o.prompt_cache <= 0) {
                 basalt::log::warn("basalt serve", "conversation cache on disk off: --prompt-cache 0");
             } else if (!disk.open(o.conversation_cache_dir, identity, (uint64_t) o.conversation_cache_disk_mib << 20, de)) {

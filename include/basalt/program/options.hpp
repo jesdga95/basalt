@@ -136,6 +136,10 @@ struct CommonOptions {
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
+    /// --serve (--conversation-cache-slot-pin): the idle batch slots' parked conversations count against BOTH caps
+    /// above like the budgeted ones, the oldest parked of either kind leaving first; off (default) the idle kind
+    /// stays outside the byte budget, capped by its caller's count, the kinds staying separate.
+    bool conversation_cache_slot_pin = false;
     int64_t conversation_cache_min_free_mib = 2560;
     int conversation_cache_min_tokens = 0;   ///< --serve: park only conversations of at least N tokens (0 = park every one)
     /// --serve: the folder of the disk tier (the server names one inside the model cache folder): a conversation
@@ -143,6 +147,10 @@ struct CommonOptions {
     /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)
     std::string conversation_cache_dir;
     int64_t conversation_cache_disk_mib = 0;   ///< byte budget of the disk tier, least recently used first; above 0 turns it on
+    /// --serve (--conversation-cache-disk-fifo): over that budget the disk tier drops the conversation it took first
+    /// instead of the least recently used one - the copy a harness parked first leaves first, a freshly spilled one
+    /// survives.  Off (default): least recently used, as before.
+    bool conversation_cache_disk_fifo = false;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;

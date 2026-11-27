@@ -287,7 +287,9 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         if cdir and cmib != "0" and a.debug:
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
-        engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
+        engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True,
+                               slot_identity=a.conversation_cache_slot_identity,
+                               slot_pin=a.conversation_cache_slot_pin)
         if cfg.get("log"):                              # follow the engine's log file
             print(f"[server] engine log: {cfg['log']}", flush=True)
             echo_engine_line = engine_echo(engine)

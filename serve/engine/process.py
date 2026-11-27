@@ -285,9 +285,18 @@ class ProcessEngine:
         self.__dict__.setdefault("_ptl", threading.local()).state = None
 
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False):
+                 env: dict | None = None, lazy: bool = False,
+                 slot_identity: tuple[str, ...] | None = None, slot_pin: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
         self.model_path = flag_value(args, "--model") or ""
+        # the two slot knobs, both the server's own settings handed over at construction: the pin keeps a
+        # session to the slot it owns (when the setting is on the server also hands the engine its
+        # --conversation-cache-slot-pin word), and the identity names say which headers the server keyed its
+        # sessions by
+        if "slot_pin" not in self.__dict__:         # a restart re-runs this with the same words, not with
+            self.slot_pin = bool(slot_pin)           # the server's settings: keep what it first got
+        if "slot_identity" not in self.__dict__:
+            self.slot_identity = tuple(slot_identity or ())
         self.quit_s = QUIT_DISK_S if (flag_value(args, "--conversation-cache-disk-mib") or "0") != "0" else QUIT_S
         self.log_path = log
         self.proc, self.pump, self.err_pump, self.log = None, None, None, None
@@ -442,6 +451,9 @@ class ProcessEngine:
         # wherever and copied in.  A session may hold several slots: parallel agents of one session (a subagent
         # sends its parent's header), a retry while the first request runs.
         self.slot_owner: dict[int, str] = {}
+        # requests asleep in the admission lane that wait for a slot they own: with the pin on, no other
+        # session's pick takes a slot such a sleeper owns - its next turn's conversation sits there
+        self.pin_wait: dict[str, int] = {}
         # the request thread that last took each slot: the slot table shows a running request on its own slot
         self.slot_thread: list[int | None] = [None] * self.batch
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
@@ -1401,7 +1413,8 @@ class ProcessEngine:
                                         break
                                     cur_meets = meets()
                                     slot = self.pick_slot(cur_meets, size(), session)
-                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size())):
+                                    waiting_for_slot = slot is None
+                                    if not waiting_for_slot and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size())):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
                                         slot_gen = self.gen
@@ -1416,7 +1429,7 @@ class ProcessEngine:
                                         self.ctl.release()
                                         holding = False
                                         self.slot_cv.notify_all()
-                                    self.slot_cv.wait(timeout=10.0)
+                                    self._pin_sleep(session, waiting_for_slot)   # _pin_sleep: only a slot wait holds
                                     if cancel.is_set():
                                         return
                             if refresh:
@@ -1698,10 +1711,25 @@ class ProcessEngine:
         prompt continues first (the longest held prefix - a conversation stays where its K/V sits), then an unowned
         slot (the longest held prefix, else an empty one, then the least recently used), then the session's other
         own slot, and only then another session's: that owner lost its conversation.  None when none is free.
-        Read-only: `claim_slot` records the choice."""
+        Read-only: `claim_slot` records the choice.  With `conversation-cache-slot-pin` on the rules are
+        stricter: a session that owns a slot gets that slot when it is free and nothing when it is busy
+        (never a second one), and a slot stays with a session asleep on it, so the request that woke up for
+        it is not left standing somewhere else."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        if self.slot_pin:
+            # the pin's no-drift rule, ahead of every spread: a session that owns a slot uses that one slot
+            # and no other - its own if free, else it waits for the K/V sitting there
+            own = [b for b in free if session is not None and self.slot_owner.get(b) == session]
+            if own:
+                return own[0]
+            if session is not None and any(o == session for o in self.slot_owner.values()):
+                return None                       # its own slot is busy: wait for the K/V there, no second copy
+            waits = {b for b, o in self.slot_owner.items() if o in self.pin_wait}
+            free = [b for b in free if b not in waits]
+            if not free:
+                return None                       # every free slot is one its owner is on its way back to
 
         def held_prefix(b):
             return meet[b] if 0 < meet[b] < size else 0
@@ -1726,7 +1754,49 @@ class ProcessEngine:
         self.slot_thread[slot] = threading.get_ident()
         if session is None:
             return
+        if self.slot_pin:      # the pin's one-slot promise: a session's other binding (a pin toggled onto a
+            for b in [b for b, o in self.slot_owner.items() if o == session and b != slot]:
+                del self.slot_owner[b]             # multi-slot holder, or a rebinding after a theft) is given up
         self.slot_owner[slot] = session
+
+    def _pin_hold(self, session: str | None) -> None:
+        """Keeps a waiting request's own slots out of other sessions' picks (caller holds slot_cv, and only
+        while the pin is on): the hold covers the window in which the own slot - BUSY now with a turn of
+        its own - goes idle while its owner sleeps, so the wake-up finds its K/V where it left it instead
+        of another session's conversation parked in it. _pin_sleep decides which sleeps hold. The owner's
+        own pick is unaffected: pick_slot answers a pinned session its own slot before the holds filter."""
+        if self.slot_pin and session is not None:
+            if any(o == session for o in self.slot_owner.values()):
+                self.pin_wait[session] = self.pin_wait.get(session, 0) + 1
+
+    def _pin_release(self, session: str | None) -> None:
+        """Ends that hold on the way back to the pick, counted, so that several requests of one session end
+        their waits one by one and none of them keeps a slot it could have taken itself."""
+        if self.slot_pin and session is not None and session in self.pin_wait:
+            n = self.pin_wait[session] - 1
+            if n > 0:
+                self.pin_wait[session] = n
+            else:
+                del self.pin_wait[session]
+
+    def _pin_sleep(self, session: str | None, waiting_for_slot: bool) -> None:
+        """The admission lane's sleep (caller holds slot_cv): wait on the lane's condition, holding the
+        session's own slot out of other sessions' picks only while the sleep waits FOR A SLOT. A sleep that
+        already saw a slot waits for the admission lane alone: the queue in front of it can run for a whole
+        turn, and an own IDLE slot held through that stands empty with nobody able to use it - a bounded
+        stall every other session pays. What letting it go costs, and to whom: only a session that owns no
+        slot can be handed the idle own slot by pick_slot (every bound session gets its own slot or nothing),
+        and when that happens the thief's claim moves the binding, the owner's parked K/V there is lost and
+        rebuilds the way a shed one rebuilds, and its next pick spreads. A slot nobody took the owner's
+        own-first pick simply takes back - one conversation in one slot either way, the pin's promise kept."""
+        hold = waiting_for_slot and self.slot_pin and session is not None
+        if hold:
+            self._pin_hold(session)
+        try:
+            self.slot_cv.wait(timeout=10.0)
+        finally:
+            if hold:
+                self._pin_release(session)
 
     def slot_view(self) -> list[dict]:
         """Per batch slot: the thread whose request runs in it (None when idle) and the tokens it holds for the
