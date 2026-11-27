@@ -1751,6 +1751,13 @@ target_link_libraries(shipped_profiles_test PRIVATE platform)
 target_include_directories(shipped_profiles_test PRIVATE include)
 basalt_cpu_test(NAME shipped_profiles_test COMMAND shipped_profiles_test)
 
+add_executable(ple_reader_ram_test tests/ngram/ple_reader_ram_test.cpp src/ngram/ple_reader.cpp)
+target_link_libraries(ple_reader_ram_test PRIVATE platform warnings Threads::Threads)
+target_include_directories(ple_reader_ram_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+basalt_embed_manifest(ple_reader_ram_test)
+basalt_cpu_test(NAME ple_reader_ram_test COMMAND ple_reader_ram_test)
+set_tests_properties(ple_reader_ram_test PROPERTIES TIMEOUT 60)
+
 if(BASALT_MODEL_QWEN4EXP)
 # the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
 add_executable(ple_reader_test tests/ngram/ple_reader_test.cpp)
