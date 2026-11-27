@@ -94,7 +94,7 @@ Flow Request::complete() {
                 (long long) dc.ram_blobs, (long long) dc.file_blobs, dc.file_mb, (long long) read_n,
                 (long long) dc.offloaded, (long long) windows);
     std::fflush(stdout);
-    // no swap stays in flight between requests: the last round's copies land once the reply is out
+    // Drain the main adaptive pipeline once the reply is out. A peer refill can still own an unpublished slot.
     if (!tiers_settle()) {
         std::printf("ERR an adaptive refill failed\n");
         return Flow::error;

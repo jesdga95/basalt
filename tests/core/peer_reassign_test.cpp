@@ -41,6 +41,7 @@ void run(const FixtureFile& file, size_t bytes, bool exclusive) {
     PeerExperts peer;
     check(peer.prepare(1, src, layers, experts, dim, dim, err), err);
     check(peer.open_slots(std::vector<int64_t>(2, (int64_t) bytes), err), err);
+    check(peer.slot_stats().unaccounted == 2, "slots without an owner");
     for (int e = 0; e < 2; ++e) {
         peer.admit(0, e, e);
         peer.slot_in(e, src.blob(0, e), 0, bytes);
@@ -51,7 +52,8 @@ void run(const FixtureFile& file, size_t bytes, bool exclusive) {
     auto verify = [&](int a, int b) {
         const auto& r = peer.residency();
         const auto s = peer.slot_stats();
-        check(s.allocated == 2 && s.mapped == 2 && s.in_flight == 0 && s.loaned == 0, "settled slot counts");
+        check(s.allocated == 2 && s.mapped == 2 && s.in_flight == 0 && s.loaned == 0 && s.unaccounted == 0,
+              "settled slot counts");
         check(r[a] >= 0 && r[b] >= 0 && r[a] != r[b] &&
               std::count_if(r.begin(), r.end(), [](int s) { return s >= 0; }) == 2, "lost or aliased peer slot");
         std::vector<uint8_t> read(bytes);
@@ -76,6 +78,9 @@ void run(const FixtureFile& file, size_t bytes, bool exclusive) {
     move(4, 2, src.blob(0, 2));          // the promotion source has no peer mapping
     check(peer.adapt(usage.data(), main.data(), 1, err), err);
     if (exclusive) {
+        const auto eviction = peer.slot_stats();
+        check(eviction.mapped == 2 && eviction.in_flight == 1 && eviction.unaccounted == 0,
+              "an evicting slot is still mapped and should count once");
         check(!src.has_resident(0, 0), "victim already had a RAM home");
         move(1, 2, src.blob(0, 2));     // another slot wants the pending eviction's destination
         move(0, 3, src.blob(0, 3));     // eviction still owns this victim, its D2H must finish
@@ -89,7 +94,8 @@ void run(const FixtureFile& file, size_t bytes, bool exclusive) {
 
     move(2, 3, src.blob(0, 3));        // a normal promotion queues its replacement
     const auto refilling = peer.slot_stats();
-    check(refilling.allocated == 2 && refilling.mapped == 1 && refilling.in_flight == 1, "refill ownership counts");
+    check(refilling.allocated == 2 && refilling.mapped == 1 && refilling.in_flight == 1 && refilling.unaccounted == 0,
+          "refill ownership counts");
     move(1, 3, src.blob(0, 3));        // the same destination cannot own two slots
     peer.apply_pending(true);
     verify(1, 3);
@@ -104,7 +110,8 @@ void run(const FixtureFile& file, size_t bytes, bool exclusive) {
         std::vector<std::pair<int32_t, int32_t>> lent;
         check(peer.lend(0, lent, err), err);
         const auto borrowed = peer.slot_stats();
-        check(borrowed.allocated == 2 && borrowed.mapped == 0 && borrowed.loaned == 2, "loaned slot counts");
+        check(borrowed.allocated == 2 && borrowed.mapped == 0 && borrowed.loaned == 2 && borrowed.unaccounted == 0,
+              "loaned slot counts");
         check(peer.give_back(lent, err), err);
         check(peer.slot_stats().loaned == 2, "loan remains until refill lands");
         check(peer.give_back_wait(lent, err), err);

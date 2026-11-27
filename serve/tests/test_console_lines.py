@@ -134,13 +134,13 @@ class Lines(unittest.TestCase):
 class Hardware(unittest.TestCase):
     def test_peer_slots_follow_the_card_bus(self):
         info = {"cards": "0000:01:00.0/2/-/1/0;0000:08:00.0/4/-/2/0",
-                "peer_slots": "00000000:08:00.0/4/3/1/0/1/2/3/4/5;bad/3;0000:01:00.0/2/x/0/0/0/0/0/0/0"}
+                "peer_slots": "00000000:08:00.0/4/3/1/0/1/2/3/4/5/0;bad/3;0000:01:00.0/2/x/0/0/0/0/0/0/0/0"}
         cards, l3 = engine_facts(info)
         current = {"gpus": [{"index": 1}, {"index": 0}]}
         static = {"gpus": [{"index": 0, "bus": "0000:01:00.0"}, {"index": 1, "bus": "0000:08:00.0"}]}
         peer, main = hardware_view(current, static, info, cards, l3)["gpus"]
         self.assertNotIn("peer_slots", main)
-        self.assertEqual(peer["peer_slots"], {"allocated": 4, "mapped": 3, "in_flight": 1, "loaned": 0,
+        self.assertEqual(peer["peer_slots"], {"allocated": 4, "mapped": 3, "in_flight": 1, "loaned": 0, "unaccounted": 0,
                          "skipped_refills": {"no_source_mapping": 1, "source_in_flight": 2, "destination_mapped": 3,
                                              "missing_host_copy": 4, "destination_in_flight": 5}})
 

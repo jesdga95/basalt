@@ -207,16 +207,18 @@ def parse_cards(words) -> dict[str, dict]:
 
 
 def parse_peer_slots(words) -> dict[str, dict]:
-    """The peer tiers' slot state and cumulative promotion-refill skips at the last settled boundary."""
+    """The peer tiers' slot state and cumulative promotion-refill skips at the request boundary."""
     counts = ("allocated", "mapped", "in_flight", "loaned")
     reasons = ("no_source_mapping", "source_in_flight", "destination_mapped", "missing_host_copy", "destination_in_flight")
     out = {}
     for part in str(words or "").split(";"):
         bus, *fields = part.split("/")
-        if not bus or len(fields) != len(counts) + len(reasons) or not all(v.isdecimal() for v in fields):
+        if (not bus or len(fields) != len(counts) + len(reasons) + 1 or not all(v.isdecimal() for v in fields[:-1])
+                or not fields[-1].removeprefix("-").isdecimal()):
             continue
         values = list(map(int, fields))
-        out[norm_bus(bus)] = {**dict(zip(counts, values)), "skipped_refills": dict(zip(reasons, values[len(counts):]))}
+        out[norm_bus(bus)] = {**dict(zip(counts, values)), "unaccounted": values[-1],
+                              "skipped_refills": dict(zip(reasons, values[len(counts):-1]))}
     return out
 
 

@@ -203,6 +203,7 @@ public:
         size_t mapped = 0;
         size_t in_flight = 0;   ///< includes evictions whose source is still mapped
         size_t loaned = 0;      ///< until the borrowed slots have been refilled and remapped
+        int64_t unaccounted = 0;
         RefillSkips skipped_refills;
     };
     /// Read on the tier's owning thread, outside the decode loop.

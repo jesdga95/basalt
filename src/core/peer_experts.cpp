@@ -675,11 +675,17 @@ std::vector<size_t> PeerExperts::incoming() const {
 
 PeerExperts::SlotStats PeerExperts::slot_stats() const {
     const size_t allocated = cache_.slots();
-    std::vector<bool> mapped(allocated);
-    for (const int32_t slot : res_)
-        if (slot >= 0 && (size_t) slot < allocated) mapped[(size_t) slot] = true;
-    return {allocated, (size_t) std::count(mapped.begin(), mapped.end(), true),
-            pending_.size() + evicting_.size(), loaned_, refill_skips_};
+    std::vector<bool> owned(allocated);
+    const auto claim = [&](int32_t slot) {
+        if (slot >= 0 && (size_t) slot < allocated) owned[(size_t) slot] = true;
+    };
+    for (const int32_t slot : res_) claim(slot);
+    const size_t mapped = (size_t) std::count(owned.begin(), owned.end(), true);
+    for (const auto& p : pending_) claim(p.second);
+    for (const Evict& x : evicting_) claim(x.slot);
+    // Borrowing clears each slot's mapping and requires an empty transfer queue.
+    const int64_t unaccounted = std::count(owned.begin(), owned.end(), false) - (int64_t) loaned_;
+    return {allocated, mapped, pending_.size() + evicting_.size(), loaned_, unaccounted, refill_skips_};
 }
 
 bool PeerExperts::reassign(int64_t layer, int32_t in, int64_t lout, int32_t out, const uint8_t* blob, std::string& err) {

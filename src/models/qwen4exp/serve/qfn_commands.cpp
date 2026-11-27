@@ -63,6 +63,7 @@ void QfnRuntime::stats_peer_slots() {
                           k.no_source_mapping, k.source_in_flight, k.destination_mapped,
                           k.missing_host_copy, k.destination_in_flight})
             snapshot += '/' + std::to_string(n);
+        snapshot += '/' + std::to_string(s.unaccounted);
     };
     append(peer);
     for (const auto& tier : xpeers) append(*tier);
