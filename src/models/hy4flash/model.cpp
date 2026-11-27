@@ -75,6 +75,14 @@ const DevTensor* Hy4Model::tensor(const std::string& name) const {
 bool Hy4Model::embedding_row(int32_t token, float* out) const {
     const uint64_t n = (uint64_t) geo().n_embd;
     if (token < 0 || (int64_t) token >= geo().n_vocab) return false;
+    if (embd_type_ == kTypeBF16) {
+        const uint16_t* row = reinterpret_cast<const uint16_t*>(embd_.data()) + (uint64_t) token * n;
+        for (uint64_t i = 0; i < n; ++i) {
+            const uint32_t u = (uint32_t) row[i] << 16;
+            std::memcpy(out + i, &u, 4);
+        }
+        return true;
+    }
     const uint8_t* row = embd_.data() + (uint64_t) token * (n / 32) * 34;
     for (uint64_t b = 0; b < n / 32; ++b) dequantize_q8_0(row + b * 34, out + b * 32);
     return true;
@@ -156,9 +164,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     uint64_t dense = 0;
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight") {
-            if (t.type != kTypeQ8_0 || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
-                return {model::Status::Error, "hy4flash: token_embd.weight is not Q8_0 [n_embd][vocab]"};
+            if ((t.type != kTypeQ8_0 && t.type != kTypeBF16) || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
+                return {model::Status::Error, "hy4flash: token_embd.weight is not Q8_0 or BF16 [n_embd][vocab]"};
             }
+            embd_type_ = t.type;
             embd_.resize(t.bytes);
             core::LoadItem it;
             it.file = file;
