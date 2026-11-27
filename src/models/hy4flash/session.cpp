@@ -2983,6 +2983,9 @@ private:
         pd = Pending{};
         pd.on = true;
         pd.tl = tl;
+        // Submit pending promotions before arming the peer's wait kernel, so a
+        // peer copy is not submitted behind a GPU wait for this layer's plan.
+        tier_->pump(tl, 2 + G);
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer_for(tl);
         if (peer) {
@@ -2991,7 +2994,6 @@ private:
             if (!peer->arm(limited, h_x_, G, K, core::policy::peer_groups(G), err)) return false;
             pd.peer = peer;
         }
-        tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
         if (!await_ids(err)) return false;
         int32_t uniq[kLookupK];
         int uidx[kLookupK], nu = 0;
