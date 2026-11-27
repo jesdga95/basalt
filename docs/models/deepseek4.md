@@ -24,10 +24,13 @@ from token ID 1. The default all-RAM tier exhausted VRAM during its post-pin all
 left 160 experts per layer file-backed. This is a bring-up smoke only, not a quality or performance result.
 
 The session currently supports one conversation and positions 0–127. It does not yet maintain the V4 compressed/indexer
-cache, so longer requests are refused. The vision planner, patch formatter, and transformer/projector encoder exist, but
-image encoding is not connected to the session or dynamic memory give-back. The attention primitive accepts windows up to
-eight rows and matches sequential one-row output/cache state bitwise; this does not yet establish session window parity.
-Do not describe the model as production-ready until cache, image prefill, serving, and quality gates pass.
+cache, so longer requests are refused. The session now decodes and encodes images with the V4 planner, transformer, and
+projector, then releases encoder objects and returns any borrowed expert-cache memory in `images_done()`. On the sample
+Basalt logo it produced 197 image rows in 417 ms, but prompt execution refused those rows because compressed-cache image
+prefill is not connected. That run does not verify end-to-end image understanding or zero idle memory. The attention
+primitive accepts windows up to eight rows and matches sequential one-row output/cache state bitwise; this does not yet
+establish session window parity. Do not describe the model as production-ready until cache, image prefill, serving, and
+quality gates pass.
 
 ## Architecture and ownership
 
