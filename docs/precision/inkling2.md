@@ -68,10 +68,18 @@ as fast as through MMQ.
   numerator drops that scale before the split merge, while the softmax denominator sums the unscaled fp32 probabilities. A
   row's arithmetic is the same alone and in a verify window at the same key count, but not bit-identical to the scalar
   reader, which shallower rows and the sliding-window layers keep.
+- **Slices:** both INT8 readers split a full-cache row's keys into slices of whole 128-key passes, sized by the row's own
+  key count, and merge them in fp32 in slice order. The most slices an INT8 row takes follows the card's multiprocessor
+  count (the count whose launches end in whole waves, 63 on an 84-SM card, logged at load as `attention slices`). A row
+  of more than 128 keys a slice at that count can take larger slices than at 64: at 63, exactly the rows that would take
+  64 slices; at a smaller count, more rows. Moving the slice boundaries changes the fp32 merge order and, in the
+  tensor-core reader, the running maximum a tile's probabilities are taken against before they round to fp16, so such a
+  row can round differently from a card with another count. On one card, a row's bits do not depend on its window. FP16
+  and FP8 caches take at most 64 slices on every card.
 
 ### Cost of the tensor-core INT8 reader
 
-The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16`, `--kv fp8` and shallower INT8 rows run the scalar reader unchanged.
+The tensor-core reader (full-attention rows of an INT8 cache at 32,768 keys and more) rounds the query and the softmax probabilities to fp16 where the scalar reader keeps fp32, so it is a new rounding and costs a little quality. It acts only under `--kv int8`; `--kv fp16` and `--kv fp8` keep their own tensor-core reader and shallower INT8 rows the scalar reader, unchanged.
 
 Two measurements against the scalar INT8 reader of the same build, with the same weights and forced tokens (and the same expert placement, except where a row says otherwise).
 
