@@ -1,9 +1,10 @@
 // src/models/gemma4/model.hpp - a loaded Gemma 4 pack: every weight on the main card (the projections FP8 E4M3 with a
-// scale per matrix, the experts of a layer in one run of NVFP4 blobs, the head FP8 rows with a scale per row), the token
-// embedding in mapped host memory.
+// scale per matrix, or the MLP's NVFP4 planes, the experts of a layer in one run of NVFP4 blobs, the head FP8 rows with a
+// scale per row), the token embedding in mapped host memory.
 #pragma once
 
 #include "basalt/model/adapter.hpp"
+#include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/models/gemma4/kernels.hpp"
 #include "models/gemma4/pack.hpp"
@@ -20,11 +21,13 @@ constexpr int64_t kDefaultContext = 8192;
 /// Rows of a prompt chunk (prompt.hpp): a window layer's ring holds its window and a chunk.
 constexpr int kChunk = 2048;
 
-/// An FP8 E4M3 matrix [rows][K] and its device FP32 scale (per matrix, or per row for the head).
-struct F8Mat {
+/// A projection [rows][K]: FP8 E4M3 codes, or NVFP4 planes (kernels/nvfp4_planes.hpp), and its device FP32 scale (per
+/// matrix, or per row for the FP8 head).
+struct Mat {
     const uint8_t* w = nullptr;
     const float* scale = nullptr;
     int64_t rows = 0, K = 0;
+    basalt::kernels::wgemm::Format fmt = basalt::kernels::wgemm::Format::F8;
 };
 
 struct LayerWeights {
@@ -32,7 +35,7 @@ struct LayerWeights {
     RopeTab rope;                         ///< the layer kind's rotary tables
     const float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *post_attn = nullptr;
     const float *ffn_norm = nullptr, *post_ffw = nullptr, *scalar = nullptr;
-    F8Mat q, k, v, o, gate, up, down;     ///< v empty on a layer whose keys are its values
+    Mat q, k, v, o, gate, up, down;       ///< v empty on a layer whose keys are its values; the MLP's three FP8 or NVFP4
     // the experts (a layer with experts)
     const float *post_ffw1 = nullptr, *post_ffw2 = nullptr, *pre_ffw2 = nullptr;
     const float* router = nullptr;        ///< F32 [n_expert][n_embd], its input scale folded in
@@ -50,7 +53,7 @@ struct DrafterLayer {
     RopeTab rope;
     const float *attn_norm = nullptr, *q_norm = nullptr, *post_attn = nullptr, *ffn_norm = nullptr, *post_ffw = nullptr;
     const float* scalar = nullptr;
-    F8Mat q, o, gate, up, down;
+    Mat q, o, gate, up, down;
 };
 
 /// Google's assistant drafter (gemma4.assistant.*): [the anchor's embedding | the model's last normed state] projected
@@ -58,7 +61,7 @@ struct DrafterLayer {
 struct DrafterWeights {
     int n_embd = 0;
     int64_t n_ff_pad = 0;
-    F8Mat pre, post, head;
+    Mat pre, post, head;
     const float* out_norm = nullptr;
     std::vector<DrafterLayer> layers;
 };
@@ -77,10 +80,11 @@ public:
     const Geometry& geo() const { return pack_.geo; }
     const LayerWeights& layer(int l) const { return layers_[(size_t) l]; }
     const uint16_t* embedding() const { return embd_dev_; }   ///< BF16 [n_vocab][n_embd], mapped host memory
-    const F8Mat& head() const { return head_; }               ///< rows n_vocab, a scale per row
+    const Mat& head() const { return head_; }               ///< rows n_vocab, a scale per row
     const float* output_norm() const { return output_norm_; }
     const float* ones() const { return ones_; }               ///< [n_embd] of 1: the router input's unweighted norm
     int64_t n_ff_pad() const { return n_ff_pad_; }            ///< the MLP's inner width as the products read it
+    bool mlp_nvfp4() const { return mlp_nvfp4_; }             ///< the MLP's projections are NVFP4 planes (else FP8)
     KvType kv_type() const { return kv_; }
     int device() const { return device_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
@@ -94,8 +98,9 @@ public:
 
 private:
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err);
-    bool f8(const std::string& name, int64_t rows, int64_t K, core::LoadPlan& reads, int file, F8Mat& m, std::string& err,
-            bool per_row = false);
+    /// An FP8 matrix, or with `nvfp4` an NVFP4-planes one; its bytes added to `bytes`.
+    bool mat(const std::string& name, int64_t rows, int64_t K, core::LoadPlan& reads, int file, Mat& m, std::string& err,
+             bool per_row = false, bool nvfp4 = false);
     void* device_buf(uint64_t bytes);
 
     Pack pack_;
@@ -105,11 +110,13 @@ private:
     std::vector<void*> dev_;                 ///< every device allocation, freed with the model
     uint16_t* embd_host_ = nullptr;          ///< pinned, mapped
     uint16_t* embd_dev_ = nullptr;
-    F8Mat head_;
+    Mat head_;
     float* output_norm_ = nullptr;
     float* ones_ = nullptr;
     RopeTab rope_swa_, rope_full_;
     int64_t n_ff_pad_ = 0;
+    bool mlp_nvfp4_ = false;
+    uint64_t weight_bytes_ = 0;              ///< the card's projection and head bytes
     KvType kv_ = KvType::F16;
     int device_ = 0, fd_ = -1;
     int64_t ctx_ = kDefaultContext;
@@ -125,6 +132,8 @@ std::unique_ptr<model::ModelSession> make_session(Gemma4Model& model, std::strin
 /// chunk's rows, a full layer's cells), its logits and graphs.
 uint64_t session_bytes(const Geometry& g, int64_t context, KvType kv);
 /// The device bytes every session shares once on the card: the forward's scratch and the prompt path's.
-uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv);
+uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv);
+/// The split-K workspace of the decode window's NVFP4 MLP products (floats of partial sums, tickets); 0 for FP8.
+void mlp_workspace(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, size_t& partial, size_t& tickets);
 
 }  // namespace basalt::models::gemma4

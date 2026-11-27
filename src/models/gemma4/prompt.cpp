@@ -6,6 +6,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
+#include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "models/gemma4/model.hpp"
@@ -17,6 +18,7 @@ namespace basalt::models::gemma4 {
 namespace bk = basalt::kernels;
 namespace fp8 = basalt::prefill::fp8;
 namespace fp4 = basalt::prefill::fp4;
+namespace fp4d = basalt::prefill::fp4_dense;
 
 // One allocation carved into the chunk\x27s buffers; with no base it only counts, so the sizing and the allocation agree.
 struct PromptPath::Carve {
@@ -31,7 +33,7 @@ struct PromptPath::Carve {
     }
 };
 
-void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, int64_t context, KvType kv) {
+void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, bool mlp_nvfp4, int64_t context, KvType kv) {
     const size_t C = kChunk, E = (size_t) g.n_embd;
     size_t qmax = 0, kmax = 0;
     for (int l = 0; l < g.n_layers; ++l) {
@@ -44,6 +46,7 @@ void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, int64_t context,
     q_ = c.take<float>(C * qmax), qp_ = c.take<float>(C * qmax), k_ = c.take<float>(C * kmax), v_ = c.take<float>(C * kmax);
     g_ = c.take<float>(C * (size_t) F), u_ = c.take<float>(C * (size_t) F);
     act_ = c.take<uint8_t>(fp8::act_bytes((int64_t) C, (int64_t) std::max({E, qmax, (size_t) F})));
+    if (mlp_nvfp4) a4m_ = c.take<uint8_t>(fp4d::act_bytes((int64_t) C, (int64_t) std::max(E, (size_t) F))), gsm_ = c.take<float>(C);
     size_t one = 0;   // a full layer's cache cell whose keys are its values
     for (int l = 0; l < g.n_layers; ++l)
         if (g.shape(l).one) one = std::max(one, (size_t) g.shape(l).n_kv * g.shape(l).hd);
@@ -61,10 +64,10 @@ void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, int64_t context,
     h_ = c.take<float>(P * Fe), ex_ = c.take<float>(P * E);
 }
 
-uint64_t PromptPath::bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv) {
+uint64_t PromptPath::bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv) {
     PromptPath p;
     Carve c;
-    p.layout(c, g, n_ff_pad, context, kv);
+    p.layout(c, g, n_ff_pad, mlp_nvfp4, context, kv);
     return c.at;
 }
 
@@ -77,7 +80,7 @@ PromptPath::~PromptPath() {
 bool PromptPath::init(const Gemma4Model& m, std::string& err) {
     m_ = &m;
     Carve c;
-    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type());
+    layout(c, m.geo(), m.n_ff_pad(), m.mlp_nvfp4(), m.context(), m.kv_type());
     if (cudaMalloc(&base_, c.at) != cudaSuccess || cudaMallocHost((void**) &io_h_, 2 * (size_t) kChunk * 4) != cudaSuccess ||
         cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming) != cudaSuccess) {
         cudaGetLastError();
@@ -85,7 +88,7 @@ bool PromptPath::init(const Gemma4Model& m, std::string& err) {
         return false;
     }
     c = Carve{static_cast<uint8_t*>(base_)};
-    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type());
+    layout(c, m.geo(), m.n_ff_pad(), m.mlp_nvfp4(), m.context(), m.kv_type());
     return true;
 }
 
@@ -151,12 +154,21 @@ void PromptPath::layers(int rows, int64_t pos0, bool span, const std::vector<Seg
         fp8::gemm(w.o.w, E, qd, w.o.scale, act_, rows, tmp_, E, fp8::Epilogue::Store, st);
         add_norm(x_, tmp_, w.post_attn, eps, rows, E, st);
         // the MLP
-        fp8::rms_norm_quantize(x_, w.ffn_norm, eps, rows, E, act_, nullptr, st);
-        const fp8::Segment gu[2] = {{w.gate.w, w.gate.rows, w.gate.scale, g_, F}, {w.up.w, w.up.rows, w.up.scale, u_, F}};
-        fp8::gemm_segmented(gu, 2, E, act_, rows, fp8::Epilogue::Store, st);
-        gelu_mul(g_, u_, rows, g.n_ff, F, F, g_, st);
-        fp8::quantize(g_, rows, F, F, act_, st);
-        fp8::gemm(w.down.w, E, F, w.down.scale, act_, rows, mlp_, E, fp8::Epilogue::Store, st);
+        if (m.mlp_nvfp4()) {
+            fp4d::rms_norm_quantize(x_, w.ffn_norm, eps, rows, E, a4m_, gsm_, nullptr, st);
+            fp4d::product(w.gate.w, w.gate.scale, F, E, a4m_, gsm_, rows, g_, F, false, st);
+            fp4d::product(w.up.w, w.up.scale, F, E, a4m_, gsm_, rows, u_, F, false, st);
+            gelu_mul(g_, u_, rows, g.n_ff, F, F, g_, st);
+            fp4d::quantize(g_, rows, F, F, a4m_, gsm_, st);
+            fp4d::product(w.down.w, w.down.scale, E, F, a4m_, gsm_, rows, mlp_, E, false, st);
+        } else {
+            fp8::rms_norm_quantize(x_, w.ffn_norm, eps, rows, E, act_, nullptr, st);
+            const fp8::Segment gu[2] = {{w.gate.w, w.gate.rows, w.gate.scale, g_, F}, {w.up.w, w.up.rows, w.up.scale, u_, F}};
+            fp8::gemm_segmented(gu, 2, E, act_, rows, fp8::Epilogue::Store, st);
+            gelu_mul(g_, u_, rows, g.n_ff, F, F, g_, st);
+            fp8::quantize(g_, rows, F, F, act_, st);
+            fp8::gemm(w.down.w, E, F, w.down.scale, act_, rows, mlp_, E, fp8::Epilogue::Store, st);
+        }
         FfnEnd fe;
         fe.x = x_, fe.mlp = mlp_, fe.n_post = w.post_ffw, fe.scalar = w.scalar, fe.eps = eps;
         if (g.moe()) {   // the router reads the residual unweighted-normed, the experts its pre_ffw2 norm
