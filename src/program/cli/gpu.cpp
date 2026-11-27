@@ -102,7 +102,9 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     }
     // a split hands a window's activations from one card to the next and a peer reads its experts device to device: both
     // want peer access, which every pair opts into once per process
-    if (gc.cards.size() > 1) {
+    if (gc.cards.size() > 1 && o.no_peer_access) {
+        basalt::log::info("basalt", "peer access: off (--no-peer-access): card-to-card copies go through host");
+    } else if (gc.cards.size() > 1) {
         int tried = 0;
         const int pairs = basalt::core::enable_peer_access((int) gc.cards.size(), tried);
         if (tried > 0) basalt::log::info("basalt", "peer access: %d of %d ordered pairs enabled", pairs, tried);

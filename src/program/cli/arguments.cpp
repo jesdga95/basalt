@@ -129,6 +129,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             o.stop_eos = true;
         }
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
+        else if (a == "--no-peer-access") o.no_peer_access = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--resident-budget-gib") {
             const double gib = std::atof(next("--resident-budget-gib"));
