@@ -29,6 +29,11 @@ void indexer_project_q8_0(const void* w_q, const uint16_t* w_proj, const float* 
                           const float* rope_angle, int n_tokens, float* q_out, float* head_weights,
                           void* workspace, size_t workspace_bytes, void* stream);
 
+void indexer_round_bf16(const float* qr, int n_tokens, float* qr_bf16, void* stream);
+void indexer_project_post(const uint16_t* w_proj, const float* q_raw, const float* x,
+                          const float* rope_angle, int n_tokens, float* w_raw, float* q_out,
+                          float* head_weights, void* stream);
+
 /// Scores compressed indexer keys and writes each query's top rows in descending score order, with lower row ids first
 /// on ties. q is [n_tokens][64][128], head_weights is [n_tokens][64] and already includes the source scale
 /// 1/sqrt(64*128), keys is [n_comp][128]. The output is [n_tokens][512], padded with -1; n_selected is [n_tokens].

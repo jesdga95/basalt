@@ -14,7 +14,7 @@ namespace {
 constexpr int kRatio = 4;
 constexpr int kThreads = 1024;
 constexpr int kWarps = kThreads / 32;
-constexpr int kMaxTokens = 8;
+constexpr int kMaxTokens = 128;
 constexpr int kMaxRows = 1 << 20;
 constexpr int kSingleBlockRows = 12288;
 constexpr int kSelectThreads = 1024;

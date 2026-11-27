@@ -208,4 +208,27 @@ void indexer_project_q8_0(const void* w_q, const uint16_t* w_proj, const float* 
     check(cudaGetLastError(), "head-weight scaling launch");
 }
 
+void indexer_round_bf16(const float* qr, int n_tokens, float* qr_bf16, void* stream) {
+    if (!qr || !qr_bf16 || !stream || n_tokens < 1)
+        throw std::invalid_argument("deepseek4 indexer_round_bf16: invalid arguments");
+    round_bf16_kernel<<<((size_t) n_tokens * QRank + 255) / 256, 256, 0, (cudaStream_t) stream>>>(
+        qr, n_tokens * QRank, qr_bf16);
+    check(cudaGetLastError(), "indexer_round_bf16 launch");
+}
+
+void indexer_project_post(const uint16_t* w_proj, const float* q_raw, const float* x,
+                          const float* rope_angle, int n_tokens, float* w_raw, float* q_out,
+                          float* head_weights, void* stream) {
+    if (!w_proj || !q_raw || !x || !rope_angle || !w_raw || !q_out || !head_weights || !stream || n_tokens < 1)
+        throw std::invalid_argument("deepseek4 indexer_project_post: invalid arguments");
+    const cudaStream_t s = (cudaStream_t) stream;
+    gemv_bf16_kernel<<<dim3((H + GemvWarps - 1) / GemvWarps, n_tokens), 32 * GemvWarps, 0, s>>>(
+        w_proj, x, n_tokens, Embd, H, w_raw);
+    check(cudaGetLastError(), "head-weight projection launch");
+    indexer_query_post_kernel<<<n_tokens * H, D, 0, s>>>(q_raw, rope_angle, n_tokens, q_out);
+    check(cudaGetLastError(), "query transform launch");
+    scale_head_weights_kernel<<<(n_tokens * H + 127) / 128, 128, 0, s>>>(w_raw, n_tokens, head_weights);
+    check(cudaGetLastError(), "head-weight scaling launch");
+}
+
 }  // namespace basalt::models::deepseek4

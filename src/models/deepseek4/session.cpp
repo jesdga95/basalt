@@ -1038,9 +1038,12 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
           *normalized = nullptr, *hc_workspace = nullptr, *logits = nullptr, *route_weights = nullptr,
           *shared = nullptr, *routed = nullptr, *chunk_q_latent = nullptr, *chunk_kv_proj = nullptr,
           *chunk_kv_row = nullptr, *chunk_out_latent = nullptr, *tile_q_heads = nullptr, *tile_mqa_out = nullptr,
-          *tile_comp_kv = nullptr, *tile_comp_score = nullptr, *tile_idx_kv = nullptr, *tile_idx_score = nullptr;
+          *tile_comp_kv = nullptr, *tile_comp_score = nullptr, *tile_idx_kv = nullptr, *tile_idx_score = nullptr,
+          *tile_idx_qr_bf16 = nullptr, *tile_idx_q_raw = nullptr, *tile_idx_q_out = nullptr,
+          *tile_idx_w_raw = nullptr, *tile_idx_hw = nullptr, *tile_idx_angles = nullptr;
     int32_t *route_ids = nullptr, *fixed_rows = nullptr, *chunk_pos = nullptr, *chunk_win_start = nullptr,
-            *chunk_win_n = nullptr, *chunk_comp_limit = nullptr, *tile_comp_row = nullptr, *hca_ids = nullptr;
+            *chunk_win_n = nullptr, *chunk_comp_limit = nullptr, *tile_comp_row = nullptr, *hca_ids = nullptr,
+            *tile_sel_ids = nullptr, *tile_sel_cnt = nullptr;
     uint8_t *fixed_mask = nullptr, *alternate_mask = nullptr;
     std::unique_ptr<PrefillFfn> prompt_ffn;
     const int hca_max_visible = std::max(1, (int) ((pos + total_tokens) / 16));
@@ -1074,6 +1077,14 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         tile_comp_score = static_cast<float*>(alloc((size_t) tile_cap * 1024 * sizeof(float)));
         tile_idx_kv = static_cast<float*>(alloc((size_t) tile_cap * 256 * sizeof(float)));
         tile_idx_score = static_cast<float*>(alloc((size_t) tile_cap * 256 * sizeof(float)));
+        tile_idx_qr_bf16 = static_cast<float*>(alloc((size_t) tile_cap * 1024 * sizeof(float)));
+        tile_idx_q_raw = static_cast<float*>(alloc((size_t) tile_cap * 64 * 128 * sizeof(float)));
+        tile_idx_q_out = static_cast<float*>(alloc((size_t) tile_cap * 64 * 128 * sizeof(float)));
+        tile_idx_w_raw = static_cast<float*>(alloc((size_t) tile_cap * 64 * sizeof(float)));
+        tile_idx_hw = static_cast<float*>(alloc((size_t) tile_cap * 64 * sizeof(float)));
+        tile_idx_angles = static_cast<float*>(alloc((size_t) tile_cap * 32 * sizeof(float)));
+        tile_sel_ids = static_cast<int32_t*>(alloc((size_t) tile_cap * kernels::kSparseMqaTopK * sizeof(int32_t)));
+        tile_sel_cnt = static_cast<int32_t*>(alloc((size_t) tile_cap * sizeof(int32_t)));
         tile_comp_row = static_cast<int32_t*>(alloc((size_t) tile_cap * sizeof(int32_t)));
         hca_ids = static_cast<int32_t*>(alloc((size_t) kExpertWindow * hca_max_visible * sizeof(int32_t)));
         chunk_pos = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
@@ -1084,8 +1095,10 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                              logits && route_ids && route_weights && shared && routed && fixed_rows &&
                              fixed_mask && alternate_mask && chunk_q_latent && chunk_kv_proj && chunk_kv_row &&
                              chunk_out_latent && tile_q_heads && tile_mqa_out && tile_comp_kv && tile_comp_score &&
-                             tile_idx_kv && tile_idx_score && tile_comp_row && hca_ids && chunk_pos &&
-                             chunk_win_start && chunk_win_n && chunk_comp_limit;
+                             tile_idx_kv && tile_idx_score && tile_idx_qr_bf16 && tile_idx_q_raw && tile_idx_q_out &&
+                             tile_idx_w_raw && tile_idx_hw && tile_idx_angles && tile_sel_ids && tile_sel_cnt &&
+                             tile_comp_row && hca_ids && chunk_pos && chunk_win_start && chunk_win_n &&
+                             chunk_comp_limit;
         if (bufs_ok) {
             std::string ffn_err;
             prompt_ffn = make_prefill_ffn(model_.weights(), *tier, cap, ffn_err);
@@ -1230,6 +1243,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                 kernels::sparse_mqa_q_head_norm_rope(tile_q_heads, chunk_pos + row, ropes_[(size_t) layer].attention,
                                                      attention.attention.q.head_rms_eps, b, stream_);
 
+                const int tile_visible = ratio ? (int) ((pos + offset + row + b) / ratio) : 0;
                 if (ratio) {
                     LayerCache& cache = layer_cache_[(size_t) layer];
                     if (ratio == 4) {
@@ -1244,6 +1258,27 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                             static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
                             cache.indexer_state_kv, cache.indexer_state_score,
                             reinterpret_cast<float*>(cache.indexer->data()), tile_comp_row, stream_);
+                        if (tile_visible > 0) {
+                            indexer_round_bf16(chunk_q_latent + (size_t) row * 1024, b, tile_idx_qr_bf16, stream_);
+                            if (!prompt_ffn->dense_mmq(tile_idx_qr_bf16, 1024, index_q->type, index_q->ptr,
+                                                       1024, 64 * 128, b, tile_idx_q_raw, 64 * 128, stream_, err_))
+                                return false;
+                            std::vector<float> angles((size_t) b * 32);
+                            for (int t = 0; t < b; ++t)
+                                for (int i = 0; i < 32; ++i)
+                                    angles[(size_t) t * 32 + i] =
+                                        (float) (pos + offset + row + t) * ropes_[(size_t) layer].frequency[(size_t) i];
+                            if (cudaMemcpyAsync(tile_idx_angles, angles.data(), angles.size() * sizeof(float),
+                                                cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+                                return fail_cuda("prompt indexer rope angles upload");
+                            indexer_project_post(static_cast<const uint16_t*>(index_proj->ptr), tile_idx_q_raw,
+                                normalized + (size_t) row * n, tile_idx_angles, b, tile_idx_w_raw,
+                                tile_idx_q_out, tile_idx_hw, stream_);
+                            indexer_select(tile_idx_q_out, tile_idx_hw,
+                                reinterpret_cast<const float*>(cache.indexer->data()),
+                                tile_visible, (int) (pos + offset + row), b, tile_sel_ids, tile_sel_cnt,
+                                indexer_select_workspace_, indexer_select_workspace_bytes(tile_visible), stream_);
+                        }
                     }
                     const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
                     project_and_compress(kind, ratio, geo_.n_embd, b, normalized + (size_t) row * n,
@@ -1270,30 +1305,13 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                     if (ratio) {
                         LayerCache& cache = layer_cache_[(size_t) layer];
                         const int visible = (int) ((sub_pos + count) / ratio);
-                        if (ratio == 4) {
-                            float angles[kExpertWindow * 32]{};
-                            for (int t = 0; t < count; ++t)
-                                for (int i = 0; i < 32; ++i)
-                                    angles[(size_t) t * 32 + i] = (float) (sub_pos + t) * ropes_[(size_t) layer].frequency[(size_t) i];
-                            if (cudaMemcpyAsync(indexer_rope_angles_, angles, (size_t) count * 32 * sizeof(float),
-                                                cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-                                return fail_cuda("prompt indexer rope angles upload");
-                            indexer_project_q8_0(index_q->ptr, static_cast<const uint16_t*>(index_proj->ptr),
-                                chunk_q_latent + (size_t) g_row * 1024, normalized + (size_t) g_row * n,
-                                indexer_rope_angles_, count, indexer_q_, indexer_head_weights_,
-                                indexer_project_workspace_, indexer_project_workspace_bytes(count), stream_);
-                            if (visible > 0) {
-                                indexer_select(indexer_q_, indexer_head_weights_,
-                                    reinterpret_cast<const float*>(cache.indexer->data()),
-                                    visible, (int) sub_pos, count, selected_ids_, indexer_select_count_,
-                                    indexer_select_workspace_, indexer_select_workspace_bytes(visible), stream_);
-                                sel.n_sel = kernels::kSparseMqaTopK;
-                                sel.sel = selected_ids_;
-                                sel.comp = cache.attention->data();
-                                sel.comp_type = kernels::MqaRowType::F32;
-                                sel.comp_limit = chunk_comp_limit + g_row;
-                            }
-                        } else if (visible > 0) {
+                        if (ratio == 4 && visible > 0) {
+                            sel.n_sel = kernels::kSparseMqaTopK;
+                            sel.sel = tile_sel_ids + (size_t) sub * kernels::kSparseMqaTopK;
+                            sel.comp = cache.attention->data();
+                            sel.comp_type = kernels::MqaRowType::F32;
+                            sel.comp_limit = chunk_comp_limit + g_row;
+                        } else if (ratio != 4 && visible > 0) {
                             sel.n_sel = hca_max_visible;
                             sel.comp = cache.attention->data();
                             sel.comp_type = kernels::MqaRowType::F32;
