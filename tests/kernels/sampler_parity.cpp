@@ -985,6 +985,63 @@ int split_parity(bool bench) {
     return bad;
 }
 
+// ---- `--dist`: the engine's final distribution of one logit row, for a reference outside this file.
+// tools/koboldcpp_sampler_reference.py writes a case as two lines - the parameters, then the logits - and reads
+// back the probability of every token under the chain's last step (0 outside the survivors).  The row is repeated
+// once per token so that `sample_tokens_split` can be asked for each token's probability in turn.
+int dist_loop() {
+    for (long case_no = 1;; ++case_no) {
+        int nv = 0, top_k = 0, split = 0;
+        basalt::kernels::SamplerParams p;
+        int read = std::scanf("%d %d %f %f %f %f %f %f %f %f %f %f %f %f %f %d", &nv, &top_k, &p.top_p, &p.min_p,
+                              &p.temperature, &p.tfs_z, &p.typical_p, &p.top_a, &p.xtc_prob, &p.xtc_thresh,
+                              &p.dyna_low, &p.dyna_high, &p.dyna_exp, &p.smooth_factor, &p.smooth_curve, &split);
+        if (read == EOF) break;
+        if (read != 16 || nv < 2 || nv > 4096) {
+            std::fprintf(stderr, "--dist: case %ld malformed (%d fields, n_vocab %d)\n", case_no, read, nv);
+            return 2;
+        }
+        std::vector<float> one((size_t) nv);
+        for (int v = 0; v < nv; ++v) {
+            if (std::scanf("%f", &one[(size_t) v]) != 1) {
+                std::fprintf(stderr, "--dist: case %ld: %d logits expected, fewer read\n", case_no, nv);
+                return 2;
+            }
+        }
+        p.top_k = top_k;
+        p.min_keep = 1;
+        if (split < 0) split = (top_k <= 0 || top_k > basalt::kernels::kSamplerNarrowMax) ? 3 : 2;
+        // one row per token, every row the same logits, so qprob[t] is the probability of token t
+        std::vector<float> rows((size_t) nv * nv);
+        std::vector<int> query((size_t) nv), out((size_t) nv);
+        for (int t = 0; t < nv; ++t) {
+            std::copy(one.begin(), one.end(), rows.begin() + (size_t) t * nv);
+            query[(size_t) t] = t;
+        }
+        float *dl = nullptr, *dp = nullptr;
+        int *dq = nullptr, *do_ = nullptr;
+        check(cudaMalloc(&dl, rows.size() * sizeof(float)), "dist logits");
+        check(cudaMalloc(&dp, out.size() * sizeof(float)), "dist probs");
+        check(cudaMalloc(&dq, query.size() * sizeof(int)), "dist query");
+        check(cudaMalloc(&do_, out.size() * sizeof(int)), "dist out");
+        check(cudaMemcpy(dl, rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice), "dist upload logits");
+        check(cudaMemcpy(dq, query.data(), query.size() * sizeof(int), cudaMemcpyHostToDevice), "dist upload query");
+        check(cudaMemset(dp, 0xFF, out.size() * sizeof(float)), "dist fill probs");
+        basalt::kernels::sample_tokens_split(split, dl, nv, nv, nullptr, 0, p, do_, dq, nv, dp, nullptr);
+        check(cudaDeviceSynchronize(), "dist run");
+        std::vector<float> prob((size_t) nv);
+        check(cudaMemcpy(prob.data(), dp, prob.size() * sizeof(float), cudaMemcpyDeviceToHost), "dist back");
+        for (int v = 0; v < nv; ++v) std::printf(v ? " %.9g" : "%.9g", prob[(size_t) v]);
+        std::printf("\n");
+        std::fflush(stdout);
+        cudaFree(dl);
+        cudaFree(dp);
+        cudaFree(dq);
+        cudaFree(do_);
+    }
+    return 0;
+}
+
 }  // namespace
 
 // ---- drawn drafts (speculative sampling): rows that carry a draft drawn from a proposal q keep it by min(1, p / q), else
@@ -1093,14 +1150,16 @@ int drawn_parity() {
 }
 
 int main(int argc, char** argv) {
-    bool selftest = false, bench = false, split = false, drawn = false;
+    bool selftest = false, bench = false, split = false, drawn = false, dist = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--selftest") selftest = true;
+        if (std::string(argv[i]) == "--dist") dist = true;
+        else if (std::string(argv[i]) == "--selftest") selftest = true;
         else if (std::string(argv[i]) == "--bench") bench = true;
         else if (std::string(argv[i]) == "--split") split = true;
         else if (std::string(argv[i]) == "--drawn") drawn = true;
-        else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench] [--split [--bench]] [--drawn]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench] [--split [--bench]] [--drawn] [--dist]\n"); return 2; }
     }
+    if (dist) return dist_loop();
     if (drawn) {
         const int bad = drawn_parity();
         std::printf(bad ? "DRAWN PARITY FAIL (%d)\n" : "DRAWN PARITY OK\n", bad);

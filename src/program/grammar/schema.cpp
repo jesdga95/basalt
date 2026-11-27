@@ -494,6 +494,15 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
         } else {
             gbnf = json_schema_to_gbnf(schema, err);
         }
+    } else if (kind->s == "gbnf") {
+        // a grammar written out: the raw-completion API's request field, held from the first generated token
+        const JsonValue* text = req.get("bnf");
+        if (!text || !text->is(Type::String)) {
+            err = "grammar: gbnf needs a string";
+            return out;
+        }
+        out.grammar = Grammar::parse(text->s, err);
+        return out;
     } else if (kind->s == "tools") {
         const JsonValue* tools = req.get("tools");
         if (!tools || !tools->is(Type::Array)) {

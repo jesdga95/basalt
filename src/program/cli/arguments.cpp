@@ -89,6 +89,11 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             if (v != "on" && v != "off") { basalt::log::error("basalt", "--grammar: on or off"); return 2; }
             o.grammar = v == "on";
         }
+        else if (a == "--more-samplers") {
+            const std::string v = next("--more-samplers");
+            if (v != "on" && v != "off") { basalt::log::error("basalt", "--more-samplers: on or off"); return 2; }
+            o.more_samplers = v == "on";
+        }
         else if (a == "--kv-pool") {
             const std::string v = next("--kv-pool");
             if (v != "on" && v != "off") { basalt::log::error("basalt", "--kv-pool: on or off"); return 2; }

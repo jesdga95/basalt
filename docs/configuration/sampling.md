@@ -14,6 +14,14 @@ default, then the engine's. `/props` reports what is in effect. An out-of-range 
 | `penalty_last_n` | 0..4096 | Window for the penalties (default 64). |
 | `seed` | integer | Fixes the draw for a reproducible sampled reply on Qwen3.8-27B; on Flash-Next the same seeded request repeats run to run for the same session history (the same requests in the same order, one at a time; see [adaptive tier](adaptive.md)). Without one, a request with `top_k` 1 to 64 on a model with a block drafter (Qwen3.8-27B) draws its drafts and keeps them by speculative sampling ([precision](../precision/qwen38-27b.md#sampling-with-drafts)): the same distribution, more drafts kept, but the text then depends on the windows the draft policy picks. |
 | `relaxed_drafting` | [0, 1] or `false` | This request's relaxed-drafting threshold. `false` or `0` forces exact sampling. |
+| `tfs` | [0, 1] | Tail-free sampling (koboldcpp's `sample_tail_free`): cut the list where its normalized second-derivative mass passes `tfs`. `0` or `1` is off. Needs `top_k` 1..64. |
+| `typical` | [0, 1] | Locally typical sampling: keep the smallest set of tokens whose shifted score holds `typical` of the mass. `0` or `1` is off. Needs `top_k` 1..64. |
+| `top_a` | [0, 1] | Keep tokens with p >= `top_a` * p_max². `0` is off. Needs `top_k` 1..64. |
+| `xtc_probability`, `xtc_threshold` | [0, 1], [0, 0.5] | XTC (llama.cpp's): with chance `xtc_probability`, drop the top tokens at or above `xtc_threshold` and keep the tail - an anti-repetition cut drawn from its own random stream, so toggling it does not shift the picks. Needs `top_k` 1..64. |
+| `dynatemp_min`, `dynatemp_max`, `dynatemp_exponent` | numbers >= 0 | Koboldcpp's dynamic temperature: the temperature becomes `min + (max - min) * (the surviving list's normalized entropy)^exponent`. Off while min = max (the default). Needs `top_k` 1..64. |
+| `smoothing_factor`, `smoothing_curve` | >= 0, number | Koboldcpp's smoothing: the divided logits reshape to `-(k*sf*(l-h)²) + (s*sf*(l-h)³) + h`, h their maximum, k = (3-curve)/2, s = (curve-1)/2. `smoothing_factor` 0 is off (the default); curve 1 is the linear-cubic default shape. Needs `top_k` 1..64. |
+| `mirostat` | 0 | Not supported: mirostat's state spans the reply, which the speculative decode windows cannot follow. A request with `mirostat` > 0 is a 400. |
+| `samplers_order` | list | Only the default `rep_pen, top_k, top_a, tfs, typical, top_p, temp` is accepted (the engine's chain is fixed); anything else is a 400. |
 
 Also read: `max_tokens` / `max_completion_tokens` (`0` or `-1` = the rest of the context), `stop`, `logit_bias`, `reasoning_effort`,
 `enable_thinking`, `reasoning_budget_tokens` (`0` = no thinking budget). Anthropic's `thinking.budget_tokens` is the same budget.
@@ -103,6 +111,21 @@ endpoint above is served, `"logprobs"` that logprobs come back on all three APIs
 ([logprobs](#logprobs)), `"documents"` that messages may carry PDF and text documents ([documents](documents.md)), and `"video"` (only
 while video is on) that this model takes video parts now (image input on, a model that reads video, FFmpeg found:
 [video](../running.md#video)). Later features add their names to the same list.
+
+## The optional samplers and raw grammars
+
+`tfs`, `typical`, `top_a`, `xtc_*`, `dynatemp_*` and `smoothing_factor` are off until the server is started with
+`--more-samplers on`: without it, a request on any API that switches one on gets a 400 naming the flag. The values
+that switch nothing (`tfs` 1, `top_a` 0, `smoothing_factor` 0, `dynatemp_min` = `dynatemp_max`...) pass either way.
+
+With `--gbnf-grammar on` a request on any generation API may hold its text to a grammar of its own: `grammar` is
+GBNF (llama.cpp's syntax), `grammar_schema` a JSON schema. It takes the place of what the request's response format
+asks for, and a request cannot hold both tools and a grammar. Without the flag such a request gets a 400. The grammar
+of tool calls and of `response_format` on the chat APIs is `--grammar`'s.
+
+`POST /v1/completions` and the KoboldCpp API (`POST /api/v1/generate`, `POST /api/extra/generate/stream`) continue the
+prompt as plain text: no chat template, no thinking, no tool parsing, so a grammar there is held from the first
+generated token.
 
 ## Thinking loops
 

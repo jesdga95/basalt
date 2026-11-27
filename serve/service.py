@@ -25,6 +25,7 @@ from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_str
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
+from serve.config import more_samplers_on
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobChannels, entry as logprob_entry
 from serve.config import GRAMMAR_DEFAULT
 from serve.monitor import Monitor
@@ -105,7 +106,8 @@ class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
-                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS):
+                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS,
+                 more_samplers: bool = False, gbnf_grammar: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written
         self.literals = self.dialect.literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
@@ -113,6 +115,9 @@ class Service:
         self.video_max_tokens = video_max_tokens      # one video's merged tokens over all its groups
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
         self.grammar_engine = grammar_engine          # the engine understands the request key
+        self.more_samplers = more_samplers            # --more-samplers on: requests may set the MORE_SAMPLERS keys
+        # a request's own grammar needs --gbnf-grammar on and an engine started with --grammar
+        self.gbnf_grammar = bool(gbnf_grammar and grammar_engine)
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
         self.vram_cv = threading.Condition()            # guards the queued resize; new requests wait while one is queued
@@ -545,6 +550,12 @@ class Service:
         else:
             why = f"{e}: {note}" if note else str(e)
         print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
+
+    def require_more_samplers(self, req: dict) -> None:
+        """A sampler --more-samplers did not turn on is refused rather than served without it."""
+        on = more_samplers_on(req)
+        if on and not self.more_samplers:
+            raise ValueError(", ".join(on) + ": start the server with --more-samplers on")
 
     def require_grammar(self, response_format) -> None:
         """A JSON response format the engine would not enforce is refused rather than silently served as free text."""
@@ -2037,6 +2048,268 @@ class Service:
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
+
+
+    def run_raw(self, text, max_new, sampling, cancel, session=None, live=None) -> Iterator[tuple[str, object]]:
+        """The raw-completion path (/v1/completions, /api/v1/generate): `text` is the model's prompt as sent -
+        no template, no thinking, no tool parsing; what the model writes is what the client gets.  Yields
+        ("piece", str) per decoded piece, ("ping", None) as heartbeat, ("done", {...}) last (finish,
+        completion_tokens, prompt_tokens, reused, timings).  `text` may be a PromptText (the engine tokenizes)
+        or a list of ids.  The server's sampling defaults fill the fields the request leaves out, as on the chat path."""
+        if self.sampling_defaults:
+            sampling = {**self.sampling_defaults, **{k: v for k, v in (sampling or {}).items() if v is not None}}
+        par = bool(getattr(self.engine, "batch", 0))
+        st = {} if par else self.status
+        rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate
+        wait_key = object()
+        ids = text
+        detok, n, finish = Detokenizer(self.tok), 0, "length"
+        stop_list = stop_strings(sampling)
+        stops = StopMatcher(stop_list) if stop_list else None
+        timings, before, reused0, prompt_ms0 = None, None, None, None
+        engine_last0 = getattr(self.engine, "last", None)
+        counted_last = engine_last0
+        path = getattr(self.request_ctx, "path", None) or "/v1/completions"
+        emb = getattr(self.embeddings, "path", None)
+        with self.status_lock:
+            self.status["queued"] += 1
+            if not par:
+                self.waiting[id(wait_key)] = {"api": "completions", "model": self.model,
+                                              "prompt_tokens": len(ids), "started": time.time()}
+        try:
+            try:
+                open_gate = yield from self._vram_gate(cancel)
+            except BaseException:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                    self.waiting.pop(id(wait_key), None)
+                raise
+            if not open_gate:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                    self.waiting.pop(id(wait_key), None)
+                yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                               "prompt_tokens": len(ids)}
+                return
+            turn = contextlib.ExitStack()
+            if not par:
+                got = False
+                try:
+                    while not got:
+                        got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                        if got:
+                            turn.callback(self.fifo.release)
+                        elif cancel.is_set():
+                            break
+                        else:
+                            yield "ping", None
+                except BaseException:
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
+                    raise
+                if not got:
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                   "prompt_tokens": len(ids)}
+                    return
+            with turn:
+                try:
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
+                    with (self.fifo if par else contextlib.nullcontext()):
+                        self.ensure_loaded()
+                    with self.status_lock:
+                        st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
+                                  started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new,
+                                  slot=None, reused=None, thread=threading.get_ident(), api="completions",
+                                  model=self.model)
+                        if par:
+                            self.live_reqs[id(st)] = (st, rate)
+                            self.status.update(st)
+                        self.last_request_at = time.time()
+                        rate.clear()
+                    before = getattr(self.engine, "last", None)
+                    if live is not None:
+                        live.state = "prompt"
+                    prompt = ids
+                    while True:
+                        if isinstance(ids, PromptText) and ids.max_new:
+                            max_new = ids.max_new
+                        cap = max_new - n
+                        gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
+                                                   session=session) if emb \
+                            else self.engine.generate(prompt, cap, sampling, cancel, session=session)
+                        seg = []
+                        drained = False
+                        try:
+                            last_out = time.monotonic()
+                            for t in gen:
+                                if isinstance(ids, PromptText) and ids.max_new:
+                                    max_new = ids.max_new
+                                if t is None:
+                                    if isinstance(ids, PromptText) and ids.n is not None \
+                                            and st.get("prompt_tokens") != ids.n:
+                                        with self.status_lock:
+                                            st.update(prompt_tokens=ids.n, max_tokens=ids.max_new or max_new)
+                                    last_out = time.monotonic()
+                                    yield "ping", None
+                                    continue
+                                if t in self.stop_ids:                 # the end token is not part of the reply
+                                    finish = "stop"
+                                    break
+                                n += 1
+                                seg.append(t)
+                                piece = detok.push(t)
+                                if stops is not None:
+                                    piece = stops.push(piece)
+                                    if stops.hit is not None:
+                                        piece = piece or ""
+                                if piece:
+                                    self._note_text(n, piece, st, rate, par)
+                                    yield "piece", piece
+                                    last_out = time.monotonic()
+                                elif time.monotonic() - last_out >= KEEPALIVE_S:
+                                    last_out = time.monotonic()
+                                    yield "ping", None
+                                if st.get("reused") is None:
+                                    run_last = getattr(self.engine, "last", None)
+                                    if isinstance(run_last, dict) and run_last is not engine_last0 \
+                                            and run_last.get("reused") is not None:
+                                        with self.status_lock:
+                                            st["reused"] = min(int(run_last["reused"]), len(ids))
+                                if stops is not None and stops.hit is not None:
+                                    finish = "stop"         # gen.close() below STOPs the engine
+                                    break
+                            else:
+                                drained = True
+                        except EngineDied as e:
+                            finish = "error"
+                            self._say_died(e)
+                            raise
+                        except ValueError as e:
+                            finish = "error"
+                            print(f"[server] error: engine reported {e}", flush=True)
+                            raise
+                        except GeneratorExit:
+                            finish = "disconnect"
+                            raise
+                        finally:
+                            try:
+                                gen.close()
+                            except EngineSilent as e:
+                                finish = "error"
+                                self._say_died(e)
+                                if not cancel.is_set():
+                                    raise
+                        run_last = getattr(self.engine, "last", None)
+                        with self.status_lock:
+                            st["run_windows"] = st["run_tokens"] = 0
+                            if isinstance(run_last, dict) and run_last is not counted_last and run_last.get("windows"):
+                                st["windows"] = (st.get("windows") or 0) + run_last["windows"]
+                                st["window_tokens"] = (st.get("window_tokens") or 0) + n
+                                counted_last = run_last
+                        if isinstance(run_last, dict) and run_last is not engine_last0 \
+                                and run_last.get("finish") == "error":
+                            finish = "error"
+                            raise EngineError("the engine ended the request itself (the grammar allowed no token?)")
+                        if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
+                                and run_last.get("reused") is not None:
+                            reused0 = min(int(run_last["reused"]), len(ids))
+                            prompt_ms0 = run_last.get("prompt_ms")
+                        if cancel.is_set():
+                            finish = "cancel"
+                        elif finish == "length" and n < max_new and self.stopping.is_set():
+                            finish = "error"
+                            raise EngineDied("the server is stopping")
+                        break
+                except GeneratorExit:
+                    finish = "disconnect"
+                    raise
+                finally:
+                    with self.status_lock:
+                        if st.get("busy"):
+                            last = dict(getattr(self.engine, "last", {}) or {}) \
+                                if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            if reused0 is not None and last.get("reused") is not None:
+                                last["reused"] = reused0
+                                if prompt_ms0 is not None:
+                                    last["prompt_ms"] = prompt_ms0
+                            started = st.get("started", time.time())
+                            hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                            routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
+                            pcie_share = round(last["offloaded"] / routed, 3) \
+                                if last.get("offloaded") is not None and routed else None
+                            ssd_share = round(last["file_reads"] / routed, 3) \
+                                if last.get("file_reads") and routed else None
+                            seen = prompt_tokens_seen(len(ids), last)
+                            self.requests_done += 1
+                            for key, add in (("prompt", seen), ("reused", last.get("reused") or 0), ("written", n),
+                                             ("prompt_ms", last.get("prompt_ms") or 0.0),
+                                             ("decode_ms", last.get("decode_ms") or 0.0)):
+                                self.totals[key] += add
+                            if st.get("slot") is not None:
+                                self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
+                                                              "accepted": last.get("drafts_accepted"),
+                                                              "at": time.time()}
+                            ft = st.get("first_token")
+                            ttft = ft - st["started"] if ft and st.get("started") else None
+                            windows, window_tokens = st.get("windows") or 0, st.get("window_tokens") or 0
+                            dl = window_tokens / windows if windows else None
+                            self.history.append({
+                                "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
+                                "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
+                                "prompt_ms": last.get("prompt_ms"),
+                                "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                                if n and last.get("generated") and last.get("decode_ms") else None,
+                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ssd_share": ssd_share,
+                                "drafts_offered": last.get("drafts_offered"),
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                "ttft_s": round(ttft, 2) if ttft is not None else None,
+                                "draft_len": round(dl, 2) if dl is not None else None})
+                            self._note_best(self.history[-1])
+                            fresh = getattr(self.engine, "last", None)
+                            if fresh is not None and fresh is not before:
+                                timings = request_timings(seen, n, last)
+                                self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                            self.last_request_at = time.time()
+                            now = time.time()
+                            rate = n / max(1e-6, now - ft) if ft else 0.0
+                            print(done_line(self._slot_of(st), seen, n, finish, cancel.is_set(), timings, ttft,
+                                            rate, dl, hit_rate, pcie_share, ssd_share), flush=True)
+                        st["busy"] = False
+                        st.pop("tail", None)
+                        if par:
+                            self.live_reqs.pop(id(st), None)
+                            if self.live_reqs:
+                                self.status.update(list(self.live_reqs.values())[-1][0])
+                            else:
+                                self.status.update(busy=False)
+                                self.status.pop("tail", None)
+        finally:
+            if emb:
+                Path(emb).unlink(missing_ok=True)
+        if stops is not None and stops.hit is not None and stops.held:
+            yield "piece", stops.flush()
+        done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+                "timings": timings, "prompt_tokens": len(ids)}
+        if stops is not None and stops.hit is not None:
+            done["stop_sequence"] = stops.hit
+        yield "done", done
+
+    def _note_text(self, n, piece, st, rate, par) -> None:
+        """The raw path's per-piece status note (run() notes parsed events; there are none here)."""
+        now = time.time()
+        with self.status_lock:
+            st.update(generated=n, phase="answering", tail=(st.get("tail", "") + piece)[-40:])
+            if st.get("first_token") is None:
+                st["first_token"] = now
+            if par:
+                rate.append((now, n))
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:

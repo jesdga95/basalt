@@ -26,11 +26,11 @@ from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStart
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, checked as checked_logprobs
-from serve.config import checked_sampling
+from serve.config import PENALTY_WINDOW_MAX, _num, checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import checked_return_progress, openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
-from serve.prompt import primed
+from serve.prompt import CTX_SLACK, PromptText, primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.live import AnswerNowRefused
 from serve.monitor import clear as clear_monitor, gather
@@ -504,6 +504,8 @@ def make_handler(target: Service | Router):
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
+            elif path == "/api/extra/version":
+                self._json(200, {"result": "KoboldCpp", "version": "1.122.1-basalt-raw"})
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     models = router.models()
@@ -657,8 +659,10 @@ def make_handler(target: Service | Router):
                     return
                 requested = req.get("model")
                 # llama.cpp's tokenizer routes name no model: the shown one's tokenizer, as /props describes it
-                self.svc = router.shown() if requested is None and path in ("/tokenize", "/detokenize") else \
-                    router.service_for(requested)
+                raw_model_optional = requested is None and path in (
+                    "/tokenize", "/detokenize", "/v1/completions", "/api/v1/generate",
+                    "/api/extra/generate/stream", "/api/extra/tokencount")
+                self.svc = router.shown() if raw_model_optional else router.service_for(requested)
                 if self.svc is None:
                     self._unknown_model(path, requested)
                     return
@@ -672,6 +676,15 @@ def make_handler(target: Service | Router):
                         self._responses(req)
                     elif path == "/v1/chat/completions":
                         self._openai(req)
+                    elif path == "/v1/completions":
+                        self._completions(req)
+                    elif path == "/api/v1/generate" or path == "/api/extra/generate/stream":
+                        self._kobold_generate(req)
+                    elif path == "/api/extra/tokencount":
+                        text = req.get("prompt")
+                        if not isinstance(text, str):
+                            raise ValueError("prompt: a string")
+                        self._json(200, {"results": [{"value": len(self.svc.tok.encode(text, parse_special=True))}]})
                     elif path == "/v1/messages":
                         self._anthropic(req)
                     elif path == "/v1/messages/count_tokens":
@@ -850,6 +863,7 @@ def make_handler(target: Service | Router):
             check_format(req.get("response_format"))
             self.svc.require_grammar(req.get("response_format"))
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
+            self.svc.require_more_samplers(req)              # likewise a sampler the server was not started for
             checked_return_progress(req)                      # and a return_progress that is not a boolean
             max_new = _checked_max_tokens(req, "max_completion_tokens", "max_tokens")   # 0/-1: the rest of the context
             self._open_live("chatcmpl-" + uuid.uuid4().hex[:24], req)
@@ -857,8 +871,8 @@ def make_handler(target: Service | Router):
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             req[BIAS_KEY] = checked_bias(req, self.svc.engine)     # a bad logit_bias is a 400 before streaming
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               req.get("response_format"))
+            req[GRAMMAR_KEY] = self._explicit_grammar(req, self.svc.grammar_for(
+                tools, req.get("tool_choice"), req.get("tools"), req.get("response_format")))
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
@@ -996,8 +1010,11 @@ def make_handler(target: Service | Router):
                 self.svc.require_grammar(responses_api.text_format(req))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               responses_api.text_format(req))
+            try:
+                req[GRAMMAR_KEY] = self._explicit_grammar(req, self.svc.grammar_for(
+                    tools, req.get("tool_choice"), req.get("tools"), responses_api.text_format(req)))
+            except ValueError as e:
+                raise ResponsesError(str(e), "grammar") from None
             noted = self.svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool (bounded)
             fresh = sorted(set(skipped) - noted)
             if fresh:
@@ -1017,6 +1034,7 @@ def make_handler(target: Service | Router):
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             try:
                 checked_sampling(req)
+                self.svc.require_more_samplers(req)
             except ValueError as e:
                 raise ResponsesError(str(e), str(e).split(":")[0]) from None
             req[LOGPROBS_KEY] = responses_api.requested_logprobs(req)
@@ -1040,6 +1058,250 @@ def make_handler(target: Service | Router):
             asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, rid=self.live.id)
             return ids, thinking, tools, max_new, asm, req, force
+
+        def _request_grammar(self, req) -> dict | None:
+            """The request's own `grammar` (GBNF text) or `grammar_schema` (a JSON schema) as the engine's grammar
+            request, its `think` left to the caller; None when the request has neither. Every generation API takes
+            the two fields, with --gbnf-grammar on."""
+            text, schema = req.get("grammar"), req.get("grammar_schema")
+            if text is None and schema is None:
+                return None
+            if not self.svc.gbnf_grammar:
+                raise ValueError("grammar, grammar_schema: start the server with --gbnf-grammar on")
+            if text is not None:
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("grammar: a GBNF string")
+                return {"kind": "gbnf", "bnf": text}
+            if isinstance(schema, str):
+                try:
+                    schema = json.loads(schema)
+                except ValueError:
+                    raise ValueError("grammar_schema: a JSON object, or a string holding one") from None
+            if not isinstance(schema, dict):
+                raise ValueError("grammar_schema: a JSON object, or a string holding one")
+            return {"kind": "json_schema", "schema": schema}
+
+        def _explicit_grammar(self, req, own: dict | None) -> dict | None:
+            """A chat request's grammar for the engine: its own `grammar` / `grammar_schema` when it has one, in
+            place of what its response format asks for; else `own`, the grammar its tools and response format
+            ask for (Service.grammar_for). A request cannot hold tools and a grammar of its own."""
+            explicit = self._request_grammar(req)
+            if explicit is None:
+                return own
+            if isinstance(own, dict) and own.get("kind") == "tools":
+                raise ValueError("grammar, grammar_schema: a request cannot hold both tools and a grammar")
+            return explicit
+
+        def _sampling_from_raw(self, req, kobold: bool) -> dict:
+            """The raw APIs' sampling fields into the engine's sampling dict; checked_sampling validates it.
+            `kobold` adds the KoboldCpp/Horde field names (rep_pen, max_length as max_tokens elsewhere...)."""
+            s = {}
+            g = req.get
+            for k in ("temperature", "top_p", "min_p", "top_k", "presence_penalty", "frequency_penalty",
+                      "repetition_penalty", "penalty_last_n", "seed", "tfs", "typical", "top_a",
+                      "xtc_threshold", "xtc_probability", "dynatemp_min", "dynatemp_max", "dynatemp_exponent",
+                      "smoothing_factor", "smoothing_curve"):
+                v = g(k)
+                if v is not None:
+                    s[k] = v
+            if kobold:
+                for k_src, k_dst in (("rep_pen", "repetition_penalty"), ("rep_pen_range", "penalty_last_n"),
+                                     ("sampler_seed", "seed")):
+                    v = g(k_src)
+                    if v is not None:
+                        s[k_dst] = v
+                if g("rep_pen_range") == 0 and _num(g("rep_pen")) and float(g("rep_pen")) != 1.0:
+                    # koboldcpp reads a range of 0 as the whole context; the engine's cap is the window max
+                    s["penalty_last_n"] = PENALTY_WINDOW_MAX
+                dr = g("dynatemp_range")
+                if dr is not None and _num(dr) and float(dr) > 0 and "dynatemp_min" not in s:
+                    temp = float(g("temperature") or 1.0)
+                    s["dynatemp_min"] = max(0.0, temp - float(dr))
+                    s["dynatemp_max"] = max(0.0, temp + float(dr))
+            lo, hi = s.get("dynatemp_min"), s.get("dynatemp_max")
+            if _num(lo) and _num(hi) and float(lo) > float(hi):
+                raise ValueError("dynatemp_min must not exceed dynatemp_max")
+            checked_sampling(s)
+            self.svc.require_more_samplers(s)
+            # koboldcpp's field is singular, the horde's plural; both name the same thing
+            order = g("samplers_order")
+            if order is None:
+                order = g("sampler_order")
+            checked_sampling({"mirostat": g("mirostat"), "samplers_order": order,
+                              "rep_pen_slope": g("rep_pen_slope")})
+            return s
+
+        def _completions(self, req):
+            """OpenAI's POST /v1/completions: the raw prompt continues as the model writes it - no chat
+            template, no thinking, no tools.  The samplers are the chat path's plus the horde set (--more-samplers
+            on); `grammar` or `grammar_schema` holds the text to a GBNF grammar (--gbnf-grammar on).
+            `suffix` is the text that follows the completion: the model reads it after the prompt (an infill) and
+            the reply holds the completion alone, or the prompt, the completion and the suffix with `echo`.
+            `stop` strings end the completion and are left out of it."""
+            prompt = req.get("prompt")
+            if isinstance(prompt, list):
+                if not all(isinstance(x, str) for x in prompt):
+                    raise ValueError("prompt: a string or a list of strings (one completion; a list of one is taken)")
+                if len(prompt) != 1:
+                    raise ValueError("prompt: a list names exactly one prompt (n is not supported)")
+                prompt = prompt[0]
+            if not isinstance(prompt, str):
+                raise ValueError("prompt: a string or a list of strings")
+            if req.get("n") not in (None, 1):
+                raise ValueError("n: only 1 completion per request")
+            suffix = req.get("suffix")
+            if suffix is not None and not isinstance(suffix, str):
+                raise ValueError("suffix: a string")
+            echo = bool(req.get("echo"))
+            max_new = int(req.get("max_tokens") if req.get("max_tokens") is not None
+                          else req.get("max_completion_tokens") or 0)
+            stop = req.get("stop")
+            if stop is not None and not isinstance(stop, (str, list)):
+                raise ValueError("stop: a string or a list of strings")
+            sampling = self._sampling_from_raw(req, kobold=False)
+            spec = self._request_grammar(req)
+            if spec is not None:
+                sampling[GRAMMAR_KEY] = dict(spec, think=False)      # held from the first generated token
+            if stop is not None:
+                sampling["stop"] = stop
+            req[BIAS_KEY] = checked_bias(req, self.svc.engine)
+            self._open_live("cmpl-" + uuid.uuid4().hex[:24], req)
+            self._take_turn(bool(req.get("stream")))
+            self.svc.load()
+            ctx = self.svc.engine.max_context
+            if ctx <= 0:
+                ctx = getattr(self.svc.engine, "known_ctx", 0)
+            unset = max_new <= 0
+            if unset:
+                max_new = max(0, ctx - CTX_SLACK) if ctx else 4096
+            prompt_text = PromptText(self.svc.tok, prompt + suffix if suffix else prompt, (), tail=suffix or "",
+                                     clip=unset or self.svc.fit_max_tokens)
+            prompt_text.max_new = max_new
+            cancel = self._client_cancel()
+            stream = bool(req.get("stream"))
+
+            def pieces():
+                text = []
+                for kind, x in self.svc.run_raw(prompt_text, max_new, sampling, cancel, session=self._session_id(req),
+                                                live=self.live):
+                    if kind == "piece":
+                        text.append(x)
+                        yield x, None
+                    elif kind == "ping":
+                        yield None, None
+                    elif kind == "done":
+                        yield None, (x, "".join(text))
+
+            def chunk(text_piece, finish=None):
+                return {"id": self.live.id, "object": "text_completion.chunk", "created": int(time.time()),
+                        "model": self.svc.model,
+                        "choices": [{"index": 0, "text": text_piece or "", "finish_reason": finish}]}
+
+            if not stream:
+                text, tail = [], None
+                for piece, done in pieces():
+                    if piece:
+                        text.append(piece)
+                    elif done is not None:
+                        tail = done
+                d, full = tail
+                stop_hit = d.get("stop_sequence")
+                body_text = prompt + full + suffix if echo and suffix else (prompt + full if echo else full)
+                out = {"id": self.live.id, "object": "text_completion", "created": int(time.time()),
+                       "model": self.svc.model,
+                       "choices": [{"index": 0, "text": body_text, "finish_reason": d["finish"],
+                                    "stop_reason": stop_hit}],
+                       "usage": {"prompt_tokens": d["prompt_tokens"], "completion_tokens": d["completion_tokens"],
+                                 "total_tokens": d["prompt_tokens"] + d["completion_tokens"]}}
+                return self._json(200, out)
+            self._sse()
+            try:
+                for piece, done in pieces():
+                    if piece:
+                        self.wfile.write(b"data: " + json.dumps(chunk(piece)).encode() + b"\n\n")
+                    elif done is not None:
+                        d, full = done
+                        last = chunk("", finish=d["finish"])
+                        last["choices"][0]["stop_reason"] = d.get("stop_sequence")
+                        self.wfile.write(b"data: " + json.dumps(last).encode() + b"\n\n")
+                        self.wfile.write(b"data: [DONE]\n\n")
+                    else:
+                        self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+            except ClientGone:
+                pass
+
+        def _kobold_generate(self, req):
+            """KoboldCpp's POST /api/v1/generate (sync) and /api/extra/generate/stream (SSE): the horde worker's
+            text API.  The prompt continues raw; the samplers are the horde set (rep_pen, top_a, tfs, typical,
+            dynatemp, smoothing, xtc; mirostat is refused).  `stop_sequence` strings end the generation and are
+            left out of the text, as koboldcpp's `trim_stop` (its default, true) has them; with `trim_stop`
+            false the stop string that ended the generation is the text's end."""
+            kobold_stream = self.path.split("?")[0].rstrip("/") == "/api/extra/generate/stream"
+            prompt = req.get("prompt")
+            if not isinstance(prompt, str):
+                raise ValueError("prompt: a string")
+            max_new = int(req.get("max_length") or 0)
+            sampling = self._sampling_from_raw(req, kobold=True)
+            spec = self._request_grammar(req)
+            if spec is not None:
+                sampling[GRAMMAR_KEY] = dict(spec, think=False)      # held from the first generated token
+            stop = req.get("stop_sequence")
+            if stop is not None and not isinstance(stop, list):
+                raise ValueError("stop_sequence: a list of strings")
+            if stop:
+                sampling["stop"] = stop
+            trim_stop = req.get("trim_stop")
+            if trim_stop is not None and not isinstance(trim_stop, bool):
+                raise ValueError("trim_stop: true or false")
+            self._open_live("kcpp-" + uuid.uuid4().hex[:24], req)
+            self._take_turn(kobold_stream)
+            self.svc.load()
+            ctx = self.svc.engine.max_context
+            if ctx <= 0:
+                ctx = getattr(self.svc.engine, "known_ctx", 0)
+            unset = max_new <= 0
+            if unset:
+                max_new = max(0, ctx - CTX_SLACK) if ctx else 4096
+            prompt_text = PromptText(self.svc.tok, prompt, (), clip=unset or self.svc.fit_max_tokens)
+            prompt_text.max_new = max_new
+            cancel = self._client_cancel()
+
+            pieces = []
+
+            def kept_stop(done):
+                """The stop string the text keeps: koboldcpp leaves it in only with trim_stop false."""
+                return (done.get("stop_sequence") or "") if trim_stop is False else ""
+
+            def collect():
+                text, done = [], None
+                for kind, x in self.svc.run_raw(prompt_text, max_new, sampling, cancel,
+                                                session=self._session_id(req), live=self.live):
+                    if kind == "piece":
+                        text.append(x)
+                    elif kind == "done":
+                        done = x
+                return "".join(text), done
+
+            if not kobold_stream:
+                text, done = collect()
+                return self._json(200, {"results": [{"text": text + kept_stop(done)}]})
+            self._sse()
+            try:
+                for kind, x in self.svc.run_raw(prompt_text, max_new, sampling, cancel,
+                                                session=self._session_id(req), live=self.live):
+                    if kind == "piece":
+                        pieces.append(x)
+                        self.wfile.write(b"data: " + json.dumps({"token": x}).encode() + b"\n\n")
+                    elif kind == "ping":
+                        self.wfile.write(b": keep-alive\n\n")
+                    elif kind == "done":
+                        text = "".join(pieces) + kept_stop(x)
+                        self.wfile.write(b"data: " + json.dumps({"text": text, "events": None,
+                                                                 "finish_reason": x["finish"]}).encode() + b"\n\n")
+                    self.wfile.flush()
+            except ClientGone:
+                pass
 
         def _tokenize(self, req):
             """llama.cpp's /tokenize: the model's token ids for `content`, special-token text read as its token unless
@@ -1078,9 +1340,11 @@ def make_handler(target: Service | Router):
                 self.svc.require_grammar(response_format)
             except ValueError as e:
                 raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
+            req[GRAMMAR_KEY] = self._explicit_grammar(req, self.svc.grammar_for(
+                tools, req.get("tool_choice"), req.get("tools"), response_format))
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
+            self.svc.require_more_samplers(req)              # likewise a sampler the server was not started for
             req[LOGPROBS_KEY] = checked_logprobs(req)         # Basalt's logprobs, as Chat Completions takes them
             stop_strings(req)                                 # likewise a bad stop
             self._open_live("msg_" + uuid.uuid4().hex[:24], req)

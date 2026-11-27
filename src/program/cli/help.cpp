@@ -139,6 +139,8 @@ void usage() {
                  "                       Default off (exact)\n"
                  "  --grammar on|off     --serve: enforce a request's \"grammar\" (tool-call, JSON-schema or JSON-object\n"
                  "                       grammar) on the sampled tokens; the vocabulary comes from the pack.  Default off\n"
+                 "  --more-samplers on|off  --serve: a request may set tfs, typ, top_a, xtc, dyna and sm (koboldcpp's tail\n"
+                 "                       filters and dynamic temperature; top_k 1..64).  Default off: such a request is refused\n"
                  "  --kv-pool on|off     a model with a KV pool backs every slot's cells from it as its conversation grows,\n"
                  "                       each slot reaching the whole --max-context (default on); off: every slot holds\n"
                  "                       its own KV for the whole --max-context, fixed at start\n"

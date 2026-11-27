@@ -924,6 +924,35 @@ class ProcessEngine:
         seed = sampling.get("seed")
         if _number(seed) and seed == int(seed):
             keys += f" seed={int(seed)}"
+        # the horde/koboldcpp filters and the dynamic temperature + smoothing (the engine refuses a list
+        # filter or a dynamic temperature on the wide path; config.checked_sampling validates the ranges)
+        z = sampling.get("tfs")
+        if _number(z) and 0.0 < float(z) < 1.0:
+            keys += f" tfs={float(z)!r}"
+        ty = sampling.get("typical")
+        if _number(ty) and 0.0 < float(ty) < 1.0:
+            keys += f" typ={float(ty)!r}"
+        ta = sampling.get("top_a")
+        if _number(ta) and float(ta) > 0.0:
+            keys += f" top_a={float(ta)!r}"
+        xp = sampling.get("xtc_probability")
+        if _number(xp) and float(xp) > 0.0:
+            keys += f" xtc_p={float(xp)!r}"
+            xt = sampling.get("xtc_threshold")
+            if _number(xt) and float(xt) > 0.0:
+                keys += f" xtc_t={float(xt)!r}"
+        lo, hi = sampling.get("dynatemp_min"), sampling.get("dynatemp_max")
+        if _number(lo) and _number(hi) and float(lo) != float(hi):
+            keys += f" dyna_lo={float(lo)!r} dyna_hi={float(hi)!r}"
+            ex = sampling.get("dynatemp_exponent")
+            if _number(ex) and float(ex) > 0.0:
+                keys += f" dyna_exp={float(ex)!r}"
+        sf = sampling.get("smoothing_factor")
+        if _number(sf) and float(sf) > 0.0:
+            keys += f" sm_f={float(sf)!r}"
+            sc = sampling.get("smoothing_curve")
+            if _number(sc):
+                keys += f" sm_c={float(sc)!r}"
         # relaxed_drafting: this request's --relaxed-drafting threshold, 0 or false for exact sampling
         rd = sampling.get("relaxed_drafting")
         if rd is False:
