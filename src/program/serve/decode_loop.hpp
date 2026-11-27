@@ -22,10 +22,11 @@ Flow Request::decode_loop(B& b) {
     draft_offered = 0;
     draft_accepted = 0;
     windows = 0;
-    const size_t win_cap = (size_t) std::max<int64_t>(b.max_window(), n - fold_p0);
+    const int64_t row_cap = ppl != nullptr ? std::max<int64_t>(b.max_window(), b.max_verify_window()) : (int64_t) b.max_window();
+    const size_t win_cap = (size_t) std::max<int64_t>(row_cap, n - fold_p0);
     window = std::vector<int32_t>(win_cap);
     outv = std::vector<int32_t>(win_cap);
-    consumed.reserve((size_t) (n + max_new + b.max_window()));
+    consumed.reserve((size_t) (n + max_new + row_cap));
     for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
     finish = "length";
     b.decode_state_begin();
