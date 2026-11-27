@@ -4,6 +4,7 @@
 #include "basalt/kernels/head_proxy.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "../../../kernels/cuda/philox.cuh"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -489,13 +490,62 @@ __device__ __forceinline__ void exact_x(const Q81* __restrict__ xh_g, const Q81*
     }
 }
 
+// Radix select of the kMaxCand-th largest key among candidates within `delta` of m.
+// Uses part[t].x to skip tiles outside [m - delta, m] and exits after the 4 float bytes whenever the 64th score is unique.
+__device__ __forceinline__ unsigned long long kth_key_delta(px::Final& f, int n_tiles, const float2* __restrict__ cand,
+                                                            const float2* __restrict__ part, float m, float delta) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float ninf = __int_as_float(0xff800000);
+    __shared__ int done;
+    if (tid == 0) { f.want = 0ull; f.need = px::kMaxCand; done = 0; }
+    unsigned long long mask = 0ull;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        if (tid < 256) f.hist[tid] = 0;
+        __syncthreads();
+        if (done) break;
+        const unsigned long long want = f.want;
+        for (int t = tid; t < n_tiles; t += 512) {
+            const float tm = __ldcg(&part[t].x);
+            if (!(tm > ninf && tm >= m - delta)) continue;
+            for (int kk = 0; kk < px::kPer; ++kk) {
+                const float2 c = __ldcg(&cand[t * px::kPer + kk]);
+                if (!(c.x > ninf && c.x >= m - delta)) continue;
+                const unsigned long long k = px::cand_key(c);
+                if ((k & mask) == want) atomicAdd(&f.hist[(int) ((k >> shift) & 255u)], 1);
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            int b[8], s = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { b[j] = f.hist[255 - 8 * lane - j]; s += b[j]; }
+            int incl = s;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const int need = f.need, excl = incl - s;
+            if (excl < need && incl >= need) {
+                int acc = excl, j = 0;
+                while (acc + b[j] < need) acc += b[j++];
+                f.want = want | ((unsigned long long) (255 - 8 * lane - j) << shift);
+                f.need = need - acc;
+                if (shift == 32 && b[j] == 1) done = 1;
+            }
+        }
+        mask |= 255ull << shift;
+        __syncthreads();
+    }
+    return f.want;
+}
+
 // px::collect<false, true> from the tiles' maxima: a tile's softmax partial holds its best score (part[t].x, the score
-// of its first candidate), so the best is the tiles' best and only a tile whose best is within kDelta of it can hold a
-// listed candidate; the list is the same, read from a quarter of the scores. More than kMaxCand: px::collect's radix
-// select over every candidate.
+// of its first candidate), so the best is the tiles' best and only a tile whose best is within `delta` of it can hold a
+// listed candidate; the list is the same, read from a quarter of the scores. More than kMaxCand: radix select.
 __device__ __forceinline__ int collect_tiles(px::Final& f, int n_tiles, const float2* __restrict__ cand,
                                              const float2* __restrict__ part, int* __restrict__ out_id,
-                                             float* __restrict__ out_prob) {
+                                             float* __restrict__ out_prob, float delta = px::kDelta) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const float ninf = __int_as_float(0xff800000);
     float m = ninf;
@@ -515,10 +565,10 @@ __device__ __forceinline__ int collect_tiles(px::Final& f, int n_tiles, const fl
     }
     for (int t = tid; t < n_tiles; t += 512) {
         const float tm = __ldcg(&part[t].x);
-        if (!(tm > ninf && tm >= m - px::kDelta)) continue;
+        if (!(tm > ninf && tm >= m - delta)) continue;
         for (int k = 0; k < px::kPer; ++k) {
             const float2 c = __ldcg(&cand[t * px::kPer + k]);
-            if (c.x > ninf && c.x >= m - px::kDelta) {
+            if (c.x > ninf && c.x >= m - delta) {
                 const int p = atomicAdd(&f.cnt, 1);
                 if (p < px::kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
             }
@@ -527,15 +577,18 @@ __device__ __forceinline__ int collect_tiles(px::Final& f, int n_tiles, const fl
     __syncthreads();
     const int total = f.cnt;
     if (total > px::kMaxCand) {
-        const int nc = n_tiles * px::kPer;
-        const unsigned long long kth = px::kth_key(f, nc, cand, m);
+        const unsigned long long kth = kth_key_delta(f, n_tiles, cand, part, m, delta);
         if (tid == 0) f.cnt = 0;
         __syncthreads();
-        for (int i = tid; i < nc; i += 512) {
-            const float2 c = __ldcg(&cand[i]);
-            if (c.x > ninf && c.x >= m - px::kDelta && px::cand_key(c) >= kth) {
-                const int p = atomicAdd(&f.cnt, 1);
-                if (p < px::kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
+        for (int t = tid; t < n_tiles; t += 512) {
+            const float tm = __ldcg(&part[t].x);
+            if (!(tm > ninf && tm >= m - delta)) continue;
+            for (int kk = 0; kk < px::kPer; ++kk) {
+                const float2 c = __ldcg(&cand[t * px::kPer + kk]);
+                if (c.x > ninf && c.x >= m - delta && px::cand_key(c) >= kth) {
+                    const int p = atomicAdd(&f.cnt, 1);
+                    if (p < px::kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
+                }
             }
         }
         __syncthreads();
@@ -554,26 +607,121 @@ __device__ __forceinline__ int collect_tiles(px::Final& f, int n_tiles, const fl
     return n;
 }
 
-// One block: the rows near the best approximate logit scored exactly (a warp per row); the exact best is draft i:
-// *prev = ids[i] = it, conf[i] = its probability (the tiles' softmax sums with the rescored rows made exact), w1_row = its
-// single winning row of w1 (read once after the pick instead of over-reading all rescored rows from mapped host memory
-// over PCIe).
+// Stochastic speculative draft pick (or greedy argmax when draw_meta == nullptr || temperature <= 0).
+// On the greedy path this is identical to px::pick_block<false>. On the stochastic path, sorts the n <= 64
+// rescored candidates descending by exact logit, applies top_k / top_p / min_p / temperature, draws from the
+// resulting proposal q on Philox(seed, pos + 1 + step_i, kPhiloxDraft), exports (q_ids, q_p) for exact
+// Leviathan/Chen verification, and writes a calibrated acceptance proxy into *conf_out.
+static_assert(kDsQMax == px::kMaxCand, "kDsQMax must match px::kMaxCand");
+__device__ __forceinline__ void pick_or_draw_block(px::Final& f, int n, int n_tiles, const float2* __restrict__ part,
+                                                   int step_i, const DsDrawMeta* __restrict__ dm,
+                                                   int32_t* __restrict__ prev, float* __restrict__ conf_out,
+                                                   int32_t* __restrict__ q_ids_row, float* __restrict__ q_p_row) {
+    px::pick_block<false>(f, n, n_tiles, nullptr, part, prev, conf_out);
+    if (dm == nullptr || q_ids_row == nullptr || q_p_row == nullptr) return;
+    const float temp = dm->temperature;
+    if (!(temp > 0.0f)) return;
+    __syncthreads();
+    const int tid = threadIdx.x;
+    __shared__ int s_id[kDsQMax];
+    __shared__ float s_ex[kDsQMax];
+    if (tid < n) {
+        const int my_id = f.list[tid];
+        const float my_ex = f.ex[tid];
+        int rank = 0;
+        for (int j = 0; j < n; ++j) {
+            const float oex = f.ex[j];
+            if (oex > my_ex || (oex == my_ex && f.list[j] < my_id)) ++rank;
+        }
+        s_id[rank] = my_id;
+        s_ex[rank] = my_ex;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int m = n;
+        if (dm->top_k > 0 && dm->top_k < m) m = dm->top_k;
+        const float mx = s_ex[0];
+        const float p_max_t1 = *conf_out;
+        if (dm->top_p < 1.0f && m > 1) {
+            double z1_sub = 0.0;
+            for (int j = 0; j < m; ++j) z1_sub += exp((double) s_ex[j] - (double) mx);
+            const double sum_full = p_max_t1 > 0.0f ? (1.0 / (double) p_max_t1) : z1_sub;
+            const double z1 = (dm->top_k > 0 && dm->top_k <= n) ? z1_sub : fmax(sum_full, z1_sub);
+            const double thr_p = (double) dm->top_p * z1;
+            double cum = 0.0;
+            int cut = m;
+            for (int j = 0; j < m; ++j) {
+                cum += exp((double) s_ex[j] - (double) mx);
+                if (cum >= thr_p) { cut = j + 1; break; }
+            }
+            const int mk = dm->min_keep > 1 ? dm->min_keep : 1;
+            if (cut < mk) cut = mk < m ? mk : m;
+            m = cut;
+        }
+        if (dm->min_p > 0.0f && m > 1) {
+            const float thresh = mx + logf(dm->min_p);
+            for (int j = 1; j < m; ++j)
+                if (s_ex[j] < thresh) { m = j; break; }
+        }
+        const float inv_t = 1.0f / temp;
+        const double smx = (double) (mx * inv_t);
+        double e2[kDsQMax];
+        double z2 = 0.0;
+        for (int j = 0; j < m; ++j) {
+            e2[j] = exp((double) (s_ex[j] * inv_t) - smx);
+            z2 += e2[j];
+        }
+        const float u = basalt::kernels::philox_uniform(dm->seed, (uint64_t) ((int64_t) dm->pos + 1 + step_i),
+                                                        basalt::kernels::kPhiloxDraft);
+        double cum = 0.0;
+        int pick_idx = m - 1;
+        bool found = false;
+        for (int j = 0; j < m; ++j) {
+            const double qj = z2 > 0.0 ? e2[j] / z2 : (j == 0 ? 1.0 : 0.0);
+            q_ids_row[j] = s_id[j];
+            q_p_row[j] = (float) qj;
+            cum += qj;
+            if (!found && (double) u < cum) { pick_idx = j; found = true; }
+        }
+        for (int j = m; j < kDsQMax; ++j) {
+            q_ids_row[j] = -1;
+            q_p_row[j] = 0.0f;
+        }
+        *prev = s_id[pick_idx];
+        // Keep full [0, 1] dynamic range so all 9 DraftPolicy bins separate uncertain vs confident tokens cleanly.
+        *conf_out = p_max_t1;
+    }
+    __syncthreads();
+}
+
+// One block: the rows near the best approximate logit scored exactly (a warp per row); the exact best (or stochastic draw
+// from the rescored candidates) is draft i: *prev = ids[i] = it, conf[i] = its chance, w1_row = its single winning row of
+// w1 (read once after the pick instead of over-reading all rescored rows from mapped host memory over PCIe).
 constexpr int kW1Words = kDsRank * 2 / 16;   // uint4 of a w1 row: a lane each
 static_assert(kW1Words == 32, "a w1 row is a warp's uint4");
 __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __restrict__ xh_g, const Q81* __restrict__ xl_g,
                                                          int n_tiles, const float2* __restrict__ cand, const float2* __restrict__ part,
                                                          int32_t* __restrict__ prev, int32_t* __restrict__ ids,
                                                          float* __restrict__ conf, int i, const uint16_t* __restrict__ w1,
-                                                         uint16_t* __restrict__ w1_row) {
+                                                         uint16_t* __restrict__ w1_row, const DsDrawMeta* __restrict__ dm,
+                                                         int32_t* __restrict__ q_ids_row, float* __restrict__ q_p_row) {
     __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
     __shared__ px::Final f;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     pdl_wait();
     if (tid == 0) f.cnt = 0;
     exact_x(xh_g, xl_g, xh, xl, tid, 512);
-    const int n = collect_tiles(f, n_tiles, cand, part, prev, conf + i);
+    const float delta = (dm != nullptr && dm->temperature > 0.0f && dm->delta > 0.0f) ? dm->delta : px::kDelta;
+    const int n = collect_tiles(f, n_tiles, cand, part, prev, conf + i, delta);
     if (n == 0) {   // never: the vocabulary has rows
-        if (tid == 0) ids[i] = *prev;
+        if (tid == 0) {
+            ids[i] = *prev;
+            if (q_ids_row && q_p_row) {
+                q_ids_row[0] = *prev;
+                q_p_row[0] = 1.0f;
+                for (int j = 1; j < kDsQMax; ++j) { q_ids_row[j] = -1; q_p_row[j] = 0.0f; }
+            }
+        }
         if (warp == 0) reinterpret_cast<uint4*>(w1_row)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) *prev * kDsRank)[lane];
         return;
     }
@@ -586,7 +734,7 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
         }
     }
     __syncthreads();
-    px::pick_block<false>(f, n, n_tiles, nullptr, part, prev, conf + i);
+    pick_or_draw_block(f, n, n_tiles, part, i, dm, prev, conf + i, q_ids_row, q_p_row);
     __syncthreads();
     const int pick = *prev;
     if (tid == 0) ids[i] = pick;
@@ -778,7 +926,7 @@ void dspark_combine_h_batch(const float* hd, const float* latent, const uint16_t
 
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
                       int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
-                      const void* h_eff_q) {
+                      const void* h_eff_q, const DsDrawMeta* draw_meta, int32_t* q_ids, float* q_p) {
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
     float2* cand = (float2*) scratch;
@@ -790,7 +938,7 @@ void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const f
     const Q81* xh_exact = (h_eff_q != nullptr) ? static_cast<const Q81*>(h_eff_q) : ((const Q81*) hq + (size_t) i * kHeadNb);
     const Q81* xl_exact = h.fold ? (const Q81*) latq : nullptr;
     launch_pdl(head_final_kernel, dim3(1), dim3(512), 0, s, h, xh_exact, xl_exact, tiles,
-               (const float2*) cand, (const float2*) part, prev, ids, conf, i, w1, w1_row);
+               (const float2*) cand, (const float2*) part, prev, ids, conf, i, w1, w1_row, draw_meta, q_ids, q_p);
     check("head pick");
 }
 
@@ -1054,7 +1202,9 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
                                                                int32_t* __restrict__ ids, float* __restrict__ conf,
                                                                const uint16_t* __restrict__ w1,
                                                                uint16_t* __restrict__ w1_row,
-                                                               const Q81* __restrict__ h_eff_step) {
+                                                               const Q81* __restrict__ h_eff_step,
+                                                               const DsDrawMeta* __restrict__ dm_all,
+                                                               int32_t* __restrict__ q_ids_all, float* __restrict__ q_p_all) {
     __shared__ Q81 xh[kHeadNb], xl[kFoldNb];
     __shared__ px::Final f;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = (int) blockIdx.x;
@@ -1070,9 +1220,20 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
     int32_t* ids_b = ids + (size_t) b * kDsBlock;
     float* conf_b = conf + (size_t) b * kDsBlock;
     uint16_t* w1_b = w1_row + (size_t) b * kDsRank;
-    const int n = collect_tiles(f, n_tiles, cand, part, prev_b, conf_b + step_i);
+    const DsDrawMeta* dm_b = dm_all ? dm_all + b : nullptr;
+    int32_t* qi_b = q_ids_all ? q_ids_all + ((size_t) b * kDsDrafts + step_i) * kDsQMax : nullptr;
+    float* qp_b = q_p_all ? q_p_all + ((size_t) b * kDsDrafts + step_i) * kDsQMax : nullptr;
+    const float delta = (dm_b != nullptr && dm_b->temperature > 0.0f && dm_b->delta > 0.0f) ? dm_b->delta : px::kDelta;
+    const int n = collect_tiles(f, n_tiles, cand, part, prev_b, conf_b + step_i, delta);
     if (n == 0) {
-        if (tid == 0) ids_b[step_i] = *prev_b;
+        if (tid == 0) {
+            ids_b[step_i] = *prev_b;
+            if (qi_b && qp_b) {
+                qi_b[0] = *prev_b;
+                qp_b[0] = 1.0f;
+                for (int j = 1; j < kDsQMax; ++j) { qi_b[j] = -1; qp_b[j] = 0.0f; }
+            }
+        }
         if (warp == 0) reinterpret_cast<uint4*>(w1_b)[lane] = reinterpret_cast<const uint4*>(w1 + (int64_t) *prev_b * kDsRank)[lane];
         return;
     }
@@ -1085,7 +1246,7 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
         }
     }
     __syncthreads();
-    px::pick_block<false>(f, n, n_tiles, nullptr, part, prev_b, conf_b + step_i);
+    pick_or_draw_block(f, n, n_tiles, part, step_i, dm_b, prev_b, conf_b + step_i, qi_b, qp_b);
     __syncthreads();
     const int pick = *prev_b;
     if (tid == 0) ids_b[step_i] = pick;
@@ -1157,7 +1318,7 @@ void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const floa
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
                             int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
                             float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
-                            const void* h_eff_q_step) {
+                            const void* h_eff_q_step, const DsDrawMeta* draw_meta, int32_t* q_ids, float* q_p) {
     if (count <= 0) return;
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
@@ -1168,7 +1329,7 @@ void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_st
                approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad, (uint8_t*) scratch, scratch_stride);
     launch_pdl(head_final_batch_kernel, dim3((unsigned) count), dim3(512), 0, s, h, (const Q81*) hq, (const Q81*) latq_step,
                tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row,
-               static_cast<const Q81*>(h_eff_q_step));
+               static_cast<const Q81*>(h_eff_q_step), draw_meta, q_ids, q_p);
     check("head pick batch");
 }
 

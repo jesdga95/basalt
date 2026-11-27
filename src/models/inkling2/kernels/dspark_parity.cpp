@@ -494,6 +494,61 @@ void test_head() {
         for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1, d_w1r, nullptr);
     });
     timing("head, a block of 7 drafts", us, (double) dspark_screen_bytes(E, V) + R * (double) dspark_screen_bytes(kDsRank, V));
+    // timing with real mapped host w1 (PCIe) and stochastic draw mode
+    {
+        uint16_t* h_w1 = nullptr;
+        uint16_t* d_w1_mapped = nullptr;
+        cudaHostAlloc((void**) &h_w1, w1.size() * 2, cudaHostAllocMapped | cudaHostAllocPortable);
+        std::memcpy(h_w1, w1.data(), w1.size() * 2);
+        cudaHostGetDevicePointer((void**) &d_w1_mapped, h_w1, 0);
+        DsDrawMeta dm_h{};
+        dm_h.pos = 100;
+        dm_h.temperature = 1.0f;
+        dm_h.top_k = 0;
+        dm_h.top_p = 1.0f;
+        dm_h.min_p = 0.0f;
+        dm_h.min_keep = 1;
+        dm_h.seed = 424242ull;
+        DsDrawMeta* d_dm = nullptr;
+        cudaMalloc(&d_dm, sizeof(DsDrawMeta));
+        cudaMemcpy(d_dm, &dm_h, sizeof(DsDrawMeta), cudaMemcpyHostToDevice);
+        int32_t* d_qids = zeros<int32_t>((size_t) R * kDsQMax);
+        float* d_qp = zeros<float>((size_t) R * kDsQMax);
+        dspark_head_base(h, d_hq, R, d_approx, nullptr);
+        for (int i = 0; i < R; ++i)
+            dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1_mapped, d_w1r, nullptr,
+                             nullptr, d_dm, d_qids + (size_t) i * kDsQMax, d_qp + (size_t) i * kDsQMax);
+        const auto dids = host(d_ids, R);
+        const auto dcf = host(d_conf, R);
+        const auto hqids = host(d_qids, (size_t) R * kDsQMax);
+        const auto hqp = host(d_qp, (size_t) R * kDsQMax);
+        bool draw_ok = std::memcmp(host(d_w1r, kDsRank).data(), w1.data() + (size_t) dids[R - 1] * kDsRank, kDsRank * 2) == 0;
+        for (int i = 0; i < R && draw_ok; ++i) {
+            double qs = 0.0;
+            bool in_q = false;
+            for (int j = 0; j < kDsQMax; ++j) {
+                const int id = hqids[(size_t) i * kDsQMax + j];
+                const float pr = hqp[(size_t) i * kDsQMax + j];
+                if (id >= 0) {
+                    qs += (double) pr;
+                    if (id == dids[i] && pr > 0.0f) in_q = true;
+                    for (int k = 0; k < j; ++k)
+                        if (hqids[(size_t) i * kDsQMax + k] == id) draw_ok = false;   // distinct ids
+                }
+            }
+            if (!in_q || std::fabs(qs - 1.0) > 1e-4 || !(dcf[i] >= 0.0f && dcf[i] <= 1.001f)) draw_ok = false;
+        }
+        check("head: stochastic draw + q export + mapped w1", draw_ok);
+        double us_m = time_us([&] {
+            dspark_head_base(h, d_hq, R, d_approx, nullptr);
+            for (int i = 0; i < R; ++i)
+                dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1_mapped, d_w1r, nullptr,
+                                 nullptr, d_dm, d_qids + (size_t) i * kDsQMax, d_qp + (size_t) i * kDsQMax);
+        });
+        timing("head, 7 drafts (mapped w1, drawn)", us_m, (double) dspark_screen_bytes(E, V) + R * (double) dspark_screen_bytes(kDsRank, V));
+        cudaFree(d_dm); cudaFree(d_qids); cudaFree(d_qp);
+        cudaFreeHost(h_w1);
+    }
 }
 
 void test_fold() {
@@ -792,6 +847,7 @@ void test_combine_h() {
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("no GPU\n");

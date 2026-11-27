@@ -19,6 +19,20 @@ constexpr int kDsTargets = 4;         ///< target features a position carries: v
 constexpr int kDsMixes = 4;           ///< mixes of them: one per draft layer, then the Markov head's context
 constexpr int kDsRank = 256;          ///< the Markov head's rank
 constexpr int kDsRnn = 3 * kDsRank;   ///< its recurrence's rows: the gate, the candidate and the latent
+constexpr int kDsQMax = 64;           ///< max proposal support exported per drawn draft (matches px::kMaxCand)
+
+/// Per-block stochastic draft sampling metadata read on device (so head graphs stay capturable across turns/temps).
+struct DsDrawMeta {
+    int32_t anchor = 0;
+    int32_t pos = 0;
+    int32_t top_k = 0;                ///< 0 = full vocab (capped to rescored candidates)
+    int32_t min_keep = 1;
+    float temperature = 0.0f;         ///< <= 0: greedy argmax
+    float top_p = 1.0f;
+    float min_p = 0.0f;
+    float delta = 8.0f;               ///< approximate-logit window for stochastic candidate rescoring
+    uint64_t seed = 0;
+};
 
 /// The mixes' weights: alpha [kDsMixes][kDsTargets] (each row softmaxed over the targets), norm[j] mix j's RMS norm weights.
 struct DsMixArgs {
@@ -92,7 +106,8 @@ void dspark_combine_h_batch(const float* hd, const float* latent, const uint16_t
 /// When `h.fold == nullptr` and `h_eff_q != nullptr`, exact rescoring evaluates `head[v] . h_eff_q` (single combined row).
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
                       int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
-                      const void* h_eff_q = nullptr);
+                      const void* h_eff_q = nullptr, const DsDrawMeta* draw_meta = nullptr, int32_t* q_ids = nullptr,
+                      float* q_p = nullptr);
 /// The reference: every row's exact logit (the arithmetic the pick rescores with) into logits[n_vocab].
 void dspark_head_exact(const DsHead& h, const void* hq, const void* latq, int i, float* logits, void* stream);
 
@@ -150,6 +165,7 @@ void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const floa
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
                             int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
                             float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
-                            const void* h_eff_q_step = nullptr);
+                            const void* h_eff_q_step = nullptr, const DsDrawMeta* draw_meta = nullptr, int32_t* q_ids = nullptr,
+                            float* q_p = nullptr);
 
 }  // namespace basalt::models::inkling2

@@ -478,7 +478,7 @@ public:
     }
     void fill_drafts(int T, bool from_sfx) {
         for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf_[(size_t) i - 1] : drafts_[(size_t) i - 1];
-        own_drafts_ = !from_sfx && !hybrid_drafts_;
+        own_drafts_ = !from_sfx;
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
