@@ -157,6 +157,15 @@ int GlmSession::max_window() const {
     return g.nextn > 0 && g.index_share_mtp ? 2 : 1;
 }
 
+model::ModelSession::ExpertCounts GlmSession::expert_counts() const {
+    // The tier counts from the first lookup it served, so these are totals: the serve layer deltas them against what
+    // it read when the request started. The drafter's tier is not folded in - the same choice the deepseek41 and
+    // hy4flash sessions make - because a draft is one row, and its experts would blur the per-request split.
+    core::ExpertTier* t = model_.tier();
+    if (t == nullptr) return {};
+    return {t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
+}
+
 model::Result GlmSession::draft_begin(int32_t anchor, int64_t pos, int n) {
     draft_ready_ = false;
     if (max_window() < 2 || n < 1) return {};

@@ -60,6 +60,10 @@ public:
     /// only hands the token and its chance back.
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override;
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override;
+    /// What the expert tier has served since the session opened: the serve reporting layer's source for the stats
+    /// line's expert split and for the `DONE` line a client counts decode experts from (`tools/ppl_gate.py`). The
+    /// inherited answer is zeros, which reads as a request that touched no experts.
+    ExpertCounts expert_counts() const override;
 
 private:
     /// How many tokens a window can carry in the device memory free right now: the plan's chunk for that much memory,
