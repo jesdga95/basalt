@@ -14,7 +14,8 @@ Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Ne
 on an NVIDIA Blackwell GPU (sm_120) - or, in this fork, an Ada GPU (sm_89, RTX 40-series) - on Linux and Windows x64, and on the DGX Spark (GB10, Arm64), with what does not fit in VRAM
 (the experts of a mixture-of-experts model) in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
 
-<p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
+<p align="center"><img src="docs/img/frontend-rtx40.png" alt="The Basalt web UI while a reply streams on an RTX 40-series GPU: 101 tok/s decode and 4,496 tok/s prefill with 74.5% of the model's experts resident in system RAM" width="720"></p>
+<p align="center"><em>Screenshot of running <a href="https://huggingface.co/unsloth">Qwen3.8-Flash-Next-UD-IQ3_XXS</a> from Unsloth (81.6 GB) on a 16 GB RTX 4080.</em></p>
 
 **Help wanted:** spare Blackwell compute for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
 
@@ -82,7 +83,7 @@ The server listens on 127.0.0.1. Every setting: [configuration](docs/configurati
 | Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) | [guide](docs/models/hy4-flash.md) | [guide](docs/models/inkling2.md) | [guide](docs/models/ernie55.md) |
 | Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) | [precision](docs/precision/hy4-flash.md) | [precision](docs/precision/inkling2.md) | [precision](docs/precision/ernie55.md) |
 
-All models compared, with each one's context limit, flags and cards: [models](docs/models/index.md). On this fork every model in its release build - Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, Qwen3.8-27B, Hy4-flash and Inkling 2 Mini - builds and passes its kernel parity tests on Ada (sm_89). ERNIE-5.5-Flash is upstream's newest model and is not in this fork's build yet (`-DBASALT_MODELS=all` selects it, but it has not been built or tested for sm_89). The Flash-Next NVFP4 pack is verified end to end, and the two-card Ada paths are ported but not yet exercised on two physical Ada cards - see [ADA_PORT_NOTES.md](ADA_PORT_NOTES.md).
+All models compared, with each one's context limit, flags and cards: [models](docs/models/index.md). On this fork the five models it validates on Ada hardware - Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, Qwen3.8-27B, Hy4-flash and Inkling 2 Mini - build and pass their kernel parity tests on sm_89. ERNIE-5.5-Flash is upstream's newest model: it compiles for sm_89, its CPU tests pass, and the release archives carry it, but it has never been *run* on an Ada card (no kernel parity, no perplexity gate, no server session), so treat it as experimental here. The Flash-Next NVFP4 pack is verified end to end, and the two-card Ada paths are ported but not yet exercised on two physical Ada cards - see [ADA_PORT_NOTES.md](ADA_PORT_NOTES.md).
 
 The context limits are the models' own; what a card actually runs is set by the KV-cache budget - `--kv int8` halves it, and [configuration](docs/configuration/index.md) covers the rest.
 
