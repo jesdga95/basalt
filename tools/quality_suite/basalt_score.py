@@ -11,11 +11,11 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--pack", required=True); ap.add_argument("--ref", required=True); ap.add_argument("--out", required=True)
 ap.add_argument("--smoke", action="store_true"); ap.add_argument("--top", type=int, default=256)
 ap.add_argument("--engine", default=str(Path(__file__).resolve().parents[2] / "bin" / "basalt"), help="the basalt binary (default: bin/basalt in the repo)"); ap.add_argument("--gpu", default="0")
-ap.add_argument("--max-context", type=int, default=5120); ap.add_argument("--limit", type=int)
+ap.add_argument("--max-context", type=int, default=5120); ap.add_argument("--ppl-t", type=int, default=16); ap.add_argument("--limit", type=int)
 a = ap.parse_args()
 for what, path in (("--pack", a.pack), ("--ref", a.ref), ("--engine", a.engine)):
     if not os.path.isfile(path): ap.error(f"{what} {path}: no such file")
-t = load_file(a.ref); off, toks = t["conv_off"], t["tokens"]
+t = load_file(a.ref); off, ro, toks = t["conv_off"], t["row_off"], t["tokens"]
 convs = smoke_convs(off) if a.smoke else [c for c in range(len(off) - 1) if off[c + 1] - off[c] <= a.max_context]
 if a.limit: convs = convs[:a.limit]
 os.makedirs(a.out, exist_ok=True)
@@ -29,8 +29,13 @@ for line in eng.stdout:
 else: sys.exit("engine exited before READY; see " + log.name)
 t0 = time.time(); prev = 0; used = []
 for n, c in enumerate(convs):
-    ids = ",".join(map(str, toks[off[c]:off[c + 1]].tolist()))
-    eng.stdin.write(f"GEN 1 score=0 score_top={a.top} {ids}\n"); eng.stdin.flush()
+    c0, c1 = int(off[c]), int(off[c + 1])
+    nz = [i - c0 for i in range(c0, c1) if ro[i + 1] > ro[i]]
+    if not nz:
+        open(os.path.join(a.out, f"conv_{c:04d}.txt"), "wb").write(b""); used.append(c); continue
+    first_pos = nz[0]
+    ids = ",".join(map(str, toks[c0:c1].tolist()))
+    eng.stdin.write(f"GEN 1 score={first_pos} score_top={a.top} ppl_t={a.ppl_t} {ids}\n"); eng.stdin.flush()
     for line in eng.stdout:
         if line.startswith("ERR"): sys.exit(f"conv {c}: {line.strip()}")
         if line.startswith("DONE"): break

@@ -13,6 +13,7 @@ enum class RoleFilter { Assistant, Other, All };
 
 bool parse_role_filter(const std::string& s, RoleFilter& out);
 const char* role_filter_name(RoleFilter r);
+bool role_matches(uint8_t role, RoleFilter filter);
 
 /// Stored BF16 reference file (.safetensors) produced by tools/quality_suite/extract.py (or slim_ref.py).
 struct Reference {
@@ -34,6 +35,9 @@ bool load_reference(const std::string& path, Reference& ref, std::string& err);
 /// Selects conversation indices to run, matching tools/quality_suite/common.py:smoke_convs and basalt_score.py.
 /// `skipped` receives the count of conversations excluded because their length exceeds `max_context`.
 std::vector<int64_t> select_conversations(const Reference& ref, bool smoke, int64_t max_context, int64_t& skipped);
+
+/// First relative position (i - conv_off[conv_idx]) with a stored reference row matching `role`, or -1 if none.
+int64_t first_scored_pos(const Reference& ref, int64_t conv_idx, RoleFilter role);
 
 /// One parsed line from Basalt `--ppl-out` (`pos target lp_target lse id:lp ...`).
 struct ParsedRow {
@@ -62,7 +66,7 @@ struct ScoredRow {
 /// Incremental scorer: feed one conversation at a time as the engine finishes it.
 class Scorer {
 public:
-    explicit Scorer(const Reference& ref) : ref_(ref) {}
+    explicit Scorer(const Reference& ref, RoleFilter role = RoleFilter::All) : ref_(ref), role_(role) {}
 
     /// Aligns `rows` for conversation `conv_idx` against the reference and appends per-row metrics.
     bool add_conversation(int64_t conv_idx, const std::vector<ParsedRow>& rows, std::string& err);
@@ -72,6 +76,7 @@ public:
 
 private:
     const Reference& ref_;
+    RoleFilter role_ = RoleFilter::All;
     int shift_ = -1;   // -1 = undetected, 0 = pos is target index, 1 = pos is source index
     int64_t missing_ref_ids_ = 0;
     std::vector<ScoredRow> scored_;

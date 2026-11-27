@@ -1245,18 +1245,20 @@ int main(int argc, char** argv) {
                     if (eng.info.count("lossy")) lossy = eng.info["lossy"];
                     quality.load_s = secs(t0, Clock::now());
                     const auto t1 = Clock::now();
-                    basalt::program::quality::Scorer scorer(ref);
+                    basalt::program::quality::Scorer scorer(ref, o.quality_role);
                     uint64_t prev_off = 0;
                     bool ok = true;
-                    const std::string keys = fmt(" score=0 score_top=%d", o.quality_top);
                     std::vector<basalt::program::quality::ParsedRow> parsed;
                     for (size_t idx = 0; idx < convs.size(); ++idx) {
                         const int64_t c = convs[idx];
+                        const int64_t first_pos = basalt::program::quality::first_scored_pos(ref, c, o.quality_role);
+                        if (first_pos < 0) continue;
                         const int64_t a = ref.conv_off[static_cast<size_t>(c)];
                         const int64_t b = ref.conv_off[static_cast<size_t>(c + 1)];
                         std::vector<int64_t> ids;
                         ids.reserve(static_cast<size_t>(b - a));
                         for (int64_t k = a; k < b; ++k) ids.push_back(static_cast<int64_t>(ref.tokens[static_cast<size_t>(k)]));
+                        const std::string keys = fmt(" score=%lld score_top=%d ppl_t=16", (long long) first_pos, o.quality_top);
                         Done d;
                         if (!eng.request(keys, 1, ids, d)) {
                             quality.err = fmt("conv %lld: %s", (long long) c, d.err.c_str());

@@ -351,6 +351,15 @@ const char* role_filter_name(RoleFilter r) {
     return "assistant";
 }
 
+bool role_matches(uint8_t role, RoleFilter filter) {
+    switch (filter) {
+        case RoleFilter::Assistant: return role == 1;
+        case RoleFilter::Other: return role == 2;
+        case RoleFilter::All: return role > 0;
+    }
+    return false;
+}
+
 bool load_reference(const std::string& path, Reference& ref, std::string& err) {
     ref = Reference{};
     uint64_t fsize = 0;
@@ -480,6 +489,20 @@ std::vector<int64_t> select_conversations(const Reference& ref, bool smoke, int6
     return sel;
 }
 
+int64_t first_scored_pos(const Reference& ref, int64_t conv_idx, RoleFilter role) {
+    if (conv_idx < 0 || conv_idx >= ref.num_convs()) return -1;
+    const int64_t a = ref.conv_off[static_cast<size_t>(conv_idx)];
+    const int64_t b = ref.conv_off[static_cast<size_t>(conv_idx + 1)];
+    const int64_t n_roles = static_cast<int64_t>(ref.roles.size());
+    for (int64_t i = a; i < b; ++i) {
+        if (ref.row_off[static_cast<size_t>(i + 1)] <= ref.row_off[static_cast<size_t>(i)]) continue;
+        if (i + 1 < b && i + 1 < n_roles && role_matches(ref.roles[static_cast<size_t>(i + 1)], role)) {
+            return i - a;
+        }
+    }
+    return -1;
+}
+
 bool parse_basalt_rows(const char* data, size_t len, std::vector<ParsedRow>& out, std::string& err) {
     out.clear();
     const char* p = data;
@@ -566,8 +589,10 @@ bool Scorer::add_conversation(int64_t conv_idx, const std::vector<ParsedRow>& ro
     const int64_t b = ref_.conv_off[static_cast<size_t>(conv_idx + 1)];
 
     bool has_ref_rows = false;
+    const int64_t n_roles = static_cast<int64_t>(ref_.roles.size());
     for (int64_t i = a; i < b; ++i) {
-        if (ref_.row_off[static_cast<size_t>(i + 1)] > ref_.row_off[static_cast<size_t>(i)]) {
+        if (ref_.row_off[static_cast<size_t>(i + 1)] > ref_.row_off[static_cast<size_t>(i)] &&
+            i + 1 < n_roles && role_matches(ref_.roles[static_cast<size_t>(i + 1)], role_)) {
             has_ref_rows = true;
             break;
         }
@@ -608,6 +633,8 @@ bool Scorer::add_conversation(int64_t conv_idx, const std::vector<ParsedRow>& ro
         const int64_t r0 = ref_.row_off[static_cast<size_t>(i)];
         const int64_t r1 = ref_.row_off[static_cast<size_t>(i + 1)];
         if (r1 <= r0) continue;
+        const uint8_t row_role = (i + 1 < n_roles) ? ref_.roles[static_cast<size_t>(i + 1)] : 0;
+        if (!role_matches(row_role, role_)) continue;
 
         const int64_t key = shift_ ? (i - a) : (i - a + 1);
         const auto it = pos_map.find(key);

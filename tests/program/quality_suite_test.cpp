@@ -255,6 +255,52 @@ void test_smoke_and_max_context() {
     CHECK(skipped == 1);
 }
 
+void test_score_nonzero_offset(const std::string& tmpdir) {
+    // Unslimmed conversation: BOS (0), user prompt tokens (role 2) at idx 1..2, assistant tokens (role 1) at idx 3..4.
+    // Reference has rows at positions 0, 1, 2, 3; first assistant row is at pos 2 (predicting token idx 3).
+    const std::vector<int32_t> tokens = {2, 20, 21, 10, 11};
+    const std::vector<uint8_t> roles = {0, 2, 2, 1, 1};
+    const std::vector<int64_t> conv_off = {0, 5};
+    const std::vector<int64_t> row_off = {0, 2, 4, 6, 8, 8};
+    const std::vector<int32_t> topk_ids = {20, 21, 20, 21, 10, 11, 10, 11};
+    const float lp0 = static_cast<float>(std::log(0.6));
+    const float lp1 = static_cast<float>(std::log(0.3));
+    const std::vector<float> topk_lp = {lp0, lp1, lp0, lp1, lp0, lp1, lp0, lp1};
+    const std::vector<float> leftover = {0.1f, 0.1f, 0.1f, 0.1f, 0.0f};
+    const std::string path = (fs::path(tmpdir) / "ref_offset.safetensors").string();
+    CHECK(write_safetensors(path, {
+        make_blob("tokens", "I32", tokens),
+        make_blob("roles", "U8", roles),
+        make_blob("conv_off", "I64", conv_off),
+        make_blob("row_off", "I64", row_off),
+        make_blob("topk_ids", "I32", topk_ids),
+        make_blob("topk_lp", "F32", topk_lp),
+        make_blob("leftover", "F32", leftover),
+    }, ""));
+    Reference ref;
+    std::string err;
+    CHECK(load_reference(path, ref, err));
+    CHECK(first_scored_pos(ref, 0, RoleFilter::Assistant) == 2);
+    CHECK(first_scored_pos(ref, 0, RoleFilter::Other) == 0);
+    CHECK(first_scored_pos(ref, 0, RoleFilter::All) == 0);
+    // Engine ran with score=2, so it only emitted rows at pos 2 and 3.
+    Scorer sc(ref, RoleFilter::Assistant);
+    std::vector<ParsedRow> rows;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "2 10 0 0 10:%.9f 11:%.9f 99:-9.0\n"
+        "3 11 0 0 10:%.9f 11:%.9f 99:-9.0\n",
+        std::log(0.6), std::log(0.3), std::log(0.6), std::log(0.3));
+    CHECK(parse_basalt_rows(buf, std::strlen(buf), rows, err));
+    CHECK(sc.add_conversation(0, rows, err));
+    Summary sum;
+    CHECK(summarize(sc.scored_rows(), RoleFilter::Assistant, 50, 0, sum, err));
+    CHECK(sum.n_rows == 2);
+    CHECK_NEAR(sum.kld_mean, 0.0, 1e-6);
+    CHECK_NEAR(sum.top1, 1.0, 1e-9);
+    CHECK_NEAR(sum.ppl_ratio, 1.0, 1e-6);
+}
+
 void test_role_filters() {
     std::vector<ScoredRow> rows;
     ScoredRow a; a.conv = 0; a.role = 1; a.kld = 0.1; a.same = 1.0; a.has_target = true; a.nllb = 1.0; a.nllq = 1.1;
@@ -288,6 +334,7 @@ int main() {
     test_fixture_and_scoring(tmpdir);
     test_smoke_and_max_context();
     test_role_filters();
+    test_score_nonzero_offset(tmpdir);
     fs::remove_all(tmpdir, ec);
     if (g_fail != 0) {
         std::fprintf(stderr, "quality_suite_test: %d failures\n", g_fail);
