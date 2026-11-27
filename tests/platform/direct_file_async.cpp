@@ -372,6 +372,81 @@ static void test_wait_bounds_and_wakes(unsigned max) {
     check(f.wait(&extra, 1, 0) == 0, "extra completion after every one was returned");
     f.close();
 }
+#else
+/// On file systems that reject O_DIRECT with EINVAL (such as tmpfs under /dev/shm), DirectFile falls back to buffered
+/// reads, reports bypasses_cache() == false, and preserves the exact read / short-EOF / past-EOF contract.
+static void test_buffered_fallback_on_tmpfs() {
+    const uint32_t page = DirectFile::alignment();
+    constexpr unsigned pages = 4, tail = 29;
+    const std::string path = "/dev/shm/basalt-direct-tmpfs-test-" + std::to_string((unsigned long) getpid()) + ".bin";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) return;   // /dev/shm unavailable or read-only in this environment
+        for (unsigned i = 0; i < pages; ++i) {
+            const std::string chunk(page, (char) ('a' + i));
+            out.write(chunk.data(), (std::streamsize) chunk.size());
+        }
+        const std::string last(tail, 'Z');
+        out.write(last.data(), (std::streamsize) last.size());
+        if (!out) {
+            std::remove(path.c_str());
+            return;
+        }
+    }
+    struct Cleanup {
+        std::string p;
+        void* mem = nullptr;
+        ~Cleanup() {
+            DirectFile::free_aligned(mem);
+            std::remove(p.c_str());
+        }
+    } cleanup{path, DirectFile::alloc_aligned((size_t) (pages + 2) * page)};
+    check(cleanup.mem != nullptr, "tmpfs fallback buffer allocation");
+    // Only assert bypasses_cache() == false when this mount actually rejects O_DIRECT.
+    const int probe = basalt::platform::open_unbuffered(path);
+    const bool rejects_direct = probe < 0;
+    if (probe >= 0) basalt::platform::close_fd(probe);
+
+    DirectFile f;
+    std::string error;
+    call_ok(f.open(path, error, 2), error, "open on /dev/shm tmpfs");
+    check(f.is_open(), "tmpfs DirectFile not open");
+    check(f.size() == (uint64_t) pages * page + tail, "tmpfs DirectFile size mismatch");
+    if (rejects_direct) check(!f.bypasses_cache(), "tmpfs buffered fallback reported bypasses_cache() == true");
+
+    const unsigned reads = pages + 2;   // full pages, short last page, and one past EOF
+    std::memset(cleanup.mem, 0, (size_t) reads * page);
+    for (unsigned i = 0; i < reads; ++i)
+        call_ok(f.submit((uint64_t) i * page, static_cast<char*>(cleanup.mem) + (size_t) i * page, page, i, error),
+                error, "tmpfs submit");
+    std::vector<bool> seen(reads, false);
+    unsigned got = 0;
+    while (got < reads) {
+        Completion batch[8];
+        const int n = f.wait(batch, 8, 5000);
+        check(n > 0, "tmpfs completion timeout");
+        for (int i = 0; i < n; ++i) {
+            const Completion& c = batch[i];
+            check(c.tag < reads && !seen[c.tag], "tmpfs wrong or repeated completion");
+            seen[c.tag] = true;
+            ++got;
+            check(c.ok, "tmpfs read failed");
+            const char* p = static_cast<const char*>(cleanup.mem) + (size_t) c.tag * page;
+            if (c.tag < pages) {
+                const char want = (char) ('a' + c.tag);
+                check(c.bytes == page && p[0] == want && p[page - 1] == want, "tmpfs page data mismatch");
+            } else if (c.tag == pages) {
+                check(c.bytes == tail && p[0] == 'Z' && p[tail - 1] == 'Z', "tmpfs short EOF mismatch");
+            } else {
+                check(c.bytes == 0, "tmpfs past-EOF read returned bytes");
+            }
+        }
+    }
+    f.close();
+    check(!f.is_open() && !f.bypasses_cache(), "tmpfs close left state dirty");
+    std::cout << "direct_file_async: passed Linux /dev/shm buffered fallback (rejects_direct="
+              << (rejects_direct ? "true" : "false") << ")\n";
+}
 #endif
 
 int main() {
@@ -422,6 +497,8 @@ int main() {
         const unsigned maxes[] = {1u, 2u, 3u, 7u, 17u};   // one slot and a batch across the boundary
         for (unsigned max : maxes) test_wait_bounds_and_wakes(max);
         std::cout << "direct_file_async: passed Windows close with reads in flight, waits bounded by max\n";
+#else
+        test_buffered_fallback_on_tmpfs();
 #endif
         DirectFile::free_aligned(memory); std::remove(name.c_str());
         std::cout << "direct_file_async: passed queued reads, short EOF, wake, close drain, reopen, beside a view\n";
