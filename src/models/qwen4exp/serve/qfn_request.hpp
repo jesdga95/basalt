@@ -115,12 +115,6 @@ private:
     bool kv_ok{};
     // `copied`: the copies already ran (and were waited for) on the overlapped read's thread, so only the table is left
     bool ov_copied{};
-    // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
-    // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-    // decode for a share of the time the chunk took (half), so a long prompt does not stop the others.  The
-    // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
-    // run on the CPU), never a prompt buffer.
-    static constexpr double decode_share = 0.5;
     bool beside_{};   ///< this part is read beside the decoding slots: lend() found a chunk worth sharing the card
     bool batch_fatal{};
     int64_t il_parts{};

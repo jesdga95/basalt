@@ -3,6 +3,7 @@
 #include "session_engine.hpp"
 
 #include "batch_plan.hpp"
+#include "prompt_window.hpp"
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
@@ -130,6 +131,11 @@ public:
                                               : std::string();
         std::printf("INFO logit_bias=%lld context=%lld spec=%d mtp_max=0 lookup=0%s engine=" BASALT_VERSION "\n",
                     (long long) n_vocab, (long long) o.max_context, o.spec, slots.c_str());
+    }
+    bool prompt_window_ready() {
+        if (halted() || !batch_on()) return false;
+        std::lock_guard<std::mutex> lk(in_mu);
+        return prompt_window_queue(in_lines, bs);
     }
     bool next_batch_window() override;
     bool slot_ready(int b) override { return (size_t) b >= pool_ready_.size() || pool_ready_[(size_t) b]; }
@@ -1119,7 +1125,9 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
-            const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
+            const int64_t text_end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
+            const int chunk = rt_.batch_on() && !rt_.bs[(size_t) rt_.active_slot()].active ? rt_.session().prefill_window_rows() : 0;
+            const int64_t end = chunk > 0 ? std::min(text_end, at + chunk) : text_end;
             basalt::model::PrefillRequest pr;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
@@ -1141,8 +1149,17 @@ Flow SessionRequest::read_to(int64_t to) {
                 progress_line("PL", base + k);
             };
             pr.stop = [this] { return runtime_.halted(); };
+            const auto start = end < text_end ? Clock::now() : Clock::time_point{};
             r = rt_.session().prefill_chunk(pr);
-            if (!runtime_.halted()) at = end;
+            if (!runtime_.halted()) {
+                at = end;
+                if (r.ok() && at < text_end) {
+                    if (!prompt_decode_windows(start, [&] { return rt_.prompt_window_ready(); },
+                                               [&] { return rt_.next_batch_window(); })) return Flow::error;
+                    if (runtime_.halted()) { cancelled = true; return Flow::quit; }
+                    continue;   // the synchronized chunk already reported its progress
+                }
+            }
         }
         if (r.status == basalt::model::Status::Refused) {   // no room for this prompt: the engine serves on
             basalt::log::warn("basalt serve", "%s", r.message.c_str());

@@ -154,6 +154,8 @@ public:
     virtual ~ModelSession() = default;
     virtual Result decode_window(const DecodeRequest& r) = 0;
     virtual Result prefill_chunk(const PrefillRequest& r) = 0;
+    /// A synchronized text chunk after which other sessions can decode; 0 keeps the whole read exclusive.
+    virtual int prefill_window_rows() const { return 0; }
     /// The rows a decode_batch call holds in all; 0: this model's sessions do not batch their windows.
     virtual int batch_rows() const { return 0; }
     /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
