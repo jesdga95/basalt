@@ -35,8 +35,13 @@ public:
     int device() const { return device_; }
     const DeviceTensor* tensor(const std::string& name) const;
     const DeviceTensor* tensor(int layer, const char* suffix) const;
+    bool attention_layer_weights(int layer, AttentionLayerWeights& weights, std::string& err) const;
+    bool ffn_layer_weights(int layer, FfnRouteWeights& route, SharedExpertWeights& shared, std::string& err) const;
+    bool head_weights(HeadWeights& weights, std::string& err) const;
     bool embedding_row(int32_t token, std::vector<float>& row, std::string& err) const;
     bool hash_route_table(int layer, std::vector<int32_t>& ids, std::string& err) const;
+    /// Read one validated expert blob from the pack into caller-owned staging memory.
+    bool read_expert_blob(int layer, int expert, void* dst, size_t bytes, std::string& err) const;
     bool expert_tier_spec(const model::LoadRequest& request, core::ExpertTierSpec& spec, std::string& err) const;
 
 private:

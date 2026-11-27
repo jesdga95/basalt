@@ -152,6 +152,29 @@ bool ModelWeights::hash_route_table(int layer, std::vector<int32_t>& ids, std::s
     return load_hash_route_table(pack_, layer, ids, err);
 }
 
+bool ModelWeights::read_expert_blob(int layer, int expert, void* dst, size_t bytes, std::string& err) const {
+    if (fd_ < 0 || !dst || layer < 0 || layer >= (int) pack_.experts.size() ||
+        expert < 0 || expert >= pack_.geo.n_expert) {
+        err = "deepseek4 weights: invalid expert staging request";
+        return false;
+    }
+    const ExpertLayer& el = pack_.experts[(size_t) layer];
+    const core::ModelFile::Section* section = pack_.file.find("experts");
+    if (!section || bytes != el.bytes ||
+        (uint64_t) expert > (std::numeric_limits<uint64_t>::max() - el.offset) / el.bytes) {
+        err = "deepseek4 weights: expert staging size or layout is invalid";
+        return false;
+    }
+    const uint64_t rel = el.offset + (uint64_t) expert * el.bytes;
+    if (rel > section->bytes || el.bytes > section->bytes - rel || section->offset > UINT64_MAX - rel ||
+        !platform::pread_all(fd_, dst, bytes, section->offset + rel)) {
+        err = "deepseek4 weights: cannot read expert blob from the pack";
+        return false;
+    }
+    err.clear();
+    return true;
+}
+
 bool ModelWeights::expert_tier_spec(const model::LoadRequest& request, core::ExpertTierSpec& spec,
                                     std::string& err) const {
     if (path_.empty() || fd_ < 0) {

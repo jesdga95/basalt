@@ -74,6 +74,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const basalt::core::FileRange experts = source.file.range("experts");
+    std::vector<uint8_t> expert_blob((size_t) source.experts.front().bytes);
+    std::vector<uint8_t> expert_reference(expert_blob.size());
+    if (experts.empty() || !weights.read_expert_blob(0, 0, expert_blob.data(), expert_blob.size(), err) ||
+        !basalt::core::read_range_at(experts, source.experts.front().offset, expert_reference.data(),
+                                     expert_reference.size(), err) || expert_blob != expert_reference) {
+        std::cerr << (err.empty() ? "DeepSeek4 staged expert blob differs from its pack bytes" : err) << '\n';
+        return 1;
+    }
+
     const DeviceTensor* output = weights.tensor("output.weight");
     const DeviceTensor* router = weights.tensor(0, "ffn_gate_inp.weight");
     const TensorRef* output_ref = source.find("output.weight");
