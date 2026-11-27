@@ -760,6 +760,17 @@ void free_aligned(void* p) {
 #endif
 }
 
+void advise_hugepages(void* p, uint64_t bytes) {
+    constexpr uint64_t kHugePage = 2ull << 20;
+    if (p == nullptr || bytes < kHugePage) return;
+#if defined(_WIN32)
+    (void) p;
+    (void) bytes;
+#else
+    (void) madvise(p, (size_t) bytes, MADV_HUGEPAGE);
+#endif
+}
+
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes) {
     if (base == nullptr || bytes == 0) return true;
 #if defined(_WIN32)
