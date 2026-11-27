@@ -5,8 +5,8 @@
 // (both exact).  Products: mma m16n8k16 (bf16 in, fp32 accumulate) with the window's rows as the columns, 8 per mma.  A
 // column's sums never meet another column's, and the order of a row's sums (fixed chunks of K in order within a K slice,
 // the slices added in slice order; FP8 slices K across a block's warps, the others across blocks) depends only on the
-// shapes of the call's matrices: a row's bits do not depend on T or on what the other rows hold, so a drafted or
-// batched window gives the same rows as plain decoding.
+// shapes of the call's matrices (and its row groups, see gemm): a row's bits do not depend on T up to kRows or on what the
+// other rows hold, so a drafted or batched window gives the same rows as plain decoding.
 //
 // Products start as programmatic dependents inside a PdlScope (pdl.hpp): each stages its first weights before it waits
 // for the kernel before it.
@@ -16,7 +16,8 @@
 
 namespace basalt::kernels::wgemm {
 
-constexpr int kRows = 64;   // rows (columns of the product) a call takes: a window's 16, or two batched slots' blocks
+constexpr int kRows = 64;   // rows (columns of the product) a group takes: a window's 16, or two batched slots' blocks; a call
+                            // of more rows runs them as groups of kRows in one launch (not FP8)
 
 enum class Format {
     F8,      // E4M3 codes [rows][K]
@@ -82,11 +83,13 @@ struct Call {
 /// that runs some of the main card's layers plans as the main card, so its rows are the main card's.
 void plan_device(int device);
 
-/// The workspace a call needs (its shape and the planning device).
+/// The workspace a call needs for each group of kRows rows (its shape and the planning device).
 void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tickets);
 
-/// Runs the call for rows 0..T-1 (1..16) of `act` (packed for c.K).  F8: K a multiple of 128, W 16-byte aligned.  NVFP4:
-/// W in planes, rows a multiple of 128, K a multiple of 128.
+/// Runs the call for rows 0..T-1 of `act` (packed for c.K; T up to kRows for F8, any T for the others, each group of kRows
+/// rows with its own workspace part, so the workspace holds ceil(T / kRows) of workspace_need's).  A call of several
+/// groups may take fewer K slices than one group: its rows' bits are those of any call of as many groups.  F8: K a multiple of
+/// 128, W 16-byte aligned.  NVFP4: W in planes, rows a multiple of 128, K a multiple of 128.
 void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stream);
 
 }  // namespace basalt::kernels::wgemm

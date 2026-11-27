@@ -72,7 +72,6 @@ constexpr int kAttRows = 2048;                 // rows of one attention step ins
 constexpr int kStageExperts = 16;              // experts of one prompt launch (a blob each in the staging)
 constexpr int kMmqTile = 128;                  // the widest column tile of an MMQ product
 constexpr int kLaunchRows = 32768;              // most (row, expert) pairs of one prompt launch
-constexpr int kMaxWindow = 8;                  // rows of a decode window, and of one expert group
 constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
 constexpr uint64_t kModuleRoom = 4ull << 27;   // kernel modules + graphs still to load when the tier opens (512 MiB)

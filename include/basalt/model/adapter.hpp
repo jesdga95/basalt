@@ -107,6 +107,7 @@ struct LoadRequest {
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
+    bool kv_pool = true;              ///< --kv-pool: a model with a KV pool backs every session's cells from it (false: each its own, fixed)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
 };
 
@@ -264,6 +265,14 @@ public:
     }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
+    /// The shared KV pool (core/kv_pool.hpp): a session that backs its per-position cells from one pool as its conversation
+    /// grows reaches the whole context while the pool has room. Backs the cells of `positions` positions: Refused, with
+    /// nothing changed, when the pool is short. A session whose caches are its own, sized at start, has them already.
+    virtual Result kv_back(int64_t positions) { (void) positions; return {}; }
+    /// Gives the pool back the cells past `positions` (0: the conversation left the card).
+    virtual void kv_trim(int64_t positions) { (void) positions; }
+    /// The pool's figures for the log, empty without a pool: its bytes, what is free and what this session backs.
+    virtual std::string kv_pool_line() const { return {}; }
     /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below
     /// the slots a prompt chunk needs; -1 without an elastic KV.
     virtual int64_t kv_ceiling() { return -1; }
@@ -374,6 +383,9 @@ public:
     virtual const char* community_quant() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
+    /// The most parallel slots (--batch) the model batches: each slot's window takes at least one row of a batch window. A
+    /// start asking for more is refused.
+    virtual int max_slots() const = 0;
     /// What the model runs with several cards: the most cards each mode takes, 0 for a mode it does not run.
     virtual program::GpuModes gpu_modes() const = 0;
     virtual TokenNames token_names() const = 0;

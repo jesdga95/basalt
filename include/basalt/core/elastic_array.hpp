@@ -15,8 +15,9 @@ public:
     ElasticArray(const ElasticArray&) = delete;
     ElasticArray& operator=(const ElasticArray&) = delete;
 
-    /// Reserves `bytes` of address space. Without virtual memory management the whole array is allocated at once.
-    bool open(uint64_t bytes, std::string& err);
+    /// Reserves `bytes` of address space; a grow maps whole steps of `step_granules` allocation granules. Without virtual
+    /// memory management the whole array is allocated at once.
+    bool open(uint64_t bytes, std::string& err, uint32_t step_granules = 4);
     /// Backs at least the first `bytes` bytes (rounded up to the allocation granularity; the new bytes are zeroed).
     /// False with `err` when the device has no memory for them with `keep_free` left; what was backed stays.
     bool ensure(uint64_t bytes, uint64_t keep_free, std::string& err);
@@ -39,7 +40,7 @@ private:
         unsigned long long handle;
     };
     uint8_t* base_ = nullptr;
-    uint64_t reserved_ = 0, backed_ = 0, gran_ = 0;
+    uint64_t reserved_ = 0, backed_ = 0, gran_ = 0, step_ = 0;
     bool unusable_ = false;   // a map, clear or release could not be confirmed: the range's backing is not known
     bool out_of_memory_ = false;
     bool plain_ = false;   // one cudaMalloc, no virtual memory

@@ -339,7 +339,7 @@ class ParallelOption(unittest.TestCase):
         self.assertEqual(cli_engine[:2], ["--batch", "4"])
 
     def test_range(self):
-        for bad in ("0", "9", "x"):
+        for bad in ("0", "65", "x"):
             with self.assertRaises(SystemExit):
                 self.parse("--mock-engine", "--parallel", bad)
 

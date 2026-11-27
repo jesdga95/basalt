@@ -481,6 +481,13 @@ int QfnRuntime::init_conversations() {
     check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
 
     // (the checkpoints' pooled blocks were reserved, their pages written, before the RAM copy)
+    if (o.prompt_cache > 0) {   // the pool every chain shares, as the start reserved it
+        size_t bytes = basalt::core::conversation_checkpoint_bytes(ss, g);
+        for (const auto& st : stages) bytes += basalt::core::conversation_checkpoint_bytes(st->ss, g);
+        check_pool = basalt::program::conv_cache::pool_checkpoints((uint64_t) o.checkpoint_pool_mib << 20, bytes,
+                                                                   o.prompt_cache, o.batch);
+        check_bytes = bytes;
+    }
     if (o.prompt_cache > 0 && !multi_gpu) {
         std::string ce;
         if (!ckd.reserve(basalt::core::conversation_checkpoint_bytes(ss, g), ce))

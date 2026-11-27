@@ -407,6 +407,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.rope = o.rope;
         lreq.route = o.route;
         lreq.kv_resident = o.kv_resident;
+        lreq.kv_pool = o.kv_pool;
         lreq.diag_rows = o.diag_rows;
         const basalt::model::Result r = adapter->start(lreq, started);
         if (!r.ok() || started.sessions.empty()) return fatal_start_error(r.message);

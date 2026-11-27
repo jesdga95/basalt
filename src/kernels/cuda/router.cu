@@ -38,6 +38,7 @@ constexpr int kLogitThreads = 256;  // one block per gate row
 constexpr int kMaxVec = 8;          // float4 per thread: n_embd <= 4 * kMaxVec * kLogitThreads
 constexpr int kMaxExpert = 512;
 constexpr int kRowsMinTok = 64;     // tokens from which a launch takes several gate rows a block
+constexpr int kWideTok = 32;        // tokens from which a 2304-wide launch takes 8 gate rows a block (a batch window)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -259,12 +260,14 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
                                 weights + (size_t) t * k, sh, held, prior);
 }
 
-// Two gate rows per block for n_embd == 2304 (576 float4s = 2 * 256 + 64) with PDL overlap: halves activation reloads across
-// multi-token decode windows while preserving router_logits_row's exact FP32 summation order bit-for-bit.
+// G gate rows per block for n_embd == 2304 (576 float4s = 2 * 256 + 64) with PDL overlap: a block reads its tokens'
+// activations once for G rows (2 for a decode window, 8 for a batch window, where those reads bound the launch) while
+// preserving router_logits_row's exact FP32 summation order bit-for-bit, whatever G.
+template <int G>
 __global__ void __launch_bounds__(kLogitThreads)
-router_logits_2304_g2_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_expert, int n_tokens,
-                             float* __restrict__ logits) {
-    constexpr int n_embd = 2304, n4 = n_embd >> 2, G = 2;
+router_logits_2304_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_expert, int n_tokens,
+                          float* __restrict__ logits) {
+    constexpr int n_embd = 2304, n4 = n_embd >> 2;
     __shared__ float red[G][kMaxTok * (kLogitThreads / 32)];
     const int r0 = blockIdx.x * G, t0 = blockIdx.y * kMaxTok, nt = min(kMaxTok, n_tokens - t0);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -280,7 +283,7 @@ router_logits_2304_g2_kernel(const float* __restrict__ x, const float* __restric
     pdl_launch_dependents();
     for (int t = 0; t < nt; ++t) {
         const float4* xv = reinterpret_cast<const float4*>(x + (size_t) (t0 + t) * n_embd);
-        float acc[G] = {0.f, 0.f};
+        float acc[G] = {};
         const float4 v0 = xv[tid];
         const float4 v1 = xv[tid + kLogitThreads];
 #pragma unroll
@@ -311,6 +314,7 @@ router_logits_2304_g2_kernel(const float* __restrict__ x, const float* __restric
         }
     }
     __syncthreads();
+    static_assert(G * kMaxTok <= kLogitThreads, "a thread a row and token");
     const int g = tid / kMaxTok, t = tid % kMaxTok;
     if (g < G && t < nt) {
         float s = 0.f;
@@ -407,8 +411,13 @@ void router_logits_impl(const float* x, const W* gate, int n_tokens, const Route
             continue;
         }
         if constexpr (std::is_same_v<W, float>) {
+            if (rows2_2304 && nt >= kWideTok && a.n_expert % 8 == 0) {
+                launch_pdl(router_logits_2304_kernel<8>, dim3(a.n_expert / 8, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
+                           x + (size_t) t0 * a.n_embd, gate, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
+                continue;
+            }
             if (rows2_2304) {
-                launch_pdl(router_logits_2304_g2_kernel, dim3(a.n_expert / 2, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
+                launch_pdl(router_logits_2304_kernel<2>, dim3(a.n_expert / 2, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
                            x + (size_t) t0 * a.n_embd, gate, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
                 continue;
             }

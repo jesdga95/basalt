@@ -9,6 +9,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/window_gemm.hpp"
+#include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/dflash2_kernels.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
@@ -26,6 +27,7 @@ namespace basalt::models::inkling2 {
 namespace {
 
 namespace bk = basalt::kernels;
+namespace bp = basalt::prefill;
 
 constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
@@ -40,7 +42,7 @@ uint64_t q8_bytes(uint64_t rows, uint64_t n_in) { return rows * (n_in / 32) * 34
 
 int64_t ring_cells(const Dflash2Geometry& d) { return (int64_t) d.window + kRingExtra; }
 
-void ws_need(const Dflash2Geometry& d, int n_vocab, bool head_fp4, size_t& partial, size_t& tickets) {
+void ws_need(const Dflash2Geometry& d, int n_vocab, size_t& partial, size_t& tickets) {
     namespace wg = bk::wgemm;
     partial = tickets = 0;
     const auto need = [&](wg::Format fmt, int64_t K, std::initializer_list<int64_t> rows, wg::Epilogue epi) {
@@ -62,7 +64,7 @@ void ws_need(const Dflash2Geometry& d, int n_vocab, bool head_fp4, size_t& parti
     need(wg::Format::Nvfp4, kDf2Q, {kE}, wg::Epilogue::Store);
     need(wg::Format::Nvfp4, kE, {d.n_ff, d.n_ff}, wg::Epilogue::SwiGLU);
     need(wg::Format::Nvfp4, d.n_ff, {kE}, wg::Epilogue::Store);
-    need(head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8, kE, {n_vocab}, wg::Epilogue::Store);
+    need(wg::Format::Q8, kE, {n_vocab}, wg::Epilogue::Store);
     need(wg::Format::Bf16, kE, {kDf2Rank}, wg::Epilogue::Store);
 }
 
@@ -185,10 +187,9 @@ model::Result dflash2_plan(const Pack& pack, core::LoadPlan& reads, int file, in
         L.fp4_scale = (float*) w->dev(kFp4Mats * 4, ok);
     }
 
-    if (bk::nvfp4p::fits(g.n_vocab, kE)) {
-        w->head_fp4 = w->dev(bk::nvfp4p::bytes(g.n_vocab, kE), ok);
-        w->head_fp4_scale = (float*) w->dev(4, ok);
-    }
+    w->head_rows = ((int64_t) g.n_vocab + 127) / 128 * 128;
+    w->head_fp4 = w->dev(bk::nvfp4p::bytes(w->head_rows, kE), ok);
+    w->head_fp4_scale = (float*) w->dev(4, ok);
     if (!ok) return fail(err.empty() ? "out of device memory" : err);
 
     basalt::log::info("basalt inkling2",
@@ -222,7 +223,19 @@ model::Result Dflash2Weights::finish(const void* head_q8, const uint16_t* emb, c
         cudaMemcpyAsync(tmp, fc_q8, q8_bytes(kE, (uint64_t) kDf2Targets * kE), cudaMemcpyDeviceToDevice, s);
         dflash2_split_fc_q8(tmp, fc_q8, s);
 
-        if (head_fp4) bk::nvfp4p::from_q8(head_q8, n_vocab, kE, head_fp4, head_fp4_scale, s);
+        {   // the head's planes from a copy padded with zero rows to whole tiles, in mapped host memory (read once)
+            const size_t rb = q8_bytes(1, kE);
+            void* padded = nullptr;
+            if (cudaHostAlloc(&padded, rb * (size_t) head_rows, cudaHostAllocMapped) != cudaSuccess)
+                throw std::runtime_error("out of host memory converting the DFlash 2 head");
+            std::memset(static_cast<uint8_t*>(padded) + rb * (size_t) n_vocab, 0, rb * (size_t) (head_rows - n_vocab));
+            cudaMemcpyAsync(padded, head_q8, rb * (size_t) n_vocab, cudaMemcpyDeviceToHost, s);
+            void* dpad = nullptr;
+            cudaHostGetDevicePointer(&dpad, padded, 0);
+            bk::nvfp4p::from_q8(dpad, head_rows, kE, head_fp4, head_fp4_scale, s);
+            cudaStreamSynchronize(s);
+            cudaFreeHost(padded);
+        }
 
         for (Dflash2Layer& L : layer) {
             bk::nvfp4p::from_q8(L.wk_q8, kDf2KV, kE, L.wk, L.fp4_scale + 1, s);
@@ -253,10 +266,13 @@ model::Result Dflash2Weights::finish(const void* head_q8, const uint16_t* emb, c
     return {};
 }
 
-uint64_t dflash2_session_bytes(const Pack& pack) {
+uint64_t dflash2_session_bytes(const Pack& pack) { return pack.dflash2.present ? 4096 : 0; }
+
+uint64_t dflash2_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran) {
     const Dflash2Geometry& d = pack.dflash2;
     if (!d.present) return 0;
-    return (uint64_t) d.n_layers * 2ull * (uint64_t) ring_cells(d) * kDf2KV * 2 + 4096;
+    const uint64_t b = (uint64_t) std::min<int64_t>(ring_cells(d), positions + kDf2Block) * kDf2KV * 2;
+    return (uint64_t) d.n_layers * 2ull * ((b + gran - 1) / gran * gran);
 }
 
 const Dflash2Weights::SharedScratch* Dflash2Weights::ensure_shared_scratch(std::string& err) const {
@@ -297,7 +313,7 @@ const Dflash2Weights::SharedScratch* Dflash2Weights::ensure_shared_scratch(std::
     s.act_h = alloc_z(bk::wgemm::act_bytes((int64_t) ff));
     {
         size_t pf = 0, tk = 0;
-        ws_need(geo, n_vocab, head_fp4 != nullptr, pf, tk);
+        ws_need(geo, n_vocab, pf, tk);
         s.ws.partial = f(std::max<size_t>(pf, 1));
         s.ws.tickets = (int32_t*) alloc_z(std::max<size_t>(tk, 1) * 4);
         s.ws.partial_floats = pf;
@@ -351,16 +367,21 @@ bool Dflash2Hook::init(const Dflash2Weights* w, const Geometry& g, int64_t conte
     slot_.assign(g.visits.size(), -1);
     for (int k = 0; k + 1 < kDf2Targets; ++k) slot_[(size_t) d.targets[(size_t) k]] = k;
 
+    // the rings: each reserves its whole range and backs it from the KV pool as the conversation grows (the session's
+    // first grow takes a granule of each from the pool, and a trim keeps it)
     const int64_t cap = ring_cells(d);
+    ring_ = cap;
     const size_t ring_b = (size_t) cap * kDf2KV * 2;
-    void* slab = dev((size_t) d.n_layers * 2 * ring_b, ok);
     cache_.assign((size_t) d.n_layers, Cache{});
     for (int l = 0; ok && l < d.n_layers; ++l) {
         Cache& c = cache_[(size_t) l];
         c.cap = cap;
-        auto* base = static_cast<uint8_t*>(slab) + (size_t) l * 2 * ring_b;
-        c.k = reinterpret_cast<uint16_t*>(base);
-        c.v = reinterpret_cast<uint16_t*>(base + ring_b);
+        for (int j = 0; j < 2; ++j) {
+            auto a = std::make_unique<core::ElasticArray>();
+            if (!a->open(ring_b, err, 1)) ok = false;
+            (j ? c.v : c.k) = reinterpret_cast<uint16_t*>(a->data());
+            rings_.push_back(std::move(a));
+        }
     }
 
     meta_d_ = (int32_t*) dev(2 * 4, ok);
@@ -587,9 +608,9 @@ void Dflash2Hook::stage(int k, int n, void* stream) {
 
     dflash2_norm_draft_pack(s.x, w.norm, d.rms_eps, kDf2Block, 1, n, s.act_a, s.hq, nullptr, stream);
     wg::Call hc;
-    hc.fmt = w.head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8;
+    hc.fmt = wg::Format::Q8;
     hc.K = kE;
-    hc.m[0] = mat(w.head_fp4 ? w.head_fp4 : w.head, w.n_vocab, w.head_fp4_scale, s.logits, w.n_vocab);
+    hc.m[0] = mat(w.head, w.n_vocab, nullptr, s.logits, w.n_vocab);
     wg::gemm(hc, s.act_a, n, s.ws, stream);
 
     wg::Call sc_call;
@@ -598,7 +619,7 @@ void Dflash2Hook::stage(int k, int n, void* stream) {
     sc_call.m[0] = mat(w.sel_h, kDf2Rank, nullptr, s.g, kDf2Rank);
     wg::gemm(sc_call, s.act_a, n, s.ws, stream);
 
-    dflash2_top16(s.logits, w.head, true, s.hq, n, w.n_vocab, d.logit_softcap, s.top_scr, s.cand, s.tail_lse, stream);
+    dflash2_top16(s.logits, w.head, true, s.hq, n, w.n_vocab, w.n_vocab, d.logit_softcap, s.top_scr, s.cand, s.tail_lse, stream);
     dflash2_select(meta_d_, 2, s.cand, s.tail_lse, s.g, w.pred, w.succ, 1, n, d.logit_softcap, ids_d_, kDf2Block,
                    conf_d_, kDf2Block, stream);
     cudaMemcpyAsync(ids_h_, ids_d_, (size_t) n * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
@@ -691,6 +712,54 @@ model::Result Dflash2Hook::draft_end(int32_t* ids, float* conf, int max_n, int& 
     return {};
 }
 
+void Dflash2Hook::count_cells() {
+    cells_ = ring_;
+    for (const auto& a : rings_) cells_ = std::min<int64_t>(cells_, (int64_t) (a->backed() / (kDf2KV * 2)));
+}
+
+uint64_t Dflash2Hook::grow_bytes(int64_t positions) const {
+    uint64_t n = 0;
+    for (const auto& a : rings_) n += a->growth((uint64_t) ring_cells_for(positions) * kDf2KV * 2);
+    return n;
+}
+
+bool Dflash2Hook::ensure(int64_t positions, std::string& err) {
+    if (ring_cells_for(positions) <= cells_) return true;
+    const uint64_t bytes = (uint64_t) ring_cells_for(positions) * kDf2KV * 2;
+    for (const auto& a : rings_)
+        if (!a->ensure(bytes, 0, err)) {
+            err = "the drafter's rings cannot grow to " + std::to_string(positions) + " positions: " + err;
+            count_cells();
+            return false;
+        }
+    count_cells();
+    return true;
+}
+
+void Dflash2Hook::trim(int64_t positions) {
+    const uint64_t keep = (uint64_t) ring_cells_for(std::max<int64_t>(positions, 1)) * kDf2KV * 2;
+    for (const auto& a : rings_) a->trim(keep);
+    count_cells();
+}
+
+uint64_t Dflash2Hook::backing_bytes() const {
+    uint64_t n = 0;
+    for (const auto& a : rings_) n += a->backed();
+    return n;
+}
+
+bool Dflash2Hook::out_of_memory() const {
+    for (const auto& a : rings_)
+        if (a->out_of_memory()) return true;
+    return false;
+}
+
+bool Dflash2Hook::usable() const {
+    for (const auto& a : rings_)
+        if (!a->usable()) return false;
+    return true;
+}
+
 size_t Dflash2Hook::running_bytes() const {
     if (!w_) return 0;
     size_t n = kRunHeadBytes;
@@ -713,9 +782,12 @@ void Dflash2Hook::running_state(int64_t pos, bool save, core::RunningState& st) 
     } else {
         st.head.insert(st.head.end(), kRunHeadBytes, 0);
     }
+    // the cells positions up to pos + a block sit in (the ring's first ones until it wraps): backed while the session
+    // holds pos
+    const size_t cells = (size_t) ring_cells_for(pos);
     for (const Cache& c : cache_) {
-        st.regions.push_back({c.k, (size_t) c.cap * kDf2KV * 2});
-        st.regions.push_back({c.v, (size_t) c.cap * kDf2KV * 2});
+        st.regions.push_back({c.k, cells * kDf2KV * 2});
+        st.regions.push_back({c.v, cells * kDf2KV * 2});
     }
 }
 
@@ -782,8 +854,9 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     const Dflash2Geometry& d = w->geo;
     const size_t E = kE, ff = (size_t) d.n_ff;
     const int S_all = std::min(max_sessions, (int) bk::kWindowSegsMax);
-    const int CR = kChunkSlots * kDf2Block;       // 64
-    const int CD = kChunkSlots * kDf2Drafts;      // 56
+    const int CR = S_all * kDf2Block;      // block rows of a pass
+    const int CD = S_all * kHeadDrafts;    // draft rows of a head pass
+    const int CG = (std::max(CR, max_rows) + wg::kRows - 1) / wg::kRows;   // row groups of the widest product
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };
 
@@ -792,9 +865,10 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     tap_rows_ = std::max(tap_rows, kSlice);
     tap_ = tap;
 
-    c_tap_bf16_ = dev(wg::act_bytes((int64_t) kDf2Targets * kE), ok);
-    c_raw_ = f((size_t) wg::kRows * E);
-    c_act_ = dev(std::max(wg::act_bytes(kE), (size_t) (max_rows + wg::kRows) * E * sizeof(uint16_t)), ok);
+    const int CM = std::max(max_rows, wg::kRows);   // commit rows
+    c_tap_bf16_ = dev((size_t) CM * kDf2Targets * E * sizeof(uint16_t), ok);
+    c_raw_ = f((size_t) CM * E);
+    c_act_ = dev((size_t) CM * E * sizeof(uint16_t), ok);
     c_kb_ = f((size_t) max_rows * kDf2KV);
     c_vb_ = f((size_t) max_rows * kDf2KV);
 
@@ -807,12 +881,16 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     vb_ = f((size_t) CR * kDf2KV);
     qr_ = f((size_t) CR * kDf2Q);
     attn_ = f((size_t) CR * kDf2Q);
-    act_a_ = dev(wg::act_bytes(kE), ok);
-    act_q_ = dev(wg::act_bytes(kDf2Q), ok);
-    act_h_ = dev(wg::act_bytes((int64_t) ff), ok);
+    act_a_ = dev((size_t) CR * E * sizeof(uint16_t), ok);
+    act_h_ = dev((size_t) CR * ff * sizeof(uint16_t), ok);
+    a4_ = dev(bp::fp4_dense::act_bytes(CR, (int64_t) std::max<size_t>({E, (size_t) kDf2Q, ff})), ok);
+    gs4_ = f((size_t) CR);
+    amax4_ = f((size_t) CR);
     {
         size_t pf = 0, tk = 0;
-        ws_need(d, w->n_vocab, w->head_fp4 != nullptr, pf, tk);
+        ws_need(d, w->n_vocab, pf, tk);
+        pf *= (size_t) CG;
+        tk *= (size_t) CG;
         ws_.partial = f(std::max<size_t>(pf, 1));
         ws_.tickets = (int32_t*) dev(std::max<size_t>(tk, 1) * 4, ok);
         ws_.partial_floats = pf;
@@ -821,7 +899,10 @@ bool Dflash2Batch::init(const Dflash2Weights* w, int max_sessions, int max_rows,
     att_cells_ = ring_cells(d);
     att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, CR, kDf2Heads, kDf2HeadDim));
 
-    logits_ = f((size_t) CD * (size_t) w->n_vocab);
+    logits_ = f((size_t) CD * (size_t) w->head_rows);
+    hd_ = f((size_t) CD * E);
+    head_gs_ = f((size_t) CD);
+    head_act_ = dev(bp::fp4_dense::act_bytes(CD, kE), ok);
     g_ = f((size_t) CD * kDf2Rank);
     tail_lse_ = f((size_t) CD * 2);
     hq_ = dev(bk::native_q8_1_bytes(kE, CD), ok);
@@ -857,17 +938,13 @@ void Dflash2Batch::commit(Dflash2Hook* const* hooks, int n_seg, const bk::Window
         return wg::Matrix{(const uint8_t*) p, r, scale, y, ld_y};
     };
 
-    for (int r0 = 0; r0 < rows; r0 += wg::kRows) {
-        const int n = std::min(wg::kRows, rows - r0);
-        dflash2_pack_tap_bf16(tap_ + (size_t) r0 * kE, (int64_t) tap_rows_ * kE, n, c_tap_bf16_, stream);
-        wg::Call fc;
-        fc.fmt = wg::Format::Q8;
-        fc.K = kDf2Targets * kE;
-        fc.m[0] = mat(w_->fc_p, kE, nullptr, c_raw_, kE);
-        wg::gemm(fc, c_tap_bf16_, n, ws_, stream);
-        wg::norm_pack(c_raw_, w_->hidden_norm, d.rms_eps, kE, n, static_cast<uint16_t*>(c_act_) + (size_t) r0 * kE,
-                      nullptr, stream);
-    }
+    dflash2_pack_tap_bf16(tap_, (int64_t) tap_rows_ * kE, rows, c_tap_bf16_, stream);
+    wg::Call fc;
+    fc.fmt = wg::Format::Q8;
+    fc.K = kDf2Targets * kE;
+    fc.m[0] = mat(w_->fc_p, kE, nullptr, c_raw_, kE);
+    wg::gemm(fc, c_tap_bf16_, rows, ws_, stream);
+    wg::norm_pack(c_raw_, w_->hidden_norm, d.rms_eps, kE, rows, c_act_, nullptr, stream);
 
     DsCommitSegs segs;
     segs.at_d = at_d;
@@ -878,16 +955,13 @@ void Dflash2Batch::commit(Dflash2Hook* const* hooks, int n_seg, const bk::Window
             segs.k[i] = hooks[i]->cache_[(size_t) l].k;
             segs.v[i] = hooks[i]->cache_[(size_t) l].v;
         }
-        for (int r0 = 0; r0 < rows; r0 += wg::kRows) {
-            const int n = std::min(wg::kRows, rows - r0);
-            wg::Call kv;
-            kv.fmt = wg::Format::Nvfp4;
-            kv.K = kE;
-            kv.n = 2;
-            kv.m[0] = mat(L.wk, kDf2KV, L.fp4_scale + 1, c_kb_ + (size_t) r0 * kDf2KV, kDf2KV);
-            kv.m[1] = mat(L.wv, kDf2KV, L.fp4_scale + 2, c_vb_ + (size_t) r0 * kDf2KV, kDf2KV);
-            wg::gemm(kv, static_cast<const uint16_t*>(c_act_) + (size_t) r0 * kE, n, ws_, stream);
-        }
+        wg::Call kv;
+        kv.fmt = wg::Format::Nvfp4;
+        kv.K = kE;
+        kv.n = 2;
+        kv.m[0] = mat(L.wk, kDf2KV, L.fp4_scale + 1, c_kb_, kDf2KV);
+        kv.m[1] = mat(L.wv, kDf2KV, L.fp4_scale + 2, c_vb_, kDf2KV);
+        wg::gemm(kv, c_act_, rows, ws_, stream);
         dspark_kv_commit_batch(c_kb_, c_vb_, L.k_norm, d.rms_eps, d.rope_base, pos_d, rows, segs, cap, stream);
     }
 }
@@ -936,100 +1010,88 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
 
     try {
         bk::PdlScope pdl(true);
-        for (int s0 = 0; s0 < B; s0 += kChunkSlots) {
-            const int cn = std::min(kChunkSlots, B - s0);
-            const int R = cn * kDf2Block;
-            int sub_nmax = 1;
-            for (int c = 0; c < cn; ++c) sub_nmax = std::max(sub_nmax, act_n[s0 + c]);
-            const int D_rows = cn * sub_nmax;
+        // a block of the anchor and as many masks as drafts are wanted: its attention sees only these rows (the drafts then
+        // differ from a whole block's); every slot's block runs in one pass, each product one launch over all its rows
+        int n_max = 1;
+        for (int b = 0; b < B; ++b) n_max = std::max(n_max, act_n[b]);
+        const int blk = n_max + 1;
+        const int R = B * blk;
+        dflash2_block_inputs_batch(w.embedding, meta_d_, w.embed_norm, w.target_eps, w.mask, blk, B, x_, st);
+        wg::norm_pack(x_, w.layer[0].attn_norm, d.rms_eps, kE, R, act_a_, xn_, st);
+        for (int l = 0; l < d.n_layers; ++l) {
+            const Dflash2Layer& L = w.layer[(size_t) l];
+            const float* sc = L.fp4_scale;
+            wg::Call ca;
+            ca.fmt = wg::Format::Q8;
+            ca.K = kE;
+            ca.m[0] = mat(L.conv_a, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
+            wg::gemm(ca, act_a_, R, ws_, st);
+            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, blk, B, act_a_, z_, st);
 
-            dflash2_block_inputs_batch(w.embedding, meta_d_ + 2 * s0, w.embed_norm, w.target_eps, w.mask, kDf2Block, cn,
-                                       x_, st);
-            wg::norm_pack(x_, w.layer[0].attn_norm, d.rms_eps, kE, R, act_a_, xn_, st);
-            for (int l = 0; l < d.n_layers; ++l) {
-                const Dflash2Layer& L = w.layer[(size_t) l];
-                const float* sc = L.fp4_scale;
-                wg::Call ca;
-                ca.fmt = wg::Format::Q8;
-                ca.K = kE;
-                ca.m[0] = mat(L.conv_a, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
-                wg::gemm(ca, act_a_, R, ws_, st);
-                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_a, kDf2Block, cn, act_a_, nullptr, st);
+            // the window's products on the FP4 block-scaled tensor cores (W4A4: the drafts only)
+            bp::fp4_dense::quantize(z_, R, kE, kE, a4_, gs4_, st);
+            bp::fp4_dense::product(L.wq, sc + 0, kDf2Q, kE, a4_, gs4_, R, q_, kDf2Q, false, st);
+            bp::fp4_dense::product(L.wk, sc + 1, kDf2KV, kE, a4_, gs4_, R, kb_, kDf2KV, false, st);
+            bp::fp4_dense::product(L.wv, sc + 2, kDf2KV, kE, a4_, gs4_, R, vb_, kDf2KV, false, st);
 
-                wg::Call qkv;
-                qkv.fmt = wg::Format::Nvfp4;
-                qkv.K = kE;
-                qkv.n = 3;
-                qkv.m[0] = mat(L.wq, kDf2Q, sc + 0, q_, kDf2Q);
-                qkv.m[1] = mat(L.wk, kDf2KV, sc + 1, kb_, kDf2KV);
-                qkv.m[2] = mat(L.wv, kDf2KV, sc + 2, vb_, kDf2KV);
-                wg::gemm(qkv, act_a_, R, ws_, st);
-
-                DsBatchKv kv;
+            DsBatchKv kv;
+            const int64_t cap = act[0]->cache_[(size_t) l].cap;
+            for (int c = 0; c < B; ++c) {
+                kv.k[c] = act[c]->cache_[(size_t) l].k;
+                kv.v[c] = act[c]->cache_[(size_t) l].v;
+            }
+            dflash2_block_qk_prep_batch(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, d.rope_base, meta_d_, blk, B, qr_, kv,
+                                        cap, st);
+            {   // every slot's block in one launch
                 bk::GqaWindowSeg gsegs[bk::kWindowSegsMax] = {};
                 int64_t max_cells = 0;
-                const int64_t cap = act[s0]->cache_[(size_t) l].cap;
-                for (int c = 0; c < cn; ++c) {
-                    const Dflash2Hook::Cache& cc = act[s0 + c]->cache_[(size_t) l];
-                    kv.k[c] = cc.k;
-                    kv.v[c] = cc.v;
-                    const int64_t p0 = act_pos[s0 + c];
+                for (int c = 0; c < B; ++c) {
+                    const Dflash2Hook::Cache& cc = act[c]->cache_[(size_t) l];
+                    const int64_t p0 = act_pos[c];
                     int64_t win = d.window;
                     bool block_win = false;
-                    window_range(d, p0, act[s0 + c]->lo_, win, block_win);
-                    const int64_t cells = p0 + kDf2Block - std::max<int64_t>(0, p0 - win + 1) + 64;
+                    window_range(d, p0, act[c]->lo_, win, block_win);
+                    const int64_t cells = p0 + blk - std::max<int64_t>(0, p0 - win + 1) + 64;
                     max_cells = std::max(max_cells, std::min(att_cells_, cells));
-                    gsegs[c] = {cc.k, cc.v, p0, kDf2Block, p0 + kDf2Block, win, cc.cap, block_win};
+                    gsegs[c] = {cc.k, cc.v, p0, blk, p0 + blk, win, cc.cap, block_win};
                 }
-                dflash2_block_qk_prep_batch(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, d.rope_base, meta_d_ + 2 * s0,
-                                            kDf2Block, cn, qr_, kv, cap, st);
-                bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, cn, att_scr_, max_cells, attn_, st);
-
-                wg::pack(attn_, kDf2Q, kDf2Q, R, act_q_, st);
-                wg::Call o;
-                o.fmt = wg::Format::Nvfp4;
-                o.K = kDf2Q;
-                o.m[0] = mat(L.wo, kE, sc + 3, z_, kE);
-                wg::gemm(o, act_q_, R, ws_, st);
-                dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_a, kDf2Block, cn, x_, L.post_norm, d.rms_eps,
-                                            act_a_, xn_, st);
-
-                wg::Call cf;
-                cf.fmt = wg::Format::Q8;
-                cf.K = kE;
-                cf.m[0] = mat(L.conv_f, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
-                wg::gemm(cf, act_a_, R, ws_, st);
-                dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, kDf2Block, cn, act_a_, nullptr, st);
-
-                wg::Call gu;
-                gu.fmt = wg::Format::Nvfp4;
-                gu.K = kE;
-                gu.n = 2;
-                gu.epi = wg::Epilogue::SwiGLU;
-                gu.m[0] = mat(L.gate, d.n_ff, sc + 4, nullptr, d.n_ff);
-                gu.m[1] = mat(L.up, d.n_ff, sc + 5, nullptr, d.n_ff);
-                gu.act_out = act_h_;
-                wg::gemm(gu, act_a_, R, ws_, st);
-
-                wg::Call dn;
-                dn.fmt = wg::Format::Nvfp4;
-                dn.K = d.n_ff;
-                dn.m[0] = mat(L.down, kE, sc + 6, z_, kE);
-                wg::gemm(dn, act_h_, R, ws_, st);
-                if (l + 1 < d.n_layers) {
-                    dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_f, kDf2Block, cn, x_,
-                                                w.layer[(size_t) l + 1].attn_norm, d.rms_eps, act_a_, xn_, st);
-                } else {
-                    dflash2_conv2_add(z_, dyn_, kDf2Dyn, L.base_f, kDf2Block, cn, x_, st);
-                }
+                bk::gqa_window_attn_segs(qr_, kDf2Heads, kDf2KvHeads, kDf2HeadDim, gsegs, B, att_scr_, max_cells, attn_, st, true);
             }
 
-            dflash2_norm_draft_pack(x_, w.norm, d.rms_eps, kDf2Block, cn, sub_nmax, act_a_, hq_, nullptr, st);
-            wg::Call hc;
-            hc.fmt = w.head_fp4 ? wg::Format::Nvfp4 : wg::Format::Q8;
-            hc.K = kE;
-            hc.m[0] = mat(w.head_fp4 ? w.head_fp4 : w.head, w.n_vocab, w.head_fp4_scale, logits_, w.n_vocab);
-            wg::gemm(hc, act_a_, D_rows, ws_, st);
+            bp::fp4_dense::quantize(attn_, R, kDf2Q, kDf2Q, a4_, gs4_, st);
+            bp::fp4_dense::product(L.wo, sc + 3, kE, kDf2Q, a4_, gs4_, R, z_, kE, false, st);
+            dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_a, blk, B, x_, L.post_norm, d.rms_eps, act_a_, xn_, st);
+
+            wg::Call cf;
+            cf.fmt = wg::Format::Q8;
+            cf.K = kE;
+            cf.m[0] = mat(L.conv_f, kDf2Dyn, nullptr, dyn_, kDf2Dyn);
+            wg::gemm(cf, act_a_, R, ws_, st);
+            dflash2_conv2_pack(xn_, dyn_, kDf2Dyn, L.base_f, blk, B, act_a_, z_, st);
+
+            bp::fp4_dense::quantize(z_, R, kE, kE, a4_, gs4_, st);
+            bp::fp4_dense::swiglu(L.gate, L.up, sc + 4, sc + 5, d.n_ff, kE, a4_, gs4_, R, (uint16_t*) act_h_, d.n_ff, st, amax4_);
+            bp::fp4_dense::quantize_amax((const uint16_t*) act_h_, amax4_, R, d.n_ff, d.n_ff, a4_, gs4_, st);
+            bp::fp4_dense::product(L.down, sc + 6, kE, d.n_ff, a4_, gs4_, R, z_, kE, false, st);
+            if (l + 1 < d.n_layers) {
+                dflash2_conv2_add_norm_pack(z_, dyn_, kDf2Dyn, L.base_f, blk, B, x_, w.layer[(size_t) l + 1].attn_norm,
+                                            d.rms_eps, act_a_, xn_, st);
+            } else {
+                dflash2_conv2_add(z_, dyn_, kDf2Dyn, L.base_f, blk, B, x_, st);
+            }
+        }
+
+        // the head over the draft rows, as many slots a pass as its kHeadDrafts rows a slot hold
+        const int head_slots = max_sessions_ * kHeadDrafts / n_max;
+        for (int s0 = 0; s0 < B; s0 += head_slots) {
+            const int cn = std::min(head_slots, B - s0);
+            const int D_rows = cn * n_max;
+            dflash2_norm_draft_pack(x_ + (size_t) s0 * blk * kE, w.norm, d.rms_eps, blk, cn, n_max, act_a_, hq_, hd_, st);
+            // the 200K-row screen on the FP4 block-scaled tensor cores (the rows as NVFP4 with a scale a row); the top
+            // candidates are rescored on the Q8 head by dflash2_top16
+            bp::fp4_dense::quantize(hd_, D_rows, kE, kE, head_act_, head_gs_, st);
+            bp::fp4_dense::product(w.head_fp4, w.head_fp4_scale, w.head_rows, kE, head_act_, head_gs_, D_rows, logits_,
+                                   w.head_rows, false, st);
 
             wg::Call sc_call;
             sc_call.fmt = wg::Format::Bf16;
@@ -1037,8 +1099,8 @@ model::Result Dflash2Batch::draft(Dflash2Hook* const* hooks, const int32_t* anch
             sc_call.m[0] = mat(w.sel_h, kDf2Rank, nullptr, g_, kDf2Rank);
             wg::gemm(sc_call, act_a_, D_rows, ws_, st);
 
-            dflash2_top16(logits_, w.head, true, hq_, D_rows, w.n_vocab, d.logit_softcap, top_scr_, cand_, tail_lse_, st);
-            dflash2_select(meta_d_ + 2 * s0, 2, cand_, tail_lse_, g_, w.pred, w.succ, cn, sub_nmax, d.logit_softcap,
+            dflash2_top16(logits_, w.head, true, hq_, D_rows, w.n_vocab, w.head_rows, d.logit_softcap, top_scr_, cand_, tail_lse_, st);
+            dflash2_select(meta_d_ + 2 * s0, 2, cand_, tail_lse_, g_, w.pred, w.succ, cn, n_max, d.logit_softcap,
                            ids_d_ + (size_t) s0 * kDf2Block, kDf2Block, conf_d_ + (size_t) s0 * kDf2Block, kDf2Block, st);
         }
         cudaMemcpyAsync(ids_h_, ids_d_, (size_t) B * kDf2Block * 4, cudaMemcpyDeviceToHost, st);

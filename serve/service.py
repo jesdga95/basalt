@@ -1813,9 +1813,12 @@ class Service:
                                 st["decoded"] = (st.get("decoded") or 0) + int(run_last.get("generated") or 0)
                                 st["passes"] = (st.get("passes") or 0) + 1
                                 timed_last = run_last
-                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
-                            finish = "error"          # the engine ended the request itself: the grammar allowed no token
-                            err = "the grammar allowed no token to continue the reply; the engine log has the state"
+                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") in ("error", "room"):
+                            finish = "error"          # the engine ended the request itself
+                            err = ("the KV pool had no room for this conversation to grow while every running request "
+                                   "waited for room; the conversation is kept, so asking again continues it"
+                                   if run_last.get("finish") == "room" else
+                                   "the grammar allowed no token to continue the reply; the engine log has the state")
                             print(f"[server] error: engine reported {err}", flush=True)
                             raise EngineError(err)
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \

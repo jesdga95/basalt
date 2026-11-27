@@ -11,6 +11,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/route_flags.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/meta.hpp"
@@ -72,6 +73,7 @@ public:
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
     /// Peer: the second cards hold experts, each a contiguous block of layers.
+    int max_slots() const override { return kMaxT; }   // one row each of a window
     program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }
 
     const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
