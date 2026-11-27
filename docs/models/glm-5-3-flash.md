@@ -152,7 +152,10 @@ alone, so use `--diag-tier-frozen` across a peer comparison.
   nothing about how far IQ1_S sits from BF16 either: that is the tensor audit above, and this pack is not in
   the [BF16 gate](../precision/quality.md), which is scored against a BF16 base this model does not have.
   Reproduce it with
-  `python3 tools/ppl_gate.py --model GLM5.3-Flash-UD-IQ1_S.basalt --base <llama.cpp's .kld> --out <dir> --architecture glm5next --engine-args "--diag-tier-vram 8"`.
+  `python3 tools/ppl_gate.py --model GLM5.3-Flash-UD-IQ1_S.basalt --base <llama.cpp's .kld> --out <dir> --architecture other --chunks 20`
+  and the engine's own flags after it, which the gate hands to the engine: `--gpu 1 --vram-reserve-mib 512
+  --diag-tier-vram 8` for the run above. Name the card even when one is enough: the gate puts the model on
+  `--gpu 0,1 --gpu-mode peer` by itself when it sees two cards. The peer arm of this table is not measured yet.
 
 ## Not measured
 
