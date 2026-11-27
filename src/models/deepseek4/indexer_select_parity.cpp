@@ -108,7 +108,34 @@ bool run() {
     const double bytes = (double) T * (kIndexerHeads * kIndexerDim + kIndexerHeads) * sizeof(float) +
                          (double) N * kIndexerDim * sizeof(float);
     ds4test::bench_line("DS4 indexer score + top-512", us, bytes);
-    return ok && chunk_ok && edge_ok;
+
+    bool boundary_ok = true;
+    for (const int rows : {12288, 12289}) {
+        const int start = rows * kIndexerRatio - 1;
+        auto bq = ds4test::randn((size_t) kIndexerHeads * kIndexerDim, 0x4b544751u + (uint32_t) rows, .25f);
+        auto bw = ds4test::randn(kIndexerHeads, 0x4b544757u + (uint32_t) rows, .01f);
+        auto bk = ds4test::randn((size_t) rows * kIndexerDim, 0x4b544b59u + (uint32_t) rows, .25f);
+        std::vector<int32_t> expected((size_t) kIndexerTopK, -1), expected_count(1, 0);
+        reference(bq, bw, bk, rows, start, 1, expected, expected_count);
+        Dev<float> dbq(bq), dbw(bw), dbk(bk);
+        Dev<int32_t> actual((size_t) kIndexerTopK), actual_count(1);
+        const size_t bytes_ws = indexer_select_workspace_bytes(rows);
+        Dev<uint8_t> dws(bytes_ws);
+        indexer_select(dbq.p, dbw.p, dbk.p, rows, start, 1, actual.p, actual_count.p, dws.p, bytes_ws, nullptr);
+        const bool one_ok = actual.down() == expected && actual_count.down() == expected_count;
+        boundary_ok = boundary_ok && one_ok;
+        std::printf("DS4 indexer selector boundary rows=%d: %s\n", rows, one_ok ? "match" : "MISMATCH");
+        if (rows == 12288) {
+            const double large_us = ds4test::bench_stream_us([&](void* stream) {
+                indexer_select(dbq.p, dbw.p, dbk.p, rows, start, 1, actual.p, actual_count.p,
+                               dws.p, bytes_ws, stream);
+            }, 10);
+            const double large_bytes = (double) (kIndexerHeads * kIndexerDim + kIndexerHeads) * sizeof(float) +
+                                        (double) rows * kIndexerDim * sizeof(float);
+            ds4test::bench_line("DS4 indexer score + top-512 (12288 rows)", large_us, large_bytes);
+        }
+    }
+    return ok && chunk_ok && edge_ok && boundary_ok;
 }
 
 }  // namespace

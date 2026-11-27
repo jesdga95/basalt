@@ -216,27 +216,23 @@ __global__ void compress_kernel(const float* __restrict__ ckv, const float* __re
     __shared__ float sh[kLatent];
     __shared__ float red[32];
     const int c = threadIdx.x;
-    float kv[2], sc[2];
-    kv[0] = state_kv[c];
-    sc[0] = state_score[c];
-    kv[1] = ratio > 1 ? state_kv[kLatent + c] : 0.f;
-    sc[1] = ratio > 1 ? state_score[kLatent + c] : 0.f;
     for (int t = 0; t < n_tokens; ++t) {
         const int p = pos[t];
         const int slot = p % ratio;
         const float nkv = ckv[(size_t) t * kLatent + c];
         const float nsc = csc ? csc[(size_t) t * kLatent + c] : 0.f;
-        if (slot == 0) { kv[0] = nkv; sc[0] = nsc; } else { kv[1] = nkv; sc[1] = nsc; }
+        state_kv[(size_t) slot * kLatent + c] = nkv;
+        state_score[(size_t) slot * kLatent + c] = nsc;
         const bool close = (p + 1) % ratio == 0;
         if (c == 0) row_of[t] = close ? p / ratio : kNoRow;
         if (!close) continue;
-        float m = sc[0];
-        if (ratio > 1) m = fmaxf(m, sc[1]);
+        float m = -INFINITY;
+        for (int j = 0; j < ratio; ++j) m = fmaxf(m, state_score[(size_t) j * kLatent + c]);
         float den = 0.f, num = 0.f;
         for (int j = 0; j < ratio; ++j) {
-            const float e = expf(sc[j] - m);
+            const float e = expf(state_score[(size_t) j * kLatent + c] - m);
             den += e;
-            num += kv[j] * e;
+            num += state_kv[(size_t) j * kLatent + c] * e;
         }
         const float comp = num / den;
         const float ss = block_sum(comp * comp, red);
@@ -253,12 +249,6 @@ __global__ void compress_kernel(const float* __restrict__ ckv, const float* __re
         }
         put_comp(o, c, comp_kv, (size_t) (p / ratio), packed);
         __syncthreads();
-    }
-    state_kv[c] = kv[0];
-    state_score[c] = sc[0];
-    if (ratio > 1) {
-        state_kv[kLatent + c] = kv[1];
-        state_score[kLatent + c] = sc[1];
     }
 }
 
@@ -1160,24 +1150,22 @@ __global__ void compress_batch_kernel(const float* __restrict__ ckv, const float
     const bool close = (p + 1) % ratio == 0;
     if (c == 0) row_of[t] = close ? p / ratio : kNoRow;
     if (!close) return;
-    float kv[2] = {0.f, 0.f}, sc[2] = {0.f, 0.f};
+    float m = -INFINITY;
     for (int j = 0; j < ratio; ++j) {
         const int tj = t - (ratio - 1 - j);
-        if (tj >= 0) {
-            kv[j] = ckv[(size_t) tj * kLatent + c];
-            sc[j] = csc ? csc[(size_t) tj * kLatent + c] : 0.f;
-        } else {
-            kv[j] = state_kv[j * kLatent + c];
-            sc[j] = state_score[j * kLatent + c];
-        }
+        const float s = tj >= 0 ? (csc ? csc[(size_t) tj * kLatent + c] : 0.f)
+                                : state_score[(size_t) j * kLatent + c];
+        m = fmaxf(m, s);
     }
-    float m = sc[0];
-    if (ratio > 1) m = fmaxf(m, sc[1]);
     float den = 0.f, num = 0.f;
     for (int j = 0; j < ratio; ++j) {
-        const float e = expf(sc[j] - m);
+        const int tj = t - (ratio - 1 - j);
+        const float kv = tj >= 0 ? ckv[(size_t) tj * kLatent + c] : state_kv[(size_t) j * kLatent + c];
+        const float sc = tj >= 0 ? (csc ? csc[(size_t) tj * kLatent + c] : 0.f)
+                                 : state_score[(size_t) j * kLatent + c];
+        const float e = expf(sc - m);
         den += e;
-        num += kv[j] * e;
+        num += kv * e;
     }
     const float comp = num / den;
     const float ss = block_sum(comp * comp, red);
@@ -1242,7 +1230,7 @@ void index_keys(const CompressArgs& a, const float* pre, const int32_t* row_of, 
 size_t compress_workspace_bytes() { return (size_t) kMaxT * (3 * kLatent * sizeof(float) + sizeof(int32_t)) + 256; }
 
 void compress(const CompressArgs& a, const float* x, const int32_t* pos, int n_tokens, void* workspace, void* stream) {
-    if (n_tokens < 1 || n_tokens > kMaxT || (a.ratio != 1 && a.ratio != 2)) throw std::invalid_argument("compress: bad args");
+    if (n_tokens < 1 || n_tokens > kMaxT || a.ratio < 1 || a.ratio > 128) throw std::invalid_argument("compress: bad args");
     cudaStream_t s = as_stream(stream);
     float* ckv = static_cast<float*>(workspace);
     float* csc = ckv + kMaxT * kLatent;
@@ -1261,7 +1249,7 @@ void compress(const CompressArgs& a, const float* x, const int32_t* pos, int n_t
 
 
 void compress_window(const CompressArgs& a, const float* x, const int32_t* pos, int n_tokens, void* workspace, void* stream) {
-    if (n_tokens < 1 || n_tokens > kMaxT || (a.ratio != 1 && a.ratio != 2)) throw std::invalid_argument("compress_window: bad args");
+    if (n_tokens < 1 || n_tokens > kMaxT || a.ratio < 1 || a.ratio > 128) throw std::invalid_argument("compress_window: bad args");
     cudaStream_t s = as_stream(stream);
     float* ckv = static_cast<float*>(workspace);
     float* csc = ckv + kMaxT * kLatent;
@@ -1360,7 +1348,7 @@ void indexer_rank(const IndexerArgs& a, const float* qr, const int32_t* pos, int
     if (n_tokens < 1 || n_tokens > kMaxT || a.n_comp < 1) throw std::invalid_argument("indexer_rank: bad args");
     cudaStream_t s = as_stream(stream);
     const IdxWs w = carve(workspace, a.n_comp);
-    gemv_bf16(a.w_q, qr, n_tokens, 1280, kIdxHeads * kIdxDim, w.iq, stream);
+    gemv_bf16(a.w_q, qr, n_tokens, a.q_rank, kIdxHeads * kIdxDim, w.iq, stream);
     idx_rope_round_kernel<<<dim3(n_tokens, kIdxHeads), kIdxDim, 0, s>>>(w.iq, pos, a.rope_freq, a.format == CacheFormat::Fp8);
     const int n_blk = (a.n_comp + a.block_size - 1) / a.block_size;
     const float w_scale = 1.0f / sqrtf((float) (kIdxHeads * kIdxDim));
@@ -1415,7 +1403,7 @@ size_t compress_batch_workspace_bytes(int max_tokens) {
 }
 
 void compress_batch(const CompressArgs& a, const float* x, const int32_t* pos, int n_tokens, void* workspace, void* stream) {
-    if (n_tokens < 1 || n_tokens > 65535 || (a.ratio != 1 && a.ratio != 2)) throw std::invalid_argument("compress_batch: bad args");
+    if (n_tokens < 1 || n_tokens > 65535 || a.ratio < 1 || a.ratio > 128) throw std::invalid_argument("compress_batch: bad args");
     cudaStream_t s = as_stream(stream);
     float* ckv = static_cast<float*>(workspace);
     float* csc = ckv + (size_t) n_tokens * kLatent;
@@ -1457,7 +1445,7 @@ void indexer_select_batch(const IndexerArgs& a, const float* qr, const float* x,
     if (n_tokens < 1 || n_tokens > 65535 || a.n_comp < 1) throw std::invalid_argument("indexer_select_batch: bad args");
     cudaStream_t s = as_stream(stream);
     const IdxWs w = carve_batch(workspace, n_tokens, a.n_comp);
-    gemm_bf16(a.w_q, qr, n_tokens, 1280, kIdxHeads * kIdxDim, w.iq, stream);
+    gemm_bf16(a.w_q, qr, n_tokens, a.q_rank, kIdxHeads * kIdxDim, w.iq, stream);
     idx_rope_round_kernel<<<dim3(n_tokens, kIdxHeads), kIdxDim, 0, s>>>(w.iq, pos, a.rope_freq, a.format == CacheFormat::Fp8);
     gemm_bf16(a.w_proj, x, n_tokens, a.n_embd, kIdxHeads, w.iw, stream);
     const int n_blk = (a.n_comp + a.block_size - 1) / a.block_size;

@@ -127,7 +127,7 @@ void test_window(Verdict& v) {
 }
 
 void test_compress(Verdict& v) {
-    const int N = 41, P0 = 5;
+    const int N = 140, P0 = 5;
     const auto freq = make_table();
     Dev<uint16_t> dwkv(rand_bf16((size_t) kLatent * D, 21, 0.02f)), dwg(rand_bf16((size_t) kLatent * D, 22, 0.02f));
     Dev<uint16_t> dwik(rand_bf16((size_t) kIdxDim * kLatent, 23, 0.05f));
@@ -136,8 +136,8 @@ void test_compress(Verdict& v) {
     for (int i = 0; i < N; ++i) pos[i] = P0 + i;
     Dev<int32_t> dpos(pos);
     Dev<char> ws(compress_workspace_bytes()), wsb(compress_batch_workspace_bytes(N));
-    for (int ratio = 1; ratio <= 2; ++ratio) {
-        const int cap = 48;
+    for (int ratio : {1, 2, 4, 128}) {
+        const int cap = P0 + N + 1;
         struct St {
             Dev<float> skv, ssc;
             Dev<uint8_t> ckv, cik;

@@ -1,5 +1,7 @@
 #include "basalt/models/deepseek4/indexer.hpp"
 
+#include "basalt/kernels/native_mmvq.hpp"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -87,6 +89,11 @@ __global__ void gemv_bf16_kernel(const uint16_t* __restrict__ weights, const flo
     if (lane == 0) y[(size_t) token * out + output] = bf16_rn(sum);
 }
 
+__global__ void round_bf16_kernel(const float* __restrict__ in, int n, float* __restrict__ out) {
+    const int i = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = bf16_rn(in[i]);
+}
+
 __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float frequency) {
     float sine, cosine;
     sincosf(frequency, &sine, &cosine);
@@ -109,11 +116,11 @@ __global__ void indexer_query_post_kernel(const float* __restrict__ raw, const f
     if (token >= n_tokens) return;
     const float* q = raw + ((size_t) token * H + head) * D;
     const float* angle = rope_angle + (size_t) token * (R / 2);
-    float value = q[c];
+    float value = bf16_rn(q[c]);
     if (c >= D - R) {
         const int pair = (c - (D - R)) >> 1;
-        float x0 = q[D - R + pair * 2];
-        float x1 = q[D - R + pair * 2 + 1];
+        float x0 = bf16_rn(q[D - R + pair * 2]);
+        float x1 = bf16_rn(q[D - R + pair * 2 + 1]);
         rotate_pair(x0, x1, angle[pair]);
         value = bf16_rn((c & 1) ? x1 : x0);
     }
@@ -168,22 +175,30 @@ size_t indexer_project_workspace_bytes(int max_tokens) {
     if (max_tokens < 1 || max_tokens > TMax) throw std::invalid_argument("deepseek4 indexer: invalid token capacity");
     const size_t q_bytes = (size_t) max_tokens * H * D * sizeof(float);
     const size_t w_bytes = (size_t) max_tokens * H * sizeof(float);
-    return align256(q_bytes) + align256(w_bytes) + 256;
+    const size_t latent_bytes = (size_t) max_tokens * QRank * sizeof(float);
+    const size_t activation_bytes = kernels::native_q8_1_bytes(QRank, max_tokens);
+    return align256(q_bytes) + align256(w_bytes) + align256(latent_bytes) + align256(activation_bytes) + 256;
 }
 
-void indexer_project_bf16(const uint16_t* w_q, const uint16_t* w_proj, const float* qr, const float* x,
+void indexer_project_q8_0(const void* w_q, const uint16_t* w_proj, const float* qr, const float* x,
                           const float* rope_angle, int n_tokens, float* q_out, float* head_weights,
                           void* workspace, size_t workspace_bytes, void* stream) {
-    if (!w_q || !w_proj || !qr || !x || !rope_angle || !q_out || !head_weights || !workspace || n_tokens < 1 ||
-        n_tokens > TMax || workspace_bytes < indexer_project_workspace_bytes(n_tokens))
-        throw std::invalid_argument("deepseek4 indexer projection: invalid arguments");
+    if (!w_q || !w_proj || !qr || !x || !rope_angle || !q_out || !head_weights || !workspace || !stream ||
+        n_tokens < 1 || n_tokens > TMax || workspace_bytes < indexer_project_workspace_bytes(n_tokens))
+        throw std::invalid_argument("deepseek4 indexer Q8_0 projection: invalid arguments");
     auto* base = static_cast<unsigned char*>(workspace);
     float* q_raw = reinterpret_cast<float*>(base);
     float* w_raw = reinterpret_cast<float*>(base + align256((size_t) n_tokens * H * D * sizeof(float)));
+    float* qr_bf16 = reinterpret_cast<float*>(base + align256((size_t) n_tokens * H * D * sizeof(float)) +
+                                             align256((size_t) n_tokens * H * sizeof(float)));
+    void* qr_q8_1 = base + align256((size_t) n_tokens * H * D * sizeof(float)) +
+                    align256((size_t) n_tokens * H * sizeof(float)) +
+                    align256((size_t) n_tokens * QRank * sizeof(float));
     const cudaStream_t s = (cudaStream_t) stream;
-    gemv_bf16_kernel<<<dim3((H * D + GemvWarps - 1) / GemvWarps, n_tokens), 32 * GemvWarps, 0, s>>>(
-        w_q, qr, n_tokens, QRank, H * D, q_raw);
-    check(cudaGetLastError(), "query projection launch");
+    round_bf16_kernel<<<((size_t) n_tokens * QRank + 255) / 256, 256, 0, s>>>(qr, n_tokens * QRank, qr_bf16);
+    check(cudaGetLastError(), "Q8_0 query activation boundary launch");
+    kernels::native_quantize_q8_1(qr_bf16, qr_q8_1, QRank, n_tokens, stream);
+    kernels::native_q8_0_mmvq(w_q, qr_q8_1, q_raw, QRank, H * D, n_tokens, stream);
     gemv_bf16_kernel<<<dim3((H + GemvWarps - 1) / GemvWarps, n_tokens), 32 * GemvWarps, 0, s>>>(
         w_proj, x, n_tokens, Embd, H, w_raw);
     check(cudaGetLastError(), "head-weight projection launch");

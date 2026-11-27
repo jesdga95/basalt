@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -121,8 +122,10 @@ def verify(pack: str, first_gguf, workers: int = 16) -> bool:
 
     def place(name, loc):
         if name not in src.where:
-            bad(f"{loc[0]} holds {name}, which the source does not have")
-            return
+            entry = loc[3] if len(loc) == 4 and isinstance(loc[3], dict) else {}
+            if entry.get("origin") != "hf_checkpoint" or not re.fullmatch(r"[0-9a-f]{64}", entry.get("source_sha256", "")):
+                bad(f"{loc[0]} holds {name}, which the source does not have and the checkpoint manifest does not verify")
+                return
         have = where.setdefault(name, [])
         if have and {have[0][0], loc[0]} not in ({"dense", "gguf"}, {"mtp/dense", "gguf"}):
             bad(f"{name} is stored twice ({have[0][0]} and {loc[0]})")
@@ -182,6 +185,18 @@ def verify(pack: str, first_gguf, workers: int = 16) -> bool:
     kind = {v: k for k, v in S.KIND.items()}
     kind["3"] = "F32"                  # stored as F32 in dense; the loader narrows to F16
     for name, loc in ((n, l) for n, ls in where.items() for l in ls):
+        if name not in src.where:
+            _, off, ln, e = loc
+            sec_name = loc[0]
+            sec_size = m.section(sec_name)[1] if sec_name in m.sections else -1
+            shape = e.get("shape")
+            if (e.get("bytes") != ln or e.get("type") != "F32" or e.get("type_id") != 0 or
+                    not isinstance(shape, list) or any(not isinstance(x, int) or x <= 0 for x in shape) or
+                    math.prod(shape) * 4 != ln or off < 0 or ln < 0 or off > sec_size or ln > sec_size - off):
+                bad(f"{name}: invalid checkpoint tensor record")
+            elif off % TENSOR_ALIGN:
+                bad(f"{name}: offset {off} in {sec_name} is not {TENSOR_ALIGN} aligned")
+            continue
         g, t, p = src.where[name]
         nb = arch.own_section_bytes(name, t)
         if loc[0] in ("dense", "mtp/dense"):
@@ -222,11 +237,15 @@ def verify(pack: str, first_gguf, workers: int = 16) -> bool:
     def one(name):
         if name in src.short:    # the shard stops after its header: the section was copied from --sections-from
             return name, None
+        locs = where[name]
+        if name not in src.where:
+            a = locs[0][3]["source_sha256"]
+            return name, all(a == pack_bytes_hash(name, loc) for loc in locs)
         raw = src.bytes(name)    # size_of's row geometry applies, so an own-section tensor hashes whole rows
         a = sha(raw)
         t = src.where[name][1]
         conv_res = None
-        for loc in where[name]:
+        for loc in locs:
             if loc[0] in ("dense", "mtp/dense") and name in converted:
                 if conv_res is None:
                     got = S.convert_tensor(name, t.type_name, raw, compat_bf16, arch)
@@ -242,7 +261,7 @@ def verify(pack: str, first_gguf, workers: int = 16) -> bool:
                 return name, False
         return name, True
 
-    todo = [n for n in where if n in src.where]
+    todo = list(where)
     done = 0
     mism, skipped = [], []
     with ThreadPoolExecutor(12) as ex:
@@ -261,13 +280,18 @@ def verify(pack: str, first_gguf, workers: int = 16) -> bool:
     # summary by role
     role = defaultdict(lambda: [0, 0])
     for name, locs in where.items():
-        t = src.where[name][1]
         for loc in locs:
             key = loc[0] + (" (bf16/f32 pool)" if loc[0].endswith("dense") else "")
-            if loc[0] == "gguf":
-                key = "gguf (" + t.type_name + ")"
+            if name in src.where:
+                t = src.where[name][1]
+                if loc[0] == "gguf":
+                    key = "gguf (" + t.type_name + ")"
+                size = t.expected_bytes()
+            else:
+                key += " (checkpoint)"
+                size = loc[2]
             role[key][0] += 1
-            role[key][1] += arch.own_section_bytes(name, t)
+            role[key][1] += arch.own_section_bytes(name, t) if name in src.where else size
     print("by section:")
     for k, (n, b) in sorted(role.items()):
         print(f"  {k:<28} {n:>5} tensors {b / (1 << 30):>10.3f} GiB")

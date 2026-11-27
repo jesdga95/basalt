@@ -1,5 +1,6 @@
 """Regression test for DeepSeek V4's raw I32 routing tensor."""
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -60,6 +61,26 @@ def add_geometry(gguf):
         gguf.add(f"deepseek4.{key}", value)
 
 
+def write_tiny_checkpoint(root):
+    root.mkdir(parents=True)
+    config = {"model_type": "deepseek_v4", "hidden_size": 4096, "hc_mult": 4, "num_hidden_layers": 43}
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (root / "LICENSE").write_text("MIT", encoding="utf-8")
+    names = (("hc_head_fn", [4, 16384]), ("hc_head_base", [4]), ("hc_head_scale", [1]))
+    header, body, weight_map = {}, bytearray(), {}
+    for name, shape in names:
+        size = 4 * int(np.prod(shape))
+        start = len(body)
+        body.extend(bytes(size))
+        header[name] = {"dtype": "F32", "shape": shape, "data_offsets": [start, len(body)]}
+        weight_map[name] = "model-00001-of-00001.safetensors"
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    shard = root / "model-00001-of-00001.safetensors"
+    shard.write_bytes(struct.pack("<Q", len(encoded)) + encoded + body)
+    (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+
+
 class DeepSeek4I32Test(unittest.TestCase):
     def test_incomplete_architecture_metadata_is_refused(self):
         with self.assertRaisesRegex(ConvertError, "missing required deepseek4.block_count"):
@@ -76,6 +97,8 @@ class DeepSeek4I32Test(unittest.TestCase):
     def test_i32_tensor_is_preserved_and_architecture_is_recorded(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            checkpoint = root / "checkpoint"
+            write_tiny_checkpoint(checkpoint)
             gguf = GGUFWriter()
             gguf.add("general.architecture", "deepseek4")
             gguf.add("general.name", "Tiny DeepSeek V4 Vision")
@@ -103,7 +126,7 @@ class DeepSeek4I32Test(unittest.TestCase):
                     "mtp_source": None, "mtp_dense": None, "draft_vocab": None,
                     "name": "Tiny DeepSeek V4 Vision", "compat_bf16": False, "no_vision": True,
                     "force": False, "sections_from": None, "dspark": None,
-                    "dry_run": False, "hf_dir": None,
+                    "dry_run": False, "hf_dir": str(checkpoint),
                 })()
                 convert.convert(args)
             finally:
@@ -118,6 +141,20 @@ class DeepSeek4I32Test(unittest.TestCase):
             self.assertEqual(info["type_id"], 26)
             section = pack.read("gguf")
             self.assertEqual(section[info["offset"]:info["offset"] + info["bytes"]], raw)
+            head_fn = meta["tensors"]["hc_head_fn.weight"]
+            self.assertEqual({k: head_fn[k] for k in ("type", "type_id", "shape", "bytes", "offset", "section", "origin")}, {
+                "type": "F32", "type_id": 0, "shape": [16384, 4], "bytes": 16384 * 4 * 4,
+                "offset": 0, "section": "deepseek4/head", "origin": "hf_checkpoint",
+            })
+            self.assertEqual(len(head_fn["source_sha256"]), 64)
+            head = pack.read("deepseek4/head")
+            self.assertEqual(meta["tensors"]["hc_head_base.weight"]["offset"], 16384 * 4 * 4)
+            self.assertEqual(meta["tensors"]["hc_head_scale.weight"]["offset"], 16384 * 4 * 4 + 4096)
+            self.assertEqual(len(head), 16384 * 4 * 4 + 4096 + 4)
+            for name in ("hc_head_fn.weight", "hc_head_base.weight", "hc_head_scale.weight"):
+                record = meta["tensors"][name]
+                self.assertEqual(head[record["offset"]:record["offset"] + record["bytes"]],
+                                 bytes(record["bytes"]))
 
 
 if __name__ == "__main__":

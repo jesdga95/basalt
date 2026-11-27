@@ -26,7 +26,7 @@ from model_file import ModelFile  # noqa: E402
 
 PROMPTS = ("conv", "struct", "prose")
 # flags after `--` replace these
-BASE = ["--spec", "7", "--max-context", "8192"]
+BASE = ["--max-context", "8192"]
 PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
 
 
@@ -42,8 +42,10 @@ def model_arch(model_path: str) -> str | None:
 
 def build_args(model_path: str, extra: list[str]) -> list[str]:
     """Engine args for `model_path`: qwen4exp-only adaptive-swap pinning is added only for qwen4exp packs."""
-    pinned = PINNED if model_arch(model_path) == "qwen4exp" else []
-    return set_args(["--model", model_path, *BASE], pinned + extra)
+    arch = model_arch(model_path)
+    pinned = PINNED if arch == "qwen4exp" else []
+    spec = [] if arch == "deepseek4" else ["--spec", "7"]
+    return set_args(["--model", model_path, *spec, *BASE], pinned + extra)
 
 
 def set_args(args: list[str], extra: list[str]) -> list[str]:

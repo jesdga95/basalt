@@ -56,6 +56,10 @@ class Arch:
         """Meta keys read from the Hugging Face directory (--hf-dir): the license text and the config."""
         return {}
 
+    def hf_sections(self, hf_dir) -> dict[str, list[dict]]:
+        """Tensor records to preserve from selected Hugging Face checkpoint weights."""
+        return {}
+
     def license(self, kv: dict) -> dict:
         raise NotImplementedError
 

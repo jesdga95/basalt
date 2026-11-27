@@ -327,6 +327,12 @@ class Job:
                 self.index[name] = f.read() if size is None else f.read(size)
         self._report(name, self.w.entries[-1][2], time.time() - t)
 
+    def parts(self, name, parts):
+        t = time.time()
+        offsets = self.w.add_parts(name, parts, TENSOR_ALIGN)
+        self._report(name, self.w.entries[-1][2], time.time() - t)
+        return offsets
+
     def chunks(self, name, chunks, size=None):
         t = time.time()
         n = self.w.add_size(name, size) if size is not None and self.dry else self.w.add_chunks(name, chunks)
@@ -428,6 +434,7 @@ def convert(a) -> None:
         for k, v in arch.sampling_kv.items():
             kv.setdefault(k, v)
         hf_meta = arch.hf_meta(hf_dir) if hf_dir else {}
+        hf_sections = arch.hf_sections(hf_dir) if hf_dir else {}
         mtp_ids = arch.mtp_layers(kv)
         in_mtp = lambda n: (m := re.match(r"blk\.(\d+)\.", n)) is not None and int(m.group(1)) in mtp_ids
         mtp_gguf = None
@@ -517,6 +524,13 @@ def convert(a) -> None:
                     job.file(section, src, off, size)
                 own_entries[name] = {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
                                      "bytes": size, "offset": 0, "section": section}
+            hf_entries = {}
+            for section, records in hf_sections.items():
+                offsets = job.parts(section, [(r["source"], r["offset"], r["bytes"]) for r in records])
+                for record, offset in zip(records, offsets):
+                    hf_entries[record["name"]] = {k: record[k] for k in ("type", "type_id", "shape", "bytes")}
+                    hf_entries[record["name"]].update(offset=offset, section=section, origin="hf_checkpoint",
+                                                       source_sha256=record["source_sha256"])
             if base is not None:
                 prefixes = ("vision/", "dspark/") if mtp_gguf is not None else ("mtp/", "vision/", "dspark/")
                 for name in base.names():
@@ -580,7 +594,7 @@ def convert(a) -> None:
                 "gguf_kv": kv,
                 "tensors": {**{n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
                                    "bytes": nb, "offset": tensor_offsets[n]}
-                               for n, _, _, nb, t in tensors}, **own_entries},
+                               for n, _, _, nb, t in tensors}, **own_entries, **hf_entries},
                 "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
                 "license": arch.license(kv),
                 **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
@@ -609,6 +623,8 @@ def convert(a) -> None:
                 meta["sources"] += [{"path": f"hf/{n}", "size": (hf_dir / n).stat().st_size,
                                      "sha256": hashlib.sha256((hf_dir / n).read_bytes()).hexdigest()}
                                     for n in ("config.json", "LICENSE")]
+                checkpoint_paths = sorted({Path(r["source"]) for records in hf_sections.values() for r in records})
+                meta["sources"] += [source_record(path) for path in checkpoint_paths]
             if base is not None:
                 meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
                                          "fingerprint_sha256_first_last_64mib_and_size": fingerprint(Path(a.sections_from)),
@@ -892,7 +908,8 @@ def main():
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
-    ap.add_argument("--hf-dir", metavar="DIR", help="hy_v4_flash: the tencent/Hy4-flash directory (LICENSE, config.json)")
+    ap.add_argument("--hf-dir", metavar="DIR",
+                    help="deepseek4: its Hugging Face checkpoint (adds final mHC head tensors); hy_v4_flash: Tencent checkpoint")
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
     ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")

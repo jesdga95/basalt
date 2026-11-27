@@ -53,6 +53,10 @@ int main() {
         !require(args.fixed_table == table && args.fixed_rows == fixed_rows && args.fixed_mask == fixed_mask &&
                      args.alternate_mask == alternate_mask && args.bias == bias && args.alternate_bias == alternate_bias,
                  "mixed selector inputs were not forwarded")) return 1;
+    const auto scored = router_mixed_args(256, vocab, nullptr, fixed_rows, fixed_mask, alternate_mask, bias, alternate_bias);
+    if (!require(!scored.fixed_table && !scored.fixed_rows && scored.fixed_table_rows == 0 && !scored.fixed_mask &&
+                     scored.alternate_mask == alternate_mask && scored.bias == bias && scored.alternate_bias == alternate_bias,
+                 "scored-only selector retained hash-table inputs")) return 1;
 
     const int32_t bad_tokens[] = {7, -1};
     if (!require(!build_route_rows(bad_tokens, 2, vocab, 0, 43, 3, rows, err) && err.find("negative token") != std::string::npos,

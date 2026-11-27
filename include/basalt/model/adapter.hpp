@@ -127,6 +127,7 @@ struct DecodeRequest {
     /// Rows 1 .. n_tokens-1 are the drafts the session's own drafter left last (draft_end), in order. A sampled window may
     /// then keep each by the drafter's proposal (speculative sampling) instead of comparing it with its own draw.
     bool drawn_drafts = false;
+    bool retain_logits_rows = false; ///< keep each row available to copy_logits(row), for diagnostics such as PPL scoring
 };
 
 struct PrefillRequest {

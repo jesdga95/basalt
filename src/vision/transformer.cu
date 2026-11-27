@@ -347,6 +347,12 @@ bool TransformerEncoder::init(const Mmproj& mp, TransformerBlas& blas, std::stri
     return true;
 }
 
+size_t TransformerEncoder::work_bytes(const TransformerGrid& grid) const {
+    if (grid.gx <= 0 || grid.gy <= 0 || grid.lw != (grid.gx + 2) / 3 || grid.lh != (grid.gy + 2) / 3)
+        return 0;
+    return impl_->work_bytes(grid.n_patches(), grid.n_cells(), grid.n_block_rows());
+}
+
 bool TransformerEncoder::reserve(const TransformerGrid& pl, std::string& err) {
     Impl& s = *impl_;
     const int n = pl.n_patches(), ng = pl.n_cells(), ntok = pl.n_block_rows();

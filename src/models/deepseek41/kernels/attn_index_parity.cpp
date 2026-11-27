@@ -2,6 +2,7 @@
 // random inputs against a double-precision host reference with the cache roundings, the packed window rows against the
 // CPU packing byte for byte, independence from the call width T and the position, and a microbench.
 #include "basalt/models/deepseek41/attn_index.hpp"
+#include "basalt/models/deepseek41/prefill_index.hpp"
 #include "test_util.hpp"
 
 #include <cuda_fp16.h>
@@ -234,7 +235,7 @@ void test_frozen(Verdict& v) {
 }
 
 void test_compress(Verdict& v) {
-    const int N = 12, P0 = 5;
+    const int N = 132, P0 = 5;
     const auto freq = make_table(true);
     const auto wkv = rand_bf16((size_t) kLatent * D, 21, 0.02f), wg = rand_bf16((size_t) kLatent * D, 22, 0.02f);
     const auto wik = rand_bf16((size_t) kIdxDim * kLatent, 23, 0.05f);
@@ -247,9 +248,13 @@ void test_compress(Verdict& v) {
     Dev<int32_t> dpos(pos);
     Dev<char> ws(compress_workspace_bytes());
 
-    for (int ratio = 1; ratio <= 2; ++ratio) {
-        const int cap = 32;
-        std::vector<std::vector<int>> parts = {{4, 4, 4}, std::vector<int>(12, 1), {3, 2, 4, 1, 2}};
+    for (int ratio : {1, 2, 4, 128}) {
+        const int cap = P0 + N + 1;
+        std::vector<int> fours, irregular;
+        for (int n = N; n > 0;) { const int q = std::min(4, n); fours.push_back(q); n -= q; }
+        const int pat[] = {3, 2, 4, 1, 2};
+        for (int n = N, i = 0; n > 0; ++i) { const int q = std::min(pat[i % 5], n); irregular.push_back(q); n -= q; }
+        std::vector<std::vector<int>> parts = {fours, std::vector<int>(N, 1), irregular};
         std::vector<std::vector<uint8_t>> outs, outk;
         for (const auto& part : parts) {
             CompState st(ratio, cap);
@@ -587,6 +592,18 @@ void bench() {
     Dev<int32_t> cpos(std::vector<int32_t>{1, 2, 3, 4});
     bench_line("compress ratio 2 T=1", bench_us([&] { compress(c, x.p, cpos.p, 1, cws.p, nullptr); }, 200), 2.0 * kLatent * D * 2);
     bench_line("compress ratio 2 T=4", bench_us([&] { compress(c, x.p, cpos.p, 4, cws.p, nullptr); }, 200), 2.0 * kLatent * D * 2);
+    constexpr int hc_tokens = 128;
+    Dev<float> hx(randn((size_t) hc_tokens * D, 52, 1.f));
+    std::vector<int32_t> hp(hc_tokens);
+    std::iota(hp.begin(), hp.end(), 0);
+    Dev<int32_t> dhp(hp);
+    CompState hs(128, 4);
+    CompressArgs hc;
+    hc.ratio = 128; hc.w_kv = wkv.p; hc.w_gate = wg.p; hc.norm_w = nw.p; hc.rope_freq = dfreq.p;
+    hc.state_kv = hs.skv.p; hc.state_score = hs.ssc.p; hc.comp_kv = hs.ckv.p;
+    Dev<char> hcws(compress_batch_workspace_bytes(hc_tokens));
+    bench_line("compress_batch ratio 128 T=128", bench_us([&] { compress_batch(hc, hx.p, dhp.p, hc_tokens, hcws.p, nullptr); }, 10),
+               2.0 * kLatent * D * 2 + (double) hc_tokens * D * 4);
     Dev<float> raw(randn(4 * kLatent, 51, 1.f)), out(4 * kLatent);
     Dev<uint8_t> ring((size_t) kWindowSlots * kWinRowBytes);
     bench_line("kv_window T=4", bench_us([&] { kv_window(raw.p, nw.p, cpos.p, 4, 1e-20f, dfreq.p, out.p, ring.p, CacheFormat::Fp8, nullptr); }, 500), 4.0 * kLatent * 12);

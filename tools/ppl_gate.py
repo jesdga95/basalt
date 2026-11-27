@@ -4,11 +4,11 @@
 The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-token chunks, second half scored). The
 engine runs as `--serve` with the model plus --ppl-base and --ppl-out; per chunk it reads the first half as a prompt
 and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). It sets --spec 5 for models
-with a drafter and --spec 0 for `deepseek4`, whose target pack has no drafter. With two visible GPUs it uses --gpu 0,1. `--architecture qwen4exp` also disables adaptive swaps so placement stays
+with a drafter and uses plain decode for `deepseek4`, whose target pack has no drafter. With two visible GPUs it uses --gpu 0,1. `--architecture qwen4exp` also disables adaptive swaps so placement stays
 fixed. Flags passed after the tool's options replace these defaults.
 
   python3 tools/ppl_gate.py --model FILE.basalt --architecture qwen4exp|deepseek4|inkling2|other \
-                             --base base.kld --out DIR [--engine-bin BIN] [--chunks 20] [--t 3]
+                             --base base.kld --out DIR [--engine-bin BIN] [--chunks 20] [--chunk K ...] [--t 3]
                              [--gpu 0 ...]
   python3 tools/ppl_gate.py --report DIR/rows.tsv          # summary of a finished run
   python3 tools/ppl_gate.py --diff A/rows.tsv B/rows.tsv   # row by row: identical rows, largest NLL/KLD change
@@ -143,14 +143,28 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
 
 def architecture_args(architecture: str) -> list[str]:
     """Architecture-specific quality-gate defaults, before explicit caller overrides."""
-    args = ["--spec", "0" if architecture == "deepseek4" else "5"]
+    args = [] if architecture == "deepseek4" else ["--spec", "5"]
     if architecture == "qwen4exp":
         args += ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
     return args
 
 
+def select_chunks(n_chunk: int, chunks: int = 0, selected: list[int] | None = None) -> list[int]:
+    if selected and chunks:
+        raise ValueError("--chunk and --chunks cannot be combined")
+    if selected is None:
+        return list(range(min(chunks, n_chunk) if chunks > 0 else n_chunk))
+    if any(k < 0 or k >= n_chunk for k in selected):
+        raise ValueError(f"--chunk indices must be in [0, {n_chunk})")
+    return selected
+
+
 def run(a) -> int:
     n_ctx, n_vocab, n_chunk, chunks = read_base(a.base)
+    try:
+        selected = select_chunks(n_chunk, a.chunks, getattr(a, "chunk", None))
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
     first = n_ctx // 2
     model_path = Path(a.model)
     args = ["--model", str(model_path.resolve()), *architecture_args(a.architecture)]
@@ -180,9 +194,9 @@ def run(a) -> int:
             t_load = time.time() - t0
             hits = look = off = 0
             pp_ms = dec_ms = 0.0
-            nc = min(a.chunks, n_chunk) if a.chunks > 0 else n_chunk
+            nc = len(selected)
             t1 = time.time()
-            for k in range(nc):
+            for i, k in enumerate(selected):
                 ids = ",".join(str(t) for t in chunks[k][:first + 1])
                 eng.stdin.write(f"GEN {n_ctx - 1 - first} ppl={k} ppl_t={a.t} {ids}\n")
                 eng.stdin.flush()
@@ -203,8 +217,8 @@ def run(a) -> int:
                 else:
                     print(f"chunk {k}: the engine exited; see", out / "engine.log")
                     return 1
-                if a.progress and (k + 1) % a.progress == 0:
-                    print(f"  {k + 1}/{nc} chunks, {time.time() - t1:.0f} s", flush=True)
+                if a.progress and (i + 1) % a.progress == 0:
+                    print(f"  {i + 1}/{nc} chunks (last: {k}), {time.time() - t1:.0f} s", flush=True)
             t_run = time.time() - t1
             eng.stdin.write("QUIT\n")
             eng.stdin.flush()
@@ -248,6 +262,7 @@ def main() -> int:
     ap.add_argument("--base")
     ap.add_argument("--out")
     ap.add_argument("--chunks", type=int, default=0, help="the first N chunks (0: all)")
+    ap.add_argument("--chunk", type=int, action="append", help="specific zero-based chunk; repeat to select several")
     ap.add_argument("--t", type=int, default=3, help="tokens per verify window")
     ap.add_argument("--progress", type=int, default=10, help="a progress line every N chunks (0: none)")
     ap.add_argument("--report", help="print the summary of an existing rows.tsv and exit")

@@ -110,12 +110,35 @@ bool tensor_shape(const Pack& pack, const std::string& name, std::initializer_li
 
 bool validate_tensor_layout(const Pack& pack, std::string& err) {
     const Geometry& g = pack.geo;
-    if (!tensor_shape(pack, "token_embd.weight", {(uint64_t) g.n_embd, (uint64_t) g.n_vocab}, 30) ||
-        !tensor_shape(pack, "output.weight", {(uint64_t) g.n_embd, (uint64_t) g.n_vocab}, 30) ||
-        !tensor_shape(pack, "output_norm.weight", {(uint64_t) g.n_embd})) {
-        err = "token embedding or output tensor has an unexpected shape or type";
+    const auto require = [&](const char* name, std::initializer_list<uint64_t> expected, int expected_type) {
+        const TensorRef* tensor = pack.find(name);
+        if (tensor && tensor->shape == std::vector<uint64_t>(expected) && tensor->type == expected_type) return true;
+        std::ostringstream message;
+        message << name << ": expected type " << expected_type << " shape [";
+        bool first = true;
+        for (const uint64_t dim : expected) {
+            if (!first) message << ',';
+            message << dim;
+            first = false;
+        }
+        message << "], got ";
+        if (!tensor) message << "missing";
+        else {
+            message << "type " << tensor->type << " shape [";
+            for (size_t i = 0; i < tensor->shape.size(); ++i) {
+                if (i) message << ',';
+                message << tensor->shape[i];
+            }
+            message << ']';
+        }
+        err = "deepseek4 tensor layout: " + message.str();
         return false;
-    }
+    };
+    if (!require("token_embd.weight", {(uint64_t) g.n_embd, (uint64_t) g.n_vocab}, 30) ||
+        !require("output.weight", {(uint64_t) g.n_embd, (uint64_t) g.n_vocab}, 30) ||
+        !require("output_norm.weight", {(uint64_t) g.n_embd}, 0) ||
+        !require("hc_head_fn.weight", {(uint64_t) g.output_embd, 4}, 0) ||
+        !require("hc_head_base.weight", {4}, 0) || !require("hc_head_scale.weight", {1}, 0)) return false;
     for (int layer = 0; layer < g.n_layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
         const auto has_shape = [&](const char* suffix, std::initializer_list<uint64_t> shape, int type = -1) {

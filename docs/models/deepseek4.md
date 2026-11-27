@@ -23,14 +23,19 @@ adapter. On the RTX 5090 at 475 W, Basalt loaded the `-hchead` pack with `--resi
 from token ID 1. The default all-RAM tier exhausted VRAM during its post-pin allocation check; the 32 GiB resident budget
 left 160 experts per layer file-backed. This is a bring-up smoke only, not a quality or performance result.
 
-The session currently supports one conversation and positions 0–127. It does not yet maintain the V4 compressed/indexer
-cache, so longer requests are refused. The session now decodes and encodes images with the V4 planner, transformer, and
-projector, then releases encoder objects and returns any borrowed expert-cache memory in `images_done()`. On the sample
-Basalt logo it produced 197 image rows in 417 ms, but prompt execution refused those rows because compressed-cache image
-prefill is not connected. That run does not verify end-to-end image understanding or zero idle memory. The attention
-primitive accepts windows up to eight rows and matches sequential one-row output/cache state bitwise; this does not yet
-establish session window parity. Do not describe the model as production-ready until cache, image prefill, serving, and
-quality gates pass.
+The session now maintains per-layer sliding, compressed-attention, and indexer caches and runs sparse MQA in the V4
+layer schedule. A one-token decode from token ID 1 succeeds on the derived `-hchead` pack. A 130-ID prompt also passes the
+former 128-row boundary: Basalt prefetched 129 prompt tokens in 15.4 seconds and generated one token. This is a smoke test,
+not a quality or long-context result; chunk/token identity, images, and resource release after an image request remain
+unverified. Image preprocessing previously produced 197 rows for the sample logo, but that run happened before compressed
+cache prefill was connected and does not establish image understanding. Keep the model marked work-in-progress until the
+vision, serving, precision, lifecycle, and performance gates below pass.
+
+Conversation checkpoints now snapshot the sliding-window rings and rolling attention/indexer compressor state; compressed
+attention and CSA index rows use the shared positional-cell save/restore path. A two-chunk Wikitext gate exercised save,
+restore, and restarting at position zero. `BatchSession` is registered with the shared batch driver, but V4's host-steered
+expert routing currently selects its sequential fallback; this verifies API identity semantics, not parallel batch speed.
+The single available RTX 5090 leaves multi-GPU peer identity untested.
 
 ## Architecture and ownership
 

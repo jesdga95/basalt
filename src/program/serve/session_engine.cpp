@@ -757,6 +757,7 @@ public:
         if (tail_only) d.next_token = &outv[(size_t) e0];
         else (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
+        d.retain_logits_rows = ppl != nullptr;
         d.history = hist_n > 0 ? history_.data() + (tail_only ? (size_t) e0 * hist_n : 0) : nullptr;
         d.history_len = hist_n;
         req_sp.counter = draws_;

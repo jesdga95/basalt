@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import math
+import json
+import hashlib
+from pathlib import Path
 
 from . import Arch, register
 from .deepseek41 import MIT
@@ -53,10 +56,54 @@ _SUPPORTED_GEOMETRY = {
 
 class DeepSeek4(Arch):
     name = "deepseek4"
+    needs_hf_dir = True
     side_sections = False
     mmproj_only = True
     projector_type = "deepseek4v"
     sampling_kv = {"general.sampling.temp": 1.0, "general.sampling.top_p": 1.0, "general.sampling.top_k": 0}
+
+    def hf_sections(self, hf_dir):
+        from model_sections import ConvertError, read_safetensors_header
+
+        root = Path(hf_dir)
+        try:
+            config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            index = json.loads((root / "model.safetensors.index.json").read_text(encoding="utf-8"))
+            weight_map = index["weight_map"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ConvertError(f"{root}: invalid DeepSeek V4 checkpoint config or safetensors index: {exc}") from exc
+        if (config.get("model_type") != "deepseek_v4" or config.get("hidden_size") != 4096 or
+                config.get("hc_mult") != 4 or config.get("num_hidden_layers") != 43):
+            raise ConvertError(f"{root}: checkpoint is not the supported DeepSeek V4-0731 geometry")
+
+        expected = {
+            "hc_head_fn": ("hc_head_fn.weight", [4, 16384], [16384, 4]),
+            "hc_head_base": ("hc_head_base.weight", [4], [4]),
+            "hc_head_scale": ("hc_head_scale.weight", [1], [1]),
+        }
+        records = []
+        for source_name, (name, source_shape, pack_shape) in expected.items():
+            try:
+                shard_name = weight_map[source_name]
+                shard = root / shard_name
+                header, data_start = read_safetensors_header(shard)
+                tensor = header[source_name]
+                start, end = tensor["data_offsets"]
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise ConvertError(f"{root}: missing or invalid checkpoint tensor {source_name}: {exc}") from exc
+            size = 4 * math.prod(source_shape)
+            if tensor.get("dtype") != "F32" or tensor.get("shape") != source_shape or end - start != size:
+                raise ConvertError(f"{shard}: {source_name} is {tensor.get('dtype')} {tensor.get('shape')}, "
+                                   f"expected F32 {source_shape}")
+            with shard.open("rb") as f:
+                f.seek(data_start + start)
+                raw = f.read(size)
+            if len(raw) != size:
+                raise ConvertError(f"{shard}: truncated checkpoint tensor {source_name}")
+            records.append({"name": name, "source": str(shard), "offset": data_start + start, "bytes": size,
+                            "type": "F32", "type_id": 0, "shape": pack_shape,
+                            "source_sha256": hashlib.sha256(raw).hexdigest()})
+        return {"deepseek4/head": records}
 
     def license(self, kv):
         lic = {"name": "MIT", "text": MIT}

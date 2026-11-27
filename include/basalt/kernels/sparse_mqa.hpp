@@ -12,6 +12,7 @@ constexpr int kSparseMqaRopeDim = 64;
 constexpr int kSparseMqaWindow = 128;
 constexpr int kSparseMqaMaxTokens = 8;
 constexpr int kSparseMqaTopK = 512;
+constexpr int kSparseMqaMaxSelected = 1 << 15;
 constexpr int kSparseMqaOutputGroups = 8;
 constexpr int kSparseMqaOutputRank = 1024;
 constexpr int kSparseMqaGroupInput = kSparseMqaHeads * kSparseMqaDim / kSparseMqaOutputGroups;

@@ -252,9 +252,17 @@ class TestGreedyIdentity(unittest.TestCase):
 
 class TestPplGate(unittest.TestCase):
     def test_deepseek4_gate_defaults_to_plain_decode(self):
-        self.assertEqual(ppl.architecture_args("deepseek4"), ["--spec", "0"])
+        self.assertEqual(ppl.architecture_args("deepseek4"), [])
         self.assertEqual(ppl.architecture_args("qwen4exp"),
                          ["--spec", "5", "--adapt-swaps", "0", "--peer-adapt-swaps", "0"])
+
+    def test_select_chunks_preserves_requested_order_and_rejects_bad_ranges(self):
+        self.assertEqual(ppl.select_chunks(100, selected=[55, 82, 65, 98]), [55, 82, 65, 98])
+        self.assertEqual(ppl.select_chunks(100, chunks=3), [0, 1, 2])
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            ppl.select_chunks(100, chunks=3, selected=[55])
+        with self.assertRaisesRegex(ValueError, r"\[0, 100\)"):
+            ppl.select_chunks(100, selected=[100])
 
     @staticmethod
     def _row(chunk, pos, nll, nllb, kld, same=1, top="10", dlp=0.01):

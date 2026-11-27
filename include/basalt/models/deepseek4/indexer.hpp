@@ -15,16 +15,17 @@ constexpr int kIndexerQueryRank = 1024;
 /// Workspace for indexer_select() over at most max_rows compressed keys.
 size_t indexer_select_workspace_bytes(int max_rows);
 
-/// Workspace for indexer_project_bf16() for up to max_tokens rows.
+/// Workspace for indexer_project_q8_0() for up to max_tokens rows.
 size_t indexer_project_workspace_bytes(int max_tokens);
 
-/// Source indexer projections. qr is [T][1024], x is [T][4096], BF16 weights are [8192][1024] and [64][4096],
-/// rope_angle is [T][32] radians after the configured RoPE/YaRN scaling. Inputs and outputs are F32 containers, with
-/// each source BF16/FP4 rounding boundary simulated.
-/// q_out is [T][64][128] after rotary, Hadamard and FP4 quant/dequant; head_weights is [T][64] after the source score
-/// scaling. The workspace size is returned by indexer_project_workspace_bytes(max_tokens); all pointers are device
-/// pointers and stream may be null.
-void indexer_project_bf16(const uint16_t* w_q, const uint16_t* w_proj, const float* qr, const float* x,
+/// Source indexer projections. qr is [T][1024], x is [T][4096], the query matrix is Q8_0 [8192][1024], and
+/// the head-weight matrix is BF16 [64][4096].
+/// rope_angle is [T][32] radians after the configured RoPE/YaRN scaling. The latent is BF16-rounded, quantized through
+/// Basalt's Q8_1 activation path, then multiplied by the pack's Q8_0 query matrix. q_out is [T][64][128] after the
+/// source BF16/FP4/rotary/Hadamard boundaries, and head_weights is [T][64] after source score scaling. w_proj is BF16.
+/// The workspace size is returned by indexer_project_workspace_bytes(max_tokens); pointers are device pointers and the
+/// stream must be non-null.
+void indexer_project_q8_0(const void* w_q, const uint16_t* w_proj, const float* qr, const float* x,
                           const float* rope_angle, int n_tokens, float* q_out, float* head_weights,
                           void* workspace, size_t workspace_bytes, void* stream);
 

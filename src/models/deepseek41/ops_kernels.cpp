@@ -171,11 +171,11 @@ public:
         rope_[0] = rope_table_window();
         rope_[1] = rope_table_compressed(g_.comp_rope_base, g_.yarn_factor, g_.yarn_beta_fast, g_.yarn_beta_slow, g_.yarn_orig_ctx);
 
-        const size_t xq = std::max<size_t>({kernels::native_q8_1_bytes(kAttnEmbd, kMaxT), attn_out_scratch_bytes(kMaxT), 1 << 16});
+        const size_t xq = std::max<size_t>({kernels::native_q8_1_bytes(g_.n_embd, kMaxT), attn_out_scratch_bytes(kMaxT), 1 << 16});
         const size_t ws_f = sparse_mqa_workspace_floats(kMaxT, kTopK) + 64;
         const size_t max_rows = (size_t) ctx_ + 1;
-        if (!alloc(&xq_, xq) || !alloc(&xq2_, std::max<size_t>(q_path_scratch_bytes(kMaxT), 1 << 16)) ||
-            !alloc((void**) &kvraw_, (size_t) kMaxT * kLatent * 4) || !alloc((void**) &qr_, (size_t) kMaxT * kAttnQRank * 4) ||
+        if (!alloc(&xq_, xq) || !alloc(&xq2_, std::max<size_t>(q_path_scratch_bytes(kMaxT, g_.q_lora), 1 << 16)) ||
+            !alloc((void**) &kvraw_, (size_t) kMaxT * kLatent * 4) || !alloc((void**) &qr_, (size_t) kMaxT * g_.q_lora * 4) ||
             !alloc((void**) &q_, (size_t) kMaxT * kAttnHeads * kAttnHeadDim * 4) ||
             !alloc((void**) &attn_, (size_t) kMaxT * kAttnHeads * kAttnHeadDim * 4) ||
             !alloc((void**) &oa_, attn_out_scratch_floats(kMaxT) * 4) || !alloc((void**) &mws_, ws_f * 4) ||
@@ -187,7 +187,7 @@ public:
         if (cudaHostAlloc((void**) &h_pos_, (size_t) nl * kPosStride * 4, cudaHostAllocPortable) != cudaSuccess) return oom(err);
         const int nf = g_.n_ff_exp * std::max(g_.n_shared, 1);
         if (!alloc((void**) &sh_g_, (size_t) nf * kMaxT * 4) || !alloc((void**) &sh_u_, (size_t) nf * kMaxT * 4) ||
-            !alloc((void**) &sh_h_, (size_t) nf * kMaxT * 4) || !alloc(&sh_q1_, kernels::native_q8_1_bytes(kAttnEmbd, kMaxT)) ||
+            !alloc((void**) &sh_h_, (size_t) nf * kMaxT * 4) || !alloc(&sh_q1_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
             !alloc(&sh_q2_, kernels::native_q8_1_bytes(nf, kMaxT)))
             return oom(err);
         return true;
@@ -480,13 +480,13 @@ public:
         const int ratio = g_.compress_ratio[(size_t) il];
         auto T = [&](const char* s) { return m_.tensor(il, s); };
         const DevTensor *wc = T("attn_compressor_kv.weight"), *cn = T("attn_compressor_norm.weight");
-        const DevTensor *wg = ratio == 2 ? T("attn_compressor_gate.weight") : nullptr;
+        const DevTensor *wg = ratio > 1 ? T("attn_compressor_gate.weight") : nullptr;
         const DevTensor *ik = T("indexer.attn_k.weight"), *ikn = T("indexer.k_norm.weight");
         CompressArgs ca;
         ca.ratio = ratio;
         ca.format = fmt_;
         ca.rms_eps = g_.rms_eps;
-        ca.n_embd = kAttnEmbd;
+        ca.n_embd = g_.n_embd;
         ca.w_kv = wc ? (const uint16_t*) wc->ptr : nullptr;
         ca.w_gate = wg ? (const uint16_t*) wg->ptr : nullptr;
         ca.norm_w = cn ? (const float*) cn->ptr : nullptr;
@@ -522,9 +522,9 @@ public:
         };
 
         // window latent, beside the query path
-        kernels::native_quantize_q8_1(x, xq_, kAttnEmbd, T, stream);
+        kernels::native_quantize_q8_1(x, xq_, g_.n_embd, T, stream);
         if (!after(ms, br_[0], br_ev_[0])) return failed("attention branch");
-        kernels::native_mmvq(wkv->type, wkv->ptr, xq_, kvraw_, kAttnEmbd, kLatent, T, br_[0]);
+        kernels::native_mmvq(wkv->type, wkv->ptr, xq_, kvraw_, g_.n_embd, kLatent, T, br_[0]);
         kv_window(kvraw_, (const float*) kvn->ptr, d_pos, T, g_.rms_eps, freq_[kind], nullptr, ring_[il], fmt_, br_[0]);
 
         // the compressor and the indexer's head weights read only x: beside the query path as well
@@ -536,7 +536,7 @@ public:
         }
         if (compressing) {
             if (!W("attn_compressor_kv.weight") || !W("attn_compressor_norm.weight") ||
-                (ratio == 2 && !W("attn_compressor_gate.weight"))) {
+                (ratio > 1 && !W("attn_compressor_gate.weight"))) {
                 err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
                 return false;
             }
@@ -553,7 +553,8 @@ public:
             ia.mode = index_mode(il);
             ia.ratio = ratio;
             ia.format = fmt_;
-            ia.n_embd = kAttnEmbd;
+            ia.n_embd = g_.n_embd;
+            ia.q_rank = g_.q_lora;
             ia.n_comp = ctx_ / ratio + 1;   // the buffers' row capacity; only the visible rows are scored
             ia.w_q = (const uint16_t*) iqb->ptr;
             ia.w_proj = (const uint16_t*) ipj->ptr;
@@ -568,6 +569,8 @@ public:
 
         // query path; its latent is also the indexer's input
         QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
+        qw.n_embd = g_.n_embd;
+        qw.q_rank = g_.q_lora;
         q_latent(xq_, qw, T, qr_, xq2_, stream);
         if (indexing) {
             // the selection waits for the latent, the head weights and the layer's index keys
@@ -600,7 +603,7 @@ public:
         a.out = attn_;
         sparse_mqa(a, mws_, stream);
 
-        AttnOutWeights ow{oa->ptr, oa->type, ob->ptr, ob->type};
+        AttnOutWeights ow{oa->ptr, oa->type, ob->ptr, ob->type, g_.n_embd};
         attn_out(attn_, ow, T, xq_, oa_, out, stream);
         return true;
     }
@@ -1006,12 +1009,12 @@ public:
             return false;
         }
         const int nf = g_.n_ff_exp * std::max(g_.n_shared, 1);
-        kernels::native_quantize_q8_1(x, sh_q1_, kAttnEmbd, T, stream);
-        kernels::native_mmvq(gt->type, gt->ptr, sh_q1_, sh_g_, kAttnEmbd, nf, T, stream);
-        kernels::native_mmvq(up->type, up->ptr, sh_q1_, sh_u_, kAttnEmbd, nf, T, stream);
+        kernels::native_quantize_q8_1(x, sh_q1_, g_.n_embd, T, stream);
+        kernels::native_mmvq(gt->type, gt->ptr, sh_q1_, sh_g_, g_.n_embd, nf, T, stream);
+        kernels::native_mmvq(up->type, up->ptr, sh_q1_, sh_u_, g_.n_embd, nf, T, stream);
         swiglu_clamped(sh_g_, sh_u_, nf * T, g_.clamp_shexp[(size_t) il], sh_h_, stream);
         kernels::native_quantize_q8_1(sh_h_, sh_q2_, nf, T, stream);
-        kernels::native_mmvq(dn->type, dn->ptr, sh_q2_, out, nf, kAttnEmbd, T, stream);
+        kernels::native_mmvq(dn->type, dn->ptr, sh_q2_, out, nf, g_.n_embd, T, stream);
         return true;
     }
 

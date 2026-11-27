@@ -2,6 +2,8 @@
 
 #include "models/deepseek4/pack.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/models/deepseek4/layer.hpp"
+#include "basalt/models/deepseek4/head.hpp"
 
 #include <map>
 #include <string>

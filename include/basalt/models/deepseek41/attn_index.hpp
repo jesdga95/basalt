@@ -115,6 +115,7 @@ struct IndexerArgs {
     IndexMode mode = IndexMode::Full;
     int ratio = 2;
     int n_embd = 5120;
+    int q_rank = 1280;
     int n_comp = 0;                     ///< row capacity of the buffers: >= max over the call's tokens of (pos+1)/ratio;
                                         ///< only the rows the last token can see are read or scored
     int block_size = 8;                 ///< candidate block size (rows)

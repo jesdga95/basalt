@@ -30,9 +30,9 @@ inline kernels::RouterMixedArgs router_mixed_args(int n_expert, int token_vocab,
     args.weight_scale = 1.5f;
     args.gate = kernels::RouterGate::SqrtSoftplus;
     args.fixed_table = fixed_table;
-    args.fixed_rows = fixed_rows;
-    args.fixed_table_rows = token_vocab;
-    args.fixed_mask = fixed_mask;
+    args.fixed_rows = fixed_table ? fixed_rows : nullptr;
+    args.fixed_table_rows = fixed_table ? token_vocab : 0;
+    args.fixed_mask = fixed_table ? fixed_mask : nullptr;
     args.alternate_mask = alternate_mask;
     args.bias = bias;
     args.alternate_bias = alternate_bias;

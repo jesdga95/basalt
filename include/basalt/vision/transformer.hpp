@@ -44,6 +44,7 @@ public:
     TransformerEncoder& operator=(const TransformerEncoder&) = delete;
 
     bool init(const Mmproj& projector, TransformerBlas& blas, std::string& err);
+    size_t work_bytes(const TransformerGrid& grid) const;
     bool reserve(const TransformerGrid& grid, std::string& err);
     /// Returns [ceil(grid_height/3)*ceil(grid_width/3)][projector width] projected grid rows.
     bool encode_grid(const std::vector<float>& patches, const TransformerGrid& grid,

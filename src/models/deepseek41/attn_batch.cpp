@@ -46,15 +46,15 @@ constexpr size_t kIndexBudget = 160u << 20;   // bytes of indexer workspace
 struct Sizes {
     size_t xq, kvraw, qr, q, attn, oa, ident, stage, mws, cws, iws, fixed;
 };
-Sizes sizes(CacheFormat f) {
+Sizes sizes(CacheFormat f, int n_embd = kAttnEmbd, int q_rank = kAttnQRank) {
     namespace mmq = basalt::prefill::mmq;
     const size_t S = kSub;
     Sizes z;
-    z.xq = std::max({mmq::q8_bytes((int64_t) S, kAttnEmbd), mmq::q8_bytes((int64_t) S, kAttnQRank),
+    z.xq = std::max({mmq::q8_bytes((int64_t) S, n_embd), mmq::q8_bytes((int64_t) S, q_rank),
                      mmq::q8_bytes((int64_t) S * kAttnGroups, kAttnGroupIn),
                      mmq::q8_bytes((int64_t) S, kAttnGroups * kAttnOutRank), (size_t) 1 << 16});
     z.kvraw = S * kLatent * 4;
-    z.qr = S * kAttnQRank * 4;
+    z.qr = S * (size_t) q_rank * 4;
     z.q = z.attn = S * kAttnHeads * kAttnHeadDim * 4;
     z.oa = S * kAttnGroups * kAttnOutRank * 4;
     z.ident = S * 4;
@@ -80,7 +80,7 @@ public:
     bool init(std::string& err) {
         namespace mmq = basalt::prefill::mmq;
         const size_t C = (size_t) cap_, S = kSub;
-        const Sizes z = sizes(c_.format);
+        const Sizes z = sizes(c_.format, g_.n_embd, g_.q_lora);
         bool ok = alloc(&xq_, z.xq) && alloc(&kvraw_, z.kvraw) && alloc(&qr_, z.qr) && alloc(&q_, z.q) &&
                   alloc(&attn_, z.attn) && alloc(&oa_, z.oa) && alloc(&ident_, z.ident) && alloc(&stage_, z.stage) &&
                   alloc(&mws_, z.mws) && alloc(&cws_, z.cws) && alloc(&iws_, z.iws) &&
@@ -109,11 +109,11 @@ public:
         if (il == 0 || chunk_pos0_ != pos0 || chunk_n_ != T) upload_positions(pos0, T, st);
         for (int s0 = 0; s0 < T; s0 += kSub) {
             const int S = std::min(kSub, T - s0);
-            const float* xs = x + (size_t) s0 * kAttnEmbd;
+            const float* xs = x + (size_t) s0 * g_.n_embd;
             select_fixed(S, stream);
             if (!dense_in(il, s0, S, xs, stream, err)) return false;
             if (!sub(il, pos0, s0, S, xs, stream, err)) return false;
-            if (!dense_out(il, S, out + (size_t) s0 * kAttnEmbd, stream, err)) return false;
+            if (!dense_out(il, S, out + (size_t) s0 * g_.n_embd, stream, err)) return false;
         }
         return true;
     }
@@ -125,7 +125,7 @@ public:
         }
         if (chunk_pos0_ != pos0 || chunk_n_ != T) upload_positions(pos0, T, (cudaStream_t) stream);
         for (int s0 = 0; s0 < T; s0 += kSub)
-            if (!compress_sub(il, x + (size_t) s0 * kAttnEmbd, d_pos_ + s0, std::min(kSub, T - s0), stream, err)) return false;
+            if (!compress_sub(il, x + (size_t) s0 * g_.n_embd, d_pos_ + s0, std::min(kSub, T - s0), stream, err)) return false;
         return true;
     }
 
@@ -202,13 +202,13 @@ private:
             err = "deepseek41: layer " + std::to_string(il) + " lacks attention tensors";
             return false;
         }
-        mmq::quantize(x, nullptr, xq_, wkv->type, kAttnEmbd, kAttnEmbd, S, stream);
-        gemm(wkv, kLatent, kAttnEmbd, xq_, S, kvraw_, stream);
-        if (qa->type != wkv->type) mmq::quantize(x, nullptr, xq_, qa->type, kAttnEmbd, kAttnEmbd, S, stream);
-        gemm(qa, kAttnQRank, kAttnEmbd, xq_, S, qr_, stream);
-        rms_norm_rows(qr_, (const float*) qan->ptr, kAttnQRank, g_.rms_eps, S, stream);
-        mmq::quantize(qr_, nullptr, xq_, qb->type, kAttnQRank, kAttnQRank, S, stream);
-        gemm(qb, kAttnHeads * kAttnHeadDim, kAttnQRank, xq_, S, q_, stream);
+        mmq::quantize(x, nullptr, xq_, wkv->type, g_.n_embd, g_.n_embd, S, stream);
+        gemm(wkv, kLatent, g_.n_embd, xq_, S, kvraw_, stream);
+        if (qa->type != wkv->type) mmq::quantize(x, nullptr, xq_, qa->type, g_.n_embd, g_.n_embd, S, stream);
+        gemm(qa, g_.q_lora, g_.n_embd, xq_, S, qr_, stream);
+        rms_norm_rows(qr_, (const float*) qan->ptr, g_.q_lora, g_.rms_eps, S, stream);
+        mmq::quantize(qr_, nullptr, xq_, qb->type, g_.q_lora, g_.q_lora, S, stream);
+        gemm(qb, kAttnHeads * kAttnHeadDim, g_.q_lora, xq_, S, q_, stream);
         rope_rows(q_, S * kAttnHeads, kAttnHeadDim, kAttnHeads, d_pos_ + s0, c_.rope[g_.compress_ratio[(size_t) il] ? 1 : 0],
                   false, stream);
         return true;
@@ -239,7 +239,7 @@ private:
         p.ld_dst = kAttnOutRank;
         ctx_.run(p, stream);
         mmq::quantize(oa_, nullptr, xq_, ob->type, kAttnGroups * kAttnOutRank, kAttnGroups * kAttnOutRank, S, stream);
-        gemm(ob, kAttnEmbd, kAttnGroups * kAttnOutRank, xq_, S, out, stream);
+        gemm(ob, g_.n_embd, kAttnGroups * kAttnOutRank, xq_, S, out, stream);
         return true;
     }
 
@@ -248,9 +248,9 @@ private:
         const int ratio = g_.compress_ratio[(size_t) il];
         auto Tn = [&](const char* s) { return m_.tensor(il, s); };
         const DevTensor *wc = Tn("attn_compressor_kv.weight"), *cn = Tn("attn_compressor_norm.weight");
-        const DevTensor *wg = ratio == 2 ? Tn("attn_compressor_gate.weight") : nullptr;
+        const DevTensor *wg = ratio > 1 ? Tn("attn_compressor_gate.weight") : nullptr;
         const DevTensor *ik = Tn("indexer.attn_k.weight"), *ikn = Tn("indexer.k_norm.weight");
-        if (!wc || !cn || (ratio == 2 && !wg)) {
+        if (!wc || !cn || (ratio > 1 && !wg)) {
             err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
             return false;
         }
@@ -258,7 +258,7 @@ private:
         ca.ratio = ratio;
         ca.format = c_.format;
         ca.rms_eps = g_.rms_eps;
-        ca.n_embd = kAttnEmbd;
+        ca.n_embd = g_.n_embd;
         ca.w_kv = (const uint16_t*) wc->ptr;
         ca.w_gate = wg ? (const uint16_t*) wg->ptr : nullptr;
         ca.norm_w = (const float*) cn->ptr;
@@ -315,7 +315,8 @@ private:
                     ia.mode = index_mode(il);
                     ia.ratio = ratio;
                     ia.format = c_.format;
-                    ia.n_embd = kAttnEmbd;
+                    ia.n_embd = g_.n_embd;
+                    ia.q_rank = g_.q_lora;
                     ia.n_comp = std::max<int>(1, (int) ((p0 + g0 + n) / ratio));
                     ia.w_q = (const uint16_t*) iqb->ptr;
                     ia.w_proj = (const uint16_t*) ipj->ptr;
@@ -325,7 +326,7 @@ private:
                     ia.cand_n = cand_n_ + s0 + g0;
                     ia.out_ids = ids_ + (size_t) (s0 + g0) * kTopK;
                     ia.out_n = idn_ + s0 + g0;
-                    indexer_select_batch(ia, qr_ + (size_t) g0 * kAttnQRank, x + (size_t) g0 * kAttnEmbd, d_pos + g0, n, iws_,
+                    indexer_select_batch(ia, qr_ + (size_t) g0 * g_.q_lora, x + (size_t) g0 * g_.n_embd, d_pos + g0, n, iws_,
                                          stream);
                 }
             }

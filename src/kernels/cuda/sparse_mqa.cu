@@ -364,7 +364,7 @@ void sparse_mqa_output_q8(int wo_a_type, const void* wo_a, int wo_b_type, const 
 }
 
 size_t sparse_mqa_workspace_floats(int n_tokens, int n_sel) {
-    if (n_tokens < 1 || n_tokens > kSparseMqaMaxTokens || n_sel < 0 || n_sel > kSparseMqaTopK)
+    if (n_tokens < 1 || n_tokens > kSparseMqaMaxTokens || n_sel < 0 || n_sel > kSparseMqaMaxSelected)
         throw std::invalid_argument("sparse_mqa_workspace_floats: bounds");
     const size_t n_chunks = (size_t) ((kSparseMqaWindow + kChunk - 1) / kChunk) + (size_t) ((n_sel + kChunk - 1) / kChunk);
     return (size_t) n_tokens * kSparseMqaHeads * n_chunks * (kSparseMqaDim + 2);
@@ -372,7 +372,7 @@ size_t sparse_mqa_workspace_floats(int n_tokens, int n_sel) {
 
 void sparse_mqa(const SparseMqaArgs& a, float* workspace, void* stream) {
     if (a.n_tokens < 1 || a.n_tokens > kSparseMqaMaxTokens) throw std::invalid_argument("sparse_mqa: n_tokens");
-    if (a.n_sel < 0 || a.n_sel > kSparseMqaTopK) throw std::invalid_argument("sparse_mqa: n_sel");
+    if (a.n_sel < 0 || a.n_sel > kSparseMqaMaxSelected) throw std::invalid_argument("sparse_mqa: n_sel");
     if (a.win_cap < 1) throw std::invalid_argument("sparse_mqa: win_cap");
     if (!a.q || !a.win || !a.win_start || !a.win_n || !a.sinks || !a.pos || !a.out || !workspace)
         throw std::invalid_argument("sparse_mqa: null required pointer");
