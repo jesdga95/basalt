@@ -104,9 +104,11 @@ Peer speed, measured against the RTX 5080 alone with a GeForce RTX 4070 Ti SUPER
 The peer took `peer GPU 1: 2205 experts`: 49 of the 288 a layer across layers 0-44, 12.9 GiB of its 16 GiB at the
 default `--peer-reserve-mib 600`. `TIER final` read `10.4% VRAM, 0.0% second card, 89.6% CPU` on one card and
 `10.6% VRAM, 15.5% second card, 73.8% CPU` with it - the 6,977 lookups the peer took are the ones the pool gave up,
-and the pool is the bottleneck path, so the move pays almost as much as it costs: two thirds of the ideal gain, the
-rest being the host wait `peer->finish` puts between a block's launches and its sum. DeepSeek 4.1 hides that wait
-with a word the sum waits for on the card (`wait_word`, raised after `finish`); this pass has not.
+and the pool is the bottleneck path, so the move pays almost as much as it costs: two thirds of the ideal gain. The
+shortfall is the per-block handshake - the activation copy into pinned memory and the `arm`/`raise`/`run_fetched`/
+`finish` launches that go with it - and not the host's wait for the writers: the block's sum now queues behind a word
+the host raises once those rows land (`core::JoinWord`), which is all that wait could be hidden behind while the pass
+runs one stream and one block per window.
 
 Pin the tier when a number has to read across runs; the arms never agree pick for pick, because a peer takes homes
 the main card or RAM would otherwise have had:
@@ -117,7 +119,15 @@ bin/basalt --model GLM5.3-Flash-UD-IQ1_S.basalt --gpu 1,0 --gpu-mode peer --diag
 ```
 
 `--diag-tier-vram` is the other pin, but it caps the main card's slots only: it leaves the deal of the peer's homes
-alone, so use `--diag-tier-frozen` across a peer comparison.
+alone, so use `--diag-tier-frozen` across a peer comparison. It is also a different regime, because frozen switches
+off the promotions - and with them the peer's scratch slots, where it computes experts it does not hold. On live
+promotions the peer does far more than the frozen run's 15.5%: over the 20 chunks of the
+[perplexity gate](#parity), with the main card capped at 8 copies a layer, `TIER final` read
+`2691066 lookups: 20.9% VRAM, 0.0% second card, 12.2% bus copy, 66.9% CPU` on one card against
+`2691027: 8.2% VRAM, 51.6% second card, 8.1% bus copy, 32.1% CPU` with it. Wall time 586.5 s against **422.4 s**:
+the 256-token prompts 8,325 against 5,259 ms a chunk, the scored decode 20,999 against 15,858. The cap flatters the
+peer - a cap of 8 keeps the CPU pool big and the main card small, which is more for a peer to win than an unpinned
+card leaves - and perplexity did not move (Parity), which is what makes the offload worth having.
 
 ## Parity
 
@@ -145,17 +155,27 @@ alone, so use `--diag-tier-frozen` across a peer comparison.
   | --- | --- | --- | --- |
   | llama.cpp's own rows (the base file) | 5.5144 ± 0.1813 | - | - |
   | Basalt, IQ1_S pack | **5.5217 ± 0.1821** | 0.0447 (0.0179, 0.378) | 91.84% |
+  | Basalt, IQ1_S pack, peer on an RTX 4070 Ti SUPER | 5.5328 ± 0.1827 | 0.0464 (0.0198, 0.3688) | 91.57% |
 
   A perplexity 0.13% off llama.cpp's, and per chunk between ×0.94 and ×1.04 with no trend: the decode path
   reproduces the other engine's distribution over the same weights. The 91.84% is agreement between two
   engines, not accuracy - llama.cpp's own top-1 against the corpus token is 60.06% on these rows. It says
   nothing about how far IQ1_S sits from BF16 either: that is the tensor audit above, and this pack is not in
   the [BF16 gate](../precision/quality.md), which is scored against a BF16 base this model does not have.
+
+  The peer row is the gate's control for *where* an expert gets computed: the second card took 51.6% of the main
+  tier's 2.69M lookups ([two cards](#two-cards)) and perplexity stayed inside the noise of the tier itself. Two
+  one-card runs of these rows - a fresh process, same arguments - agree on 92.55% of chunk 0's picks and differ by
+  0.137 nats a row on average; the peer arm against the one-card arm agrees on 94.90% and differs by 0.110. A row
+  the peer computed is a grouped card kernel over a q8_1 activation where the pool's is fp32 CPU arithmetic, so a
+  small per-row difference is the expected result; a row wired to the wrong expert or summed without the SwiGLU clamp
+  is what would move perplexity by a multiple, and it does not.
   Reproduce it with
   `python3 tools/ppl_gate.py --model GLM5.3-Flash-UD-IQ1_S.basalt --base <llama.cpp's .kld> --out <dir> --architecture other --chunks 20`
   and the engine's own flags after it, which the gate hands to the engine: `--gpu 1 --vram-reserve-mib 512
   --diag-tier-vram 8` for the run above. Name the card even when one is enough: the gate puts the model on
-  `--gpu 0,1 --gpu-mode peer` by itself when it sees two cards. The peer arm of this table is not measured yet.
+  `--gpu 0,1 --gpu-mode peer` by itself when it sees two cards. The rows above add `--gpu 1` for the first Basalt arm
+  and `--gpu 1,0 --gpu-mode peer` for the peer arm, both with `--vram-reserve-mib 512`.
 
 ## Not measured
 
