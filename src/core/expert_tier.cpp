@@ -217,6 +217,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
             return false;
         f.gate_softcap = el.gate_softcap;
         f.up_softcap = el.up_softcap;
+        f.gelu = el.gelu;
         fmt_.push_back(f);
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);

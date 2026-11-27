@@ -27,6 +27,9 @@ struct NativeFmt {
     int up_type = -1;                   ///< the up rows' type (gu_type when they agree)
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats; gate and up share one)
     int64_t n_embd = 0, n_ff = 0;
+    /// The down rows' width: n_ff, or an MXFP8 down's n_ff padded with zero columns to whole 128-value blocks (the
+    /// activation's values past n_ff are zero), as the card's grouped experts read it.
+    int64_t n_ffk = 0;
     size_t gu_row = 0, d_row = 0;       ///< bytes per gate row and per down row
     size_t up_row = 0;                  ///< bytes per up row (gu_row when the types agree)
     size_t up_off = 0, down_off = 0;    ///< inside the blob
@@ -35,6 +38,7 @@ struct NativeFmt {
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
     float gate_softcap = 0.f, up_softcap = 0.f;   ///< > 0: the softcapped SwiGLU (swiglu.hpp); the caller sets them
+    bool gelu = false;                  ///< the GELU gate (swiglu.hpp); the caller sets it
 };
 
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
@@ -44,7 +48,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
-/// h (n_ff floats) -> the down activation (h_bytes).
+/// h (n_ff floats) -> the down activation (h_bytes; zeros past n_ff up to n_ffk).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 
 /// NVFP4 blobs end in FP32 {s_gate, s_up, s_down, 0}: the scale tail's byte count.
