@@ -139,6 +139,90 @@ int check(const Isa& isa, int n, int mode, int rows) {
     return bad;
 }
 
+// every code through the rows kernel: a 256-weight row holding each code once, against one-hot activations (one value
+// 1 at the code's position, scale 1), so each dot is that code's decoded value times the sub-block scale; for one
+// token (rows two at a time, and an odd last row) and for 2-8 tokens, each result the scalar row's bits and the table's value
+int check_codes(const Isa& isa) {
+    const int n = 256, nb = 2, R = 3;
+    std::vector<block_mxfp8> w(nb * R);
+    for (int r = 0; r < R; ++r)
+        for (int b = 0; b < nb; ++b) {
+            for (int j = 0; j < 128; ++j) w[r * nb + b].qs[j] = (uint8_t) ((b * 128 + j + 37 * r) & 0xFF);
+            for (int k = 0; k < 4; ++k) w[r * nb + b].d[k] = (uint8_t) (120 + r + k);
+        }
+    int bad = 0;
+    std::vector<block_q8_0> a(nb * 4);
+    std::vector<std::vector<float>> prep(8, std::vector<float>(nb * 144));
+    for (int pos = 0; pos < n; ++pos) {
+        for (auto& b : a) {
+            b.d = ggml_fp32_to_fp16(1.0f);
+            std::memset(b.qs, 0, sizeof(b.qs));
+        }
+        a[pos / 32].qs[pos % 32] = 1;
+        for (auto& pp : prep) isa.prep(n, a.data(), pp.data());
+        for (const int nt : {1, 2, 5, 8})
+            for (const auto rr : {std::pair<int, int>{0, R}, {1, R}, {0, 1}}) {
+                const float* pp[8];
+                float* op[8];
+                std::vector<std::vector<float>> out(nt, std::vector<float>(R, -1.f));
+                for (int k = 0; k < nt; ++k) { pp[k] = prep[k].data(); op[k] = out[k].data(); }
+                isa.rows(n, w.data(), nb * sizeof(block_mxfp8), pp, nt, op, rr.first, rr.second);
+                for (int r = rr.first; r < rr.second; ++r) {
+                    float want = 0;
+                    isa.scalar(n, &want, w.data() + r * nb, a.data());
+                    const block_mxfp8& blk = w[r * nb + pos / 128];
+                    const uint8_t c = blk.qs[pos % 128];
+                    const int e = (c >> 3) & 15, m = c & 7;
+                    const double v = (e == 15 && m == 7) ? 0.0 : e == 0 ? std::ldexp((double) m, -9) : std::ldexp(1.0 + m / 8.0, e - 7);
+                    const double exact = (c & 0x80 ? -v : v) * std::ldexp(1.0, blk.d[(pos % 128) / 32] - 127);
+                    for (int k = 0; k < nt; ++k)
+                        if ((!same(want, out[k][r]) || (double) out[k][r] != exact) && bad++ < 5)
+                            std::printf("  %s code 0x%02x (row %d, nt %d): rows %a, scalar %a, value %a\n", isa.name, c, r, nt,
+                                        out[k][r], want, exact);
+                }
+            }
+    }
+    std::printf("%-7s all 256 codes through the rows kernel: %d wrong\n", isa.name, bad);
+    return bad;
+}
+
+// the rows kernel over row ranges of a 13-row matrix (pairs, an odd last row, a range not from 0), every token
+// count, against the scalar row per row and token
+int check_ranges(const Isa& isa, int n, int mode) {
+    std::mt19937 rng(777 + n + mode);
+    const int nb = n / 128, R = 13;
+    std::vector<block_mxfp8> w(nb * R);
+    std::vector<block_q8_0> dummy(1);
+    fill(rng, w, dummy, mode);
+    std::vector<std::vector<block_q8_0>> acts(8, std::vector<block_q8_0>(nb * 4));
+    std::vector<std::vector<float>> prep(8, std::vector<float>(nb * 144));
+    for (int k = 0; k < 8; ++k) {
+        std::vector<block_mxfp8> junk(nb);
+        fill(rng, junk, acts[k], mode);
+        isa.prep(n, acts[k].data(), prep[k].data());
+    }
+    int bad = 0;
+    for (int nt = 1; nt <= 8; ++nt)
+        for (const auto rr : {std::pair<int, int>{0, R}, {1, R - 1}, {3, 4}, {0, 1}, {2, R}}) {
+            const float* pp[8];
+            float* op[8];
+            std::vector<std::vector<float>> out(nt, std::vector<float>(R, -1.f));
+            for (int k = 0; k < nt; ++k) { pp[k] = prep[k].data(); op[k] = out[k].data(); }
+            isa.rows(n, w.data(), nb * sizeof(block_mxfp8), pp, nt, op, rr.first, rr.second);
+            for (int r = 0; r < R; ++r)
+                for (int k = 0; k < nt; ++k) {
+                    const bool in = r >= rr.first && r < rr.second;
+                    float want = -1.f;
+                    if (in) isa.scalar(n, &want, w.data() + r * nb, acts[k].data());
+                    if (!same(want, out[k][r]) && bad++ < 5)
+                        std::printf("  %s n=%d mode=%d nt=%d rows [%d,%d) row %d token %d: scalar %a, rows %a\n", isa.name, n,
+                                    mode, nt, rr.first, rr.second, r, k, want, out[k][r]);
+                }
+        }
+    std::printf("%-7s n=%-5d mode=%d: row ranges x 1-8 tokens, %d not bit-identical\n", isa.name, n, mode, bad);
+    return bad;
+}
+
 double ns_per(int reps, void (*f)(void*), void* ctx) {
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < reps; ++i) f(ctx);
@@ -339,11 +423,15 @@ int main(int argc, char** argv) {
             std::printf("%s: not on this host, skipped\n", isa.name);
             continue;
         }
-        for (const int n : {128, 256, 640, 3072, 4096})
+        for (const int n : {128, 256, 640, 1152, 2304, 3072, 4096})
             for (const int mode : {0, 1}) bad += check(isa, n, mode, 400);
+        bad += check_codes(isa);
+        for (const int n : {128, 1152, 2304})
+            for (const int mode : {0, 1}) bad += check_ranges(isa, n, mode);
     }
     bad += check_native(256, 384, 0.f);
     bad += check_native(640, 256, 7.f);
+    bad += check_native(2304, 1152, 0.f);
     std::printf(bad ? "FAIL\n" : "OK\n");
     return bad ? 1 : 0;
 }
