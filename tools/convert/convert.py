@@ -924,7 +924,7 @@ def main():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
-        if checkpoint_model_type(Path(a.checkpoint)) == "gemma4":
+        if checkpoint_model_type(Path(a.checkpoint)) in ("gemma4", "gemma4_unified"):
             if a.head:
                 ap.error("--head goes with a qwen35 checkpoint")
             import checkpoint_gemma4 as G

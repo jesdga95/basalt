@@ -53,6 +53,10 @@ EXPERTS_PER_JOB = 8
 PAD = 128                     # the dense products take K in multiples of 128
 TEXT = "model.language_model."
 ASSIST = "model."             # the assistant's own text model
+# config.json model_type of the model / its text model, and of the assistant: Gemma 4 and the 12B's Gemma 4 Unified, whose
+# text model is the same decoder (only its vision embedder differs, which the pack does not carry)
+MODEL_TYPES = {"gemma4": "gemma4_text", "gemma4_unified": "gemma4_unified_text"}
+ASSIST_TYPES = {"gemma4_assistant": "gemma4_text", "gemma4_unified_assistant": "gemma4_unified_text"}
 
 
 def pad_to(n: int, m: int = PAD) -> int:
@@ -76,9 +80,10 @@ class Plan:
     def __init__(self, ck: C.Checkpoint, drafter: C.Checkpoint | None):
         tc = ck.text
         self.ck, self.dr = ck, drafter
-        if ck.config.get("model_type") != "gemma4" or tc.get("model_type") != "gemma4_text":
-            raise S.ConvertError(f"config.json: model_type {ck.config.get('model_type')} / {tc.get('model_type')}, "
-                                 "expected gemma4 / gemma4_text")
+        mt = ck.config.get("model_type")
+        if mt not in MODEL_TYPES or tc.get("model_type") != MODEL_TYPES[mt]:
+            raise S.ConvertError(f"config.json: model_type {mt} / {tc.get('model_type')}, expected one of "
+                                 + ", ".join(f"{a} / {b}" for a, b in MODEL_TYPES.items()))
         for k, want in (("attention_bias", False), ("hidden_size_per_layer_input", 0), ("num_kv_shared_layers", 0),
                         ("use_double_wide_mlp", False), ("hidden_activation", "gelu_pytorch_tanh"),
                         ("tie_word_embeddings", True)):
@@ -140,8 +145,10 @@ class Plan:
 
     def _drafter(self, dr: C.Checkpoint):
         c, tc = dr.config, dr.text
-        if c.get("model_type") != "gemma4_assistant" or tc.get("model_type") != "gemma4_text":
-            raise S.ConvertError(f"{dr.dir}/config.json: model_type {c.get('model_type')}, expected gemma4_assistant")
+        mt = c.get("model_type")
+        if mt not in ASSIST_TYPES or tc.get("model_type") != ASSIST_TYPES[mt]:
+            raise S.ConvertError(f"{dr.dir}/config.json: model_type {mt} / {tc.get('model_type')}, expected one of "
+                                 + ", ".join(f"{a} / {b}" for a, b in ASSIST_TYPES.items()))
         if int(c["backbone_hidden_size"]) != self.h:
             raise S.ConvertError("the drafter's backbone width is not the model's")
         if c.get("use_ordered_embeddings"):
@@ -629,13 +636,17 @@ def build(a, Job, fingerprint, die) -> None:
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
     try:
-        ck = C.Checkpoint(a.checkpoint)
+        ck = C.Checkpoint(a.checkpoint, single=(pathlib.Path(a.checkpoint) / "model.safetensors").is_file())
         dr = C.Checkpoint(a.drafter, single=True) if a.drafter else None
         plan = Plan(ck, dr)
         experts = Experts(ck) if plan.moe else None
         name = a.name or "Gemma 4"
         kv = model_kv(ck, dr, name)
         vision = has_vision(ck)
+        for k in ("vision_config", "audio_config"):   # the towers the pack does not carry
+            if ck.config.get(k) and not (k == "vision_config" and vision):
+                print(f"not converted: the checkpoint's {ck.config[k].get('model_type')} (the pack reads text only)",
+                      flush=True)
     except S.ConvertError as e:
         die(str(e))
     partial.unlink(missing_ok=True)
