@@ -46,9 +46,27 @@ class Tokenize(unittest.TestCase):
     def test_bad_bodies_are_400(self):
         for path, body in (("/tokenize", {}), ("/tokenize", {"content": 5}), ("/tokenize", {"content": "a", "parse_special": 1}),
                            ("/detokenize", {}), ("/detokenize", {"tokens": [1, "2"]}), ("/detokenize", {"tokens": [-1]}),
-                           ("/detokenize", {"tokens": [True]}), ("/detokenize", {"tokens": [10 ** 9]})):
+                           ("/detokenize", {"tokens": [True]}), ("/detokenize", {"tokens": [10 ** 9]}),
+                           ("/apply-template", {}), ("/apply-template", {"messages": "hi"})):
             with self.subTest(path=path, body=body):
                 self.assertEqual(self.post(path, body)[0], 400)
+
+    def test_apply_template_renders_without_generating(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        status, out = self.post("/apply-template", {"messages": msgs})
+        self.assertEqual(status, 200)
+        want, _ = self.svc.render_text(msgs, None, self.svc.thinking_kwargs({}))
+        self.assertEqual(out, {"prompt": want})
+
+    def test_apply_template_reasoning_effort(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        renders = {}
+        for effort in ("none", "low", "medium", "high"):
+            status, out = self.post("/apply-template", {"messages": msgs, "reasoning_effort": effort})
+            self.assertEqual(status, 200)
+            renders[effort] = out["prompt"]
+        self.assertNotEqual(renders["none"], renders["low"])
+        self.assertNotEqual(renders["low"], renders["high"])
 
 
 if __name__ == "__main__":
