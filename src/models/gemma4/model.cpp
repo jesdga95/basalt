@@ -142,6 +142,7 @@ bool Gemma4Model::open_tier(const model::LoadRequest& req, uint64_t need, uint64
     s.pool_affinity = req.pool_affinity;
     s.pool_affinity_given = req.pool_affinity_given;
     s.expert_profile = req.expert_profile;
+    s.keep_homes = true;   // a prompt stages the RAM experts beside the homes, it borrows no slot
     if (cudaHostAlloc((void**) &tier_rows_, (size_t) kMoePairs * g.n_embd * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) !=
         cudaSuccess) {
         cudaGetLastError();

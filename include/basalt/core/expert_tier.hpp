@@ -90,6 +90,9 @@ struct ExpertTierSpec {
     /// same total), for a model whose layers miss at different rates. Empty: every layer the same, the way the first model
     /// ran them. Main card homes are always the same in every layer.
     std::vector<float> layer_weights;
+    /// The main card keeps its homes whatever room RAM has: for a model whose prompts stage the RAM experts on the card
+    /// and never borrow its slots. False: where RAM is roomy the card holds copies only, which a long prompt borrows.
+    bool keep_homes = false;
     /// Bytes of each segment the base arena of copies is mapped in, so a prompt or the caches can borrow part of it
     /// (ExpertTier::lend) and the rest keep their experts; 0: one allocation, which only lend_all gives up.
     uint64_t lend_segment = 0;

@@ -145,7 +145,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     // what the machine can give the tier whatever else runs: its RAM (or the container's) less the engine's own buffers.
     // The home-versus-copies choice reads this alone, so the cache state at start never moves it.
     const uint64_t total = std::min(platform::total_physical_memory(), hm.cgroup_limit);
-    const int ram_cap = ram_given ? -1 : (int) std::min<uint64_t>(places_in(total > host_bytes_ ? total - host_bytes_ : 0), 1u << 20);
+    // (a model that keeps its homes reads it as no room: plan_homes then homes all the card holds)
+    const int ram_cap = ram_given ? -1 : s_.keep_homes ? 0 : (int) std::min<uint64_t>(places_in(total > host_bytes_ ? total - host_bytes_ : 0), 1u << 20);
     homes_ = core::policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
         if (s_.host.set_ring && !s_.host.set_ring(s_.ring_pieces, err)) return false;
