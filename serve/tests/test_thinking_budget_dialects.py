@@ -128,6 +128,35 @@ class Budget:
                          [("search", {"q": "2+2"})])
         self.assertEqual(b["choices"][0]["finish_reason"], "tool_calls")
 
+    def test_unset_max_tokens_with_text_prompt_does_not_overflow_on_wrapup(self):
+        # Regression for #595: when no max_tokens is sent and the engine takes PromptText, pass 1 is capped by the
+        # thinking budget (so ids.max_new comes back unclipped). Pass 2 must still stay within max_context.
+        from serve.prompt import PromptText
+        self.start(ANSWER)
+        self.engine.takes_text = True
+        orig = self.engine.generate
+
+        def counted(ids, max_new, sampling, cancel, embeddings=None, session=None):
+            if isinstance(ids, PromptText):
+                raw = ids.ids()
+                ids.set_counted(len(raw), int(max_new))
+                yield None
+                ids = raw
+            elif len(ids) + int(max_new) > self.engine.max_context:
+                raise ValueError(f"prompt ({len(ids)} tokens) + max_new ({max_new}) exceeds the context ({self.engine.max_context})")
+            yield from orig(ids, max_new, sampling, cancel, embeddings, session)
+
+        self.engine.generate = counted
+        body = {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}], "reasoning_budget_tokens": 20}
+        req = urllib.request.Request(f"http://127.0.0.1:{self.httpd.server_address[1]}/v1/chat/completions",
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            code, b = r.status, json.loads(r.read())
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["content"], ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertLessEqual(len(self.engine.prompts[1]) + self.engine.caps[1], self.engine.max_context)
+
 
 class QwenBudget(Budget, unittest.TestCase):
     case = QwenCase

@@ -1670,6 +1670,14 @@ class Service:
                                         cap = ids.max_new
                                         if thinking and budget_ready:   # a budget set from the cap the engine cut
                                             budget, budget_ready = budget_asked, False
+                                    # When pass 1 was capped by the thinking budget (cap < room), ids.max_new came back
+                                    # unclipped and max_new stayed at ctx - CTX_SLACK; lower it to the actual room left
+                                    # after ids.n so a wrap-up continuation pass does not overflow the context (#595).
+                                    if ids.clip:
+                                        ctx_now = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+                                        room = ctx_now - CTX_SLACK - ids.n
+                                        if room >= 1:
+                                            max_new = min(max_new, n_pass0 + room)
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
