@@ -101,7 +101,7 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;
+        if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes)) return false;
     }
     return true;
 }
