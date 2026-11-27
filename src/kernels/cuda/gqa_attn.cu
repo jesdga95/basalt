@@ -1309,9 +1309,9 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
 
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
-                     float* out, void* stream, bool block) {
+                     float* out, void* stream, bool block, KvInt8 q8) {
     if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || window <= 0 ||
-        (head_dim != 128 && head_dim != 256) || hi < pos0 + T) {
+        (head_dim != 128 && head_dim != 256) || hi < pos0 + T || q8.fp4) {
         basalt::log::error("basalt", "gqa_window_attn: invalid arguments");
         std::exit(1);
     }
@@ -1330,8 +1330,8 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
         basalt::log::error("basalt", "gqa_window_attn: the window passes its scratch");
         std::exit(1);
     }
-    if (head_dim == 128) launch_window<128>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
-    else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
+    if (head_dim == 128) launch_window<128>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8);
+    else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8);
 }
 
 void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWindowSeg* segs, int n_seg,
@@ -1346,13 +1346,15 @@ void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, co
     d.n = n_seg;
     for (int k = 0; k < n_seg; ++k) {
         const GqaWindowSeg& g = segs[k];
-        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.window <= 0 || g.hi < g.pos0 + g.T) {
+        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.window <= 0 || g.hi < g.pos0 + g.T || g.q8.fp4 ||
+            (g.q8.k != nullptr) != (segs[0].q8.k != nullptr)) {
             basalt::log::error("basalt", "gqa_window_attn_segs: invalid segment");
             std::exit(1);
         }
         d.row0[k + 1] = d.row0[k] + g.T;
         d.kc[k] = (const __half*) g.k_cache;
         d.vc[k] = (const __half*) g.v_cache;
+        d.q8[k] = g.q8;
         Range& r = d.r[k];
         r.pos0 = g.pos0;
         r.hi = g.hi;

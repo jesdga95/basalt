@@ -448,7 +448,7 @@ public:
             return false;
         }
         if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(call_rows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
-                          elastic_.empty() ? 0 : core::kElasticKvBase, err))
+                          elastic_.empty() ? 0 : core::kElasticKvBase, m_.cache_int8(), err))
             return false;
         count_backed();
         if (heat_tally_) sh_->heat_sessions.push_back(this);
