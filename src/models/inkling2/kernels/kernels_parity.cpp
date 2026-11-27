@@ -194,7 +194,7 @@ void put_row(Kv kv, const float* x, uint8_t* row, double* got) {
             for (int d = grp * 16; d < grp * 16 + 16; ++d) {
                 const double scaled = std::min(std::max((double) x[d] / s, -6.0), 6.0);
                 const uint32_t q = e2m1_code(scaled);
-                if (d % 2 == 0) row[d / 2] = (uint8_t) (row[d / 2] & 0xf0 | q);
+                if (d % 2 == 0) row[d / 2] = (uint8_t) ((row[d / 2] & 0xf0) | q);
                 else row[d / 2] = (uint8_t) ((q << 4) | (row[d / 2] & 0x0f));
                 got[d] = e2m1_value(q) * s;
             }
