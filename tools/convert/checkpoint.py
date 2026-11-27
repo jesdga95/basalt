@@ -115,6 +115,13 @@ def nvfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
     return out.reshape(-1)
 
 
+def mxfp8_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """MXFP8 rows -> Basalt's blocks (type 46). `codes` [rows, cols] E4M3; `scales` [rows, cols/32] UE8M0. A block of
+    128 values is the 4 scale bytes of its 32-value sub-blocks, then the 128 code bytes."""
+    rows, cols = codes.shape
+    return np.concatenate([scales.reshape(rows, cols // 128, 4), codes.reshape(rows, cols // 128, 128)], axis=2).reshape(-1)
+
+
 def csf_decode(fixed: np.ndarray, exceptions: np.ndarray) -> np.ndarray:
     """A CSF stream pair (Model Optimizer's compressed block scales) -> the UE4M3 scale bytes [rows, cols] it holds.
 
