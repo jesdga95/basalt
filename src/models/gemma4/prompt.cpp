@@ -8,6 +8,7 @@
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/prefill/moe_mxfp8.hpp"
 #include "models/gemma4/model.hpp"
 
 #include <algorithm>
@@ -17,6 +18,9 @@ namespace basalt::models::gemma4 {
 namespace bk = basalt::kernels;
 namespace fp8 = basalt::prefill::fp8;
 namespace fp4 = basalt::prefill::fp4;
+namespace mx8 = basalt::prefill::mxfp8;
+
+constexpr int kTypeMxfp8 = 46;
 
 // One allocation carved into the chunk\x27s buffers; with no base it only counts, so the sizing and the allocation agree.
 struct PromptPath::Carve {
@@ -31,7 +35,7 @@ struct PromptPath::Carve {
     }
 };
 
-void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, int64_t context, KvType kv) {
+void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, int64_t context, KvType kv, bool mxfp8) {
     const size_t C = kChunk, E = (size_t) g.n_embd;
     size_t qmax = 0, kmax = 0;
     for (int l = 0; l < g.n_layers; ++l) {
@@ -59,12 +63,17 @@ void PromptPath::layout(Carve& c, const Geometry& g, int64_t F, int64_t context,
     a4h_ = c.take<uint8_t>(fp4::a4_bytes((int64_t) P, 2 * (int64_t) ((Fe + 127) / 128 * 128), (int) NE));
     gsh_ = c.take<float>(fp4::scale_count((int64_t) P, (int) NE));
     h_ = c.take<float>(P * Fe), ex_ = c.take<float>(P * E);
+    if (!mxfp8) return;
+    const size_t Fk = (Fe + 127) / 128 * 128;   // an MXFP8 down reads whole 128-value blocks: H's columns past Fe stay zero
+    mxx_ = c.take<uint8_t>(mx8::act_bytes((int64_t) C, (int64_t) E));
+    mxh_ = c.take<uint8_t>(mx8::act_bytes((int64_t) P, (int64_t) Fk));
+    h16_ = c.take<uint16_t>(P * Fk), mx_blk_ = c.take<int32_t>(NE + 1);
 }
 
-uint64_t PromptPath::bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv) {
+uint64_t PromptPath::bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv, bool mxfp8) {
     PromptPath p;
     Carve c;
-    p.layout(c, g, n_ff_pad, context, kv);
+    p.layout(c, g, n_ff_pad, context, kv, mxfp8);
     return c.at;
 }
 
@@ -77,7 +86,7 @@ PromptPath::~PromptPath() {
 bool PromptPath::init(const Gemma4Model& m, std::string& err) {
     m_ = &m;
     Carve c;
-    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type());
+    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type(), m.mxfp8_experts());
     if (cudaMalloc(&base_, c.at) != cudaSuccess || cudaMallocHost((void**) &io_h_, 2 * (size_t) kChunk * 4) != cudaSuccess ||
         cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming) != cudaSuccess) {
         cudaGetLastError();
@@ -85,7 +94,8 @@ bool PromptPath::init(const Gemma4Model& m, std::string& err) {
         return false;
     }
     c = Carve{static_cast<uint8_t*>(base_)};
-    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type());
+    layout(c, m.geo(), m.n_ff_pad(), m.context(), m.kv_type(), m.mxfp8_experts());
+    if (h16_) cudaMemset(h16_, 0, (size_t) kChunk * m.geo().n_used * ((m.geo().n_ff_exp + 127) / 128 * 128) * 2);   // the pad columns stay zero
     return true;
 }
 
@@ -168,19 +178,35 @@ void PromptPath::layers(int rows, int64_t pos0, bool span, const std::vector<Seg
             bk::router_select(rlog_, nullptr, rows, ra, ids_, rw_, st);
             bk::rms_norm_rows(x_, w.pre_ffw2, rows, E, eps, xn_, st);
             bk::moe_sort(ids_, rows, k, NE, sort_scr_, bounds_, tok_, dst_, exp_, st);
-            fp4::plan_blocks(bounds_, NE, tile_off_, blk_off_, st);
-            fp4::quantize_tokens(xn_, rows, E, E, a4x_, gsx_, st, true);
             const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, Fe);
-            fp4::Product up;
-            up.base = w.experts, up.stride = w.expert_stride, up.blk_off = blk_off_, up.blocks = fp4::max_blocks(P, NE), up.n = NE;
-            up.w_rows = 2 * Fe, up.w_cols = E, up.a4 = a4x_, up.gs = gsx_, up.bounds = bounds_, up.ids = tok_, up.tokens = rows;
-            up.swiglu = true, up.gelu = true, up.tail_off = L.bytes - 16, up.dst = h_, up.ld_dst = Fe, up.two = true;
-            fp4::run(up, st);
-            fp4::quantize(h_, nullptr, bounds_, tile_off_, NE, a4h_, gsh_, Fe, Fe, P, st, true);
-            fp4::Product dn = up;
-            dn.swiglu = false, dn.gelu = false, dn.ids = nullptr, dn.w_off = L.down_off, dn.w_rows = E, dn.w_cols = Fe;
-            dn.a4 = a4h_, dn.gs = gsh_, dn.tile_off = tile_off_, dn.dst = ex_, dn.dst_ids = dst_, dn.ld_dst = E;
-            fp4::run(dn, st);
+            if (w.gu_type == kTypeMxfp8) {   // E4M3 activations per 32 values; H rounded to fp16 between the products
+                const int64_t Fk = (Fe + 127) / 128 * 128;   // the down rows' padded width: H's columns past Fe stay zero
+                mx8::plan_blocks(bounds_, NE, mx_blk_, st);
+                mx8::quantize_tokens(xn_, rows, E, E, mxx_, st);
+                mx8::Product gu;
+                gu.base = w.experts, gu.stride = w.expert_stride, gu.w_off = 0, gu.w_rows = 2 * Fe, gu.w_cols = E, gu.n = NE;
+                gu.act = mxx_, gu.act_rows = rows, gu.bounds = bounds_, gu.blk_off = mx_blk_, gu.blocks = mx8::max_blocks(P, NE);
+                gu.ids = tok_, gu.dst_f16 = h16_, gu.ld_dst = Fk, gu.swiglu = true, gu.gelu = true;
+                mx8::run(gu, st);
+                mx8::quantize_f16(h16_, P, Fk, Fk, mxh_, st);
+                mx8::Product dn = gu;
+                dn.swiglu = false, dn.gelu = false, dn.ids = nullptr, dn.w_off = L.down_off, dn.w_rows = E, dn.w_cols = Fk;
+                dn.act = mxh_, dn.act_rows = P, dn.dst_f16 = nullptr, dn.dst = ex_, dn.dst_ids = dst_, dn.ld_dst = E;
+                mx8::run(dn, st);
+            } else {   // NVFP4
+                fp4::plan_blocks(bounds_, NE, tile_off_, blk_off_, st);
+                fp4::quantize_tokens(xn_, rows, E, E, a4x_, gsx_, st, true);
+                fp4::Product up;
+                up.base = w.experts, up.stride = w.expert_stride, up.blk_off = blk_off_, up.blocks = fp4::max_blocks(P, NE), up.n = NE;
+                up.w_rows = 2 * Fe, up.w_cols = E, up.a4 = a4x_, up.gs = gsx_, up.bounds = bounds_, up.ids = tok_, up.tokens = rows;
+                up.swiglu = true, up.gelu = true, up.tail_off = L.bytes - 16, up.dst = h_, up.ld_dst = Fe, up.two = true;
+                fp4::run(up, st);
+                fp4::quantize(h_, nullptr, bounds_, tile_off_, NE, a4h_, gsh_, Fe, Fe, P, st, true);
+                fp4::Product dn = up;
+                dn.swiglu = false, dn.gelu = false, dn.ids = nullptr, dn.w_off = L.down_off, dn.w_rows = E, dn.w_cols = Fe;
+                dn.a4 = a4h_, dn.gs = gsh_, dn.tile_off = tile_off_, dn.dst = ex_, dn.dst_ids = dst_, dn.ld_dst = E;
+                fp4::run(dn, st);
+            }
             fe.experts = ex_, fe.weights = rw_, fe.k = k, fe.n1 = w.post_ffw1, fe.n2 = w.post_ffw2;
         }
         ffn_end(fe, rows, E, st);

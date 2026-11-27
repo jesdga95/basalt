@@ -75,6 +75,7 @@ public:
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
+    bool mxfp8_experts() const { return mxfp8_experts_; }   ///< some layer's experts are MXFP8
     const LayerWeights& layer(int l) const { return layers_[(size_t) l]; }
     const uint16_t* embedding() const { return embd_dev_; }   ///< BF16 [n_vocab][n_embd], mapped host memory
     const F8Mat& head() const { return head_; }               ///< rows n_vocab, a scale per row
@@ -93,6 +94,7 @@ public:
     ImageEncoder& encoder() const { return vis_; }
 
 private:
+    bool mxfp8_experts_ = false;
     float* small(const std::string& name, uint64_t floats, core::LoadPlan& reads, int file, std::string& err);
     bool f8(const std::string& name, int64_t rows, int64_t K, core::LoadPlan& reads, int file, F8Mat& m, std::string& err,
             bool per_row = false);
