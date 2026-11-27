@@ -267,7 +267,11 @@ python3 tools/convert/convert.py --checkpoint gemma4 --drafter gemma4-assistant 
 
 - `experts`, `experts.layout`: each layer's routed experts, one NVFP4 (type 40) blob per expert `[gate | up | down]` (gate the
   first half of `gate_up_proj`), per matrix the tensor scale amax / (6 x 448), per 16 values the UE4M3 scale of least squared
-  error among half to four times amax / 6, then the FP32 tail `{s_gate, s_up, s_down x per_expert_scale, 0}`.
+  error among half to four times amax / 6, then the FP32 tail `{s_gate, s_up, s_down x per_expert_scale, 0}`. The layers that
+  `--experts-mxfp8 LAYERS` names (e.g. `0,5,10-12`) hold MXFP8 (type 46) blobs instead, no tail: 128-value blocks of four UE8M0
+  scales then 128 E4M3 codes, per 32 values the smallest power of two that brings the largest magnitude within 448, the codes
+  to nearest; the down rows padded with zero columns to whole 128-value blocks; the per_expert_scale folded into the down
+  weights before rounding. `meta` notes those layers (`checkpoint.experts_mxfp8`).
 - `gguf`: the attention and MLP projections `F8_E4M3` (type 44) with one FP32 scale per matrix (amax / 448, `<name>.scale`), the
   MLP's inner width zero-padded to a multiple of 128; `token_embd.weight` BF16 as stored; `output.weight` the tied embedding as
   `F8_E4M3` rows with `output.scale` per row; `ffn_gate_inp.weight` the router F32 with its input scale and 1 / sqrt(hidden)

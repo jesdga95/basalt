@@ -16,6 +16,7 @@ Where Gemma 4 rounds and how its output compares. Method: [quality](quality.md).
 | Tensors | Stored as | From the BF16 checkpoint |
 | --- | --- | --- |
 | Routed experts | NVFP4 (E2M1, an E4M3 scale per 16 values, an FP32 scale per matrix) | rounded once; the router's per-expert scale folded into the down scale |
+| Routed experts of the `--experts-mxfp8` layers | MXFP8 (E4M3, a power-of-two scale per 32 values), the down rows zero-padded to whole 128-value blocks | rounded once, the router's per-expert scale folded into the down weights first |
 | Attention and MLP projections | FP8 E4M3, an FP32 scale per matrix | rounded once; the MLP's inner width zero-padded to a multiple of 128 |
 | Output head (tied embedding) | FP8 E4M3 rows, an FP32 scale per row | rounded once |
 | Token embedding | BF16, in page-locked RAM | as stored |
@@ -29,6 +30,7 @@ Where Gemma 4 rounds and how its output compares. Method: [quality](quality.md).
 | --- | --- | --- |
 | Projections, MLP, head | FP8 E4M3 weights | decode: bf16 activations, fp32 sums; prompt chunks: activations rounded to E4M3 per row (scale amax / 448) on the FP8 tensor cores, fp32 accumulation |
 | Routed experts | NVFP4 | decode: q8_1 activations, fp32 sums, the tail-scaled GELU gate in fp32; prompt chunks: two FP4 terms per activation row on the FP4 block-scaled tensor cores, the GELU gate in fp32, H rounded to two FP4 terms |
+| Routed experts | MXFP8 | decode: q8_1 activations, fp32 sums, the GELU gate in fp32; prompt chunks: activations rounded to E4M3 per 32 values (a power-of-two scale) on the MXFP8 block-scaled tensor cores, the GELU gate in fp32, H rounded to fp16, then to E4M3 per 32 values |
 | Router | F32 | fp32 logits, softmax over the top 8 |
 | Attention | fp16 or E4M3 caches | fp16 tensor cores with fp32 scores, softmax and sums; decode: the query as two fp16 terms (fp32-precise scores), probabilities fp16; prompt chunks: queries and probabilities fp16; a full layer's keys rotated from its stored values in fp32, then rounded to fp16 |
 | Norms, residual, softcap | F32 | fp32 |

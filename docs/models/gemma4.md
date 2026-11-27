@@ -6,10 +6,12 @@ Google's Gemma 4 (Apache-2.0), first the 26B A4B instruction model. Runs with th
 ## Pack
 
 Built from Google's BF16 checkpoint (`google/gemma-4-26b-a4b-it`) and, for drafting, its assistant drafter
-(`google/gemma-4-26B-A4B-it-assistant`) by `tools/convert/convert.py --checkpoint DIR [--drafter DIR]`
+(`google/gemma-4-26B-A4B-it-assistant`) by `tools/convert/convert.py --checkpoint DIR [--drafter DIR] [--experts-mxfp8 LAYERS]`
 ([model file](../model-file.md#gemma-4-pack)):
 
-- Routed experts: NVFP4 rounded once from BF16, the router's per-expert scale folded into each expert's down scale.
+- Routed experts: NVFP4 rounded once from BF16, the router's per-expert scale folded into each expert's down scale. The layers
+  `--experts-mxfp8` names hold MXFP8 instead (E4M3, a power-of-two scale per 32 values, the per-expert scale folded into the
+  down weights): about twice the bytes of an NVFP4 layer, closer to the BF16 model.
 - Attention and MLP projections: FP8 E4M3 with one FP32 scale per matrix; the MLP's inner width padded with zeros to a
   multiple of 128.
 - Output head (the tied embedding): FP8 E4M3 rows with an FP32 scale per row. Token embedding BF16, kept in RAM.
@@ -45,7 +47,8 @@ The `gemma4` architecture (code in `src/models/gemma4`):
 
 - **Prompt:** a read longer than a decode window runs in chunks of up to 2,048 rows: the projections and the MLP as W8A8
   products on the FP8 tensor cores (activations rounded per row), the router over the chunk in fp32, the experts on the FP4
-  tensor cores (two FP4 terms per activation, about 8 bits) with the GELU between the two products, the attention flash
+  tensor cores (two FP4 terms per activation, about 8 bits), an MXFP8 layer's on the MXFP8 block-scaled tensor cores
+  (activations rounded to E4M3 per 32 values), with the GELU between the two products, the attention flash
   style on the fp16 tensor cores. A full layer's keys are rotated from its values once a chunk into an fp16 buffer the
   attention reads in place.
 - **Decode:** the projections and the head read their FP8 weights once per window of up to 16 rows; the experts run grouped
