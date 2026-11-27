@@ -276,7 +276,7 @@ public:
         LoadPlan& reads, const ExpertCache& cache, std::string& err, bool pin = true,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
-        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr, bool allow_empty = false);
     bool finish_complement(bool unbuffered, std::string& err);
     /// The bytes of a planned copy its step registers with the driver once its reads have landed (0 when there is none
     /// or it is registered): a tier sized before then leaves their mapping free (pin_mapping_bytes).

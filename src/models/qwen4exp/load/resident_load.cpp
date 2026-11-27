@@ -103,7 +103,7 @@ int resident_load(Context& context) {
             // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.
             whole_err = err;
             resident_ok = src.plan_cache_complement(*context.reads, xcache, err, o.resident_pin, gpu_only, -1, resident_headroom,
-                                                    basalt::core::FileExpertSource::kResidentWhatFits, &rank);
+                                                    basalt::core::FileExpertSource::kResidentWhatFits, &rank, o.serve);
             if (resident_ok) {
                 basalt::log::warn("basalt generate", "the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
                                      "are kept in RAM", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
