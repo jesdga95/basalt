@@ -261,7 +261,6 @@ int QfnRuntime::init_batch() {
 
     // a prompt read on its own thread beside the slots' windows: the tier stays as it is meanwhile
     ov_active = false;
-    ov_post_done = false;
     return 0;
 }
 

@@ -109,7 +109,6 @@ Flow QfnRequest::read_to(int64_t to) {
         return true;
     };
     if (win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
-    runtime_.ov_post_done = false;
     runtime_.ov_post = [&]() -> bool {
         // The part's checkpoint is taken on the main thread after the read, not here: it synchronizes the whole
         // device, and the main thread may be capturing a window graph meanwhile, which a device-wide sync from
