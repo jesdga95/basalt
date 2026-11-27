@@ -25,10 +25,12 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
-#include <random>
 #include <map>
 #include <mutex>
+#include <random>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace basalt::models::inkling2;
@@ -2320,13 +2322,142 @@ void test_router_select_plan() {
     cudaFree(rn_ref); cudaFree(rn_got); cudaFree(tl_ref); cudaFree(tl_got);
 }
 
+// l2_fill only reads: the range is unchanged, and the sink holds what the CPU predicts from each thread's fold of its
+// words (unchanged unless a fold equals the kernel's constant), for ranges of one to many strides and several grids; and
+// a range in which every thread's fold is the constant, so all of them store.
+void test_l2_fill() {
+    std::printf("l2_fill\n");
+    bool ok = true;
+    for (const size_t bytes : {(size_t) 16, (size_t) 4112, (size_t) 1 << 20, (size_t) kProj * (E / 32 * 34)}) {
+        std::vector<uint32_t> h(bytes / 4);
+        for (auto& v : h) v = (uint32_t) rng();
+        uint32_t* d = dev(h);
+        for (const int blocks : {1, 7, 168}) {
+            const uint32_t before = 0x5a5a5a5au;
+            uint32_t* sink = dev(std::vector<uint32_t>{before});
+            l2_fill(d, bytes, blocks, sink, nullptr);
+            const size_t threads = (size_t) blocks * 256, n = bytes / 16;
+            uint32_t want = before;
+            for (size_t t = 0; t < threads && t < n; ++t) {
+                uint32_t acc = 0;
+                for (size_t i = t; i < n; i += threads) acc ^= h[4 * i] ^ h[4 * i + 1] ^ h[4 * i + 2] ^ h[4 * i + 3];
+                if (acc == 0x9e3779b9u) want = acc;
+            }
+            ok &= cudaDeviceSynchronize() == cudaSuccess && host(sink, 1)[0] == want && host(d, h.size()) == h;
+            cudaFree(sink);
+        }
+        cudaFree(d);
+    }
+    std::printf("%-34s %s\n", "  range unchanged, sink as predicted", ok ? "ok" : "FAIL");
+    failures += !ok;
+    {
+        std::vector<uint32_t> h(4 * 256 * 3, 0);   // three records a thread at one block: folds of K, 0, 0
+        for (size_t i = 0; i < 256; ++i) h[4 * i] = 0x9e3779b9u;
+        uint32_t* d = dev(h);
+        uint32_t* sink = dev(std::vector<uint32_t>{0});
+        l2_fill(d, h.size() * 4, 1, sink, nullptr);
+        const bool all = cudaDeviceSynchronize() == cudaSuccess && host(sink, 1)[0] == 0x9e3779b9u && host(d, h.size()) == h;
+        std::printf("%-34s %s\n", "  every thread storing", all ? "ok" : "FAIL");
+        failures += !all;
+        cudaFree(sink);
+        cudaFree(d);
+    }
+    bool refused = true;
+    for (const auto& [bytes, blocks] : {std::pair<uint64_t, int>{0, 1}, {24, 1}, {16, 0}}) {
+        try {
+            l2_fill(nullptr, bytes, blocks, nullptr, nullptr);
+            refused = false;
+        } catch (const std::runtime_error&) {
+        }
+    }
+    std::printf("%-34s %s\n", "  empty, unaligned or gridless", refused ? "refused" : "FAIL");
+    failures += !refused;
+}
+
+// --bench-l2: the input projection a visit starts with (native_q8_planes_mmvq over the [kProj x E] planes) read from DRAM
+// against read from L2. The calls rotate over kMatrices distinct matrices, as a window's visits do, so a call's matrix was
+// last read kMatrices - 1 matrices earlier (cold). Warm: the same matrix's call just before. Filled: l2_fill of the matrix
+// at two blocks a multiprocessor, an idle gap a wait on the CPU pool would give, then the call. Medians of per-call times.
+void bench_projection_l2() {
+    constexpr int kMatrices = 48, kRounds = 3, kMaxRows = 8;
+    const size_t plane_bytes = (size_t) kProj * E + (size_t) kProj * (E / 32) * 2;
+    const size_t x_bytes = (size_t) kMaxRows * (E / 32) * 36;
+    char* planes = nullptr;
+    void* xq = nullptr;
+    float* y = nullptr;
+    uint32_t* sink = nullptr;
+    cudaMalloc(&planes, plane_bytes * kMatrices);
+    cudaMalloc(&xq, x_bytes);
+    cudaMalloc(&y, (size_t) kMaxRows * kProj * sizeof(float));
+    cudaMalloc(&sink, sizeof(uint32_t));
+    cudaMemset(planes, 0x11, plane_bytes * kMatrices);   // codes 17, fp16 scales 0x1111: finite
+    cudaMemset(xq, 0x11, x_bytes);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaStream_t s = nullptr;
+    cudaStreamCreate(&s);
+    const auto timed = [&](auto&& launch) {
+        cudaEventRecord(e0, s);
+        launch();
+        cudaEventRecord(e1, s);
+        cudaEventSynchronize(e1);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        return 1000. * ms;
+    };
+    const auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const auto idle = [&] {
+        cudaStreamSynchronize(s);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    };
+    std::printf("projection L2 bench: [%d x %d] planes, %.2f MB, rotating over %d matrices (%.0f MB); %d calls a point\n",
+                kProj, E, plane_bytes / 1e6, kMatrices, plane_bytes * kMatrices / 1e6, kMatrices * kRounds);
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    const int blocks = 2 * sms;
+    for (const int rows : {1, 2, 3, 4, 5, 6, 8}) {
+        const auto gemv = [&](int m) { bk::native_q8_planes_mmvq(planes + (size_t) m * plane_bytes, xq, y, E, kProj, rows, s); };
+        std::vector<double> cold, warm, fill, fill_k;
+        for (int m = 0; m < kMatrices; ++m) gemv(m);   // every matrix touched once before the first timed round
+        for (int r = 0; r < kRounds; ++r)
+            for (int m = 0; m < kMatrices; ++m) cold.push_back(timed([&] { gemv(m); }));
+        for (int r = 0; r < kRounds; ++r)
+            for (int m = 0; m < kMatrices; ++m) {
+                gemv(m);
+                warm.push_back(timed([&] { gemv(m); }));
+            }
+        for (int r = 0; r < kRounds; ++r)
+            for (int m = 0; m < kMatrices; ++m) {
+                fill_k.push_back(timed([&] { l2_fill(planes + (size_t) m * plane_bytes, plane_bytes, blocks, sink, s); }));
+                idle();
+                fill.push_back(timed([&] { gemv(m); }));
+            }
+        const double c = median(cold), w = median(warm), f = median(fill), k = median(fill_k);
+        std::printf("projection L2 bench: T=%d cold %.1f us (%.0f GB/s), warm %.1f us, after l2_fill %.1f us (saving %.1f); "
+                    "l2_fill %dx256 %.1f us (%.0f GB/s)\n", rows, c, plane_bytes / c / 1e3, w, f, c - f, blocks, k,
+                    plane_bytes / k / 1e3);
+    }
+    cudaStreamDestroy(s);
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    for (void* p : {(void*) planes, xq, (void*) y, (void*) sink}) cudaFree(p);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("no GPU\n");
         return 77;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--bench-l2") == 0) {
+        bench_projection_l2();
+        return 0;
     }
     test_mix();
     test_ctrl();
@@ -2341,6 +2472,7 @@ int main() {
     test_attention_window();
     test_post_attn();
     test_expert_prefetch();
+    test_l2_fill();
     test_moe_finish();
     test_cpu_merge();
     test_cpu_ring();

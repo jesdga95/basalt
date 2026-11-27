@@ -252,6 +252,9 @@ void heat_fold(const int32_t* ids, const int32_t* layer, int visits, int row_str
 /// Requests into L2 the first `bytes` of each of the *n blobs (moe_plan's record of a visit), 32 blocks each keeping one
 /// 128 KiB step in flight: run on a side stream while the glue before the experts runs; reads only.
 void expert_read_ahead(const unsigned long long* blobs, const int32_t* n, uint64_t bytes, void* stream);
+/// Reads [p, p + bytes) once through L2 with `blocks` blocks of 256 threads: a matrix the next kernel reads, while the card
+/// would otherwise wait. Nothing keeps the lines in L2 afterwards. Writes nothing but, at most, the word at `sink`.
+void l2_fill(const void* p, uint64_t bytes, int blocks, uint32_t* sink, void* stream);
 /// Requests into L2 the first `bytes` of the blobs of the distinct experts among ids[0..n) (blobs[e]: expert e's device
 /// address, 0 when it is not on the card: skipped; a guess at a visit's experts), by 16-byte loads over every block: run on a side stream while the attention and the glue
 /// before the experts run. Reads only; `sink` (4 bytes) is written on a 2^-32 chance so the loads are kept.
