@@ -3008,7 +3008,10 @@ class SharingTheGpu(unittest.TestCase):
                 self.running = True
 
         self.svc.vision = CrashingSidecar()
-        # Engine is already loaded and holding VRAM; restarting only the vision sidecar must not trip min_free_vram_mib.
+        # Engine is already loaded and holding VRAM; restarting only the vision sidecar must not trip
+        # min_free_vram_mib or re-run before_load.
+        mark = td / "before_load_ran"
+        self.svc.before_load = [sys.executable, "-c", f"open({str(mark)!r}, 'w').close()"]
         self.svc.min_free_vram_mib = 8000
         self.svc.free_vram_mib = lambda: 500
         img_req = {
@@ -3027,6 +3030,21 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(s2, 200, b2)
         self.assertEqual(self.svc.vision.restarts, 1)
         self.assertEqual(self.engine.starts, 0)
+        self.assertFalse(mark.exists())
+        self.assertTrue(self.svc.vision.alive())
+
+        # A request that already passed load() before the sidecar died still restarts it inside _encode_media().
+        self.svc.vision.running = False
+        ids, _, _ = self.svc.prepare(
+            [{"role": "user", "content": [
+                {"type": "image", "source": "data:image/png;base64,AA=="},
+                {"type": "text", "text": "describe"},
+            ]}],
+            None, {}, 32,
+        )
+        self.assertTrue(ids)
+        self.assertEqual(self.svc.vision.restarts, 2)
+        self.assertFalse(mark.exists())
         self.assertTrue(self.svc.vision.alive())
 
     def test_off_by_default(self):
