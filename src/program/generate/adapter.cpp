@@ -237,7 +237,13 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
     }
     const auto t1 = Clock::now();
     // A window holds the last pick and the drafts after it, from the drafter or from the expected continuation.
-    const int cap = sess->max_window();
+    const int max_rows = sess->max_window();
+    // --diag-logits: a file's row i is the distribution the pick at token i came from, and a session owes
+    // DecodeRequest::logits the logits of one row - the window's last - so a drafted window would leave the file's later
+    // slots unwritten and its earlier ones the wrong position. One row per window keeps every row of the dump real.
+    const bool logits_only = g_diag_logits && max_rows > 1;
+    if (logits_only) basalt::log::info("basalt generate", "--diag-logits: no drafting, one row per window");
+    const int cap = logits_only ? 1 : max_rows;
     std::vector<int32_t> window((size_t) cap), rows((size_t) cap), drafts((size_t) cap);
     std::vector<float> conf((size_t) cap);
     std::vector<float> diag_rows;
@@ -339,10 +345,15 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
             by += (k ? " " : "") + std::to_string(accepted_at[(size_t) k]) + "/" + std::to_string(offered_at[(size_t) k]);
         basalt::log::info("basalt generate", "drafts accepted by position: %s", by.c_str());
     }
-    if (cap > 1)
-        basalt::log::info("basalt generate", "windows %lld of %.2f tokens: %lld of %lld drafts accepted, %lld picks differ from the oracle; draft %.2f ms, verify %.2f ms per window",
+    if (cap > 1) {
+        // Only a teacher run (--diag-teacher over a --spec-oracle) compares picks with an expected text: without it the
+        // count would sit at 0 and read as a check that never ran.
+        const std::string oracle_clause =
+            !teacher ? std::string() : ", " + std::to_string(differ) + " picks differ from the oracle";
+        basalt::log::info("basalt generate", "windows %lld of %.2f tokens: %lld of %lld drafts accepted%s; draft %.2f ms, verify %.2f ms per window",
                           (long long) windows, windows ? (double) (accepted + windows) / (double) windows : 0.0, (long long) accepted,
-                          (long long) offered, (long long) differ, windows ? ms_draft / (double) windows : 0.0, windows ? ms_verify / (double) windows : 0.0);
+                          (long long) offered, oracle_clause.c_str(), windows ? ms_draft / (double) windows : 0.0, windows ? ms_verify / (double) windows : 0.0);
+    }
     return 0;
 }
 

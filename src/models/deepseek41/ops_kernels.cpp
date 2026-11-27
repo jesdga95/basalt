@@ -4,6 +4,7 @@
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
@@ -55,20 +56,8 @@ struct CpuJoin {
     }
 };
 
-// The word a layer's weighted sum waits for: armed with the value the sum was queued behind, the host writes it once
-// the CPU's and the second card's rows landed, or on any way out, so the stream never waits for good.
-struct JoinWord {
-    uint32_t* word = nullptr;
-    uint32_t value = 0;
-    bool armed = false;
-    ~JoinWord() { raise(); }
-    void raise() {
-        if (!armed) return;
-        std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
-        *(volatile uint32_t*) word = value;
-        armed = false;
-    }
-};
+// The word a layer's weighted sum waits for is core::JoinWord: the host raises it once the CPU's and the second
+// card's rows landed, or on any way out, so the stream never waits for good.
 
 // Raises an armed second-card share on every way out before its plan, so the card never waits for good (the share
 // then has nothing to do).
@@ -766,7 +755,7 @@ public:
             reading = reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
-        JoinWord jw;
+        core::JoinWord jw;
         CpuJoin join;
         if (cpu) {
             tier_->start_cpu_window(il, h_x_, lk, use, h_rows_);
@@ -902,7 +891,7 @@ public:
             reading = reading || lk.reading[k];
             on_peer = on_peer || lk.peer[k];
         }
-        JoinWord jw;
+        core::JoinWord jw;
         CpuJoin join;
         if (cpu) {
             tier_->start_cpu(il, h_x_, lk, h_rows_);
@@ -1009,7 +998,7 @@ public:
         kernels::native_quantize_q8_1(x, sh_q1_, kAttnEmbd, T, stream);
         kernels::native_mmvq(gt->type, gt->ptr, sh_q1_, sh_g_, kAttnEmbd, nf, T, stream);
         kernels::native_mmvq(up->type, up->ptr, sh_q1_, sh_u_, kAttnEmbd, nf, T, stream);
-        swiglu_clamped(sh_g_, sh_u_, nf * T, g_.clamp_shexp[(size_t) il], sh_h_, stream);
+        kernels::swiglu_clamped(sh_g_, sh_u_, g_.clamp_shexp[(size_t) il], sh_h_, 1, nf * T, nf * T, stream);
         kernels::native_quantize_q8_1(sh_h_, sh_q2_, nf, T, stream);
         kernels::native_mmvq(dn->type, dn->ptr, sh_q2_, out, nf, kAttnEmbd, T, stream);
         return true;

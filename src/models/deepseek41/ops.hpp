@@ -15,9 +15,6 @@ void add_inplace(float* out, const float* a, int n, void* stream);
 /// out[i] = a[i] + b[i].
 void add(const float* a, const float* b, float* out, int n, void* stream);
 
-/// out[i] = silu(min(gate[i], limit)) * clamp(up[i], -limit, limit).
-void swiglu_clamped(const float* gate, const float* up, int n, float limit, float* out, void* stream);
-
 /// dst[0..n_words) = src[0..n_words) as a kernel, so mapped host memory reaches the device without a copy-engine job.
 void copy_words(const void* src, void* dst, int n_words, void* stream);
 

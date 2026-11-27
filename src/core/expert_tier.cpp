@@ -168,7 +168,15 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     modules_ = reserve.modules;
     per_layer_ = homes_.main > 0 ? homes_.main : copies;
     if (homes_.main == 0 && per_layer_ < s_.top_k) {
-        err = s_.name + ": not enough device memory for the expert tier";
+        // A card cap below one token's pick count is not tight memory, it is a configuration that cannot run: with
+        // nothing resident on the card, every picked expert lands in a card copy, so `top_k` copies per layer are the
+        // floor whatever the machine has.
+        if (cap_per_layer_ >= 0 && cap_per_layer_ < s_.top_k)
+            err = s_.name + ": asks for " + std::to_string(cap_per_layer_) + " expert(s) per layer on the card, but a"
+                  " token routes to " + std::to_string(s_.top_k) + " and each needs a card copy of its own, so the"
+                  " floor is " + std::to_string(s_.top_k) + " (--expert-cache or --diag-tier-vram)";
+        else
+            err = s_.name + ": not enough device memory for the expert tier";
         return false;
     }
     if (!open_base(per_layer_, err)) return false;
@@ -212,6 +220,13 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     }
     for (int l = 0; l < n_layers_; ++l) {
         const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
+        // A layer with no expert blob (a model's dense lead layers, which the model itself never looks up) has no
+        // expert to compute, so no format to build either: its types come from the pack as 0, and asking for a dot
+        // product for those would stop a start that has nothing wrong with it.
+        if (!el.blob_bytes) {
+            fmt_.push_back({});
+            continue;
+        }
         kernels::cpu::NativeFmt f;
         if (!kernels::cpu::native_fmt(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err, el.clamp))
             return false;
@@ -318,6 +333,9 @@ int ExpertTier::peer_take(int layer, const std::vector<int64_t>& ram_rows, int64
 
 // Second card `card`'s prompt share takes its buffers before the card's slots are sized, and the prices of its layers.
 bool ExpertTier::open_share(size_t card, std::string& err) {
+    // A model that states no prompt chunk has no prompt share: the peer holds and computes experts, and the model's own
+    // prompt path reads them the way it reads the rest, so no staging goes on that card.
+    if (!s_.share_max_tokens) return true;
     prefill::PeerShare::Dims d;
     d.n_embd = s_.n_embd;
     d.n_ff = s_.n_ff;

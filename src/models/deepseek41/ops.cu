@@ -15,14 +15,6 @@ __global__ void k_add(const float* a, const float* b, float* out, int n) {
     if (i < n) out[i] = a[i] + b[i];
 }
 
-__global__ void k_swiglu(const float* g, const float* u, int n, float limit, float* out) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float gv = fminf(g[i], limit);
-    const float uv = fminf(fmaxf(u[i], -limit), limit);
-    out[i] = gv / (1.f + __expf(-gv)) * uv;
-}
-
 __global__ void k_wsum(const float* rows, const float* w, int n_rows, int n, float* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -175,10 +167,6 @@ void weighted_sum_row_ptrs(const RowPtrs& rows, const float* w, int n_rows, int 
 
 void weighted_sum_rows(const float* rows, const float* w, int n_rows, int n, float* out, void* stream) {
     k_wsum<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(rows, w, n_rows, n, out);
-}
-
-void swiglu_clamped(const float* gate, const float* up, int n, float limit, float* out, void* stream) {
-    k_swiglu<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(gate, up, n, limit, out);
 }
 
 void rms_norm(const float* x, const float* w, int n_tokens, int n, float eps, float* out, void* stream) {

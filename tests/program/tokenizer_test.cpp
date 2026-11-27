@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 
+#include "basalt/program/glm_forms.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "unicode_flags.hpp"
 
@@ -28,6 +29,7 @@ constexpr PreTok kJoyai = basalt::models::deepseek41::pretok_joyai;
 constexpr PreTok kJoyai = nullptr;
 #endif
 constexpr PreTok kQwen35 = basalt::program::tokenizer::pretok_qwen35;
+constexpr PreTok kGlm4 = basalt::program::tokenizer::pretok_glm4;
 }  // namespace
 
 namespace {
@@ -147,12 +149,79 @@ void synthetic() {
     CHECK((pieces("\xFF" "abc") == std::vector<std::string>{"\xFF" "abc"}));
 }
 
+// The pieces the glm4 expression fixes. Each expected split comes from the reference expression that tools/tokenizer.py
+// ships for the same pre-type, so the two implementations are checked against one another, not against my reading of it.
+// The cases are chosen where glm4 and qwen35 part company: a word run is \p{L} alone (a combining mark starts a piece),
+// a digit run holds at most three digits, and the punctuation class keeps the marks.
+void glm4_pieces() {
+    struct Case { const char* text; std::vector<std::string> pieces; };
+    const std::vector<Case> cases = {
+        {"don't stop believing", {"don", "'t", " stop", " believing"}},
+        {"Don't STOP'T 'RE 've 'M 'LL 'd", {"Don", "'t", " STOP", "'T", " '", "RE", " '", "ve", " '", "M", " '", "LL", " '", "d"}},
+        {"it's a 12345 test", {"it", "'s", " a", " ", "123", "45", " test"}},
+        {"123456789", {"123", "456", "789"}},
+        {"v1.2.3", {"v", "1", ".", "2", ".", "3"}},
+        {"  blank  ", {" ", " blank", "  "}},
+        {"a\n\nb", {"a", "\n\n", "b"}},
+        {"line1\r\nline2", {"line", "1", "\r\n", "line", "2"}},
+        {"trailing spaces   ", {"trailing", " spaces", "   "}},
+        {"tab\tsep\tvals", {"tab", "\tsep", "\tvals"}},
+        {"h\xc3\xa9llo w\xc3\xb6rld", {"h\xc3\xa9llo", " w\xc3\xb6rld"}},
+        {"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x83\x86\xe3\x82\xad\xe3\x82\xb9\xe3\x83\x88", {"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x83\x86\xe3\x82\xad\xe3\x82\xb9\xe3\x83\x88"}},
+        {"e\xcc\x81" "e\xcc\x81" "fa\xc3\xa7 ca", {"e", "\xcc\x81" "e", "\xcc\x81" "fa\xc3\xa7", " ca"}},
+        {"\xc3\xa9\xcc\x81", {"\xc3\xa9", "\xcc\x81"}},
+        {"\xf0\x9f\x8e\x89 emoji \xf0\x9f\x8e\x89", {"\xf0\x9f\x8e\x89", " emoji", " \xf0\x9f\x8e\x89"}},
+        {"<|user|>\nhello\n", {"<|", "user", "|>\n", "hello", "\n"}},
+        {"[id=abc123]call(x) [func=get_weather] {\"a\": 1}", {"[id", "=abc", "123", "]call", "(x", ")", " [", "func", "=get", "_weather", "]", " {\"", "a", "\":", " ", "1", "}"}},
+        {"[get_weather]({\"city\": \"Paris\"})", {"[get", "_weather", "]({\"", "city", "\":", " \"", "Paris", "\"})"}},
+        {"  \n \t \n  ", {"  \n \t \n", "  "}},
+        {"...!?  ok", {"...!?", " ", " ok"}},
+        {"a  b   c  ", {"a", " ", " b", "  ", " c", "  "}},
+        {"don't\xe3\x80\x8ctest\xe3\x80\x8d", {"don", "'t", "\xe3\x80\x8ctest", "\xe3\x80\x8d"}},
+        {"3.14159 42 7", {"3", ".", "141", "59", " ", "42", " ", "7"}},
+        {"-42 +17", {"-", "42", " +", "17"}},
+        {"x'y z", {"x", "'y", " z"}},
+        {"  ", {"  "}},
+        {"\n", {"\n"}},
+        {"\t\t", {"\t\t"}},
+        {"\x0c\x0b x", {"\x0c\x0b", " x"}},
+        {"\xc2\xab\xc3\xa7" "a\xc2\xbb 'l'homme", {"\xc2\xab\xc3\xa7" "a", "\xc2\xbb", " '", "l", "'homme"}},
+        {"caf\xc3\xa9 au lait  ", {"caf\xc3\xa9", " au", " lait", "  "}},
+        {"0123456789012345", {"012", "345", "678", "901", "234", "5"}},
+        {"'s'T'rE'vE'm'LL'D'\xc4\xb0", {"'s", "'T", "'rE", "'vE", "'m", "'LL", "'D", "'\xc4\xb0"}},
+        {"\xd8\xa7\xd9\x84\xd8\xb9\xd8\xb1\xd8\xa8\xd9\x8a\xd8\xa9 \xd9\xa1\xd9\xa2\xd9\xa3\xd9\xa4", {"\xd8\xa7\xd9\x84\xd8\xb9\xd8\xb1\xd8\xa8\xd9\x8a\xd8\xa9", " ", "\xd9\xa1\xd9\xa2\xd9\xa3", "\xd9\xa4"}},
+        {"Hello, world! It's 2026 \xe2\x80\x94 don't you agree?", {"Hello", ",", " world", "!", " It", "'s", " ", "202", "6", " \xe2\x80\x94", " don", "'t", " you", " agree", "?"}},
+        {"R\xc3\xa9" "flexion\xe2\x80\xa6 l'\xc3\xa9t\xc3\xa9 s'ach\xc3\xa8ve.", {"R\xc3\xa9" "flexion", "\xe2\x80\xa6", " l", "'\xc3\xa9t\xc3\xa9", " s", "'ach\xc3\xa8ve", "."}},
+        {"<system>\nYou are GLM.\n</system>", {"<system", ">\n", "You", " are", " GLM", ".\n", "</", "system", ">"}},
+    };
+    for (const Case& c : cases) {
+        std::vector<size_t> ends;
+        kGlm4(c.text, std::string(c.text).size(), ends);
+        std::vector<std::string> got;
+        size_t from = 0;
+        for (size_t e : ends) { got.push_back(std::string(c.text).substr(from, e - from)); from = e; }
+        if (got != c.pieces) {
+            std::fprintf(stderr, "FAIL glm4 '%s':", c.text);
+            for (const std::string& p : got) std::fprintf(stderr, " [%s]", p.c_str());
+            std::fprintf(stderr, " want");
+            for (const std::string& p : c.pieces) std::fprintf(stderr, " [%s]", p.c_str());
+            std::fprintf(stderr, "\n");
+            ++failures;
+        }
+    }
+}
+
 int parity(const std::string& dir, const std::string& golden) {
     Tokenizer t;
     std::string err;
     const auto t0 = std::chrono::steady_clock::now();
     // the rule the pack names
-    const PreTok pre = read_all(dir + "/tokenizer.json").find("\"pre\": \"joyai-llm\"") != std::string::npos ? kJoyai : kQwen35;
+    const std::string cfg = read_all(dir + "/tokenizer.json");
+    const PreTok pre = cfg.find("\"pre\": \"joyai-llm\"") != std::string::npos   ? kJoyai
+                       : cfg.find("\"pre\": \"hy_v4\"") != std::string::npos      ? kJoyai
+                       : cfg.find("\"pre\": \"glm4\"") != std::string::npos       ? kGlm4
+                       : cfg.find("\"pre\": \"glm5\"") != std::string::npos       ? kGlm4
+                       : kQwen35;
     if (pre == nullptr) {
         std::fprintf(stderr, "the pre-tokenizer of this pack belongs to a model this build left out\n");
         return 1;
@@ -228,6 +297,7 @@ int parity(const std::string& dir, const std::string& golden) {
 
 int main(int argc, char** argv) {
     synthetic();
+    glm4_pieces();
     if (failures) return 1;
     if (argc >= 3) return parity(argv[1], argv[2]);
     std::printf("tokenizer_test: synthetic checks passed\n");

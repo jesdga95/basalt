@@ -72,6 +72,9 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch == "ernie55":
         from serve.models.ernie55 import Ernie55
         return Ernie55()
+    if arch in ("glm5next", "glm5-next"):
+        from serve.models.glm5next import Glm5Next
+        return Glm5Next()
     if arch in ("hy4flash", "hy_v4_flash"):
         from serve.models.hy4flash import Hy4Flash
         return Hy4Flash()

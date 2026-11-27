@@ -2,6 +2,8 @@
 //
 //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
 //     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
+//       `GU/DOWN@H:FF` runs it at another geometry (a pack's true expert shape, e.g. iq2_xxs/iq3_xxs@4096:2048),
+//       `#cL` appends the model's SwiGLU limit (gate capped at L, up clamped to +-L): the CPU and GPU limited paths.
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
 //     build/native_expert_parity --synthetic nvfp4/nvfp4      NVFP4: the CPU tier and the GPU's generic kernels
 //     build/native_expert_parity --experts FILE [layer ...]   NVFP4 experts of a pack's experts.bin or a .basalt
@@ -63,6 +65,9 @@ constexpr int64_t H = 2560, FF = 640;
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
                cudaStream_t s) {
     int failures = 0;
+    const int64_t H = f.n_embd, FF = f.n_ff;   // the layer's own shape, not the file's default
+    const float limit = f.swiglu_limit;
+
     // (a) the float reference
     const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
     const auto* td = ggml_get_type_traits((ggml_type) f.d_type);
@@ -76,18 +81,44 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> x((size_t) NT * H);
     for (auto& v : x) v = nd(rng);
-    std::vector<float> ref((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
+    if (limit > 0.f) {   // scale x so the limit bites: token 0's median |gate| lands on it
+        std::vector<double> gmag((size_t) FF);
+        for (int64_t r = 0; r < FF; ++r) {
+            double g = 0.0;
+            for (int64_t i = 0; i < H; ++i) g += (double) G[(size_t) r * H + i] * x[i];
+            gmag[(size_t) r] = std::fabs(g);
+        }
+        std::nth_element(gmag.begin(), gmag.begin() + FF / 2, gmag.end());
+        const double med = gmag[(size_t) (FF / 2)];
+        if (med > 0.0) {
+            const double k = (double) limit / med;
+            for (auto& v : x) v = (float) ((double) v * k);
+        }
+    }
+    // Two references when a limit is in play: the clamped one (what both paths must produce) and the same expert
+    // without the clamp. Only comparing to the clamped one leaves "clamped a different way" and "never clamped"
+    // looking alike, because a layer whose gates straddle the limit doubles its output range either way.
+    std::vector<float> ref((size_t) NT * H), ref0((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
     for (int k = 0; k < NT; ++k) {
-        std::vector<float> h(FF);
+        std::vector<float> h(FF), h0(FF);
         for (int64_t r = 0; r < FF; ++r) {
             double g = 0, u = 0;
             for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * x[k * H + i]; u += (double) U[r * H + i] * x[k * H + i]; }
+            h0[r] = (float) (g / (1.0 + std::exp(-g)) * u);
+            if (limit > 0.f) {   // native_expert_grouped_clamped: gate capped above, up clamped to +-limit
+                g = (std::min)(g, (double) limit);
+                u = std::clamp(u, (double) -limit, (double) limit);
+            }
             h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
         }
         for (int64_t r = 0; r < H; ++r) {
-            double o = 0;
-            for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
+            double o = 0, o0 = 0;
+            for (int64_t i = 0; i < FF; ++i) {
+                o += (double) D[r * FF + i] * h[i];
+                o0 += (double) D[r * FF + i] * h0[i];
+            }
             ref[k * H + r] = (float) o;
+            ref0[k * H + r] = (float) o0;
         }
     }
     // (b) the CPU
@@ -142,13 +173,18 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                                 ggml_type_name((ggml_type) f.gu_type), tag, rg);   // not rounding
                     ++failures;
                 }
-                float* f1[1] = {ffp[0]};
+                // The throughput timing runs the plain-SwiGLU kernels; they must write a scratch of their own, not
+                // ffp: ffp holds native_gu_rows' clamped output when the layer is limited, and overwriting it there
+                // would measure the unclamped expert as the CPU path.
+                std::vector<std::vector<float>> bench(NT, std::vector<float>(FF));
+                std::vector<float*> bp(NT);
+                for (int k = 0; k < NT; ++k) bp[k] = bench[k].data();
                 const int it = 50;
                 const auto gu = is512 ? cpu::iq512_gu_rows : cpu::iq256_gu_rows;
                 auto t0 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, 1, f1, 0, (int) FF);
+                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, 1, bp.data(), 0, (int) FF);
                 auto t1 = std::chrono::steady_clock::now();
-                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, NT, ffp, 0, (int) FF);
+                for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, NT, bp.data(), 0, (int) FF);
                 auto t2 = std::chrono::steady_clock::now();
                 const double us1 = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
                 const double usn = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
@@ -308,7 +344,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     }
     // (c) the GPU: one group holding the NT entries
     {
-        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF, limit);
         void *dblob, *dx, *dxq, *dscr;
         float* dout;
         unsigned long long* dptr;
@@ -332,8 +368,12 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
         cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
+        auto gpu_run = [&](float* out) {   // the limited layer goes through the clamped kernel, as the model does
+            if (limit > 0.f) basalt::kernels::native_expert_grouped_clamped(L, limit, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, out, s);
+            else             basalt::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, out, s);
+        };
         basalt::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
-        basalt::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        gpu_run(dout);
         cudaStreamSynchronize(s);
         cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
         {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (
@@ -341,7 +381,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             std::vector<float> old_g(got_g.size());
             const bool was = basalt::kernels::iq_old_kernels();
             basalt::kernels::iq_set_old_kernels(!was);
-            basalt::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+            gpu_run(dout);
             basalt::kernels::iq_set_old_kernels(was);
             cudaStreamSynchronize(s);
             cudaMemcpy(old_g.data(), dout, old_g.size() * 4, cudaMemcpyDeviceToHost);
@@ -397,14 +437,24 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-    double cpu_max_abs = 0.0;
+    const double ec0 = rel(got_c, ref0), eg0 = rel(got_g, ref0);
+    double ref_max = 0.0, ref0_max = 0.0, cpu_max = 0.0, gpu_max = 0.0, cpu_abs_max = 0.0, gpu_abs_max = 0.0;
     for (size_t i = 0; i < ref.size(); ++i) {
-        cpu_max_abs = (std::max)(cpu_max_abs, std::fabs((double) got_c[i] - ref[i]));
+        ref_max = (std::max)(ref_max, std::fabs((double) ref[i]));
+        ref0_max = (std::max)(ref0_max, std::fabs((double) ref0[i]));
+        cpu_max = (std::max)(cpu_max, std::fabs((double) got_c[i] - ref[i]));
+        gpu_max = (std::max)(gpu_max, std::fabs((double) got_g[i] - ref[i]));
+        cpu_abs_max = (std::max)(cpu_abs_max, std::fabs((double) got_c[i]));
+        gpu_abs_max = (std::max)(gpu_abs_max, std::fabs((double) got_g[i]));
     }
     const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
-    std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  cpu max abs %.6g  gpu rel %.2e  cpu-gpu %.2e  %s\n",
+    const std::string mode = limit > 0.f ? "clamp " + std::to_string((int) limit) : "no clamp";
+    std::printf("%-9s %-8s/%-7s blob %8zu H %4ld FF %4ld %-11s cpu rel %.2e rel0 %.2e  gpu rel %.2e rel0 %.2e  "
+                "cpu-gpu %.2e  maxabs ref %.3g ref0 %.3g cpu %.3g gpu %.3g  %s\n",
                 label.c_str(), ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type),
-                f.bytes, ec, cpu_max_abs, eg, ecg, ok ? "ok" : "FAIL");
+                f.bytes, (long) H, (long) FF, mode.c_str(),
+                ec, ec0, eg, eg0, ecg, ref_max, ref0_max, cpu_abs_max, gpu_abs_max, ok ? "ok" : "FAIL");
+    std::printf("          max abs difference: cpu vs clamped ref %.3g, gpu vs clamped ref %.3g\n", cpu_max, gpu_max);
     return failures + (ok ? 0 : 1);
 }
 
@@ -420,22 +470,21 @@ int type_of(std::string name) {
     return -1;
 }
 
-// Random weights (rows of different magnitudes) quantized by ggml into the blob layout.
+// Random weights in the blob layout.  This ggml reads but never writes the i-quants ("the i-quant formats are read,
+// never written"), so ggml_quantize_chunk leaves an iq destination untouched; random code bytes with a finite block
+// scale decode to ordinary weights, and the reference below dequantizes the very same bytes.
 std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
     std::vector<uint8_t> blob(f.bytes);
     std::mt19937 rng(seed);
-    std::normal_distribution<float> nd(0.f, 1.f);
-    auto quant = [&](int type, int64_t rows, int64_t cols, uint8_t* dst) {
-        std::vector<float> w((size_t) (rows * cols));
-        for (int64_t r = 0; r < rows; ++r) {
-            const float scale = 0.02f * (0.5f + (float) (r % 7) / 7.0f);
-            for (int64_t c = 0; c < cols; ++c) w[(size_t) (r * cols + c)] = scale * nd(rng);
-        }
-        ggml_quantize_chunk((ggml_type) type, w.data(), dst, 0, rows, cols);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (auto& b : blob) b = (uint8_t) byte(rng);
+    auto stamp = [&](uint8_t* dst, size_t bytes, int type, uint16_t scale_bits) {
+        const size_t bs = ggml_type_size((ggml_type) type);
+        for (size_t o = 0; o + 2 <= bytes; o += bs) std::memcpy(dst + o, &scale_bits, 2);   // the block's fp16 scale
     };
-    quant(f.gu_type, FF, H, blob.data());
-    quant(f.gu_type, FF, H, blob.data() + f.up_off);
-    quant(f.d_type, H, FF, blob.data() + f.down_off);
+    stamp(blob.data(), f.up_off, f.gu_type, (uint16_t) 0x2C00);
+    stamp(blob.data() + f.up_off, f.down_off - f.up_off, f.gu_type, (uint16_t) 0x2A00);
+    stamp(blob.data() + f.down_off, f.bytes - f.down_off, f.d_type, (uint16_t) 0x2800);
     return blob;
 }
 
@@ -869,7 +918,67 @@ int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const s
 
 // Expert `e` of `layer` from an NVFP4 pack: a native experts.bin (its native_experts.txt beside it) or a .basalt
 // (its `experts` section and `experts.layout`).  Blobs are layer-major, `blob` bytes each.
+struct PackExpertLayout {   // `# experts v5: layer gu_type d_type offset blob_bytes`: per-layer base and blob size
+    struct Layer { uint64_t gu, dn, offset, blob; };
+    uint64_t base = 0, n_expert = 512;
+    std::map<int, Layer> layers;
+    bool find(int layer, Layer& out) const {
+        const auto it = layers.find(layer);
+        if (it == layers.end()) return false;
+        out = it->second;
+        return true;
+    }
+};
+
+bool read_pack_expert_layout(const std::string& path, PackExpertLayout& L) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    uint64_t base = 0;
+    char magic[8] = {};
+    in.read(magic, 8);
+    if (std::memcmp(magic, "BASALTMF", 8) != 0) return false;
+    uint32_t ver = 0, n = 0;
+    in.read((char*) &ver, 4);
+    in.read((char*) &n, 4);
+    for (uint32_t i = 0; i < n; ++i) {
+        char ent[128];
+        in.seekg(64 + (std::streamoff) i * 128);
+        in.read(ent, 128);
+        uint64_t off, size;
+        std::memcpy(&off, ent + 64, 8);
+        std::memcpy(&size, ent + 72, 8);
+        if (std::strncmp(ent, "experts", 64) == 0) base = off;
+        if (std::strncmp(ent, "experts.layout", 64) == 0) {
+            std::string text(size, '\0');
+            in.seekg((std::streamoff) off);
+            in.read(text.data(), (std::streamsize) size);
+            const size_t at = text.find("(n_expert ");
+            if (at != std::string::npos) L.n_expert = std::strtoull(text.c_str() + at + 10, nullptr, 10);
+            std::istringstream rows(text);
+            std::string row;
+            while (std::getline(rows, row)) {
+                if (!row.empty() && row[0] == '#') continue;
+                unsigned l, gu, dn;
+                unsigned long long o, b;
+                if (std::sscanf(row.c_str(), "%u %u %u %llu %llu", &l, &gu, &dn, &o, &b) == 5)
+                    L.layers[(int) l] = PackExpertLayout::Layer{gu, dn, base + o, b};
+            }
+        }
+    }
+    L.base = base;
+    return !L.layers.empty();
+}
+
 bool read_pack_expert(const std::string& path, int layer, int e, const cpu::NativeFmt& f, std::vector<uint8_t>& out) {
+    PackExpertLayout L;
+    PackExpertLayout::Layer ly;
+    if (read_pack_expert_layout(path, L) && L.find(layer, ly) && ly.blob == f.bytes) {
+        out.assign(ly.blob, 0);
+        std::ifstream in(path, std::ios::binary);
+        in.seekg((std::streamoff) (ly.offset + (uint64_t) e * ly.blob));
+        in.read((char*) out.data(), (std::streamsize) ly.blob);
+        return (size_t) in.gcount() == ly.blob;
+    }
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
     uint64_t base = 0, n_expert = 512;
@@ -1732,7 +1841,8 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
     if (argc < 2) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
-                             "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
+                             "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1; a"
+                             " pack's own shape with GU/DOWN@n_embd:n_ff)\n"
                              "       native_expert_parity --cpu-synthetic GU/DOWN ...   (CPU tier only, e.g. q6_K/q8_0)\n"
                              "       native_expert_parity --mxfp4 [GU]   (MXFP4 down at the deepseek41 geometry, CPU tier only)\n"
                              "       native_expert_parity --experts experts.bin|MODEL.basalt [layer ...]   (NVFP4)\n"
@@ -1774,19 +1884,44 @@ int main(int argc, char** argv) {
             failures += check_cpu_pair(gu, dn, i);
         }
     } else if (mode == "--synthetic") {
+        // Several cases in one run: `iq2_xxs/iq3_xxs@4096:2048,iq2_s/iq4_xs@4096:2048#c10`
+        std::vector<std::string> toks;
         for (int i = 2; i < argc; ++i) {
-            const std::string arg = argv[i];
+            const std::string a = argv[i];
+            size_t p = 0;
+            while (p <= a.size()) {
+                const size_t q = a.find(',', p);
+                toks.push_back(a.substr(p, q == std::string::npos ? std::string::npos : q - p));
+                if (q == std::string::npos) break;
+                p = q + 1;
+            }
+        }
+        for (int i = 0; i < (int) toks.size(); ++i) {
+            std::string arg = toks[i];
+            // A pack's own expert geometry, when the file's default is not the one to ask about: `iq2_xxs/iq3_xxs@4096:2048`
+            int64_t hs = H, fs = FF;
+            float clamp = 0.f;
+            if (const size_t hash = arg.find('#'); hash != std::string::npos) {
+                clamp = (float) std::atof(arg.c_str() + hash + 2);   // `#c10`
+                arg = arg.substr(0, hash);
+            }
+            if (const size_t at = arg.find('@'); at != std::string::npos) {
+                hs = std::atoll(arg.c_str() + at + 1);
+                const size_t colon = arg.find(':', at);
+                fs = colon == std::string::npos ? 0 : std::atoll(arg.c_str() + colon + 1);
+                arg = arg.substr(0, at);
+            }
             const size_t slash = arg.find('/');
             const int gu = slash == std::string::npos ? -1 : type_of(arg.substr(0, slash));
             const int dn = slash == std::string::npos ? -1 : type_of(arg.substr(slash + 1));
             cpu::NativeFmt f;
             std::string err;
-            if (gu == GGML_TYPE_NVFP4 && dn == GGML_TYPE_NVFP4 && cpu::native_fmt(gu, dn, H, FF, f, err)) {
+            if (gu == GGML_TYPE_NVFP4 && dn == GGML_TYPE_NVFP4 && cpu::native_fmt(gu, dn, hs, fs, f, err)) {
                 failures += check_nvfp4_cpu(f, synthetic_nvfp4_blob(f, i), i, "synthetic", gpu());
                 continue;
             }
-            if (gu < 0 || dn < 0 || !cpu::native_fmt(gu, dn, H, FF, f, err) ||
-                !basalt::kernels::native_expert_supported(gu, dn, H, FF)) {
+            if (gu < 0 || dn < 0 || hs <= 0 || fs <= 0 || !cpu::native_fmt(gu, dn, hs, fs, f, err, clamp) ||
+                !basalt::kernels::native_expert_supported(gu, dn, hs, fs)) {
                 std::printf("%s: %s\n", arg.c_str(), err.empty() ? "not a pair the GPU expert kernels take" : err.c_str());
                 ++failures;
                 continue;
@@ -1812,6 +1947,53 @@ int main(int argc, char** argv) {
                 continue;
             }
             failures += check_nvfp4_cpu(f, blob, l, "layer " + std::to_string(l), gpu());
+        }
+    } else if (mode == "--pack-expert") {
+        // Real weights from a pack, with the layer's own types from `experts.layout`: `--pack-expert F 11@4096:2048#c10`
+        if (argc < 4) { std::fprintf(stderr, "--pack-expert FILE LAYER[@H:FF][#cCLAMP]\n"); return 2; }
+        PackExpertLayout L;
+        if (!read_pack_expert_layout(argv[2], L)) {
+            std::printf("no experts.layout in %s\n", argv[2]);
+            return 1;
+        }
+        for (int i = 3; i < argc; ++i) {
+            std::string arg = argv[i];
+            int64_t hs = H, fs = FF;
+            float clamp = 0.f;
+            if (const size_t hash = arg.find('#'); hash != std::string::npos) {
+                clamp = (float) std::atof(arg.c_str() + hash + 2);   // `#c10`
+                arg = arg.substr(0, hash);
+            }
+            if (const size_t at = arg.find('@'); at != std::string::npos) {
+                hs = std::atoll(arg.c_str() + at + 1);
+                const size_t colon = arg.find(':', at);
+                fs = colon == std::string::npos ? 0 : std::atoll(arg.c_str() + colon + 1);
+                arg = arg.substr(0, at);
+            }
+            const int l = std::atoi(arg.c_str());
+            PackExpertLayout::Layer ly;
+            if (!L.find(l, ly)) {
+                std::printf("layer %d: not in %s's experts.layout\n", l, argv[2]);
+                ++failures;
+                continue;
+            }
+            cpu::NativeFmt f;
+            std::string err;
+            if (!cpu::native_fmt((int) ly.gu, (int) ly.dn, hs, fs, f, err, clamp) ||
+                !basalt::kernels::native_expert_supported((int) ly.gu, (int) ly.dn, hs, fs)) {
+                std::printf("layer %d (gu %llu dn %llu): %s\n", l, (unsigned long long) ly.gu,
+                            (unsigned long long) ly.dn, err.empty() ? "not a pair the GPU expert kernels take" : err.c_str());
+                ++failures;
+                continue;
+            }
+            std::vector<uint8_t> blob;
+            if (!read_pack_expert(argv[2], l, E, f, blob)) {
+                std::printf("layer %d: cannot read expert %d of %llu B from %s\n", l, E,
+                            (unsigned long long) ly.blob, argv[2]);
+                ++failures;
+                continue;
+            }
+            failures += check_blob(f, blob, 100 + l, "layer " + std::to_string(l) + " real", gpu());
         }
     } else {
         const basalt::GgufModel model(basalt::gguf_split_paths(argv[1]));

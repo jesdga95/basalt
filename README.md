@@ -1,6 +1,6 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
-Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Next**, **DeepSeek-V4.1-Flash**, **Qwen3.8-27B**, **Hy4-flash**, **Inkling 2 Mini** and **ERNIE-5.5-Flash**. It runs
+Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Next**, **DeepSeek-V4.1-Flash**, **Qwen3.8-27B**, **Hy4-flash**, **Inkling 2 Mini**, **ERNIE-5.5-Flash** and **GLM-5.3-Flash**. It runs
 on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, and on the DGX Spark (GB10, Arm64), with what does not fit in VRAM
 (the experts of a mixture-of-experts model) in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
 

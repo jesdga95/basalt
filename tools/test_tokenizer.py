@@ -144,5 +144,37 @@ class Extract(unittest.TestCase):
                 self.assertTrue(b"\n" in data and b"\r" not in data, "%s: lines do not end in LF alone" % name)
 
 
+class PreTokenizer(unittest.TestCase):
+    """The pre-tokenizer a pack names is the one it gets: the wrong regex splits a prompt differently from the
+    reference engine, and a round trip of the pieces back to text cannot show that."""
+
+    def make(self, pre):
+        tokens, merges, types = synthetic(CORPUS)
+        return T.Tokenizer(tokens, merges, types, pre=pre)
+
+    def test_glm4_split(self):
+        tk = self.make("glm4")
+        self.assertTrue(tk.ignore_merges)                                     # llama.cpp gives CHATGLM4 ignore_merges
+        self.assertEqual(tk._split("1234567890"), ["123", "456", "789", "0"])   # digit runs of at most three
+        self.assertEqual(tk._split("it's here"), ["it", "'s", " here"])         # the contraction stays its own piece
+        self.assertEqual(tk._split("  blank  "), [" ", " blank", "  "])         # a space run splits at the word
+
+    def test_glm5_is_the_same_pre_tokenizer(self):
+        glm4, glm5 = self.make("glm4"), self.make("glm5")
+        self.assertTrue(glm5.ignore_merges)
+        for text in CORPUS:
+            self.assertEqual(glm4._split(text), glm5._split(text), text[:20])
+
+    def test_a_pack_names_the_pattern_it_split_with(self):
+        tokens, merges, types = synthetic(CORPUS)
+        md = {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.tokens": tokens, "tokenizer.ggml.merges": merges,
+              "tokenizer.ggml.token_type": types, "tokenizer.ggml.pre": "glm4"}
+        with tempfile.TemporaryDirectory() as d:
+            cfg = T.extract_metadata(md, d)
+        self.assertEqual(cfg["pre"], "glm4")
+        self.assertEqual(cfg["pre_patterns"], T.GLM4_PATTERNS)
+        self.assertIn("CHATGLM4", cfg["pre_pattern_source"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,7 +89,6 @@ public:
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
-        else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;

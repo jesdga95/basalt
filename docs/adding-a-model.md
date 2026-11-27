@@ -11,6 +11,18 @@ A model lives in `src/models/<arch>/` and `include/basalt/models/<arch>/`. Share
   A model whose conversations resume from checkpoints lists its running state in `running_state` (device regions, in a fixed
   order, and a host head) and takes the head back in `running_restored`; the shared engine copies it through page-locked blocks
   (`core/checkpoint_transfer.hpp`) and never reads the model's memory itself.
+  A model whose caches hold state that only moves forward - a recurrent state, a conv history - has to restart that state when a read
+  starts at `pos == 0`: the engine keeps one session per slot across conversations, and a model that keeps no checkpoints gets no other
+  signal that a conversation begins (there is no reset hook on `ModelSession`, and the two calls that could bring a parked conversation
+  back - `running_state` and `save_cells` - are the ones such a model declines; serve reads a declined restore as its cue to drop the
+  resume and read the prompt from the start, `restore_image` in `serve/session_engine.cpp`, so `pos == 0` really is where a fresh
+  conversation arrives). Skipping it does not corrupt one conversation, only every later one in that slot, so it is a
+  perplexity number and not a crash (`glm5next`: `GlmCaches::reset` from both `prefill_chunk` and `decode_window`; `deepseek41` trims
+  its ops at the same place).
+  Not every forward-only buffer needs it, only the ones a read takes before it writes, so ask that of each in turn: a cache written at
+  every position a window reaches cannot serve a stale row, and neither can a handoff keyed by absolute position that every window
+  rewrites (`glm5next`'s MLA latents and indexer pool, and the drafter's kept tail in `mtp_prev_*`, which `mtp_keep_row` selects by
+  position and `mtp_rows` overwrites on every drafting window).
 - A dialect in `serve/models/`: prompt rendering, output parsing, stop texts.
 
 Registering it is one word: the id in `BASALT_BUILTIN_MODELS` (`cmake/models.cmake`), which adds it to `-DBASALT_MODELS`

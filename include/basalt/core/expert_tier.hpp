@@ -29,6 +29,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -109,6 +110,23 @@ struct ExpertTierSpec {
     /// table of the experts the GPUs hold that the model's decode windows route with (ExpertTier::publish_held).
     int route_tail_skip = 0;
     float route_prior = 0.0f;
+};
+
+// The word a model's weighted sum waits for on its own stream: armed with the value the sum was queued behind, the
+// host writes it once the CPU pool's and any second card's rows landed - or on any way out of the block, so a stream
+// never waits for good. The fence matters: what the host wrote before the word must be visible to the work queued
+// behind it.
+struct JoinWord {
+    uint32_t* word = nullptr;
+    uint32_t value = 0;
+    bool armed = false;
+    ~JoinWord() { raise(); }
+    void raise() {
+        if (!armed) return;
+        std::atomic_thread_fence(std::memory_order_release);   // the rows before the word
+        *(volatile uint32_t*) word = value;
+        armed = false;
+    }
 };
 
 /// The tier is the peer of every model that runs it (model/peer_hooks.hpp): each second card holds the second-card homes of

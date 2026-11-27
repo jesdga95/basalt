@@ -14,6 +14,7 @@ from serve.frontend import ChatTemplate
 from serve.handler import serve
 from serve.models import deepseek41 as ds
 from serve.models import deepseek41_encoding as enc
+from serve.models import glm5next as glm
 from serve.models.qwen import Qwen
 from serve.service import Service
 from serve.util.text import ByteTokenizer
@@ -49,6 +50,21 @@ class DeepseekCase:
     end = enc.eos_token
     call = (f'{ds.CALLS_GAP}{ds.CALLS_START}\n{ds.INVOKE_START} name="search">\n'
             f'{ds.PARAM_START} name="q" string="true">2+2{ds.PARAM_END}\n{ds.INVOKE_END}\n{ds.CALLS_END}')
+
+
+class GlmTokenizer(ByteTokenizer):
+    SPECIALS = ByteTokenizer.SPECIALS + ["<|user|>", "<|observation|>", "<|system|>", "<|assistant|>"] + [
+        glm.THINK, glm.THINK_END, glm.CALL, glm.CALL_END, glm.KEY, glm.KEY_END, glm.VALUE, glm.VALUE_END]
+
+
+class GlmCase:
+    dialect = glm.Glm5Next()
+    tok = GlmTokenizer()
+    template = ChatTemplate.from_file(ROOT / "serve/tests/fixtures/glm5next_chat_template.jinja")
+    opener = glm.THINK              # the template's generation prompt ends by opening the thinking itself
+    close = glm.THINK_END
+    end = "<|endoftext|>"
+    call = glm.CALL + "search" + glm.KEY + "q" + glm.KEY_END + glm.VALUE + "2+2" + glm.VALUE_END + glm.CALL_END
 
 
 class ScriptEngine(MockEngine):
@@ -258,6 +274,8 @@ class Inkling2Budget(unittest.TestCase):
         self.assertEqual(caps[0], 15)
         self.assertEqual(caps[1], 2000 - 15)                    # uncapped once in content
         self.assertEqual(body["choices"][0]["message"]["content"], long_ans)
+class GlmBudget(Budget, unittest.TestCase):
+    case = GlmCase
 
 
 if __name__ == "__main__":

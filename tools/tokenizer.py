@@ -63,11 +63,24 @@ INKLING2_PATTERNS = [
     r"|\s+(?!\S)"
     r"|\s+",
 ]
-PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS, "inkling2": INKLING2_PATTERNS}
-PRE_SOURCES = {"joyai-llm": "JOYAI_LLM", "hy_v4": "HY_V4", "inkling2": "GPT4O"}
+# `glm4` and `glm5` (GLM-4.6, GLM-5.x, whose GGUFs name either): ChatGLM 4's one regex, digit runs of up to three
+# (llama.cpp LLAMA_VOCAB_PRE_TYPE_CHATGLM4, which it also gives `ignore_merges`). Transcribed as it stands, letter
+# class `\p{L}` without the `\p{M}` of the qwen35 pattern.
+GLM4_PATTERNS = [
+    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+",
+]
+PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS, "inkling2": INKLING2_PATTERNS,
+                "glm4": GLM4_PATTERNS, "glm5": GLM4_PATTERNS}
+PRE_SOURCES = {"joyai-llm": "JOYAI_LLM", "hy_v4": "HY_V4", "inkling2": "GPT4O", "glm4": "CHATGLM4", "glm5": "CHATGLM4"}
 # pre-tokenizers whose checkpoint sets Hugging Face BPE's ignore_merges: a piece that is a vocabulary entry is that token
 # (llama.cpp sets ignore_merges for the same pre-types)
-IGNORE_MERGES = {"inkling2"}
+IGNORE_MERGES = {"inkling2", "glm4", "glm5"}
 
 
 class Tokenizer:
