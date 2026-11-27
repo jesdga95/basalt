@@ -264,7 +264,7 @@ target_link_libraries(model_gemma4 PUBLIC model engine_session gemma4_kernels ke
 if(BUILD_TESTING)
   add_executable(gemma4_kernels_parity src/models/gemma4/kernels/kernels_parity.cpp)
   target_include_directories(gemma4_kernels_parity PRIVATE ${_gpu_include_directories})
-  target_link_libraries(gemma4_kernels_parity PRIVATE gemma4_kernels kernels ${_gpu_runtime_target})
+  target_link_libraries(gemma4_kernels_parity PRIVATE gemma4_kernels kernels prefill_mxfp8 ${_gpu_runtime_target})
   basalt_gpu_test(NAME gemma4_kernels_parity COMMAND gemma4_kernels_parity)
   add_executable(gemma4_vision_test src/models/gemma4/vision_test.cpp src/models/gemma4/vision.cpp)
   target_include_directories(gemma4_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
