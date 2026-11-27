@@ -1,0 +1,36 @@
+{
+  "submitter": "ApexArray",
+  "date": "2026-11-27",
+  "commit": "e0b322be27",
+  "preset": "community-1",
+  "model": "Hy4-flash",
+  "gpus": [
+    {
+      "name": "RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "vram_gib": 96,
+      "power_w": 300,
+      "pcie": "3.0 x16",
+      "h2d_gbps": 13.8
+    }
+  ],
+  "ram_gib": 118,
+  "cpu": "Intel Xeon CPU E5-2660 v4, 10 cores",
+  "ram_gbps": 66.3,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "fp16",
+  "prefill_16k_tps": 2378.2,
+  "prefill_64k_tps": 3036.5,
+  "decode_tps": 195.4,
+  "decode_conv_tps": 143.6,
+  "decode_struct_tps": 235.7,
+  "decode_prose_tps": 121.0,
+  "accept_conv_pct": 69.4,
+  "accept_struct_pct": 100.0,
+  "accept_prose_pct": 60.0,
+  "draft_len_conv": 2.1,
+  "draft_len_struct": 4.9,
+  "draft_len_prose": 1.4,
+  "engine_args": "--gpu 0 --max-context 56544",
+  "notes": "ESXi 8.0.2 VM on a PowerEdge R730xd; GPU via PCI passthrough, 10 vCPUs pinned to one socket on the NUMA node with the GPU."
+}
