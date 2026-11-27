@@ -68,21 +68,36 @@ measurable bias on this corpus. The scorers take either.
 
 ## Build a reference
 
-One NVIDIA GPU and the BF16 checkpoint. vLLM is the only reference engine. A model that does not fit the card runs with
-`cpu_offload_gb`; the settings are recorded in the file's metadata.
+One NVIDIA GPU and the BF16 checkpoint. vLLM is the only reference engine, and it is not a Basalt dependency: install it only to build
+a reference. A model that does not fit the card runs with CPU offload; the settings are recorded in the file's metadata.
+
+The scripts download nothing and the repository ships no data. The sources are public datasets under MIT or Apache-2.0
+(the table above); fetch them with the hf CLI into one directory, in the layout `gen.py` reads:
+
+```sh
+D=data
+hf download HuggingFaceH4/ultrachat_200k --repo-type dataset --include "data/test_sft*" --local-dir $D/ultrachat
+hf download ise-uiuc/Magicoder-OSS-Instruct-75K --repo-type dataset --include "data-oss_instruct-decontaminated.jsonl" --local-dir $D/magicoder
+hf download openai/gsm8k --repo-type dataset --include "main/test*" --local-dir $D/gsm8k
+hf download OpenAssistant/oasst1 --repo-type dataset --include "data/train*" --local-dir $D/oasst1
+hf download glaiveai/glaive-function-calling-v2 --repo-type dataset --include "glaive-function-calling-v2.json" --local-dir $D/glaive
+hf download abisee/cnn_dailymail --repo-type dataset --include "3.0.0/validation*" --local-dir $D/cnn
+```
 
 ```sh
 pip install vllm transformers pandas safetensors numpy      # vLLM 0.34.0 built the published references
-# download the six datasets above with the hf CLI into the data directory named at the top of gen.py
-python3 tools/quality_suite/gen.py                           # corpus.jsonl: assistant turns by vLLM, greedy
-python3 tools/quality_suite/extract.py corpus.jsonl ref.safetensors
-python3 tools/quality_suite/slim_ref.py ref.safetensors ref_assistant.safetensors --roles 1
+python3 tools/quality_suite/gen.py --model CHECKPOINT_DIR --data $D --out WORK [--offload-gb N] [--max-model-len 34000] [--max-seqs 320]
+python3 tools/quality_suite/extract.py WORK/corpus.jsonl WORK/ref.safetensors --model CHECKPOINT_DIR [--offload-gb N]
+python3 tools/quality_suite/slim_ref.py WORK/ref.safetensors WORK/ref_assistant.safetensors --roles 1
 ```
 
-`QSV2_MODEL` selects the model in `common.py`; `QSV2_OFFLOAD_GB`, `QSV2_MAXLEN` and `QSV2_MAX_SEQS` size the offload, the context and
-the batch. A mixture-of-experts model needs a vLLM MoE backend that avoids the fused-MoE JIT (it can start many compiler processes
-and fill RAM); a dense model needs none. Generation is limited by the KV cache and, with offload, by PCIe; extraction is prefill only
-and runs faster per token.
+`--offload-gb` is vLLM's `cpu_offload_gb`, `--max-seqs` its `max_num_seqs`. A mixture-of-experts model needs a vLLM MoE backend that
+avoids the fused-MoE JIT (it can start many compiler processes and fill RAM): `--moe-backend triton`. A dense model needs none.
+Generation is limited by the KV cache and, with offload, by PCIe; extraction is prefill only and runs faster per token.
+`extract.py --model-name` and `--model-sha` set the name and checkpoint hash recorded in the metadata.
+
+The corpus builder and the role masks read Gemma 4's chat markup (turn, thought-channel and tool-response tokens, and its tool-call
+format). Another model family needs its own markup in `common.py` and `gen.py` before it can have a reference.
 
 ## Score a Basalt pack
 
@@ -95,11 +110,26 @@ python3 tools/quality_suite/basalt_score.py --pack PACK.basalt --ref ref.safeten
 python3 tools/quality_suite/score.py ref.safetensors --basalt DIR/conv_*.txt [--smoke]
 ```
 
-The script's `--max-context` (default 5,120) skips the longer conversations; raise it to cover the long ones.
+The script's `--max-context` (default 5,120) skips the longer conversations; raise it to cover the long ones. `--engine` defaults to
+`bin/basalt` in the repository and `--gpu` picks the card.
+
+Which models: any model whose session returns head logits (`copy_logits`), which every model in the tree does. The request goes
+through the shared serving loop and the same teacher-forced path as the wikitext gate (`ppl=K`), so the model plugs in nothing of
+its own. The stream is forced token by token, with no drafting. A stream with a token outside the vocabulary, a scored position
+outside the stream, a `score_top` above 256 or an image in the request is refused with an `ERR` line.
 
 ## Score a GGUF
 
-`tools/quality_suite/llama_project.cpp` links against a llama.cpp build and projects a GGUF onto the reference's token streams:
+`tools/quality_suite/llama_project.cpp` links against a llama.cpp build and projects a GGUF onto the reference's token streams. It is
+not part of Basalt's build. Build llama.cpp as shared libraries with CUDA, then, from a checkout `$LLAMA` and its build directory
+`$LLAMA/build`:
+
+```sh
+g++ -O2 -std=c++17 tools/quality_suite/llama_project.cpp -o llama_project -I$LLAMA/include -I$LLAMA/ggml/include \
+    -L$LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin
+```
+
+Use the llama.cpp commit that supports the model's architecture; the projection is only as good as that port.
 
 ```sh
 python3 tools/quality_suite/make_req.py ref.safetensors req.bin [--smoke]

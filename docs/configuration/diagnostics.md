@@ -67,6 +67,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--quality-t N` | bench | 3 | Tokens per verify window in the gate. |
 | `--ppl-base`, `--ppl-out` | serve | | Base file for `ppl=` requests, and where they write rows. |
 | `ppl=K`, `ppl_t=T` | request keys | | Score chunk K; window width T. |
+| `score=N`, `score_top=K` | request keys | | Teacher-force the request's own ids and write the rows from position N to `--ppl-out` with their K likeliest ids (0: the whole row). [quality suite](../precision/quality-suite.md) |
 
 | Bench flag | Default | What it does |
 |---|---|---|
