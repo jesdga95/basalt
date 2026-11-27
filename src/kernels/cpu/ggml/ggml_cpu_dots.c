@@ -190,6 +190,10 @@ static void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRIC
     }
 }
 
+static inline float q8_1_finite_c(float v) {
+    return fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v;
+}
+
 static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK8_1 == 0);
     const int nb = k / QK8_1;
@@ -203,6 +207,18 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         __m256 v3 = _mm256_loadu_ps( x + 24 );
         x += 32;
 
+        // Preserve NaN in any lane (x86 vmaxps drops a NaN in its first operand).
+        const __m256 nan_mask = _mm256_or_ps(
+            _mm256_cmp_ps( v0, v1, _CMP_UNORD_Q ),
+            _mm256_cmp_ps( v2, v3, _CMP_UNORD_Q ) );
+        if (_mm256_movemask_ps(nan_mask) != 0) {
+            const float qnan = fp32_from_bits(0x7fc00000u);
+            y[i].d = GGML_CPU_FP32_TO_FP16(qnan);
+            y[i].s = GGML_CPU_FP32_TO_FP16(qnan);
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            continue;
+        }
+
         // Compute max(abs(e)) for the block
         const __m256 signBit = _mm256_set1_ps( -0.0f );
         __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
@@ -215,10 +231,13 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
         const float max_scalar = _mm_cvtss_f32( max4 );
 
-        // Quantize these floats
-        const float d = max_scalar / 127.f;
+        // Quantize these floats, keeping fp16 scale and sum finite (matching q8_1_finite.hpp on GPU)
+        const float raw_d = max_scalar / 127.f;
+        const int d_clamped = raw_d > 65504.0f;
+        const float d = d_clamped ? 65504.0f : raw_d;
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
-        const float id = ( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f;
+        float id = d_clamped ? (1.0f / 65504.0f) : (( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f);
+        if (!isfinite(id)) id = 0.0f;
         const __m256 mul = _mm256_set1_ps( id );
 
         // Apply the multiplier
@@ -233,6 +252,15 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         v2 = _mm256_round_ps( v2, _MM_ROUND_NEAREST );
         v3 = _mm256_round_ps( v3, _MM_ROUND_NEAREST );
 
+        if (d_clamped) {
+            const __m256 q_min = _mm256_set1_ps( -127.0f );
+            const __m256 q_max = _mm256_set1_ps(  127.0f );
+            v0 = _mm256_min_ps( _mm256_max_ps( v0, q_min ), q_max );
+            v1 = _mm256_min_ps( _mm256_max_ps( v1, q_min ), q_max );
+            v2 = _mm256_min_ps( _mm256_max_ps( v2, q_min ), q_max );
+            v3 = _mm256_min_ps( _mm256_max_ps( v3, q_min ), q_max );
+        }
+
         // Convert floats to integers
         __m256i i0 = _mm256_cvtps_epi32( v0 );
         __m256i i1 = _mm256_cvtps_epi32( v1 );
@@ -240,7 +268,8 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         __m256i i3 = _mm256_cvtps_epi32( v3 );
 
         // Compute the sum of the quants and set y[i].s
-        y[i].s = GGML_CPU_FP32_TO_FP16(d * hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3))));
+        const float sum_f = d * (float) hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
+        y[i].s = GGML_CPU_FP32_TO_FP16(q8_1_finite_c(sum_f));
 
         // Convert int32 to int16
         i0 = _mm256_packs_epi32( i0, i1 );	// 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
