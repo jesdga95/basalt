@@ -55,12 +55,13 @@ The `gemma4` architecture (code in `src/models/gemma4`):
 - **Prompt:** a read longer than a decode window runs in chunks of up to 2,048 rows: the projections and the MLP as W8A8
   products on the FP8 tensor cores (activations rounded per row; an NVFP4 MLP W4A4 on the FP4 tensor cores), the router
   over the chunk in fp32, the experts on the FP4 tensor cores (two FP4 terms per activation, about 8 bits) with the GELU
-  between the two products, the attention flash style on the fp16 tensor cores. A full layer's keys are rotated from its values once a chunk into an fp16 buffer the
-  attention reads in place.
+  between the two products, the attention flash style on the fp16 tensor cores. A full layer's keys are rotated from its
+  values once a chunk into an fp16 buffer the attention reads in place.
 - **Decode:** the projections and the head read their FP8 (or the MLP's NVFP4) weights once per window of up to 16 rows;
-  the experts run grouped by expert; the attention splits each row's keys in chunks by its own position, each chunk on the fp16 tensor cores (the
-  query as two fp16 terms, so the scores keep its fp32 precision), then merges them, so a row's result does not depend on
-  the rows beside it (batch windows and drafting give plain decoding's tokens). Precision: [Gemma 4](../precision/gemma4.md).
+  the experts run grouped by expert; the attention splits each row's keys in chunks by its own position, each chunk on the
+  fp16 tensor cores (the query as two fp16 terms, so the scores keep its fp32 precision), then merges them, so a row's
+  result does not depend on the rows beside it (batch windows and drafting give plain decoding's tokens). Precision:
+  [Gemma 4](../precision/gemma4.md).
 
 ## Memory
 
