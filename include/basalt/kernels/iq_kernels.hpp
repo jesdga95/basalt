@@ -52,7 +52,8 @@ struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
     int up_type = -1;                   // the up rows' type (gu_type when they agree)
     int64_t n_embd = 0, n_ff = 0;
-    size_t gu_row = 0, d_row = 0;       // bytes per gate row and per down row
+    size_t gu_row = 0, d_row = 0;       // bytes per gate row and per down row (an MXFP8 down row whose n_ff is not whole
+                                        // 128-value blocks is padded with zero columns to them; GELU gate only)
     size_t up_row = 0;                  // bytes per up row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
