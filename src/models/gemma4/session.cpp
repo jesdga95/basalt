@@ -231,7 +231,11 @@ public:
             head_rows_ = head;
             win_pos_ = r.pos + t0;
             win_rows_ = n;
-            if (!want) continue;
+            if (!want) {
+                if (TierExperts* ex = m_.experts(); ex && ex->off_card() && !last && cudaStreamSynchronize(stream_) != cudaSuccess)
+                    return {model::Status::Error, "gemma4: the window failed"};
+                continue;
+            }
             const int32_t* p = draw(r, t0, head, err, stream_);
             if (!p || cudaStreamSynchronize(stream_) != cudaSuccess) return {model::Status::Error, "gemma4: the pick failed"};
             if (r.row_tokens) std::copy(p, p + n, r.row_tokens + t0);
@@ -442,6 +446,7 @@ public:
     // ---- the assistant drafter: its drafts after an anchor read the model's state at the row before it (the tap of the
     // last window) and the caches of the model's last layer of each kind, all at the anchor's position.
     int max_window() const override { return m_.drafter() ? std::clamp(m_.flags().spec, 1, kRows) : 1; }
+    int max_verify_window() const override { return kRows; }
     bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         ds_.pending = 0;
