@@ -1,5 +1,5 @@
 // tests/kernels/cpu/mxfp8_cpu_rows_test.cpp - the MXFP8 (type 46) CPU dot on each instruction set, bit for bit against
-// the scalar row, on random blocks that include subnormals, the largest code, zero, both signs and E4M3's NaN code;
+// the scalar row (a NaN result matches any NaN), on random blocks that include subnormals, the largest code, zero, both signs and E4M3's NaN code;
 // and against a double reference.  `--bench [n_embd] [n_ff]` times one expert's three matrices per row set against
 // the Q8_0 row.
 #define GGML_COMMON_DECL_CPP
@@ -46,7 +46,7 @@ void fill(std::mt19937& rng, std::vector<block_mxfp8>& w, std::vector<block_q8_0
         for (auto& d : b.d) {
             const uint32_t r = rng();
             // mode 0: scales around 1; mode 1: the whole UE8M0 range with 0 and 255 over-represented
-            d = mode == 0 ? (uint8_t) (110 + r % 40) : (r % 8 == 0 ? (uint8_t) (r % 2 ? 0xFF : 0x00) : (uint8_t) (r >> 8));
+            d = mode == 0 ? (uint8_t) (110 + r % 40) : (r % 8 == 0 ? (uint8_t) ((r >> 3) % 2 ? 0xFF : 0x00) : (uint8_t) (r >> 8));
         }
     }
     for (auto& b : a) {
@@ -59,6 +59,7 @@ void fill(std::mt19937& rng, std::vector<block_mxfp8>& w, std::vector<block_q8_0
     }
 }
 
+// equal bits, or both NaN (the widest scales can overflow a sum to inf - inf); NaN payloads are not compared
 bool same(float x, float y) {
     if (std::isnan(x) && std::isnan(y)) return true;
     return std::memcmp(&x, &y, 4) == 0;
@@ -140,15 +141,18 @@ int check(const Isa& isa, int n, int mode, int rows) {
 }
 
 // every code through the rows kernel: a 256-weight row holding each code once, against one-hot activations (one value
-// 1 at the code's position, scale 1), so each dot is that code's decoded value times the sub-block scale; for one
-// token (rows two at a time, and an odd last row) and for 2-8 tokens, each result the scalar row's bits and the table's value
+// 1 at the code's position, scale 1), so each dot is that code's decoded value times the sub-block scale; rows with
+// ordinary scales, all 0 (2^-127), all 255 (zero) and mixes of them; for one token (rows two at a time, and an odd
+// last row) and for 2-8 tokens, each result the scalar row's bits and the exact value.  A dot cannot show the sign of
+// a zero weight (the lane sums start at +0).
 int check_codes(const Isa& isa) {
-    const int n = 256, nb = 2, R = 3;
+    const int n = 256, nb = 2, R = 5;
+    const uint8_t scales[R][4] = {{120, 121, 122, 123}, {0, 0, 0, 0}, {255, 255, 255, 255}, {0, 255, 1, 200}, {200, 127, 255, 0}};
     std::vector<block_mxfp8> w(nb * R);
     for (int r = 0; r < R; ++r)
         for (int b = 0; b < nb; ++b) {
             for (int j = 0; j < 128; ++j) w[r * nb + b].qs[j] = (uint8_t) ((b * 128 + j + 37 * r) & 0xFF);
-            for (int k = 0; k < 4; ++k) w[r * nb + b].d[k] = (uint8_t) (120 + r + k);
+            for (int k = 0; k < 4; ++k) w[r * nb + b].d[k] = scales[r][k];
         }
     int bad = 0;
     std::vector<block_q8_0> a(nb * 4);
@@ -161,7 +165,7 @@ int check_codes(const Isa& isa) {
         a[pos / 32].qs[pos % 32] = 1;
         for (auto& pp : prep) isa.prep(n, a.data(), pp.data());
         for (const int nt : {1, 2, 5, 8})
-            for (const auto rr : {std::pair<int, int>{0, R}, {1, R}, {0, 1}}) {
+            for (const auto rr : {std::pair<int, int>{0, R}, {1, R}, {0, 1}, {3, R}}) {
                 const float* pp[8];
                 float* op[8];
                 std::vector<std::vector<float>> out(nt, std::vector<float>(R, -1.f));
@@ -174,7 +178,8 @@ int check_codes(const Isa& isa) {
                     const uint8_t c = blk.qs[pos % 128];
                     const int e = (c >> 3) & 15, m = c & 7;
                     const double v = (e == 15 && m == 7) ? 0.0 : e == 0 ? std::ldexp((double) m, -9) : std::ldexp(1.0 + m / 8.0, e - 7);
-                    const double exact = (c & 0x80 ? -v : v) * std::ldexp(1.0, blk.d[(pos % 128) / 32] - 127);
+                    const uint8_t u = blk.d[(pos % 128) / 32];
+                    const double exact = (c & 0x80 ? -v : v) * (u == 0xFF ? 0.0 : std::ldexp(1.0, u - 127));
                     for (int k = 0; k < nt; ++k)
                         if ((!same(want, out[k][r]) || (double) out[k][r] != exact) && bad++ < 5)
                             std::printf("  %s code 0x%02x (row %d, nt %d): rows %a, scalar %a, value %a\n", isa.name, c, r, nt,
