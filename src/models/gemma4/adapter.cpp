@@ -30,6 +30,11 @@ public:
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
     std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<Gemma4Model>(); }
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "gemma4"}; }
+    // the 26B A4B's routing order (the experts the card keeps first); a dense pack routes nothing
+    std::vector<std::string> shipped_profiles(const std::string& key) const override {
+        if (key != "gemma4-30x128") return {};
+        return {key + ".prof"};
+    }
     // A call: <|tool_call>call:NAME{key:value,...}<tool_call|>, a string value between <|"|> marks.
     program::grammar::ToolForm tool_form() const override {
         program::grammar::ToolForm f;
