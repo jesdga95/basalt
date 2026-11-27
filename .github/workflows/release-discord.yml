@@ -5,8 +5,6 @@ name: release-discord
 on:
   release:
     types: [published]
-  push:   # SMOKE TEST, removed before merge
-    branches: [release-discord]
 
 permissions:
   contents: read
@@ -18,9 +16,9 @@ jobs:
       - name: Post to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
-          NAME: ${{ github.event.release.name || github.event.release.tag_name || 'Webhook smoke test' }}
-          URL: ${{ github.event.release.html_url || 'https://github.com/jesdga95/basalt' }}
-          BODY: ${{ github.event.release.body || 'Testing the release announcement. Ignore me, this gets deleted.' }}
+          NAME: ${{ github.event.release.name || github.event.release.tag_name }}
+          URL: ${{ github.event.release.html_url }}
+          BODY: ${{ github.event.release.body }}
         run: |
           if [ -z "$WEBHOOK" ]; then echo "::error::DISCORD_RELEASE_WEBHOOK is not set"; exit 1; fi
           notes=$(printf '%s' "$BODY" | head -c 3500)
