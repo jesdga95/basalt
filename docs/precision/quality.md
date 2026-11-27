@@ -31,6 +31,7 @@ Every score is against the original model in BF16:
 | Qwen3.8-27B | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp 5676dfbe), wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192` | 6.7437 (6.7411 on the scored rows) |
 | Hy4-flash | Tencent's BF16 checkpoint converted to a BF16 GGUF (llama.cpp 0a054d0b0), through `llama-perplexity` with the llama.cpp port's Engram gate norm epsilon set to FP32's (#556) and `add_bos_token=true`, wikitext-2, 100 chunks of 512; `hy4flash-bf16-base.kld` | 18.416 (over the 25,500 scored rows) |
 | Inkling 2 Mini | the official release with its experts dequantized to BF16 (no BF16 checkpoint exists; the release ships NVFP4 and MXFP8 experts): a BF16 GGUF from `convert_hf_to_gguf --outtype bf16` (llama.cpp 29b52d398), through `llama-perplexity`, wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192`; `inkling2-bf16-base.kld`. Not comparable with the other models' true-BF16 bases | 7.0714 |
+| ERNIE-5.5-Flash | Baidu publishes an official BF16 checkpoint (`baidu/ERNIE-5.5-Flash-Preview-BF16`, ~560 GB); wikitext-2 100-chunk BF16 KLD base pending community run | pending |
 
 The official Flash-Next packs are scored against the first base on their
 [Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). That gate is 100 chunks, T 3, int8 KV, resident
@@ -55,9 +56,9 @@ refuses it.
   weights stay as the router gave them (no renormalisation). R is 1 to k-1, lower drops more; the flag alone is k-1.
 - `--route-prior [LAMBDA]`: a decode window picks its top k as if every expert a GPU holds had LAMBDA added to the score the
   router ranks by: the log probability for a softmax router (Flash-Next), the biased score `s + bias` for a sqrt-softplus or
-  sigmoid one (DeepSeek, Hy4). The weights stay the router's own scores of the picked experts, normalised over the picks as the
+  sigmoid one (DeepSeek, Hy4, ERNIE-5.5). The weights stay the router's own scores of the picked experts, normalised over the picks as the
   model normalises them. LAMBDA is in (0, 16]; the flag alone is each model's own default (0.5 on Flash-Next, 0.1 on
-  DeepSeek, 0.01 on Hy4), since the scores' scales differ.
+  DeepSeek, 0.01 on Hy4, 0.05 on ERNIE-5.5), since the scores' scales differ.
 
 "Held" means a main-card slot or a second card's. Both flags are off for prompts and for the drafters' own routing, and off when
 every expert is held by a GPU (nothing to skip). DeepSeek and Hy4 read which experts are held at the start of each decode window,

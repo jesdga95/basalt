@@ -210,8 +210,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     for (int l = 0; l < n_layers_; ++l) {
         const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
         kernels::cpu::NativeFmt f;
-        if (!kernels::cpu::native_fmt(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err, s_.layers[(size_t) l].clamp))
+        if (!kernels::cpu::native_fmt(el.gu_type, el.d_type, s_.n_embd, s_.n_ff, f, err, el.clamp))
             return false;
+        f.gate_softcap = el.gate_softcap;
+        f.up_softcap = el.up_softcap;
         fmt_.push_back(f);
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);
@@ -894,6 +896,11 @@ ExpertTier::Source ExpertTier::locate(int layer, int e) const {
     return r;
 }
 
+const uint8_t* ExpertTier::host_blob(int layer, int e) const {
+    if (pinned(layer, e) || homes_.file > 0) return blob_of(layer, e);
+    return nullptr;
+}
+
 void ExpertTier::start_cpu(int layer, const float* x, const Lookup& lk, float* rows, bool reading) {
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
     int n = 0;
@@ -1124,6 +1131,20 @@ void ExpertTier::issue(int layer, int pieces) {
     queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const Queued& q) { return q.off >= q.bytes; }), queue_.end());
 }
 
+void ExpertTier::issue_after(int layer, cudaEvent_t ev) {
+    bool main = false, far = false;
+    for (const Queued& q : queue_) main = main || q.p.layer == layer;
+    for (const PeerMove& m : peer_moves_) far = far || (m.layer == layer && m.in_off < m.bytes);
+    if (!main && !far) return;
+    cudaStreamWaitEvent(copy_stream_, ev, 0);
+    cudaStreamWaitEvent(out_stream_, ev, 0);
+    if (far) peer_for(layer)->copies_after(ev);
+    gap_marked_ = false;
+    if (far) issue_peer(layer, 0);
+    if (!main) return;
+    issue(layer, 0);
+}
+
 void ExpertTier::pump(int layer, int pieces) {
     issue(layer, pieces);
     if (layer >= 0) land(layer);
@@ -1175,6 +1196,13 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
         if (lk.dev[i] || lk.fetched[i] || lk.dropped[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         // with the RAM tier caching the file, the experts the CPU keeps computing; else a repeat miss
         if (reads_.is_open() && s_.admit_uses == 0 ? !core::policy::count_use(uses_[(size_t) layer * n_expert_ + lk.experts[i]]) : !lk.again[i]) continue;
+        if (s_.admit_margin > 0 && !looks_.empty()) {   // only an expert looked up enough more than its victim
+            uint64_t best = 0;
+            const int32_t vs = oldest_slot(layer, /*homes_too=*/true, best);
+            const int32_t vo = vs >= 0 ? owner_[(size_t) vs] : -1;
+            const int lv = vo >= 0 ? looks_[(size_t) layer * n_expert_ + vo] : 0;
+            if (vs >= 0 && (int) looks_[(size_t) layer * n_expert_ + lk.experts[i]] < lv + s_.admit_margin) continue;
+        }
         if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
             claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }

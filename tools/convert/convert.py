@@ -14,6 +14,7 @@
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--head nvfp4] [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --checkpoint INKLING2_DIR --out MODEL.basalt [--dflash2 DFLASH2_DIR] [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --checkpoint ERNIE55_DIR --out MODEL.basalt [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -76,6 +77,12 @@ From an Inkling 2 checkpoint (no --sections-from; tools/convert/checkpoint_inkli
                      tower, mtp.safetensors beside the shards)
   --dflash2 DIR      a DFlash 2 block drafter for Inkling 2 (incoai/Inkling-2-Mini-DFlash2), embedded as dflash2.*
                      tensors in place of dspark.*
+
+From an ERNIE-5.5-Flash checkpoint (no --sections-from; tools/convert/checkpoint_ernie55.py)
+  --checkpoint DIR   Baidu's ERNIE-5.5-Flash-Preview checkpoint (baidu/ERNIE-5.5-Flash-Preview): MXFP4 routed experts
+                     kept bit for bit, 128x128 FP8 dense projections rounded once to Q8_0, embeddings and head BF16,
+                     norms / mHC / sinks / routers F32. Attach the bundled DSpark drafter (`model.mtp.*`) afterwards
+                     with tools/convert/dspark_ernie55_attach.py --checkpoint DIR --into MODEL.basalt.
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -889,8 +896,8 @@ def main():
     ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
     ap.add_argument("--checkpoint", metavar="DIR",
-                    help="an NVFP4 or FP4-Local safetensors checkpoint: with --sections-from, the language model is read from it; "
-                         "with --requant-dense-q6k, the BF16 projections; alone, a whole qwen35 or inkling2 pack")
+                    help="an NVFP4, FP4-Local, or ERNIE-5.5 safetensors checkpoint: with --sections-from, the language model is read from it; "
+                         "with --requant-dense-q6k, the BF16 projections; alone, a whole qwen35, inkling2, or ernie55 pack")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
     ap.add_argument("--stream-shards", action="store_true",
@@ -962,6 +969,12 @@ def main():
             return
         if a.dflash2:
             ap.error("--dflash2 goes with an inkling2 checkpoint; use --drafter for qwen35")
+        if checkpoint_model_type(Path(a.checkpoint)) == "ernie5_5_moe":
+            if a.drafter or a.head:
+                ap.error("--drafter and --head go with a qwen35 checkpoint")
+            import checkpoint_ernie55 as E
+            E.build(a, Job, fingerprint, die)
+            return
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return
