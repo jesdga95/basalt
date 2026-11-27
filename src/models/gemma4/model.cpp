@@ -7,6 +7,7 @@
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/loader.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 
@@ -23,18 +24,13 @@ constexpr uint64_t kMiB = 1ull << 20;
 constexpr int kTypeF32 = 0;
 constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
+constexpr int kTypeMxfp8 = 46;
 constexpr int kTypeF8 = 44;
 // what each session needs beside its caches (its graphs and staging), and what the card keeps free for the kernels'
 // modules and the driver
 constexpr uint64_t kSessionFixed = 96 * kMiB;
 constexpr uint64_t kCardSpare = 1024 * kMiB;
 constexpr uint64_t kExpertSlack = 4096;   // zeroed bytes after a layer's last blob (the kernels' last loads)
-
-// A blob's stride on the card: whole NVFP4 blocks (36 bytes) and 16 bytes, so a kernel reads each expert's blocks in place.
-uint64_t expert_stride(uint64_t blob) {
-    constexpr uint64_t unit = 144;   // lcm(36, 16)
-    return (blob + unit - 1) / unit * unit;
-}
 
 uint64_t layer_cache_bytes(const Geometry& g, int l, int64_t context, KvType kv) {
     const LayerShape s = g.shape(l);
@@ -50,13 +46,13 @@ uint64_t session_bytes(const Geometry& g, int64_t context, KvType kv) {
     return caches + kSessionFixed + (uint64_t) kRows * (uint64_t) g.n_vocab * 4;
 }
 
-uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv) {
+uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv, bool mxfp8) {
     const uint64_t R = kRows, E = (uint64_t) g.n_embd;
     const uint64_t qmax = (uint64_t) g.n_head * std::max(g.hd_swa, g.hd_full);
     const uint64_t rowbuf = R * (4 * E + 3 * qmax + 3 * (uint64_t) n_ff_pad) * 4;
     const uint64_t experts = g.moe() ? R * (uint64_t) g.n_used * (E * 4 + (uint64_t) g.n_ff_exp * 16) + (64ull << 20) : 0;
     const uint64_t attn = attn_scratch_floats(kRows, g.n_head, std::max(g.hd_swa, g.hd_full)) * 4;
-    return rowbuf + experts + attn + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB + PromptPath::bytes(g, n_ff_pad, context, kv);
+    return rowbuf + experts + attn + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB + PromptPath::bytes(g, n_ff_pad, context, kv, mxfp8);
 }
 
 Gemma4Model::Gemma4Model() = default;
@@ -219,11 +215,17 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
             !(w.router = S("ffn_gate_inp.weight", (uint64_t) g.n_expert * E)))
             return fail(err);
         const ExpertLayer& el = pack_.experts[(size_t) l];
-        if (el.gu_type != kTypeNvfp4 || el.d_type != kTypeNvfp4) return fail("experts of a type other than NVFP4 at layer " + std::to_string(l));
+        if (el.gu_type != el.d_type || (el.gu_type != kTypeNvfp4 && el.gu_type != kTypeMxfp8))
+            return fail("experts of a type other than NVFP4 or MXFP8 at layer " + std::to_string(l));
+        if (el.gu_type == kTypeMxfp8 && E % 128)
+            return fail("MXFP8 experts need a hidden size that is a multiple of 128 (layer " + std::to_string(l) + ")");
+        if (el.blob_bytes != basalt::kernels::native_expert_layout(el.gu_type, el.d_type, E, g.n_ff_exp).bytes)
+            return fail("experts.layout: the blobs of layer " + std::to_string(l) + " are not the size of their type");
+        mxfp8_experts_ = mxfp8_experts_ || el.gu_type == kTypeMxfp8;
         w.gu_type = el.gu_type;
         w.d_type = el.d_type;
         w.blob_bytes = el.blob_bytes;
-        w.expert_stride = expert_stride(el.blob_bytes);
+        w.expert_stride = basalt::kernels::native_expert_stride(el.gu_type, el.blob_bytes);
         const uint64_t layer_b = (uint64_t) g.n_expert * w.expert_stride + kExpertSlack;
         if (!(w.experts = (uint8_t*) device_buf(layer_b)) || !(w.blob_table = (unsigned long long*) device_buf((uint64_t) g.n_expert * 8)))
             return fail("out of device memory loading the experts of layer " + std::to_string(l));
@@ -302,20 +304,24 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
     basalt::core::gpu_mem_info(&free_b, &total_b);
     const uint64_t spare = (req.vram_reserve_mib > 0 ? (uint64_t) req.vram_reserve_mib * kMiB : kCardSpare) + vision_room;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-    const uint64_t need = session_bytes(g, want, kv_) * n_sess + shared_bytes(g, n_ff_pad_, want, kv_) + spare;
+    const uint64_t need = session_bytes(g, want, kv_) * n_sess + shared_bytes(g, n_ff_pad_, want, kv_, mxfp8_experts_) + spare;
     if (need > free_b) {
         const uint64_t per = (session_bytes(g, 2, kv_) - session_bytes(g, 1, kv_)) * n_sess +
-                             shared_bytes(g, n_ff_pad_, 2, kv_) - shared_bytes(g, n_ff_pad_, 1, kv_);
-        const uint64_t base = session_bytes(g, 0, kv_) * n_sess + shared_bytes(g, n_ff_pad_, 0, kv_) + spare;
+                             shared_bytes(g, n_ff_pad_, 2, kv_, mxfp8_experts_) - shared_bytes(g, n_ff_pad_, 1, kv_, mxfp8_experts_);
+        const uint64_t base = session_bytes(g, 0, kv_) * n_sess + shared_bytes(g, n_ff_pad_, 0, kv_, mxfp8_experts_) + spare;
         const int64_t fits = free_b > base ? (int64_t) ((free_b - base) / per) : 0;
         return fail("--max-context " + std::to_string(want) + " needs " + std::to_string(need >> 20) + " MiB beside the weights, " +
                     std::to_string(free_b >> 20) + " MiB are free: at most about " + std::to_string(fits) +
                     " positions fit (a smaller --max-context, --kv fp8 or fewer --batch slots)");
     }
     ctx_ = want;
-    basalt::log::info("basalt gemma4", "weights: dense %.2f GiB (FP8), experts %.2f GiB (NVFP4), embedding %.2f GiB in RAM; "
+    int n_mx = 0;
+    for (const ExpertLayer& el : pack_.experts) n_mx += el.gu_type == kTypeMxfp8;
+    const std::string fmt = n_mx == 0 ? "NVFP4" : n_mx == (int) pack_.experts.size() ? "MXFP8"
+                                                : "NVFP4, MXFP8 at " + std::to_string(n_mx) + " layers";
+    basalt::log::info("basalt gemma4", "weights: dense %.2f GiB (FP8), experts %.2f GiB (%s), embedding %.2f GiB in RAM; "
                       "context %lld x %llu sessions, %s KV",
-                      (double) dense / (double) kGiB, (double) experts / (double) kGiB, (double) V * E * 2 / (double) kGiB,
+                      (double) dense / (double) kGiB, (double) experts / (double) kGiB, fmt.c_str(), (double) V * E * 2 / (double) kGiB,
                       (long long) ctx_, (unsigned long long) n_sess, kv_ == KvType::F8 ? "fp8" : "fp16");
     return {};
 }

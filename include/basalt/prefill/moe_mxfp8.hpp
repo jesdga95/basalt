@@ -41,6 +41,7 @@ struct Product {
     uint16_t* dst_f16 = nullptr;        ///< optional FP16 output (replaces dst)
     int64_t ld_dst = 0;
     bool swiglu = false;                ///< fused gate/up + SwiGLU (w_rows = 2 * F, outputs F values per row)
+    bool gelu = false;                  ///< with swiglu: the GELU (tanh form) gate, h = gelu(g) u (not with the softcaps)
     float gate_softcap = 0.0f;          ///< > 0: cg * tanh(g / cg) * sigmoid(g) * cu * tanh(u / cu)
     float up_softcap = 0.0f;
 };

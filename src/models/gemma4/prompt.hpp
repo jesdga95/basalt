@@ -27,8 +27,9 @@ class PromptPath {
 public:
     ~PromptPath();
     bool init(const Gemma4Model& m, std::string& err);
-    /// The device bytes init takes for a model of geometry `g`, MLP width `n_ff_pad`, `context` positions and caches of `kv`.
-    static uint64_t bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv);
+    /// The device bytes init takes for a model of geometry `g`, MLP width `n_ff_pad`, `context` positions and caches of `kv`;
+    /// `mxfp8`: some layer's experts are MXFP8 (their buffers are carved too).
+    static uint64_t bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv, bool mxfp8);
     /// One chunk: `rows` (at most kChunk) tokens at positions pos0.. through every layer, their keys and values written to
     /// `caches` ([layer]); no head. Queued on `st`; `tokens` are host memory, staged before the call returns.
     void chunk(const int32_t* tokens, int rows, int64_t pos0, const std::vector<SegKv>& caches, cudaStream_t st);
@@ -42,7 +43,7 @@ private:
     // the layers over the chunk's rows in x_, the positions staged
     void layers(int rows, int64_t pos0, bool span, const std::vector<SegKv>& caches, cudaStream_t st);
     struct Carve;
-    void layout(Carve& c, const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv);
+    void layout(Carve& c, const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv, bool mxfp8);
 
     const Gemma4Model* m_ = nullptr;
     void* base_ = nullptr;
@@ -59,6 +60,9 @@ private:
     void* sort_scr_ = nullptr;
     void *a4x_ = nullptr, *a4h_ = nullptr;
     float *gsx_ = nullptr, *gsh_ = nullptr;
+    void *mxx_ = nullptr, *mxh_ = nullptr;                                    // MXFP8 activation planes: tokens, H
+    uint16_t* h16_ = nullptr;                                                 // H as fp16 [C k][n_ff_exp rounded up to 128]
+    int32_t* mx_blk_ = nullptr;
     float* h_ = nullptr;                                                      // the experts' H [C k][n_ff_exp]
     float* ex_ = nullptr;                                                     // the experts' outputs [C k][E]
     void *k16_ = nullptr, *v16_ = nullptr;   // a full layer's keys (and an E4M3 cache's values) as fp16, [context][n_kv][hd]

@@ -1,11 +1,15 @@
 // src/models/gemma4/kernels/kernels_parity.cpp - the Gemma 4 kernels against CPU references in double: the attention's
 // preparation and decode attention (a window layer's ring past its wrap, a full layer whose keys are its values), the glue;
 // a batch window of two conversations bitwise equal to each alone; the prompt attention against the decode attention and
-// split anywhere bitwise equal; a picture's rows read as one span (both ways at the window layers); the fused glue; and
-// microbench lines of the decode and prompt attention and the glue.
+// split anywhere bitwise equal; a picture's rows read as one span (both ways at the window layers); the fused glue; an
+// MXFP8 expert layer, decode and prompt; and microbench lines of the decode and prompt attention and the glue.
+#include "basalt/kernels/expert_plan.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/models/gemma4/kernels.hpp"
+#include "basalt/prefill/moe_mxfp8.hpp"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -698,6 +702,275 @@ void fused_checks(std::mt19937& rng) {
         cudaFree(q);
 }
 
+// An MXFP8 expert layer at the model's geometry (hidden 2816, expert width 704, the down rows padded with zero columns to
+// 768, the per-expert scale folded into the weights): the decode product (grouped experts on q8_1 rows) and the prompt
+// product (the block-scaled tensor cores, E4M3 rows) against the plain reference (the weights' values, the rows unrounded,
+// in double); the prompt product's gate/up and down against double on the very E4M3 rows it read; a token's outputs
+// bitwise the same alone as in a window or a chunk.
+struct MxLayer {
+    static constexpr int E = 2816, F = 704, Fk = 768, NE = 12, K = 8;
+    size_t gu_row = (size_t) E / 128 * 132, d_row = (size_t) Fk / 128 * 132;
+    size_t down_off = (size_t) 2 * F * gu_row, blob = down_off + (size_t) E * d_row, stride = 0;
+    std::vector<uint8_t> host;              // NE blobs, `stride` apart
+    std::vector<std::vector<float>> val;    // per expert the values: [2F][E] gate/up, then [E][Fk] down
+};
+
+double e4m3_val(uint8_t b) {
+    const int e = (b >> 3) & 15, m = b & 7;
+    const double v = e == 0 ? std::ldexp((double) m, -9) : std::ldexp(1.0 + m * 0.125, e - 7);
+    return (b & 0x80) ? -v : v;
+}
+
+// x [K] -> the 128-value blocks of type 46: per 32 values the smallest power of two that brings the largest magnitude
+// within 448, E4M3 to nearest; the decoded values back into x
+void mx_round(float* x, int K, uint8_t* out) {
+    for (int b = 0; b < K / 128; ++b) {
+        uint8_t* blk = out + (size_t) b * 132;
+        for (int s = 0; s < 4; ++s) {
+            float* v = x + b * 128 + s * 32;
+            double amax = 0;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs((double) v[i]));
+            int e = -127;
+            if (amax > 0) {
+                e = (int) std::ceil(std::log2(amax / 448.0));
+                if (amax <= std::ldexp(448.0, e - 1)) --e;
+                if (amax > std::ldexp(448.0, e)) ++e;
+            }
+            blk[s] = (uint8_t) (e + 127);
+            for (int i = 0; i < 32; ++i) {
+                const __nv_fp8_storage_t c = __nv_cvt_double_to_fp8(std::ldexp((double) v[i], -e), __NV_SATFINITE, __NV_E4M3);
+                blk[4 + s * 32 + i] = c;
+                v[i] = (float) std::ldexp(e4m3_val(c), e);
+            }
+        }
+    }
+}
+
+MxLayer mx_layer(std::mt19937& rng) {
+    MxLayer m;
+    m.stride = basalt::kernels::native_expert_stride(46, m.blob);
+    m.host.assign((size_t) MxLayer::NE * m.stride, 0);
+    std::normal_distribution<float> d(0.f, 0.02f);
+    const int E = MxLayer::E, F = MxLayer::F, Fk = MxLayer::Fk;
+    for (int j = 0; j < MxLayer::NE; ++j) {
+        std::vector<float> v((size_t) 2 * F * E + (size_t) E * Fk, 0.f);
+        for (size_t i = 0; i < (size_t) 2 * F * E; ++i) v[i] = d(rng);
+        for (int r = 0; r < E; ++r)
+            for (int c = 0; c < F; ++c) v[(size_t) 2 * F * E + (size_t) r * Fk + c] = d(rng);
+        uint8_t* b = m.host.data() + (size_t) j * m.stride;
+        for (int r = 0; r < 2 * F; ++r) mx_round(&v[(size_t) r * E], E, b + (size_t) r * m.gu_row);
+        for (int r = 0; r < E; ++r) mx_round(&v[(size_t) 2 * F * E + (size_t) r * Fk], Fk, b + m.down_off + (size_t) r * m.d_row);
+        m.val.push_back(std::move(v));
+    }
+    return m;
+}
+
+// h = gelu(g) u of one pair from a row of activations `x` [E] (double), the expert's values
+void mx_ref_h(const MxLayer& m, int j, const double* x, double* h) {
+    const int E = MxLayer::E, F = MxLayer::F;
+    const float* w = m.val[(size_t) j].data();
+    for (int r = 0; r < F; ++r) {
+        double g = 0, u = 0;
+        for (int c = 0; c < E; ++c) g += (double) w[(size_t) r * E + c] * x[c], u += (double) w[(size_t) (F + r) * E + c] * x[c];
+        h[r] = 0.5 * g * (1.0 + std::tanh(0.7978845608028654 * (g + 0.044715 * g * g * g))) * u;
+    }
+}
+void mx_ref_down(const MxLayer& m, int j, const double* h, int width, double* out) {
+    const int E = MxLayer::E, F = MxLayer::F, Fk = MxLayer::Fk;
+    const float* w = m.val[(size_t) j].data() + (size_t) 2 * F * E;
+    for (int r = 0; r < E; ++r) {
+        double s = 0;
+        for (int c = 0; c < width; ++c) s += (double) w[(size_t) r * Fk + c] * h[c];
+        out[r] = s;
+    }
+}
+// row `r` of MXFP8 activation planes for `rows` rows of `cols` values (prefill/moe_mxfp8.hpp), decoded
+void mx_act_row(const std::vector<uint8_t>& planes, int rows, int cols, int r, double* out) {
+    const size_t soff = ((size_t) rows * cols + 15) & ~(size_t) 15;
+    for (int c = 0; c < cols; ++c)
+        out[c] = e4m3_val(planes[(size_t) r * cols + c]) * std::ldexp(1.0, (int) planes[soff + (size_t) r * (cols / 32) + c / 32] - 127);
+}
+
+struct MxRun {
+    std::vector<float> out;      // [pairs][E], pair = row * K + slot
+    std::vector<uint8_t> xq;     // the prompt product's E4M3 rows of the tokens, and of H
+    std::vector<uint8_t> hq;
+    std::vector<uint16_t> h16;   // H [pairs][Fk] fp16, in sorted order
+    std::vector<int32_t> dst;    // sorted entry -> pair
+};
+
+// The prompt product, as the Gemma 4 prompt path runs an MXFP8 layer
+MxRun mx_prompt(const MxLayer& m, const uint8_t* dw, const std::vector<float>& x, const std::vector<int32_t>& ids, int rows) {
+    namespace mx8 = basalt::prefill::mxfp8;
+    namespace bk = basalt::kernels;
+    const int E = MxLayer::E, Fe = MxLayer::F, Fk = MxLayer::Fk, NE = MxLayer::NE, P = rows * MxLayer::K;
+    float* dx = dev(x);
+    int32_t* did = dev(ids);
+    int32_t *bounds, *tok, *dst, *exp, *blk;
+    cudaMalloc(&bounds, (NE + 1) * 4), cudaMalloc(&blk, (NE + 1) * 4);
+    cudaMalloc(&tok, P * 4), cudaMalloc(&dst, P * 4), cudaMalloc(&exp, P * 4);
+    void *scr, *ax, *ah;
+    cudaMalloc(&scr, bk::moe_sort_scratch(P, NE));
+    cudaMalloc(&ax, mx8::act_bytes(rows, E)), cudaMalloc(&ah, mx8::act_bytes(P, Fk));
+    uint16_t* h16;
+    float* out;
+    cudaMalloc(&h16, (size_t) P * Fk * 2), cudaMalloc(&out, (size_t) P * E * 4);
+    cudaMemset(h16, 0, (size_t) P * Fk * 2);
+    bk::moe_sort(did, rows, MxLayer::K, NE, scr, bounds, tok, dst, exp, nullptr);
+    mx8::plan_blocks(bounds, NE, blk, nullptr);
+    mx8::quantize_tokens(dx, rows, E, E, ax, nullptr);
+    mx8::Product gu;
+    gu.base = dw, gu.stride = m.stride, gu.w_off = 0, gu.w_rows = 2 * Fe, gu.w_cols = E, gu.n = NE;
+    gu.act = ax, gu.act_rows = rows, gu.bounds = bounds, gu.blk_off = blk, gu.blocks = mx8::max_blocks(P, NE);
+    gu.ids = tok, gu.dst_f16 = h16, gu.ld_dst = Fk, gu.swiglu = true, gu.gelu = true;
+    mx8::run(gu, nullptr);
+    mx8::quantize_f16(h16, P, Fk, Fk, ah, nullptr);
+    mx8::Product dn = gu;
+    dn.swiglu = false, dn.gelu = false, dn.ids = nullptr, dn.w_off = m.down_off, dn.w_rows = E, dn.w_cols = Fk;
+    dn.act = ah, dn.act_rows = P, dn.dst_f16 = nullptr, dn.dst = out, dn.dst_ids = dst, dn.ld_dst = E;
+    mx8::run(dn, nullptr);
+    MxRun r;
+    r.out = host(out, (size_t) P * E);
+    r.xq = host((const uint8_t*) ax, mx8::act_bytes(rows, E));
+    r.hq = host((const uint8_t*) ah, mx8::act_bytes(P, Fk));
+    r.h16 = host(h16, (size_t) P * Fk);
+    r.dst = host(dst, (size_t) P);
+    for (void* q : {(void*) dx, (void*) did, (void*) bounds, (void*) blk, (void*) tok, (void*) dst, (void*) exp, scr, ax, ah,
+                    (void*) h16, (void*) out})
+        cudaFree(q);
+    return r;
+}
+
+// The decode product, as the Gemma 4 decode path runs an MXFP8 layer
+std::vector<float> mx_decode(const MxLayer& m, const uint8_t* dw, const std::vector<float>& x, const std::vector<int32_t>& ids,
+                             int rows) {
+    namespace bk = basalt::kernels;
+    const int E = MxLayer::E, NE = MxLayer::NE, P = rows * MxLayer::K;
+    std::vector<unsigned long long> table(NE);
+    for (int j = 0; j < NE; ++j) table[(size_t) j] = (unsigned long long) (dw + (size_t) j * m.stride);
+    unsigned long long* dtab = dev(table);
+    float* dx = dev(x);
+    int32_t* did = dev(ids);
+    unsigned long long* ptr;
+    int32_t *start, *ng, *dst, *tok;
+    cudaMalloc(&ptr, P * 8), cudaMalloc(&start, (P + 2) * 4), cudaMalloc(&ng, 4), cudaMalloc(&dst, P * 4), cudaMalloc(&tok, P * 4);
+    void *xq, *scr;
+    float* out;
+    cudaMalloc(&xq, (size_t) rows * (E / 32) * 36), cudaMalloc(&scr, bk::native_expert_scratch_bytes(P, MxLayer::F));
+    cudaMalloc(&out, (size_t) P * E * 4);
+    bk::quantize_q8_1_rows(dx, rows, E, xq, nullptr);
+    bk::moe_plan(did, rows, MxLayer::K, NE, dtab, ptr, start, ng, dst, tok, nullptr);
+    bk::NativeExpertLayout L = bk::native_expert_layout(46, 46, E, MxLayer::F);
+    L.gelu = true;
+    bk::native_expert_grouped(L, ptr, start, ng, dst, tok, std::min(P, NE), P, xq, scr, out, nullptr);
+    std::vector<float> r = host(out, (size_t) P * E);
+    for (void* q : {(void*) dtab, (void*) dx, (void*) did, (void*) ptr, (void*) start, (void*) ng, (void*) dst, (void*) tok, xq,
+                    scr, (void*) out})
+        cudaFree(q);
+    return r;
+}
+
+void experts_mxfp8_checks(std::mt19937& rng) {
+    const int E = MxLayer::E, F = MxLayer::F, Fk = MxLayer::Fk, NE = MxLayer::NE, K = MxLayer::K;
+    const MxLayer m = mx_layer(rng);
+    uint8_t* dw = nullptr;
+    cudaMalloc(&dw, m.host.size() + 4096);
+    cudaMemcpy(dw, m.host.data(), m.host.size(), cudaMemcpyHostToDevice);
+    cudaMemset(dw + m.host.size(), 0, 4096);
+    const int T = 24, Td = basalt::models::gemma4::kRows;   // a prompt chunk's rows, a decode window's
+    std::vector<float> x = randv((size_t) T * E, rng);
+    std::vector<int32_t> ids((size_t) T * K);
+    for (int t = 0; t < T; ++t) {   // K distinct experts a row
+        std::vector<int32_t> p(NE);
+        for (int j = 0; j < NE; ++j) p[(size_t) j] = j;
+        std::shuffle(p.begin(), p.end(), rng);
+        std::copy(p.begin(), p.begin() + K, ids.begin() + (size_t) t * K);
+    }
+    // the plain reference: every pair's expert output
+    std::vector<double> ref((size_t) T * K * E);
+    {
+        std::vector<double> xd(E), h(F);
+        for (int t = 0; t < T; ++t) {
+            for (int c = 0; c < E; ++c) xd[(size_t) c] = x[(size_t) t * E + c];
+            for (int s = 0; s < K; ++s) {
+                const int j = ids[(size_t) t * K + s];
+                mx_ref_h(m, j, xd.data(), h.data());
+                mx_ref_down(m, j, h.data(), F, &ref[((size_t) t * K + s) * E]);
+            }
+        }
+    }
+    auto vs_ref = [&](const std::vector<float>& got, int rows, double& rel_rms) {
+        double se = 0, sr = 0, mx = 0;
+        for (size_t i = 0; i < (size_t) rows * K * E; ++i) {
+            const double e = (double) got[i] - ref[i];
+            se += e * e, sr += ref[i] * ref[i], mx = std::max(mx, std::fabs(e));
+        }
+        rel_rms = std::sqrt(se / sr);
+        return mx / std::sqrt(sr / (double) ((size_t) rows * K * E));
+    };
+    // the prompt product
+    const MxRun pr = mx_prompt(m, dw, x, ids, T);
+    double rr = 0, mr = vs_ref(pr.out, T, rr);
+    std::printf("mxfp8 experts, prompt product vs the plain reference: rms err %.3g of the outputs' rms, max %.3g\n", rr, mr);
+    // E4M3 rounding of the rows and of H: each about 3.6% rms of a value
+    expect(rr < 0.06 && mr < 0.5, "mxfp8 experts, prompt product (E4M3 rows) vs plain double", rr);
+    {   // gate/up and down against double on the rows the product read
+        double eh = 0, ed = 0;
+        bool pad0 = true;
+        std::vector<double> xa(E), hd(Fk), o(E);
+        const int P = T * K;
+        for (int i = 0; i < P; ++i) {
+            const int pair = pr.dst[(size_t) i], t = pair / K, j = ids[(size_t) pair];
+            mx_act_row(pr.xq, T, E, t, xa.data());
+            std::vector<double> h(F);
+            mx_ref_h(m, j, xa.data(), h.data());
+            for (int c = 0; c < F; ++c) {
+                __half_raw hr;
+                hr.x = pr.h16[(size_t) i * Fk + c];
+                const double got = (double) __half2float(__half(hr));
+                eh = std::max(eh, std::fabs(got - h[(size_t) c]) / std::max(1.0, std::fabs(h[(size_t) c])));
+            }
+            for (int c = F; c < Fk; ++c) pad0 = pad0 && pr.h16[(size_t) i * Fk + c] == 0;
+            mx_act_row(pr.hq, P, Fk, i, hd.data());
+            mx_ref_down(m, j, hd.data(), Fk, o.data());
+            for (int r = 0; r < E; ++r)
+                ed = std::max(ed, std::fabs((double) pr.out[(size_t) pair * E + r] - o[(size_t) r]) / std::max(1.0, std::fabs(o[(size_t) r])));
+        }
+        expect(eh < 2e-3, "mxfp8 experts, prompt gate/up GELU vs double on its E4M3 rows (fp16 H)", eh);
+        expect(ed < 2e-5, "mxfp8 experts, prompt down (768 padded columns) vs double on its rows", ed);
+        expect(pad0, "mxfp8 experts, H's padded columns stay zero", 0);
+    }
+    // the decode product over a window
+    const std::vector<float> xw(x.begin(), x.begin() + (size_t) Td * E);
+    const std::vector<int32_t> iw(ids.begin(), ids.begin() + (size_t) Td * K);
+    const std::vector<float> de = mx_decode(m, dw, xw, iw, Td);
+    double dr = 0, dm = vs_ref(de, Td, dr);
+    std::printf("mxfp8 experts, decode product vs the plain reference: rms err %.3g of the outputs' rms, max %.3g\n", dr, dm);
+    // q8_1 rounding of the rows and of H
+    expect(dr < 0.02 && dm < 0.1, "mxfp8 experts, decode product (q8_1 rows) vs plain double", dr);
+    {   // prompt against decode on the window's pairs
+        double se = 0, sr = 0;
+        for (size_t i = 0; i < (size_t) Td * K * E; ++i) se += ((double) pr.out[i] - de[i]) * ((double) pr.out[i] - de[i]), sr += (double) de[i] * de[i];
+        std::printf("mxfp8 experts, prompt vs decode product: rms difference %.3g of the outputs' rms\n", std::sqrt(se / sr));
+    }
+    // a token alone: the decode product in a window of one, the prompt product in a chunk of its last rows
+    {
+        const int t = Td - 1;
+        const std::vector<float> x1(x.begin() + (size_t) t * E, x.begin() + (size_t) (t + 1) * E);
+        const std::vector<int32_t> i1(ids.begin() + (size_t) t * K, ids.begin() + (size_t) (t + 1) * K);
+        const std::vector<float> d1 = mx_decode(m, dw, x1, i1, 1);
+        const bool same = std::memcmp(d1.data(), de.data() + (size_t) t * K * E, (size_t) K * E * 4) == 0;
+        expect(same, "mxfp8 experts, decode: a row alone = in its window (bitwise)", 0);
+        const int t0 = T - 5;
+        const std::vector<float> x5(x.begin() + (size_t) t0 * E, x.end());
+        const std::vector<int32_t> i5(ids.begin() + (size_t) t0 * K, ids.end());
+        const MxRun p5 = mx_prompt(m, dw, x5, i5, T - t0);
+        const bool same5 = std::memcmp(p5.out.data(), pr.out.data() + (size_t) t0 * K * E, (size_t) 5 * K * E * 4) == 0;
+        expect(same5, "mxfp8 experts, prompt: the last 5 rows as a chunk = in the whole chunk (bitwise)", 0);
+    }
+    cudaFree(dw);
+}
+
 }  // namespace
 
 int main() {
@@ -724,6 +997,7 @@ int main() {
     span_case("picture span, full layer: bitwise as causal", {16, 2, 512, 64, 0, true}, 300, 280, rng);
     glue_checks(rng);
     fused_checks(rng);
+    experts_mxfp8_checks(rng);
     bench(rng);
     prompt_bench("window layer (16x256, 8 kv, window 1024) 2048 rows after 8192", {16, 8, 256, 128, 1024, false}, 8192, 2048, rng);
     prompt_bench("full layer (16x512, 2 kv, one cache) 2048 rows after 8192", {16, 2, 512, 64, 0, true}, 8192, 2048, rng);
