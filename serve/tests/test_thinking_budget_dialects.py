@@ -154,21 +154,38 @@ class Inkling2Budget(unittest.TestCase):
         self.dialect = Inkling2()
         self.template = self.dialect.template(tpl_src)
 
-    def run_budget(self, reply_fn, budget=20):
+    def run_budget(self, reply_fn, budget=20, *, fit_max_tokens=False, takes_text=False, answer_room=None):
+        from serve.prompt import CTX_SLACK, PromptText
+
         tok, dialect = self.tok, self.dialect
         caps, prompts = [], []
 
         class Eng(MockEngine):
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
-                prompts.append(list(ids))
-                caps.append(max_new)
-                out = reply_fn(tok.decode(ids), len(prompts))
-                for t in tok.encode(out, parse_special=True)[:max_new]:
-                    if cancel.is_set():
-                        return
-                    yield t
+            pass
 
-        svc = Service(Eng(tok, "x", max_context=32768), tok, self.template, dialect=dialect)
+        Eng.takes_text = takes_text
+
+        def generate(self_eng, ids, max_new, sampling, cancel, embeddings=None, session=None):
+            if isinstance(ids, PromptText):
+                n = len(ids.ids())
+                if ids.clip:
+                    max_new = min(max_new, 32768 - CTX_SLACK - n)
+                ids.set_counted(n, max_new)
+                yield None
+                ids = ids.ids()
+            prompts.append(list(ids))
+            caps.append(max_new)
+            out = reply_fn(tok.decode(ids), len(prompts))
+            for t in tok.encode(out, parse_special=True)[:max_new]:
+                if cancel.is_set():
+                    return
+                yield t
+
+        Eng.generate = generate
+        svc = Service(Eng(tok, "x", max_context=32768), tok, self.template, dialect=dialect,
+                      fit_max_tokens=fit_max_tokens)
+        if answer_room is not None:
+            svc.answer_room = answer_room
         httpd = serve(svc, port=0)
         try:
             body = {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 2000,
@@ -200,6 +217,28 @@ class Inkling2Budget(unittest.TestCase):
         msg = body["choices"][0]["message"]
         self.assertEqual(msg["content"], ANSWER)
         self.assertEqual(len(msg["reasoning_content"]), 19)     # <|content_thinking|> + 19 thinking bytes = budget 20
+        self.assertTrue(self.tok.decode(prompts[-1]).endswith(THOUGHT[:19] + E))
+
+    def test_clipped_text_prompt_still_wraps_on_budget(self):
+        H, TH, TX, E, ET = self.HEADER, self.THINK, self.TEXT, self.END, self.END_TURN
+        full = H + TH + THOUGHT + E + H + TX + ANSWER + E + ET
+
+        def script(prompt, pass_n):
+            if prompt.endswith(E) and TH in prompt:
+                return H + TX + ANSWER + E + ET
+            idx = prompt.rfind(H + TH)
+            if idx >= 0:
+                said = prompt[idx:]
+                return full[len(said):]
+            return full
+
+        code, body, caps, prompts = self.run_budget(script, budget=20, fit_max_tokens=True, takes_text=True, answer_room=100)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(caps[0], 20)
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+        msg = body["choices"][0]["message"]
+        self.assertEqual(msg["content"], ANSWER)
+        self.assertEqual(len(msg["reasoning_content"]), 19)
         self.assertTrue(self.tok.decode(prompts[-1]).endswith(THOUGHT[:19] + E))
 
     def test_no_thinking_block_resumes_uncapped_on_pass2(self):
