@@ -10,7 +10,7 @@
 
 namespace basalt::models::deepseek4 {
 namespace {
-constexpr uint64_t kModuleRoom = 7ull << 27;
+constexpr uint64_t kModuleRoom = 512ull << 20;
 
 model::Result failure(const std::string& message) {
     return {model::Status::Error, "deepseek4: " + message};
