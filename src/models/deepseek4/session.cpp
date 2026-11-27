@@ -1037,11 +1037,13 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
     float *current = nullptr, *attended = nullptr, *coefficients = nullptr, *collapsed = nullptr,
           *normalized = nullptr, *hc_workspace = nullptr, *logits = nullptr, *route_weights = nullptr,
           *shared = nullptr, *routed = nullptr, *chunk_q_latent = nullptr, *chunk_kv_proj = nullptr,
-          *chunk_kv_row = nullptr, *chunk_out_latent = nullptr, *tile_q_heads = nullptr, *tile_mqa_out = nullptr;
+          *chunk_kv_row = nullptr, *chunk_out_latent = nullptr, *tile_q_heads = nullptr, *tile_mqa_out = nullptr,
+          *tile_comp_kv = nullptr, *tile_comp_score = nullptr, *tile_idx_kv = nullptr, *tile_idx_score = nullptr;
     int32_t *route_ids = nullptr, *fixed_rows = nullptr, *chunk_pos = nullptr, *chunk_win_start = nullptr,
-            *chunk_win_n = nullptr, *chunk_comp_limit = nullptr;
+            *chunk_win_n = nullptr, *chunk_comp_limit = nullptr, *tile_comp_row = nullptr, *hca_ids = nullptr;
     uint8_t *fixed_mask = nullptr, *alternate_mask = nullptr;
     std::unique_ptr<PrefillFfn> prompt_ffn;
+    const int hca_max_visible = std::max(1, (int) ((pos + total_tokens) / 16));
 
     for (;;) {
         buffers.clear();
@@ -1068,6 +1070,12 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         chunk_out_latent = static_cast<float*>(alloc((size_t) cap * 1024 * sizeof(float)));
         tile_q_heads = static_cast<float*>(alloc((size_t) tile_cap * 64 * 512 * sizeof(float)));
         tile_mqa_out = static_cast<float*>(alloc((size_t) tile_cap * 64 * 512 * sizeof(float)));
+        tile_comp_kv = static_cast<float*>(alloc((size_t) tile_cap * 1024 * sizeof(float)));
+        tile_comp_score = static_cast<float*>(alloc((size_t) tile_cap * 1024 * sizeof(float)));
+        tile_idx_kv = static_cast<float*>(alloc((size_t) tile_cap * 256 * sizeof(float)));
+        tile_idx_score = static_cast<float*>(alloc((size_t) tile_cap * 256 * sizeof(float)));
+        tile_comp_row = static_cast<int32_t*>(alloc((size_t) tile_cap * sizeof(int32_t)));
+        hca_ids = static_cast<int32_t*>(alloc((size_t) kExpertWindow * hca_max_visible * sizeof(int32_t)));
         chunk_pos = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
         chunk_win_start = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
         chunk_win_n = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
@@ -1075,8 +1083,9 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         const bool bufs_ok = current && attended && coefficients && collapsed && normalized && hc_workspace &&
                              logits && route_ids && route_weights && shared && routed && fixed_rows &&
                              fixed_mask && alternate_mask && chunk_q_latent && chunk_kv_proj && chunk_kv_row &&
-                             chunk_out_latent && tile_q_heads && tile_mqa_out && chunk_pos && chunk_win_start &&
-                             chunk_win_n && chunk_comp_limit;
+                             chunk_out_latent && tile_q_heads && tile_mqa_out && tile_comp_kv && tile_comp_score &&
+                             tile_idx_kv && tile_idx_score && tile_comp_row && hca_ids && chunk_pos &&
+                             chunk_win_start && chunk_win_n && chunk_comp_limit;
         if (bufs_ok) {
             std::string ffn_err;
             prompt_ffn = make_prefill_ffn(model_.weights(), *tier, cap, ffn_err);
@@ -1089,6 +1098,16 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
             return false;
         }
         cap = std::max(1024, cap / 2);
+    }
+
+    {
+        std::vector<int32_t> h_hca((size_t) kExpertWindow * hca_max_visible);
+        for (int t = 0; t < kExpertWindow; ++t)
+            for (int i = 0; i < hca_max_visible; ++i)
+                h_hca[(size_t) t * hca_max_visible + i] = i;
+        if (cudaMemcpyAsync(hca_ids, h_hca.data(), h_hca.size() * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return fail_cuda("prompt HCA ids upload");
     }
 
     std::vector<float> host((size_t) cap * stream_row);
@@ -1211,6 +1230,30 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                 kernels::sparse_mqa_q_head_norm_rope(tile_q_heads, chunk_pos + row, ropes_[(size_t) layer].attention,
                                                      attention.attention.q.head_rms_eps, b, stream_);
 
+                if (ratio) {
+                    LayerCache& cache = layer_cache_[(size_t) layer];
+                    if (ratio == 4) {
+                        kernels::bf16_rows_dot(normalized + (size_t) row * n,
+                                               static_cast<const uint16_t*>(index_kv->ptr), tile_idx_kv,
+                                               b, 256, geo_.n_embd, stream_);
+                        kernels::bf16_rows_dot(normalized + (size_t) row * n,
+                                               static_cast<const uint16_t*>(index_gate->ptr), tile_idx_score,
+                                               b, 256, geo_.n_embd, stream_);
+                        indexer_compress_projected(b, tile_idx_kv, tile_idx_score,
+                            static_cast<const float*>(index_ape->ptr), chunk_pos + row,
+                            static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
+                            cache.indexer_state_kv, cache.indexer_state_score,
+                            reinterpret_cast<float*>(cache.indexer->data()), tile_comp_row, stream_);
+                    }
+                    const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
+                    project_and_compress(kind, ratio, geo_.n_embd, b, normalized + (size_t) row * n,
+                        static_cast<const uint16_t*>(attn_kv->ptr), static_cast<const uint16_t*>(attn_gate->ptr),
+                        static_cast<const float*>(attn_ape->ptr), chunk_pos + row,
+                        static_cast<const float*>(attn_norm->ptr), geo_.rms_eps, compress_rope_freq_,
+                        tile_comp_kv, tile_comp_score, cache.attention_state_kv, cache.attention_state_score,
+                        reinterpret_cast<float*>(cache.attention->data()), tile_comp_row, stream_);
+                }
+
                 for (int sub = 0; sub < b; sub += kExpertWindow) {
                     const int count = std::min(kExpertWindow, b - sub);
                     const int g_row = row + sub;
@@ -1228,17 +1271,6 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                         LayerCache& cache = layer_cache_[(size_t) layer];
                         const int visible = (int) ((sub_pos + count) / ratio);
                         if (ratio == 4) {
-                            kernels::bf16_rows_dot(normalized + (size_t) g_row * n,
-                                                   static_cast<const uint16_t*>(index_kv->ptr), indexer_kv_,
-                                                   count, 256, geo_.n_embd, stream_);
-                            kernels::bf16_rows_dot(normalized + (size_t) g_row * n,
-                                                   static_cast<const uint16_t*>(index_gate->ptr), indexer_score_,
-                                                   count, 256, geo_.n_embd, stream_);
-                            indexer_compress_projected(count, indexer_kv_, indexer_score_,
-                                static_cast<const float*>(index_ape->ptr), chunk_pos + g_row,
-                                static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
-                                cache.indexer_state_kv, cache.indexer_state_score,
-                                reinterpret_cast<float*>(cache.indexer->data()), comp_row_, stream_);
                             float angles[kExpertWindow * 32]{};
                             for (int t = 0; t < count; ++t)
                                 for (int i = 0; i < 32; ++i)
@@ -1261,28 +1293,13 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                                 sel.comp_type = kernels::MqaRowType::F32;
                                 sel.comp_limit = chunk_comp_limit + g_row;
                             }
-                        } else {
-                            sel.n_sel = visible;
+                        } else if (visible > 0) {
+                            sel.n_sel = hca_max_visible;
                             sel.comp = cache.attention->data();
                             sel.comp_type = kernels::MqaRowType::F32;
-                            if (visible > 0) {
-                                std::vector<int32_t> ids((size_t) count * visible);
-                                for (int t = 0; t < count; ++t)
-                                    for (int i = 0; i < visible; ++i) ids[(size_t) t * visible + i] = i;
-                                if (cudaMemcpyAsync(selected_ids_, ids.data(), ids.size() * sizeof(int32_t),
-                                                    cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-                                    return fail_cuda("prompt compressed attention ids upload");
-                                sel.sel = selected_ids_;
-                                sel.comp_limit = chunk_comp_limit + g_row;
-                            }
+                            sel.sel = hca_ids;
+                            sel.comp_limit = chunk_comp_limit + g_row;
                         }
-                        const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
-                        project_and_compress(kind, ratio, geo_.n_embd, count, normalized + (size_t) g_row * n,
-                            static_cast<const uint16_t*>(attn_kv->ptr), static_cast<const uint16_t*>(attn_gate->ptr),
-                            static_cast<const float*>(attn_ape->ptr), chunk_pos + g_row,
-                            static_cast<const float*>(attn_norm->ptr), geo_.rms_eps, compress_rope_freq_,
-                            attn_comp_kv_, attn_comp_score_, cache.attention_state_kv, cache.attention_state_score,
-                            reinterpret_cast<float*>(cache.attention->data()), comp_row_, stream_);
                     }
                     cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * 512,
                                            chunk_kv_row + (size_t) g_row * 512, chunk_pos + g_row, count, stream_);

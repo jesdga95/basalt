@@ -209,7 +209,7 @@ void check_launch(const char* name) {
 void indexer_compress_projected(int n_tokens, const float* kv, const float* score, const float* ape,
                                 const int32_t* pos, const float* norm_w, float rms_eps, const float* rope_freq,
                                 float* state_kv, float* state_score, float* out, int32_t* row_of, void* stream) {
-    if (n_tokens < 1 || n_tokens > 8 || !kv || !score || !ape || !pos || !norm_w || !(rms_eps > 0.f) || !rope_freq ||
+    if (n_tokens < 1 || !kv || !score || !ape || !pos || !norm_w || !(rms_eps > 0.f) || !rope_freq ||
         !state_kv || !state_score || !out || !row_of)
         throw std::invalid_argument("deepseek4 indexer compressor: invalid arguments");
     indexer_compress_kernel<<<1, D, 0, (cudaStream_t) stream>>>(n_tokens, kv, score, ape, pos, norm_w, rms_eps,

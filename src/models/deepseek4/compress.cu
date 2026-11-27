@@ -211,7 +211,7 @@ void compress_projected(CompressKind kind, int ratio, int n_tokens, const float*
                         const float* ape, const int32_t* pos, const float* norm_w, float rms_eps,
                         const float* rope_freq, float* state_kv, float* state_score, float* out,
                         int32_t* row_of, void* stream) {
-    if (ratio != expected_ratio(kind) || n_tokens < 1 || n_tokens > 8 || !kv || !score || !ape || !pos ||
+    if (ratio != expected_ratio(kind) || n_tokens < 1 || !kv || !score || !ape || !pos ||
         !norm_w || !rope_freq || !state_kv || !state_score || !out || !row_of || !(rms_eps > 0.0f))
         throw std::invalid_argument("deepseek4 compress_projected: invalid arguments");
     compress_kernel<<<1, kHeadDim, 0, (cudaStream_t) stream>>>(kind, ratio, n_tokens, kv, score, ape, pos, norm_w,
@@ -225,7 +225,7 @@ void project_and_compress(CompressKind kind, int ratio, int n_embd, int n_tokens
                           float* kv_projected, float* score_projected, float* state_kv, float* state_score,
                           float* out, int32_t* row_of, void* stream) {
     const int width = kind == CompressKind::Csa ? 2 * kHeadDim : kHeadDim;
-    if (ratio != expected_ratio(kind) || n_embd < 8 || n_embd % 8 != 0 || n_tokens < 1 || n_tokens > 8 ||
+    if (ratio != expected_ratio(kind) || n_embd < 8 || n_embd % 8 != 0 || n_tokens < 1 ||
         !x || !kv_weight || !score_weight || !ape || !pos || !norm_w || !rope_freq || !kv_projected ||
         !score_projected || !state_kv || !state_score || !out || !row_of || !stream || !(rms_eps > 0.0f))
         throw std::invalid_argument("deepseek4 project_and_compress: invalid arguments");
