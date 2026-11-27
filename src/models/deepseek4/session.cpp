@@ -96,6 +96,7 @@ public:
     }
 
     bool init(std::string& err) {
+        format_ = model_.cache_format();
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
             err = "cannot create a CUDA stream";
             return false;
@@ -147,7 +148,7 @@ public:
         win_n_ = position_meta_ + 2 * rows;
         if (!dev(head_hc_workspace_, kernels::hc_plain_workspace_floats(kExpertWindow, 4)) ||
             !dev(head_coef_, (size_t) kernels::hc_plain_coef_stride(4) * rows) || !dev(head_collapsed_, n * rows) ||
-            !dev(head_normed_, n * rows) || !dev(window_rings_, (size_t) geo_.n_layers * kBootstrapWindow * 512)) {
+            !dev(head_normed_, n * rows) || !dev(window_rings_, (size_t) geo_.n_layers * kBootstrapWindow * win_row_bytes(format_))) {
             err = "out of device memory for DeepSeek4 session state";
             return false;
         }
@@ -204,7 +205,7 @@ public:
             LayerCache& cache = layer_cache_[(size_t) layer];
             const uint64_t rows = (uint64_t) model_.context() / (uint64_t) ratio + 1;
             cache.attention = std::make_unique<core::ElasticArray>();
-            if (!cache.attention->open(rows * 512 * sizeof(float), err)) return false;
+            if (!cache.attention->open(rows * comp_row_bytes(format_), err)) return false;
             const int state_width = ratio == 4 ? 1024 : 512;
             const int state_rows = ratio == 4 ? 2 * ratio : ratio;
             if (!dev(cache.attention_state_kv, (size_t) state_width * state_rows) ||
@@ -213,7 +214,7 @@ public:
                                  cache.attention_state_kv, cache.attention_state_score, stream_);
             if (ratio == 4) {
                 cache.indexer = std::make_unique<core::ElasticArray>();
-                if (!cache.indexer->open(rows * 128 * sizeof(float), err) ||
+                if (!cache.indexer->open(rows * idx_row_bytes(format_), err) ||
                     !dev(cache.indexer_state_kv, 8 * 256) || !dev(cache.indexer_state_score, 8 * 256)) return false;
                 reset_indexer_compress_state(cache.indexer_state_kv, cache.indexer_state_score, stream_);
             }
@@ -514,7 +515,7 @@ public:
     // the sliding-window rings and each compressor's rolling overlap state. Compressed rows themselves are
     // serialized by save_cells(). The checkpoint is taken only at the session's current token boundary.
     size_t running_bytes() const override {
-        size_t bytes = (size_t) geo_.n_layers * kBootstrapWindow * 512 * sizeof(float);
+        size_t bytes = (size_t) geo_.n_layers * kBootstrapWindow * win_row_bytes(format_);
         for (int layer = 0; layer < geo_.n_layers; ++layer) {
             const int ratio = geo_.compress_ratio[(size_t) layer];
             if (!ratio) continue;
@@ -532,7 +533,7 @@ public:
         if (pos < 0 || pos > model_.context() || (save && pos != (int64_t) tokens_.size()))
             return {model::Status::Error, "deepseek4: checkpoint position is not a valid session boundary"};
         if (save && !sync()) return {model::Status::Error, "deepseek4: " + err_};
-        state.regions.push_back({window_rings_, (size_t) geo_.n_layers * kBootstrapWindow * 512 * sizeof(float)});
+        state.regions.push_back({window_rings_, (size_t) geo_.n_layers * kBootstrapWindow * win_row_bytes(format_)});
         for (int layer = 0; layer < geo_.n_layers; ++layer) {
             const int ratio = geo_.compress_ratio[(size_t) layer];
             if (!ratio) continue;
@@ -575,8 +576,8 @@ public:
             const int ratio = geo_.compress_ratio[(size_t) layer];
             if (!ratio) continue;
             const size_t rows = (size_t) (positions / ratio);
-            bytes += rows * 512 * sizeof(float);
-            if (ratio == 4) bytes += rows * 128 * sizeof(float);
+            bytes += rows * comp_row_bytes(format_);
+            if (ratio == 4) bytes += rows * idx_row_bytes(format_);
         }
         return bytes;
     }
@@ -592,19 +593,21 @@ public:
             const int ratio = geo_.compress_ratio[(size_t) layer];
             if (!ratio) continue;
             const size_t rows = (size_t) (positions / ratio);
-            const size_t attn_bytes = rows * 512 * sizeof(float);
+            const size_t attn_bytes = rows * comp_row_bytes(format_);
+            const size_t index_bytes = rows * idx_row_bytes(format_);
             const LayerCache& c = layer_cache_[(size_t) layer];
             if (attn_bytes > c.attention->backed() ||
-                (ratio == 4 && rows * 128 * sizeof(float) > c.indexer->backed()))
+                (ratio == 4 && index_bytes > c.indexer->backed()))
                 return {model::Status::Error, "deepseek4: a compressed cache is not backed through the checkpoint position"};
             core::ConversationKv item;
-            item.format = 400 + ratio;
+            // 4xx is the F32 layout; packed/fp16 images carry their own code so a mismatched encoder is refused.
+            item.format = (format_ == CacheFormat::Fp8 ? 500 : 600) + ratio;
             item.cells = positions;
             item.page_size = ratio;
             item.heads = 1;
-            item.head_dim = 512;
+            item.head_dim = (int64_t) comp_row_bytes(format_);
             item.pooled_rows = ratio == 4 ? (int64_t) rows : 0;
-            item.idx_dim = ratio == 4 ? 128 : 0;
+            item.idx_dim = ratio == 4 ? (int64_t) idx_row_bytes(format_) : 0;
             item.k.resize_for_overwrite(attn_bytes);
             const auto down = [&](const uint8_t* src, core::ConversationBuffer& dst) {
                 return dst.visit(0, dst.size(), [&](uint8_t* p, size_t n, size_t at) {
@@ -614,7 +617,7 @@ public:
             if (!down(c.attention->data(), item.k))
                 return {model::Status::Error, "deepseek4: compressed attention checkpoint copy failed"};
             if (ratio == 4) {
-                item.pooled.resize_for_overwrite(rows * 128 * sizeof(float));
+                item.pooled.resize_for_overwrite(index_bytes);
                 if (!down(c.indexer->data(), item.pooled))
                     return {model::Status::Error, "deepseek4: indexer checkpoint copy failed"};
             }
@@ -634,11 +637,13 @@ public:
             if (index >= kv.size()) return {model::Status::Error, "deepseek4: parked conversation is missing a compressed layer"};
             const core::ConversationKv& item = kv[index++];
             const size_t rows = (size_t) (positions / ratio);
-            const size_t attn_bytes = rows * 512 * sizeof(float);
-            if (item.format != 400 + ratio || item.cells != positions || item.page_size != ratio || item.heads != 1 ||
-                item.head_dim != 512 || item.k.size() != attn_bytes ||
-                (ratio == 4 && (item.pooled_rows != (int64_t) rows || item.idx_dim != 128 ||
-                                item.pooled.size() != rows * 128 * sizeof(float))) ||
+            const size_t attn_bytes = rows * comp_row_bytes(format_);
+            const size_t index_bytes = rows * idx_row_bytes(format_);
+            if (item.format != ((format_ == CacheFormat::Fp8 ? 500 : 600) + ratio) || item.cells != positions ||
+                item.page_size != ratio || item.heads != 1 ||
+                item.head_dim != (int64_t) comp_row_bytes(format_) || item.k.size() != attn_bytes ||
+                (ratio == 4 && (item.pooled_rows != (int64_t) rows || item.idx_dim != (int64_t) idx_row_bytes(format_) ||
+                                item.pooled.size() != index_bytes)) ||
                 (ratio != 4 && (!item.pooled.empty() || item.pooled_rows != 0 || item.idx_dim != 0)))
                 return {model::Status::Error, "deepseek4: parked compressed layer geometry does not match"};
             LayerCache& c = layer_cache_[(size_t) layer];
@@ -650,7 +655,7 @@ public:
                     if (!c.attention->ensure(attn_bytes, keep_free, why)) return {model::Status::Error, "deepseek4: " + why};
                 } else return {model::Status::Error, "deepseek4: " + why};
             }
-            if (ratio == 4 && !c.indexer->ensure(rows * 128 * sizeof(float), keep_free, why))
+            if (ratio == 4 && !c.indexer->ensure(index_bytes, keep_free, why))
                 return {model::Status::Error, "deepseek4: " + why};
             const auto up = [&](const core::ConversationBuffer& src, uint8_t* dst) {
                 return src.visit(0, src.size(), [&](const uint8_t* p, size_t n, size_t at) {
@@ -735,7 +740,7 @@ public:
 
     std::string info_words() const override {
         const core::ExpertTier* tier = model_.tier();
-        const std::string kv = "kv=fp32";   // window rows, compressed rows and index keys are F32
+        const std::string kv = format_ == CacheFormat::Fp8 ? "kv=fp8" : "kv=fp16";
         return tier ? "expert_slots=" + std::to_string(tier->gpu_slots()) + " expert_slots_primary=" +
                           std::to_string(tier->slots()) + " ram_experts_mib=" + std::to_string(tier->ram_bytes() >> 20) +
                           " " + kv + " " + program::spill_words(tier->spill())
@@ -776,7 +781,7 @@ private:
 
     bool reset_sequence() {
         if (!sync()) return false;
-        if (cudaMemsetAsync(window_rings_, 0, (size_t) geo_.n_layers * kBootstrapWindow * 512 * sizeof(float), stream_) != cudaSuccess) {
+        if (cudaMemsetAsync(window_rings_, 0, (size_t) geo_.n_layers * kBootstrapWindow * win_row_bytes(format_), stream_) != cudaSuccess) {
             err_ = "cannot clear the attention window rings";
             return false;
         }
@@ -946,7 +951,8 @@ private:
     uint8_t *route_fixed_mask_ = nullptr, *route_alt_mask_ = nullptr;
     int32_t *position_meta_ = nullptr, *positions_ = nullptr, *win_start_ = nullptr, *win_n_ = nullptr, *sampled_ = nullptr;
     int32_t* hash_routes_ = nullptr;
-    float* window_rings_ = nullptr;
+    uint8_t* window_rings_ = nullptr;
+    CacheFormat format_ = CacheFormat::Fp8;   // the KV cache row format chosen at model start
     void *expert_input_q8_ = nullptr, *expert_scratch_ = nullptr, *expert_plan_ = nullptr;
     float* logit_bias_ = nullptr;
     float *head_hc_workspace_ = nullptr, *head_coef_ = nullptr, *head_collapsed_ = nullptr, *head_normed_ = nullptr;
@@ -1029,8 +1035,8 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
 
         kernels::SparseMqaArgs selection;
         selection.n_tokens = n_tokens;
-        selection.win = window_rings_ + (size_t) layer * kBootstrapWindow * 512;
-        selection.win_type = kernels::MqaRowType::F32;
+        selection.win = window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_);
+        selection.win_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp8 : kernels::MqaRowType::F16;
         selection.win_cap = kBootstrapWindow;
         selection.win_start = win_start_;
         selection.win_n = win_n_;
@@ -1056,7 +1062,7 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
             selection.comp_limit = nullptr;
             if (ratio) {
                 LayerCache& cache = layer_cache_[(size_t) layer];
-                const uint64_t cache_bytes = (uint64_t) visible * 512 * sizeof(float);
+                const uint64_t cache_bytes = (uint64_t) visible * comp_row_bytes(format_);
                 const uint64_t keep_free = model_.tier() ? model_.tier()->free_floor() : 0;
                 std::string cache_error;
                 const auto ensure_cache = [&](core::ElasticArray& array, uint64_t bytes) {
@@ -1090,7 +1096,7 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                         err_ = "deepseek4: CSA layer is missing validated indexer tensors";
                         return false;
                     }
-                    if (!ensure_cache(*cache.indexer, (uint64_t) visible * 128 * sizeof(float))) return false;
+                    if (!ensure_cache(*cache.indexer, (uint64_t) visible * idx_row_bytes(format_))) return false;
 
                     kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
                                                        static_cast<const uint16_t*>(index_kv->ptr), indexer_kv_,
@@ -1101,7 +1107,7 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                     indexer_compress_projected(n_tokens, indexer_kv_, indexer_score_, static_cast<const float*>(index_ape->ptr),
                         positions_, static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
                         cache.indexer_state_kv, cache.indexer_state_score,
-                        reinterpret_cast<float*>(cache.indexer->data()), comp_row_, stream_);
+                        cache.indexer->data(), comp_row_, format_, stream_);
 
                     float angles[kExpertWindow * 32]{};
                     for (int t = 0; t < n_tokens; ++t)
@@ -1113,9 +1119,9 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                         attn_normed_, indexer_rope_angles_, n_tokens, indexer_q_, indexer_head_weights_,
                         indexer_project_workspace_, indexer_project_workspace_bytes(n_tokens), stream_);
                     if (visible > 0) {
-                        indexer_select(indexer_q_, indexer_head_weights_, reinterpret_cast<const float*>(cache.indexer->data()),
+                        indexer_select(indexer_q_, indexer_head_weights_, cache.indexer->data(),
                             visible, (int) pos, n_tokens, selected_ids_, indexer_select_count_, indexer_select_workspace_,
-                            indexer_select_workspace_bytes(visible), stream_);
+                            indexer_select_workspace_bytes(visible), format_, stream_);
                         selection.n_sel = kernels::kSparseMqaTopK;
                         selection.sel = selected_ids_;
                         selection.comp = cache.attention->data();
@@ -1143,7 +1149,7 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                     static_cast<const float*>(attn_ape->ptr), positions_, static_cast<const float*>(attn_norm->ptr),
                     geo_.rms_eps, compress_rope_freq_, attn_comp_kv_, attn_comp_score_,
                     cache.attention_state_kv, cache.attention_state_score,
-                    reinterpret_cast<float*>(cache.attention->data()), comp_row_, stream_);
+                    cache.attention->data(), comp_row_, format_, stream_);
             }
 
             kernels::sparse_mqa_q_heads(attention.attention.q, n_tokens, positions_, ropes_[(size_t) layer].attention,
@@ -1151,8 +1157,8 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
             project_attention_kv(attn_normed_, attention.attention.kv_type, attention.attention.kv,
                 attention.attention.kv_norm, geo_.rms_eps, positions_, ropes_[(size_t) layer].attention, n_tokens,
                 attn_q8_, kv_projected_, kv_row_, stream_);
-            cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * 512,
-                                   kv_row_, positions_, n_tokens, stream_);
+            cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_),
+                                   kv_row_, positions_, n_tokens, format_, stream_);
             selection.q = q_heads_;
             selection.sinks = attention.attention.sinks;
             selection.round_output_bf16 = true;
@@ -1476,7 +1482,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                 const int visible_end = (int) ((pos + offset + T) / ratio);
                 const uint64_t keep_free = tier->free_floor();
                 std::string cache_error;
-                if (!cache.attention->ensure((uint64_t) visible_end * 512 * sizeof(float), keep_free, cache_error)) {
+                if (!cache.attention->ensure((uint64_t) visible_end * comp_row_bytes(format_), keep_free, cache_error)) {
                     err_ = "deepseek4: cannot grow compressed cache: " + cache_error;
                     return false;
                 }
@@ -1489,7 +1495,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                     return false;
                 }
                 if (ratio == 4) {
-                    if (!cache.indexer->ensure((uint64_t) visible_end * 128 * sizeof(float), keep_free, cache_error)) {
+                    if (!cache.indexer->ensure((uint64_t) visible_end * idx_row_bytes(format_), keep_free, cache_error)) {
                         err_ = "deepseek4: cannot grow indexer cache: " + cache_error;
                         return false;
                     }
@@ -1530,7 +1536,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                             static_cast<const float*>(index_ape->ptr), chunk_pos + row,
                             static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
                             cache.indexer_state_kv, cache.indexer_state_score,
-                            reinterpret_cast<float*>(cache.indexer->data()), tile_comp_row, stream_);
+                            cache.indexer->data(), tile_comp_row, format_, stream_);
                         if (tile_visible > 0) {
                             indexer_round_bf16(chunk_q_latent + (size_t) row * 1024, b, tile_idx_qr_bf16, stream_);
                             if (!prompt_ffn->dense_mmq(tile_idx_qr_bf16, 1024, index_q->type, index_q->ptr,
@@ -1547,10 +1553,9 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                             indexer_project_post(static_cast<const uint16_t*>(index_proj->ptr), tile_idx_q_raw,
                                 normalized + (size_t) row * n, tile_idx_angles, b, tile_idx_w_raw,
                                 tile_idx_q_out, tile_idx_hw, stream_);
-                            indexer_select(tile_idx_q_out, tile_idx_hw,
-                                reinterpret_cast<const float*>(cache.indexer->data()),
+                            indexer_select(tile_idx_q_out, tile_idx_hw, cache.indexer->data(),
                                 tile_visible, (int) (pos + offset + row), b, tile_sel_ids, tile_sel_cnt,
-                                indexer_select_workspace_, indexer_select_workspace_bytes(tile_visible), stream_);
+                                indexer_select_workspace_, indexer_select_workspace_bytes(tile_visible), format_, stream_);
                         }
                     }
                     const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
@@ -1559,7 +1564,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                         static_cast<const float*>(attn_ape->ptr), chunk_pos + row,
                         static_cast<const float*>(attn_norm->ptr), geo_.rms_eps, compress_rope_freq_,
                         tile_comp_kv, tile_comp_score, cache.attention_state_kv, cache.attention_state_score,
-                        reinterpret_cast<float*>(cache.attention->data()), tile_comp_row, stream_);
+                        cache.attention->data(), tile_comp_row, format_, stream_);
                 }
 
                 for (int sub = 0; sub < b; sub += kExpertWindow) {
@@ -1568,8 +1573,8 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                     const int64_t sub_pos = pos + offset + g_row;
                     kernels::SparseMqaArgs sel;
                     sel.n_tokens = count;
-                    sel.win = window_rings_ + (size_t) layer * kBootstrapWindow * 512;
-                    sel.win_type = kernels::MqaRowType::F32;
+                    sel.win = window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_);
+                    sel.win_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp8 : kernels::MqaRowType::F16;
                     sel.win_cap = kBootstrapWindow;
                     sel.win_start = chunk_win_start + g_row;
                     sel.win_n = chunk_win_n + g_row;
@@ -1592,8 +1597,8 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                             sel.comp_limit = chunk_comp_limit + g_row;
                         }
                     }
-                    cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * 512,
-                                           chunk_kv_row + (size_t) g_row * 512, chunk_pos + g_row, count, stream_);
+                    cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_),
+                                           chunk_kv_row + (size_t) g_row * 512, chunk_pos + g_row, count, format_, stream_);
                     sel.q = tile_q_heads + (size_t) sub * 64 * 512;
                     sel.sinks = attention.attention.sinks;
                     sel.round_output_bf16 = true;

@@ -46,15 +46,7 @@ std::vector<float> reference(const std::vector<float>& projected, const std::vec
             out[base + d] = bf16_round((float) (a * cosine - b * sine));
             out[base + d + 1] = bf16_round((float) (a * sine + b * cosine));
         }
-        for (int group = 0; group < QuantWidth / 64; ++group) {
-            float amax = 0.f;
-            for (int i = group * 64; i < (group + 1) * 64; ++i) amax = std::max(amax, std::fabs(out[base + i]));
-            const float scale = pow2_ceil(std::max(amax, 1e-4f) * (1.f / 448.f));
-            for (int i = group * 64; i < (group + 1) * 64; ++i) {
-                const float q = std::clamp(out[base + i] / scale, -448.f, 448.f);
-                out[base + i] = bf16_round(e4m3_round(q) * scale);
-            }
-        }
+        // f32 rows keep the reference's unrounded boundary values.
     }
     return out;
 }
@@ -82,7 +74,7 @@ int main(int argc, char** argv) {
     Dev<float> dcache(initial);
     const std::vector<int32_t> cache_positions = {1, 3, 126, 127, 128};
     Dev<int32_t> dcache_positions(cache_positions);
-    cache_attention_window(dcache.p, dout.p, dcache_positions.p, T, nullptr);
+    cache_attention_window_f32(dcache.p, dout.p, dcache_positions.p, T, nullptr);
     const auto cache = dcache.down();
     std::vector<float> cache_ref = initial;
     for (int t = 0; t < T; ++t) {
@@ -111,7 +103,7 @@ int main(int argc, char** argv) {
         });
         bench_line("deepseek4 KV boundary T=5", us, (double) T * (2 * D + D + 1) * sizeof(float));
         const double cache_us = bench_stream_us([&](void* stream) {
-            cache_attention_window(dcache.p, dout.p, dcache_positions.p, T, stream);
+            cache_attention_window_f32(dcache.p, dout.p, dcache_positions.p, T, stream);
         });
         bench_line("deepseek4 KV ring write T=5", cache_us, (double) T * D * 2 * sizeof(float));
     }

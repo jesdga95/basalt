@@ -1,5 +1,7 @@
 #include "basalt/models/deepseek4/attention.hpp"
 
+#include "cache_rows.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -55,17 +57,12 @@ __device__ __forceinline__ float bf16_round(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
 
-__device__ __forceinline__ float pow2_ceil(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    const int exponent = (int) ((bits >> 23) & 0xffu) - 127 + ((bits & 0x7fffffu) != 0u);
-    return __uint_as_float((uint32_t) (exponent + 127) << 23);
-}
-
+// The KV boundary's values: BF16-rounded projection, RMSNorm, forward RoPE, BF16-rounded. The cache writer rounds them
+// for its format (the reference's act_quant for packed rows); `out` keeps the unrounded values for staging.
 __global__ void prepare_kv_kernel(const float* projected, const float* norm, float eps, const int32_t* positions,
                                   kernels::MqaRopeTable rope, float* out) {
     __shared__ float row[D];
     __shared__ float partial[Threads / 32];
-    __shared__ float scales[QuantWidth / 64];
     const int token = blockIdx.x;
     const int i = threadIdx.x;
     const size_t base = (size_t) token * D;
@@ -87,31 +84,23 @@ __global__ void prepare_kv_kernel(const float* projected, const float* norm, flo
         row[d + 1] = bf16_round(a * sine + b * cosine);
     }
     __syncthreads();
-
-#pragma unroll
-    for (int group = 0; group < QuantWidth / 64; ++group) {
-        const float local = i >= group * 64 && i < (group + 1) * 64 ? fabsf(row[i]) : 0.f;
-        const float amax = reduce_max(local, partial);
-        if (i == 0) scales[group] = pow2_ceil(fmaxf(amax, 1e-4f) * (1.f / 448.f));
-        __syncthreads();
-    }
-
-    float value = row[i];
-    if (i < QuantWidth) {
-        const float scale = scales[i / 64];
-        const float quantized = fminf(448.f, fmaxf(-448.f, value / scale));
-        value = bf16_round((float) __nv_fp8_e4m3(quantized) * scale);
-    }
-    out[base + i] = value;
+    out[base + i] = row[i];
 }
 
-__global__ void cache_window_kernel(float* ring, const float* rows, const int32_t* positions, int n_tokens) {
+__global__ void cache_window_kernel(uint8_t* ring, const float* rows, const int32_t* positions, int n_tokens,
+                                    int row_bytes, int mode) {
     const int token = blockIdx.x;
     const int position = positions[token];
     if (position < 0) return;
-    const size_t dst = (size_t) (position % 128) * D;
-    const size_t src = (size_t) token * D;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) ring[dst + i] = rows[src + i];
+    uint8_t* row = ring + (size_t) (position % 128) * row_bytes;
+    const float* src = rows + (size_t) token * D;
+    if (mode == 1) {
+        rows::put_fp8(src[threadIdx.x], threadIdx.x, D, row);
+    } else if (mode == 0) {
+        static_cast<__half*>(static_cast<void*>(row))[threadIdx.x] = __float2half(src[threadIdx.x]);
+    } else {
+        static_cast<float*>(static_cast<void*>(row))[threadIdx.x] = src[threadIdx.x];
+    }
 }
 
 void check_launch() {
@@ -130,10 +119,21 @@ void prepare_attention_kv(const float* projected, const float* norm, float rms_e
     check_launch();
 }
 
-void cache_attention_window(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream) {
+void cache_attention_window(void* ring, const float* rows, const int32_t* positions, int n_tokens, CacheFormat fmt,
+                            void* stream) {
     if (!ring || !rows || !positions || n_tokens < 1)
         throw std::invalid_argument("deepseek4 cache_attention_window: invalid arguments");
-    cache_window_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(ring, rows, positions, n_tokens);
+    cache_window_kernel<<<n_tokens, D, 0, (cudaStream_t) stream>>>(static_cast<uint8_t*>(ring), rows, positions,
+                                                                   n_tokens, win_row_bytes(fmt),
+                                                                   row_mode(fmt));
+    check_launch();
+}
+
+void cache_attention_window_f32(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream) {
+    if (!ring || !rows || !positions || n_tokens < 1)
+        throw std::invalid_argument("deepseek4 cache_attention_window_f32: invalid arguments");
+    cache_window_kernel<<<n_tokens, D, 0, (cudaStream_t) stream>>>(reinterpret_cast<uint8_t*>(ring), rows, positions,
+                                                                   n_tokens, D * 4, 2);
     check_launch();
 }
 

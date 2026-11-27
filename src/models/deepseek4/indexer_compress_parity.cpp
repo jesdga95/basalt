@@ -107,7 +107,8 @@ void reference(int n_tokens, const std::vector<float>& kv, const std::vector<flo
             for (int c = group * 32; c < (group + 1) * 32; ++c) amax = std::max(amax, std::fabs(values[c]));
             const float scale = pow2_ceil(amax * (1.f / 6.f));
             for (int c = group * 32; c < (group + 1) * 32; ++c)
-                values[c] = bf16_rn(fp4_rn(std::clamp(values[c] / scale, -6.f, 6.f)) * scale);
+                (void) fp4_rn;   // --kv f32 keeps the unrounded rotated values
+                (void) scale;
         }
         for (int c = 0; c < D; ++c) out[(size_t) (p / Ratio) * D + c] = values[c];
     }
@@ -136,7 +137,7 @@ bool run_case(int total_tokens, int chunk, uint32_t seed) {
         const int count = std::min(chunk, total_tokens - start);
         indexer_compress_projected(count, dkv.p + (size_t) start * Width, dscore.p + (size_t) start * Width,
                                    dape.p, dpos.p + start, dnorm.p, eps, dfreq.p, dstate_kv.p, dstate_score.p,
-                                   dout.p, drow.p + start, nullptr);
+                                   dout.p, drow.p + start, CacheFormat::F32, nullptr);
     }
     got_kv = dstate_kv.down();
     got_score = dstate_score.down();
@@ -157,7 +158,7 @@ bool run_case(int total_tokens, int chunk, uint32_t seed) {
                 got_rows == ref_rows ? "match" : "MISMATCH");
     const double us = ds4test::bench_stream_us([&](void* stream) {
         indexer_compress_projected(std::min(chunk, 8), dkv.p, dscore.p, dape.p, dpos.p, dnorm.p, eps, dfreq.p,
-                                   dstate_kv.p, dstate_score.p, dout.p, drow.p, stream);
+                                   dstate_kv.p, dstate_score.p, dout.p, drow.p, CacheFormat::F32, stream);
     }, 100);
     const double bytes = (double) std::min(chunk, 8) * Width * 2 * sizeof(float) +
                          (double) Ratio * Width * sizeof(float) + D * 2 * sizeof(float);

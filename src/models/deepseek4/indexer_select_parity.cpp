@@ -15,8 +15,36 @@ namespace {
 
 struct ScoredRow { double score; int32_t row; };
 
-void reference(const std::vector<float>& q, const std::vector<float>& weights, const std::vector<float>& keys,
+float e2m1_rn(float v) {
+    const float a = std::fabs(v);
+    const float m = a <= 0.25f ? 0.f : a < 0.75f ? .5f : a <= 1.25f ? 1.f : a < 1.75f ? 1.5f : a <= 2.5f ? 2.f
+                    : a < 3.5f ? 3.f : a <= 5.f ? 4.f : 6.f;
+    return std::copysign(m, v);
+}
+
+float pow2_ceil(float v) {
+    int e = 0;
+    const float f = std::frexp(v, &e);
+    return std::ldexp(1.f, f == 0.5f ? e - 1 : e);
+}
+
+// The indexer rounds its queries the way it rounds its keys: E2M1 codes with a power-of-two scale per 32.
+std::vector<float> round_queries(const std::vector<float>& q) {
+    std::vector<float> r = q;
+    for (size_t h = 0; h < r.size() / kIndexerDim; ++h)
+        for (int g = 0; g < kIndexerDim; g += 32) {
+            float amax = 0.f;
+            for (int d = g; d < g + 32; ++d) amax = std::max(amax, std::fabs(r[h * kIndexerDim + d]));
+            const float scale = pow2_ceil(std::max(amax, 6.f * 1.1754943508222875e-38f) / 6.f);
+            for (int d = g; d < g + 32; ++d)
+                r[h * kIndexerDim + d] = e2m1_rn(std::clamp(r[h * kIndexerDim + d] / scale, -6.f, 6.f)) * scale;
+        }
+    return r;
+}
+
+void reference(const std::vector<float>& q_in, const std::vector<float>& weights, const std::vector<float>& keys,
                int n_comp, int start_pos, int n_tokens, std::vector<int32_t>& out, std::vector<int32_t>& counts) {
+    const std::vector<float> q = round_queries(q_in);
     for (int t = 0; t < n_tokens; ++t) {
         const int visible = (start_pos + t + 1) / kIndexerRatio;
         const int count = std::min(kIndexerTopK, visible);
@@ -56,7 +84,7 @@ bool run() {
     Dev<int32_t> got((size_t) T * kIndexerTopK), got_n(T);
     const size_t workspace_bytes = indexer_select_workspace_bytes(N);
     Dev<uint8_t> workspace(workspace_bytes);
-    indexer_select(dq.p, dw.p, dk.p, N, Start, T, got.p, got_n.p, workspace.p, workspace_bytes, nullptr);
+    indexer_select(dq.p, dw.p, dk.p, N, Start, T, got.p, got_n.p, workspace.p, workspace_bytes, CacheFormat::F32, nullptr);
     const auto ids = got.down();
     const auto counts = got_n.down();
     const bool ok = ids == expected && counts == expected_n;
@@ -73,13 +101,13 @@ bool run() {
 
     std::vector<int32_t> chunk_ids((size_t) T * kIndexerTopK, -1), chunk_counts(T, 0);
     Dev<int32_t> chunk_out((size_t) T * kIndexerTopK), chunk_n(T);
-    indexer_select(dq.p, dw.p, dk.p, N, Start, 4, chunk_out.p, chunk_n.p, workspace.p, workspace_bytes, nullptr);
+    indexer_select(dq.p, dw.p, dk.p, N, Start, 4, chunk_out.p, chunk_n.p, workspace.p, workspace_bytes, CacheFormat::F32, nullptr);
     auto first_ids = chunk_out.down();
     auto first_counts = chunk_n.down();
     std::copy_n(first_ids.begin(), (size_t) 4 * kIndexerTopK, chunk_ids.begin());
     std::copy_n(first_counts.begin(), 4, chunk_counts.begin());
     indexer_select(dq.p + (size_t) 4 * kIndexerHeads * kIndexerDim, dw.p + (size_t) 4 * kIndexerHeads,
-                   dk.p, N, Start + 4, 4, chunk_out.p, chunk_n.p, workspace.p, workspace_bytes, nullptr);
+                   dk.p, N, Start + 4, 4, chunk_out.p, chunk_n.p, workspace.p, workspace_bytes, CacheFormat::F32, nullptr);
     const auto second_ids = chunk_out.down();
     const auto second_counts = chunk_n.down();
     std::copy_n(second_ids.begin(), (size_t) 4 * kIndexerTopK,
@@ -91,7 +119,7 @@ bool run() {
     Dev<int32_t> edge_out((size_t) 4 * kIndexerTopK), edge_n(4);
     const size_t edge_workspace_bytes = indexer_select_workspace_bytes(1);
     Dev<uint8_t> edge_workspace(edge_workspace_bytes);
-    indexer_select(dq.p, dw.p, dk.p, 1, 0, 4, edge_out.p, edge_n.p, edge_workspace.p, edge_workspace_bytes, nullptr);
+    indexer_select(dq.p, dw.p, dk.p, 1, 0, 4, edge_out.p, edge_n.p, edge_workspace.p, edge_workspace_bytes, CacheFormat::F32, nullptr);
     const auto edge_ids = edge_out.down();
     const auto edge_counts = edge_n.down();
     const bool edge_ok = edge_counts == std::vector<int32_t>({0, 0, 0, 1}) &&
@@ -103,7 +131,7 @@ bool run() {
     std::printf("DS4 indexer select empty/single-row edge: %s\n", edge_ok ? "match" : "MISMATCH");
 
     const double us = ds4test::bench_stream_us([&](void* stream) {
-        indexer_select(dq.p, dw.p, dk.p, N, Start, T, got.p, got_n.p, workspace.p, workspace_bytes, stream);
+        indexer_select(dq.p, dw.p, dk.p, N, Start, T, got.p, got_n.p, workspace.p, workspace_bytes, CacheFormat::F32, stream);
     }, 25);
     const double bytes = (double) T * (kIndexerHeads * kIndexerDim + kIndexerHeads) * sizeof(float) +
                          (double) N * kIndexerDim * sizeof(float);
@@ -121,14 +149,14 @@ bool run() {
         Dev<int32_t> actual((size_t) kIndexerTopK), actual_count(1);
         const size_t bytes_ws = indexer_select_workspace_bytes(rows);
         Dev<uint8_t> dws(bytes_ws);
-        indexer_select(dbq.p, dbw.p, dbk.p, rows, start, 1, actual.p, actual_count.p, dws.p, bytes_ws, nullptr);
+        indexer_select(dbq.p, dbw.p, dbk.p, rows, start, 1, actual.p, actual_count.p, dws.p, bytes_ws, CacheFormat::F32, nullptr);
         const bool one_ok = actual.down() == expected && actual_count.down() == expected_count;
         boundary_ok = boundary_ok && one_ok;
         std::printf("DS4 indexer selector boundary rows=%d: %s\n", rows, one_ok ? "match" : "MISMATCH");
         if (rows == 12288) {
             const double large_us = ds4test::bench_stream_us([&](void* stream) {
                 indexer_select(dbq.p, dbw.p, dbk.p, rows, start, 1, actual.p, actual_count.p,
-                               dws.p, bytes_ws, stream);
+                               dws.p, bytes_ws, CacheFormat::F32, stream);
             }, 10);
             const double large_bytes = (double) (kIndexerHeads * kIndexerDim + kIndexerHeads) * sizeof(float) +
                                         (double) rows * kIndexerDim * sizeof(float);

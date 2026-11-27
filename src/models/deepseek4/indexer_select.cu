@@ -1,5 +1,7 @@
 #include "basalt/models/deepseek4/indexer.hpp"
 
+#include <cuda_fp8.h>
+
 #include <cuda_runtime.h>
 #include <cub/device/device_radix_sort.cuh>
 
@@ -30,6 +32,19 @@ __device__ __forceinline__ float warp_sum(float value) {
 __device__ __forceinline__ uint32_t ordered_float(float value) {
     const uint32_t bits = __float_as_uint(value);
     return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+// ---- the index key's rounding and reading (cache_rows.hpp): E2M1 codes with a power-of-two scale per 32 ----------
+__device__ __forceinline__ float pow2_ceil_local(float x) {
+    const uint32_t b = __float_as_uint(x);
+    const int e = (int) ((b >> 23) & 0xffu) - 127 + ((b & 0x7fffffu) != 0u);
+    return __uint_as_float((uint32_t) (e + 127) << 23);
+}
+__device__ __forceinline__ float e2m1_round14(float v) {
+    const float a = fabsf(v);
+    const float m = a <= 0.25f ? 0.f : a < 0.75f ? .5f : a <= 1.25f ? 1.f : a < 1.75f ? 1.5f : a <= 2.5f ? 2.f
+                    : a < 3.5f ? 3.f : a <= 5.f ? 4.f : 6.f;
+    return copysignf(m, v) * 16384.0f;   // times 2^-14, the fp16-bit decoding's factor
 }
 
 __device__ __forceinline__ int select_scan(int v, int& total, int* ws) {
@@ -180,7 +195,7 @@ select_top_one_kernel(const float* __restrict__ scores, int n, int k, int32_t* _
 }
 
 __global__ void score_rows_kernel(const float* __restrict__ q, const float* __restrict__ head_weights,
-                                  const float* __restrict__ keys, int n_rows,
+                                  const uint8_t* __restrict__ keys, int n_rows, int mode, int row_bytes,
                                   unsigned long long* __restrict__ sort_keys, float* __restrict__ scores) {
     __shared__ float head_scores[kIndexerHeads];
     const int row = (int) blockIdx.x;
@@ -188,7 +203,7 @@ __global__ void score_rows_kernel(const float* __restrict__ q, const float* __re
     const int lane = (int) (threadIdx.x & 31);
     const float* row_q = q;
     const float* row_w = head_weights;
-    const float* row_key = keys + (size_t) row * kIndexerDim;
+    const uint8_t* row_key = keys + (size_t) row * row_bytes;
     if (row >= n_rows) return;
 
     for (int head_base = 0; head_base < kIndexerHeads; head_base += kWarps) {
@@ -197,7 +212,27 @@ __global__ void score_rows_kernel(const float* __restrict__ q, const float* __re
 #pragma unroll
         for (int part = 0; part < 4; ++part) {
             const int d = lane + 32 * part;
-            dot = fmaf(row_q[(size_t) head * kIndexerDim + d], row_key[d], dot);
+            const float qv = row_q[(size_t) head * kIndexerDim + d];
+            float amax = fabsf(qv);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            const float qscale = pow2_ceil_local(fmaxf(amax, 6.f * 1.1754943508222875e-38f) * (1.f / 6.f));
+            const float qr = e2m1_round14(fminf(6.f, fmaxf(-6.f, qv / qscale))) * qscale * (1.0f / 16384.0f);
+            float kv;
+            if (mode == 1) {
+                const uint8_t scale = row_key[kIndexerDim / 2 + part];
+                const uint8_t code = row_key[d / 2];
+                const uint8_t nib = (d & 1) ? (code >> 4) : (code & 15);
+                const float m14 = (float) (nib & 7u);   // magnitude code
+                const float mag = m14 == 0.f ? 0.f : m14 == 1.f ? .5f : m14 == 2.f ? 1.f : m14 == 3.f ? 1.5f
+                                : m14 == 4.f ? 2.f : m14 == 5.f ? 3.f : m14 == 6.f ? 4.f : 6.f;
+                kv = copysignf(mag, (nib & 8u) ? -1.f : 1.f) * __uint_as_float((uint32_t) scale << 23);
+            } else if (mode == 0) {
+                kv = __half2float(*reinterpret_cast<const __half*>(row_key + 2 * d));
+            } else {
+                kv = *reinterpret_cast<const float*>(row_key + 4 * d);
+            }
+            dot = fmaf(qr, kv, dot);
         }
         dot = warp_sum(dot);
         if (lane == 0) head_scores[head] = fmaxf(dot, 0.f) * row_w[head];
@@ -256,9 +291,9 @@ size_t indexer_select_workspace_bytes(int max_rows) {
     return align256(arrays) + align256(temp_bytes) + 256;
 }
 
-void indexer_select(const float* q, const float* head_weights, const float* keys, int n_comp, int start_pos,
+void indexer_select(const float* q, const float* head_weights, const void* keys, int n_comp, int start_pos,
                     int n_tokens, int32_t* out_ids, int32_t* n_selected, void* workspace, size_t workspace_bytes,
-                    void* stream) {
+                    CacheFormat fmt, void* stream) {
     const int required_rows = start_pos >= 0 && n_tokens > 0
         ? (int) (((int64_t) start_pos + n_tokens) / kRatio) : 0;
     const size_t minimum_bytes = n_comp > 0
@@ -289,7 +324,8 @@ void indexer_select(const float* q, const float* head_weights, const float* keys
         if (visible <= kSingleBlockRows) {
             auto* scores = reinterpret_cast<float*>(base);
             score_rows_kernel<<<visible, kThreads, 0, cuda_stream>>>(q + (size_t) t * kIndexerHeads * kIndexerDim,
-                head_weights + (size_t) t * kIndexerHeads, keys, visible, nullptr, scores);
+                head_weights + (size_t) t * kIndexerHeads, static_cast<const uint8_t*>(keys), visible,
+                row_mode(fmt), idx_row_bytes(fmt), nullptr, scores);
             check(cudaGetLastError(), "score launch");
             select_top_one_kernel<<<1, kSelectThreads, 0, cuda_stream>>>(scores, visible, count, out, out_n);
             check(cudaGetLastError(), "single-block selection launch");
@@ -301,7 +337,8 @@ void indexer_select(const float* q, const float* head_weights, const float* keys
         void* temp = base + arrays;
         size_t temp_bytes = workspace_bytes - arrays - 256;
         score_rows_kernel<<<visible, kThreads, 0, cuda_stream>>>(q + (size_t) t * kIndexerHeads * kIndexerDim,
-            head_weights + (size_t) t * kIndexerHeads, keys, visible, keys_in, nullptr);
+            head_weights + (size_t) t * kIndexerHeads, static_cast<const uint8_t*>(keys), visible,
+            row_mode(fmt), idx_row_bytes(fmt), keys_in, nullptr);
         check(cudaGetLastError(), "score launch");
         check(cub::DeviceRadixSort::SortKeysDescending(temp, temp_bytes, keys_in, keys_out, visible, 0, 64,
                                                        cuda_stream),

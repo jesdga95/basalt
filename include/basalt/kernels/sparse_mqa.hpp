@@ -17,7 +17,9 @@ constexpr int kSparseMqaOutputGroups = 8;
 constexpr int kSparseMqaOutputRank = 1024;
 constexpr int kSparseMqaGroupInput = kSparseMqaHeads * kSparseMqaDim / kSparseMqaOutputGroups;
 
-enum class MqaRowType { F32, F16, BF16 };
+/// A cache row's storage. Fp8: the model's window rows, E4M3 codes with a power-of-two scale per 32 (528 B at
+/// kSparseMqaDim 512); Fp4: compressed rows, E2M1 codes with an E4M3 scale per 16 (288 B). Layouts: cache_rows.hpp.
+enum class MqaRowType { F32, F16, BF16, Fp8, Fp4 };
 
 /// Inverse RoPE parameters applied after sparse attention; the last 64 output dimensions are rotated.
 struct MqaRopeTable {
@@ -60,8 +62,10 @@ void sparse_mqa_output(const float* attn, int wo_a_type, const void* wo_a, int w
 void sparse_mqa_output_q8(int wo_a_type, const void* wo_a, int wo_b_type, const void* wo_b, int n_embd,
                           int n_tokens, void* q8_scratch, float* latent, float* out, void* stream);
 
-/// Decode sparse MQA. Query rows are [T][64][512] float; window and selected rows are 512-wide F32/F16/BF16.
-/// Supported row pairs are F32/F32, F16/F16, F16/F32, and BF16/BF16 (the selected-row type is ignored when n_sel is 0).
+/// Decode sparse MQA. Query rows are [T][64][512] float; window and selected rows are 512-wide F32/F16/BF16, or the
+/// packed Fp8/Fp4 cache rows (layouts: the model's cache_rows.hpp; masked rows decode as zeros). Supported row pairs are
+/// F32/F32, F16/F16, F16/F32, F16/Fp4, Fp8/Fp8, Fp8/Fp4, Fp8/F32, Fp4/Fp4, and BF16/BF16 (the selected-row type is
+/// ignored when n_sel is 0).
 /// Each score is dot(q, key) * scale. `sinks[head]` joins the softmax denominator without a value. The window is a
 /// ring read in logical order from `win_start[t]` for at most 128 rows; selected IDs outside [0, comp_limit[t]) are masked.
 /// `round_output_bf16` applies the source-style BF16 output boundary after inverse RoPE while retaining float storage.

@@ -1,14 +1,15 @@
 #pragma once
 
 #include "basalt/kernels/sparse_mqa.hpp"
+#include "basalt/models/deepseek4/cache_rows.hpp"
 
 #include <cstdint>
 #include <cstddef>
 
 namespace basalt::models::deepseek4 {
 
-/// Applies the source V4 KV boundary: BF16 RMSNorm, forward RoPE, UE8M0 E4M3 simulation for non-RoPE lanes,
-/// and BF16 rounding. `projected` and `out` are [n_tokens][512] F32 containers.
+/// Applies the source V4 KV boundary: BF16 RMSNorm, forward RoPE and BF16 rounding. `projected` and `out` are
+/// [n_tokens][512] F32 containers of the unrounded values; the cache writer rounds them for its format.
 void prepare_attention_kv(const float* projected, const float* norm, float rms_eps, const int32_t* positions,
                           const kernels::MqaRopeTable& rope, int n_tokens, float* out, void* stream);
 
@@ -19,8 +20,12 @@ void project_attention_kv(const float* x, int wkv_type, const void* wkv, const f
                           const int32_t* positions, const kernels::MqaRopeTable& rope, int n_tokens,
                           void* q8_scratch, float* projected, float* out, void* stream);
 
-/// Writes prepared `[T][512]` rows to the sliding cache slot `position % 128`; ring slots must be unique within the call.
-void cache_attention_window(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream);
+/// Writes prepared `[T][512]` values to the sliding cache slot `position % 128` in `fmt`'s row layout (win_row_bytes);
+/// ring slots must be unique within the call.
+void cache_attention_window(void* ring, const float* rows, const int32_t* positions, int n_tokens, CacheFormat fmt,
+                            void* stream);
+/// The fp32 ring the step/parity paths use.
+void cache_attention_window_f32(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream);
 
 struct AttentionStepWeights {
     kernels::SparseMqaQWeights q;

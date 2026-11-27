@@ -1,5 +1,7 @@
 #include "basalt/models/deepseek4/compress.hpp"
 
+#include "cache_rows.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -93,7 +95,8 @@ __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float position
 
 __global__ void indexer_compress_kernel(int n_tokens, const float* kv, const float* score, const float* ape,
                                        const int32_t* pos, const float* norm_w, float eps, const float* rope_freq,
-                                       float* state_kv, float* state_score, float* out, int32_t* row_of) {
+                                       float* state_kv, float* state_score, void* out_bytes, int32_t* row_of,
+                                       int mode, int row_bytes) {
     __shared__ float values[D];
     __shared__ float hadamard_a[D];
     __shared__ float hadamard_b[D];
@@ -177,16 +180,11 @@ __global__ void indexer_compress_kernel(int n_tokens, const float* kv, const flo
         values[c] = rotated;
         __syncthreads();
 
-        constexpr float kFp4MinAmax = 6.f * 0x1p-126f;
-        for (int group = 0; group < D / 32; ++group) {
-            const float local = c >= group * 32 && c < (group + 1) * 32 ? fabsf(values[c]) : 0.f;
-            const float amax = fmaxf(block_max(local, partial), kFp4MinAmax);
-            if (c == 0) fp4_scales[group] = pow2_ceil(amax * (1.f / 6.f));
-            __syncthreads();
-        }
-        const float scale = fp4_scales[c / 32];
-        const float dequantized = fp4_e2m1_rn(fminf(6.f, fmaxf(-6.f, values[c] / scale))) * scale;
-        out[(size_t) row_index * D + c] = bf16_rn(dequantized);
+        // The reference rounds the key for its format: E2M1 codes with a power-of-two scale per 32, or plain fp16.
+        uint8_t* key_row = static_cast<uint8_t*>(out_bytes) + (size_t) row_index * row_bytes;
+        if (mode == 1) rows::put_fp4p(rotated, c, D, key_row);
+        else if (mode == 0) static_cast<__half*>(static_cast<void*>(key_row))[c] = __float2half(rotated);
+        else static_cast<float*>(static_cast<void*>(key_row))[c] = rotated;
         __syncthreads();
     }
 }
@@ -208,12 +206,14 @@ void check_launch(const char* name) {
 
 void indexer_compress_projected(int n_tokens, const float* kv, const float* score, const float* ape,
                                 const int32_t* pos, const float* norm_w, float rms_eps, const float* rope_freq,
-                                float* state_kv, float* state_score, float* out, int32_t* row_of, void* stream) {
+                                float* state_kv, float* state_score, void* out, int32_t* row_of, CacheFormat fmt,
+                                void* stream) {
     if (n_tokens < 1 || !kv || !score || !ape || !pos || !norm_w || !(rms_eps > 0.f) || !rope_freq ||
         !state_kv || !state_score || !out || !row_of)
         throw std::invalid_argument("deepseek4 indexer compressor: invalid arguments");
     indexer_compress_kernel<<<1, D, 0, (cudaStream_t) stream>>>(n_tokens, kv, score, ape, pos, norm_w, rms_eps,
-                                                                 rope_freq, state_kv, state_score, out, row_of);
+                                                                 rope_freq, state_kv, state_score, out, row_of,
+                                                                 row_mode(fmt), idx_row_bytes(fmt));
     check_launch("deepseek4 indexer compressor");
 }
 

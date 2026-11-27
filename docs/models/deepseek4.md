@@ -37,6 +37,31 @@ restore, and restarting at position zero. `BatchSession` is registered with the 
 expert routing currently selects its sequential fallback; this verifies API identity semantics, not parallel batch speed.
 The single available RTX 5090 leaves multi-GPU peer identity untested.
 
+## KV caches and `--kv`
+
+The session keeps three compressed cache families: sliding-window rows, the compressors' output rows, and the CSA
+indexer's keys. `--kv` chooses their row layouts at start (it is a model flag, validated by the `deepseek4` adapter):
+
+| `--kv` | window row | compressed row | index key | 65,536-token reserve | 1,048,576-token reserve |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `fp8` (default) | 528 B | 288 B | 68 B | 0.13 GiB | 1.88 GiB |
+| `fp16` | 1,024 B | 1,024 B | 256 B | 0.44 GiB | 6.74 GiB |
+
+The packed layouts are the reference's own roundings (`act_quant` for window rows and `fp4_act_quant` for compressed
+rows and index keys, as imported from Project Maya/Strata): E4M3 codes with a power-of-two (UE8M0) scale per 32,
+E2M1 codes with an E4M3 scale per 16, and E2M1 codes with a UE8M0 scale per 32. The indexer rounds its queries the same
+way before scoring. Sparse MQA decodes the packed rows exactly: score keys use each group's scale, PV values multiply
+their row's per-group scale, and masked window or selected rows decode as zeros. `ds4_cache_rows_parity` checks the
+writers and readers against a CPU packing byte for byte, and `ds4_attention_step_parity` runs the window path with
+Fp8 rows against the F32 ring (max abs 0.10 on its random fixture).
+
+Saved conversation cells carry the layout in their format code (500+ratio for packed rows, 600+ratio for fp16) and the
+row geometry, so a snapshot taken with one `--kv` is refused by the other. Cache sizes are planned by
+`src/models/deepseek4/context_policy.hpp` from those row bytes; the table's reserves are the printed cache reserve at
+`--max-context 65536` and `--max-context 1048576` on the `-hchead` pack (the 1M fp8 run used
+`--resident-budget-gib 120`). Decode is 21-22 tok/s in both layouts at 64k and 1M contexts on that SSD-bound tier (within the run-to-run spread),
+so this change buys memory, not speed.
+
 ## Drafting
 
 When the pack carries the DSpark drafter, decode drafts by default in windows of up to 6 rows (the last accepted token

@@ -32,6 +32,9 @@
 // Loads come first and conversions at use, so a lane's reads of several rows are in flight together.
 #pragma once
 
+#include <type_traits>
+#include <utility>
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -55,6 +58,15 @@ constexpr int kPvBatch = 16;
 // R::RawR where the keys have rope dims (a placeholder where they have none)
 template <class R, bool HasRope> struct RawROf { using T = uint32_t; };
 template <class R> struct RawROf<R, true> { using T = typename R::RawR; };
+
+template <class R, class = void>
+struct has_value_index_cvt4 : std::false_type {};
+template <class R>
+struct has_value_index_cvt4<R, std::void_t<decltype(R::kValueIndexCvt4)>> : std::true_type {};
+template <class R, class = void>
+struct has_scaled_cvt2 : std::false_type {};
+template <class R>
+struct has_scaled_cvt2<R, std::void_t<decltype(R::kScaledCvt2)>> : std::true_type {};
 
 // A lane's values of kScoreKeys keys (4 at lane + 32 j of each key's latent, j < 4, and Rope / 64 pairs of the rest),
 // rows of type R; masked keys give zeros. All row loads are issued before the first use.
@@ -88,7 +100,10 @@ __device__ __forceinline__ void score_keys(const uint8_t* base, const int* rowid
 #pragma unroll
     for (int u = 0; u < kScoreKeys; ++u) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) R::cvt4(raw[u][j], scl[u], j, kv[u][j]);
+        for (int j = 0; j < 4; ++j) {
+            if constexpr (has_value_index_cvt4<R>::value) R::cvt4(raw[u][j], scl[u], 4 * (lane + 32 * j), kv[u][j]);
+            else R::cvt4(raw[u][j], scl[u], j, kv[u][j]);
+        }
         if constexpr (NR > 0) {
 #pragma unroll
             for (int p = 0; p < NR; ++p) R::cvtr(rr[u][p], &kr[u][2 * p]);
@@ -100,14 +115,22 @@ __device__ __forceinline__ void score_keys(const uint8_t* base, const int* rowid
 template <class R>
 __device__ __forceinline__ void pv_rows(const uint8_t* base, const int* rowid, int k0, float (*k2)[2]) {
     typename R::Raw2 r2[kPvBatch];
+    typename R::Scales scl[kPvBatch];
 #pragma unroll
     for (int i = 0; i < kPvBatch; ++i) {
         const int row = rowid[k0 + i];
         r2[i] = typename R::Raw2{};
-        if (row >= 0) r2[i] = R::load2(base + (size_t) row * R::kRowBytes, threadIdx.x);
+        scl[i] = typename R::Scales{};
+        if (row >= 0) {
+            r2[i] = R::load2(base + (size_t) row * R::kRowBytes, threadIdx.x);
+            if constexpr (has_scaled_cvt2<R>::value) scl[i] = R::scales(base + (size_t) row * R::kRowBytes);
+        }
     }
 #pragma unroll
-    for (int i = 0; i < kPvBatch; ++i) R::cvt2(r2[i], k2[i]);
+    for (int i = 0; i < kPvBatch; ++i) {
+        if constexpr (has_scaled_cvt2<R>::value) R::cvt2(r2[i], scl[i], 2 * threadIdx.x, k2[i]);
+        else R::cvt2(r2[i], k2[i]);
+    }
 }
 
 // One step of the transposed reduction: a lane gives away the half of its N head sums its partner keeps (the upper

@@ -77,7 +77,8 @@ int main(int argc, char** argv) {
     }
     const auto& v = mmproj.hp();
     const auto cache_plan = basalt::models::deepseek4::ctxp::plan_context(
-        g.context_length, g.context_length, UINT64_MAX, g.compress_ratio);
+        g.context_length, g.context_length, UINT64_MAX, g.compress_ratio,
+        basalt::models::deepseek4::CacheFormat::Fp8);
     if (!cache_plan.error.empty() || cache_plan.context != g.context_length) {
         basalt::log::error("deepseek4 pack test", "native cache plan: %s",
                            cache_plan.error.empty() ? "native context was changed" : cache_plan.error.c_str());

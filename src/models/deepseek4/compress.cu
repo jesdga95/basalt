@@ -1,4 +1,6 @@
 #include "basalt/models/deepseek4/compress.hpp"
+
+#include "cache_rows.cuh"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 
@@ -68,8 +70,8 @@ __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float position
 
 __global__ void compress_kernel(CompressKind kind, int ratio, int n_tokens, const float* kv, const float* score,
                                 const float* ape, const int32_t* pos, const float* norm_w, float rms_eps,
-                                const float* rope_freq, float* state_kv, float* state_score, float* out,
-                                int32_t* row_of) {
+                                const float* rope_freq, float* state_kv, float* state_score, void* out_bytes,
+                                int32_t* row_of, int mode, int row_bytes) {
     __shared__ float values[kHeadDim];
     __shared__ float warp_sums[32];
     __shared__ float fp8_scales[(kHeadDim - kRopeDim) / 64];
@@ -163,28 +165,11 @@ __global__ void compress_kernel(CompressKind kind, int ratio, int n_tokens, cons
         }
         values[c] = normalized;
         __syncthreads();
-        constexpr int kFp8Width = kHeadDim - kRopeDim;
-        constexpr int kFp8Groups = kFp8Width / 64;
-        for (int group = 0; group < kFp8Groups; ++group) {
-            const float local = c >= group * 64 && c < (group + 1) * 64 ? fabsf(values[c]) : 0.f;
-            const float amax = block_max(local, warp_sums);
-            if (c == 0) {
-                const float scaled = fmaxf(amax, 1e-4f) * (1.f / 448.f);
-                const uint32_t bits = __float_as_uint(scaled);
-                int exponent = (int) ((bits >> 23) & 0xffu) - 127 + ((bits & 0x7fffffu) != 0u);
-                fp8_scales[group] = __uint_as_float((uint32_t) (exponent + 127) << 23);
-            }
-            __syncthreads();
-        }
-        if (c < kFp8Width) {
-            const float scale = fp8_scales[c / 64];
-            const float q = fminf(448.f, fmaxf(-448.f, values[c] / scale));
-            const float dequantized = (float) __nv_fp8_e4m3(q) * scale;
-            normalized = __bfloat162float(__float2bfloat16_rn(dequantized));
-        } else {
-            normalized = values[c];
-        }
-        out[(size_t) row_index * kHeadDim + c] = normalized;
+        // The reference rounds the cached row for its format: E2M1 codes with an E4M3 scale per 16, or plain fp16.
+        uint8_t* row = static_cast<uint8_t*>(out_bytes) + (size_t) row_index * row_bytes;
+        if (mode == 1) rows::put_fp4(normalized, c, kHeadDim, row);
+        else if (mode == 0) static_cast<__half*>(static_cast<void*>(row))[c] = __float2half(normalized);
+        else static_cast<float*>(static_cast<void*>(row))[c] = normalized;
         __syncthreads();
     }
 }
@@ -210,13 +195,14 @@ void check_launch(const char* name) {
 
 void compress_projected(CompressKind kind, int ratio, int n_tokens, const float* kv, const float* score,
                         const float* ape, const int32_t* pos, const float* norm_w, float rms_eps,
-                        const float* rope_freq, float* state_kv, float* state_score, float* out,
-                        int32_t* row_of, void* stream) {
+                        const float* rope_freq, float* state_kv, float* state_score, void* out,
+                        int32_t* row_of, CacheFormat fmt, void* stream) {
     if (ratio != expected_ratio(kind) || n_tokens < 1 || !kv || !score || !ape || !pos ||
         !norm_w || !rope_freq || !state_kv || !state_score || !out || !row_of || !(rms_eps > 0.0f))
         throw std::invalid_argument("deepseek4 compress_projected: invalid arguments");
     compress_kernel<<<1, kHeadDim, 0, (cudaStream_t) stream>>>(kind, ratio, n_tokens, kv, score, ape, pos, norm_w,
-                                                                rms_eps, rope_freq, state_kv, state_score, out, row_of);
+                                                                rms_eps, rope_freq, state_kv, state_score, out, row_of,
+                                                                row_mode(fmt), comp_row_bytes(fmt));
     check_launch("deepseek4 compress_projected");
 }
 
@@ -224,7 +210,7 @@ void project_and_compress(CompressKind kind, int ratio, int n_embd, int n_tokens
                           const uint16_t* kv_weight, const uint16_t* score_weight, const float* ape,
                           const int32_t* pos, const float* norm_w, float rms_eps, const float* rope_freq,
                           float* kv_projected, float* score_projected, float* state_kv, float* state_score,
-                          float* out, int32_t* row_of, void* stream) {
+                          void* out, int32_t* row_of, CacheFormat fmt, void* stream) {
     const int width = kind == CompressKind::Csa ? 2 * kHeadDim : kHeadDim;
     if (ratio != expected_ratio(kind) || n_embd < 8 || n_embd % 8 != 0 || n_tokens < 1 ||
         !x || !kv_weight || !score_weight || !ape || !pos || !norm_w || !rope_freq || !kv_projected ||
@@ -238,7 +224,7 @@ void project_and_compress(CompressKind kind, int ratio, int n_embd, int n_tokens
         kernels::bf16_rows_dot(x, score_weight, score_projected, n_tokens, width, n_embd, stream);
     }
     compress_projected(kind, ratio, n_tokens, kv_projected, score_projected, ape, pos, norm_w, rms_eps, rope_freq,
-                       state_kv, state_score, out, row_of, stream);
+                       state_kv, state_score, out, row_of, fmt, stream);
 }
 
 void reset_compress_state(CompressKind kind, int ratio, float* state_kv, float* state_score, void* stream) {

@@ -48,7 +48,7 @@ model::Result DsModel::ensure_tier() {
     spec.host.ram_only = [this] { weights_.warm_token_table(); };
     auto tier = std::make_shared<core::ExpertTier>(std::move(spec));
     core::ExpertTier::Reserve reserve;
-    const ctxp::Footprint footprint = ctxp::cache_footprint(context_, g.compress_ratio);
+    const ctxp::Footprint footprint = ctxp::cache_footprint(context_, g.compress_ratio, format_);
     if (!footprint.error.empty()) return failure(footprint.error);
     uint64_t gpu_keep = footprint.total;
     if (!ctxp::add(gpu_keep, kModuleRoom, gpu_keep))
@@ -104,6 +104,9 @@ model::Result DsModel::plan(const model::LoadRequest& request, core::LoadPlan& r
         return failure("DeepSeek4 currently runs on one GPU");
 
     request_ = request;
+    if (!request.kv.empty() && request.kv != "fp8" && request.kv != "fp16")
+        return failure("unsupported --kv " + request.kv + "; DeepSeek4 caches are fp8 (default) or fp16");
+    format_ = request.kv == "fp16" ? CacheFormat::Fp16 : CacheFormat::Fp8;
     if (cudaGetDevice(&device_) != cudaSuccess) return failure("cannot query the current CUDA device");
     std::string err;
     if (!weights_.plan(request.paths.front(), device_, reads, err)) return failure(err);
@@ -143,7 +146,7 @@ model::Result DsModel::plan(const model::LoadRequest& request, core::LoadPlan& r
         return failure("cannot query free CUDA memory after dense weights were planned");
     (void) total_bytes;
     const ctxp::Plan context_plan = ctxp::plan_context(request.max_context, g.context_length,
-                                                        (uint64_t) free_bytes, g.compress_ratio);
+                                                        (uint64_t) free_bytes, g.compress_ratio, format_);
     if (!context_plan.error.empty()) return failure(context_plan.error);
     context_ = context_plan.context;
     if (!context_plan.note.empty()) basalt::log::warn("basalt deepseek4", "%s", context_plan.note.c_str());

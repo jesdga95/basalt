@@ -57,8 +57,8 @@ public:
     program::GpuModes gpu_modes() const override { return {}; }
     int max_slots() const override { return 8; }
     const char* model_name() const override { return "DeepSeek-V4-Flash-Vision-Exp"; }
-    // Its caches are F32, it takes no --kv format: a community row runs the model's own.
-    const char* community_kv() const override { return ""; }
+    // The model's own caches run with the --kv format; community rows default to fp8, the shipped configuration.
+    const char* community_kv() const override { return "fp8"; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         if (model::parse_route_flag(a, args, o.route, code)) {}
@@ -68,6 +68,8 @@ public:
             if (o.spec < 0 || o.spec > 8) code = 2;
         } else if (a == "--spec-oracle") {
             o.spec_oracle = args.next("--spec-oracle");
+        } else if (a == "--kv") {
+            o.kv = args.next("--kv");
         } else if (a == "--draft-experts") {
             o.draft_experts = std::atoi(args.next("--draft-experts"));
         } else if (a == "--draft-log") {
@@ -83,6 +85,7 @@ public:
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (o.kv.empty()) o.kv = "fp8";
         core::ModelFile file;
         std::string err;
         const bool opened = !o.model.empty() && file.open(o.model, err);
@@ -108,6 +111,10 @@ public:
         if (const std::optional<int> code =
                 model::finish_route_flags(o, used ? (int) used->num() : 0, kRoutePriorBare, "basalt deepseek4"))
             return code;
+        if (!o.kv.empty() && o.kv != "fp8" && o.kv != "fp16") {
+            basalt::log::error("basalt deepseek4", "--kv %s: DeepSeek4 caches are fp8 (default) or fp16", o.kv.c_str());
+            return 2;
+        }
         if (!meta) return std::nullopt;
         const core::Json* native = kv ? kv->get("deepseek4.context_length") : nullptr;
         const core::Json* layers = geo ? geo->get("block_count") : nullptr;
@@ -117,7 +124,8 @@ public:
         std::vector<int> ratios;
         for (uint64_t i = 0; i < layers->u64() && i < schedule->items.size(); ++i)
             ratios.push_back((int) schedule->items[(size_t) i].u64());
-        const ctxp::Plan plan = ctxp::plan_context(o.max_context, (int64_t) native->u64(), UINT64_MAX, ratios);
+        const ctxp::Plan plan = ctxp::plan_context(o.max_context, (int64_t) native->u64(), UINT64_MAX, ratios,
+                                                   o.kv == "fp16" ? CacheFormat::Fp16 : CacheFormat::Fp8);
         if (plan.error.empty()) return std::nullopt;
         basalt::log::error("basalt deepseek4", "%s", plan.error.c_str());
         return 2;

@@ -683,7 +683,7 @@ bool DsparkDrafter::inject_device(int w, int64_t pos0, int n_rows, const float* 
         if (!wkv || !kvn) return false;
         project_attention_kv(p_->d_feat_norm, wkv->type, wkv->ptr, static_cast<const float*>(kvn->ptr), p_->g.rms_eps,
                              p_->d_pos, p_->ropes[st].attention, n_rows, p_->d_q8, p_->d_kv_proj, p_->d_kv_row, s);
-        cache_attention_window(ws.rings + (size_t) st * kDsparkWinCap * 512, p_->d_kv_row, p_->d_pos, n_rows, s);
+        cache_attention_window_f32(ws.rings + (size_t) st * kDsparkWinCap * 512, p_->d_kv_row, p_->d_pos, n_rows, s);
     }
     ws.valid_end = pos0 + n_rows;
     if (!ck(cudaEventRecord(p_->ev_free, s), "inject done", err)) return false;

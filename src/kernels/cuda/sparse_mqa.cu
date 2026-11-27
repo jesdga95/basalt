@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -68,6 +69,80 @@ struct RowBF16 {
     static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) {
         const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
         k[0] = f.x; k[1] = f.y;
+    }
+};
+
+// Packed cache rows (layouts: the model's cache_rows.hpp). E4M3 codes with a UE8M0 scale per 32 for window rows,
+// E2M1 codes with an E4M3 scale per 16 for compressed rows; both decode exactly.
+__device__ __forceinline__ float ue8m0_scale(uint32_t b) { return __uint_as_float(b << 23); }
+__device__ __forceinline__ float e4m3_scale(uint32_t b) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) b, __NV_E4M3)));
+}
+// The E2M1 values as fp16 bits, times 2^-14 (the code's sign, exponent and mantissa bit are fp16 bits).
+__device__ __forceinline__ float e2m1_value14(uint32_t c) {
+    return __half2float(__ushort_as_half((unsigned short) (((c & 8u) << 12) | ((c & 7u) << 9))));
+}
+
+struct RowFp8 {
+    using Raw4 = uint32_t;   // four E4M3 codes
+    using Raw2 = uint16_t;
+    using Scales = const uint8_t*;
+    static constexpr int kRowBytes = kSparseMqaDim + kSparseMqaDim / 32;
+    static __device__ __forceinline__ Scales scales(const uint8_t* r) { return r + kSparseMqaDim; }
+    static constexpr bool kValueIndexCvt4 = true;
+    static constexpr bool kScaledCvt2 = true;
+    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const uint32_t*>(r)[i]; }
+    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) { return reinterpret_cast<const uint16_t*>(r)[i]; }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales& s, int c, float k[4]) {
+        if (s == nullptr) {   // a masked row has no scale pointer; its values must be zeros
+            k[0] = k[1] = k[2] = k[3] = 0.f;
+            return;
+        }
+        const float sc = ue8m0_scale(s[c >> 5]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            k[i] = __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) ((v >> (8 * i)) & 0xffu), __NV_E4M3))) * sc;
+    }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) {
+        k[0] = __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) (v & 0xffu), __NV_E4M3)));
+        k[1] = __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) (v >> 8), __NV_E4M3)));
+    }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, const Scales& s, int c, float k[2]) {
+        cvt2(v, k);
+        const float sc = s == nullptr ? 0.f : ue8m0_scale(s[c >> 5]);
+        k[0] *= sc;
+        k[1] *= sc;
+    }
+};
+
+struct RowFp4 {
+    using Raw4 = uint16_t;   // four E2M1 codes (two bytes)
+    using Raw2 = uint8_t;
+    using Scales = const uint8_t*;
+    static constexpr int kRowBytes = kSparseMqaDim / 2 + kSparseMqaDim / 16;
+    static __device__ __forceinline__ Scales scales(const uint8_t* r) { return r + kSparseMqaDim / 2; }
+    static constexpr bool kValueIndexCvt4 = true;
+    static constexpr bool kScaledCvt2 = true;
+    static __device__ __forceinline__ Raw4 load4(const uint8_t* r, int i) { return reinterpret_cast<const uint16_t*>(r)[i]; }
+    static __device__ __forceinline__ Raw2 load2(const uint8_t* r, int i) { return r[i]; }
+    static __device__ __forceinline__ void cvt4(const Raw4& v, const Scales& s, int c, float k[4]) {
+        if (s == nullptr) {
+            k[0] = k[1] = k[2] = k[3] = 0.f;
+            return;
+        }
+        const float sc = e4m3_scale(s[c >> 4]) * 16384.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) k[i] = e2m1_value14((v >> (4 * i)) & 15u) * sc;
+    }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, float k[2]) {
+        k[0] = e2m1_value14(v & 15u);
+        k[1] = e2m1_value14(v >> 4);
+    }
+    static __device__ __forceinline__ void cvt2(const Raw2& v, const Scales& s, int c, float k[2]) {
+        cvt2(v, k);
+        const float sc = s == nullptr ? 0.f : e4m3_scale(s[c >> 4]) * 16384.0f;
+        k[0] *= sc;
+        k[1] *= sc;
     }
 };
 
@@ -179,10 +254,11 @@ __global__ void __launch_bounds__(kThreads) mqa_partial_kernel(SparseMqaArgs a, 
                 const int cap = a.win_cap;
                 r = (int) (((int64_t) a.win_start[t] + j) % cap);
                 if (r < 0) r += cap;
+                if (r >= cap) r = -1;
             }
         } else if (j < a.n_sel) {
             const int id = a.sel[(size_t) t * a.n_sel + j];
-            if (id >= 0 && id < a.comp_limit[t]) r = id;
+            if (id >= 0 && id < a.comp_limit[t]) r = id;   // comp_limit is this token's written rows
         }
         rowid[tid] = r;
     }
@@ -260,11 +336,23 @@ void launch(const SparseMqaArgs& a, int n_win, int n_chunks, float* o_part, floa
             case MqaRowType::F32: return dispatch<RowF32, RowF32>(a, n_win, n_chunks, o_part, ml, s);
             case MqaRowType::F16: return dispatch<RowF16, RowF16>(a, n_win, n_chunks, o_part, ml, s);
             case MqaRowType::BF16: return dispatch<RowBF16, RowBF16>(a, n_win, n_chunks, o_part, ml, s);
+            case MqaRowType::Fp8: return dispatch<RowFp8, RowFp8>(a, n_win, n_chunks, o_part, ml, s);
+            case MqaRowType::Fp4: return dispatch<RowFp4, RowFp4>(a, n_win, n_chunks, o_part, ml, s);
         }
+    } else if (a.win_type == MqaRowType::Fp8 && a.comp_type == MqaRowType::Fp4) {
+        return dispatch<RowFp8, RowFp4>(a, n_win, n_chunks, o_part, ml, s);
+    } else if (a.win_type == MqaRowType::Fp8 && a.comp_type == MqaRowType::Fp8) {
+        return dispatch<RowFp8, RowFp8>(a, n_win, n_chunks, o_part, ml, s);
+    } else if (a.win_type == MqaRowType::Fp8 && a.comp_type == MqaRowType::F32) {
+        return dispatch<RowFp8, RowF32>(a, n_win, n_chunks, o_part, ml, s);
+    } else if (a.win_type == MqaRowType::Fp4 && a.comp_type == MqaRowType::Fp4) {
+        return dispatch<RowFp4, RowFp4>(a, n_win, n_chunks, o_part, ml, s);
     } else if (a.win_type == MqaRowType::F32 && a.comp_type == MqaRowType::F32) {
         return dispatch<RowF32, RowF32>(a, n_win, n_chunks, o_part, ml, s);
     } else if (a.win_type == MqaRowType::F16 && a.comp_type == MqaRowType::F16) {
         return dispatch<RowF16, RowF16>(a, n_win, n_chunks, o_part, ml, s);
+    } else if (a.win_type == MqaRowType::F16 && a.comp_type == MqaRowType::Fp4) {
+        return dispatch<RowF16, RowFp4>(a, n_win, n_chunks, o_part, ml, s);
     } else if (a.win_type == MqaRowType::F16 && a.comp_type == MqaRowType::F32) {
         return dispatch<RowF16, RowF32>(a, n_win, n_chunks, o_part, ml, s);
     } else if (a.win_type == MqaRowType::BF16 && a.comp_type == MqaRowType::BF16) {

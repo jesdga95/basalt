@@ -6,6 +6,8 @@
 
 #include <cuda_fp16.h>
 
+#include <cmath>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -125,7 +127,7 @@ int main(int argc, char** argv) {
     sparse_mqa_q_heads(q_weights, 1, direct.pos.p, rope, direct.q_latent_q8.p, direct.q_heads.p, stream);
     project_attention_kv(direct.x.p, 8, d_kv.p, direct.kv_norm.p, 1e-20f, direct.pos.p, rope, 1,
                          direct.input_q8.p, direct.kv_projected.p, direct.kv_row.p, stream);
-    cache_attention_window(direct.ring.p, direct.kv_row.p, direct.pos.p, 1, stream);
+    cache_attention_window_f32(direct.ring.p, direct.kv_row.p, direct.pos.p, 1, stream);
     SparseMqaArgs direct_args = selection;
     direct_args.pos = direct.pos.p; direct_args.win_start = direct.win_start.p; direct_args.win_n = direct.win_n.p;
     direct_args.q = direct.q_heads.p; direct_args.win = direct.ring.p; direct_args.win_type = MqaRowType::F32;
@@ -138,6 +140,32 @@ int main(int argc, char** argv) {
 
     const auto actual_out = actual.output.down();
     const auto direct_out = direct.output.down();
+
+    // The packed window rows (--kv fp8) must decode to the same attention as the F32 ring up to the row rounding.
+    Dev<uint8_t> packed_ring((size_t) 128 * basalt::models::deepseek4::win_row_bytes(
+        basalt::models::deepseek4::CacheFormat::Fp8));
+    std::vector<int32_t> ring_positions(128);
+    for (int i = 0; i < 128; ++i) ring_positions[(size_t) i] = i;
+    Dev<int32_t> dring_positions(ring_positions);
+    basalt::models::deepseek4::cache_attention_window(packed_ring.p, direct.ring.p, dring_positions.p, 128,
+                                                      basalt::models::deepseek4::CacheFormat::Fp8, stream);
+    Dev<float> packed_mqa{(size_t) HeadsDim};
+    Dev<float> packed_workspace{sparse_mqa_workspace_floats(1, 0)};
+    SparseMqaArgs packed_args = direct_args;
+    packed_args.win = packed_ring.p;
+    packed_args.win_type = MqaRowType::Fp8;
+    packed_args.out = packed_mqa.p;
+    sparse_mqa(packed_args, packed_workspace.p, stream);
+    check(cudaStreamSynchronize(stream), "synchronize packed window parity");
+    Dev<int32_t> one_pos(std::vector<int32_t>{0}), one_start(std::vector<int32_t>{0}), one_n(std::vector<int32_t>{1});
+    SparseMqaArgs one_args = packed_args;
+    one_args.pos = one_pos.p; one_args.win_start = one_start.p; one_args.win_n = one_n.p;
+    sparse_mqa(one_args, packed_workspace.p, stream);
+    check(cudaStreamSynchronize(stream), "synchronize single packed window parity");
+    const auto packed_out = packed_mqa.down();
+    float packed_max = 0.f;
+    for (size_t i = 0; i < packed_out.size(); ++i)
+        packed_max = std::max(packed_max, std::fabs(packed_out[i] - direct_out[i]));
     const auto actual_ring = actual.ring.down();
     const auto direct_ring = direct.ring.down();
     const bool output_equal = actual_out == direct_out;
@@ -293,6 +321,7 @@ int main(int argc, char** argv) {
                 window_equal ? "bitwise" : "DIFFERS", window_ring_equal ? "bitwise" : "DIFFERS");
     std::printf("DeepSeek4 attention layer mHC composition T=2: output %s\n",
                 layer_window_equal ? "bitwise" : "DIFFERS");
+    std::printf("DeepSeek4 packed window rows: Fp8 vs F32 output max abs %.3g\n", packed_max);
     std::printf("DeepSeek4 one-token attention step: output %s; ring state %s; Q8_0 checkpoint geometry %d/%d/%d\n",
                 output_equal ? "bitwise" : "DIFFERS", ring_equal ? "bitwise" : "DIFFERS", Embd, Rank, HeadsDim);
     if (argc > 1 && std::string(argv[1]) == "--bench") {
@@ -320,5 +349,5 @@ int main(int argc, char** argv) {
     }
     cudaStreamDestroy(stream);
     return output_equal && ring_equal && layer_output_equal && layer_ring_equal && window_equal && window_ring_equal &&
-                   layer_window_equal ? 0 : 1;
+                   layer_window_equal && packed_max < 0.25f ? 0 : 1;
 }

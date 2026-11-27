@@ -44,7 +44,7 @@ void attention_step(const float* x, const AttentionStepWeights& w, const kernels
     // previous ring. A bulk cache write would let a later row overwrite a wrapped slot still needed by an earlier row.
     for (int t = 0; t < n_tokens; ++t) {
         float* mqa_out = s.mqa_output + (size_t) t * 64 * 512;
-        cache_attention_window(window_ring, s.kv_row + (size_t) t * 512, selection.pos + t, 1, stream);
+        cache_attention_window_f32(window_ring, s.kv_row + (size_t) t * 512, selection.pos + t, 1, stream);
         kernels::SparseMqaArgs row = selection;
         row.n_tokens = 1;
         row.q = s.q_heads + (size_t) t * 64 * 512;

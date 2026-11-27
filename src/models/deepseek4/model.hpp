@@ -1,6 +1,7 @@
 #pragma once
 
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/models/deepseek4/cache_rows.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/vision/transformer.hpp"
@@ -19,6 +20,8 @@ public:
 
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return context_; }
+    /// The KV cache row format the session must use; chosen once at start from --kv.
+    CacheFormat cache_format() const { return format_; }
     model::Result plan(const model::LoadRequest& request, core::LoadPlan& reads,
                        std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
     model::Result attach(const model::LoadRequest& request,
@@ -49,6 +52,7 @@ private:
     float* h_expert_rows_ = nullptr;
     int device_ = -1;
     int64_t context_ = 0;
+    CacheFormat format_ = CacheFormat::Fp8;
 };
 
 std::unique_ptr<model::ModelSession> make_session_impl(DsModel& model, std::string& err);

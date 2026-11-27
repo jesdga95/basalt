@@ -1,5 +1,7 @@
 #pragma once
 
+#include "basalt/models/deepseek4/cache_rows.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -34,9 +36,9 @@ inline bool multiply(uint64_t a, uint64_t b, uint64_t& out) {
     return true;
 }
 
-/// Persistent device cache capacity for `positions` tokens. Compressor outputs are F32 rows; ratio-4 CSA
-/// also keeps its independent 128-wide index keys. Partial compressor groups are fixed per compressed layer.
-inline Footprint cache_footprint(int64_t positions, const std::vector<int>& ratios) {
+/// Persistent device cache capacity for `positions` tokens in `fmt`'s row layouts; ratio-4 CSA also keeps its
+/// independent index keys. Partial compressor groups are fixed per compressed layer.
+inline Footprint cache_footprint(int64_t positions, const std::vector<int>& ratios, CacheFormat fmt) {
     Footprint f;
     if (positions < 0 || ratios.empty()) {
         f.error = "invalid DeepSeek4 cache geometry";
@@ -46,7 +48,7 @@ inline Footprint cache_footprint(int64_t positions, const std::vector<int>& rati
     // for a short requested context.
     const uint64_t window_rows = kWindow;
     uint64_t per_layer_window = 0;
-    if (!multiply(window_rows, 512u * kFloatBytes, per_layer_window) ||
+    if (!multiply(window_rows, win_row_bytes(fmt), per_layer_window) ||
         !multiply(per_layer_window, ratios.size(), f.window)) {
         f.error = "DeepSeek4 cache size overflow";
         return f;
@@ -59,12 +61,10 @@ inline Footprint cache_footprint(int64_t positions, const std::vector<int>& rati
             return f;
         }
         const uint64_t rows = (uint64_t) positions / (uint64_t) ratio;
-        const uint64_t attention_width = ratio == 4 ? 512u : 512u;
-        const uint64_t index_width = ratio == 4 ? 128u : 0u;
         uint64_t bytes = 0, index_bytes = 0;
-        if (!multiply(rows, attention_width * kFloatBytes, bytes) ||
+        if (!multiply(rows, comp_row_bytes(fmt), bytes) ||
             !add(f.compressed, bytes, f.compressed) ||
-            !multiply(rows, index_width * kFloatBytes, index_bytes) ||
+            !multiply(rows, ratio == 4 ? idx_row_bytes(fmt) : 0, index_bytes) ||
             !add(f.index_keys, index_bytes, f.index_keys)) {
             f.error = "DeepSeek4 cache size overflow";
             return f;
@@ -97,7 +97,8 @@ struct Plan {
 
 /// Context refusal is based on persistent cache capacity after dense weights load; transient prefill/index workspaces
 /// are planned separately from the remaining device memory.
-inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, const std::vector<int>& ratios) {
+inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, const std::vector<int>& ratios,
+                        CacheFormat fmt) {
     Plan p;
     if (native <= 0 || native > kMaxIndexerContext) {
         p.error = "invalid DeepSeek4 native context limit";
@@ -114,7 +115,7 @@ inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes,
                   std::to_string(std::min<int64_t>(native, kMaxIndexerContext));
         return p;
     }
-    p.footprint = cache_footprint(context, ratios);
+    p.footprint = cache_footprint(context, ratios, fmt);
     if (!p.footprint.error.empty()) {
         p.error = p.footprint.error;
         return p;
