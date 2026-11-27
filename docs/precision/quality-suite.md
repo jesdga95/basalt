@@ -101,17 +101,25 @@ format). Another model family needs its own markup in `common.py` and `gen.py` b
 
 ## Score a Basalt pack
 
-The engine scores a token stream itself. `--ppl-out FILE` names the rows file, and `GEN 1 score=N score_top=K IDS` on `--serve`
-teacher-forces the whole stream: ids 0 to N are the prompt and every later row (the distribution over the next token) is written with
-its K likeliest ids (K is 0 to 256; 0 writes the whole row, binary). `basalt_score.py` drives it, one request per conversation:
+Run the quality suite directly through `basalt-bench`:
+
+```sh
+basalt-bench --model PACK.basalt --quality ref.safetensors [--smoke] [--quality-top 256] [--quality-role assistant] [--quality-max-context 5120] [--quality-boot 2000]
+```
+
+Alone, `--quality` runs only the quality suite; with `-p` or `-t` it runs after them. `--quality-max-context` (default 5,120) sets
+`--max-context` for the engine (unless overridden after `--`) and skips conversations longer than that; raise it to cover the long
+ones. Add `-o json` for machine-readable output under the `"quality"` key.
+
+Under the hood, the engine scores each conversation itself: `--ppl-out FILE` names the rows file, and `GEN 1 score=N score_top=K IDS`
+on `--serve` teacher-forces the whole stream (ids 0 to N are the prompt and every later row is written with its K likeliest ids, K in
+0..256; 0 writes the whole row, binary). For offline scoring or paired A/B comparisons, `basalt_score.py` and `score.py` drive the
+same protocol and save per-conversation row files:
 
 ```sh
 python3 tools/quality_suite/basalt_score.py --pack PACK.basalt --ref ref.safetensors --out DIR [--smoke]
 python3 tools/quality_suite/score.py ref.safetensors --basalt DIR/conv_*.txt [--smoke]
 ```
-
-The script's `--max-context` (default 5,120) skips the longer conversations; raise it to cover the long ones. `--engine` defaults to
-`bin/basalt` in the repository and `--gpu` picks the card.
 
 Which models: any model whose session returns head logits (`copy_logits`), which every model in the tree does. The request goes
 through the shared serving loop and the same teacher-forced path as the wikitext gate (`ppl=K`), so the model plugs in nothing of
@@ -157,7 +165,7 @@ measures the error bars at smaller subsamples.
 
 ## Smoke slice
 
-`--smoke` (in `score.py`, `make_req.py` and `basalt_score.py`) selects every 20th conversation shorter than 5,000 tokens: 21
+`--smoke` (in `basalt-bench --quality`, `score.py`, `make_req.py` and `basalt_score.py`) selects every 20th conversation shorter than 5,000 tokens: 21
 conversations, 14,226 tokens, 11,864 assistant rows, a mix of chat, code, reasoning, multilingual and tool conversations. The test inputs
 must cover exactly those conversations. It is a quick check of a change, not the gate. `gen.py --smoke` writes a corpus of two
 conversations per kind (no long ones) to try the settings and the speed.

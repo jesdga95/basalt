@@ -174,6 +174,6 @@ boosts by about half (its text is easier: base PPL 2.2717 there against 2.7314 o
 Reproduce (the base is [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases)):
 
 ```sh
-basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 --quality 100 --kld-base dsv41-bf16-base.kld -- --route-prior 0.1
+basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 --kld 100 --kld-base dsv41-bf16-base.kld -- --route-prior 0.1
 basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 -t conv,struct,prose --seed 1 -- --route-prior 0.1
 ```

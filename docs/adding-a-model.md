@@ -21,7 +21,7 @@ The router then needs one config entry. Nothing in the server names a model.
 
 ## Fixtures, flags and loading
 
-- Benchmark token ids go in `data/bench/<arch>`. Quality is measured against a BF16 reference with the [quality suite](precision/quality-suite.md) (`--quality` runs the wikitext KLD gate).
+- Benchmark token ids go in `data/bench/<arch>`. Quality is measured against a BF16 reference with the [quality suite](precision/quality-suite.md) (`basalt-bench --quality REF.safetensors`; `--kld --kld-base FILE` runs the wikitext KLD gate).
 - Flags: `parse_flag` and `finish_flags`. A flag a model lacks is the normal unknown-argument error. Token id flags default to the pack's tokens.
 - The start (`ModelAdapter::start`) runs in three steps. The model's `plan` decides and allocates everything, in the order its
   sizing depends on (weights, then what is sized from the memory left: caches, tiers, a peer's prompt stages), and queues every

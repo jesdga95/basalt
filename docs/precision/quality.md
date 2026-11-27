@@ -65,10 +65,10 @@ for quick checks and reproducing those numbers.
 
 ### The gate
 
-`basalt-bench --quality` runs the gate. `tools/ppl_gate.py` runs it offline against a built engine ([commands](#reproduce-the-reference)).
+`basalt-bench --kld --kld-base FILE` runs the gate. `tools/ppl_gate.py` runs it offline against a built engine ([commands](#reproduce-the-reference)).
 
 - **Text:** wikitext-2 in 512-token chunks. The first 256 tokens of each chunk are prefilled.
-- **Scored rows:** 256 to 510, through the decode path in verify windows of `--quality-t` tokens (default 3). The window tokens are the
+- **Scored rows:** 256 to 510, through the decode path in verify windows of `--kld-t` tokens (default 3). The window tokens are the
   reference text, so the drafter's output is not used.
 - **Reference:** a llama.cpp KL-divergence base file (`--kl-divergence-base`).
 - **KLD** is KL(base || test) over the full vocabulary, from the fp32 log-softmax, summed in double. Base terms at log-probability -16 or
@@ -98,7 +98,7 @@ The official Flash-Next packs are scored against the first base on their
 experts and tiers pinned, on an RTX 5090 at 400 W with an RTX 5060 Ti at 180 W.
 
 The bases are published as the [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases) dataset on Hugging Face,
-with checksums: pass one to `basalt-bench --quality --kld-base FILE` to score a build or a self-converted pack.
+with checksums: pass one to `basalt-bench --kld --kld-base FILE` to score a build or a self-converted pack.
 
 A quantized base is not a reference. llama.cpp's Q8_0 GGUF adds its own rounding, so every pack reads 0.003 to 0.010 KLD higher against a
 Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)).
