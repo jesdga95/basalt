@@ -110,8 +110,10 @@ Flow QfnRequest::read_to(int64_t to) {
     };
     if (win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
     runtime_.ov_post_done = false;
-    runtime_.ov_post = [&, to]() -> bool {
-        if (part_checkpoint(to) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
+    runtime_.ov_post = [&]() -> bool {
+        // The part's checkpoint is taken on the main thread after the read, not here: it synchronizes the whole
+        // device, and the main thread may be capturing a window graph meanwhile, which a device-wide sync from
+        // another thread invalidates (dense_tc then fails with "a previous error during capture").
         // the lent slots get their experts back here, beside the windows; the table follows on the main thread
         for (PfPart& p : runtime_.pf_parts) {
             if (p.lent.empty()) continue;
@@ -152,7 +154,7 @@ Flow QfnRequest::read_to(int64_t to) {
     at = to;
     resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
     runtime_.ov_post = nullptr;
-    if (part_checkpoint(to) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
+    if (part_checkpoint(to) && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
         std::printf("ERR saving a conversation checkpoint failed%s\n", runtime_.ckpt_why.c_str());
         return Flow::error;
     }
