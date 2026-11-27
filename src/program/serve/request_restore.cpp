@@ -238,10 +238,9 @@ Flow Request::restore() {
         const auto t0 = Clock::now();
         basalt::core::SavedConversation image;
         std::string de;
-        if (!runtime_.capture_admit(need, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
-                              "admission; need %llu MiB)", (long long) on_disk.tokens,
-                              (unsigned long long) (need >> 20));
+        if (basalt::core::Admission why; !runtime_.capture_admit(need, floor, &why)) {
+            basalt::log::warn("basalt serve", "conversation cache: %lld tokens on disk not read: %s",
+                              (long long) on_disk.tokens, basalt::core::conversation_refusal(why).c_str());
         } else if (!runtime_.disk.load(on_disk, image, de)) {
             basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
                               "dropped", de.c_str());

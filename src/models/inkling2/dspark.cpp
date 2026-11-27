@@ -7,6 +7,7 @@
 // contributors to the vLLM project).
 #include "basalt/core/device_copy.hpp"
 #include "models/inkling2/dspark.hpp"
+#include "models/inkling2/dflash2.hpp"
 
 #include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
@@ -88,6 +89,8 @@ void ws_need(const DsparkGeometry& d, size_t& partial, size_t& tickets) {
 
 // ---- weights --------------------------------------------------------------------------------------------------------------
 
+DsparkWeights::DsparkWeights() = default;
+
 DsparkWeights::~DsparkWeights() {
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
@@ -121,6 +124,18 @@ void* DsparkWeights::dev(size_t bytes, bool& ok) {
 
 model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DsparkWeights>& out) {
     out.reset();
+    if (pack.dflash2.present) {
+        std::unique_ptr<Dflash2Weights> df2;
+        if (model::Result r = dflash2_plan(pack, reads, file, device, df2); !r.ok()) return r;
+        auto w = std::make_unique<DsparkWeights>();
+        w->n_vocab = pack.geo.n_vocab;
+        w->logit_softcap = pack.dflash2.logit_softcap;
+        w->target_eps = pack.geo.rms_eps;
+        w->bytes_ = df2->bytes();
+        w->df2 = std::move(df2);
+        out = std::move(w);
+        return {};
+    }
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return {};
     const Geometry& g = pack.geo;
@@ -232,6 +247,11 @@ model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, co
     head = head_q8;
     embedding = emb;
     embed_norm = en;
+    if (df2) {
+        model::Result r = df2->finish(head_q8, emb, en, target_eps, stream);
+        bytes_ = df2->bytes();
+        return r;
+    }
     if (finished_) return {};
     const cudaStream_t s = (cudaStream_t) stream;
     float raw[kDsMixes * kDsTargets], al[kDsMixes * kDsTargets];
@@ -298,6 +318,7 @@ DsHead DsparkWeights::head_args() const {
 uint64_t dspark_tap_bytes(int tap_rows) { return 4ull * (uint64_t) std::max(tap_rows, kSlice) * kE * 4; }
 
 uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
+    if (pack.dflash2.present) return dflash2_session_bytes(pack);
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE;
@@ -365,6 +386,8 @@ const DsparkWeights::SharedScratch* DsparkWeights::ensure_shared_scratch(int64_t
 
 // ---- the session's hook ---------------------------------------------------------------------------------------------------
 
+DsparkHook::DsparkHook() = default;
+
 DsparkHook::~DsparkHook() {
     for (cudaGraphExec_t g : g_stage_)
         if (g) cudaGraphExecDestroy(g);
@@ -401,6 +424,13 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
 bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
                       int64_t backed, std::string& err) {
     if (!w) return true;
+    if (w->df2) {
+        tap_rows_ = std::max(tap_rows, kSlice);
+        context_ = context;
+        tap_ = tap;
+        df2_ = std::make_unique<Dflash2Hook>();
+        return df2_->init(w->df2.get(), g, context, tap_rows, tap, err);
+    }
     const DsparkGeometry& d = w->geo;
     const size_t E = kE;
     const auto* scr = w->ensure_shared_scratch(context, err);
@@ -506,11 +536,22 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     return true;
 }
 
+void DsparkHook::use_tap(float* tap, int rows) {
+    tap_ = tap;
+    tap_rows_ = rows;
+    if (df2_) df2_->use_tap(tap, rows);
+}
+
 int DsparkHook::slot_of_visit(int visit) const {
+    if (df2_) return df2_->slot_of_visit(visit);
     return w_ && visit >= 0 && visit < (int) slot_.size() ? slot_[(size_t) visit] : -1;
 }
 
 void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) {
+    if (df2_) {
+        df2_->commit(pos_d, rows, stream, row0);
+        return;
+    }
     if (!w_ || rows <= 0) return;
     const DsparkGeometry& d = w_->geo;
     DsMixArgs ma;
@@ -538,6 +579,10 @@ void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) 
 
 void DsparkHook::commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::mmq::Context& mmq, const PromptScratch& s,
                                void* stream) {
+    if (df2_) {
+        df2_->commit_prompt(pos_d, rows, mmq, s, stream);
+        return;
+    }
     if (!w_ || rows <= 0) return;
     if (rows <= kSlice) {
         commit(pos_d, rows, stream);
@@ -584,6 +629,10 @@ void DsparkHook::commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::
 }
 
 void DsparkHook::note(int64_t pos0, int rows) {
+    if (df2_) {
+        df2_->note(pos0, rows);
+        return;
+    }
     if (!w_ || rows <= 0) return;
     if (pos0 > hi_ || pos0 + rows < lo_) lo_ = pos0;   // a gap or a jump back: the record starts again at this run
     else lo_ = std::min(lo_, pos0);
@@ -707,6 +756,7 @@ bool DsparkHook::stage_graph(int k, int n, void* stream) {
 }
 
 model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* stream) {
+    if (df2_) return df2_->draft_begin(anchor, pos, n, stream);
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     pending_ = 0;
     batch_owner_ = nullptr;
@@ -750,6 +800,7 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
 
 model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed&,
                                     void* stream) {
+    if (df2_) return df2_->draft_end(ids, conf, max_n, n, stream);
     n = 0;
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     if (pending_ == 0) return {};
@@ -801,13 +852,18 @@ model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n
 }
 
 size_t DsparkHook::running_bytes() const {
+    if (df2_) return df2_->running_bytes();
     size_t n = 0;
     for (const Cache& c : cache_)
         if (c.ring) n += 2 * (size_t) c.cap * kKV * 2;
     return n;
 }
 
-void DsparkHook::running_regions(core::RunningState& st) const {
+void DsparkHook::running_state(int64_t pos, bool save, core::RunningState& st) const {
+    if (df2_) {
+        df2_->running_state(pos, save, st);
+        return;
+    }
     for (const Cache& c : cache_) {
         if (!c.ring) continue;
         st.regions.push_back({c.k, (size_t) c.cap * kKV * 2});
@@ -815,11 +871,21 @@ void DsparkHook::running_regions(core::RunningState& st) const {
     }
 }
 
+bool DsparkHook::running_restored(int64_t pos, const uint8_t* head) {
+    if (df2_) return df2_->running_restored(pos, head);
+    return true;
+}
+
 size_t DsparkHook::cells_bytes(int64_t positions) const {
+    if (df2_) return 0;
     size_t n = 0;
     for (const Cache& c : cache_)
         if (!c.ring) n += 2 * (size_t) positions * kKV * 2;
     return n;
+}
+
+int64_t DsparkHook::backed_cells() const {
+    return df2_ ? df2_->backed_cells() : backed_cells_;
 }
 
 void DsparkHook::count_backed() {
@@ -828,13 +894,14 @@ void DsparkHook::count_backed() {
 }
 
 uint64_t DsparkHook::grow_bytes(int64_t positions) const {
+    if (df2_) return 0;
     uint64_t n = 0;
     for (const auto& a : full_) n += a->growth((uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2);
     return n;
 }
 
 bool DsparkHook::ensure(int64_t positions, std::string& err) {
-    if (full_.empty() || full_cells(positions) <= backed_cells_) return true;
+    if (df2_ || full_.empty() || full_cells(positions) <= backed_cells_) return true;
     const uint64_t bytes = (uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2;
     for (const auto& a : full_)
         if (!a->ensure(bytes, 0, err)) {
@@ -846,11 +913,14 @@ bool DsparkHook::ensure(int64_t positions, std::string& err) {
 }
 
 void DsparkHook::trim(int64_t positions) {
+    if (df2_) return;
     for (const auto& a : full_) a->trim((uint64_t) full_cells(positions) * kKV * 2);
     count_backed();
 }
 
 bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const {
+    if (df2_) return df2_->save_cells(positions, stream);
+    if (!w_) return true;
     if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
     for (const Cache& c : cache_) {
@@ -875,6 +945,8 @@ bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t posit
 }
 
 bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream) {
+    if (df2_) return df2_->restore_cells(kv.size(), at, positions, stream);
+    if (!w_) return at == kv.size();
     if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
     const size_t run = (size_t) positions * kKV * sizeof(uint16_t);
@@ -898,6 +970,8 @@ bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size
 
 // ---- multi-session batched DSpark commit & draft --------------------------------------------------------------------------
 
+DsparkBatch::DsparkBatch() = default;
+
 DsparkBatch::~DsparkBatch() {
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
@@ -917,6 +991,10 @@ void* DsparkBatch::dev(size_t bytes, bool& ok) {
 bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, int tap_rows, float* tap, int64_t context,
                        std::string& err) {
     if (!w || max_sessions <= 1) return true;
+    if (w->df2) {
+        df2_ = std::make_unique<Dflash2Batch>();
+        return df2_->init(w->df2.get(), max_sessions, max_rows, tap_rows, tap, err);
+    }
     const DsparkGeometry& d = w->geo;
     const size_t E = kE, V = (size_t) w->n_vocab, ff = (size_t) d.n_ff;
     const int S = std::min(max_sessions, kMaxDraftSessions);
@@ -988,6 +1066,13 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
 
 void DsparkBatch::commit(DsparkHook* const* hooks, int n_seg, const bk::WindowSegs* at_d, const int32_t* pos_d, int rows,
                          void* stream) {
+    if (df2_) {
+        if (rows <= 0 || n_seg <= 0) return;
+        Dflash2Hook* dh[bk::kWindowSegsMax] = {};
+        for (int i = 0; i < n_seg; ++i) dh[i] = hooks[i]->df2_.get();
+        df2_->commit(dh, n_seg, at_d, pos_d, rows, stream);
+        return;
+    }
     if (!w_ || rows <= 0 || n_seg <= 0) return;
     const DsparkGeometry& d = w_->geo;
     DsMixArgs ma;
@@ -1015,6 +1100,17 @@ void DsparkBatch::commit(DsparkHook* const* hooks, int n_seg, const bk::WindowSe
 
 model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchors, const int64_t* pos, const int* n,
                                  int count, void* stream) {
+    if (df2_) {
+        if (count <= 0) return {};
+        if (count > (int) bk::kWindowSegsMax) {
+            for (int i = 0; i < count; ++i)
+                if (model::Result r = hooks[i]->draft_begin(anchors[i], pos[i], n[i], stream); !r.ok()) return r;
+            return {};
+        }
+        Dflash2Hook* dh[bk::kWindowSegsMax] = {};
+        for (int i = 0; i < count; ++i) dh[i] = hooks[i]->df2_.get();
+        return df2_->draft(dh, anchors, pos, n, count, stream);
+    }
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     if (count <= 0) return {};
     if (count > (int) bk::kWindowSegsMax) {
@@ -1178,6 +1274,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
 }
 
 model::Result DsparkBatch::take(int slot, int pending, int32_t* ids, float* conf, int max_n, int& n) {
+    if (df2_) return df2_->take(slot, pending, ids, conf, max_n, n);
     n = 0;
     if (!synced_) {
         if (cudaStreamSynchronize((cudaStream_t) sync_stream_) != cudaSuccess)
@@ -1214,7 +1311,8 @@ void dspark_finish_flags(program::CommonOptions& o) {
     core::ModelFile file;
     std::string err;
     const core::Json* kv = !o.model.empty() && file.open(o.model, err) && file.load_meta(err) ? file.meta().get("gguf_kv") : nullptr;
-    const bool present = kv != nullptr && kv->get("inkling2.dspark.block_count") != nullptr;
+    const bool present = kv != nullptr &&
+                         (kv->get("inkling2.dspark.block_count") != nullptr || kv->get("inkling2.dflash2.block_count") != nullptr);
     // the pack's drafter offers a whole block (the window policy takes the rows that pay) unless --spec caps it
     if (!o.spec_given) o.spec = present ? (o.suffix_draft > 0 ? kDecodeRows : kDsBlock) : 0;
     if (o.spec >= 2 && !present) {

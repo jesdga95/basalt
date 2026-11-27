@@ -13,6 +13,8 @@
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--head nvfp4] [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --checkpoint INKLING2_DIR --out MODEL.basalt [--dflash2 DFLASH2_DIR] [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --checkpoint ERNIE55_DIR --out MODEL.basalt [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -69,6 +71,18 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
   --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
   --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
                      to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
+
+From an Inkling 2 checkpoint (no --sections-from; tools/convert/checkpoint_inkling2.py)
+  --checkpoint DIR   Thinking Machines' Inkling 2 checkpoint (NVFP4 / MXFP8 experts, BF16 dense projections and vision
+                     tower, mtp.safetensors beside the shards)
+  --dflash2 DIR      a DFlash 2 block drafter for Inkling 2 (incoai/Inkling-2-Mini-DFlash2), embedded as dflash2.*
+                     tensors in place of dspark.*
+
+From an ERNIE-5.5-Flash checkpoint (no --sections-from; tools/convert/checkpoint_ernie55.py)
+  --checkpoint DIR   Baidu's ERNIE-5.5-Flash-Preview checkpoint (baidu/ERNIE-5.5-Flash-Preview): MXFP4 routed experts
+                     kept bit for bit, 128x128 FP8 dense projections rounded once to Q8_0, embeddings and head BF16,
+                     norms / mHC / sinks / routers F32. Attach the bundled DSpark drafter (`model.mtp.*`) afterwards
+                     with tools/convert/dspark_ernie55_attach.py --checkpoint DIR --into MODEL.basalt.
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -173,7 +187,10 @@ def add_dspark(a) -> None:
     if not pack.is_file():
         die(f"missing input: {pack}")
     if a.roll_back:
-        undo_append(str(pack), a.undo_dir)
+        try:
+            undo_append(str(pack), a.undo_dir)
+        except (ValueError, OSError) as e:
+            die(str(e))
         print(f"done: {pack} is back to {pack.stat().st_size} bytes")
         return
     dspark = Path(a.dspark)
@@ -303,6 +320,10 @@ class Job:
     def file(self, name, src, offset=0, size=None):
         t = time.time()
         self.w.add_file(name, str(src), offset, size)
+        if self.dry and name in ("dense.index", "mtp/dense.index"):
+            with open(src, "rb") as f:
+                f.seek(offset)
+                self.index[name] = f.read() if size is None else f.read(size)
         self._report(name, self.w.entries[-1][2], time.time() - t)
 
     def chunks(self, name, chunks, size=None):
@@ -472,7 +493,7 @@ def convert(a) -> None:
                         die(f"{name}: its shard holds only the header, and {a.sections_from} has no section of that tensor")
                     off, _ = base.section(section)
                     job.file(section, a.sections_from, off, size)
-                    if w.entries[-1][3] != base.sections[section][2]:
+                    if not dry and w.entries[-1][3] != base.sections[section][2]:
                         die(f"section {section}: the copy's SHA-256 differs from {a.sections_from}'s")
                     copied.append(section)
                 else:
@@ -496,12 +517,13 @@ def convert(a) -> None:
                 own_entries[name] = {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
                                      "bytes": size, "offset": 0, "section": section}
             if base is not None:
+                prefixes = ("vision/", "dspark/") if mtp_gguf is not None else ("mtp/", "vision/", "dspark/")
                 for name in base.names():
-                    if name != "vision/text_vocab" and name.startswith(("mtp/", "vision/", "dspark/")):
+                    if name != "vision/text_vocab" and (name == "dfly" or name.startswith(prefixes)):
                         off, size = base.section(name)
                         job.file(name, a.sections_from, off, size)
-                        if w.entries[-1][3] != base.sections[name][2]:
-                            die(f"section {name}: the copys SHA-256 differs from {a.sections_from}s")
+                        if not dry and w.entries[-1][3] != base.sections[name][2]:
+                            die(f"section {name}: the copy's SHA-256 differs from {a.sections_from}'s")
                         copied.append(name)
                 if "vision/text_vocab" in base.sections:
                     import pack_vision
@@ -521,7 +543,16 @@ def convert(a) -> None:
             if mtp is not None:
                 job.chunks("mtp/dense", mtp.dense_chunks())
                 job.bytes("mtp/dense.index", mtp.dense_index())
-                job.chunks("mtp/experts", mtp.expert_chunks())
+                if dry:
+                    job.chunks("mtp/experts", iter(()), mtp.expert_bytes)
+                else:
+                    import multiprocessing
+                    workers = max(1, min(getattr(a, "workers", 16), S.MTP_NE))
+                    if workers > 1:
+                        with multiprocessing.Pool(workers) as pool:
+                            job.chunks("mtp/experts", mtp.expert_chunks(pool), mtp.expert_bytes)
+                    else:
+                        job.chunks("mtp/experts", mtp.expert_chunks(), mtp.expert_bytes)
                 if draft_vocab is not None:
                     job.bytes("mtp/draft_vocab", draft_vocab)
             if arch.side_sections:
@@ -551,15 +582,16 @@ def convert(a) -> None:
                                for n, _, _, nb, t in tensors}, **own_entries},
                 "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
                 "license": arch.license(kv),
+                **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
                 "mtp": base_meta.get("mtp") if base is not None else None if mtp is None else {"source_sha256": mtp.source_sha256(),
                                                   "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
                                                   "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
                                                             if mtp.tuned else {"tuning": None})},
                 "vision": base_meta.get("vision") if base is not None else None if not vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
-                **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
                 **({"dspark": dspark_record(dspark)} if dspark else {}),
                 **({"dspark": base_meta["dspark"]} if base is not None and "dspark" in base_meta else {}),
+                **({"dfly2": base_meta["dfly2"]} if base is not None and "dfly2" in base_meta else {}),
             }
             if mtp_gguf is not None:
                 meta["mtp"] = {"source": "gguf", "layers": mtp_ids, "format": "as stored in the GGUF",
@@ -569,7 +601,10 @@ def convert(a) -> None:
                                "experts": {"layers": m_experts.layers, "gate_type_id": m_experts.layout[0][1],
                                            "down_type_id": m_experts.layout[0][2], "bytes": m_experts.total}}
             if hf_dir is not None:
+                lic = meta["license"]
                 meta.update(hf_meta)
+                if "license" in hf_meta:
+                    meta["license"] = {**lic, **hf_meta["license"]}
                 meta["sources"] += [{"path": f"hf/{n}", "size": (hf_dir / n).stat().st_size,
                                      "sha256": hashlib.sha256((hf_dir / n).read_bytes()).hexdigest()}
                                     for n in ("config.json", "LICENSE")]
@@ -877,8 +912,8 @@ def main():
     ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
     ap.add_argument("--checkpoint", metavar="DIR",
-                    help="an NVFP4 or FP4-Local safetensors checkpoint: with --sections-from, the language model is read from it; "
-                         "with --requant-dense-q6k, the BF16 projections; alone, a whole qwen35 or inkling2 pack")
+                    help="an NVFP4, FP4-Local, or ERNIE-5.5 safetensors checkpoint: with --sections-from, the language model is read from it; "
+                         "with --requant-dense-q6k, the BF16 projections; alone, a whole qwen35, inkling2, or ernie55 pack")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
     ap.add_argument("--stream-shards", action="store_true",
@@ -886,6 +921,8 @@ def main():
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
                     "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
+    ap.add_argument("--dflash2", metavar="DIR", help="with an inkling2 --checkpoint: a DFlash 2 block drafter "
+                    "(DFlash2DraftModel safetensors and config.json) embedded as dflash2.* tensors in place of dspark.*")
     ap.add_argument("--head", choices=("fp8", "nvfp4"),
                     help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
                          "(default) or to NVFP4")
@@ -894,7 +931,7 @@ def main():
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
     if a.into or a.roll_back or a.undo_dir:
-        if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k:
+        if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k or a.dflash2:
             ap.error("--into takes --undo-dir and one of --dspark, --dfly or --roll-back, and nothing else")
         if a.dfly:
             from dfly_attach import add_dfly
@@ -907,11 +944,11 @@ def main():
     if a.dense_q6k and not a.nvfp4:
         ap.error("--dense-q6k needs --nvfp4")
     if a.verify:
-        if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark:
+        if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark or a.dflash2:
             ap.error("--verify takes --gguf and nothing else")
         import verify_pack
         try:
-            ok = verify_pack.verify(a.verify, a.gguf[0], a.workers)
+            ok = verify_pack.verify(a.verify, a.gguf, a.workers)
         except S.ConvertError as e:
             die(str(e))
         sys.exit(0 if ok else 1)
@@ -920,12 +957,12 @@ def main():
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
         ap.error("--dspark goes with --gguf")
     if a.requant_dense_q6k:
-        if a.sections_from or a.gguf or a.dense_q8_0 or a.dry_run:
+        if a.sections_from or a.gguf or a.dense_q8_0 or a.dry_run or a.dflash2:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
     if a.sections_from and a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.dry_run:
+        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.dry_run or a.dflash2:
             ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
                      "--stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
@@ -937,20 +974,32 @@ def main():
     if a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards \
                 or a.dry_run:
-            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --workers and --force")
+            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --dflash2, --head, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")
+        if a.dflash2 and not Path(a.dflash2).is_dir():
+            ap.error(f"missing input: {a.dflash2}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
         if checkpoint_model_type(Path(a.checkpoint)) == "inkling2_loop":
             if a.drafter or a.head:
-                ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 carries its drafter")
+                ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 uses --dflash2 or its built-in drafter")
             import checkpoint_inkling2 as I
             I.build(a, Job, fingerprint, die)
+            return
+        if a.dflash2:
+            ap.error("--dflash2 goes with an inkling2 checkpoint; use --drafter for qwen35")
+        if checkpoint_model_type(Path(a.checkpoint)) == "ernie5_5_moe":
+            if a.drafter or a.head:
+                ap.error("--drafter and --head go with a qwen35 checkpoint")
+            import checkpoint_ernie55 as E
+            E.build(a, Job, fingerprint, die)
             return
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return
+    if a.dflash2:
+        ap.error("--dflash2 needs --checkpoint")
     if a.dense_q8_0 or a.stream_shards:
         ap.error("--dense-q8-0 and --stream-shards need --checkpoint and --sections-from")
     if not a.gguf:

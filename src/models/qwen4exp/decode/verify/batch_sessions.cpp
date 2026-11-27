@@ -67,15 +67,20 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         for (int64_t m = 0; m < l; ++m) qi += is_qsa_layer(*g_, m) ? 1 : 0;
         for (SessionState* x : slots) {
             const QsaState& st = x->qsa_states[qi];
-            if (st.kv_mode > 1 || !st.kv_int8 || st.kv_rot || st.kv_hybrid || st.kv_q4) {
+            if (st.kv_mode > 1 || st.kv_rot || st.kv_hybrid || st.kv_q4) {
                 err = "verify: batch windows need INT8 K/V without rotation, resident or streamed (--kv int8)";
                 return false;
             }
-            if (st.kv_mode == 1 && st.n_slots < basalt::kernels::kKvStreamMinSlots) {   // one step of the resolve's sweep
+            // FP16 is supported by the batch chain only resident: the streamed resolve copies INT8 pools.
+            if (!st.kv_int8 && st.kv_mode != 0) {
+                err = "verify: a batch window's FP16 K/V must be resident (drop --kv-resident)";
+                return false;
+            }
+            if (st.kv_int8 && st.kv_mode == 1 && st.n_slots < basalt::kernels::kKvStreamMinSlots) {
                 err = "verify: a streamed slot holds too few pages for the resolve; raise --kv-resident";
                 return false;
             }
-            batch_stream_ = batch_stream_ || st.kv_mode == 1;
+            batch_stream_ = batch_stream_ || (st.kv_int8 && st.kv_mode == 1);
         }
     }
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;

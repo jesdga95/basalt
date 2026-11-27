@@ -6,7 +6,7 @@ Protocol (one line each):
     `RESUME <n>`, then `DONE ...` (its last field: the run's decode windows); `STOP` ends it early. With `logprobs=K` each `T` line follows its
     `P <id> <lp> [<id>:<lp> ...]` line (the pick's log probability and the K likeliest tokens). `ERR ...` is a failure; a prompt that does not fit the
     context is `ERR <context_overflow|context_no_room> prompt=N [max_new=N] context=N [slot=N]: <message>`.
-  * any time after READY: `CONV parked=N bytes=N evictions=N [restored=N restored_ms=X]`, the conversation cache's
+  * any time after READY: `CONV parked=N bytes=N evictions=N refused=N [restored=N restored_ms=X]`, the conversation cache's
     figures after a park or a restore (never a reply line, like INFO).
   * solo, text (INFO text_prompt=1): `GENT <max_new> [k=v ...] <nbytes> [plain=a:b,...]`, a newline, then nbytes of
     raw UTF-8: the engine tokenizes (control literals on; `plain` byte spans are text) and answers like a GEN, with
@@ -53,9 +53,10 @@ from serve.engine.console import LINES as CONSOLE_LINES, ConsoleLines
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
 from serve.engine.slots import AdmissionQueue
-from serve.prompt import PromptText, room_error
+from serve.prompt import REPLY_KEY, PromptText, room_error
 from serve.util import vram
 from serve.util.console import tagged
+from serve.util.loglevel import STAMP_FORMAT, unstamp
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
 
@@ -77,7 +78,7 @@ QUIT_DISK_S = 300.0      # ... with a disk tier: it writes the conversations it 
 
 
 def conversation_facts(line: str) -> dict:
-    """The facts of a `CONV` line (`CONV parked=N bytes=N evictions=N[ restored=N restored_ms=X]`): the cache's figures
+    """The facts of a `CONV` line (`CONV parked=N bytes=N evictions=N refused=N[ restored=N restored_ms=X]`): the cache's figures
     after a park or, with restored and restored_ms, after a restore."""
     facts = {}
     for kv in line.split()[1:]:
@@ -162,6 +163,17 @@ def pump_lines(stream, sink) -> None:
                 stream.close()
             except OSError:
                 pass
+
+
+def stamped_writer(log):
+    """The sink that writes each engine stderr line to `log` after the local time it arrived, `MM-DD HH:MM:SS `."""
+    def write(line: str) -> None:
+        try:
+            log.write(time.strftime(STAMP_FORMAT) + line)
+            log.flush()
+        except (OSError, ValueError):                   # the log is gone (the engine is being replaced)
+            pass
+    return write
 
 
 REQUEST_LINES = False    # --request-lines: echo each request's DONE figures on stdout
@@ -278,7 +290,7 @@ class ProcessEngine:
         self.model_path = flag_value(args, "--model") or ""
         self.quit_s = QUIT_DISK_S if (flag_value(args, "--conversation-cache-disk-mib") or "0") != "0" else QUIT_S
         self.log_path = log
-        self.proc, self.pump, self.log = None, None, None
+        self.proc, self.pump, self.err_pump, self.log = None, None, None, None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
             self.slot_cv = threading.Condition()
         if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
@@ -320,10 +332,11 @@ class ProcessEngine:
                                         kwargs={"gpus": gpus, "on_progress": self._note_load}, daemon=True)
             narrator.start()
         sink = None if log else ProcessEngine.stderr_sink
+        stamped = log and self.log
         self.max_context = 0                            # before the new process is visible: never its predecessor's
         try:
             self.proc = lifeline.popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE if sink else self.log,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE if sink or stamped else self.log,
                                        text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
         except OSError as e:                            # missing or not executable: nothing started, so this is a start error
             loading.set()                               # the narrator stops and the log handle goes back
@@ -334,10 +347,14 @@ class ProcessEngine:
                     pass
                 self.log = None
             raise EngineStartError(f"the engine could not be started: {e}", log) from e
-        frame_pipes(self.proc, sink is not None)
+        frame_pipes(self.proc, sink is not None or bool(stamped))
         proc = self.proc
+        self.err_pump = None
         if sink:
             threading.Thread(target=pump_lines, args=(proc.stderr, sink), daemon=True).start()
+        elif stamped:                                   # the engine's stderr reaches its log with the time of each line
+            self.err_pump = threading.Thread(target=pump_lines, args=(proc.stderr, stamped_writer(self.log)), daemon=True)
+            self.err_pump.start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
         ready_q: queue.Queue = queue.Queue()
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self.log), daemon=True).start()
@@ -382,6 +399,8 @@ class ProcessEngine:
                 self.proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            if self.err_pump is not None:               # the last lines, a crash's among them, reach the log first
+                self.err_pump.join(timeout=2)
             for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr,
                            self.log if self.log not in (None, subprocess.DEVNULL) else None):
                 if stream is not None:
@@ -589,7 +608,7 @@ class ProcessEngine:
         status = self._format_exit_status(rc)
         if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
             return f"{status} after it reported: {self.last_err}"
-        raw_lines = tail.splitlines()
+        raw_lines = [unstamp(x) for x in tail.splitlines()]
         err_idx = next((i for i in range(len(raw_lines) - 1, -1, -1)
                         if ": error: " in raw_lines[i] or raw_lines[i].lstrip().startswith("ERR")), None)
         if err_idx is not None:
@@ -905,8 +924,10 @@ class ProcessEngine:
             keys += f" relax={float(rd)!r}"
         gram = grammar_key(sampling.get(GRAMMAR_KEY))
         gp = gprompt_key(sampling.get(GPROMPT_KEY)) if gram else ""
+        reply = sampling.get(REPLY_KEY)
+        rk = f" reply={int(reply)}" if _number(reply) and int(reply) > 0 else ""   # the ids past it are the reply so far
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + gram + gp + logprobs_key(sampling.get(LOGPROBS_KEY))
+            + gram + gp + rk + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1920,6 +1941,8 @@ class ProcessEngine:
             if self.proc is not None and self.proc.poll() is not None:
                 if self.pump is not None:
                     self.pump.join(timeout=2)
+                if self.err_pump is not None:
+                    self.err_pump.join(timeout=2)
                 for stream in (self.proc.stdin, self.proc.stdout, getattr(self.proc, "stderr", None),
                                self.log if self.log not in (None, subprocess.DEVNULL) else None):
                     if stream is not None and hasattr(stream, "close"):

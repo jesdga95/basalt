@@ -8,6 +8,7 @@
 #include <cmath>
 #include <chrono>
 #include "basalt/platform/compiler.hpp"
+#include "basalt/platform/cpu.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -281,8 +282,178 @@ void ExpertPool::wait_ready(int e) {
     }
 }
 
+int ExpertPool::claim_from(std::atomic<uint64_t>& head, uint32_t epoch, uint32_t limit) {
+    uint64_t h = head.load(std::memory_order_acquire);
+    for (;;) {
+        if ((uint32_t) (h >> 32) != epoch) return -1;
+        const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
+        if (i >= n || i >= limit) return -1;
+        if (head.compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire)) return (int) i;
+    }
+}
+
+bool ExpertPool::split_by_groups(const std::vector<std::vector<int>>& groups) {
+    const int G = (int) groups.size();
+    if (G < 2 || G > kMaxGroups || n_ < G) return false;
+    int max_cpu = 0;
+    for (const auto& g : groups) {
+        if (g.empty()) return false;
+        for (int c : g) max_cpu = (std::max)(max_cpu, c);
+    }
+    std::vector<int> cg((size_t) max_cpu + 1, -1);
+    for (int g = 0; g < G; ++g)
+        for (int c : groups[(size_t) g]) cg[(size_t) c] = g;
+    idle_stop();
+    wait_parked("before pinning the workers to their groups");
+    std::vector<int> wg((size_t) n_);
+    for (int i = 0; i < n_; ++i) {
+        wg[(size_t) i] = i % G;
+        if (!basalt::platform::pin_thread_to_cpus(threads_[(size_t) i], groups[(size_t) (i % G)])) {
+            basalt::log::warn("basalt", "expert pool: cannot pin worker %d to its L3 group", i);
+            return false;
+        }
+    }
+    cpu_group_ = std::move(cg);
+    worker_group_ = std::move(wg);
+    n_groups_ = G;
+    return true;
+}
+
+int ExpertPool::group_here() const {
+    const int c = basalt::platform::current_cpu();
+    return c >= 0 && c < (int) cpu_group_.size() && cpu_group_[(size_t) c] >= 0 ? cpu_group_[(size_t) c] : 0;
+}
+
+void ExpertPool::warm_clear() {
+    idle_stop();
+    for (int g = 0; g < n_groups_; ++g) {
+        warm_[g].clear();
+        warm_next_[g].store(0, std::memory_order_relaxed);
+    }
+}
+
+void ExpertPool::warm_expert(const NativeFmt& f, const uint8_t* blob) {
+    constexpr uint64_t kChunk = 64u << 10;   // a worker's claim
+    const auto add = [&](int g, const uint8_t* p, uint64_t n) {
+        for (uint64_t o = 0; o < n; o += kChunk) warm_[g].push_back({p + o, (uint32_t) (std::min)(kChunk, n - o)});
+    };
+    for (int g = 0; g < n_groups_; ++g) {
+        int flo = 0, fhi = 0, dlo = 0, dhi = 0;
+        group_rows(g, n_groups_, (int) f.n_ff, flo, fhi);
+        group_rows(g, n_groups_, (int) f.n_embd, dlo, dhi);
+        add(g, blob + (size_t) flo * f.gu_row, (uint64_t) (fhi - flo) * f.gu_row);
+        add(g, blob + f.up_off + (size_t) flo * f.up_row, (uint64_t) (fhi - flo) * f.up_row);
+        add(g, blob + f.down_off + (size_t) dlo * f.d_row, (uint64_t) (dhi - dlo) * f.d_row);
+    }
+}
+
+void ExpertPool::warm_start() {
+    if (n_groups_ > 0) idle_start(&ExpertPool::warm_work, this);
+}
+
+// A parked worker's warm work: its group's spans, a claim at a time, one load a cache line, until they run out or the
+// pool stops the work (checked every 4 KiB).
+void ExpertPool::warm_work(void* ctx, int, int, const std::atomic<bool>& stop) {
+    ExpertPool& pool = *(ExpertPool*) ctx;
+    const int g = pool.group_here();
+    const std::vector<WarmSpan>& sp = pool.warm_[g];
+    uint64_t acc = 0;
+    for (;;) {
+        const int i = pool.warm_next_[g].fetch_add(1, std::memory_order_relaxed);
+        if (i >= (int) sp.size()) break;
+        const uint8_t* p = sp[(size_t) i].p;
+        const uint32_t n = sp[(size_t) i].n;
+        for (uint32_t o = 0; o < n; o += 4096) {
+            if (stop.load(std::memory_order_relaxed)) {
+                pool.warm_sink_.fetch_add(acc, std::memory_order_relaxed);
+                return;
+            }
+            const uint32_t end = (std::min)(n, o + 4096);
+            for (uint32_t q = o; q < end; q += 64) acc += *(const volatile uint64_t*) (p + q);
+        }
+    }
+    pool.warm_sink_.fetch_add(acc, std::memory_order_relaxed);
+}
+
+int ExpertPool::part_row_tail(int part, int parts, int rows, int tail) {
+    const int small = (std::min)(tail, parts / 2), big = parts - small;
+    const int64_t units = 4 * (int64_t) (std::min)(part, big) + (std::max)(0, part - big);
+    return (int) ((int64_t) rows * units / (4 * (int64_t) big + small));
+}
+
+void ExpertPool::drain_groups(int id, uint32_t epoch) {
+    const int G = n_groups_, mine = id >= 0 ? worker_group_[(size_t) id] : group_here();
+    for (;;) {
+        int g = 0, i = -1;
+        for (int k = 0; k < G && i < 0; ++k) {
+            g = (mine + k) % G;
+            i = claim_from(ghead_[g].h, epoch, 0xffffu);
+        }
+        if (i < 0) break;
+        if (id >= 0) wstate_[(size_t) id].store(i, std::memory_order_relaxed);
+        else { hstate_.store(i, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
+        run_group_task(g, i, epoch);
+        done_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void ExpertPool::run_group_task(int g, int i, uint32_t epoch) {
+    const int n = fused_n_, pg = group_gu_parts_, pd = group_d_parts_, G = n_groups_;
+    if (i < n * pg) {
+        const int e = i / pg, part = i % pg;
+        int lo = 0, hi = 0;
+        group_rows(g, G, (int) nfmt_->n_ff, lo, hi);
+        native_gu_range(e, lo + part_row_tail(part, pg, hi - lo, group_tail_),
+                        lo + part_row_tail(part + 1, pg, hi - lo, group_tail_));
+        FusedExpert& fe = fused_[(size_t) e];
+        if (fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            native_quantize(e);
+            fe.ready.store(1, std::memory_order_release);
+        }
+        return;
+    }
+    const int k = i - n * pg, e = k / pd, part = k % pd;
+    int lo = 0, hi = 0;
+    group_rows(g, G, (int) nfmt_->n_embd, lo, hi);
+    const int r0 = lo + part_row_tail(part, pd, hi - lo, group_tail_);
+    const int r1 = lo + part_row_tail(part + 1, pd, hi - lo, group_tail_);
+    if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0)
+        help_until_ready(e, epoch, mjobs_[e].blob + nfmt_->down_off + (size_t) r0 * nfmt_->d_row, (size_t) (r1 - r0) * nfmt_->d_row);
+    native_down_range(e, r0, r1);
+}
+
+void ExpertPool::help_until_ready(int e, uint32_t epoch, const uint8_t* down, size_t down_bytes) {
+    StallClock clock;
+    const uint32_t gu_tasks = (uint32_t) (fused_n_ * group_gu_parts_);
+    bool loaded = false;
+    while (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
+        int g = 0, i = -1;
+        for (; g < n_groups_ && i < 0; ++g) i = claim_from(ghead_[g].h, epoch, gu_tasks);
+        if (i >= 0) {
+            run_group_task(g - 1, i, epoch);
+            done_.fetch_add(1, std::memory_order_release);
+            continue;
+        }
+        if (!loaded) {   // nothing left to help with: this part's down rows into the cache meanwhile
+            prefetch_until_ready(e, down, down_bytes);
+            loaded = true;
+            continue;
+        }
+        basalt::platform::cpu_relax();
+        if (clock.expired(done_.load(std::memory_order_relaxed))) {
+            basalt::log::error("basalt", "the CPU expert pool stalled: the gate/up rows of expert %d of the grouped batch did "
+                                 "not finish (%u of %d tasks done) - stopping the engine so the server can start it again",
+                         e, done_.load(), njobs_);
+            stalled();
+        }
+    }
+}
+
 void ExpertPool::drain(int id, uint32_t epoch) {
-    (void) id;
+    if (mode_ == 9) {
+        drain_groups(id, epoch);
+        return;
+    }
     for (;;) {
         const int ci = claim(epoch);
         if (ci < 0) break;
@@ -328,11 +499,14 @@ int ExpertPool::part_row(int part, int parts, int rows) const {
 }
 
 void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const {
-    // into L2 (a part is tens of KB, more than L1 holds), checking every 4 KB whether the wait is already over
+    // into L2 (a part is tens of KB, more than L1 holds) by a load a cache line, checking every 4 KB whether the wait is
+    // already over: a software prefetch is a hint the core drops when its miss queue is full (on Zen 5 most of these were)
+    uint64_t acc = 0;
     for (size_t o = 0; o < bytes; o += 64) {
-        basalt::platform::prefetch(p + o, false);
-        if ((o & 4095) == 4032 && fused_[(size_t) e].ready.load(std::memory_order_relaxed) != 0) return;
+        acc += *(const volatile uint64_t*) ((const char*) p + o);
+        if ((o & 4095) == 4032 && fused_[(size_t) e].ready.load(std::memory_order_relaxed) != 0) break;
     }
+    warm_sink_.fetch_add(acc, std::memory_order_relaxed);
 }
 
 void ExpertPool::native_gu_range(int e, int r0, int r1) {
@@ -458,8 +632,29 @@ void ExpertPool::start_split_multi_native(const NativeFmt& f, ExpertJobMulti* jo
         return;
     }
     pend_t0_ = std::chrono::steady_clock::now();
-    const int tasks = split_multi_batch(f, jobs, n, pend_gu_share_);
+    int tasks = split_multi_batch(f, jobs, n, pend_gu_share_);
     idle_stop();
+    if (n_groups_ > 0) {
+        // each group's share of the rows in its own list, the same parts per expert in each
+        const int G = n_groups_;
+        group_gu_parts_ = (std::min)((int) f.n_ff / G, (std::max)(1, (fused_gu_parts_ + G - 1) / G));
+        group_d_parts_ = (std::min)((int) f.n_embd / G, (std::max)(1, (fused_d_parts_ + G - 1) / G));
+        group_tail_ = (std::max)(1, fused_tail_ / G);
+        for (int e = 0; e < n; ++e) fused_[(size_t) e].gu_left.store(G * group_gu_parts_, std::memory_order_relaxed);
+        const int per = n * (group_gu_parts_ + group_d_parts_);
+        tasks = G * per;
+        mode_ = 9;
+        njobs_ = tasks;
+        done_.store(0, std::memory_order_relaxed);
+        const uint32_t ep = epoch_.load(std::memory_order_relaxed) + 1;
+        head_.store(pack_head(ep, 0, 0), std::memory_order_relaxed);
+        for (int g = 0; g < G; ++g) ghead_[g].h.store(pack_head(ep, (uint32_t) per, 0), std::memory_order_release);
+        publish();
+        pend_epoch_ = ep;
+        pend_tasks_ = tasks;
+        pend_n_ = n;
+        return;
+    }
     mode_ = 8;
     njobs_ = tasks;
     pend_epoch_ = begin_batch(tasks);

@@ -95,11 +95,11 @@ def bf16_values(buf) -> np.ndarray:
 
 def _expert_job(args):
     """Blobs of experts [e0, e1) of one layer: each [gate | up | down] NVFP4 blocks and the FP32 scale tail."""
-    path, mats, e0, e1 = args       # mats: three (offset, rows, cols) of the whole [expert, rows, cols] tensors
+    mats, e0, e1 = args             # mats: three (path, offset, rows, cols) of the whole [expert, rows, cols] tensors
     out = []
     for e in range(e0, e1):
         tail = []
-        for off, rows, cols in mats:
+        for path, off, rows, cols in mats:
             nb = rows * cols * 2
             x = bf16_values(pread(path, off + e * nb, nb)).reshape(rows, cols)
             if not np.isfinite(x).all():
@@ -238,11 +238,9 @@ class Plan:
     # -- experts
     def expert_jobs(self, l):
         names = [f"blk.{l}.ffn_{r}_exps.weight" for r in ROLES]
-        mats = [(self.model.abs_range(n)[1], rows, cols) for n, (rows, cols) in zip(names, self.dims)]
-        path = self.model.abs_range(names[0])[0]
-        if any(self.model.abs_range(n)[0] != path for n in names):
-            raise S.ConvertError(f"layer {l}: the expert tensors are in different files")
-        return [(path, mats, e, min(e + EXPERTS_PER_JOB, self.n_expert)) for e in range(0, self.n_expert, EXPERTS_PER_JOB)]
+        mats = [(self.model.abs_range(n)[0], self.model.abs_range(n)[1], rows, cols)
+                for n, (rows, cols) in zip(names, self.dims)]
+        return [(mats, e, min(e + EXPERTS_PER_JOB, self.n_expert)) for e in range(0, self.n_expert, EXPERTS_PER_JOB)]
 
     def expert_chunks(self, pool):
         for l in self.layers:
@@ -320,8 +318,11 @@ def check_tokenizer(kv: dict, hf_dir: Path) -> None:
         raise S.ConvertError(f"the GGUF's merges differ from {hf_dir.name}/tokenizer.json")
     by_tok = {t: i for i, t in enumerate(toks)}
     for key, field in (("bos", "bos_token"), ("eos", "eos_token"), ("padding", "pad_token")):
-        if by_tok.get(tc.get(field)) != kv.get(f"tokenizer.ggml.{key}_token_id"):
-            raise S.ConvertError(f"the GGUF's {key} token id is not {tc.get(field)!r}'s id in tokenizer.json")
+        tok = tc.get(field)
+        if isinstance(tok, dict):
+            tok = tok.get("content")
+        if by_tok.get(tok) != kv.get(f"tokenizer.ggml.{key}_token_id"):
+            raise S.ConvertError(f"the GGUF's {key} token id is not {tok!r}'s id in tokenizer.json")
     if (hf_dir / "chat_template.jinja").read_text(encoding="utf-8") != kv.get("tokenizer.chat_template"):
         raise S.ConvertError(f"the GGUF's chat template differs from {hf_dir.name}/chat_template.jinja")
 
@@ -353,14 +354,15 @@ def build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_
         dense = plan.dense()
     except (S.ConvertError, KeyError) as e:
         raise SystemExit(f"convert: {e}")
+    for p in (mmproj, dfly):
+        if p is not None and not p.is_file():
+            raise SystemExit(f"convert: missing input: {p}")
     if mmproj is not None:
         with open(mmproj, "rb") as f:
             head = f.read(1 << 20)
         if head[:4] != b"GGUF" or ARCH.projector_type.encode() not in head:
             raise SystemExit(f"convert: {mmproj} is not a {ARCH.projector_type} projector GGUF")
-    for p in (mmproj, dfly):
-        if p is not None and not p.is_file():
-            raise SystemExit(f"convert: missing input: {p}")
+    dfly_meta = dfly_record(dfly, hf_meta["hf_config"]) if dfly is not None else None
     if partial.exists():
         partial.unlink()
     name = a.name or DEFAULT_NAME + (" Q6K" if q6k else "")
@@ -422,7 +424,6 @@ def build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_
                 "gguf_kv": kv,
                 "tensors": tensors,
                 "conversions": {"compat_bf16": False, "tensors": dense.records},
-                "license": ARCH.license(kv),
                 "mtp": None,
                 **ARCH.meta_extra(kv, {n: t for n, t in tensors.items() if n != ENGRAM_TENSOR}, own),
                 "vision": vision,
@@ -435,8 +436,9 @@ def build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_
                     "dense_variant": "Q6_K" if q6k else "Q8_0", "head": "BF16 (the F32 values are BF16 numbers)",
                     "engram": {"format": "E4M3 codes (llama.cpp type 43), to nearest, ties to even, no scale", **(engram_cost or {})},
                 },
-                **({"dfly2": dfly_record(dfly, hf_meta["hf_config"])} if dfly is not None else {}),
+                **({"dfly2": dfly_meta} if dfly_meta is not None else {}),
                 **hf_meta,
+                "license": {**ARCH.license(kv), **hf_meta.get("license", {})},
             }
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
@@ -475,7 +477,7 @@ def compare(section: np.ndarray, at: int, chunks, what: str, bad) -> int:
     return at
 
 
-def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
+def verify(pack: str, first_gguf, workers: int = 16) -> bool:
     """Every section's SHA-256, then each section's bytes against the roundings of the source, repeated."""
     t0 = time.time()
     problems: list[str] = []
@@ -487,7 +489,11 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
     m = ModelFile(pack)
     meta = json.loads(m.read("meta"))
     q = meta["quantized_from"]
-    paths = S.expand_shards(Path(first_gguf))
+    if isinstance(first_gguf, (str, Path)):
+        paths = S.expand_shards(Path(first_gguf))
+    else:
+        ggufs = [Path(p) for p in first_gguf]
+        paths = S.expand_shards(ggufs[0]) if len(ggufs) == 1 else ggufs
     model = S.SourceModel(paths, frozenset())
     plan = Plan(model, q["dense_variant"] == "Q6_K")
     print(f"{pack}: {len(m.names())} sections, {Path(pack).stat().st_size} bytes; source {len(paths)} GGUFs, {len(model.where)} tensors")
