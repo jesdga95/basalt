@@ -14,7 +14,7 @@ from serve.service import WRAP_SOFT_MAX, Service
 from serve.util.text import ByteTokenizer
 
 ROOT = Path(__file__).resolve().parents[2]
-CTX = 16384
+CTX = 2048                                  # small: a run to the context is one pass of a few thousand tokens
 
 
 class WindowEngine(MockEngine):
@@ -114,7 +114,7 @@ class BudgetWrap(unittest.TestCase):
         # no max_tokens: the engine clips the cap to the context's room, the budget follows the clipped cap, and the
         # pass the budget does not cap stops at the end of its window with every written token kept
         self.start(WindowEngine)
-        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 5
         code, b = self.chat()
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
@@ -138,7 +138,7 @@ class BudgetWrap(unittest.TestCase):
     def test_a_small_answer_room_is_not_spent_on_the_window(self):
         # a fixed answer room smaller than what a soft stop may keep: the wrap stops at the budget
         self.start(WindowEngine)
-        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 5
         self.engine.WINDOW = 50
         self.svc.answer_room = 40
         code, b = self.chat()
@@ -150,7 +150,7 @@ class BudgetWrap(unittest.TestCase):
 
     def test_a_soft_wrap_keeps_at_most_its_bound_past_the_budget(self):
         self.start(WindowEngine)
-        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 5
         self.engine.WINDOW = 80                                 # an engine that stops only after many tokens
         code, b = self.chat()
         self.assertEqual(code, 200, b)
@@ -161,7 +161,7 @@ class BudgetWrap(unittest.TestCase):
 
     def test_soft_stops_need_no_live_tracker(self):
         self.start(WindowEngine)
-        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 5
         events = list(self.svc.run(PromptText(self.svc.tok, self.svc.render_text(
             [{"role": "user", "content": "two plus two?"}], None, {})[0], clip=True), True, None, CTX - CTX_SLACK, {},
             threading.Event()))
@@ -170,7 +170,7 @@ class BudgetWrap(unittest.TestCase):
 
     def test_without_stop_soon_the_clipped_cap_still_answers(self):
         self.start(HardEngine)
-        self.engine.THOUGHT = WindowEngine.THOUGHT * 20
+        self.engine.THOUGHT = WindowEngine.THOUGHT * 5
         code, b = self.chat()
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["content"], WindowEngine.ANSWER)

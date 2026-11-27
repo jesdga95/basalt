@@ -1,2 +1,3 @@
 # What the serve tests need beyond the server.
 -r requirements.txt
+safetensors==0.8.0   # tools/quality_suite tests

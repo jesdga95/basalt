@@ -40,6 +40,7 @@ struct Args {
     int n;
     int64_t K, part_rows;
     int T, tiles, ks, cps, nchunks, epi;
+    int groups;            // kRows-row groups of the T rows: group j is rows 64j .. 64j + 63, with its own workspace part
     const uint16_t* act;   // bf16 rows
     uint16_t* act_out;     // SwiGLU: h as the next product's bf16 rows ([16][rows]), or null
     float* partial;
@@ -114,7 +115,9 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
     __shared__ int last;
     __shared__ float xchg[NM == 2 ? RS * kRows : 1];   // SwiGLU: the up rows for the gate warps
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
-    const int ks = a.ks, items = a.tiles * ks, G = gridDim.x;
+    // an item of the grid is (row tile, K slice, row group), the group fastest: the blocks that run together read the
+    // same weights, so a call of several groups reads each weight tile once from memory
+    const int ks = a.ks, groups = a.groups, items = a.tiles * ks * groups, G = gridDim.x;
     const int64_t row_bytes = kQ8 ? a.K : kBf16 ? 2 * a.K : a.K / 2;
 
     // a work item is (row tile, K slice); a block takes items blockIdx.x, + G, ... and streams their chunks as one
@@ -125,8 +128,9 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
             while (mi + 1 < a.n && tile >= a.tile0[mi + 1]) ++mi;
         return mi;
     };
-    auto chunks_of = [&](int item) { return min(a.cps, a.nchunks - (item % ks) * a.cps); };
+    auto chunks_of = [&](int item) { return min(a.cps, a.nchunks - ((item / groups) % ks) * a.cps); };
     auto issue = [&](int item, int i, int stage) {
+        item /= groups;
         const int tile = item / ks, mi = matrix_of(tile);
         const int64_t row0 = (int64_t) (tile - a.tile0[mi]) * RS;
         const int64_t kc = (int64_t) ((item % ks) * a.cps + i);   // chunk index along K
@@ -185,16 +189,18 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
 
     const int wm = NM == 1 ? 0 : warp / kWarpsPerM;   // this warp's matrix slot in the stage
     const int rw = warp % kWarpsPerM;
-    bool live[NT];
-    const uint16_t* xcol[NT];
-#pragma unroll
-    for (int t = 0; t < NT; ++t) {
-        live[t] = t * 8 + g < a.T;
-        xcol[t] = a.act + (int64_t) (t * 8 + g) * a.K + 16 * c;
-    }
     int q = 0;   // chunks consumed
     for (int item = blockIdx.x; item < items; item += G) {
-        const int tile = item / ks, slice = item % ks, mi = matrix_of(tile);
+        const int grp = item % groups, wi = item / groups;
+        const int tile = wi / ks, slice = wi % ks, mi = matrix_of(tile);
+        const int T = min(kRows, a.T - grp * kRows), c0 = grp * kRows;   // the group's rows and its first row
+        bool live[NT];
+        const uint16_t* xcol[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            live[t] = t * 8 + g < T;
+            xcol[t] = a.act + (int64_t) (c0 + t * 8 + g) * a.K + 16 * c;
+        }
         const int64_t row0 = (int64_t) (tile - a.tile0[mi]) * RS;
         const int n = chunks_of(item);
         const int64_t k0 = (int64_t) slice * a.cps * CH;
@@ -324,7 +330,9 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
         const int64_t rows = a.rows[mat];
         bool final_block = true;
         if (ks > 1) {
-            float* part = a.partial + (int64_t) slice * kRows * a.part_rows + a.row_off[mat];
+            float* const gpart = a.partial + (int64_t) grp * ks * kRows * a.part_rows;
+            int32_t* const gtick = a.tickets + (int64_t) grp * a.tiles;
+            float* part = gpart + (int64_t) slice * kRows * a.part_rows + a.row_off[mat];
 #pragma unroll
             for (int mt = 0; mt < MW; ++mt)
 #pragma unroll
@@ -333,16 +341,16 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                     for (int j = 0; j < 4; ++j) {
                         const int col = t * 8 + 2 * c + (j & 1);
                         const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                        if (col < a.T && r < rows) part[col * a.part_rows + r] = acc[mt][t][j];
+                        if (col < T && r < rows) part[col * a.part_rows + r] = acc[mt][t][j];
                     }
             __threadfence();
             __syncthreads();
-            if (threadIdx.x == 0) last = atomicAdd(a.tickets + tile, 1) == ks - 1;
+            if (threadIdx.x == 0) last = atomicAdd(gtick + tile, 1) == ks - 1;
             __syncthreads();
             final_block = last;
             if (final_block) {
                 __threadfence();
-                const float* base = a.partial + a.row_off[mat];
+                const float* base = gpart + a.row_off[mat];
                 // slice by slice, every element's load of a slice issued together (each element still sums its
                 // slices in order from 0)
 #pragma unroll
@@ -361,10 +369,10 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                             for (int j = 0; j < 4; ++j) {
                                 const int col = t * 8 + 2 * c + (j & 1);
                                 const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                                if (col < a.T && r < rows) acc[mt][t][j] += __ldcg(bk + (int64_t) col * a.part_rows + r);
+                                if (col < T && r < rows) acc[mt][t][j] += __ldcg(bk + (int64_t) col * a.part_rows + r);
                             }
                 }
-                if (threadIdx.x == 0) a.tickets[tile] = 0;
+                if (threadIdx.x == 0) gtick[tile] = 0;
             }
         }
         if (!final_block) continue;
@@ -380,7 +388,7 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                         for (int j = 0; j < 4; ++j) {
                             const int col = t * 8 + 2 * c + (j & 1);
                             const int rl = (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                            if (col < a.T) xchg[rl * kRows + col] = acc[mt][t][j] * su;
+                            if (col < T) xchg[rl * kRows + col] = acc[mt][t][j] * su;
                         }
             __syncthreads();
             if (wm == 0)
@@ -392,11 +400,12 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                         for (int j = 0; j < 4; ++j) {
                             const int col = t * 8 + 2 * c + (j & 1);
                             const int rl = (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                            if (col >= a.T || row0 + rl >= rows) continue;
+                            if (col >= T || row0 + rl >= rows) continue;
                             const float gv = acc[mt][t][j] * sg, uv = xchg[rl * kRows + col];
                             const float hv = gv / (1.0f + expf(-gv)) * uv;
-                            if (a.y[0]) a.y[0][col * a.ld_y[0] + row0 + rl] = hv;
-                            if (a.act_out) a.act_out[col * rows + row0 + rl] = __bfloat16_as_ushort(__float2bfloat16_rn(hv));
+                            const int64_t cg = c0 + col;
+                            if (a.y[0]) a.y[0][cg * a.ld_y[0] + row0 + rl] = hv;
+                            if (a.act_out) a.act_out[cg * rows + row0 + rl] = __bfloat16_as_ushort(__float2bfloat16_rn(hv));
                         }
             __syncthreads();   // xchg is free for the next item
         } else {
@@ -411,16 +420,17 @@ __global__ void __launch_bounds__(Cfg<F, RS, NM, CH, ST>::kThreads / MW, 1) wgem
                     for (int j = 0; j < 4; ++j) {
                         const int col = t * 8 + 2 * c + (j & 1);
                         const int64_t r = row0 + (rw * MW + mt) * 16 + g + 8 * (j >> 1);
-                        if (col >= a.T || r >= rows) continue;
+                        if (col >= T || r >= rows) continue;
                         const float v = acc[mt][t][j] * sc;
+                        const int64_t cg = c0 + col;
                         if (a.epi == (int) Epilogue::AddBf16) {
-                            uint16_t* d16 = a.y16[mat] + col * ld + r;
+                            uint16_t* d16 = a.y16[mat] + cg * ld + r;
                             // the product rounded as Store leaves it (no fma into the add), then one add, one rounding
                             *d16 = __bfloat16_as_ushort(__float2bfloat16_rn(
                                 __fadd_rn(__bfloat162float(__ushort_as_bfloat16(*d16)), __fmul_rn(acc[mt][t][j], sc))));
                             continue;
                         }
-                        float* dst = y + col * ld + r;
+                        float* dst = y + cg * ld + r;
                         if (a.epi == (int) Epilogue::Add) *dst += v;
                         else *dst = v;
                     }

@@ -544,6 +544,13 @@ static void test_schema_regressions() {
         auto int_all = build(R"({"allOf":[{"type":"integer","minimum":5},{"type":"integer","maximum":10}]})");
         CHECK(int_all && ok(int_all, "5") && ok(int_all, "10") && !ok(int_all, "4") && !ok(int_all, "11") && !ok(int_all, "{}"));
         CHECK(json_schema_to_gbnf(R"({"allOf":[{"enum":["a"]},{"enum":["b"]}]})", err).empty() && !err.empty());
+        // integer + number (Home Assistant's HassFanSetSpeed.percentage): an integer under the number's bounds
+        auto int_num = build(R"({"allOf":[{"type":"integer"},{"type":"number","minimum":0,"maximum":100}]})");
+        CHECK(int_num && ok(int_num, "0") && ok(int_num, "100") && !ok(int_num, "101") && !ok(int_num, "-1") && !ok(int_num, "1.5"));
+        auto num_frac = build(R"({"allOf":[{"type":"number","minimum":0.5,"exclusiveMaximum":10},{"type":"integer"}]})");
+        CHECK(num_frac && !ok(num_frac, "0") && ok(num_frac, "1") && ok(num_frac, "9") && !ok(num_frac, "10"));
+        auto num_huge = build(R"({"allOf":[{"type":"integer"},{"type":"number","maximum":1e300}]})");
+        CHECK(num_huge && ok(num_huge, "123456789"));
     }
 
     // R2C-1: number_text overflow, ULLONG_MAX, and malformed JSON numbers

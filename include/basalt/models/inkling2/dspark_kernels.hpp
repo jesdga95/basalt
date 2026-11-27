@@ -96,20 +96,26 @@ void dspark_split_rnn(const uint16_t* w, uint16_t* w_sp, uint16_t* w_h, uint16_t
 
 // ---- batched multi-session commit & draft kernels -----------------------------------------------------------------------
 
+/// A segment's cache: fp16 `k` and `v` [cell][kv head][head width], or, with `ks` set, the int8 cache (gqa_attn.hpp
+/// KvInt8: `k` and `v` its codes, `ks` and `vs` its fp16 scales, one per 64 values).
 struct DsCommitSegs {
     const basalt::kernels::WindowSegs* at_d = nullptr;
     float* fr[basalt::kernels::kWindowSegsMax] = {};
     uint16_t* k[basalt::kernels::kWindowSegsMax] = {};
     uint16_t* v[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* ks[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* vs[basalt::kernels::kWindowSegsMax] = {};
 };
 
 struct DsBatchFr {
     const float* fr[basalt::kernels::kWindowSegsMax] = {};
 };
 
-struct DsBatchKv {
+struct DsBatchKv {   ///< as DsCommitSegs' caches
     uint16_t* k[basalt::kernels::kWindowSegsMax] = {};
     uint16_t* v[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* ks[basalt::kernels::kWindowSegsMax] = {};
+    uint16_t* vs[basalt::kernels::kWindowSegsMax] = {};
 };
 
 void dspark_mix_batch(const float* tap, int64_t tap_stride, int rows, const DsMixArgs& a, float* out, int64_t out_stride,
@@ -130,14 +136,20 @@ void dspark_block_qk_prep_batch(const float* q, const float* kb, const float* vb
 void dspark_pack_draft_rows(const float* h_chunk, int block, int count_chunk, int slot0, int n_max, float* hd_all,
                             void* stream);
 
-void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, float* approx, void* stream);
+/// dspark_head_base for `count` sessions' n_max rows each (hq: count x n_max q8_1 rows; approx: the same rows of
+/// dspark_screen_rows floats), bit for bit, on int8 tensor cores; cols_scratch holds dspark_head_base_cols_bytes(count x n_max).
+size_t dspark_head_base_cols_bytes(int cols);
+void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_max, void* cols_scratch, float* approx,
+                            void* stream);
 
 void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
                               const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
                               void* stream);
 
+/// The scratch bytes dspark_head_pick_batch's latent columns take for `count` slots.
+size_t dspark_head_step_cols_bytes(int count);
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
-                            int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
-                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
+                            int n_max, int count, void* cols_scratch, void* scratch, size_t scratch_stride, int32_t* prev,
+                            int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
 
 }  // namespace basalt::models::inkling2

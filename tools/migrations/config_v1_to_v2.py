@@ -15,7 +15,7 @@ from pathlib import Path
 
 VERSION = 2
 # stays with the model: its identity, what it costs and how it answers
-ENTRY_KEYS = {"model", "alias", "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "slot-full-context",
+ENTRY_KEYS = {"model", "alias", "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "kv-pool", "slot-full-context",
               "max-context", "kv", "temperature", "top-p", "top-k", "min-p", "presence-penalty",
               "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "reasoning-effort",
               "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "grammar", "fit-max-tokens",

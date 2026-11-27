@@ -47,9 +47,11 @@ row counts. A model captures one graph per composition and keeps the most recent
 
 ### Scheduling slots x draft rows
 
-The shared engine schedules; a model only states its cap. Each round, every busy slot drafts its next window. With no more
-slots than rows one pass serves every slot (`batch_shares`): each takes one row, then each further row goes to the slot whose
-next draft is likeliest kept (the joint of its drafts' calibrated chances), and rows no draft wants go round the slots. A
+The shared engine schedules; a model only states its cap and its most slots (`ModelAdapter::max_slots`, the segments of one
+window): a start with `--batch` above it is refused, naming the model and the limit. Each round, every busy slot drafts its next window. With no more
+slots than rows one pass serves every slot (`batch_confident_shares`, after ingine-batch): each slot verifies its leading drafts
+while the joint of their calibrated chances stays above half the busy share of the slots, at least 2 and at most 4; past the cap
+the least likely drafts beyond each slot's first 2 come off first. A lone slot takes the policy's window (`batch_shares`). A
 drafter that sets its own windows' length (`own_window`: a stop rule in its chain) states no chances to weigh: each window
 takes the rows it would take alone, shared max-min fairly when they do not fit (`batch_fair_shares`: the windows wanting
 least served in full, the others splitting what is left), and the policy only weighs a lookup proposal against its drafts.
@@ -57,6 +59,11 @@ With more slots than rows each may take the cap and the windows are packed first
 (`batch_groups`). A lone window runs as `decode_window`, the solo path. The engine keeps one draft policy for solo windows and
 one for batch windows, whose rounds cost differently. A runtime may hold a slot out of a round (`slot_ready`, Flash-Next's
 elastic KV beside a prompt read); it keeps its place.
+
+A short text part before a prompt's last token (`Request::kWindowReadMax`, a model with `prompt_fold_window` above 1) is
+read as decode windows of forced rows: a batch admission leaves it to its slot (`BSlot::pend`), whose windows run in the
+rounds beside the other slots' (many prompts share one pass over the weights) and take the turn checkpoint after the last
+one; a solo request reads the same windows itself (`read_windows`), so its cells and reply are the same.
 
 ## Shared code and what a model provides
 
@@ -83,6 +90,28 @@ session. That is safe because the engine runs one call at a time: each session c
 the driver syncs every session's stream before a batch runs on the leader's. A model sizes its memory as per-session state
 times the slots plus the shared scratch once, so more slots cost only their caches.
 
+### The KV pool
+
+Every slot reaches the whole `--max-context`; there is no per-slot share. A model may back its sessions' per-position cells
+from one pool per card (`core::KvPool`): each cache reserves the address range of the whole context (`core::ElasticArray`,
+one allocation granule a step) and maps it as the conversation grows, so addresses, kernels and captured graphs are those of
+a contiguous cache and a row's bits do not change. The model sizes the pool at start from what its weights, the sessions' own
+buffers (rings, small state), the shared scratch and the spare leave: at least one session at the whole context or every
+session at its first granule, whichever is more, spilling experts only below that. The session hooks are `ModelSession::kv_back` (Refused, nothing
+changed, when the pool is short), `kv_trim` and `kv_pool_line`; a model without a pool keeps the defaults and sizes every
+session at the whole context.
+
+The session runtime (`session_engine.cpp`) backs a request's prompt and first window before it reads (`admit_room`) and every
+active slot's next window before each round (`next_batch_window`). A short pool parks idle conversations first, the longest
+idle first, into the RAM tier (`ConversationCache::put_slot`) or only on disk, else they are dropped; then a batch admission
+answers `BWAIT <slot>` and the server asks again after the next `BDONE`, no admission runs while a slot waits, and a slot
+that cannot grow sits out (`slot_ready`). When every running slot waits, the newest ends with finish `room` and keeps its
+conversation, which the next round parks.
+
+With `--kv-pool off` (the server's `--no-kv-pool`) the model sizes the pool as every session at the whole context and each
+session backs all of it when it starts and never trims it: dedicated, fixed per-slot KV, the same cells and bits as a model
+without a pool, and `kv_back` never refuses.
+
 ### Adding batching to a model
 
 1. Split the session's allocations: per-slot state in the session, the forward scratch in one object the sessions share.
@@ -107,7 +136,7 @@ times the slots plus the shared scratch once, so more slots cost only their cach
 
 Every model batches through the shared driver and the shared rounds: no separate batching path.
 
-- **Qwen3.8-27B** (the dense stack, `src/dense`) is on the driver. A window holds up to 16 rows (`kBatch`); its kernels read
+- **Qwen3.8-27B** (the dense stack, `src/dense`) is on the driver. A window holds up to 32 rows (`kBatch`); its kernels read
   their own segment tables (the attention's `GqaSeg` per segment, GDN's `BatchTable` through `dec_gdn_rec_seg_split`), which
   carry each segment's cache and recurrent-state addresses beside its rows. `batch_reserve` settles a session (the last
   window's GDN commit on its side stream; the driver readies every session before it waits on any, so the commits run side by
@@ -135,7 +164,7 @@ How each model below went onto the driver: its state, the kernels that read it, 
   without one (n = 0) the call is one conversation's, as today.
 - **The fused small-window attention** (1 to 3 rows, one cluster kernel) stays solo-only; a batch takes the prepare, split
   and combine kernels, which give the same bits.
-- **Cap:** 8 rows, the products' column limit (`kDecodeRows`).
+- **Cap:** 128 rows (`kBatchRows`) and 64 slots, the segments one window holds (`kWindowSegsMax`).
 - **On the driver:** `batch_stage` stages every row's token and position, `batch_forward` runs the visits with each
   segment's caches, then the head over every row into the shared batch logits, and commits each session's drafter context
   from its rows of the shared tap; `batch_take` copies a segment's head rows into its session's logits; `batch_draw` samples
@@ -261,7 +290,7 @@ rows.
   prompts: `--parallel 1` is unchanged.
 - **Serve identity** (`tools/batch_identity.py`): each prompt first in a one-slot engine (`--batch 1`), then in an engine
   with `--batch N` alone in slot 0 and all together, one per slot; every slot's tokens must equal the one-slot run's, greedy,
-  at 2, 4 and 8 slots.
+  at 2, 4 and 8 slots; `--prompt-tokens N` cuts the prompts short, so they take the windowed read.
 - **Throughput:** the same tool's aggregate tokens per second (every slot's tokens over the wall time from the first slot's
   start to the last one's end) at 1, 2, 4 and 8 slots, drafting on and with `--spec 1`, main against the branch, the bench
   fixtures (conv, struct, prose). Labelled with the cards and power (400 W RTX 5090, 180 W RTX 5060 Ti). Main's numbers are

@@ -28,7 +28,7 @@
 namespace basalt::models::inkling2 {
 namespace cpu = kernels::cpu;
 
-static_assert(kBatchRows * 8 <= 1024, "a batch visit's RAM pairs fit one call");
+static_assert(kBatchRows * 8 <= kMaxPairs, "a batch visit's RAM pairs fit one call");
 
 namespace {
 // The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
@@ -65,7 +65,7 @@ struct CpuExperts::Impl {
     // [kDecodeRows * k][kWidth] from the pool; each with its device address
     CpuBell* bell = nullptr;
     CpuBell* bell_dev = nullptr;
-    uint32_t* seq = nullptr;   // the device-side ticket counter
+    uint32_t* seq = nullptr;   // the device-side counters: the ring's tickets, then the rows' publications
     float* input = nullptr;
     float* input_dev = nullptr;
     int32_t* ids = nullptr;
@@ -124,9 +124,15 @@ struct CpuExperts::Impl {
         std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
     }
 
+    // On the doorbell's thread: a visit's rows quantized for its layer as soon as they come, before its choices.
+    void quantize(int layer, int rows) {
+        for (int r = 0; r < rows; ++r)
+            cpu::native_quant_act(fmt[(size_t) layer], input + (size_t) r * kWidth, acts[(size_t) r].data());
+    }
     // On the doorbell's thread: the visit's pairs on experts the second card holds go to it first, then the RAM pairs, every
-    // row of an expert in one job, on the pool; the card's rows land in `out` beside the pool's.
-    void run(int layer, int rows) {
+    // row of an expert in one job, on the pool; the card's rows land in `out` beside the pool's. `quantized`: its rows
+    // were quantized when they came.
+    void run(int layer, int rows, bool quantized) {
         std::fill(job_of.begin(), job_of.end(), -1);
         bool quant[kBatchRows] = {};
         int n = 0, on_peer = 0;
@@ -157,22 +163,41 @@ struct CpuExperts::Impl {
             job.out[job.nt++] = out + (size_t) p * kWidth;
             quant[r] = true;
         }
-        for (int r = 0; r < rows; ++r)
+        for (int r = 0; r < rows && !quantized; ++r)
             if (quant[r]) cpu::native_quant_act(fmt[(size_t) layer], input + (size_t) r * kWidth, acts[(size_t) r].data());
         if (n) pool->run_split_multi_native(fmt[(size_t) layer], jobs.data(), n);
         if (on_peer && !peer->finish(out, err)) peer_failed(err);
     }
-    // The doorbell's thread: a raised bell is taken (cleared), its visit computed, then `done` set for the card's merge.
-    // It spins while visits come, naps once none has come for kSpin, and wake() ends a nap.
+    // The doorbell's thread: a new rows publication is quantized, then acknowledged (the buffer goes back to the card); a
+    // raised bell is taken, its visit computed (its rows quantized first if their publication is not the one taken), then
+    // `done` set for the card's merge. It spins while visits come, naps once none has come for kSpin, and wake() ends a nap.
     void serve() {
-        std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done);
+        std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done), raised(bell->rows),
+            shape(bell->rows_shape), acked(bell->rows_ack), ring_rows(bell->ring_rows);
         auto busy = std::chrono::steady_clock::now();
-        uint32_t seen = wakes.load(std::memory_order_relaxed), spins = 0;
+        uint32_t seen = wakes.load(std::memory_order_relaxed), spins = 0, taken = 0;
+        // the latest publication, once new: quantized, then acknowledged after the last read of the buffer. The next
+        // publication waits for the acknowledgement, so none is missed or overwritten while it is read.
+        auto take_rows = [&] {
+            const uint32_t n = raised.load(std::memory_order_acquire);
+            if (!n || n == taken) return false;
+            const uint32_t w = shape.load(std::memory_order_relaxed);
+            quantize((int) (w >> 8 & 0xffu), (int) (w >> 16));
+            taken = n;
+            acked.store(n, std::memory_order_release);
+            return true;
+        };
         for (;;) {
+            if (take_rows()) {
+                busy = std::chrono::steady_clock::now();
+                continue;
+            }
             if (const uint32_t w = ring.load(std::memory_order_acquire)) {
                 const uint32_t visit = ticket.load(std::memory_order_relaxed);
+                const uint32_t pub = ring_rows.load(std::memory_order_relaxed);
                 ring.store(0, std::memory_order_relaxed);
-                run((int) (w >> 8 & 0xffu), (int) (w >> 16));
+                take_rows();   // the ring's release covers its rows' publication: one not seen before the ring is seen now
+                run((int) (w >> 8 & 0xffu), (int) (w >> 16), pub != 0 && pub == taken);
                 fin.store(visit, std::memory_order_release);
                 busy = std::chrono::steady_clock::now();
                 continue;
@@ -191,7 +216,8 @@ struct CpuExperts::Impl {
             napping.store(true, std::memory_order_seq_cst);
             nap_cv.wait_for(lk, kNap, [&] {
                 return wakes.load(std::memory_order_seq_cst) != seen || stop.load(std::memory_order_relaxed) ||
-                       ring.load(std::memory_order_acquire) != 0;
+                       ring.load(std::memory_order_acquire) != 0 ||
+                       raised.load(std::memory_order_acquire) != taken;
             });
             napping.store(false, std::memory_order_relaxed);
         }
@@ -211,7 +237,7 @@ CpuExperts::~CpuExperts() = default;
 std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string& err) {
     if (!m.spill().any()) return nullptr;
     const Geometry& g = m.geo();
-    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kBatchRows > 1024) {
+    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kBatchRows > kMaxPairs) {
         err = "the CPU experts do not fit this geometry";
         return nullptr;
     }
@@ -252,8 +278,8 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
         cudaHostGetDevicePointer((void**) &p.ids_dev, p.ids, 0) != cudaSuccess ||
         cudaHostAlloc((void**) &p.out, pairs * kWidth * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &p.out_dev, p.out, 0) != cudaSuccess ||
-        cudaMalloc(&p.seq, sizeof(*p.seq)) != cudaSuccess ||
-        cudaMemsetAsync(p.seq, 0, sizeof(*p.seq), p.stream) != cudaSuccess) {
+        cudaMalloc(&p.seq, 2 * sizeof(*p.seq)) != cudaSuccess ||
+        cudaMemsetAsync(p.seq, 0, 2 * sizeof(*p.seq), p.stream) != cudaSuccess) {
         cudaGetLastError();
         err = "cannot set up the CPU experts' buffers";
         return nullptr;
@@ -274,11 +300,18 @@ std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string&
     return out;
 }
 
-void CpuExperts::start(int l, int rows, const float* input, const int32_t* ids, cudaStream_t stream) {
+void CpuExperts::rows(int l, int rows, const float* input, cudaStream_t stream) {
     Impl& p = *impl_;
     must(cudaEventRecord(p.ready, stream), "fork");
     must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
-    moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, input, l, p.input_dev, p.ids_dev, p.bell_dev, p.seq, p.stream);
+    moe_cpu_rows(input, rows, l, p.input_dev, p.bell_dev, p.seq, p.stream);
+}
+
+void CpuExperts::start(int l, int rows, const int32_t* ids, cudaStream_t stream) {
+    Impl& p = *impl_;
+    must(cudaEventRecord(p.ready, stream), "fork");
+    must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
+    moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, l, p.ids_dev, p.bell_dev, p.seq, p.stream);
     must(cudaEventRecord(p.done, p.stream), "join");
 }
 

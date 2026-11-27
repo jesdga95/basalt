@@ -490,16 +490,21 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_pdl_kernel(const floa
 }
 
 template<typename... KArgs, typename... Args>
-void launch_dependent(void (*kernel)(KArgs...), dim3 grid, cudaStream_t s, Args... args) {
+void launch_dependent_smem(void (*kernel)(KArgs...), dim3 grid, size_t smem, cudaStream_t s, Args... args) {
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at[0].val.programmaticStreamSerializationAllowed = 1;
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = grid;
     cfg.blockDim = dim3(256);
-    cfg.dynamicSmemBytes = 0;
+    cfg.dynamicSmemBytes = smem;
     cfg.stream = s;
     cfg.attrs = at;
     cfg.numAttrs = 1;
     (void) cudaLaunchKernelEx(&cfg, kernel, args...);   // an error stays for the caller's check
+}
+
+template<typename... KArgs, typename... Args>
+void launch_dependent(void (*kernel)(KArgs...), dim3 grid, cudaStream_t s, Args... args) {
+    launch_dependent_smem(kernel, grid, 0, s, args...);
 }

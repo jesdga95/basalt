@@ -100,6 +100,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             last = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
                               "output_tokens": x["completion_tokens"]}}
+            if x.get("timings"):
+                last["timings"] = x["timings"]         # llama.cpp's field: the speed its clients show
             if want_lp:                             # entries no delta took (a call's closing markup)
                 last["logprobs"] = logprobs_part(lps["content"], lps["reasoning"], lps["tool"])
             yield "message_delta", last
@@ -155,6 +157,8 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+            if e.get("timings"):
+                msg["timings"] = e["timings"]
     if blocks and "_json" in blocks[-1]:
         blocks.pop()
     if msg is None:

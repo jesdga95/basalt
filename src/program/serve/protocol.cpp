@@ -68,7 +68,45 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 void Runtime::report_conversations(long long restored, double restored_ms) {
     if (!conversations) return;
     basalt::protocol::emit_text(basalt::protocol::conversation_line(conversations->size(), conversations->bytes(),
-                                                                    conversations->evictions(), restored, restored_ms));
+                                                                    conversations->evictions(), parking_refusals.total(),
+                                                                    restored, restored_ms));
+}
+
+bool Runtime::capture_admit(uint64_t need, uint64_t floor, basalt::core::Admission* verdict) {
+    uint64_t guard_floor = 0;
+    const bool guard_ok = basalt::platform::ram_guard_level(nullptr, &guard_floor) == basalt::platform::RamLevel::Ok;
+    const basalt::core::Admission a = basalt::core::conversation_admission(
+        guard_ok, guard_floor, basalt::core::conversation_available_memory(), need, floor);
+    if (verdict) *verdict = a;
+    return (bool) a;
+}
+
+void Runtime::refuse_parking(const basalt::core::Admission& why, const char* what, size_t tokens, uint64_t snapshot_bytes) {
+    if (parking_refusals.refused()) {
+        const bool ram = conversations && conversations->enabled();
+        basalt::log::warn("basalt serve", "conversation cache: %s refused for %zu tokens (snapshot %llu MiB): %s; %s closed "
+                          "until free RAM recovers", what, tokens,
+                          (unsigned long long) (snapshot_bytes >> 20), basalt::core::conversation_refusal(why).c_str(),
+                          ram && disk.enabled() ? "both tiers (RAM and disk)" : disk.enabled() ? "the disk tier" : "the RAM tier");
+    }
+    report_conversations();
+}
+
+void Runtime::parking_admitted() {
+    if (const uint64_t n = parking_refusals.admitted())
+        basalt::log::info("basalt serve", "conversation cache: RAM admission open again: %llu refusal%s while it was closed, "
+                          "%llu since startup", (unsigned long long) n, n == 1 ? "" : "s",
+                          (unsigned long long) parking_refusals.total());
+}
+
+bool Runtime::admit_parking(uint64_t need, uint64_t floor, const char* what, size_t tokens, uint64_t snapshot_bytes) {
+    basalt::core::Admission a;
+    if (capture_admit(need, floor, &a)) {
+        parking_admitted();
+        return true;
+    }
+    refuse_parking(a, what, tokens, snapshot_bytes);
+    return false;
 }
 
 bool Runtime::next_line(std::string& out) {

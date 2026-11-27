@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace basalt::kernels::cpu {
 namespace {
@@ -463,29 +464,33 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
 template <int TY>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
-    switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+    for (int t0 = 0; t0 < nt; t0 += 8) {
+        const int k = nt - t0 < 8 ? nt - t0 : 8;
+        switch (k) {
+            case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 8: gu_rows<TY, 8>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            default: break;
+        }
     }
 }
 
 template <int TY>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
-    switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        switch (k) {
+            case 1: dot_rows<TY, 1>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 2: dot_rows<TY, 2>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 3: dot_rows<TY, 3>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 4: dot_rows<TY, 4>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            default: break;
         }
     }
 }
@@ -499,9 +504,19 @@ void quantize_q8_K_avx512(const float* x, void* dst, int64_t k) {
     for (int64_t i = 0; i < nb; ++i, x += QK_K) {
         __m512 v[QK_K / 16];
         __m512 am = _mm512_setzero_ps();
-        for (int j = 0; j < QK_K / 16; ++j) {
-            v[j] = _mm512_loadu_ps(x + 16 * j);
+        unsigned has_nan = 0;
+        for (int j = 0; j < QK_K / 16; j += 2) {
+            v[j]     = _mm512_loadu_ps(x + 16 * j);
+            v[j + 1] = _mm512_loadu_ps(x + 16 * (j + 1));
             am = _mm512_max_ps(am, _mm512_abs_ps(v[j]));
+            am = _mm512_max_ps(am, _mm512_abs_ps(v[j + 1]));
+            has_nan |= (unsigned) _mm512_cmp_ps_mask(v[j], v[j + 1], _CMP_UNORD_Q);
+        }
+        if (has_nan != 0) {
+            y[i].d = std::numeric_limits<float>::quiet_NaN();
+            std::memset(y[i].qs, 0, QK_K);
+            std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
         }
         const float amax = _mm512_reduce_max_ps(am);
         if (amax == 0.f) {

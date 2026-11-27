@@ -1,0 +1,35 @@
+{
+  "submitter": "Dmitriy-Romanov",
+  "date": "2026-11-26",
+  "commit": "8c0fe539e0",
+  "preset": "community-1",
+  "model": "Inkling-2-Mini",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti Laptop GPU",
+      "vram_gib": 12,
+      "power_w": 140,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 14.4
+    }
+  ],
+  "ram_gib": 62,
+  "cpu": "AMD Ryzen AI 7 350 w/ Radeon 860M, 8 cores",
+  "ram_gbps": 58.6,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 3896.2,
+  "prefill_64k_tps": 3550.3,
+  "decode_tps": 156.4,
+  "decode_conv_tps": 102.6,
+  "decode_struct_tps": 186.4,
+  "decode_prose_tps": 86.3,
+  "accept_conv_pct": 73.8,
+  "accept_struct_pct": 90.5,
+  "accept_prose_pct": 49.5,
+  "draft_len_conv": 1.3,
+  "draft_len_struct": 6.4,
+  "draft_len_prose": 1.2,
+  "engine_args": "--gpu 0 --max-context 63233 --kv int8"
+}
