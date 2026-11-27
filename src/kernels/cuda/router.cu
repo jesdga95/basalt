@@ -28,6 +28,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <type_traits>
 
 namespace basalt::kernels {
 namespace {
@@ -45,16 +46,26 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+__device__ __forceinline__ float4 load_w4(const float* __restrict__ p, int i) {
+    return reinterpret_cast<const float4*>(p)[i];
+}
+__device__ __forceinline__ float4 load_w4(const uint16_t* __restrict__ p, int i) {
+    const uint2 u = reinterpret_cast<const uint2*>(p)[i];
+    return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u),
+                       __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xffff0000u));
+}
+
 // Stage: one gate row against up to kMaxTok token vectors. The row is loaded once into registers, each thread owns
 // fixed columns, and the warp and block sums run in a fixed order for every token.
-__device__ void router_logits_row(const float* __restrict__ gate_row, const float* __restrict__ x, int n_embd,
+template <typename W>
+__device__ void router_logits_row(const W* __restrict__ gate_row, const float* __restrict__ x, int n_embd,
                                   int n_tokens, float* __restrict__ logits, int n_expert, int row, float* red) {
     const int n4 = n_embd >> 2;
     float4 w[kMaxVec];
 #pragma unroll
     for (int c = 0; c < kMaxVec; ++c) {
         const int i = threadIdx.x + c * kLogitThreads;
-        if (i < n4) w[c] = reinterpret_cast<const float4*>(gate_row)[i];
+        if (i < n4) w[c] = load_w4(gate_row, i);
     }
     // the gate row is constant: it is read while the kernel before finishes (inside a PdlScope)
     pdl_wait();
@@ -88,8 +99,9 @@ __device__ void router_logits_row(const float* __restrict__ gate_row, const floa
     }
 }
 
+template <typename W>
 __global__ void __launch_bounds__(kLogitThreads)
-router_logits_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_embd, int n_expert,
+router_logits_kernel(const float* __restrict__ x, const W* __restrict__ gate, int n_embd, int n_expert,
                      int n_tokens, float* __restrict__ logits) {
     __shared__ float red[kMaxTok * (kLogitThreads / 32)];
     const int row = blockIdx.x;
@@ -102,9 +114,9 @@ router_logits_kernel(const float* __restrict__ x, const float* __restrict__ gate
 // The same logits, G gate rows a block: a token's float4 is read once for the G rows. Each (row, token) sum runs in exactly
 // router_logits_row's order (thread columns, then the warp tree, then the warps in order), so the bits are the same; for
 // n_embd = 4 * NV * kLogitThreads.
-template <int NV, int G>
+template <typename W, int NV, int G>
 __global__ void __launch_bounds__(kLogitThreads)
-router_logits_rows_kernel(const float* __restrict__ x, const float* __restrict__ gate, int n_embd, int n_expert, int n_tokens,
+router_logits_rows_kernel(const float* __restrict__ x, const W* __restrict__ gate, int n_embd, int n_expert, int n_tokens,
                           float* __restrict__ logits) {
     __shared__ float red[G][kMaxTok * (kLogitThreads / 32)];
     const int r0 = blockIdx.x * G, t0 = blockIdx.y * kMaxTok, nt = min(kMaxTok, n_tokens - t0);
@@ -113,7 +125,7 @@ router_logits_rows_kernel(const float* __restrict__ x, const float* __restrict__
 #pragma unroll
     for (int g = 0; g < G; ++g)
 #pragma unroll
-        for (int c = 0; c < NV; ++c) w[g][c] = reinterpret_cast<const float4*>(gate + (size_t) (r0 + g) * n_embd)[threadIdx.x + c * kLogitThreads];
+        for (int c = 0; c < NV; ++c) w[g][c] = load_w4(gate + (size_t) (r0 + g) * n_embd, threadIdx.x + c * kLogitThreads);
     for (int t = 0; t < nt; ++t) {
         const float4* xv = reinterpret_cast<const float4*>(x + (size_t) (t0 + t) * n_embd);
         float acc[G];
@@ -248,8 +260,6 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
                                 weights + (size_t) t * k, sh, held, prior);
 }
 
-}  // namespace
-
 // G gate rows per block for n_embd == 2304 (576 float4s = 2 * 256 + 64) with PDL overlap: a block reads its tokens'
 // activations once for G rows (2 for a decode window, 8 for a batch window, where those reads bound the launch) while
 // preserving router_logits_row's exact FP32 summation order bit-for-bit, whatever G.
@@ -376,7 +386,8 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
     }
 }
 
-void router_logits(const float* x, const float* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
+template <typename W>
+void router_logits_impl(const float* x, const W* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
     if (n_tokens <= 0) return;
     if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 16 || a.k > a.n_expert)
         throw std::invalid_argument("router: unsupported geometry");
@@ -390,33 +401,51 @@ void router_logits(const float* x, const float* gate, int n_tokens, const Router
     for (int t0 = 0; t0 < n_tokens; t0 += kLaunchTok) {
         const int nt = n_tokens - t0 < kLaunchTok ? n_tokens - t0 : kLaunchTok;
         if (rows4) {
-            router_logits_rows_kernel<3, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
+            router_logits_rows_kernel<W, 3, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
                 x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
             continue;
         }
         if (rows4w) {
-            router_logits_rows_kernel<5, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
+            router_logits_rows_kernel<W, 5, kRowsG><<<dim3(a.n_expert / kRowsG, (nt + kMaxTok - 1) / kMaxTok), kLogitThreads, 0, st>>>(
                 x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
             continue;
         }
-        if (rows2_2304 && nt >= kWideTok && a.n_expert % 8 == 0) {
-            launch_pdl(router_logits_2304_kernel<8>, dim3(a.n_expert / 8, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
-                       x + (size_t) t0 * a.n_embd, gate, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
-            continue;
+        if constexpr (std::is_same_v<W, float>) {
+            if (rows2_2304 && nt >= kWideTok && a.n_expert % 8 == 0) {
+                launch_pdl(router_logits_2304_kernel<8>, dim3(a.n_expert / 8, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
+                           x + (size_t) t0 * a.n_embd, gate, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
+                continue;
+            }
+            if (rows2_2304) {
+                launch_pdl(router_logits_2304_kernel<2>, dim3(a.n_expert / 2, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
+                           x + (size_t) t0 * a.n_embd, gate, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
+                continue;
+            }
         }
-        if (rows2_2304) {
-            launch_pdl(router_logits_2304_kernel<2>, dim3(a.n_expert / 2, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
-                       x + (size_t) t0 * a.n_embd, gate, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
-            continue;
-        }
-        launch_pdl(router_logits_kernel, dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
+        launch_pdl(router_logits_kernel<W>, dim3(a.n_expert, (nt + kMaxTok - 1) / kMaxTok), dim3(kLogitThreads), 0, st,
                    x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
+}
+
+}  // namespace
+
+void router_logits(const float* x, const float* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
+    router_logits_impl(x, gate, n_tokens, a, logits, stream);
 }
 
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
             int32_t* ids, float* weights, void* stream) {
     router_logits(x, gate, n_tokens, a, logits, stream);
+    router_select(logits, bias, n_tokens, a, ids, weights, stream);
+}
+
+void router_logits_bf16(const float* x, const uint16_t* gate, int n_tokens, const RouterArgs& a, float* logits, void* stream) {
+    router_logits_impl(x, gate, n_tokens, a, logits, stream);
+}
+
+void router_bf16(const float* x, const uint16_t* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
+                 int32_t* ids, float* weights, void* stream) {
+    router_logits_bf16(x, gate, n_tokens, a, logits, stream);
     router_select(logits, bias, n_tokens, a, ids, weights, stream);
 }
 

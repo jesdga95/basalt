@@ -24,6 +24,7 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
@@ -73,7 +74,7 @@ constexpr int kMmqTile = 128;                  // the widest column tile of an M
 constexpr int kLaunchRows = 32768;              // most (row, expert) pairs of one prompt launch
 constexpr int kRawRing = kAttRows + 16;        // the indexer's rows of the last positions (a multiple of the pool size)
 constexpr int64_t kGrowPositions = 16384;      // positions the caches are backed in
-constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load when the tier opens
+constexpr uint64_t kModuleRoom = 4ull << 27;   // kernel modules + graphs still to load when the tier opens (512 MiB)
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
 constexpr int kLookupK = core::ExpertTier::kMaxK;
 constexpr int kTypeNvfp4 = 40;                 // ggml's NVFP4: blobs end in the FP32 scales {s_gate, s_up, s_down, 0}
@@ -1416,10 +1417,22 @@ private:
         const MlaArgs a = mla_args(H, swa ? g_.rope_base_swa : g_.rope_base);
         if (phases & kQuery) {
             quant_n(R);
-            gemm_n(T(l, "attn_q_a.weight"), qa_, g_.q_lora, R);
-            bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
-            gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
-            gemm_n(T(l, "attn_kv_a_mqa.weight"), kvraw_, rank + g_.rope_dim, R);
+            const DevTensor* wqa = T(l, "attn_q_a.weight");
+            const DevTensor* wkv = T(l, "attn_kv_a_mqa.weight");
+            if (R <= kMaxWindow && E == 3072 && wqa->type == 8 && wkv->type == 8) {
+                const Q8xMat mats[2] = {
+                    {wqa->ptr, xq_n_, qa_, g_.q_lora},
+                    {wkv->ptr, xq_n_, kvraw_, rank + g_.rope_dim},
+                };
+                q8x_mmvq(mats, 2, E, R, stream_);
+                bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
+                gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
+            } else {
+                gemm_n(wqa, qa_, g_.q_lora, R);
+                bk::rms_norm_rows(qa_, F(l, "attn_q_a_norm.weight"), qan_, R, g_.q_lora, g_.rms_eps, stream_);
+                gemm(T(l, "attn_q_b.weight"), qan_, q_, g_.q_lora, H * g_.qk_dim, R);
+                gemm_n(wkv, kvraw_, rank + g_.rope_dim, R);
+            }
         }
         if (!(phases & (kCells | kOutput | kAttend))) return true;
         // the cells each row attends
@@ -2334,7 +2347,11 @@ private:
             ra.held = lossy_->held_tabs(l - g_.n_dense);
             ra.prior = lossy_->route_prior();
         }
-        bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        const DevTensor* gate = T(l, "ffn_gate_inp.weight");
+        if (gate->type == 30)
+            bk::router_bf16(xn_, (const uint16_t*) gate->ptr, F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        else
+            bk::router(xn_, (const float*) gate->ptr, F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
         if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
             for (int g0 = 0; g0 < R; g0 += kMaxWindow)
                 bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
@@ -2343,8 +2360,18 @@ private:
         gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
         if (!prompt) publish(0, std::min(kMaxWindow, R));
         float *sg = gu_, *su = gu_ + (size_t) R * g_.n_ff_exp;
-        gemm_n(T(l, "ffn_gate_shexp.weight"), sg, g_.n_ff_exp, R);
-        gemm_n(T(l, "ffn_up_shexp.weight"), su, g_.n_ff_exp, R);
+        const DevTensor* wsg = T(l, "ffn_gate_shexp.weight");
+        const DevTensor* wsu = T(l, "ffn_up_shexp.weight");
+        if (R <= kMaxWindow && E == 3072 && wsg->type == 8 && wsu->type == 8) {
+            const Q8xMat mats[2] = {
+                {wsg->ptr, xq_n_, sg, g_.n_ff_exp},
+                {wsu->ptr, xq_n_, su, g_.n_ff_exp},
+            };
+            q8x_mmvq(mats, 2, E, R, stream_);
+        } else {
+            gemm_n(wsg, sg, g_.n_ff_exp, R);
+            gemm_n(wsu, su, g_.n_ff_exp, R);
+        }
         bk::swiglu_scaled(sg, su, nullptr, nullptr, h_, R, g_.n_ff_exp, g_.n_ff_exp, stream_);
         gemm(T(l, "ffn_down_shexp.weight"), h_, sh_, g_.n_ff_exp, E, R);
     }
@@ -2369,7 +2396,10 @@ private:
                 err = "cannot begin a graph capture";
                 return false;
             }
-            body();
+            {
+                bk::PdlScope pdl(true, /*first_plain=*/true);
+                body();
+            }
             cudaGraph_t g = nullptr;
             const cudaError_t ce = cudaStreamEndCapture(stream_, &g);
             const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&ex, g, 0) : ce;
@@ -2772,10 +2802,16 @@ private:
     static constexpr uint64_t kReadAheadBytes = 56ull << 20;
     void read_ahead(int l, uint32_t word, cudaStream_t st) {
         if (ra_.empty()) {   // every layer's ranges, once
+            // Cap read-ahead to 7/12 of the card's L2 cache (56 MiB on a 96 MiB 5090, 28 MiB on a 48 MiB 5070 Ti)
+            // so the tail of the prefetch does not evict its own head or active KV/expert lines.
+            int l2 = 0;
+            uint64_t cap = kReadAheadBytes;
+            if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, m_.device()) == cudaSuccess && l2 > 0)
+                cap = std::min<uint64_t>(kReadAheadBytes, ((uint64_t) l2 * 7 / 12) & ~15ull);
             ra_.resize((size_t) g_.n_layers);
             for (int k = 0; k < g_.n_layers; ++k) {
                 L2Ranges& r = ra_[(size_t) k];
-                uint64_t left = kReadAheadBytes;
+                uint64_t left = cap;
                 int n = 0;
                 const auto add = [&](const DevTensor* t) {
                     if (t == nullptr || n == kL2Ranges || ((uintptr_t) t->ptr & 15) != 0) return;
