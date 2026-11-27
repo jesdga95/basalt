@@ -124,16 +124,83 @@ uint16_t f2h(float f) { return __half_raw(__float2half(f)).x; }
 double tanhd(double x) { return std::tanh(x); }
 double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
-// The cache formats: fp16, E4M3 codes (fp8), INT8 codes with an fp16 scale per 64 channels (int8).
-enum Kv { kF16, kE4M3, kI8 };
-const Kv kAllKv[] = {kF16, kE4M3, kI8};
-size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8); }
-const char* kv_tag(Kv kv) { return kv == kE4M3 ? ", E4M3" : kv == kI8 ? ", INT8" : ""; }
-void kv_set(Kv kv, AttnPrep& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
-void kv_set(Kv kv, AttnArgs& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
+// The cache formats: fp16, E4M3 codes (fp8), INT8 codes with an fp16 scale per 64 channels (int8), NVFP4 E2M1 codes with
+// an E4M3 scale per 16 channels (nvfp4).
+enum Kv { kF16, kE4M3, kI8, kNvfp4 };
+const Kv kAllKv[] = {kF16, kE4M3, kI8, kNvfp4};
+size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8, kv == kNvfp4); }
+const char* kv_tag(Kv kv) { return kv == kE4M3 ? ", E4M3" : kv == kI8 ? ", INT8" : kv == kNvfp4 ? ", NVFP4" : ""; }
+void kv_set(Kv kv, AttnPrep& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; a.nvfp4 = kv == kNvfp4; }
+void kv_set(Kv kv, AttnArgs& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; a.nvfp4 = kv == kNvfp4; }
+// The first padding byte of a row (INT8: past its two fp16 scales; NVFP4: past its eight E4M3 scales); 0: no padding.
+size_t kv_pad_start(Kv kv) { return kv == kI8 ? kHeadDim + 4 : kv == kNvfp4 ? kHeadDim / 2 + kHeadDim / 16 : 0; }
+// Host copies of kv_fp4.cuh's conversions: the nearest E4M3/E2M1 codes and their values, and the normalized 128-point
+// transform the nvfp4 keys and queries are turned by (prep.cuh's butterfly sequence, in fp64).
+uint32_t e4m3_code(float v) { return (uint32_t) __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3); }
+double e4m3_value(uint32_t q) { return (double) __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) q, __NV_E4M3))); }
+uint32_t e2m1_code(double v) {
+    const double a = std::fabs(v);
+    uint32_t m;
+    if (a <= 0.25) m = 0;
+    else if (a < 0.75) m = 1;
+    else if (a <= 1.25) m = 2;
+    else if (a < 1.75) m = 3;
+    else if (a <= 2.5) m = 4;
+    else if (a < 3.5) m = 5;
+    else if (a <= 5.0) m = 6;
+    else m = 7;
+    return m | (std::signbit(v) ? 8u : 0u);
+}
+double e2m1_value(uint32_t c) {
+    static const double mag[8] = {0., .5, 1., 1.5, 2., 3., 4., 6.};
+    return (c & 8u) ? -mag[c & 7u] : mag[c & 7u];
+}
+// hadamard128_warp's arithmetic in fp64: lane l of the warp holds channels 4l..4l+3.
+void hadamard128_ref(double* x) {
+    double v[128];
+    for (int l = 0; l < 32; ++l) {
+        const double a0 = x[4 * l] + x[4 * l + 1], a1 = x[4 * l] - x[4 * l + 1];
+        const double a2 = x[4 * l + 2] + x[4 * l + 3], a3 = x[4 * l + 2] - x[4 * l + 3];
+        v[4 * l] = a0 + a2;
+        v[4 * l + 2] = a0 - a2;
+        v[4 * l + 1] = a1 + a3;
+        v[4 * l + 3] = a1 - a3;
+    }
+    for (int off = 1; off < 32; off <<= 1) {
+        double w[128];
+        for (int l = 0; l < 32; ++l) {
+            const bool hi = (l & off) != 0;
+            for (int u = 0; u < 4; ++u) {
+                const int d = 4 * l + u;
+                const double other = v[4 * (l ^ off) + u];
+                w[d] = hi ? other - v[d] : v[d] + other;
+            }
+        }
+        std::memcpy(v, w, sizeof v);
+    }
+    constexpr double inv = 0.08838834764831845;   // 1 / sqrt(128)
+    for (int d = 0; d < 128; ++d) x[d] = v[d] * inv;
+}
 // One head row of kHeadDim values `x` written in format kv to `row` (kv_bytes(kv) bytes); `got` takes the values the row
 // holds. INT8: each 64 channels' scale the fp16 rounding of their max |x| / 127, codes x / scale rounded to nearest even.
 void put_row(Kv kv, const float* x, uint8_t* row, double* got) {
+    if (kv == kNvfp4) {
+        for (int grp = 0; grp < 8; ++grp) {
+            float m = 0.f;
+            for (int d = grp * 16; d < grp * 16 + 16; ++d) m = std::max(m, std::fabs(x[d]));
+            const uint32_t sb = e4m3_code(std::max(m, 6.0f * 0.001953125f) / 6.0f);
+            row[kHeadDim / 2 + grp] = (uint8_t) sb;
+            const double s = e4m3_value(sb);
+            for (int d = grp * 16; d < grp * 16 + 16; ++d) {
+                const double scaled = std::min(std::max((double) x[d] / s, -6.0), 6.0);
+                const uint32_t q = e2m1_code(scaled);
+                if (d % 2 == 0) row[d / 2] = (uint8_t) ((row[d / 2] & 0xf0) | q);
+                else row[d / 2] = (uint8_t) ((q << 4) | (row[d / 2] & 0x0f));
+                got[d] = e2m1_value(q) * s;
+            }
+        }
+        return;
+    }
     if (kv == kI8) {
         for (int grp = 0; grp < 2; ++grp) {
             float m = 0.f;
@@ -176,7 +243,10 @@ std::vector<uint8_t> kv_rows(Kv kv, size_t rows, float s, std::vector<double>* v
 void get_row(Kv kv, const uint8_t* rows, size_t i, double* out) {
     const uint8_t* r = rows + i * kv_bytes(kv);
     for (int d = 0; d < kHeadDim; ++d) {
-        if (kv == kI8) {
+        if (kv == kNvfp4) {
+            const uint32_t q = d % 2 == 0 ? r[d / 2] & 15u : r[d / 2] >> 4;
+            out[d] = e2m1_value(q) * e4m3_value(r[kHeadDim / 2 + d / 16]);
+        } else if (kv == kI8) {
             uint16_t sh;
             std::memcpy(&sh, r + kHeadDim + 2 * (d / 64), 2);
             out[d] = (double) (int8_t) r[d] * h2d(sh);
@@ -393,6 +463,9 @@ void test_prepare() {
                     for (int d = 0; d < kHeadDim; ++d) (which ? rv : rk).push_back(val[d] * f);
                 }
             }
+        // nvfp4 keys are stored Hadamard-rotated: the reference rows the cache check compares against, head row by head row
+        std::vector<double> rk_rot = rk;
+        for (size_t base = 0; base < rk_rot.size(); base += kHeadDim) hadamard128_ref(&rk_rot[base]);
         // each cache format from the same rings, into poisoned caches: the values its cells hold against the reference
         // (INT8: within half a step of its group's scale, and the row's padding written as zeros)
         for (const Kv kv : kAllKv) {
@@ -414,36 +487,51 @@ void test_prepare() {
                         const size_t cell = (size_t) (pos[r] % cap) * kKvHeads + h;
                         get_row(kv, (which ? hv : hk).data(), cell, row.data());
                         for (int d = 0; d < kHeadDim; ++d) (which ? gv : gk).push_back((float) row[d]);
-                        for (size_t b = kHeadDim + 4; kv == kI8 && b < kv_bytes(kv); ++b) pad = pad && (which ? hv : hk)[cell * kv_bytes(kv) + b] == 0;
+                        for (size_t b = kv_pad_start(kv); (kv == kI8 || kv == kNvfp4) && b < kv_bytes(kv); ++b)
+                            pad = pad && (which ? hv : hk)[cell * kv_bytes(kv) + b] == 0;
                     }
-            const double tol = kv == kI8 ? 4e-3 : kv == kE4M3 ? 7e-2 : 1e-3;
+            const double tol = kv == kNvfp4 ? 2e-1 : kv == kI8 ? 4e-3 : kv == kE4M3 ? 7e-2 : 1e-3;
             char tag[64];
             std::snprintf(tag, sizeof tag, "attn_prepare keys (%s%s)", full ? "full" : "window", kv == kF16 ? ", fp16" : kv_tag(kv));
-            report(tag, gk, rk, tol);
+            report(tag, gk, kv == kNvfp4 ? rk_rot : rk, tol);
             std::snprintf(tag, sizeof tag, "attn_prepare values (%s%s)", full ? "full" : "window", kv == kF16 ? ", fp16" : kv_tag(kv));
             report(tag, gv, rv, tol);
-            if (kv == kI8) {
-                std::printf("%-34s %s\n", "  INT8 rows' padding zeroed", pad ? "ok" : "FAIL");
+            if (kv == kI8 || kv == kNvfp4) {
+                std::printf("%-34s %s\n", kv == kNvfp4 ? "  NVFP4 rows' padding zeroed" : "  INT8 rows' padding zeroed", pad ? "ok" : "FAIL");
                 failures += !pad;
+            }
+            // each format's queries as it leaves them: nvfp4's Hadamard-rotated, the others' unrotated
+            {
+                const std::vector<float> gqf = host(q, (size_t) R * kHeads * kHeadDim);
+                std::vector<double> rqf(gqf.size());
+                for (int r = 0; r < R; ++r) {
+                    const double tau = full ? 1.0 + 0.1 * std::log(std::max((pos[r] + 1.0) / 8192.0, 1.0)) : 1.0;
+                    for (int h = 0; h < kHeads; ++h) {
+                        double ss = 0;
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            const double v = (double) yq[(size_t) r * kProjQ + h * kHeadDim + d] * qs[h * kHeadDim + d];
+                            ss += v * v;
+                        }
+                        const double f = std::min(22.627417 / (std::sqrt(ss) + 1e-6), 1.0) * tau;
+                        for (int d = 0; d < kHeadDim; ++d)
+                            rqf[((size_t) r * kHeads + h) * kHeadDim + d] = (double) yq[(size_t) r * kProjQ + h * kHeadDim + d] * qs[h * kHeadDim + d] * f;
+                    }
+                }
+                if (kv == kNvfp4)
+                    for (size_t base = 0; base < rqf.size(); base += kHeadDim) hadamard128_ref(&rqf[base]);
+                std::snprintf(tag, sizeof tag, "attn_prepare queries%s", kv_tag(kv));
+                report(tag, gqf, rqf, 2e-6);
             }
             if (!full) std::printf("  %.1f us a call (1 row%s)\n", time_us([&] { attn_prepare(a, 1, nullptr); }), kv_tag(kv));
             cudaFree(kcache);
             cudaFree(vcache);
         }
-        // queries, relative states, sinks
-        const std::vector<float> gq = host(q, (size_t) R * kHeads * kHeadDim), gr = host(rr, (size_t) R * kHeads * kRel), gs = host(sink, (size_t) R * kHeads);
-        std::vector<double> rq(gq.size()), rr2(gr.size()), rsk(gs.size());
+        // relative states and sinks (the queries are checked per format above: nvfp4 leaves them Hadamard-rotated)
+        const std::vector<float> gr = host(rr, (size_t) R * kHeads * kRel), gs = host(sink, (size_t) R * kHeads);
+        std::vector<double> rr2(gr.size()), rsk(gs.size());
         for (int r = 0; r < R; ++r) {
             const double tau = full ? 1.0 + 0.1 * std::log(std::max((pos[r] + 1.0) / 8192.0, 1.0)) : 1.0;
             for (int h = 0; h < kHeads; ++h) {
-                double ss = 0;
-                for (int d = 0; d < kHeadDim; ++d) {
-                    const double v = (double) yq[(size_t) r * kProjQ + h * kHeadDim + d] * qs[h * kHeadDim + d];
-                    ss += v * v;
-                }
-                const double f = std::min(22.627417 / (std::sqrt(ss) + 1e-6), 1.0) * tau;
-                for (int d = 0; d < kHeadDim; ++d)
-                    rq[((size_t) r * kHeads + h) * kHeadDim + d] = (double) yq[(size_t) r * kProjQ + h * kHeadDim + d] * qs[h * kHeadDim + d] * f;
                 double s2 = 0;
                 for (int i = 0; i < kRel; ++i) {
                     const double v = (double) yq[(size_t) r * kProjQ + kOffR + h * kRel + i] * rs[h * kRel + i];
@@ -455,7 +543,6 @@ void test_prepare() {
                 rsk[(size_t) r * kHeads + h] = yq[(size_t) r * kProjQ + kOffSink + h];
             }
         }
-        report("attn_prepare queries", gq, rq, 2e-6);
         report("attn_prepare relative states", gr, rr2, 2e-6);
         report("attn_prepare sinks", gs, rsk, 0);
         // the rings took the window's inputs
@@ -470,10 +557,11 @@ void test_prepare() {
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 void test_attention() {
-    // a window ring, a full cache, a full cache of E4M3 codes, a full cache and a window ring of INT8 codes
-    for (int mode = 0; mode < 5; ++mode) {
-        const bool window = mode == 0 || mode == 4;
-        const Kv kv = mode == 2 ? kE4M3 : mode >= 3 ? kI8 : kF16;
+    // a window ring, a full cache, a full cache of E4M3 codes, a full cache and a window ring of INT8 codes, a full cache
+    // and a window ring of NVFP4 codes
+    for (int mode = 0; mode < 7; ++mode) {
+        const bool window = mode == 0 || mode == 4 || mode == 6;
+        const Kv kv = mode == 2 ? kE4M3 : mode == 3 || mode == 4 ? kI8 : mode >= 5 ? kNvfp4 : kF16;
         const int R = 4;
         const int p0 = window ? 2900 : 2995;
         const int64_t cap = window ? kExtent + 8 : 3000;
@@ -1008,9 +1096,9 @@ void test_attention_window() {
             std::vector<int> pos(R);
             for (int r = 0; r < R; ++r) pos[r] = k.p0 + r;
             std::vector<uint8_t> kc = kv_rows(kv, (size_t) kKvHeads * k.cap, 0.6f), vc = kv_rows(kv, (size_t) kKvHeads * k.cap, 1.0f);
-            if (kv == kI8)   // the padding poisoned: the rows the window writes must come out zero-padded
+            if (kv == kI8 || kv == kNvfp4)   // the padding poisoned: the rows the window writes must come out zero-padded
                 for (size_t i = 0; i < kc.size(); ++i)
-                    if (i % kv_bytes(kv) >= kHeadDim + 4) kc[i] = vc[i] = 0xa5;
+                    if (i % kv_bytes(kv) >= kv_pad_start(kv)) kc[i] = vc[i] = 0xa5;
             const std::vector<float> y = randn((size_t) R * kProj, 1.5f);
             const std::vector<float> tk = randn(1024 * kConv, 0.3f), tv = randn(1024 * kConv, 0.3f);
             const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
@@ -1052,13 +1140,13 @@ void test_attention_window() {
             std::snprintf(tag, sizeof tag, "attention_window (%s%s, %d rows at %d)", k.window ? "window" : "full", kv_tag(kv), R, k.p0);
             std::printf("%-46s %s\n", tag, same ? "bitwise = prepare + attention" : "FAIL");
             failures += !same;
-            if (kv == kI8) {
+            if (kv == kI8 || kv == kNvfp4) {
                 bool pad = true;
                 for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
                     const std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
                     for (int r = 0; r < R; ++r)
                         for (int h = 0; h < kKvHeads; ++h)
-                            for (size_t x = kHeadDim + 4; x < kv_bytes(kv); ++x)
+                            for (size_t x = kv_pad_start(kv); x < kv_bytes(kv); ++x)
                                 pad = pad && b[((size_t) (pos[r] % k.cap) * kKvHeads + h) * kv_bytes(kv) + x] == 0;
                 }
                 std::printf("%-46s %s\n", "  the written rows' padding zeroed", pad ? "ok" : "FAIL");
@@ -1067,9 +1155,9 @@ void test_attention_window() {
             std::vector<uint8_t> all = host((uint8_t*) aa[1].q8, q8b);
             for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
                 std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
-                if (kv == kI8)   // the hash covers codes and scales: the padding is checked above
+                if (kv == kI8 || kv == kNvfp4)   // the hash covers codes and scales: the padding is checked above
                     for (size_t i = 0; i < b.size(); ++i)
-                        if (i % kv_bytes(kv) >= kHeadDim + 4) b[i] = 0;
+                        if (i % kv_bytes(kv) >= kv_pad_start(kv)) b[i] = 0;
                 all.insert(all.end(), b.begin(), b.end());
             }
             print_hash("q8_1 output and caches", all);

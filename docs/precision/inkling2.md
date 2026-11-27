@@ -6,6 +6,7 @@ Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quali
 
 - **Against the reference:** the default pack (`NVFP4-MX8`, the release's MXFP8 experts native) scores mean KLD 0.00297 and top-1 97.83% over 100 chunks, and 0.00303 and 97.72% with its RAM experts on the CPU; the `NVFP4-DQ8` pack 0.00305 and 97.76% ([below](#against-the-reference)).
 - **INT8 KV:** on the DQ8 pack, the final rebased 100-chunk run scored mean KLD 0.00343 with 97.47% top-1; its row is 144 bytes versus 256 for FP16.
+- **NVFP4 KV (`--kv nvfp4`):** on the MX8 pack (100 chunks, RTX 5070 at 250 W, pinned 900 GPU experts), `--kv nvfp4` scores mean KLD 0.00673 and 96.30% top-1 (PPL 7.0823) against `--kv fp8`'s 0.00452 and 97.20% (PPL 7.0688) on the same placement; its full-attention row is 80 bytes (10 KiB/position across the 8 full visits, −37.5% vs FP8 and −68.8% vs FP16), while the 40 fixed sliding-window rings stay FP8 (84.5 MiB total).
 - **At 256k context:** FP8 saves 4.25 GiB and INT8 saves 3.74 GiB of total VRAM versus FP16 with the same expert placement ([measurements](#earlier-vram-use-at-256k-context)).
 - **The reference is not a true BF16 model.** No BF16 checkpoint exists: the release ships its routed experts in NVFP4 and
   MXFP8. The base is the official release with its experts dequantized to BF16, so its KLD is not comparable with the other
@@ -43,7 +44,7 @@ Formats measured for layers 20 to 23 over 20 chunks: native MXFP8 0.00265 KLD, Q
 | Q8_0 projections (`w.proj`, `w.out`), head | Q8_0 (loaded into `q8_planes` for `w.proj`/`w.out`) | q8_1 activations via `native_q8_planes_mmvq` (decode, bitwise `native_q8_0_mmvq`); block-32 Q8_0 2-CTA TMA int8 tensor cores (`prefill::q8`, prompt); fp32 logits, softcap 30 |
 | Router | F32 | fp32 sigmoid, top 8 |
 | Attention-residual mixes, controllers, norms | F32, BF16 weights | fp32 |
-| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), or fp8 (E4M3, unit scale) | decode: fp32 scores and softmax (a full int8 cache at 32,768 keys and more: fp16 tensor-core tiles, [below](#attention-caches)); prompt: values dequantized to fp16 tiles, fp32 accumulation |
+| Attention caches | fp16, int8 (`--kv int8`: signed codes with an FP16 scale per 64 channels), fp8 (E4M3, unit scale), or nvfp4 (`--kv nvfp4`: E2M1 codes with an E4M3 scale per 16 channels and 128-point Hadamard rotation on K/Q for the 8 full visits; fixed sliding-window rings in FP8) | decode: fp32 scores and softmax (a full int8 cache at 32,768 keys and more, and full fp16/fp8/nvfp4 caches: fp16 tensor-core tiles, [below](#attention-caches)); prompt: values dequantized to fp16 tiles, fp32 accumulation |
 | Short-convolution state | fp32 | fp32 |
 
 A decode row's arithmetic does not depend on how many rows share its window. Prompt chunks round differently from decoded rows;
@@ -68,6 +69,12 @@ as fast as through MMQ.
   numerator drops that scale before the split merge, while the softmax denominator sums the unscaled fp32 probabilities. A
   row's arithmetic is the same alone and in a verify window at the same key count, but not bit-identical to the scalar
   reader, which shallower rows and the sliding-window layers keep.
+- **`--kv nvfp4`:** E2M1 codes with an E4M3 scale per 16 channels on the 8 full-attention visits (80 bytes per head row: 64 code
+  bytes, 8 scale bytes, 8 zero padding bytes; 10 KiB per position, 37.5% less than FP8 and 68.8% less than FP16). Keys and
+  queries are turned by the normalized 128-point Walsh-Hadamard transform (orthonormal, zero shared memory via warp shuffles)
+  before rounding; values are stored directly. The 40 fixed-size sliding-window rings stay in FP8 (84.5 MiB total at any
+  context length). Decode and prompt kernels unpack E2M1 × E4M3 directly to exact fp16 tiles for tensor-core attention; parked
+  conversations tag full-attention cells as format 5.
 
 ### Cost of the tensor-core INT8 reader
 
@@ -118,6 +125,8 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | 100 chunks, `--kv fp8` (#552's build) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | 100 chunks, `--kv fp16` (#552's build), the same set of runs as the two rows above | 0.00310 | 97.78% | 7.0695 (base 7.0644) |
 | MX8 pack, 100 chunks, the sm_120 prompt and decode kernels (#579's build; 0.00442, 97.17%, 7.0704 before it) | 0.00441 | 97.22% | 7.0647 |
+| MX8 pack, 100 chunks, `--kv fp8`, pinned `--expert-cache 900` (RTX 5070, 250 W; 52.4% VRAM hits) | 0.00452 | 97.20% | 7.0688 (base 7.0633) |
+| MX8 pack, 100 chunks, `--kv nvfp4`, pinned `--expert-cache 900` (RTX 5070, 250 W; 52.4% VRAM hits) | 0.00673 | 96.30% | 7.0823 (base 7.0633) |
 
 Which RAM experts have a card copy changes their arithmetic (the card's q8_1 activations against the CPU's Q8_0), so
 placement is part of the result. Measured when copies were ranked by lookups per token (the earlier ranking): with
@@ -205,6 +214,19 @@ Measured after `READY 262144`, before a prompt, on an RTX 5090 at 400 W. The ful
 | INT8 | 26,366 MiB (25.75 GiB) | 24,471 MiB | 3,826 MiB (3.74 GiB) |
 
 The previous INT8 row-writer parity matched the CPU reference for 257 rows of width 128. Dequantized max absolute error was 0.00559; the microbench took 2.81 µs for 4,096 rows at 957 GB/s.
+
+## NVFP4 KV microbench and long-context check
+
+RTX 5070 at 250 W, MX8 pack. Kernel decode attention (`inkling2_kv_nvfp4_parity --bench`, 3 rows, read alone):
+
+| Depth | FP16 (µs) | INT8 (µs) | FP8 (µs) | NVFP4 (µs) | NVFP4 vs FP8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 32,768 | 240.1 | 440.4 | 148.1 | 127.3 | −14.0% |
+| 65,536 | 474.2 | 370.1 | 297.6 | 287.9 | −3.3% |
+| 131,072 | 896.0 | 635.1 | 510.0 | 529.3 | +3.8% (window 508.1 vs 553.4, −8.2%) |
+| 262,144 | 1,814.0 | 1,180.8 | 984.0 | 999.9 | +1.6% (window 971.6 vs 1,040.8, −6.6%) |
+
+Pinned-placement ABBA (`basalt-bench -t conv -p 16384 -r 1 --seed 20261122 --spec 5 --max-context 32768 --expert-cache 900`, RTX 5070 at 250 W): `--kv nvfp4` averaged 46.38 tok/s (41.31 ms/window, 24.21 passes/s, 75.5% accept, 1.22 draft len, 5,254 tok/s 16K prefill) against `--kv fp8`'s 46.24 tok/s (39.66 ms/window, 25.22 passes/s, 73.7% accept, 1.13 draft len, 5,184 tok/s 16K prefill). At `--max-context 131072` without `--expert-cache`, `--kv nvfp4` placed 4.5 GiB of weights on the card against `--kv fp8`'s 3.7 GiB (+0.8 GiB), passed needle retrieval at 50% depth for 50K, 75K and 112K prompts, and read prompts at 4,361, 4,032 and 3,468 tok/s against FP8's 3,729, 3,387 and 3,158 tok/s.
 
 ## Drafting
 

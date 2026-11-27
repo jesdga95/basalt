@@ -45,7 +45,9 @@ the text model.
   embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. Two cards: [peer or split](#two-cards).
 - **Context:** `--max-context` from 1,024 to 1,048,576, default 8,192.
 - **Per position:** the 8 full-attention visits keep every position, 32 KiB with `--kv fp16`, 18 KiB with `--kv int8`, 16 KiB
-  with `--kv fp8`, plus the drafter's full layer (fp16 in every mode); the window layers' rings do not grow.
+  with `--kv fp8`, or 10 KiB with `--kv nvfp4` (E2M1 codes with an E4M3 scale per 16 channels, keys and queries turned by a
+  normalized 128-point Hadamard transform; the 40 fixed-size sliding-window rings stay FP8 at 84.5 MiB total), plus the drafter's
+  full layer (fp16 in every mode); the window layers' rings do not grow.
 - **Experts in RAM when the context needs the room:** when the asked context does not fit beside every expert, the least
   routed experts (by the shipped profile `data/profiles/inkling2-24x128.prof`) are planned into page-locked RAM, just enough,
   and decode computes them on the CPU. After routing, a visit with RAM experts publishes its choices and the input rows

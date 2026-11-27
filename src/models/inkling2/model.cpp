@@ -92,16 +92,20 @@ uint64_t expert_stride(int type, uint64_t blob) {
 
 namespace {
 // The cached keys and values of one visit of layer `layer` for `context` positions (a sliding-window layer: its ring).
-uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8, bool int8) {
-    const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);
-    return per_pos * (g.swa[(size_t) layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
+// Under --kv nvfp4, the fixed-size sliding-window rings stay in FP8 while the context-scaling full visits use NVFP4.
+uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8, bool int8, bool nvfp4 = false) {
+    const bool swa = g.swa[(size_t) layer];
+    const bool use_fp8 = fp8 || (nvfp4 && swa);
+    const bool use_nvfp4 = nvfp4 && !swa;
+    const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(use_fp8, int8, use_nvfp4);
+    return per_pos * (swa ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
 }
 }  // namespace
 
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut, int card) {
+uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, bool nvfp4, int cut, int card) {
     uint64_t caches = 0;
     for (const Visit& v : g.visits)
-        if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
+        if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8, nvfp4);
     return caches + kSessionFixed;
 }
 
@@ -208,6 +212,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     cudaGetDevice(&device_);
     ldev_ = device_;
     fp8_ = req.kv == "fp8";
+    nvfp4_ = req.kv == "nvfp4";
     const Geometry& g = pack_.geo;
     desc_.arch = "inkling2";
     desc_.n_layers = g.n_layers;
@@ -377,6 +382,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     cudaSetDevice(device_);
     fp8_ = req.kv == "fp8";
     int8_ = req.kv == "int8";
+    nvfp4_ = req.kv == "nvfp4";
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
     if (req.spec >= 2)
         if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
@@ -410,7 +416,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = spare_base > vision_modules ? spare_base - vision_modules : 0;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
+            return session_bytes(g, c, fp8_, int8_, nvfp4_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
@@ -420,7 +426,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 cudaSetDevice(card_device(c));
                 size_t fb = 0, tb = 0;
                 basalt::core::gpu_mem_info(&fb, &tb);
-                const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) +
+                const uint64_t need = (session_bytes(g, want, fp8_, int8_, nvfp4_, cut_, c) +
                                        (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
                                       (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
                 if (need > fb) {
@@ -511,7 +517,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
             return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
                                               std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
-                                              " positions fit" + (fp8_ || int8_ ? "" : " (--kv fp8 halves a position's bytes)")};
+                                              " positions fit" + (fp8_ || int8_ || nvfp4_ ? "" : " (--kv fp8 halves a position's bytes)")};
         }
         ctx_ = want;
         }
@@ -692,7 +698,7 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
     // card already, so its room is what is free now)
     const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-    const bool fp8 = req.kv == "fp8", int8 = req.kv == "int8";
+    const bool fp8 = req.kv == "fp8", int8 = req.kv == "int8", nvfp4 = req.kv == "nvfp4";
     std::vector<int> visits((size_t) g.n_layers, 0);
     for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
     model::SplitSpec s;
@@ -703,9 +709,9 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
                                2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
                                prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
         s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense +
-                          (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8) * n_sess);
+                          (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8, nvfp4) * n_sess);
     }
-    const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
+    const uint64_t slot_rest = session_bytes(g, want, fp8, int8, nvfp4, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
     s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
                kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
     for (const model::GpuCards::Card& card : c.cards) {

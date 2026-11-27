@@ -505,10 +505,14 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
         void* cache = w ? (b ? sc.v : a.v_cache) : (b ? sc.k : a.k_cache);
         float val[4], raw[4], f, scale[2] = {};
         prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f, ring, b ? at.row0[k] : 0, scale);
-        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
+        const size_t row_bytes = (size_t) kv_cache_row_bytes(a.fp8, a.int8, a.nvfp4);
         void* row = static_cast<uint8_t*>(cache) + ((size_t) (p % a.cap) * kKvHeads + g) * row_bytes;
+        if (a.nvfp4) {
+            prep::store_kv_nvfp4(row, val, f, w == 0, lane);
+        } else {
 #pragma unroll
-        for (int u = 0; u < 4; ++u) prep::store_kv(row, a.fp8, a.int8, lane * 4 + u, val[u] * f, scale, lane);
+            for (int u = 0; u < 4; ++u) prep::store_kv(row, a.fp8, a.int8, lane * 4 + u, val[u] * f, scale, lane);
+        }
         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
             make_float4(raw[0], raw[1], raw[2], raw[3]);
         return;

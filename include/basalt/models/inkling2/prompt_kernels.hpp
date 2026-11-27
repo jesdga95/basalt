@@ -28,6 +28,7 @@ struct AttnPromptArgs {
     int64_t chunk_cap = 0;
     bool fp8 = false;                  ///< unit-scale E4M3 codes instead of fp16
     bool int8 = false;                 ///< symmetric INT8 codes with two per-row FP16 scales
+    bool nvfp4 = false;                ///< E2M1 codes with an E4M3 scale per 16 channels
     int window = 0;                    ///< > 0: keys at distance < window only
     float scale = 0.08838834764831845f;
 };
