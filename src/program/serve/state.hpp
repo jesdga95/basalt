@@ -156,6 +156,7 @@ public:
         int64_t kv_bytes = -1;
     };
     virtual std::vector<CardFacts> card_facts() { return {}; }
+    virtual void stats_peer_slots() {}
     std::string cards_sent_{};
     /// A decode window of `slot` (see ConsoleStats::window); around a window or a batch round, its lookups.
     void stats_window(int slot, int offered, int accepted, int tokens) {

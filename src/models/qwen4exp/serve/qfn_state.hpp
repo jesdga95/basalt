@@ -216,6 +216,8 @@ public:
     basalt::program::serve::LookupCounts lookup_counts() override;
     bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override;
     std::vector<CardFacts> card_facts() override;
+    void stats_peer_slots() override;
+    std::string peer_slots_sent;
     void at_exit() override;
     bool next_batch_window() override;
     basalt::model::ModelSession& slot_session(int b) override { return *slot_ss[(size_t) b]; }

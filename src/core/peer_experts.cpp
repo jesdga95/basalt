@@ -111,6 +111,8 @@ void PeerExperts::close() {
     loaded_.clear();
     evicting_.clear();
     pending_.clear();
+    loaned_ = 0;
+    refill_skips_ = {};
     device_ = -1;
 }
 
@@ -671,20 +673,36 @@ std::vector<size_t> PeerExperts::incoming() const {
     return v;
 }
 
+PeerExperts::SlotStats PeerExperts::slot_stats() const {
+    const size_t allocated = cache_.slots();
+    std::vector<bool> mapped(allocated);
+    for (const int32_t slot : res_)
+        if (slot >= 0 && (size_t) slot < allocated) mapped[(size_t) slot] = true;
+    return {allocated, (size_t) std::count(mapped.begin(), mapped.end(), true),
+            pending_.size() + evicting_.size(), loaned_, refill_skips_};
+}
+
 bool PeerExperts::reassign(int64_t layer, int32_t in, int64_t lout, int32_t out, const uint8_t* blob, std::string& err) {
     const size_t i_in = (size_t) (layer * n_expert_ + in), i_out = (size_t) (lout * n_expert_ + out);
     const int32_t slot = res_[i_in];
     hold_[i_in] = 0;
-    if (slot < 0) return true;
+    if (slot < 0) { ++refill_skips_.no_source_mapping; return true; }
     for (const auto& p : pending_)
-        if (p.second == slot) { res_[i_in] = kNotResident; return true; }   // a refill already owns the bytes
+        if (p.second == slot) {
+            ++refill_skips_.source_in_flight;
+            res_[i_in] = kNotResident;   // a refill already owns the bytes
+            return true;
+        }
     // Keep the old bytes mapped until a refill actually takes the slot. If the primary also
     // holds them, adapt can reuse that copy for a different expert on its next round.
-    if (res_[i_out] >= 0 || blob == nullptr) return true;
+    if (res_[i_out] >= 0) { ++refill_skips_.destination_mapped; return true; }
+    if (blob == nullptr) { ++refill_skips_.missing_host_copy; return true; }
     for (const auto& p : pending_)
-        if ((size_t) p.first == i_out) return true;
-    for (const Evict& x : evicting_)
-        if ((x.layer == lout && x.in == out) || x.slot == slot) return true;   // issue_pending retires its victim
+        if ((size_t) p.first == i_out) { ++refill_skips_.destination_in_flight; return true; }
+    for (const Evict& x : evicting_) {
+        if (x.slot == slot) { ++refill_skips_.source_in_flight; return true; }  // issue_pending retires its victim
+        if (x.layer == lout && x.in == out) { ++refill_skips_.destination_in_flight; return true; }
+    }
     const auto& lay = basalt::kernels::cpu::expert_layout();
     On on(device_);
     if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(lout), cudaMemcpyHostToDevice,
@@ -712,6 +730,7 @@ bool PeerExperts::lend(int32_t first, std::vector<std::pair<int32_t, int32_t>>& 
             lent.emplace_back((int32_t) i, res_[i]);
             res_[i] = kNotResident;
         }
+    loaned_ += lent.size();
     return true;
 }
 
@@ -737,6 +756,7 @@ bool PeerExperts::give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent,
         if (!ck(cudaEventSynchronize(refill_ev_), "give back", err)) return false;
     }
     for (const auto& [i, slot] : lent) res_[(size_t) i] = slot;
+    loaned_ -= lent.size();
     lent.clear();
     return true;
 }

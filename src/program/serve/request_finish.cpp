@@ -99,6 +99,7 @@ Flow Request::complete() {
         std::printf("ERR an adaptive refill failed\n");
         return Flow::error;
     }
+    if (!runtime_.batch_on()) runtime_.stats_peer_slots();
     if (runtime_.admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
         bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) runtime_.live.size() == p
                             : !cancelled && produced_n == 1 && runtime_.admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&

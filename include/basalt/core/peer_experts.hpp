@@ -191,6 +191,22 @@ public:
     int64_t entries() const { return entries_; }      ///< routed entries the peer computed
     int64_t experts() const { return experts_; }      ///< distinct (layer, expert) the peer computed
     int64_t swaps() const { return swaps_; }
+    struct RefillSkips {
+        uint64_t no_source_mapping = 0;
+        uint64_t source_in_flight = 0;
+        uint64_t destination_mapped = 0;
+        uint64_t missing_host_copy = 0;
+        uint64_t destination_in_flight = 0;
+    };
+    struct SlotStats {
+        size_t allocated = 0;
+        size_t mapped = 0;
+        size_t in_flight = 0;   ///< includes evictions whose source is still mapped
+        size_t loaned = 0;      ///< until the borrowed slots have been refilled and remapped
+        RefillSkips skipped_refills;
+    };
+    /// Read on the tier's owning thread, outside the decode loop.
+    SlotStats slot_stats() const;
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
 
 private:
@@ -199,6 +215,8 @@ private:
     ExpertCache cache_;
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
+    size_t loaned_ = 0;
+    RefillSkips refill_skips_;
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
     FileExpertSource* fsrc_ = nullptr;                ///< set with --peer-exclusive
     std::vector<std::pair<int32_t, int32_t>> asleep_; ///< (residency index, slot) that `sleep` took out
