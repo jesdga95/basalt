@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/prompt_read.cpp - request prompt_read operations.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "../../../program/serve/prompt_window.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -191,12 +192,11 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
             basalt::log::info("basalt batch", "BYIELD %d not taken at %lld of %lld%s%s", ys, (long long) q,
                          (long long) n, ye.empty() ? "" : ": ", ye.c_str());
         }
-        if (decode_share <= 0.0 || !runtime_.batch_on()) continue;
-        const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+        if (!runtime_.batch_on()) continue;
         const auto td = Clock::now();
-        do {
-            if (!runtime_.next_batch_window()) { batch_fatal = true; e = "a batch window failed"; return false; }
-        } while (runtime_.batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+        if (!prompt_decode_windows(tq, [&] { return runtime_.batch_on(); }, [&] { return runtime_.next_batch_window(); })) {
+            batch_fatal = true; e = "a batch window failed"; return false;
+        }
         ++il_parts;
         il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
     }
