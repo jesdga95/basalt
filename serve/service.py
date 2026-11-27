@@ -343,7 +343,10 @@ class Service:
             raise EngineDied("the server is stopping")
         if getattr(self.engine, "asleep", False) is True:
             self._wake()
-        if self.loaded() and not self._vision_down():
+        if self.loaded():
+            if self._vision_down():
+                print("[server] restarting the vision encoder", flush=True)
+                self.vision.restart()
             return
         if self.before_load:
             cmd = self.before_load
@@ -372,8 +375,6 @@ class Service:
         if self._vision_down():                         # first: a GPU encoder takes its VRAM before the engine sizes its cache
             print("[server] restarting the vision encoder", flush=True)
             self.vision.restart()
-        if self.loaded():
-            return
         if self.stopping.is_set():                      # shutdown began while the hook or the VRAM wait ran
             raise EngineDied("the server is stopping")
         again = bool(getattr(self.engine, "known_ctx", 0))   # a first load says nothing: the load bars do
@@ -1292,7 +1293,7 @@ class Service:
         try:
             # encode under the fifo: the encoder and a running engine must not use the GPU together
             with self.fifo:
-                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                if getattr(self.vision, "in_engine", False) or self._vision_down():
                     self.ensure_loaded()
                 try:
                     if not videos:
