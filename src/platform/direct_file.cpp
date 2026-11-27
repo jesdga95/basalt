@@ -371,6 +371,7 @@ struct DirectFile::Impl {
                 }
                 if (got == 0) break;   // end of file
                 total += (uint32_t) got;
+                if (no_buffering && (total % DirectFile::alignment()) != 0) break;   // unaligned short O_DIRECT read is EOF
             }
             lk.lock();
             // only a waiter that found the list empty is blocked, so only the first completion needs to wake it
