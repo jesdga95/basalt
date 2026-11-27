@@ -845,6 +845,8 @@ def main():
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
     ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")
+    ap.add_argument("--experts-mxfp8", metavar="LAYERS",
+                    help="gemma4: the layers (e.g. 0,5,10-12) whose routed experts are MXFP8; the others are NVFP4")
     ap.add_argument("--nvfp4", action="store_true",
                     help="hy4flash: from the BF16 GGUF, the routed experts as NVFP4, projections Q8_0, the Engram table E4M3 (needs --hf-dir)")
     ap.add_argument("--dense-q6k", action="store_true", help="with --nvfp4: the attention, shared-expert and dense FFN projections as Q6_K")
@@ -919,11 +921,13 @@ def main():
     if a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards \
                 or a.dry_run:
-            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --workers and --force")
+            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --experts-mxfp8, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
+        if a.experts_mxfp8 and checkpoint_model_type(Path(a.checkpoint)) != "gemma4":
+            ap.error("--experts-mxfp8 goes with a gemma4 checkpoint")
         if checkpoint_model_type(Path(a.checkpoint)) == "gemma4":
             if a.head:
                 ap.error("--head goes with a qwen35 checkpoint")

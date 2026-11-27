@@ -4,7 +4,10 @@ routed experts) straight from the official BF16 checkpoint, for tools/convert/co
   experts             the routed experts per layer, [gate | up | down] (the checkpoint's gate_up_proj rows: gate the
                         first half, up the second): NVFP4 (type 40) blocks rounded once from BF16 (per matrix the
                         tensor scale amax / (6 x 448), per 16 values the UE4M3 scale of least squared error among half
-                        to four times amax / 6), then the FP32 tail {s_gate, s_up, s_down * per_expert_scale, 0}
+                        to four times amax / 6), then the FP32 tail {s_gate, s_up, s_down * per_expert_scale, 0};
+                        the layers of `--experts-mxfp8` as MXFP8 (type 46) blocks (per 32 values the UE8M0 scale that
+                        brings the largest magnitude within 448; the down rows padded with zero columns to whole 128-value
+                        blocks; the per-expert scale folded into the down weights, no tail)
   experts.layout      one `layer gu_type d_type offset blob_bytes` line per layer that has experts
   gguf                every other text tensor in llama.cpp-style names: the attention and MLP projections F8_E4M3
                         (type 44) with one FP32 scale per matrix (amax / 448, `<name>.scale`), the MLP's inner width
@@ -47,6 +50,7 @@ from model_file import TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 ARCH = "gemma4"
 TYPE_ID = {"F32": 0, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44}
 NVFP4 = 40
+MXFP8 = 46
 BYTE = 6                      # llama.cpp's token type of a byte-fallback token
 ROWS_PER_JOB = 4096
 EXPERTS_PER_JOB = 8
@@ -278,16 +282,24 @@ def _row_amax(ck, src) -> np.ndarray:
 
 # ------------------------------------------------------------------ routed experts
 class Experts:
-    """The `experts` section: per MoE layer the NVFP4 blobs of its routed experts."""
+    """The `experts` section: per MoE layer the NVFP4 or MXFP8 blobs of its routed experts."""
 
-    def __init__(self, ck: C.Checkpoint):
+    def __init__(self, ck: C.Checkpoint, mxfp8: frozenset = frozenset()):
         tc = ck.text
         self.ck = ck
         self.n_layers, self.n_expert = int(tc["num_hidden_layers"]), int(tc["num_experts"])
         self.h, self.ff = int(tc["hidden_size"]), int(tc["moe_intermediate_size"])
         if self.h % 64 or self.ff % 64:
             raise S.ConvertError("NVFP4 experts need hidden_size and moe_intermediate_size multiples of 64")
-        self.blob = 2 * self.ff * S.nvfp4_row_bytes(self.h) + self.h * S.nvfp4_row_bytes(self.ff) + S.NVFP4_TAIL
+        if mxfp8 and self.h % 128:
+            raise S.ConvertError("MXFP8 experts need a hidden_size that is a multiple of 128")
+        if not mxfp8 <= set(range(self.n_layers)):
+            raise S.ConvertError(f"--experts-mxfp8: layers {sorted(mxfp8 - set(range(self.n_layers)))} do not exist")
+        self.mxfp8 = sorted(mxfp8)
+        self.fmt = {l: MXFP8 if l in mxfp8 else NVFP4 for l in range(self.n_layers)}
+        ffk = pad_to(self.ff)   # an MXFP8 down row holds whole 128-value blocks: its columns past ff are zero
+        self.blobs = {NVFP4: 2 * self.ff * S.nvfp4_row_bytes(self.h) + self.h * S.nvfp4_row_bytes(self.ff) + S.NVFP4_TAIL,
+                      MXFP8: 2 * self.ff * (self.h // 128 * 132) + self.h * (ffk // 128 * 132)}
         self.layers, offset = [], 0
         for l in range(self.n_layers):
             p = f"{TEXT}layers.{l}."
@@ -295,13 +307,14 @@ class Experts:
             ck.need(p + "experts.down_proj", "BF16", (self.n_expert, self.h, self.ff))
             ck.need(p + "router.per_expert_scale", "BF16", (self.n_expert,))
             self.layers.append((l, offset))
-            offset += self.blob * self.n_expert
+            offset += self.blobs[self.fmt[l]] * self.n_expert
         self.total = offset
 
     def layout_text(self) -> bytes:
         head = ("# experts v6: layer gu_type d_type offset blob_bytes (n_expert %d, total %d); "
                 "an NVFP4 blob ends in FP32 {s_gate, s_up, s_down, 0}\n" % (self.n_expert, self.total))
-        return (head + "".join("%d %d %d %d %d\n" % (l, NVFP4, NVFP4, off, self.blob) for l, off in self.layers)).encode()
+        return (head + "".join("%d %d %d %d %d\n" % (l, self.fmt[l], self.fmt[l], off, self.blobs[self.fmt[l]])
+                               for l, off in self.layers)).encode()
 
     def jobs(self):
         ck = self.ck
@@ -311,7 +324,7 @@ class Experts:
             pes = ck.values(p + "router.per_expert_scale").astype(np.float32)
             for s in range(0, self.n_expert, EXPERTS_PER_JOB):
                 n = min(EXPERTS_PER_JOB, self.n_expert - s)
-                yield ("experts", str(gu[0]), gu[1], str(dn[0]), dn[1], self.h, self.ff, s, n, pes[s:s + n])
+                yield ("experts", self.fmt[l], str(gu[0]), gu[1], str(dn[0]), dn[1], self.h, self.ff, s, n, pes[s:s + n])
 
     def chunks(self, pool, depth: int = 8):
         for b in S.bounded_imap(pool, _job, self.jobs(), depth):
@@ -324,6 +337,36 @@ def _nvfp4_matrix(x: np.ndarray):
     gs = Q.fp4q_global(float(np.abs(x).max()))
     codes, sc = Q.fp4q_rows(x, gs)
     return C.nvfp4_rows(codes, sc).tobytes(), gs
+
+
+def _mxfp8_matrix(x: np.ndarray) -> bytes:
+    """[rows][K] values (K a multiple of 128) as MXFP8: per 32 values the UE8M0 scale, the smallest power of two that
+    brings the largest magnitude within E4M3's 448, then the codes to nearest."""
+    rows, K = x.shape
+    b = x.reshape(rows, K // 32, 32).astype(np.float64)
+    amax = np.abs(b).max(axis=2)
+    e = np.frexp(amax / 448.0)[1].astype(np.int64)   # within one of the answer: settled by exact comparisons
+    e = np.where(amax <= np.ldexp(448.0, e - 1), e - 1, e)
+    e = np.where(amax > np.ldexp(448.0, e), e + 1, e)
+    e = np.clip(np.where(amax > 0, e, -127), -127, 127)
+    codes = Q.e4m3_round(np.ldexp(b, -e[:, :, None])).reshape(rows, K)
+    return C.mxfp8_rows(codes, (e + 127).astype(np.uint8)).tobytes()
+
+
+def _expert_blobs_mxfp8(gu_path, gu_off, dn_path, dn_off, h, ff, e0, n, pes) -> bytes:
+    out = []
+    for i in range(n):
+        e = e0 + i
+        gu = S._bf16_to_f32(np.fromfile(gu_path, "<u2", count=2 * ff * h, offset=gu_off + e * 2 * ff * h * 2)).reshape(2 * ff, h)
+        dn = S._bf16_to_f32(np.fromfile(dn_path, "<u2", count=h * ff, offset=dn_off + e * h * ff * 2)).reshape(h, ff)
+        if not (np.isfinite(gu).all() and np.isfinite(dn).all()):
+            return f"expert {e}: a non-finite value"
+        if not (np.isfinite(pes[i]) and pes[i] > 0):
+            return f"expert {e}: a per-expert scale that is not finite and positive"
+        dk = np.zeros((h, pad_to(ff)), np.float64)
+        dk[:, :ff] = dn * np.float64(pes[i])   # no tail in an MXFP8 blob: the per-expert scale rides in the down weights (exact)
+        out += [_mxfp8_matrix(gu[:ff]), _mxfp8_matrix(gu[ff:]), _mxfp8_matrix(dk)]
+    return b"".join(out)
 
 
 def _expert_blobs(gu_path, gu_off, dn_path, dn_off, h, ff, e0, n, pes) -> bytes:
@@ -346,7 +389,7 @@ def _expert_blobs(gu_path, gu_off, dn_path, dn_off, h, ff, e0, n, pes) -> bytes:
 
 def _job(args):
     if args[0] == "experts":
-        return _expert_blobs(*args[1:])
+        return (_expert_blobs_mxfp8 if args[1] == MXFP8 else _expert_blobs)(*args[2:])
     op, path, off, src_cols, K, row0, rows, src_rows, sc = args
     # rows [row0, row0 + rows) of the padded [.][K] matrix; source rows past src_rows and columns past src_cols are 0
     x = np.zeros((rows, K), np.float64)
@@ -621,6 +664,24 @@ def mmproj(ck: C.Checkpoint, out: pathlib.Path, name: str) -> None:
 LICENSE = {"apache-2.0": "Apache License 2.0", "gemma": "Gemma Terms of Use"}
 
 
+def mxfp8_note(layers: list[int]) -> str:
+    """The meta's account of the layers whose experts are MXFP8."""
+    return ("layers " + ", ".join(map(str, layers)) + ": MXFP8 (type 46) rounded once from BF16 instead: per 32 values "
+            "the UE8M0 scale that brings the largest magnitude within 448, E4M3 to nearest (ties to even); the down rows "
+            "padded with zero columns to whole 128-value blocks; the router's per_expert_scale folded into the down "
+            "weights (no tail)")
+
+
+def parse_layers(text: str | None) -> list[int]:
+    """`--experts-mxfp8 0,5,10-12` -> [0, 5, 10, 11, 12]."""
+    out = []
+    for part in (text or "").split(","):
+        if part.strip():
+            lo, _, hi = part.partition("-")
+            out += range(int(lo), int(hi or lo) + 1)
+    return out
+
+
 def build(a, Job, fingerprint, die) -> None:
     import os
     import tokenizer
@@ -632,7 +693,7 @@ def build(a, Job, fingerprint, die) -> None:
         ck = C.Checkpoint(a.checkpoint)
         dr = C.Checkpoint(a.drafter, single=True) if a.drafter else None
         plan = Plan(ck, dr)
-        experts = Experts(ck) if plan.moe else None
+        experts = Experts(ck, frozenset(parse_layers(a.experts_mxfp8))) if plan.moe else None
         name = a.name or "Gemma 4"
         kv = model_kv(ck, dr, name)
         vision = has_vision(ck)
@@ -689,6 +750,7 @@ def build(a, Job, fingerprint, die) -> None:
                     "experts": "NVFP4 rounded once from BF16: per matrix amax / (6 x 448), per 16 values the UE4M3 scale "
                                "of least squared error among half to four times amax / 6, E2M1 to nearest; the router's "
                                "per_expert_scale folded into s_down",
+                    **({"experts_mxfp8": mxfp8_note(experts.mxfp8)} if experts and experts.mxfp8 else {}),
                     "projections": "F8_E4M3 to nearest (ties to even) with one FP32 scale per matrix, amax / 448; the "
                                    "MLP's inner width padded with zeros to a multiple of 128",
                     "head": "the tied embedding as F8_E4M3 rows with an FP32 scale per row, amax / 448",
