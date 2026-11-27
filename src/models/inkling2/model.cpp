@@ -573,13 +573,25 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                                   (long long) want);
             else
             {
-                const long long positions = (long long) (kv_pool_[c].budget() / std::max<uint64_t>(per_on(c), 1));
+                // the positions a slot backs when `slots` slots back as many and the rest one granule each, the caches'
+                // granules counted whole (each grow maps a granule of every cache, the drafter's rings too)
+                const auto reach = [&](int64_t slots) {
+                    const uint64_t rest = (uint64_t) (n_sess - slots) * one_on(c, 1, gran);
+                    int64_t lo = 0, hi = want;
+                    while (lo < hi) {
+                        const int64_t mid = lo + (hi - lo + 1) / 2;
+                        if (rest + (uint64_t) slots * one_on(c, mid, gran) <= kv_pool_[c].budget()) lo = mid;
+                        else hi = mid - 1;
+                    }
+                    return (long long) lo;
+                };
+                const long long each = reach(n_sess);
                 basalt::log::info("basalt inkling2",
-                                  "KV pool%s: %.0f MiB, about %lld positions across the %d slot%s (%lld a slot when all are full; one slot "
+                                  "KV pool%s: %.0f MiB, %lld positions across the %d slot%s (%lld a slot when all are full; one slot "
                                   "can reach %lld)",
                                   cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "",
-                                  (double) kv_pool_[c].budget() / (double) kMiB, positions, n_sess, n_sess == 1 ? "" : "s",
-                                  positions / n_sess, std::min<long long>(positions, (long long) want));
+                                  (double) kv_pool_[c].budget() / (double) kMiB, each * n_sess, n_sess, n_sess == 1 ? "" : "s", each,
+                                  reach(1));
             }
     }
     basalt::log::info("basalt inkling2", "weights on the GPU: dense %.2f GiB, experts %.2f GiB; the embedding in host memory (%.2f GiB)",
