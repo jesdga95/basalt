@@ -58,15 +58,16 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--ple-io direct`, `ram` | engine | `direct` | Read the n-gram table unbuffered (`direct`) or lock it in RAM (`ram`). |
 | `--ple-row-cache`, `--ple-inflight`, `--ple-delay-us` | engine | 1048576 rows, 256, 0 | Row cache size, outstanding reads, and injected read delay for tests. |
 
-## Quality gate and bench
+## Quality suite, legacy gate and bench
 
 | Flag or key | Binary | Default | What it does |
 |---|---|---|---|
-| `--quality` | bench | 20 chunks | Run the PPL/KLD/top-1 gate through decode. [method](../precision/quality.md) |
+| `--quality` | bench | 20 chunks | Run the legacy wikitext PPL/KLD/top-1 gate through decode. [legacy gate](../precision/quality.md#legacy-the-wikitext-gate) |
 | `--kld-base FILE` | bench | | The llama.cpp KL-divergence base. |
 | `--quality-t N` | bench | 3 | Tokens per verify window in the gate. |
-| `--ppl-base`, `--ppl-out` | serve | | Base file for `ppl=` requests, and where they write rows. |
-| `ppl=K`, `ppl_t=T` | request keys | | Score chunk K; window width T. |
+| `--ppl-base`, `--ppl-out` | serve | | Base file for `ppl=` requests (legacy gate), and where `ppl=` and `score=` requests write rows. |
+| `ppl=K`, `ppl_t=T` | request keys | | Legacy gate: score chunk K; window width T. |
+| `score=N`, `score_top=K` | request keys | | Teacher-force the request's own ids and write the rows from position N to `--ppl-out` with their K likeliest ids (0: the whole row). [quality suite](../precision/quality-suite.md) |
 
 | Bench flag | Default | What it does |
 |---|---|---|

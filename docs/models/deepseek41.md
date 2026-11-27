@@ -73,7 +73,7 @@ modes it runs.
   card's free memory (or by `gpu-share`) so that every layer keeps the same number of peer slots. A peer that would hold nothing is
   refused. The peer computes its experts in every decode window and its share of each prompt chunk. An sm_89 peer is refused: its
   kernels are built for sm_120 only.
-- **Quality:** against one card a peer differs at CPU-against-GPU expert rounding (KLD 0.01 on the reference's own picks, BF16 gate
+- **Quality:** against one card a peer differs at CPU-against-GPU expert rounding (KLD 0.01 on the reference's own picks, BF16 legacy gate
   0.2805 against 0.2794); the same text as the earlier release with the tier frozen.
 
 ## Long prompts

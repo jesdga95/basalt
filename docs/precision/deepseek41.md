@@ -1,6 +1,7 @@
 # DeepSeek-V4.1-Flash precision
 
-Where DeepSeek rounds and how its output compares. Method: [quality](quality.md). Guide: [DeepSeek](../models/deepseek41.md).
+Where DeepSeek rounds and how its output compares. Guide: [DeepSeek](../models/deepseek41.md).
+Method: the [quality suite](quality-suite.md). The KLD, PPL and top-1 figures on this page were measured with the [legacy wikitext gate](quality.md#legacy-the-wikitext-gate).
 
 Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geometry: 5120 hidden, 40 layers,
 384 routed experts (top-6) plus one shared, a 128-token window, a two-level top-512 indexer, and an Engram table on two layers.

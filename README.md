@@ -85,7 +85,7 @@ How a request names a video, and the limits: [video](docs/running.md#video).
   [Qwen3.8-27B](docs/models/qwen38-27b.md), [Hy4-flash](docs/models/hy4-flash.md), [Inkling 2 Mini](docs/models/inkling2.md),
   [ERNIE-5.5-Flash](docs/models/ernie55.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).
-- **Quality:** [precision](docs/precision/index.md), [method](docs/precision/quality.md).
+- **Quality:** [precision](docs/precision/index.md), [method](docs/precision/quality-suite.md).
 - **Build and develop:** [building](docs/building.md), [adding a model](docs/adding-a-model.md), [community runs](docs/community.md),
   [changelog](docs/changelog/index.md), [contributing](CONTRIBUTING.md).
 

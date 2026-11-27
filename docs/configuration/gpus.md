@@ -89,7 +89,7 @@ with `use gpu 0`.
 Measured, from the ledger's rows:
 
 - **Flash-Next:** no speed loss against the earlier peer path (64K prefill 9,823 against 9,835 tok/s, conversation decode within
-  noise). A normal peer run scores BF16 KLD 0.06174 against 0.06221 on one card and top-1 91.84% against 91.80%.
+  noise). A normal peer run scores BF16 KLD 0.06174 against 0.06221 on one card and top-1 91.84% against 91.80% (the [legacy wikitext gate](../precision/quality.md#legacy-the-wikitext-gate)).
 - **Qwen3.8-27B:** a 64K prefill reads 17% faster than on one card (7,410 against 6,336 tok/s); decode stays on the main card.
 - **Inkling 2 Mini:** a peer helps only when experts spill beyond what the main card's elastic copies cover. At default settings one
   card is fastest up to 1M tokens, and a peer is refused when the main card holds every expert

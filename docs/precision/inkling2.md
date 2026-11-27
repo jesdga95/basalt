@@ -1,6 +1,7 @@
 # Inkling 2 Mini precision
 
-Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quality.md). Guide: [Inkling 2 Mini](../models/inkling2.md).
+Where Inkling 2 Mini rounds and how its output compares. Guide: [Inkling 2 Mini](../models/inkling2.md).
+Method: the [quality suite](quality-suite.md). The KLD, PPL and top-1 figures on this page were measured with the [legacy wikitext gate](quality.md#legacy-the-wikitext-gate).
 
 ## Summary
 

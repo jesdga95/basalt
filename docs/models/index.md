@@ -22,6 +22,6 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none | none | `--route-prior`, `--route-tail-skip` (off) |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) | no | no | no | no |
 | Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) | yes (Linux) | yes (Linux); a second-card sleep may be refused |
-| `basalt-bench --quality` | yes | yes, one row per window | yes | yes | yes | yes |
+| `basalt-bench --quality` (legacy wikitext gate) | yes | yes, one row per window | yes | yes | yes | yes |
 | Guide | [guide](qwen38-flash-next.md) | [guide](deepseek41.md) | [guide](qwen38-27b.md) | [guide](hy4-flash.md) | [guide](inkling2.md) | [guide](ernie55.md) |
 | Precision | [precision](../precision/qwen38-flash-next.md) | [precision](../precision/deepseek41.md) | [precision](../precision/qwen38-27b.md) | [precision](../precision/hy4-flash.md) | [precision](../precision/inkling2.md) | [precision](../precision/ernie55.md) |

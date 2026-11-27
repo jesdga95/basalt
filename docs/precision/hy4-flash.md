@@ -1,6 +1,7 @@
 # Hy4-flash precision
 
-Where Hy4-flash rounds and how its output compares. Method: [quality](quality.md). Guide: [Hy4-flash](../models/hy4-flash.md).
+Where Hy4-flash rounds and how its output compares. Guide: [Hy4-flash](../models/hy4-flash.md).
+Method: the [quality suite](quality-suite.md). The KLD, PPL and top-1 figures on this page were measured with the [legacy wikitext gate](quality.md#legacy-the-wikitext-gate).
 
 ## Summary
 

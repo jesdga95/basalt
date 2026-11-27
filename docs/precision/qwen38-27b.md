@@ -1,7 +1,7 @@
 # Qwen3.8-27B precision
 
-What the dense stack computes in, where it rounds, and what that costs against the BF16 model. The method:
-[how quality is measured](quality.md).
+What the dense stack computes in, where it rounds, and what that costs against the BF16 model.
+Method: the [quality suite](quality-suite.md). The KLD, PPL and top-1 figures on this page were measured with the [legacy wikitext gate](quality.md#legacy-the-wikitext-gate).
 
 ## Weights
 

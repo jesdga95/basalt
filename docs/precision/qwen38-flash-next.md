@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next precision
 
-Where Flash-Next rounds and what each rounding costs. Method and reference: [quality](quality.md). Guide:
-[Flash-Next](../models/qwen38-flash-next.md).
+Where Flash-Next rounds and what each rounding costs. Guide: [Flash-Next](../models/qwen38-flash-next.md).
+Method: the [quality suite](quality-suite.md). The KLD, PPL and top-1 figures on this page were measured with the [legacy wikitext gate](quality.md#legacy-the-wikitext-gate).
 
 Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W as the peer expert tier, 128 GB of system RAM. Each number names its
 build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10.
