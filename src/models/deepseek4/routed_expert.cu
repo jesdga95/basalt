@@ -28,6 +28,16 @@ __global__ void weighted_route_sum_kernel(const float* rows, const float* weight
     output[i] = value;
 }
 
+__global__ void swiglu_split_clamped_kernel(const float* gate_up, int64_t n, int n_ff, float limit, float* output) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t row = i / n_ff;
+    const int col = (int) (i - row * n_ff);
+    const float gate = fminf(gate_up[row * 2 * n_ff + col], limit);
+    const float up = fminf(fmaxf(gate_up[row * 2 * n_ff + n_ff + col], -limit), limit);
+    output[i] = gate / (1.f + __expf(-gate)) * up;
+}
+
 }  // namespace
 
 void weighted_route_sum(const float* rows, const float* weights, int n_tokens, int n_embd, float* output, void* stream) {
@@ -39,6 +49,17 @@ void weighted_route_sum(const float* rows, const float* weights, int n_tokens, i
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess)
         throw std::runtime_error(std::string("deepseek4 route sum: ") + cudaGetErrorString(error));
+}
+
+void swiglu_split_clamped(const float* gate_up, int n_rows, int n_ff, float limit, float* output, void* stream) {
+    const int64_t total = (int64_t) n_rows * n_ff;
+    if (!gate_up || !output || n_rows <= 0 || n_ff <= 0 || total > INT_MAX || !(limit > 0.f) || !stream)
+        throw std::invalid_argument("deepseek4 split SwiGLU: invalid arguments");
+    swiglu_split_clamped_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0,
+                                  static_cast<cudaStream_t>(stream)>>>(gate_up, total, n_ff, limit, output);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("deepseek4 split SwiGLU: ") + cudaGetErrorString(error));
 }
 
 }  // namespace basalt::models::deepseek4

@@ -1,6 +1,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek4/layer.hpp"
+#include "models/deepseek4/routed_expert.hpp"
 #include "parity_util.hpp"
 
 #include <algorithm>
@@ -83,6 +84,28 @@ int main(int argc, char** argv) {
     using namespace basalt::models::deepseek4;
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+
+    constexpr int kSwiRows = 13;
+    auto split = randn((size_t) kSwiRows * 2 * F, 0x44533453, 0.2f);
+    Dev<float> d_split(split), d_hidden((size_t) kSwiRows * F);
+    cudaStream_t swiglu_stream = nullptr;
+    check(cudaStreamCreate(&swiglu_stream), "create split SwiGLU stream");
+    swiglu_split_clamped(d_split.p, kSwiRows, F, 10.f, d_hidden.p, swiglu_stream);
+    check(cudaStreamSynchronize(swiglu_stream), "wait for split SwiGLU");
+    const auto split_got = d_hidden.down();
+    std::vector<float> split_expected((size_t) kSwiRows * F);
+    for (int row = 0; row < kSwiRows; ++row)
+        for (int col = 0; col < F; ++col) {
+            const float g = std::min(split[(size_t) row * 2 * F + col], 10.f);
+            const float u = std::clamp(split[(size_t) row * 2 * F + F + col], -10.f, 10.f);
+            split_expected[(size_t) row * F + col] = g / (1.f + std::exp(-g)) * u;
+        }
+    const Err split_error = compare(split_got, split_expected);
+    cudaStreamDestroy(swiglu_stream);
+    if (split_error.max_abs > 2e-5) {
+        std::fprintf(stderr, "DeepSeek4 split SwiGLU parity failed: max_abs=%.6g\n", split_error.max_abs);
+        return 1;
+    }
 
     std::vector<Expert> experts(E);
     std::vector<uint8_t> storage;
