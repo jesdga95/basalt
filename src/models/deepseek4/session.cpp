@@ -266,16 +266,8 @@ public:
                     std::to_string(r.pos) + ", history=" + std::to_string(tokens_.size()) + ")"};
         if (r.pos + r.n_tokens > model_.context())
             return {model::Status::Refused, "deepseek4: prompt exceeds the loaded context"};
-        for (int t = 0; t < r.n_tokens;) {
-            if (r.stop && r.stop()) return {model::Status::Error, "deepseek4: prompt read was stopped"};
-            const int chunk_rows = model_.diag_rows() > 0 ? model_.diag_rows() : 1024;
-            const int rows = std::min(chunk_rows, r.n_tokens - t);
-            if (!prefill_rows(r.tokens + t, rows, r.pos + t)) return {model::Status::Error, err_};
-            tokens_.insert(tokens_.end(), r.tokens + t, r.tokens + t + rows);
-            t += rows;
-            if (r.progress) r.progress(t);
-        }
-        if (!sync()) return {model::Status::Error, err_};
+        if (!prefill_rows(r.tokens, r.n_tokens, r.pos, nullptr, r.stop, r.progress))
+            return {model::Status::Error, err_};
         return {};
     }
 
@@ -368,16 +360,9 @@ public:
             return {model::Status::Error, "deepseek4: invalid or nonconsecutive image rows"};
         if (pos + n_rows > model_.context())
             return {model::Status::Refused, "deepseek4: image prompt exceeds the loaded context"};
-        for (int row = 0; row < n_rows;) {
-            const int chunk_rows = model_.diag_rows() > 0 ? model_.diag_rows() : 1024;
-            const int count = std::min(chunk_rows, n_rows - row);
-            std::vector<int32_t> tokens((size_t) count, geo_.n_vocab);
-            if (!prefill_rows(tokens.data(), count, pos + row, rows + (size_t) row * geo_.n_embd))
-                return {model::Status::Error, err_};
-            tokens_.insert(tokens_.end(), (size_t) count, geo_.n_vocab);
-            row += count;
-        }
-        if (!sync()) return {model::Status::Error, err_};
+        std::vector<int32_t> tokens((size_t) n_rows, geo_.n_vocab);
+        if (!prefill_rows(tokens.data(), n_rows, pos, rows))
+            return {model::Status::Error, err_};
         return {};
     }
 
@@ -697,7 +682,8 @@ private:
     bool forward_one(int32_t token, int64_t pos, const float* supplied_embedding = nullptr);
     bool forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr,
                       bool attention_only = false, int layer_only = -1, bool begin_tier = true);
-    bool prefill_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr);
+    bool prefill_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr,
+                      const std::function<bool()>& stop = {}, const std::function<void(int)>& progress = {});
     bool routed_step(int layer, const float* normalized, int n_tokens, const FfnRouteWeights& route,
                      const float* weights, float* output);
     bool fail_cuda(const char* operation);
@@ -1000,8 +986,9 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
     return true;
 }
 
-bool Session::prefill_rows(const int32_t* tokens, int T, int64_t pos, const float* supplied_embeddings) {
-    if (!tokens || T < 1 || T > 8192 || pos < 0 || pos + T > model_.context()) {
+bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos, const float* supplied_embeddings,
+                           const std::function<bool()>& stop, const std::function<void(int)>& progress) {
+    if (!tokens || total_tokens < 1 || pos < 0 || pos + total_tokens > model_.context()) {
         err_ = "deepseek4: invalid prompt row chunk";
         return false;
     }
@@ -1012,7 +999,7 @@ bool Session::prefill_rows(const int32_t* tokens, int T, int64_t pos, const floa
     }
 
     // The prompt workspaces temporarily use the VRAM occupied by expert copies.  Destroy them before
-    // reclaiming those slots so the tier can restore its planned placement after this chunk.
+    // reclaiming those slots so the tier can restore its planned placement after the full prompt.
     tier->settle();
     tier->shrink();
     tier->lend_all();
@@ -1027,121 +1014,166 @@ bool Session::prefill_rows(const int32_t* tokens, int T, int64_t pos, const floa
     } restore{tier};
     struct DeviceBuffers {
         std::vector<void*> allocations;
-        ~DeviceBuffers() { for (void* p : allocations) cudaFree(p); }
+        void clear() {
+            for (void* p : allocations) cudaFree(p);
+            allocations.clear();
+        }
+        ~DeviceBuffers() { clear(); }
     } buffers;
     auto alloc = [&](size_t bytes) -> void* {
         void* p = nullptr;
-        if (!bytes || cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
+        if (!bytes || cudaMalloc(&p, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
         buffers.allocations.push_back(p);
         return p;
     };
 
     const size_t n = (size_t) geo_.n_embd;
     const size_t stream_row = 4 * n;
-    const size_t state_bytes = (size_t) T * stream_row * sizeof(float);
-    float* current = static_cast<float*>(alloc(state_bytes));
-    float* attended = static_cast<float*>(alloc(state_bytes));
-    float* coefficients = static_cast<float*>(alloc((size_t) T * kernels::kHcCoef * sizeof(float)));
-    float* collapsed = static_cast<float*>(alloc((size_t) T * n * sizeof(float)));
-    float* normalized = static_cast<float*>(alloc((size_t) T * n * sizeof(float)));
-    float* hc_workspace = static_cast<float*>(alloc(kernels::hc_mixes_workspace_floats(T) * sizeof(float)));
-    float* logits = static_cast<float*>(alloc((size_t) T * geo_.n_expert * sizeof(float)));
-    int32_t* route_ids = static_cast<int32_t*>(alloc((size_t) T * geo_.n_used * sizeof(int32_t)));
-    float* route_weights = static_cast<float*>(alloc((size_t) T * geo_.n_used * sizeof(float)));
-    float* shared = static_cast<float*>(alloc((size_t) T * n * sizeof(float)));
-    float* routed = static_cast<float*>(alloc((size_t) T * n * sizeof(float)));
-    int32_t* fixed_rows = static_cast<int32_t*>(alloc((size_t) T * sizeof(int32_t)));
-    uint8_t* fixed_mask = static_cast<uint8_t*>(alloc((size_t) T));
-    uint8_t* alternate_mask = static_cast<uint8_t*>(alloc((size_t) T));
-    if (!current || !attended || !coefficients || !collapsed || !normalized || !hc_workspace || !logits ||
-        !route_ids || !route_weights || !shared || !routed || !fixed_rows || !fixed_mask || !alternate_mask) {
-        err_ = "deepseek4: out of device memory for the chunked prompt workspaces";
-        return false;
+    int cap = std::min(model_.diag_rows() > 0 ? model_.diag_rows() : 8192, total_tokens);
+    float *current = nullptr, *attended = nullptr, *coefficients = nullptr, *collapsed = nullptr,
+          *normalized = nullptr, *hc_workspace = nullptr, *logits = nullptr, *route_weights = nullptr,
+          *shared = nullptr, *routed = nullptr;
+    int32_t *route_ids = nullptr, *fixed_rows = nullptr;
+    uint8_t *fixed_mask = nullptr, *alternate_mask = nullptr;
+    std::unique_ptr<PrefillFfn> prompt_ffn;
+
+    for (;;) {
+        buffers.clear();
+        prompt_ffn.reset();
+        const size_t state_bytes = (size_t) cap * stream_row * sizeof(float);
+        current = static_cast<float*>(alloc(state_bytes));
+        attended = static_cast<float*>(alloc(state_bytes));
+        coefficients = static_cast<float*>(alloc((size_t) cap * kernels::kHcCoef * sizeof(float)));
+        collapsed = static_cast<float*>(alloc((size_t) cap * n * sizeof(float)));
+        normalized = static_cast<float*>(alloc((size_t) cap * n * sizeof(float)));
+        hc_workspace = static_cast<float*>(alloc(kernels::hc_mixes_workspace_floats(cap) * sizeof(float)));
+        logits = static_cast<float*>(alloc((size_t) cap * geo_.n_expert * sizeof(float)));
+        route_ids = static_cast<int32_t*>(alloc((size_t) cap * geo_.n_used * sizeof(int32_t)));
+        route_weights = static_cast<float*>(alloc((size_t) cap * geo_.n_used * sizeof(float)));
+        shared = static_cast<float*>(alloc((size_t) cap * n * sizeof(float)));
+        routed = static_cast<float*>(alloc((size_t) cap * n * sizeof(float)));
+        fixed_rows = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
+        fixed_mask = static_cast<uint8_t*>(alloc((size_t) cap));
+        alternate_mask = static_cast<uint8_t*>(alloc((size_t) cap));
+        const bool bufs_ok = current && attended && coefficients && collapsed && normalized && hc_workspace &&
+                             logits && route_ids && route_weights && shared && routed && fixed_rows &&
+                             fixed_mask && alternate_mask;
+        if (bufs_ok) {
+            std::string ffn_err;
+            prompt_ffn = make_prefill_ffn(model_.weights(), *tier, cap, ffn_err);
+            if (prompt_ffn) break;
+            cudaGetLastError();
+            err_ = ffn_err;
+        }
+        if (model_.diag_rows() > 0 || cap <= 1024) {
+            if (err_.empty()) err_ = "deepseek4: out of device memory for the chunked prompt workspaces";
+            return false;
+        }
+        cap = std::max(1024, cap / 2);
     }
 
-    std::vector<float> host((size_t) T * stream_row);
+    std::vector<float> host((size_t) cap * stream_row);
     std::vector<float> embedding;
-    for (int t = 0; t < T; ++t) {
-        const float* src = supplied_embeddings ? supplied_embeddings + (size_t) t * n : nullptr;
-        if (!src) {
-            if (tokens[t] < 0 || tokens[t] >= geo_.n_vocab || !model_.weights().embedding_row(tokens[t], embedding, err_)) {
-                if (err_.empty()) err_ = "deepseek4: token id is outside the checkpoint vocabulary";
+    for (int offset = 0; offset < total_tokens;) {
+        if (stop && stop()) {
+            err_ = "deepseek4: prompt read was stopped";
+            return false;
+        }
+        const int T = std::min(cap, total_tokens - offset);
+        const int32_t* chunk_tokens = tokens + offset;
+        const size_t state_bytes = (size_t) T * stream_row * sizeof(float);
+        for (int t = 0; t < T; ++t) {
+            const float* src = supplied_embeddings ? supplied_embeddings + (size_t) (offset + t) * n : nullptr;
+            if (!src) {
+                if (chunk_tokens[t] < 0 || chunk_tokens[t] >= geo_.n_vocab ||
+                    !model_.weights().embedding_row(chunk_tokens[t], embedding, err_)) {
+                    if (err_.empty()) err_ = "deepseek4: token id is outside the checkpoint vocabulary";
+                    return false;
+                }
+                src = embedding.data();
+            }
+            for (int s = 0; s < 4; ++s)
+                std::copy_n(src, n, host.data() + (size_t) t * stream_row + (size_t) s * n);
+        }
+        if (cudaMemcpyAsync(current, host.data(), state_bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return fail_cuda("prompt embedding upload");
+
+        tier->begin_token(T);
+        for (int layer = 0; layer < geo_.n_layers; ++layer) {
+            for (int row = 0; row < T; row += kExpertWindow) {
+                const int count = std::min(kExpertWindow, T - row);
+                const size_t bytes = (size_t) count * stream_row * sizeof(float);
+                if (cudaMemcpyAsync(streams_, current + (size_t) row * stream_row, bytes,
+                                    cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
+                    return fail_cuda("prompt attention input slice");
+                if (!forward_rows(chunk_tokens + row, count, pos + offset + row, nullptr, true, layer, false))
+                    return false;
+                if (cudaMemcpyAsync(attended + (size_t) row * stream_row, next_streams_, bytes,
+                                    cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
+                    return fail_cuda("prompt attention output slice");
+            }
+
+            FfnRouteWeights route;
+            SharedExpertWeights ignored_shared;
+            if (!model_.weights().ffn_layer_weights(layer, route, ignored_shared, err_)) {
+                err_ = "deepseek4: " + err_;
                 return false;
             }
-            src = embedding.data();
+            RouteRows rows;
+            if (!build_route_rows(chunk_tokens, T, geo_.n_vocab, layer, geo_.n_layers, geo_.hash_layers, rows, err_))
+                return false;
+            if (rows.fixed_rows.size() != (size_t) T || rows.fixed_mask.size() != (size_t) T ||
+                rows.alternate_mask.size() != (size_t) T ||
+                cudaMemcpyAsync(fixed_rows, rows.fixed_rows.data(), (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
+                cudaMemcpyAsync(fixed_mask, rows.fixed_mask.data(), (size_t) T, cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
+                cudaMemcpyAsync(alternate_mask, rows.alternate_mask.data(), (size_t) T, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+                err_ = "deepseek4: cannot upload chunked prompt route metadata";
+                return false;
+            }
+            route.routing = router_mixed_args(geo_.n_expert, geo_.n_vocab,
+                layer < geo_.hash_layers ? hash_routes_ + (size_t) layer * geo_.n_vocab * 6 : nullptr,
+                fixed_rows, fixed_mask, alternate_mask, route.routing.bias, route.routing.alternate_bias);
+            FfnRouteScratch scratch{hc_workspace, coefficients, collapsed, normalized, logits, route_ids, route_weights};
+            try {
+                prepare_ffn_routes(attended, T, route, scratch, stream_);
+            } catch (const std::exception& e) {
+                err_ = std::string("deepseek4 prompt FFN routes: ") + e.what();
+                return false;
+            }
+            if (!prompt_ffn->shared(layer, T, normalized, shared, stream_, err_) ||
+                !prompt_ffn->routed(layer, T, normalized, route_ids, route_weights, routed, stream_, err_)) return false;
+            try {
+                finish_ffn_layer(attended, coefficients, shared, routed, T, geo_.n_embd, current, stream_);
+            } catch (const std::exception& e) {
+                err_ = std::string("deepseek4 prompt FFN finish: ") + e.what();
+                return false;
+            }
+            std::swap(current, attended);
         }
-        for (int s = 0; s < 4; ++s)
-            std::copy_n(src, n, host.data() + (size_t) t * stream_row + (size_t) s * n);
-    }
-    if (cudaMemcpyAsync(current, host.data(), state_bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-        return fail_cuda("prompt embedding upload");
 
-    std::unique_ptr<PrefillFfn> prompt_ffn = make_prefill_ffn(model_.weights(), *tier, T, err_);
-    if (!prompt_ffn) return false;
-    tier->begin_token(T);
-    for (int layer = 0; layer < geo_.n_layers; ++layer) {
-        for (int row = 0; row < T; row += kExpertWindow) {
-            const int count = std::min(kExpertWindow, T - row);
-            const size_t bytes = (size_t) count * stream_row * sizeof(float);
-            if (cudaMemcpyAsync(streams_, current + (size_t) row * stream_row, bytes,
-                                cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
-                return fail_cuda("prompt attention input slice");
-            if (!forward_rows(tokens + row, count, pos + row, nullptr, true, layer, false)) return false;
-            if (cudaMemcpyAsync(attended + (size_t) row * stream_row, next_streams_, bytes,
-                                cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
-                return fail_cuda("prompt attention output slice");
+        if (offset + T == total_tokens) {
+            HeadWeights head;
+            if (!model_.weights().head_weights(head, err_)) {
+                err_ = "deepseek4: " + err_;
+                return false;
+            }
+            HeadScratch head_scratch{head_hc_workspace_, head_coef_, head_collapsed_, head_normed_};
+            try {
+                model_head_step(current + (size_t) (T - 1) * stream_row, 1, head, head_scratch, final_logits_, stream_);
+            } catch (const std::exception& e) {
+                err_ = std::string("deepseek4 prompt output head: ") + e.what();
+                return false;
+            }
         }
-
-        FfnRouteWeights route;
-        SharedExpertWeights ignored_shared;
-        if (!model_.weights().ffn_layer_weights(layer, route, ignored_shared, err_)) {
-            err_ = "deepseek4: " + err_;
-            return false;
-        }
-        RouteRows rows;
-        if (!build_route_rows(tokens, T, geo_.n_vocab, layer, geo_.n_layers, geo_.hash_layers, rows, err_)) return false;
-        if (rows.fixed_rows.size() != (size_t) T || rows.fixed_mask.size() != (size_t) T ||
-            rows.alternate_mask.size() != (size_t) T ||
-            cudaMemcpyAsync(fixed_rows, rows.fixed_rows.data(), (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
-            cudaMemcpyAsync(fixed_mask, rows.fixed_mask.data(), (size_t) T, cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
-            cudaMemcpyAsync(alternate_mask, rows.alternate_mask.data(), (size_t) T, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
-            err_ = "deepseek4: cannot upload chunked prompt route metadata";
-            return false;
-        }
-        route.routing = router_mixed_args(geo_.n_expert, geo_.n_vocab,
-            layer < geo_.hash_layers ? hash_routes_ + (size_t) layer * geo_.n_vocab * 6 : nullptr,
-            fixed_rows, fixed_mask, alternate_mask, route.routing.bias, route.routing.alternate_bias);
-        FfnRouteScratch scratch{hc_workspace, coefficients, collapsed, normalized, logits, route_ids, route_weights};
-        try {
-            prepare_ffn_routes(attended, T, route, scratch, stream_);
-        } catch (const std::exception& e) {
-            err_ = std::string("deepseek4 prompt FFN routes: ") + e.what();
-            return false;
-        }
-        if (!prompt_ffn->shared(layer, T, normalized, shared, stream_, err_) ||
-            !prompt_ffn->routed(layer, T, normalized, route_ids, route_weights, routed, stream_, err_)) return false;
-        try {
-            finish_ffn_layer(attended, coefficients, shared, routed, T, geo_.n_embd, current, stream_);
-        } catch (const std::exception& e) {
-            err_ = std::string("deepseek4 prompt FFN finish: ") + e.what();
-            return false;
-        }
-        std::swap(current, attended);
+        if (!sync()) return false;
+        tokens_.insert(tokens_.end(), chunk_tokens, chunk_tokens + T);
+        offset += T;
+        if (progress) progress(offset);
     }
-
-    HeadWeights head;
-    if (!model_.weights().head_weights(head, err_)) {
-        err_ = "deepseek4: " + err_;
-        return false;
-    }
-    HeadScratch head_scratch{head_hc_workspace_, head_coef_, head_collapsed_, head_normed_};
-    try {
-        model_head_step(current + (size_t) (T - 1) * stream_row, 1, head, head_scratch, final_logits_, stream_);
-    } catch (const std::exception& e) {
-        err_ = std::string("deepseek4 prompt output head: ") + e.what();
-        return false;
-    }
-    return sync();
+    return true;
 }
 
 bool Session::routed_step(int layer, const float* normalized, int n_tokens, const FfnRouteWeights&,
