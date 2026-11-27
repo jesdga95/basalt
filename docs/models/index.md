@@ -19,7 +19,7 @@ file and picks the chat format, tool syntax and thinking switch. Several models 
 | `gpu-mode split` | up to 8 cards | refused | 2 cards | refused | 2 cards | refused | not measured |
 | Cards by default | the main card alone | the main card alone | the main card alone | the main card alone | the main card, experts in RAM when the context needs their room | the main card alone | the main card alone, experts in RAM (78.0 GiB) with 26 copies a layer on the card |
 | Parallel slots | yes; each slot drafts | yes; each slot drafts | yes; each slot drafts | not measured | not measured | sequential (1 slot per pass) | no: one sequence, the KDA state is per sequence |
-| Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none | none | `--route-prior`, `--route-tail-skip` (off) | none |
+| Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none | none | none | none | `--route-prior`, `--route-tail-skip` (off) | `--route-prior`, `--route-tail-skip` (off) |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) | no | no | no | no | no |
 | Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused | no | yes (Linux) | yes (Linux) | yes (Linux); a second-card sleep may be refused | not measured |
 | `basalt-bench --quality` | yes | yes, one row per window | yes | yes | yes | yes | no, and why ([parity](glm-5-3-flash.md#parity)) |
