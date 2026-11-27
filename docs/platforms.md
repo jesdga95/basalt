@@ -2,7 +2,7 @@
 
 Linux x64 and Windows x64 with NVIDIA Blackwell (sm_120), and Linux Arm64 with the integrated Blackwell GPU (sm_121) of the DGX
 Spark, described in [arm64](arm64.md). Linux x64 is where the engine is tested and benchmarked. CI builds all three and runs the
-CPU tests on each. The GPU tests and the quality gate need a card.
+CPU tests on each. The GPU tests and the quality suite need a card.
 
 The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON`, a second card of sm_89 (Ada) can be a Flash-Next peer that holds and
 computes experts (`gpu-mode peer`, [GPUs](configuration/gpus.md#an-older-peer-card)); every other path and every other
@@ -55,7 +55,7 @@ tier. A pack is read where it lies, so the packs go on `/models` and the config 
 `basalt serve --config /data/basalt_config.json --host 0.0.0.0` and arguments after the image name follow it (`--api-key KEY`).
 The served port is `server.port` (8080) and the mapped host port has to match it; `--gpu` names the cards the container sees.
 
-The container path is untested: no `basalt-bench` run and no PPL/KLD quality run has been measured inside the image, so the
+The container path is untested: no `basalt-bench` run and no quality-suite run has been measured inside the image, so the
 benchmark numbers describe native runs.
 
 ## Platform code
@@ -113,4 +113,4 @@ on both, and the pool output matches the serial run bit for bit.
 
 Greedy tokens differ across the builds: with tiers pinned and adaptive swaps off, `struct` matches over 300 tokens, `conv` diverges at
 token 23 and `prose` at token 44. One build matches itself run to run, so the difference is the host compiler's CPU code (78% of expert
-rows). Quality of the Windows build has not been run ([quality](precision/quality.md)).
+rows). Quality of the Windows build has not been run ([quality](precision/quality-suite.md)).

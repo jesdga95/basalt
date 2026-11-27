@@ -108,7 +108,10 @@ class BenchFlags(unittest.TestCase):
         return r.stdout.split()
 
     def test_community_refuses_anything_that_changes_the_workload(self):
-        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"], ["--quality"], ["--seed", "7"],
+        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"],
+                      ["--quality", "ref.safetensors"], ["--kld"], ["--smoke"], ["--quality-top", "64"],
+                      ["--quality-role", "all"], ["--quality-max-context", "4096"], ["--quality-boot", "100"],
+                      ["--kld-base", "base.kld"], ["--kld-t", "5"], ["--seed", "7"],
                       ["--set", "--kv int8"], ["-o", "json"], ["--engine", "x"], ["--", "--spec", "3"]):
             with self.subTest(extra=extra):
                 r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", *extra],
@@ -148,6 +151,42 @@ class BenchFlags(unittest.TestCase):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)
         self.assertIn("Engine flags (passed to basalt):", r.stdout)
         self.assertIn("--max-context", r.stdout)
+        self.assertIn("--quality FILE", r.stdout)
+        self.assertIn("--smoke", r.stdout)
+        self.assertIn("--quality-top", r.stdout)
+        self.assertIn("--quality-role", r.stdout)
+        self.assertIn("--quality-max-context", r.stdout)
+        self.assertIn("--quality-boot", r.stdout)
+        self.assertIn("--kld [N]", r.stdout)
+        self.assertIn("--kld-base FILE", r.stdout)
+        self.assertIn("--kld-t T", r.stdout)
+        self.assertNotIn("--quality-t ", r.stdout)
+
+    def test_quality_and_kld_flag_validation(self):
+        # --quality requires a reference file path and defaults --max-context to 5120
+        cmd = self.command("--quality", "ref.safetensors")
+        self.assertEqual(cmd[cmd.index("--max-context") + 1], "5120")
+        self.assertEqual(cmd[cmd.index("--prompt-cache") + 1], "0")
+        cmd = self.command("--quality", "ref.safetensors", "--", "--prompt-cache", "2")
+        self.assertEqual(cmd[cmd.index("--prompt-cache") + 1], "2")
+        cmd = self.command("--quality", "ref.safetensors", "--quality-max-context", "8192")
+        self.assertEqual(cmd[cmd.index("--max-context") + 1], "8192")
+        cmd = self.command("--quality", "ref.safetensors", "--", "--max-context", "16384")
+        self.assertEqual(cmd[cmd.index("--max-context") + 1], "16384")
+        for bad in (["--quality"], ["--quality", "ref.safetensors", "--quality-role", "bogus"],
+                    ["--quality", "ref.safetensors", "--quality-top", "0"],
+                    ["--quality", "ref.safetensors", "--quality-top", "257"],
+                    ["--quality", "ref.safetensors", "--quality-boot", "-1"],
+                    ["--kld", "--kld-t", "0"]):
+            with self.subTest(bad=bad):
+                r = subprocess.run([str(BENCH), "--engine", str(ENGINE), "--model", "m.basalt", *bad],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2)
+        # --kld without --kld-base is refused
+        r = subprocess.run([str(BENCH), "--engine", str(ENGINE), "--model", "m.basalt", "--kld"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--kld-base", r.stderr)
 
 
 if __name__ == "__main__":

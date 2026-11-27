@@ -1,12 +1,13 @@
 # ERNIE-5.5-Flash precision
 
-Where ERNIE-5.5-Flash rounds and how its output compares. Method: [quality](quality.md). Guide: [ERNIE-5.5-Flash](../models/ernie55.md).
+Where ERNIE-5.5-Flash rounds and how its output compares. Guide: [ERNIE-5.5-Flash](../models/ernie55.md).
+Method: the [quality suite](quality-suite.md).
 
 ## Summary
 
 - **Pack source & BF16 reference:** The `.basalt` pack converts Baidu's official `baidu/ERNIE-5.5-Flash-Preview` release
   (native `MXFP4` routed experts + 128×128 blockwise `FP8` dense projections). Baidu also publishes
-  `baidu/ERNIE-5.5-Flash-Preview-BF16` (~560 GB), so a true BF16 KLD reference is possible (pending a community run on a
+  `baidu/ERNIE-5.5-Flash-Preview-BF16` (~560 GB), so a true BF16 quality-suite reference is possible (pending a community run on a
   machine that fits the ~560 GB BF16 checkpoint).
 - **Routed experts are bit for bit the release's bits.** All 42 MoE layers × 512 experts (top-10 routed + 1 shared) keep the
   release's MXFP4 E2M1 codes and UE8M0 scales unchanged (`GGML_TYPE_MXFP4 = 39`, 17 bytes per 32 values).
@@ -141,5 +142,5 @@ resumed decode can occasionally flip a boundary expert on near-tie tokens while 
   - `native_expert_parity --mxfp4`: **0 failures** (bitwise `memcmp == 0` across `nt = 1..8`, AVX2 & AVX-VNNI).
   - `prompt_cache_resume_drift_test.py`: **PASS** (cached resume vs. full recompute across short and long suffixes).
   - `conversation_store_test` & `conversation_cache_test`: **PASS** (hybrid HCA `ratio=128` + DSA multi-block roundtrip; 15,307 checks).
-- **BF16 KLD reference (wikitext-2, 100 chunks):**
+- **BF16 quality-suite reference:**
   - Pending community run against `baidu/ERNIE-5.5-Flash-Preview-BF16` (~560 GB, exceeding our 192 GB workstation).
