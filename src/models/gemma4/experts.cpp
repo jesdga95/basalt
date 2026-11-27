@@ -273,8 +273,8 @@ std::unique_ptr<TierExperts> TierExperts::make(const Gemma4Model& m, core::Exper
         if (err.empty()) err = "gemma4: cannot write the expert tables";
         return nullptr;
     }
-    // every expert a home on the card for good: no hand-off, no lookups
-    p.off = tier.ram_bytes() > 0 || std::find(p.on_card.begin(), p.on_card.end(), (uint8_t) 0) != p.on_card.end();
+    // every expert a home on the card (no RAM home and no prompt staging, so nothing ever moves): no hand-off, no lookups
+    p.off = m.stage_experts() > 0 || std::find(p.on_card.begin(), p.on_card.end(), (uint8_t) 0) != p.on_card.end();
     if (p.off) {
         p.server = std::thread([&p] { p.serve(); });
         basalt::log::info("basalt gemma4", "experts: the card's from its tables, the others through the doorbell (%d pool workers)",
