@@ -7,6 +7,7 @@
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/model/adapter.hpp"
 
+#include <initializer_list>
 #include <string>
 
 namespace basalt::models::qwen35 {
@@ -28,7 +29,14 @@ inline std::string linear_type_error(const std::string& base, uint32_t type, int
     return {};
 }
 
-inline const MetaValue* key(const GgufFile& g, const char* suffix) { return g.get(std::string("qwen35.") + suffix); }
+/// The routed-expert variant (`qwen35moe`: the same layers with a routed-expert FFN) or the dense `qwen35`.
+inline bool is_moe(const GgufFile& g) {
+    const MetaValue* a = g.get("general.architecture");
+    return a != nullptr && a->s == "qwen35moe";
+}
+inline const MetaValue* key(const GgufFile& g, const char* suffix) {
+    return g.get(std::string(is_moe(g) ? "qwen35moe." : "qwen35.") + suffix);
+}
 inline uint64_t key_u(const GgufFile& g, const char* suffix) {
     const MetaValue* v = key(g, suffix);
     return v ? v->u : 0;
@@ -37,8 +45,12 @@ inline uint64_t key_u(const GgufFile& g, const char* suffix) {
 inline std::string validate_meta(const GgufFile& g) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    if (arch->s != "qwen35") return "architecture is '" + arch->s + "', this adapter requires 'qwen35'";
-    for (const char* k : {"block_count", "embedding_length", "feed_forward_length", "attention.head_count",
+    if (arch->s != "qwen35" && arch->s != "qwen35moe") return "architecture is '" + arch->s + "', this adapter requires 'qwen35' or 'qwen35moe'";
+    for (const char* k : is_moe(g) ? std::initializer_list<const char*>{"expert_count", "expert_used_count", "expert_feed_forward_length",
+                                                                         "expert_shared_feed_forward_length"}
+                                   : std::initializer_list<const char*>{"feed_forward_length"})
+        if (key_u(g, k) == 0) return std::string("missing or zero ") + (is_moe(g) ? "qwen35moe." : "qwen35.") + k;
+    for (const char* k : {"block_count", "embedding_length", "attention.head_count",
                           "attention.head_count_kv", "attention.key_length", "rope.dimension_count", "ssm.state_size",
                           "ssm.group_count", "ssm.time_step_rank", "ssm.conv_kernel", "full_attention_interval"})
         if (key_u(g, k) == 0) return std::string("missing or zero qwen35.") + k;
@@ -48,7 +60,7 @@ inline std::string validate_meta(const GgufFile& g) {
 
 inline model::ModelDesc describe_meta(const GgufFile& g) {
     model::ModelDesc d;
-    d.arch = "qwen35";
+    d.arch = is_moe(g) ? "qwen35moe" : "qwen35";
     d.n_layers = (int64_t) key_u(g, "block_count");
     d.n_embd = (int64_t) key_u(g, "embedding_length");
     d.context_length = (int64_t) key_u(g, "context_length");
@@ -61,7 +73,14 @@ inline dense::Geometry geometry(const GgufFile& g, std::string& err) {
     dense::Geometry o;
     o.n_layers = (int) key_u(g, "block_count");
     o.n_embd = (int) key_u(g, "embedding_length");
-    o.n_ff = (int) key_u(g, "feed_forward_length");
+    if (is_moe(g)) {   // the FFN dense kernels run is the shared expert; the routed experts are the layer's own
+        o.moe_experts = (int) key_u(g, "expert_count");
+        o.moe_used = (int) key_u(g, "expert_used_count");
+        o.moe_ff = (int) key_u(g, "expert_feed_forward_length");
+        o.n_ff = (int) key_u(g, "expert_shared_feed_forward_length");
+    } else {
+        o.n_ff = (int) key_u(g, "feed_forward_length");
+    }
     if (const MetaValue* t = g.get("tokenizer.ggml.tokens")) o.n_vocab = (int) t->count;
     o.n_head = (int) key_u(g, "attention.head_count");
     o.n_kv = (int) key_u(g, "attention.head_count_kv");

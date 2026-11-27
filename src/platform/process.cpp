@@ -66,6 +66,25 @@ std::vector<wchar_t> command_line(const std::vector<std::string>& argv) {
     return out;
 }
 
+/// One job for every child this process starts, set to kill its members when the last handle to it closes (when this process
+/// ends, however it ends): a child's own children belong to it too, so a killed or crashed launcher leaves no engine or server
+/// running with the GPU and the port.
+HANDLE kill_on_close_job() {
+    static const HANDLE job = [] {
+        HANDLE h = CreateJobObjectW(nullptr, nullptr);
+        if (h != nullptr) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(h, JobObjectExtendedLimitInformation, &info, sizeof info)) {
+                CloseHandle(h);
+                h = nullptr;
+            }
+        }
+        return h;
+    }();
+    return job;
+}
+
 /// Starts the child and hands back its handle. nullptr when it could not start, with errno set for the caller.
 /// With `std_handles`, the child's three standard handles are those (stdin, stdout, stderr).
 HANDLE start(const std::vector<std::string>& argv, const HANDLE* std_handles = nullptr) {
@@ -81,11 +100,14 @@ HANDLE start(const std::vector<std::string>& argv, const HANDLE* std_handles = n
     PROCESS_INFORMATION pi{};
     // The handles the caller marked inheritable go to the child: that is how a caller wires a child's standard
     // descriptors to pipes it owns.
-    if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+    // started suspended and put in the job before it runs, so nothing it starts can escape the job
+    if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
         const DWORD e = GetLastError();
         errno = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? ENOENT : EINVAL;
         return nullptr;
     }
+    if (const HANDLE job = kill_on_close_job()) (void) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
     return pi.hProcess;
 }

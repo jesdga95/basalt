@@ -346,7 +346,7 @@ target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision expert_tier tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
 
-if(BASALT_MODEL_QWEN35)
+if(BASALT_MODEL_QWEN35 OR BASALT_MODEL_QWEN35MOE)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp)
@@ -377,12 +377,24 @@ if(BUILD_TESTING)
   target_include_directories(qwen35_linear_types_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen35_linear_types_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen35_linear_types_test COMMAND qwen35_linear_types_test)
+  # a qwen35moe pack's routed experts: the per-pair INT8 kernels against the grouped MMQ products (a pack: argument; skipped without)
+  add_executable(qwen35_moe_parity_test tests/models/qwen35/moe_parity_test.cpp)
+  target_link_libraries(qwen35_moe_parity_test PRIVATE dense ${_gpu_runtime_target})
+  basalt_gpu_test(NAME qwen35_moe_parity_test COMMAND qwen35_moe_parity_test)
+  set_tests_properties(qwen35_moe_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # where the 27B's layers go on two cards: the cut by the shares over its bytes, and the refusals (host only)
   add_executable(qwen35_split_plan_test tests/models/qwen35/split_plan_test.cpp src/model/multi_gpu.cpp)
   target_include_directories(qwen35_split_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen35_split_plan_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen35_split_plan_test COMMAND qwen35_split_plan_test)
 endif()
+endif()
+
+if(BASALT_MODEL_QWEN35MOE)
+# qwen35moe: the dense stack's routed-expert layers, through the qwen35 adapter's code
+add_library(model_qwen35moe STATIC src/models/qwen35moe/adapter.cpp)
+target_include_directories(model_qwen35moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(model_qwen35moe PUBLIC model_qwen35 model)
 endif()
 
 # The composition root links the built models and sees their ids (BASALT_MODEL_<ARCH>) and the registration list.
@@ -598,6 +610,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_commit.cu
                         src/kernels/cuda/gdn_prompt.cu
                         src/kernels/cuda/dense_ops.cu
+                        src/kernels/cuda/moe_ffn.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
                         src/kernels/cuda/mhc.cu
@@ -1018,6 +1031,9 @@ add_executable(gdn_seg_split_parity tests/kernels/gdn_seg_split_parity.cpp)
 target_link_libraries(gdn_seg_split_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gdn_seg_split_parity COMMAND gdn_seg_split_parity)
 set_tests_properties(gdn_seg_split_parity PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(q8_wide_window_test tests/kernels/q8_wide_window_test.cpp)
+target_link_libraries(q8_wide_window_test PRIVATE window_gemm kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q8_wide_window_test COMMAND q8_wide_window_test)
 add_executable(window_gemm_parity tests/kernels/window_gemm_parity.cpp)
 target_link_libraries(window_gemm_parity PRIVATE window_gemm kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME window_gemm_parity COMMAND window_gemm_parity)
