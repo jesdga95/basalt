@@ -26,6 +26,8 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -1277,33 +1279,60 @@ void test_cpu_merge() {
     failures += !ok;
 }
 
-// A host thread serving the doorbell as cpu_experts.cpp does: a raised bell taken (cleared), then after `delay_us` each
-// pair whose expert is off the card gets row (x_m row * 0.5 + its expert + the replay) in `out`, then `done`.
+// A host thread serving the doorbell as cpu_experts.cpp does: a new rows publication is read (after `early_us`, a slow
+// early consumer) into `q` as the pool's input and acknowledged; a raised bell is taken (cleared), its rows read again
+// if their publication is not the one read, then after `delay_us` each pair whose expert is off the card gets row
+// (input row * 0.5 + its expert + the replay) in `out`, then `done`. `copies` keeps every publication's read, by number.
 struct BellServer {
     CpuBell* bell = nullptr;
     const float* x_m = nullptr;
     const int32_t* ids_m = nullptr;
     float* out = nullptr;
     const unsigned long long* tab = nullptr;   // host copy of the blob table
-    int k = 0, delay_us = 0, layer = -1, rows = -1;
-    std::atomic<int> replay{0}, rings{0};
+    int k = 0, delay_us = 0, early_us = 0, layer = -1, rows = -1;
+    std::atomic<int> replay{0}, rings{0}, reread{0};
     std::atomic<bool> stop{false};
+    std::vector<float> q = std::vector<float>((size_t) kDecodeRows * E);
+    std::map<uint32_t, std::vector<float>> copies;
+    std::mutex mu;
     std::thread t;
     void start() {
         t = std::thread([this] {
-            std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done);
+            std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done), raised(bell->rows),
+                shape(bell->rows_shape), acked(bell->rows_ack), ring_rows(bell->ring_rows);
+            uint32_t taken = 0;
+            auto read_rows = [&](int n) { std::memcpy(q.data(), x_m, (size_t) n * E * sizeof(float)); };
+            auto take_rows = [&] {
+                const uint32_t n = raised.load(std::memory_order_acquire);
+                if (!n || n == taken) return;
+                const int r = (int) (shape.load(std::memory_order_relaxed) >> 16);
+                if (early_us) std::this_thread::sleep_for(std::chrono::microseconds(early_us));
+                read_rows(r);
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    copies[n] = std::vector<float>(q.begin(), q.begin() + (size_t) r * E);
+                }
+                taken = n;
+                acked.store(n, std::memory_order_release);
+            };
             while (!stop.load(std::memory_order_relaxed)) {
+                take_rows();
                 const uint32_t w = ring.load(std::memory_order_acquire);
                 if (!w) continue;
-                const uint32_t visit = ticket.load(std::memory_order_relaxed);
+                const uint32_t visit = ticket.load(std::memory_order_relaxed), pub = ring_rows.load(std::memory_order_relaxed);
                 ring.store(0, std::memory_order_relaxed);
+                take_rows();
                 layer = (int) (w >> 8 & 0xffu);
                 rows = (int) (w >> 16);
+                if (pub == 0 || pub != taken) {
+                    read_rows(rows);
+                    reread.fetch_add(1);
+                }
                 if (delay_us) std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
                 for (int p = 0; p < rows * k; ++p)
                     if (!tab[ids_m[p]])
                         for (int c = 0; c < E; ++c)
-                            out[(size_t) p * E + c] = x_m[(size_t) (p / k) * E + c] * 0.5f + (float) ids_m[p] + (float) replay.load();
+                            out[(size_t) p * E + c] = q[(size_t) (p / k) * E + c] * 0.5f + (float) ids_m[p] + (float) replay.load();
                 rings.fetch_add(1);
                 fin.store(visit, std::memory_order_release);
             }
@@ -1314,6 +1343,29 @@ struct BellServer {
         t.join();
     }
 };
+
+// After a stream's visits have run: the latest rows publication, acquired, and whether the host acknowledged it within a
+// deadline (an all-card visit's stream can finish while the host still reads its rows), before the payload is checked or
+// poisoned again.
+bool rows_acked(CpuBell* bell) {
+    const uint32_t pub = std::atomic_ref<uint32_t>(bell->rows).load(std::memory_order_acquire);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::atomic_ref<uint32_t>(bell->rows_ack).load(std::memory_order_acquire) != pub) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::yield();
+    }
+    return pub != 0;
+}
+
+// rows_acked, or the case stops: the test's host is joined (it may still own the buffer), the failure printed, and the
+// process ends before anything reuses or frees the buffers.
+void require_ack(CpuBell* bell, BellServer& sv, const char* where) {
+    if (rows_acked(bell)) return;
+    sv.end();
+    std::printf("moe_cpu_ring + merge: doorbell FAIL (%s: rows not acknowledged)\n", where);
+    std::fflush(stdout);
+    std::_Exit(1);
+}
 
 // Replay a ring/merge graph with a delayed host. Only RAM visits advance the ticket and publish their choices and
 // RAM rows. The merge takes the host's rows only for the matching ticket in each replay.
@@ -1331,7 +1383,7 @@ void test_cpu_ring() {
     cudaHostGetDevicePointer((void**) &ids_md, ids_m, 0);
     cudaHostGetDevicePointer((void**) &out_md, out_m, 0);
     uint32_t* seq = nullptr;
-    cudaMalloc(&seq, sizeof(*seq));
+    cudaMalloc(&seq, 2 * sizeof(*seq));
     bool ok = true;
     for (int rows = 1; rows <= kDecodeRows; ++rows)
         for (int mode : {0, 1, 2, 3}) {
@@ -1364,11 +1416,12 @@ void test_cpu_ring() {
             sv.start();
             cudaStream_t st;
             cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
-            cudaMemsetAsync(seq, 0, sizeof(*seq), st);
+            cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
-            moe_cpu_ring(di, rows, K, dt, dx, L, x_md, ids_md, bell_d, seq, st);
+            moe_cpu_rows(dx, rows, L, x_md, bell_d, seq, st);
+            moe_cpu_ring(di, rows, K, dt, L, ids_md, bell_d, seq, st);
             moe_cpu_merge(di, rows, K, dt, out_md, dy, tally, st, bell_d, seq);
             cudaStreamEndCapture(st, &graph);
             cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
@@ -1390,6 +1443,7 @@ void test_cpu_ring() {
                 sv.replay.store(replay);
                 cudaGraphLaunch(exec, st);
                 ok &= cudaStreamSynchronize(st) == cudaSuccess;
+                require_ack(bell, sv, "a replay");   // published, and read and handed back by the host
                 if (grows) {
                     ++served;
                     last_rows = rows;
@@ -1407,13 +1461,15 @@ void test_cpu_ring() {
                     }
                 }
                 ok &= counts == want;
-                for (int r = 0; r < kDecodeRows; ++r)   // the payload is this replay's, rows and choices, bit for bit
+                for (int r = 0; r < kDecodeRows; ++r)   // the payload is this replay's, every row and the choices, bit for bit
                     for (int c = 0; c < E; ++c) {
                         const float got = x_m[(size_t) r * E + c];
                         uint32_t bits;
                         std::memcpy(&bits, &got, 4);
-                        ok &= grows >> r & 1 ? std::memcmp(&got, &gx[(size_t) r * E + c], 4) == 0 : bits == 0xffffffffu;
+                        ok &= r < rows ? std::memcmp(&got, &gx[(size_t) r * E + c], 4) == 0 : bits == 0xffffffffu;
                     }
+                ok &= std::atomic_ref<uint32_t>(bell->rows_shape).load(std::memory_order_relaxed) ==
+                      (1u | (uint32_t) L << 8 | (uint32_t) rows << 16);   // this visit's shape
                 for (int p = 0; p < kDecodeRows * K; ++p) ok &= ids_m[p] == (grows && p < pairs ? gids[(size_t) p] : -1);
 
                 // The merge without a bell takes the same completed host rows without the hand-off.
@@ -1429,9 +1485,11 @@ void test_cpu_ring() {
                         constexpr size_t row_values = (size_t) K * E;
                         poison();
                         cudaMemcpyAsync(dy, before.data(), row_values * sizeof(float), cudaMemcpyHostToDevice, st);
-                        moe_cpu_ring(di + r * K, 1, K, dt, dx + (size_t) r * E, L, x_md, ids_md, bell_d, seq, st);
+                        moe_cpu_rows(dx + (size_t) r * E, 1, L, x_md, bell_d, seq, st);
+                        moe_cpu_ring(di + r * K, 1, K, dt, L, ids_md, bell_d, seq, st);
                         moe_cpu_merge(di + r * K, 1, K, dt, out_md, dy, nullptr, st, bell_d, seq);
                         ok &= cudaStreamSynchronize(st) == cudaSuccess;
+                        require_ack(bell, sv, "a one-row visit");   // before the next row's poison
                         const auto single = host(dy, row_values);
                         ok &= std::memcmp(single.data(), y.data() + (size_t) r * row_values, row_values * sizeof(float)) == 0;
                         if (grows >> r & 1) {
@@ -1441,15 +1499,19 @@ void test_cpu_ring() {
                     }
                 }
             }
+            if (rows == 1 && mode == 0)
+                std::printf("  moe_cpu_rows %.1f us a call (1 row, the host acknowledging each)\n",
+                            time_us([&] { moe_cpu_rows(dx, 1, L, x_md, bell_d, seq, nullptr); }));
+            require_ack(bell, sv, "the timing calls");
             sv.end();
             const uint32_t expected = (uint32_t) served;
             ok &= bell->ring == 0 && bell->ticket == expected && bell->abort == 0;
             ok &= bell->done == (served ? expected : UINT32_MAX) && host(seq, 1)[0] == expected;
-            ok &= sv.rings.load() == served;
+            ok &= sv.rings.load() == served && sv.reread.load() == 0;   // every ring found its rows already read
             if (served) ok &= sv.layer == L && sv.rows == last_rows;
             if (rows == 1 && mode != 2) {
                 std::printf("  moe_cpu_ring %.1f us a call (1 row, %s)\n",
-                            time_us([&] { moe_cpu_ring(di, 1, K, dt, dx, L, x_md, ids_md, bell_d, seq, nullptr); }),
+                            time_us([&] { moe_cpu_ring(di, 1, K, dt, L, ids_md, bell_d, seq, nullptr); }),
                             mode == 0 ? "every expert on the card: no bell" : mode == 1 ? "every pair off the card" : "one pair off the card");
                 bell->ring = 0;
             }
@@ -1493,7 +1555,7 @@ void test_cpu_abort() {
     float *dx = dev(x), *dy = dev(before);
     uint32_t* tally = zeros<uint32_t>(NE);
     uint32_t* seq = nullptr;
-    cudaMalloc(&seq, sizeof(*seq));
+    cudaMalloc(&seq, 2 * sizeof(*seq));
     cudaStream_t st;
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
     struct LateCompletion {
@@ -1506,7 +1568,8 @@ void test_cpu_abort() {
     auto capture = [&](int n, cudaGraph_t& graph, cudaGraphExec_t& exec, LateCompletion* completion = nullptr) {
         cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
         for (int v = 0; v < n; ++v) {
-            moe_cpu_ring(di, rows, K, dt, dx, L, x_md, ids_md, bell_d, seq, st);
+            moe_cpu_rows(dx, rows, L, x_md, bell_d, seq, st);
+            moe_cpu_ring(di, rows, K, dt, L, ids_md, bell_d, seq, st);
             if (completion)
                 cudaLaunchHostFunc(st, +[](void* p) { static_cast<LateCompletion*>(p)->publish(); }, completion);
             moe_cpu_merge(di, rows, K, dt, out_md, dy, tally, st, bell_d, seq);
@@ -1533,7 +1596,7 @@ void test_cpu_abort() {
         std::memset(out_m, 0xff, (size_t) kDecodeRows * K * E * 4);
         cudaMemcpyAsync(dy, before.data(), before.size() * 4, cudaMemcpyHostToDevice, st);
         cudaMemsetAsync(tally, 0, NE * 4, st);
-        cudaMemsetAsync(seq, 0, sizeof(*seq), st);
+        cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
     };
     auto require_drain = [&](const char* where) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1578,7 +1641,7 @@ void test_cpu_abort() {
     abort_bell();
     cudaGraphLaunch(exec, st);
     require_drain("pre-aborted visits");
-    ok &= untouched() && payload_untouched() && bell->ring == 0 && bell->ticket == 0 && bell->done == 0;
+    ok &= untouched() && payload_untouched() && bell->ring == 0 && bell->rows == 0 && bell->ticket == 0 && bell->done == 0;
     ok &= host(seq, 1)[0] == visits;
     // 3. a served window, then the abort: what was taken stays, the next window takes nothing
     reset();
@@ -1723,6 +1786,147 @@ void test_cpu_abort() {
     cudaFreeHost(out_m);
 }
 
+// The rows buffer's hand-back: a slow early consumer (each publication read 300 us after it is seen), visits of the same
+// layer and width in a row, the first with every expert on the card (published, no ring, a merge that does not wait),
+// the second with pairs off the card, distinct rows each visit and replay. Every publication the host read must be
+// exactly the rows its visit sent (none overwritten while read), the ring's visit must use its own rows without a second
+// read, and an abort between a publication and its ring raises no ring and takes nothing.
+void test_cpu_rows_reuse() {
+    const int K = 8, NE = 128, L = 11, rows = 2, pairs = rows * K;
+    CpuBell *bell = nullptr, *bell_d = nullptr;
+    float *x_m = nullptr, *x_md = nullptr, *out_m = nullptr, *out_md = nullptr;
+    int32_t *ids_m = nullptr, *ids_md = nullptr;
+    cudaHostAlloc((void**) &bell, sizeof(CpuBell), cudaHostAllocMapped);
+    cudaHostAlloc((void**) &x_m, (size_t) kDecodeRows * E * 4, cudaHostAllocMapped);
+    cudaHostAlloc((void**) &ids_m, (size_t) kDecodeRows * K * 4, cudaHostAllocMapped);
+    cudaHostAlloc((void**) &out_m, (size_t) kDecodeRows * K * E * 4, cudaHostAllocMapped);
+    cudaHostGetDevicePointer((void**) &bell_d, bell, 0);
+    cudaHostGetDevicePointer((void**) &x_md, x_m, 0);
+    cudaHostGetDevicePointer((void**) &ids_md, ids_m, 0);
+    cudaHostGetDevicePointer((void**) &out_md, out_m, 0);
+    std::vector<unsigned long long> tab(NE);
+    for (int e = 0; e < NE; ++e) tab[(size_t) e] = e % 2;   // the even experts are off the card
+    std::vector<int32_t> ids_a((size_t) pairs), ids_b((size_t) pairs);
+    for (int p = 0; p < pairs; ++p) {
+        ids_a[(size_t) p] = 2 * ((p * 5) % 64) + 1;   // all on the card
+        ids_b[(size_t) p] = (p % K * 7 + p / K) % NE;
+    }
+    int32_t *da = dev(ids_a), *db = dev(ids_b);
+    unsigned long long* dt = dev(tab);
+    float *xa = dev(randn((size_t) rows * E)), *xb = dev(randn((size_t) rows * E));
+    const std::vector<float> before((size_t) pairs * E, -17.f);
+    float *ya = dev(before), *yb = dev(before);
+    uint32_t* seq = nullptr;
+    cudaMalloc(&seq, 2 * sizeof(*seq));
+    cudaStream_t st;
+    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    *bell = CpuBell{};
+    cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
+    BellServer sv;
+    sv.bell = bell;
+    sv.x_m = x_m;
+    sv.ids_m = ids_m;
+    sv.out = out_m;
+    sv.tab = tab.data();
+    sv.k = K;
+    sv.early_us = 300;
+    sv.start();
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+    moe_cpu_rows(xa, rows, L, x_md, bell_d, seq, st);
+    moe_cpu_ring(da, rows, K, dt, L, ids_md, bell_d, seq, st);
+    moe_cpu_merge(da, rows, K, dt, out_md, ya, nullptr, st, bell_d, seq);
+    moe_cpu_rows(xb, rows, L, x_md, bell_d, seq, st);
+    moe_cpu_ring(db, rows, K, dt, L, ids_md, bell_d, seq, st);
+    moe_cpu_merge(db, rows, K, dt, out_md, yb, nullptr, st, bell_d, seq);
+    cudaStreamEndCapture(st, &graph);
+    cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    bool ok = true;
+    std::vector<std::vector<float>> sent;   // by publication number - 1
+    for (int replay = 1; replay <= 6; ++replay) {
+        const std::vector<float> ga = randn((size_t) rows * E), gb = randn((size_t) rows * E);
+        basalt::core::device_copy(xa, ga.data(), ga.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(xb, gb.data(), gb.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(yb, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
+        sent.push_back(ga);
+        sent.push_back(gb);
+        sv.replay.store(replay);
+        cudaGraphLaunch(exec, st);
+        ok &= cudaStreamSynchronize(st) == cudaSuccess;
+        const std::vector<float> y = host(yb, (size_t) pairs * E);
+        for (int p = 0; p < pairs; ++p) {
+            const int e = ids_b[(size_t) p];
+            for (int c = 0; c < E; ++c) {
+                const float ref = !tab[(size_t) e] ? gb[(size_t) (p / K) * E + c] * 0.5f + (float) e + (float) replay : -17.f;
+                ok &= std::memcmp(&y[(size_t) p * E + c], &ref, 4) == 0;
+            }
+        }
+    }
+    // the host reads the second visit's rows only once, when published: the ring finds them read
+    ok &= sv.rings.load() == 6 && sv.reread.load() == 0;
+    {
+        std::lock_guard<std::mutex> lk(sv.mu);
+        ok &= sv.copies.size() == sent.size();   // every publication read, none skipped
+        for (const auto& [n, got] : sv.copies)
+            ok &= n >= 1 && n <= sent.size() && std::memcmp(got.data(), sent[n - 1].data(), got.size() * 4) == 0;
+        ok &= sv.copies.count((uint32_t) sent.size()) == 1;   // the last publication, a ringing visit's, was read
+    }
+    // an abort between the second visit's publication and its ring: no ring, nothing taken
+    {
+        struct Abort {
+            CpuBell* bell;
+            static void fire(void* p) {
+                std::atomic_ref<uint32_t>(static_cast<Abort*>(p)->bell->abort).store(1, std::memory_order_release);
+            }
+        } ab{bell};
+        basalt::core::device_copy(yb, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
+        const int rung = sv.rings.load();
+        const uint32_t ticket = bell->ticket;
+        moe_cpu_rows(xb, rows, L, x_md, bell_d, seq, st);
+        cudaLaunchHostFunc(st, &Abort::fire, &ab);
+        moe_cpu_ring(db, rows, K, dt, L, ids_md, bell_d, seq, st);
+        moe_cpu_merge(db, rows, K, dt, out_md, yb, nullptr, st, bell_d, seq);
+        ok &= cudaStreamSynchronize(st) == cudaSuccess;
+        const std::vector<float> y = host(yb, (size_t) pairs * E);
+        ok &= std::all_of(y.begin(), y.end(), [](float v) { return v == -17.f; });
+        ok &= sv.rings.load() == rung && bell->ring == 0 && bell->ticket == ticket && bell->rows == (uint32_t) sent.size() + 1;
+    }
+    sv.end();
+    // nobody acknowledges: the second publication waits for the first's acknowledgement until an abort from outside the
+    // stream ends the wait; it then copies and publishes nothing
+    {
+        *bell = CpuBell{};
+        cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
+        const std::vector<float> g1 = randn((size_t) rows * E);
+        basalt::core::device_copy(xa, g1.data(), g1.size() * 4, cudaMemcpyHostToDevice);
+        moe_cpu_rows(xa, rows, L, x_md, bell_d, seq, st);
+        moe_cpu_rows(xb, rows, L, x_md, bell_d, seq, st);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ok &= cudaStreamQuery(st) == cudaErrorNotReady;   // the second is waiting
+        std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        cudaError_t q = cudaErrorNotReady;
+        while ((q = cudaStreamQuery(st)) == cudaErrorNotReady && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (q != cudaSuccess) {   // the device may still write the shared buffers: neither read nor freed
+            std::printf("moe_cpu_rows: buffer hand-back FAIL (an aborted wait did not drain)\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        ok &= bell->rows == 1 && bell->rows_ack == 0;
+        ok &= std::memcmp(x_m, g1.data(), g1.size() * 4) == 0;   // the first visit's rows, not overwritten
+    }
+    std::printf("%-34s %s\n", "moe_cpu_rows: buffer hand-back", ok ? "ok" : "FAIL");
+    failures += !ok;
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(st);
+    cudaFree(seq);
+    for (void* q : {(void*) da, (void*) db, (void*) dt, (void*) xa, (void*) xb, (void*) ya, (void*) yb}) cudaFree(q);
+    for (void* q : {(void*) bell, (void*) x_m, (void*) ids_m, (void*) out_m}) cudaFreeHost(q);
+}
+
 // Hand-off time from graphs of visits with no CPU expert work: copies plus a host callback versus the doorbell,
 // and doorbell-only timings for visits with no RAM pairs or several RAM pairs.
 void time_cpu_handoff() {
@@ -1759,8 +1963,8 @@ void time_cpu_handoff() {
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
     cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking);
     uint32_t* seq = nullptr;
-    cudaMalloc(&seq, sizeof(*seq));
-    cudaMemsetAsync(seq, 0, sizeof(*seq), side);
+    cudaMalloc(&seq, 2 * sizeof(*seq));
+    cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), side);
     cudaStreamSynchronize(side);
     cudaEvent_t ready, done;
     cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
@@ -1799,7 +2003,8 @@ void time_cpu_handoff() {
     auto bell_visit = [&](const unsigned long long* t, int rows) {
         cudaEventRecord(ready, st);
         cudaStreamWaitEvent(side, ready, 0);
-        moe_cpu_ring(di, rows, K, t, dx, 5, x_md, ids_md, bell_d, seq, side);
+        moe_cpu_rows(dx, rows, 5, x_md, bell_d, seq, side);
+        moe_cpu_ring(di, rows, K, t, 5, ids_md, bell_d, seq, side);
         cudaEventRecord(done, side);
         cudaStreamWaitEvent(st, done, 0);
         moe_cpu_merge(di, rows, K, t, out_md, dy, nullptr, st, bell_d, seq);
@@ -2140,6 +2345,7 @@ int main() {
     test_cpu_merge();
     test_cpu_ring();
     test_cpu_abort();
+    test_cpu_rows_reuse();
     time_cpu_handoff();
     test_heat_fold();
     test_batch_window();
