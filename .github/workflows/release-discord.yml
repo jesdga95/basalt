@@ -23,7 +23,7 @@ jobs:
           if [ -z "$WEBHOOK" ]; then echo "::error::DISCORD_RELEASE_WEBHOOK is not set"; exit 1; fi
           notes=$(printf '%s' "$BODY" | head -c 3500)
           [ "${#BODY}" -gt 3500 ] && notes="$notes"$'\n\n…'
-          jq -n --arg name "Basalt $NAME" --arg url "$URL" --arg notes "$notes" '{
+          jq -n --arg name "$NAME" --arg url "$URL" --arg notes "$notes" '{
             username: "Basalt",
             allowed_mentions: {parse: []},
             embeds: [{title: $name, url: $url, description: $notes, color: 15885867}]
