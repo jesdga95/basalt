@@ -274,6 +274,46 @@ public:
         return true;
     }
 
+    bool dense_mmq(const float* x, int ld_x, int w_type, const void* w, int n_in, int n_out,
+                   int T, float* out, int ld_out, void* stream, std::string& err) override {
+        if (!x || !w || !out || !stream || T < 1 || T > cap_ || n_in < 32 || n_out < 1 ||
+            ld_x < n_in || ld_out < n_out || !mmq::fits(w_type, n_out)) {
+            err = "deepseek4: invalid dense MMQ request";
+            return false;
+        }
+        if (mmq::q8_bytes(T, n_in) > mmq::q8_bytes((int64_t) route_cap_, g_.n_embd)) {
+            err = "deepseek4: dense MMQ activation scratch overflow";
+            return false;
+        }
+        last_stream_ = (cudaStream_t) stream;
+        const int32_t b[2] = {0, T};
+        if (cudaMemcpyAsync(shared_bounds_, b, sizeof(b), cudaMemcpyHostToDevice, last_stream_) != cudaSuccess) {
+            err = "deepseek4: cannot upload dense MMQ bounds";
+            return false;
+        }
+        try {
+            mmq::quantize(x, identity_, xq_, w_type, n_in, ld_x, T, last_stream_);
+            mmq::Product p;
+            p.w = w;
+            p.type = w_type;
+            p.w_rows = n_out;
+            p.w_cols = n_in;
+            p.n = 1;
+            p.xq = xq_;
+            p.bounds = shared_bounds_;
+            p.ids = identity_;
+            p.total_rows = T;
+            p.max_rows = T;
+            p.dst = out;
+            p.ld_dst = ld_out;
+            mmq_.run(p, last_stream_);
+        } catch (const std::exception& e) {
+            err = std::string("deepseek4 dense MMQ: ") + e.what();
+            return false;
+        }
+        return true;
+    }
+
     bool shared(int layer, int T, const float* x, float* out, void* stream, std::string& err) override {
         if (layer < 0 || layer >= g_.n_layers || T < 1 || T > cap_ || !x || !out || !stream) {
             err = "deepseek4: invalid chunk shared-expert request";

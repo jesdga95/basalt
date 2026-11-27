@@ -99,7 +99,7 @@ __global__ void __launch_bounds__(256) q_rms_norm_kernel(float* x, const float* 
     for (int i = threadIdx.x; i < n; i += 256) {
         const float y = row[i] * scale * w[i];
         row[i] = y;
-        q8_1_store_fm(y, xq, ((size_t) blockIdx.x * n + i) / 32, threadIdx.x & 31);
+        if (xq) q8_1_store_fm(y, xq, ((size_t) blockIdx.x * n + i) / 32, threadIdx.x & 31);
     }
 }
 
@@ -291,6 +291,30 @@ void sparse_mqa_q_latent(const void* x_q8_1, const SparseMqaQWeights& w, int n_t
     q_rms_norm_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(qr, w.q_norm, w.q_rank, w.rms_eps,
                                                                    static_cast<Q81Fm*>(qr_q8_1));
     check_launch("sparse_mqa_q_latent norm");
+}
+
+void sparse_mqa_q_norm(float* qr, const float* q_norm, int q_rank, float rms_eps, int n_tokens, void* stream) {
+    if (!qr || !q_norm || !stream || n_tokens < 1 || q_rank < 32 || q_rank % 32 != 0 ||
+        !(rms_eps > 0.f) || !std::isfinite(rms_eps))
+        throw std::invalid_argument("sparse_mqa_q_norm: invalid input");
+    q_rms_norm_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(qr, q_norm, q_rank, rms_eps, nullptr);
+    check_launch("sparse_mqa_q_norm");
+}
+
+void sparse_mqa_q_head_norm_rope(float* q, const int32_t* pos, const MqaRopeTable& rope, float head_rms_eps,
+                                 int n_tokens, void* stream) {
+    if (!q || !pos || !stream || n_tokens < 1 || !std::isfinite(rope.mscale) ||
+        head_rms_eps < 0.f || !std::isfinite(head_rms_eps))
+        throw std::invalid_argument("sparse_mqa_q_head_norm_rope: invalid input");
+    if (head_rms_eps > 0.f) {
+        q_head_norm_rope_kernel<<<n_tokens * kSparseMqaHeads, kSparseMqaDim / 2, 0, (cudaStream_t) stream>>>(
+            q, pos, rope, head_rms_eps);
+        check_launch("sparse_mqa_q_head_norm_rope norm and rope");
+    } else {
+        q_rope_rows_kernel<<<n_tokens * kSparseMqaHeads, kSparseMqaRopeDim / 2, 0, (cudaStream_t) stream>>>(
+            q, n_tokens * kSparseMqaHeads, kSparseMqaDim, kSparseMqaHeads, pos, rope, false);
+        check_launch("sparse_mqa_q_head_norm_rope rope");
+    }
 }
 
 void sparse_mqa_q_heads(const SparseMqaQWeights& w, int n_tokens, const int32_t* pos, const MqaRopeTable& rope,

@@ -123,7 +123,7 @@ void check_launch() {
 
 void prepare_attention_kv(const float* projected, const float* norm, float rms_eps, const int32_t* positions,
                           const kernels::MqaRopeTable& rope, int n_tokens, float* out, void* stream) {
-    if (!projected || !norm || !positions || !out || n_tokens < 1 || n_tokens > 8 ||
+    if (!projected || !norm || !positions || !out || n_tokens < 1 ||
         !(rms_eps > 0.f) || !std::isfinite(rms_eps) || !std::isfinite(rope.mscale))
         throw std::invalid_argument("deepseek4 prepare_attention_kv: invalid arguments");
     prepare_kv_kernel<<<n_tokens, Threads, 0, (cudaStream_t) stream>>>(projected, norm, rms_eps, positions, rope, out);
@@ -131,7 +131,7 @@ void prepare_attention_kv(const float* projected, const float* norm, float rms_e
 }
 
 void cache_attention_window(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream) {
-    if (!ring || !rows || !positions || n_tokens < 1 || n_tokens > 8)
+    if (!ring || !rows || !positions || n_tokens < 1)
         throw std::invalid_argument("deepseek4 cache_attention_window: invalid arguments");
     cache_window_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(ring, rows, positions, n_tokens);
     check_launch();

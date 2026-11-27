@@ -17,6 +17,8 @@ public:
     virtual bool routed(int layer, int rows, const float* x, const int32_t* ids, const float* weights,
                         float* out, void* stream, std::string& err) = 0;
     virtual bool shared(int layer, int rows, const float* x, float* out, void* stream, std::string& err) = 0;
+    virtual bool dense_mmq(const float* x, int ld_x, int w_type, const void* w, int n_in, int n_out,
+                           int rows, float* out, int ld_out, void* stream, std::string& err) = 0;
 };
 
 std::unique_ptr<PrefillFfn> make_prefill_ffn(ModelWeights& weights, core::ExpertTier& tier, int row_cap,

@@ -1032,11 +1032,14 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
 
     const size_t n = (size_t) geo_.n_embd;
     const size_t stream_row = 4 * n;
+    constexpr int kAttnTile = 128;
     int cap = std::min(model_.diag_rows() > 0 ? model_.diag_rows() : 8192, total_tokens);
     float *current = nullptr, *attended = nullptr, *coefficients = nullptr, *collapsed = nullptr,
           *normalized = nullptr, *hc_workspace = nullptr, *logits = nullptr, *route_weights = nullptr,
-          *shared = nullptr, *routed = nullptr;
-    int32_t *route_ids = nullptr, *fixed_rows = nullptr;
+          *shared = nullptr, *routed = nullptr, *chunk_q_latent = nullptr, *chunk_kv_proj = nullptr,
+          *chunk_kv_row = nullptr, *chunk_out_latent = nullptr, *tile_q_heads = nullptr, *tile_mqa_out = nullptr;
+    int32_t *route_ids = nullptr, *fixed_rows = nullptr, *chunk_pos = nullptr, *chunk_win_start = nullptr,
+            *chunk_win_n = nullptr, *chunk_comp_limit = nullptr;
     uint8_t *fixed_mask = nullptr, *alternate_mask = nullptr;
     std::unique_ptr<PrefillFfn> prompt_ffn;
 
@@ -1044,6 +1047,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         buffers.clear();
         prompt_ffn.reset();
         const size_t state_bytes = (size_t) cap * stream_row * sizeof(float);
+        const int tile_cap = std::min(kAttnTile, cap);
         current = static_cast<float*>(alloc(state_bytes));
         attended = static_cast<float*>(alloc(state_bytes));
         coefficients = static_cast<float*>(alloc((size_t) cap * kernels::kHcCoef * sizeof(float)));
@@ -1058,9 +1062,21 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         fixed_rows = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
         fixed_mask = static_cast<uint8_t*>(alloc((size_t) cap));
         alternate_mask = static_cast<uint8_t*>(alloc((size_t) cap));
+        chunk_q_latent = static_cast<float*>(alloc((size_t) cap * 1024 * sizeof(float)));
+        chunk_kv_proj = static_cast<float*>(alloc((size_t) cap * 512 * sizeof(float)));
+        chunk_kv_row = static_cast<float*>(alloc((size_t) cap * 512 * sizeof(float)));
+        chunk_out_latent = static_cast<float*>(alloc((size_t) cap * 1024 * sizeof(float)));
+        tile_q_heads = static_cast<float*>(alloc((size_t) tile_cap * 64 * 512 * sizeof(float)));
+        tile_mqa_out = static_cast<float*>(alloc((size_t) tile_cap * 64 * 512 * sizeof(float)));
+        chunk_pos = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
+        chunk_win_start = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
+        chunk_win_n = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
+        chunk_comp_limit = static_cast<int32_t*>(alloc((size_t) cap * sizeof(int32_t)));
         const bool bufs_ok = current && attended && coefficients && collapsed && normalized && hc_workspace &&
                              logits && route_ids && route_weights && shared && routed && fixed_rows &&
-                             fixed_mask && alternate_mask;
+                             fixed_mask && alternate_mask && chunk_q_latent && chunk_kv_proj && chunk_kv_row &&
+                             chunk_out_latent && tile_q_heads && tile_mqa_out && chunk_pos && chunk_win_start &&
+                             chunk_win_n && chunk_comp_limit;
         if (bufs_ok) {
             std::string ffn_err;
             prompt_ffn = make_prefill_ffn(model_.weights(), *tier, cap, ffn_err);
@@ -1101,19 +1117,199 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         if (cudaMemcpyAsync(current, host.data(), state_bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess)
             return fail_cuda("prompt embedding upload");
 
+        std::vector<int32_t> h_pos((size_t) T), h_wstart((size_t) T), h_wn((size_t) T), h_clim((size_t) T);
+        for (int t = 0; t < T; ++t) {
+            const int32_t p = (int32_t) (pos + offset + t);
+            const int32_t s = (int32_t) std::max<int64_t>(0, (int64_t) p - kBootstrapWindow + 1);
+            h_pos[(size_t) t] = p;
+            h_wstart[(size_t) t] = s;
+            h_wn[(size_t) t] = p - s + 1;
+        }
+        if (cudaMemcpyAsync(chunk_pos, h_pos.data(), (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
+            cudaMemcpyAsync(chunk_win_start, h_wstart.data(), (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
+            cudaMemcpyAsync(chunk_win_n, h_wn.data(), (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return fail_cuda("prompt attention positions upload");
+
         tier->begin_token(T);
         for (int layer = 0; layer < geo_.n_layers; ++layer) {
-            for (int row = 0; row < T; row += kExpertWindow) {
-                const int count = std::min(kExpertWindow, T - row);
-                const size_t bytes = (size_t) count * stream_row * sizeof(float);
-                if (cudaMemcpyAsync(streams_, current + (size_t) row * stream_row, bytes,
-                                    cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
-                    return fail_cuda("prompt attention input slice");
-                if (!forward_rows(chunk_tokens + row, count, pos + offset + row, nullptr, true, layer, false))
+            AttentionLayerWeights attention;
+            if (!model_.weights().attention_layer_weights(layer, attention, err_)) {
+                err_ = "deepseek4: " + err_;
+                return false;
+            }
+            AttentionLayerScratch attn_scratch;
+            attn_scratch.hc_workspace = hc_workspace;
+            attn_scratch.coefficients = coefficients;
+            attn_scratch.collapsed = collapsed;
+            attn_scratch.normalized = normalized;
+            try {
+                prepare_attention_layer(current, T, attention, attn_scratch, stream_);
+            } catch (const std::exception& e) {
+                err_ = std::string("deepseek4 prompt attention prep: ") + e.what();
+                return false;
+            }
+            if (!prompt_ffn->dense_mmq(normalized, geo_.n_embd, attention.attention.q.wq_a_type,
+                                       attention.attention.q.wq_a, geo_.n_embd, 1024, T,
+                                       chunk_q_latent, 1024, stream_, err_)) return false;
+            kernels::sparse_mqa_q_norm(chunk_q_latent, attention.attention.q.q_norm, 1024, geo_.rms_eps, T, stream_);
+            if (!prompt_ffn->dense_mmq(normalized, geo_.n_embd, attention.attention.kv_type,
+                                       attention.attention.kv, geo_.n_embd, 512, T,
+                                       chunk_kv_proj, 512, stream_, err_)) return false;
+            prepare_attention_kv(chunk_kv_proj, attention.attention.kv_norm, geo_.rms_eps, chunk_pos,
+                                 ropes_[(size_t) layer].attention, T, chunk_kv_row, stream_);
+
+            const int ratio = geo_.compress_ratio[(size_t) layer];
+            const DeviceTensor *attn_ape = nullptr, *attn_norm = nullptr, *attn_gate = nullptr, *attn_kv = nullptr;
+            const DeviceTensor *index_ape = nullptr, *index_norm = nullptr, *index_gate = nullptr, *index_kv = nullptr,
+                               *index_q = nullptr, *index_proj = nullptr;
+            if (ratio) {
+                for (int t = 0; t < T; ++t) h_clim[(size_t) t] = (int32_t) ((pos + offset + t + 1) / ratio);
+                if (cudaMemcpyAsync(chunk_comp_limit, h_clim.data(), (size_t) T * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+                    return fail_cuda("prompt compressed limits upload");
+                LayerCache& cache = layer_cache_[(size_t) layer];
+                const int visible_end = (int) ((pos + offset + T) / ratio);
+                const uint64_t keep_free = tier->free_floor();
+                std::string cache_error;
+                if (!cache.attention->ensure((uint64_t) visible_end * 512 * sizeof(float), keep_free, cache_error)) {
+                    err_ = "deepseek4: cannot grow compressed cache: " + cache_error;
                     return false;
-                if (cudaMemcpyAsync(attended + (size_t) row * stream_row, next_streams_, bytes,
-                                    cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
-                    return fail_cuda("prompt attention output slice");
+                }
+                attn_ape = model_.weights().tensor(layer, "attn_compressor_ape.weight");
+                attn_norm = model_.weights().tensor(layer, "attn_compressor_norm.weight");
+                attn_gate = model_.weights().tensor(layer, "attn_compressor_gate.weight");
+                attn_kv = model_.weights().tensor(layer, "attn_compressor_kv.weight");
+                if (!attn_ape || !attn_norm || !attn_gate || !attn_kv) {
+                    err_ = "deepseek4: compressed-attention layer is missing validated compressor tensors";
+                    return false;
+                }
+                if (ratio == 4) {
+                    if (!cache.indexer->ensure((uint64_t) visible_end * 128 * sizeof(float), keep_free, cache_error)) {
+                        err_ = "deepseek4: cannot grow indexer cache: " + cache_error;
+                        return false;
+                    }
+                    index_ape = model_.weights().tensor(layer, "indexer_compressor_ape.weight");
+                    index_norm = model_.weights().tensor(layer, "indexer_compressor_norm.weight");
+                    index_gate = model_.weights().tensor(layer, "indexer_compressor_gate.weight");
+                    index_kv = model_.weights().tensor(layer, "indexer_compressor_kv.weight");
+                    index_q = model_.weights().tensor(layer, "indexer.attn_q_b.weight");
+                    index_proj = model_.weights().tensor(layer, "indexer.proj.weight");
+                    if (!index_ape || !index_norm || !index_gate || !index_kv || !index_q || !index_proj) {
+                        err_ = "deepseek4: CSA layer is missing validated indexer tensors";
+                        return false;
+                    }
+                }
+            }
+
+            const size_t per_group_w = kernels::native_mmvq_weight_bytes(
+                attention.attention.output_a_type, kernels::kSparseMqaGroupInput, kernels::kSparseMqaOutputRank);
+            for (int row = 0; row < T; row += kAttnTile) {
+                const int b = std::min(kAttnTile, T - row);
+                if (!prompt_ffn->dense_mmq(chunk_q_latent + (size_t) row * 1024, 1024,
+                                           attention.attention.q.wq_b_type, attention.attention.q.wq_b,
+                                           1024, 64 * 512, b, tile_q_heads, 64 * 512, stream_, err_)) return false;
+                kernels::sparse_mqa_q_head_norm_rope(tile_q_heads, chunk_pos + row, ropes_[(size_t) layer].attention,
+                                                     attention.attention.q.head_rms_eps, b, stream_);
+
+                for (int sub = 0; sub < b; sub += kExpertWindow) {
+                    const int count = std::min(kExpertWindow, b - sub);
+                    const int g_row = row + sub;
+                    const int64_t sub_pos = pos + offset + g_row;
+                    kernels::SparseMqaArgs sel;
+                    sel.n_tokens = count;
+                    sel.win = window_rings_ + (size_t) layer * kBootstrapWindow * 512;
+                    sel.win_type = kernels::MqaRowType::F32;
+                    sel.win_cap = kBootstrapWindow;
+                    sel.win_start = chunk_win_start + g_row;
+                    sel.win_n = chunk_win_n + g_row;
+                    sel.pos = chunk_pos + g_row;
+                    sel.rope = ropes_[(size_t) layer].attention;
+                    if (ratio) {
+                        LayerCache& cache = layer_cache_[(size_t) layer];
+                        const int visible = (int) ((sub_pos + count) / ratio);
+                        if (ratio == 4) {
+                            kernels::bf16_rows_dot(normalized + (size_t) g_row * n,
+                                                   static_cast<const uint16_t*>(index_kv->ptr), indexer_kv_,
+                                                   count, 256, geo_.n_embd, stream_);
+                            kernels::bf16_rows_dot(normalized + (size_t) g_row * n,
+                                                   static_cast<const uint16_t*>(index_gate->ptr), indexer_score_,
+                                                   count, 256, geo_.n_embd, stream_);
+                            indexer_compress_projected(count, indexer_kv_, indexer_score_,
+                                static_cast<const float*>(index_ape->ptr), chunk_pos + g_row,
+                                static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
+                                cache.indexer_state_kv, cache.indexer_state_score,
+                                reinterpret_cast<float*>(cache.indexer->data()), comp_row_, stream_);
+                            float angles[kExpertWindow * 32]{};
+                            for (int t = 0; t < count; ++t)
+                                for (int i = 0; i < 32; ++i)
+                                    angles[(size_t) t * 32 + i] = (float) (sub_pos + t) * ropes_[(size_t) layer].frequency[(size_t) i];
+                            if (cudaMemcpyAsync(indexer_rope_angles_, angles, (size_t) count * 32 * sizeof(float),
+                                                cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+                                return fail_cuda("prompt indexer rope angles upload");
+                            indexer_project_q8_0(index_q->ptr, static_cast<const uint16_t*>(index_proj->ptr),
+                                chunk_q_latent + (size_t) g_row * 1024, normalized + (size_t) g_row * n,
+                                indexer_rope_angles_, count, indexer_q_, indexer_head_weights_,
+                                indexer_project_workspace_, indexer_project_workspace_bytes(count), stream_);
+                            if (visible > 0) {
+                                indexer_select(indexer_q_, indexer_head_weights_,
+                                    reinterpret_cast<const float*>(cache.indexer->data()),
+                                    visible, (int) sub_pos, count, selected_ids_, indexer_select_count_,
+                                    indexer_select_workspace_, indexer_select_workspace_bytes(visible), stream_);
+                                sel.n_sel = kernels::kSparseMqaTopK;
+                                sel.sel = selected_ids_;
+                                sel.comp = cache.attention->data();
+                                sel.comp_type = kernels::MqaRowType::F32;
+                                sel.comp_limit = chunk_comp_limit + g_row;
+                            }
+                        } else {
+                            sel.n_sel = visible;
+                            sel.comp = cache.attention->data();
+                            sel.comp_type = kernels::MqaRowType::F32;
+                            if (visible > 0) {
+                                std::vector<int32_t> ids((size_t) count * visible);
+                                for (int t = 0; t < count; ++t)
+                                    for (int i = 0; i < visible; ++i) ids[(size_t) t * visible + i] = i;
+                                if (cudaMemcpyAsync(selected_ids_, ids.data(), ids.size() * sizeof(int32_t),
+                                                    cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+                                    return fail_cuda("prompt compressed attention ids upload");
+                                sel.sel = selected_ids_;
+                                sel.comp_limit = chunk_comp_limit + g_row;
+                            }
+                        }
+                        const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
+                        project_and_compress(kind, ratio, geo_.n_embd, count, normalized + (size_t) g_row * n,
+                            static_cast<const uint16_t*>(attn_kv->ptr), static_cast<const uint16_t*>(attn_gate->ptr),
+                            static_cast<const float*>(attn_ape->ptr), chunk_pos + g_row,
+                            static_cast<const float*>(attn_norm->ptr), geo_.rms_eps, compress_rope_freq_,
+                            attn_comp_kv_, attn_comp_score_, cache.attention_state_kv, cache.attention_state_score,
+                            reinterpret_cast<float*>(cache.attention->data()), comp_row_, stream_);
+                    }
+                    cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * 512,
+                                           chunk_kv_row + (size_t) g_row * 512, chunk_pos + g_row, count, stream_);
+                    sel.q = tile_q_heads + (size_t) sub * 64 * 512;
+                    sel.sinks = attention.attention.sinks;
+                    sel.round_output_bf16 = true;
+                    sel.out = tile_mqa_out + (size_t) sub * 64 * 512;
+                    kernels::sparse_mqa(sel, mqa_workspace_, stream_);
+                }
+
+                for (int g = 0; g < kernels::kSparseMqaOutputGroups; ++g) {
+                    const auto* ww = static_cast<const uint8_t*>(attention.attention.output_a) + (size_t) g * per_group_w;
+                    if (!prompt_ffn->dense_mmq(tile_mqa_out + (size_t) g * kernels::kSparseMqaGroupInput, 64 * 512,
+                                               attention.attention.output_a_type, ww,
+                                               kernels::kSparseMqaGroupInput, kernels::kSparseMqaOutputRank, b,
+                                               chunk_out_latent + (size_t) row * 1024 + (size_t) g * kernels::kSparseMqaOutputRank,
+                                               1024, stream_, err_)) return false;
+                }
+            }
+            if (!prompt_ffn->dense_mmq(chunk_out_latent, 1024, attention.attention.output_b_type,
+                                       attention.attention.output_b, 1024, geo_.n_embd, T,
+                                       shared, geo_.n_embd, stream_, err_)) return false;
+            try {
+                finish_attention_layer(current, coefficients, shared, T, geo_.n_embd, attended, stream_);
+            } catch (const std::exception& e) {
+                err_ = std::string("deepseek4 prompt attention finish: ") + e.what();
+                return false;
             }
 
             FfnRouteWeights route;

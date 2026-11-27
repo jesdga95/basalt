@@ -92,4 +92,8 @@ size_t sparse_mqa_workspace_floats(int n_tokens, int n_sel);
 /// Enqueues sparse MQA work on `stream`; inputs, output, and workspace are device pointers.
 void sparse_mqa(const SparseMqaArgs& args, float* workspace, void* stream);
 
+void sparse_mqa_q_norm(float* qr, const float* q_norm, int q_rank, float rms_eps, int n_tokens, void* stream);
+void sparse_mqa_q_head_norm_rope(float* q, const int32_t* pos, const MqaRopeTable& rope, float head_rms_eps,
+                                 int n_tokens, void* stream);
+
 }  // namespace basalt::kernels

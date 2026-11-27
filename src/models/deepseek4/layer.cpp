@@ -19,7 +19,7 @@ void prepare_attention_layer(const float* streams, int n_tokens, const Attention
     if (!streams || !weights.hc_fn || !weights.hc_scale || !weights.hc_base || !weights.norm ||
         !scratch.hc_workspace || !scratch.coefficients || !scratch.collapsed || !scratch.normalized ||
         weights.hc.sinkhorn_iters <= 0 || n_embd <= 0 || weights.attention.q.n_embd != n_embd ||
-        n_tokens <= 0 || n_tokens > 8)
+        n_tokens <= 0)
         throw std::invalid_argument("deepseek4 attention layer prepare: invalid weights, state, or workspace");
 
     kernels::hc_mixes(streams, weights.hc_fn, weights.hc_scale, weights.hc_base, n_tokens, weights.hc,
@@ -30,7 +30,7 @@ void prepare_attention_layer(const float* streams, int n_tokens, const Attention
 
 void finish_attention_layer(const float* streams, const float* coefficients, const float* attention_output,
                             int n_tokens, int n_embd, float* next_streams, void* stream) {
-    if (!streams || !coefficients || !attention_output || !next_streams || n_tokens <= 0 || n_tokens > 8 ||
+    if (!streams || !coefficients || !attention_output || !next_streams || n_tokens <= 0 ||
         n_embd <= 0 || next_streams == streams || next_streams == coefficients ||
         next_streams == attention_output)
         throw std::invalid_argument("deepseek4 attention layer finish: invalid state or output");
