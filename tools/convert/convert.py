@@ -70,6 +70,8 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
                      with a gemma4 checkpoint, Google's assistant drafter (google/gemma-4-*-it-assistant) as assistant.*
   --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
                      to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
+  --mlp-nvfp4        with a gemma4 checkpoint (tools/convert/checkpoint_gemma4.py): the MLP's projections rounded once to
+                     NVFP4 planes, the attention's FP8 (a dense model too large for its card in FP8)
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -875,10 +877,14 @@ def main():
     ap.add_argument("--head", choices=("fp8", "nvfp4"),
                     help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
                          "(default) or to NVFP4")
+    ap.add_argument("--mlp-nvfp4", action="store_true",
+                    help="with a gemma4 --checkpoint: the MLP's projections as NVFP4 (the attention's stay FP8)")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
+    if a.mlp_nvfp4 and (not a.checkpoint or a.sections_from or a.requant_dense_q6k):
+        ap.error("--mlp-nvfp4 goes with a gemma4 --checkpoint")
     if a.into or a.roll_back or a.undo_dir:
         if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k:
             ap.error("--into takes --undo-dir and one of --dspark, --dfly or --roll-back, and nothing else")
@@ -919,11 +925,14 @@ def main():
     if a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards \
                 or a.dry_run:
-            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --workers and --force")
+            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --head, --mlp-nvfp4, --workers "
+                     "and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
+        if a.mlp_nvfp4 and checkpoint_model_type(Path(a.checkpoint)) not in ("gemma4", "gemma4_unified"):
+            ap.error("--mlp-nvfp4 goes with a gemma4 --checkpoint")
         if checkpoint_model_type(Path(a.checkpoint)) in ("gemma4", "gemma4_unified"):
             if a.head:
                 ap.error("--head goes with a qwen35 checkpoint")
