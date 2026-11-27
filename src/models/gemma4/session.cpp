@@ -49,6 +49,7 @@ struct Shared {
     float *q = nullptr, *k = nullptr, *v = nullptr, *qp = nullptr;                      // [R][qmax] / [R][kmax]
     float *g = nullptr, *u = nullptr;                                                   // [R][n_ff_pad]
     void* act = nullptr;                                                                // wgemm activations
+    wg::Workspace ws;   // the NVFP4 MLP products' split-K sums (FP8 products take none: the drafters' chains never touch it)
     float *rlog = nullptr, *rw = nullptr;
     int32_t* ids = nullptr;
     void* xq = nullptr;                                                                 // q8_1 of the experts' input
@@ -92,6 +93,12 @@ struct Shared {
         attn_scr = f((int64_t) attn_scratch_floats(kRows, g.n_head, std::max(g.hd_swa, g.hd_full)));
         blog = f(R * g.n_vocab);
         io = (int32_t*) a(2 * R * 4);
+        mlp_workspace(g, F, m.mlp_nvfp4(), ws.partial_floats, ws.tickets_n);
+        if (ws.tickets_n) {
+            ws.partial = f((int64_t) ws.partial_floats);
+            ws.tickets = (int32_t*) a(ws.tickets_n * 4);
+            if (ok && cudaMemset(ws.tickets, 0, ws.tickets_n * 4) != cudaSuccess) ok = false;
+        }
         if (g.moe()) {
             const int64_t P = R * g.n_used;
             rlog = f(R * g.n_expert), rw = f(P);
@@ -646,13 +653,13 @@ private:
         return s;
     }
 
-    void product(const F8Mat& m, float* y, int64_t ld_y, int rows) {
+    void product(const Mat& m, float* y, int64_t ld_y, int rows) {
         wg::Call c;
-        c.fmt = wg::Format::F8;
+        c.fmt = m.fmt;
         c.K = m.K;
         c.m[0] = {m.w, m.rows, m.scale, y, ld_y};
         c.n = 1;
-        wg::gemm(c, sh_->act, rows, ws_, stream_);
+        wg::gemm(c, sh_->act, rows, sh_->ws, stream_);
     }
 
     // The layers and the head over `rows` rows (tokens and positions staged): every row's final normed state into x.xn
@@ -681,7 +688,7 @@ private:
                     c.m[2] = {w.v.w, w.v.rows, w.v.scale, x.v, kd};
                     c.n = 3;
                 }
-                wg::gemm(c, x.act, rows, ws_, stream_);
+                wg::gemm(c, x.act, rows, sh_->ws, stream_);
             }
             Prep p;
             p.q = x.q, p.k = x.k, p.v = x.v, p.ldq = qd, p.ldk = kd, p.ldv = kd;
@@ -705,12 +712,12 @@ private:
             wg::norm_pack(x.x, w.ffn_norm, g_.rms_eps, E, rows, x.act, nullptr, stream_);
             {
                 wg::Call c;
-                c.fmt = wg::Format::F8;
+                c.fmt = w.gate.fmt;
                 c.K = E;
                 c.m[0] = {w.gate.w, w.gate.rows, w.gate.scale, x.g, F};
                 c.m[1] = {w.up.w, w.up.rows, w.up.scale, x.u, F};
                 c.n = 2;
-                wg::gemm(c, x.act, rows, ws_, stream_);
+                wg::gemm(c, x.act, rows, sh_->ws, stream_);
             }
             gelu_pack(x.g, x.u, rows, g_.n_ff, F, F, x.act, stream_);
             product(w.down, x.mlp, E, rows);
@@ -740,19 +747,19 @@ private:
         if (head <= 0) return;
         wg::pack(x.xn + (size_t) (rows - head) * E, E, E, head, x.act, stream_);
         {
-            const F8Mat& hm = m_.head();
+            const Mat& hm = m_.head();
             wg::Call c;
             c.fmt = wg::Format::F8;
             c.K = hm.K;
             c.m[0] = {hm.w, hm.rows, nullptr, logits, (int64_t) g_.n_vocab};
             c.m[0].row_scales = hm.scale;
             c.n = 1;
-            wg::gemm(c, x.act, head, ws_, stream_);
+            wg::gemm(c, x.act, head, sh_->ws, stream_);
         }
         softcap(logits, (int64_t) head * g_.n_vocab, g_.softcap, stream_);
     }
 
-    void dproduct(const F8Mat& m, const float* x, int64_t ld_x, float* y, bool row_scales = false) {
+    void dproduct(const Mat& m, const float* x, int64_t ld_x, float* y, bool row_scales = false) {
         wg::pack(x, ld_x, m.K, 1, ds_.act, stream_);
         wg::Call c;
         c.fmt = wg::Format::F8;
@@ -760,7 +767,7 @@ private:
         c.m[0] = {m.w, m.rows, row_scales ? nullptr : m.scale, y, m.rows};
         if (row_scales) c.m[0].row_scales = m.scale;
         c.n = 1;
-        wg::gemm(c, ds_.act, 1, ws_, stream_);
+        wg::gemm(c, ds_.act, 1, sh_->ws, stream_);
     }
 
     // `n` drafts in a chain (launches only): each step embeds its token beside the state, runs the drafter's layers at the
@@ -785,7 +792,7 @@ private:
                 c.K = DE;
                 c.m[0] = {w.q.w, w.q.rows, w.q.scale, ds_.q, qd};
                 c.n = 1;
-                wg::gemm(c, ds_.act, 1, ws_, stream_);
+                wg::gemm(c, ds_.act, 1, sh_->ws, stream_);
                 Prep p;
                 p.q = ds_.q, p.ldq = qd, p.pos = pos, p.q_norm = w.q_norm, p.rope = w.rope, p.eps = g_.rms_eps;
                 p.sh = w.sh, p.kv_type = m_.kv_type(), p.q_out = ds_.qp, p.q_only = true;
@@ -805,7 +812,7 @@ private:
                 gu.m[0] = {w.gate.w, w.gate.rows, w.gate.scale, ds_.gt, dw.n_ff_pad};
                 gu.m[1] = {w.up.w, w.up.rows, w.up.scale, ds_.up, dw.n_ff_pad};
                 gu.n = 2;
-                wg::gemm(gu, ds_.act, 1, ws_, stream_);
+                wg::gemm(gu, ds_.act, 1, sh_->ws, stream_);
                 gelu_mul(ds_.gt, ds_.up, 1, (int) dw.n_ff_pad, dw.n_ff_pad, dw.n_ff_pad, ds_.h, stream_);
                 dproduct(w.down, ds_.h, dw.n_ff_pad, ds_.mlp);
                 FfnEnd fe;
@@ -877,7 +884,6 @@ private:
     std::vector<void*> pinned_;
     std::vector<SegKv> caches_;              // [layer]
     std::shared_ptr<Shared> sh_;
-    wg::Workspace ws_;                       // FP8 products take none
     std::map<uint64_t, core::CapturedGraph> graphs_;   // by window shape: full layers' bound, head rows, rows
     std::set<uint64_t> direct_;                        // the shapes whose first window has run
     const model::BatchView* view_ = nullptr;

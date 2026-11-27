@@ -8,6 +8,7 @@
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace basalt::models::gemma4 {
 namespace {
@@ -26,6 +28,7 @@ constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
 constexpr int kTypeMxfp8 = 46;
 constexpr int kTypeF8 = 44;
+constexpr int kTypeNvfp4Planes = 45;
 // what each session needs beside its caches (its graphs and staging), and what the card keeps free for the kernels'
 // modules and the driver
 constexpr uint64_t kSessionFixed = 96 * kMiB;
@@ -46,13 +49,35 @@ uint64_t session_bytes(const Geometry& g, int64_t context, KvType kv) {
     return caches + kSessionFixed + (uint64_t) kRows * (uint64_t) g.n_vocab * 4;
 }
 
-uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, int64_t context, KvType kv, bool mxfp8) {
+void mlp_workspace(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, size_t& partial, size_t& tickets) {
+    namespace wg = basalt::kernels::wgemm;
+    partial = tickets = 0;
+    if (!mlp_nvfp4) return;
+    wg::Call gu;   // the gate and up products in one call, then the down product
+    gu.fmt = wg::Format::Nvfp4;
+    gu.K = g.n_embd;
+    gu.m[0].rows = gu.m[1].rows = n_ff_pad;
+    gu.n = 2;
+    wg::Call dn;
+    dn.fmt = wg::Format::Nvfp4;
+    dn.K = n_ff_pad;
+    dn.m[0].rows = g.n_embd;
+    for (const wg::Call* c : {&gu, &dn}) {
+        size_t p = 0, t = 0;
+        wg::workspace_need(*c, p, t);
+        partial = std::max(partial, p);
+        tickets = std::max(tickets, t);
+    }
+}
+
+uint64_t shared_bytes(const Geometry& g, int64_t n_ff_pad, bool mlp_nvfp4, int64_t context, KvType kv, bool mxfp8) {
     const uint64_t R = kRows, E = (uint64_t) g.n_embd;
     const uint64_t qmax = (uint64_t) g.n_head * std::max(g.hd_swa, g.hd_full);
     const uint64_t rowbuf = R * (4 * E + 3 * qmax + 3 * (uint64_t) n_ff_pad) * 4;
     const uint64_t experts = g.moe() ? R * (uint64_t) g.n_used * (E * 4 + (uint64_t) g.n_ff_exp * 16) + (64ull << 20) : 0;
     const uint64_t attn = attn_scratch_floats(kRows, g.n_head, std::max(g.hd_swa, g.hd_full)) * 4;
-    return rowbuf + experts + attn + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB + PromptPath::bytes(g, n_ff_pad, context, kv, mxfp8);
+    return rowbuf + experts + attn + (ws_p + ws_t) * 4 + R * (uint64_t) g.n_vocab * 4 + 256 * kMiB +
+           PromptPath::bytes(g, n_ff_pad, mlp_nvfp4, context, kv, mxfp8);
 }
 
 Gemma4Model::Gemma4Model() = default;
@@ -91,11 +116,17 @@ float* Gemma4Model::small(const std::string& name, uint64_t floats, core::LoadPl
     return static_cast<float*>(p);
 }
 
-bool Gemma4Model::f8(const std::string& name, int64_t rows, int64_t K, core::LoadPlan& reads, int file, F8Mat& m,
-                     std::string& err, bool per_row) {
+bool Gemma4Model::mat(const std::string& name, int64_t rows, int64_t K, core::LoadPlan& reads, int file, Mat& m,
+                      std::string& err, bool per_row, bool nvfp4) {
+    namespace nvfp4p = basalt::kernels::nvfp4p;
     const TensorRef* t = pack_.find(name + ".weight");
-    if (!t || t->type != kTypeF8 || t->bytes != (uint64_t) rows * K || t->shape.size() != 2 || (int64_t) t->shape[0] != K) {
-        err = name + ".weight" + (t ? " is not F8_E4M3 [" + std::to_string(rows) + "][" + std::to_string(K) + "]" : " is missing");
+    const int type = nvfp4 ? kTypeNvfp4Planes : kTypeF8;
+    const uint64_t want = nvfp4 ? (uint64_t) nvfp4p::bytes(rows, K) : (uint64_t) rows * K;
+    if (!t || t->type != type || t->bytes != want || t->shape.size() != 2 || (int64_t) t->shape[0] != K ||
+        (nvfp4 && !nvfp4p::fits(rows, K))) {
+        err = name + ".weight" + (t ? std::string(" is not ") + (nvfp4 ? "NVFP4_PLANES" : "F8_E4M3") + " [" + std::to_string(rows) +
+                                          "][" + std::to_string(K) + "]"
+                                    : " is missing");
         return false;
     }
     void* p = device_buf(t->bytes);
@@ -113,6 +144,8 @@ bool Gemma4Model::f8(const std::string& name, int64_t rows, int64_t K, core::Loa
     m.w = static_cast<uint8_t*>(p);
     m.rows = rows;
     m.K = K;
+    m.fmt = nvfp4 ? basalt::kernels::wgemm::Format::Nvfp4 : basalt::kernels::wgemm::Format::F8;
+    weight_bytes_ += t->bytes;
     m.scale = small(name + ".scale", per_row ? (uint64_t) rows : 1, reads, file, err);
     return m.scale != nullptr;
 }
@@ -159,7 +192,9 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         it.host = reinterpret_cast<uint8_t*>(embd_host_);
         reads.add(it);
     }
-    if (!f8("output", V, E, reads, file, head_, err, true)) return fail(err);
+    if (!mat("output", V, E, reads, file, head_, err, true)) return fail(err);
+    const TensorRef* down0 = pack_.find("blk.0.ffn_down.weight");
+    mlp_nvfp4_ = down0 && down0->type == kTypeNvfp4Planes;
     if (!(output_norm_ = small("output_norm.weight", (uint64_t) E, reads, file, err))) return fail(err);
     {   // the router input's unweighted norm
         std::vector<float> one((size_t) E, 1.f);
@@ -186,9 +221,11 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         if (!t || t->shape.size() != 2) return fail("blk.0.ffn_down.weight is missing");
         n_ff_pad_ = (int64_t) t->shape[0];
         if (n_ff_pad_ < g.n_ff || n_ff_pad_ % 128) return fail("the MLP's padded width is not a multiple of 128 at least its width");
+        if (mlp_nvfp4_ && (n_ff_pad_ % 256 || E % 256))   // the prompt's FP4 products take K in multiples of 256
+            return fail("an NVFP4 MLP whose widths are not multiples of 256");
     }
 
-    uint64_t dense = (uint64_t) V * E, experts = 0;
+    uint64_t experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
     for (int l = 0; l < g.n_layers; ++l) {
         LayerWeights& w = layers_[(size_t) l];
@@ -197,13 +234,13 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
         w.rope = w.sh.window > 0 ? rope_swa_ : rope_full_;
         const int64_t qd = (int64_t) w.sh.n_head * w.sh.hd, kd = (int64_t) w.sh.n_kv * w.sh.hd;
         auto S = [&](const char* suffix, uint64_t floats) { return small(b + suffix, floats, reads, file, err); };
-        if (!f8(b + "attn_q", qd, E, reads, file, w.q, err) || !f8(b + "attn_k", kd, E, reads, file, w.k, err) ||
-            (!w.sh.one && !f8(b + "attn_v", kd, E, reads, file, w.v, err)) ||
-            !f8(b + "attn_output", E, qd, reads, file, w.o, err) ||
-            !f8(b + "ffn_gate", n_ff_pad_, E, reads, file, w.gate, err) || !f8(b + "ffn_up", n_ff_pad_, E, reads, file, w.up, err) ||
-            !f8(b + "ffn_down", E, n_ff_pad_, reads, file, w.down, err))
+        if (!mat(b + "attn_q", qd, E, reads, file, w.q, err) || !mat(b + "attn_k", kd, E, reads, file, w.k, err) ||
+            (!w.sh.one && !mat(b + "attn_v", kd, E, reads, file, w.v, err)) ||
+            !mat(b + "attn_output", E, qd, reads, file, w.o, err) ||
+            !mat(b + "ffn_gate", n_ff_pad_, E, reads, file, w.gate, err, false, mlp_nvfp4_) ||
+            !mat(b + "ffn_up", n_ff_pad_, E, reads, file, w.up, err, false, mlp_nvfp4_) ||
+            !mat(b + "ffn_down", E, n_ff_pad_, reads, file, w.down, err, false, mlp_nvfp4_))
             return fail(err);
-        dense += (uint64_t) (qd + 2 * kd) * E + (uint64_t) qd * E + 3ull * n_ff_pad_ * E;
         if (!(w.attn_norm = S("attn_norm.weight", (uint64_t) E)) || !(w.q_norm = S("attn_q_norm.weight", (uint64_t) w.sh.hd)) ||
             !(w.k_norm = S("attn_k_norm.weight", (uint64_t) w.sh.hd)) || !(w.post_attn = S("post_attention_norm.weight", (uint64_t) E)) ||
             !(w.ffn_norm = S("ffn_norm.weight", (uint64_t) E)) || !(w.post_ffw = S("post_ffw_norm.weight", (uint64_t) E)) ||
@@ -257,8 +294,8 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
             if (!t || t->shape.size() != 2) return fail("assistant.blk.0.ffn_down.weight is missing");
             d->n_ff_pad = (int64_t) t->shape[0];
         }
-        if (!f8("assistant.pre_proj", DE, 2 * E, reads, file, d->pre, err) || !f8("assistant.post_proj", E, DE, reads, file, d->post, err) ||
-            !f8("assistant.head", V, DE, reads, file, d->head, err, true) ||
+        if (!mat("assistant.pre_proj", DE, 2 * E, reads, file, d->pre, err) || !mat("assistant.post_proj", E, DE, reads, file, d->post, err) ||
+            !mat("assistant.head", V, DE, reads, file, d->head, err, true) ||
             !(d->out_norm = small("assistant.output_norm.weight", (uint64_t) DE, reads, file, err)))
             return fail(err);
         int last_swa = -1, last_full = -1;
@@ -274,9 +311,9 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
             const std::string b = "assistant.blk." + std::to_string(l) + ".";
             const int64_t qd = (int64_t) w.sh.n_head * w.sh.hd;
             auto S = [&](const char* suffix, uint64_t floats) { return small(b + suffix, floats, reads, file, err); };
-            if (!f8(b + "attn_q", qd, DE, reads, file, w.q, err) || !f8(b + "attn_output", DE, qd, reads, file, w.o, err) ||
-                !f8(b + "ffn_gate", d->n_ff_pad, DE, reads, file, w.gate, err) || !f8(b + "ffn_up", d->n_ff_pad, DE, reads, file, w.up, err) ||
-                !f8(b + "ffn_down", DE, d->n_ff_pad, reads, file, w.down, err) ||
+            if (!mat(b + "attn_q", qd, DE, reads, file, w.q, err) || !mat(b + "attn_output", DE, qd, reads, file, w.o, err) ||
+                !mat(b + "ffn_gate", d->n_ff_pad, DE, reads, file, w.gate, err) || !mat(b + "ffn_up", d->n_ff_pad, DE, reads, file, w.up, err) ||
+                !mat(b + "ffn_down", DE, d->n_ff_pad, reads, file, w.down, err) ||
                 !(w.attn_norm = S("attn_norm.weight", (uint64_t) DE)) || !(w.q_norm = S("attn_q_norm.weight", (uint64_t) w.sh.hd)) ||
                 !(w.post_attn = S("post_attention_norm.weight", (uint64_t) DE)) || !(w.ffn_norm = S("ffn_norm.weight", (uint64_t) DE)) ||
                 !(w.post_ffw = S("post_ffw_norm.weight", (uint64_t) DE)) || !(w.scalar = S("layer_scalar", 1)))
@@ -304,11 +341,12 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
     basalt::core::gpu_mem_info(&free_b, &total_b);
     const uint64_t spare = (req.vram_reserve_mib > 0 ? (uint64_t) req.vram_reserve_mib * kMiB : kCardSpare) + vision_room;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-    const uint64_t need = session_bytes(g, want, kv_) * n_sess + shared_bytes(g, n_ff_pad_, want, kv_, mxfp8_experts_) + spare;
+    const uint64_t need = session_bytes(g, want, kv_) * n_sess + shared_bytes(g, n_ff_pad_, mlp_nvfp4_, want, kv_, mxfp8_experts_) + spare;
     if (need > free_b) {
         const uint64_t per = (session_bytes(g, 2, kv_) - session_bytes(g, 1, kv_)) * n_sess +
-                             shared_bytes(g, n_ff_pad_, 2, kv_, mxfp8_experts_) - shared_bytes(g, n_ff_pad_, 1, kv_, mxfp8_experts_);
-        const uint64_t base = session_bytes(g, 0, kv_) * n_sess + shared_bytes(g, n_ff_pad_, 0, kv_, mxfp8_experts_) + spare;
+                             shared_bytes(g, n_ff_pad_, mlp_nvfp4_, 2, kv_, mxfp8_experts_) -
+                             shared_bytes(g, n_ff_pad_, mlp_nvfp4_, 1, kv_, mxfp8_experts_);
+        const uint64_t base = session_bytes(g, 0, kv_) * n_sess + shared_bytes(g, n_ff_pad_, mlp_nvfp4_, 0, kv_, mxfp8_experts_) + spare;
         const int64_t fits = free_b > base ? (int64_t) ((free_b - base) / per) : 0;
         return fail("--max-context " + std::to_string(want) + " needs " + std::to_string(need >> 20) + " MiB beside the weights, " +
                     std::to_string(free_b >> 20) + " MiB are free: at most about " + std::to_string(fits) +
@@ -319,9 +357,12 @@ model::Result Gemma4Model::plan(const model::LoadRequest& req, core::LoadPlan& r
     for (const ExpertLayer& el : pack_.experts) n_mx += el.gu_type == kTypeMxfp8;
     const std::string fmt = n_mx == 0 ? "NVFP4" : n_mx == (int) pack_.experts.size() ? "MXFP8"
                                                 : "NVFP4, MXFP8 at " + std::to_string(n_mx) + " layers";
-    basalt::log::info("basalt gemma4", "weights: dense %.2f GiB (FP8), experts %.2f GiB (%s), embedding %.2f GiB in RAM; "
-                      "context %lld x %llu sessions, %s KV",
-                      (double) dense / (double) kGiB, (double) experts / (double) kGiB, fmt.c_str(), (double) V * E * 2 / (double) kGiB,
+    char ex[96] = "";
+    if (g.moe()) std::snprintf(ex, sizeof ex, ", experts %.2f GiB (%s)", (double) experts / (double) kGiB, fmt.c_str());
+    basalt::log::info("basalt gemma4", "weights: projections and head %.2f GiB (%s)%s, embedding %.2f GiB in RAM; context "
+                      "%lld x %llu sessions, %s KV",
+                      (double) weight_bytes_ / (double) kGiB, mlp_nvfp4_ ? "FP8, the MLP NVFP4" : "FP8", ex,
+                      (double) V * E * 2 / (double) kGiB,
                       (long long) ctx_, (unsigned long long) n_sess, kv_ == KvType::F8 ? "fp8" : "fp16");
     return {};
 }

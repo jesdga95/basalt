@@ -995,6 +995,17 @@ int main() {
     span_case("picture span, window layer, 280 rows after 1500", {16, 8, 256, 128, 1024, false}, 1500, 280, rng);
     span_case("picture span, window layer, 9 rows first", {16, 8, 256, 128, 64, false}, 0, 9, rng);
     span_case("picture span, full layer: bitwise as causal", {16, 2, 512, 64, 0, true}, 300, 280, rng);
+    // the dense models' shapes: 12B full layers (16 query heads on one key head), 31B (32 query heads)
+    run_case({"full layer (16x512, 1 kv: group 16, keys = values), 4 rows", {16, 1, 512, 64, 0, true}, 700, 4}, rng, true);
+    run_case({"full layer (32x512, 4 kv, keys = values), chunked keys, 3 rows", {32, 4, 512, 64, 0, true}, 5000, 3}, rng, true);
+    run_case({"window layer (32x256, 16 kv, window 64), 6 rows", {32, 16, 256, 128, 64, false}, 203, 6}, rng, true);
+    batch_check(rng, {16, 1, 512, 64, 0, true}, "batch of two conversations = each alone (full layer, group 16)");
+    prompt_case("prompt attention, full layer, group 16, 300 rows", {16, 1, 512, 64, 0, true}, 1500, 300, KvType::F16, rng);
+    prompt_case("prompt attention, full layer, group 16, fp8 cache, 129 rows", {16, 1, 512, 64, 0, true}, 0, 129, KvType::F8,
+                rng);
+    prompt_case("prompt attention, full layer (32x512, 4 kv), 200 rows", {32, 4, 512, 64, 0, true}, 900, 200, KvType::F16, rng);
+    prompt_case("prompt attention, window layer (32x256, 16 kv, window 64), 150 rows", {32, 16, 256, 128, 64, false}, 333, 150,
+                KvType::F16, rng);
     glue_checks(rng);
     fused_checks(rng);
     experts_mxfp8_checks(rng);

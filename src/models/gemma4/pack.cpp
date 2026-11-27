@@ -90,9 +90,10 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     for (int l = 0; l < g.n_layers; ++l) {
         const LayerShape s = g.shape(l);
         if ((s.hd != 256 && s.hd != 512) || s.n_kv < 1 || g.n_head % s.n_kv || g.n_head > kMaxHeads ||
-            g.n_head / s.n_kv > 8) {
-            err = path + ": a Gemma 4 attention layout this engine does not run (heads of 256 or 512, at most 8 query heads "
-                         "per key head)";
+            g.n_head / s.n_kv > kMaxGroup || (g.n_head / s.n_kv & (g.n_head / s.n_kv - 1))) {
+            err = path + ": a Gemma 4 attention layout this engine does not run (heads of 256 or 512, at most " +
+                  std::to_string(kMaxHeads) + " query heads, a power of two up to " + std::to_string(kMaxGroup) +
+                  " per key head)";
             return false;
         }
     }

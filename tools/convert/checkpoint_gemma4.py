@@ -11,7 +11,9 @@ routed experts) straight from the official BF16 checkpoint, for tools/convert/co
   experts.layout      one `layer gu_type d_type offset blob_bytes` line per layer that has experts
   gguf                every other text tensor in llama.cpp-style names: the attention and MLP projections F8_E4M3
                         (type 44) with one FP32 scale per matrix (amax / 448, `<name>.scale`), the MLP's inner width
-                        padded with zero rows and columns to a multiple of 128; the token embedding BF16 as stored; the
+                        padded with zero rows and columns to a multiple of 128; with --mlp-nvfp4 the MLP's three
+                        projections NVFP4_PLANES (type 45: the experts' rounding, the scales in 128-row tiles) with the
+                        tensor scale as `<name>.scale`; the token embedding BF16 as stored; the
                         output head (the tied embedding) F8_E4M3 rows with an FP32 scale per row (`output.scale`); the
                         router F32 with its input scale and 1 / sqrt(hidden) folded into the columns; norms and layer
                         scalars F32 (exact). The assistant drafter's tensors (`--drafter DIR`) as `assistant.*`.
@@ -48,15 +50,21 @@ from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 
 ARCH = "gemma4"
-TYPE_ID = {"F32": 0, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44}
+TYPE_ID = {"F32": 0, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44, "NVFP4_PLANES": 45}
 NVFP4 = 40
 MXFP8 = 46
 BYTE = 6                      # llama.cpp's token type of a byte-fallback token
 ROWS_PER_JOB = 4096
+FP4_ROWS_PER_JOB = 512        # an NVFP4 job's rows (its scale search holds several float32 copies of them)
+FP4_K = 256                   # the prompt's FP4 products take K in multiples of 256
 EXPERTS_PER_JOB = 8
 PAD = 128                     # the dense products take K in multiples of 128
 TEXT = "model.language_model."
 ASSIST = "model."             # the assistant's own text model
+# config.json model_type of the model / its text model, and of the assistant: Gemma 4 and the 12B's Gemma 4 Unified, whose
+# text model is the same decoder (only its vision embedder differs, which the pack does not carry)
+MODEL_TYPES = {"gemma4": "gemma4_text", "gemma4_unified": "gemma4_unified_text"}
+ASSIST_TYPES = {"gemma4_assistant": "gemma4_text", "gemma4_unified_assistant": "gemma4_unified_text"}
 
 
 def pad_to(n: int, m: int = PAD) -> int:
@@ -70,19 +78,20 @@ class Tensor:
 
     def expected_bytes(self) -> int:
         n = int(np.prod(self.ne))
-        return {"F32": 4 * n, "BF16": 2 * n, "F8_E4M3": n}[self.form]
+        return {"F32": 4 * n, "BF16": 2 * n, "F8_E4M3": n, "NVFP4_PLANES": n // 64 * 36}[self.form]
 
 
 # ------------------------------------------------------------------ the dense tensors
 class Plan:
     """The pack's `gguf` tensors: the language model's, then the drafter's."""
 
-    def __init__(self, ck: C.Checkpoint, drafter: C.Checkpoint | None):
+    def __init__(self, ck: C.Checkpoint, drafter: C.Checkpoint | None, mlp_nvfp4: bool = False):
         tc = ck.text
         self.ck, self.dr = ck, drafter
-        if ck.config.get("model_type") != "gemma4" or tc.get("model_type") != "gemma4_text":
-            raise S.ConvertError(f"config.json: model_type {ck.config.get('model_type')} / {tc.get('model_type')}, "
-                                 "expected gemma4 / gemma4_text")
+        mt = ck.config.get("model_type")
+        if mt not in MODEL_TYPES or tc.get("model_type") != MODEL_TYPES[mt]:
+            raise S.ConvertError(f"config.json: model_type {mt} / {tc.get('model_type')}, expected one of "
+                                 + ", ".join(f"{a} / {b}" for a, b in MODEL_TYPES.items()))
         for k, want in (("attention_bias", False), ("hidden_size_per_layer_input", 0), ("num_kv_shared_layers", 0),
                         ("use_double_wide_mlp", False), ("hidden_activation", "gelu_pytorch_tanh"),
                         ("tie_word_embeddings", True)):
@@ -93,6 +102,10 @@ class Plan:
         self.n_vocab = int(tc["vocab_size"])
         self.ff = int(tc["intermediate_size"])
         self.ff_pad = pad_to(self.ff)
+        self.mlp_nvfp4 = mlp_nvfp4
+        if mlp_nvfp4 and (self.ff % FP4_K or self.h % FP4_K):
+            raise S.ConvertError(f"--mlp-nvfp4: hidden_size {self.h} and intermediate_size {self.ff} must be multiples of "
+                                 f"{FP4_K}")
         self.kinds = list(tc["layer_types"])
         self.moe = bool(tc.get("enable_moe_block"))
         self.kev = bool(tc.get("attention_k_eq_v"))
@@ -123,9 +136,14 @@ class Plan:
             self._f32(b + "attn_k_norm.weight", L + "self_attn.k_norm.weight", [hd])
             self._f32(b + "post_attention_norm.weight", L + "post_attention_layernorm.weight", [self.h])
             self._f32(b + "ffn_norm.weight", L + "pre_feedforward_layernorm.weight", [self.h])
-            self._f8(b + "ffn_gate.weight", L + "mlp.gate_proj.weight", [self.h, self.ff_pad], pad_rows=self.ff)
-            self._f8(b + "ffn_up.weight", L + "mlp.up_proj.weight", [self.h, self.ff_pad], pad_rows=self.ff)
-            self._f8(b + "ffn_down.weight", L + "mlp.down_proj.weight", [self.ff_pad, self.h], pad_cols=self.ff)
+            if mlp_nvfp4:
+                self._fp4(b + "ffn_gate.weight", L + "mlp.gate_proj.weight", [self.h, self.ff])
+                self._fp4(b + "ffn_up.weight", L + "mlp.up_proj.weight", [self.h, self.ff])
+                self._fp4(b + "ffn_down.weight", L + "mlp.down_proj.weight", [self.ff, self.h])
+            else:
+                self._f8(b + "ffn_gate.weight", L + "mlp.gate_proj.weight", [self.h, self.ff_pad], pad_rows=self.ff)
+                self._f8(b + "ffn_up.weight", L + "mlp.up_proj.weight", [self.h, self.ff_pad], pad_rows=self.ff)
+                self._f8(b + "ffn_down.weight", L + "mlp.down_proj.weight", [self.ff_pad, self.h], pad_cols=self.ff)
             self._f32(b + "post_ffw_norm.weight", L + "post_feedforward_layernorm.weight", [self.h])
             self._f32(b + "layer_scalar", L + "layer_scalar", [1])
             if self.moe:
@@ -144,8 +162,10 @@ class Plan:
 
     def _drafter(self, dr: C.Checkpoint):
         c, tc = dr.config, dr.text
-        if c.get("model_type") != "gemma4_assistant" or tc.get("model_type") != "gemma4_text":
-            raise S.ConvertError(f"{dr.dir}/config.json: model_type {c.get('model_type')}, expected gemma4_assistant")
+        mt = c.get("model_type")
+        if mt not in ASSIST_TYPES or tc.get("model_type") != ASSIST_TYPES[mt]:
+            raise S.ConvertError(f"{dr.dir}/config.json: model_type {mt} / {tc.get('model_type')}, expected one of "
+                                 + ", ".join(f"{a} / {b}" for a, b in ASSIST_TYPES.items()))
         if int(c["backbone_hidden_size"]) != self.h:
             raise S.ConvertError("the drafter's backbone width is not the model's")
         if c.get("use_ordered_embeddings"):
@@ -209,6 +229,17 @@ class Plan:
         self.tensors[sname] = Tensor(sname, "F32", src, "row_scales" if per_row else "scale",
                                      [ne[1]] if per_row else [1], {"ck": ck, "src_shape": shape})
 
+    def _fp4(self, name, src, ne):
+        """A [rows][K] projection as NVFP4 planes; ne = [K, rows] as the source [rows][K]."""
+        shape = self._src(self.ck, src, ne, ("BF16",))
+        if shape != [ne[1], ne[0]]:
+            raise S.ConvertError(f"{src} has shape {shape}, expected {[ne[1], ne[0]]}")
+        if ne[1] % 128 or ne[0] % FP4_K:
+            raise S.ConvertError(f"{src}: NVFP4 planes take rows in 128s and K in multiples of {FP4_K}, not {shape}")
+        self.tensors[name] = Tensor(name, "NVFP4_PLANES", src, "fp4", ne)
+        sname = name[: -len(".weight")] + ".scale"
+        self.tensors[sname] = Tensor(sname, "F32", src, "fp4_scale", [1])
+
     # ---- values
     def float_bytes(self, name) -> bytes:
         t = self.tensors[name]
@@ -219,6 +250,8 @@ class Plan:
             x = (p * s[None, :] / math.sqrt(self.h)).astype(np.float32)
         elif t.how == "scale":
             x = np.array([_f8_scale(_amax(ck, t.src))], np.float32)
+        elif t.how == "fp4_scale":
+            x = np.array([Q.fp4q_global(_amax(ck, t.src))], np.float32)
         elif t.how == "row_scales":
             x = Q.f8q_row_scales(_row_amax(ck, t.src))
         else:
@@ -233,11 +266,22 @@ class Plan:
         return (u >> 16).astype("<u2").tobytes()
 
     def chunks(self, name, pool, depth: int = 32):
-        """An F8 matrix's codes, padded, in row chunks."""
+        """An F8 matrix's codes, padded, in row chunks; an NVFP4 matrix's code plane in row chunks, then its scale plane."""
         t = self.tensors[name]
         ck = t.extra.get("ck", self.ck)
         p, off, _, (src_rows, src_cols), _ = ck.t[t.src]
         K, rows = t.ne
+        if t.how == "fp4":   # the shared NVFP4 rounding (checkpoint_qwen35's fp4q job): (codes, scales) per row block
+            gs = float(Q.fp4q_global(_amax(ck, t.src)))
+            jobs = (("fp4q", str(p), off, K, r, min(FP4_ROWS_PER_JOB, rows - r), gs) for r in range(0, rows, FP4_ROWS_PER_JOB))
+            scales = []
+            for b in S.bounded_imap(pool, Q._job, jobs, depth):
+                if isinstance(b, str):
+                    raise S.ConvertError(f"{name}: {b}")
+                scales.append(b[1])
+                yield b[0]
+            yield Q.nvfp4_scale_tiles(np.concatenate(scales)).tobytes()
+            return
         if t.how == "rows":
             sc = Q.f8q_row_scales(_row_amax(ck, t.src))
             jobs = (("f8rows", str(p), off, src_cols, K, r, min(ROWS_PER_JOB, rows - r), src_rows,
@@ -690,13 +734,17 @@ def build(a, Job, fingerprint, die) -> None:
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
     try:
-        ck = C.Checkpoint(a.checkpoint)
+        ck = C.Checkpoint(a.checkpoint, single=(pathlib.Path(a.checkpoint) / "model.safetensors").is_file())
         dr = C.Checkpoint(a.drafter, single=True) if a.drafter else None
-        plan = Plan(ck, dr)
+        plan = Plan(ck, dr, a.mlp_nvfp4)
         experts = Experts(ck, frozenset(parse_layers(a.experts_mxfp8))) if plan.moe else None
         name = a.name or "Gemma 4"
         kv = model_kv(ck, dr, name)
         vision = has_vision(ck)
+        for k in ("vision_config", "audio_config"):   # the towers the pack does not carry
+            if ck.config.get(k) and not (k == "vision_config" and vision):
+                print(f"not converted: the checkpoint's {ck.config[k].get('model_type')} (the pack reads text only)",
+                      flush=True)
     except S.ConvertError as e:
         die(str(e))
     partial.unlink(missing_ok=True)
@@ -715,7 +763,7 @@ def build(a, Job, fingerprint, die) -> None:
             t = time.time()
             parts, names = [], []
             for n, info in plan.tensors.items():
-                if info.form == "F8_E4M3":
+                if info.form in ("F8_E4M3", "NVFP4_PLANES"):
                     parts.append(Stream(info.expected_bytes(), plan.chunks(n, pool)))
                 else:
                     parts.append(plan.float_bytes(n))
@@ -753,6 +801,9 @@ def build(a, Job, fingerprint, die) -> None:
                     **({"experts_mxfp8": mxfp8_note(experts.mxfp8)} if experts and experts.mxfp8 else {}),
                     "projections": "F8_E4M3 to nearest (ties to even) with one FP32 scale per matrix, amax / 448; the "
                                    "MLP's inner width padded with zeros to a multiple of 128",
+                    **({"mlp": "NVFP4_PLANES rounded once from BF16: per matrix amax / (6 x 448), per 16 values the UE4M3 "
+                               "scale of least squared error among half to four times amax / 6, E2M1 to nearest"}
+                       if plan.mlp_nvfp4 else {}),
                     "head": "the tied embedding as F8_E4M3 rows with an FP32 scale per row, amax / 448",
                     "router": "proj x scale / sqrt(hidden) in float64, rounded once to FP32"},
             }
