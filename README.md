@@ -8,6 +8,8 @@ on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, and on the DGX Spa
 
 **Help wanted:** spare Blackwell compute for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
 
+Questions, help or just hanging out: join the [Discord](https://discord.gg/HMakYWw9G6).
+
 <p align="center">
   <a href="https://github.com/sponsors/jesdga95"><img src="assets/donate/github.svg" height="44" alt="Sponsor on GitHub"></a>
   <a href="https://ko-fi.com/jesdga"><img src="assets/donate/kofi.svg" height="44" alt="Support on Ko-fi"></a>
