@@ -40,6 +40,9 @@ model::Result DsModel::ensure_tier() {
     core::ExpertTierSpec spec;
     std::string err;
     if (!weights_.expert_tier_spec(request_, spec, err)) return failure(err);
+    // The image encoder's cuBLAS handle takes host memory when created (the handle and its first products), so it opens
+    // before the tier reads the free RAM: the RAM expert tier is sized from what is left after it.
+    if (request_.vision) spec.host.open = [this](std::string& open_err) { return vision_blas_.open(open_err); };
     auto tier = std::make_shared<core::ExpertTier>(std::move(spec));
     core::ExpertTier::Reserve reserve;
     const ctxp::Footprint footprint = ctxp::cache_footprint(context_, g.compress_ratio);

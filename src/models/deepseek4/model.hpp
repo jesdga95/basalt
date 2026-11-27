@@ -3,6 +3,7 @@
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/batch_driver.hpp"
+#include "basalt/vision/transformer.hpp"
 #include "models/deepseek4/model_weights.hpp"
 
 #include <memory>
@@ -27,6 +28,8 @@ public:
     const ModelWeights& weights() const { return weights_; }
     core::ExpertTier* tier() const { return tier_.get(); }
     DsparkDrafter* dspark() const { return dspark_.get(); }
+    /// The image encoders' cuBLAS handle, opened by the expert tier at load when images are on.
+    basalt::vision::TransformerBlas& vision_blas() const { return vision_blas_; }
     int spec() const { return request_.spec; }
     bool vision_enabled() const { return request_.vision; }
     int diag_rows() const { return request_.diag_rows; }
@@ -40,6 +43,7 @@ private:
     model::BatchShared batch_shared_;
     core::LoadPlan* planning_ = nullptr;
     std::shared_ptr<core::ExpertTier> tier_;
+    mutable basalt::vision::TransformerBlas vision_blas_;
     std::unique_ptr<DsparkDrafter> dspark_;
     float* h_expert_input_ = nullptr;
     float* h_expert_rows_ = nullptr;

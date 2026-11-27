@@ -86,9 +86,14 @@ public:
                   device(shared_up_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
                   device(shared_hidden_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
                   device(shared_bounds_, 2 * sizeof(int32_t)) && device(identity_, (size_t) cap_ * sizeof(int32_t));
-        if (!ok || cudaHostAlloc(reinterpret_cast<void**>(&stage_host_), stage_stride_ * expert_cap,
-                                 cudaHostAllocPortable) != cudaSuccess) {
-            err = "deepseek4: out of memory for the prompt MMQ buffers";
+        const cudaError_t pinned = ok ? cudaHostAlloc(reinterpret_cast<void**>(&stage_host_), stage_stride_ * expert_cap,
+                                                      cudaHostAllocPortable) : cudaSuccess;
+        if (!ok || pinned != cudaSuccess) {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            cudaGetLastError();
+            err = "deepseek4: out of memory for the prompt MMQ buffers (" + std::to_string(free_b >> 20) + " MiB free" +
+                  (ok ? std::string(", pinned host: ") + cudaGetErrorString(pinned) : ", device buffers") + ")";
             return false;
         }
         rows_host_.resize(route_cap_);

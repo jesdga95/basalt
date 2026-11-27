@@ -356,15 +356,16 @@ public:
             if (tier) tier->shrink();
             vision_mmproj_ = std::make_unique<basalt::vision::Mmproj>();
             if (!vision_mmproj_->open(model_.weights().pack().vision, err_, "deepseek4v")) return fail_image(err_);
-            vision_blas_ = std::make_unique<basalt::vision::TransformerBlas>();
+            // the handle the model opened at load, before the expert tier read the free RAM
+            basalt::vision::TransformerBlas& blas = model_.vision_blas();
             vision_encoder_ = std::make_unique<basalt::vision::TransformerEncoder>();
-            if (!vision_encoder_->init(*vision_mmproj_, *vision_blas_, err_)) {
+            if (!vision_encoder_->init(*vision_mmproj_, blas, err_)) {
                 vision_encoder_.reset();
                 if (!lend_vision(tier, model_.weights().pack().vision.size())) return fail_image(err_);
                 err_.clear();
-                vision_blas_ = std::make_unique<basalt::vision::TransformerBlas>();
+                if (!blas.open(err_)) return fail_image(err_);
                 vision_encoder_ = std::make_unique<basalt::vision::TransformerEncoder>();
-                if (!vision_encoder_->init(*vision_mmproj_, *vision_blas_, err_)) return fail_image(err_);
+                if (!vision_encoder_->init(*vision_mmproj_, blas, err_)) return fail_image(err_);
             }
         }
 
@@ -404,7 +405,6 @@ public:
 
     void images_done() override {
         vision_encoder_.reset();
-        vision_blas_.reset();
         vision_mmproj_.reset();
         if (!vision_borrowed_) return;
         vision_borrowed_ = false;
@@ -865,7 +865,6 @@ private:
     std::string err_;
     bool has_bias_ = false;
     std::unique_ptr<basalt::vision::Mmproj> vision_mmproj_;
-    std::unique_ptr<basalt::vision::TransformerBlas> vision_blas_;
     std::unique_ptr<basalt::vision::TransformerEncoder> vision_encoder_;
     bool vision_borrowed_ = false;
     bool vision_lent_ = false;
