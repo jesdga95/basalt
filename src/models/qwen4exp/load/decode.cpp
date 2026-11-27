@@ -75,7 +75,7 @@ int decode(Context& context) {
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
         ver.set_route_tail_skip(o.route.tail_skip);
         ver.set_route_prior(o.route.prior);
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, o.fixed_expert_tiers(), err)) {
             return fatal_start_error(err);
         }
         const bool use_mtp = !o.mtp.empty();

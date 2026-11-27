@@ -105,7 +105,7 @@ Verifier::~Verifier() {
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-                    const NativeHead* head, int max_t, std::string& err) {
+                    const NativeHead* head, int max_t, bool fixed_tiers, std::string& err) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -124,6 +124,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     hits_ = hits;
     head_ = head;
     max_t_ = max_t;
+    fixed_tiers_ = fixed_tiers;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
     if (max_t < 2 || max_t > basalt::kernels::kVerifyMaxT || max_t > basalt::kernels::cpu::MAXT) {

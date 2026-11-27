@@ -57,6 +57,13 @@ GPU experts run the same kernels on every tier, so an expert gives the same bits
 ggml's `vec_dot_type` (Q8_K per 256 for i-quant gate/up, Q8_0 for down). They round about 1% of a layer's routed output differently, so
 which experts sit where changes the last bits. Pin `--adapt-swaps 0 --peer-adapt-swaps 0` for identity checks.
 
+With fixed expert tiers, mixed-size packs and setups with one peer can send mapped CPU misses to CUDA0's staging buffer
+while one sequence is active. Adaptive configurations keep their existing path. Peer hits stay on their card. GPU and CPU
+rounding differences still apply to the experts moved into staging. With pinned 2,725 primary and 6,684 peer slots,
+IQ3_S-Q4 on two RTX 5080s
+(400 W each; INT8 KV; T=3; 100 BF16-reference chunks) measured PPL 3.23261 to 3.23581, mean KLD 0.0956440 to 0.0952783,
+and top-1 agreement 89.9333% to 90.0078% with staging.
+
 ### Prefill
 
 Prefill is a different computation from decode: fp16 and BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts. The gate
