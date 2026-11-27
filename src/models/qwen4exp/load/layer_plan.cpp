@@ -55,14 +55,23 @@ int layer_plan(Context& context) {
         // the cut by the shares (or --diag-gpu-cut) over what each card holds before its experts: the shared driver over
         // LayerSplit (model::SplitHooks), which gives split_at and the stages' devices
         const size_t ns = o.gpus.cards.size();
+        std::set<std::string> shared_blk;
+        for_each_index_name(pack_files.index, [&](const std::string& n) {
+            if (n.rfind("blk.", 0) == 0 && n.find("ple") != std::string::npos) shared_blk.insert(n);
+        });
+        const int64_t batch_sess = (multi_gpu && o.serve && o.batch > 0 && o.kv == "int8")
+                                       ? std::min<int64_t>(o.batch, basalt::kernels::kVerifyMaxT)
+                                       : 0;
         LayerSplit& split = *context.split;
         LayerSplit::Open in;
         in.pack = &pack_files;
         in.native_shards = &o.native_shards;
         in.skip = &skip;
+        in.shared_blk = &shared_blk;
         in.g = &g;
         in.k = K;
         in.max_context = o.max_context;
+        in.n_sess = 1 + batch_sess;
         in.room = [&, ns](size_t i) -> uint64_t {
             return (uint64_t) stage_room(i == 0 ? -1 : o.gpus.cards[i].device, i > 0, i == 0 ? kDrafterMib : i + 1 == ns ? kHeadMib : 0);
         };

@@ -140,7 +140,13 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
                                                       return st->state_in.copy(d, sr, nb, e);
                                                   }, e);
         }
-        for (PromptStage* st : run) ok = ok && st->state_in.wait(e);
+        for (PromptStage* st : run) {
+            std::string we;
+            if (!st->state_in.wait(we)) {
+                if (e.empty()) e = we;
+                ok = false;
+            }
+        }
         if (!ok) {
             if (e.empty()) e = "prompt split: a stage's state from the main session";
             give_back_all();
@@ -275,7 +281,13 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
                                                         [&](void* d, const void* sr, uint64_t nb) {
                                                             return st->state_back.copy(d, sr, nb, ce);
                                                         }, ce);
-        for (PromptStage* st : run) ok = ok && st->state_back.wait(ce);
+        for (PromptStage* st : run) {
+            std::string we;
+            if (!st->state_back.wait(we)) {
+                if (ce.empty()) ce = we;
+                ok = false;
+            }
+        }
         if (!ok) {
             if (ce.empty()) ce = "prompt split: a stage's state back to the main session";
             return false;

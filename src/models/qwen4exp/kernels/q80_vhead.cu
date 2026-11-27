@@ -4,6 +4,7 @@
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "q80p.cuh"
 #include "smem_opt_in.cuh"
 
@@ -54,8 +55,9 @@ constexpr int kLinkDone = 48;           // the peer: the window whose list is in
 constexpr int kLinkErr = 56;            // CUDA0: the window whose share did not answer
 constexpr int kLinkWords = 64;
 constexpr unsigned kLinkFail = 0x80000000u;
-constexpr unsigned long long kPubWaitNs = 2000000ull;     // a share waits this long for CUDA0's thresholds
-constexpr unsigned long long kLinkWaitNs = 200000000ull;  // either card waits this long for the other's input or list
+constexpr unsigned long long kPubWaitNs = 2000000ull;       // a share waits this long for CUDA0's thresholds
+constexpr unsigned long long kLinkWaitNs = 200000000ull;    // CUDA0 waits this long for the peer's list
+constexpr unsigned long long kFetchWaitNs = 20000000000ull; // the peer waits this long for CUDA0's input (SSD-backed windows)
 __device__ __forceinline__ unsigned long long dm_now_ns() {
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -342,7 +344,7 @@ __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* 
         const float d = __low2float(*reinterpret_cast<const half2*>(&dsb));
         sy[j][0][b] = make_int4(v[0], v[1], v[2], v[3]);
         sy[j][1][b] = make_int4(v[4], v[5], v[6], v[7]);
-        sc[j][b] = make_float4(4.0f * d, -31.625f * (float) sum, 1.5f * d * (float) sabs, 0.0f);
+        sc[j][b] = make_float4(4.0f * d, -31.625f * (float) sum, 1.5f * fabsf(d) * (float) sabs, 0.0f);
         if ((__float_as_uint(d) & 0x7f800000u) == 0x7f800000u) bad[j] = 1;   // not finite (a bit test: fast math)
     }
     __syncthreads();
@@ -380,7 +382,7 @@ __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* 
                     u = DP4A((int) h[7], e.w, u);
                     const float4 f = sc[j][b];
                     v[j] = fmaf(cur.d[i] * f.x, (float) u + f.y, v[j]);   // (float) u + f.y is exact
-                    v[P + j] = fmaf(cur.d[i], f.z, v[P + j]);
+                    v[P + j] = fmaf(fabsf(cur.d[i]), f.z, v[P + j]);
                 }
             }
         }
@@ -452,9 +454,9 @@ __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* 
             vs->thr[c] = bin > 0 && !bad[c] ? (float) (bin - VHIST / 2) / VBIN : __int_as_float(0xff800000);
         for (int i = lane; i < VHIST; i += 32) vs->hist[c][i] = 0u;
     }
+    __syncthreads();
     if (tid == 0) vs->done = 0u;
     if (pub != nullptr) {   // CUDA0: the thresholds, then the window they belong to
-        __syncthreads();
         if (tid == 0) {
             __threadfence();
             volatile unsigned* l = pub;
@@ -510,22 +512,26 @@ __global__ void __launch_bounds__(256) q80p_post_kernel(const uint4* __restrict_
 }
 
 // The share: this window's input from the input block into x and k (its own memory), once CUDA0 posted it; an input
-// that does not come in kLinkWaitNs leaves the share's list empty and marked (k 0, fail).
+// that does not come in kFetchWaitNs (or when the wait-abort word is set) leaves the share's list empty and marked
+// (k 0, fail).
 __global__ void __launch_bounds__(256) q80p_fetch_kernel(const uint4* in, int n16, int ko, const unsigned* link,
                                                          uint4* __restrict__ x, int* __restrict__ k,
-                                                         VScratch* __restrict__ vs) {
+                                                         VScratch* __restrict__ vs,
+                                                         const unsigned long long* abort_word) {
     __shared__ int ok;
     if (threadIdx.x == 0) {
         const volatile unsigned* l = link;
+        const volatile unsigned long long* ab = abort_word;
         const unsigned want = l[kLinkSeq];
         unsigned long long t0 = 0;
         bool got = false;
         for (unsigned i = 0;; ++i) {
             if (l[kLinkIn] == want) { got = true; break; }
             if ((i & 63u) == 0u) {
+                if (ab != nullptr && *ab != 0ull) break;
                 const unsigned long long t = dm_now_ns();
                 if (t0 == 0) t0 = t;
-                else if (t - t0 > kLinkWaitNs) break;
+                else if (t - t0 > kFetchWaitNs) break;
             }
             __nanosleep(32);
         }
@@ -589,12 +595,13 @@ __global__ void __launch_bounds__(256) q80p_list_kernel(const float* __restrict_
 // that does not come in kLinkWaitNs (or comes without its input) marks the window in the link's error word.
 __global__ void __launch_bounds__(256) q80p_merge_kernel(float* __restrict__ y, int n_out, int first, int ncols,
                                                          int list_rows, const int* __restrict__ k, const unsigned* list,
-                                                         unsigned* link) {
+                                                         unsigned* link, const unsigned long long* abort_word) {
     __shared__ int ok;
     const int j = threadIdx.x >> 5, lane = threadIdx.x & 31;
     if (__ldg(k) == 0) return;
     if (threadIdx.x == 0) {
         volatile unsigned* l = link;
+        const volatile unsigned long long* ab = abort_word;
         const unsigned want = l[kLinkSeq];
         unsigned long long t0 = 0;
         unsigned d = 0;
@@ -602,6 +609,7 @@ __global__ void __launch_bounds__(256) q80p_merge_kernel(float* __restrict__ y, 
             d = l[kLinkDone];
             if ((d & ~kLinkFail) == want) break;
             if ((i & 63u) == 0u) {
+                if (ab != nullptr && *ab != 0ull) { d = kLinkFail; break; }
                 const unsigned long long t = dm_now_ns();
                 if (t0 == 0) t0 = t;
                 else if (t - t0 > kLinkWaitNs) { d = kLinkFail; break; }
@@ -757,10 +765,11 @@ void q80p_vhead_fetch(const void* input, const void* link, void* x_q8_1, int* k,
         basalt::log::error("basalt", "q80p_vhead_fetch: unsupported shape (n_in %d, ncols %d)", n_in, ncols);
         std::exit(1);
     }
+    wait_abort_init();
     const int n16 = (int) ((size_t) ncols * (n_in / 32) * sizeof(Q81Block) / 16);
     q80p_fetch_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const uint4*) input, n16, (int) input_k_offset(n_in, ncols),
                                                            (const unsigned*) link, (uint4*) x_q8_1, k,
-                                                           (VScratch*) scratch);
+                                                           (VScratch*) scratch, wait_abort_device_word());
     check("q80p_vhead_fetch");
 }
 
@@ -775,6 +784,7 @@ static void prepare_cols() {
 }
 
 void q80p_vhead_prepare() {
+    wait_abort_init();
     prepare_cols<1>(); prepare_cols<2>(); prepare_cols<3>(); prepare_cols<4>();
     prepare_cols<5>(); prepare_cols<6>(); prepare_cols<7>(); prepare_cols<8>();
     cudaFuncAttributes fa;
@@ -818,8 +828,9 @@ void q80p_vhead_merge(float* y, int n_out, int first, int ncols, int list_rows, 
                            first, list_rows, ncols);
         std::exit(1);
     }
+    wait_abort_init();
     q80p_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(y, n_out, first, ncols, list_rows, k, (const unsigned*) list,
-                                                         (unsigned*) link);
+                                                         (unsigned*) link, wait_abort_device_word());
     check("q80p_vhead_merge");
 }
 

@@ -56,5 +56,6 @@ private:
     std::vector<void*> allocs_;    // the device allocations holding them
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
+    int device_ = -1;
 };
 } // namespace basalt::core

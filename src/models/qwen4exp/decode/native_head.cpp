@@ -3,6 +3,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"
@@ -19,6 +20,7 @@
 namespace basalt::core {
 
 NativeHead::~NativeHead() {
+    const OnDevice on_device(device_);
     if (vproxy_) cudaFree(vproxy_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
@@ -95,6 +97,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
+        device_ = dev;
         // the verify head's 2-bit copy (packed by finish(); without it the exact head runs), held now with the rows
         if (type_ == 14 && basalt::kernels::q6k_vhead_supported((int) n_in, (int) n_out, 1)) {
             if (cudaMalloc(&vproxy_, basalt::kernels::q6k_vproxy_bytes(n_out)) != cudaSuccess) vproxy_ = nullptr;
@@ -109,6 +112,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
 
 bool NativeHead::finish(std::string& err) {
     if (!loaded()) return true;
+    const OnDevice on_device(device_);
     // a Q8_0 head in bit planes, rewritten in place: the same bytes per row, read by every kernel of this head
     if (type_ == 8 && basalt::kernels::q80p_supported(n_in_, 1)) {
         basalt::kernels::q80p_pack(weights_, n_out_, nullptr);
@@ -165,9 +169,15 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
-    if (hot_) cudaFree(hot_);
+    if (hot_) {
+        const OnDevice on_device(hot_device_);
+        cudaFree(hot_);
+    }
     if (host_) cudaFreeHost(host_);
-    else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
+    else if (dev_) {
+        const OnDevice on_device(dev_device_);
+        cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
+    }
 }
 
 bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, LoadPlan& reads, std::string& err) {
@@ -210,7 +220,8 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                 return false;
             }
             it.dev = d;
-            cudaGetDevice(&it.device);
+            if (cudaGetDevice(&it.device) != cudaSuccess) it.device = 0;
+            dev_device_ = it.device;
             reads.add(it);
             basalt::log::warn("basalt", "native embedding: cannot pin %llu MiB, kept in VRAM instead",
                          (unsigned long long) (bytes_ >> 20));

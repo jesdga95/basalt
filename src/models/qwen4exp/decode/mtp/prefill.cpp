@@ -46,7 +46,10 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (n > 0) {
         if (pf_cap_ < n * per_row) {
-            if (pf_dev_) cudaFree(pf_dev_);
+            if (pf_dev_) {
+                if (cs_) (void) cudaStreamSynchronize(cs_);
+                cudaFree(pf_dev_);
+            }
             pf_dev_ = nullptr;
             pf_cap_ = 0;
             if (cudaMalloc((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t)) != cudaSuccess) {
@@ -68,6 +71,15 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
             stp[i * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
         }
+        // Drain cs_ on any early error return before `rec` or caller-owned row buffers go out of scope.
+        bool synced = false;
+        struct SyncGuard {
+            cudaStream_t cs;
+            bool& synced;
+            ~SyncGuard() {
+                if (!synced && cs) (void) cudaStreamSynchronize(cs);
+            }
+        } sync_guard{cs_, synced};
         if (cudaMemcpyAsync(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "mtp prefill: the input records upload failed";
             return false;
@@ -104,6 +116,7 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
                 return false;
             }
         }
+        synced = true;
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
             return false;

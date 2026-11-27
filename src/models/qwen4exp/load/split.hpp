@@ -22,9 +22,10 @@ public:
     struct Open {
         const basalt::core::PackFiles* pack = nullptr;
         const std::vector<std::string>* native_shards = nullptr;
-        const std::set<std::string>* skip = nullptr;    ///< tensors no card loads
+        const std::set<std::string>* skip = nullptr;        ///< tensors no card loads
+        const std::set<std::string>* shared_blk = nullptr;  ///< blk.* tensors every card loads (e.g. PLE)
         const basalt::core::ModelGeometry* g = nullptr;
-        int64_t k = 0, max_context = 0;
+        int64_t k = 0, max_context = 0, n_sess = 1;
         std::function<uint64_t(size_t card)> room;      ///< per card: its free memory past its reserves
         std::vector<int64_t>* split_at = nullptr;       ///< out: each later stage's first layer
         std::vector<int>* split_devs = nullptr;         ///< out: each later stage's device
