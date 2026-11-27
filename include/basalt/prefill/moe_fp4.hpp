@@ -79,6 +79,8 @@ struct Product {
 /// k-tile (a multiple of 64) when the weight rows are 8-byte aligned or the product is `two` with w_rows a multiple of 256.
     const uint8_t* base = nullptr;
     size_t stride = 0;
+    /// In place of base + j * stride: expert j's blob at blobs[j] (device [n], blobs where a tier keeps them).
+    const unsigned long long* blobs = nullptr;
     const int32_t* blk_off = nullptr;
     int64_t blocks = 0;
     const int32_t* dst_ids = nullptr;

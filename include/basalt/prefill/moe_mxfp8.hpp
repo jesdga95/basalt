@@ -27,6 +27,7 @@ void quantize_f16(const uint16_t* x, int64_t rows, int64_t cols, int64_t ld, voi
 struct Product {
     const uint8_t* base = nullptr;      ///< expert 0's blob; expert j is at base + j * stride
     size_t stride = 0;
+    const unsigned long long* blobs = nullptr;   ///< in place of base + j * stride: expert j's blob at blobs[j] (device [n])
     size_t w_off = 0;
     int64_t w_rows = 0, w_cols = 0;     ///< w_rows a multiple of 128, w_cols a multiple of 128
     int n = 0;                          ///< number of experts (<= 1024)

@@ -357,8 +357,9 @@ struct GemmArgs {
     uint16_t* dst_f16;
     int64_t ld_dst;
     size_t tail_off;          // SWIGLU: the blob's {s_gate, s_up, s_down, -}
-    const uint8_t* base;      // FLAT: expert j's blob at base + j * stride, its blocks from blk_off
+    const uint8_t* base;      // FLAT: expert j's blob at base + j * stride (or blobs[j]), its blocks from blk_off
     size_t stride;
+    const unsigned long long* blobs;
     const int32_t* blk_off;
     int n;
     const int32_t* dst_ids;   // FLAT: output row r to dst row dst_ids[r] (null: r)
@@ -503,7 +504,7 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     const int nkt = (a.w_cols + kKTile - 1) / kKTile;   // weight k-tiles (TM activation k-tiles each); the last may be half
     const size_t row_bytes = (size_t) (a.w_cols / 64) * 36;
     const size_t tile_stride = (size_t) TM * nkt * kAStage;
-    const uint8_t* blob = FLAT ? a.base + (size_t) j * a.stride : a.blob[j];
+    const uint8_t* blob = !FLAT ? a.blob[j] : a.blobs ? (const uint8_t*) a.blobs[j] : a.base + (size_t) j * a.stride;
     const uint8_t* w_src = blob + a.w_off;
     const int64_t tile0 = GATHER ? 0 : a.tile_off[j] + kBlockTiles * tp;
     const uint8_t* a_src = GATHER ? nullptr : a.a4 + tile0 * (int64_t) tile_stride;
@@ -703,7 +704,7 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
     const int nkt = (a.w_cols + kKTile - 1) / kKTile;   // the last may be half
     const size_t row_bytes = (size_t) (a.w_cols / 64) * 36;
     const size_t tile_stride = (size_t) 2 * nkt * kAStage;
-    const uint8_t* blob = a.base + (size_t) j * a.stride;
+    const uint8_t* blob = a.blobs ? (const uint8_t*) a.blobs[j] : a.base + (size_t) j * a.stride;
     const uint8_t* w_src = blob + a.w_off;
     const int64_t tile0 = GATHER ? 0 : a.tile_off[j] + kBlockTiles * tp;
     const uint8_t* a_src = GATHER ? nullptr : a.a4 + tile0 * (int64_t) tile_stride;
@@ -954,7 +955,7 @@ template <bool GATHER, bool SWIGLU> void launch256(const GemmArgs& a, dim3 grid,
 }
 
 void run(const Product& p, void* stream) {
-    if (p.base) {   // a layer's experts in one launch
+    if (p.base || p.blobs) {   // a layer's experts in one launch
         if (p.n <= 0 || p.blocks <= 0) return;
         if ((p.ids != nullptr) != p.swiglu || !p.blk_off || (p.swiglu && !p.gelu && p.gate_softcap <= 0.0f)) {
             basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off, softcaps or the GELU, and token rows with the gate");
@@ -971,7 +972,7 @@ void run(const Product& p, void* stream) {
         a.gs = p.gs; a.bounds = p.bounds; a.tile_off = p.tile_off; a.ids = p.ids; a.dst = p.dst; a.dst_f16 = p.dst_f16; a.ld_dst = p.ld_dst;
         a.tail_off = p.tail_off;
         a.a4s = p.ids ? (const uint8_t*) p.a4 + (size_t) p.tokens * (size_t) ((p.two ? 2 : 1) * p.w_cols / 2) : nullptr;
-        a.base = p.base; a.stride = p.stride; a.blk_off = p.blk_off; a.n = p.n; a.dst_ids = p.dst_ids;
+        a.base = p.base; a.stride = p.stride; a.blobs = p.blobs; a.blk_off = p.blk_off; a.n = p.n; a.dst_ids = p.dst_ids;
         a.cg = p.gate_softcap; a.cu = p.up_softcap; a.gelu = p.gelu;
         const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) p.blocks, 1);
         if (p.two) {

@@ -159,6 +159,7 @@ __global__ void quantize_mxfp8_kernel(const T* __restrict__ x, int64_t rows, int
 
 struct GemmArgs {
     const uint8_t* base;
+    const unsigned long long* blobs;
     size_t stride, w_off;
     const uint8_t* a_codes;
     const uint8_t* a_scales;
@@ -227,7 +228,7 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     const int ntiles = min(kBlockTiles, (cnt - first + kTileTokens - 1) / kTileTokens);
     const int nkt = a.w_cols / kBK;
     const size_t row_bytes = (size_t) nkt * kBlockBytes;
-    const uint8_t* w_src = a.base + (size_t) j * a.stride + a.w_off;
+    const uint8_t* w_src = (a.blobs ? (const uint8_t*) a.blobs[j] : a.base + (size_t) j * a.stride) + a.w_off;
     const int brow0 = a.bounds[j] + first;
 
     if constexpr (GATHER) {
@@ -443,6 +444,7 @@ void run(const Product& p, void* stream) {
     }
     GemmArgs a{};
     a.base = p.base;
+    a.blobs = p.blobs;
     a.stride = p.stride;
     a.w_off = p.w_off;
     a.a_codes = static_cast<const uint8_t*>(p.act);
