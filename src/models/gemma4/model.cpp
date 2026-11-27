@@ -106,6 +106,9 @@ bool Gemma4Model::open_tier(const model::LoadRequest& req, uint64_t need, uint64
     const uint64_t left = free_b > need ? free_b - need : 0, all = 2 * (uint64_t) g.n_expert * room.slot;
     int64_t h = left > all && room.one_each > 2 * room.slot ? (int64_t) ((left - all) / (room.one_each - 2 * room.slot)) : 0;
     h = std::min<int64_t>(h, g.n_expert);
+    // an exact --expert-cache or the diagnostic's homes cap them as the tier does
+    if (req.expert_cache > 0) h = std::min<int64_t>(h, req.expert_cache / g.n_layers);
+    if (req.diag_tier_vram >= 0) h = std::min<int64_t>(h, req.diag_tier_vram);
     stage_experts_ = (int) (g.n_expert - h);
     stage_slot_ = room.slot;
     core::ExpertTierSpec s;
