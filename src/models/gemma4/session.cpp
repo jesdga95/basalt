@@ -593,8 +593,19 @@ public:
     }
     size_t cells_bytes_layer(int l) const { return (g_.shape(l).one ? 1 : 2) * (size_t) m_.context() * cell_bytes(l); }
 
-    // the experts are all on the card: every lookup is a hit
-    ExpertCounts expert_counts() const override { return {lookups_, lookups_, 0, 0}; }
+    // the tier's lookups when experts are off the card; else every lookup is a hit
+    ExpertCounts expert_counts() const override {
+        const core::ExpertTier* t = m_.tier();
+        if (t && m_.experts()->off_card()) return {t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
+        return {lookups_, lookups_, 0, 0};
+    }
+    std::vector<CardExperts> experts_by_card() const override {
+        const core::ExpertTier* t = m_.tier();
+        if (!t) return {};
+        std::vector<CardExperts> out;
+        for (const auto& c : t->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
 
 private:
     static model::Result stale() {
