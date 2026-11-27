@@ -1,0 +1,40 @@
+{
+  "submitter": "mmknet2025",
+  "date": "2026-11-27",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8"
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8"
+    }
+  ],
+  "ram_gib": 60,
+  "cpu": "AMD Ryzen 7 9700X, 8 cores",
+  "ram_gbps": 56.9,
+  "os": "Linux",
+  "quant": "IQ3_XXS",
+  "kv": "int8",
+  "prefill_16k_tps": 1706.8,
+  "prefill_64k_tps": 3632.1,
+  "decode_tps": 193.8,
+  "decode_conv_tps": 135.0,
+  "decode_struct_tps": 235.1,
+  "decode_prose_tps": 112.9,
+  "accept_conv_pct": 69.0,
+  "accept_struct_pct": 94.4,
+  "accept_prose_pct": 61.7,
+  "draft_len_conv": 2.6,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 1.8,
+  "engine_args": "--gpu 0,1 --gpu-mode peer --gpu-share 1,1 --max-context 66661 --kv int8"
+}

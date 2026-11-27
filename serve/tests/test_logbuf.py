@@ -25,6 +25,13 @@ class Levels(unittest.TestCase):
                                    "basalt-bench: warning: NVML is unavailable"),
                          ["info", "warn", "err", "err", "info", "warn"])
 
+    def test_a_stamp_before_the_line_changes_nothing(self):
+        self.assertEqual(self.read("11-26 09:15:02 basalt serve: warning: low", "11-26 09:15:03 basalt serve: ready",
+                                   "11-26 09:15:04 Traceback (most recent call last):", "11-26 09:15:04   File x", "11-26 09:15:04 ValueError: x", "11-26 09:15:05 basalt serve: ready"),
+                         ["warn", "info", "err", "err", "err", "info"])
+        e = engine_line("11-26 09:15:02 basalt serve: warning: low")
+        self.assertEqual((e.tag, e.level, e.text), ("basalt serve", "warn", "low"))
+
     def test_older_engine_markers(self):
         self.assertEqual(self.read("basalt error: boom", "basalt warning: slow disk"), ["err", "warn"])
 

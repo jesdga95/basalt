@@ -111,7 +111,17 @@ public:
     virtual void between_requests(const std::string& line) = 0;
     virtual Flow run_request() = 0;
     virtual void solo_draft_back(bool) {}
-    virtual bool capture_admit(uint64_t need, uint64_t floor) = 0;
+    /// Whether a capture or a read of `need` bytes of RAM may go ahead: only while the RAM guard reads its level as ok,
+    /// and with `floor` left free after it (the disk tier's floor sits above the guard's). `verdict` gets the check
+    /// that decided and the host RAM available at that instant.
+    bool capture_admit(uint64_t need, uint64_t floor, basalt::core::Admission* verdict = nullptr);
+    /// The refusal of a capture of `tokens` tokens (a snapshot of `snapshot_bytes`): counted, and said in the log once
+    /// per episode, at warn level, while admission stays closed. `what` names the step ("parking", "disk write").
+    void refuse_parking(const basalt::core::Admission& why, const char* what, size_t tokens, uint64_t snapshot_bytes);
+    /// A capture was admitted: an episode of refusals ends, with one summary line.
+    void parking_admitted();
+    /// capture_admit, then refuse_parking or parking_admitted by its verdict.
+    bool admit_parking(uint64_t need, uint64_t floor, const char* what, size_t tokens, uint64_t snapshot_bytes);
     virtual bool park_current(size_t held, int64_t kept) = 0;
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
     /// Waits for the checkpoint save still on its way to the host, if any; a save that failed drops its checkpoint.  Every
@@ -194,6 +204,7 @@ public:
     uint64_t check_clock{};
     bool cvec_cached{};
     std::optional<basalt::core::ConversationCache> conversations;
+    basalt::core::RefusalEpisodes parking_refusals;
     // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
     // and a prompt that starts with a stored conversation reads it back, after a restart too
     basalt::core::ConversationStore disk{};

@@ -50,13 +50,6 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     return basalt::core::conversation_store_hash_file(o.model, h);
 }
 
-// A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
-// guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
-bool QfnRuntime::capture_admit(uint64_t need, uint64_t floor) {
-    return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
-           basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
-}
-
 // Save only on a switch/rewind, not on each continuing request. No graph
 // addresses change: all parked images live in ordinary host vectors.
 // `kept`: the tokens of the outgoing conversation the session goes on holding (the request continues from its
@@ -160,9 +153,8 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
                                                   disk.enabled() ? disk_floor : 0);
         const size_t retained = reuse.bytes() + stage_retained;
         const size_t additional = estimate > retained ? estimate - retained : 0;
-        if (!capture_admit(additional, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable, or RAM below the guard)",
-                         additional >> 20, (long long) o.conversation_cache_min_free_mib);
+        if (basalt::core::Admission why; !capture_admit(additional, floor, &why)) {
+            refuse_parking(why, "parking", live.size(), estimate);
             return true;
         }
         basalt::core::SavedConversation image;
@@ -184,10 +176,11 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
                 return false;
             image.stage_images.push_back(std::move(part));
         }
-        if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), 0, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)");
+        if (basalt::core::Admission why; !capture_admit(0, floor, &why)) {
+            refuse_parking(why, "parking (after the capture)", live.size(), image.bytes());
             return true;
         }
+        parking_admitted();
         const size_t snapshot_bytes = image.bytes();
         const bool stored = to_disk ? disk.put(std::move(image), kDiskQueueCap)
                                     : conversations->put(std::move(image), held);
@@ -281,11 +274,7 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
             return;
         }
         if (at_exit) disk.flush();   // one image in RAM at a time
-        if (!capture_admit(bytes, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
-                              "admission)", ids.size());
-            return;
-        }
+        if (!admit_parking(bytes, floor, "disk write", ids.size(), bytes)) return;
         try {
             const auto t0 = Clock::now();
             basalt::core::SavedConversation image;

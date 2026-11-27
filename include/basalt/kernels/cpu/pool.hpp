@@ -104,6 +104,31 @@ public:
     /// experts runs whole in start. `jobs` and their buffers stay untouched until finish returns.
     void start_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     void finish_split_multi_native();
+
+    /// Pins worker i to the logical processors of `groups[i % groups.size()]` (one L3 cache each, platform::cpu_l3_groups)
+    /// and from then on cuts each native batch's rows into one contiguous range per group (group_rows): a worker takes the
+    /// tasks of its own group's range first and then the others', so what a group read into its L3 before the batch
+    /// (warming the same ranges between batches) is read from there. A down task whose expert's gate/up rows are not done
+    /// runs gate/up tasks of any group meanwhile, so no group waits on another group's unclaimed work. False, with
+    /// nothing changed, unless 2..kMaxGroups groups and at least as many workers (and on Windows).
+    bool split_by_groups(const std::vector<std::vector<int>>& groups);
+    static constexpr int kMaxGroups = 4;
+    int groups() const { return n_groups_; }
+    /// The group of the processor the calling thread runs on (0 without split_by_groups).
+    int group_here() const;
+    /// Warming (with split_by_groups): byte ranges read into the caches of the group that computes them, by the parked
+    /// workers, until the next batch. warm_clear empties the list, warm_expert adds each group's rows of an expert's blob
+    /// (its gate and up rows, then its down rows: the way a batch reads them), warm_start runs the list (again after a
+    /// batch: on from where it stopped), warm_stop ends the work. One thread drives them, the one that runs the batches.
+    void warm_clear();
+    void warm_expert(const NativeFmt& f, const uint8_t* blob);
+    void warm_start();
+    void warm_stop() { idle_stop(); }
+    /// Rows [lo, hi) of `rows` that group g of `groups` takes.
+    static void group_rows(int g, int groups, int rows, int& lo, int& hi) {
+        lo = (int) ((int64_t) rows * g / groups);
+        hi = (int) ((int64_t) rows * (g + 1) / groups);
+    }
     static constexpr int kMaxSplitMulti = 96;
     /// Row-range tasks per thread in each phase of the multi-token paths.  The cores differ in speed, so a thread
     /// that finishes early claims another: the more and smaller the tasks, the shorter the wait for the slowest one
@@ -156,6 +181,15 @@ private:
     void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
+    /// claim() on `head`, and only an index below `limit`.
+    static int claim_from(std::atomic<uint64_t>& head, uint32_t epoch, uint32_t limit);
+    /// The grouped native batch (mode 9): `id` >= 0 a worker, -1 the host thread.
+    void drain_groups(int id, uint32_t epoch);
+    /// Task i of group g's list: its gate/up parts of every expert, then its down parts.
+    void run_group_task(int g, int i, uint32_t epoch);
+    /// Before a down part of expert e: gate/up tasks of any group until e's intermediate is ready, then its `down_bytes`
+    /// of down rows at `down` into the cache (prefetch_until_ready).
+    void help_until_ready(int e, uint32_t epoch, const uint8_t* down, size_t down_bytes);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
     uint32_t begin_batch(int n);
     /// The host's waits, bounded by `kStall`.
@@ -218,6 +252,26 @@ private:
         std::atomic<int> ready{0};
     };
     std::unique_ptr<FusedExpert[]> fused_;
+    // split_by_groups: the groups, each worker's, each logical processor's (-1: none), and per group the head of its
+    // task list (epoch << 32 | tasks << 16 | next index); the gate/up and down parts per expert in each list
+    int n_groups_ = 0;
+    std::vector<int> worker_group_, cpu_group_;
+    struct alignas(64) GroupHead {
+        std::atomic<uint64_t> h{0};
+    };
+    GroupHead ghead_[kMaxGroups];
+    int group_gu_parts_ = 1, group_d_parts_ = 1, group_tail_ = 1;
+    /// part_row over `rows` rows with `tail` quarter-size parts at the end.
+    static int part_row_tail(int part, int parts, int rows, int tail);
+    // warming: per group its byte spans in the order they are read and the next one to claim
+    struct WarmSpan {
+        const uint8_t* p;
+        uint32_t n;
+    };
+    std::vector<WarmSpan> warm_[kMaxGroups];
+    std::atomic<int> warm_next_[kMaxGroups] = {};
+    mutable std::atomic<uint64_t> warm_sink_{0};
+    static void warm_work(void* ctx, int worker, int workers, const std::atomic<bool>& stop);
     int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1, fused_tail_ = 1;
     /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
     /// `fused_tail_` quarter-size ones.

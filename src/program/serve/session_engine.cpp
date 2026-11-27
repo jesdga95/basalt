@@ -201,10 +201,8 @@ public:
             if (at_exit) disk.flush();   // one image in RAM at a time
             const int64_t positions = (int64_t) ids.size();
             if (!disk.fits(session().running_bytes() + session().cells_bytes(positions))) return;   // no copy the writer drops
-            if (!capture_admit(session().running_bytes() + session().cells_bytes(positions), floor)) {
-                basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM admission)", ids.size());
-                return;
-            }
+            const uint64_t snapshot = session().running_bytes() + session().cells_bytes(positions);
+            if (!admit_parking(snapshot, floor, "disk write", ids.size(), snapshot)) return;
             basalt::core::SavedConversation image;
             std::string se;
             if (!capture(image, ids, imgs, cks, cvec, se)) {
@@ -256,10 +254,6 @@ public:
         if (!out.empty()) out[0].kv_bytes = kv;
         return out;
     }
-    bool capture_admit(uint64_t need, uint64_t floor) override {
-        return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
-               basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
-    }
     /// The session's conversation as an image: its running state and its positional state by layer.
     bool capture(basalt::core::SavedConversation& image, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
                  const std::vector<ConvCheckpoint>& cks, bool cvec, std::string& e) {
@@ -297,10 +291,7 @@ public:
         if (to_disk && !disk.fits(estimate)) return true;   // a full disk: no copy off the card that the writer drops
         if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
         const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk.enabled() ? disk_floor : 0);
-        if (!capture_admit(estimate, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %zu tokens not parked (physical RAM admission)", live.size());
-            return true;
-        }
+        if (!admit_parking(estimate, floor, "parking", live.size(), estimate)) return true;
         basalt::core::SavedConversation image;
         if (!capture(image, live, live_imgs, checks, cvec_cached, err)) return false;
         (void) (to_disk ? disk.put(std::move(image), kDiskQueueCap) : conversations->put(std::move(image), held));
