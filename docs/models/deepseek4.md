@@ -7,17 +7,27 @@ The target pack is the DeepSeek-V4-Flash-Vision-Exp checkpoint derived from V4-F
 uses MXFP4 routed experts and Q8_0 for source FP8 linears, so it is not a BF16 0731 reference.
 
 The converter, pack validation, serving dialect, model-local CUDA primitives, and C++ metadata adapter exist. The adapter
-selects the pack's `joyai-llm` tokenizer, V4 token names, image pad, DSML grammar, and one-GPU mode; its metadata test and
-real-pack validation pass. `ModelWeights` now queues the pack's dense tensors in the start's `LoadPlan`, widens the BF16
-router gate to F32, and leaves token embeddings and hash routes file-backed; a real-pack GPU test validates that plan.
+selects the pack's `joyai-llm` tokenizer, V4 token names, image pad, DSML grammar, and one-GPU mode. The regular
+`DeepSeek-V4-Flash-Vision-Exp.basalt` fails pack validation because it lacks `hc_head_fn.weight`; the separately generated
+`-hchead.basalt` includes the three checkpoint-sourced head tensors and passes Basalt's pack test and source-GGUF byte
+verification. Keep the original pack unchanged. `ModelWeights` queues dense tensors in the start's `LoadPlan`, widens the
+BF16 router gate to F32 and leaves token embeddings and hash routes file-backed. Its layer views bind validated attention,
+router, shared-expert, and output-head tensors.
 MXFP4 grouped experts now accept gate/up as well as down tensors, with Basalt's grouped parity suite covering synthetic
 and double-reference V4-shaped cases. The pack reader can fetch validated BF16 token-embedding rows from the GGUF section
-on demand. The engine does not yet register `deepseek4` as loadable: there is no `LoadedModel`, `ModelSession`, or full
-transformer forward. The final BF16 RMSNorm and logits projection stage is implemented and verified against the real output head, but
-is not yet connected to a session.
-The CPU image planner and patch formatter exist, but the vision transformer/projector execution is not integrated into a
-Basalt session. The attention stage now accepts decode windows of up to eight rows and matches sequential one-row output and
-cache state bitwise. Do not describe this pack as runnable until text decode, image prefill, and serving tests pass.
+on demand. The indexer query projection now consumes the converted Q8_0 matrix. Its V4-shaped Q8_0/Q8_1
+matvec matches the CPU double reference with max absolute error 2.24e-8 and relative RMS 1.13e-7; batched
+rows match single-row calls bitwise. On the RTX 5090 at a 475 W power limit, the V4-shaped synthetic two-row
+projection takes 17.52 us and moves 9.48 MB (541.1 GB/s). A `LoadedModel` and single-session text forward are wired into the
+adapter. On the RTX 5090 at 475 W, Basalt loaded the `-hchead` pack with `--resident-budget-gib 32` and generated token 67
+from token ID 1. The default all-RAM tier exhausted VRAM during its post-pin allocation check; the 32 GiB resident budget
+left 160 experts per layer file-backed. This is a bring-up smoke only, not a quality or performance result.
+
+The session currently supports one conversation and positions 0–127. It does not yet maintain the V4 compressed/indexer
+cache, so longer requests are refused. The vision planner, patch formatter, and transformer/projector encoder exist, but
+image encoding is not connected to the session or dynamic memory give-back. The attention primitive accepts windows up to
+eight rows and matches sequential one-row output/cache state bitwise; this does not yet establish session window parity.
+Do not describe the model as production-ready until cache, image prefill, serving, and quality gates pass.
 
 ## Architecture and ownership
 
@@ -36,7 +46,7 @@ cache state bitwise. Do not describe this pack as runnable until text decode, im
   `src/models/deepseek4/` unless another model can use the exact same tensor contract.
 - `src/program/tokenizer/pretok_joyai.cpp` implements the pack's `tokenizer.ggml.pre=joyai-llm` boundaries. The
   DeepSeek4 wrapper and the existing DeepSeek4.1 wrapper share this tokenizer; `ds4_tokenizer_test` covers its numeric,
-  CJK, and text splits. The adapter still needs to connect it to the pack tokenizer metadata.
+  CJK, and text splits. The adapter exposes the JoyAI pretokenizer and `tokenizer.ggml.tokens` metadata to the shared loader.
 - `serve/models/deepseek4.py` owns prompt rendering, image placeholders, stop/reasoning/tool parsing. Shared `serve/`
   code remains architecture-agnostic.
 
@@ -47,6 +57,11 @@ Text weights are read from the pack into the GPU or RAM/file-backed expert tiers
 KV/sliding-window rows, compressed attention rows, index keys, mHC state, prefill/decode scratch, and position state;
 `core::ElasticArray` should grow those caches on demand and participate in cell save/restore. Model-shared tier and batch
 state must not be duplicated per session.
+
+The per-layer RoPE builder follows the source model: ratio-zero layers use the plain `rope_base`, while ratio-4 and
+ratio-128 layers use `comp_rope_base` with the checkpoint's YaRN frequency interpolation. The source applies unit-magnitude
+complex phases, so the table has no additional YaRN magnitude correction. `ds4_rope_test` checks both schedules against the
+source formula.
 
 Implement one correct token path first, then chunked prefill through the same layer semantics. Each layer must follow the
 checkpoint's ordering: hyper-connection expansion, indexer/compressor work where scheduled, latent attention and output
