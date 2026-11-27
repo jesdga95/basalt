@@ -3,6 +3,7 @@
 #include "basalt/kernels/doorbell.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "prep.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -299,9 +300,13 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         const float f = which == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
         float scale[2] = {};
         const int64_t cell = p % a.cap;
-        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
+        const size_t row_bytes = (size_t) kv_cache_row_bytes(a.fp8, a.int8, a.nvfp4);
         void* cache = which ? a.v_cache : a.k_cache;
-        if (a.int8) {
+        if (a.nvfp4) {
+            float val[4] = {val0, val1, val2, val3};
+            void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;
+            prep::store_kv_nvfp4(row, val, f, which == 0, lane);
+        } else if (a.int8) {
             float val[4] = {val0, val1, val2, val3};
             int8_scales(val, f, lane, scale);
             void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;
@@ -324,8 +329,10 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         ss = fmaf(q3, q3, ss);
         ss = warp_sum(ss);
         const float f = fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) * tau;
+        float qf[4] = {__fmul_rn(q0, f), __fmul_rn(q1, f), __fmul_rn(q2, f), __fmul_rn(q3, f)};
+        if (a.nvfp4) prep::hadamard128_warp(qf, lane);
         *reinterpret_cast<float4*>(a.q + ((size_t) r * kHeads + h) * kHeadDim + i) =
-            make_float4(q0 * f, q1 * f, q2 * f, q3 * f);
+            make_float4(qf[0], qf[1], qf[2], qf[3]);
         // the relative state: 16 values, lanes 0..15
         const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * a.r_scale[h * kRel + lane] : 0.f;
         const float rs = warp_sum(rv * rv);

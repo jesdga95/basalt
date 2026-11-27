@@ -93,6 +93,7 @@ public:
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
     bool cache_int8() const { return int8_; }
+    bool cache_nvfp4() const { return nvfp4_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests
     /// and windows, so nothing reads the experts while it holds their memory (lend_room).
     ImageEncoder& encoder() const { return vis_; }
@@ -267,7 +268,7 @@ private:
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
     int ldev_ = 0;                           ///< the card the weights being planned load to
-    bool fp8_ = false, int8_ = false;
+    bool fp8_ = false, int8_ = false, nvfp4_ = false;
     int64_t ctx_ = kDefaultContext;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
@@ -362,7 +363,8 @@ std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::stri
 
 /// The device bytes a session takes for `context` positions in the selected KV cache format, its drafter aside, on card
 /// `card` of a split at `cut` (0: one card, every visit).
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut = 0, int card = 0);
+uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, bool nvfp4 = false, int cut = 0, int card = 0);
+
 /// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
 /// first card's).
 uint64_t shared_bytes(const Geometry& g, bool drafter);

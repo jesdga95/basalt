@@ -3,6 +3,7 @@
 // row (warps 0 and 1), and its three query heads' clipped queries, relative states and sinks (warps 2 and 3).
 #pragma once
 
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -174,6 +175,54 @@ __device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t 
     }
 }
 
+// Normalized 128-point Walsh-Hadamard transform over one warp (lane l holds channels 4*l..4*l+3).
+// Orthonormal and its own inverse; zero shared memory, 5 warp shuffles.
+__device__ __forceinline__ void hadamard128_warp(float (&v)[4], int lane) {
+    const float a0 = __fadd_rn(v[0], v[1]), a1 = __fsub_rn(v[0], v[1]);
+    const float a2 = __fadd_rn(v[2], v[3]), a3 = __fsub_rn(v[2], v[3]);
+    v[0] = __fadd_rn(a0, a2);
+    v[2] = __fsub_rn(a0, a2);
+    v[1] = __fadd_rn(a1, a3);
+    v[3] = __fsub_rn(a1, a3);
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const bool hi = (lane & off) != 0;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float other = __shfl_xor_sync(0xffffffffu, v[u], off);
+            v[u] = hi ? __fsub_rn(other, v[u]) : __fadd_rn(v[u], other);
+        }
+    }
+    constexpr float kInvSqrt128 = 0.08838834764831845f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) v[u] = __fmul_rn(v[u], kInvSqrt128);
+}
+
+// Store a 128-channel head row in NVFP4 (64 code bytes, 8 E4M3 scale bytes, 8 zero padding bytes).
+// Keys are turned by the normalized 128-point Hadamard transform; values are stored directly.
+__device__ __forceinline__ void store_kv_nvfp4(void* row, const float (&val)[4], float f, bool is_key, int lane) {
+    float v[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) v[u] = __fmul_rn(val[u], f);
+    if (is_key) hadamard128_warp(v, lane);
+    float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const uint32_t sc_byte = basalt::kernels::kv4_group_scale(amax);
+    const float s = basalt::kernels::kv4_e4m3_value(sc_byte);
+    const uint32_t c0 = basalt::kernels::kv4_group_code(v[0], s);
+    const uint32_t c1 = basalt::kernels::kv4_group_code(v[1], s);
+    const uint32_t c2 = basalt::kernels::kv4_group_code(v[2], s);
+    const uint32_t c3 = basalt::kernels::kv4_group_code(v[3], s);
+    const uint16_t packed = (uint16_t) ((c0 | (c1 << 4)) | ((c2 | (c3 << 4)) << 8));
+    reinterpret_cast<uint16_t*>(row)[lane] = packed;
+    if ((lane & 3) == 0) static_cast<uint8_t*>(row)[kHeadDim / 2 + (lane >> 2)] = (uint8_t) sc_byte;
+    if (lane == 0) {
+        for (int b = kHeadDim / 2 + kHeadDim / 16; b < kKvNvfp4RowBytes; b += 4)
+            *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + b) = 0u;
+    }
+}
+
 // Warps 2 and 3 of head g for row r at position p: the clipped (and scaled) queries of heads 3g..3g+2 into q3
 // [3][kHeadDim], warp 3 also their relative states into r3 [3][kRel] and their sinks into s3 [3]. Every projection value a
 // warp takes is loaded before its first sum, so the warp waits for one memory trip, not one a head.
@@ -206,7 +255,9 @@ __device__ __forceinline__ void q_heads(const AttnPrep& a, int r, int p, int g, 
         }
         ss = warp_sum(ss);
         const float f = fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) * tau;
-        *reinterpret_cast<float4*>(q3 + (h - g * 3) * kHeadDim + lane * 4) = make_float4(q[0] * f, q[1] * f, q[2] * f, q[3] * f);
+        float qf[4] = {__fmul_rn(q[0], f), __fmul_rn(q[1], f), __fmul_rn(q[2], f), __fmul_rn(q[3], f)};
+        if (a.nvfp4) hadamard128_warp(qf, lane);
+        *reinterpret_cast<float4*>(q3 + (h - g * 3) * kHeadDim + lane * 4) = make_float4(qf[0], qf[1], qf[2], qf[3]);
     }
     if (w == 3) {
 #pragma unroll
