@@ -44,6 +44,7 @@ struct CommonOptions {
     int expert_cache = 0;
     /// Multi-GPU: the VRAM a card after the main one leaves free
     int peer_reserve_mib = 600;
+    bool no_peer_access = false;  ///< --no-peer-access: leave CUDA peer access off, so card-to-card copies go through host
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
     /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)

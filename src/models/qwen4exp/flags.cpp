@@ -111,6 +111,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     }
     else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(args.next("--adapt-swaps"));
     else if (a == "--peer-exclusive") { o.peer_exclusive = true; o.peer_exclusive_given = true; }
+    else if (a == "--no-peer-exclusive") { o.peer_exclusive = false; o.peer_exclusive_given = true; }
     else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(args.next("--peer-adapt-swaps"));
     else if (a == "--expert-profile-save") o.expert_profile_save = args.next("--expert-profile-save");
     else if (a == "--expert-profile-save-every")
