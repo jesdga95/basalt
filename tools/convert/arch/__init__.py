@@ -24,6 +24,11 @@ class Arch:
     not_in_dense: frozenset = frozenset()
     # tensor name -> section that holds it alone (2 MiB aligned); such tensors are left out of `gguf`
     own_sections: dict[str, str] = {}
+
+    def own_section_bytes(self, name, tensor):
+        """Bytes of a tensor that gets a section of its own (default: the GGUF block geometry)."""
+        return tensor.expected_bytes()
+
     # drafter, hc8 and vision sections
     side_sections = True
     # only the vision projector section (vision/mmproj), written when --mmproj is given

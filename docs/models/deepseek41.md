@@ -17,7 +17,8 @@ python3 tools/convert/convert.py --gguf DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-0000
 ```
 
 An NVFP4 pack, `DeepSeek-V4.1-Flash-1017-NVFP4` (about 428 GB), is built from NVIDIA's NVFP4 checkpoint: NVFP4 routed
-experts, the FP8 projections as Q8_0, the MXFP4 Engram table ([how](../model-file.md#deepseek-nvfp4-pack)). It is meant for
+experts, the FP8 projections as Q8_0, the MXFP4 Engram table (a UD set's Engram may be IQ4_NL, Q5_K, Q6_K, MXFP4 or
+MXFP8; [how](../model-file.md#deepseek-nvfp4-pack)). It is meant for
 machines whose RAM holds most of its experts (about 320 GB or more); with less, most experts are read from the SSD and decode
 is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W + 180 W).
 

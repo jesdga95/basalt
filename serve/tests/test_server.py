@@ -2977,6 +2977,76 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(order, ["vision", "engine"])             # the encoder first, as at a start
         self.assertTrue(self.svc.vision.alive())
 
+    def test_crashed_vision_sidecar_restarts_for_next_image(self):
+        td = Path(tempfile.mkdtemp(prefix="basalt-vision-recover-"))
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+
+        class CrashingSidecar:
+            running = True
+            restarts = 0
+            failed_once = False
+
+            def alive(self):
+                return self.running
+
+            def read(self, sources, allowed=None):
+                return [b"png" for _ in sources]
+
+            def encode(self, datas):
+                if not self.running:
+                    raise ValueError("the image could not be read: the vision encoder stopped")
+                if not self.failed_once:
+                    self.failed_once = True
+                    self.running = False
+                    raise ValueError("the image could not be read: the vision encoder stopped")
+                out = td / "ok.sve"
+                out.write_bytes(b"SVE1")
+                return out, [4 for _ in datas]
+
+            def restart(self):
+                self.restarts += 1
+                self.running = True
+
+        self.svc.vision = CrashingSidecar()
+        # Engine is already loaded and holding VRAM; restarting only the vision sidecar must not trip
+        # min_free_vram_mib or re-run before_load.
+        mark = td / "before_load_ran"
+        self.svc.before_load = [sys.executable, "-c", f"open({str(mark)!r}, 'w').close()"]
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 500
+        img_req = {
+            "model": "basalt",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": "describe"},
+            ]}],
+        }
+        s1, b1 = self.req("/v1/chat/completions", img_req)
+        self.assertEqual(s1, 400, b1)
+        self.assertIn("the vision encoder stopped", b1["error"]["message"])
+        self.assertFalse(self.svc.vision.alive())
+
+        s2, b2 = self.req("/v1/chat/completions", img_req)
+        self.assertEqual(s2, 200, b2)
+        self.assertEqual(self.svc.vision.restarts, 1)
+        self.assertEqual(self.engine.starts, 0)
+        self.assertFalse(mark.exists())
+        self.assertTrue(self.svc.vision.alive())
+
+        # A request that already passed load() before the sidecar died still restarts it inside _encode_media().
+        self.svc.vision.running = False
+        ids, _, _ = self.svc.prepare(
+            [{"role": "user", "content": [
+                {"type": "image", "source": "data:image/png;base64,AA=="},
+                {"type": "text", "text": "describe"},
+            ]}],
+            None, {}, 32,
+        )
+        self.assertTrue(ids)
+        self.assertEqual(self.svc.vision.restarts, 2)
+        self.assertFalse(mark.exists())
+        self.assertTrue(self.svc.vision.alive())
+
     def test_off_by_default(self):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)

@@ -1134,6 +1134,21 @@ struct SchemaConverter::Impl {
         for (const SchemaNode* b : other_branches) {
             if (b->kind == SchemaNode::Const) return visit(*b, name);
         }
+        // integer and number branches intersect to an integer under the tightest bounds
+        bool numeric = true, any_int = false;
+        for (const SchemaNode* b : other_branches) {
+            numeric = numeric && (b->kind == SchemaNode::Integer || b->kind == SchemaNode::Number);
+            any_int = any_int || b->kind == SchemaNode::Integer;
+        }
+        if (numeric && any_int) {
+            SchemaNode merged;
+            merged.kind = SchemaNode::Integer;
+            for (const SchemaNode* b : other_branches) {
+                if (b->minimum > merged.minimum) merged.minimum = b->minimum;
+                if (b->maximum < merged.maximum) merged.maximum = b->maximum;
+            }
+            return visit(merged, name);
+        }
         const SchemaNode::Kind first_kind = other_branches[0]->kind;
         bool same_kind = true;
         for (const SchemaNode* b : other_branches) {
@@ -1152,15 +1167,6 @@ struct SchemaConverter::Impl {
                     if (b->format != SchemaNode::FormatNone && merged.format == SchemaNode::FormatNone) {
                         merged.format = b->format;
                     }
-                }
-                return visit(merged, name);
-            }
-            if (first_kind == SchemaNode::Integer) {
-                SchemaNode merged;
-                merged.kind = SchemaNode::Integer;
-                for (const SchemaNode* b : other_branches) {
-                    if (b->minimum > merged.minimum) merged.minimum = b->minimum;
-                    if (b->maximum < merged.maximum) merged.maximum = b->maximum;
                 }
                 return visit(merged, name);
             }

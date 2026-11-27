@@ -418,7 +418,8 @@ def convert(a) -> None:
     err = None
     try:
         print("reading the source GGUFs ...", flush=True)
-        model = S.SourceModel(paths, frozenset(arch.own_sections) if base is not None else frozenset())
+        model = S.SourceModel(paths, frozenset(arch.own_sections) if base is not None else frozenset(),
+                              size_of=lambda name, t: arch.own_section_bytes(name, t))
         kv, tensors = source_tensors(model, arch.own_sections)
         own = {n: model.where[n][1] for n in arch.own_sections if n in model.where}
         if not arch.side_sections:
@@ -485,7 +486,7 @@ def convert(a) -> None:
             for name, section in arch.own_sections.items():
                 t = own[name]
                 if name in model.short:   # its shard stops after the header: the same tensor's section in the base
-                    size = t.expected_bytes()
+                    size = arch.own_section_bytes(name, t)
                     bt = base_meta.get("tensors", {}).get(name, {})
                     if (bt.get("section"), bt.get("type_id"), bt.get("shape"), bt.get("bytes")) != \
                             (section, t.type_id, [int(d) for d in t.shape], size) or section not in base.sections:
@@ -496,7 +497,22 @@ def convert(a) -> None:
                         die(f"section {section}: the copy's SHA-256 differs from {a.sections_from}'s")
                     copied.append(section)
                 else:
-                    src, off, size = model.abs_range(name)
+                    src, off, _ = model.abs_range(name)
+                    size = arch.own_section_bytes(name, t)
+                    # Bound the copy by the nearest tensor that starts after it in the shard (the directory lists
+                    # tensors in name order, not offset order); the last tensor is bounded by the end of the file
+                    # (its own directory offset is all the shard tells us of it).
+                    g = model.where[name][0]
+                    after = [x.offset for x in g.tensors if x.offset > t.offset]
+                    if after:
+                        limit = g.data_start + min(after) - off
+                        if size > limit:
+                            die(f"{name}: its shard holds {limit} bytes from its offset before the next tensor, "
+                                f"the section needs {size}")
+                    else:
+                        avail = Path(src).stat().st_size - off
+                        if size > avail:
+                            die(f"{name}: its shard holds {avail} bytes from its offset, the section needs {size}")
                     job.file(section, src, off, size)
                 own_entries[name] = {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
                                      "bytes": size, "offset": 0, "section": section}
@@ -931,7 +947,11 @@ def main():
         if not a.gguf or a.out or a.sections_from or a.checkpoint or a.dspark or a.dflash2:
             ap.error("--verify takes --gguf and nothing else")
         import verify_pack
-        sys.exit(0 if verify_pack.verify(a.verify, a.gguf, a.workers) else 1)
+        try:
+            ok = verify_pack.verify(a.verify, a.gguf, a.workers)
+        except S.ConvertError as e:
+            die(str(e))
+        sys.exit(0 if ok else 1)
     if not a.out:
         ap.error("--out is required")
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):

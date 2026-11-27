@@ -106,7 +106,7 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, bool ple_ram, 
         // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
         if (ple_ram) {
             if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false)) return false;
-        } else if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) {
+        } else if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes)) {
             return false;
         }
     }

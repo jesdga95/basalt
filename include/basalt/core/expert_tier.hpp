@@ -227,7 +227,7 @@ public:
     /// second card, core::policy::peer_bus_count of them cross its own link into its scratch slots instead (`peer`, marked
     /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
     /// makes `main` wait for them.
-    int fetch(int layer, Lookup& lk);
+    int fetch(int layer, Lookup& lk, const Use* use = nullptr);
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
     /// VRAM tier (side stream, off the token path, in pieces).
