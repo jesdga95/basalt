@@ -125,5 +125,47 @@ class UnionParameters(unittest.TestCase):
             self.assertEqual(json.loads(streamed), {"name": "123", "every": 8}, step)
 
 
+class RepeatedNonStringParameters(unittest.TestCase):
+    """A repeated non-string <parameter=X> closes at the first </parameter> instead of merging into a string (#523)."""
+
+    SCHEMA = {"name": "Edit", "parameters": {"type": "object", "properties": {
+        "file_path": {"type": "string"}, "old_string": {"type": "string"},
+        "new_string": {"type": "string"}, "replace_all": {"type": "boolean"},
+        "count": {"type": "integer"}}}}
+
+    def test_repeated_boolean_and_integer(self):
+        body = ("<function=Edit>\n<parameter=file_path>\n/tmp/a.v\n</parameter>\n"
+                "<parameter=old_string>\nx\n</parameter>\n<parameter=new_string>\ny\n</parameter>\n"
+                "<parameter=replace_all>\nfalse\n</parameter>\n"
+                "<parameter=replace_all>\nfalse\n</parameter>\n"
+                "<parameter=count>\n3\n</parameter>\n"
+                "<parameter=count>\n3\n</parameter>\n</function>")
+        args = parse_tool_call(body, self.SCHEMA).arguments
+        self.assertEqual(args, {"file_path": "/tmp/a.v", "old_string": "x", "new_string": "y",
+                                "replace_all": False, "count": 3})
+        self.assertIs(args["replace_all"], False)
+
+    def test_streamed_repeated_boolean(self):
+        text = ("<tool_call>\n<function=Edit>\n<parameter=file_path>\n/tmp/a.v\n</parameter>\n"
+                "<parameter=replace_all>\nfalse\n</parameter>\n"
+                "<parameter=replace_all>\nfalse\n</parameter>\n</function>\n</tool_call>")
+        for step in (1, 7, len(text)):
+            p = OutputParser(thinking=False, tools=[self.SCHEMA], stream_tools=True)
+            events = []
+            for i in range(0, len(text), step):
+                events += p.feed(text[i:i + step])
+            events += p.finish()
+            streamed = "".join(e.text for e in events if e.kind == "tool_args")
+            parsed = json.loads(streamed)
+            self.assertEqual(parsed, {"file_path": "/tmp/a.v", "replace_all": False}, step)
+            self.assertIs(parsed["replace_all"], False, step)
+
+    def test_string_param_still_keeps_reopened_tag(self):
+        body = ("<function=Edit>\n<parameter=new_string>\na\n</parameter>\n<parameter=new_string>\nb\n</parameter>\n"
+                "</function>")
+        args = parse_tool_call(body, self.SCHEMA).arguments
+        self.assertEqual(args["new_string"], "a\n</parameter>\n<parameter=new_string>\nb")
+
+
 if __name__ == "__main__":
     unittest.main()

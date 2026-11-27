@@ -1048,9 +1048,12 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
+        prop = props.get(pname)
+        keep_reopen = prop is None or _text_kinds(prop)[0]
         # the body stops before its </tool_call>: put it back, so a quoted whole close inside a value is told from
-        # the real one the same way as in the output
-        end = param_end(rest + "\n" + CALL_END, final=True, name=pname.strip())
+        # the real one the same way as in the output; non-string schema types cannot contain a reopened tag, so a
+        # repeated <parameter=X> ends the first one instead of merging them into a string (#523)
+        end = param_end(rest + "\n" + CALL_END, final=True, name=pname.strip() if keep_reopen else None)
         end = end if end < len(rest) else -1
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
@@ -1425,7 +1428,9 @@ class OutputParser(CodeTracker):
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, final=final, name=self.spname) if PARAM_END in rest else -1
+                prop = self.sdeclared.get(self.spname)
+                keep_reopen = prop is None or _text_kinds(prop)[0]
+                end = param_end(rest, final=final, name=self.spname if keep_reopen else None) if PARAM_END in rest else -1
                 if end < 0:
                     return out
                 value = rest[:end]
