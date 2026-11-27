@@ -10,6 +10,8 @@
 
 namespace basalt::models::deepseek4 {
 
+class DsparkDrafter;
+
 class DsModel final : public model::LoadedModel {
 public:
     ~DsModel() override;
@@ -24,6 +26,8 @@ public:
     ModelWeights& weights() { return weights_; }
     const ModelWeights& weights() const { return weights_; }
     core::ExpertTier* tier() const { return tier_.get(); }
+    DsparkDrafter* dspark() const { return dspark_.get(); }
+    int spec() const { return request_.spec; }
     bool vision_enabled() const { return request_.vision; }
     int diag_rows() const { return request_.diag_rows; }
     model::Result ensure_tier();
@@ -36,6 +40,7 @@ private:
     model::BatchShared batch_shared_;
     core::LoadPlan* planning_ = nullptr;
     std::shared_ptr<core::ExpertTier> tier_;
+    std::unique_ptr<DsparkDrafter> dspark_;
     float* h_expert_input_ = nullptr;
     float* h_expert_rows_ = nullptr;
     int device_ = -1;

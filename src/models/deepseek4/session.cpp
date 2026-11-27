@@ -21,6 +21,7 @@
 #include "basalt/vision/preprocess.hpp"
 #include "basalt/vision/transformer.hpp"
 #include "basalt/models/deepseek4/router.hpp"
+#include "models/deepseek4/dspark.hpp"
 #include "models/deepseek4/routed_expert.hpp"
 #include "models/deepseek4/prefill_ffn.hpp"
 
@@ -214,47 +215,93 @@ public:
             err = result.message;
             return false;
         }
+        if (model_.dspark()) {
+            drafter_ = model_.dspark();
+            dwin_ = drafter_->open_window();
+            if (dwin_ < 0) {
+                err = "deepseek4: more sessions than dspark windows";
+                return false;
+            }
+            if (!dev(d_feat_, (size_t) kExpertWindow * drafter_->feature_floats())) {
+                err = "deepseek4: cannot allocate dspark feature tap buffer";
+                return false;
+            }
+        }
         err.clear();
         return true;
     }
 
     model::Result prepare() override { return {}; }
 
-    int max_window() const override { return 1; }
+    int max_window() const override {
+        if (!drafter_ || model_.spec() < 2) return 1;
+        return std::clamp(model_.spec(), 1, std::min(kExpertWindow, drafter_->block_size() + 1));
+    }
     int batch_rows() const override { return 8; }
+
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        if (!drafter_) return {model::Status::NotImplemented, "deepseek4: no dspark drafter loaded"};
+        if (feat_rows_ > 0 && feat_pos0_ >= 0) {
+            const int take = std::min(feat_rows_, (int) std::max<int64_t>(0, pos - feat_pos0_));
+            if (take > 0 && !drafter_->inject_device(dwin_, feat_pos0_, take, d_feat_, stream_, err_))
+                return {model::Status::Error, err_};
+            feat_rows_ = 0;
+        }
+        drafter_->forget_from(dwin_, pos);
+        const int lim = std::min(max_window() - 1, drafter_->block_size());
+        if (lim < 1) {
+            last_draft_ = {};
+            return {};
+        }
+        const int want = std::clamp(n, 1, lim);
+        if (!drafter_->draft(dwin_, anchor, pos, want, stream_, last_draft_, err_))
+            return {model::Status::Error, err_};
+        return {};
+    }
+
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
+        if (!drafter_) return {model::Status::NotImplemented, "deepseek4: no dspark drafter loaded"};
+        n = std::min(max_n, last_draft_.n);
+        std::copy(last_draft_.token, last_draft_.token + n, ids);
+        std::copy(last_draft_.conf, last_draft_.conf + n, conf);
+        return {};
+    }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.pos == 0 && !tokens_.empty() && !reset_sequence()) return {model::Status::Error, "deepseek4: " + err_};
         if (!r.tokens || r.n_tokens < 1 || r.n_tokens > 8 || r.pos < 0)
             return {model::Status::Error, "deepseek4: invalid decode window"};
-        if (r.pos != (int64_t) tokens_.size())
-            return {model::Status::Refused, "deepseek4: decode position is not the next unprocessed token"};
+        if (r.pos > (int64_t) tokens_.size())
+            return {model::Status::Refused, "deepseek4: decode position is beyond the processed history"};
+        if (r.pos < (int64_t) tokens_.size()) tokens_.resize((size_t) r.pos);
         if (r.pos + r.n_tokens > model_.context())
             return {model::Status::Refused, "deepseek4: request exceeds the loaded context"};
 
         retained_logits_rows_ = r.retain_logits_rows ? r.n_tokens : 0;
-        for (int t = 0; t < r.n_tokens; ++t) {
-            if (!forward_one(r.tokens[t], r.pos + t)) return {model::Status::Error, err_};
-            if (r.retain_logits_rows && cudaMemcpyAsync(retained_logits_ + (size_t) t * geo_.n_vocab, final_logits_,
-                    (size_t) geo_.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
-                return {model::Status::Error, "deepseek4: cannot retain a decode logits row"};
-            tokens_.push_back(r.tokens[t]);
-            if (r.row_tokens) {
+        if (!forward_rows(r.tokens, r.n_tokens, r.pos)) return {model::Status::Error, err_};
+        if (r.retain_logits_rows && cudaMemcpyAsync(retained_logits_, final_logits_,
+                (size_t) r.n_tokens * geo_.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
+            return {model::Status::Error, "deepseek4: cannot retain decode logits rows"};
+        tokens_.insert(tokens_.end(), r.tokens, r.tokens + r.n_tokens);
+        if (r.row_tokens) {
+            for (int t = 0; t < r.n_tokens; ++t) {
                 kernels::SamplerParams params = r.sampling ? *r.sampling : kernels::SamplerParams{.temperature = 0.f, .greedy = true};
                 params.counter += (uint64_t) t;
                 const int* history = r.history ? r.history + (size_t) t * r.history_len : nullptr;
-                kernels::sample_tokens(final_logits_, 1, geo_.n_vocab, history, r.history_len, params, sampled_, stream_);
+                kernels::sample_tokens(final_logits_ + (size_t) t * geo_.n_vocab, 1, geo_.n_vocab,
+                                       history, r.history_len, params, sampled_, stream_);
                 int32_t picked = -1;
                 if (!copy_to_host(&picked, sampled_, sizeof(picked))) return {model::Status::Error, err_};
                 r.row_tokens[t] = picked;
             }
         }
-        if (r.logits && !copy_to_host(r.logits, final_logits_, (size_t) geo_.n_vocab * sizeof(float)))
+        const float* last_logits = final_logits_ + (size_t) (r.n_tokens - 1) * geo_.n_vocab;
+        if (r.logits && !copy_to_host(r.logits, last_logits, (size_t) geo_.n_vocab * sizeof(float)))
             return {model::Status::Error, err_};
         if (r.next_token) {
             kernels::SamplerParams params = r.sampling ? *r.sampling : kernels::SamplerParams{.temperature = 0.f, .greedy = true};
             const int* history = r.history ? r.history + (size_t) (r.n_tokens - 1) * r.history_len : nullptr;
-            kernels::sample_tokens(final_logits_, 1, geo_.n_vocab, history, r.history_len, params, sampled_, stream_);
+            kernels::sample_tokens(last_logits, 1, geo_.n_vocab, history, r.history_len, params, sampled_, stream_);
             if (!copy_to_host(r.next_token, sampled_, sizeof(*r.next_token))) return {model::Status::Error, err_};
         } else if (!sync()) return {model::Status::Error, err_};
         return {};
@@ -267,6 +314,13 @@ public:
                     std::to_string(r.pos) + ", history=" + std::to_string(tokens_.size()) + ")"};
         if (r.pos + r.n_tokens > model_.context())
             return {model::Status::Refused, "deepseek4: prompt exceeds the loaded context"};
+        if (r.n_tokens <= kExpertWindow && model_.diag_rows() <= 0) {
+            if (!forward_rows(r.tokens, r.n_tokens, r.pos)) return {model::Status::Error, err_};
+            tokens_.insert(tokens_.end(), r.tokens, r.tokens + r.n_tokens);
+            if (r.progress) r.progress(r.n_tokens);
+            if (!sync()) return {model::Status::Error, err_};
+            return {};
+        }
         if (!prefill_rows(r.tokens, r.n_tokens, r.pos, nullptr, r.stop, r.progress))
             return {model::Status::Error, err_};
         return {};
@@ -620,6 +674,9 @@ private:
             if (ratio == 4) reset_indexer_compress_state(c.indexer_state_kv, c.indexer_state_score, stream_);
         }
         tokens_.clear();
+        feat_rows_ = 0;
+        feat_pos0_ = -1;
+        if (drafter_) drafter_->forget_from(dwin_, 0);
         return sync();
     }
 
@@ -680,7 +737,6 @@ private:
         return sync();
     }
 
-    bool forward_one(int32_t token, int64_t pos, const float* supplied_embedding = nullptr);
     bool forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr,
                       bool attention_only = false, int layer_only = -1, bool begin_tier = true);
     bool prefill_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr,
@@ -707,6 +763,12 @@ private:
 
     float *streams_ = nullptr, *next_streams_ = nullptr, *attention_output_ = nullptr;
     float *ffn_output_ = nullptr, *shared_output_ = nullptr, *routed_output_ = nullptr, *final_logits_ = nullptr;
+    DsparkDrafter* drafter_ = nullptr;
+    int dwin_ = -1;
+    DsparkDraft last_draft_{};
+    float* d_feat_ = nullptr;
+    int64_t feat_pos0_ = -1;
+    int feat_rows_ = 0;
     float *normalized_ = nullptr, *hc_workspace_ = nullptr, *attn_coef_ = nullptr, *ffn_coef_ = nullptr;
     float *collapsed_ = nullptr, *attn_normed_ = nullptr, *ffn_normed_ = nullptr;
     void *attn_q8_ = nullptr, *q_latent_q8_ = nullptr, *attn_out_q8_ = nullptr;
@@ -739,10 +801,6 @@ private:
     int32_t* d_expert_ids_ = nullptr;
     RouteMeta *h_route_meta_ = nullptr, *d_route_meta_ = nullptr;
 };
-
-bool Session::forward_one(int32_t token, int64_t pos, const float* supplied_embedding) {
-    return forward_rows(&token, 1, pos, supplied_embedding);
-}
 
 bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings,
                            bool attention_only, int layer_only, bool begin_tier) {
@@ -971,6 +1029,20 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
         } catch (const std::exception& e) {
             err_ = std::string("deepseek4 FFN finish ") + std::to_string(layer) + ": " + e.what();
             return false;
+        }
+        if (drafter_) {
+            const int slot = drafter_->feature_slot(layer);
+            if (slot >= 0) {
+                const size_t fstride = (size_t) drafter_->feature_floats();
+                for (int t = 0; t < n_tokens; ++t) {
+                    if (cudaMemcpyAsync(d_feat_ + (size_t) t * fstride + (size_t) slot * n,
+                                        collapsed_ + (size_t) t * n, n * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
+                        return fail_cuda("dspark feature tap");
+                }
+                feat_pos0_ = pos;
+                feat_rows_ = n_tokens;
+            }
         }
     }
 

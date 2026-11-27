@@ -37,12 +37,28 @@ struct ExpertLayer {
     uint64_t offset = 0, bytes = 0;
 };
 
+struct DsparkExpertStage {
+    int stage = 0, gu_type = 0, d_type = 0, n_expert = 0;
+    uint64_t offset = 0, blob_bytes = 0;
+};
+
+struct DsparkPack {
+    bool present = false;
+    int num_stages = 0, block_size = 0, markov_rank = 0;
+    int32_t noise_token_id = 0;
+    std::vector<int> target_layer_ids;
+    std::map<std::string, TensorRef> tensors;
+    std::vector<DsparkExpertStage> experts;
+    core::FileRange section;
+};
+
 struct Pack {
     core::ModelFile file;
     Geometry geo;
     std::map<std::string, TensorRef> tensors;
     std::vector<ExpertLayer> experts;
     core::FileRange vision;
+    DsparkPack dspark;
 
     const TensorRef* find(const std::string& name) const {
         const auto it = tensors.find(name);

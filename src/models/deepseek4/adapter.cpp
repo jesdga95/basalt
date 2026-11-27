@@ -1,8 +1,11 @@
 #include "models/deepseek4/adapter.hpp"
 
+#include "basalt/core/diag.hpp"
+#include "basalt/log.hpp"
 #include "basalt/program/options.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/models/deepseek4/tokenizer.hpp"
+#include "models/deepseek4/dspark.hpp"
 #include "models/deepseek4/meta.hpp"
 #include "models/deepseek4/model.hpp"
 
@@ -42,6 +45,16 @@ public:
     int max_slots() const override { return 8; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
+        if (a == "--spec") {
+            o.spec = std::atoi(args.next("--spec"));
+            o.spec_given = true;
+            if (o.spec < 0 || o.spec > 8) code = 2;
+            return true;
+        }
+        if (a == "--draft-log") {
+            basalt::core::diagnostics().draft_log = args.next("--draft-log");
+            return true;
+        }
         if (a == "--diag-rows") {
             o.diag_rows = std::atoi(args.next("--diag-rows"));
             if (o.diag_rows < 1 || o.diag_rows > 8192) code = 2;
@@ -50,6 +63,11 @@ public:
         if (a != "--diag-tier-frozen") return false;
         o.diag_tier_frozen = true;
         return true;
+    }
+
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (!o.spec_given) o.spec = kDsparkBlock + 1;
+        return std::nullopt;
     }
 
     std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<DsModel>(); }

@@ -3,6 +3,7 @@
 #include "basalt/core/load_progress.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek4/context_policy.hpp"
+#include "models/deepseek4/dspark.hpp"
 
 #include <cuda_runtime.h>
 
@@ -18,6 +19,7 @@ model::Result failure(const std::string& message) {
 }  // namespace
 
 DsModel::~DsModel() {
+    dspark_.reset();
     tier_.reset();
     if (h_expert_input_) cudaFreeHost(h_expert_input_);
     if (h_expert_rows_) cudaFreeHost(h_expert_rows_);
@@ -87,6 +89,12 @@ model::Result DsModel::plan(const model::LoadRequest& request, core::LoadPlan& r
     if (cudaGetDevice(&device_) != cudaSuccess) return failure("cannot query the current CUDA device");
     std::string err;
     if (!weights_.plan(request.paths.front(), device_, reads, err)) return failure(err);
+
+    if (weights_.pack().dspark.present && request.spec >= 2) {
+        const int file_handle = reads.file(request.paths.front());
+        dspark_ = DsparkDrafter::plan_load(*this, file_handle, reads, std::max(request.sessions, 1), err);
+        if (!dspark_) return failure(err);
+    }
 
     const Geometry& g = weights_.geo();
     desc_.arch = "deepseek4";

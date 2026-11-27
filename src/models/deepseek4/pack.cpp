@@ -405,6 +405,54 @@ bool open_pack(const std::string& path, Pack& pack, std::string& err) {
         err = path + ": vision/mmproj section is missing";
         return false;
     }
+    pack.dspark = {};
+    if (const core::FileRange ds_sec = pack.file.range("dspark"); !ds_sec.empty()) {
+        const core::Json* ds = member(meta, "dspark");
+        if (ds && ds->is_object()) {
+            DsparkPack dp;
+            dp.present = true;
+            dp.section = ds_sec;
+            dp.num_stages = integer(member(*ds, "num_stages"), 0);
+            dp.block_size = integer(member(*ds, "block_size"), 0);
+            dp.markov_rank = integer(member(*ds, "markov_rank"), 0);
+            dp.noise_token_id = (int32_t) integer(member(*ds, "noise_token_id"), 0);
+            if (const core::Json* tl = member(*ds, "target_layer_ids"); tl && tl->is_array()) {
+                for (const core::Json& x : tl->items)
+                    if (x.is_number()) dp.target_layer_ids.push_back((int) x.num());
+            }
+            if (const core::Json* ts = member(*ds, "tensors"); ts && ts->is_object()) {
+                for (const auto& [name, info] : ts->members) {
+                    if (!info.is_object()) continue;
+                    TensorRef ref;
+                    ref.type = integer(member(info, "type_id"), -1);
+                    ref.offset = ds_sec.offset + (uint64_t) number(member(info, "offset"));
+                    ref.bytes = (uint64_t) number(member(info, "bytes"));
+                    if (const core::Json* sh = member(info, "shape"); sh && sh->is_array()) {
+                        for (const core::Json& d : sh->items)
+                            if (d.is_number()) ref.shape.push_back((uint64_t) d.num());
+                    }
+                    dp.tensors.emplace(name, std::move(ref));
+                }
+            }
+            if (const core::Json* ex = member(*ds, "experts"); ex && ex->is_array()) {
+                for (const core::Json& e : ex->items) {
+                    if (!e.is_object()) continue;
+                    DsparkExpertStage st;
+                    st.stage = integer(member(e, "stage"), 0);
+                    st.gu_type = integer(member(e, "gu_type"), 0);
+                    st.d_type = integer(member(e, "d_type"), 0);
+                    st.n_expert = integer(member(e, "n_expert"), 0);
+                    st.offset = ds_sec.offset + (uint64_t) number(member(e, "offset"));
+                    st.blob_bytes = (uint64_t) number(member(e, "blob_bytes"));
+                    dp.experts.push_back(st);
+                }
+            }
+            if (dp.num_stages > 0 && dp.block_size > 0 && dp.markov_rank > 0 && !dp.tensors.empty() &&
+                dp.experts.size() == (size_t) dp.num_stages) {
+                pack.dspark = std::move(dp);
+            }
+        }
+    }
     return true;
 }
 

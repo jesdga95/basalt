@@ -367,7 +367,8 @@ endif()
 
 if(BASALT_MODEL_DEEPSEEK4)
 add_library(model_deepseek4 STATIC src/models/deepseek4/adapter.cpp src/models/deepseek4/model.cpp
-  src/models/deepseek4/session.cpp src/models/deepseek4/prefill_ffn.cpp)
+  src/models/deepseek4/session.cpp src/models/deepseek4/prefill_ffn.cpp
+  src/models/deepseek4/dspark.cpp src/models/deepseek4/dspark_kernels.cu)
 target_include_directories(model_deepseek4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(model_deepseek4 PUBLIC model tokenizer deepseek4_tokenizer deepseek4_model_weights
   deepseek4_kernels deepseek4_vision_plan expert_tier tiers mmq peer_share kernels core ${_gpu_runtime_target})
