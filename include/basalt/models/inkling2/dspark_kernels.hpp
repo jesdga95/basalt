@@ -46,7 +46,7 @@ void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const f
 /// [kDsRnn][2 kDsRank], w1_row the previous token's row of w1, BF16 [kDsRank] on the device); gate = sigmoid(raw[0:r]); state_out = gate * state_in + (1 - gate) *
 /// tanh(raw[r:2r]); latent = tanh(raw[2r:3r]) into `latent` (fp32 [kDsRank]).
 void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1_row,
-                        const float* state_in, float* state_out, float* latent, void* stream);
+                        const float* state_in, float* state_out, float* latent, void* stream, void* lat_q8 = nullptr);
 
 /// The draft head: draft i's logits l[v] = cap tanh((head_v . h + fold_v . lat + fold_b[v]) / cap) over v < n_vocab, h = block
 /// row i + 1 (q8_1, kWidth) and lat its latent (q8_1, kDsRank). Its argmax is screened (basalt/kernels/head_proxy.cuh) by
@@ -77,11 +77,22 @@ size_t dspark_head_scratch_bytes(int64_t n_vocab);
 /// The head term of the copy for the block's draft rows, once: approx[r][copy row] for the `rows` (1..kDsDrafts) q8_1 rows of
 /// hq (approx: kDsDrafts x dspark_screen_rows floats).
 void dspark_head_base(const DsHead& h, const void* hq, int rows, float* approx, void* stream);
+/// Combines a draft hidden row `hd_row` [kWidth] with the Markov head output projection `out_w` (BF16 [kWidth][kDsRank])
+/// times `latent` [kDsRank] plus `out_b` [kWidth], and quantizes the combined vector directly into Q8_1 `h_eff_q8` [kWidth].
+/// Eliminates storing the persistent Q8_0 `fold` [n_vocab][kDsRank] table (40-52 MiB VRAM) via head.(h + out_w*lat + out_b).
+void dspark_combine_h(const float* hd_row, const float* latent, const uint16_t* out_w, const float* out_b,
+                      void* h_eff_q8, void* stream);
+
+void dspark_combine_h_batch(const float* hd, const float* latent, const uint16_t* out_w, const float* out_b,
+                            int step_i, int n_max, int count, void* h_eff_q8, void* stream);
+
 /// Draft i (from 0): over hq's row i, the latent `latq` and approx (dspark_head_base's): ids[i] = *prev = the pick (the lowest
 /// row on a tie), conf[i] = its softmax probability (the rows not rescored at their approximate logits), w1_row = the pick's
 /// row of w1 (the rescored rows' are read while they are scored, so the next step reads the card, not w1's host memory).
+/// When `h.fold == nullptr` and `h_eff_q != nullptr`, exact rescoring evaluates `head[v] . h_eff_q` (single combined row).
 void dspark_head_pick(const DsHead& h, const void* hq, const void* latq, const float* approx, int i, void* scratch, int32_t* prev,
-                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
+                      int32_t* ids, float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
+                      const void* h_eff_q = nullptr);
 /// The reference: every row's exact logit (the arithmetic the pick rescores with) into logits[n_vocab].
 void dspark_head_exact(const DsHead& h, const void* hq, const void* latq, int i, float* logits, void* stream);
 
@@ -134,10 +145,11 @@ void dspark_head_base_batch(const DsHead& h, const void* hq, int count, int n_ma
 
 void dspark_markov_step_batch(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp,
                               const uint16_t* w1_row, float* state, int step_i, int n_max, int count, float* latent,
-                              void* stream);
+                              void* stream, void* lat_q8 = nullptr);
 
 void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_step, const float* approx, int step_i,
                             int n_max, int count, void* scratch, size_t scratch_stride, int32_t* prev, int32_t* ids,
-                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream);
+                            float* conf, const uint16_t* w1, uint16_t* w1_row, void* stream,
+                            const void* h_eff_q_step = nullptr);
 
 }  // namespace basalt::models::inkling2

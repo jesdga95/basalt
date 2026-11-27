@@ -149,7 +149,7 @@ struct Shared {
         if (!(cpu = CpuExperts::make(m, err)) && !err.empty()) return false;
         if (m.sessions() > 1 && m.dspark()) {
             ds_batch = std::make_unique<DsparkBatch>();
-            if (!ds_batch->init(m.dspark(), m.sessions(), max_rows, std::max(max_rows, kPromptChunk), tap, m.context(), err))
+            if (!ds_batch->init(m.dspark(), m.sessions(), max_rows, max_rows, tap, m.context(), err))
                 return false;
         }
         prompt = make_prompt(m, stream, err);   // PROMPT HOOK
@@ -204,7 +204,7 @@ struct Shared {
         x.tok_d_ = x.io_d_;
         x.pos_d_ = x.io_d_ + R;
         x.at_d_ = reinterpret_cast<const bk::WindowSegs*>(x.io_d_ + 2 * R);
-        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(std::max(max_rows, kPromptChunk)));   // DSPARK HOOK
+        if (first && m.dspark()) tap = (float*) alloc(dspark_tap_bytes(max_rows));   // DSPARK HOOK (prompt tap lives in Prompt::Bufs loan arena)
         if (!ok) {
             cudaGetLastError();
             err = "out of device memory for the sessions' scratch";
@@ -447,7 +447,7 @@ public:
             err = "the session stream failed during initialization";
             return false;
         }
-        if (!dspark_.init(m_.dspark(), g_, m_.context(), std::max(call_rows, kPromptChunk), sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
+        if (!dspark_.init(m_.dspark(), g_, m_.context(), call_rows, sh_->tap, m_.flags().diag_dump,   // DSPARK HOOK
                           elastic_.empty() ? 0 : core::kElasticKvBase, err))
             return false;
         count_backed();

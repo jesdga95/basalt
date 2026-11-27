@@ -106,7 +106,7 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
 }
 
 uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
+    return kSharedFixed + prompt_bytes(g, drafter) + (drafter ? dspark_tap_bytes(kBatchRows) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
 }
 
 InklingModel::InklingModel() = default;
