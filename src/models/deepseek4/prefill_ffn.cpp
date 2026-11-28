@@ -1,6 +1,7 @@
 #include "models/deepseek4/prefill_ffn.hpp"
 
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/dense_ops.hpp"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <vector>
 
 namespace basalt::models::deepseek4 {
@@ -23,6 +25,10 @@ namespace mmq = basalt::prefill::mmq;
 constexpr int kRoutes = 6;
 constexpr int kGroup = mmq::kGatherGroupMax;
 constexpr int kBf16 = 30;
+constexpr int kCpuRows = 8;
+constexpr int kShareTokens = 512;
+constexpr int kShareRows = 1024;
+constexpr int64_t kAheadPairs = 12288;
 
 bool dense_supported(int type, int64_t rows) {
     return type == kBf16 || mmq::fits(type, rows);
@@ -52,6 +58,9 @@ public:
             if (s.host) cudaFreeHost(s.host);
         }
         if (copy_) cudaStreamDestroy(copy_);
+        if (hx_) cudaFreeHost(hx_);
+        if (hrows_) cudaFreeHost(hrows_);
+        if (act_) cudaFreeHost(act_);
         for (void* p : dev_) cudaFree(p);
     }
 
@@ -174,17 +183,80 @@ public:
         }
         std::vector<int> used;
         used.reserve((size_t) g_.n_expert);
-        int total = 0, max_rows = 0;
-        bounds_host_[0] = 0;
-        for (int e = 0; e < g_.n_expert; ++e) {
+        for (int e = 0; e < g_.n_expert; ++e)
             if (!by[(size_t) e].empty()) used.push_back(e);
+
+        struct Share {
+            std::vector<kernels::cpu::ExpertJobMulti> jobs;
+            std::vector<int32_t> act_tokens, pair;
+            int cpu_rows = 0;
+            std::thread cpu_thread;
+            void join() {
+                if (cpu_thread.joinable()) cpu_thread.join();
+            }
+            ~Share() { join(); }
+        } share;
+
+        if ((int64_t) T * kRoutes < kAheadPairs && T <= kShareTokens && tier_.pool()) {
+            int pinned = 0;
+            for (int e : used) pinned += tier_.locate(layer, e).pinned != nullptr;
+            if (pinned > 0 && ensure_share_buffers()) {
+                const size_t n = (size_t) g_.n_embd;
+                std::vector<uint8_t> stays((size_t) g_.n_expert, 0);
+                std::vector<int32_t> tok_row((size_t) T, -1);
+                int rows = 0;
+                for (int c = 1; c <= kCpuRows; ++c) {
+                    for (int e : used) {
+                        const core::ExpertTier::Source src = tier_.locate(layer, e);
+                        if (!src.pinned || (int) by[(size_t) e].size() != c || stays[(size_t) e]) continue;
+                        if (share.cpu_rows + c > pinned - (int) share.jobs.size() - 1 || rows + c > kShareRows) break;
+                        kernels::cpu::ExpertJobMulti j;
+                        j.blob = src.pinned;
+                        j.nt = c;
+                        for (int i = 0; i < c; ++i) {
+                            const int32_t p = by[(size_t) e][(size_t) i], t = p / kRoutes;
+                            if (tok_row[(size_t) t] < 0) {
+                                tok_row[(size_t) t] = (int32_t) share.act_tokens.size();
+                                share.act_tokens.push_back(t);
+                            }
+                            j.nact[i] = act_ + (size_t) tok_row[(size_t) t] * kernels::cpu::kNativeActBytes;
+                            j.out[i] = hrows_ + (size_t) rows * n;
+                            share.pair.push_back(p);
+                            ++rows;
+                        }
+                        share.jobs.push_back(j);
+                        stays[(size_t) e] = 1;
+                        share.cpu_rows += c;
+                    }
+                }
+                if (rows > 0) {
+                    used.erase(std::remove_if(used.begin(), used.end(), [&](int e) { return stays[(size_t) e] != 0; }),
+                               used.end());
+                    if (cudaMemcpyAsync(hx_, x, (size_t) T * n * sizeof(float), cudaMemcpyDeviceToHost, last_stream_) != cudaSuccess ||
+                        cudaStreamSynchronize(last_stream_) != cudaSuccess) {
+                        err = "deepseek4: reading short-prompt activations for CPU offload failed";
+                        return false;
+                    }
+                    share.cpu_thread = std::thread([this, layer, &share] {
+                        const kernels::cpu::NativeFmt& f = tier_.fmt(layer);
+                        for (size_t i = 0; i < share.act_tokens.size(); ++i)
+                            kernels::cpu::native_quant_act(f, hx_ + (size_t) share.act_tokens[i] * g_.n_embd,
+                                                           act_ + i * kernels::cpu::kNativeActBytes);
+                        tier_.pool()->run_split_multi_native(f, share.jobs.data(), (int) share.jobs.size());
+                    });
+                }
+            }
+        }
+
+        int total = 0, max_rows = 0;
+        for (int e : used) {
+            bounds_host_[(size_t) e] = total;
             for (int32_t route : by[(size_t) e]) {
                 rows_host_[(size_t) total] = route;
                 token_host_[(size_t) total] = route / kRoutes;
                 ++total;
             }
             max_rows = std::max(max_rows, (int) by[(size_t) e].size());
-            bounds_host_[(size_t) e + 1] = total;
         }
         if (cudaMemsetAsync(rows_, 0, nr_cap * (size_t) g_.n_embd * sizeof(float), last_stream_) != cudaSuccess ||
             (total && (cudaMemcpyAsync(token_ids_, token_host_.data(), (size_t) total * sizeof(int32_t),
@@ -197,6 +269,15 @@ public:
             return false;
         }
         if (!total) {
+            share.join();
+            for (size_t i = 0; i < share.pair.size(); ++i) {
+                if (cudaMemcpyAsync(rows_ + (size_t) share.pair[i] * (size_t) g_.n_embd,
+                                    hrows_ + i * (size_t) g_.n_embd, (size_t) g_.n_embd * sizeof(float),
+                                    cudaMemcpyHostToDevice, last_stream_) != cudaSuccess) {
+                    err = "deepseek4: cannot upload CPU short-prompt expert rows";
+                    return false;
+                }
+            }
             weighted_route_sum(rows_, weights, T, g_.n_embd, out, stream);
             return true;
         }
@@ -317,6 +398,15 @@ public:
                 return false;
             }
         }
+        share.join();
+        for (size_t i = 0; i < share.pair.size(); ++i) {
+            if (cudaMemcpyAsync(rows_ + (size_t) share.pair[i] * (size_t) g_.n_embd,
+                                hrows_ + i * (size_t) g_.n_embd, (size_t) g_.n_embd * sizeof(float),
+                                cudaMemcpyHostToDevice, last_stream_) != cudaSuccess) {
+                err = "deepseek4: cannot upload CPU short-prompt expert rows";
+                return false;
+            }
+        }
         weighted_route_sum(rows_, weights, T, g_.n_embd, out, stream);
         return true;
     }
@@ -399,6 +489,15 @@ public:
     }
 
 private:
+    bool ensure_share_buffers() {
+        if (hrows_) return true;
+        return cudaHostAlloc(reinterpret_cast<void**>(&hx_), (size_t) kShareTokens * (size_t) g_.n_embd * sizeof(float),
+                             cudaHostAllocPortable) == cudaSuccess &&
+               cudaHostAlloc(reinterpret_cast<void**>(&hrows_), (size_t) kShareRows * (size_t) g_.n_embd * sizeof(float),
+                             cudaHostAllocPortable) == cudaSuccess &&
+               cudaHostAlloc(reinterpret_cast<void**>(&act_), (size_t) kShareTokens * kernels::cpu::kNativeActBytes,
+                             cudaHostAllocPortable) == cudaSuccess;
+    }
     bool alloc(void*& p, size_t bytes) {
         if (!bytes || cudaMalloc(&p, bytes) != cudaSuccess) return false;
         dev_.push_back(p);
@@ -446,6 +545,8 @@ private:
     std::vector<int32_t> rows_host_, token_host_, bounds_host_;
     mmq::Context mmq_;
     cudaStream_t last_stream_ = nullptr;
+    float *hx_ = nullptr, *hrows_ = nullptr;
+    uint8_t* act_ = nullptr;
 };
 
 }  // namespace
