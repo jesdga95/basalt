@@ -38,7 +38,7 @@ struct Plan {
 /// are resident: below kMinContext or past the native maximum is refused. The caches are elastic (core/elastic_kv.hpp): a session
 /// backs its first kElasticKvBase positions at start, refused when they need more than half the free memory; the rest comes from
 /// the expert tier when a prompt needs it.
-inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, int sparse_layers, bool fp8 = false) {
+inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes, int sparse_layers, bool fp8 = false, int sessions = 1) {
     Plan p;
     if (native <= 0) native = kLegacyContext;
     if (requested < kMinContext) {
@@ -49,7 +49,8 @@ inline Plan plan_context(int64_t requested, int64_t native, uint64_t free_bytes,
         p.error = "--max-context " + std::to_string(requested) + " is past the model's maximum context of " + std::to_string(native) + " tokens";
         return p;
     }
-    const int64_t base = std::min<int64_t>(requested, core::kElasticKvBase);
+    const int64_t kv_base = sessions > 1 ? core::kElasticKvBaseBatch : core::kElasticKvBase;
+    const int64_t base = std::min<int64_t>(requested, kv_base);
     const uint64_t need = context_bytes(base, sparse_layers, fp8);
     if (need > free_bytes / 2) {
         p.error = "--max-context " + std::to_string(requested) + ": the first " + std::to_string(base) + " positions need " +

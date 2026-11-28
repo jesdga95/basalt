@@ -1,4 +1,4 @@
-// src/models/qwen4exp/load/peers.hpp - Flash-Next's gpu-mode peer (model::PeerHooks, docs/design/multi-gpu.md): an expert
+// src/models/qwen4exp/load/peers.hpp - Flash-Next's gpu-mode peer (model::PeerHooks, docs/architecture/multi-gpu.md): an expert
 // tier on each card after the main one, holding the ranked experts the main card does not, and a prompt stage on each.
 // The shared driver deals the experts hottest first by the cards' rooms and shares, refuses a peer that would hold
 // nothing, cuts the prompt stages' layers and writes each card's part of the start line; this fills the tiers it dealt.

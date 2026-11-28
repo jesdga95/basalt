@@ -53,6 +53,9 @@ struct CommonOptions {
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
+    /// --ple-io direct|ram: how the n-gram table is read (direct = unbuffered SSD reads, ram = memory-mapped in RAM),
+    /// for the models with an n-gram table
+    std::string ple_io = "direct";
     int diag_rows = 0;
     /// --diag-gpu-cut N: diagnostic, a two-card split's second card from layer N on, whatever the shares give (0: off)
     int diag_gpu_cut = 0;
@@ -67,6 +70,7 @@ struct CommonOptions {
     /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
     /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
     bool grammar = false;
+    bool kv_pool = true;               ///< --kv-pool on|off: a model with a KV pool backs every slot's cells from it (off: each slot's own, fixed)
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
@@ -134,6 +138,9 @@ struct CommonOptions {
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
     /// RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
+    /// --serve: the page-locked RAM, in MiB, the checkpoints of every chain share (the solo session's and every batch
+    /// slot's).  Held from the start; when the chains hold more than it fits, the least recently used checkpoint leaves.
+    int64_t checkpoint_pool_mib = 4096;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;

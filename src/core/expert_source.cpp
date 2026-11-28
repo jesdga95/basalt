@@ -588,7 +588,7 @@ bool FileExpertSource::plan_cache_complement(
     if (lend_room > 0) {
         // the budget holds every expert of the complement and the free places for the adaptive swaps: none is left to
         // the files, and the prompt path's lend region is kept in what the budget has left (a budget that holds the
-        // experts but not the free places keeps them as before: the swaps would lose their places, #342, #366)
+        // experts but not the free places keeps them as before: the swaps would lose their places)
         basalt::log::info("basalt", "FileExpertSource: RAM budget %.2f GiB holds the %.2f GiB of experts the GPU cache does "
                              "not hold; the prompt path's lend region takes the rest of it",
                      (double) budget_bytes / 1073741824.0, (double) bytes / 1073741824.0);

@@ -620,6 +620,35 @@ class StopStrings(unittest.TestCase):
         self.assertEqual(m.hit, "</s>")
         self.assertEqual(m.push("more"), "")
 
+    def test_stop_sequence_hit_during_parser_finish_updates_finish_reason(self):
+        # OutputParser holds trailing newlines in buf as a potential gap before <tool_call>;
+        # if max_tokens cuts right after them and stop=["\n\n"], finish() hits the stop string -> "stop", not "length".
+        tok = ByteTokenizer()
+        script = "abc\n\nxyz"
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, body in (
+                ("/v1/chat/completions", {"model": "basalt", "max_tokens": 5, "reasoning_effort": "none",
+                                          "stop": ["\n\n"], "messages": [{"role": "user", "content": "hi"}]}),
+                ("/v1/messages", {"model": "basalt", "max_tokens": 5, "thinking": {"type": "disabled"},
+                                  "stop_sequences": ["\n\n"], "messages": [{"role": "user", "content": "hi"}]}),
+            ):
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
+                    "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    res = json.loads(r.read())
+                if path == "/v1/chat/completions":
+                    self.assertEqual(res["choices"][0]["finish_reason"], "stop")
+                    self.assertEqual(res["choices"][0]["message"]["content"], "abc")
+                else:
+                    self.assertEqual((res["stop_reason"], res["stop_sequence"]), ("stop_sequence", "\n\n"))
+                    self.assertEqual("".join(b["text"] for b in res["content"] if b["type"] == "text"), "abc")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 class EffortAtTheEnd(unittest.TestCase):
     """A non-default effort goes in a system turn before the answer so the cached conversation is kept."""
@@ -2756,10 +2785,20 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(last["timings"]["cache_n"], ClockedEngine.REUSED)
 
     def test_anthropic(self):
-        u = self.chat("/v1/messages")["usage"]
+        b = self.chat("/v1/messages")
+        u, t = b["usage"], b["timings"]
         self.assertEqual(u["cache_read_input_tokens"], ClockedEngine.REUSED)
         self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], len(self.engine.last_prompt))
         self.assertGreater(u["output_tokens"], 0)
+        self.assertEqual(t["cache_n"], ClockedEngine.REUSED)
+        self.assertEqual(t["prompt_n"] + t["cache_n"], u["input_tokens"] + u["cache_read_input_tokens"])
+        self.assertEqual(t["predicted_n"], u["output_tokens"])
+        self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+
+    def test_anthropic_stream(self):
+        delta = next(e for e in self.chat("/v1/messages", stream=True) if e["type"] == "message_delta")
+        self.assertEqual(delta["usage"]["cache_read_input_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(delta["timings"]["cache_n"], ClockedEngine.REUSED)
 
     def test_v1_status(self):
         self.chat("/v1/chat/completions")
@@ -2946,6 +2985,76 @@ class SharingTheGpu(unittest.TestCase):
         self.assertFalse(self.svc.vision.alive())
         self.assertEqual(self.chat()[0], 200)
         self.assertEqual(order, ["vision", "engine"])             # the encoder first, as at a start
+        self.assertTrue(self.svc.vision.alive())
+
+    def test_crashed_vision_sidecar_restarts_for_next_image(self):
+        td = Path(tempfile.mkdtemp(prefix="basalt-vision-recover-"))
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+
+        class CrashingSidecar:
+            running = True
+            restarts = 0
+            failed_once = False
+
+            def alive(self):
+                return self.running
+
+            def read(self, sources, allowed=None):
+                return [b"png" for _ in sources]
+
+            def encode(self, datas):
+                if not self.running:
+                    raise ValueError("the image could not be read: the vision encoder stopped")
+                if not self.failed_once:
+                    self.failed_once = True
+                    self.running = False
+                    raise ValueError("the image could not be read: the vision encoder stopped")
+                out = td / "ok.sve"
+                out.write_bytes(b"SVE1")
+                return out, [4 for _ in datas]
+
+            def restart(self):
+                self.restarts += 1
+                self.running = True
+
+        self.svc.vision = CrashingSidecar()
+        # Engine is already loaded and holding VRAM; restarting only the vision sidecar must not trip
+        # min_free_vram_mib or re-run before_load.
+        mark = td / "before_load_ran"
+        self.svc.before_load = [sys.executable, "-c", f"open({str(mark)!r}, 'w').close()"]
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 500
+        img_req = {
+            "model": "basalt",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": "describe"},
+            ]}],
+        }
+        s1, b1 = self.req("/v1/chat/completions", img_req)
+        self.assertEqual(s1, 400, b1)
+        self.assertIn("the vision encoder stopped", b1["error"]["message"])
+        self.assertFalse(self.svc.vision.alive())
+
+        s2, b2 = self.req("/v1/chat/completions", img_req)
+        self.assertEqual(s2, 200, b2)
+        self.assertEqual(self.svc.vision.restarts, 1)
+        self.assertEqual(self.engine.starts, 0)
+        self.assertFalse(mark.exists())
+        self.assertTrue(self.svc.vision.alive())
+
+        # A request that already passed load() before the sidecar died still restarts it inside _encode_media().
+        self.svc.vision.running = False
+        ids, _, _ = self.svc.prepare(
+            [{"role": "user", "content": [
+                {"type": "image", "source": "data:image/png;base64,AA=="},
+                {"type": "text", "text": "describe"},
+            ]}],
+            None, {}, 32,
+        )
+        self.assertTrue(ids)
+        self.assertEqual(self.svc.vision.restarts, 2)
+        self.assertFalse(mark.exists())
         self.assertTrue(self.svc.vision.alive())
 
     def test_off_by_default(self):
@@ -3245,6 +3354,7 @@ class ThinkingBudget(unittest.TestCase):
         from serve.service import REASONING_CLOSE
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
         self.engine.takes_text = True
+        self.svc.fit_max_tokens = True      # the engine cuts the cap of a prompt that asks it to (clip=1) and refuses others
         original = self.engine.generate
 
         effective_cap = 1024
@@ -3291,7 +3401,7 @@ class ThinkingBudget(unittest.TestCase):
         self.engine.generate = pt
 
     def test_thinking_budget_caps_the_thinking_not_the_reply_on_the_text_path(self):
-        # issue #512: the engine answers PT with the pass's cap (the budget); that must not become the total cap
+        # the engine answers PT with the pass's cap (the budget); that must not become the total cap
         self.engine.max_context = 16384
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40           # far longer than any budget below
         self._pt_engine()
@@ -3306,7 +3416,7 @@ class ThinkingBudget(unittest.TestCase):
                 self.assertEqual(b["choices"][0]["finish_reason"], "stop")
                 self.assertGreater(b["usage"]["completion_tokens"], 800)
                 self.assertLessEqual(b["usage"]["completion_tokens"], 3000)
-        code, b = self.openai(max_tokens=16384, thinking_budget_tokens=4096)
+        code, b = self.openai(max_tokens=16000, thinking_budget_tokens=4096)   # a cap that fits beside the prompt
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         self.assertGreater(b["usage"]["completion_tokens"], 4096)
@@ -3834,6 +3944,42 @@ class LostStep(unittest.TestCase):
 
     def test_stop_never_acknowledged(self):
         self.run_mode("stop", stream=False)
+
+
+class TemplateAndCollectEdgeCases(unittest.TestCase):
+    def test_chat_template_leading_tool_message_opens_user_turn(self):
+        tpl = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
+        single = tpl.render([{"role": "tool", "content": "r1"}], enable_thinking=False)
+        self.assertIn("<|im_start|>user\n<tool_response>\nr1\n</tool_response><|im_end|>\n", single)
+        self.assertEqual(single.count("<|im_start|>"), single.count("<|im_end|>") + 1)  # +1 for open assistant turn
+        pair = tpl.render([{"role": "tool", "content": "r1"}, {"role": "tool", "content": "r2"}], enable_thinking=False)
+        self.assertIn("<|im_start|>user\n<tool_response>\nr1\n</tool_response>\n<tool_response>\nr2\n</tool_response><|im_end|>\n", pair)
+
+    def test_collect_handles_early_cancel_before_done(self):
+        from serve.api.anthropic import anthropic_collect
+        from serve.api.openai import openai_collect
+
+        # OpenAI: empty stream, heartbeats only, or role chunk without usage/finish_reason
+        for chunks in ([], [None], [{"id": "c1", "created": 1, "model": "m",
+                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"},
+                                                  "finish_reason": None}]}]):
+            out = openai_collect(chunks)
+            self.assertEqual(out["choices"][0]["finish_reason"], "stop")
+            self.assertIn("usage", out)
+
+        # Anthropic: empty stream, heartbeats only, or stream cancelled mid-tool_use before stop/delta
+        for events in ([], [None], [
+            ("message_start", {"type": "message_start", "message": {
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "m", "content": [],
+                "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 5, "output_tokens": 0}}}),
+            ("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "tool_use", "id": "t1", "name": "f", "input": {}}}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "input_json_delta", "partial_json": '{"x":'}}),
+        ]):
+            msg = anthropic_collect(events)
+            self.assertEqual(msg["stop_reason"], "end_turn")
+            self.assertEqual(msg["content"], [])
 
 
 class UrlHostFormatting(unittest.TestCase):

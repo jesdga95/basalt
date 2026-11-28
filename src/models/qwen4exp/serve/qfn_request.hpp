@@ -19,6 +19,7 @@ public:
     void decode_state_begin();
     void decode_stats_begin();
     int max_window() const { return runtime_.S; }
+    int max_verify_window() const { return max_window(); }
     int draft_window();
     void lookup_window(int& T, bool& from_sfx, int& sfx_match);
     void fill_drafts(int T, bool from_sfx);

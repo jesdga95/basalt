@@ -219,6 +219,11 @@ int main(int argc, char** argv) {
     check(pack_quant_label("Inkling 2 Mini") == "unknown" && pack_quant_label("Hy4-flash NVFP4") == "NVFP4" &&
               pack_quant_label("Foo Q8_0") == "Q8_0" && pack_quant_label("Foo BF16") == "BF16" && pack_quant_label("Foo UD-Mini") == "unknown",
           "pack_quant_label: a last word without a digit is no quant label");
+    check(pack_quant_label("Gemma 4") == "unknown" && pack_quant_label("Gemma 4 12B") == "unknown" &&
+              pack_quant_label("Gemma 4 31B") == "unknown" && pack_quant_label("Gemma 4 31B FP8") == "FP8" &&
+              pack_quant_label("Gemma 4 26B A4B") == "unknown" && pack_quant_label("Gemma 4 26B A4B NVFP4") == "NVFP4" &&
+              pack_quant_label("Foo 8bit") == "8bit",
+          "pack_quant_label: a size or a version is no quant label");
     check(cpu_label("", 8).empty() && cpu_label("X", 0) == "X", "cpu_label: empty name, unknown cores");
 
     const auto links = parse_link_rates("noise\npcie_h2d 0000:01:00.0 55.3\npcie_h2d 0000:02:00.0 bad\npcie_h2d 0000:03:00.0 27.9\n");

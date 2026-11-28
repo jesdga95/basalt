@@ -1,6 +1,7 @@
 # Hy4-flash precision
 
-Where Hy4-flash rounds and how its output compares. Method: [quality](quality.md). Guide: [Hy4-flash](../models/hy4-flash.md).
+Where Hy4-flash rounds and how its output compares. Guide: [Hy4-flash](../models/hy4-flash.md).
+Method: the [quality suite](quality-suite.md) (preferred). The KLD, PPL and top-1 figures on this page were measured with [wikitext KLD](quality.md#wikitext-kld).
 
 ## Summary
 
@@ -13,7 +14,7 @@ Where Hy4-flash rounds and how its output compares. Method: [quality](quality.md
 
 ## Weights
 
-The published pack, from Tencent's BF16 checkpoint ([model file](../model-file.md#hy4-flash-nvfp4-pack)). Every rounding is
+The published pack, from Tencent's BF16 checkpoint ([model file](../model-file/hy4-flash.md#hy4-flash-nvfp4-pack)). Every rounding is
 deterministic and runs once in the converter; `convert.py --verify` repeats it and compares the bytes.
 
 | Tensors | Stored as | From the BF16 checkpoint |
@@ -59,8 +60,8 @@ A decode row's arithmetic does not depend on how many rows share its window.
   25,500 rows). The default's fp16 rows score mean KLD 0.2003, top-1 85.87% and PPL 17.4934 on the same tier size, so the
   format costs 0.0043 KLD and a heavier tail (p99 3.21 against 3.01, max 23.3 against 20.8) while top-1 and PPL do not move
   beyond their spread. It halves the cache: 8.6 KB a position against 14.6, and 8.4 GiB against 14.3 at 256K. The default stays
-  fp16, the format the BF16 reference kept; `--kv fp8` is the memory choice. Both rows are against the first base
-  ([above](#against-the-bf16-reference)); the 0.5.0 engine's unpinned 0.201 against it lands within 0.001 of the fp16 row.
+  fp16, the format the BF16 reference kept; `--kv fp8` is the memory choice. Both rows are against the bf16-epsilon base
+  ([below](#against-the-bf16-reference)), so they compare with each other, not with that section's table.
 - Needles in a 253,410-token prompt are found with both formats.
 - Pin the tier when comparing formats: this model declares no `quality_flags` for the gate, so pass `--expert-cache N` (and the
   same count) to both runs. Without it the freer VRAM of fp8 moves experts onto the card and the two runs are not comparable: an
@@ -90,32 +91,31 @@ rows with `--kv fp8`) changes only which drafts are accepted.
 
 ## Against the BF16 reference
 
-Reference: [quality](quality.md#the-bf16-reference), `hy4flash-bf16-base.kld` (base PPL 18.416). 100 chunks, 25,500 rows, RTX 5090,
+Reference: [quality](quality.md#the-bf16-reference), `hy4flash-bf16-base.kld` (base PPL 18.416, FP32 epsilon). 100 chunks, 25,500 rows, RTX 5090,
 `--expert-cache 4800`, T 1:
 
-| Engine | PPL | KLD mean | Top-1 |
+| Engram gate epsilon | PPL | KLD mean | Top-1 |
 |---|---:|---:|---:|
-| FP32 epsilon in the Engram gate (0.5.6) | 17.484 | 0.209 | 86.14% |
-| bf16 epsilon (before #556) | 17.565 | 0.782 | 76.77% |
+| FP32 (the engine's) | 17.484 | 0.209 | 86.14% |
+| bf16 | 17.565 | 0.782 | 76.77% |
 
-The base was rebuilt for 0.5.6 with FP32's epsilon in the llama.cpp port's Engram gate ([below](#the-engram-gates-epsilon)). The
-first base (sha abab2c9f…, base PPL 18.572) kept bf16's; against it the 0.5.0 engine scored 0.201 and 86.09%. The tables further
-down that predate 0.5.6 (`--kv fp8`, the output head, the lossy routing flags) were measured against the first base with the bf16
-epsilon: their rows compare with each other, not with the table above.
+The base was built with FP32's epsilon in the llama.cpp port's Engram gate ([below](#the-engram-gates-epsilon)). An earlier
+base (sha abab2c9f…, base PPL 18.572) kept bf16's. The tables below that were measured against it (`--kv fp8`, the output
+head, the lossy routing flags) compare their rows with each other, not with the table above.
 
 ### The Engram gate's epsilon
 
-The gate norms the stream and the key with FP32's machine epsilon, as Maya and Strata do. Before #556 it used bf16's
-(0.0078125), which is what an unset `nn.RMSNorm` eps resolves to in vLLM's bf16 forward and what the first base kept. That
+The gate norms the stream and the key with FP32's machine epsilon, as Maya and Strata do. bf16's
+(0.0078125) is what an unset `nn.RMSNorm` eps resolves to in vLLM's bf16 forward, and what the earlier base kept. That
 epsilon swamps small keys. After a line end sampled as `},` `\n` ` ` instead of `},\n` ` `, the next row put 77 to 94% on
 `...\n`, with byte tokens, `\x7f` and U+FEFF behind it. With FP32's epsilon the same prefix gives ` {"` at p 1.000.
 
-Against the first base, which kept bf16's epsilon, the FP32 epsilon looked far off (20 chunks: KLD 0.2498 before, 1.0072
-after) while predicting the text better (PPL 18.854 to 16.353). Against the rebuilt base the fix scores as the old engine did
-against the old base, and the old engine is the one far off ([above](#against-the-bf16-reference)).
+Against the bf16-epsilon base, the FP32 epsilon looks far off (20 chunks: KLD 0.2498 with bf16's, 1.0072 with FP32's) while
+predicting the text better (PPL 18.854 to 16.353). Against the FP32-epsilon base it is the bf16 engine that is far off
+([above](#against-the-bf16-reference)).
 
-The #556 harness (JSON, SEO tags and a JS sitemap at temperature 0.9 and top_p 1.0) went from 3 to 4 stray answers in 48 to
-0 in 48.
+A harness of JSON, SEO tags and a JS sitemap at temperature 0.9 and top_p 1.0 gives 3 to 4 stray answers in 48 with bf16's
+epsilon and 0 in 48 with FP32's.
 
 ### The output head
 
@@ -137,9 +137,9 @@ alone moves more: the same 50 chunks with the BF16 head score 0.21549 at 133 cop
 What the flags do: [quality](quality.md#lossy-routing-flags). Here k is 16, so `--route-tail-skip` takes R 1 to 15 (bare 15), and
 `--route-prior` adds LAMBDA to the sigmoid score plus its bias, which the top 16 is taken from (bare 0.01).
 
-Two cards (400 W + 180 W), the default placement, the 0.5.0 engine's BF16 head. Speed: `basalt-bench -t conv,struct,prose
+Two cards (400 W + 180 W), the default placement, the BF16 head. Speed: `basalt-bench -t conv,struct,prose
 --seed 1`, one cold run each (off twice, before and after the rest); ms a window is the step time. CPU and bus picks: the run's `TIER final` line. Quality: the gate at 50
-chunks against the BF16 base (12,750 rows; this subset's off row reads 0.2069, the 100-chunk one 0.201).
+chunks against the bf16-epsilon BF16 base (12,750 rows).
 
 | Flags | CPU / bus picks | conv tok/s, ms/w | struct tok/s, ms/w | prose tok/s, ms/w | KLD | Same top-1 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -158,5 +158,5 @@ dropped) costs nothing the gate sees for 4% of conv's window, 12 (44% dropped) c
 on, few misses are left for the tail skip. The gate's PPL falls as the error grows (14.85 off, 13.77 at R 8), so it is no measure
 of closeness here; KLD and top-1 are.
 
-With the Q8_0 head the same steps hold: off 24.0 ms a conv window (two runs, 22.5 and 25.6) and KLD 0.2060; R 15 23.1 ms and
+With the Q8_0 head the same steps hold (same base): off 24.0 ms a conv window (two runs, 22.5 and 25.6) and KLD 0.2060; R 15 23.1 ms and
 0.2091; R 12 20.6 ms and 0.2402; LAMBDA 0.01 21.5 ms and 0.2295. A KLD step under about 0.005 is placement noise.

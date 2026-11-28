@@ -2,6 +2,7 @@
 // layers' to the second), the embedding to mapped host memory, then the context sized from what the weights leave.
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
+#include "models/inkling2/caches.hpp"
 #include "models/inkling2/model.hpp"
 
 #include "basalt/core/elastic_kv.hpp"
@@ -12,10 +13,13 @@
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/q8_gemm.hpp"
+#include "basalt/model/batch_driver.hpp"
 #include "basalt/model/multi_gpu.hpp"
 #include "models/inkling2/loan_layout.hpp"
 #include "models/inkling2/prompt.hpp"
@@ -41,15 +45,17 @@ constexpr uint64_t kLoanBytesPerWindow = 192 * kMiB;
 constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;
-constexpr int kTypeNvfp4 = 40;
-constexpr int kTypeMxfp8 = 46;
 constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 row of the hidden width
 // what the sessions share once (the forward's row buffers and expert scratch, the batch windows' logits), what each one
 // needs beside its caches (its logits, its windows' graphs) and what the card keeps free for the kernels' modules and the
 // driver
 constexpr uint64_t kSharedFixed = 896 * kMiB;
-constexpr uint64_t kSessionFixed = 44 * kMiB;
+constexpr uint64_t kSessionMargin = 12 * kMiB;   // a session's small buffers and the allocator's rounding
 constexpr uint64_t kCardSpare = 1024 * kMiB;
+// a batch window's graph on the main card (its kernel nodes): a batch of slots keeps up to BatchShared::kGraphs of them,
+// instantiated as compositions come, so the plan holds them beside the KV pool
+constexpr uint64_t kBatchGraphBytes = 3 * kMiB;
+uint64_t batch_graphs_bytes(int n_sess) { return n_sess > 1 ? kBatchGraphBytes * model::BatchShared::kGraphs : 0; }
 // with --vram-reserve-mib: what loads after the copies are placed (kernels at their first launch, the windows' graphs),
 // kept free beside the reserve until that much has loaded
 constexpr uint64_t kLateRoom = 256 * kMiB;
@@ -76,37 +82,39 @@ constexpr ProjPart kProjParts[] = {
     {"attn_v.weight", kRowV, 1024, false},       {"attn_v_conv_proj.weight", kRowV + kOffTaps, 32, true},
 };
 const char* const kStreamNames[kStreams] = {"q", "k", "v", "ffn"};
-// A blob's stride on the card: whole blocks of its type and 16 bytes, so a kernel can read each expert's blocks in place.
-uint64_t expert_stride(int type, uint64_t blob) {
-    const uint64_t block = type == kTypeQ8_0 ? 34 : type == kTypeNvfp4 ? 36 : type == kTypeMxfp8 ? 132 : 1;
-    uint64_t a = block, b = 16;
-    while (b) {
-        const uint64_t t = a % b;
-        a = b;
-        b = t;
-    }
-    const uint64_t unit = block / a * 16;
-    return (blob + unit - 1) / unit * unit;
-}
 }  // namespace
 
 namespace {
 // The cached keys and values of one visit of layer `layer` for `context` positions (a sliding-window layer: its ring).
 uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8, bool int8) {
     const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);
-    return per_pos * (g.swa[(size_t) layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
+    return per_pos * (uint64_t) visit_cells(g.swa[(size_t) layer], (int64_t) g.window, context);
 }
 }  // namespace
 
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut, int card) {
-    uint64_t caches = 0;
-    for (const Visit& v : g.visits)
-        if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
-    return caches + kSessionFixed;
+    // a visit's window caches, its four convolution rings, and the window's routed ids the copies' ranking keeps
+    uint64_t own = kSessionMargin + 3ull * (uint64_t) g.n_layers * (uint64_t) g.n_expert * 4;
+    for (const Visit& v : g.visits) {
+        if ((cut > 0 && v.layer >= cut ? 1 : 0) != card) continue;
+        if (g.swa[(size_t) v.layer]) own += visit_cache_bytes(g, v.layer, context, fp8, int8);
+        own += (uint64_t) kConvRing * (2ull * kKvHeads * kHeadDim + 2ull * (uint64_t) g.n_embd) * 4;
+        own += (uint64_t) kBatchRows * (uint64_t) g.n_used * 4;
+    }
+    return own;
 }
 
-uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0);   // PROMPT, DSPARK HOOKS
+uint64_t pool_bytes(const Geometry& g, int64_t positions, bool fp8, bool int8, uint64_t gran, int cut, int card) {
+    const uint64_t cells = (uint64_t) kKvHeads * kv_cache_row_bytes(fp8, int8) * (uint64_t) positions;
+    uint64_t n = 0;
+    for (const Visit& v : g.visits)
+        if (!g.swa[(size_t) v.layer] && (cut > 0 && v.layer >= cut ? 1 : 0) == card) n += 2 * ((cells + gran - 1) / gran * gran);
+    return n;
+}
+
+uint64_t shared_bytes(const Geometry& g, bool drafter, bool head) {
+    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0) +   // PROMPT, DSPARK HOOKS
+           (head ? kernels::sampler_wide_bytes((int) g.n_vocab) : 0);
 }
 
 InklingModel::InklingModel() = default;
@@ -371,7 +379,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         w.gu_type = el.gu_type;
         w.d_type = el.d_type;
         w.blob_bytes = el.blob_bytes;
-        w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
+        w.expert_stride = kernels::native_expert_stride(el.gu_type, el.blob_bytes);
     }
     ldev_ = device_;
     cudaSetDevice(device_);
@@ -399,7 +407,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                           (double) vis_.region_bytes() / (double) kGiB);
     }
 
-    // the context: what the weights leave, less the card's spare
+    // the context: every session reaches the whole --max-context, its full visits' cells backed from the card's KV pool as
+    // its conversation grows; the pool is what the weights, the sessions' own buffers and the card's spare leave, at least
+    // one session at the whole context or every session at its first granule, whichever is more
     {
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
@@ -408,11 +418,43 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         // less what the image encoder staged on the card (its kernels' modules, capped at a quarter of the card's spare)
         const uint64_t spare_base = spare_ ? spare_ : kCardSpare;
         const uint64_t spare = spare_base > vision_modules ? spare_base - vision_modules : 0;   // [vision]
-        const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-        const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
+        const int n_sess = std::max(req.sessions, 1);
+        if (!core::vmm::supported()) return fail("the KV pool needs virtual memory management, which this card does not offer");
+        const uint64_t gran = core::vmm::granularity();
+        // DSPARK HOOK: a session's drafter beside its own buffers, its full layers' cells in the main card's pool
+        const auto own_on = [&](int c) { return session_bytes(g, want, fp8_, int8_, cut_, c) + (c == 0 && dspark_ ? dspark_session_bytes(pack_) : 0); };
+        // a pool of `positions` positions of one session (its granules rounded as `round` says)
+        const auto one_on = [&](int c, int64_t positions, uint64_t round) {
+            return pool_bytes(g, positions, fp8_, int8_, round, cut_, c) + (c == 0 && dspark_ ? dspark_pool_bytes(pack_, positions, round, int8_) : 0);
         };
-        const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
+        // the least pool: every session at its first granule (the pool takes what is left after the experts; a conversation
+        // that outgrows it waits for room or is refused); with --kv-pool off every session holds the whole context
+        const auto pool_on = [&](int c) {
+            return req.kv_pool ? (uint64_t) n_sess * one_on(c, 1, gran) : (uint64_t) n_sess * one_on(c, want, gran);
+        };
+        // a position's bytes in card c's pool, granules aside
+        const auto per_on = [&](int c) { return one_on(c, 2, 1) - one_on(c, 1, 1); };
+        const uint64_t shared = shared_bytes(g, dspark_ != nullptr, true);
+        // what card c keeps beside its pool: the sessions' own buffers, what they share and the spare
+        const auto kept_on = [&](int c) {
+            return own_on(c) * (uint64_t) n_sess + (c == 0 ? shared + batch_graphs_bytes(n_sess) + spare : shared_bytes(g, false, false) + kCardSpare);
+        };
+        const auto size_pool = [&](int c, uint64_t free_b) -> model::Result {
+            const uint64_t kept = kept_on(c);
+            const uint64_t least = pool_on(c);
+            if (free_b < kept + least) {
+                const uint64_t per = per_on(c);
+                const uint64_t room = free_b > kept ? free_b - kept : 0;
+                return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " with " + std::to_string(n_sess) +
+                                                  " slot" + (n_sess == 1 ? "" : "s") + " needs a KV pool of " + std::to_string(least >> 20) +
+                                                  " MiB on CUDA" + std::to_string(card_device(c)) + "; " + std::to_string(room >> 20) +
+                                                  " MiB are left beside the weights and the slots' own buffers (about " +
+                                                  std::to_string(per ? room / per : 0) + " positions" +
+                                                  (fp8_ || int8_ ? ")" : "; --kv fp8 halves a position's bytes)")};
+            }
+            kv_pool_[c].set_budget(free_b - kept);
+            return {};
+        };
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
             if (req.expert_cache > 0) return fail("--expert-cache takes one card; the layer split keeps every expert on its card");
             if (model::Result r = load_experts(reads, file, experts); !r.ok()) return r;
@@ -420,21 +462,16 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 cudaSetDevice(card_device(c));
                 size_t fb = 0, tb = 0;
                 basalt::core::gpu_mem_info(&fb, &tb);
-                const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) +
-                                       (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
-                                      (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
-                if (need > fb) {
+                if (model::Result r = size_pool(c, fb); !r.ok()) {
                     cudaSetDevice(device_);
-                    return fail("the layer split at layer " + std::to_string(cut_) + ": card " + std::to_string(card_device(c)) +
-                                " needs " + std::to_string(need >> 20) + " MiB beside its weights for --max-context " + std::to_string(want) +
-                                ", " + std::to_string(fb >> 20) + " MiB are free (a smaller --max-context, --kv fp8, or one card)");
+                    return r;
                 }
             }
             cudaSetDevice(device_);
             ctx_ = want;
         } else {
-        // the experts: all on the card when they fit beside the asked context; else the least routed go to RAM, just enough
-        // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
+        // the experts: all on the card when they fit beside the slots' own buffers and the least pool; else the least routed
+        // go to RAM, just enough (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
         {
             size_t free_b = 0, total_b = 0;
             basalt::core::gpu_mem_info(&free_b, &total_b);
@@ -452,8 +489,13 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 full += vg ? (eb + past + vg - 1) / vg * vg : eb + past;
             }
             // include the margin for tables, maps and driver rounding before deciding whether anything must spill
-            const uint64_t want_b = full + bytes_at(want) * n_sess + shared + spare + (vmm ? 128 * kMiB : 0);
+            const uint64_t want_b = full + kept_on(0) + pool_on(0) + (vmm ? 128 * kMiB : 0);
             const uint64_t short_b = want_b > free_b ? want_b - free_b : 0;
+            basalt::log::info("basalt inkling2", "card plan: %.2f GiB free; experts %.2f GiB, the slots' own %.2f GiB (%.1f MiB each), "
+                              "shared and spare %.2f GiB, the least pool %.2f GiB",
+                              (double) free_b / (double) kGiB, (double) full / (double) kGiB,
+                              (double) (own_on(0) * (uint64_t) n_sess) / (double) kGiB, (double) own_on(0) / (double) kMiB,
+                              (double) (kept_on(0) - own_on(0) * (uint64_t) n_sess) / (double) kGiB, (double) pool_on(0) / (double) kGiB);
             const int64_t keep = req.expert_cache > 0 ? req.expert_cache : -1;
             if (short_b > 0 || keep >= 0) {
                 if (!vmm) return fail("the experts do not fit beside the context and this card has no virtual memory management");
@@ -503,18 +545,41 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         }
         size_t free_b = 0, total_b = 0;
         basalt::core::gpu_mem_info(&free_b, &total_b);
-        const uint64_t avail = free_b > spare + shared ? (free_b - spare - shared) / n_sess : 0;
-        const uint64_t need = bytes_at(want);
-        if (need > avail) {
-            const uint64_t per = bytes_at(2) - bytes_at(1);
-            const uint64_t base = bytes_at(0);
-            const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
-            return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
-                                              std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
-                                              " positions fit" + (fp8_ || int8_ ? "" : " (--kv fp8 halves a position's bytes)")};
-        }
+        if (model::Result r = size_pool(0, free_b); !r.ok()) return r;
         ctx_ = want;
         }
+        // the sampler's list for a request without a top-k limit (top_k 0 or above 64), counted in the first card's shared
+        // bytes: made now, so no request allocates it beside a full pool
+        if (!kernels::sampler_wide_reserve((int) g.n_vocab, nullptr))
+            return fail("out of device memory for the sampler's list (" + std::to_string(kernels::sampler_wide_bytes((int) g.n_vocab) >> 20) +
+                        " MiB)");
+        for (int c = 0; c < cards(); ++c)
+            if (!req.kv_pool)
+                basalt::log::info("basalt inkling2", "KV%s: each of the %d slot%s holds its own %lld positions (--kv-pool off)",
+                                  cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "", n_sess, n_sess == 1 ? "" : "s",
+                                  (long long) want);
+            else
+            {
+                // the positions a slot backs when `slots` slots back as many and the rest one granule each, the caches'
+                // granules counted whole (each grow maps a granule of every cache, the drafter's rings too)
+                const auto reach = [&](int64_t slots) {
+                    const uint64_t rest = (uint64_t) (n_sess - slots) * one_on(c, 1, gran);
+                    int64_t lo = 0, hi = want;
+                    while (lo < hi) {
+                        const int64_t mid = lo + (hi - lo + 1) / 2;
+                        if (rest + (uint64_t) slots * one_on(c, mid, gran) <= kv_pool_[c].budget()) lo = mid;
+                        else hi = mid - 1;
+                    }
+                    return (long long) lo;
+                };
+                const long long each = reach(n_sess);
+                basalt::log::info("basalt inkling2",
+                                  "KV pool%s: %.0f MiB, %lld positions across the %d slot%s (%lld a slot when all are full; one slot "
+                                  "can reach %lld)",
+                                  cards() > 1 ? (" on CUDA" + std::to_string(card_device(c))).c_str() : "",
+                                  (double) kv_pool_[c].budget() / (double) kMiB, each * n_sess, n_sess, n_sess == 1 ? "" : "s", each,
+                                  reach(1));
+            }
     }
     basalt::log::info("basalt inkling2", "weights on the GPU: dense %.2f GiB, experts %.2f GiB; the embedding in host memory (%.2f GiB)",
                       (double) dense / (double) kGiB, (double) experts / (double) kGiB,
@@ -693,6 +758,7 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
     const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
     const bool fp8 = req.kv == "fp8", int8 = req.kv == "int8";
+    const uint64_t gran = core::vmm::supported() ? core::vmm::granularity() : 1;
     std::vector<int> visits((size_t) g.n_layers, 0);
     for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
     model::SplitSpec s;
@@ -702,12 +768,17 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
                                prefill::q8::scale_plane_bytes(kProjQ, (int64_t) g.n_embd) +
                                2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
                                prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
-        s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense +
-                          (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8) * n_sess);
+        // a sliding-window visit's rings in every slot; a full visit's cells in the card's KV pool, at least one slot at the
+        // whole context or every slot at one granule (with --kv-pool off, every slot at the whole context)
+        const uint64_t cells = (uint64_t) kKvHeads * kv_cache_row_bytes(fp8, int8) * (uint64_t) want;
+        const uint64_t full = (cells + gran - 1) / gran * gran;
+        const uint64_t kv = g.swa[(size_t) l] ? visit_cache_bytes(g, l, want, fp8, int8) * n_sess
+                                              : 2 * (req.kv_pool ? std::max(full, n_sess * gran) : n_sess * full);
+        s.layer.push_back((uint64_t) g.n_expert * kernels::native_expert_stride(el.gu_type, el.blob_bytes) + dense + (uint64_t) visits[(size_t) l] * kv);
     }
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
-    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
-               kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
+    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2, true) + batch_graphs_bytes(n_sess) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
+               kCardSpare + shared_bytes(g, false, false) + slot_rest * n_sess};
     for (const model::GpuCards::Card& card : c.cards) {
         cudaSetDevice(card.device);
         size_t free_b = 0, total_b = 0;

@@ -668,6 +668,7 @@ public:
     PreTokenizer pretokenizer() const override { return {"qwen35", program::tokenizer::pretok_qwen35}; }
     model::TokenNames token_names() const override { return program::qwen_token_names(); }
     program::grammar::ToolForm tool_form() const override { return program::qwen_tool_form(); }
+    int max_slots() const override { return dense::kBatch; }   // rows of a batch window
     program::GpuModes gpu_modes() const override { return {2, 2, 0}; }   // peer: one prompt stage; split: the layer stage
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
@@ -724,7 +725,7 @@ private:
         const core::Json* t = file.meta().get("tensors");
         return t != nullptr && (t->get("mtp.fc.weight") != nullptr || t->get("dflash.fc.0.weight") != nullptr);
     }
-    const char* model_name() const override { return "Qwen3.8-27B"; }
+    const char* model_name(const core::Json&) const override { return "Qwen3.8-27B"; }
 };
 
 }  // namespace

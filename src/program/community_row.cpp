@@ -100,9 +100,23 @@ std::string pack_quant_label(const std::string& name) {
         before = q.size();
         for (const char* pre : {"NVIDIA-", "UD-"}) strip(pre);
     }
-    // a quant label carries a digit (NVFP4, Q4_K_M, IQ1_M, BF16); a last word without one ("Mini") is part of the model's name
+    // a quant label starts with a letter and carries a digit (NVFP4, Q4_K_M, IQ1_M, BF16); a last word without a digit
+    // ("Mini") or starting with one (a size or a version: "12B", "4") is part of the model's name
     const bool digit = std::any_of(q.begin(), q.end(), [](char c) { return std::isdigit((unsigned char) c) != 0; });
-    return digit ? q : "unknown";
+    const auto all_digits = [](const std::string& s, size_t from, size_t to) {
+        if (from >= to) return false;
+        for (size_t i = from; i < to; ++i)
+            if (std::isdigit((unsigned char) s[i]) == 0) return false;
+        return true;
+    };
+    // an active-parameter tag ("A4B", the 26B A4B's) is a size too; a bit width ("8bit", "4bit") is a label
+    const bool active = q.size() >= 3 && (q.front() == 'A' || q.front() == 'a') && (q.back() == 'B' || q.back() == 'b') &&
+                        all_digits(q, 1, q.size() - 1);
+    size_t k = 0;
+    while (k < q.size() && std::isdigit((unsigned char) q[k]) != 0) ++k;
+    const bool bits = k > 0 && q.size() == k + 3 && (q.compare(k, 3, "bit") == 0 || q.compare(k, 3, "BIT") == 0 || q.compare(k, 3, "Bit") == 0);
+    const bool letter = !q.empty() && std::isalpha((unsigned char) q.front()) != 0;
+    return digit && !active && (letter || bits) ? q : "unknown";
 }
 
 std::string community_row_text(const CommunityRow& r) {

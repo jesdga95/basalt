@@ -174,6 +174,7 @@ bool Mmproj::open(const core::FileRange& range, std::string& err, const char* pr
     projector_ = projector;
     hp_.proj = (int) num("clip.vision.projection_dim", 0);
     hp_.eps = (float) num("clip.vision.attention.layer_norm_epsilon", 1e-6, false);
+    hp_.rope_theta = (float) num("clip.vision.rope.freq_base", 0, false);
     if (!err.empty()) return false;
     for (const char* k : {"clip.vision.image_mean", "clip.vision.image_std"}) {
         auto it = kv.find(k);

@@ -5,7 +5,7 @@ supports next to the others: [models](index.md). Rounding and quality: [precisio
 
 ## Pack
 
-The default download is `Inkling-2-Mini-NVFP4-MX8.basalt` (19.6 GB, needs 0.5.6 or later, SHA-256
+The default download is `Inkling-2-Mini-NVFP4-MX8.basalt` (19.6 GB, SHA-256
 `28ec70723feaa037942a02f55b9d5e898276f3e62a3b1fa083745f932a041b99`), built from the official release with its vision encoder
 and DSpark drafter:
 
@@ -16,9 +16,9 @@ and DSpark drafter:
   loop's small tensors F32; loop controllers BF16.
 - Vision encoder and projector (BF16, 0.6 GB) and the DSpark drafter (BF16, 0.6 GB), whole.
 
-`Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB), the 0.5.5 pack, stores layers 20 to 23 as Q8_0 of the release's MXFP8 values,
+`Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB) stores layers 20 to 23 as Q8_0 of the release's MXFP8 values,
 everything else as above. The MX8 pack reads a prompt about 5% faster on the card, with the release's native bits on
-block-scaled MXFP8 tensor cores, at level quality ([precision](../precision/inkling2.md#against-the-reference)). Both load.
+block-scaled MXFP8 tensor cores, at level quality ([precision](../precision/inkling2.md#against-the-reference)). Either loads.
 
 Build it from the release directory: `tools/convert/convert.py --checkpoint DIR` reads both safetensors files, the quant config,
 the tokenizer and the template, and writes the MX8 form.
@@ -45,7 +45,8 @@ the text model.
   embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. Two cards: [peer or split](#two-cards).
 - **Context:** `--max-context` from 1,024 to 1,048,576, default 8,192.
 - **Per position:** the 8 full-attention visits keep every position, 32 KiB with `--kv fp16`, 18 KiB with `--kv int8`, 16 KiB
-  with `--kv fp8`, plus the drafter's full layer (fp16 in every mode); the window layers' rings do not grow.
+  with `--kv fp8`, plus the drafter's full layer (4 KiB fp16, 2.06 KiB int8 with `--kv int8`); the window layers' rings do not
+  grow.
 - **Experts in RAM when the context needs the room:** when the asked context does not fit beside every expert, the least
   routed experts (by the shipped profile `data/profiles/inkling2-24x128.prof`) are planned into page-locked RAM, just enough,
   and decode computes them on the CPU. After routing, a visit with RAM experts publishes its choices and the input rows
@@ -114,7 +115,7 @@ and the elastic copies bring them back while the caches leave room, so most runs
 small or held back (a desktop, another process).
 
 - **Peer:** the main card runs every layer, and the hottest experts that spilled from it live in the second card's VRAM (no RAM
-  copy). In decode the peer computes those experts' rows beside the CPU pool and the card merges them as before; in a prompt the
+  copy). In decode the peer computes those experts' rows beside the CPU pool and the card merges them; in a prompt the
   rows with an expert on the peer go to the peer and its partial sums come back. The elastic copies also bring a peer's experts to
   the main card while it has room, and a layer all of whose experts are copied runs on the main card alone. A peer that would hold
   nothing (the main card holds every expert) is refused with `use gpu 0`.
@@ -132,7 +133,7 @@ small or held back (a desktop, another process).
     At 1M tokens, where the elastic copies bring all 1,938 spilled experts back, one card reads 8,992 tok/s and decodes 365, 650 and
     313 (conversation, struct, prose) and the peer 8,895 and 357, 645 and 311: the peer buys nothing there.
   - Quality: with the experts on the peer the BF16 KLD is level with the CPU's (`--expert-cache 1500`: 0.00440 and 97.25% top-1
-    against 0.00444 and 97.15% on one card, 100 chunks). A peer's prompt differs from a resident card's at summation-order rounding
+    against 0.00444 and 97.15% on one card, 100 chunks of wikitext KLD). A peer's prompt differs from a resident card's at summation-order rounding
     (about 0.01 KLD on `--diag-gpu-check`, the same as reordering any expert sum); its decode rows are exact, and with every spilled
     expert copied back it is bitwise one card.
 - **Split:** the second card runs the layers from the cut on, with their experts, caches and rings; the first runs the rest, the
@@ -196,7 +197,7 @@ threshold stays 3.
 
 `--parallel N` starts N sessions, each with its own caches, rings and drafter context; the forward's scratch, the prompt path
 and the drafter's tap are one for all of them. The busy slots decode together, one pass through the weights of up to 8 rows
-([batched decoding](../design/batching.md)), the rows going to the drafts likeliest kept. A request alone in its slot gives the
+([batched decoding](../architecture/batching.md)), the rows going to the drafts likeliest kept. A request alone in its slot gives the
 same greedy tokens as with `--parallel 1`, and requests decoding together each give the tokens they give alone.
 
 ## Images
@@ -233,7 +234,7 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 
 - Two cards: peer (the spilled experts on the second card) or split (never with experts in RAM), no third card. Experts in RAM run on the CPU,
   so a spilled card decodes slower than a full one: an RTX 5060 Ti alone at 180 W with a Ryzen 9 9950X and about 1,100 experts in RAM decodes conversation at 59 tok/s,
-  struct at 118 and prose at 53, about 2.6 times as fast as reading them over the bus; prompts read as before (2,430 tok/s
+  struct at 118 and prose at 53, about 2.6 times as fast as reading them over the bus; prompts read as on a full card (2,430 tok/s
   at 16K).
 - The server's `decode expert cache hit rate` counts a lookup as a hit when its expert was on a GPU when it ran, the second
   card's included (a copy that moves later leaves its past lookups where they were); the engine's `experts: ... on the card, ... on GPU 1, ... on the CPU` line at the end of a session splits them.

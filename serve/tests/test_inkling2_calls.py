@@ -1,4 +1,4 @@
-"""Inkling 2 tool calls that reach the reply in a form other than the one in the template (#540, #553): the native
+"""Inkling 2 tool calls that reach the reply in a form other than the one in the template: the native
 call with no name in its header, with no header, or in a block left open, and the call written as XML
 (`<invoke name=...><parameter name=...>`, bare or wrapped in `<tool_call><function_calls>`). Each is a call whole and
 streamed, in every chunking, through the OpenAI and Anthropic routes; text that only talks about the tags stays text."""
@@ -90,7 +90,17 @@ class Native(unittest.TestCase):
 
     def test_a_call_cut_off_inside_its_arguments_is_not_a_call(self):
         for reply in (HEADER + "edit_file" + TOOL_JSON + '{"name":"edit_file","args":{"path":"a', ENVELOPE[:-9]):
-            self.assertFalse([e for e in run(reply) if e.kind == "tool_call"], reply)
+            for stream in (True, False):
+                evs = run(reply, stream_tools=stream)
+                self.assertFalse([e for e in evs if e.kind == "tool_call"], (reply, stream))
+                if not stream:
+                    self.assertFalse([e for e in evs if e.kind in ("tool_start", "tool_args")], reply)
+                    self.assertFalse([e for e in evs if e.kind == "content" and TOOL_JSON in e.text], reply)
+
+    def test_name_state_handles_end_and_header_before_later_tool_json(self):
+        call_block = HEADER + "edit_file" + ENVELOPE + END
+        for reply in (HEADER + "Plain text." + END + call_block, HEADER + "Plain text." + call_block):
+            self.agree(reply, [("content", "Plain text."), ("args", ARGS_TEXT), CALL])
 
 
 class Xml(unittest.TestCase):
@@ -176,6 +186,30 @@ class Xml(unittest.TestCase):
             self.assertEqual([g for g in merged(run(reply, width)) if g[0] != "args"],
                              [CALL, ("call", "edit_file", {"path": "z"})], width)
 
+    def test_prose_xml_openers_do_not_stall_streaming_without_gt(self):
+        # prose containing <tool_call>, <function_calls> or <invoke name=...> must flush during feed(), not wait for '>'
+        for opener, follow in (("<tool_call>", " tags in prose without angle brackets"),
+                               ("<function_calls>", " in prose without angle brackets"),
+                               ('<invoke name="edit_file">', " is how you invoke it")):
+            p = Inkling2Parser(tools=TOOLS)
+            got = ""
+            got += "".join(e.text for e in p.feed(HEADER + TEXT + "Use " + opener) if e.kind == "content")
+            for ch in follow:
+                got += "".join(e.text for e in p.feed(ch) if e.kind == "content")
+            self.assertEqual(got, "Use " + opener + follow, opener)
+
+    def test_zero_arg_xml_call_and_trailing_prose_without_gt(self):
+        body = '<invoke name="edit_file"></invoke>'
+        for width in WIDTHS:
+            got = [g for g in merged(run(self.blocks(body), width)) if g[0] != "args"]
+            self.assertEqual(got, [("call", "edit_file", {})], width)
+        # trailing prose with no '>' after </invoke> flushes the call and text during feed()
+        p = Inkling2Parser(tools=TOOLS)
+        evs = p.feed(HEADER + TEXT + body)
+        evs += p.feed(" Done now.")
+        self.assertEqual([(e.kind, e.call.name if e.call else e.text) for e in evs if e.kind in ("tool_call", "content")],
+                         [("tool_call", "edit_file"), ("content", "Done now.")])
+
 
 class Routes(unittest.TestCase):
     """The same replies through the server: OpenAI and Anthropic, whole and streamed."""
@@ -253,6 +287,32 @@ class Routes(unittest.TestCase):
                     text, calls = read(self.ask(HEADER + TEXT + talk + END, route, stream), stream)
                     self.assertEqual((text, calls), (talk, []))
 
+    def test_non_streaming_truncated_native_call_does_not_leak(self):
+        for script in (HEADER + "edit_file" + ENVELOPE + END, HEADER + ENVELOPE + END):
+            tok = service().tok
+            cut = len(tok.encode(script[:script.index("old_string")], parse_special=True))
+            for path, extra in (self.OPENAI, self.ANTHROPIC):
+                svc = service(script)
+                svc.answer_room = 0     # no thinking budget: MockEngine replays from token 0 on a second pass
+                httpd = serve(svc, port=0)
+                body = dict(extra, model="ink", stream=False, max_tokens=cut,
+                            messages=[{"role": "user", "content": "edit it"}])
+                try:
+                    req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                                                 data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        res = json.loads(r.read().decode())
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if path == "/v1/chat/completions":
+                    self.assertEqual(res["choices"][0]["finish_reason"], "length", script)
+                    self.assertNotIn("tool_calls", res["choices"][0]["message"], script)
+                else:
+                    self.assertEqual(res["stop_reason"], "max_tokens", script)
+                    self.assertEqual([b for b in res["content"] if b["type"] == "tool_use"], [], script)
+
 
 
 class NoneChoice(unittest.TestCase):
@@ -270,6 +330,7 @@ class NoneChoice(unittest.TestCase):
     def ask(self, script, stream, max_tokens=900, **extra):
         """(reply: content, reasoning, calls, finish and every tool_calls delta, the prompt the engine read)."""
         svc = service(script)
+        svc.answer_room = 0     # no thinking budget: a thinking request's first pass would stop at it (MockEngine replays)
         httpd = serve(svc, port=0)
         body = dict(model="ink", stream=stream, max_tokens=max_tokens, tools=[self.TOOL],
                     messages=[{"role": "user", "content": "what is in src/app.py?"}], **extra)

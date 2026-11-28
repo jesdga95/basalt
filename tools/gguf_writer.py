@@ -118,7 +118,8 @@ class GGUFWriter:
     # ---- serialisation
     def _kv_bytes(self, key: str, type_name: str, value) -> bytes:
         out = bytearray()
-        out += struct.pack("<Q", len(key)) + key.encode("utf-8")
+        kb = key.encode("utf-8")
+        out += struct.pack("<Q", len(kb)) + kb
         if type_name.startswith("array:"):
             elem = type_name.split(":", 1)[1]
             out += struct.pack("<I", _META_IDS["array"])
@@ -154,7 +155,8 @@ class GGUFWriter:
         offset = 0
         infos = bytearray()
         for t in self.tensors:
-            infos += struct.pack("<Q", len(t.name)) + t.name.encode("utf-8")
+            nb = t.name.encode("utf-8")
+            infos += struct.pack("<Q", len(nb)) + nb
             infos += struct.pack("<I", len(t.shape))
             infos += struct.pack(f"<{len(t.shape)}Q", *t.shape)
             infos += struct.pack("<I", TYPE_IDS[t.type_name])

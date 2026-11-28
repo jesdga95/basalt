@@ -122,7 +122,7 @@ public:
 
 private:
     /// Opens the pack and allocates every dense tensor, their reads queued in `reads`.
-    bool load(const std::string& path, core::LoadPlan& reads, std::string& err);
+    bool load(const std::string& path, core::LoadPlan& reads, bool ple_ram, std::string& err);
 
     core::LoadPlan* planning_ = nullptr;
     CacheFormat cache_format_ = CacheFormat::Fp8;

@@ -94,8 +94,8 @@ __global__ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __r
     // whole 4-warp blocks, so a call with `rows` = 2 - the QSA k-norm, the only non-multiple-of-4 row count in
     // the engine - runs EIGHT warps: rows 0 and 1 are the data, and rows 2 and 3 write 2*cols floats PAST the
     // end of `b.kcur`, which in the arena is exactly where `b.vcur` begins.  `b.vcur` was therefore silently
-    // replaced by two rows of `rms_norm(...) * attn_k_norm`: a normalized vector with l2 ~20.6 against V's
-    // ~5.7, which the attention then attended to.  `rope_neox_kernel` has had this guard all along.
+    // replaced by two rows of `rms_norm(...) * attn_k_norm`, which the attention then attended to.
+    // `rope_neox_kernel` has the same guard.
     if (row >= rows) return;
     float* r = x + row * cols;
     float acc = 0.0f;

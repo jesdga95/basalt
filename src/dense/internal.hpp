@@ -22,7 +22,6 @@ class CudaEncoder;
 namespace basalt::dense {
 
 constexpr int kWindow = 16;       // rows one session's decode window holds
-constexpr int kBatch = 32;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)

@@ -29,11 +29,11 @@ PRESET = "community-1"
 ENGINE_FLAGS = {"--gpu": r"\d+(,\d+)*", "--gpu-mode": "peer|split|tensor", "--gpu-share": r"\d+(\.\d+)?(,\d+(\.\d+)?)*",
                 "--max-context": r"\d{4,7}", "--kv": "|".join(re.escape(k) for k in cb.KV_FORMATS)}
 # Band: a new row's decode_tps and prefill_16k_tps must lie in [lowest/BAND, highest*BAND] of the earlier rows of the
-# same model, GPU name and GPU count (different quants of one card spread about 4.5x in the table).
+# same model, GPU name and GPU count (different quants of one card spread widely).
 BAND = 2.5
-# Hard ceilings, whatever the card: the table's best rows are 656 tok/s decode and 18,710 tok/s prefill.
+# Hard ceilings, whatever the card: above the best rows of the table.
 CAP_DECODE, CAP_PREFILL = 2000, 40000
-# prefill_64k_tps over prefill_16k_tps: the table spans 0.70 to 4.06.
+# prefill_64k_tps over prefill_16k_tps, bounded around the spread of the table.
 RATIO_LOW, RATIO_HIGH = 0.3, 6.0
 CAPS = {"submitter": 40, "notes": 200, "cpu": 80, "engine_args": 300, "quant": 40, "preset": 30, "gpu_name": 80}
 TEXT_RE = re.compile(r"^[^<>`\\]*$")

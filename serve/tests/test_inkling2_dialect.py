@@ -168,7 +168,7 @@ class Parse(unittest.TestCase):
 
     def test_a_cut_off_call_streams_valid_json(self):
         # what was streamed is closed: a value cut inside a string keeps its text, a dangling key, separator, literal or
-        # escape is dropped, nothing is invented (vLLM #53739)
+        # escape is dropped, nothing is invented
         head = HEADER + "f" + TOOL_JSON + '{"name":"f","args":'
         for cut, want in (('{"s": "hel', {"s": "hel"}), ('{"s": "hello", ', {"s": "hello"}), ('{"n": 42, ', {"n": 42}),
                           ('{"s": "a", "n": tr', {"s": "a"}), ('{"s": "a", "k', {"s": "a"}), ('{"s": "a", "k":', {"s": "a"}),

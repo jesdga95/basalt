@@ -92,6 +92,10 @@ public:
     bool open_scratch(int n, uint64_t bytes, std::string& err);
     /// Scratch slots still free for the armed share (all of them again once the next one is armed).
     int scratch_free() const { return (int) scratch_.size() - scratch_used_; }
+    /// Whether a share is armed and not raised yet.
+    bool armed() const { return armed_; }
+    /// Whether the armed share holds `expert` in a scratch slot (fetch).
+    bool fetched(int64_t expert) const;
     /// Copies `bytes` at `src` (pinned host memory) into a free scratch slot for `expert`, over this card's own link on a
     /// stream of its own; the slot, or null when none is free.  The armed share's next `raise` plans the expert's entries
     /// where kind is 3, and `run_fetched` queues them behind the copies.

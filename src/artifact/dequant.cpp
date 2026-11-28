@@ -10,12 +10,27 @@ int main(int argc, char** argv) {
     }
     try {
         basalt::GgufFile g(argv[1]);
+        const uint64_t payload = g.file_size() - g.data_start();
+        auto safe_elements = [](const basalt::TensorInfo& t) -> uint64_t {
+            uint64_t n = 1;
+            for (uint64_t d : t.shape) {
+                if (d != 0 && n > (std::numeric_limits<uint64_t>::max)() / d)
+                    throw std::runtime_error("tensor '" + t.name + "' element count overflow");
+                n *= d;
+            }
+            return n;
+        };
+        auto check_bounds = [&](const basalt::TensorInfo& t, uint64_t nb, uint64_t bsz) {
+            if (t.offset > payload || nb > (payload - t.offset) / bsz)
+                throw std::runtime_error("tensor '" + t.name + "' extends past end of file");
+        };
         int checked = 0, bad = 0;
         for (const auto& t : g.tensors()) {
             if (t.type != 42) continue; // Q2_0 only for now
             if (checked >= 8) break;
+            const uint64_t nblocks = safe_elements(t) / 64;
+            check_bounds(t, nblocks, 18);
             const uint8_t* base = g.tensor_data(t);
-            const uint64_t nblocks = t.elements() / 64;
             for (uint64_t b = 0; b < nblocks && b < 64; ++b) {
                 const uint8_t* blk = base + b * 18;
                 float out[64];
@@ -38,7 +53,6 @@ int main(int argc, char** argv) {
                 // implementation on identical bytes. A single implementation being self-consistent
                 // proves little - two disagreeing is what finds bugs.
                 double sum = 0, sumabs = 0;
-                const uint8_t* base = g.tensor_data(t);
                 for (uint64_t b = 0; b < nblocks && b < 64; ++b) {
                     float out[64];
                     basalt::dequantize_q2_0(base + b * 18, out);
@@ -56,7 +70,6 @@ int main(int argc, char** argv) {
             if (t.type != 6 && t.type != 20 && t.type != 14 && t.type != 12 && t.type != 13 && t.type != 11 &&
                 t.type != 23)
                 continue;
-            const uint8_t* base = g.tensor_data(t);
             const int bsz =
                 (t.type == 20)
                     ? 18
@@ -67,24 +80,26 @@ int main(int argc, char** argv) {
                                   : (t.type == 13 ? 176 : (t.type == 11 ? 110 : (t.type == 23 ? 136 : 22)))));
             const int nel =
                 (t.type == 14 || t.type == 12 || t.type == 13 || t.type == 11 || t.type == 23) ? 256 : 32;
-            const uint64_t nb = t.elements() / (uint64_t)nel;
+            const uint64_t nb = safe_elements(t) / (uint64_t)nel;
+            check_bounds(t, nb, (uint64_t)bsz);
+            const uint8_t* base = g.tensor_data(t);
             double sum = 0, sumabs = 0;
             for (uint64_t b = 0; b < nb && b < 64; ++b) {
                 float out[256];
                 if (t.type == 20)
-                    basalt::dequantize_iq4_nl(base + b * bsz, out);
+                    basalt::dequantize_iq4_nl(base + b * (uint64_t)bsz, out);
                 else if (t.type == 14)
-                    basalt::dequantize_q6_K(base + b * bsz, out);
+                    basalt::dequantize_q6_K(base + b * (uint64_t)bsz, out);
                 else if (t.type == 12)
-                    basalt::dequantize_q4_K(base + b * bsz, out);
+                    basalt::dequantize_q4_K(base + b * (uint64_t)bsz, out);
                 else if (t.type == 13)
-                    basalt::dequantize_q5_K(base + b * bsz, out);
+                    basalt::dequantize_q5_K(base + b * (uint64_t)bsz, out);
                 else if (t.type == 11)
-                    basalt::dequantize_q3_K(base + b * bsz, out);
+                    basalt::dequantize_q3_K(base + b * (uint64_t)bsz, out);
                 else if (t.type == 23)
-                    basalt::dequantize_iq4_xs(base + b * bsz, out);
+                    basalt::dequantize_iq4_xs(base + b * (uint64_t)bsz, out);
                 else
-                    basalt::dequantize_q5_0(base + b * bsz, out);
+                    basalt::dequantize_q5_0(base + b * (uint64_t)bsz, out);
                 for (int j = 0; j < nel; ++j) {
                     sum += out[j];
                     sumabs += std::fabs(out[j]);
@@ -92,24 +107,26 @@ int main(int argc, char** argv) {
             }
             std::printf("  CHECKSUM %s %s sum=%.10g sumabs=%.10g\n", t.type_name(), t.name.c_str(), sum,
                         sumabs);
-            float f8[256];
-            if (t.type == 20)
-                basalt::dequantize_iq4_nl(base, f8);
-            else if (t.type == 14)
-                basalt::dequantize_q6_K(base, f8);
-            else if (t.type == 12)
-                basalt::dequantize_q4_K(base, f8);
-            else if (t.type == 13)
-                basalt::dequantize_q5_K(base, f8);
-            else if (t.type == 11)
-                basalt::dequantize_q3_K(base, f8);
-            else if (t.type == 23)
-                basalt::dequantize_iq4_xs(base, f8);
-            else
-                basalt::dequantize_q5_0(base, f8);
-            std::printf("  REF first8:");
-            for (int j = 0; j < 8; ++j) std::printf(" %.6g", f8[j]);
-            std::printf("\n");
+            if (nb > 0) {
+                float f8[256];
+                if (t.type == 20)
+                    basalt::dequantize_iq4_nl(base, f8);
+                else if (t.type == 14)
+                    basalt::dequantize_q6_K(base, f8);
+                else if (t.type == 12)
+                    basalt::dequantize_q4_K(base, f8);
+                else if (t.type == 13)
+                    basalt::dequantize_q5_K(base, f8);
+                else if (t.type == 11)
+                    basalt::dequantize_q3_K(base, f8);
+                else if (t.type == 23)
+                    basalt::dequantize_iq4_xs(base, f8);
+                else
+                    basalt::dequantize_q5_0(base, f8);
+                std::printf("  REF first8:");
+                for (int j = 0; j < 8; ++j) std::printf(" %.6g", f8[j]);
+                std::printf("\n");
+            }
             if (t.type == 23) break; // emit Q5_0 first, then IQ4_NL
         }
         std::printf("%s\n  Q2_0 tensors spot-checked: %d\n  symbolic invariant violations: %d -> %s\n",

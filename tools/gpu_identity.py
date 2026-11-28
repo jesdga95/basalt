@@ -4,7 +4,7 @@
         [--ref-flags "--gpu 0"] [--ref-engine BIN] [--prompts conv,struct,prose,prefill] [--tokens N] [--fixtures DIR]
         [--logits] [-- COMMON ENGINE ARGS...]   (Flash-Next: -- --adapt-swaps 0 --peer-adapt-swaps 0)
 
-The serve-level multi-GPU check of any model (docs/design/multi-gpu.md), the sibling of batch_identity.py. The reference
+The serve-level multi-GPU check of any model (docs/architecture/multi-gpu.md), the sibling of batch_identity.py. The reference
 engine (ENGINE, or --ref-engine for another build: v0.5.6 against the branch) and the mode's engine each run as `--serve`
 with the common args; each prompt (the bench fixtures conv, struct, prose and the long prefill, which exceeds a chunk so a
 prompt stage or a split's hand-off runs) is greedy at temperature 0 and every token is compared. A split too large for one

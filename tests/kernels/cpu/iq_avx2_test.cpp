@@ -20,6 +20,7 @@
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/iq_avx2.hpp"
+#include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -161,6 +163,331 @@ int frozen_rows(const char* build, GuFn gu, DotFn dot, bool print) {
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Q8_1 FP16 clamping (scale and sum stay in [-65504, 65504], qs clamped to [-127, 127], NaN preserved) across
+// quantize_row_q8_1_ref and the AVX2/AVX-512 ggml quantizers, plus a Q5_1 dot with m = 0 (no 0 * inf = NaN).
+int check_q8_1_finite(bool avx512) {
+    int bad = 0;
+    struct Impl {
+        const char* name;
+        ggml_from_float_t fn;
+    };
+    const auto* tr_ref = ggml_get_type_traits(GGML_TYPE_Q8_1);
+    const auto* tr_avx2 = ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q8_1);
+    const auto* tr_avx512 = avx512 ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_Q8_1) : nullptr;
+    const auto* q51_avx2 = ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q5_1);
+    std::vector<Impl> impls = {{"ref", tr_ref->from_float_ref}, {"avx2", tr_avx2->from_float}};
+    if (tr_avx512 != nullptr) impls.push_back({"avx512", tr_avx512->from_float});
+
+    auto read_q81 = [](const uint8_t* blk, uint16_t& d_bits, uint16_t& s_bits) {
+        std::memcpy(&d_bits, blk, 2);
+        std::memcpy(&s_bits, blk + 2, 2);
+    };
+
+    // (1) Sum overflow with finite scale: x[0] = +-66000, and all-3000 / all-(-3000)
+    for (const Impl& im : impls) {
+        for (int c = 0; c < 4; ++c) {
+            float x[32] = {};
+            const float want_s = (c & 1) ? -65504.0f : 65504.0f;
+            if (c < 2) x[0] = (c == 0) ? 66000.0f : -66000.0f;
+            else for (float& v : x) v = (c == 2) ? 3000.0f : -3000.0f;
+            uint8_t blk[36];
+            std::memset(blk, 0xA5, sizeof blk);
+            im.fn(x, blk, 32);
+            uint16_t db = 0, sb = 0;
+            read_q81(blk, db, sb);
+            const float d = ggml_fp16_to_fp32(db), s = ggml_fp16_to_fp32(sb);
+            if (!std::isfinite(d) || s != want_s) {
+                std::printf("Q8_1 %s sum-overflow case %d: d=%g s=%g want_s=%g\n", im.name, c, d, s, want_s);
+                ++bad;
+            }
+            // Q5_1 block with m = 0 must not turn into 0 * inf = NaN
+            uint8_t w51[24] = {};
+            const uint16_t one_h = ggml_fp32_to_fp16(1.0f);
+            std::memcpy(w51, &one_h, 2);
+            float dot = 0.0f;
+            q51_avx2->vec_dot(32, &dot, 0, w51, 0, blk, 0, 1);
+            if (!std::isfinite(dot)) {
+                std::printf("Q8_1 %s Q5_1 dot (m=0) case %d produced non-finite %g\n", im.name, c, dot);
+                ++bad;
+            }
+        }
+        // (2) Scale overflow (amax > 65504 * 127) and +-inf: d clamped to 65504, qs clamped to [-127, 127] with sign
+        for (int c = 0; c < 3; ++c) {
+            float x[32] = {};
+            const float big = c == 0 ? 1.0e7f : c == 1 ? 1.0e20f : std::numeric_limits<float>::infinity();
+            x[0] = big;
+            x[1] = -big;
+            x[2] = 65504.0f;
+            uint8_t blk[36];
+            std::memset(blk, 0xA5, sizeof blk);
+            im.fn(x, blk, 32);
+            uint16_t db = 0, sb = 0;
+            read_q81(blk, db, sb);
+            const float d = ggml_fp16_to_fp32(db), s = ggml_fp16_to_fp32(sb);
+            const int q0 = (int) (int8_t) blk[4], q1 = (int) (int8_t) blk[5], q2 = (int) (int8_t) blk[6];
+            if (d != 65504.0f || !std::isfinite(s) || std::fabs(s) > 65504.0f || q0 != 127 || q1 != -127 || q2 != 1) {
+                std::printf("Q8_1 %s scale-overflow case %d: d=%g s=%g q=(%d,%d,%d)\n", im.name, c, d, s, q0, q1, q2);
+                ++bad;
+            }
+        }
+        // (3) Tiny subnormal: finite zero scale and sum
+        {
+            float x[32] = {};
+            x[0] = 1.0e-40f;
+            uint8_t blk[36];
+            std::memset(blk, 0xA5, sizeof blk);
+            im.fn(x, blk, 32);
+            uint16_t db = 0, sb = 0;
+            read_q81(blk, db, sb);
+            if (ggml_fp16_to_fp32(db) != 0.0f || ggml_fp16_to_fp32(sb) != 0.0f) {
+                std::printf("Q8_1 %s subnormal: d=%g s=%g\n", im.name, ggml_fp16_to_fp32(db), ggml_fp16_to_fp32(sb));
+                ++bad;
+            }
+        }
+        // (4) NaN in any lane must stay NaN (not dropped by vmaxps / MAX)
+        for (int lane : {0, 1, 7, 8, 15, 16, 24, 31}) {
+            for (float fill_v : {0.0f, 1.0f}) {
+                float x[32];
+                for (float& v : x) v = fill_v;
+                x[lane] = std::numeric_limits<float>::quiet_NaN();
+                uint8_t blk[36];
+                std::memset(blk, 0xA5, sizeof blk);
+                im.fn(x, blk, 32);
+                uint16_t db = 0, sb = 0;
+                read_q81(blk, db, sb);
+                if (!std::isnan(ggml_fp16_to_fp32(db)) || !std::isnan(ggml_fp16_to_fp32(sb))) {
+                    std::printf("Q8_1 %s NaN lane %d (fill %g): d=%g s=%g\n", im.name, lane, fill_v,
+                                ggml_fp16_to_fp32(db), ggml_fp16_to_fp32(sb));
+                    ++bad;
+                }
+            }
+        }
+    }
+    std::printf("  Q8_1 finite/NaN checks (%zu backends): %d failures\n", impls.size(), bad);
+    return bad;
+}
+
+// Q8_K zero-block bsums initialization (quantize_row_q8_K_ref) and NaN propagation (ref, AVX2, AVX-512).
+int check_q8_k_edge(bool avx512) {
+    int bad = 0;
+    struct Impl {
+        const char* name;
+        ggml_from_float_t fn;
+    };
+    const auto* tr_ref = ggml_get_type_traits(GGML_TYPE_Q8_K);
+    std::vector<Impl> impls = {{"ref", tr_ref->from_float_ref}, {"avx2", cpu::quantize_q8_K_avx2}};
+    if (avx512) impls.push_back({"avx512", cpu::quantize_q8_K_avx512});
+
+    for (const Impl& im : impls) {
+        // (1) All-zero block must zero d, qs, AND bsums (no uninitialized bytes)
+        float zeros[256] = {};
+        uint8_t blk[292];
+        std::memset(blk, 0xA5, sizeof blk);
+        im.fn(zeros, blk, 256);
+        uint8_t expected_zero[292] = {};
+        if (std::memcmp(blk, expected_zero, sizeof blk) != 0) {
+            std::printf("Q8_K %s all-zero block left non-zero bytes (bsums UB)\n", im.name);
+            ++bad;
+        }
+        // (2) NaN in any lane must produce d = NaN (not -0.0f or finite) and zeroed qs/bsums
+        for (int lane : {0, 1, 7, 8, 15, 16, 31, 127, 128, 254, 255}) {
+            for (float fill_v : {0.0f, 1.0f, std::numeric_limits<float>::infinity()}) {
+                float x[256];
+                for (float& v : x) v = fill_v;
+                x[lane] = std::numeric_limits<float>::quiet_NaN();
+                std::memset(blk, 0xA5, sizeof blk);
+                im.fn(x, blk, 256);
+                float d = 0.0f;
+                std::memcpy(&d, blk, 4);
+                bool tail_zero = true;
+                for (size_t i = 4; i < sizeof blk; ++i) tail_zero &= blk[i] == 0;
+                if (!std::isnan(d) || !tail_zero) {
+                    std::printf("Q8_K %s NaN lane %d (fill %g): d=%g tail_zero=%d\n", im.name, lane, fill_v, d, (int) tail_zero);
+                    ++bad;
+                }
+            }
+        }
+    }
+    // (3) Bitwise parity between ref and AVX2 (and AVX-512) on mixed finite + zero blocks without masking bsums
+    std::mt19937 rng(707);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> x(H);
+    for (int i = 0; i < H; ++i) x[(size_t) i] = (i / 256) % 2 == 0 ? 0.0f : nd(rng);
+    const size_t rb = ggml_row_size(GGML_TYPE_Q8_K, H);
+    std::vector<uint8_t> ref_b(rb, 0xA5), got_b(rb, 0xA5);
+    tr_ref->from_float_ref(x.data(), ref_b.data(), H);
+    for (size_t k = 1; k < impls.size(); ++k) {
+        std::fill(got_b.begin(), got_b.end(), (uint8_t) 0xA5);
+        impls[k].fn(x.data(), got_b.data(), H);
+        if (std::memcmp(ref_b.data(), got_b.data(), rb) != 0) {
+            std::printf("Q8_K %s differs from ref on mixed finite/zero blocks\n", impls[k].name);
+            ++bad;
+        }
+    }
+    std::printf("  Q8_K zero-bsums/NaN checks (%zu backends): %d failures\n", impls.size(), bad);
+    return bad;
+}
+
+// Multi-token bounds: nt <= 0 must be a clean no-op (nullptr arrays), and nt > 8 (9, 13) must process every token
+// bitwise identically to nt = 1 without overflowing stack arrays or dropping tokens 8..nt-1.
+int check_multitoken_bounds(bool vnni, bool avx512) {
+    int bad = 0;
+    constexpr int kBigT = 13;
+    constexpr int kRows = 16;
+    std::mt19937 rng(913);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    // (1) IQ2/3/4_XS gate/up and dot rows (AVX2 base/vnni, plus AVX-512 if present)
+    for (int type : {16, 17, 18, 21, 22, 23}) {
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(type, 20, H, FF, f, err)) return 1;
+        std::vector<uint8_t> blob(2 * f.up_off);
+        fill(blob, type, 400 + (uint64_t) type, 0);
+        // nt <= 0 with nullptr pointers
+        for (int nt : {0, -1}) {
+            cpu::iq256_gu_rows_base(type, blob.data(), f.gu_row, f.up_off, H, nullptr, nt, nullptr, 0, kRows);
+            cpu::iq256_rows_base(type, blob.data(), f.gu_row, H, nullptr, nt, nullptr, 0, kRows);
+            if (vnni) {
+                cpu::iq256_gu_rows_vnni(type, blob.data(), f.gu_row, f.up_off, H, nullptr, nt, nullptr, 0, kRows);
+                cpu::iq256_rows_vnni(type, blob.data(), f.gu_row, H, nullptr, nt, nullptr, 0, kRows);
+            }
+            if (avx512 && cpu::iq512_supported(type)) {
+                cpu::iq512_gu_rows(type, blob.data(), f.gu_row, f.up_off, H, nullptr, nt, nullptr, 0, kRows);
+                cpu::iq512_rows(type, blob.data(), f.gu_row, H, nullptr, nt, nullptr, 0, kRows);
+            }
+        }
+        std::vector<std::vector<uint8_t>> act(kBigT, std::vector<uint8_t>(cpu::kNativeActBytes));
+        std::vector<float> x(H);
+        const void* ap[kBigT];
+        for (int t = 0; t < kBigT; ++t) {
+            for (float& v : x) v = nd(rng);
+            cpu::native_quant_act(f, x.data(), act[(size_t) t].data());
+            ap[t] = act[(size_t) t].data();
+        }
+        auto check_pair = [&](const char* tag, GuFn gu, DotFn dot) {
+            std::vector<std::vector<float>> ref_gu(kBigT, std::vector<float>(kRows)), ref_dot(kBigT, std::vector<float>(kRows));
+            for (int t = 0; t < kBigT; ++t) {
+                float* fg[1] = {ref_gu[(size_t) t].data()};
+                float* fd[1] = {ref_dot[(size_t) t].data()};
+                gu(type, blob.data(), f.gu_row, f.up_off, H, ap + t, 1, fg, 0, kRows);
+                dot(type, blob.data(), f.gu_row, H, ap + t, 1, fd, 0, kRows);
+            }
+            for (int nt : {9, 13}) {
+                std::vector<std::vector<float>> g(nt, std::vector<float>(kRows, -123.0f));
+                std::vector<std::vector<float>> d(nt, std::vector<float>(kRows, -123.0f));
+                float *gp[kBigT], *dp[kBigT];
+                for (int t = 0; t < nt; ++t) { gp[t] = g[(size_t) t].data(); dp[t] = d[(size_t) t].data(); }
+                gu(type, blob.data(), f.gu_row, f.up_off, H, ap, nt, gp, 0, kRows);
+                dot(type, blob.data(), f.gu_row, H, ap, nt, dp, 0, kRows);
+                for (int t = 0; t < nt; ++t) {
+                    if (std::memcmp(gp[t], ref_gu[(size_t) t].data(), kRows * 4) != 0 ||
+                        std::memcmp(dp[t], ref_dot[(size_t) t].data(), kRows * 4) != 0) {
+                        std::printf("MISMATCH %s type %d nt %d token %d\n", tag, type, nt, t);
+                        ++bad;
+                    }
+                }
+            }
+        };
+        check_pair("avx2-base", cpu::iq256_gu_rows_base, cpu::iq256_rows_base);
+        if (vnni) check_pair("avx2-vnni", cpu::iq256_gu_rows_vnni, cpu::iq256_rows_vnni);
+        if (avx512 && cpu::iq512_supported(type)) check_pair("avx512", cpu::iq512_gu_rows, cpu::iq512_rows);
+    }
+
+    // (2) IQ4_NL down rows (nt = 0, -1, 9, 13: must not overflow stack y[8] for nt > 8)
+    {
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(22, 20, H, FF, f, err)) return 1;
+        std::vector<uint8_t> blob(f.d_row * (size_t) kRows);
+        fill(blob, 20, 950, 0);
+        for (int nt : {0, -1}) {
+            cpu::iq4nl256_down_rows_base(blob.data(), f.d_row, FF, nullptr, nt, nullptr, 0, kRows);
+            if (vnni) cpu::iq4nl256_down_rows_vnni(blob.data(), f.d_row, FF, nullptr, nt, nullptr, 0, kRows);
+        }
+        std::vector<std::vector<uint8_t>> hq(kBigT, std::vector<uint8_t>(cpu::kNativeHBytes));
+        std::vector<float> h(FF);
+        const void* hp[kBigT];
+        for (int t = 0; t < kBigT; ++t) {
+            for (float& v : h) v = nd(rng);
+            cpu::native_quant_h(f, h.data(), hq[(size_t) t].data());
+            hp[t] = hq[(size_t) t].data();
+        }
+        for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+            auto fn = v ? cpu::iq4nl256_down_rows_vnni : cpu::iq4nl256_down_rows_base;
+            std::vector<std::vector<float>> ref(kBigT, std::vector<float>(kRows));
+            for (int t = 0; t < kBigT; ++t) {
+                float* rp[1] = {ref[(size_t) t].data()};
+                fn(blob.data(), f.d_row, FF, hp + t, 1, rp, 0, kRows);
+            }
+            for (int nt : {9, 13}) {
+                std::vector<std::vector<float>> got(nt, std::vector<float>(kRows, -123.0f));
+                float* gp[kBigT];
+                for (int t = 0; t < nt; ++t) gp[t] = got[(size_t) t].data();
+                fn(blob.data(), f.d_row, FF, hp, nt, gp, 0, kRows);
+                for (int t = 0; t < nt; ++t) {
+                    if (std::memcmp(gp[t], ref[(size_t) t].data(), kRows * 4) != 0) {
+                        std::printf("MISMATCH IQ4_NL down %s nt %d token %d\n", v ? "vnni" : "base", nt, t);
+                        ++bad;
+                    }
+                }
+            }
+        }
+    }
+
+    // (3) Q2_0 GGUF multi-token down rows (AVX-512 expert.cpp when available, plus AVX2 base/vnni)
+    {
+        constexpr int NB = FF / 64;
+        constexpr size_t ROW = (size_t) NB * 18;
+        std::vector<uint8_t> blob(ROW * (size_t) kRows);
+        std::mt19937_64 wr(2500);
+        for (auto& b : blob) b = (uint8_t) wr();
+        for (size_t b = 0; b + 18 <= blob.size(); b += 18) {
+            const uint16_t d = (uint16_t) (0x2800 + (blob[b] & 0xff));
+            std::memcpy(&blob[b], &d, 2);
+        }
+        for (int nt : {0, -1}) {
+            cpu::q2_0_gguf_rows_multi_avx2_base(blob.data(), ROW, NB, nullptr, nt, nullptr, 0, kRows);
+            if (vnni) cpu::q2_0_gguf_rows_multi_avx2_vnni(blob.data(), ROW, NB, nullptr, nt, nullptr, 0, kRows);
+            if (avx512) cpu::q2_0_gguf_rows_multi(blob.data(), ROW, NB, nullptr, nt, nullptr, 0, kRows);
+        }
+        std::vector<cpu::ActQ> a(kBigT);
+        std::vector<float> h(FF);
+        const cpu::ActQ* ap[kBigT];
+        for (int t = 0; t < kBigT; ++t) {
+            for (float& v : h) v = nd(rng);
+            cpu::act_quant_q8_1_avx2(h.data(), FF, a[(size_t) t]);
+            ap[t] = &a[(size_t) t];
+        }
+        auto check_q2 = [&](const char* tag,
+                            void (*fn)(const uint8_t*, size_t, int, const cpu::ActQ* const*, int, float* const*, int, int)) {
+            std::vector<std::vector<float>> ref(kBigT, std::vector<float>(kRows));
+            for (int t = 0; t < kBigT; ++t) {
+                float* rp[1] = {ref[(size_t) t].data()};
+                fn(blob.data(), ROW, NB, ap + t, 1, rp, 0, kRows);
+            }
+            for (int nt : {9, 13}) {
+                std::vector<std::vector<float>> got(nt, std::vector<float>(kRows, -123.0f));
+                float* gp[kBigT];
+                for (int t = 0; t < nt; ++t) gp[t] = got[(size_t) t].data();
+                fn(blob.data(), ROW, NB, ap, nt, gp, 0, kRows);
+                for (int t = 0; t < nt; ++t) {
+                    if (std::memcmp(gp[t], ref[(size_t) t].data(), kRows * 4) != 0) {
+                        std::printf("MISMATCH Q2_0 %s nt %d token %d\n", tag, nt, t);
+                        ++bad;
+                    }
+                }
+            }
+        };
+        check_q2("avx2-base", cpu::q2_0_gguf_rows_multi_avx2_base);
+        if (vnni) check_q2("avx2-vnni", cpu::q2_0_gguf_rows_multi_avx2_vnni);
+        if (avx512) check_q2("avx512", cpu::q2_0_gguf_rows_multi);
+    }
+
+    std::printf("  multi-token bounds (nt <= 0 and nt = 9, 13): %d failures\n", bad);
+    return bad;
 }
 
 }  // namespace
@@ -567,6 +894,9 @@ int main(int argc, char** argv) {
             if (st512.max_rel > 1e-3) { std::printf("AVX-512 Q2_0 down rows too far from AVX2\n"); ++bad; }
         }
     }
+    bad += check_q8_1_finite(avx512);
+    bad += check_q8_k_edge(avx512);
+    bad += check_multitoken_bounds(vnni, avx512);
     std::printf("iq_avx2_test: %d base/vnni and gathered-row comparisons, %d failures\n", compared, bad);
 
     if (bench) {   // 200 gate/up rows (the pool's task) per call, the arena far larger than the caches

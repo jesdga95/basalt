@@ -269,6 +269,36 @@ void test_router() {
     report("router weights", w, rw, 1e-5);
     std::printf("%-30s %s\n", "router ids", same ? "equal" : "FAIL");
     failures += !same;
+    // BF16 router must be bit-for-bit identical to FP32 router on BF16-exact weights (both decode and prefill paths).
+    for (int T : {1, 6, 128}) {
+        std::vector<float> xt = randn((size_t) T * E), g32((size_t) NE * E);
+        std::vector<uint16_t> g16((size_t) NE * E);
+        for (size_t i = 0; i < g32.size(); ++i) {
+            uint32_t u = 0;
+            std::memcpy(&u, &gate[i], 4);
+            u &= 0xffff0000u;
+            g16[i] = (uint16_t) (u >> 16);
+            std::memcpy(&g32[i], &u, 4);
+        }
+        float *dxt = dev(xt), *dg32 = dev(g32), *dl32 = devf((size_t) T * NE), *dl16 = devf((size_t) T * NE);
+        float *dw32 = devf((size_t) T * K), *dw16 = devf((size_t) T * K);
+        uint16_t* dg16 = nullptr;
+        int32_t *di32 = nullptr, *di16 = nullptr;
+        cudaMalloc(&dg16, g16.size() * 2);
+        cudaMemcpy(dg16, g16.data(), g16.size() * 2, cudaMemcpyHostToDevice);
+        cudaMalloc(&di32, (size_t) T * K * 4);
+        cudaMalloc(&di16, (size_t) T * K * 4);
+        bk::router(dxt, dg32, db, T, ra, dl32, di32, dw32, nullptr);
+        bk::router_bf16(dxt, dg16, db, T, ra, dl16, di16, dw16, nullptr);
+        const std::vector<float> l32 = host(dl32, (size_t) T * NE), l16 = host(dl16, (size_t) T * NE);
+        const std::vector<float> w32 = host(dw32, (size_t) T * K), w16 = host(dw16, (size_t) T * K);
+        const std::vector<int32_t> i32 = host(di32, (size_t) T * K), i16 = host(di16, (size_t) T * K);
+        const bool eq = l32 == l16 && w32 == w16 && i32 == i16;
+        std::printf("router_bf16 bit-exact T=%-5d  %s\n", T, eq ? "equal" : "FAIL");
+        failures += !eq;
+        cudaFree(dxt); cudaFree(dg32); cudaFree(dg16); cudaFree(dl32); cudaFree(dl16);
+        cudaFree(dw32); cudaFree(dw16); cudaFree(di32); cudaFree(di16);
+    }
 }
 
 // The kernel's own arithmetic on the CPU: the q8_1 rounding of each 32 values, exact integer block sums, the blocks added in
@@ -568,6 +598,95 @@ void test_engram() {
         }
     }
     report("engram_apply (rows, one masked)", got, ref, 2e-6);
+    // GPU engram_norm_e4m3 vs host E4M3 LUT + sequential RMSNorm (bit-exact check).
+    {
+        const int RT = 67, NC = 16, W = 96;
+        std::vector<uint8_t> raw((size_t) RT * NC * W);
+        for (size_t i = 0; i < raw.size(); ++i) {
+            uint8_t b = (uint8_t) ((i * 73u + 19u) & 0xffu);
+            if ((b & 0x7fu) == 0x7fu) b = 0x7eu;   // avoid NaN codes
+            raw[i] = b;
+        }
+        std::vector<float> nrm = randn((size_t) NC * W, 0.7f), vld(RT, 1.f);
+        vld[0] = 0.f;
+        vld[17] = 0.f;
+        uint8_t* draw = nullptr;
+        cudaMalloc(&draw, raw.size());
+        cudaMemcpy(draw, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+        float *dnrm = dev(nrm), *dvld = dev(vld), *dout = devf((size_t) RT * NC * W);
+        engram_norm_e4m3(draw, dnrm, dvld, RT, NC, W, dout, nullptr);
+        const std::vector<float> gpu = host(dout, (size_t) RT * NC * W);
+        auto e4m3 = [](uint8_t b) -> float {
+            const int e = (b >> 3) & 15, m = b & 7;
+            if (e == 15 && m == 7) return NAN;
+            const float v = e ? std::ldexp(1.f + (float) m / 8.f, e - 7) : std::ldexp((float) m, -9);
+            return (b & 0x80) ? -v : v;
+        };
+        std::vector<float> cpu((size_t) RT * NC * W);
+        std::vector<double> cpu_d((size_t) RT * NC * W);
+        for (int t = 0; t < RT; ++t) {
+            for (int c = 0; c < NC; ++c) {
+                float ss = 0.f;
+                const size_t base = ((size_t) t * NC + c) * W;
+                for (int d = 0; d < W; ++d) {
+                    const float v = e4m3(raw[base + d]);
+                    cpu[base + d] = v;
+                    ss += v * v;
+                }
+                const float r = 1.0f / std::sqrt(ss / (float) W + 1.1920929e-07f);
+                for (int d = 0; d < W; ++d) {
+                    cpu[base + d] = cpu[base + d] * r * nrm[(size_t) c * W + d] * vld[t];
+                    cpu_d[base + d] = cpu[base + d];
+                }
+            }
+        }
+        int diff_bits = 0;
+        for (size_t i = 0; i < gpu.size(); ++i) {
+            uint32_t a_b = 0, b_b = 0;
+            std::memcpy(&a_b, &gpu[i], 4);
+            std::memcpy(&b_b, &cpu[i], 4);
+            if (a_b != b_b) ++diff_bits;
+        }
+        report("engram_norm_e4m3 vs host", gpu, cpu_d, 1e-6);
+        std::printf("%-30s %d diff bits (%s)\n", "engram_norm_e4m3 exact", diff_bits, diff_bits == 0 ? "bit-exact" : "within tol");
+        cudaFree(draw); cudaFree(dnrm); cudaFree(dvld); cudaFree(dout);
+    }
+    // Multi-matrix q8x_mmvq vs native_q8_0_mmvq (bit-exact check for n_in = 3072 and 6144).
+    {
+        cudaStream_t qst = nullptr;
+        cudaStreamCreate(&qst);
+        for (int n_in : {3072, 6144}) {
+            const int n0 = 1024, n1 = 576;
+            const Q8 w0 = make_q8(n0, n_in);
+            const Q8 w1 = make_q8(n1, n_in);
+            void *dw0 = nullptr, *dw1 = nullptr;
+            cudaMalloc(&dw0, w0.bytes.size());
+            cudaMalloc(&dw1, w1.bytes.size());
+            cudaMemcpy(dw0, w0.bytes.data(), w0.bytes.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(dw1, w1.bytes.data(), w1.bytes.size(), cudaMemcpyHostToDevice);
+            for (int nc : {1, 2, 6, 8}) {
+                if (n_in == 6144 && nc > 1) continue;
+                const std::vector<float> x = randn((size_t) nc * n_in, 0.5f);
+                float *dx = dev(x), *y0r = devf((size_t) nc * n0), *y1r = devf((size_t) nc * n1),
+                      *y0g = devf((size_t) nc * n0), *y1g = devf((size_t) nc * n1);
+                void* xq = nullptr;
+                cudaMalloc(&xq, bk::native_q8_1_bytes(n_in, nc));
+                bk::native_quantize_q8_1(dx, xq, n_in, nc, qst);
+                bk::native_q8_0_mmvq(dw0, xq, y0r, n_in, n0, nc, qst);
+                bk::native_q8_0_mmvq(dw1, xq, y1r, n_in, n1, nc, qst);
+                const Q8xMat mats[2] = {{dw0, xq, y0g, n0}, {dw1, xq, y1g, n1}};
+                q8x_mmvq(mats, 2, n_in, nc, qst);
+                cudaStreamSynchronize(qst);
+                const bool eq = host(y0r, (size_t) nc * n0) == host(y0g, (size_t) nc * n0) &&
+                                host(y1r, (size_t) nc * n1) == host(y1g, (size_t) nc * n1);
+                std::printf("q8x_mmvq K=%-4d nc=%d           %s\n", n_in, nc, eq ? "equal" : "FAIL");
+                failures += !eq;
+                cudaFree(dx); cudaFree(xq); cudaFree(y0r); cudaFree(y1r); cudaFree(y0g); cudaFree(y1g);
+            }
+            cudaFree(dw0); cudaFree(dw1);
+        }
+        cudaStreamDestroy(qst);
+    }
 }
 
 void test_indexer() {
@@ -1009,7 +1128,7 @@ void test_mla_long() {
 }
 
 // Microbench of a window's attention kernels at the model's geometry (the weights rotate through more than the L2 holds):
-// us per call and GB/s of the bytes each must read.
+// time per call and bandwidth over the bytes each must read.
 void bench_mla() {
     cudaStream_t st;
     cudaStreamCreate(&st);

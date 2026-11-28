@@ -3,7 +3,7 @@
     python3 tools/batch_identity.py ENGINE --model FILE.basalt [--slots 2,4,8] [--tokens N] [--fixtures DIR]
                                     [--out FILE.json] [-- ENGINE ARGS...]
 
-The serve-level batch check of any model (docs/design/batching.md). First each prompt (the bench fixtures conv, struct,
+The serve-level batch check of any model (docs/architecture/batching.md). First each prompt (the bench fixtures conv, struct,
 prose) runs in an engine of one slot (`--serve --batch 1`, the same code as `--parallel 1`): the reference. Then for each
 slot count N the engine runs as `--serve --batch N`: each of N prompts (the fixtures in turn) runs alone in slot 0, then
 all N run together, one per slot, at temperature 0. Every slot's tokens, alone and together, must equal the reference.
@@ -112,6 +112,8 @@ def main() -> int:
     ap.add_argument("--slots", default="2,4,8")
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--fixtures", default="")
+    ap.add_argument("--prompt-tokens", type=int, default=0,
+                    help="each fixture's first N tokens only (0: all of it): a short prompt takes the windowed read")
     ap.add_argument("--out", default="")
     ap.add_argument("--log-dir", default=".")
     argv = sys.argv[1:]
@@ -119,20 +121,24 @@ def main() -> int:
     a = ap.parse_args(argv[:cut])
     extra = argv[cut + 1:]
     fixtures = Path(a.fixtures) if a.fixtures else HERE.parent / "data" / "bench"
+
+    def prompt_ids(name: str) -> str:
+        ids = fixture_ids(fixtures, name)
+        return ",".join(ids.split(",")[:a.prompt_tokens]) if a.prompt_tokens > 0 else ids
     report: dict = {"slots": {}}
     differs = False
     # the reference: each prompt in an engine of one slot
     log = Path(a.log_dir) / "batch_identity.ref.log"
     try:
         eng = Engine([a.engine, "--model", a.model, "--serve", "--batch", "1", "--prompt-cache", "0"] + extra, log)
-        ref = {name: run_slots(eng, [(0, fixture_ids(fixtures, name))], a.tokens)[0][0] for name in PROMPTS}
+        ref = {name: run_slots(eng, [(0, prompt_ids(name))], a.tokens)[0][0] for name in PROMPTS}
         eng.stop()
     except RuntimeError as e:
         print(f"one slot: {e} (see {log})")
         return 2
     report["reference"] = ref
     for n in [int(s) for s in a.slots.split(",")]:
-        ids = [fixture_ids(fixtures, PROMPTS[j % len(PROMPTS)]) for j in range(n)]
+        ids = [prompt_ids(PROMPTS[j % len(PROMPTS)]) for j in range(n)]
         log = Path(a.log_dir) / f"batch_identity.{n}.log"
         cmd = [a.engine, "--model", a.model, "--serve", "--batch", str(max(n, 2)), "--prompt-cache", "0"] + extra
         try:

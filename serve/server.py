@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable a
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
-                          sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
+                          sampling_items, shared_line, slots_text, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine import suspend  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
@@ -179,12 +179,6 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
                 lines.append(f"[server] warning: {plan['warning']}")
             cfg["gpu"] = plan["devices"]
             cfg["spec"] = plan.get("spec")
-            if getattr(a, "split_default", False) and plan.get("max_context"):
-                # the engine's default context, shared by the slots
-                a.shared_context = int(plan["max_context"])
-                part = ["--max-context", str(slot_share(a.shared_context, a.parallel))]
-                cfg["args"] += part
-                cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
             for flag, value in (("--gpu-mode", gpu_text(a.gpu_mode)), ("--gpu-share", gpu_text(a.gpu_share))):
@@ -193,7 +187,6 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
     for flag in a.skipped:
         lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
     cfg["items"] = start_items(file_engine, cli_engine,
-                               (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                grammar_entry(a.grammar, sys.argv[1:], used_argv), a.debug) if pack and not a.mock_engine else []
     cfg["items"] = with_spec(cfg["items"], cfg.get("spec"))
     if a.alias and not pack:
@@ -491,8 +484,7 @@ def main() -> int:
                 if not a.mock_engine:
                     warn_tight_ram(engine.info.get("arena_mib"))
                 if getattr(engine, "batch", 0):
-                    shared = None if m.slot_full_context else getattr(m, "shared_context", None)
-                    print(tagged("slots", slots_text(engine.batch, engine.max_context, shared) + ", others queue"),
+                    print(tagged("slots", slots_text(engine.batch, engine.max_context, m.kv_pool) + ", others queue"),
                           flush=True)
             print(tagged("weights", f"loaded{f' {s.model}' if multi else ''}, ctx={engine.max_context} "
                                     f"images={'on' if s.vision else 'off'}"), flush=True)

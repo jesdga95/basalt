@@ -22,6 +22,8 @@
 
 namespace basalt::dense {
 
+constexpr int kBatch = 32;   // rows a batch window (several sessions' windows) holds
+
 enum class Mixer { Gdn, Attention };
 
 /// One projection: `rows` outputs of `cols` inputs, ggml blocks of `type` (Q8_0 8, NVFP4 40, F8_E4M3 44: one E4M3 code

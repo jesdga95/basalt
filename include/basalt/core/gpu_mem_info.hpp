@@ -26,10 +26,9 @@ inline bool current_device_integrated() {
 
 /// cudaMemGetInfo, with an integrated GPU's free memory as the host's MemAvailable (at most the total).
 ///
-/// An integrated GPU's memory is the machine's. Its driver (a GB10) reports MemFree as free, so the page cache counts as
-/// used: right after a large download or file read it reported 8 GiB free of 122 GiB while 120 GiB were available, and
-/// every plan refused. Its allocations take page cache back on demand (40 GiB allocated and written with 8 GiB "free"
-/// succeeded, the cache shrinking under it), so MemAvailable is what a plan can spend. A discrete card is reported as the
+/// An integrated GPU's memory is the machine's. Its driver reports MemFree as free, so the page cache counts as
+/// used: right after a large download or file read it reports little free while most of the memory is available, and
+/// every plan refuses. Its allocations take page cache back on demand, so MemAvailable is what a plan can spend. A discrete card is reported as the
 /// runtime reports it.
 inline cudaError_t gpu_mem_info(size_t* free_bytes, size_t* total_bytes) {
     const cudaError_t e = cudaMemGetInfo(free_bytes, total_bytes);

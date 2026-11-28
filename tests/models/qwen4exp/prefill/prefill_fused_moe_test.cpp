@@ -269,8 +269,8 @@ void reference_part(cudaStream_t s) {
     ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
     mmq::Context ctx;
     MmqBufs mb(rows, E);
-    // the uploads (legacy stream) must land before the non-blocking stream reads them (S20 found the kernels could run
-    // on all-zero routing otherwise - every pair on one expert: fast and wrong)
+    // the uploads (legacy stream) must land before the non-blocking stream reads them; otherwise the kernels can run
+    // on all-zero routing, every pair on one expert
     ck(cudaDeviceSynchronize(), "uploads");
     run_mmq(ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
     FusedBufs fb(T, rows, E);

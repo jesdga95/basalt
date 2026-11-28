@@ -151,7 +151,7 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
 ///
 /// The accumulator stays a FLOAT VECTOR for the whole row and is reduced once at the end.  Reducing per
 /// 64-weight block (two 8-lane horizontal sums: a store plus 16 scalar adds) cost far more than the dot
-/// products themselves - it made the kernel compute-bound at 21 GB/s instead of DRAM-bound at 32.
+/// products themselves and made the kernel compute-bound instead of DRAM-bound.
 inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
     return row_dot_z(codes, scales, a, nblocks);
 }
@@ -306,15 +306,19 @@ void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const
 
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1) {
-    switch (nt) {
-        case 1: q2g_rows<1>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 2: q2g_rows<2>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 3: q2g_rows<3>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 4: q2g_rows<4>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 5: q2g_rows<5>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 6: q2g_rows<6>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        case 7: q2g_rows<7>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        default: q2g_rows<8>(w, row_bytes, nblocks, a, out, r0, r1); break;
+    for (int t0 = 0; t0 < nt; t0 += 8) {
+        const int k = nt - t0 < 8 ? nt - t0 : 8;
+        switch (k) {
+            case 1: q2g_rows<1>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            case 2: q2g_rows<2>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            case 3: q2g_rows<3>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            case 4: q2g_rows<4>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            case 5: q2g_rows<5>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            case 6: q2g_rows<6>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            case 7: q2g_rows<7>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            case 8: q2g_rows<8>(w, row_bytes, nblocks, a + t0, out + t0, r0, r1); break;
+            default: break;
+        }
     }
 }
 

@@ -33,6 +33,7 @@ from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.live import AnswerNowRefused
+from serve.monitor import clear as clear_monitor, gather
 from serve.router import Router
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
@@ -44,6 +45,7 @@ CONTROL_BODY_MAX = 64 << 10                 # the body limit for control routes 
 HOSTED_TOOLS_NOTED_MAX = 64                 # cap tracked unknown hosted-tool names per service
 # Routes that mutate server/model state: require JSON + same-origin (or trusted origin) before reading any body
 OWN_PAGE_ROUTES = {
+    "/api/monitor/clear": "the request monitor can be cleared",
     "/unload": "the model can be loaded or unloaded",
     "/load": "the model can be loaded or unloaded",
     "/v1/load": "the model can be loaded or unloaded",
@@ -360,6 +362,8 @@ def make_handler(target: Service | Router):
             self.wfile.write(data)
 
         def _json(self, code, obj):
+            if getattr(self, "svc", None) is not None:
+                self.svc.monitor.json(code, obj)
             if self.sse_open:
                 return self._stream_error(obj)
             body = json.dumps(obj, ensure_ascii=False).encode()
@@ -417,6 +421,23 @@ def make_handler(target: Service | Router):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path == "/api-monitor":                      # the page is inert without the data, so it needs no key
+                body = (ROOT / "serve" / "web" / "monitor.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/api/monitor":
+                if not self._authorized():
+                    return self._json(401, {"error": {"message": "unauthorized"}})
+                q = parse_qs(urlsplit(self.path).query)
+                rid = (q.get("id") or [None])[0]
+                data = gather(router.services, rid)
+                if rid is not None and data is None:
+                    return self._json(404, {"error": {"message": "request not found"}})
+                return self._json(200, data)
             if path == "/metrics":
                 if self._authorized():
                     qs = parse_qs(urlsplit(self.path).query)
@@ -512,8 +533,10 @@ def make_handler(target: Service | Router):
             own_what = OWN_PAGE_ROUTES.get(path)
             if own_what is not None and not self._own_page(own_what):
                 return
-            if path in ("/unload", "/load") and not self._control_body():
+            if path in ("/unload", "/load", "/api/monitor/clear") and not self._control_body():
                 return
+            if path == "/api/monitor/clear":
+                return self._json(200, clear_monitor(router.services))
             if path == "/unload":                            # unload between requests
                 try:
                     r = router.unload(router.shown())
@@ -639,6 +662,8 @@ def make_handler(target: Service | Router):
                 if self.svc is None:
                     self._unknown_model(path, requested)
                     return
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    self.svc.monitor.begin(path, req)
                 self.svc.request_ctx.path = path
                 self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
                 self.svc.request_ctx.arrived = time.time()   # arrival timestamp for end-to-end / TTFT histograms
@@ -686,6 +711,8 @@ def make_handler(target: Service | Router):
                 self._end_request()
 
         def _end_request(self) -> None:
+            if getattr(self, "svc", None) is not None:
+                self.svc.monitor.finish()
             if self.turn is not None:
                 router.leave(self.turn)
                 self.turn = None
@@ -838,8 +865,9 @@ def make_handler(target: Service | Router):
                                                  image_access=self._image_access())
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
-            chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
-                                          session=self._session_id(req), live=self.live), ids)
+            chunks = primed(self.svc.monitor.capture(
+                openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
+                              session=self._session_id(req), live=self.live), "openai"), ids)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -892,7 +920,7 @@ def make_handler(target: Service | Router):
 
             generation = events()
             try:
-                items = primed(generation, ids)
+                items = primed(self.svc.monitor.capture(generation, "responses"), ids)
             except EngineError:
                 raise
             except ValueError as e:                          # too long for the context: found when the engine counted
@@ -1062,8 +1090,9 @@ def make_handler(target: Service | Router):
                                                  image_access=self._image_access())
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
-            events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
-                                              session=self._session_id(req), live=self.live), ids)
+            events = primed(self.svc.monitor.capture(
+                anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
+                                  session=self._session_id(req), live=self.live), "anthropic"), ids)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()

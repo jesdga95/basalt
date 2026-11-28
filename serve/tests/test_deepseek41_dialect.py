@@ -138,6 +138,21 @@ class Render(unittest.TestCase):
         out = self.t.render(messages, tools, **kw)
         self.assertIn(CALLS + invoke("f", x="y") + CALLS_END + EOS + f"{U}<tool_result>ok</tool_result>{A}</think>", out)
 
+    def test_invalid_inputs_raise_value_error(self):
+        with self.assertRaises(ValueError):
+            self.t.render([{"role": "banana", "content": "hi"}], enable_thinking=False)
+        for bad_effort in ("bogus", 0, 101):
+            with self.assertRaises(ValueError):
+                self.t.render([{"role": "user", "content": "hi"}], reasoning_effort=bad_effort)
+        with self.assertRaises(ValueError):
+            self.t.render([{"role": "user", "content": "hi"}], tools=[{"name": "a::b::c", "parameters": {}}])
+        with self.assertRaises(ValueError):
+            enc._split_tool_name("ns1::fn", namespace="ns2")
+        with self.assertRaises(ValueError):
+            enc.render_message(0, [{"role": "tool", "content": "x"}], thinking_mode="chat")
+        with self.assertRaises(ValueError):
+            enc.render_message(0, [{"role": "user", "content": "x", "task": "bogus"}], thinking_mode="chat")
+
 
 class Parse(unittest.TestCase):
     def all_splits(self, text, thinking, want):
@@ -248,6 +263,49 @@ class Parse(unittest.TestCase):
         self.assertEqual([(c.name, c.arguments) for c in calls],
                          [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in ref["tool_calls"]])
 
+    def test_malformed_invoke_does_not_stall_or_drop_tail(self):
+        # malformed parameter tag inside invoke recovers cleanly and preserves trailing text
+        bad_param = CALLS + '<｜DSML｜ invoke name="f">\n<｜DSML｜ parameter name="x">1</｜DSML｜ parameter>\nHello after.'
+        for cuts in ([], [5, 25, 60], list(range(1, len(bad_param)))):
+            _, content, calls, _ = parse(bad_param, False, cuts)
+            self.assertEqual(calls, [], cuts)
+            self.assertIn("Hello after.", content, cuts)
+        # unclosed invoke followed directly by </｜DSML｜ calls> still emits trailing answer text
+        closed_early = CALLS + '<｜DSML｜ invoke name="f">\n' + CALLS_END + "After calls."
+        for cuts in ([], list(range(1, len(closed_early)))):
+            _, content, calls, _ = parse(closed_early, False, cuts)
+            self.assertEqual((content, calls), ("After calls.", []), cuts)
+        # unclosed invoke followed by a valid second invoke still parses the second invoke
+        second = CALLS + '<｜DSML｜ invoke name="broken">\n' + invoke("good", x="1") + CALLS_END
+        for cuts in ([], [10, 40], list(range(1, len(second)))):
+            _, content, calls, _ = parse(second, False, cuts)
+            self.assertEqual([(c.name, c.arguments) for c in calls], [("good", {"x": "1"})], cuts)
+
+    def test_prose_calls_tag_and_second_block_preserve_text_and_calls(self):
+        # prose <｜DSML｜ calls> followed by a real call block in one chunk and split
+        mixed = "Use <｜DSML｜ calls> to call tools.\n\n" + CALLS + invoke("f", x="1") + CALLS_END
+        self.all_splits(mixed, False, ("", "Use <｜DSML｜ calls> to call tools.", [("f", {"x": "1"})]))
+        # completed call followed by prose without </｜DSML｜ calls> must not prepend bogus CALLS_START
+        unclosed = CALLS + invoke("f", x="1") + "Done."
+        for cuts in ([], list(range(1, len(unclosed)))):
+            _, content, calls, _ = parse(unclosed, False, cuts)
+            self.assertEqual([(c.name, c.arguments) for c in calls], [("f", {"x": "1"})], cuts)
+            self.assertEqual(content, "Done.", cuts)
+            self.assertNotIn(CALLS.strip(), content, cuts)
+        # trailing non-call <｜DSML｜ calls> after a completed call block is not dropped at finish()
+        trailing = CALLS + invoke("f", x="1") + CALLS_END + " see <｜DSML｜ calls>\n<｜DSML｜ inv"
+        _, content, calls, _ = parse(trailing, False)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, " see <｜DSML｜ calls>\n<｜DSML｜ inv")
+
+    def test_stream_tools_false_drops_cut_call_and_keeps_complete_call(self):
+        p = DeepseekParser(thinking=False, stream_tools=False)
+        evs = p.feed(CALLS + '<｜DSML｜ invoke name="f">\n<｜DSML｜ parameter name="s" string="true">abc') + p.finish()
+        self.assertEqual([e for e in evs if e.kind in ("tool_start", "tool_args", "tool_call")], [])
+        p2 = DeepseekParser(thinking=False, stream_tools=False)
+        evs2 = p2.feed(CALLS + invoke("f", s="abc") + CALLS_END) + p2.finish()
+        self.assertEqual([(e.kind, e.call.name, e.call.arguments) for e in evs2], [("tool_call", "f", {"s": "abc"})])
+
 
 class Seam(unittest.TestCase):
     def test_dialect_choice(self):
@@ -296,6 +354,94 @@ class Seam(unittest.TestCase):
         tok = ST.Tokenizer(["a", lit, "b"], [], token_types=[1, 4, 1])
         self.assertEqual(tok.token_bytes(1), lit.encode("utf-8"))
         self.assertEqual(tok.decode([0, 1, 2]), "a" + lit + "b")
+
+    def test_text_prompt_forced_call_includes_nothink_lead(self):
+        from serve.engine.mock import MockEngine
+        from serve.service import Service
+        from serve.util.text import ByteTokenizer
+
+        class TextMock(MockEngine):
+            takes_text = True
+
+        tok = ByteTokenizer()
+        d = DeepSeek41()
+        svc = Service(TextMock(tok, "ok", max_context=4096), tok, d.template(""), dialect=d)
+        force = d.forced_opening("get_time")
+        prompt, thinking, _ = svc.prepare([{"role": "user", "content": "hi"}], [{"name": "get_time", "parameters": {}}],
+                                          {"enable_thinking": False}, 64, force=force)
+        self.assertFalse(thinking)
+        self.assertEqual(prompt.tail, d.nothink_lead + force)
+        self.assertTrue(prompt.text.endswith(enc.thinking_end_token + d.nothink_lead + force))
+
+    def test_non_streaming_truncated_call_does_not_leak_and_bad_role_is_400(self):
+        import urllib.error
+        import urllib.request
+        from serve.engine.mock import MockEngine
+        from serve.handler import serve
+        from serve.service import Service
+        from serve.util.text import ByteTokenizer
+
+        class DsTok(ByteTokenizer):
+            SPECIALS = ByteTokenizer.SPECIALS + [enc.bos_token, enc.eos_token, enc.USER_SP_TOKEN,
+                                                 enc.ASSISTANT_SP_TOKEN, enc.SYSTEM_SP_TOKEN]
+
+        tok = DsTok()
+        d = DeepSeek41()
+        full = CALLS + invoke("get_time", city="Tokyo", n=("123", False)) + CALLS_END
+        cut = full.index("kyo")
+        eng = MockEngine(tok, full, max_context=4096)
+        eng.scripts = [tok.encode(full, parse_special=True) + tok.encode(EOS, parse_special=True)]
+        eng.script = eng.scripts[0]
+        svc = Service(eng, tok, d.template(""), dialect=d, model_name="ds")
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            # 1) Non-streaming OpenAI truncated call must NOT leak as executable tool_call
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps({
+                "model": "ds", "max_tokens": cut, "reasoning_effort": "none", "stream": False,
+                "tools": [{"type": "function", "function": {"name": "get_time", "parameters": {"type": "object"}}}],
+                "messages": [{"role": "user", "content": "time?"}]}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = json.loads(r.read())
+            self.assertEqual(body["choices"][0]["finish_reason"], "length")
+            self.assertNotIn("tool_calls", body["choices"][0]["message"])
+
+            # 2) Non-streaming Anthropic truncated call must NOT leak as tool_use
+            req = urllib.request.Request(base + "/v1/messages", data=json.dumps({
+                "model": "ds", "max_tokens": cut, "thinking": {"type": "disabled"}, "stream": False,
+                "tools": [{"name": "get_time", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "time?"}]}).encode(),
+                headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                abody = json.loads(r.read())
+            self.assertEqual(abody["stop_reason"], "max_tokens")
+            self.assertEqual([b for b in abody["content"] if b["type"] == "tool_use"], [])
+
+            # 3) Complete call still returns tool_calls / tool_use in non-streaming
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps({
+                "model": "ds", "max_tokens": 500, "reasoning_effort": "none", "stream": False,
+                "tools": [{"type": "function", "function": {"name": "get_time", "parameters": {"type": "object"}}}],
+                "messages": [{"role": "user", "content": "time?"}]}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = json.loads(r.read())
+            self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+            self.assertEqual(json.loads(body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+                             {"city": "Tokyo", "n": 123})
+
+            # 4) Unknown message role returns HTTP 400 (not 500 NotImplementedError)
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps({
+                "model": "ds", "max_tokens": 16, "reasoning_effort": "none",
+                "messages": [{"role": "banana", "content": "hi"}]}).encode(),
+                headers={"Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req, timeout=15)
+            self.assertEqual(e.exception.code, 400)
+            e.exception.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 if __name__ == "__main__":

@@ -1445,10 +1445,12 @@ __global__ void sampler_wide_out_kernel(const unsigned* __restrict__ keys, const
         qprob[t0 + t] = live && r.qpos < r.n_keep ? (float) (e[(size_t) t * n_vocab + r.qpos] / r.total2) : 0.0f;
 }
 
-// The wide path's buffers, one set per (device, stream) as `split_scratch`, for kWideRows rows of the vocabulary:
+// The wide path's buffers, one set per device, for kWideRows rows of the vocabulary:
 // the keys and ids in, which the passes then reuse as their terms (8 bytes an entry), the sorted keys and ids, the
 // chunk sums and prefixes, the rows' scan state and the sorts' own storage, one per row: the rows' sorts run on streams
 // of their own (`side`, forked at `fork` and joined at `join`), since one row's sort leaves most of the card idle.
+// Every stream of the device shares the set (a batch's sessions each have a stream; a set is ~50 MB at a 200K
+// vocabulary): a pass records `done` on its stream, and a pass on another stream waits for it first.
 // Grown (a grown-out set is retired, as the split's), never shrunk; false when the memory cannot be had.
 struct WideBuffers {
     unsigned* keys_in;
@@ -1464,18 +1466,35 @@ struct WideBuffers {
     cudaStream_t side[kWideRows - 1];   // rows 1.. sort there, row 0 on the caller's stream
     cudaEvent_t fork;
     cudaEvent_t join[kWideRows - 1];
+    cudaEvent_t done;       // recorded on the caller's stream after the pass
 };
+
+// A set's bytes for `n_vocab` entries; `temp`: one sort's storage (256-byte rounded). 0 when the sort cannot size itself.
+size_t wide_set_bytes(int n_vocab, size_t& temp) {
+    temp = 0;
+    if (cub::DeviceRadixSort::SortPairs(nullptr, temp, (const unsigned*) nullptr, (unsigned*) nullptr, (const int*) nullptr,
+                                        (int*) nullptr, n_vocab, 0, 32) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    temp = (temp + 255) / 256 * 256;
+    const size_t chunks = (size_t) kWideRows * kWideChunks * sizeof(double);
+    const size_t state = ((size_t) kWideRows * sizeof(WideRow) + 255) / 256 * 256;
+    const size_t row = (size_t) kWideRows * n_vocab * 4;
+    return 4 * row + 2 * chunks + state + temp * kWideRows;
+}
 
 bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
     struct Slot {
         int device;
-        void* stream;
         int n_vocab;
         void* base;
         size_t temp_bytes;
         cudaStream_t side[kWideRows - 1];
         cudaEvent_t fork;
         cudaEvent_t join[kWideRows - 1];
+        cudaEvent_t done;
+        void* last;          // the stream of the last pass (nullptr: none yet)
     };
     static std::mutex mu;
     static std::vector<Slot> slots;
@@ -1488,11 +1507,12 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
     std::lock_guard<std::mutex> lock(mu);
     Slot* slot = nullptr;
     for (Slot& s : slots)
-        if (s.device == device && s.stream == stream) slot = &s;
+        if (s.device == device) slot = &s;
     if (slot == nullptr) {
         if (stream_capturing(stream)) return false;
-        Slot ns{device, stream, 0, nullptr, 0, {}, nullptr, {}};
-        bool ok = cudaEventCreateWithFlags(&ns.fork, cudaEventDisableTiming) == cudaSuccess;
+        Slot ns{device, 0, nullptr, 0, {}, nullptr, {}, nullptr, nullptr};
+        bool ok = cudaEventCreateWithFlags(&ns.fork, cudaEventDisableTiming) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&ns.done, cudaEventDisableTiming) == cudaSuccess;
         for (int i = 0; ok && i < kWideRows - 1; ++i)
             ok = cudaStreamCreateWithFlags(&ns.side[i], cudaStreamNonBlocking) == cudaSuccess &&
                  cudaEventCreateWithFlags(&ns.join[i], cudaEventDisableTiming) == cudaSuccess;
@@ -1507,16 +1527,9 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
     const size_t state = ((size_t) kWideRows * sizeof(WideRow) + 255) / 256 * 256;
     if (slot->n_vocab < n_vocab) {
         size_t temp = 0;
-        if (cub::DeviceRadixSort::SortPairs(nullptr, temp, (const unsigned*) nullptr, (unsigned*) nullptr,
-                                            (const int*) nullptr, (int*) nullptr, n_vocab, 0, 32,
-                                            (cudaStream_t) stream) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return false;
-        }
-        const size_t row = (size_t) kWideRows * n_vocab * 4;
-        temp = (temp + 255) / 256 * 256;
+        const size_t bytes = wide_set_bytes(n_vocab, temp);
         void* base = nullptr;
-        if (stream_capturing(stream) || cudaMalloc(&base, 4 * row + 2 * chunks + state + temp * kWideRows) != cudaSuccess) {
+        if (bytes == 0 || stream_capturing(stream) || cudaMalloc(&base, bytes) != cudaSuccess) {
             (void) cudaGetLastError();
             return false;
         }
@@ -1543,6 +1556,15 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
         out.join[i] = slot->join[i];
     }
     out.fork = slot->fork;
+    out.done = slot->done;
+    // after the last pass, which ran on another stream (in a capture: as an external event's wait node)
+    const bool capturing = stream_capturing(stream);
+    if (slot->last != nullptr && slot->last != stream &&
+        cudaStreamWaitEvent((cudaStream_t) stream, slot->done, capturing ? cudaEventWaitExternal : 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    slot->last = stream;
     return true;
 }
 
@@ -1604,9 +1626,18 @@ void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* hist
         sampler_wide_out_kernel<<<1, 32, 0, cs>>>(w.keys, w.ids, n_vocab, R, w.terms, w.rows, t0, out,
                                                   qprob != nullptr ? n_query : 0, qprob);
     }
+    if (cudaEventRecordWithFlags(w.done, cs, stream_capturing(stream) ? cudaEventRecordExternal : 0) != cudaSuccess) {
+        basalt::log::error("basalt", "sample_tokens: cannot mark the wide pass done");
+        std::exit(1);
+    }
 }
 
 }  // namespace
+
+size_t sampler_wide_bytes(int n_vocab) {
+    size_t temp = 0;
+    return n_vocab > 0 ? wide_set_bytes(n_vocab, temp) : 0;
+}
 
 bool sampler_wide_reserve(int n_vocab, void* stream) {
     WideBuffers w{};

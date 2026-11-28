@@ -44,9 +44,9 @@ CSF_FIXED, CSF_EXC = ".nvfp4_csf_fixed", ".nvfp4_csf_exceptions"
 class Checkpoint:
     """The safetensors files of a checkpoint directory: name -> (path, absolute offset, dtype, shape, bytes)."""
 
-    def __init__(self, d, side: dict[str, str] | None = None):
+    def __init__(self, d, side: dict[str, str] | None = None, single: bool = False):
         """`side`: files beside the shards whose tensor names carry no prefix of their own, each mapped to the prefix
-        its names get here (Inkling's `mtp.safetensors` -> `mtp.`)."""
+        its names get here (Inkling's `mtp.safetensors` -> `mtp.`). `single`: the checkpoint is one model.safetensors."""
         self.dir = pathlib.Path(d)
         cfg = self.dir / "config.json"
         if not cfg.is_file():
@@ -54,7 +54,8 @@ class Checkpoint:
         self.config = json.loads(cfg.read_text(encoding="utf-8"))
         self.text = self.config.get("text_config", self.config)
         self.files = sorted(self.dir.glob("*.safetensors")) + sorted(self.dir.glob("tensors/*.safetensors"))
-        self.shards = [p for p in self.files if re.fullmatch(r"model-\d+-of-\d+\.safetensors", p.name)]
+        shard = r"model\.safetensors" if single else r"model-\d+-of-\d+\.safetensors"
+        self.shards = [p for p in self.files if re.fullmatch(shard, p.name)]
         if not self.shards:
             raise S.ConvertError(f"{self.dir}: no model-NNNNN-of-NNNNN.safetensors shards")
         side = side or {}
@@ -104,14 +105,24 @@ def nvfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
     2i+1 in the high one; `scales` [rows, cols/16] UE4M3. A Basalt block of 64 values is 4 scale bytes then 32 code
     bytes where sub-block s keeps value j in the low nibble of byte 8 s + j and value j + 8 in its high nibble."""
     rows, cols = codes.shape[0], codes.shape[1] * 2
-    v = np.empty((rows, cols), np.uint8)
-    v[:, 0::2] = codes & 15
-    v[:, 1::2] = codes >> 4
-    v = v.reshape(rows, cols // 64, 4, 16)
-    out = np.empty((rows, cols // 64, 36), np.uint8)
-    out[..., :4] = scales.reshape(rows, cols // 64, 4)
-    out[..., 4:] = (v[..., :8] | (v[..., 8:] << 4)).reshape(rows, cols // 64, 32)
+    nb = cols // 64
+    c32 = np.ascontiguousarray(codes, dtype=np.uint8).view(np.uint32).reshape(rows, nb, 4, 2)
+    lo, hi = c32[..., 0], c32[..., 1]
+    ev = (lo & np.uint32(0x0F0F0F0F)) | ((hi & np.uint32(0x0F0F0F0F)) << np.uint32(4))
+    od = ((lo >> np.uint32(4)) & np.uint32(0x0F0F0F0F)) | (hi & np.uint32(0xF0F0F0F0))
+    out = np.empty((rows, nb, 36), np.uint8)
+    out[..., :4] = scales.reshape(rows, nb, 4)
+    q = out[..., 4:].reshape(rows, nb, 4, 4, 2)
+    q[..., 0] = ev.view(np.uint8).reshape(rows, nb, 4, 4)
+    q[..., 1] = od.view(np.uint8).reshape(rows, nb, 4, 4)
     return out.reshape(-1)
+
+
+def mxfp8_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """MXFP8 rows -> Basalt's blocks (type 46). `codes` [rows, cols] E4M3; `scales` [rows, cols/32] UE8M0. A block of
+    128 values is the 4 scale bytes of its 32-value sub-blocks, then the 128 code bytes."""
+    rows, cols = codes.shape
+    return np.concatenate([scales.reshape(rows, cols // 128, 4), codes.reshape(rows, cols // 128, 128)], axis=2).reshape(-1)
 
 
 def csf_decode(fixed: np.ndarray, exceptions: np.ndarray) -> np.ndarray:
@@ -123,16 +134,20 @@ def csf_decode(fixed: np.ndarray, exceptions: np.ndarray) -> np.ndarray:
     if fixed.ndim != 2 or fixed.shape[1] < 32 or fixed.shape[1] % 16:
         raise S.ConvertError(f"a CSF fixed stream of shape {list(fixed.shape)}")
     rows, cols = fixed.shape[0] * 16, (fixed.shape[1] // 16 - 1) * 2
-    base = fixed[:, :16].reshape(rows, 1).astype(np.int16)
+    base = fixed[:, :16].reshape(rows, 1)
     if (base > 240).any():
         raise S.ConvertError("a CSF base byte above 240")
     packed = fixed[:, 16:].reshape(rows, cols // 2)
-    out = (base + np.stack((packed & 15, packed >> 4), axis=-1).reshape(rows, cols)).reshape(-1)
-    pos = exceptions & 0xFFFFFF
-    if pos.size and int(pos.max()) >= rows * cols:
-        raise S.ConvertError("a CSF exception past the end of its matrix")
-    out[pos] = exceptions >> 24
-    return out.astype(np.uint8).reshape(rows, cols)
+    out = np.empty((rows, cols), np.uint8)
+    out[:, 0::2] = packed & np.uint8(15)
+    out[:, 1::2] = packed >> np.uint8(4)
+    out += base
+    if exceptions.size:
+        pos = exceptions & 0xFFFFFF
+        if int(pos.max()) >= rows * cols:
+            raise S.ConvertError("a CSF exception past the end of its matrix")
+        out.reshape(-1)[pos] = (exceptions >> 24).astype(np.uint8)
+    return out
 
 
 def _scales(ent) -> np.ndarray:

@@ -31,9 +31,8 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   start warns when `gpu` is unset and more are visible.
   - `peer` (up to four cards): the main card runs every layer; each peer holds experts the main card does not, computes their rows
     in every decode window and their share of each prompt chunk, and reads a share of the layers of long prompts. A peer faster
-    than the main card also takes a share of each GDN mixer and of the head. With the peer, 64K prefill speed is level with the
-    path before the multi-GPU rework (9,823 against 9,835 tok/s) and the normal peer run scores BF16 KLD 0.06174 against
-    0.06221 on one card, top-1 91.84% against 91.80%.
+    than the main card also takes a share of each GDN mixer and of the head. The peer run scores BF16 KLD 0.06174 against
+    0.06221 on one card, top-1 91.84% against 91.80% ([wikitext KLD](../precision/quality.md#wikitext-kld)).
   - `split` (up to eight cards): the layers are cut by `gpu-share` (free VRAM by default), each card holding its layers' dense
     weights, caches and experts; windows overlap on two cards ([GPUs](../configuration/gpus.md#split-mode)).
   - `tensor` is refused.

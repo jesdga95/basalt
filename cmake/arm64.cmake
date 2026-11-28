@@ -30,7 +30,8 @@ endfunction()
 # kernels_cpu: the x86 kernels and the two x86 builds of the ggml dot products out; the NEON kernels, the NEON build of
 # the dot products, and the x86 kernels' names (probes that say no) in.
 function(basalt_arm64_kernels_cpu)
-  basalt_drop_sources(kernels_cpu "(_avx[0-9]*(_vnni)?\\.cpp$|/expert\\.cpp$|f16c_scalar_msvc\\.c$|TARGET_OBJECTS:ggml_dots_avx)")
+  # the AVX kernels carry a tier suffix past the ISA: `_vnni` (AVX-VNNI-INT8) and `_dpbusd` (the NVFP4 rows' AVX-VNNI rung)
+  basalt_drop_sources(kernels_cpu "(_avx[0-9]*(_vnni|_dpbusd)?\\.cpp$|/expert\\.cpp$|f16c_scalar_msvc\\.c$|TARGET_OBJECTS:ggml_dots_avx)")
   set_target_properties(ggml_dots_avx2 ggml_dots_avx512 PROPERTIES EXCLUDE_FROM_ALL ON)
   add_library(ggml_dots_neon OBJECT src/kernels/cpu/ggml/ggml_cpu_dots_neon.c)
   target_include_directories(ggml_dots_neon PRIVATE include src/kernels/cpu/ggml)

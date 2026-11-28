@@ -7,6 +7,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "unicode_flags.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
@@ -29,6 +30,8 @@ public:
         return run_engine(static_cast<Options&>(o), cards);
     }
 
+    int max_slots() const override { return kernels::kVerifyMaxT; }   // rows of a batch window
+
     // peer: the main card, kDmMaxX peers with their own rings and one more; split: one stage per card (SplitDrive)
     program::GpuModes gpu_modes() const override { return {kernels::kDmMaxX + 2, engine_local::SplitDrive::kMax, 0, true}; }
 
@@ -36,7 +39,7 @@ public:
     const char* quality_flags() const override { return "--spec 5 --adapt-swaps 0 --peer-adapt-swaps 0 --resident-experts"; }
     int quality_window() const override { return 0; }
 
-    const char* model_name() const override { return "Qwen3.8-Flash-Next"; }
+    const char* model_name(const core::Json&) const override { return "Qwen3.8-Flash-Next"; }
 
     std::vector<model::SideTableSpec> side_tables(const model::ModelDesc&) const override {
         return {{model::SideTableSpec::Kind::Ple, "per_layer_token_embd.weight", 0, 0}};

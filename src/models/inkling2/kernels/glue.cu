@@ -1,17 +1,20 @@
 // src/models/inkling2/kernels/glue.cu - Inkling 2's fused glue for a decode window: the block-residual mixes with the norm
 // and the q8_1 rounding of the products' inputs, the loop controllers (down, up, blend, norm and rounding), the attention
-// preparation a key/value head a block, the attention output's convolution with the residual and the MLP's mix, and the
-// experts' sum with its convolution and the residual.
+// preparation a key/value head a block, and the attention output's convolution with the residual and the MLP's mix
+// (into the experts' activation rows).
 //
 // A block takes one row (or one row and head, or one stream and row), and no row's arithmetic reads another row's partial
 // sums, so a row's bits do not depend on the rows beside it. A window's convolutions read the rows before them in the
 // window and the ring for the positions before the window, and each row writes its own ring slot: a window of at most
-// kDecodeRows rows touches distinct slots (kDecodeRows + kConv - 1 <= kConvRing).
+// kDecodeRows rows touches distinct slots, and none of the kConv - 1 its rows read before it (kDecodeRows + kConv - 1 <=
+// kConvRing).
+#include "basalt/kernels/expert_rows.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "prep.cuh"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -173,10 +176,11 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p, float (&x)
     for (int j = 0; j < kPer; ++j) x[j] = p[threadIdx.x + j * kThreads];
 }
 
-// RMS norm of the thread-held row x with the thread-held weights w, into q8_1 (and fp32 when `f32` is set): the sum of
-// squares each warp's, then the warps' in warp order. The kernel's last use of `red` (kWarpsB + 1 floats).
-__device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float (&w)[kPer], float eps, void* q8, float* f32,
-                                        int r, float* red) {
+// RMS norm of the thread-held row x with the thread-held weights w, into q8_1, or the experts' activation rows when `xh`
+// is set (f16, or bf16 with `bf16`, at xh_pos), and fp32 when `f32` is set: the sum of squares each warp's, then the
+// warps' in warp order. The kernel's last use of `red` (kWarpsB + 1 floats).
+__device__ __forceinline__ void norm_out(const float (&x)[kPer], const float (&w)[kPer], float eps, void* q8, void* xh, bool bf16,
+                                         float* f32, int r, float* red) {
     float ss = 0.f;
 #pragma unroll
     for (int j = 0; j < kPer; ++j) ss = fmaf(x[j], x[j], ss);
@@ -192,14 +196,22 @@ __device__ __forceinline__ void norm_q8(const float (&x)[kPer], const float (&w)
     }
     __syncthreads();
     const float inv = rsqrtf(red[kWarpsB] / (float) kWidth + eps);
-    Q81* row = reinterpret_cast<Q81*>(q8) + (size_t) r * (kWidth / 32);
     float y[kPer];
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         y[j] = x[j] * inv * w[j];
         if (f32) f32[(size_t) r * kWidth + threadIdx.x + j * kThreads] = y[j];
     }
-    q8_store3(y, row, wp, lane);
+    if (xh) {
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            const size_t at = (size_t) r * kWidth + bk::xt::xh_pos(threadIdx.x + j * kThreads);
+            if (bf16) static_cast<uint16_t*>(xh)[at] = __bfloat16_as_ushort(__float2bfloat16_rn(y[j]));
+            else static_cast<uint16_t*>(xh)[at] = __half_as_ushort(__float2half_rn(y[j]));
+        }
+        return;
+    }
+    q8_store3(y, reinterpret_cast<Q81*>(q8) + (size_t) r * (kWidth / 32), wp, lane);
 }
 
 using prep::conv_in;
@@ -282,7 +294,7 @@ __global__ void __launch_bounds__(kThreads) mix_norm_kernel(MixNorm a) {
             a.mix_out[(size_t) q * a.out_stride + (size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[j];
         return;
     }
-    norm_q8(mixed, nw, a.eps, a.q8[q], q == 0 ? a.norm_out : nullptr, r, red);
+    norm_out(mixed, nw, a.eps, a.q8[q], nullptr, false, q == 0 ? a.norm_out : nullptr, r, red);
 }
 
 // ---- loop controllers --------------------------------------------------------------------------------------------------
@@ -389,6 +401,166 @@ __global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_kernel(CtrlArgs a, 
     }
 }
 
+// One level of warp_sum's butterfly (mask M) over a lane's L values, keeping half: the lane with bit M set keeps the upper
+// half, its partner the lower, each adding the other's copy (a + b is b + a: warp_sum's bits for every value it keeps).
+template <int L, int M, int N>
+__device__ __forceinline__ void butterfly_halve(float (&v)[N], int lane) {
+    static_assert(L % 2 == 0 && L <= N);
+    const bool up = lane & M;
+#pragma unroll
+    for (int i = 0; i < L / 2; ++i) {
+        const float lo = v[i], hi = v[i + L / 2];
+        const float send = up ? lo : hi, keep = up ? hi : lo;
+        v[i] = keep + __shfl_xor_sync(0xffffffffu, send, M);
+    }
+}
+
+// ctrl_down_kernel's sums for a wide window: block (o0 / O, s, r0 / RMAX) holds its O outputs' weights in shared memory, so
+// a window's inputs are read once for O outputs instead of 2 (the inputs, not the dots, bound the wide windows). Each lane,
+// warp and output adds the same products in the same order as ctrl_down_kernel: the same bits.
+template<int O, int RMAX>
+__global__ void __launch_bounds__(kDownWarps * 32) ctrl_down_wide_kernel(CtrlArgs a, int rows_all) {
+    extern __shared__ uint32_t sw[];   // [O][kWidth]: output o0 + j's 2 kWidth bf16
+    __shared__ float part[kDownWarps][O][RMAX][2];
+    const int r0 = (int) blockIdx.z * RMAX;
+    const int rows = min(RMAX, rows_all - r0);
+    const int o0 = blockIdx.x * O, s = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bool second = w >= kDownWarps / 2;
+    const int c0 = (w % (kDownWarps / 2)) * kSlice;
+    {   // the weights, before pdl_wait (constant)
+        const uint4* src = reinterpret_cast<const uint4*>(a.down[s] + (size_t) o0 * 2 * kWidth);
+        uint4* dst = reinterpret_cast<uint4*>(sw);
+        for (int i = threadIdx.x; i < O * kWidth / 4; i += kDownWarps * 32) dst[i] = src[i];
+    }
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    __syncthreads();
+    const float* in = (second ? a.msg[s] : a.dest[s]) + (size_t) r0 * kWidth;
+    const uint32_t* wr = sw + ((second ? kWidth : 0) + c0) / 2;
+    constexpr int kIn = 9;
+    constexpr int kPass = RMAX < 4 ? RMAX : 4;
+    static_assert(kSlice / 2 == 32 * kIn, "a lane's pairs are one batch");
+    if constexpr (RMAX == 16) {
+        if (rows == RMAX) {
+            // every row present: the same chains unpredicated, row t's O dots and its square sum at v[t (O + 1)..], then
+            // warp_sum's levels 16, 8, 4, 2 each keeping half the values (one row's in the end, row bits 3..0 = lane bits
+            // 4..1) and level 1 whole
+            constexpr int V = O + 1;
+            float v[RMAX * V];
+#pragma unroll
+            for (int i = 0; i < RMAX * V; ++i) v[i] = 0.f;
+#pragma unroll
+            for (int h = 0; h < RMAX; h += kPass) {
+                float2 x[kIn][kPass];
+#pragma unroll
+                for (int b = 0; b < kIn; ++b)
+#pragma unroll
+                    for (int t = 0; t < kPass; ++t) x[b][t] = reinterpret_cast<const float2*>(in + (size_t) (h + t) * kWidth + c0)[lane + 32 * b];
+#pragma unroll
+                for (int b = 0; b < kIn; ++b) {
+#pragma unroll
+                    for (int t = 0; t < kPass; ++t)
+                        v[(h + t) * V + O] = fmaf(x[b][t].y, x[b][t].y, fmaf(x[b][t].x, x[b][t].x, v[(h + t) * V + O]));
+#pragma unroll
+                    for (int j = 0; j < O; ++j) {
+                        const uint32_t u = wr[(size_t) j * kWidth + lane + 32 * b];
+                        const float w0 = __uint_as_float(u << 16), w1 = __uint_as_float(u & 0xffff0000u);
+#pragma unroll
+                        for (int t = 0; t < kPass; ++t)
+                            v[(h + t) * V + j] = fmaf(w1, x[b][t].y, fmaf(w0, x[b][t].x, v[(h + t) * V + j]));
+                    }
+                }
+            }
+            butterfly_halve<RMAX * V, 16>(v, lane);
+            butterfly_halve<RMAX * V / 2, 8>(v, lane);
+            butterfly_halve<RMAX * V / 4, 4>(v, lane);
+            butterfly_halve<RMAX * V / 8, 2>(v, lane);
+#pragma unroll
+            for (int i = 0; i < V; ++i) v[i] += __shfl_xor_sync(0xffffffffu, v[i], 1);
+            if (!(lane & 1)) {
+                const int t = (lane & 16 ? 8 : 0) + (lane & 8 ? 4 : 0) + (lane & 4 ? 2 : 0) + (lane & 2 ? 1 : 0);
+#pragma unroll
+                for (int j = 0; j < O; ++j) {
+                    part[w][j][t][0] = v[j];
+                    part[w][j][t][1] = v[O];
+                }
+            }
+            __syncthreads();
+            for (int i = threadIdx.x; i < rows * O; i += kDownWarps * 32) {
+                const int t = i % rows, j = i / rows;
+                float dd = 0.f, sd = 0.f, dm = 0.f, sm = 0.f;
+#pragma unroll
+                for (int k = 0; k < kDownWarps / 2; ++k) {
+                    dd += part[k][j][t][0];
+                    sd += part[k][j][t][1];
+                    dm += part[kDownWarps / 2 + k][j][t][0];
+                    sm += part[kDownWarps / 2 + k][j][t][1];
+                }
+                a.scratch[((size_t) s * kBatchRows + r0 + t) * a.rank + o0 + j] =
+                    dd * rsqrtf(sd / (float) kWidth + 1e-6f) + dm * rsqrtf(sm / (float) kWidth + 1e-6f);
+            }
+            return;
+        }
+    }
+    float dot[O][RMAX], sq[RMAX];
+#pragma unroll
+    for (int t = 0; t < RMAX; ++t) {
+        sq[t] = 0.f;
+#pragma unroll
+        for (int j = 0; j < O; ++j) dot[j][t] = 0.f;
+    }
+#pragma unroll
+    for (int h = 0; h < RMAX; h += kPass) {
+        float2 x[kIn][kPass];
+#pragma unroll
+        for (int b = 0; b < kIn; ++b)
+#pragma unroll
+            for (int t = 0; t < kPass; ++t)
+                if (h + t < rows) x[b][t] = reinterpret_cast<const float2*>(in + (size_t) (h + t) * kWidth + c0)[lane + 32 * b];
+#pragma unroll
+        for (int b = 0; b < kIn; ++b) {
+#pragma unroll
+            for (int t = 0; t < kPass; ++t)
+                if (h + t < rows) sq[h + t] = fmaf(x[b][t].y, x[b][t].y, fmaf(x[b][t].x, x[b][t].x, sq[h + t]));
+#pragma unroll
+            for (int j = 0; j < O; ++j) {
+                const uint32_t u = wr[(size_t) j * kWidth + lane + 32 * b];
+                const float w0 = __uint_as_float(u << 16), w1 = __uint_as_float(u & 0xffff0000u);
+#pragma unroll
+                for (int t = 0; t < kPass; ++t)
+                    if (h + t < rows) dot[j][h + t] = fmaf(w1, x[b][t].y, fmaf(w0, x[b][t].x, dot[j][h + t]));
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < RMAX; ++t) {
+        if (t >= rows) break;
+        const float q = warp_sum(sq[t]);
+#pragma unroll
+        for (int j = 0; j < O; ++j) {
+            const float d = warp_sum(dot[j][t]);
+            if (lane == 0) {
+                part[w][j][t][0] = d;
+                part[w][j][t][1] = q;
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < rows * O; i += kDownWarps * 32) {
+        const int t = i % rows, j = i / rows;
+        float dd = 0.f, sd = 0.f, dm = 0.f, sm = 0.f;
+#pragma unroll
+        for (int k = 0; k < kDownWarps / 2; ++k) {
+            dd += part[k][j][t][0];
+            sd += part[k][j][t][1];
+            dm += part[kDownWarps / 2 + k][j][t][0];
+            sm += part[kDownWarps / 2 + k][j][t][1];
+        }
+        a.scratch[((size_t) s * kBatchRows + r0 + t) * a.rank + o0 + j] =
+            dd * rsqrtf(sd / (float) kWidth + 1e-6f) + dm * rsqrtf(sm / (float) kWidth + 1e-6f);
+    }
+}
+
 // gf[s][r][i] = up_s[i] . hid[s][r] for the 2 kWidth rows of up_s: eight lanes a row (rank / 8 values each), 32 rows a
 // block.
 constexpr int kUpWords = 8;   // a lane's first weight words, read before pdl_wait (all of them up to rank 128)
@@ -470,7 +642,70 @@ __global__ void __launch_bounds__(256) ctrl_up_kernel(CtrlArgs a, int rows_all) 
     }
 }
 
-// The norm into q8_1 of stream s and row r's blended controller state.
+// ctrl_up_kernel for a rank known at compile time: a thread holds one of the 2 kWidth rows' weights in registers and
+// forms that row's gate and filter for 2 of the block's 16 rows whole: the 8 parts' chains ctrl_up_kernel's eight lanes
+// form (part p: weights p rank / 8 .. in order), added in its butterfly's tree (a + b is b + a), so the same bits
+// without shuffles; warp w takes rows 2 w and 2 w + 1, lane l output row 32 blockIdx.x + l.
+template <int RANK>
+__global__ void __launch_bounds__(256) ctrl_up_rows_kernel(CtrlArgs a, int rows_all) {
+    constexpr int kParts = 8, kPer = RANK / kParts, kT = 2, kWords = RANK / 2;
+    static_assert(RANK % 16 == 0 && kT * 8 == kDecodeRows, "parts of whole words; 8 warps of kT rows");
+    __shared__ __align__(16) float hs[kDecodeRows][RANK];
+    const int r0 = (int) blockIdx.z * kDecodeRows;
+    const int rows = min(kDecodeRows, rows_all - r0);
+    const int s = blockIdx.y;
+    const int row = blockIdx.x * 32 + (threadIdx.x & 31), t0 = (threadIdx.x >> 5) * kT;
+    uint32_t ug[kWords], uf[kWords];
+    {
+        const uint4* pg = reinterpret_cast<const uint4*>(a.up[s] + (size_t) row * RANK);
+        const uint4* pf = reinterpret_cast<const uint4*>(a.up[s] + (size_t) (row + kWidth) * RANK);
+#pragma unroll
+        for (int i = 0; i < kWords / 4; ++i) {
+            const uint4 g = pg[i], f = pf[i];
+            ug[4 * i] = g.x, ug[4 * i + 1] = g.y, ug[4 * i + 2] = g.z, ug[4 * i + 3] = g.w;
+            uf[4 * i] = f.x, uf[4 * i + 1] = f.y, uf[4 * i + 2] = f.z, uf[4 * i + 3] = f.w;
+        }
+    }
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    const float* hid = a.scratch + ((size_t) s * kBatchRows + r0) * RANK;
+    for (int i = threadIdx.x; i < rows * RANK; i += blockDim.x) hs[i / RANK][i % RANK] = hid[i];
+    __syncthreads();
+    float pg[kT][kParts], pf[kT][kParts];
+#pragma unroll
+    for (int t = 0; t < kT; ++t)
+#pragma unroll
+        for (int p = 0; p < kParts; ++p) pg[t][p] = pf[t][p] = 0.f;
+#pragma unroll
+    for (int p = 0; p < kParts; ++p)
+#pragma unroll
+        for (int k = 0; k < kPer / 2; ++k) {
+            const int w = p * kPer / 2 + k, kk = 2 * w;
+            const float g0 = __uint_as_float(ug[w] << 16), g1 = __uint_as_float(ug[w] & 0xffff0000u);
+            const float f0 = __uint_as_float(uf[w] << 16), f1 = __uint_as_float(uf[w] & 0xffff0000u);
+#pragma unroll
+            for (int t = 0; t < kT; ++t) {
+                const float2 h = *reinterpret_cast<const float2*>(&hs[t0 + t][kk]);
+                pg[t][p] = fmaf(g1, h.y, fmaf(g0, h.x, pg[t][p]));
+                pf[t][p] = fmaf(f1, h.y, fmaf(f0, h.x, pf[t][p]));
+            }
+        }
+    float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank;
+#pragma unroll
+    for (int tt = 0; tt < kT; ++tt) {
+        const int t = t0 + tt;
+        if (t >= rows) break;
+        const float vg = ((pg[tt][0] + pg[tt][1]) + (pg[tt][2] + pg[tt][3])) + ((pg[tt][4] + pg[tt][5]) + (pg[tt][6] + pg[tt][7]));
+        const float vf = ((pf[tt][0] + pf[tt][1]) + (pf[tt][2] + pf[tt][3])) + ((pf[tt][4] + pf[tt][5]) + (pf[tt][6] + pf[tt][7]));
+        float g, f;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(g) : "f"(vg));
+        asm("tanh.approx.f32 %0, %1;" : "=f"(f) : "f"(vf));
+        const size_t idx = (size_t) (r0 + t) * kWidth + row;
+        yb[((size_t) s * kBatchRows + r0 + t) * kWidth + row] = (1.f - f) * a.dest[s][idx] + g * a.msg[s][idx];
+    }
+}
+
+// The norm into q8_1 (stream 0: or the experts' rows) of stream s and row r's blended controller state.
 __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const int r = blockIdx.x, s = blockIdx.y;
     float nw[kPer];
@@ -481,7 +716,7 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
     const float* yb = a.scratch + (size_t) kMaxStreams * kBatchRows * a.rank + ((size_t) s * kBatchRows + r) * kWidth;
     float y[kPer];
     load_row(yb, y);
-    norm_q8(y, nw, a.eps, a.q8[s], s == 0 ? a.norm_out : nullptr, r, red);
+    norm_out(y, nw, a.eps, a.q8[s], s == 0 ? a.xh : nullptr, a.xh_bf16, s == 0 ? a.norm_out : nullptr, r, red);
 }
 
 // ---- attention preparation ---------------------------------------------------------------------------------------------
@@ -587,53 +822,7 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
         for (int j = 0; j < kPer; ++j) a.mix_out[(size_t) r * kWidth + threadIdx.x + j * kThreads] = mixed[j];
         return;
     }
-    norm_q8(mixed, nw, a.eps, a.q8, a.norm_out, r, red);
-}
-
-// ---- experts -----------------------------------------------------------------------------------------------------------
-
-// Block (row, 256 channels), a thread a channel: the experts' weighted sums of this row and the rows before it in the
-// window that its convolution reads, the ring for the positions before the window, plus the residual; the ring takes this
-// row's sum.
-__global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
-    const int r = blockIdx.x;
-    const int c = blockIdx.y * 256 + threadIdx.x;
-    // a batch window's row: its conversation's ring, and its rows of the window from its segment's first
-    const bk::WindowSegs& at = seg_table(a.seg);
-    const int sk = bk::seg_of(at, r), first = at.n > 0 ? at.row0[sk] : 0;
-    float* const ring = at.n > 0 ? a.seg.c[sk].m_ring : a.ring;
-    float taps[kConv];   // read while the kernel before finishes
-#pragma unroll
-    for (int j = 0; j < kConv; ++j) taps[j] = a.taps[c * kConv + (kConv - 1 - j)];
-    if (threadIdx.x < kConv - 1) {   // the block's ring entries of the three positions before this row into L2
-        const int pj = a.pos[r] - 1 - (int) threadIdx.x;
-        if (pj >= 0)
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ring + (size_t) (pj % kConvRing) * kWidth + blockIdx.y * 256),
-                         "r"(256u * 4u) : "memory");
-    }
-    bk::pdl_wait();
-    bk::pdl_launch_dependents();
-    {
-        float acc = 0.f, x0 = 0.f;
-#pragma unroll
-        for (int j = 0; j < kConv; ++j) {
-            float x;
-            if (r - j >= first) {
-                x = 0.f;
-                for (int s = 0; s < a.k; ++s) x = fmaf(a.w[(r - j) * a.k + s], a.rows[((size_t) (r - j) * a.k + s) * kWidth + c], x);
-            } else {
-                const int p = a.pos[r] - j;
-                x = p < 0 ? 0.f : ring[(size_t) (p % kConvRing) * kWidth + c];
-            }
-            if (j == 0) x0 = x;
-            acc = fmaf(taps[j], x, acc);
-        }
-        const size_t i = (size_t) r * kWidth + c;
-        const float y = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];
-        a.out[i] = y;
-        if (a.tap) a.tap[i] = y;
-        ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;
-    }
+    norm_out(mixed, nw, a.eps, nullptr, a.xh, a.xh_bf16, a.norm_out, r, red);
 }
 
 void check_rows(int rows, const char* what) {
@@ -665,12 +854,26 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
     const int up_rows = std::min(rows, kDecodeRows);
     // 3-4 rows read their inputs once for 4 outputs (they are 8 rows x 18 KB), 5+ rows once for 2 (twice the blocks, half
     // the dots and sums on each one's chain), a lone row keeps rank blocks
-    if (rows >= 9) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams, z), dim3(kDownWarps * 32), 0, s, a, rows);
+    if (rows > kDecodeRows) {   // a batch window
+        constexpr int O = 8, RM = kDecodeRows;   // 8 outputs' weights are 72 KB of shared memory
+        auto* k = ctrl_down_wide_kernel<O, RM>;
+        const size_t sm = (size_t) O * kWidth * 4;
+        static thread_local int set_dev = -1;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (set_dev != dev) {
+            cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+            set_dev = dev;
+        }
+        if (a.rank % O) throw std::runtime_error("inkling2 controllers: rank");
+        bk::launch_pdl(k, dim3((unsigned) (a.rank / O), (unsigned) streams, (unsigned) ((rows + RM - 1) / RM)), dim3(kDownWarps * 32), sm, s, a, rows);
+    } else if (rows >= 9) bk::launch_pdl(ctrl_down_kernel<2, kDecodeRows>, dim3((unsigned) a.rank / 2, (unsigned) streams, z), dim3(kDownWarps * 32), 0, s, a, rows);
     else if (rows >= 5) bk::launch_pdl(ctrl_down_kernel<2, 8>, dim3((unsigned) a.rank / 2, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else if (rows >= 3) bk::launch_pdl(ctrl_down_kernel<4, 4>, dim3((unsigned) a.rank / 4, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     else bk::launch_pdl(ctrl_down_kernel<1, 2>, dim3((unsigned) a.rank, (unsigned) streams, 1u), dim3(kDownWarps * 32), 0, s, a, rows);
     check("controllers/down");
-    bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), (size_t) up_rows * a.rank * 4, s, a, rows);
+    if (a.rank == 64) bk::launch_pdl(ctrl_up_rows_kernel<64>, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), 0, s, a, rows);
+    else bk::launch_pdl(ctrl_up_kernel, dim3((unsigned) (kWidth / 32), (unsigned) streams, z), dim3(256), (size_t) up_rows * a.rank * 4, s, a, rows);
     check("controllers/up");
     bk::launch_pdl(ctrl_blend_kernel, dim3((unsigned) rows, (unsigned) streams), dim3(kThreads), 0, s, a);
     check("controllers/blend");
@@ -689,13 +892,6 @@ void post_attn(const PostAttn& a, int rows, void* stream) {
     if (a.n_blocks + (a.boundary ? 1 : 0) + 1 > kMaxMix) throw std::runtime_error("inkling2 post_attn: blocks");
     bk::launch_pdl(post_attn_kernel, dim3((unsigned) rows), dim3(kThreads), 0, (cudaStream_t) stream, a);
     check("post_attn");
-}
-
-void moe_finish(const MoeFinish& a, int rows, void* stream) {
-    if (rows <= 0) return;
-    check_rows(rows, "moe_finish");
-    bk::launch_pdl(moe_finish_kernel, dim3((unsigned) rows, kWidth / 256), dim3(256), 0, (cudaStream_t) stream, a);
-    check("moe_finish");
 }
 
 }  // namespace basalt::models::inkling2

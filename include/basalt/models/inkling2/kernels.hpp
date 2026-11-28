@@ -7,6 +7,8 @@
 // depends on how many rows share its call or where it sits among them. `stream` may be null (the call then synchronises).
 #pragma once
 
+#include "basalt/kernels/expert_plan.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/window_segs.hpp"
 
 #include <cstddef>
@@ -23,10 +25,11 @@ constexpr int kv_cache_row_bytes(bool fp8, bool int8) { return fp8 ? kHeadDim : 
 constexpr int kRel = 16;            ///< relative state per head
 constexpr int kExtent = 1024;       ///< distances the relative bias covers (also the window)
 constexpr int kConv = 4;            ///< short convolution taps
-constexpr int kConvRing = 32;       ///< positions a convolution ring keeps: a window of up to 8 rows and the 3 before it
 constexpr int kMaxMix = 6;          ///< states one mix reads: the finished blocks and the partial
 constexpr int kDecodeRows = 16;      ///< rows of one conversation's decode window
-constexpr int kBatchRows = 128;      ///< rows of a batched decode window across conversations
+constexpr int kBatchRows = 320;      ///< rows of a batched decode window across conversations (64 slots x 5)
+constexpr int kMaxPairs = 8 * kBatchRows;   ///< routed (row, expert) pairs of a visit at most
+constexpr int kConvRing = kDecodeRows + kConv - 1;   ///< positions a convolution ring keeps: a window's rows and the 3 before it
 constexpr int kMaxStreams = 4;      ///< loop controllers one call runs side by side
 
 /// A layer's fused projection rows, in this order: q, r, gate, sink (read from the query input), k and the key
@@ -68,7 +71,7 @@ struct SegCaches {
     float* a_ring = nullptr;
     float* m_ring = nullptr;
 };
-/// A decode window of several conversations (docs/design/batching.md): segment i's rows (at.row0[i]..) take c[i]'s caches,
+/// A decode window of several conversations (docs/architecture/batching.md): segment i's rows (at.row0[i]..) take c[i]'s caches,
 /// and a row's convolutions read only the rows of its own segment before it. at.n = 0 (the default): one conversation, the
 /// arguments' own caches. Every row gives the bits it gives in its conversation's own call.
 struct Segments {
@@ -152,7 +155,7 @@ size_t attention_decode_scratch(int rows, int64_t max_keys);
 /// sizes the launch only: a row's keys split in slices fixed by its own key count). `out` may be null when q8 is set.
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream);
 
-/// Initialize the INT8 MMA plans for the current device during model load.
+/// Initialize the INT8 MMA plans and the INT8 slice count for the current device during model load.
 void attention_decode_int8_init();
 
 enum class Int8MmaPlan { Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct };
@@ -173,6 +176,11 @@ bool attention_decode_int8_test(const AttnArgs& a, int rows, int64_t max_keys, v
                                 bool mma, Int8MmaPlan plan = Int8MmaPlan::Auto, Int8MmaPlanInfo* info = nullptr,
                                 Int8MmaShards shards = Int8MmaShards::Auto, int shard_count = 0);
 int attention_decode_int8_test_min_keys();
+/// The current device's INT8 slice count: the most slices a full-cache INT8 row takes (FP16 and E4M3 rows take 64).
+int attention_decode_int8_slices();
+/// Parity only: set the current device's INT8 slice count, within the rule's range. Call it only with no attention work in
+/// flight on the device and no captured graph that will replay, and set the card's own count back before serving.
+void attention_decode_int8_test_set_slices(int slices);
 
 /// out[r] = attn[r] * sigmoid(yq[r][kOffGate..]), the attention output gated by its own row's gate projection.
 void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream, int64_t yq_ld = kProjQ);
@@ -187,22 +195,36 @@ void post_conv(const float* x, const int32_t* pos, const float* taps, float* rin
 
 // ---- experts -----------------------------------------------------------------------------------------------------------
 
-/// Doorbell words in mapped host memory, accessed atomically at system scope. The ring's release publishes the choices,
-/// RAM rows and nonzero visit ticket. The host acquires the ring, takes the ticket, clears the ring and computes its rows.
-/// Its release store to `done` publishes those rows with that ticket. The merge acquires only a completion for its visit.
-/// `abort` is sticky: a RAM visit that observes it does not publish, and waiting merges check it periodically.
+/// Doorbell words in mapped host memory, accessed atomically at system scope. The rows' release publishes a visit's MLP
+/// input rows and their shape under a nonzero publication number, so the host can quantize them before the choices come;
+/// `rows_ack` (the host's release, after its last read of them) hands the buffer back, and the next publication waits for
+/// it. The ring's release publishes the choices, the nonzero visit ticket and the publication its rows came in. The host
+/// acquires the ring, takes the ticket, clears the ring and computes its rows. Its release store to `done` publishes those
+/// rows with that ticket. The merge acquires only a completion for its visit. `abort` is sticky: a visit that observes it
+/// does not publish, and waiting merges and publications check it periodically.
 struct CpuBell {
     alignas(64) uint32_t ring;
     uint32_t ticket;
+    uint32_t ring_rows;
     alignas(64) uint32_t done;
     uint32_t abort;
+    uint32_t rows_ack;
+    alignas(64) uint32_t rows;
+    uint32_t rows_shape;
 };
 
-/// Each visit with a RAM pair advances the device word `seq` (initialized to zero), even after an abort. A live RAM visit
-/// publishes its choices to ids_m, its RAM rows to x_m, and its ticket before raising `ring` with `layer` and `rows`.
-/// A visit with no RAM pair touches neither `seq` nor mapped host memory. rows <= kDecodeRows, rows * k <= 1024.
-void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* x, int layer, float* x_m,
-                  int32_t* ids_m, CpuBell* bell, uint32_t* seq, void* stream);
+/// Every visit with experts in RAM, before its moe_cpu_ring on the same stream: the next publication number from seq[1],
+/// a wait for the host's acknowledgement of the one before, its `rows` MLP input rows `x` into x_m, then `rows_shape`
+/// (the ring's encoding of `layer` and `rows`) and `rows` raised to that number. Nothing when abort is seen.
+/// rows <= kBatchRows.
+void moe_cpu_rows(const float* x, int rows, int layer, float* x_m, CpuBell* bell, uint32_t* seq, void* stream);
+
+/// `seq`: two device words, initialized to zero: seq[0] the ring's tickets, seq[1] moe_cpu_rows' publications. Each visit
+/// with a RAM pair advances seq[0], even after an abort. A live RAM visit publishes its choices to ids_m, its ticket and
+/// its rows' publication (seq[1]; its moe_cpu_rows comes first on the stream) before raising `ring` with `layer` and
+/// `rows`. A visit with no RAM pair touches neither seq[0] nor mapped host memory. rows <= kDecodeRows, rows * k <= 1024.
+void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long* blobs, int layer, int32_t* ids_m, CpuBell* bell,
+                  uint32_t* seq, void* stream);
 
 /// The CPU's rows of a window's experts (cpu_experts.hpp): pair p = r * k + slot whose expert is not on the card (blobs[e]
 /// 0) takes row p of `cpu` (mapped host memory, the pool's output) into row p of `output`, and adds its lookup to tally[e]
@@ -211,21 +233,13 @@ void moe_cpu_ring(const int32_t* ids, int rows, int k, const unsigned long long*
 void moe_cpu_merge(const int32_t* ids, int rows, int k, const unsigned long long* blobs, const float* cpu, float* output,
                    uint32_t* tally, void* stream, CpuBell* bell = nullptr, const uint32_t* seq = nullptr);
 
-/// The grouped expert kernel's plan from the router's choices: group g is an expert on the card (its blob at blobs[e], a
-/// device address; 0 when it is not on the card) and its entries are the (row, slot) pairs that chose it, in row order;
-/// an entry writes row r * k + slot of the output. A pair whose expert is not on the card is left out (the caller
-/// supplies its row). ptr [k rows], start [k rows + 2], n_groups [1], dst and tok [k rows]. rows * k <= 1024. With
-/// `tally` [n_expert], each expert on the card adds its pairs to its entry (the console's expert map).
-void moe_plan(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* blobs, unsigned long long* ptr,
-              int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream, uint32_t* tally = nullptr,
-              unsigned long long* rec_blobs = nullptr, int32_t* rec_n = nullptr);
-/// Fused sigmoid router selection + moe_plan for decode windows (n_expert == 128, rows <= kDecodeRows): bitwise equal to
+/// Fused sigmoid router selection + moe_plan (basalt/kernels/expert_plan.hpp) for decode windows (n_expert == 128, rows <= kDecodeRows): bitwise equal to
 /// router_select + moe_plan without intermediate HBM round-trip or shared atomicAdd.
 void router_select_plan(const float* logits, const float* bias, int rows, int k, int n_expert, float weight_scale,
                         int32_t* ids, float* weights, const unsigned long long* blobs, unsigned long long* ptr,
                         int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream,
                         uint32_t* tally = nullptr, unsigned long long* rec_blobs = nullptr, int32_t* rec_n = nullptr);
-constexpr int kAheadExperts = 8;   ///< the groups of a visit moe_plan records (rec_blobs, rec_n) for the next window
+constexpr int kAheadExperts = basalt::kernels::kPlanAhead;   ///< the groups of a visit moe_plan records (rec_blobs, rec_n) for the next window
 /// The lookups of a window's first `rows` rows (the rows it keeps): for each of `visits` visits, ids[v][r][j] (row r of at
 /// most `row_stride`, k choices) adds 1 to tally[layer[v] * n_expert + id]. One block a visit.
 void heat_fold(const int32_t* ids, const int32_t* layer, int visits, int row_stride, int rows, int k, int n_expert,
@@ -288,6 +302,8 @@ struct CtrlArgs {
     const uint16_t* up[kMaxStreams] = {};
     const float* norm[kMaxStreams] = {};
     void* q8[kMaxStreams] = {};
+    void* xh = nullptr;                ///< set: stream 0's normed rows go here in the experts' layout instead of q8[0]
+    bool xh_bf16 = false;
     float* norm_out = nullptr;
     float* scratch = nullptr;
     int rank = 0;
@@ -322,15 +338,16 @@ struct PostAttn {
     const float* query = nullptr;
     const float* norm = nullptr;
     float eps = 1e-6f;
-    void* q8 = nullptr;
+    void* xh = nullptr;
+    bool xh_bf16 = false;              ///< expert_input's type for the layer
     float* norm_out = nullptr;
     float* mix_out = nullptr;
     Segments seg;                      ///< a batch window's: each segment's ring (a_ring)
 };
 void post_attn(const PostAttn& a, int rows, void* stream);
 
-/// The experts' sum of each row (w[r][slot] * rows[r * k + slot], slot order), its convolution (the ring for the positions
-/// before the window) plus `resid` into `out`.
+/// The experts' sum of each row (w[r][slot] * rows[r * k + slot], an fma chain in slot order), its convolution (the ring
+/// for the positions before the window) plus `resid` into `out`: the finish experts_down runs as its rows come in.
 struct MoeFinish {
     const float* rows = nullptr;       ///< [rows][k][kWidth]
     const float* w = nullptr;          ///< [rows][k]
@@ -343,7 +360,41 @@ struct MoeFinish {
     float* tap = nullptr;              ///< set: the output rows also here (the drafter's copy of the next visit's input)
     Segments seg;                      ///< a batch window's: each segment's ring (m_ring)
 };
-void moe_finish(const MoeFinish& a, int rows, void* stream);
+
+// ---- experts (kernels/experts.cu) ----------------------------------------------------------------------------------------
+//
+// A visit's routed experts on tensor cores: gate/up with the SwiGLU, then down, whose blocks also run the finish
+// (MoeFinish) of each segment once its rows are all in. The MLP input comes as expert_input rows: f16 when the layer's
+// experts are NVFP4, bf16 when MXFP8, each 16-value group stored as the pairs (v_j, v_{j+8}). An entry's bits are the
+// same whatever else shares the call (basalt/kernels expert_tile.cuh).
+
+/// The activation rows' element type of a layer whose experts are `type`: true for bf16.
+constexpr bool expert_input_bf16(int type) { return type == 46; }
+/// Bytes of the experts' scratch for `pairs` (row, slot) pairs: the down's input rows.
+size_t expert_h_bytes(int pairs, int64_t n_ff);
+/// Ints of the finish tickets (zeroed once; each call leaves them zero).
+size_t expert_tickets();
+
+struct ExpertCall {
+    basalt::kernels::NativeExpertLayout L;   ///< NVFP4 (40) or MXFP8 (46), gate, up and down alike, kWidth x 1152
+    const unsigned long long* ptr = nullptr; ///< moe_plan's groups and entries
+    const int32_t* start = nullptr;
+    const int32_t* n_groups = nullptr;
+    const int32_t* dst = nullptr;
+    const int32_t* tok = nullptr;
+    int pairs = 0;                           ///< rows x k
+    int n_expert = 0;
+    const void* x = nullptr;                 ///< [rows][kWidth] expert_input rows
+    void* h = nullptr;                       ///< scratch, expert_h_bytes
+    int32_t* tickets = nullptr;              ///< expert_tickets ints
+};
+void experts_gate_up(const ExpertCall& e, void* stream);
+/// The down and the finish, every pair's expert on the card.
+void experts_down(const ExpertCall& e, const MoeFinish& f, int rows, void* stream);
+/// A visit with experts off the card: the down writes the card's pairs' rows only; the other rows come in (the CPU's
+/// merge), then experts_finish runs the finish.
+void experts_down_rows(const ExpertCall& e, const MoeFinish& f, int rows, void* stream);
+void experts_finish(const ExpertCall& e, const MoeFinish& f, int rows, void* stream);
 
 // ---- head --------------------------------------------------------------------------------------------------------------
 

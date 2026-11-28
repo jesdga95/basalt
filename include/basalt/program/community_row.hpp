@@ -39,8 +39,8 @@ inline constexpr const char* kCommunityTestNames[3] = {"conv", "struct", "prose"
 /// Processor" and the like are dropped, then ", N cores" is added. Empty when the name is empty.
 std::string cpu_label(const std::string& raw_name, int physical_cores);
 
-/// The quant label of a pack from its name: the last word, without the publisher's prefixes; "unknown" when empty or when that word has no digit
-/// (a name ending in a plain word carries no quant; the model's adapter names it, see community_quant).
+/// The quant label of a pack from its name: the last word, without the publisher's prefixes; "unknown" when empty or when that word is no format
+/// name, which starts with a letter and carries a digit (the model's adapter names the quant then, see community_quant).
 std::string pack_quant_label(const std::string& pack_name);
 
 /// A JSON string literal, quoted the way json.dumps(ensure_ascii=False) does.

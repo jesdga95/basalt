@@ -53,10 +53,11 @@ public:
     }
 
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
+    int max_slots() const override { return kMaxWindow; }   // one row each of a window
     program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }   // peer: experts by layer block
-    const char* model_name() const override { return "Hy4-flash"; }
+    const char* model_name(const core::Json&) const override { return "Hy4-flash"; }
 
-    // --kv (the sparse layers' latent rows, fp16 by default or fp8) and, DFLY HOOK, --spec and its companions as DeepSeek's
+    // --kv (the sparse layers' latent rows, fp16 by default or fp8), --ple-io (Engram table reads) and, DFLY HOOK, --spec and its companions as DeepSeek's
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         if (model::parse_route_flag(a, args, o.route, code)) return true;
         if (a == "--diag-rows") {
@@ -67,12 +68,20 @@ public:
             o.kv = args.next("--kv");
             return true;
         }
+        if (a == "--ple-io") {
+            o.ple_io = args.next("--ple-io");
+            return true;
+        }
         return dfly_parse_flag(a, args, o);
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
         if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "f32") {
             basalt::log::error("basalt hy4flash", "--kv %s: the latent caches are fp16 (the default) or fp8", o.kv.c_str());
+            return 2;
+        }
+        if (o.ple_io != "direct" && o.ple_io != "ram") {
+            basalt::log::error("basalt hy4flash", "--ple-io %s: direct (the default) or ram", o.ple_io.c_str());
             return 2;
         }
         dfly_finish_flags(o);

@@ -13,8 +13,8 @@ namespace basalt::prefill::fp4 {
 constexpr int kTileTokens = 64;
 constexpr int kMaxExperts = 16;   // experts per launch
 
-/// Bytes of the activation planes for `rows` rows of `cols` values (multiple of 128) split over up to `experts`
-/// segments, each padded to whole tiles.
+/// Bytes of the activation planes for `rows` rows of `cols` values (multiple of 64: a last half k-tile is padded) split
+/// over up to `experts` segments, each padded to whole tiles.
 size_t a4_bytes(int64_t rows, int64_t cols, int experts);
 /// Floats of the per-token scale array for the same split.
 size_t scale_count(int64_t rows, int experts);
@@ -29,7 +29,7 @@ void rebase(const int32_t* bounds, int n, int32_t* out, void* stream);
 /// Rounds rows to FP4: row i of the segments is row ids[i] of x (or i), `ld` floats per row.  `bounds`/`tile_off` as
 /// planned; writes the planes `a4` and the token scales `gs`.  With `two`, each row is two FP4 terms under its one token
 /// scale, its rounding and the rounding of what that leaves (about 8 bits); the planes then hold 2 * cols values a row
-/// (size them as for 2 * cols), the k-tiles alternating the two terms of the same 128 columns.
+/// (size them as for 2 * cols, cols rounded up to 128), the k-tiles alternating the two terms of the same 128 columns.
 void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
               float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream, bool two = false);
 /// Same as quantize(..., two = true) reading fp16 rows (halves intermediate H traffic between gate/up and down).
@@ -75,14 +75,20 @@ struct Product {
     size_t tail_off = 0;
     /// A layer's experts in one launch (any n): expert j's blob at base + j * stride (blob[] unused), its GEMM blocks
     /// from blk_off (plan_blocks; the grid covers `blocks`, max_blocks()); output row r goes to dst row dst_ids[r]
-    /// (null: r); the SwiGLU, with gate_softcap > 0, is mmq::swiglu's softcapped form.
+    /// (null: r); the SwiGLU, with gate_softcap > 0, is mmq::swiglu's softcapped form.  Its w_cols may end in a half
+/// k-tile (a multiple of 64) when the weight rows are 8-byte aligned or the product is `two` with w_rows a multiple of 256.
     const uint8_t* base = nullptr;
     size_t stride = 0;
+    /// In place of base + j * stride: expert j's blob at blobs[j] (device [n], blobs where a tier keeps them).
+    const unsigned long long* blobs = nullptr;
     const int32_t* blk_off = nullptr;
     int64_t blocks = 0;
     const int32_t* dst_ids = nullptr;
     float gate_softcap = 0.0f, up_softcap = 0.0f;
     bool two = false;   ///< the activations as two FP4 terms (quantize's `two`: planes of 2 * w_cols values a row)
+    /// A layer's gate/up product (base set, swiglu): the tail-scaled GELU gate (tanh form) gelu(g s_gate) (u s_up) s_down
+    /// in place of the SwiGLU (no softcaps).
+    bool gelu = false;
 };
 void run(const Product& p, void* stream);
 /// The 16-byte scale tail at `tail_off` of each of p's n blobs to dst[4 j .. 4 j + 3] (the tail swiglu reads).

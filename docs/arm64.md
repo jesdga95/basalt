@@ -64,10 +64,8 @@ integrated GPU (the SoC's limit is the system's, not the GPU's) and refuses besi
 
 ## Quality
 
-The GPU kernels are the discrete card's, compiled for 12.1, and give the same output: Inkling 2 Mini's 100-chunk KLD on a GB10
-matched an RTX 5090's to every printed digit. The NEON expert kernels sum in a different order from the AVX-512 ones, so CPU
-experts are not bit-identical to an x86 build, at the same quality: with `--expert-cache 1500` the GB10 scored KLD 0.00435, top-1
-97.20% against the 5090's 0.00451 and 97.20%.
+The GPU kernels are the discrete card's, compiled for 12.1, and give the same output as on that card. The NEON expert kernels sum in a different order from the AVX-512 ones, so CPU
+experts are not bit-identical to an x86 build.
 
 ## Limits
 
