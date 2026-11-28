@@ -36,6 +36,10 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
     else if (a == "--no-capture") o.no_capture = true;
     else if (a == "--no-pool") o.no_pool = true;
+    else if (a == "--cpu-governor") o.cpu_governor = true;
+    else if (a == "--cpu-governor-hi") o.cpu_governor_hi = std::atof(args.next("--cpu-governor-hi"));
+    else if (a == "--cpu-governor-lo") o.cpu_governor_lo = std::atof(args.next("--cpu-governor-lo"));
+    else if (a == "--cpu-governor-max-shed") o.cpu_governor_max_shed = (int) std::atoll(args.next("--cpu-governor-max-shed"));
     else if (a == "--diag-main-card-bits") basalt::core::diagnostics().main_card_bits = true;
     else if (a == "--diag-fixed-experts") o.diag_fixed_experts = true;
     else if (a == "--stage-timing") o.stage_timing = true;

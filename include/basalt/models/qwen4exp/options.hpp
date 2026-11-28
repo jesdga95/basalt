@@ -20,6 +20,10 @@ struct Options : CommonOptions {
     std::string dump_routing;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
+    bool cpu_governor = false;        // --cpu-governor: decode on a thinned pool while other processes keep cores busy
+    int cpu_governor_max_shed = 1;    // workers the governor may shed at most; load that stays sheds another, down to max(workers - this, 1)
+    double cpu_governor_hi = 1.0;     // external busy cores that, held, thin the pool
+    double cpu_governor_lo = 0.35;    // external busy cores that, held, restore the full pool
     /// Per-stage CUDA-event timings inside the layer halves.  `--no-capture` only: an event recorded inside a
     /// stream capture is silently dropped, so the captured path cannot carry this.
     bool stage_timing = false;

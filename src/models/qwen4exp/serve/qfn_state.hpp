@@ -95,7 +95,9 @@ namespace basalt::models::qwen4exp { std::shared_ptr<basalt::program::ProbePeerP
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <atomic>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include "basalt/log.hpp"
@@ -207,6 +209,7 @@ class QfnRuntime final : public Runtime, private Context {
 public:
     explicit QfnRuntime(Context& context)
         : Runtime(context.o, context.model_file, context.err, context.n_vocab, context.grammar_vocab), Context(context) {}
+    ~QfnRuntime() override { governor_stop(); }
     int init_before_input() override;
     int init_after_input() override;
     void after_input_start() override;
@@ -237,6 +240,17 @@ private:
     using Context::n_vocab;
     using Context::grammar_vocab;
     friend class Request;
+    // --cpu-governor: while other processes hold more than --cpu-governor-hi busy cores, the pool sheds a worker -
+    // and another for each further held window of load, down to its count minus --cpu-governor-max-shed (never under
+    // 1); each regained worker needs its own held window of quiet (below --cpu-governor-lo fast, below the shed
+    // trigger calm), so half the machine calming climbs half the ladder.  The thread only calls
+    // ExpertPool::set_active_workers, which lands at the next batch boundary; PROBE-set worker counts ride under the
+    // governor: the next shed or regain moves one rung from wherever the count stands.
+    void governor_start();
+    void governor_stop();
+    std::thread gov_thr_;
+    std::atomic<bool> gov_quit_{false};
+    bool gov_live_ = false;
     basalt::prefill::Prefill sp{};
     void* borrow{};
     uint64_t borrow_bytes{};

@@ -5,6 +5,7 @@
 #include "basalt/platform/process.hpp"
 
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -237,5 +238,78 @@ ThreadWaits threads_in_disk_wait() {
 }
 
 #endif
+
+double ExternalCpuLoad::sample() {
+    double busy = 0, self = 0, workers = 0;   // `workers` stays 0 where the OS has no kernel-thread listing
+#if defined(_WIN32)
+    auto secs = [](const FILETIME& t) {
+        ULARGE_INTEGER u;
+        u.LowPart = t.dwLowDateTime; u.HighPart = t.dwHighDateTime;
+        return (double) u.QuadPart / 1e7;   // hundred-nanosecond ticks to seconds
+    };
+    FILETIME idle, kern, user;
+    if (GetSystemTimes(&idle, &kern, &user)) busy = secs(kern) + secs(user) - secs(idle);   // the kernel total includes the idle
+    FILETIME created, exited, pk, pu;
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &pk, &pu)) self = secs(pk) + secs(pu);
+#else
+    // The cpu aggregate line: user nice system idle iowait irq softirq steal guest guest_nice.  The guests bill
+    // inside user, so the sum without idle and iowait is the busy time.
+    if (std::ifstream f("/proc/stat"); f) {
+        std::string cpu;
+        long long v;
+        f >> cpu;
+        for (int i = 0; i < 10 && (f >> v); ++i)
+            if (i != 3 && i != 4) busy += (double) v;
+    }
+    {
+        std::ifstream f("/proc/self/stat");
+        std::string line;
+        std::getline(f, line);
+        const char* s = std::strrchr(line.c_str(), ')');   // fields after the command name: 3 state ... 14 utime 15 stime
+        long long ut = 0, st = 0;
+        for (int field = 2; s && field < 14; ++field) s = std::strchr(s + 1, ' ');
+        if (s) {
+            ut = std::strtoll(s + 1, nullptr, 10);
+            if (const char* t = std::strchr(s + 1, ' ')) st = std::strtoll(t + 1, nullptr, 10);
+        }
+        const double hz = (double) sysconf(_SC_CLK_TCK);   // jiffies to thread-seconds
+        busy /= hz;
+        self = (double) (ut + st) / hz;
+    }
+    {
+        // Kernel reclaim and compaction workers: they page and compact on behalf of whichever process churned the
+        // page cache, which on this machine is mostly us. Left in the external bucket they make the pool shed
+        // against its own expert reads, down to one worker on an otherwise idle machine.
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator("/proc", ec)) {
+            const std::string name = e.path().filename().string();
+            if (name.empty() || !std::isdigit((unsigned char) name[0])) continue;
+            std::string comm;
+            {
+                std::ifstream f(e.path() / "comm");
+                if (!std::getline(f, comm)) continue;
+            }
+            if (comm.rfind("kswapd", 0) != 0 && comm.rfind("kcompactd", 0) != 0 && comm != "khugepaged") continue;
+            std::ifstream f(e.path() / "stat");
+            std::string line;
+            if (!std::getline(f, line)) continue;
+            const char* s = std::strrchr(line.c_str(), ')');   // fields after the command name: ... 14 utime 15 stime
+            for (int field = 2; s && field < 14; ++field) s = std::strchr(s + 1, ' ');
+            if (!s) continue;
+            workers += (double) std::strtoll(s + 1, nullptr, 10);
+            if (const char* t = std::strchr(s + 1, ' ')) workers += (double) std::strtoll(t + 1, nullptr, 10);
+        }
+        workers /= (double) sysconf(_SC_CLK_TCK);
+    }
+#endif
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    double ext = 0;
+    if (prev_wall_ > 0 && wall > prev_wall_) {
+        ext = ((busy - prev_busy_) - (self - prev_self_) - (workers - prev_workers_)) / (wall - prev_wall_);
+        if (ext < 0) ext = 0;   // a process's total never outruns the machine's, but a sampling race can look that way
+    }
+    prev_busy_ = busy; prev_self_ = self; prev_workers_ = workers; prev_wall_ = wall;
+    return ext;
+}
 
 }  // namespace basalt::platform
