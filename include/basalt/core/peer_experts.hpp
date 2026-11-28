@@ -92,6 +92,8 @@ public:
     bool open_scratch(int n, uint64_t bytes, std::string& err);
     /// Scratch slots still free for the armed share (all of them again once the next one is armed).
     int scratch_free() const { return (int) scratch_.size() - scratch_used_; }
+    /// Wait for the previous share before submitting peer copies.
+    bool prepare_for_copy_pump(std::string& err);
     /// Whether a share is armed and not raised yet.
     bool armed() const { return armed_; }
     /// Whether the armed share holds `expert` in a scratch slot (fetch).
