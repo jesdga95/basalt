@@ -278,6 +278,7 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
         lw.dflash = {};
         model = make_model(g, lw, o, err);
         if (!model) return false;
+        model->home = main.home;   // products plan as the card that holds layer 0, not as this stage's parent
         model->w.dflash.window = bd.window;
         model->w.dflash.target_layers = bd.target_layers.empty() ? targets : bd.target_layers;
         if (!model->ensure_chunk(err)) return false;
@@ -338,8 +339,8 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
             stage_ev.push_back(e);
         }
     }
-    // prompt attention rounds as the main card's (every stage, so a third card matches CUDA0 too)
-    kernels::gqa_prompt_plan_device(split ? 0 : main_dev);
+    // prompt attention rounds as the card that holds layer 0, so a later card matches it
+    kernels::gqa_prompt_plan_device(main.home);
     return true;
 }
 
@@ -651,8 +652,8 @@ bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err
     const size_t H = (size_t) g.n_embd, slot = (size_t) kBatch * H * 2;
     int main_dev = 0;
     cudaGetDevice(&main_dev);
-    // every stage's window products plan as CUDA0 (before its model sizes their workspace), so its rows round as the main card's
-    kernels::wgemm::plan_device(0);
+    // window products plan as the card that holds layer 0 (before this stage's model sizes their workspace)
+    kernels::wgemm::plan_device(m.home);
     StagePtr p(new Stage());
     Stage& L = *p;
     const auto fail = [&](const std::string& what) {
@@ -694,7 +695,7 @@ bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err
     m.split_dev = dev;
     const int last = (layer_end > 0 ? layer_end : g.n_layers) - 1;
     basalt::log::info("basalt dense", "layer split: CUDA%d runs layers %d-%d of every window and prompt chunk; its products planned as "
-                      "CUDA0's (buffers on CUDA%d)", dev, cut, last, main_dev);
+                      "CUDA%d's (buffers on CUDA%d)", dev, cut, last, m.home, main_dev);
     m.split = std::move(p);
     return true;
 }
@@ -729,7 +730,12 @@ bool split_session(Model& m, SessionState& st, std::string& err) {
 
 namespace {
 
-int card_dev(const SessionState& st) { return st.dev >= 0 ? st.dev : 0; }
+int card_dev(const SessionState& st) {
+    if (st.dev >= 0) return st.dev;
+    int d = 0;
+    cudaGetDevice(&d);
+    return d;
+}
 
 // The stage whose model is `card` (the hand-off into it). Null for the main card.
 Stage* stage_owning(Model& root, Model* card) {
@@ -751,7 +757,11 @@ bool chain_chunk(Model& root, SessionState& root_st, const int32_t* tokens, cons
     uint8_t* back = copy_back ? root.split->hand[1] : nullptr;
     Model* card = &root;
     SessionState* ss = &root_st;
-    for (int guard = 0; card != nullptr && guard < 8; ++guard) {
+    for (int guard = 0; card != nullptr; ++guard) {
+        if (guard >= 8) {
+            err = root.o.arch + ": a layer split runs on at most 8 cards";
+            return false;
+        }
         if (ss == nullptr) {
             err = root.o.arch + ": a layer-split card has no session";
             return false;
@@ -857,7 +867,11 @@ bool chain_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
     {
         Model* from = &m;
         SessionState* from_ss = &st;
-        while (from->split != nullptr && from->split_model != nullptr && from_ss->peer != nullptr && hops.size() < 8) {
+        while (from->split != nullptr && from->split_model != nullptr && from_ss->peer != nullptr) {
+            if (hops.size() >= 7) {   // the main card plus these hops is eight
+                err = m.o.arch + ": a layer split runs on at most 8 cards";
+                return false;
+            }
             hops.push_back({from->split.get(), from->split_model, from_ss->peer.get(), from, from_ss});
             from = from->split_model;
             from_ss = from_ss->peer.get();
@@ -916,9 +930,12 @@ bool chain_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
         const int32_t* bc = t == T ? bnd : bnd + 2;
         const bool tail = block && p + t > b0 - cap && tail_pos.size() < n_keep;
         const int32_t* p3 = pos3 + (size_t) i * T * 3;
-        chunk_start(m, st, tokens + (size_t) i * T, nullptr, t, p3, bc);
-        chunk_layers(m, st, t, p, 0, m.le, block ? &bd : nullptr);
-        L.send(m, st, k, again, tail ? L.mtail[tail_pos.size()] : nullptr);
+        {
+            const core::OnDevice on(card_dev(st));
+            chunk_start(m, st, tokens + (size_t) i * T, nullptr, t, p3, bc);
+            chunk_layers(m, st, t, p, 0, m.le, block ? &bd : nullptr);
+            L.send(m, st, k, again, tail ? L.mtail[tail_pos.size()] : nullptr);
+        }
         for (size_t c = 0; c < hops.size(); ++c) {
             const Hop& h = hops[c];
             const bool holds_last = h.card->le >= g.n_layers;
@@ -942,6 +959,7 @@ bool chain_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
         if (e == cudaSuccess) e = r;
     }
     if (e == cudaSuccess && !stopped) {
+        const core::OnDevice on(card_dev(st));
         // the ring's chunks' features in order: the main card's part, then each later card's rows projected on the main card
         for (size_t j = 0; j < tail_pos.size(); ++j) {
             const int t = tail_rows[j];

@@ -198,6 +198,12 @@ public:
     /// A model split across two cards: the second card's part of that save, on its device.
     basalt::core::CheckpointDeferral ckd_peer{};
     int ckd_peer_dev = -1;
+    /// Cards after the second: one spare each, so their part of a save does not wait on the copy. Six is the rest of an
+    /// 8-card split.
+    static constexpr int kFurtherCkpt = 6;
+    basalt::core::CheckpointDeferral ckd_further[kFurtherCkpt]{};
+    int ckd_further_dev[kFurtherCkpt] = {};
+    int ckd_further_n = 0;
     /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
     bool touch_check(int64_t to, ConvCheckpoint::Source source);
     /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache, and past the pool

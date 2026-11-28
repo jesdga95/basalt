@@ -66,9 +66,11 @@ struct SplitCut {
 
 /// The cut nearest the Split shares (or --diag-gpu-cut). Without `gpu-share`, the free-VRAM shares divide the layers and
 /// each card's fixed bytes (the head, the drafter, the scratch) stay on that card, so a larger fixed cost does not take
-/// layers away from it. With `gpu-share`, card i ends where the bytes of cards 0..i come nearest their shares of every
-/// card's bytes, fixed included. A card whose share is less than a layer would hold nothing and is refused; so is a card
-/// whose part does not fit its room, with its numbers.
+/// layers away from it. When that cut does not fit, layers move onto a card that has room, the nearest such cut, and a
+/// cut that still does not fit is refused. With `gpu-share`, card i ends where the bytes of cards 0..i come nearest
+/// their shares of every card's bytes, fixed included, and a part that does not fit is refused as asked. A card whose
+/// share is less than a layer would hold nothing and is refused; so is a card whose part does not fit its room, with
+/// its numbers.
 SplitCut split_cut(const GpuCards& c, const SplitSpec& s);
 
 /// "layers 0-29" of card `i` of a cut over `n_layers`.

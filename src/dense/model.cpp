@@ -516,6 +516,8 @@ bool Model::ensure_chunk(std::string& err) {
 
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err) {
     ModelPtr m(new Model());
+    cudaGetDevice(&m->dev);
+    m->home = m->dev;
     m->g = g;
     m->w = w;
     m->o = o;

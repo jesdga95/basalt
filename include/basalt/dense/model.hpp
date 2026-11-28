@@ -164,7 +164,7 @@ bool warm_prompt_split(Model& m, std::string& err);
 /// their cells and recurrent state, and runs them in every decode window and prompt chunk of `m`, which holds the layers
 /// before `cut`.  `end` 0 runs through the last layer.  A card that already forwards to another keeps that hand-off; the
 /// card attached here takes the new one.  Called with the parent card current (the main card, for the first stage), before
-/// any session is made.  Products are planned as CUDA device 0, so every stage matches the main card to the bit.
+/// any session is made.  Products are planned as the card that holds layer 0, so every stage matches that card to the bit.
 bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err, int layer_end = 0);
 /// Layers across `n_cards` (3 or more). `bounds` has `n_cards + 1` entries (0 .. n_layers), `devs[c]` is the CUDA device of
 /// card c (`devs[0]` is the main card), and `ws[c]` holds that card's layers. Card 0 is `m`, already built.

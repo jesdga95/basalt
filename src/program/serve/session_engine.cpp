@@ -494,13 +494,16 @@ public:
                 return {basalt::model::Status::Error, e};
         }
         size_t skip = rs.head.size() + rs.regions_bytes() + basalt::core::RunningState::sum(rs.peer_regions);
+        int fi = 0;
         for (const basalt::core::RunningState::LaterCard& later : rs.further) {
             if (later.regions.empty()) continue;
+            if (fi >= kFurtherCkpt) return {basalt::model::Status::Error, "a layer split runs on at most 8 cards"};
             const basalt::core::OnDevice on(later.device);
             const std::vector<basalt::core::RestoreSegment> later_seg{{from.data() + skip, later.regions}};
-            if (!basalt::core::checkpoint_copy_in(later_seg, (cudaStream_t) later.stream, e))
+            if (!ckd_further[fi].restore(later_seg, (cudaStream_t) later.stream, e))
                 return {basalt::model::Status::Error, e};
             skip += basalt::core::RunningState::sum(later.regions);
+            ++fi;
         }
         return session().running_restored(pos, from.data());
     }
@@ -534,6 +537,17 @@ public:
             if (std::string e; !ckd_peer.reserve(basalt::core::RunningState::sum(rs.peer_regions), e))
                 basalt::log::warn("basalt serve", "deferred checkpoint copy off on the second card: %s", e.c_str());
         }
+        int fi = 0;
+        for (const basalt::core::RunningState::LaterCard& later : rs.further) {
+            if (later.regions.empty()) continue;
+            if (fi >= kFurtherCkpt) break;
+            const basalt::core::OnDevice on(later.device);
+            ckd_further_dev[fi] = later.device;
+            if (std::string e; !ckd_further[fi].reserve(basalt::core::RunningState::sum(later.regions), e))
+                basalt::log::warn("basalt serve", "deferred checkpoint copy off on CUDA%d: %s", later.device, e.c_str());
+            ++fi;
+        }
+        ckd_further_n = fi;
         return true;
     }
 

@@ -45,15 +45,23 @@ void Runtime::shed_if_low() {
 
 void Runtime::ckd_finish() {
     const void* dst = ckd.pending();
-    if (dst == nullptr) return;
     std::string ce;
-    bool ok = ckd.finish(ce);
+    bool ok = true;
+    bool any = dst != nullptr;
+    if (dst != nullptr) ok = ckd.finish(ce);
     if (ckd_peer.pending()) {
+        any = true;
         const basalt::core::OnDevice on(ckd_peer_dev);
         ok = ckd_peer.finish(ce) && ok;
     }
-    if (ok) return;
+    for (int i = 0; i < ckd_further_n; ++i) if (ckd_further[i].pending()) {
+        any = true;
+        const basalt::core::OnDevice on(ckd_further_dev[i]);
+        ok = ckd_further[i].finish(ce) && ok;
+    }
+    if (!any || ok) return;
     basalt::log::error("basalt serve", "%s", ce.c_str());
+    if (dst == nullptr) return;
     checks.erase(std::remove_if(checks.begin(), checks.end(),
                                 [&](const ConvCheckpoint& k) { return k.state_a.data() == dst; }), checks.end());
 }
@@ -106,15 +114,27 @@ bool Runtime::capture_check(basalt::model::ModelSession& s, int64_t to, ConvChec
         const std::vector<basalt::core::SaveSegment> ps{{c.state_a.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
         if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, c.state_a.data(), err)) return false;
     }
-    // cards after the second have no deferred spare: their part is copied now, on each card's device
     size_t skip = rs.head.size() + rs.regions_bytes() + basalt::core::RunningState::sum(rs.peer_regions);
+    int fi = 0;
     for (const basalt::core::RunningState::LaterCard& later : rs.further) {
         if (later.regions.empty()) continue;
+        if (fi >= kFurtherCkpt) {
+            ckd_further_n = fi;
+            err = "a layer split runs on at most 8 cards";
+            return false;
+        }
         const basalt::core::OnDevice on(later.device);
+        ckd_further_dev[fi] = later.device;
         const std::vector<basalt::core::SaveSegment> later_seg{{c.state_a.data() + skip, later.regions}};
-        if (!basalt::core::checkpoint_copy_out(later_seg, (cudaStream_t) later.stream, err)) return false;
+        if (!ckd_further[fi].save(later_seg, (cudaStream_t) later.stream, c.state_a.data(), err)) return false;
         skip += basalt::core::RunningState::sum(later.regions);
+        ++fi;
     }
+    for (int i = fi; i < ckd_further_n; ++i) if (ckd_further[i].pending()) {
+        const basalt::core::OnDevice on(ckd_further_dev[i]);
+        if (!ckd_further[i].finish(err)) return false;
+    }
+    ckd_further_n = fi;
     return true;
 }
 

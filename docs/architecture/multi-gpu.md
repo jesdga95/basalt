@@ -52,8 +52,9 @@ gpu 1,0: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be sm_120
 
 - The main card must be sm_120. Split and tensor need every card sm_120. Peer also takes an sm_89 card in a `-DPEER_ADA=ON` build,
   and only for a model whose `GpuModes::peer_ada` is true (its peer kernels are among those that build compiles for sm_89).
-- A part that does not fit its card is refused with its numbers (what it needs, what is free) and the settings to lower
-  (`gpu-share`, `max-context`, `parallel`). A peer that would hold nothing is refused, with `use gpu 0`.
+- A part that still does not fit its card is refused with its numbers (what it needs, what is free) and the settings to lower
+  (`gpu-share`, `max-context`, `parallel`). The split's default cut moves layers onto a card with room before that. A peer that
+  would hold nothing is refused, with `use gpu 0`.
 - A visible card `gpu` does not name is no error: when `gpu` is unset every model warns once at start, in the CLI, the server and
   the bench: `GPU 1 (RTX 5060 Ti) unused; to use more cards set gpu (0,1 or all) and gpu-mode`.
 - In the config `gpu` and `gpu-share` may be a number, a list or a string; the server forwards `--gpu-mode` and `--gpu-share`
@@ -80,7 +81,7 @@ given `gpu-share` is used for every use; otherwise the default depends on what i
 
 | Mode, part | What the share divides | Default without `gpu-share` |
 | --- | --- | --- |
-| split | without `gpu-share`, the free-VRAM shares divide the layers and each card keeps its fixed bytes; with `gpu-share`, the shares divide every byte. A part that does not fit is refused | free VRAM at start |
+| split | without `gpu-share`, the free-VRAM shares divide the layers and each card keeps its fixed bytes; a part that does not fit moves layers onto a card with room. With `gpu-share`, the shares divide every byte and a part that does not fit is refused | free VRAM at start |
 | peer, experts | the experts outside the main card, dealt hottest first to the peers by share; the main card always fills first | free VRAM of the peers |
 | peer, prompt stages | the layers of a long prompt's chunk: the main card reads the first part, each stage card the next part by share | memory bandwidth (a slow card must not take a large part of a chunk's layers) |
 | peer, the main card's hot share | only when `gpu-share` is given (Flash-Next): the hottest experts are interleaved between the main card and a peer by share | off: the main card keeps the hottest |
@@ -100,7 +101,8 @@ given `gpu-share` is used for every use; otherwise the default depends on what i
 
 The flow is the same for every model: parse and narrow the cards; check `gpu_modes()` (an unsupported mode, or more cards than the
 mode takes, is refused before the load and in `--gpu-plan`); the model states what it can divide, the shared layer deals or cuts
-it (a part that does not fit is refused with its numbers); the model's `*_open` places its part; both start lines print.
+it (the split's default cut moves layers onto a card with room, and a part that still does not fit is refused with its
+numbers); the model's `*_open` places its part; both start lines print.
 
 ### What a model declares
 
@@ -138,8 +140,9 @@ when their buffers turn out not to fit.
 
 ### Split
 
-`SplitHooks` (`model/split_hooks.hpp`): `split_open` cuts the layers with `split_cut` over the model's `split_spec`, refuses a
-card that would hold nothing or whose part does not fit, then calls `split_place`.
+`SplitHooks` (`model/split_hooks.hpp`): `split_open` cuts the layers with `split_cut` over the model's `split_spec`. The default
+cut moves layers onto a card with room; a card that would hold nothing, or whose part still does not fit, is refused. Then it
+calls `split_place`.
 
 | Hook | Contract |
 | --- | --- |
@@ -148,8 +151,9 @@ card that would hold nothing or whose part does not fit, then calls `split_place
 | `split_part(card)` | The card's own part beside its layers for the start line; empty: nothing more to say. |
 
 `split_report(card)` prefixes `layers a-b` to the model's part. Without `gpu-share`, the free-VRAM shares divide the layers and
-each card keeps its fixed bytes. With `gpu-share`, the cut is the layer boundary where the cumulative bytes come nearest the
-shares of every card's bytes, fixed included. A part that does not fit is refused.
+each card keeps its fixed bytes; when that cut does not fit, layers move onto a card with room. With `gpu-share` or
+`--diag-gpu-cut`, the cut stays as given: the boundary where the cumulative bytes come nearest the shares of every card's
+bytes, fixed included, and a part that does not fit is refused.
 
 ### Tensor (reserved)
 

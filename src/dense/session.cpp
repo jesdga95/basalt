@@ -35,6 +35,7 @@ bool sync_chain(const SessionState& st) {
 // One session's device state on the card of model `m` (its layers' cells and recurrent state; on the card that holds layer 0
 // also the logits, the picks and the drafter's state), on the current device.
 bool init_state(Model& m, SessionState& st, std::string& err) {
+    cudaGetDevice(&st.dev);
     const Geometry& g = m.g;
     if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&st.side, cudaStreamNonBlocking) != cudaSuccess ||
@@ -294,7 +295,8 @@ public:
         }
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
-        for (int i = 0; i < count; ++i) ss[(size_t) i]->join_commit();   // the sessions' commits ran side by side
+        for (int i = 0; i < count; ++i)
+            if (!ss[(size_t) i]->join_commit()) return fail(m_.o.arch + ": a layer split runs on at most 8 cards");
         for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(share, width[(size_t) i] - 1);   // all the block's, as solo
         return {};
     }
@@ -370,7 +372,10 @@ protected:
             err = s.message;
             return false;
         }
-        join_commit();
+        if (!join_commit()) {
+            err = m_.o.arch + ": a layer split runs on at most 8 cards";
+            return false;
+        }
         for (const SessionState* p = st_.peer.get(); p != nullptr; p = p->peer.get())
             if (cudaStreamSynchronize(p->stream) != cudaSuccess) {
             err = cudaGetErrorString(cudaGetLastError());
@@ -555,7 +560,7 @@ public:
         s.peer_regions.clear();
         s.further.clear();
         bool first_later = true;
-        each_later_card([&](Model& card, SessionState& ss, int dev) {
+        if (!each_later_card([&](Model& card, SessionState& ss, int dev) {
             if (card.n_gdn == 0) return;
             const core::DeviceRegion region{ss.gdn, (size_t) card.n_gdn * ss.gdn_floats * 4};
             if (first_later) {
@@ -570,7 +575,7 @@ public:
             later.stream = ss.stream;
             later.device = dev;
             s.further.push_back(std::move(later));
-        });
+        })) return fail(m_.o.arch + ": a layer split runs on at most 8 cards");
         return {};
     }
 
@@ -764,28 +769,32 @@ public:
 
 private:
     // Every card after the one that holds layer 0: its model, its session, and the device that session lives on.
+    // False when the chain is longer than 8 cards.
     template <class Fn>
-    void each_later_card(Fn fn) {
+    bool each_later_card(Fn fn) {
         Model* model = m_.split_model;
         SessionState* st = st_.peer.get();
         int dev = m_.split_dev;
-        for (int n = 0; model != nullptr && st != nullptr && n < 8; ++n) {
+        for (int n = 0; model != nullptr && st != nullptr; ++n) {
+            if (n >= 7) return false;   // seven cards after the main one is an 8-card split
             fn(*model, *st, dev);
             dev = model->split_dev;
             model = model->split_model;
             st = st->peer.get();
         }
+        return true;
     }
     // The last window's accepted rows go into the recurrent state once the next call says where it starts.
-    void join_commit() {
-        if (!commit_pending_) return;
+    bool join_commit() {
+        if (!commit_pending_) return true;
         if (m_.n_gdn) cudaStreamWaitEvent(st_.stream, st_.join, 0);
-        each_later_card([&](Model& card, SessionState& ss, int dev) {
-            if (card.n_gdn == 0) return;
-            const core::OnDevice on(dev);
-            cudaStreamWaitEvent(ss.stream, ss.join, 0);
-        });
+        if (!each_later_card([&](Model& card, SessionState& ss, int dev) {
+                if (card.n_gdn == 0) return;
+                const core::OnDevice on(dev);
+                cudaStreamWaitEvent(ss.stream, ss.join, 0);
+            })) return false;
         commit_pending_ = false;
+        return true;
     }
     // `defer`: the commit's join is left to the caller (join_commit), which queues work beside it first
     Result settle(int64_t pos, bool defer = false) {
@@ -800,19 +809,20 @@ private:
                 cudaMemsetAsync(st_.gdn, 0, (size_t) m_.n_gdn * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
             bool cleared = true;
-            each_later_card([&](Model& card, SessionState& ss, int dev) {
+            if (!each_later_card([&](Model& card, SessionState& ss, int dev) {
                 const core::OnDevice on(dev);
                 ss.alt_ready = false;
                 if (card.n_gdn &&
                     cudaMemsetAsync(ss.gdn, 0, (size_t) card.n_gdn * ss.gdn_floats * 4, ss.stream) != cudaSuccess)
                     cleared = false;
-            });
+            })) return fail(m_.o.arch + ": a layer split runs on at most 8 cards");
             if (!cleared) return fail("clearing the recurrent state failed");
             return {};
         }
         if (pend_T_ == 0) {
             st_.alt_ready = false;
-            each_later_card([&](Model&, SessionState& ss, int) { ss.alt_ready = false; });
+            if (!each_later_card([&](Model&, SessionState& ss, int) { ss.alt_ready = false; }))
+                return fail(m_.o.arch + ": a layer split runs on at most 8 cards");
             return {};
         }
         const int64_t n = pos - pend_pos_;
@@ -837,7 +847,7 @@ private:
             cudaEventRecord(st_.join, st_.side);
             commit_pending_ = true;
         }
-        each_later_card([&](Model& card, SessionState& ss, int dev) {
+        if (!each_later_card([&](Model& card, SessionState& ss, int dev) {
             const core::OnDevice on(dev);
             const bool card_swapped = take_row(ss);
             ss.alt_ready = false;
@@ -848,8 +858,8 @@ private:
                 cudaEventRecord(ss.join, ss.side);
                 commit_pending_ = true;
             }
-        });
-        if (commit_pending_ && !defer) join_commit();
+        })) return fail(m_.o.arch + ": a layer split runs on at most 8 cards");
+        if (commit_pending_ && !defer && !join_commit()) return fail(m_.o.arch + ": a layer split runs on at most 8 cards");
         if (block_ && n > 0) {   // the kept rows become the block drafter's context
             std::string err;
             if (!block_ctx_window(m_, st_, (int) n, pend_pos_, err)) return fail(err);

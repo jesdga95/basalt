@@ -56,14 +56,14 @@ Shares are normalized to sum to 1 and stay fixed for the run. What a share divid
 
 | Mode, part | What the share divides | Default without `gpu-share` |
 | --- | --- | --- |
-| split | without `gpu-share`, the free-VRAM shares divide the layers, and each card keeps its own fixed bytes (the head and the drafter on the main card). With `gpu-share`, the shares divide every byte, fixed included | free VRAM at start |
+| split | without `gpu-share`, the free-VRAM shares divide the layers, and each card keeps its own fixed bytes (the head and the drafter on the main card). A part that does not fit moves layers onto a card with room. With `gpu-share`, the shares divide every byte, fixed included, and a part that does not fit is refused | free VRAM at start |
 | peer, experts | the experts the main card does not hold, dealt hottest first to the peers; the main card fills first | free VRAM of the peers |
 | peer, prompt layers | the layers of a long prompt's chunk: the main card reads the first part, each card the next by share | memory bandwidth |
 | peer, the main card's hot share | only with `gpu-share`: Flash-Next interleaves the hottest experts between the main card and a peer by share | off: the main card keeps the hottest |
 
-A part that does not fit its card is refused with the numbers (what it needs, what is free); lower that card's `gpu-share`,
-`max-context` or `parallel`. A peer that would hold nothing (the main card holds every expert, or its room is gone) is refused too,
-with `use gpu 0`.
+A part that still does not fit its card is refused with the numbers (what it needs, what is free); lower that card's `gpu-share`,
+`max-context` or `parallel`. The split's default cut moves layers onto a card with room before that. A peer that would hold nothing
+(the main card holds every expert, or its room is gone) is refused too, with `use gpu 0`.
 
 ## Peer mode
 

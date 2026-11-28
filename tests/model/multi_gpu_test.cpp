@@ -188,6 +188,42 @@ int main() {
         const SplitCut bytes = split_cut(c, s);
         CHECK(bytes.error.empty() && bytes.first[1] < 16);
     }
+    {
+        // free VRAM 2:1 puts four of six equal layers on the main card, and the main card's fixed bytes then do not
+        // fit. The nearest cut that does fit moves those layers onto the second card. gpu-share is not moved.
+        SplitSpec s;
+        s.layer.assign(6, 10);
+        s.fixed = {25, 5};
+        s.room = {40, 60};
+        GpuCards c = two(GpuMode::Split, 2 * GiB, GiB);
+        const SplitCut cut = split_cut(c, s);
+        CHECK(cut.error.empty());
+        CHECK(cut.first == std::vector<int>({0, 1}));
+        CHECK(cut.need[0] == 35 && cut.need[1] == 55);
+        c.given = {2.0 / 3.0, 1.0 / 3.0};
+        CHECK(!split_cut(c, s).error.empty());
+        s.room = {30, 30};
+        c.given.clear();
+        const std::string refused = split_cut(c, s).error;
+        CHECK(refused.find("layers 0-3") != std::string::npos);
+    }
+    {
+        // three cards: the layer cut gives the main card two layers, which its fixed bytes do not fit. The nearest
+        // fit keeps one layer there and leaves the rest where they still fit.
+        SplitSpec s;
+        s.layer.assign(6, 10);
+        s.fixed = {20, 0, 0};
+        s.room = {30, 30, 30};
+        GpuCards c = two(GpuMode::Split, GiB, GiB);
+        c.cards.push_back(c.cards[1]);
+        c.cards[2].device = 2;
+        c.cards[2].index = 2;
+        c.cards[2].free = GiB;
+        c.cards[2].label = "GPU 2 (RTX 5060 Ti)";
+        const SplitCut cut = split_cut(c, s);
+        CHECK(cut.error.empty());
+        CHECK(cut.first == std::vector<int>({0, 1, 4}));
+    }
 
     // ---- peer: the expert deal by share
     {

@@ -127,9 +127,9 @@ cache and recurrent state for every slot. On two cards the start line names the 
 Three or more cards (up to eight) each hold one band; the residual is handed from one card to the next, and a prompt's chunks run as a pipeline across them.
 
 - **The cut** divides the layers by the cards' free VRAM, and the head and the drafter stay on the main card's budget, so they do not
-  take layers off it. `gpu-share` instead divides every byte, fixed cost included. A part that does not fit its card is refused
-  with its numbers (lower that card's `gpu-share`, `--max-context` or `--parallel`). Nothing is priced: a model that fits one
-  card splits only when you say so.
+  take layers off it. When that cut does not fit, layers move onto a card that has room. `gpu-share` instead divides every byte,
+  fixed cost included, and is not moved. A part that still does not fit is refused with its numbers (lower that card's
+  `gpu-share`, `--max-context` or `--parallel`). Nothing is priced: a model that fits one card splits only when you say so.
 - **Decode:** each card runs its layers of every window as its own CUDA graph; the residual crosses through page-locked RAM that both
   graphs read and write with kernels, and the main card reads the block drafter's rows of the later layers back. Every product on the
   second card is planned as on the main card, so the output is the main card's alone to the bit, at every window width, with
