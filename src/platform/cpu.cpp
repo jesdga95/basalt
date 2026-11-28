@@ -274,6 +274,12 @@ bool read_cpu_list(const char* path, std::vector<char>& mark) {
     }
     return any;
 }
+
+// Is `cpu` one of the processors a CPU list read above names?  A negative number or one past the end of the mark is
+// simply not.
+bool in_list(const std::vector<char>& mark, int cpu) {
+    return cpu >= 0 && (size_t) cpu < mark.size() && mark[(size_t) cpu] != 0;
+}
 }  // namespace
 
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
@@ -341,22 +347,37 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
         all_cpus.push_back(cl);
     }
 
-    // x86 kernels publish no cpu_capacity (the file comes from the arch_topology driver, which x86 does not build), so
-    // a hybrid Intel processor read as one class of cores. Its classes are the CPU lists of the kernel's two hybrid
+    // x86 kernels have published no cpu_capacity (the file comes from the arch_topology driver, which x86 does not
+    // build), so a hybrid Intel processor read as one class of cores. Its classes are the CPU lists of the kernel's two hybrid
     // PMUs instead (Linux 5.13 and later): cpu_core names the performance cores' CPUs, cpu_atom the efficient ones.
     // They stand in as two capacities for the rule below. A CPU in neither list keeps none and counts as efficient.
-    if (max_cap == 0) {
+    //
+    // They were consulted only where NO capacity was published, and that is the gap: kernels that do publish one publish
+    // the SAME number for every processor - an i7-14700F reads cpu_capacity 1024 on each of the 16 processors of its 8
+    // performance cores and 1024 on each of the 12 efficient ones - so the spread below separated nothing and this same
+    // hybrid processor was read as one class of cores: `p-cores` had no performance tier to size a pool by, and `auto`
+    // sized it as though there were no classes. So where the kernel states its classes outright - both lists readable,
+    // and each naming a processor this run may run on - the lists are taken whatever the capacities reported, and they
+    // stand in as 1024 and 512, which the gap below always reads as a gap. A kernel whose capacities do split into two
+    // classes keeps them as the rule, and a run `taskset` inside one class - one list naming no processor this run may
+    // use - stays one class, exactly as before.
+    if (!(max_cap > 0 && (long long) max_cap * 10 > (long long) min_cap * 11)) {
         std::vector<char> in_core, in_atom;
         if (read_cpu_list("/sys/devices/cpu_core/cpus", in_core) && read_cpu_list("/sys/devices/cpu_atom/cpus", in_atom)) {
-            const auto has = [](const std::vector<char>& mark, int cpu) {
-                return cpu >= 0 && (size_t) cpu < mark.size() && mark[(size_t) cpu] != 0;
-            };
-            for (auto& cl : all_cpus) {
-                if (has(in_core, cl.cpu)) cl.cap = 1024;
-                else if (has(in_atom, cl.cpu)) cl.cap = 512;
-                if (cl.cap > 0) {
-                    max_cap = (std::max)(max_cap, cl.cap);
-                    min_cap = (std::min)(min_cap, cl.cap);
+            int listed_p = 0, listed_e = 0;
+            for (const auto& cl : all_cpus) {
+                if (in_list(in_core, cl.cpu)) ++listed_p;
+                else if (in_list(in_atom, cl.cpu)) ++listed_e;
+            }
+            if (listed_p > 0 && listed_e > 0) {   // the lists named two classes; the capacities named one number
+                max_cap = 0;
+                min_cap = 1000000;
+                for (auto& cl : all_cpus) {
+                    cl.cap = in_list(in_core, cl.cpu) ? 1024 : (in_list(in_atom, cl.cpu) ? 512 : 0);
+                    if (cl.cap > 0) {
+                        max_cap = (std::max)(max_cap, cl.cap);
+                        min_cap = (std::min)(min_cap, cl.cap);
+                    }
                 }
             }
         }
