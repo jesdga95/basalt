@@ -21,21 +21,38 @@
 // SOFTWARE.
 #include "basalt/models/deepseek41/kernels.hpp"
 
+#include <climits>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
 
 void engram_hash(const EngramHashParams& p, int e, const int32_t* tokens, int n, int64_t pos0, const int32_t* prev,
                  int32_t* out) {
-    const int n_gram = p.n_gram, n_prev = n_gram - 1, n_head = p.n_head, n_cols = p.n_cols();
-    const uint64_t* mult = p.mult.data() + (size_t) e * n_gram;
-    const uint64_t* primes = p.primes.data() + (size_t) e * n_cols;
-    const uint64_t* offs = p.offsets.data() + (size_t) e * n_cols;
-    const int64_t pad = p.token_map[(size_t) p.pad_token_id];
+    const int n_gram = p.n_gram, n_prev = n_gram - 1, n_head = p.n_head;
+    if (n <= 0 || n_gram < 2 || n_head <= 0 || e < 0 || !tokens || !out) return;
+    if ((int64_t) (n_gram - 1) * n_head > INT_MAX) return;
+    const int n_cols = p.n_cols();
+    if ((size_t) e >= p.mult.size() / (size_t) n_gram ||
+        (size_t) e >= p.primes.size() / (size_t) n_cols ||
+        (size_t) e >= p.offsets.size() / (size_t) n_cols) {
+        return;
+    }
+    const uint64_t* mult = p.mult.data() + (size_t) e * (size_t) n_gram;
+    const uint64_t* primes = p.primes.data() + (size_t) e * (size_t) n_cols;
+    const uint64_t* offs = p.offsets.data() + (size_t) e * (size_t) n_cols;
+    const int64_t pad = p.pad_token_id >= 0 && (size_t) p.pad_token_id < p.token_map.size()
+                            ? p.token_map[(size_t) p.pad_token_id]
+                            : 0;
     const auto cid = [&](int32_t t) -> int64_t {
         return t < 0 || (size_t) t >= p.token_map.size() ? -1 : p.token_map[(size_t) t];
     };
-    std::vector<uint64_t> toks((size_t) n_gram);
+    uint64_t stack_toks[16] = {};
+    std::vector<uint64_t> heap_toks;
+    uint64_t* toks = stack_toks;
+    if ((size_t) n_gram > 16) {
+        heap_toks.resize((size_t) n_gram);
+        toks = heap_toks.data();
+    }
     for (int i = 0; i < n; ++i) {
         // shift 0 is the token itself; once a shift is blocked (sequence start or dead token) every longer one is too
         int64_t c = cid(tokens[i]);
@@ -46,7 +63,7 @@ void engram_hash(const EngramHashParams& p, int e, const int32_t* tokens, int n,
                 c = -1;
             } else {
                 const int j = i - s;
-                c = cid(j >= 0 ? tokens[j] : prev[n_prev + j]);
+                c = j >= 0 ? cid(tokens[j]) : (prev ? cid(prev[n_prev + j]) : -1);
             }
             blocked = blocked || c < 0;
             toks[(size_t) s] = (uint64_t) (blocked ? pad : c);
@@ -56,7 +73,8 @@ void engram_hash(const EngramHashParams& p, int e, const int32_t* tokens, int n,
             rolling ^= toks[(size_t) o] * mult[o];
             for (int h = 0; h < n_head; ++h) {
                 const int col = (o - 1) * n_head + h;
-                out[(size_t) i * n_cols + col] = (int32_t) (rolling % primes[col] + offs[col]);
+                const uint64_t pr = primes[col];
+                out[(size_t) i * (size_t) n_cols + (size_t) col] = (int32_t) ((pr ? rolling % pr : 0) + offs[col]);
             }
         }
     }
