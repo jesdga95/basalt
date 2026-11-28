@@ -181,5 +181,9 @@ zeros). `ds4_cache_rows_parity` checks both writers and readers against a CPU pa
 Planned cache reserve on the `-hchead` pack, from the printed `cache reserve` at start: 65,536 tokens = 0.13 GiB packed /
 0.44 GiB fp16; 1,048,576 tokens = 1.88 GiB packed / 6.74 GiB fp16. Prose decode at 64k and 1M with
 `--resident-budget-gib 120 --expert-cache 512 --spec 0` ran at 21-22 tok/s in both layouts, within the run-to-run spread.
-A Wikitext KLD gate against the converted checkpoint was not run: no matching `--kld-base` file is present on this host,
-so the packed cache's quality delta is not yet measured.
+The 100-chunk `--kv fp8` Wikitext-2 gate against `dsv4visionexp-source-base.kld` (25,500 rows, RTX 5090 @ 475 W,
+`--resident-budget-gib 145`) completed with PPL `3.9836 +/- 0.0596` (base `4.3379`, `ln(PPL/base) -0.08522`), mean KLD
+`0.15429`, median `0.03136`, p99 `1.9900`, max `7.2995`, and top-1 agreement `87.92%` (`prompt ms/chunk 1568`,
+`decode ms/chunk 11596`, `60.9% VRAM / 15.4% PCIe / 23.7% CPU`). At 475 W, `basalt-bench` measured `pp16384` at `1,884`
+tok/s, lossless `tg` at `23 / 24-27 / 24-25` tok/s (`conv / struct / prose`), and opt-in lossy `tg`
+(`--route-prior 0.5 --route-tail-skip 4`) at `34 / 43 / 35` tok/s.

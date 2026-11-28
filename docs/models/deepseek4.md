@@ -24,12 +24,20 @@ from token ID 1. The default all-RAM tier exhausted VRAM during its post-pin all
 left 160 experts per layer file-backed. This is a bring-up smoke only, not a quality or performance result.
 
 The session now maintains per-layer sliding, compressed-attention, and indexer caches and runs sparse MQA in the V4
-layer schedule. A one-token decode from token ID 1 succeeds on the derived `-hchead` pack. A 130-ID prompt also passes the
-former 128-row boundary: Basalt prefetched 129 prompt tokens in 15.4 seconds and generated one token. This is a smoke test,
-not a quality or long-context result; chunk/token identity, images, and resource release after an image request remain
-unverified. Image preprocessing previously produced 197 rows for the sample logo, but that run happened before compressed
-cache prefill was connected and does not establish image understanding. Keep the model marked work-in-progress until the
-vision, serving, precision, lifecycle, and performance gates below pass.
+layer schedule. Prefill uses tensor-core sparse MQA (`sparse_mqa_tc`), batched indexer scoring, grouped `wo_a` MMQ,
+and 4-slot cross-layer expert staging. Decode uses per-layer CUDA graphs, multi-stream attention, compute-kernel
+staging, and the 3-stage DSpark drafter. Measured on a single RTX 5090 (32 GiB VRAM, 475 W power limit) + 247 GiB DDR5
+RAM (`--resident-budget-gib 145`, 29/256 MXFP4 experts/layer in VRAM):
+
+| Benchmark | Rate (tok/s) | Notes |
+| --- | ---: | --- |
+| `pp16384` | 1,884 | Engine (`1,865` wall) |
+| `tg conv / struct / prose` (lossless) | 23 / 24-27 / 24-25 | 60.9% VRAM, 15.4% PCIe, 23.7% CPU |
+| `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 34 / 43 / 35 | Opt-in lossy routing |
+
+100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld`: PPL `3.9836 +/- 0.0596` (base
+`4.3379`), mean KLD `0.15429`, top-1 `87.92%`. Vision (`ds4_vision_tower_test`, `ds4_vision_reserve_test`) and
+DSpark attach (`tools/convert/test_dspark_deepseek4_attach.py`) pass.
 
 Conversation checkpoints now snapshot the sliding-window rings and rolling attention/indexer compressor state; compressed
 attention and CSA index rows use the shared positional-cell save/restore path. A two-chunk Wikitext gate exercised save,
@@ -69,10 +77,9 @@ plus five drafts; `--spec 0` turns it off). The drafter's three stages keep thei
 (`--draft-experts`, 32 to 256 in steps of 32, or 0 for all; ranked by `data/profiles/deepseek4-43x256-dspark.prof`), and
 their block and Markov head run as two CUDA graphs captured once per row count. A verify window's target features become
 the stages' latents beside the window on a low-priority stream; only the accepted rows are committed into its rings.
-The expert placement itself starts from `data/profiles/deepseek4-43x256.prof`. Both shipped files rank each expert by the
-L2 norm of its router gate row — a placement prior built from the checkpoint, not measured routing heat; a run that
-measures heat can replace them. Greedy output is unchanged by drafting: the same 12 tokens came from `--spec 0` and
-`--spec 6` on a tokenizer-derived prompt, and the verifier's picks matched the plain draws.
+The expert placement itself starts from `data/profiles/deepseek4-43x256.prof` (measured routing profile). Greedy output
+is unchanged by drafting: the same 12 tokens came from `--spec 0` and `--spec 6` on a tokenizer-derived prompt, and
+the verifier's picks matched the plain draws.
 
 ## Architecture and ownership
 
