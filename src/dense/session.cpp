@@ -28,6 +28,7 @@ Result fail(const std::string& m) { return {Status::Error, m}; }
 // One session's device state on the card of model `m` (its layers' cells and recurrent state; on the card that holds layer 0
 // also the logits, the picks and the drafter's state), on the current device.
 bool init_state(Model& m, SessionState& st, std::string& err) {
+    cudaGetDevice(&st.dev);
     const Geometry& g = m.g;
     if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&st.side, cudaStreamNonBlocking) != cudaSuccess ||
@@ -152,7 +153,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         st.picks = st.arena.take<int32_t>(kWindow);
     }
     st.n_keep = st.arena.take<int32_t>(4);
-    if (!st.n_keep || (ng && !st.gdn) || (!st.kc.empty() && !m.o.kv_int8 && !st.vc.back())) {
+    if (!st.arena.ok() || !st.n_keep || (ng && !st.gdn) || (!st.kc.empty() && !m.o.kv_int8 && !st.vc.back())) {
         err = m.o.arch + ": a session's buffers do not fit its arena";
         return false;
     }
@@ -163,16 +164,20 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     return cudaStreamSynchronize(st.stream) == cudaSuccess;
 }
 
-// What init_state made, on the current device (the arena frees itself).
+// What init_state made, on the state's owning device.
 void free_state(SessionState& st) {
+    const core::OnDevice on(st.dev);
+    if (st.stream) cudaStreamSynchronize(st.stream);
+    if (st.side) cudaStreamSynchronize(st.side);
     for (auto& per_buffer : st.wg)
         for (cudaGraphExec_t& e : per_buffer)
-            if (e) cudaGraphExecDestroy(e);
-    if (st.stream) cudaStreamDestroy(st.stream);
-    if (st.side) cudaStreamDestroy(st.side);
-    if (st.fork) cudaEventDestroy(st.fork);
-    if (st.join) cudaEventDestroy(st.join);
-    if (st.far_host) cudaFreeHost(st.far_host);
+            if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    if (st.stream) { cudaStreamDestroy(st.stream); st.stream = nullptr; }
+    if (st.side) { cudaStreamDestroy(st.side); st.side = nullptr; }
+    if (st.fork) { cudaEventDestroy(st.fork); st.fork = nullptr; }
+    if (st.join) { cudaEventDestroy(st.join); st.join = nullptr; }
+    if (st.far_host) { cudaFreeHost(st.far_host); st.far_host = nullptr; }
+    st.arena.reserve(0);
 }
 
 namespace {
@@ -182,9 +187,11 @@ public:
     explicit Session(Model& m) : m_(m), g_(m.g) {}
     ~Session() override {
         st_.peer.reset();
+        const core::OnDevice on(st_.dev);
         free_state(st_);
         if (done_) cudaEventDestroy(done_);
         if (h_picks_) cudaFreeHost(h_picks_);
+        owned_.clear();
     }
 
     bool init(std::string& err) {
@@ -364,9 +371,12 @@ protected:
             return false;
         }
         join_commit();
-        if (st_.peer && cudaStreamSynchronize(st_.peer->stream) != cudaSuccess) {
-            err = cudaGetErrorString(cudaGetLastError());
-            return false;
+        if (st_.peer) {
+            const core::OnDevice on(m_.split_dev);
+            if (cudaStreamSynchronize(st_.peer->stream) != cudaSuccess) {
+                err = cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
         }
         return prepare_draw(r, err);
     }
@@ -377,39 +387,48 @@ protected:
     }
 
     // every row's token and rope position (its session's offset), the drafter's window tokens; the composition is the key
-    void batch_pack(const model::BatchView& v, std::vector<BatchSeg>& segs, std::vector<int32_t>& pos3) const {
-        segs.resize((size_t) v.n);
-        pos3.clear();
+    void batch_pack(const model::BatchView& v, BatchSeg* segs, int32_t* pos3) const {
+        int n_pos = 0;
         for (int i = 0; i < v.n; ++i) {
-            segs[(size_t) i] = seg_of(v, i);
-            const SessionState& st = *segs[(size_t) i].st;
-            for (int t = 0; t < segs[(size_t) i].T; ++t) {
-                const int32_t p = (int32_t) (segs[(size_t) i].pos + t + st.rope_delta);
-                pos3.insert(pos3.end(), {p, p, p});
+            segs[i] = seg_of(v, i);
+            const SessionState& st = *segs[i].st;
+            for (int t = 0; t < segs[i].T; ++t) {
+                const int32_t p = (int32_t) (segs[i].pos + t + st.rope_delta);
+                pos3[n_pos++] = p;
+                pos3[n_pos++] = p;
+                pos3[n_pos++] = p;
             }
         }
     }
 
-    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key&, std::string&) override {
+    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key&, std::string& err) override {
+        if (v.n > kBatch || v.w.rows > kBatch) {
+            err = "a batch exceeds " + std::to_string(kBatch) + " rows";
+            return false;
+        }
         for (int i = 0; i < v.n; ++i) {
             Session& se = *static_cast<Session*>(v.ss[i]);
             if (se.drafter_)
                 cudaMemcpyAsync(se.st_.win_tok, v.reqs[i].tokens, (size_t) v.reqs[i].n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice, v.stream);
         }
         if (m_.split) return true;   // forward_batch stages both cards
-        std::vector<BatchSeg> segs;
-        std::vector<int32_t> pos3;
+        BatchSeg segs[kBatch];
+        int32_t pos3[kBatch * 3];
         batch_pack(v, segs, pos3);
-        stage_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data());
+        stage_batch(m_, segs, v.n, v.w.tokens.data(), pos3);
         return true;
     }
 
     bool batch_forward(const model::BatchView& v, std::string& err) override {
-        std::vector<BatchSeg> segs;
-        std::vector<int32_t> pos3;
+        if (v.n > kBatch || v.w.rows > kBatch) {
+            err = "a batch exceeds " + std::to_string(kBatch) + " rows";
+            return false;
+        }
+        BatchSeg segs[kBatch];
+        int32_t pos3[kBatch * 3];
         batch_pack(v, segs, pos3);
-        if (m_.split) return forward_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data(), err);
-        batch_body(m_, segs.data(), v.n);
+        if (m_.split) return forward_batch(m_, segs, v.n, v.w.tokens.data(), pos3, err);
+        batch_body(m_, segs, v.n);
         return true;
     }
 
@@ -569,7 +588,10 @@ public:
     // No cache to lend: all it holds is state the driver moves to host memory. Both cards' work is finished first.
     Result set_low_memory(bool, int64_t&) override {
         cudaStreamSynchronize(st_.stream);
-        if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        if (st_.peer) {
+            const core::OnDevice on(m_.split_dev);
+            cudaStreamSynchronize(st_.peer->stream);
+        }
         return {};
     }
 
@@ -596,7 +618,10 @@ public:
 
     Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         cudaStreamSynchronize(st_.stream);
-        if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        if (st_.peer) {
+            const core::OnDevice on(m_.split_dev);
+            cudaStreamSynchronize(st_.peer->stream);
+        }
         kv.clear();
         // a layer's array: its first `split` bytes on the card (`dev`), the rest streamed (`far`, host memory)
         const auto down = [&](const void* dev, const void* far_buf, size_t split, core::ConversationBuffer& to, size_t bytes) {
@@ -639,7 +664,10 @@ public:
 
     Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
         cudaStreamSynchronize(st_.stream);
-        if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        if (st_.peer) {
+            const core::OnDevice on(m_.split_dev);
+            cudaStreamSynchronize(st_.peer->stream);
+        }
         if (kv.size() != kv_layers() + (drafter_ ? 1 : 0)) return fail(m_.o.arch + ": a parked conversation has other caches");
         if (positions > m_.o.max_context) return fail(m_.o.arch + ": a parked conversation is longer than the context");
         const auto up = [&](void* dev, void* far_buf, size_t split, const core::ConversationBuffer& from, size_t bytes) {
@@ -761,7 +789,8 @@ private:
             if (SessionState* p = st_.peer.get()) {
                 const core::OnDevice on(m_.split_dev);
                 p->alt_ready = false;
-                if (cudaMemsetAsync(p->gdn, 0, (size_t) m_.split_model->n_gdn * p->gdn_floats * 4, p->stream) != cudaSuccess)
+                if (m_.split_model->n_gdn &&
+                    cudaMemsetAsync(p->gdn, 0, (size_t) m_.split_model->n_gdn * p->gdn_floats * 4, p->stream) != cudaSuccess)
                     return fail("clearing the recurrent state failed");
             }
             return {};

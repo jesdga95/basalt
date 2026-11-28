@@ -729,6 +729,16 @@ void lower_flags(SplitHand& h) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
+// Unblocks a second card already spinning on SplitHand::flag[0] when the main card fails to launch, then drains it.
+void release_split_wait(Model& m, SessionState& peer) {
+    volatile uint32_t* f = m.hand->flag;
+    f[0] = 1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const core::OnDevice on(m.split_dev);
+    (void) cudaStreamSynchronize(peer.stream);
+    (void) cudaGetLastError();
+}
+
 }  // namespace
 
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
@@ -738,7 +748,11 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         const core::OnDevice on(m.split_dev);
         if (!launch_window(*m.split_model, *st.peer, nullptr, T, pos, pos3, err)) return false;
     }
-    return launch_window(m, st, tokens, T, pos, pos3, err);
+    if (!launch_window(m, st, tokens, T, pos, pos3, err)) {
+        if (m.split) release_split_wait(m, *st.peer);
+        return false;
+    }
+    return true;
 }
 
 namespace {
@@ -897,14 +911,22 @@ bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, 
 }  // namespace
 
 bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+    if (S < 1 || S > kBatch) {
+        err = "dense batch window: invalid segment count";
+        return false;
+    }
     if (m.split) {   // the second card's sessions, their graph first: it waits for the main card's rows
         lower_flags(*m.hand);
-        std::vector<BatchSeg> ps((size_t) S);
-        for (int k = 0; k < S; ++k) ps[(size_t) k] = {segs[k].st->peer.get(), segs[k].T, segs[k].pos};
+        BatchSeg ps[kBatch];
+        for (int k = 0; k < S; ++k) ps[k] = {segs[k].st->peer.get(), segs[k].T, segs[k].pos};
         const core::OnDevice on(m.split_dev);
-        if (!launch_batch(*m.split_model, ps.data(), S, nullptr, pos3, err)) return false;
+        if (!launch_batch(*m.split_model, ps, S, nullptr, pos3, err)) return false;
     }
-    return launch_batch(m, segs, S, tokens, pos3, err);
+    if (!launch_batch(m, segs, S, tokens, pos3, err)) {
+        if (m.split) release_split_wait(m, *segs[0].st->peer);
+        return false;
+    }
+    return true;
 }
 
 void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, const int32_t* pos3,

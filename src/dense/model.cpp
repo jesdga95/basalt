@@ -1,5 +1,6 @@
 // src/dense/model.cpp - the dense stack's shared scratch and geometry checks.
 #include "basalt/core/device_copy.hpp"
+#include "basalt/core/on_device.hpp"
 #include "internal.hpp"
 
 #include "basalt/kernels/gdn_prompt.hpp"
@@ -19,26 +20,46 @@
 namespace basalt::dense {
 
 Arena::~Arena() {
-    if (base_) cudaFree(base_);
+    if (base_) {
+        const core::OnDevice on(device_);
+        cudaFree(base_);
+    }
 }
 
 bool Arena::reserve(size_t bytes) {
-    if (base_) cudaFree(base_);
+    if (base_) {
+        const core::OnDevice on(device_);
+        cudaFree(base_);
+    }
     base_ = nullptr;
     size_ = used_ = 0;
+    device_ = -1;
+    failed_ = false;
     if (bytes == 0) return true;
+    int dev = -1;
+    cudaGetDevice(&dev);
     if (cudaMalloc(&base_, bytes) != cudaSuccess) {
-        cudaGetLastError();
+        (void) cudaGetLastError();
         base_ = nullptr;
         return false;
     }
+    device_ = dev;
     size_ = bytes;
     return true;
 }
 
 void* Arena::take_bytes(size_t n) {
-    const size_t at = (used_ + 255) & ~(size_t) 255;
-    if (at + n > size_) return nullptr;
+    if (!base_ || used_ > size_) {
+        failed_ = true;
+        return nullptr;
+    }
+    const size_t rem = used_ & (size_t) 255;
+    const size_t pad = rem ? 256 - rem : 0;
+    if (pad > size_ - used_ || n > size_ - used_ - pad) {
+        failed_ = true;
+        return nullptr;
+    }
+    const size_t at = used_ + pad;
     used_ = at + n;
     return base_ + at;
 }
@@ -48,10 +69,10 @@ int Geometry::attn_layers() const { return (int) std::count(kinds.begin(), kinds
 
 std::string Geometry::check() const {
     if ((int) kinds.size() != n_layers || n_layers <= 0) return "the layer kinds do not cover the layers";
-    if (n_embd % 256 || n_ff % 256) return "widths must be whole 256-value blocks";
+    if (n_embd <= 0 || n_ff <= 0 || n_vocab <= 0 || n_embd % 256 || n_ff % 256) return "widths must be whole 256-value blocks";
     if (attn_layers() > 0) {
         if (head_dim != 256) return "attention heads must be 256 wide";
-        if (n_kv <= 0 || n_head % n_kv || n_head / n_kv > 8) return "attention head grouping not supported";
+        if (n_kv <= 0 || n_head <= 0 || n_head % n_kv || n_head / n_kv > 8) return "attention head grouping not supported";
         if (rope.rot <= 0 || rope.rot > head_dim || rope.rot % 2 || rope.rot / 2 > 64) return "rotary width not supported";
     }
     if (gdn_layers() > 0) {
@@ -66,7 +87,7 @@ namespace {
 // bytes of the decode window's scratch
 // the block drafter's rows in the window scratch
 size_t block_scratch_floats(const Geometry& g, const BlockDrafter& bd) {
-    if (!bd.present) return 0;
+    if (!bd.present || bd.layers.empty()) return 0;
     const size_t W = kBatch, AQ = (size_t) bd.n_head * bd.head_dim, KV = (size_t) bd.n_kv * bd.head_dim;
     return W * (3 * AQ + 2 * KV + bd.layers[0].conv_a.rows + g.n_embd + kernels::kLogprobStride + bd.rank + 3) +
            kernels::gqa_decode_scratch_floats(bd.window + 256, kBatch, bd.n_head, bd.head_dim) + 64 * 64;
@@ -230,6 +251,9 @@ bool decode_drafter(Model& m, std::string& err) {
                 void* sc = nullptr;
                 if (!q8(*l) || cudaMalloc(&p, kernels::nvfp4p::bytes(l->rows, l->cols)) != cudaSuccess ||
                     cudaMalloc(&sc, 16) != cudaSuccess) {
+                    if (p) cudaFree(p);
+                    if (sc) cudaFree(sc);
+                    (void) cudaGetLastError();
                     ok = false;
                     break;
                 }
@@ -282,8 +306,13 @@ bool decode_drafter(Model& m, std::string& err) {
     for (const Linear& l : bd.fc) need({&l});
     if (need_p > m.ws.w8.partial_floats || need_t > m.ws.w8.tickets_n) {
         void *p = nullptr, *t = nullptr;
-        if (cudaMalloc(&p, std::max<size_t>(need_p, 1) * 4) != cudaSuccess || cudaMalloc(&t, need_t * 4) != cudaSuccess ||
-            cudaMemset(t, 0, need_t * 4) != cudaSuccess) {
+        const size_t p_bytes = std::max<size_t>(need_p, 1) * 4;
+        const size_t t_bytes = std::max<size_t>(need_t, 1) * 4;
+        if (cudaMalloc(&p, p_bytes) != cudaSuccess || cudaMalloc(&t, t_bytes) != cudaSuccess ||
+            cudaMemset(t, 0, t_bytes) != cudaSuccess) {
+            if (p) cudaFree(p);
+            if (t) cudaFree(t);
+            (void) cudaGetLastError();
             err = m.o.arch + ": out of device memory for the drafter's workspace";
             return false;
         }
@@ -380,10 +409,13 @@ model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDraf
 }
 
 Model::~Model() {
-    if (gate_side) cudaStreamDestroy(gate_side);
+    prompt_split.reset();
+    split.reset();
+    const core::OnDevice on(device);
+    if (gate_side) { cudaStreamSynchronize(gate_side); cudaStreamDestroy(gate_side); }
     if (gate_fork) cudaEventDestroy(gate_fork);
     if (gate_join) cudaEventDestroy(gate_join);
-    if (stage_side) cudaStreamDestroy(stage_side);
+    if (stage_side) { cudaStreamSynchronize(stage_side); cudaStreamDestroy(stage_side); }
     if (stage_free) cudaEventDestroy(stage_free);
     if (stage_ready) cudaEventDestroy(stage_ready);
     for (void* p : owned) cudaFree(p);
@@ -500,7 +532,7 @@ bool Model::ensure_chunk(std::string& err) {
     b.g = pre_arena.take<float>(T * gg.n_ff);
     b.u = pre_arena.take<float>(T * gg.n_ff);
     b.h = pre_arena.take<float>(T * gg.n_ff);
-    if (!b.h || !b.x) {
+    if (!pre_arena.ok() || !b.h || !b.x) {
         err = o.arch + ": the prompt workspaces do not fit their arena";
         return false;
     }
@@ -515,12 +547,27 @@ bool Model::ensure_chunk(std::string& err) {
 
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err) {
     ModelPtr m(new Model());
+    cudaGetDevice(&m->device);
     m->g = g;
     m->w = w;
     m->o = o;
     if (const std::string e = g.check(); !e.empty()) {
         err = o.arch + ": " + e;
         return nullptr;
+    }
+    if (o.max_context <= 0) {
+        err = o.arch + ": max_context must be positive";
+        return nullptr;
+    }
+    if (o.drafter == Drafter::Block) {
+        const BlockDrafter& bd = w.dflash;
+        if (!bd.present || bd.layers.empty() || bd.block < 2 || bd.block > kWindow || bd.conv_group <= 0 ||
+            g.n_embd % bd.conv_group != 0 || bd.window <= 0 || bd.n_kv <= 0 || bd.n_head <= 0 ||
+            bd.n_head % bd.n_kv != 0 || bd.n_head / bd.n_kv > 8 || (bd.head_dim != 128 && bd.head_dim != 256) ||
+            bd.rank <= 0 || bd.top_k <= 0 || bd.top_k > kDraftQ) {
+            err = o.arch + ": the block drafter geometry is not supported";
+            return nullptr;
+        }
     }
     // the adapter refuses these at its flags; a caller of this stack that skips them gets the reason here, not cells
     // misread: the write's Hadamard transform and kv4_to_int8 take a head as one transform's width, the format lives in
@@ -623,7 +670,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         }
     }
     b.btab = a.take<BatchTable>(1);
-    if (!b.bounds) {
+    if (!a.ok() || !b.btab) {
         err = o.arch + ": the decode scratch does not fit its arena";
         return nullptr;
     }
@@ -642,6 +689,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
             cudaEventCreateWithFlags(&m->stage_free, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->stage_ready, cudaEventDisableTiming) != cudaSuccess) {
             if (p) cudaFree(p);
+            (void) cudaGetLastError();
             err = o.arch + ": out of device memory for the streamed K/V's prompt copy";
             return nullptr;
         }
@@ -662,6 +710,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         const size_t cells = (size_t) o.max_context * g.n_kv * g.head_dim;
         void* p = nullptr;
         if (cudaMalloc(&p, (size_t) o.max_context * cell_bytes(g, 1)) != cudaSuccess) {
+            (void) cudaGetLastError();
             err = o.arch + ": out of device memory for the NVFP4 cache's prompt copy";
             return nullptr;
         }
