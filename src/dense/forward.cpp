@@ -172,16 +172,17 @@ void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x,
         return;
     }
     WindowScratch& b = m.ws;
-    if (on_wg(gate.type)) {   // two products (their scales applied), then SwiGLU
+    float* out = h ? h : b.h;
+    if (on_wg(gate.type) || on_wg(up.type)) {   // products (their scales applied), then SwiGLU
         prod_group(m, x, xq, gate.type, {{&gate, b.g}, {&up, b.u}}, T, s);
-        kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, h, T, gate.rows, gate.rows, s);
+        kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, out, T, gate.rows, gate.rows, s);
     } else {
         mmq_run(m, gate, xq, b.g, T, s);
         if (up.type != gate.type) xq = wact(m, x, up.type, up.cols, T, s);
         mmq_run(m, up, xq, b.u, T, s);
-        kernels::swiglu_scaled(b.g, b.u, gate.scale, up.scale, h, T, gate.rows, gate.rows, s);
+        kernels::swiglu_scaled(b.g, b.u, gate.scale, up.scale, out, T, gate.rows, gate.rows, s);
     }
-    if (h16) wg::pack(h, gate.rows, gate.rows, T, h16, s);
+    if (h16) wg::pack(out, gate.rows, gate.rows, T, h16, s);
 }
 
 // y [T][rows] = W . x from chunk_act's activations: on MMQ, or for F8 and NVFP4 planes on the FP8 / FP4 tensor cores with
@@ -276,8 +277,9 @@ void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
-    const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, T, g.eps, s);
-    prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, T, s);
+    const bool all_wg = on_wg(L.q.type) && L.k.type == L.q.type && L.v.type == L.q.type;
+    const void* xq = wnorm(m, b.x, L.attn_norm, all_wg ? nullptr : b.xn, L.q.type, H, T, g.eps, s);
+    prod_group(m, all_wg ? nullptr : b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, b.pos0, q8, far_kv);
     const bool gated = on_wg(L.o.type);   // the merge gates and readies the rows for o
@@ -309,13 +311,14 @@ void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
-    const void* xq = wnorm(m, b.x, L.ffn_norm, b.xn, L.gate.type, H, T, g.eps, s);
+    const bool all_wg = on_wg(L.gate.type) && L.up.type == L.gate.type;
+    const void* xq = wnorm(m, b.x, L.ffn_norm, all_wg ? nullptr : b.xn, L.gate.type, H, T, g.eps, s);
     if (on_wg(L.down.type)) {   // h straight into the down product's bf16 rows
-        prod_swiglu(m, L.gate, L.up, b.xn, xq, nullptr, T, s, b.hq);
+        prod_swiglu(m, L.gate, L.up, all_wg ? nullptr : b.xn, xq, nullptr, T, s, b.hq);
         prod_add(m, L.down, b.hq, b.x, T, s);
         return;
     }
-    prod_swiglu(m, L.gate, L.up, b.xn, xq, b.h, T, s);
+    prod_swiglu(m, L.gate, L.up, all_wg ? nullptr : b.xn, xq, b.h, T, s);
     prod_add(m, L.down, wact(m, b.h, L.down.type, g.n_ff, T, s), b.x, T, s);
 }
 
@@ -335,22 +338,26 @@ prefill::fp8::Segment f8_seg(const Linear& l, void* dst) { return {(const uint8_
 uint16_t* residual(ChunkScratch& b) { return reinterpret_cast<uint16_t*>(b.x); }
 uint16_t* bf(float* p) { return reinterpret_cast<uint16_t*>(p); }
 
-// x += W . a for a chunk's output projection on other matrix types (FP32 a): NVFP4 planes add into the BF16 residual in
-// their epilogue (in fp32, rounded once), others through tmp
+// x += W . a for an F8 output projection whose input rows its producer already rounded into b.xq
+void chunk_residual_f8(Model& m, const Linear& l, int T, cudaStream_t s) {
+    prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, residual(m.cs), l.rows,
+                       prefill::fp8::Epilogue::AddBf16, s);
+}
+// x += W . a for a chunk's output projection on other matrix types (FP32 a): F8 and NVFP4 planes add into the BF16
+// residual in their epilogue (in fp32, rounded once), others through tmp
 void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int T, cudaStream_t s) {
     ChunkScratch& b = m.cs;
     chunk_act(m, a, l.type, cols, T, s);
+    if (l.type == kTypeF8) {
+        chunk_residual_f8(m, l, T, s);
+        return;
+    }
     if (l.type == kTypeNvfp4Planes) {
         prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, residual(b), l.rows, s);
         return;
     }
     gemm(m, l, b.tmp, T, s);
     kernels::add_scaled(residual(b), b.tmp, post_scale(l), (int64_t) T * l.rows, s);
-}
-// x += W . a for an F8 output projection whose input rows its producer already rounded into b.xq
-void chunk_residual_f8(Model& m, const Linear& l, int T, cudaStream_t s) {
-    prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, residual(m.cs), l.rows,
-                       prefill::fp8::Epilogue::AddBf16, s);
 }
 // x += W . a for an NVFP4 planes output projection of BF16 rows a whose producer gave each row's largest |value| (rowmax)
 void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const float* rowmax, int64_t cols, int T, cudaStream_t s) {
@@ -468,6 +475,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     if (cells_only) {
         chunk_act(m, b.xn, L.k.type, H, T, s);
         gemm(m, L.k, b.k, T, s);
+        if (L.v.type != L.k.type) chunk_act(m, b.xn, L.v.type, H, T, s);
         gemm(m, L.v, b.v, T, s);
         kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
                                  256, true, 0, nullptr, q8, far_kv);
@@ -477,6 +485,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     gemm(m, L.q, b.qfull, T, s);
     if (L.k.type != L.q.type) chunk_act(m, b.xn, L.k.type, H, T, s);
     gemm(m, L.k, b.k, T, s);
+    if (L.v.type != L.k.type) chunk_act(m, b.xn, L.v.type, H, T, s);
     gemm(m, L.v, b.v, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, nullptr, q8, far_kv);
@@ -537,7 +546,7 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
-    if (L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes) {
+    if (all_nvfp4({&L.gate, &L.up, &L.down})) {
         // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
         // added by down's; H is BF16 (in b.h's buffer), read once by its quantizer
         uint16_t* h16 = reinterpret_cast<uint16_t*>(b.h);
@@ -548,15 +557,23 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
         prefill::fp4_dense::product_add_bf16(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, residual(b), H, s);
         return;
     }
+    if (all_f8({&L.gate, &L.up, &L.down})) {
+        // FP8: the norm in the quantizer, gate and up as one segmented product (scales applied), down added directly into residual
+        prefill::fp8::rms_norm_quantize(residual(b), L.ffn_norm, g.eps, T, H, b.xq, nullptr, s);
+        const prefill::fp8::Segment seg[2] = {f8_seg(L.gate, b.g), f8_seg(L.up, b.u)};
+        prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::Store, s);
+        kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, b.h, T, g.n_ff, g.n_ff, s);
+        prefill::fp8::quantize(b.h, T, g.n_ff, g.n_ff, b.xq, s);
+        chunk_residual_f8(m, L.down, T, s);
+        return;
+    }
     kernels::rms_norm_rows(residual(b), L.ffn_norm, b.xn, T, H, g.eps, s);
     chunk_act(m, b.xn, L.gate.type, H, T, s);
     gemm(m, L.gate, b.g, T, s);
     if (L.up.type != L.gate.type) chunk_act(m, b.xn, L.up.type, H, T, s);
     gemm(m, L.up, b.u, T, s);
-    kernels::swiglu_scaled(b.g, b.u, L.gate.scale, L.up.scale, b.h, T, g.n_ff, g.n_ff, s);
-    chunk_act(m, b.h, L.down.type, g.n_ff, T, s);
-    gemm(m, L.down, b.tmp, T, s);
-    kernels::add_scaled(residual(b), b.tmp, L.down.scale, (int64_t) T * H, s);
+    kernels::swiglu_scaled(b.g, b.u, post_scale(L.gate), post_scale(L.up), b.h, T, g.n_ff, g.n_ff, s);
+    chunk_residual(m, L.down, b.h, g.n_ff, T, s);
 }
 
 // The block drafter's rope: plain positions over the whole head.
@@ -674,7 +691,8 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
         win_ffn(m, L, T, s);
     }, s);
     if (m.lb > 0) return;   // the second card of a split has no head
-    prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s), st.logits, T, s);
+    const bool need_xn = st.hid != nullptr || !on_wg(w.head.type);
+    prod(m, w.head, wnorm(m, b.x, w.out_norm, need_xn ? b.xn : nullptr, w.head.type, H, T, g.eps, s), st.logits, T, s);
     if (st.hid) cudaMemcpyAsync(st.hid, b.xn, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);   // the drafter's
 }
 
@@ -687,6 +705,12 @@ namespace {
 bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3, std::string& err) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
+    auto cuda_fail = [&](const char* what, cudaError_t e) {
+        err = std::string(what) + ": " + cudaGetErrorString(e);
+        (void) cudaGetLastError();
+        return false;
+    };
+    if (m.ws_done) cudaStreamWaitEvent(s, m.ws_done, 0);
     const int32_t bounds[2] = {0, T}, first[2] = {(int32_t) pos, 0};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos0, first, sizeof first, cudaMemcpyHostToDevice, s);
@@ -696,7 +720,7 @@ bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int
     st.alt_ready = T == 1 && st.gdn_alt != nullptr;
     cudaGraphExec_t& wg = st.wg[st.gdn != st.gdn_first ? 1 : 0][T];
     if (wg) {
-        if (cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+        if (const cudaError_t e = cudaGraphLaunch(wg, s); e != cudaSuccess) return cuda_fail("dense window graph", e);
         return cuda_ok("dense window", err);
     }
     // The first window of T rows runs as launched, then is captured for the next ones.  A layer split's window waits on the
@@ -708,15 +732,20 @@ bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int
         if (!cuda_ok("dense window", err)) return false;
     }
     cudaGraph_t graph = nullptr;
-    if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) != cudaSuccess) return cuda_ok("dense window capture", err);
+    if (const cudaError_t e = cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed); e != cudaSuccess)
+        return cuda_fail("dense window capture", e);
     window_body(m, st, T, pos);
-    if (cudaStreamEndCapture(s, &graph) != cudaSuccess || cudaGraphInstantiate(&wg, graph, 0) != cudaSuccess) {
+    const cudaError_t ec = cudaStreamEndCapture(s, &graph);
+    const cudaError_t ei = ec == cudaSuccess ? cudaGraphInstantiate(&wg, graph, 0) : ec;
+    if (ei != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         wg = nullptr;
-        return cuda_ok("dense window capture", err);
+        return cuda_fail("dense window capture", ei);
     }
     cudaGraphDestroy(graph);
-    if (split && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+    if (split) {
+        if (const cudaError_t e = cudaGraphLaunch(wg, s); e != cudaSuccess) return cuda_fail("dense window graph", e);
+    }
     return cuda_ok("dense window", err);
 }
 
@@ -751,8 +780,9 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
-    const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, rows, g.eps, s);
-    prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, rows, s);
+    const bool all_wg = on_wg(L.q.type) && L.k.type == L.q.type && L.v.type == L.q.type;
+    const void* xq = wnorm(m, b.x, L.attn_norm, all_wg ? nullptr : b.xn, L.q.type, H, rows, g.eps, s);
+    prod_group(m, all_wg ? nullptr : b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, rows, s);
     // each segment's queries and cache cells, then every segment's attention in one launch
     int row = 0;
     kernels::GqaSeg as[kBatch];
@@ -838,7 +868,9 @@ void batch_body(Model& m, const BatchSeg* segs, int S) {
             win_ffn(m, L, rows, s);
         }, s);
         if (m.lb > 0) return;   // the second card of a split has no head
-        prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, rows, g.eps, s), b.hl, rows, s);
+        bool need_xn = !on_wg(w.head.type);
+        for (int k = 0; k < S && !need_xn; ++k) need_xn = segs[k].st->hid != nullptr;
+        prod(m, w.head, wnorm(m, b.x, w.out_norm, need_xn ? b.xn : nullptr, w.head.type, H, rows, g.eps, s), b.hl, rows, s);
     }
     int row = 0;
     for (int k = 0; k < S; row += segs[k++].T) {
@@ -855,6 +887,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S) {
 void stage_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
+    if (m.ws_done) cudaStreamWaitEvent(s, m.ws_done, 0);
     int rows = 0;
     BatchTable tab{};
     for (int k = 0; k < S; ++k) {
@@ -1001,7 +1034,7 @@ void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64
     }
 }
 
-bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err) {
+bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err, const int32_t* pos3) {
     const Geometry& g = m.g;
     const Weights& w = m.w;
     ChunkScratch& b = m.cs;
@@ -1013,13 +1046,35 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
     // the drafter's pairs (main's normed row at cell c, the input row at c + 1): the waiting tail first
     kernels::rms_norm_rows(residual(b), w.out_norm, b.hn + H, T, H, g.eps, s);
     const bool tail = st.tail_cell == pos - 1 && pos > 0;
+    const int32_t prev_tail[3] = {st.tail_pos3[0], st.tail_pos3[1], st.tail_pos3[2]};
     if (tail) cudaMemcpyAsync(b.hn, st.tail, (size_t) H * sizeof(float), cudaMemcpyDeviceToDevice, s);
     cudaMemcpyAsync(st.tail, b.hn + (size_t) T * H, (size_t) H * sizeof(float), cudaMemcpyDeviceToDevice, s);
     st.tail_cell = pos + T - 1;
+    if (pos3 != nullptr) {
+        const int32_t* last = pos3 + (size_t) (T - 1) * 3;
+        st.tail_pos3[0] = last[0];
+        st.tail_pos3[1] = last[1];
+        st.tail_pos3[2] = last[2];
+    } else {
+        st.tail_pos3[0] = st.tail_pos3[1] = st.tail_pos3[2] = (int32_t) (pos + T - 1 + st.rope_delta);
+    }
     // the embeddings moved past the normed rows: emb rows [T][H] at b.cat, normed rows at b.hn (+H when no tail)
     const int n = tail ? T : T - 1;
     if (n <= 0) return true;
-    return mtp_chunk(m, st, tail ? b.hn : b.hn + H, nullptr, tail ? b.cat : b.cat + H, n, tail ? pos - 1 : pos, err);
+    std::vector<int32_t> mtp_pos3;
+    if (pos3 != nullptr) {
+        mtp_pos3.resize((size_t) n * 3);
+        size_t dst = 0;
+        if (tail) {
+            mtp_pos3[0] = prev_tail[0];
+            mtp_pos3[1] = prev_tail[1];
+            mtp_pos3[2] = prev_tail[2];
+            dst = 3;
+        }
+        if (T > 1) std::copy(pos3, pos3 + (size_t) (T - 1) * 3, mtp_pos3.data() + dst);
+    }
+    return mtp_chunk(m, st, tail ? b.hn : b.hn + H, nullptr, tail ? b.cat : b.cat + H, n, tail ? pos - 1 : pos, err,
+                     pos3 != nullptr ? mtp_pos3.data() : nullptr);
 }
 
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
@@ -1028,27 +1083,36 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
     if (!m.ensure_chunk(err)) return false;
     chunk_start(m, st, tokens, rows, T, pos3);
     chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
-    return chunk_finish(m, st, T, pos, err);
+    return chunk_finish(m, st, T, pos, err, pos3);
 }
 
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err) {
+    if (n <= 0 || n > kWindow) {
+        err = "block drafter context: invalid row count";
+        return false;
+    }
     const BlockDrafter& bd = m.bd_dec;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int H = m.g.n_embd;
+    if (m.ws_done) cudaStreamWaitEvent(s, m.ws_done, 0);
     const int32_t bounds[2] = {0, n};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
-    std::vector<int32_t> p3;
-    text_positions(p3, n, pos, 0);
-    cudaMemcpyAsync(b.bpos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    const void* xq = wnorm(m, st.dacc, bd.hidden_norm, b.xn, bd.layers[0].k.type, H, n, bd.eps, s);
+    int32_t p3[kWindow * 3];
+    for (int t = 0; t < n; ++t) p3[t * 3] = p3[t * 3 + 1] = p3[t * 3 + 2] = (int32_t) (pos + t);
+    cudaMemcpyAsync(b.bpos, p3, (size_t) n * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    bool all_wg = on_wg(bd.layers[0].k.type);
+    for (const BlockDrafter::Layer& D : bd.layers)
+        all_wg = all_wg && D.k.type == bd.layers[0].k.type && D.v.type == bd.layers[0].k.type;
+    const void* xq = wnorm(m, st.dacc, bd.hidden_norm, all_wg ? nullptr : b.xn, bd.layers[0].k.type, H, n, bd.eps, s);
     const kernels::RopeSpec rope = block_rope(bd);
     for (size_t l = 0; l < bd.layers.size(); ++l) {
         const BlockDrafter::Layer& D = bd.layers[l];
-        prod_group(m, b.xn, xq, D.k.type, {{&D.k, b.bk}, {&D.v, b.bv}}, n, s);
+        prod_group(m, all_wg ? nullptr : b.xn, xq, D.k.type, {{&D.k, b.bk}, {&D.v, b.bv}}, n, s);
         kernels::attn_qk_prepare(nullptr, b.bk, b.bv, nullptr, D.k_norm, bd.eps, rope, b.bpos, n, 0, bd.n_kv, nullptr,
                                  st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dctx_cap);
     }
+    if (m.ws_done) cudaEventRecord(m.ws_done, s);
     return cuda_ok("block drafter context", err);
 }
 
@@ -1059,6 +1123,10 @@ bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int wi
 
 bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, const int* widths, int S,
                        std::string& err, cudaStream_t stream) {
+    if (S < 1 || S > kBatch) {
+        err = "block drafter: a batch of " + std::to_string(S) + " sessions";
+        return false;
+    }
     const BlockDrafter& bd = m.bd_dec;
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
@@ -1075,18 +1143,19 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
         r0[k + 1] = r0[k] + widths[k];
     }
     const int R = r0[S];
-    if (S < 1 || R > kBatch) {
+    if (R > kBatch) {
         err = "block drafter: a batch of " + std::to_string(R) + " rows";
         return false;
     }
+    if (m.ws_done) cudaStreamWaitEvent(s, m.ws_done, 0);
     // each block: its anchor, then mask tokens, at positions pos ..
     int32_t tok[kBatch];
-    std::vector<int32_t> p3((size_t) R * 3);
+    int32_t p3[kBatch * 3];
     for (int k = 0; k < S; ++k) {
         tok[r0[k]] = anchors[k];
         for (int i = 1; i < widths[k]; ++i) tok[r0[k] + i] = bd.mask_id;
         for (int i = 0; i < widths[k]; ++i) {
-            int32_t* q = &p3[(size_t) (r0[k] + i) * 3];
+            int32_t* q = &p3[(r0[k] + i) * 3];
             q[0] = q[1] = q[2] = (int32_t) (pos[k] + i);
         }
         cudaMemcpyAsync(sts[k]->win_tok, &tok[r0[k]], sizeof(int32_t), cudaMemcpyHostToDevice, s);
@@ -1094,7 +1163,7 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     const int32_t bounds[2] = {0, R};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.tok, tok, (size_t) R * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-    cudaMemcpyAsync(b.bpos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.bpos, p3, (size_t) R * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     kernels::PdlScope pdl(true, true);   // after the uploads: each product stages its weights during the kernel before
     embed_rows(m, b.tok, R, s);
     const kernels::RopeSpec rope = block_rope(bd);
@@ -1134,44 +1203,54 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
     }
     // slots 1 .. B-1 of each block: the head's candidates, then one path through them
     // the head over the vocabulary's first rows only (a BPE vocabulary's ids run roughly by frequency): its picks there
+    // for a lone block, skip its unused anchor row 0 through the head and selector
+    const bool skip0 = S == 1;
+    const int Rh = skip0 ? R - 1 : R;
+    const bool head_wg = on_wg(m.w.head.type);
+    if (!head_wg && skip0) {
+        const int32_t hb[2] = {0, Rh};
+        cudaMemcpyAsync(b.bounds, hb, sizeof hb, cudaMemcpyHostToDevice, s);
+    }
     const int64_t nv = draft_vocab(m);
-    const void* hq = wnorm(m, b.x, bd.norm, b.xn, m.w.head.type, H, R, bd.eps, s);
+    const void* hq = wnorm(m, skip0 ? b.x + (size_t) H : b.x, bd.norm, head_wg ? nullptr : b.xn, m.w.head.type, H, Rh, bd.eps, s);
     if (nv < g.n_vocab) {
         const Linear& hd = m.w.head;   // its first nv rows: F8 rows (and their scales) lead; planes keep the whole scale plane
         wg::Call c = wcall(hd);
         c.m[0] = wmat(hd, b.hl);
         c.m[0].rows = c.m[0].ld_y = nv;
         if (hd.type == kTypeNvfp4Planes) c.m[0].scales = (const uint8_t*) hd.w + kernels::nvfp4p::scale_offset(hd.rows, hd.cols);
-        wg::gemm(c, hq, R, m.ws.w8, s);
+        wg::gemm(c, hq, Rh, m.ws.w8, s);
     } else {
-        prod(m, m.w.head, hq, b.hl, R, s);
+        prod(m, m.w.head, hq, b.hl, Rh, s);
     }
-    {   // the selector's projection of every row (BF16 weights) on the window gemm
+    {   // the selector's projection of every row (BF16 weights) on the window gemm; wnorm already packed b.xq when head_wg
         wg::Call c;
         c.fmt = wg::Format::Bf16;
         c.K = H;
         c.m[0] = {(const uint8_t*) bd.sel_h, bd.rank, nullptr, b.bsel, bd.rank};
-        wg::pack(b.xn, H, H, R, b.xq, s);
-        wg::gemm(c, b.xq, R, m.ws.w8, s);
+        if (!head_wg) wg::pack(b.xn, H, H, Rh, b.xq, s);
+        wg::gemm(c, b.xq, Rh, m.ws.w8, s);
     }
     for (int k = 0; k < S; ++k) {
         const size_t q0 = (size_t) r0[k];
+        const size_t h0 = skip0 ? 0 : q0 + 1;
         const int B = widths[k];
-        kernels::row_logprobs(b.hl + (q0 + 1) * nv, B - 1, nv, b.tok + q0 + 1, bd.top_k, b.blp, b.lp_scratch, s);
+        kernels::row_logprobs(b.hl + h0 * (size_t) nv, B - 1, nv, b.tok + q0 + 1, bd.top_k, b.blp, b.lp_scratch, s);
         kernels::CandidateDraw draw;
         draw.temperature = sts[k]->dtemp;
         draw.seed = sts[k]->dseed;
         draw.pos0 = pos[k] + 1;
         draw.q_ids = sts[k]->dq_ids;
         draw.q_p = sts[k]->dq_p;
-        kernels::candidate_path(b.blp, kernels::kLogprobStride, bd.top_k, b.bsel + (q0 + 1) * bd.rank, bd.pred, bd.succ, bd.rank,
+        kernels::candidate_path(b.blp, kernels::kLogprobStride, bd.top_k, b.bsel + h0 * (size_t) bd.rank, bd.pred, bd.succ, bd.rank,
                                 sts[k]->win_tok, B - 1, sts[k]->dids, sts[k]->dconf, draw, s);
     }
+    if (m.ws_done) cudaEventRecord(m.ws_done, s);
     return cuda_ok("block drafter", err);
 }
 
 bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok, const float* emb, int n, int64_t c0,
-               std::string& err) {
+               std::string& err, const int32_t* pos3) {
     const Geometry& g = m.g;
     const Mtp& d = m.w.mtp;
     ChunkScratch& b = m.cs;
@@ -1183,29 +1262,40 @@ bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok,
     mtp_input(m, emb, hid, cat, n, s);
     const int32_t bounds[2] = {0, n};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
-    std::vector<int32_t> p3;
-    text_positions(p3, n, c0, st.rope_delta);
-    cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    if (pos3 != nullptr) {
+        cudaMemcpyAsync(b.pos, pos3, (size_t) n * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    } else {
+        std::vector<int32_t> p3;
+        text_positions(p3, n, c0, st.rope_delta);
+        cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    }
     chunk_act(m, cat, d.fc.type, 2 * H, n, s);
     gemm(m, d.fc, b.tmp, n, s);
     kernels::to_bf16(b.tmp, residual(b), (int64_t) n * H, s);   // the chunk path's residual is BF16
-    chunk_attn(m, d.layer, st.mtp_kc, st.mtp_vc, n, c0, s);
+    chunk_attn(m, d.layer, st.mtp_kc, st.mtp_vc, n, c0, s, {}, true);
     return cuda_ok("drafter history", err);
 }
 
 bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out,
-                float* lp_row, std::string& err) {
+                float* lp_row, std::string& err, const int32_t* pos3) {
+    if (n <= 0 || n > kWindow) {
+        err = "drafter: invalid row count";
+        return false;
+    }
     const Geometry& g = m.g;
     const Mtp& d = m.w.mtp;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int H = g.n_embd;
-    std::vector<int32_t> p3;
-    text_positions(p3, n, c0, st.rope_delta);
+    if (m.ws_done) cudaStreamWaitEvent(s, m.ws_done, 0);
+    int32_t p3[kWindow * 3];
+    if (pos3 == nullptr) {
+        for (int t = 0; t < n; ++t) p3[t * 3] = p3[t * 3 + 1] = p3[t * 3 + 2] = (int32_t) (c0 + t + st.rope_delta);
+    }
     const int32_t bounds[2] = {0, n}, first[2] = {(int32_t) c0, 0};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(b.pos0, first, sizeof first, cudaMemcpyHostToDevice, s);
-    cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.pos, pos3 ? pos3 : p3, (size_t) n * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, tok, n, H, b.tmp, s);
     mtp_input(m, b.tmp, hid, b.cat, n, s);
     prod(m, d.fc, wact(m, b.cat, d.fc.type, 2 * H, n, s), b.tmp, n, s);
@@ -1220,6 +1310,7 @@ bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok
                         cudaMemcpyDeviceToDevice, s);
         kernels::row_logprobs(st.dlogits, 1, g.n_vocab, tok + n - 1, 1, lp_row, b.lp_scratch, s);
     }
+    if (m.ws_done) cudaEventRecord(m.ws_done, s);
     return cuda_ok("drafter", err);
 }
 

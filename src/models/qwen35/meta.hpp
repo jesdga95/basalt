@@ -84,6 +84,10 @@ inline dense::Geometry geometry(const GgufFile& g, std::string& err) {
     o.gdn_gate = kernels::GdnGate::Silu;
     const int interval = (int) key_u(g, "full_attention_interval");
     const MetaValue* rec = key(g, "attention.recurrent_layers");
+    if ((!rec || rec->items.size() != (size_t) o.n_layers) && interval <= 0) {
+        if (err.empty()) err = "missing or zero full_attention_interval";
+        return o;
+    }
     for (int il = 0; il < o.n_layers; ++il) {
         const bool recurrent = rec && rec->items.size() == (size_t) o.n_layers ? rec->items[(size_t) il].u != 0
                                                                                 : (il + 1) % interval != 0;

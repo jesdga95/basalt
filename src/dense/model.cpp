@@ -388,6 +388,7 @@ Model::~Model() {
     if (stage_ready) cudaEventDestroy(stage_ready);
     for (void* p : owned) cudaFree(p);
     vision_detach();
+    if (ws_done) cudaEventDestroy(ws_done);
 }
 
 bool Model::vision_attach(int tokens, std::string& err) {
@@ -527,6 +528,11 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     // the int8 buffers, and streamed cells are only ever read as int8
     if (o.kv_fp4 && (g.head_dim != 256 || !o.kv_int8 || o.kv_resident > 0)) {
         err = o.arch + ": --kv nvfp4 needs 256-wide heads, the int8 buffers (kv_int8) and every cell on the card (no --kv-resident)";
+        return nullptr;
+    }
+    if (cudaEventCreateWithFlags(&m->ws_done, cudaEventDisableTiming) != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = o.arch + ": creating the workspace sync event failed";
         return nullptr;
     }
     m->lb = o.layer_begin;
