@@ -4,6 +4,7 @@
 // Engram step taken over T tokens at once. Attention and the experts go through the LayerOps batch entries, which
 // keep the causal order inside the chunk.
 #include "basalt/core/device_copy.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/prefill.hpp"
 
@@ -40,7 +41,11 @@ public:
     PrefillImpl(DsModel& m, LayerOps& ops, void* stream, int cap)
         : m_(m), g_(m.geo()), ops_(ops), stream_((cudaStream_t) stream), cap_(cap) {}
     ~PrefillImpl() override {
+        core::OnDevice g(m_.device());
+        if (stream_) cudaStreamSynchronize(stream_);
         finish_reads(ahead_);
+        for (cudaEvent_t e : ev_)
+            if (e) cudaEventDestroy(e);
         for (void* p : allocs_) cudaFree(p);
         if (batch_open_) ops_.close_batch();
     }
@@ -70,8 +75,18 @@ public:
                   buf(hc_ws_, hc_mixes_workspace_floats(cap_)) && buf(rlogits_, C * (size_t) g_.n_expert) &&
                   buf(rw_, C * 8) && buf(ids_, C * 8) &&
                   buf(kv_dev_, C * 5 * n) && buf(q8_, q8) && buf(rows_all_, C * (cols ? cols : 1));
-        if (!ok) err = "out of device memory for the prefill buffers";
-        return ok;
+        if (!ok) {
+            err = "out of device memory for the prefill buffers";
+            return false;
+        }
+        ev_.assign((size_t) g_.n_layers * 3 + 1, nullptr);
+        for (cudaEvent_t& e : ev_) {
+            if (cudaEventCreate(&e) != cudaSuccess) {
+                err = "deepseek41: cannot create prefill timing events";
+                return false;
+            }
+        }
+        return true;
     }
 
     bool run(const int32_t* tokens, int n, int64_t pos0, int64_t rows_after, std::vector<int32_t>& hist, std::string& err) override {
@@ -213,7 +228,15 @@ private:
         std::string err;
         const std::vector<int32_t> dead((size_t) (embd ? T : 0), -1);
         const int32_t* tokens = embd ? dead.data() : tokens_in;
-        hist.insert(hist.end(), tokens, tokens + T);
+        const size_t hist_before = hist.size();
+        struct HistRollback {
+            std::vector<int32_t>& h;
+            size_t before;
+            bool commit = false;
+            ~HistRollback() {
+                if (!commit) h.resize(before);
+            }
+        } rollback{hist, hist_before, false};
 
         // embeddings, repeated into the four streams, kEmbedRows tokens at a time
         {
@@ -233,6 +256,7 @@ private:
                 DS_CUDA(cudaStreamSynchronize(stream_));
             }
         }
+        hist.insert(hist.end(), tokens, tokens + T);
 
         // Engram rows for every Engram layer: this chunk's were requested a chunk ago, so their SSD reads overlapped it
         const EngramInfo& en = m_.pack().engram;
@@ -278,9 +302,7 @@ private:
         const int K = g_.n_used;
 
         // GPU-timeline marks around the attention and FFN of every layer, summed into the split line at the end
-        std::vector<cudaEvent_t> ev((size_t) g_.n_layers * 3 + 1);
-        for (cudaEvent_t& e : ev) cudaEventCreate(&e);
-        cudaEventRecord(ev.back(), stream_);
+        cudaEventRecord(ev_.back(), stream_);
 
         // a host function queued after each layer reports the layers done when the GPU gets there: no synchronization
         ticks_.resize((size_t) g_.n_layers);
@@ -339,11 +361,11 @@ private:
                 hc_pre_first(T, n);
                 rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
             }
-            cudaEventRecord(ev[(size_t) il * 3], stream_);
+            cudaEventRecord(ev_[(size_t) il * 3], stream_);
             if (il == yl && cut > 0 && !ops_.compress_batch(il, pos0, cut, normed_, st, err)) return fail(err);
             if (Tf > 0 && !ops_.attention_batch(il, pos0 + r1, Tf, tokens + r1, normed_ + (size_t) r1 * n, attn_ + (size_t) r1 * n, (int) n, st, err))
                 return fail(err);
-            cudaEventRecord(ev[(size_t) il * 3 + 1], stream_);
+            cudaEventRecord(ev_[(size_t) il * 3 + 1], stream_);
             if (Tf > 0) {
                 dump_rows("attn_out", il, pos0 + r1, Tf, attn_ + (size_t) r1 * n, n);
                 hc_post(attn_ + (size_t) r1 * n, x_ + (size_t) r1 * 4 * n, coef_a_ + (size_t) r1 * kHcCoef, kHcCoef, Tf, (int) n, x2_ + (size_t) r1 * 4 * n, st);
@@ -373,7 +395,7 @@ private:
                 pre_prev = coef_f;
                 fi ^= 1;
             }
-            cudaEventRecord(ev[(size_t) il * 3 + 2], stream_);
+            cudaEventRecord(ev_[(size_t) il * 3 + 2], stream_);
             if (live && il + 1 < n_run) {   // the chunk's end is reported by `progress`
                 ticks_[(size_t) il] = {&live, off + (int) ((int64_t) T * (il + 1) / n_run)};
                 cudaLaunchHostFunc(stream_, &PrefillImpl::tick, &ticks_[(size_t) il]);
@@ -384,22 +406,23 @@ private:
         {
             float attn_ms = 0, ffn_ms = 0, all_ms = 0, t = 0;
             for (int il = 0; il < n_run; ++il) {
-                cudaEventElapsedTime(&t, ev[(size_t) il * 3], ev[(size_t) il * 3 + 1]);
+                cudaEventElapsedTime(&t, ev_[(size_t) il * 3], ev_[(size_t) il * 3 + 1]);
                 attn_ms += t;
-                cudaEventElapsedTime(&t, ev[(size_t) il * 3 + 1], ev[(size_t) il * 3 + 2]);
+                cudaEventElapsedTime(&t, ev_[(size_t) il * 3 + 1], ev_[(size_t) il * 3 + 2]);
                 ffn_ms += t;
             }
-            cudaEventElapsedTime(&all_ms, ev.back(), ev[(size_t) (n_run - 1) * 3 + 2]);
+            cudaEventElapsedTime(&all_ms, ev_.back(), ev_[(size_t) (n_run - 1) * 3 + 2]);
             // the first layer also carries the one-time tier load; the rest scale to a whole pass
-            float rest_ms = 0;
-            cudaEventElapsedTime(&rest_ms, ev[2], ev[(size_t) (n_run - 1) * 3 + 2]);
+            float rest_ms = all_ms;
+            if (n_run > 1) cudaEventElapsedTime(&rest_ms, ev_[2], ev_[(size_t) (n_run - 1) * 3 + 2]);
+            const float pass_ms = n_run > 1 ? rest_ms * (float) n_run / (float) (n_run - 1) : all_ms;
             char far[48] = "";
             if (cut > 0) std::snprintf(far, sizeof far, ", %d of them to layer %d", cut, yl);
             basalt::log::info("basalt deepseek41", "prefill chunk of %d tokens%s: attention %.0f ms, ffn %.0f ms, other %.0f ms; "
                          "layers 1.. %.0f ms (%.0f ms per pass)\n", T, far, attn_ms, ffn_ms, all_ms - attn_ms - ffn_ms, rest_ms,
-                         rest_ms * n_run / (n_run - 1));
+                         pass_ms);
         }
-        for (cudaEvent_t e : ev) cudaEventDestroy(e);
+        rollback.commit = true;
         return true;
     }
 
@@ -432,6 +455,7 @@ private:
     int cap_;
     bool batch_open_ = false;   // the ops hold this read's batched attention
     std::vector<void*> allocs_;
+    std::vector<cudaEvent_t> ev_;
     std::string err_;
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_ = nullptr, *moe_ = nullptr,
           *sh_ = nullptr, *sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr}, *hc_ws_ = nullptr,
