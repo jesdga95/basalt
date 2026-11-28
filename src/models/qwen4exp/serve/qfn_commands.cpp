@@ -234,7 +234,43 @@ int QfnRuntime::init_after_input() {
     return init_batch();
 }
 
+QfnRuntime::~QfnRuntime() {
+    if (ba_job) { ba_thr.join(); ba_job = false; }
+    {
+        const basalt::core::OnDevice on0(0);
+        if (adapt_stream != nullptr) (void) cudaStreamSynchronize(adapt_stream);
+        (void) cudaDeviceSynchronize();
+        if (adapt_ev != nullptr) { cudaEventDestroy(adapt_ev); adapt_ev = nullptr; }
+        if (p2p_ev != nullptr) { cudaEventDestroy(p2p_ev); p2p_ev = nullptr; }
+        if (adapt_stream != nullptr) { cudaStreamDestroy(adapt_stream); adapt_stream = nullptr; }
+        if (xq_pin != nullptr) { cudaFreeHost(xq_pin); xq_pin = nullptr; }
+        if (pair_snap != nullptr) { cudaFree(pair_snap); pair_snap = nullptr; }
+    }
+    for (auto& st : stages) {
+        const basalt::core::OnDevice on(st->dev);
+        (void) cudaDeviceSynchronize();
+    }
+    for (float* hh : hand_hosts)
+        if (hh != nullptr) cudaFreeHost(hh);
+    hand_hosts.clear();
+    if (hb_host != nullptr) { cudaFreeHost(hb_host); hb_host = nullptr; }
+    if (d_hist != nullptr) {
+        const basalt::core::OnDevice on_h(hist_dev >= 0 ? hist_dev : 0);
+        cudaFree(d_hist);
+        d_hist = nullptr;
+    }
+    for (auto& [d, p] : fixed_res_d) {
+        if (p == nullptr) continue;
+        const basalt::core::OnDevice on(d);
+        cudaFree(p);
+    }
+    fixed_res_d.clear();
+}
+
 void QfnRuntime::at_exit() {
+    if (ba_job) { ba_thr.join(); ba_job = false; }
+    apply_pending(true);
+    (void) xq_drain();
     for (int st = 0; st < std::max(n_stages, 1); ++st)
         for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
     save_profile("exit");   // QUIT, or the server closed stdin

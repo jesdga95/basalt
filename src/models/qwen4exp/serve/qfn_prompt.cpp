@@ -160,6 +160,7 @@ Flow QfnRequest::read_to(int64_t to) {
 }
 
 Flow QfnRequest::prompt_end() {
+    runtime_.sp.set_ple_warm(nullptr, 0, 0, 0);
     if (!refill(runtime_.err)) {
         std::printf("ERR refilling a lent slot failed: %s\n", runtime_.err.c_str());
         return Flow::error;

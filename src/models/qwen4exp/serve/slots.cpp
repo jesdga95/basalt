@@ -49,11 +49,8 @@ bool QfnRuntime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::strin
             !basalt::core::conversation_checkpoint_restore(ck, to, g, e))
             return false;
         for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-            basalt::core::ConversationKv img;
-            if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                return false;
-            if (!sync_device("batch admission: device sync failed", e)) return false;
-            if (!basalt::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+            if (!basalt::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                    to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                 return false;
         }
         if (!sync_device("batch admission: device sync failed", e)) return false;

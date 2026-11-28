@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/models/qwen4exp/decode/expert_dispatch.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -136,7 +137,17 @@ struct SplitDrive {
 };
 struct SlotDelete {
     bool own = true;
-    void operator()(basalt::core::SessionState* p) const { if (own) delete p; }
+    int dev = -1;
+    void* buf = nullptr;
+    void operator()(basalt::core::SessionState* p) const {
+        if (!own || p == nullptr) return;
+        const basalt::core::OnDevice on(dev);
+        basalt::core::session_release(*p);
+        delete[] p->qsa_states;
+        p->qsa_states = nullptr;
+        if (buf != nullptr) cudaFree(buf);
+        delete p;
+    }
 };
 using SlotSession = std::unique_ptr<basalt::core::SessionState, SlotDelete>;
 
