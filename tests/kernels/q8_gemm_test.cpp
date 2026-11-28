@@ -321,7 +321,11 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
             std::vector<float> b((size_t) T * s.M);
             ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h b");
             if (std::memcmp(single_ref.data(), b.data(), b.size() * sizeof(float)) != 0) {
-                std::printf("FAIL native_q8_planes_mmvq row-invariance %s T=%d (not bitwise identical to T=1)\n", s.name, T);
+                size_t bad = 0, first = 0;
+                for (size_t i = 0; i < b.size(); ++i)
+                    if (std::memcmp(&single_ref[i], &b[i], 4) != 0) { if (!bad) first = i; ++bad; }
+                std::printf("FAIL native_q8_planes_mmvq row-invariance %s T=%d (not bitwise identical to T=1): %zu differ, first col %zu row %zu: %.9g vs %.9g\n",
+                            s.name, T, bad, first / s.M, first % s.M, single_ref[first], b[first]);
                 std::exit(1);
             }
             if (T <= 8) {
@@ -515,6 +519,56 @@ void run_bench(std::mt19937& rng) {
     cudaEventDestroy(e1);
 }
 
+// Decode-window projections through Q8_0 planes (native_q8_planes_mmvq) at the batch round's row counts.
+void run_bench_planes(std::mt19937& rng) {
+    namespace bk = basalt::kernels;
+    struct Sh { const char* name; int M, K; };
+    const Sh shs[] = {{"w.proj [8664x2304]", 8664, 2304}, {"w.out [2304x3072]", 2304, 3072}, {"lm_head [200064x2304]", 200064, 2304}};
+    const int Ts[] = {1, 2, 3, 4, 8, 16, 32, 64, 96, 128};
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    cudaStream_t st = nullptr;
+    ck(cudaStreamCreate(&st), "stream");
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "e0");
+    ck(cudaEventCreate(&e1), "e1");
+    for (const auto& s : shs) {
+        std::vector<float> wf((size_t) s.M * s.K);
+        for (float& v : wf) v = dist(rng);
+        std::vector<block_q8_0> wb;
+        make_q8_0(wf, s.M, s.K, wb);
+        const size_t bytes = wb.size() * sizeof(block_q8_0);
+        std::vector<float> hx((size_t) 128 * s.K);
+        for (float& v : hx) v = dist(rng);
+        void *draw = nullptr, *dpl = nullptr, *dxq = nullptr;
+        float *dx = nullptr, *y = nullptr;
+        ck(cudaMalloc(&draw, bytes), "raw");
+        ck(cudaMemcpy(draw, wb.data(), bytes, cudaMemcpyHostToDevice), "cpy raw");
+        ck(cudaMalloc(&dpl, bytes), "pl");
+        bk::wgemm::q8_planes(draw, s.M, s.K, dpl, st);
+        ck(cudaMalloc(&dx, hx.size() * sizeof(float)), "dx");
+        ck(cudaMemcpy(dx, hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice), "cpy dx");
+        ck(cudaMalloc(&dxq, bk::native_q8_1_bytes(s.K, 128)), "dxq");
+        bk::native_quantize_q8_1(dx, dxq, s.K, 128, st);
+        ck(cudaMalloc(&y, (size_t) 128 * s.M * sizeof(float)), "y");
+        std::printf("%-24s", s.name);
+        for (const int T : Ts) {
+            for (int i = 0; i < 5; ++i) bk::native_q8_planes_mmvq(dpl, dxq, y, s.K, s.M, T, st);
+            ck(cudaEventRecord(e0, st), "r0");
+            for (int i = 0; i < 50; ++i) bk::native_q8_planes_mmvq(dpl, dxq, y, s.K, s.M, T, st);
+            ck(cudaEventRecord(e1, st), "r1");
+            ck(cudaEventSynchronize(e1), "sync");
+            float ms = 0.0f;
+            ck(cudaEventElapsedTime(&ms, e0, e1), "el");
+            std::printf("  T=%d %.1f us", T, ms * 1000.0f / 50);
+        }
+        std::printf("\n");
+        cudaFree(draw); cudaFree(dpl); cudaFree(dx); cudaFree(dxq); cudaFree(y);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaStreamDestroy(st);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -536,6 +590,7 @@ int main(int argc, char** argv) {
     test_q8_planes_mmvq_parity(rng);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) run_bench(rng);
+        if (std::strcmp(argv[i], "--bench-planes") == 0) run_bench_planes(rng);
     }
     std::printf("ALL Q8 GEMM TESTS PASSED\n");
     return 0;

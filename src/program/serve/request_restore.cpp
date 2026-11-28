@@ -73,6 +73,7 @@ Flow Request::restore() {
     slot_b = runtime_.solo_slot >= 0 ? runtime_.solo_slot : runtime_.admit_slot;
     in_slot = runtime_.slot0_solo() && slot_b > 0;
     solo_req = in_slot && runtime_.solo_slot > 0;   // decoded here, solo-style, on the slot's own state
+    batch_first = in_slot && !solo_req;
     if (runtime_.stats.on) {   // the slot's console figures are this request's from here
         runtime_.stats.start(slot_b);
         runtime_.stats_tick(true);
@@ -238,10 +239,9 @@ Flow Request::restore() {
         const auto t0 = Clock::now();
         basalt::core::SavedConversation image;
         std::string de;
-        if (!runtime_.capture_admit(need, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
-                              "admission; need %llu MiB)", (long long) on_disk.tokens,
-                              (unsigned long long) (need >> 20));
+        if (basalt::core::Admission why; !runtime_.capture_admit(need, floor, &why)) {
+            basalt::log::warn("basalt serve", "conversation cache: %lld tokens on disk not read: %s",
+                              (long long) on_disk.tokens, basalt::core::conversation_refusal(why).c_str());
         } else if (!runtime_.disk.load(on_disk, image, de)) {
             basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
                               "dropped", de.c_str());

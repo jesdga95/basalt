@@ -4,10 +4,10 @@
 // output quotes its input (edits, refactors, repeated code) the continuation is usually exact, and a verify pass
 // accepts many tokens at once. It needs no model and costs microseconds.
 //
-// Index: every trigram of the history (prompt + accepted output) maps to its WAYS most recent end positions in a
-// fixed-size open-addressing table, and so does every LONG_ORDER-gram in a second one: a common trigram's few slots
-// fill with recent repeats, while the longer key still finds an old source of the text being quoted. Memory is
-// bounded (128 to 256 bytes per token of capacity, 8 more per token used) and appends are O(1).
+// Index: every trigram of the history (prompt + accepted output) maps to its WAYS most recent end positions in an
+// open-addressing table, and so does every LONG_ORDER-gram in a second one: a common trigram's few slots
+// fill with recent repeats, while the longer key still finds an old source of the text being quoted. The tables double as
+// the history grows, up to 128 to 256 bytes per token of capacity (8 more per token used); appends are amortized O(1).
 // A proposal checks the candidates of both, extends each match backwards up to `max_match`, and takes the longest
 // (most recent on ties). Matches shorter than `min_match` propose nothing.
 #pragma once
@@ -52,6 +52,7 @@ private:
     static void push(Slot* s, size_t end);
     uint64_t key_at(size_t end) const;
     uint64_t long_key_at(size_t end) const;
+    void grow();   // both tables twice as wide, the keys in again
 
     int min_match_, max_match_;
     std::vector<int32_t> hist_;
@@ -59,6 +60,9 @@ private:
     std::vector<Slot> table_, long_;
     std::vector<uint32_t> dirty_;   // the slots in use (long table flagged), so a reset clears only those
     size_t mask_ = 0;
+    static constexpr size_t kFirstCap = 1u << 13;   // the tables start this wide and double with the history
+    size_t max_cap_ = 1;
+    size_t used_[2] = {0, 0};   // the slots in use in table_ and long_
     int last_match_ = 0;
 };
 

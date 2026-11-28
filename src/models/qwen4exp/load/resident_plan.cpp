@@ -113,7 +113,7 @@ int resident_plan(Context& context) {
     const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
     // ---- the host buffers serving takes at its peak, before the RAM copy reads the free memory: RAM held for the prompt
     // path's two PLE row buffers and a layer split's hand-off buffers at the largest chunk a prompt may be read in, and
-    // the checkpoint blocks of every slot holding all the checkpoints it keeps
+    // the checkpoint pool every chain shares (--checkpoint-pool-mib)
     {
         const int64_t chunk_max = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
         bool ok = true;
@@ -124,7 +124,16 @@ int resident_plan(Context& context) {
                     ok = basalt::core::host_plan((size_t) chunk_max * (size_t) (g.hc * g.n_embd) * sizeof(float));
         }
         if (ok && o.serve && o.prompt_cache > 0) {
-            const size_t keep = (size_t) (o.prompt_cache + 1) * (size_t) std::max(o.batch, 1);
+            size_t bytes = basalt::core::conversation_checkpoint_bytes(ss, g);   // a checkpoint: every stage's part
+            for (size_t i = 0; i < stages.size(); ++i) bytes += basalt::core::conversation_checkpoint_bytes(stages[i]->ss, g);
+            const size_t pool = basalt::program::conv_cache::pool_checkpoints((uint64_t) o.checkpoint_pool_mib << 20, bytes,
+                                                                              o.prompt_cache, o.batch);
+            if (pool == 0)
+                return fatal_start_error("--checkpoint-pool-mib " + std::to_string(o.checkpoint_pool_mib) +
+                                         " fits fewer than two checkpoints of this model (" +
+                                         std::to_string((bytes + (1u << 20) - 1) >> 20) +
+                                         " MiB each): raise it, or turn checkpoints off with --prompt-cache 0");
+            const size_t keep = pool + 1;   // and the one a save fills before the least recently used leaves
             auto reserve = [&](const basalt::core::SessionState& u) {
                 basalt::core::ConversationStateSizes z;
                 std::string ze;

@@ -20,6 +20,7 @@ namespace {
 constexpr int GMAX = 8;               // query heads per KV head
 constexpr int CHUNK = 32;             // cells per decode chunk
 constexpr int kDecSplits = 64;        // a decode row's blocks per KV head (its chunks dealt round robin)
+constexpr int kManySegs = 16;         // segments of a decode launch that fill the card with few splits
 constexpr int HD = 256;              // the prompt kernel's head width
 constexpr float kScaleLog2 = 0.0625f * 1.4426950408889634f;   // 1/sqrt(256) * log2(e)
 constexpr float kNeg = -1e30f;
@@ -56,7 +57,7 @@ __device__ __forceinline__ bool kv_far(const KvFar& f, int64_t& c) {
 // The windows one launch takes: segment k is rows [row0[k], row0[k + 1]) of q, the partials and the output, its 16-row
 // tiles of (row, head) pairs [tile0[k], tile0[k + 1]) of the grid, with its own cache and range.  Each block and each
 // merged row computes exactly what a launch of its segment alone would.
-constexpr int kMaxSegs = 32;
+constexpr int kMaxSegs = kWindowSegsMax;
 struct DecSegs {
     int n = 1;
     int row0[kMaxSegs + 1] = {};
@@ -67,6 +68,7 @@ struct DecSegs {
     KvFar far_kv[kMaxSegs] = {};
     Range r[kMaxSegs];
 };
+static_assert(sizeof(DecSegs) <= 32764, "the segments fit a launch's parameters");
 __device__ __forceinline__ int seg_of(const int* first, int n, int i) {
     int k = 0;
     while (k + 1 < n && i >= first[k + 1]) ++k;
@@ -572,15 +574,18 @@ __global__ void __launch_bounds__(128, HD == 128 ? 3 : 1)
 // segs.n and segs.row0 set: the blocks' tiles from the rows, then both kernels over every segment.  At head width 128 a
 // block takes two tiles of a segment (K and V staged once for 32 rows) when its split holds at least 4 chunks: below
 // that the second tile's latency costs more than the reads it saves.  At 256 one tile (the static shared-memory budget).
+// `wide` (a drafter's call, whose rows need not match a lone segment's bits): many segments fill the card by themselves,
+// so a split then takes four chunks at least and a block both tiles of a segment's rows, reading their keys once.
 template <int HD>
 void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scratch, int n_chunks, float* out, cudaStream_t s,
-                 const float* gate_q = nullptr, uint16_t* gated16 = nullptr) {
+                 const float* gate_q = nullptr, uint16_t* gated16 = nullptr, bool wide = false) {
     const float scale = 1.4426950408889634f / sqrtf((float) HD);
-    const int gx = decode_splits(n_chunks);
+    const bool many = wide && segs.n >= kManySegs;
+    const int gx = decode_splits(many ? std::max(1, n_chunks / 4) : n_chunks);
     int tiles_max = 0;
     for (int k = 0; k < segs.n; ++k)
         tiles_max = std::max(tiles_max, ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16);
-    const int ntl = HD == 128 && tiles_max > 1 && n_chunks >= 4 * gx ? 2 : 1;
+    const int ntl = HD == 128 && tiles_max > 1 && (many || n_chunks >= 4 * gx) ? 2 : 1;
     for (int k = 0; k < segs.n; ++k) {
         const int tiles = ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
         segs.tile0[k + 1] = segs.tile0[k] + (tiles + ntl - 1) / ntl;
@@ -1309,9 +1314,9 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
 
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
-                     float* out, void* stream, bool block) {
+                     float* out, void* stream, bool block, KvInt8 q8) {
     if (T < 1 || T > kGqaMaxWindow || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX || window <= 0 ||
-        (head_dim != 128 && head_dim != 256) || hi < pos0 + T) {
+        (head_dim != 128 && head_dim != 256) || hi < pos0 + T || q8.fp4) {
         basalt::log::error("basalt", "gqa_window_attn: invalid arguments");
         std::exit(1);
     }
@@ -1330,12 +1335,12 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
         basalt::log::error("basalt", "gqa_window_attn: the window passes its scratch");
         std::exit(1);
     }
-    if (head_dim == 128) launch_window<128>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
-    else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream);
+    if (head_dim == 128) launch_window<128>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8);
+    else launch_window<256>(q, k_cache, v_cache, n_head, n_kv, r, T, scratch, n_chunks, out, (cudaStream_t) stream, q8);
 }
 
 void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWindowSeg* segs, int n_seg,
-                          float* scratch, int64_t scratch_cells, float* out, void* stream) {
+                          float* scratch, int64_t scratch_cells, float* out, void* stream, bool wide) {
     if (n_seg < 1 || n_seg > kMaxSegs || n_kv < 1 || n_head % n_kv || n_head / n_kv > GMAX ||
         (head_dim != 128 && head_dim != 256)) {
         basalt::log::error("basalt", "gqa_window_attn_segs: invalid arguments");
@@ -1346,13 +1351,15 @@ void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, co
     d.n = n_seg;
     for (int k = 0; k < n_seg; ++k) {
         const GqaWindowSeg& g = segs[k];
-        if (g.T < 1 || d.row0[k] + g.T > kGqaMaxWindow || g.window <= 0 || g.hi < g.pos0 + g.T) {
+        if (g.T < 1 || g.window <= 0 || g.hi < g.pos0 + g.T || g.q8.fp4 ||
+            (g.q8.k != nullptr) != (segs[0].q8.k != nullptr)) {
             basalt::log::error("basalt", "gqa_window_attn_segs: invalid segment");
             std::exit(1);
         }
         d.row0[k + 1] = d.row0[k] + g.T;
         d.kc[k] = (const __half*) g.k_cache;
         d.vc[k] = (const __half*) g.v_cache;
+        d.q8[k] = g.q8;
         Range& r = d.r[k];
         r.pos0 = g.pos0;
         r.hi = g.hi;
@@ -1368,8 +1375,9 @@ void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, co
             std::exit(1);
         }
     }
-    if (head_dim == 128) launch_segs<128>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
-    else launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, (cudaStream_t) stream);
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (head_dim == 128) launch_segs<128>(q, n_head, n_kv, d, scratch, n_chunks, out, s, nullptr, nullptr, wide);
+    else launch_segs<256>(q, n_head, n_kv, d, scratch, n_chunks, out, s, nullptr, nullptr, wide);
 }
 
 void gqa_prompt_plan_device(int device) { plan_device.store(device, std::memory_order_relaxed); }

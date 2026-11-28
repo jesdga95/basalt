@@ -579,6 +579,32 @@ int stop_message_cases() {
         std::printf("ram stop %-50s -> %s%s\n", c.what, m.c_str(), ok ? "" : "   <-- WRONG");
         fail |= !ok;
     }
+    // Small explicit reserve (--ram-reserve-mib 1024): hard floor scales to floor / 2 (512 MiB) so Low -> Critical
+    // keeps a grace window and stop messages distinguish the guard from the scaled hard floor.
+    {
+        const uint64_t f0 = 0, f512 = 512ull << 20, f1024 = 1024ull << 20, f2048 = 2048ull << 20, f3072 = 3072ull << 20;
+        const bool scales = ram_hard_floor(f0) == 0 && ram_hard_floor(f512) == (256ull << 20) &&
+                            ram_hard_floor(f1024) == (512ull << 20) && ram_hard_floor(f2048) == kRamHardFloor &&
+                            ram_hard_floor(f3072) == kRamHardFloor;
+        std::printf("ram hard floor scaling                                      -> %s\n", scales ? "ok" : "   <-- WRONG");
+        fail |= !scales;
+
+        const uint64_t small_hard = ram_hard_floor(f1024);
+        const bool grace_ok =
+            ram_level(700ull << 20, f1024, small_hard, none, 0) == RamLevel::Low &&
+            ram_level(700ull << 20, f1024, small_hard, calm, 30000) == RamLevel::Low &&
+            ram_level(700ull << 20, f1024, small_hard, none, kRamSustainedMs) == RamLevel::Critical &&
+            ram_level(400ull << 20, f1024, small_hard, none, 0) == RamLevel::Critical;
+        std::printf("ram level --ram-reserve-mib 1024 grace window               -> %s\n", grace_ok ? "ok" : "   <-- WRONG");
+        fail |= !grace_ok;
+
+        const std::string m_low = ram_stop_message(700ull << 20, f1024, small_hard, none, 0, 0);
+        const std::string m_hard = ram_stop_message(400ull << 20, f1024, small_hard, none, 0, 0);
+        const bool msgs_ok = m_low.find("RAM low (700 MiB free < 1024 MiB guard)") != std::string::npos &&
+                             m_hard.find("RAM critical (400 MiB free < 512 MiB hard floor)") != std::string::npos;
+        std::printf("ram stop --ram-reserve-mib 1024 messages                    -> %s\n", msgs_ok ? "ok" : "   <-- WRONG");
+        fail |= !msgs_ok;
+    }
     return fail;
 }
 // The size lock_resident is exercised with: the full 256 MiB where the locked-memory limit allows it, otherwise half
@@ -600,12 +626,55 @@ uint64_t lock_test_bytes(bool& reduced) {
     return half >= 16 * page ? half : 0;
 #endif
 }
+// The transparent-hugepage hint on aligned, small, unaligned and null ranges. Whether the OS actually promotes pages
+// depends on kernel policy and is not what the seam promises, so this asserts every shape returns without faulting
+// and leaves bytes intact.
+int hugepages_hint_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    constexpr uint64_t kHuge = 2ull << 20;
+    constexpr uint64_t kBytes = 2 * kHuge;
+
+    advise_hugepages(nullptr, kHuge);
+    std::printf("hugepages hint %-54s -> returned\n", "null pointer");
+
+    std::vector<uint8_t> small(4096, 0x5a);
+    advise_hugepages(small.data(), 0);
+    advise_hugepages(small.data(), small.size());
+    advise_hugepages(small.data(), kHuge - 1);
+    bool small_ok = true;
+    for (uint8_t b : small) small_ok &= b == 0x5a;
+    std::printf("hugepages hint %-54s -> %s%s\n", "small ranges (< 2 MiB)", small_ok ? "bytes intact" : "bytes CHANGED",
+                small_ok ? "" : "   <-- WRONG");
+    fail |= !small_ok;
+
+    auto* buf = (uint8_t*) alloc_aligned((size_t) kBytes, (size_t) kHuge);
+    if (buf == nullptr) {
+        std::printf("hugepages hint %-54s   <-- alloc_aligned failed\n", "4 MiB aligned allocation");
+        return fail | 1;
+    }
+    // Hint before first touch, matching alloc_ram, then verify data survives a second hint and an unaligned interior hint.
+    advise_hugepages(buf, kBytes);
+    for (uint64_t i = 0; i < kBytes; i += 4096) buf[i] = (uint8_t) ((i >> 12) * 17u + 3u);
+    buf[kBytes - 1] = 0xc3;
+    advise_hugepages(buf, kBytes);
+    advise_hugepages(buf + 123, kHuge);
+    bool intact = buf[kBytes - 1] == 0xc3;
+    for (uint64_t i = 0; i < kBytes; i += 4096)
+        intact &= buf[i] == (uint8_t) ((i >> 12) * 17u + 3u);
+    std::printf("hugepages hint %-54s -> %s%s\n", "4 MiB 2 MiB-aligned range", intact ? "bytes intact" : "bytes CHANGED",
+                intact ? "" : "   <-- WRONG");
+    fail |= !intact;
+    free_aligned(buf);
+    return fail;
+}
 }  // namespace
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_reserve_cases() | read_ahead_cases() | drop_view_cases() |
                     guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | ram_level_cases() |
-                    admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases();
+                    admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases() |
+                    hugepages_hint_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {

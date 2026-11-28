@@ -61,7 +61,7 @@ class Hy4Parser:
         self.args: dict = {}
         self.first = True               # no argument written yet
         self.key, self.schema, self.text_value, self.raw = "", None, False, ""
-        self.calls_seen = False
+        self.block_called = False
 
     # ------------------------------------------------------------------ helpers
     def _args(self, out: list, piece: str) -> None:
@@ -86,7 +86,7 @@ class Hy4Parser:
         if calls >= 0:                  # the thinking ran straight into the calls
             if calls:
                 out.append(Event("reasoning", self.buf[:calls]))
-            self.buf, self.state = self.buf[calls + len(t.calls):], "call"
+            self.buf, self.state, self.sub, self.block_called = self.buf[calls + len(t.calls):], "call", "between", False
             return True
         keep = frontend.hold_back(self.buf, (t.think_end, t.calls))
         if len(self.buf) > keep:
@@ -99,7 +99,7 @@ class Hy4Parser:
         if calls >= 0:
             if calls:
                 out.append(Event("content", self.buf[:calls]))
-            self.buf, self.state = self.buf[calls + len(self.t.calls):], "call"
+            self.buf, self.state, self.sub, self.block_called = self.buf[calls + len(self.t.calls):], "call", "between", False
             return True
         keep = frontend.hold_back(self.buf, (self.t.calls,))
         if len(self.buf) > keep:
@@ -114,23 +114,32 @@ class Hy4Parser:
         if self.sub == "between":
             s = self.buf.lstrip()
             if s.startswith(t.calls_end):
-                self.buf, self.state, self.calls_seen = s[len(t.calls_end):], "content", True
+                self.buf, self.state = s[len(t.calls_end):], "content"
                 return True
             if s.startswith(t.call):
                 self.buf, self.sub = s[len(t.call):], "name"
                 return True
             if s and not (t.calls_end.startswith(s) or t.call.startswith(s)):
-                self.buf, self.state, self.calls_seen = t.calls + self.buf, "content", True     # not a call block: text
-                out.append(Event("content", self.buf))
-                self.buf = ""
+                if not self.block_called:
+                    out.append(Event("content", t.calls))        # not a call block: the opener is text
+                else:
+                    self.buf = s
+                self.state, self.sub = "content", "between"
+                return True
             return False
         if self.sub == "name":          # the name ends at the first argument or at the close of the call
-            ends = [i for i in (self.buf.find(t.key), self.buf.find(t.call_end)) if i >= 0]
-            if not ends:
+            marks = [(i, tag) for tag in (t.key, t.call_end, t.calls_end, t.call) if (i := self.buf.find(tag)) >= 0]
+            if not marks:
                 return False
-            end = min(ends)
+            end, tag = min(marks)
+            if tag == t.calls_end:      # block closed before any valid call header: recover to content
+                self.buf, self.state, self.sub = self.buf[end + len(t.calls_end):], "content", "between"
+                return True
+            if tag == t.call:           # a new call opened before this one ended: skip the broken name
+                self.buf = self.buf[end + len(t.call):]
+                return True
             self.call = ToolCall(name=self.buf[:end].strip(), arguments={})
-            self.args, self.first, self.sub, self.buf = {}, True, "args", self.buf[end:]
+            self.args, self.first, self.sub, self.block_called, self.buf = {}, True, "args", True, self.buf[end:]
             if self.stream_tools:
                 out.append(Event("tool_start", call=self.call))
             self._args(out, "{")
@@ -144,12 +153,30 @@ class Hy4Parser:
             if s.startswith(t.key):
                 self.buf, self.sub, self.key = s[len(t.key):], "key", ""
                 return True
-            return False                # a tag still arriving
+            if not s or t.call_end.startswith(s) or t.key.startswith(s):
+                return False                # a tag still arriving
+            # malformed tag or unexpected text inside a call: close streamed JSON (no tool_call) and recover
+            self._args(out, "}")
+            self.call = None
+            if s.startswith(t.calls_end) or t.calls_end.startswith(s) or s.startswith(t.call) or t.call.startswith(s):
+                self.buf, self.sub = s, "between"
+                return True
+            self.state, self.sub = "content", "between"
+            return True
         if self.sub == "key":
-            end = self.buf.find(t.key_end)
-            if end < 0:
+            marks = [(i, tag) for tag in (t.key_end, t.call_end, t.calls_end) if (i := self.buf.find(tag)) >= 0]
+            if not marks:
                 return False
-            self.key, self.buf, self.sub = self.buf[:end], self.buf[end + len(t.key_end):], "open"
+            end, tag = min(marks)
+            if tag == t.key_end:
+                self.key, self.buf, self.sub = self.buf[:end], self.buf[end + len(t.key_end):], "open"
+                return True
+            self._args(out, "}")
+            self.call = None
+            if tag == t.calls_end:
+                self.buf, self.state, self.sub = self.buf[end + len(t.calls_end):], "content", "between"
+            else:
+                self.buf, self.sub = self.buf[end + len(t.call_end):], "between"
             return True
         if self.sub == "open":          # the value's opening follows the key
             s = self.buf.lstrip()
@@ -212,8 +239,9 @@ class Hy4Parser:
                         self._args(out, json.dumps(frontend._decode_param(self.raw, self.schema), ensure_ascii=False))
                 self._args(out, "}")
                 self.call = None
-            elif self.buf.strip() and not self.calls_seen:
-                out.append(Event("content", self.t.calls + self.buf))
+            elif not self.block_called:
+                prefix = self.t.calls + (self.t.call if self.sub == "name" else "")
+                out.append(Event("content", prefix + self.buf))
         elif self.buf:
             out.append(Event("reasoning" if self.state == "reasoning" else "content", self.buf))
         self.buf = ""

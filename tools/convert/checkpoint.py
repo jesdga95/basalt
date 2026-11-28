@@ -104,13 +104,16 @@ def nvfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
     2i+1 in the high one; `scales` [rows, cols/16] UE4M3. A Basalt block of 64 values is 4 scale bytes then 32 code
     bytes where sub-block s keeps value j in the low nibble of byte 8 s + j and value j + 8 in its high nibble."""
     rows, cols = codes.shape[0], codes.shape[1] * 2
-    v = np.empty((rows, cols), np.uint8)
-    v[:, 0::2] = codes & 15
-    v[:, 1::2] = codes >> 4
-    v = v.reshape(rows, cols // 64, 4, 16)
-    out = np.empty((rows, cols // 64, 36), np.uint8)
-    out[..., :4] = scales.reshape(rows, cols // 64, 4)
-    out[..., 4:] = (v[..., :8] | (v[..., 8:] << 4)).reshape(rows, cols // 64, 32)
+    nb = cols // 64
+    c32 = np.ascontiguousarray(codes, dtype=np.uint8).view(np.uint32).reshape(rows, nb, 4, 2)
+    lo, hi = c32[..., 0], c32[..., 1]
+    ev = (lo & np.uint32(0x0F0F0F0F)) | ((hi & np.uint32(0x0F0F0F0F)) << np.uint32(4))
+    od = ((lo >> np.uint32(4)) & np.uint32(0x0F0F0F0F)) | (hi & np.uint32(0xF0F0F0F0))
+    out = np.empty((rows, nb, 36), np.uint8)
+    out[..., :4] = scales.reshape(rows, nb, 4)
+    q = out[..., 4:].reshape(rows, nb, 4, 4, 2)
+    q[..., 0] = ev.view(np.uint8).reshape(rows, nb, 4, 4)
+    q[..., 1] = od.view(np.uint8).reshape(rows, nb, 4, 4)
     return out.reshape(-1)
 
 
@@ -123,16 +126,20 @@ def csf_decode(fixed: np.ndarray, exceptions: np.ndarray) -> np.ndarray:
     if fixed.ndim != 2 or fixed.shape[1] < 32 or fixed.shape[1] % 16:
         raise S.ConvertError(f"a CSF fixed stream of shape {list(fixed.shape)}")
     rows, cols = fixed.shape[0] * 16, (fixed.shape[1] // 16 - 1) * 2
-    base = fixed[:, :16].reshape(rows, 1).astype(np.int16)
+    base = fixed[:, :16].reshape(rows, 1)
     if (base > 240).any():
         raise S.ConvertError("a CSF base byte above 240")
     packed = fixed[:, 16:].reshape(rows, cols // 2)
-    out = (base + np.stack((packed & 15, packed >> 4), axis=-1).reshape(rows, cols)).reshape(-1)
-    pos = exceptions & 0xFFFFFF
-    if pos.size and int(pos.max()) >= rows * cols:
-        raise S.ConvertError("a CSF exception past the end of its matrix")
-    out[pos] = exceptions >> 24
-    return out.astype(np.uint8).reshape(rows, cols)
+    out = np.empty((rows, cols), np.uint8)
+    out[:, 0::2] = packed & np.uint8(15)
+    out[:, 1::2] = packed >> np.uint8(4)
+    out += base
+    if exceptions.size:
+        pos = exceptions & 0xFFFFFF
+        if int(pos.max()) >= rows * cols:
+            raise S.ConvertError("a CSF exception past the end of its matrix")
+        out.reshape(-1)[pos] = (exceptions >> 24).astype(np.uint8)
+    return out
 
 
 def _scales(ent) -> np.ndarray:

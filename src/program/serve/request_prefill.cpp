@@ -75,6 +75,7 @@ Flow Request::read_prompt() {
     // the last window of the last windowed part carries the last prompt token too: the first generated
     // token is sampled from it, and the draft layer takes its rows like any accepted window
     fold_p0 = n - 1;
+    defer_read = -1;
     prompt_parts_begin();
     for (const int64_t to : {root_at, media_at, turn_at, n - 1}) {
         if (to <= at) continue;

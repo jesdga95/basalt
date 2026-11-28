@@ -99,6 +99,16 @@ class UnitPrometheus(unittest.TestCase):
         assert_valid_prometheus(self, text)
         self.assertIn(r'model_name="a\"b\\c\nd"', text)
 
+    def test_the_refused_parking_counter(self):
+        p = PromStats().snapshot()
+        m = {"engine": {"model": "M", "max_context": 4096}, "live": {"state": "idle"}, "totals": {},
+             "conversation": {"parked": 0, "bytes": 0, "evictions": 0, "refused": 942}}
+        text = render_prometheus([(m, p)])
+        assert_valid_prometheus(self, text)
+        self.assertIn('basalt_conversation_parking_refused_total{model_name="M"} 942', text)
+        del m["conversation"]
+        self.assertNotIn("parking_refused", render_prometheus([(m, p)]))
+
     def test_large_counters_keep_subsecond_precision(self):
         stats = PromStats()
         stats.e2e.observe(100000.0)

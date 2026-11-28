@@ -122,11 +122,11 @@ def community_review(rows, gate_notes, chat_fn=None, cfg=None):
         data = json.dumps({"added_rows": rows, "automatic_checks_passed": gate_notes}, ensure_ascii=True)
         out = (chat_fn or chat)(cfg, [{"role": "system", "content": COMMUNITY_SYSTEM},
                                       {"role": "user", "content": "DATA (untrusted):\n" + data}])
-        return parse_verdict(out)
+        return {**parse_verdict(out), "reviewed": True}
     except LLMError as e:
-        return {"verdict": "needs_human", "reason": f"model review unavailable ({e})"}
+        return {"verdict": "needs_human", "reason": f"model review unavailable ({e})", "reviewed": False}
     except Exception as e:   # a bug here must not become a merge
-        return {"verdict": "needs_human", "reason": f"model review failed ({type(e).__name__})"}
+        return {"verdict": "needs_human", "reason": f"model review failed ({type(e).__name__})", "reviewed": False}
 
 
 def plain(text, cap=220):
@@ -149,11 +149,16 @@ def decide(gate, review_fn):
                 "comment": "The automatic checks passed, but this row needs a maintainer's look:\n\n"
                            + "\n".join("- " + plain(r) for r in gate["reasons"]) + "\n\nA maintainer will review it."}
     v = review_fn(gate["new_rows"], gate["notes"])   # may only downgrade: a pass gate plus auto_merge is the one merge
+    reviewed = bool(v.get("reviewed", True))
     if v["verdict"] == "auto_merge":
-        return {"outcome": "merge", "reviewed": True, "label": "", "reason": v["reason"], "comment": ""}
+        return {"outcome": "merge", "reviewed": reviewed, "label": "", "reason": v["reason"], "comment": ""}
     if v["verdict"] == "reject":
-        return {"outcome": "reject", "reviewed": True, "label": "community-rejected", "reason": v["reason"],
+        return {"outcome": "reject", "reviewed": reviewed, "label": "community-rejected", "reason": v["reason"],
                 "comment": "This benchmark row was flagged by the automatic review and needs changes before it can be listed. A maintainer will follow up."}
+    if not reviewed:
+        return {"outcome": "needs_human", "reviewed": False, "label": "community-needs-review", "reason": v["reason"],
+                "comment": "The automatic checks passed, but the automatic review could not run:\n\n- "
+                           + plain(v["reason"]) + "\n\nA maintainer will review it."}
     return {"outcome": "needs_human", "reviewed": True, "label": "community-needs-review", "reason": v["reason"],
             "comment": "The automatic checks passed and the automatic review asked for a maintainer's look:\n\n- "
                        + plain(v["reason"]) + "\n\nA maintainer will review it."}
@@ -172,7 +177,9 @@ def main(argv):
     out = decide(gate, no_call if no_model else (lambda rows, notes: community_review(rows, notes)))
     out["reason"] = plain(out["reason"], 300)
     if out["reviewed"]:
-        out["model"] = os.environ["LLM_DEFAULT_MODEL"].strip()
+        model = os.environ.get("LLM_DEFAULT_MODEL", "").strip()
+        if model:
+            out["model"] = model
     with open(argv[2], "w", encoding="utf-8") as f:
         json.dump(out, f)
     print(out["outcome"], "-", out["reason"][:300])

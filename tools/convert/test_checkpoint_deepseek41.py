@@ -240,6 +240,111 @@ class DeepSeekCheckpointTest(unittest.TestCase):
         self.assertIn("attn_q_a", str(cm.exception))
         self.assertFalse((self.t / "bad.basalt").exists())
 
+    def test_mxfp4_base_engram_and_standalone_import(self):
+        import subprocess
+        # Build a BASE pack whose Engram table is already MXFP4 (ggufq has no MXFP4 enum entry).
+        g = GGUFWriter()
+        P = "deepseek41."
+        g.add("general.architecture", "deepseek41")
+        g.add("general.name", "Tiny-DS")
+        for k, v in (("block_count", L), ("embedding_length", H), ("expert_count", E), ("expert_used_count", 2),
+                     ("expert_feed_forward_length", FF), ("embedding_length_per_layer_input", 256), ("engram.vocab_size", 16)):
+            g.add(P + k, v, "u32")
+        g.add(P + "ple.layers", [1], "array:u32")
+        g.add(P + "ple.layer_multipliers", [7, 11, 13], "array:u64")
+        g.add(P + "ple.head_offsets", [0], "array:u64")
+        g.add(P + "ple.head_vocab_sizes", [ROWS], "array:u64")
+        g.add(P + "engram.token_map", [0, 1, 2, 3], "array:u32")
+        g.add("tokenizer.ggml.tokens", TOKENS)
+        q8 = lambda x: np.frombuffer(S.q8_0(np.ascontiguousarray(x, np.float32)), np.uint8)
+        f32 = lambda u: (u.astype(np.uint32) << 16).view(np.float32)
+        g.add_raw("token_embd.weight", [H, len(TOKENS)], "Q8_0", q8(f32(self.bf["embed.weight"])).tobytes())
+        g.add_raw("output.weight", [H, len(TOKENS)], "Q8_0", q8(f32(self.bf["head.weight"])).tobytes())
+        g.add_raw("per_layer_token_embd.weight", [256, ROWS], "MXFP4", D.mxfp4_rows(self.ecodes, self.escales).tobytes())
+        for l in range(L):
+            qa = self.fp8_values(f"layers.{l}.attn.wq_a.weight")
+            g.add_raw(f"blk.{l}.attn_q_a.weight", [H, 32], "Q8_0", q8(qa).tobytes())
+            g.add_f32(f"blk.{l}.attn_norm.weight", f32(self.bf[f"layers.{l}.attn_norm.weight"]))
+            g.add_raw(f"blk.{l}.ffn_gate_inp.weight", [H, E], "F32", f32(self.bf[f"layers.{l}.ffn.gate.weight"]).tobytes())
+            for role, rows in (("gate", FF), ("up", FF), ("down", H)):
+                g.add_raw(f"blk.{l}.ffn_{role}_exps.weight", [64, rows, E], "IQ4_NL", self.rng.bytes(18 * 2 * rows * E))
+        g.add_raw("blk.1.engram_gate.weight", [H, 4], "F32", (f32(self.qk["q_weight"]) * f32(self.qk["k_weight"])).tobytes())
+        g.add_raw("blk.1.engram_kv.weight", [256, KV], "Q8_0", q8(self.fp8_values("layers.1.engram.wkv.weight")).tobytes())
+        gguf = g.write(self.t / "base_mxfp4.gguf")
+        orig = convert.export_tokenizer
+
+        def tokenizer_files(first, out_dir):
+            d = Path(out_dir) / "tokenizer"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "tokenizer.json").write_bytes(b"{}")
+            return sorted(d.iterdir())
+        convert.export_tokenizer = tokenizer_files
+        try:
+            base_mx = self.t / "base_mxfp4.basalt"
+            a = dict(gguf=[str(gguf)], mmproj=None, out=str(base_mx), mtp_source=None, mtp_dense=None, draft_vocab=None,
+                     name="Tiny", compat_bf16=False, no_vision=False, force=False, sections_from=None)
+            convert.convert(type("A", (), a)())
+        finally:
+            convert.export_tokenizer = orig
+        m = self.run_ck("nv_from_mxfp4.basalt", base=base_mx)
+        meta = json.loads(m.read("meta"))
+        self.assertEqual(meta["checkpoint"]["engram"]["rel_rms_vs_sections_from"], 0.0)
+
+        # Standalone import without pre-populating tools/ on sys.path (Windows multiprocessing spawn path).
+        r = subprocess.run([sys.executable, "-c",
+                            f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
+                            "import checkpoint_deepseek41; print(checkpoint_deepseek41.MXFP4)"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "39")
+
+    def test_cross_shard_scales_and_gate_product_with_stream_shards(self):
+        # Put FP8 .scale, Engram .scale, and gate_product halves in different shards from their partners.
+        ck_x = self.t / "ck_cross"
+        ck_x.mkdir()
+        shard_data = []
+        for i in range(3):
+            f = self.ck / f"model-{i + 1:05d}-of-00003.safetensors"
+            head, base = S.read_safetensors_header(f)
+            raw = f.read_bytes()
+            shard_data.append({k: (v["dtype"], tuple(v["shape"]), raw[base + v["data_offsets"][0]:base + v["data_offsets"][1]])
+                               for k, v in head.items() if k != "__metadata__"})
+        # Move layer-0 wq_a.scale from shard 0 -> shard 1, q_weight from shard 2 -> shard 0, engram scale from shard 2 -> shard 1
+        shard_data[1]["layers.0.attn.wq_a.scale"] = shard_data[0].pop("layers.0.attn.wq_a.scale")
+        shard_data[0]["layers.1.engram.q_weight"] = shard_data[2].pop("layers.1.engram.q_weight")
+        shard_data[1]["layers.1.engram.embed.scale"] = shard_data[2].pop("layers.1.engram.embed.scale")
+        where = {}
+        for i, s in enumerate(shard_data):
+            fn = f"model-{i + 1:05d}-of-00003.safetensors"
+            write_safetensors(ck_x / fn, s)
+            where.update({n: fn for n in s})
+        (ck_x / "model.safetensors.index.json").write_text(json.dumps({"weight_map": where}))
+        shutil.copy(self.ck / "config.json", ck_x / "config.json")
+
+        ref = self.run_ck("ref_same_shard.basalt")
+        got = self.run_ck("cross_shard.basalt", ck=ck_x, stream=False)
+        for sec in ("experts", "engram", "gguf"):
+            self.assertEqual(got.read(sec), ref.read(sec), sec)
+
+        ck_stream = self.t / "ck_cross_stream"
+        shutil.copytree(ck_x, ck_stream)
+        got_s = self.run_ck("cross_shard_stream.basalt", ck=ck_stream, stream=True)
+        for sec in ("experts", "engram", "gguf"):
+            self.assertEqual(got_s.read(sec), ref.read(sec), sec)
+        self.assertEqual(sorted(p.name for p in ck_stream.iterdir()), ["config.json", "model.safetensors.index.json"])
+
+    def test_nan_engram_scale_is_clean_convert_error(self):
+        ck_nan = self.t / "ck_nan"
+        shutil.copytree(self.ck, ck_nan)
+        f = ck_nan / "model-00003-of-00003.safetensors"
+        head, base = S.read_safetensors_header(f)
+        raw = bytearray(f.read_bytes())
+        raw[base + head["layers.1.engram.embed.scale"]["data_offsets"][0]] = 255
+        f.write_bytes(bytes(raw))
+        with self.assertRaises(SystemExit) as cm:
+            self.run_ck("nan.basalt", ck=ck_nan)
+        self.assertIn("NaN", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,15 +28,18 @@ public:
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;
 
-    /// `workers` is 0 for the platform default, or 1..256 issuing threads. An unbuffered open the file system
-    /// refuses (no O_DIRECT / NO_BUFFERING there) fails with `err`, and the caller reads through its own handle.
+    /// `workers` is 0 for the platform default, or 1..256 issuing threads. On Linux, if the file system rejects
+    /// `O_DIRECT` with `EINVAL` (such as `tmpfs`, `FUSE`, or some `ZFS`/`overlayfs` mounts), `open` falls back to
+    /// buffered reads and `bypasses_cache()` returns false.
     /// `mapped_elsewhere`: the process also maps the file or reads it through the file cache. Windows then reads it
     /// through the file cache too, because NTFS runs the unbuffered reads of a file that has a mapped view or cached
-    /// reads one at a time; Linux reads around the cache either way. The alignment contract does not change.
+    /// reads one at a time; Linux still prefers `O_DIRECT` when the file system supports it. The alignment contract
+    /// does not change.
     bool open(const std::string& path, std::string& err, int workers = 0, bool mapped_elsewhere = false);
     void close();
     bool is_open() const;
-    /// Whether the open file is read around the file cache. False for an open with `mapped_elsewhere` on Windows.
+    /// Whether the open file is read around the file cache. False for `mapped_elsewhere` on Windows, or when Linux
+    /// fell back to buffered reads after `O_DIRECT` returned `EINVAL`.
     bool bypasses_cache() const;
     uint64_t size() const;
     static constexpr uint32_t alignment() { return 4096; }

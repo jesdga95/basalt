@@ -553,29 +553,33 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
 template <int TY, int M>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
-    switch (nt) {
-        case 1: gu_rows<TY, 1, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8, M>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+    for (int t0 = 0; t0 < nt; t0 += 8) {
+        const int k = nt - t0 < 8 ? nt - t0 : 8;
+        switch (k) {
+            case 1: gu_rows<TY, 1, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 2: gu_rows<TY, 2, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 3: gu_rows<TY, 3, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 4: gu_rows<TY, 4, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 5: gu_rows<TY, 5, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 6: gu_rows<TY, 6, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 7: gu_rows<TY, 7, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 8: gu_rows<TY, 8, M>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            default: break;
+        }
     }
 }
 
 template <int TY, int M>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
-    switch (nt) {
-        case 1: dot_rows<TY, 1, M>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2, M>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3, M>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4, M>(w, row_bytes, n, act, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY, M>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        switch (k) {
+            case 1: dot_rows<TY, 1, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 2: dot_rows<TY, 2, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 3: dot_rows<TY, 3, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 4: dot_rows<TY, 4, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            default: break;
         }
     }
 }
@@ -720,22 +724,23 @@ void BASALT_IQ_EXPORT(iq256_rows_mode)(int mode, int type, const uint8_t* w, siz
 
 void BASALT_IQ_EXPORT(iq4nl256_down_rows)(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
+    if (nt <= 0) return;
     // the tokens' block scales are held on the stack: rows of at most iq4nl_max_blocks blocks (iq4nl256_fits)
-    if (n % QK4_NL != 0 || n / QK4_NL > iq4nl_max_blocks) {
+    if (n < 0 || n % QK4_NL != 0 || n / QK4_NL > iq4nl_max_blocks) {
         basalt::log::error("basalt", "iq4nl256_down_rows: rows of %d values; at most %d, in blocks of %d", n,
                            iq4nl_max_blocks * QK4_NL, QK4_NL);
         std::exit(1);
     }
-    const block_q8_0* y[8];
-    for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
-    switch (nt) {
-        case 1: iq4nl_rows<4, 1>(w, row_bytes, n, y, out, r0, r1); break;
-        case 2: iq4nl_rows<2, 2>(w, row_bytes, n, y, out, r0, r1); break;
-        case 3: iq4nl_rows<2, 3>(w, row_bytes, n, y, out, r0, r1); break;
-        case 4: iq4nl_rows<1, 4>(w, row_bytes, n, y, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            BASALT_IQ_EXPORT(iq4nl256_down_rows)(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        const block_q8_0* y[4];
+        for (int t = 0; t < k; ++t) y[t] = (const block_q8_0*) hq[t0 + t];
+        switch (k) {
+            case 1: iq4nl_rows<4, 1>(w, row_bytes, n, y, out + t0, r0, r1); break;
+            case 2: iq4nl_rows<2, 2>(w, row_bytes, n, y, out + t0, r0, r1); break;
+            case 3: iq4nl_rows<2, 3>(w, row_bytes, n, y, out + t0, r0, r1); break;
+            case 4: iq4nl_rows<1, 4>(w, row_bytes, n, y, out + t0, r0, r1); break;
+            default: break;
         }
     }
 }

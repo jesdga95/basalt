@@ -60,5 +60,26 @@ int main() {
     constexpr uint64_t avail = 10ull << 30, park = 8ull << 30, floor = 2ull << 30;
     check(conversation_memory_admit(avail, park, floor), "fixed numbers admit park plus floor");
     check(!conversation_memory_admit(avail - 1, park, floor), "the same numbers reject one byte lower");
+    {   // the verdict names the check that failed, with the numbers that decided
+        constexpr uint64_t MiB = 1ull << 20;
+        const Admission none = conversation_admission(true, 4096 * MiB, {}, 100 * MiB, 4096 * MiB);
+        check(none.check == AdmitCheck::NoTelemetry && !none &&
+              conversation_refusal(none) == "host RAM telemetry unavailable", "no telemetry says so");
+        const Admission guard = conversation_admission(false, 4096 * MiB, 3000 * MiB, 100 * MiB, 4096 * MiB);
+        check(guard.check == AdmitCheck::BelowGuard &&
+              conversation_refusal(guard) == "host free 3000 MiB is below the RAM guard's 4096 MiB floor", "guard below its floor");
+        const Admission shortage = conversation_admission(true, 4096 * MiB, 8000 * MiB, 6492 * MiB, 4096 * MiB);
+        check(shortage.check == AdmitCheck::Short && shortage.available == 8000 * MiB &&
+              conversation_refusal(shortage) == "host free 8000 MiB < required 10588 MiB (need 6492 MiB + floor 4096 MiB)",
+              "short of need plus floor names the free RAM and the required");
+        check((bool) conversation_admission(true, 4096 * MiB, 10588 * MiB, 6492 * MiB, 4096 * MiB), "exactly enough admits");
+    }
+    {   // one episode per closed stretch of admission; the total survives it
+        RefusalEpisodes e;
+        check(e.admitted() == 0, "no episode open, nothing to end");
+        check(e.refused() && !e.refused() && !e.refused(), "only the first refusal opens the episode");
+        check(e.admitted() == 3 && e.admitted() == 0, "the episode ends with its refusal count, once");
+        check(e.refused() && e.total() == 4, "a new episode opens; the total counts all");
+    }
     std::printf("conversation_memory_test: %d checks passed\n", checks);
 }

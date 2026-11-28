@@ -45,9 +45,10 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the window's rows each
     // - row-wise identical arithmetic
     const bool qb = n > 1 && !st.kv_q4;
-    // the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the group's rows in
-    // one launch, the same bits
-    const bool fused_pre = st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
+    // the K norm + RoPE, the INT8 (or a resident FP16 batch window's) appends, the tail snapshot and the
+    // indexer appends of the group's rows in one launch, the same bits
+    const bool fp16_batch = v_.batch_rec_ && !st.kv_int8 && st.kv_mode == 0;
+    const bool fused_pre = (st.kv_int8 || fp16_batch) && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
                            qsa_dec_fused_supported(s);
     // --kv q4_0 in the same prelude: the rotation and the Q4_0 pack live in that launch, so the layer stops paying
     // the per-token norm/rope, two FWHT launches, T appends and T indexer appends. Mode 0 only; a streamed q4_0
@@ -60,6 +61,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         kp.k_norm = (const float*) wkn->data; kp.steps = v_.step_;
         kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
         if (st.kv_q4) { kp.k_q4 = st.k_q4; kp.v_q4 = st.v_q4; }
+        kp.k_pool = st.k_pool; kp.v_pool = st.v_pool;
         kp.page_table = st.page_table; kp.host = st.host;
         kp.idx_raw = idx_raw; kp.idx_k_norm = (const float*) wikn->data;
         kp.tail = st.idx_tail; kp.dead = st.idx_dead; kp.pooled = st.idx_pooled; kp.block_pos = st.idx_block_pos;
@@ -70,7 +72,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     // a batch window's rows are different sequences: the per-slot pointers come from the layer's table
     const QsaSegTable seg_tab{v_.batch_rec_ ? v_.d_qslots_[(size_t) qi] : nullptr, v_.d_qrows_, v_.d_qsegs_, (int) n, (int) n};
     auto kv_post = [&](const QsaDecKvPost& a, cudaStream_t q) {
-        if (v_.batch_rec_) qsa_dec_kv_post_seg(a, seg_tab, (int) n, s, rope_scaling(), q);
+        if (v_.batch_rec_) qsa_dec_kv_post_seg(a, seg_tab, (int) n, s, rope_scaling(), st.kv_int8, q);
         else qsa_dec_kv_post(a, n, s, rope_scaling(), q);
     };
     auto q_post_args = [&] {
@@ -261,8 +263,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         if (v_.batch_stream_) kv_stream_resolve_seg(seg_tab, v_.sel_, v_.step_, v_.cap_, s, cs);
         stamp(l, 12);
         attn_q8 = true;
-        qsa_dec_attn_seg(v_.qcur_, seg_tab, true, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs, v_.qfull_,
-                         v_.attn32_, v_.xq_);
+        qsa_dec_attn_seg(v_.qcur_, seg_tab, st.kv_int8, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs,
+                         v_.qfull_, v_.attn32_, v_.xq_);
     } else {
     {
         {
