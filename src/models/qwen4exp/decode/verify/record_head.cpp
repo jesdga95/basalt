@@ -27,6 +27,7 @@ bool Verifier::WindowRecorder::head() {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
+        bool head_q8 = false;
         if (fuse_head_gr) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
@@ -48,6 +49,10 @@ bool Verifier::WindowRecorder::head() {
                 h.T = T; h.R = Rt(0); h.R_out = Rt(0); h.apply = true; h.bo_prev = v_.bo_; h.inj_prev = v_.inj2_;
                 h.w_norm = (const float*) hn->data; h.w_down = (const uint16_t*) hd->data; h.w_up = (const uint16_t*) hu->data;
                 h.eps = EPS; h.lo = v_.lo_; h.rs = v_.rs_; h.mixed = v_.head_mixed_; h.xn = v_.xn_;
+                if (v_.head_ != nullptr && v_.head_->loaded() && hc_fused_q8_rows_ok()) {
+                    h.xq = v_.xq_;
+                    head_q8 = true;
+                }
                 hc_fused_read(h, cs);
             } else {
                 fused_gr_read_multi(fa, T, v_.xn_, cs);
@@ -66,7 +71,7 @@ bool Verifier::WindowRecorder::head() {
         }
         if (v_.head_ != nullptr && v_.head_->loaded()) {
             try {
-                native_quantize_q8_1(v_.head_mixed_, v_.xq_, (int) N, T, cs);
+                if (!head_q8) native_quantize_q8_1(v_.head_mixed_, v_.xq_, (int) N, T, cs);
                 // rows [0, n) of `w` into y (T rows of n); the same kernel and bits as the whole head
                 auto head_rows = [&](const void* w, float* y, int n, cudaStream_t s) {
                     const void* x = s == cs ? (const void*) v_.xq_ : v_.hs_xq_;

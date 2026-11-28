@@ -41,8 +41,11 @@ Verifier::~Verifier() {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
+    const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
     if (cm_) cudaStreamSynchronize(cm_);
+    if (lz_s_) cudaStreamSynchronize(lz_s_);
+    if (ple_s_) cudaStreamSynchronize(ple_s_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (sh_hi_) cudaStreamSynchronize(sh_hi_);
     if (sh_hi2_) cudaStreamSynchronize(sh_hi2_);
@@ -97,9 +100,14 @@ Verifier::~Verifier() {
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
+    if (ev_opt_) cudaEventDestroy(ev_opt_);
+    if (fence_ev_) cudaEventDestroy(fence_ev_);
+    if (prof_) cudaFree(prof_);
+    if (skip_) cudaFree(skip_);
+    if (slot_off_d_) cudaFree(slot_off_d_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_seq_, h_flag_, h_ymiss_, h_pend_,
-                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_, h_head_from_};
+                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_, h_head_from_, h_plan_err_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }

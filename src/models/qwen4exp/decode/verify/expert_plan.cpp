@@ -10,6 +10,7 @@
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -183,7 +184,20 @@ bool Verifier::landed_ok() const {
     if (landed_words() == nullptr || !landed_glue_) return false;
     for (int t = 1; t <= max_t_; ++t)
         if ((ar_off_ ? exec_nr_[t] : exec_[t]) == nullptr) return false;
-    return true;
+    if (device_ < 0 || device_ >= 64) return false;
+    static std::atomic<int> cap[64];
+    int ok = cap[device_].load(std::memory_order_acquire);
+    if (ok == 0) {
+        int engines = 0, concurrent = 0, integrated = 1;
+        const bool queried =
+            cudaDeviceGetAttribute(&engines, cudaDevAttrAsyncEngineCount, device_) == cudaSuccess &&
+            cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentKernels, device_) == cudaSuccess &&
+            cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device_) == cudaSuccess;
+        if (!queried) (void) cudaGetLastError();
+        ok = (queried && engines > 0 && concurrent != 0 && integrated == 0) ? 1 : 2;
+        cap[device_].store(ok, std::memory_order_release);
+    }
+    return ok == 1;
 }
 
 bool Verifier::landed_need(uint32_t round, std::string& err) {
