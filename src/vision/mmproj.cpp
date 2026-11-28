@@ -209,13 +209,14 @@ bool Mmproj::open(const core::FileRange& range, std::string& err, const char* pr
     projector_ = projector;
     hp_.proj = int_param("clip.vision.projection_dim", 0);
     hp_.eps = (float) num("clip.vision.attention.layer_norm_epsilon", 1e-6, false);
+    hp_.rope_theta = (float) num("clip.vision.rope.freq_base", 0, false);
     if (!err.empty()) {
         release();
         return false;
     }
     if (hp_.patch <= 0 || hp_.embd <= 0 || hp_.ffn <= 0 || hp_.layers <= 0 || hp_.heads <= 0 || hp_.merge <= 0 ||
         hp_.proj <= 0 || hp_.embd % hp_.heads != 0 || hp_.image_size < 0 || hp_.min_pixels < 0 ||
-        !std::isfinite(hp_.eps) || hp_.eps < 0.f) {
+        !std::isfinite(hp_.eps) || hp_.eps < 0.f || !std::isfinite(hp_.rope_theta) || hp_.rope_theta < 0.f) {
         return fail("invalid projector hyper-parameters");
     }
     for (const char* k : {"clip.vision.image_mean", "clip.vision.image_std"}) {

@@ -30,6 +30,10 @@ public:
     /// A piece that is itself a vocabulary entry becomes that token whole, not merged from its bytes (Hugging Face
     /// BPE's ignore_merges). Set before load().
     void set_ignore_merges(bool on) { ignore_merges_ = on; }
+    /// SentencePiece's BPE (Hugging Face BPE with byte_fallback after a space -> U+2581 normalizer): a piece starts as its
+    /// characters, a character that is no vocabulary entry as its bytes' byte-fallback tokens (type 6), and U+2581 in the
+    /// text is a space. The tables then spell the space mark as a space. Set before load().
+    void set_sentencepiece(bool on) { spm_ = on; }
 
     bool load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json, std::string& err);
     bool loaded() const { return !raw_.empty(); }
@@ -93,6 +97,8 @@ private:
 
     PreTokenize pretokenize_ = nullptr;
     bool ignore_merges_ = false;
+    bool spm_ = false;
+    std::unordered_map<std::string_view, int32_t> chars_;   // sentencepiece: a one-character entry's bytes (in raw_) -> its id
     std::unordered_map<std::string_view, int32_t> whole_;   // with ignore_merges: a plain entry's bytes (in raw_) -> its id
     // scratch for the pre-tokenizer and the merger, kept between calls
     std::vector<size_t> ends_;

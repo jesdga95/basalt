@@ -663,7 +663,7 @@ void test_experts() {
     void* scr = zeros<uint8_t>(bk::native_expert_scratch_bytes(R * K, FF));
     cudaStream_t st;
     cudaStreamCreate(&st);
-    moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx, xq, H, R, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, NE, R * K, xq, scr, rows, st);
     moe_combine(rows, dw, R, K, y, st);
@@ -690,7 +690,7 @@ void test_experts() {
         }
     report("experts (NVFP4, softcapped SwiGLU)", got, ref, 2e-2);   // q8_1 activations
     // the plan of row 1 alone gives that row's bits
-    moe_plan(dids + K, 1, K, NE, dtable, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids + K, 1, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx + H, xq, H, 1, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, K, K, xq, scr, rows, st);
     float* y1 = zeros<float>(H);
@@ -702,7 +702,7 @@ void test_experts() {
     std::vector<unsigned long long> off = table;
     off[2] = 0;
     unsigned long long* doff = dev(off);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st);
     cudaStreamSynchronize(st);
     const int n_g = host(ng, 1)[0];
     const std::vector<int32_t> hs = host(start, (size_t) R * K + 2), hd = host(dst, (size_t) R * K);
@@ -716,8 +716,8 @@ void test_experts() {
     failures += !plan_ok;
     // the console's tally: two plans add each expert's pairs on the card to its entry, the expert off it stays at zero
     uint32_t* tally = zeros<uint32_t>(NE);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
     cudaStreamSynchronize(st);
     const std::vector<uint32_t> ht = host(tally, NE);
     bool tally_ok = true;
@@ -2030,7 +2030,7 @@ void time_cpu_handoff() {
     for (void* q : {(void*) di, (void*) dt, (void*) da, (void*) dw, (void*) dx, (void*) dy}) cudaFree(q);
 }
 
-// A batch window (several conversations' rows in one call, docs/design/batching.md) against each conversation's own call:
+// A batch window (several conversations' rows in one call, docs/architecture/batching.md) against each conversation's own call:
 // the attention's q8_1 output, caches and rings, post_attn's outputs and rings, bitwise. Three segments
 // of 3, 1 and 2 rows (one at position 1, one past the window ring's wrap), over a window ring and a full cache, fp16 and E4M3.
 void test_batch_window() {
@@ -2277,7 +2277,7 @@ void test_router_select_plan() {
         cudaMemset(tl_ref, 0, NE * 4);
         cudaMemset(tl_got, 0, NE * 4);
         bk::router_select(dlog1, db, R, ra, di_ref, dw_ref, nullptr);
-        moe_plan(di_ref, R, K, NE, dt, p_ref, s_ref, ng_ref, dst_ref, tok_ref, nullptr, tl_ref, rb_ref, rn_ref);
+        bk::moe_plan(di_ref, R, K, NE, dt, p_ref, s_ref, ng_ref, dst_ref, tok_ref, nullptr, tl_ref, rb_ref, rn_ref);
         router_select_plan(dlog, db, R, K, NE, ra.weight_scale, di_got, dw_got, dt, p_got, s_got, ng_got, dst_got, tok_got, nullptr,
                            tl_got, rb_got, rn_got);
         cudaDeviceSynchronize();

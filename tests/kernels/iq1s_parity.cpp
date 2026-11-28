@@ -283,7 +283,7 @@ void cpu_pair(int gu, int d, std::mt19937& rng) {
     if (!ok) ++g_fail;
 }
 
-// IQ1_S dot against the CPU dequantizer on many rows: the ggml AVX2 dot vs double (isolates the new dot)
+// IQ1_S dot against the CPU dequantizer on many rows: the ggml AVX2 dot vs double (isolates the dot)
 void cpu_dot() {
     std::mt19937 rng(11);
     const int rows = 64;

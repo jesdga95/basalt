@@ -1,7 +1,7 @@
 # Adaptive expert tier
 
 Flash-Next only. The GPUs hold part of the experts. The adaptive tier counts what the conversation routes to and, in rounds beside decode, moves the most
-used experts into VRAM. The defaults are the fastest measured here.
+used experts into VRAM. The defaults are the fastest the project measured.
 
 ## How a round works
 
@@ -24,24 +24,6 @@ slots still depend on when each arrives.
 
 `hit=` in the `done` line counts only the main card's VRAM lookups, so a higher `hit` is not always faster. Compare `tg`.
 
-## Measured
+## Cadence
 
-RTX 5090 at 400 W (an RTX 5060 Ti at 180 W for two-card arms), NVFP4 pack, one fresh server per arm, one session: a cold 1,200-token prose request, then prose, code, prose and
-chat requests. Decode tok/s, one run per arm:
-
-| Arm (two cards: 400 W + 180 W) | Cold | Whole session |
-|---|---:|---:|
-| defaults | 285.5 | 297.8 |
-| `adapt-every 64`, `adapt-swaps 256`, `adapt-decay 0.7` | 232.4 | 212.1 |
-| `adapt-every 1`, `adapt-swaps 160` | 287.1 | 295.5 |
-
-| Arm (RTX 5090 alone, 400 W) | Cold | Whole session |
-|---|---:|---:|
-| defaults | 241.8 | 204.8 |
-| `adapt-every 64`, `adapt-swaps 256`, `adapt-decay 0.7` | 160.0 | 143.7 |
-| `adapt-every 1`, `adapt-swaps 160` | 230.1 | 206.2 |
-
-A long cadence is what hurts: the first round of a fresh engine and every topic change wait for it. Single-knob tests on two cards:
-`adapt-swaps 256` alone and `adapt-decay 0.7` alone stay within noise of the defaults.
-
-Smaller rounds can win where the card is small, since each round moves fewer experts over the link. [basalt-probe](../probe.md) tries these values on your machine, small rounds included.
+A long cadence is what hurts: the first round of a fresh engine and every topic change wait for it. Small rounds can win where the card is small, since each round moves fewer experts over the link. [basalt-probe](../probe.md) tries these values on your machine, small rounds included.

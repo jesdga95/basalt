@@ -77,7 +77,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
 /// the CPU math library by last bits. End-to-end correctness must be checked against the reference oracle.
 /// Validate both intermediate quantization and final outputs.
 /// Optional gate_up_trace receives [all gates | all ups] before SiLU, for parity diagnostics only.
-/// Plan v0.3 P4 token graph: the hit path with NO host step.  `moe_hit_select` builds this layer's hit list
+/// Token graph: the hit path with NO host step.  `moe_hit_select` builds this layer's hit list
 /// from the routed `ids` and the static residency row (`res_row[e]` = slot or -1) into `slot`/`dst`/`count`
 /// (device); `moe_hit_grouped_s2_dev` is `moe_hit_grouped_s2` sized for `cap` hits that reads the real count
 /// from `d_count`; `moe_hit_add` adds each hit's row of `hit_out` into `parts` (rows the CPU left at zero).
@@ -88,17 +88,17 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                             void* scratch, float* out, void* stream, const float* x_scales);
 void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
                  int64_t n_embd, void* stream);
-/// Plan v0.3 P6 verify window: `moe_hit_select` over `n` <= 128 routed entries (T tokens x k, flattened), and the
+/// Verify window: `moe_hit_select` over `n` <= 128 routed entries (T tokens x k, flattened), and the
 /// hit kernel with one activation PER TOKEN - entry `dst` reads token `dst / k_per_token`'s rows of `x_q8_0`
 /// ((n_embd/32)*34 bytes each) and `x_scales` (n_embd/32 floats each).  Per hit, bitwise `moe_hit_grouped_s2_dev`.
-/// Plan v0.3 P6: routed experts GROUPED.  Group g's blob is at device address grp_ptr[g] (a VRAM slot, or a mapped
+/// Routed experts GROUPED.  Group g's blob is at device address grp_ptr[g] (a VRAM slot, or a mapped
 /// host blob the kernel reads over PCIe); its entries are [grp_start[g], grp_start[g+1]) with ent_tok (the token
 /// whose activation row of x_q8_0/x_scales it reads) and ent_dst (its row of `out`).  Each row of a blob is read
 /// once for all of its entries.  Counts are read from device memory; every entry is bitwise the per-entry kernel.
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                     const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                     const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream);
-/// Plan v0.3 P6: the groups for `moe_grouped_s2` when every expert id is resident at base + id * blob (the MTP
+/// The groups for `moe_grouped_s2` when every expert id is resident at base + id * blob (the MTP
 /// layer's 512 experts): counts[0] groups, counts[1] entries; entry dst = routing index, tok = index / k_per_tok.
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,

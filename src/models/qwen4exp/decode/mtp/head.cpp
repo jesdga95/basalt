@@ -154,7 +154,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 if (cudaMalloc((void**) &proxy_, pb) == cudaSuccess && cudaMalloc(&proxy_scratch_, sb) == cudaSuccess) {
                     cudaMemset(proxy_, 0, pb);
                     if (head->type() == 13) basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
-                    else if (head->type() == GGML_Q8_0)   // the context rows (id -1 for now) are packed as they fill
+                    else if (head->type() == GGML_Q8_0)   // the context rows (id -1) are packed as they fill
                         basalt::kernels::q80_proxy_pack(head->weights(), 0, n_tier1_, proxy_, n_tier1_, nullptr, dvocab_);
                     else if (mapped)
                         basalt::kernels::q6k_proxy_pack(head->weights(), 0, n_tier1_, proxy_, n_tier1_, nullptr, dvocab_);

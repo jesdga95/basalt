@@ -76,7 +76,7 @@ public:
     int max_slots() const override { return kMaxT; }   // one row each of a window
     program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }
 
-    const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
+    const char* model_name(const core::Json&) const override { return "DeepSeek-V4.1-Flash"; }
     const char* community_kv() const override { return "fp8"; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {

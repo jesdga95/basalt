@@ -163,7 +163,9 @@ __device__ __forceinline__ float sqrt_softplus(float x) {
     return sqrtf(sp);
 }
 
-__device__ __forceinline__ float score(float x, int gate) { return gate == 0 ? sqrt_softplus(x) : 1.f / (1.f + expf(-x)); }
+__device__ __forceinline__ float score(float x, int gate) {
+    return gate == 0 ? sqrt_softplus(x) : gate == 1 ? 1.f / (1.f + expf(-x)) : x;
+}
 
 // Shared memory of one token's selection.
 struct SelectScratch {
@@ -186,7 +188,7 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
                                     SelectScratch& sh, const ResidentTabs& held, float prior) {
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
     float s = score(logits[e], gate);
-    float b = s + bias[e];
+    float b = bias ? s + bias[e] : s;
     if (kPrior && held.held(e)) b += prior;
     if (isnan(b)) { b = -INFINITY; s = 0.f; }
     float m = b;
@@ -226,7 +228,11 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
         }
     }
     __syncthreads();
-    if (e == 0) {
+    if (e == 0 && gate == 2) {   // softmax over the chosen logits, the largest first
+        float sum = 0.f;
+        for (int r = 0; r < k; ++r) sum += expf(sh.sel[r] - sh.sel[0]);
+        for (int r = 0; r < k; ++r) weights[r] = expf(sh.sel[r] - sh.sel[0]) / sum * scale;
+    } else if (e == 0) {
         float sum = 0.f;
         for (int r = 0; r < k; ++r) sum += sh.sel[r];
         if (isfinite(sum)) {
@@ -324,7 +330,8 @@ router_logits_2304_kernel(const float* __restrict__ x, const float* __restrict__
     }
 }
 
-// Warp-register Top-k router selection for NE in {128, 256} (4 warps = 4 tokens per block, zero barriers, bitwise identical).
+// Warp-register Top-k router selection for NE in {128, 256} (4 warps = 4 tokens per block, zero barriers): bitwise identical to
+// router_select_kernel, with or without a bias, the softmax gate included.
 template <int NE>
 __global__ void __launch_bounds__(128)
 router_select_warp_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n_tokens, int k,
@@ -334,7 +341,7 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
     const int t = blockIdx.x * 4 + warp;
     float bias_reg[EP];
 #pragma unroll
-    for (int j = 0; j < EP; ++j) bias_reg[j] = bias[lane + 32 * j];
+    for (int j = 0; j < EP; ++j) bias_reg[j] = bias ? bias[lane + 32 * j] : 0.f;
     pdl_wait();
     pdl_launch_dependents();
     if (t >= n_tokens) return;
@@ -343,7 +350,7 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
 #pragma unroll
     for (int j = 0; j < EP; ++j) {
         s[j] = score(tl[lane + 32 * j], gate);
-        b[j] = s[j] + bias_reg[j];
+        b[j] = bias ? s[j] + bias_reg[j] : s[j];
     }
     int sel_id = 0;
     float sel_s = 0.f;
@@ -377,6 +384,16 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
 #pragma unroll
         for (int j = 0; j < EP; ++j)
             if (bi == lane + 32 * j) b[j] = -INFINITY;
+    }
+    if (gate == 2) {   // softmax over the chosen logits, the largest first
+        const float x = expf(sel_s - __shfl_sync(0xffffffffu, sel_s, 0));
+        float sum = 0.f;
+        for (int r = 0; r < k; ++r) sum += __shfl_sync(0xffffffffu, x, r);
+        if (lane < k) {
+            ids[(size_t) t * k + lane] = sel_id;
+            weights[(size_t) t * k + lane] = x / sum * scale;
+        }
+        return;
     }
     float sum = 0.f;
     for (int r = 0; r < k; ++r) sum += __shfl_sync(0xffffffffu, sel_s, r);

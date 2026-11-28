@@ -148,7 +148,7 @@ void seed_usage_from_prompt(std::vector<float>& usage, const std::vector<uint32_
 class QfnRequest;
 class QfnRuntime;
 
-// A batch slot as a session of the shared batch driver (docs/design/batching.md): its windows run on the runtime's
+// A batch slot as a session of the shared batch driver (docs/architecture/batching.md): its windows run on the runtime's
 // verifier over the slot's own state (Verifier::run_slot_segs), a window's kept rows are committed at once (decode_kept),
 // and its drafts come from the drafter's store of the slot, by the drafter's own length rule.
 class QfnSlotSession final : public basalt::model::BatchSession {

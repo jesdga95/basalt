@@ -2,9 +2,8 @@
 //
 // A q8_1 block stores its scale d = amax / 127 and the sum of its 32 raw activations as fp16. A sum past 65504 (one
 // massive-activation dimension among 32 values is enough) rounds to inf, and d does past amax = 8.3M; the dot
-// products then read inf * 0 = NaN, and a NaN in the residual ends as one token repeated (ggml-org/llama.cpp#23606
-// is the same defect). Clamped to the largest finite half, such a block gives an approximate product instead of NaN,
-// and the values are held to the int8 range they then exceed. Every block that was finite before is stored bit for
+// products then read inf * 0 = NaN, and a NaN in the residual ends as one token repeated.
+// Clamped to the largest finite half, such a block gives an approximate product instead of NaN, and the values are held to the int8 range they then exceed. Every block that was finite before is stored bit for
 // bit as before: values in (65504, 65520) round to 65504 anyway, and a finite block's |x / d| is at most 127. A NaN
 // stays NaN (the comparisons are false for it), so DBG_NAN still sees one.
 #pragma once

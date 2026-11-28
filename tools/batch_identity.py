@@ -3,7 +3,7 @@
     python3 tools/batch_identity.py ENGINE --model FILE.basalt [--slots 2,4,8] [--tokens N] [--fixtures DIR]
                                     [--out FILE.json] [-- ENGINE ARGS...]
 
-The serve-level batch check of any model (docs/design/batching.md). First each prompt (the bench fixtures conv, struct,
+The serve-level batch check of any model (docs/architecture/batching.md). First each prompt (the bench fixtures conv, struct,
 prose) runs in an engine of one slot (`--serve --batch 1`, the same code as `--parallel 1`): the reference. Then for each
 slot count N the engine runs as `--serve --batch N`: each of N prompts (the fixtures in turn) runs alone in slot 0, then
 all N run together, one per slot, at temperature 0. Every slot's tokens, alone and together, must equal the reference.

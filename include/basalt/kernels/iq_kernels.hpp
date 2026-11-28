@@ -52,7 +52,8 @@ struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
     int up_type = -1;                   // the up rows' type (gu_type when they agree)
     int64_t n_embd = 0, n_ff = 0;
-    size_t gu_row = 0, d_row = 0;       // bytes per gate row and per down row
+    size_t gu_row = 0, d_row = 0;       // bytes per gate row and per down row (an MXFP8 down row whose n_ff is not whole
+                                        // 128-value blocks is padded with zero columns to them; GELU gate only)
     size_t up_row = 0;                  // bytes per up row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
@@ -60,6 +61,8 @@ struct NativeExpertLayout {
     /// > 0: the softcapped SwiGLU instead, h = gate_softcap tanh(g / gate_softcap) sigmoid(g) up_softcap tanh(u / up_softcap)
     /// (the sigmoid sees the raw gate; the caps bound its linear factor and up). Both set together.
     float gate_softcap = 0.0f, up_softcap = 0.0f;
+    /// The gated activation is GELU in its tanh form, h = gelu_tanh(g) up, instead of SiLU (not with the limit or the caps).
+    bool gelu = false;
 };
 /// `swiglu_limit` rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
 /// the peer card, the remote tier) applies it without a signature change.
@@ -70,6 +73,10 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).  A layer
 /// whose up type differs (`up_type`, -1: the same) is covered only for the mixes the kernels are built for.
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1) noexcept;
+
+/// A blob's stride on the card: `blob` bytes rounded up to whole blocks of its `type` (Q8_0, NVFP4, MXFP8) and 16 bytes,
+/// so a kernel reads each expert's blocks in place.
+uint64_t native_expert_stride(int type, uint64_t blob);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

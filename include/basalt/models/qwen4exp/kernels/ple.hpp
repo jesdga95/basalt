@@ -54,7 +54,7 @@ struct PleWeights {
     const void* key_native_data = nullptr;
     int key_native_type = -1;
     void* key_native_q8_1 = nullptr;
-    /// Plan v0.3 P6: the IQ model files keep `ple_key` in BF16 ([n_embd, hc_dim], `w[o*n_embd+i]`); when set it
+    /// The IQ model files keep `ple_key` in BF16 ([n_embd, hc_dim], `w[o*n_embd+i]`); when set it
     /// replaces both key paths above.
     const uint16_t* key_bf16 = nullptr;
 };

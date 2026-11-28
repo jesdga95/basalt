@@ -58,6 +58,7 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 
 class ExpertCache {
 public:
+    static constexpr uint64_t kReadPast = 4096;   ///< bytes after the last slot of open_sized's arena (the kernels' last loads)
     ExpertCache() = default;
     ~ExpertCache();
     ExpertCache(const ExpertCache&) = delete;

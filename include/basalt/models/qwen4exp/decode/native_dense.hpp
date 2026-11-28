@@ -30,7 +30,7 @@ public:
               uint64_t slab_cap = 0, LoadPlan* into = nullptr);
     /// The bytes of the block the matrices of `plan_bytes`' total take (their alignment included).
     static uint64_t slab_bytes(uint64_t plan_total);
-    /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
+    /// The canonical tensor names `load` would serve natively from these shards (eligible name,
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
                              std::set<std::string>& out, std::string& err);

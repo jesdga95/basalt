@@ -116,7 +116,7 @@ struct Bufs {
     }
 };
 
-// The forward scratch every session of a model shares (docs/design/batching.md, "Per-slot state and shared scratch"): the row
+// The forward scratch every session of a model shares (docs/architecture/batching.md, "Per-slot state and shared scratch"): the row
 // buffers of a decode window, the experts' staging and the products' workspaces. The engine runs one call at a time and each call
 // syncs its stream before it returns, so one set serves every session; only a conversation's own state is per session.
 struct Scratch {
@@ -652,7 +652,7 @@ public:
         return {};
     }
 
-    // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
+    // ---- batch windows (docs/architecture/batching.md): several sessions' windows in one pass through the weights, on this
     // session's scratch and stream. Each conversation keeps its latent caches, rings, pooled keys, Engram history, drafter
     // context, logits and draws; the attention, the indexer and the Engram's lookups run per segment over its own state, the
     // rest over every row. The host places the experts between the layers' graphs, so the forward runs directly every window
@@ -1861,8 +1861,8 @@ private:
     // A short chunk's experts the CPU computes: their jobs, (token, slot) pairs in row order, and the thread that runs them.
     static constexpr int kCpuRows = 8;          // a RAM expert with this few rows in a short chunk may go to the CPU
     static constexpr int kCpuMaxRows = 1024;    // the most rows the CPU takes of a layer
-    // The split's prices (prefill::cpu_take), measured on an RTX 5090 (x8 PCIe 5) with 15 pool workers over short turns: the CPU reads
-    // about 2.67 GB/s of expert weights a worker; the main card stages and runs RAM experts at 0.85 of its link's rate.
+    // The split's prices (prefill::cpu_take): the CPU's expert-weight read rate per pool worker, and the share of its link's
+    // rate at which the main card stages and runs RAM experts.
     static constexpr double kCpuWorkerBytesPerMs = 2.67e6, kCpuMsPerRow = 0.006, kCardLinkShare = 0.85;
     double link_bytes_ = -1;   // the main card's link (NVML), read once
     prefill::CpuBusRates cpu_rates() {
@@ -2856,7 +2856,7 @@ private:
     static constexpr uint64_t kReadAheadBytes = 56ull << 20;
     void read_ahead(int l, uint32_t word, cudaStream_t st) {
         if (ra_.empty()) {   // every layer's ranges, once
-            // Cap read-ahead to 7/12 of the card's L2 cache (56 MiB on a 96 MiB 5090, 28 MiB on a 48 MiB 5070 Ti)
+            // Cap read-ahead to 7/12 of the card's L2 cache
             // so the tail of the prefetch does not evict its own head or active KV/expert lines.
             int l2 = 0;
             uint64_t cap = kReadAheadBytes;

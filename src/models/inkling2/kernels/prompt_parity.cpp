@@ -9,6 +9,7 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
+#include "basalt/kernels/expert_plan.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/router.hpp"
@@ -608,8 +609,8 @@ void test_sort() {
     }
     int32_t* dids = dev(ids);
     int32_t *bounds = zeros<int32_t>(NE + 1), *tok = zeros<int32_t>(P), *dst = zeros<int32_t>(P), *ex = zeros<int32_t>(P);
-    void* scr = zeros<uint8_t>(moe_sort_scratch(P, NE));
-    moe_sort(dids, R, K, NE, scr, bounds, tok, dst, ex, S);
+    void* scr = zeros<uint8_t>(bk::moe_sort_scratch(P, NE));
+    bk::moe_sort(dids, R, K, NE, scr, bounds, tok, dst, ex, S);
     std::vector<int32_t> rb(NE + 1, 0), rt, rd, re;
     for (int e = 0; e < NE; ++e) {
         rb[e] = (int32_t) rt.size();
@@ -624,14 +625,14 @@ void test_sort() {
     const bool ok = host(bounds, NE + 1) == rb && host(tok, P) == rt && host(dst, P) == rd && host(ex, P) == re;
     std::printf("%-44s %s\n", "moe_sort vs CPU stable sort (2,048 rows)", ok ? "exact" : "FAIL");
     failures += !ok;
-    const double us = time_us([&] { moe_sort(dids, R, K, NE, scr, bounds, tok, dst, ex, S); });
+    const double us = time_us([&] { bk::moe_sort(dids, R, K, NE, scr, bounds, tok, dst, ex, S); });
     std::printf("  moe_sort 2,048 rows x 8: %.1f us\n", us);
 
     // pairs another card computes (id -1) are left out; bounds[NE] counts the rest
     std::vector<int32_t> part = ids;
     for (size_t i = 0; i < part.size(); ++i)
         if (part[i] % 3 == 0) part[i] = -1;
-    moe_sort(dev(part), R, K, NE, scr, bounds, tok, dst, ex, S);
+    bk::moe_sort(dev(part), R, K, NE, scr, bounds, tok, dst, ex, S);
     std::vector<int32_t> pb(NE + 1, 0), pt, pd, pe;
     for (int e = 0; e < NE; ++e) {
         pb[e] = (int32_t) pt.size();
@@ -745,7 +746,7 @@ void test_experts(int type) {
     float *dw = dev(w), *dx = dev(x);
     // the prompt path: sort, q8_1 rows by expert, gate/up, softcapped SwiGLU, q8_1 H, down, the weighted sum
     int32_t *bounds = zeros<int32_t>(NE + 1), *tok = zeros<int32_t>(P), *dst = zeros<int32_t>(P), *rexp = zeros<int32_t>(P), *ident = zeros<int32_t>(P);
-    void* scr = zeros<uint8_t>(moe_sort_scratch(P, NE));
+    void* scr = zeros<uint8_t>(bk::moe_sort_scratch(P, NE));
     void* xq = zeros<uint8_t>(mmq::q8_bytes(P, E));
     float *gu = zeros<float>((size_t) P * 2 * F), *h = zeros<float>((size_t) P * F), *y = zeros<float>((size_t) R * E);
     mmq::iota(ident, P, S);
@@ -754,7 +755,7 @@ void test_experts(int type) {
     mmq::Context ctx;
     const auto prompt = [&](int rows, const int32_t* ids_r, const float* x_r, const float* w_r, float* y_r) {
         const int pairs = rows * K;
-        moe_sort(ids_r, rows, K, NE, scr, bounds, tok, dst, rexp, S);
+        bk::moe_sort(ids_r, rows, K, NE, scr, bounds, tok, dst, rexp, S);
         mmq::quantize(x_r, tok, xq, type, E, E, pairs, S);
         mmq::Product p;
         p.w = blobs;
@@ -804,7 +805,7 @@ void test_experts(int type) {
         void* dscr = zeros<uint8_t>(bk::native_expert_scratch_bytes(WP, F));
         float *rows = zeros<float>((size_t) WP * E), *yd = zeros<float>((size_t) R * E);
         for (int r0 = 0; r0 < R; r0 += W) {
-            moe_plan(dids + (size_t) r0 * K, W, K, NE, dtable, ptr, start, ng, ddst, dtok, S);
+            basalt::kernels::moe_plan(dids + (size_t) r0 * K, W, K, NE, dtable, ptr, start, ng, ddst, dtok, S);
             bk::native_quantize_q8_1(dx + (size_t) r0 * E, dxq, E, W, S);
             bk::native_expert_grouped(ex.L, ptr, start, ng, ddst, dtok, std::min(WP, NE), WP, dxq, dscr, rows, S);
             moe_combine(rows, dw + (size_t) r0 * K, W, K, yd + (size_t) r0 * E, S);
@@ -866,11 +867,11 @@ void test_experts(int type) {
             for (int s = 0; s < K; ++s) big[(size_t) r * K + s] = perm[s];
         }
         int32_t *bids = dev(big), *bb = zeros<int32_t>(NE + 1), *bt = zeros<int32_t>(PP), *bd = zeros<int32_t>(PP), *be = zeros<int32_t>(PP), *bi = zeros<int32_t>(PP);
-        void* bscr = zeros<uint8_t>(moe_sort_scratch(PP, NE));
+        void* bscr = zeros<uint8_t>(bk::moe_sort_scratch(PP, NE));
         void* bxq = zeros<uint8_t>(mmq::q8_bytes(PP, E));
         float *bgu = zeros<float>((size_t) PP * 2 * F), *bh = zeros<float>((size_t) PP * F), *bx = dev(randn((size_t) RR * E, 1.f));
         mmq::iota(bi, PP, S);
-        moe_sort(bids, RR, K, NE, bscr, bb, bt, bd, be, S);
+        bk::moe_sort(bids, RR, K, NE, bscr, bb, bt, bd, be, S);
         mmq::quantize(bx, bt, bxq, type, E, E, PP, S);
         mmq::Product p;
         p.w = blobs;
@@ -989,14 +990,14 @@ void test_experts_fp4() {
     const int RMAX = 8192, PMAX = RMAX * K;   // the longest prompt chunk (prompt.hpp kSpillPromptChunk)
     int32_t *bounds = zeros<int32_t>(NE + 1), *tok = zeros<int32_t>(PMAX), *dst = zeros<int32_t>(PMAX), *rexp = zeros<int32_t>(PMAX);
     int32_t *toff = zeros<int32_t>(NE + 1), *boff = zeros<int32_t>(NE + 1);
-    void* scr = zeros<uint8_t>(moe_sort_scratch(PMAX, NE));
+    void* scr = zeros<uint8_t>(bk::moe_sort_scratch(PMAX, NE));
     void* a4x = zeros<uint8_t>(fp4::token_bytes(RMAX, 2 * E));   // two terms a row
     void* a4h = zeros<uint8_t>(fp4::a4_bytes(PMAX, 2 * F, NE));
     float *gsx = zeros<float>(RMAX), *gsh = zeros<float>(fp4::scale_count(PMAX, NE));
     float *h = zeros<float>((size_t) PMAX * F), *o = zeros<float>((size_t) PMAX * E), *y = zeros<float>((size_t) R * E);
     const auto run = [&](int rows, const int32_t* ids_r, const float* x_r, const float* w_r, float* y_r, bool combine) {
         const int pairs = rows * K;
-        moe_sort(ids_r, rows, K, NE, scr, bounds, tok, dst, rexp, S);
+        bk::moe_sort(ids_r, rows, K, NE, scr, bounds, tok, dst, rexp, S);
         fp4::plan_blocks(bounds, NE, toff, boff, S);
         fp4::quantize_tokens(x_r, rows, E, E, a4x, gsx, S, true);
         fp4::Product gu;
@@ -1099,7 +1100,7 @@ void test_experts_fp4() {
     // deterministic fp16 intermediate pipeline matches fp32 down + moe_combine and CPU double
     {
         float* yf = zeros<float>((size_t) R * E);
-        moe_sort(dids, R, K, NE, scr, bounds, tok, dst, rexp, S);
+        bk::moe_sort(dids, R, K, NE, scr, bounds, tok, dst, rexp, S);
         fp4::plan_blocks(bounds, NE, toff, boff, S);
         fp4::quantize_tokens(dx, R, E, E, a4x, gsx, S, true);
         fp4::Product gu;
@@ -1120,7 +1121,7 @@ void test_experts_fp4() {
         report("  fp16 H + fp16 down + combine_f16 vs CPU", std::vector<float>(gf.begin(), gf.begin() + 8 * E), ref, 2e-2);
         // Chunk invariance of the fp16 pipeline: rows 0..99 alone must be bitwise identical
         float* yf2 = zeros<float>((size_t) 100 * E);
-        moe_sort(dids, 100, K, NE, scr, bounds, tok, dst, rexp, S);
+        bk::moe_sort(dids, 100, K, NE, scr, bounds, tok, dst, rexp, S);
         fp4::plan_blocks(bounds, NE, toff, boff, S);
         fp4::quantize_tokens(dx, 100, E, E, a4x, gsx, S, true);
         gu.blocks = fp4::max_blocks(100 * K, NE); gu.tokens = 100;
