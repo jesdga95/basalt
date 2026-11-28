@@ -10,8 +10,8 @@ from pathlib import Path
 from serve.engine.mock import MockEngine
 from serve.frontend import openai_to_messages
 from serve.models import dialect_for
-from serve.models.gemma4 import (CALL, CALL_END, CHANNEL, CLOSE, END_TURN, EOS, HEAD, IMAGE, IMAGE_END, IMAGE_PAD, OWN_TOKENS,
-                                 QUOTE, RESPONSE, Gemma4, Gemma4Parser)
+from serve.models.gemma4 import (BOS, CALL, CALL_END, CHANNEL, CLOSE, END_TURN, EOS, HEAD, IMAGE, IMAGE_END, IMAGE_PAD,
+                                 OWN_TOKENS, QUOTE, RESPONSE, Gemma4, Gemma4Parser)
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -25,7 +25,7 @@ DECLARED = ('<|tool>declaration:get_weather{description:<|"|>Get weather<|"|>,pa
             'type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:f{description:<|"|>A function<|"|>}<tool|>')
 USER = {"role": "user", "content": "hi"}
 TURN_USER = "<|turn>user\nhi<turn|>\n"
-THINK = "<|turn>system\n<|think|>\n"
+THINK = BOS + "<|turn>system\n<|think|>\n"     # the prompt opens with the bos token
 EMPTY = "<|channel>thought\n<channel|>"
 
 
@@ -101,13 +101,13 @@ class Reference(unittest.TestCase):
         self.assertEqual(render([USER]), THINK + "<turn|>\n" + TURN_USER + "<|turn>model\n")
 
     def test_thinking_off_ends_in_the_empty_channel(self):
-        self.assertEqual(render([USER], enable_thinking=False), TURN_USER + "<|turn>model\n" + EMPTY)
+        self.assertEqual(render([USER], enable_thinking=False), BOS + TURN_USER + "<|turn>model\n" + EMPTY)
 
     def test_a_system_message_shares_the_first_turn_with_the_switch(self):
         msgs = [{"role": "system", "content": " Be brief. "}, USER]
         self.assertEqual(render(msgs), THINK + "Be brief.<turn|>\n" + TURN_USER + "<|turn>model\n")
         self.assertEqual(render(msgs, enable_thinking=False),
-                         "<|turn>system\nBe brief.<turn|>\n" + TURN_USER + "<|turn>model\n" + EMPTY)
+                         BOS + "<|turn>system\nBe brief.<turn|>\n" + TURN_USER + "<|turn>model\n" + EMPTY)
 
     def test_a_conversation_drops_earlier_thinking(self):
         msgs = [USER, {"role": "assistant", "content": "Hello.", "reasoning_content": "old thoughts"},
@@ -119,13 +119,14 @@ class Reference(unittest.TestCase):
     def test_a_model_turn_that_ends_after_its_answer_keeps_its_thinking(self):
         msgs = [USER, {"role": "assistant", "content": "Hello.", "reasoning_content": "fresh"}]
         self.assertEqual(render(msgs, enable_thinking=False),
-                         TURN_USER + "<|turn>model\n<|channel>thought\nfresh\n<channel|>Hello.<turn|>\n<|turn>model\n" + EMPTY)
+                         BOS + TURN_USER + "<|turn>model\n<|channel>thought\nfresh\n<channel|>Hello.<turn|>\n<|turn>model\n"
+                         + EMPTY)
 
     def test_tools_are_declared_in_the_system_turn(self):
         self.assertEqual(render([USER], TOOLS), THINK + DECLARED + "<turn|>\n" + TURN_USER + "<|turn>model\n")
         msgs = [{"role": "system", "content": "Sys."}, USER]
         self.assertEqual(render(msgs, TOOLS, enable_thinking=False),
-                         "<|turn>system\nSys." + DECLARED + "<turn|>\n" + TURN_USER + "<|turn>model\n" + EMPTY)
+                         BOS + "<|turn>system\nSys." + DECLARED + "<turn|>\n" + TURN_USER + "<|turn>model\n" + EMPTY)
 
     def round_trip(self):
         return [USER, {"role": "assistant", "content": "", "reasoning_content": "Look it up.", "tool_calls": [
@@ -143,7 +144,7 @@ class Reference(unittest.TestCase):
         off = render(self.round_trip(), TOOLS, enable_thinking=False)
         turn = "<|turn>model\n"
         self.assertEqual(off, off.split(turn)[0] + turn + head.split(turn)[1] + calls + answers)
-        self.assertTrue(off.startswith("<|turn>system\n<|tool>"))
+        self.assertTrue(off.startswith(BOS + "<|turn>system\n<|tool>"))
 
     def test_the_server_names_each_result_after_its_call(self):
         body = {"messages": [
@@ -161,7 +162,7 @@ class Reference(unittest.TestCase):
     def test_an_image_is_the_block_the_model_reads(self):
         msgs = [{"role": "user", "content": [{"type": "text", "text": "see"}, {"type": "image", "source": "x"}]}]
         self.assertEqual(render(msgs, enable_thinking=False),
-                         "<|turn>user\nsee" + IMAGE + IMAGE_PAD + IMAGE_END + "<turn|>\n<|turn>model\n" + EMPTY)
+                         BOS + "<|turn>user\nsee" + IMAGE + IMAGE_PAD + IMAGE_END + "<turn|>\n<|turn>model\n" + EMPTY)
 
     def test_the_registry(self):
         self.assertIsInstance(dialect_for("gemma4"), Gemma4)
@@ -185,7 +186,7 @@ class Controls(unittest.TestCase):
             self.assertEqual(self.prompt(reasoning_effort=level), self.prompt(), level)
 
     def test_off_is_the_empty_channel(self):
-        self.assertEqual(self.prompt(enable_thinking=False), TURN_USER + "<|turn>model\n" + EMPTY)
+        self.assertEqual(self.prompt(enable_thinking=False), BOS + TURN_USER + "<|turn>model\n" + EMPTY)
 
     def test_minimal_is_off(self):
         self.assertEqual(self.prompt(reasoning_effort="minimal"), self.prompt(enable_thinking=False))
@@ -374,7 +375,7 @@ class Tokens(unittest.TestCase):
     def test_the_prompt_special_tokens_are_the_models(self):
         ids = service().encode_prompt([USER], None, {"enable_thinking": False})
         tok = GemmaTokenizer()
-        self.assertEqual(ids, tok.encode("<|turn>user\nhi<turn|>\n<|turn>model\n" + EMPTY, parse_special=True))
+        self.assertEqual(ids, tok.encode(BOS + "<|turn>user\nhi<turn|>\n<|turn>model\n" + EMPTY, parse_special=True))
 
 
 class Run(unittest.TestCase):

@@ -18,6 +18,7 @@ from serve import frontend
 from serve.frontend import Event, ToolCall
 from serve.models import Dialect
 
+BOS = "<bos>"                           # the template's bos_token: the prompt opens with it
 CHANNEL = "<|channel>"
 HEAD = CHANNEL + "thought\n"            # what opens the model's thinking
 CLOSE = "<channel|>"
@@ -30,7 +31,7 @@ RESPONSE = "<|tool_response>"
 IMAGE = "<|image>"
 IMAGE_PAD = "<|image|>"
 IMAGE_END = "<image|>"
-OWN_TOKENS = ("<bos>", EOS, "<pad>", "<|turn>", END_TURN, "<|think|>", CHANNEL, CLOSE, "<|tool>", "<tool|>", CALL, CALL_END,
+OWN_TOKENS = (BOS, EOS, "<pad>", "<|turn>", END_TURN, "<|think|>", CHANNEL, CLOSE, "<|tool>", "<tool|>", CALL, CALL_END,
               RESPONSE, "<tool_response|>", QUOTE, IMAGE, IMAGE_PAD, IMAGE_END, "<|audio>", "<|audio|>", "<audio|>", "<|video|>")
 MARK0 = 0xF2500                         # the marks of the dialect's own tokens while a message is rendered
 _NUMBER = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
@@ -405,10 +406,11 @@ class Gemma4(Dialect):
 
     def template_kwargs(self, kwargs):
         """The template's thinking switch, on unless the request turned it off (the template's own default is off); it
-        has no levels."""
+        has no levels. The template's `bos_token` too, which opens the prompt."""
         out = super().template_kwargs(kwargs)
         out.pop("reasoning_effort", None)
         out.setdefault("enable_thinking", True)
+        out["bos_token"] = BOS
         return out
 
     def template(self, source):
