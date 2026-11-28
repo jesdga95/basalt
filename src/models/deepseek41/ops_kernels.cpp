@@ -717,16 +717,17 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
+        // Submit pending copies before arming the next share.
         core::PeerExperts* peer = tier_->peer_for(il);   // the card that holds this layer's second-card homes
         PeerArm armed;
+        if (peer && !peer->prepare_for_copy_pump(err)) return false;
+        tier_->pump(il, 2 + T);
         if (peer) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             if (!peer->arm(limited, h_x_, T, K, core::policy::peer_groups(T), err)) return false;
             armed.peer = peer;
         }
-        tier_->pump(il, 2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
         int32_t uniq[kLookupK];
         int nu = 0;
@@ -872,16 +873,17 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        // the second card's share goes out while the head runs: its kernels wait on the card for the plan
+        // Submit pending copies before arming the next share.
         core::PeerExperts* peer = tier_->peer_for(il);   // the card that holds this layer's second-card homes
         PeerArm armed;
+        if (peer && !peer->prepare_for_copy_pump(err)) return false;
+        tier_->pump(il, 3);
         if (peer) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             if (!peer->arm(limited, h_x_, 1, K, core::policy::peer_groups(1), err)) return false;
             armed.peer = peer;
         }
-        tier_->pump(il, 3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
         core::ExpertTier::Lookup lk;

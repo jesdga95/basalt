@@ -284,6 +284,11 @@ bool PeerExperts::read_until(int64_t m, std::string& err) {
     return ck(cudaEventSynchronize(marks_[(size_t) (m % (int64_t) marks_.size())]), "reading experts", err);
 }
 
+bool PeerExperts::prepare_for_copy_pump(std::string& err) {
+    if (armed_) { err = "peer experts: previous share is still armed before copy pump"; return false; }
+    return !queued_ || idle(err);
+}
+
 bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, LoadPlan& reads, std::string& err) {
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const int device = device_;
