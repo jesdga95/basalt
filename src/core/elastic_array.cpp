@@ -30,10 +30,11 @@ ElasticArray::~ElasticArray() {
     vmm::release_range(base_, reserved_);
 }
 
-bool ElasticArray::open(uint64_t bytes, std::string& err) {
+bool ElasticArray::open(uint64_t bytes, std::string& err, uint32_t step_granules) {
     if (bytes == 0) bytes = 1;
     if (vmm::supported()) {
         gran_ = vmm::granularity();
+        step_ = gran_ * (step_granules > 0 ? step_granules : 1);
         if (gran_) {
             reserved_ = (bytes + gran_ - 1) / gran_ * gran_;
             base_ = vmm::reserve(reserved_);
@@ -57,11 +58,9 @@ bool ElasticArray::open(uint64_t bytes, std::string& err) {
     return true;
 }
 
-// grow in steps of a few granules so a long generation maps rarely
 uint64_t ElasticArray::growth(uint64_t bytes) const {
     if (bytes <= backed_ || bytes > reserved_) return 0;
-    const uint64_t step = gran_ * 4;
-    return std::min(reserved_, (bytes + step - 1) / step * step) - backed_;
+    return std::min(reserved_, (bytes + step_ - 1) / step_ * step_) - backed_;
 }
 
 bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {

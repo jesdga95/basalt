@@ -38,6 +38,7 @@
 #include "basalt/model/adapter.hpp"
 #include "basalt/models/inkling2/dspark_kernels.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/program/options.hpp"
 #include "models/inkling2/pack.hpp"
@@ -130,9 +131,12 @@ private:
 /// when it has one this engine does not run.
 model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DsparkWeights>& out);
 
-/// The device bytes a session's drafter takes for `context` positions with a tap of `tap_rows` rows (0 without a drafter).
-/// A session's drafter bytes (its caches and its steps' scratch), the shared tap aside.
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context);
+/// The device bytes a session's drafter holds of its own (its rings and its steps' scratch; 0 without a drafter), the shared
+/// tap and its full layers' caches aside.
+uint64_t dspark_session_bytes(const Pack& pack);
+/// The KV pool bytes the drafter's full layers of one session take at `positions` positions, each cache's allocation
+/// granules of `gran` bytes counted whole (0 for a drafter without per-position cells); `int8`: its full layers' int8 caches.
+uint64_t dspark_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran, bool int8);
 /// The tap of `tap_rows` rows: the target's features of a call's rows, which every session's commit reads (one shared).
 uint64_t dspark_tap_bytes(int tap_rows);
 
@@ -147,10 +151,11 @@ public:
     /// `w` null: no drafter. `context` the session's positions; `tap_rows` the most rows one forward fills the tap with.
     /// `dump` (--diag-dump's directory, may be empty): every committed run's features and the first blocks' outputs (their
     /// final rows, every draft's logits, the drafts) go to dspark.bin there in order, to replay against a reference.
-    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). `backed` > 0: the full layers' caches reserve the context and
-    /// back only the cells of the first `backed` positions (and a block past them), growing with the target's (ensure).
+    /// `tap`: the shared tap of `tap_rows` rows (dspark_tap_bytes). The full layers' caches reserve the context and back
+    /// nothing at start, growing with the target's (ensure).
+    /// `int8`: the full layers' K and V by the int8 cache's quantization rule (with --kv int8), in the drafter's own dense layout; the rings stay fp16.
     bool init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
-              int64_t backed, std::string& err);
+              bool int8, std::string& err);
     bool on() const { return w_ != nullptr || df2_ != nullptr; }
     bool dumping() const { return dump_ != nullptr; }
     /// The tap slot visit `visit` fills with its input rows, or -1.
@@ -187,28 +192,17 @@ public:
     void running_state(int64_t pos, bool save, core::RunningState& st) const;
     bool running_restored(int64_t pos, const uint8_t* head);
     size_t cells_bytes(int64_t positions) const;
-    /// The elastic caches (init's `backed`): the device bytes ensure(positions) maps, backing the cells of `positions`
-    /// positions and a block past them; trim gives back what lies past them.
-    uint64_t grow_bytes(int64_t positions) const;
-    bool ensure(int64_t positions, std::string& err);
+    /// The pooled caches (DSpark's full layers for `target` positions, the session's grow step; DFlash 2's rings for
+    /// `positions`, the positions themselves): the device bytes ensure maps, backing their cells and a block past them;
+    /// trim gives back what lies past them.
+    uint64_t grow_bytes(int64_t target, int64_t positions) const;
+    bool ensure(int64_t target, int64_t positions, std::string& err);
     void trim(int64_t positions);
     int64_t backed_cells() const;
-    bool usable() const {
-        for (const auto& a : full_)
-            if (!a->usable()) return false;
-        return true;
-    }
+    bool usable() const;
     /// The last ensure failed only because the device lacked the memory.
-    bool out_of_memory() const {
-        for (const auto& a : full_)
-            if (a->out_of_memory()) return true;
-        return false;
-    }
-    uint64_t backing_bytes() const {
-        uint64_t n = 0;
-        for (const auto& a : full_) n += a->backed();
-        return n;
-    }
+    bool out_of_memory() const;
+    uint64_t backing_bytes() const;
     bool save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const;
     /// Restores from kv[at..]; `at` moves past what it read. False when kv holds no drafter cells of that shape.
     bool restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream);
@@ -217,10 +211,13 @@ private:
     friend class DsparkBatch;
     struct Cache {
         uint16_t *k = nullptr, *v = nullptr;   ///< fp16 [cap][kv heads][head width], position p at cell p % cap
+        basalt::kernels::KvInt8 q8;            ///< or the int8 cache (`q8.k` set; `k`, `v` null)
         int64_t cap = 0;
         bool ring = false;
     };
     void* dev(size_t bytes, bool& ok);
+    /// Segment i of a kernel's caches (DsCommitSegs, DsBatchKv): `c`'s fp16 K and V, or its int8 codes and scales.
+    static void put_cache(const Cache& c, int i, uint16_t** k, uint16_t** v, uint16_t** ks, uint16_t** vs);
     void count_backed();                    ///< backed_cells_ from the elastic caches
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
@@ -230,7 +227,9 @@ private:
     uint8_t* slab_ptr_ = nullptr;
     size_t slab_rem_ = 0;
     std::vector<Cache> cache_;
-    std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V when elastic
+    std::vector<std::unique_ptr<core::ElasticArray>> full_;   ///< the full layers' K and V (int8: codes and scales)
+    std::vector<uint64_t> full_cell_;       ///< the bytes a cell takes in each of full_'s arrays
+    bool int8_ = false;
     int64_t backed_cells_ = 0;              ///< cells every full layer's cache backs
     std::vector<int> slot_;                 ///< by visit
     int tap_rows_ = 0;
@@ -295,13 +294,15 @@ private:
     const DsparkWeights* w_ = nullptr;
     std::unique_ptr<Dflash2Batch> df2_;
     std::vector<void*> allocs_, pinned_;
-    int max_sessions_ = 0, max_rows_ = 0, tap_rows_ = 0;
+    // the head's draft rows a pass holds: every slot at kBatchDrafts drafts, or kMaxDraftSessions at a whole block's
+    static constexpr int kBatchDrafts = 4;
+    int max_sessions_ = 0, max_dr_rows_ = 0, max_rows_ = 0, tap_rows_ = 0;
     int64_t att_cells_ = 0;
     float* tap_ = nullptr;
     // commit_batch scratch [max_rows]
     float *c_mix_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
     void* c_act_ = nullptr;
-    // block chunk scratch [kChunkSlots * kDsBlock <= 32]
+    // block chunk scratch: kChunkSlots * kDsBlock rows, whole blocks of 8 slots or shorter blocks of more
     static constexpr int kChunkSlots = 8;
     static constexpr int kMaxDraftSessions = 16;
     float *x_ = nullptr, *h_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr, *qr_ = nullptr, *attn_ = nullptr;
@@ -311,7 +312,7 @@ private:
     // head batch scratch [max_sessions]
     float *hd_ = nullptr, *approx_ = nullptr, *ctx_h_ = nullptr, *ctx_f_ = nullptr, *state_ = nullptr, *latent_ = nullptr;
     float *frc_ = nullptr, *conf_d_ = nullptr, *conf_h_ = nullptr;
-    void *hq_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
+    void *hq_ = nullptr, *head_cols_ = nullptr, *lat_cols_ = nullptr, *lat_q_ = nullptr, *head_scr_ = nullptr;
     size_t head_scr_stride_ = 0;
     int32_t *prev_ = nullptr, *ids_d_ = nullptr, *ids_h_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     uint16_t* w1_row_ = nullptr;

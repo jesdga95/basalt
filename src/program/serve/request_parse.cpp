@@ -42,6 +42,9 @@ Flow Request::parse() {
     // the chunk teacher-forced through verify windows of T tokens, every token committed
     req_ppl = -1;
     req_ppl_t = 3;
+    // score=N [score_top=K]: the ids are a token stream scored from position N on (basalt/program/ppl_gate.hpp)
+    req_score = -1;
+    req_score_top = 20;
     req_logprobs = -1;   // logprobs=K (0..20): each sent pick's log probability and the row's K likeliest tokens
     req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
     if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
@@ -75,6 +78,8 @@ Flow Request::parse() {
             else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
+            else if (key == "score") req_score = std::atoll(tok.c_str() + eq + 1);
+            else if (key == "score_top") req_score_top = std::atoi(tok.c_str() + eq + 1);
             // unknown keys are skipped: the ids start at the first token without '='
         }
     }

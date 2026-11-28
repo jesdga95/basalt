@@ -59,6 +59,8 @@ public:
     Pick choose_window(const float* chance, int n, int lookup_k, int match) const;
     /// After such a window: the chances of its t - 1 drafts, the drafts accepted, and the round's time.
     void observe_window(const float* chance, int t, int accepted, double round_ms);
+    /// A window whose time is not its own (a batch's): only what its drafts' chances turned out to be worth.
+    void observe_chances(const float* chance, int t, int accepted);
 
     double lookup_rate(int match) const;   // current q for a match length
     double chance_rate(float chance) const;   // current q for a draft stated at `chance`

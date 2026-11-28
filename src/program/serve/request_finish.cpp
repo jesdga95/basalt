@@ -80,7 +80,7 @@ Flow Request::complete() {
         const uint64_t rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
         const uint64_t own = rss > runtime_.ready_rss ? rss - runtime_.ready_rss : 0;
         const uint64_t drop = runtime_.ready_avail > avail ? runtime_.ready_avail - avail : 0;
-        const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::kRamHardFloor,
+        const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::ram_hard_floor(floor),
                                                                    stalls, drop > own ? drop - own : 0, own);
         basalt::log::error("basalt", "%s", msg.c_str());
         std::printf("ERR %s\n", msg.c_str());
@@ -100,12 +100,12 @@ Flow Request::complete() {
         return Flow::error;
     }
     if (runtime_.admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
-        bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) runtime_.live.size() == p
+        bool cont = ram_out ? false : batch_first ? !cancelled && (int64_t) runtime_.live.size() == p
                             : !cancelled && produced_n == 1 && runtime_.admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                               (int64_t) runtime_.live.size() == p;
         const auto tc0 = Clock::now();
         // the draft layer's cell for the prompt's last token (it pairs with the first generated one), then its K/V
-        if (cont && !in_slot && !admit_draft()) {
+        if (cont && !batch_first && !admit_draft()) {
             basalt::log::error("basalt serve", "batch admission failed: %s", runtime_.err.c_str());
             cont = false;
         }
@@ -132,7 +132,11 @@ Flow Request::complete() {
             slot_init(sl);
             sl.x = x;
             sl.p = p;
-            sl.produced = in_slot ? 0 : 1;
+            if (defer_read >= 0) {   // the slot reads the rest of the prompt in its windows, then takes the turn checkpoint
+                sl.pend.assign(ids32.begin() + defer_read + 1, ids32.begin() + n);
+                sl.pend_check = part_checkpoint(n - 1);
+            }
+            sl.produced = batch_first ? 0 : 1;
             sl.max_new = runtime_.admit_max_new;
             sl.t0 = Clock::now();
             sl.ids = runtime_.live;
@@ -151,7 +155,7 @@ Flow Request::complete() {
                          (long long) runtime_.live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
         }
         if (!ram_out)   // (after ERR the server reads no BADM)
-            std::printf("BADM %d %d\n", runtime_.admit_slot, cont ? (in_slot ? 2 : 1) : 0);   // 2: no token yet
+            std::printf("BADM %d %d\n", runtime_.admit_slot, cont ? (batch_first ? 2 : 1) : 0);   // 2: no token yet
         std::fflush(stdout);
         runtime_.admit_slot = -1;
     }

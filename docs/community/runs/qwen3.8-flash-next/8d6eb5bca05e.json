@@ -1,0 +1,35 @@
+{
+  "submitter": "Dmitriy-Romanov",
+  "date": "2026-11-26",
+  "commit": "8c0fe539e0",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti Laptop GPU",
+      "vram_gib": 12,
+      "power_w": 140,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 14.4
+    }
+  ],
+  "ram_gib": 62,
+  "cpu": "AMD Ryzen AI 7 350 w/ Radeon 860M, 8 cores",
+  "ram_gbps": 58.4,
+  "os": "Linux",
+  "quant": "IQ3_XXS",
+  "kv": "int8",
+  "prefill_16k_tps": 1953.2,
+  "prefill_64k_tps": 2314.3,
+  "decode_tps": 90.7,
+  "decode_conv_tps": 71.7,
+  "decode_struct_tps": 98.3,
+  "decode_prose_tps": 71.1,
+  "accept_conv_pct": 74.8,
+  "accept_struct_pct": 95.6,
+  "accept_prose_pct": 66.1,
+  "draft_len_conv": 2.5,
+  "draft_len_struct": 6.6,
+  "draft_len_prose": 1.6,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

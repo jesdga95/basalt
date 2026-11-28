@@ -37,6 +37,8 @@ protected:
     float req_relax{};
     int req_ppl{};
     int req_ppl_t{};
+    long long req_score{};
+    int req_score_top{};
     int req_clip{};
     int req_logprobs{};   // logprobs=K: a P line ahead of every sent pick, with the K likeliest tokens (-1: off)
     std::vector<float> req_bias{};
@@ -59,6 +61,7 @@ protected:
     bool slot_swapped{};
     bool slot_bound{};
     bool solo_req{};
+    bool batch_first{};   // the batch windows give this request its first token (it reads in its slot, or slot 0 defers its prompt's tail)
     using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
     bool solo_moved{};
@@ -117,6 +120,12 @@ protected:
     bool part_checkpoint(int64_t to) const { return to == turn_at || to == root_at || to == media_at; }
     int64_t at{};
     int64_t fold_p0{};
+    /// A batch admission's short prompt part that its slot reads in the batch windows (BSlot::pend): its first position,
+    /// or -1 (read here)
+    int64_t defer_read{-1};
+    /// A text part this short before the prompt's last token is read as decode windows (both the solo request and a batch
+    /// slot, so their replies are the same): many slots' prompts then share one pass over the weights.
+    static constexpr int64_t kWindowReadMax = 128;
     double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
     /// The prompt, with the ids a held conversation wrote standing for the tokens that spell the same bytes.
@@ -125,7 +134,10 @@ protected:
     Flow parse();
     Flow prepare_prompt();
     virtual Flow prepare_image() = 0;
-    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window.
+    /// Once the prompt is known and fits the context: the room its slot's KV takes (Flow::next: the request does not run now).
+    virtual Flow admit_room() { return Flow::proceed; }
+    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window; `score=N`: the request's
+    /// ids as the stream, its prompt cut to ids[0..N].
     Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
     virtual Flow decode() = 0;

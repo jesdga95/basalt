@@ -234,6 +234,11 @@ def render_prometheus(entries: list[tuple[dict, dict]]) -> str:
             b.add("basalt_experts", "gauge", "Total number of routed experts.",
                   ml, int(engine["expert_total"]))
 
+        refused = (m.get("conversation") or {}).get("refused")
+        if refused is not None:
+            b.add("basalt_conversation_parking_refused_total", "counter",
+                  "Conversation-cache parkings refused by RAM admission since the engine started.", ml, int(refused))
+
         # ---- Host / GPU hardware metrics (emitted once per scrape) ----
         if not hw_emitted:
             hw = m.get("hardware") or {}

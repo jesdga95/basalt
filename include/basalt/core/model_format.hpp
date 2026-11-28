@@ -23,7 +23,8 @@
 //   gguf                     every non-expert tensor of the source GGUFs (token_embd.weight,
 //                            per_layer_token_embd.weight, ...), raw bytes, each starting at a multiple of
 //                            kTensorAlign within the section; meta.tensors[name].offset is relative to the section
-//   engram                   an Engram table alone, rows of 256 IQ4_NL values; meta.engram has the geometry
+//   engram                   an Engram table alone, rows of 256 values (IQ4_NL, Q5_K, Q6_K, MXFP4 or MXFP8);
+//                            meta.engram has the geometry (type_id, row_values, row_bytes)
 //   mtp/dense, mtp/dense.index, mtp/experts, mtp/draft_vocab
 //                            the drafter (the files of an mtp runtime directory)
 //   hc8                      the 8-bit copies of the hyper-connection matrices (model_file.hpp), required

@@ -14,6 +14,7 @@
 
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/elastic_array.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/adapter.hpp"
@@ -56,8 +57,9 @@ public:
     void* fc_p = nullptr;                ///< [2304][9216] Q8 planes (Tensor Core wgemm decode/batch commit)
     float *hidden_norm = nullptr, *norm = nullptr, *mask = nullptr;
     uint16_t *sel_h = nullptr, *pred = nullptr, *succ = nullptr;
-    void* head_fp4 = nullptr;            ///< NVFP4 planes [n_vocab][2304] (when n_vocab % 128 == 0; else Q8 head wgemm)
+    void* head_fp4 = nullptr;            ///< the batched drafter's NVFP4 planes [head_rows][2304], rows past n_vocab zero
     float* head_fp4_scale = nullptr;
+    int64_t head_rows = 0;               ///< n_vocab rounded up to whole 128-row tiles
     const void* head = nullptr;          ///< target's Q8 head (q8_planes at runtime after InklingModel::finish)
     const uint16_t* embedding = nullptr; ///< target's BF16 embedding rows (mapped host memory)
     const float* embed_norm = nullptr;   ///< target's F32 embedding RMSNorm weights
@@ -89,6 +91,8 @@ private:
 
 model::Result dflash2_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<Dflash2Weights>& out);
 uint64_t dflash2_session_bytes(const Pack& pack);
+/// The KV pool bytes one session's rings back for `positions` positions (granules of `gran`).
+uint64_t dflash2_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran);
 
 class Dflash2Batch;
 
@@ -118,7 +122,16 @@ public:
     bool running_restored(int64_t pos, const uint8_t* head);
     bool save_cells(int64_t positions, void* stream) const;
     bool restore_cells(size_t kv_size, size_t at, int64_t positions, void* stream);
-    int64_t backed_cells() const { return context_ + kDf2Block; }
+    /// The positions the rings back: all of them once the rings are whole, else the cells backed (from cell 0).
+    int64_t backed_cells() const { return cells_ >= ring_ ? context_ + kDf2Block : cells_; }
+    /// The rings back the cells of `positions` positions and a block past them from the KV pool, a granule at a time;
+    /// trim gives back what lies past them (one granule each stays).
+    uint64_t grow_bytes(int64_t positions) const;
+    bool ensure(int64_t positions, std::string& err);
+    void trim(int64_t positions);
+    uint64_t backing_bytes() const;
+    bool out_of_memory() const;
+    bool usable() const;
 
 private:
     friend class Dflash2Batch;
@@ -133,6 +146,10 @@ private:
     const Dflash2Weights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
     std::vector<Cache> cache_;
+    std::vector<std::unique_ptr<basalt::core::ElasticArray>> rings_;   // each layer's keys, then its values
+    int64_t ring_ = 0, cells_ = 0;   // a ring's cells; the cells every ring backs
+    int64_t ring_cells_for(int64_t positions) const { return std::min<int64_t>(ring_, positions + kDf2Block); }
+    void count_cells();
     std::vector<int> slot_;
     int tap_rows_ = 0;
     int64_t context_ = 0;
@@ -174,14 +191,17 @@ private:
     void *c_tap_bf16_ = nullptr, *c_act_ = nullptr;
     float *c_raw_ = nullptr, *c_kb_ = nullptr, *c_vb_ = nullptr;
 
-    // block + head chunk scratch (up to kChunkSlots = 8 slots -> R <= 64 block rows, D <= 56 draft rows)
-    static constexpr int kChunkSlots = 8;
+    // block scratch for every slot's whole block; the head takes up to kHeadDrafts draft rows a slot a pass
+    static constexpr int kHeadDrafts = 4;
     float *x_ = nullptr, *xn_ = nullptr, *z_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *kb_ = nullptr, *vb_ = nullptr;
     float *qr_ = nullptr, *attn_ = nullptr, *att_scr_ = nullptr;
-    void *act_a_ = nullptr, *act_q_ = nullptr, *act_h_ = nullptr;
+    void *act_a_ = nullptr, *act_h_ = nullptr;
+    void* a4_ = nullptr;                            // a draft pass's rows as FP4 activation planes
+    float *gs4_ = nullptr, *amax4_ = nullptr;       // their token scales; the SwiGLU rows' largest values
     basalt::kernels::wgemm::Workspace ws_;
     float *logits_ = nullptr, *g_ = nullptr, *tail_lse_ = nullptr;
-    void *hq_ = nullptr, *top_scr_ = nullptr;
+    float *hd_ = nullptr, *head_gs_ = nullptr;   // the head's normed draft rows and their FP4 token scales
+    void *hq_ = nullptr, *top_scr_ = nullptr, *head_act_ = nullptr;
     int32_t *cand_ = nullptr, *meta_d_ = nullptr, *meta_h_ = nullptr;
     int32_t *ids_d_ = nullptr, *ids_h_ = nullptr;
     float *conf_d_ = nullptr, *conf_h_ = nullptr;

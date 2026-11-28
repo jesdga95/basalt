@@ -150,7 +150,7 @@ class Plan:
                 form = "F8"           # FP8 projections keep their codes and scale
             if form == "Q8" and packed and not mm:
                 form = "FP4"          # NVFP4 projections keep their codes and scales
-            if form == "FP4" and dt == "BF16":
+            if gname == "output.weight" and form == "FP4" and dt == "BF16":
                 form = "FP4Q" if head == "nvfp4" else "F8Q"   # a BF16 head: rounded once to FP8 rows or NVFP4
             elif gname == "output.weight" and head == "fp8":
                 raise S.ConvertError(f"--head fp8 rounds a BF16 head; {k} is {dt}")
@@ -235,13 +235,19 @@ class Plan:
 
     def float_bytes(self, name) -> bytes:
         t = self.tensors[name]
+        if t.type_name == "BF16" and t.packed:   # NVFP4 values as BF16, rounded once (to nearest, ties to even)
+            x64 = self.nvfp4_values(name, reorder=True)
+            if not np.isfinite(x64).all():
+                raise S.ConvertError(f"{name} has a non-finite value")
+            out = bf16_round(x64)
+            if not np.isfinite(S._bf16_to_f32(out)).all():
+                raise S.ConvertError(f"{name} has a non-finite value")
+            return out.tobytes()
         x = self.values(name)
         if not np.isfinite(x).all():
             raise S.ConvertError(f"{name} has a non-finite value")
         if t.type_name == "F32":
             return x.astype("<f4").tobytes()
-        if t.packed:   # NVFP4 values as BF16, rounded once (to nearest, ties to even)
-            return bf16_round(self.nvfp4_values(name, reorder=True)).tobytes()
         u = x.view(np.uint32)
         if np.count_nonzero(u & 0xFFFF):
             raise S.ConvertError(f"{name}: a value that is not BF16")
@@ -742,7 +748,9 @@ def build(a, Job, fingerprint, die) -> None:
     try:
         ck = C.Checkpoint(a.checkpoint)
         plan = Plan(ck, getattr(a, "head", None))
-        name = a.name or C.front_matter(ck.dir / "README.md").get("base_model", ["Qwen3.5"])[0].split("/")[-1] + " NVFP4"
+        bm = C.front_matter(ck.dir / "README.md").get("base_model")
+        base = (bm if isinstance(bm, str) else bm[0]) if bm else "Qwen3.5"
+        name = a.name or base.split("/")[-1] + " NVFP4"
         kv = model_kv(ck, name)
         drafter = Drafter(a.drafter, ck) if getattr(a, "drafter", None) else None
         if drafter:

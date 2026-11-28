@@ -2,11 +2,12 @@
 // against a double-precision host reference, independence from the window width and position, chunked hashing
 // against whole-sequence hashing, a microbench, and (with --fixture DIR) real layers against the per-layer
 // fixtures, including the hashed table rows read from the pack (--pack PATH).
-#include "basalt/artifact/dequant.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
+#include "models/deepseek41/engram_rows.hpp"
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 using namespace dstest;
@@ -40,9 +41,22 @@ std::vector<float> run(const Dev<float>& gw, const std::vector<float>& kv, std::
 
 int main(int argc, char** argv) {
     std::string fixture, pack;
+    int row_type = 20, row_bytes = 144;   // IQ4_NL; a --row-bytes given must be the type's row of 256 values
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--fixture") && i + 1 < argc) fixture = argv[++i];
         else if (!std::strcmp(argv[i], "--pack") && i + 1 < argc) pack = argv[++i];
+        else if (!std::strcmp(argv[i], "--row-type") && i + 1 < argc) row_type = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--row-bytes") && i + 1 < argc) row_bytes = std::atoi(argv[++i]);
+    }
+    const EngramBlock b = engram_block(row_type);
+    if (b.values == 0 || 256 % b.values) {
+        std::printf("--row-type %d is not an Engram row type\n", row_type);
+        return 1;
+    }
+    const size_t want = (size_t) (256 / b.values) * b.bytes;
+    if (row_bytes <= 0 || (size_t) row_bytes != want) {
+        std::printf("--row-type %d: --row-bytes must be %zu (a row of 256 values)\n", row_type, want);
+        return 1;
     }
     Verdict v;
     EngramArgs a;
@@ -172,10 +186,10 @@ int main(int argc, char** argv) {
                         std::string js(tj.begin(), tj.end());
                         auto grab = [&](const char* key) {
                             std::vector<int32_t> r;
-                            size_t b = js.find(std::string("\"") + key + "\"");
-                            b = js.find('[', b);
-                            const size_t en = js.find(']', b);
-                            const char* s = js.c_str() + b + 1;
+                            size_t begin = js.find(std::string("\"") + key + "\"");
+                            begin = js.find('[', begin);
+                            const size_t en = js.find(']', begin);
+                            const char* s = js.c_str() + begin + 1;
                             while (s < js.c_str() + en) {
                                 char* nx;
                                 long val = std::strtol(s, &nx, 10);
@@ -198,10 +212,10 @@ int main(int argc, char** argv) {
                         std::ifstream f(pack, std::ios::binary);
                         std::vector<float> mine((size_t) n * n_cols * 256);
                         for (size_t r = 0; r < ids.size(); ++r) {
-                            uint8_t blob[144];
-                            f.seekg((std::streamoff)(sec_off + (uint64_t) ids[r] * 144));
-                            f.read((char*) blob, 144);
-                            for (int b = 0; b < 8; ++b) basalt::dequantize_iq4_nl(blob + b * 18, &mine[r * 256 + b * 32]);
+                            uint8_t blob[4096];
+                            f.seekg((std::streamoff)(sec_off + (uint64_t) ids[r] * (uint64_t) row_bytes));
+                            f.read((char*) blob, row_bytes);
+                            engram_row_f32(row_type, 256, blob, &mine[r * 256]);
                         }
                         Err e2 = compare(mine, rows, 1e-2);
                         std::printf("; hashed rows max abs %.3g", e2.max_abs);

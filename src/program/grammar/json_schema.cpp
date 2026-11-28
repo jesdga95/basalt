@@ -48,23 +48,33 @@ class Builder {
         return (int) v;
     }
 
+    enum class BoundRange { InRange, BelowMin, AboveMax };
+
     // a fractional bound is rounded inwards, towards the integers it still admits
-    static int64_t get_bound(const JsonValue& schema, const std::string& key, const std::string& path, bool round_up) {
+    static BoundRange get_bound(const JsonValue& schema, const std::string& key, const std::string& path,
+                                bool round_up, bool saturate, int64_t& out) {
         const JsonValue& value = *schema.get(key);
         if (value.is_integer()) {
-            int64_t v = 0;
-            if (!value.parse_int64(v)) fail(path, key + " is out of 64-bit integer range");
-            return v;
+            if (value.parse_int64(out)) return BoundRange::InRange;
+            if (!saturate) fail(path, key + " is out of 64-bit integer range");
+            return !value.s.empty() && value.s[0] == '-' ? BoundRange::BelowMin : BoundRange::AboveMax;
         }
         if (value.type != Type::Number) fail(path, key + " must be a number");
         const double d = value.as_double();
         const double r = round_up ? std::ceil(d) : std::floor(d);
         constexpr double kMinI64 = -9223372036854775808.0;     // -2^63, exact in IEEE-754 double
         constexpr double kMaxI64Plus1 = 9223372036854775808.0; // +2^63, exact in IEEE-754 double
-        if (!std::isfinite(r) || r < kMinI64 || r >= kMaxI64Plus1) {
-            fail(path, key + " is out of 64-bit integer range");
+        if (std::isnan(r)) fail(path, key + " is out of 64-bit integer range");
+        if (r < kMinI64) {
+            if (!saturate) fail(path, key + " is out of 64-bit integer range");
+            return BoundRange::BelowMin;
         }
-        return (int64_t) r;
+        if (r >= kMaxI64Plus1) {
+            if (!saturate) fail(path, key + " is out of 64-bit integer range");
+            return BoundRange::AboveMax;
+        }
+        out = (int64_t) r;
+        return BoundRange::InRange;
     }
 
     static SchemaNode::Format get_format(const JsonValue& schema, const std::string& path) {
@@ -246,37 +256,59 @@ class Builder {
         return node;
     }
 
-    SchemaPtr build_integer(const JsonValue& schema, const std::string& path) {
+    SchemaPtr build_integer(const JsonValue& schema, const std::string& path, bool saturate_bounds = false) {
         auto node = std::make_unique<SchemaNode>();
         node->kind = SchemaNode::Integer;
+        auto tighten_min = [&](int64_t lo) {
+            if (!node->has_minimum || lo > node->minimum) {
+                node->minimum = lo;
+                node->has_minimum = true;
+            }
+        };
+        auto tighten_max = [&](int64_t hi) {
+            if (!node->has_maximum || hi < node->maximum) {
+                node->maximum = hi;
+                node->has_maximum = true;
+            }
+        };
         if (schema.contains("minimum")) {
-            node->minimum = get_bound(schema, "minimum", path, /* round_up */ true);
-            node->has_minimum = true;
+            int64_t b = 0;
+            const BoundRange br = get_bound(schema, "minimum", path, /* round_up */ true, saturate_bounds, b);
+            if (br == BoundRange::InRange) tighten_min(b);
+            else if (br == BoundRange::AboveMax) tighten_min((std::numeric_limits<int64_t>::max)());
         }
         if (schema.contains("exclusiveMinimum")) {
-            const int64_t b = get_bound(schema, "exclusiveMinimum", path, /* round_up */ false);
-            if (b == (std::numeric_limits<int64_t>::max)()) {
-                fail(path, "exclusiveMinimum is out of 64-bit integer range");
-            }
-            const int64_t ex_min = b + 1;
-            if (!node->has_minimum || ex_min > node->minimum) {
-                node->minimum = ex_min;
-                node->has_minimum = true;
+            int64_t b = 0;
+            const BoundRange br = get_bound(schema, "exclusiveMinimum", path, /* round_up */ false, saturate_bounds, b);
+            if (br == BoundRange::InRange) {
+                if (b == (std::numeric_limits<int64_t>::max)()) {
+                    if (!saturate_bounds) fail(path, "exclusiveMinimum is out of 64-bit integer range");
+                    tighten_min((std::numeric_limits<int64_t>::max)());
+                } else {
+                    tighten_min(b + 1);
+                }
+            } else if (br == BoundRange::AboveMax) {
+                tighten_min((std::numeric_limits<int64_t>::max)());
             }
         }
         if (schema.contains("maximum")) {
-            node->maximum = get_bound(schema, "maximum", path, /* round_up */ false);
-            node->has_maximum = true;
+            int64_t b = 0;
+            const BoundRange br = get_bound(schema, "maximum", path, /* round_up */ false, saturate_bounds, b);
+            if (br == BoundRange::InRange) tighten_max(b);
+            else if (br == BoundRange::BelowMin) tighten_max((std::numeric_limits<int64_t>::min)());
         }
         if (schema.contains("exclusiveMaximum")) {
-            const int64_t b = get_bound(schema, "exclusiveMaximum", path, /* round_up */ true);
-            if (b == (std::numeric_limits<int64_t>::min)()) {
-                fail(path, "exclusiveMaximum is out of 64-bit integer range");
-            }
-            const int64_t ex_max = b - 1;
-            if (!node->has_maximum || ex_max < node->maximum) {
-                node->maximum = ex_max;
-                node->has_maximum = true;
+            int64_t b = 0;
+            const BoundRange br = get_bound(schema, "exclusiveMaximum", path, /* round_up */ true, saturate_bounds, b);
+            if (br == BoundRange::InRange) {
+                if (b == (std::numeric_limits<int64_t>::min)()) {
+                    if (!saturate_bounds) fail(path, "exclusiveMaximum is out of 64-bit integer range");
+                    tighten_max((std::numeric_limits<int64_t>::min)());
+                } else {
+                    tighten_max(b - 1);
+                }
+            } else if (br == BoundRange::BelowMin) {
+                tighten_max((std::numeric_limits<int64_t>::min)());
             }
         }
         return node;
@@ -358,7 +390,12 @@ class Builder {
         }
         if (type_name == "array") return build_array(schema, path);
         if (type_name == "integer") return build_integer(schema, path);
-        if (type_name == "number") return simple(SchemaNode::Number);
+        if (type_name == "number") {
+            // bounds kept as integers: the number rule ignores them, an allOf with an integer branch uses them
+            auto node = build_integer(schema, path, /* saturate_bounds */ true);
+            node->kind = SchemaNode::Number;
+            return node;
+        }
         if (type_name == "boolean") return simple(SchemaNode::Boolean);
         if (type_name == "null") return simple(SchemaNode::Null);
         fail(path, "unrecognized type " + type_name);

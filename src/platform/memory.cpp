@@ -521,12 +521,13 @@ BelowFloorClock g_below;            // how long the reading has been below the f
 void guard_judge(uint64_t avail) {
     std::lock_guard<std::mutex> judge(g_judge_mu);
     const uint64_t floor = g_guard_floor.load();
+    const uint64_t hard = ram_hard_floor(floor);
     // the stall reading only matters below the floor
     const MemoryStalls stalls = ram_below_floor(avail, floor) ? memory_stalls() : MemoryStalls{};
     const uint64_t below_ms = g_below.update(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
         ram_below_floor(avail, floor));
-    const RamLevel level = ram_level(avail, floor, kRamHardFloor, stalls, below_ms);
+    const RamLevel level = ram_level(avail, floor, hard, stalls, below_ms);
     const RamLevel was = g_judged;
     {
         std::lock_guard<std::mutex> lock(g_guard_mu);
@@ -540,8 +541,8 @@ void guard_judge(uint64_t avail) {
         basalt::log::warn("basalt", "RAM low: %llu MiB free < %llu MiB guard", mib, (unsigned long long) (floor >> 20));
     if (level == RamLevel::Critical && was != RamLevel::Critical && stalls.known)
         basalt::log::warn("basalt", "RAM critical: %llu MiB free, hard floor %llu MiB, memory stalls some "
-                          "%.0f%% full %.0f%%", mib, (unsigned long long) (kRamHardFloor >> 20), stalls.some, stalls.full);
-    if (level == RamLevel::Critical && was != RamLevel::Critical && !stalls.known && avail >= kRamHardFloor)
+                          "%.0f%% full %.0f%%", mib, (unsigned long long) (hard >> 20), stalls.some, stalls.full);
+    if (level == RamLevel::Critical && was != RamLevel::Critical && !stalls.known && avail >= hard)
         basalt::log::warn("basalt", "RAM critical: %llu MiB free, below the %llu MiB guard for %llu s", mib,
                           (unsigned long long) (floor >> 20), (unsigned long long) (below_ms / 1000));
     if (level == RamLevel::Low && was == RamLevel::Critical)
@@ -757,6 +758,17 @@ void free_aligned(void* p) {
     _aligned_free(p);
 #else
     std::free(p);
+#endif
+}
+
+void advise_hugepages(void* p, uint64_t bytes) {
+    constexpr uint64_t kHugePage = 2ull << 20;
+    if (p == nullptr || bytes < kHugePage) return;
+#if defined(_WIN32)
+    (void) p;
+    (void) bytes;
+#else
+    (void) madvise(p, (size_t) bytes, MADV_HUGEPAGE);
 #endif
 }
 

@@ -170,6 +170,15 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
     }
 }
 
+static inline float q8_1_finite_c(float v) {
+    return fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v;
+}
+
+static inline int8_t q8_1_clamp_q(float v) {
+    const float q = roundf(v);
+    return (int8_t)(q > 127.0f ? 127.0f : (q < -127.0f ? -127.0f : q));
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_RESTRICT y, int64_t k) {
     assert(QK8_1 == 32);
@@ -180,12 +189,20 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
         float amax = 0.0f; // absolute max
 
         for (int j = 0; j < QK8_1; j++) {
-            const float v = x[i*QK8_1 + j];
-            amax = MAX(amax, fabsf(v));
+            const float a = fabsf(x[i*QK8_1 + j]);
+            if (a > amax || isnan(a)) amax = a;
         }
 
-        const float d = amax / ((1 << 7) - 1);
-        const float id = d ? 1.0f/d : 0.0f;
+        if (isnan(amax)) {
+            y[i].d = GGML_FP32_TO_FP16(amax);
+            y[i].s = GGML_FP32_TO_FP16(amax);
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            continue;
+        }
+
+        const float d = q8_1_finite_c(amax / ((1 << 7) - 1));
+        float id = d ? 1.0f/d : 0.0f;
+        if (!isfinite(id)) id = 0.0f;
 
         y[i].d = GGML_FP32_TO_FP16(d);
 
@@ -195,14 +212,14 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
             const float v0 = x[i*QK8_1           + j]*id;
             const float v1 = x[i*QK8_1 + QK8_1/2 + j]*id;
 
-            y[i].qs[          j] = roundf(v0);
-            y[i].qs[QK8_1/2 + j] = roundf(v1);
+            y[i].qs[          j] = q8_1_clamp_q(v0);
+            y[i].qs[QK8_1/2 + j] = q8_1_clamp_q(v1);
 
             sum += y[i].qs[          j];
             sum += y[i].qs[QK8_1/2 + j];
         }
 
-        y[i].s = GGML_FP32_TO_FP16(sum*d);
+        y[i].s = GGML_FP32_TO_FP16(q8_1_finite_c(sum*d));
     }
 }
 
@@ -1364,15 +1381,26 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
 
         float max = 0;
         float amax = 0;
+        int has_nan = 0;
         for (int j = 0; j < QK_K; ++j) {
             float ax = fabsf(x[j]);
-            if (ax > amax) {
+            if (isnan(ax)) {
+                has_nan = 1;
+            } else if (ax > amax) {
                 amax = ax; max = x[j];
             }
+        }
+        if (has_nan) {
+            y[i].d = fp32_from_bits(0x7fc00000u);
+            memset(y[i].qs, 0, QK_K);
+            memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            x += QK_K;
+            continue;
         }
         if (!amax) {
             y[i].d = 0;
             memset(y[i].qs, 0, QK_K);
+            memset(y[i].bsums, 0, sizeof(y[i].bsums));
             x += QK_K;
             continue;
         }
