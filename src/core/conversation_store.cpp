@@ -87,7 +87,19 @@ struct Section {
 static_assert(sizeof(Section) == 96, "a fixed section record");
 
 uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
-uint64_t blocks_of(uint64_t bytes) { return (bytes + kBlock - 1) / kBlock; }
+uint64_t blocks_of(uint64_t bytes) { return bytes == 0 ? 0 : (bytes - 1) / kBlock + 1; }
+
+bool add_u64(uint64_t a, uint64_t b, uint64_t& out) {
+    if (b > std::numeric_limits<uint64_t>::max() - a) return false;
+    out = a + b;
+    return true;
+}
+
+bool mul_u64(uint64_t a, uint64_t b, uint64_t& out) {
+    if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) return false;
+    out = a * b;
+    return true;
+}
 
 constexpr uint64_t P1 = 11400714785074694791ull, P2 = 14029467366897019727ull, P3 = 1609587929392839161ull,
                    P4 = 9650029242287828579ull, P5 = 2870177450012600261ull;
@@ -141,6 +153,13 @@ std::vector<ConversationImageKey> imgs_below(const std::vector<ConversationImage
     std::vector<ConversationImageKey> v;
     for (const auto& k : all) if (k.start < tokens) v.push_back(k);
     return v;
+}
+
+size_t count_imgs_below(const std::vector<ConversationImageKey>& all, int64_t tokens) {
+    size_t n = 0;
+    for (const auto& k : all)
+        if (k.start < tokens) ++n;
+    return n;
 }
 
 std::string conversation_name(uint64_t identity, uint64_t key) { return hex16(identity) + "-" + hex16(key) + kExt; }
@@ -369,15 +388,26 @@ bool read_index(int fd, uint64_t file_bytes, Header& h, std::vector<Section>& ta
     if (std::memcmp(h.magic, kMagic, sizeof kMagic) != 0 || h.version != kConversationFormat || h.header_bytes != kAlign ||
         conversation_store_hash(&z, sizeof z, 7) != h.header_hash) { error = "not a conversation file"; return false; }
     const bool conv = h.file_kind == kConversationFile;
+    const uint64_t max_imgs = file_bytes / sizeof(ConversationImageKey);
+    const uint64_t max_blocks = file_bytes / 8;
     if (h.file_bytes != file_bytes || h.n_sections == 0 || h.n_sections > 100000 || h.file_kind > kStateFile ||
         h.table_offset != kAlign || h.table_bytes != (uint64_t) h.n_sections * sizeof(Section) ||
         h.hash_offset != align_up(h.table_offset + h.table_bytes, kAlign) || h.hash_count > file_bytes / 8 ||
-        (conv && (h.n_ids <= 0 || h.n_ids > (int64_t) (file_bytes / 4))) || h.n_imgs < 0 || h.n_checks < 0 ||
-        h.n_kv < 0 || h.n_blocks < 0 || h.block_cells < 0) {
+        (conv && (h.n_ids <= 0 || (uint64_t) h.n_ids > file_bytes / 4)) ||
+        h.n_imgs < 0 || (uint64_t) h.n_imgs > max_imgs ||
+        h.n_checks < 0 || (uint64_t) h.n_checks > h.n_sections ||
+        h.n_kv < 0 || (uint64_t) h.n_kv > h.n_sections ||
+        h.n_blocks < 0 || (uint64_t) h.n_blocks > max_blocks || h.block_cells < 0) {
         error = "inconsistent header";
         return false;
     }
-    const uint64_t meta_end = align_up(h.hash_offset + h.hash_count * 8, kAlign);
+    uint64_t hash_end = 0;
+    if (!add_u64(h.hash_offset, h.hash_count * 8, hash_end) || hash_end > file_bytes ||
+        hash_end > std::numeric_limits<uint64_t>::max() - (kAlign - 1)) {
+        error = "truncated file";
+        return false;
+    }
+    const uint64_t meta_end = align_up(hash_end, kAlign);
     if (meta_end > file_bytes) { error = "truncated file"; return false; }
     const uint64_t span = meta_end - kAlign;
     Aligned meta(span);
@@ -394,6 +424,7 @@ bool read_index(int fd, uint64_t file_bytes, Header& h, std::vector<Section>& ta
     uint64_t at = meta_end, next_hash = 0;
     for (const Section& s : table) {
         if (s.offset % kAlign || s.offset < at || s.bytes > file_bytes || s.offset > file_bytes - s.bytes ||
+            s.offset + s.bytes > std::numeric_limits<uint64_t>::max() - (kAlign - 1) ||
             s.first_hash != next_hash || blocks_of(s.bytes) > h.hash_count - next_hash) {
             error = "inconsistent section table";
             return false;
@@ -655,7 +686,7 @@ ConversationStore::Match ConversationStore::best(const int32_t* prompt, size_t n
                 if (im.start >= len) continue;
                 if (j == e.imgs.size() || !(e.imgs[j++] == im)) return false;
             }
-            return j == imgs_below(e.imgs, len).size();
+            return j == count_imgs_below(e.imgs, len);
         };
         auto consider = [&](int64_t len) {
             if (usable(len) && (len > best.tokens || (len == best.tokens && e.used > best_used))) {
@@ -720,6 +751,7 @@ ConversationStore::Entry* ConversationStore::find_entry_locked(const Match& m) c
 }
 
 uint64_t ConversationStore::load_bytes(const Match& m) const {
+    if (m.tokens <= 0) return 0;
     std::lock_guard<std::mutex> lk(mu_);
     const Entry* ep = find_entry_locked(m);
     if (ep == nullptr) return 0;
@@ -729,8 +761,14 @@ uint64_t ConversationStore::load_bytes(const Match& m) const {
     for (const Section& s : e.table) {
         if (s.kind >= kGdn && s.kind <= kBlockPos && s.index == kLive) state += s.bytes;
         if (s.kind == kKvRate) {   // the cells up to the match, at most the stored ones
-            const int64_t cells = std::min<int64_t>(m.tokens + 4, s.meta[5]);
-            n += (s.meta[0] + s.meta[1] + s.meta[2] + s.meta[3]) * (uint64_t) cells +
+            if (s.meta[0] < 0 || s.meta[1] < 0 || s.meta[2] < 0 || s.meta[3] < 0 || s.meta[4] < 0 || s.meta[5] < 0)
+                continue;
+            const int64_t limit = m.tokens <= std::numeric_limits<int64_t>::max() - 4
+                                      ? m.tokens + 4
+                                      : std::numeric_limits<int64_t>::max();
+            const int64_t cells = std::max<int64_t>(0, std::min<int64_t>(limit, s.meta[5]));
+            const uint64_t per_cell = (uint64_t) s.meta[0] + (uint64_t) s.meta[1] + (uint64_t) s.meta[2] + (uint64_t) s.meta[3];
+            n += per_cell * (uint64_t) cells +
                  (uint64_t) s.meta[4] * (uint64_t) (cells / std::max<int64_t>(1, row_cells_) + 1);
         }
     }
@@ -806,12 +844,17 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             copy_state(state, at);
             img.checkpoints.push_back(std::move(at));
         }
+        const int64_t ib = std::max<int64_t>(1, row_cells_);
         for (const ConversationKv& kv : src.kv) {
             ConversationKv k;
             k.format = kv.format; k.heads = kv.heads; k.head_dim = kv.head_dim; k.page_size = kv.page_size;
             k.idx_dim = kv.idx_dim;
+            if (kv.page_size > 0 && P > std::numeric_limits<int64_t>::max() - (kv.page_size - 1)) {
+                error = "conversation store: K/V cell count overflows";
+                return false;
+            }
             k.cells = kv.page_size > 0 ? (P + kv.page_size - 1) / kv.page_size * kv.page_size : 0;
-            k.pooled_rows = kv.pooled_rows > 0 ? P / row_cells_ + 1 : 0;
+            k.pooled_rows = kv.pooled_rows > 0 ? P / ib + 1 : 0;
             const ConversationBuffer* from[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
             ConversationBuffer* to[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
             for (int b = 0; b < 5; ++b) {
@@ -842,15 +885,30 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         for (auto& f : opened) f.rf->close();
         error = "conversation store: " + name + ": " + why;
         std::lock_guard<std::mutex> lk(mu_);
+        std::string bad_part;
         if (bad != SIZE_MAX && bad > 0 && bad < opened.size()) {
-            // a block or state file that does not check out goes; every conversation that refers to it fails its read
-            basalt::platform::remove_file(dir_ + "/" + opened[bad].name);
-            parts_.erase(opened[bad].name);
-            error += " (" + opened[bad].name + ")";
+            // a block or state file that does not check out goes, along with every on-disk entry referencing it
+            bad_part = opened[bad].name;
+            basalt::platform::remove_file(dir_ + "/" + bad_part);
+            parts_.erase(bad_part);
+            error += " (" + bad_part + ")";
         }
-        for (size_t i = 0; i < entries_.size(); ++i)
-            if (entries_[i]->name == name && !entries_[i]->job) { drop_locked(i); break; }
-        ++stats_.dropped;
+        bool dropped_self = false;
+        for (size_t i = 0; i < entries_.size();) {
+            const Entry& e = *entries_[i];
+            const bool is_self = e.name == name && !e.job;
+            const bool uses_bad = !bad_part.empty() && !e.job &&
+                                  std::find(e.refs.begin(), e.refs.end(), bad_part) != e.refs.end();
+            if (is_self || uses_bad) {
+                if (is_self) dropped_self = true;
+                drop_locked(i);
+                ++stats_.dropped;
+                continue;
+            }
+            ++i;
+        }
+        if (!dropped_self) ++stats_.dropped;
+        gc_locked(0);
         return false;
     };
     auto open_file = [&](const std::string& fname, uint32_t kind, uint64_t key) -> bool {
@@ -905,36 +963,49 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             default: return c.state_e;
         }
     };
-    auto read_state = [&](size_t file, uint32_t index, ConversationCheckpoint& c) {
+    auto read_state = [&](size_t file, uint32_t index, ConversationCheckpoint& c) -> bool {
+        uint8_t seen = 0;
         for (const Section& s : opened[file].tab) {
             if (s.kind < kGdn || s.kind > kBlockPos || s.index != index) continue;
+            const uint8_t bit = (uint8_t) (1u << (s.kind - kGdn));
+            if (seen & bit) return false;
+            seen |= bit;
             CheckpointBytes& d = state_field(c, s.kind);
             d.resize(s.bytes);
             parts.push_back({file, &s, s.bytes, [&d](uint64_t o, const uint8_t* p, uint64_t n) { std::memcpy(d.data() + o, p, n); }});
         }
+        return true;
     };
     if (cut.live < 0) {
         bool live = false;
         for (const Section& s : opened[0].tab) live = live || (s.kind >= kGdn && s.kind <= kBlockPos && s.index == kLive);
         if (!live) return fail("no state at the match", SIZE_MAX);
-        read_state(0, kLive, img.live);
+        if (!read_state(0, kLive, img.live)) return fail("duplicate state section", SIZE_MAX);
     }
     else {
         if (!open_part('s', check_keys[(size_t) cut.live], checks[(size_t) cut.live], checks[(size_t) cut.live]))
             return fail(error, opened.size() - 1);
-        read_state(opened.size() - 1, 0, img.live);
+        if (!read_state(opened.size() - 1, 0, img.live)) return fail("duplicate state section", opened.size() - 1);
     }
     if (cut.root >= 0) {
         if (!open_part('s', check_keys[(size_t) cut.root], checks[(size_t) cut.root], checks[(size_t) cut.root]))
             return fail(error, opened.size() - 1);
-        read_state(opened.size() - 1, 0, root);
+        if (!read_state(opened.size() - 1, 0, root)) return fail("duplicate state section", opened.size() - 1);
     }
     // the K/V: each layer's shapes and rates, then its bytes from the blocks below the tail and from the tail
+    const int64_t ib = std::max<int64_t>(1, row_cells_);
+    const int64_t B = h.block_cells;
+    if (h.n_blocks > 0) {
+        if (B <= 0) return fail("blocks of no size", SIZE_MAX);
+        if (B % ib != 0 || (int64_t) blocks.size() != h.n_blocks) return fail("inconsistent blocks", SIZE_MAX);
+        if (h.n_blocks > std::numeric_limits<int64_t>::max() / B) return fail("inconsistent blocks", SIZE_MAX);
+    }
+    const int64_t tail_from = h.n_blocks > 0 ? h.n_blocks * B : 0;
+    if (tail_from > h.n_ids || (size_t) h.n_ids != all_ids.size()) return fail("inconsistent blocks", SIZE_MAX);
     img.kv.resize((size_t) h.n_kv);
     std::vector<int64_t> kv_cells((size_t) h.n_kv, -1), kv_rows((size_t) h.n_kv, -1);
     std::vector<Rate> rates((size_t) h.n_kv);
     std::vector<uint8_t> rated((size_t) h.n_kv, 0);
-    const int64_t B = h.block_cells, tail_from = h.n_blocks * h.block_cells;
     for (const Section& s : opened[0].tab) {
         if (s.kind == kKvHead) {
             if (s.index >= (uint32_t) h.n_kv) return fail("a K/V layer out of range", SIZE_MAX);
@@ -943,12 +1014,17 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             k.heads = s.meta[2]; k.head_dim = s.meta[3]; k.page_size = s.meta[4]; k.idx_dim = s.meta[6];
             kv_cells[s.index] = s.meta[1];
             kv_rows[s.index] = s.meta[5];
-            if (k.page_size <= 0 || s.meta[1] < tail_from || s.meta[5] < 0 || k.idx_dim < 0) return fail("bad K/V extents", SIZE_MAX);
+            if (k.page_size <= 0 || s.meta[1] < tail_from || s.meta[5] < 0 || k.idx_dim < 0 ||
+                P > std::numeric_limits<int64_t>::max() - (k.page_size - 1)) {
+                return fail("bad K/V extents", SIZE_MAX);
+            }
             k.cells = (P + k.page_size - 1) / k.page_size * k.page_size;
-            k.pooled_rows = s.meta[5] > 0 ? P / row_cells_ + 1 : 0;
+            k.pooled_rows = s.meta[5] > 0 ? P / ib + 1 : 0;
             if (k.cells > s.meta[1] || k.pooled_rows > s.meta[5]) return fail("K/V shorter than the match", SIZE_MAX);
         } else if (s.kind == kKvRate) {
             if (s.index >= (uint32_t) h.n_kv) return fail("a K/V layer out of range", SIZE_MAX);
+            if (s.meta[0] < 0 || s.meta[1] < 0 || s.meta[2] < 0 || s.meta[3] < 0 || s.meta[4] < 0)
+                return fail("bad K/V rates", SIZE_MAX);
             Rate& r = rates[s.index];
             for (int b = 0; b < 4; ++b) r.cell[b] = (uint64_t) s.meta[b];
             r.row = (uint64_t) s.meta[4];
@@ -957,17 +1033,21 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     }
     for (int64_t i = 0; i < h.n_kv; ++i)
         if (kv_cells[(size_t) i] < 0 || !rated[(size_t) i]) return fail("a K/V layer without its shapes", SIZE_MAX);
-    if (B <= 0 && h.n_blocks > 0) return fail("blocks of no size", SIZE_MAX);
-    if (h.n_blocks > 0 && (B % row_cells_ != 0 || (int64_t) blocks.size() != h.n_blocks))
-        return fail("inconsistent blocks", SIZE_MAX);
-    // the destination of each layer's buffer, sized for the match
+    // Compute destination buffer sizes and validate every block/tail section before allocating K/V buffers.
     std::vector<std::array<ConversationBuffer*, 5>> dsts((size_t) h.n_kv);
+    std::vector<std::array<uint64_t, 5>> want_bytes((size_t) h.n_kv);
+    std::vector<std::array<uint64_t, 5>> covered_bytes((size_t) h.n_kv);
     for (int64_t i = 0; i < h.n_kv; ++i) {
         ConversationKv& k = img.kv[(size_t) i];
         const Rate& r = rates[(size_t) i];
         dsts[(size_t) i] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
-        for (int b = 0; b < 4; ++b) dsts[(size_t) i][(size_t) b]->resize_for_overwrite(r.cell[b] * (uint64_t) k.cells);
-        k.pooled.resize_for_overwrite(r.row * (uint64_t) k.pooled_rows);
+        covered_bytes[(size_t) i] = {0, 0, 0, 0, 0};
+        for (int b = 0; b < 4; ++b) {
+            if (!mul_u64(r.cell[b], (uint64_t) k.cells, want_bytes[(size_t) i][(size_t) b]))
+                return fail("K/V size overflows", SIZE_MAX);
+        }
+        if (!mul_u64(r.row, (uint64_t) k.pooled_rows, want_bytes[(size_t) i][4]))
+            return fail("K/V size overflows", SIZE_MAX);
     }
     // `kind`'s bytes of layer `i` in [from_unit, to_unit) (cells, or pooled rows) of the destination: the start of a
     // section of `file` that begins at unit `from_unit`
@@ -975,10 +1055,17 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         const Rate& r = rates[(size_t) i];
         const uint64_t unit = kind < 4 ? r.cell[kind] : r.row;
         if (to_unit <= from_unit || unit == 0) return true;
-        const uint64_t need = (uint64_t) (to_unit - from_unit) * unit;
-        if (need > s.bytes) return false;
+        uint64_t need = 0, base = 0;
+        if (!mul_u64((uint64_t) (to_unit - from_unit), unit, need) ||
+            !mul_u64((uint64_t) from_unit, unit, base) || need > s.bytes) {
+            return false;
+        }
+        const uint64_t total = want_bytes[(size_t) i][(size_t) kind];
+        if (base > total || need > total - base) return false;
+        uint64_t next_covered = 0;
+        if (!add_u64(covered_bytes[(size_t) i][(size_t) kind], need, next_covered) || next_covered > total) return false;
+        covered_bytes[(size_t) i][(size_t) kind] = next_covered;
         ConversationBuffer* d = dsts[(size_t) i][(size_t) kind];
-        const uint64_t base = (uint64_t) from_unit * unit;
         parts.push_back({file, &s, need, [d, base](uint64_t o, const uint8_t* p, uint64_t c) {
                              d->visit(base + o, c, [&](uint8_t* q, size_t m2, size_t at) {
                                  std::memcpy(q, p + (at - base - o), m2);
@@ -987,7 +1074,6 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
                          }});
         return true;
     };
-    const int64_t ib = std::max<int64_t>(1, row_cells_);
     for (int64_t b = 0; b < h.n_blocks; ++b) {
         // whether the match reaches into this block (cells, or the pooled row past the last whole one)
         const int64_t c0 = b * B;
@@ -1001,28 +1087,45 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         const size_t file = opened.size() - 1;
         const Opened& f = opened[file];
         if (f.h.n_kv != h.n_kv || f.h.block_cells != B) return fail("a block of another shape", file);
+        std::vector<uint8_t> seen_block((size_t) h.n_kv, 0);
         for (const Section& s : f.tab) {
             if (s.kind < kK || s.kind > kPooled || s.index >= (uint32_t) h.n_kv) return fail("a block of another shape", file);
             const int64_t i = s.index;
             const int kind = (int) (s.kind - kK);
+            const uint8_t bit = (uint8_t) (1u << kind);
+            if (seen_block[(size_t) i] & bit) return fail("a block of another shape", file);
+            seen_block[(size_t) i] |= bit;
             const ConversationKv& k = img.kv[(size_t) i];
             const Rate& r = rates[(size_t) i];
-            const bool ok = kind < 4 ? s.bytes == r.cell[kind] * (uint64_t) B &&
-                                           take(file, s, i, kind, c0, std::min<int64_t>(k.cells, c0 + B))
-                                     : s.bytes == r.row * (uint64_t) (B / ib) &&
-                                           take(file, s, i, kind, c0 / ib, std::min<int64_t>(k.pooled_rows, (c0 + B) / ib));
+            uint64_t expect = 0;
+            const bool expect_ok = kind < 4 ? mul_u64(r.cell[kind], (uint64_t) B, expect)
+                                            : mul_u64(r.row, (uint64_t) (B / ib), expect);
+            const bool ok = expect_ok && s.bytes == expect &&
+                            (kind < 4 ? take(file, s, i, kind, c0, std::min<int64_t>(k.cells, c0 + B))
+                                      : take(file, s, i, kind, c0 / ib, std::min<int64_t>(k.pooled_rows, (c0 + B) / ib)));
             if (!ok) return fail("a block of another shape", file);
         }
     }
+    std::vector<uint8_t> seen_tail((size_t) h.n_kv, 0);
     for (const Section& s : opened[0].tab) {
         if (s.kind < kK || s.kind > kPooled) continue;
         if (s.index >= (uint32_t) h.n_kv) return fail("K/V data before its layer", SIZE_MAX);
         const int64_t i = s.index;
         const int kind = (int) (s.kind - kK);
+        const uint8_t bit = (uint8_t) (1u << kind);
+        if (seen_tail[(size_t) i] & bit) return fail("K/V sizes do not line up", SIZE_MAX);
+        seen_tail[(size_t) i] |= bit;
         const ConversationKv& k = img.kv[(size_t) i];
         const bool ok = kind < 4 ? take(0, s, i, kind, tail_from, k.cells) : take(0, s, i, kind, tail_from / ib, k.pooled_rows);
         if (!ok) return fail("K/V sizes do not line up", SIZE_MAX);
     }
+    for (int64_t i = 0; i < h.n_kv; ++i)
+        for (int kind = 0; kind < 5; ++kind)
+            if (covered_bytes[(size_t) i][(size_t) kind] != want_bytes[(size_t) i][(size_t) kind])
+                return fail("K/V sections do not cover the match", SIZE_MAX);
+    for (int64_t i = 0; i < h.n_kv; ++i)
+        for (int kind = 0; kind < 5; ++kind)
+            dsts[(size_t) i][(size_t) kind]->resize_for_overwrite(want_bytes[(size_t) i][(size_t) kind]);
     uint64_t read = 0;
     size_t bad = SIZE_MAX;
     std::vector<Source> sources;
@@ -1096,7 +1199,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     }
     const uint64_t bytes = image.bytes();
     std::lock_guard<std::mutex> lk(mu_);
-    if (queue_bytes_ + bytes > queue_cap) return false;
+    if (bytes > queue_cap || queue_bytes_ + writing_bytes_ > queue_cap - bytes) return false;
     auto job = std::make_shared<Job>();
     job->key = key_of(image.live.ids, image.live.imgs, image.cvec);
     job->name = conversation_name(identity_, job->key);
@@ -1111,11 +1214,11 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     };
     for (size_t i = 0; i < entries_.size();) {
         Entry& e = *entries_[i];
-        int64_t deepest = 0;
-        for (int64_t c : e.checks) deepest = std::max(deepest, c);
+        int64_t entry_deepest = 0;
+        for (int64_t c : e.checks) entry_deepest = std::max(entry_deepest, c);
         const bool same = e.mine && e.key == job->key;
-        const bool superseded = e.mine && e.cvec == image.cvec && deepest > 0 && held(e.ids, deepest) &&
-                                imgs_below(e.imgs, deepest) == imgs_below(image.live.imgs, deepest);
+        const bool superseded = e.mine && e.cvec == image.cvec && entry_deepest > 0 && held(e.ids, entry_deepest) &&
+                                imgs_below(e.imgs, entry_deepest) == imgs_below(image.live.imgs, entry_deepest);
         if (same || superseded) {
             if (!same) ++stats_.dropped;
             drop_locked(i);   // its block and state files stay until the writer has used them for this one
@@ -1182,7 +1285,8 @@ void ConversationStore::gc_locked(int64_t min_age) {
 void ConversationStore::evict_locked() {
     auto total = [&]() {
         uint64_t t = 0;
-        for (const auto& e : entries_) t += e->bytes;
+        for (const auto& e : entries_)
+            if (!e->job) t += e->bytes;
         for (const auto& [n, p] : parts_) t += p.bytes;
         return t;
     };
@@ -1210,13 +1314,16 @@ void ConversationStore::writer() {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
             if (queue_.empty()) return;   // stop_ with nothing left
-            job = queue_.front();
+            job = std::move(queue_.front());
+            queue_.pop_front();
+            queue_bytes_ -= job->bytes;
+            writing_bytes_ = job->bytes;
             busy_ = true;
         }
         std::string why;
         uint64_t wrote = 0, whole = 0;
         const uint64_t free_bytes = basalt::platform::disk_free_bytes(dir_);
-        const bool room = free_bytes >= job->bytes + kSpaceFloor;
+        const bool room = free_bytes >= kSpaceFloor && job->bytes <= free_bytes - kSpaceFloor;
         const bool ok = room && write_job(*job, wrote, whole, why);
         if (!room)
             basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, not written (%.1f GiB "
@@ -1225,10 +1332,7 @@ void ConversationStore::writer() {
         else if (!ok)
             basalt::log::warn("basalt serve", "conversation cache: %s", why.c_str());
         std::lock_guard<std::mutex> lk(mu_);
-        if (!queue_.empty() && queue_.front() == job) {
-            queue_.pop_front();
-            queue_bytes_ -= job->bytes;
-        }
+        writing_bytes_ = 0;
         busy_ = false;
         stats_.written_bytes += wrote;
         Entry* mine = nullptr;
@@ -1458,13 +1562,14 @@ ConversationStore::Stats ConversationStore::stats() const {
 
 uint64_t ConversationStore::queued_bytes() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return queue_bytes_;
+    return queue_bytes_ + writing_bytes_;
 }
 
 bool ConversationStore::fits(uint64_t bytes) const {
     if (!open_) return false;
     const uint64_t queued = queued_bytes(), free_bytes = basalt::platform::disk_free_bytes(dir_);
-    const bool room = free_bytes >= queued + bytes + kSpaceFloor;
+    const bool room = free_bytes >= kSpaceFloor && queued <= free_bytes - kSpaceFloor &&
+                      bytes <= free_bytes - kSpaceFloor - queued;
     if (!room && !full_said_.exchange(true))
         basalt::log::warn("basalt serve", "conversation cache: %s has %.1f GiB free, so conversations are not written "
                           "to disk until it has room (%.0f GiB kept free)", dir_.c_str(), (double) free_bytes / 1073741824.0,

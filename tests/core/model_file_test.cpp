@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -163,6 +164,79 @@ int main() {
         hc8_set_table(back);
         check(hc8_find(c.name, 3, 64) != nullptr && hc8_find(c.name, 3, 32) == nullptr && hc8_find("x", 3, 64) == nullptr,
               "hc8_find matches name and shape");
+    }
+
+    std::printf("4. integer bounds, malformed GGUF view, range and hc8 overflow guards\n");
+    {
+        Json j;
+        std::string jerr;
+        const std::string jtxt =
+            R"({"u64_max":18446744073709551615,"u64_over":18446744073709551616,)"
+            R"("i64_min":-9223372036854775808,"i64_under":-9223372036854775809,"neg_zero":-0})";
+        check(parse_json(jtxt.data(), jtxt.size(), j, jerr), "parse boundary integers: " + jerr);
+        const Json* umax = j.get("u64_max");
+        const Json* uover = j.get("u64_over");
+        const Json* imin = j.get("i64_min");
+        const Json* iunder = j.get("i64_under");
+        const Json* nzero = j.get("neg_zero");
+        check(umax && umax->type == Json::Type::Int && !umax->neg &&
+                  umax->u64() == std::numeric_limits<uint64_t>::max(),
+              "20-digit UINT64_MAX parses as exact Int");
+        check(uover && uover->type == Json::Type::Float, "UINT64_MAX + 1 falls back to Float");
+        check(imin && imin->type == Json::Type::Int && imin->neg &&
+                  imin->i64() == std::numeric_limits<int64_t>::min(),
+              "INT64_MIN parses as exact signed Int without UB");
+        check(iunder && iunder->type == Json::Type::Float, "INT64_MIN - 1 falls back to Float");
+        check(nzero && nzero->type == Json::Type::Int && !nzero->neg && nzero->u64() == 0,
+              "-0 normalizes to non-negative zero");
+    }
+    {
+        uint8_t buf[4] = {};
+        std::string rerr;
+        FileRange overflow_range(path, std::numeric_limits<uint64_t>::max() - 10, 0);
+        check(!read_range_at(overflow_range, 20, buf, sizeof buf, rerr) &&
+                  rerr.find("overflow") != std::string::npos,
+              "read_range_at rejects uint64 offset overflow: " + rerr);
+    }
+    {
+        const std::vector<std::string> bad_metas = {
+            R"({"format":"basalt","gguf_kv":{},"tensors":{"w":{"type_id":-1,"shape":[4],"offset":0}}})",
+            R"({"format":"basalt","gguf_kv":{},"tensors":{"w":{"type_id":4294967296,"shape":[4],"offset":0}}})",
+            R"({"format":"basalt","gguf_kv":{},"tensors":{"w":{"type_id":0,"shape":[-4],"offset":0}}})",
+            R"({"format":"basalt","gguf_kv":{},"tensors":{"w":{"type_id":0,"shape":[4],"offset":-1}}})",
+            R"({"format":"basalt","gguf_kv":{},"tensors":{"w":{"type_id":0,"shape":[4],"offset":999999}}})",
+            R"({"format":"basalt","gguf_kv":{},"tensors":{"w":{"type_id":0,"shape":[4],"offset":0,"bytes":-8}}})",
+        };
+        for (size_t idx = 0; idx < bad_metas.size(); ++idx) {
+            const std::string bp = write_model(d.path / ("bad_meta_" + std::to_string(idx) + ".basalt"),
+                                               {{"meta", bad_metas[idx]}, {"gguf", gg}});
+            ModelFile bm;
+            std::string berr;
+            check(bm.open(bp, berr) && bm.load_meta(berr) && !bm.register_gguf_view(berr),
+                  "malformed tensor metadata #" + std::to_string(idx) + " refused: " + berr);
+        }
+    }
+    {
+        Hc8Header hh{};
+        std::memcpy(hh.magic, "BASALTH8", 8);
+        hh.version = 1;
+        hh.n_entries = 1;
+        Hc8Entry he{};
+        std::memcpy(he.name, "blk.0.overflow", 14);
+        he.rows = 0x80000000u;
+        he.cols = 0x80000000u;   // rows*cols (2^62) + rows*srow*2 (3*2^62) wraps to 0 mod 2^64, while cols % 32 == 0
+        he.srow = 0xC0000000u;
+        he.offset = 256;
+        he.bytes = 0;
+        std::string bad_hc8(256, '\0');
+        std::memcpy(bad_hc8.data(), &hh, sizeof hh);
+        std::memcpy(bad_hc8.data() + sizeof hh, &he, sizeof he);
+        const std::string hp = write_model(d.path / "bad_hc8.basalt", {{"hc8", bad_hc8}});
+        ModelFile hm;
+        std::string herr;
+        std::map<std::string, Hc8Copy> out_hc8;
+        check(hm.open(hp, herr) && !hc8_read(hm.range("hc8"), out_hc8, herr),
+              "hc8_read rejects rows*cols uint64 overflow: " + herr);
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;
