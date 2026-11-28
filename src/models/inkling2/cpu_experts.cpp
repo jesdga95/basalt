@@ -309,15 +309,16 @@ void CpuExperts::rows(int l, int rows, const float* input, cudaStream_t stream) 
 
 void CpuExperts::start(int l, int rows, const int32_t* ids, cudaStream_t stream) {
     Impl& p = *impl_;
-    must(cudaEventRecord(p.ready, stream), "fork");
-    must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
-    moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, l, p.ids_dev, p.bell_dev, p.seq, p.stream);
+    // the ring runs on the visit's stream, after the rows' publication and before the card's experts: those fill every
+    // SM, so a ring beside them would wait for their last blocks and the CPU would start late
     must(cudaEventRecord(p.done, p.stream), "join");
+    must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");
+    moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, l, p.ids_dev, p.bell_dev, p.seq, stream);
 }
 
 void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream) {
     Impl& p = *impl_;
-    must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
+    // the ring ran on this stream (start), so it has advanced `seq` before the merge reads it
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
 

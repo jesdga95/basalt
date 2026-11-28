@@ -1577,7 +1577,7 @@ private:
         }
         // the experts
         const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
-        if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
+        if (on_cpu) {   // open until finish is queued: a throw between leaves the fork or ring outside the call's sync
             fork_open_ = true;
             sh_->cpu->rows(l, rows, nrm, k.stream);   // quantized on the host while the router chooses
         }
