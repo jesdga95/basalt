@@ -15,6 +15,7 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/core/file_reads.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -161,8 +162,10 @@ public:
             jcv_.notify_one();
             joiner_.join();
         }
+        ring_join();
         if (ra_st_) cudaStreamSynchronize(ra_st_);
         release_slot_state();
+        file_close();
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
@@ -466,6 +469,8 @@ public:
         cudaStreamSynchronize(stream_);
         n_peer_rows_ = n_cpu_rows_ = n_stage_dev_ = n_stage_bus_ = n_stage_peer_ = n_cpu_exp_ = 0;
         t_cpu_run_ms_ = 0;
+        n_stage_file_ = 0;
+        t_file_ms_ = 0;
         t_cpu_wait_ms_ = t_peer_wait_ms_ = t_gpu_wait_ms_ = 0;
         t_pre_ms_ = t_moe_ms_ = t_build_ms_ = t_issue_ms_ = t_att_ms_ = t_ffn_ms_ = 0;
         t_eng_ms_ = 0;
@@ -571,6 +576,8 @@ public:
                           t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
         basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
                           (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
+        if (n_stage_file_ > 0)
+            basalt::log::info("basalt hy4flash", "prompt experts read from the pack: %lld in %.0f ms", (long long) n_stage_file_.load(), t_file_ms_.load());
         use(sc_->dec);
         ring_close();
         big_.release();
@@ -1787,6 +1794,7 @@ private:
         // runs of experts in RAM at an even spacing go in one strided copy
         const std::vector<uint8_t>* away = (size_t) tl < away_.size() && !away_[(size_t) tl].empty() ? &away_[(size_t) tl] : nullptr;
         auto gone = [&](int x) { return away && (*away)[(size_t) x]; };   // the second card computes it
+        std::vector<std::pair<int, uint8_t*>> file;   // only the pack holds them
         int e = 0, p = 0;
         while (e < g_.n_expert && p < ring_cap_) {
             if (gone(e)) {
@@ -1820,12 +1828,82 @@ private:
             }
             if (src.dev) cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
             else if (src.peer) cudaMemcpyPeerAsync(dst, m_.device(), src.peer, tier_->peer_for(tl)->device(), el.blob_bytes, copy_);
-            else return false;
+            else file.emplace_back(e, dst);
             pos[(size_t) e] = p;
             ++e;
             ++p;
         }
+        if (!file.empty()) {
+            std::string err;
+            if (!copy_from_file(tl, file, copy_, err)) {
+                basalt::log::error("basalt hy4flash", "%s", err.c_str());
+                return false;
+            }
+        }
         cudaEventRecord(ring_copied_[slot], copy_);
+        return true;
+    }
+
+    // Experts only the pack holds (a pack larger than RAM): read through core::FileReads into two pinned buffers of kStageExperts
+    // blobs and copied to the card on `s`. One buffer fills while the other's copies run; a buffer is refilled once its copies
+    // landed. Ring threads and the main thread take the buffers one at a time.
+    core::FileReads file_reads_;
+    uint8_t* file_host_[2] = {};
+    cudaEvent_t file_copied_[2] = {};
+    int file_next_ = 0;
+    std::mutex file_mu_;
+    std::atomic<int64_t> n_stage_file_{0};
+    std::atomic<double> t_file_ms_{0};
+    bool file_open(std::string& err) {
+        if (file_host_[0]) return true;
+        if (!file_reads_.open(m_.path(), m_.fd(), err)) return false;
+        for (int i = 0; i < 2; ++i) {
+            if (cudaMallocHost((void**) &file_host_[i], (size_t) kStageExperts * stride_) != cudaSuccess ||
+                cudaEventCreateWithFlags(&file_copied_[i], cudaEventDisableTiming) != cudaSuccess) {
+                err = "cannot allocate the pinned buffers for experts read from the pack";
+                return false;
+            }
+        }
+        return true;
+    }
+    void file_close() {
+        for (int i = 0; i < 2; ++i) {
+            if (file_copied_[i]) {
+                cudaEventSynchronize(file_copied_[i]);
+                cudaEventDestroy(file_copied_[i]);
+            }
+            if (file_host_[i]) cudaFreeHost(file_host_[i]);
+            file_copied_[i] = nullptr;
+            file_host_[i] = nullptr;
+        }
+    }
+    // `to` holds (expert, device destination) pairs of tier layer tl.
+    bool copy_from_file(int tl, const std::vector<std::pair<int, uint8_t*>>& to, cudaStream_t s, std::string& err) {
+        std::lock_guard<std::mutex> g(file_mu_);
+        if (!file_open(err)) return false;
+        const double t0 = now_ms();
+        const ExpertLayer& el = m_.pack().experts[(size_t) (tl + g_.n_dense)];
+        const uint64_t base = m_.pack().experts_range.offset + el.offset;
+        std::vector<core::FileReads::Blob> blobs;
+        for (size_t b0 = 0; b0 < to.size(); b0 += kStageExperts) {
+            const size_t n = std::min<size_t>(kStageExperts, to.size() - b0);
+            const int h = file_next_;
+            file_next_ ^= 1;
+            cudaEventSynchronize(file_copied_[h]);   // the buffer's copies before have landed
+            blobs.clear();
+            for (size_t i = 0; i < n; ++i)
+                blobs.push_back({base + (uint64_t) to[b0 + i].first * el.blob_bytes, el.blob_bytes, file_host_[h] + stride_ * i});
+            file_reads_.start(blobs);
+            if (!file_reads_.wait(err)) {
+                err = "reading experts of layer " + std::to_string(tl + g_.n_dense) + " from the pack failed: " + err;
+                return false;
+            }
+            for (size_t i = 0; i < n; ++i)
+                cudaMemcpyAsync(to[b0 + i].second, file_host_[h] + stride_ * i, el.blob_bytes, cudaMemcpyHostToDevice, s);
+            cudaEventRecord(file_copied_[h], s);
+        }
+        n_stage_file_ += (int64_t) to.size();
+        t_file_ms_ = t_file_ms_ + (now_ms() - t0);
         return true;
     }
     // The copy is issued from a thread of its own: hundreds of copy calls can hold the caller until the bus has taken most of them.
@@ -2435,6 +2513,9 @@ private:
         if (set.empty()) set.assign((size_t) kMaxWindow * g_.n_layers * 3, nullptr);
         cudaGraphExec_t& ex = set[((size_t) (R - 1) * g_.n_layers + l) * 3 + part];
         if (!ex) {
+            // instantiating can wait for the card, and a group whose rows only this thread delivers (experts read from the
+            // file) leaves the card waiting for its word: deliver it first
+            if (pend_.on && pend_.reading && !join_moe(err)) return false;
             if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
                 err = "cannot begin a graph capture";
                 return false;
@@ -2766,6 +2847,7 @@ private:
             }
             Stage& B = stage_[launch_++ & 1];
             cudaStreamWaitEvent(copy_, B.done, 0);   // the device buffers of the launch before last are free
+            std::vector<std::pair<int, uint8_t*>> file;   // only the pack holds them
             for (int q = 0; q < nb; ++q) {
                 const int e = used[b0 + (size_t) q];
                 uint8_t* dst = B.blobs + stride_ * (size_t) q;
@@ -2781,10 +2863,10 @@ private:
                     core::PeerExperts* pe = tier_->peer_for(tl);
                     cudaMemcpyPeerAsync(dst, m_.device(), src.peer, pe->device(), el.blob_bytes, copy_);
                 } else {
-                    err = "expert " + std::to_string(e) + " of layer " + std::to_string(l) + " is not in RAM (a pack larger than RAM is not run yet)";
-                    return false;
+                    file.emplace_back(e, dst);
                 }
             }
+            if (!file.empty() && !copy_from_file(tl, file, copy_, err)) return false;
             cudaEventRecord(B.copied, copy_);
             tok_buf_.clear();
             bounds_buf_.clear();
@@ -2901,6 +2983,9 @@ private:
         pd = Pending{};
         pd.on = true;
         pd.tl = tl;
+        // Submit pending promotions before arming the peer's wait kernel, so a
+        // peer copy is not submitted behind a GPU wait for this layer's plan.
+        tier_->pump(tl, 2 + G);
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer_for(tl);
         if (peer) {
@@ -2909,7 +2994,6 @@ private:
             if (!peer->arm(limited, h_x_, G, K, core::policy::peer_groups(G), err)) return false;
             pd.peer = peer;
         }
-        tier_->pump(tl, 2 + G);   // what this layer's head leaves the bus of the promotions queued before it
         if (!await_ids(err)) return false;
         int32_t uniq[kLookupK];
         int uidx[kLookupK], nu = 0;
