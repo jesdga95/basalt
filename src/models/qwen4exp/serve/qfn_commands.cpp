@@ -48,6 +48,31 @@ std::vector<QfnRuntime::CardFacts> QfnRuntime::card_facts() {
     return out;
 }
 
+void QfnRuntime::stats_peer_slots() {
+    if (!stats.on) return;
+    std::string snapshot;
+    const auto append = [&](const basalt::core::PeerExperts& tier) {
+        if (!tier.valid()) return;
+        char bus[32] = {};
+        if (cudaDeviceGetPCIBusId(bus, sizeof bus, tier.device()) != cudaSuccess) return;
+        const auto s = tier.slot_stats();
+        const auto& k = s.skipped_refills;
+        if (!snapshot.empty()) snapshot += ';';
+        snapshot += bus;
+        for (uint64_t n : {uint64_t(s.allocated), uint64_t(s.mapped), uint64_t(s.in_flight), uint64_t(s.loaned),
+                          k.no_source_mapping, k.source_in_flight, k.destination_mapped,
+                          k.missing_host_copy, k.destination_in_flight})
+            snapshot += '/' + std::to_string(n);
+        snapshot += '/' + std::to_string(s.unaccounted);
+    };
+    append(peer);
+    for (const auto& tier : xpeers) append(*tier);
+    if (snapshot.empty() || snapshot == peer_slots_sent) return;
+    peer_slots_sent = std::move(snapshot);
+    std::printf("INFO peer_slots=%s\n", peer_slots_sent.c_str());
+    std::fflush(stdout);
+}
+
 basalt::program::serve::LookupCounts QfnRuntime::lookup_counts() {
     const basalt::core::ExpertDispatch& d = drive.d;   // DONE's counts (done_counts)
     return {d.cache_hits, d.cache_hits + d.cache_admitted + d.cache_refused, d.offload_entries, src.file_reads()};

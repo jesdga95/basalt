@@ -713,6 +713,12 @@ if(BUILD_TESTING)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
 
+  add_executable(peer_reassign_test tests/core/peer_reassign_test.cpp)
+  target_link_libraries(peer_reassign_test PRIVATE tiers)
+  basalt_embed_manifest(peer_reassign_test)
+  basalt_gpu_test(NAME peer_reassign_test COMMAND peer_reassign_test)
+  set_tests_properties(peer_reassign_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
   add_executable(host_registration_test tests/core/host_registration_test.cpp)
   target_link_libraries(host_registration_test PRIVATE tiers)
   basalt_embed_manifest(host_registration_test)

@@ -132,6 +132,18 @@ class Lines(unittest.TestCase):
 
 
 class Hardware(unittest.TestCase):
+    def test_peer_slots_follow_the_card_bus(self):
+        info = {"cards": "0000:01:00.0/2/-/1/0;0000:08:00.0/4/-/2/0",
+                "peer_slots": "00000000:08:00.0/4/3/1/0/1/2/3/4/5/0;bad/3;0000:01:00.0/2/x/0/0/0/0/0/0/0/0"}
+        cards, l3 = engine_facts(info)
+        current = {"gpus": [{"index": 1}, {"index": 0}]}
+        static = {"gpus": [{"index": 0, "bus": "0000:01:00.0"}, {"index": 1, "bus": "0000:08:00.0"}]}
+        peer, main = hardware_view(current, static, info, cards, l3)["gpus"]
+        self.assertNotIn("peer_slots", main)
+        self.assertEqual(peer["peer_slots"], {"allocated": 4, "mapped": 3, "in_flight": 1, "loaned": 0, "unaccounted": 0,
+                         "skipped_refills": {"no_source_mapping": 1, "source_in_flight": 2, "destination_mapped": 3,
+                                             "missing_host_copy": 4, "destination_in_flight": 5}})
+
     def test_cards_and_groups(self):
         self.assertEqual(parse_cards("0000:01:00.0/9052/52.1/23869/512;0000:08:00.0/5497/-/14500/0;bad/1/2"),
                          {"0:1:0.0": {"expert_slots": 9052, "h2d_gbps": 52.1, "experts": 23869 << 20, "kv": 512 << 20},

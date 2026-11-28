@@ -115,6 +115,10 @@ The engine's own figures, which the server asks for with `STATS` once the engine
   `expert_slots` and `h2d_gbps` (the host-to-device link as the start measured it; Flash-Next measures it, the other models
   leave it out); `cpu_ccd` (the load of each group of cores that share an L3 cache), `ram_parts` (`experts` the engine holds in
   RAM, `page_cache`, `other`; Linux only) and `disk_hist` (the read rate's last 60 s).
+- A Flash-Next peer card's `hardware.gpus[].peer_slots` reports allocated, mapped, in-flight and loaned expert slots at the
+  last request boundary. An eviction can still be mapped, and a refill can own a slot before its mapping is published.
+  `unaccounted` subtracts the union of mapped and transferring slots and the loaned slots from the allocation. The cumulative
+  `skipped_refills` counts cover refusals during primary-to-peer reassignment and reset with the engine.
 - **Prometheus:** `GET /metrics` returns Prometheus text exposition format (`text/plain; version=0.0.4`) when `Accept` asks for `text/plain` or `application/openmetrics-text`, or with `?format=prometheus` (JSON otherwise, so the stats page is unchanged). Every metric is named `basalt_*` (requests, tokens, latency histograms, draft acceptance, engine state, GPU and RAM); a dashboard made for another engine's names can use Prometheus relabeling.
 
 The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs. The conversation cache

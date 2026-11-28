@@ -70,6 +70,7 @@ Flow Runtime::dispatch() {
             if (!next_batch_window()) return Flow::error;
             // a slot that ended its request has its last figures out with its BDONE
             stats_tick(active != (size_t) std::count_if(bs.begin(), bs.end(), [](const BSlot& b) { return b.active; }));
+            if (!batch_on()) stats_peer_slots();
             return Flow::next;
         }
     } else {
@@ -143,6 +144,7 @@ Flow Runtime::dispatch() {
     if (line == "STATS") {   // the server's console: XSLOT and XMAP lines from now on (console_stats.hpp)
         stats.on = true;
         stats_tick(true);
+        if (!batch_on()) stats_peer_slots();
         return Flow::next;
     }
     if (line.rfind("PMATCH ", 0) == 0 || line.rfind("PFREE ", 0) == 0) {   // a prompt held by handle, between requests and windows

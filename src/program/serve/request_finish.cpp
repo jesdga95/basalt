@@ -94,11 +94,12 @@ Flow Request::complete() {
                 (long long) dc.ram_blobs, (long long) dc.file_blobs, dc.file_mb, (long long) read_n,
                 (long long) dc.offloaded, (long long) windows);
     std::fflush(stdout);
-    // no swap stays in flight between requests: the last round's copies land once the reply is out
+    // Drain the main adaptive pipeline once the reply is out. A peer refill can still own an unpublished slot.
     if (!tiers_settle()) {
         std::printf("ERR an adaptive refill failed\n");
         return Flow::error;
     }
+    if (!runtime_.batch_on()) runtime_.stats_peer_slots();
     if (runtime_.admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
         bool cont = ram_out ? false : batch_first ? !cancelled && (int64_t) runtime_.live.size() == p
                             : !cancelled && produced_n == 1 && runtime_.admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&

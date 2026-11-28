@@ -111,6 +111,8 @@ void PeerExperts::close() {
     loaded_.clear();
     evicting_.clear();
     pending_.clear();
+    loaned_ = 0;
+    refill_skips_ = {};
     device_ = -1;
 }
 
@@ -618,7 +620,8 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         const int32_t* r1 = res_.data() + l * n_expert_;
         for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
             if (r1[e] >= 0) {
-                if (!hold_[(size_t) (l * n_expert_ + e)]) vict.emplace_back(u[e], e);
+                // A second copy serves no extra routes while another tier covers this expert.
+                if (!hold_[(size_t) (l * n_expert_ + e)]) vict.emplace_back(r0[e] >= 0 ? -1.0f : u[e], e);
             }
             else if (r0[e] < 0 && u[e] >= 2.0f && (inflight.empty() || !inflight[(size_t) (l * n_expert_ + e)])) cand.emplace_back(u[e], e);
         }
@@ -680,22 +683,48 @@ std::vector<size_t> PeerExperts::incoming() const {
     return v;
 }
 
+PeerExperts::SlotStats PeerExperts::slot_stats() const {
+    const size_t allocated = cache_.slots();
+    std::vector<bool> owned(allocated);
+    const auto claim = [&](int32_t slot) {
+        if (slot >= 0 && (size_t) slot < allocated) owned[(size_t) slot] = true;
+    };
+    for (const int32_t slot : res_) claim(slot);
+    const size_t mapped = (size_t) std::count(owned.begin(), owned.end(), true);
+    for (const auto& p : pending_) claim(p.second);
+    for (const Evict& x : evicting_) claim(x.slot);
+    // Borrowing clears each slot's mapping and requires an empty transfer queue.
+    const int64_t unaccounted = std::count(owned.begin(), owned.end(), false) - (int64_t) loaned_;
+    return {allocated, mapped, pending_.size() + evicting_.size(), loaned_, unaccounted, refill_skips_};
+}
+
 bool PeerExperts::reassign(int64_t layer, int32_t in, int64_t lout, int32_t out, const uint8_t* blob, std::string& err) {
     const size_t i_in = (size_t) (layer * n_expert_ + in), i_out = (size_t) (lout * n_expert_ + out);
     const int32_t slot = res_[i_in];
     hold_[i_in] = 0;
-    if (slot < 0) return true;
-    res_[i_in] = kNotResident;                 // the primary computes it from now on
-    if (res_[i_out] >= 0 || blob == nullptr) return true;
+    if (slot < 0) { ++refill_skips_.no_source_mapping; return true; }
     for (const auto& p : pending_)
-        if (p.second == slot) return true;
-    for (const Evict& x : evicting_)
-        if (x.slot == slot) return true;
+        if (p.second == slot) {
+            ++refill_skips_.source_in_flight;
+            res_[i_in] = kNotResident;   // a refill already owns the bytes
+            return true;
+        }
+    // Keep the old bytes mapped until a refill actually takes the slot. If the primary also
+    // holds them, adapt can reuse that copy for a different expert on its next round.
+    if (res_[i_out] >= 0) { ++refill_skips_.destination_mapped; return true; }
+    if (blob == nullptr) { ++refill_skips_.missing_host_copy; return true; }
+    for (const auto& p : pending_)
+        if ((size_t) p.first == i_out) { ++refill_skips_.destination_in_flight; return true; }
+    for (const Evict& x : evicting_) {
+        if (x.slot == slot) { ++refill_skips_.source_in_flight; return true; }  // issue_pending retires its victim
+        if (x.layer == lout && x.in == out) { ++refill_skips_.destination_in_flight; return true; }
+    }
     const auto& lay = basalt::kernels::cpu::expert_layout();
     On on(device_);
     if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(lout), cudaMemcpyHostToDevice,
                             refill_), "reassign", err))
         return false;
+    res_[i_in] = kNotResident;
     pending_.emplace_back((int32_t) i_out, slot);
     ++swaps_;
     return ck(cudaEventRecord(refill_ev_, refill_), "reassign event", err);
@@ -717,6 +746,7 @@ bool PeerExperts::lend(int32_t first, std::vector<std::pair<int32_t, int32_t>>& 
             lent.emplace_back((int32_t) i, res_[i]);
             res_[i] = kNotResident;
         }
+    loaned_ += lent.size();
     return true;
 }
 
@@ -742,6 +772,7 @@ bool PeerExperts::give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent,
         if (!ck(cudaEventSynchronize(refill_ev_), "give back", err)) return false;
     }
     for (const auto& [i, slot] : lent) res_[(size_t) i] = slot;
+    loaned_ -= lent.size();
     lent.clear();
     return true;
 }

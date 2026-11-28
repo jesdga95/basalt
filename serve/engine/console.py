@@ -206,6 +206,22 @@ def parse_cards(words) -> dict[str, dict]:
     return out
 
 
+def parse_peer_slots(words) -> dict[str, dict]:
+    """The peer tiers' slot state and cumulative promotion-refill skips at the request boundary."""
+    counts = ("allocated", "mapped", "in_flight", "loaned")
+    reasons = ("no_source_mapping", "source_in_flight", "destination_mapped", "missing_host_copy", "destination_in_flight")
+    out = {}
+    for part in str(words or "").split(";"):
+        bus, *fields = part.split("/")
+        if (not bus or len(fields) != len(counts) + len(reasons) + 1 or not all(v.isdecimal() for v in fields[:-1])
+                or not fields[-1].removeprefix("-").isdecimal()):
+            continue
+        values = list(map(int, fields))
+        out[norm_bus(bus)] = {**dict(zip(counts, values)), "unaccounted": values[-1],
+                              "skipped_refills": dict(zip(reasons, values[len(counts):-1]))}
+    return out
+
+
 def parse_l3(words) -> list[list[int]]:
     """INFO cpu_l3=0-7,16-23;8-15,24-31 as the logical processors of each L3 cache."""
     groups = []
@@ -224,6 +240,9 @@ def engine_facts(info: dict) -> tuple[dict, list[list[int]]]:
     """Takes the per-card and CPU words out of the engine's INFO facts; with cards, the engine's expert slots are
     their sum, the one count every view shows."""
     cards = parse_cards(info.pop("cards", None))
+    for bus, slots in parse_peer_slots(info.pop("peer_slots", None)).items():
+        if bus in cards:
+            cards[bus]["peer_slots"] = slots
     l3 = parse_l3(info.pop("cpu_l3", None))
     if cards:
         info["expert_slots"] = sum(c["expert_slots"] for c in cards.values())
@@ -243,7 +262,10 @@ def hardware_view(now: dict, static: dict, info: dict, cards: dict, l3: list[lis
         if c and isinstance(used, int):
             kv = c["kv"] or 0
             parts = {"experts": c["experts"], "kv": c["kv"], "other": max(0, used - c["experts"] - kv)}
-        gpus.append({**g, "expert_slots": c.get("expert_slots"), "h2d_gbps": c.get("h2d_gbps"), "vram_parts": parts})
+        gpu = {**g, "expert_slots": c.get("expert_slots"), "h2d_gbps": c.get("h2d_gbps"), "vram_parts": parts}
+        if "peer_slots" in c:
+            gpu["peer_slots"] = c["peer_slots"]
+        gpus.append(gpu)
     hw["gpus"] = gpus
     cores = hw.pop("cpu_cores", None)
     hw["cpu_ccd"] = None
