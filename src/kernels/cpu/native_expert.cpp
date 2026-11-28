@@ -271,7 +271,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq1s_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
-    if (avx512 && !soft && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
+    const bool exact_gu_nt =
+        nt >= 2 || f.gu_type == GGML_TYPE_IQ1_M || f.gu_type == GGML_TYPE_IQ2_XXS || f.gu_type == GGML_TYPE_IQ2_XS;
+    if (avx512 && !soft && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && exact_gu_nt &&
+        iq1s_512_fits(n)) {
         iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }

@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
             fill(blob, type, 900 + (uint64_t) type, 0);
             if (type == GGML_TYPE_IQ1_M) {
                 const size_t bs = ggml_type_size(GGML_TYPE_IQ1_M);
-                for (size_t b = f.down_off; b + bs <= blob.size(); b += bs) {
+                for (size_t b = 0; b + bs <= blob.size(); b += bs) {
                     // IQ1_M packs its fp16 scale into the top nibbles of the four u16 words in scales[8] at +48.
                     blob[b + 55] = (uint8_t) ((blob[b + 55] & 0x0f) | 0x20);
                 }
@@ -243,8 +243,47 @@ int main(int argc, char** argv) {
                 std::printf("FAIL: type %d exact AVX-512 down rows differ from ggml (%zu values)\n", type, exact_diff);
                 ++bad;
             }
+            // Also verify clamped-SwiGLU exact gate/up rows across all 7 types.
+            cpu::NativeFmt fg = f;
+            fg.swiglu_limit = 7.f;
+            std::vector<float> xv(kRows);
+            std::vector<std::vector<uint8_t>> xq(MAXT, std::vector<uint8_t>(cpu::kNativeActBytes));
+            const void* xp[MAXT];
+            for (int t = 0; t < MAXT; ++t) {
+                for (auto& v : xv) v = nd(rng);
+                cpu::native_quant_act(fg, xv.data(), xq[(size_t) t].data());
+                xp[t] = xq[(size_t) t].data();
+            }
+            constexpr int gr0 = 5, gr1 = 61;
+            std::vector<std::vector<float>> gref(MAXT, std::vector<float>(kCols));
+            for (int t = 0; t < MAXT; ++t)
+                for (int r = gr0; r < gr1; ++r) {
+                    float g = 0.f, u = 0.f;
+                    tc->vec_dot(kRows, &g, 0, blob.data() + (size_t) r * fg.gu_row, 0, xp[t], 0, 1);
+                    tc->vec_dot(kRows, &u, 0, blob.data() + fg.up_off + (size_t) r * fg.gu_row, 0, xp[t], 0, 1);
+                    g = std::fmin(g, fg.swiglu_limit);
+                    u = std::fmax(std::fmin(u, fg.swiglu_limit), -fg.swiglu_limit);
+                    gref[(size_t) t][(size_t) r] = (g / (1.f + std::exp(-g))) * u;
+                }
+            size_t gu_diff = 0;
+            for (int nt = 1; nt <= MAXT; ++nt) {
+                std::vector<std::vector<float>> ffo(nt, std::vector<float>(kCols, kGuard));
+                float* fp[MAXT];
+                for (int t = 0; t < nt; ++t) fp[t] = ffo[(size_t) t].data();
+                cpu::native_gu_rows(fg, blob.data(), xp, nt, fp, gr0, gr1);
+                for (int t = 0; t < nt; ++t)
+                    for (int r = 0; r < gr1 + 4; ++r) {
+                        const float want = (r >= gr0 && r < gr1) ? gref[(size_t) t][(size_t) r] : kGuard;
+                        gu_diff += std::memcmp(&ffo[(size_t) t][(size_t) r], &want, 4) != 0;
+                    }
+            }
+            if (gu_diff) {
+                std::printf("FAIL: type %d exact AVX-512 limited gate/up rows differ from ggml (%zu values)\n", type,
+                            gu_diff);
+                ++bad;
+            }
         }
-        std::printf("  exact AVX-512 IQ down rows & Q8_K quant_h (cols=%d): %s\n", kCols, bad ? "FAIL" : "bit-exact ok");
+        std::printf("  exact AVX-512 IQ gu/down rows & Q8_K quant_h (cols=%d): %s\n", kCols, bad ? "FAIL" : "bit-exact ok");
     }
     // ---- multi-token bounds (nt <= 0 no-op, nt = 9, 13 chunking bitwise vs nt = 1) and Q8_K zero/NaN edge cases
     {

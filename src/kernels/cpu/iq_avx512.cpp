@@ -227,8 +227,8 @@ inline void iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accum[t]) + IQ1S_DELTA * accum1[t];
 }
 
-// ---- IQ2_XXS, IQ2_XS, NT tokens: integer sums folded to ggml's eight int32 lanes, its float accumulation order per
-// token, so every token's result is bit for bit ggml's single-token dot.
+// ---- IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, NT tokens: integer sums folded to ggml's eight int32 lanes, its float
+// accumulation order per token, so every token's result is bit for bit ggml's single-token dot.
 template <int TY, int NT>
 inline void row_dot_exact(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
     __m256 accum[NT];
@@ -307,7 +307,7 @@ inline void iq1m_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accum1[t]) + IQ1M_DELTA * hsum8(accum2[t]);
 }
 
-// the exact dots of one row for NT tokens: IQ1_S, IQ2_XXS, IQ2_XS, IQ1_M
+// the exact dots of one row for NT tokens: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S
 template <int TY, int NT>
 inline void exact_dot(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
     if constexpr (TY == 19) iq1s_row_dot<NT>(row, nb, y, res);
@@ -379,6 +379,7 @@ void exact_rows_k(int k, const uint8_t* w, size_t row_bytes, int nb, const void*
 // tokens in groups of up to four
 void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, bool scaled,
                       float limit, const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    if (nt <= 0 || r0 >= r1) return;
     const int nb = n / QK_K;
     for (int t0 = 0; t0 < nt; t0 += 4) {
         const int k = nt - t0 < 4 ? nt - t0 : 4;
@@ -397,6 +398,7 @@ void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_of
 
 void exact_rows_nt(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                    int r0, int r1) {
+    if (nt <= 0 || r0 >= r1) return;
     const int nb = n / QK_K;
     const int step = (type == 19 || type == 29) ? 4 : 8;   // IQ1_S and IQ1_M keep two accumulators per token
     for (int t0 = 0; t0 < nt; t0 += step) {
