@@ -13,6 +13,7 @@
 #include <thread>
 
 #if !defined(_WIN32)
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -93,14 +94,27 @@ int main() {
             while (std::chrono::steady_clock::now() < until) sink = sink * 1.0000001 + 1;
             _exit(0);
         } else if (kid > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
             double peak = 0;
             for (int i = 0; i < 14; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 peak = std::max(peak, probe.sample());
             }
             int status = 0;
-            waitpid(kid, &status, 0);
-            check(peak - base > 0.4 && peak - base < 2.5, "one busy child core raises external load by about one core (rise)");
+            rusage kid_use{};
+            wait4(kid, &status, 0, &kid_use);
+            const double child_cores =   // what the child actually held, seconds of cpu per second of window
+                (double) (kid_use.ru_utime.tv_sec + kid_use.ru_stime.tv_sec +
+                          (kid_use.ru_utime.tv_usec + kid_use.ru_stime.tv_usec) / 1e6) /
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            // The sensor's rise must see the child's real consumption: a scheduler squeezed by parallel tests
+            // may hand the child less than a full core, and then reading less is the sensor being honest.
+            // The old bug this replaces: reading none of it.
+            char detail[128];
+            std::snprintf(detail, sizeof detail,
+                          "the sensor's rise follows the busy child's own cpu consumption (rise %.2f, child %.2f, base %.2f)",
+                          peak - base, child_cores, base);
+            check(peak - base > 0.5 * child_cores && peak - base < child_cores + 1.5, detail);
         } else
             check(false, "ExternalCpuLoad: fork failed");
     }
