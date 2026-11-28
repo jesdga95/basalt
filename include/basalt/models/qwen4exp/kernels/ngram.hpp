@@ -144,7 +144,7 @@ public:
     /// Non-blocking prefetch of 16 rows for one token into the reader's row cache while the GPU is busy.
     void prefetch_rows(const uint32_t* rows16);
     void wait_prefetches();
-    /// Plan v0.3 P5: the rows of `n_tokens` tokens (16 each, `rows` token-major) into `out` (2560 floats per token),
+    /// The rows of `n_tokens` tokens (16 each, `rows` token-major) into `out` (2560 floats per token),
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);

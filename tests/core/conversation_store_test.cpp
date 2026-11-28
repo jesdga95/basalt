@@ -661,7 +661,7 @@ int main() {
         CHECK(!st.load(ma, got_a, err));
         CHECK(st.stats().dropped == dropped_before);
 
-        // Also test mismatched-length neighbor: previously load() hit "no state at the match" and deleted neighbor.
+        // Also test mismatched-length neighbor: load() must not hit "no state at the match" and delete the neighbor.
         const std::vector<int32_t> d = seq(40000, 520), e = seq(50000, 700);
         const SavedConversation sd = chat(d, {{200, Src::kRoot}, {520, Src::kTurnEnd}}),
                                 se = chat(e, {{300, Src::kRoot}, {700, Src::kTurnEnd}});

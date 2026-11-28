@@ -22,7 +22,8 @@ namespace {
 
 // Resolves the registered adapter for the pack at `path`. When `quiet` is true, errors leave `adapter` null without
 // logging (used when `-h`/`--help` also appears in argv and may be a help request rather than a flag value).
-std::optional<int> resolve_adapter(const std::string& path, const model::ModelAdapter*& adapter, bool quiet = false) {
+std::optional<int> resolve_adapter(const std::string& path, const model::ModelAdapter*& adapter,
+                                   std::string& model_name, std::string& community_quant, bool quiet = false) {
     basalt::core::ModelFile file;
     std::string err;
     if (!file.open(path, err) || !file.load_meta(err)) {
@@ -39,11 +40,14 @@ std::optional<int> resolve_adapter(const std::string& path, const model::ModelAd
         basalt::log::error("basalt", "--model: %s", model::unavailable_architecture(name).c_str());
         return 2;
     }
+    model_name = kv != nullptr ? adapter->model_name(*kv) : "";
+    community_quant = adapter->community_quant(file.meta());
     return std::nullopt;
 }
 
 // The architecture named in the file --model gives; empty without one. An exit code when it cannot be used.
-std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*& adapter) {
+std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*& adapter,
+                              std::string& model_name, std::string& community_quant) {
     std::string path;
     bool saw_help = false;
     for (int i = 1; i < argc; ++i) {
@@ -55,7 +59,7 @@ std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*&
         }
     }
     if (path.empty()) return std::nullopt;
-    return resolve_adapter(path, adapter, saw_help);
+    return resolve_adapter(path, adapter, model_name, community_quant, saw_help);
 }
 
 // What the flags left unset: each id is the pack's own token.
@@ -113,12 +117,13 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load; batched serving sets it (below).
     const bool module_loading_set = std::getenv("CUDA_MODULE_LOADING") != nullptr;
     if (!module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
-    if (const auto code = find_model(argc, argv, adapter)) return *code;
+    std::string model_name, community_quant;
+    if (const auto code = find_model(argc, argv, adapter, model_name, community_quant)) return *code;
     auto fill_adapter_meta = [&](CommonOptions& opts) {
         opts.arch = adapter->arch();
-        opts.model_name = adapter->model_name();
+        opts.model_name = model_name;
         opts.community_kv = adapter->community_kv();
-        opts.community_quant = adapter->community_quant();
+        opts.community_quant = community_quant;
         opts.quality_flags = adapter->quality_flags();
         opts.quality_window = adapter->quality_window();
     };
@@ -127,7 +132,7 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     if (const auto code = parse_options(argc, argv, *out, adapter)) return *code;
     // If another flag masked --model during the pre-scan, resolve now and re-parse into the adapter's options object.
     if (adapter == nullptr && !out->model.empty()) {
-        if (const auto code = resolve_adapter(out->model, adapter)) return *code;
+        if (const auto code = resolve_adapter(out->model, adapter, model_name, community_quant)) return *code;
         out = adapter->make_options();
         fill_adapter_meta(*out);
         if (const auto code = parse_options(argc, argv, *out, adapter)) return *code;

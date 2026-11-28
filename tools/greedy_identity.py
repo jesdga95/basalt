@@ -3,7 +3,8 @@
     python3 tools/greedy_identity.py REF_BIN NEW_BIN --model FILE.basalt [--fixtures DIR] [--tokens N] [-- ENGINE ARGS...]
 
 Each binary runs as `--serve` with BASE plus any flags after `--` (which replace BASE values). The bench fixtures'
-prompts (conv, struct, prose: comma-separated token ids per line) run at temperature 0 and every token is compared.
+prompts (conv, struct, prose: comma-separated token ids per line; the model's own folder of them when the fixtures have
+one, as basalt-bench picks) run at temperature 0 and every token is compared.
 For qwen4exp packs, adaptive swaps are off so placement cannot drift; pin the main card's tier too (`-- --expert-cache
 N`) when the builds' VRAM use differs, since auto-sized tiers change rounding. A second card's tier holds what fits:
 check that its expert count ("peer GPU 1: N experts" in both logs) matches.
@@ -124,13 +125,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("ref")
     ap.add_argument("new")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--fixtures", default=str(HERE.parent / "data" / "bench"))
+    ap.add_argument("--fixtures", default=str(HERE.parent / "data" / "bench"),
+                    help="the fixtures folder; its subfolder named for the model's architecture when there is one")
     ap.add_argument("--tokens", type=int, default=300)
     a = ap.parse_args(argv)
 
+    fixtures = Path(a.fixtures)
+    arch = model_arch(a.model)
+    if arch and (fixtures / arch).is_dir():
+        fixtures = fixtures / arch
     prompts = []
     for name in PROMPTS:
-        path = Path(a.fixtures) / f"{name}.ids"
+        path = fixtures / f"{name}.ids"
         if not path.is_file():
             print(f"greedy_identity: {path} is missing", file=sys.stderr)
             return 2

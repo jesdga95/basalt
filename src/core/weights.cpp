@@ -205,7 +205,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     }
 
     if (pool == 0 || rows.empty()) { err = "the dense index has no header or no rows"; return false; }
-    // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
+    // A skip set compacts the arena.  Kept rows are re-placed in index order at the index's
     // alignment; skipped rows keep their metadata and get no bytes.
     std::vector<bool> skipped(rows.size(), false);
     if (skip != nullptr) {

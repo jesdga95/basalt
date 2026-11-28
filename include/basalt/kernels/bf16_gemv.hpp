@@ -37,7 +37,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 
 /// Single-token, contiguous 2D BF16-weight/F32-activation MMVF from the pinned llama.cpp CUDA path.
 /// Preserves pair accumulation, adaptive block size and warp-XOR reduction order. This is a separate
-/// opt-in entry point; the legacy BF16-activation kernels above retain their behavior.
+/// opt-in entry point; the BF16-activation kernels above keep their behavior.
 /// `w[o*n_in+i]` is BF16 bits; x/y are F32. n_in must be positive and even, n_out positive, both <= INT_MAX.
 /// x must be 8-byte aligned, w 4-byte aligned, and y 4-byte aligned. Throws on invalid geometry/pointers.
 /// The device buffers must not overlap; allocation bounds remain the caller's responsibility.

@@ -68,9 +68,12 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
                      projections keep their codes and scales, FP8 ones their E4M3 codes, NVFP4 GDN a / b become BF16 of
                      their values, a BF16 head becomes FP8 E4M3 rows, the drafter's BF16 projections Q8_0, the vision
                      tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
-  --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
+  --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors;
+                     with a gemma4 checkpoint, Google's assistant drafter (google/gemma-4-*-it-assistant) as assistant.*
   --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
                      to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
+  --mlp-nvfp4        with a gemma4 checkpoint (tools/convert/checkpoint_gemma4.py): the MLP's projections rounded once to
+                     NVFP4 planes, the attention's FP8 (a dense model too large for its card in FP8)
 
 From an Inkling 2 checkpoint (no --sections-from; tools/convert/checkpoint_inkling2.py)
   --checkpoint DIR   Thinking Machines' Inkling 2 checkpoint (NVFP4 / MXFP8 experts, BF16 dense projections and vision
@@ -895,6 +898,8 @@ def main():
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
     ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")
+    ap.add_argument("--experts-mxfp8", metavar="LAYERS",
+                    help="gemma4: the layers (e.g. 0,5,10-12) whose routed experts are MXFP8; the others are NVFP4")
     ap.add_argument("--nvfp4", action="store_true",
                     help="hy4flash: from the BF16 GGUF, the routed experts as NVFP4, projections Q8_0, the Engram table E4M3 (needs --hf-dir)")
     ap.add_argument("--dense-q6k", action="store_true", help="with --nvfp4: the attention, shared-expert and dense FFN projections as Q6_K")
@@ -920,16 +925,23 @@ def main():
                     help="with --checkpoint and a deepseek41 --sections-from: shards arrive in file order and are deleted once used")
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
-                    "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
+                    "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors; with a gemma4 "
+                    "--checkpoint: Google's assistant drafter added as assistant.* tensors")
     ap.add_argument("--dflash2", metavar="DIR", help="with an inkling2 --checkpoint: a DFlash 2 block drafter "
                     "(DFlash2DraftModel safetensors and config.json) embedded as dflash2.* tensors in place of dspark.*")
     ap.add_argument("--head", choices=("fp8", "nvfp4"),
                     help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
                          "(default) or to NVFP4")
+    ap.add_argument("--mlp-nvfp4", action="store_true",
+                    help="with a gemma4 --checkpoint: the MLP's projections as NVFP4 (the attention's stay FP8)")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
+    if a.mlp_nvfp4 and (not a.checkpoint or a.sections_from or a.requant_dense_q6k):
+        ap.error("--mlp-nvfp4 goes with a gemma4 --checkpoint")
+    if a.experts_mxfp8 and (not a.checkpoint or a.sections_from):
+        ap.error("--experts-mxfp8 goes with a gemma4 --checkpoint")
     if a.into or a.roll_back or a.undo_dir:
         if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k or a.dflash2:
             ap.error("--into takes --undo-dir and one of --dspark, --dfly or --roll-back, and nothing else")
@@ -974,13 +986,24 @@ def main():
     if a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards \
                 or a.dry_run:
-            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --dflash2, --head, --workers and --force")
+            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --dflash2, --head, "
+                     "--experts-mxfp8, --mlp-nvfp4, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")
         if a.dflash2 and not Path(a.dflash2).is_dir():
             ap.error(f"missing input: {a.dflash2}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
+        if a.experts_mxfp8 and checkpoint_model_type(Path(a.checkpoint)) != "gemma4":
+            ap.error("--experts-mxfp8 goes with a gemma4 checkpoint")
+        if a.mlp_nvfp4 and checkpoint_model_type(Path(a.checkpoint)) not in ("gemma4", "gemma4_unified"):
+            ap.error("--mlp-nvfp4 goes with a gemma4 --checkpoint")
+        if checkpoint_model_type(Path(a.checkpoint)) in ("gemma4", "gemma4_unified"):
+            if a.head:
+                ap.error("--head goes with a qwen35 checkpoint")
+            import checkpoint_gemma4 as G
+            G.build(a, Job, fingerprint, die)
+            return
         if checkpoint_model_type(Path(a.checkpoint)) == "inkling2_loop":
             if a.drafter or a.head:
                 ap.error("--drafter and --head go with a qwen35 checkpoint; Inkling 2 uses --dflash2 or its built-in drafter")

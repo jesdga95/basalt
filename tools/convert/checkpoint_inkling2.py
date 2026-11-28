@@ -293,17 +293,12 @@ def _expert_blobs(kind, src, h, ff, e0, n) -> bytes:
     c2, s2 = rows("w2_weight", (h, ff)), rows("w2_weight_scale", (h, ff // 32))
     if (s13 == 255).any() or (s2 == 255).any():
         return f"experts {e0}..: a UE8M0 scale byte of 255 (NaN)"
-
-    def pack_mxfp8(c, s):   # 128-value blocks: 4 UE8M0 scales then 128 E4M3 codes (132 bytes)
-        nb = c.shape[1] // 128
-        return np.concatenate([s.reshape(c.shape[0], nb, 4), c.reshape(c.shape[0], nb, 128)], axis=2).tobytes()
-
     for e in range(n):
         if ((c13[e] & 0x7F) == 0x7F).any() or ((c2[e] & 0x7F) == 0x7F).any():
             return f"expert {e0 + e}: an E4M3 NaN code"
-        out.append(pack_mxfp8(c13[e, 0::2], s13[e, 0::2]))   # gate: the even rows of w13
-        out.append(pack_mxfp8(c13[e, 1::2], s13[e, 1::2]))   # up: the odd rows
-        out.append(pack_mxfp8(c2[e], s2[e]))
+        out.append(C.mxfp8_rows(c13[e, 0::2], s13[e, 0::2]).tobytes())   # gate: the even rows of w13
+        out.append(C.mxfp8_rows(c13[e, 1::2], s13[e, 1::2]).tobytes())   # up: the odd rows
+        out.append(C.mxfp8_rows(c2[e], s2[e]).tobytes())
     return b"".join(out)
 
 

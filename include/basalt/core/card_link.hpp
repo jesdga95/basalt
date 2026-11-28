@@ -1,5 +1,5 @@
 // include/basalt/core/card_link.hpp - what the cards of a run need to move data between them and from the host: peer
-// access for every pair, the host link's measured bandwidth and a card's free memory (design/multi-gpu.md).
+// access for every pair, the host link's measured bandwidth and a card's free memory (architecture/multi-gpu.md).
 #pragma once
 
 #include <cstdint>

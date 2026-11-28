@@ -592,7 +592,7 @@ public:
         return {};
     }
 
-    // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
+    // ---- batch windows (docs/architecture/batching.md): several sessions' windows in one pass through the weights, on this
     // session's scratch and stream. Each conversation keeps its caches, window ring and compressor state (its layer ops),
     // its Engram reads and history, its drafter rows, logits and draws; the attention (with the compressor and the
     // indexer) and the Engram run per segment over its own state, as its solo window of that many rows would, the rest

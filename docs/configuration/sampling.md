@@ -78,7 +78,7 @@ A client can end a reply's thinking while it runs: `POST /v1/answer_now` closes 
 in the same response. The engine finishes the decode window under way, so a few more thinking tokens may arrive first; the close
 then follows them, the way the budget closes, and the engine reads only the close, however long the thinking was. It works on
 `/v1/chat/completions`, `/v1/messages` and `/v1/responses`, streaming or not, and with `--parallel` slots. A request nobody asks
-runs exactly as before.
+runs unchanged.
 
 - **Naming the request:** every chat response carries `X-Request-Id`, the response's own id (`chatcmpl-...`, `msg_...`, `resp_...`,
   also the `id` of a stream's chunks). Send `{"request_id": "<id>"}`. A client that sends `x-client-request-id` with its request can
@@ -101,8 +101,8 @@ The call takes the API key like every `/v1` route. A page on another origin read
 ["answer_now", "logprobs", "documents"]}`. A client that finds `basalt` there talks to Basalt; `"answer_now" in basalt.capabilities` says the
 endpoint above is served, `"logprobs"` that logprobs come back on all three APIs with the thinking's and tool calls' tokens
 ([logprobs](#logprobs)), `"documents"` that messages may carry PDF and text documents ([documents](documents.md)), and `"video"` (only
-while video is on) that this model takes video parts now (image input on, a model that reads video, FFmpeg found:
-[video](../running.md#video)). Later features add their names to the same list.
+while video is on) that this model takes video parts (image input on, a model that reads video, FFmpeg found:
+[video](../running.md#video)).
 
 ## Thinking loops
 

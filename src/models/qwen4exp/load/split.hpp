@@ -1,4 +1,4 @@
-// src/models/qwen4exp/load/split.hpp - Flash-Next's gpu-mode split (model::SplitHooks, docs/design/multi-gpu.md): each card
+// src/models/qwen4exp/load/split.hpp - Flash-Next's gpu-mode split (model::SplitHooks, docs/architecture/multi-gpu.md): each card
 // after the main one runs a block of later layers as a stage with its own dense weights, session and expert cache. The
 // shared driver cuts the layers by the shares over the bytes stated here (or at --diag-gpu-cut) and writes each card's
 // part of the start line; this states the bytes and takes the cut and the stages' devices.

@@ -1,4 +1,4 @@
-// include/basalt/model/batch_check.hpp - the batch conformance check every batching model passes (docs/design/batching.md):
+// include/basalt/model/batch_check.hpp - the batch conformance check every batching model passes (docs/architecture/batching.md):
 // through the session interface only, so it names no model. `basalt --model FILE --batch N --tokens-file F
 // --diag-batch-check` runs it.
 #pragma once

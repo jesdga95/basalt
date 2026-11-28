@@ -44,9 +44,9 @@ CSF_FIXED, CSF_EXC = ".nvfp4_csf_fixed", ".nvfp4_csf_exceptions"
 class Checkpoint:
     """The safetensors files of a checkpoint directory: name -> (path, absolute offset, dtype, shape, bytes)."""
 
-    def __init__(self, d, side: dict[str, str] | None = None):
+    def __init__(self, d, side: dict[str, str] | None = None, single: bool = False):
         """`side`: files beside the shards whose tensor names carry no prefix of their own, each mapped to the prefix
-        its names get here (Inkling's `mtp.safetensors` -> `mtp.`)."""
+        its names get here (Inkling's `mtp.safetensors` -> `mtp.`). `single`: the checkpoint is one model.safetensors."""
         self.dir = pathlib.Path(d)
         cfg = self.dir / "config.json"
         if not cfg.is_file():
@@ -54,7 +54,8 @@ class Checkpoint:
         self.config = json.loads(cfg.read_text(encoding="utf-8"))
         self.text = self.config.get("text_config", self.config)
         self.files = sorted(self.dir.glob("*.safetensors")) + sorted(self.dir.glob("tensors/*.safetensors"))
-        self.shards = [p for p in self.files if re.fullmatch(r"model-\d+-of-\d+\.safetensors", p.name)]
+        shard = r"model\.safetensors" if single else r"model-\d+-of-\d+\.safetensors"
+        self.shards = [p for p in self.files if re.fullmatch(shard, p.name)]
         if not self.shards:
             raise S.ConvertError(f"{self.dir}: no model-NNNNN-of-NNNNN.safetensors shards")
         side = side or {}
@@ -115,6 +116,13 @@ def nvfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
     q[..., 0] = ev.view(np.uint8).reshape(rows, nb, 4, 4)
     q[..., 1] = od.view(np.uint8).reshape(rows, nb, 4, 4)
     return out.reshape(-1)
+
+
+def mxfp8_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """MXFP8 rows -> Basalt's blocks (type 46). `codes` [rows, cols] E4M3; `scales` [rows, cols/32] UE8M0. A block of
+    128 values is the 4 scale bytes of its 32-value sub-blocks, then the 128 code bytes."""
+    rows, cols = codes.shape
+    return np.concatenate([scales.reshape(rows, cols // 128, 4), codes.reshape(rows, cols // 128, 128)], axis=2).reshape(-1)
 
 
 def csf_decode(fixed: np.ndarray, exceptions: np.ndarray) -> np.ndarray:

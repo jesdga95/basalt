@@ -119,7 +119,7 @@ public:
     PreTokenizer pretokenizer() const override { return {"hy_v4", pretok_hy4}; }
     int max_slots() const override { return kMaxWindow; }   // one row each of a window
     program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }   // peer: experts by layer block
-    const char* model_name() const override { return "Hy4-flash"; }
+    const char* model_name(const core::Json&) const override { return "Hy4-flash"; }
 
     // --kv (the sparse layers' latent rows, fp16 by default or fp8), --ple-io (Engram table reads) and, DFLY HOOK, --spec and its companions as DeepSeek's
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {

@@ -561,7 +561,7 @@ public:
         return room == INT64_MAX ? 0 : (int) std::min<int64_t>(room, kWindowRows);
     }
 
-    // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
+    // ---- batch windows (docs/architecture/batching.md): several sessions' windows in one pass through the weights, on this
     // session's scratch and stream. Each conversation keeps its caches and rings (the kernels take them per segment), its
     // drafter's context, its logits and its draws; a row gives the bits it gives in its own window.
     int batch_rows() const override { return sh_->max_rows; }
@@ -1607,7 +1607,7 @@ private:
                                w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                                k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
         } else {
-            moe_plan(ids, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
+            basalt::kernels::moe_plan(ids, rows, g_.n_used, g_.n_expert, w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                      k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
         }
         if (on_cpu) sh_->cpu->start(l, rows, ids, k.stream);

@@ -30,7 +30,7 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 
 The NVFP4 pack differs in four rows: routed experts NVFP4 (E2M1 codes, an E4M3 scale per 16 values, an FP32 scale per matrix;
 q8_1 activations on the GPU, Q8_0 on the CPU), attention and shared-expert projections Q8_0 of NVIDIA's FP8 values, the Engram
-table MXFP4 (E2M1 codes, a power-of-two scale per 32 values), the output head Q8_0. It is not yet scored against BF16.
+table MXFP4 (E2M1 codes, a power-of-two scale per 32 values), the output head Q8_0. It is not scored against BF16.
 
 All activations between stages are fp32. A decode kernel's output does not depend on how many tokens share its launch (bitwise).
 
@@ -38,8 +38,7 @@ With the default `--kv fp8`, the attention caches round as the model's reference
 of Strata) and keep the codes and scales: 920 bytes per position instead of 3,200 in fp16. A code times its scale is the
 rounded value exactly, so the caches hold what fp16 copies of the rounded values would, except values below fp16's range.
 Logits equal a build that keeps those rounded values in fp16 caches, bit for bit (greedy, pinned placement, two cards and one,
-200 tokens of prose and of structured output, a 16,384-token prompt). `--kv fp16` keeps the values unrounded, as before the
-reference's roundings were adopted.
+200 tokens of prose and of structured output, a 16,384-token prompt). `--kv fp16` keeps the values unrounded.
 
 ## Experts and placement
 
@@ -102,9 +101,9 @@ temperature 1 matches plain decode. With tiers moving, rows round as under any p
 picks and 1 to 6 code picks differ over 800 tokens.
 
 Where a promotion lands decides which experts the CPU computes later, so it moves the rounding too. Sending one to the second card
-only when what it replaces there has gone unused 1,280 lookups longer than the main card's oldest (instead of any longer) scores
-within noise against BF16 (100 chunks, homes main card 35, second card 45, RAM 304): KLD 0.27971 -> 0.27944, paired by chunk -0.00027
-(95% CI -0.00199 to +0.00144), top-1 83.89% -> 83.77% (-0.12 points, -0.32 to +0.07).
+only when what it replaces there has gone unused 1,280 lookups longer than the main card's oldest (rather than any longer) scores
+within noise against BF16 (100 chunks, homes main card 35, second card 45, RAM 304): KLD 0.27971 with the any-longer rule and 0.27944
+with the margin, paired by chunk -0.00027 (95% CI -0.00199 to +0.00144), top-1 83.89% and 83.77% (-0.12 points, -0.32 to +0.07).
 
 ## Against llama.cpp
 
@@ -128,8 +127,8 @@ The UD-Q2_K_XL row is one RTX PRO 6000 Blackwell Max-Q at 300 W with 121 GiB of 
 
 The cache roundings cost nothing measurable: the same run with `--kv fp16` scores PPL 3.0387, KLD 0.2777, top-1 83.97%.
 
-The Engram projection as one MMQ GEMM and the indexer scores on the tensor cores (#573) change the prompt's rounding, not its quality:
-PPL 3.0520 -> 3.0492, KLD 0.2800 -> 0.2791, top-1 83.81% -> 83.87% (the same rows, before and after).
+The Engram projection as one MMQ GEMM and the indexer scores on the tensor cores change the prompt's rounding, not its quality
+(the same rows with and without: PPL 3.0520 and 3.0492, KLD 0.2800 and 0.2791, top-1 83.81% and 83.87%).
 
 Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 200 tokens after it match `--no-prompt-skip` closely
 (KL mean 6.2e-4 between the two runs).
@@ -156,7 +155,7 @@ cuts conv's window by 15% for +0.002 KLD, `--route-tail-skip 5` (31% of the miss
 `--route-tail-skip 3` (77% dropped) by 23% for +0.006. A KLD step under about 0.002 is placement noise: routing follows the tiers,
 which follow the run's history.
 
-`--route-prior` on DeepSeek was first ported and measured by @giveen (#434), UD-IQ1_M on one 32 GB card with a 123 GiB RAM tier
+`--route-prior` on one card: UD-IQ1_M on a 32 GB card with a 123 GiB RAM tier
 at 475 W, 100 chunks against the BF16 base (2.7314 PPL there), `--seed 1`, two runs per row:
 
 | `--route-prior` | Picks in VRAM | PPL | KLD | Same top-1 | tg conv | tg struct | tg prose |

@@ -345,6 +345,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
     L.gate_softcap = f.gate_softcap;
     L.up_softcap = f.up_softcap;
+    L.gelu = f.gelu;
     return launch_layout(layer, L, x, ids, n_tok, k, kind, err, out);
 }
 
@@ -397,7 +398,7 @@ namespace {
 bool same_kernels(const basalt::kernels::NativeExpertLayout& a, const basalt::kernels::NativeExpertLayout& b) {
     return a.gu_type == b.gu_type && a.up_type == b.up_type && a.d_type == b.d_type && a.n_embd == b.n_embd &&
            a.n_ff == b.n_ff && (a.swiglu_limit > 0.0f) == (b.swiglu_limit > 0.0f) &&
-           (a.gate_softcap > 0.0f) == (b.gate_softcap > 0.0f);
+           (a.gate_softcap > 0.0f) == (b.gate_softcap > 0.0f) && a.gelu == b.gelu;
 }
 
 }  // namespace

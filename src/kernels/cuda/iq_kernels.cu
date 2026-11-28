@@ -742,6 +742,10 @@ template<> struct Fmt<46> { static constexpr int qk = 128, ipb = 16, step = 1;
 
 // NVFP4 experts end in a 16-byte tail {s_gate, s_up, s_down, 0}: the FP32 scale of each matrix, on its output.
 constexpr size_t kNvfp4Tail = 16;
+
+// The width a down row's blocks cover: an MXFP8 down row holds whole 128-value blocks (the columns past n_ff are zero in
+// the pack), so its activation entry is padded with zero q8_1 blocks to the same width.  Every other type: n_ff.
+__host__ __device__ inline int64_t down_k(int d_type, int64_t n_ff) { return d_type == 46 ? (n_ff + 127) / 128 * 128 : n_ff; }
 __device__ __forceinline__ const float* nvfp4_tail(const void* blob, const NativeExpertLayout& L) {
     return (const float*) ((const uint8_t*) blob + L.bytes - kNvfp4Tail);
 }
@@ -2267,7 +2271,7 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     const int r = blockIdx.x * 8 + warp;
     if (r >= L.n_embd) return;
     const size_t off = L.down_off + (size_t) r * L.d_row;
-    const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
+    const int nb = (int) (down_k(TD, L.n_ff) / Fmt<TD>::qk), hb = (int) (down_k(TD, L.n_ff) / 32);
     const int ng = *n_groups;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {   // as native_gu_kernel
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
@@ -2324,7 +2328,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
         pdl_launch_dependents();   // the tail wait may start polling the tiers once every block is past its wait
     }
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
-    const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
+    const int nb = (int) (down_k(TD, L.n_ff) / Fmt<TD>::qk), hb = (int) (down_k(TD, L.n_ff) / 32);
     if constexpr (kDown40<TD>) {   // K = 40 calls per row either way: 8 lanes a row
         if (hb == 20) {
             const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
@@ -2549,7 +2553,7 @@ __global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned lo
     }
     const int r = blockIdx.x * kDownSub8Rows + (threadIdx.x >> 3), t = threadIdx.x & 7;
     if (r >= L.n_embd) return;   // whole 8-lane groups leave together: the shuffles stay within the group
-    const int K = (int) (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb, hb = (int) (L.n_ff / 32);
+    const int K = (int) (down_k(TD, L.n_ff) / Fmt<TD>::qk) * Fmt<TD>::ipb, hb = (int) (down_k(TD, L.n_ff) / 32);
     constexpr int kSub8Kc = TD == 40 ? kDownSub8Calls : (TD == 8 || TD == 46) ? 144 : 0;   // n_ff 1152 (NVFP4, Q8_0): the unrolled row
     const size_t w_off = L.down_off + (size_t) r * L.d_row;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
@@ -3477,16 +3481,29 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.n_ff = n_ff;
     L.gu_row = iq_row_bytes(gu_type, n_embd);
     L.up_row = iq_row_bytes(L.up_type, n_embd);
-    L.d_row = iq_row_bytes(d_type, n_ff);
+    L.d_row = iq_row_bytes(d_type, down_k(d_type, n_ff));
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = L.up_off + (size_t) n_ff * L.up_row;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row + (gu_type == 40 ? kNvfp4Tail : 0);   // NVFP4's scale tail
     return L;
 }
 
+uint64_t native_expert_stride(int type, uint64_t blob) {
+    const uint64_t block = type == 8 ? 34 : type == 40 ? 36 : type == 46 ? 132 : 1;   // Q8_0, NVFP4, MXFP8
+    uint64_t a = block, b = 16;
+    while (b) {
+        const uint64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    const uint64_t unit = block / a * 16;
+    return (blob + unit - 1) / unit * unit;
+}
+
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
-    return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
+    const size_t hq = (size_t) cap * (size_t) (down_k(46, n_ff) / 32) * sizeof(block_q8_1);   // an MXFP8 down's padded entries
+    return 3 * ((f + 255) & ~(size_t) 255) + ((hq + 255) & ~(size_t) 255);
 }
 
 
@@ -3545,7 +3562,34 @@ __global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const 
     }
 }
 
-enum class Act { Plain, Clamp, Softcap };
+// GELU (tanh form) gating, then the q8_1 blocks (the same pass as swiglu_q8_1_entries_kernel): h = gelu_tanh(g) u, in fp32.
+template<bool PDL>
+__global__ void __launch_bounds__(256) gelu_q8_1_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                                                const int32_t* __restrict__ grp_start,
+                                                                const int32_t* __restrict__ n_groups, int n_ff, int n_ffk,
+                                                                block_q8_1* __restrict__ hq) {
+    // n_ffk > n_ff: each entry's q8_1 row is n_ffk values wide, the values past n_ff zero (an MXFP8 down)
+    if constexpr (PDL) pdl_trigger();
+    const long long lo = (long long) grp_start[0] * n_ffk, hi = (long long) grp_start[*n_groups] * n_ffk;
+    if constexpr (PDL) pdl_wait();
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        float v = 0.0f;
+        if (n_ffk == n_ff) {
+            const float g = gate[i];
+            v = __fmul_rn(0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g))), up[i]);
+        } else {
+            const long long e = i / n_ffk, c = i - e * n_ffk;
+            if (c < n_ff) {
+                const float g = gate[e * n_ff + c];
+                v = __fmul_rn(0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g))), up[e * n_ff + c]);
+            }
+        }
+        q8_1_store(v, hq, i);
+    }
+}
+
+enum class Act { Plain, Clamp, Softcap, Gelu };
 
 // native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
 // launch sequence.
@@ -3597,9 +3641,21 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
         default: basalt::log::error("basalt", "native_expert_grouped: gate/up type %d", L.gu_type); std::exit(1);
     }
     check("native_expert_grouped/gu");
-    const long long nh = (long long) cap_entries * L.n_ff;
+    const int64_t n_ffk = down_k(L.d_type, L.n_ff);
+    if (n_ffk != L.n_ff && ACT != Act::Gelu) {
+        basalt::log::error("basalt", "native_expert_grouped: an MXFP8 down at n_ff %lld needs the GELU gate", (long long) L.n_ff);
+        std::exit(1);
+    }
+    const long long nh = (long long) cap_entries * (ACT == Act::Gelu ? n_ffk : L.n_ff);
     const bool sw_v1 = v1;
-    if constexpr (ACT == Act::Softcap) {
+    if constexpr (ACT == Act::Gelu) {
+        if (chain)
+            launch_dependent(gelu_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
+                             (const float*) up, grp_start, n_groups, (int) L.n_ff, (int) n_ffk, hq);
+        else
+            gelu_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
+                                                                                          (int) L.n_ff, (int) n_ffk, hq);
+    } else if constexpr (ACT == Act::Softcap) {
         if (chain)
             launch_dependent(swiglu_softcap_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
                              (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap,
@@ -3648,7 +3704,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
-    if (L.gate_softcap > 0.0f)
+    if (L.gelu)
+        grouped_impl<Act::Gelu>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
+                                scratch, out, stream, grid_groups, 0.0f);
+    else if (L.gate_softcap > 0.0f)
         grouped_impl<Act::Softcap>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
                                    scratch, out, stream, grid_groups, 0.0f);
     else if (L.swiglu_limit > 0.0f)

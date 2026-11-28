@@ -68,6 +68,22 @@ PRE_SOURCES = {"joyai-llm": "JOYAI_LLM", "hy_v4": "HY_V4", "inkling2": "GPT4O"}
 # pre-tokenizers whose checkpoint sets Hugging Face BPE's ignore_merges: a piece that is a vocabulary entry is that token
 # (llama.cpp sets ignore_merges for the same pre-types)
 IGNORE_MERGES = {"inkling2"}
+# SentencePiece-style BPE (its normalizer turns a space into U+2581, with byte fallback), as the engine's tokenizer runs it
+# for these models: a span between special tokens is one piece; a piece starts from its characters, each a one-character
+# entry or else its bytes' fallback tokens (<0xNN>, GGUF type 6), U+2581 read as a space; then the merges by rank
+SENTENCEPIECE = {"gemma4"}
+PRE_PATTERNS["gemma4"] = [r"(?s).+"]
+TYPE_BYTE = 6
+
+
+def _one_character(spelled: str) -> bool:
+    """A token spelled in the byte alphabet that is one whole UTF-8 character."""
+    if not spelled or any(c not in UNICODE_TO_BYTE for c in spelled):
+        return False
+    try:
+        return len(bytes(UNICODE_TO_BYTE[c] for c in spelled).decode("utf-8")) == 1
+    except UnicodeDecodeError:
+        return False
 
 
 class Tokenizer:
@@ -92,6 +108,18 @@ class Tokenizer:
             self.ranks[(parts[0], parts[1])] = i
         self._res = [regex.compile(p) for p in PRE_PATTERNS.get(pre, [QWEN35_PATTERN])]
         self.ignore_merges = pre in IGNORE_MERGES
+        self.sentencepiece = pre in SENTENCEPIECE
+        if self.sentencepiece:
+            types = token_types or []
+            self.byte_tokens = {}    # byte -> its fallback token
+            for i, ty in enumerate(types):
+                if ty == TYPE_BYTE:
+                    self.byte_tokens[int(tokens[i][3:5], 16)] = tokens[i]
+            if len(self.byte_tokens) != 256:
+                raise ValueError("a SentencePiece vocabulary needs a byte-fallback token for every byte")
+            # the one-character entries a piece starts from (spelled in the byte alphabet, so one character's bytes)
+            self.chars = {t for i, t in enumerate(tokens)
+                          if (not types or types[i] not in (3, 4, TYPE_BYTE)) and _one_character(t)}
 
         # Literals matched directly instead of through BPE (GGUF token types):
         #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, ...) always matches, with or without parse_special;
@@ -218,6 +246,10 @@ class Tokenizer:
         cache = self.__dict__.setdefault("_piece_ids", {})
         for piece in self._split(text):
             got = cache.get(piece)
+            if got is None and self.sentencepiece:
+                got = [self.ids[t] for t in self._bpe(self._spm_symbols(piece))]
+                if len(cache) < self.PIECE_CACHE_MAX:
+                    cache[piece] = got
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
@@ -232,6 +264,17 @@ class Tokenizer:
                 if len(cache) < self.PIECE_CACHE_MAX:
                     cache[piece] = got
             out.extend(got)
+        return out
+
+    def _spm_symbols(self, piece: str) -> list[str]:
+        out = []
+        for ch in piece:
+            raw = (" " if ch == "\u2581" else ch).encode("utf-8")
+            spelled = "".join(BYTE_TO_UNICODE[b] for b in raw)
+            if spelled in self.chars:
+                out.append(spelled)
+            else:
+                out.extend(self.byte_tokens[b] for b in raw)
         return out
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
@@ -278,6 +321,9 @@ class Tokenizer:
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            if self.sentencepiece and self.token_types[i] == TYPE_BYTE:   # <0xNN>: that byte
+                b = cache[i] = bytes([int(self.tokens[i][3:5], 16)])
+                return b
             raw = bytearray()
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
@@ -322,8 +368,9 @@ def extract_metadata(md: dict, out_dir) -> dict:
     }
     if tk.pre in PRE_PATTERNS:
         cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
-        cfg["pre_pattern_source"] = ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order"
-                                     % PRE_SOURCES[tk.pre])
+        cfg["pre_pattern_source"] = ("the checkpoint's tokenizer.json: SentencePiece-style BPE, a span between special tokens one piece"
+                                     if tk.pre in SENTENCEPIECE else
+                                     "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order" % PRE_SOURCES[tk.pre])
     else:
         cfg["pre_pattern"] = QWEN35_PATTERN
         cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
