@@ -112,7 +112,9 @@ __device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ 
                 m.slot_stamp[sl] = epoch;
                 m.slot_ref[sl] = 1;
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
-                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+                const int idx = atomicAdd(&s_nmiss, 1);
+                if (idx < (int) m.n_slots) m.miss_block[idx] = b;
+                else m.page_table[b] = -1;
             }
         }
     }
@@ -120,7 +122,8 @@ __device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ 
     __syncthreads();
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses (stamp == epoch) is never taken;
     //    a referenced one loses its bit as the hand passes it and is taken on the next pass.
-    const int need = s_nmiss, n = (int) m.n_slots;
+    const int raw_need = s_nmiss, n = (int) m.n_slots;
+    const int need = raw_need < n ? raw_need : n;
     int hand = m.ctl[1], got = 0;
     for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
         const int j = (int) (((long long) hand + threadIdx.x) % n);
@@ -161,7 +164,7 @@ __device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ 
         m.ctl[0] = epoch;
         m.ctl[1] = hand;
         m.ctl[2] = placed;
-        if (placed < need) m.ctl[3] = 1;
+        if (placed < raw_need) m.ctl[3] = 1;
         unsigned long long* c = reinterpret_cast<unsigned long long*>(m.ctl + 4);
         c[0] += (unsigned long long) placed;
         c[1] += (unsigned long long) s_lookups;

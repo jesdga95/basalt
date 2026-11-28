@@ -91,24 +91,36 @@ struct Top {
         s = 0.0f;
     }
     __device__ __forceinline__ void take(float l, int row) {
-        if (l > m) {
+        if (idx == 0x7fffffff) {
+            s = 1.0f;
+            m = l;
+            idx = row;
+        } else if (l > m) {
             s = s * __expf(m - l) + 1.0f;
             m = l;
             idx = row;
+        } else if (l == m) {
+            s += 1.0f;
+            if (row < idx) idx = row;
         } else {
             s += __expf(l - m);
-            if (l == m && row < idx) idx = row;
         }
     }
     __device__ __forceinline__ void merge(const Top& o) {
         if (o.idx == 0x7fffffff) return;   // no rows
-        if (idx == 0x7fffffff || o.m > m) {
+        if (idx == 0x7fffffff) {
+            s = o.s;
+            m = o.m;
+            idx = o.idx;
+        } else if (o.m > m) {
             s = o.s + s * __expf(m - o.m);
             m = o.m;
             idx = o.idx;
+        } else if (o.m == m) {
+            s += o.s;
+            if (o.idx < idx) idx = o.idx;
         } else {
             s += o.s * __expf(o.m - m);
-            if (o.m == m && o.idx < idx) idx = o.idx;
         }
     }
 };
@@ -644,17 +656,19 @@ size_t vrescore_smem(int ncols) { return (size_t) ncols * XBLK * 8 * sizeof(int2
 // One grid size for every column count: the blocks' rows, so their maxima and the thresholds, and with them which rows
 // are exact, do not depend on the window's width.
 int vscore_grid(int n_out) {
-    static int grid_max[64] = {};
+    static std::atomic<int> grid_max[64];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
-    if (grid_max[dev] == 0) {
+    int gm = grid_max[dev].load(std::memory_order_acquire);
+    if (gm == 0) {
         int sms = 0, per_sm = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, q6k_vscore_kernel<8>, 128, 0);
-        grid_max[dev] = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
+        gm = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
+        grid_max[dev].store(gm, std::memory_order_release);
     }
     const int tiles = n_out / 16;
-    return tiles < grid_max[dev] ? tiles : grid_max[dev];
+    return tiles < gm ? tiles : gm;
 }
 
 template <int NC>
@@ -675,18 +689,20 @@ size_t q6k_head_top1_scratch_bytes() { return 4096 * 3 * sizeof(float) + 256; }
 bool q6k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, const int32_t* map,
                    int* out_id, float* out_prob, void* scratch, void* stream) {
     if (n_in != BPR * QK || n_out <= 0 || !weights || !x_q8_1 || !y || !out_id || !out_prob || !scratch) return false;
-    static int grid_max[64] = {};
+    static std::atomic<int> grid_max[64];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
-    if (grid_max[dev] == 0) {
+    int gm = grid_max[dev].load(std::memory_order_acquire);
+    if (gm == 0) {
         int sms = 0, per_sm = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, q6k_head_top1_kernel, WPB * WARP, 0);
-        grid_max[dev] = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
-        if (grid_max[dev] > 4096) grid_max[dev] = 4096;
+        gm = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
+        if (gm > 4096) gm = 4096;
+        grid_max[dev].store(gm, std::memory_order_release);
     }
     const long long want = ((long long) n_out + WPB - 1) / WPB;
-    const unsigned grid = (unsigned) (want < grid_max[dev] ? want : grid_max[dev]);
+    const unsigned grid = (unsigned) (want < gm ? want : gm);
     float* part = (float*) scratch;
     unsigned* count = (unsigned*) ((char*) scratch + 4096 * 3 * sizeof(float));
     q6k_head_top1_kernel<<<grid, WPB * WARP, 0, (cudaStream_t) stream>>>((const Q6KBlock*) weights,

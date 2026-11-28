@@ -157,6 +157,12 @@ __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint
 
     const int cell = ids[id];
     const long long page = (long long) table[cell / page_size];
+    const long long dst_offset = ((id * kv_heads + h) * head_dim) + (b * QK4_0 + t);
+    if (page < 0) {
+        k_scratch[dst_offset] = 0;
+        v_scratch[dst_offset] = 0;
+        return;
+    }
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
 
     const block_q4_0* k_blk = reinterpret_cast<const block_q4_0*>(k_q4 + row * bytes_per_head) + b;
@@ -168,7 +174,6 @@ __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint
     const uint8_t v_byte = v_blk->qs[j];
     const int kq = (t < 16) ? ((k_byte & 0x0F) - 8) : ((k_byte >> 4) - 8);
     const int vq = (t < 16) ? ((v_byte & 0x0F) - 8) : ((v_byte >> 4) - 8);
-    const long long dst_offset = ((id * kv_heads + h) * head_dim) + (b * QK4_0 + t);
     k_scratch[dst_offset] = f16_from_f32((float) kq * kd);
     v_scratch[dst_offset] = f16_from_f32((float) vq * vd);
 }

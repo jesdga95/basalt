@@ -82,6 +82,13 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
     const int h = rem / per, q4 = rem - h * per;
     const int cell = ids[id];
     const long long page = (long long) table[cell / page_size];
+    const long long dst = (id * kv_heads + h) * (long long) per + q4;
+    if (page < 0) {
+        const ushort4 zero = make_ushort4(0, 0, 0, 0);
+        reinterpret_cast<ushort4*>(k_scratch)[dst] = zero;
+        reinterpret_cast<ushort4*>(v_scratch)[dst] = zero;
+        return;
+    }
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
     const int d = q4 * 4;
     const int groups = head_dim / KV_Q8_GROUP;
@@ -94,7 +101,6 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
     ko.z = f16_from_f32((float) kc.z * ks); ko.w = f16_from_f32((float) kc.w * ks);
     vo.x = f16_from_f32((float) vc.x * vs); vo.y = f16_from_f32((float) vc.y * vs);
     vo.z = f16_from_f32((float) vc.z * vs); vo.w = f16_from_f32((float) vc.w * vs);
-    const long long dst = (id * kv_heads + h) * (long long) per + q4;
     reinterpret_cast<ushort4*>(k_scratch)[dst] = ko;
     reinterpret_cast<ushort4*>(v_scratch)[dst] = vo;
 }
