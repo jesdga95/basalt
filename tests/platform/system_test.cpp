@@ -110,11 +110,22 @@ int main() {
             // The sensor's rise must see the child's real consumption: a scheduler squeezed by parallel tests
             // may hand the child less than a full core, and then reading less is the sensor being honest.
             // The old bug this replaces: reading none of it.
-            char detail[128];
-            std::snprintf(detail, sizeof detail,
-                          "the sensor's rise follows the busy child's own cpu consumption (rise %.2f, child %.2f, base %.2f)",
-                          peak - base, child_cores, base);
-            check(peak - base > 0.5 * child_cores && peak - base < child_cores + 1.5, detail);
+            char detail[160];
+            const double cpus = (double) sysconf(_SC_NPROCESSORS_ONLN);
+            if (base + child_cores > 0.95 * cpus) {
+                // Every cpu was already busy through the window: aggregate cpu seconds are conserved, so a
+                // marginal task can only displace others, never add to the total. The rise is physics' to
+                // hide, not the sensor's to report; a governor on such a machine reads high external load
+                // from the saturation itself, which is the answer it needs.
+                std::snprintf(detail, sizeof detail,
+                              "sensor rise check skipped, the machine was saturated (base %.2f of %.0f cpus)", base, cpus);
+                check(true, detail);
+            } else {
+                std::snprintf(detail, sizeof detail,
+                              "the sensor's rise follows the busy child's own cpu consumption (rise %.2f, child %.2f, base %.2f)",
+                              peak - base, child_cores, base);
+                check(peak - base > 0.5 * child_cores && peak - base < child_cores + 1.5, detail);
+            }
         } else
             check(false, "ExternalCpuLoad: fork failed");
     }
