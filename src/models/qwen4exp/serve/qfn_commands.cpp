@@ -8,6 +8,7 @@
 #include "basalt/vision/ffmpeg_api.hpp"
 #include "../../../program/tokenizer/unicode_flags.hpp"
 #include "../../../program/cli/tokens.hpp"
+#include "basalt/platform/system.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -231,10 +232,62 @@ int QfnRuntime::init_before_input() {
 int QfnRuntime::init_after_input() {
     if (const int code = init_memory()) return code;
     if (const int code = capture_windows()) return code;
-    return init_batch();
+    if (const int code = init_batch()) return code;
+    governor_start();
+    return 0;
+}
+
+// ---- --cpu-governor: hand cores back to the machine's owner while it uses them -------------------------------
+
+void QfnRuntime::governor_start() {
+    if (!o.cpu_governor || gov_live_) return;
+    const int n = pool.workers(), max_shed = (std::max)(1, o.cpu_governor_max_shed);
+    if (n < 2) {   // a one-worker pool has nothing to shed
+        basalt::log::error("basalt serve", "--cpu-governor: the pool has %d worker, there is nothing to shed; the governor stays off", n);
+        return;
+    }
+    const int floor_k = (std::max)(n - max_shed, 1);   // the most shed leaves the model is max(workers - max_shed, 1)
+    const double hi = (std::max)(0.05, o.cpu_governor_hi), lo = (std::min)((std::max)(0.0, o.cpu_governor_lo), hi);
+    gov_quit_.store(false);
+    gov_live_ = true;
+    gov_thr_ = std::thread([this, n, floor_k, hi, lo] {
+        basalt::platform::ExternalCpuLoad raw;
+        double ema = -1;
+        int over = 0, under = 0, calm = 0;
+        while (!gov_quit_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            const double s = raw.sample();
+            ema = ema < 0 ? s : ema + 0.35 * (s - ema);   // smooth so one build burst cannot shed the pool
+            const double ext = ema;
+            over = ext > hi ? over + 1 : 0;
+            under = ext < lo ? under + 1 : 0;
+            calm = ext < hi ? calm + 1 : 0;
+            const int cur = pool.active_workers();
+            if (over >= 3 && cur > floor_k) {   // 1.8s held: yield one rung; each further one needs its own window
+                const int want = pool.set_active_workers(cur - 1);
+                basalt::log::info("basalt serve", "cpu governor: %.1f external busy cores > %.1f: pool workers %d -> %d", ext, hi, cur, want);
+                over = 0; under = 0;
+            } else if (cur < n && (under >= 17 || calm >= 150)) {   // one rung back per held window: quiet fast (<lo ~10s) or calm slow (<hi ~90s)
+                const int want = pool.set_active_workers(cur + 1);
+                basalt::log::info("basalt serve", "cpu governor: %.1f external busy cores, %s: pool workers %d -> %d", ext,
+                                  under >= 17 ? "below the fast floor held ~10s" : "below the shed trigger held ~90s", cur, want);
+                over = 0; under = 0; calm = 0;
+            }
+        }
+    });
+    basalt::log::info("basalt serve", "cpu governor: pool of %d workers sheds one per ~1.8s of load above %.2f external busy cores, to %d at most; regains one per held window of quiet",
+                      n, hi, floor_k);
+}
+
+void QfnRuntime::governor_stop() {
+    if (!gov_live_) return;
+    gov_live_ = false;
+    gov_quit_.store(true);
+    if (gov_thr_.joinable()) gov_thr_.join();
 }
 
 void QfnRuntime::at_exit() {
+    governor_stop();
     for (int st = 0; st < std::max(n_stages, 1); ++st)
         for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
     save_profile("exit");   // QUIT, or the server closed stdin

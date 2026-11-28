@@ -62,6 +62,18 @@ struct ProcessMemory {
 };
 ProcessMemory process_memory();
 
+/// CPU held by processes other than this one, for a governor that decides when the pool should hand cores back to
+/// the machine. Each `sample` answers how many cores everyone else held since the previous call; this process's own
+/// threads are excluded, so an engine busy with its experts does not read as load. 0 on the first call (no interval
+/// yet) or where the OS gives no reading.
+class ExternalCpuLoad {
+public:
+    double sample();
+
+private:
+    double prev_busy_ = 0, prev_self_ = 0, prev_wall_ = 0;
+};
+
 /// Whether the file at `path` is on a rotational disk (1), not (0) or unknown (-1); `dev` names the disk when known.
 int disk_rotational(const std::string& path, std::string& dev);
 
