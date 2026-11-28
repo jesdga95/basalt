@@ -134,11 +134,13 @@ public:
                    dev(attn_comp_kv_, 1024 * rows) && dev(attn_comp_score_, 1024 * rows) &&
                    dev(indexer_project_workspace_, indexer_project_workspace_bytes(kExpertWindow)) &&
                    dev(indexer_select_workspace_, indexer_select_workspace_bytes(std::max(max_index_rows, 1))) &&
-                    dev(indexer_select_count_, rows) && dev(comp_limit_, rows) && dev(indexer_rope_angles_, 32 * rows) &&
+                    dev(indexer_select_count_, rows) && dev(comp_limit_csa_, rows) && dev(comp_limit_hca_, rows) &&
+                    dev(hca_iota_, (size_t) max_hca_rows * rows) && dev(indexer_rope_angles_, 32 * rows) &&
                     dev(compress_rope_freq_, 32) &&
                   dev(sampled_, 1) && dev(expert_input_q8_, kernels::native_q8_1_bytes(geo_.n_embd, kExpertWindow)) &&
                   dev(expert_scratch_, kernels::native_expert_scratch_bytes(kExpertWindowRoutes, geo_.n_ff_exp)) &&
-                   dev(expert_plan_, sizeof(ExpertPlan)) && dev(logit_bias_, (size_t) geo_.n_vocab) &&
+                  dev(d_gpu_expert_rows_, (size_t) kExpertWindowRoutes * n) &&
+                   dev(expert_plan_, sizeof(ExpertPlan)) && dev(expert_plan2_, sizeof(ExpertPlan)) && dev(logit_bias_, (size_t) geo_.n_vocab) &&
                   dev(sample_bias_, (size_t) geo_.n_vocab) &&
                   dev(lp_buf_, kernels::row_logprobs_scratch_floats(kExpertWindow, (int) geo_.n_vocab) +
                                   (size_t) kExpertWindow * (kernels::kLogprobStride + 1));
@@ -173,16 +175,19 @@ public:
             cudaHostAlloc(reinterpret_cast<void**>(&h_expert_rows_), (size_t) kExpertWindowRoutes * n * sizeof(float), host_flags) != cudaSuccess ||
             cudaHostAlloc(reinterpret_cast<void**>(&h_expert_ids_), (size_t) kExpertWindowRoutes * sizeof(int32_t), host_flags) != cudaSuccess ||
             cudaHostAlloc(reinterpret_cast<void**>(&h_expert_seq_), 64, host_flags) != cudaSuccess ||
+            cudaHostAlloc(reinterpret_cast<void**>(&h_join_), 64, host_flags) != cudaSuccess ||
             cudaHostAlloc(reinterpret_cast<void**>(&h_route_meta_), sizeof(RouteMeta), host_flags) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_input_), h_expert_input_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_ids_), h_expert_ids_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_seq_), h_expert_seq_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_join_), h_join_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_rows_), h_expert_rows_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_route_meta_), h_route_meta_, 0) != cudaSuccess) {
             err = "cannot map the expert staging buffers";
             return false;
         }
         *h_expert_seq_ = 0;
+        *h_join_ = 0;
         route_fixed_row_ = d_route_meta_->fixed_row;
         route_fixed_mask_ = d_route_meta_->fixed_mask;
         route_alt_mask_ = d_route_meta_->alternate_mask;
@@ -197,6 +202,17 @@ public:
                             cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
             err = "cannot upload DeepSeek4 compression RoPE frequencies";
             return false;
+        }
+        if (max_hca_rows > 0) {
+            std::vector<int32_t> h_iota((size_t) max_hca_rows * rows);
+            for (size_t t = 0; t < rows; ++t)
+                for (int i = 0; i < max_hca_rows; ++i)
+                    h_iota[t * (size_t) max_hca_rows + (size_t) i] = i;
+            if (cudaMemcpyAsync(hca_iota_, h_iota.data(), h_iota.size() * sizeof(int32_t),
+                                cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+                err = "cannot upload DeepSeek4 HCA iota table";
+                return false;
+            }
         }
         layer_cache_.resize((size_t) geo_.n_layers);
         for (int layer = 0; layer < geo_.n_layers; ++layer) {
@@ -923,7 +939,7 @@ private:
     bool vision_lent_ = false;
 
     float *streams_ = nullptr, *next_streams_ = nullptr, *attention_output_ = nullptr;
-    float *ffn_output_ = nullptr, *shared_output_ = nullptr, *routed_output_ = nullptr, *final_logits_ = nullptr;
+    float *ffn_output_ = nullptr, *shared_output_ = nullptr, *routed_output_ = nullptr, *final_logits_ = nullptr, *d_gpu_expert_rows_ = nullptr;
     DsparkDrafter* drafter_ = nullptr;
     int dwin_ = -1;
     DsparkDraft last_draft_{};
@@ -943,7 +959,7 @@ private:
     float *indexer_kv_ = nullptr, *indexer_score_ = nullptr, *indexer_q_ = nullptr, *indexer_head_weights_ = nullptr;
     float *compress_rope_freq_ = nullptr, *indexer_rope_angles_ = nullptr;
     void *indexer_project_workspace_ = nullptr, *indexer_select_workspace_ = nullptr;
-    int32_t *comp_row_ = nullptr, *selected_ids_ = nullptr, *indexer_select_count_ = nullptr, *comp_limit_ = nullptr;
+    int32_t *comp_row_ = nullptr, *selected_ids_ = nullptr, *indexer_select_count_ = nullptr, *comp_limit_csa_ = nullptr, *comp_limit_hca_ = nullptr, *hca_iota_ = nullptr;
     void *shared_in_q8_ = nullptr, *shared_hidden_q8_ = nullptr;
     float *shared_gate_ = nullptr, *shared_up_ = nullptr, *shared_hidden_ = nullptr;
     float *router_logits_ = nullptr, *route_weights_ = nullptr;
@@ -953,7 +969,7 @@ private:
     int32_t* hash_routes_ = nullptr;
     uint8_t* window_rings_ = nullptr;
     CacheFormat format_ = CacheFormat::Fp8;   // the KV cache row format chosen at model start
-    void *expert_input_q8_ = nullptr, *expert_scratch_ = nullptr, *expert_plan_ = nullptr;
+    void *expert_input_q8_ = nullptr, *expert_scratch_ = nullptr, *expert_plan_ = nullptr, *expert_plan2_ = nullptr;
     float* logit_bias_ = nullptr;
     float *head_hc_workspace_ = nullptr, *head_coef_ = nullptr, *head_collapsed_ = nullptr, *head_normed_ = nullptr;
     float *retained_logits_ = nullptr;
@@ -968,7 +984,8 @@ private:
     float* d_expert_rows_ = nullptr;
     float* d_expert_input_ = nullptr;
     int32_t *h_expert_ids_ = nullptr;
-    uint32_t *h_expert_seq_ = nullptr, *d_expert_seq_ = nullptr;
+    uint32_t *h_expert_seq_ = nullptr, *d_expert_seq_ = nullptr, *h_join_ = nullptr, *d_join_ = nullptr;
+    uint32_t join_seq_ = 0;
     int32_t* d_expert_ids_ = nullptr;
     RouteMeta *h_route_meta_ = nullptr, *d_route_meta_ = nullptr;
 };
@@ -1012,6 +1029,20 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
     }
     if (cudaMemcpyAsync(position_meta_, attention_meta, sizeof(attention_meta), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
         return fail_cuda("attention metadata upload");
+    {
+        int32_t h_csa[kExpertWindow]{}, h_hca[kExpertWindow]{};
+        float h_angles[kExpertWindow * 32]{};
+        for (int t = 0; t < n_tokens; ++t) {
+            h_csa[t] = (int32_t) ((pos + t + 1) / 4);
+            h_hca[t] = (int32_t) ((pos + t + 1) / 128);
+            for (int i = 0; i < 32; ++i)
+                h_angles[(size_t) t * 32 + i] = (float) (pos + t) * ropes_[2].frequency[(size_t) i];
+        }
+        if (cudaMemcpyAsync(comp_limit_csa_, h_csa, (size_t) n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
+            cudaMemcpyAsync(comp_limit_hca_, h_hca, (size_t) n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream_) != cudaSuccess ||
+            cudaMemcpyAsync(indexer_rope_angles_, h_angles, (size_t) n_tokens * 32 * sizeof(float), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return fail_cuda("window compression metadata upload");
+    }
 
     if (begin_tier) if (core::ExpertTier* tier = model_.tier()) tier->begin_token(n_tokens);
     const int first_layer = layer_only >= 0 ? layer_only : 0;
@@ -1050,13 +1081,7 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
 
             const int ratio = geo_.compress_ratio[(size_t) layer];
             const int visible = ratio ? (int) ((pos + n_tokens) / ratio) : 0;
-            int32_t comp_limits[kExpertWindow]{};
-            for (int t = 0; t < n_tokens; ++t)
-                comp_limits[t] = ratio ? (int32_t) ((pos + t + 1) / ratio) : 0;
-            if (ratio && cudaMemcpyAsync(comp_limit_, comp_limits, (size_t) n_tokens * sizeof(int32_t),
-                                         cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-                return fail_cuda("compressed attention limits upload");
-        selection.n_sel = 0;
+            selection.n_sel = 0;
             selection.comp = nullptr;
             selection.sel = nullptr;
             selection.comp_limit = nullptr;
@@ -1109,12 +1134,6 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                         cache.indexer_state_kv, cache.indexer_state_score,
                         cache.indexer->data(), comp_row_, format_, stream_);
 
-                    float angles[kExpertWindow * 32]{};
-                    for (int t = 0; t < n_tokens; ++t)
-                        for (int i = 0; i < 32; ++i)
-                            angles[(size_t) t * 32 + i] = (float) (pos + t) * ropes_[(size_t) layer].frequency[(size_t) i];
-                    if (cudaMemcpyAsync(indexer_rope_angles_, angles, (size_t) n_tokens * 32 * sizeof(float), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-                        return fail_cuda("indexer rope angles upload");
                     indexer_project_q8_0(index_q->ptr, static_cast<const uint16_t*>(index_proj->ptr), q_latent_,
                         attn_normed_, indexer_rope_angles_, n_tokens, indexer_q_, indexer_head_weights_,
                         indexer_project_workspace_, indexer_project_workspace_bytes(n_tokens), stream_);
@@ -1126,21 +1145,15 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                         selection.sel = selected_ids_;
                         selection.comp = cache.attention->data();
                         selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
-                        selection.comp_limit = comp_limit_;
+                        selection.comp_limit = comp_limit_csa_;
                     }
                 } else {
                     selection.n_sel = visible;
                     selection.comp = cache.attention->data();
                     selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
                     if (visible > 0) {
-                        std::vector<int32_t> ids((size_t) n_tokens * visible);
-                        for (int t = 0; t < n_tokens; ++t)
-                            for (int i = 0; i < visible; ++i) ids[(size_t) t * visible + i] = i;
-                        if (cudaMemcpyAsync(selected_ids_, ids.data(), ids.size() * sizeof(int32_t),
-                                            cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-                            return fail_cuda("compressed attention ids upload");
-                        selection.sel = selected_ids_;
-                        selection.comp_limit = comp_limit_;
+                        selection.sel = hca_iota_;
+                        selection.comp_limit = comp_limit_hca_;
                     }
                 }
                 const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
@@ -1733,13 +1746,16 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
 
     tier->pump(layer, 3);
     int32_t unique[kExpertWindowRoutes]{};
+    int uidx[kExpertWindowRoutes]{};
     core::ExpertTier::Use use[kExpertWindowRoutes]{};
     int n_unique = 0;
     for (int r = 0; r < n_ids; ++r) {
+        const int32_t e = h_expert_ids_[r];
         int u = 0;
-        while (u < n_unique && unique[u] != h_expert_ids_[r]) ++u;
-        if (u == n_unique) unique[n_unique++] = h_expert_ids_[r];
-        if (h_expert_ids_[r] >= 0) {
+        while (u < n_unique && unique[u] != e) ++u;
+        if (u == n_unique) unique[n_unique++] = e;
+        uidx[r] = u;
+        if (e >= 0) {
             core::ExpertTier::Use& row_use = use[u];
             const int nt = row_use.nt++;
             row_use.tok[nt] = r / geo_.n_used;
@@ -1751,7 +1767,7 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
         err_ = "deepseek4: " + err_;
         return false;
     }
-    const int fetched = tier->fetch(layer, lookup);
+    const int fetched = tier->fetch(layer, lookup, use);
     bool cpu = false, reading = false;
     for (int k = 0; k < lookup.k; ++k) {
         cpu = cpu || (!lookup.dev[k] && !lookup.peer[k] && !lookup.reading[k] && !lookup.dropped[k]);
@@ -1765,28 +1781,25 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
     }
     if (cpu) tier->start_cpu_window(layer, h_expert_input_, lookup, use, h_expert_rows_);
 
-    if (fetched) tier->await_fetch(stream_);
-    ExpertPlan plan;
-    int n_gpu = 0;
-    int entries = 0;
-    for (int k = 0; k < lookup.k; ++k) {
-        if (!lookup.dev[k]) continue;
-        plan.ptr[n_gpu] = (unsigned long long) lookup.dev[k];
-        plan.start[n_gpu] = entries;
-        for (int j = 0; j < use[k].nt; ++j) {
-            plan.dst[entries] = use[k].row[j];
-            plan.tok[entries] = use[k].tok[j];
-            ++entries;
+    const auto build_plan = [&](ExpertPlan& plan, bool want_fetched, int& n_gpu, int& entries) {
+        n_gpu = 0;
+        entries = 0;
+        for (int k = 0; k < lookup.k; ++k) {
+            if (!lookup.dev[k] || lookup.fetched[k] != want_fetched) continue;
+            plan.ptr[n_gpu] = (unsigned long long) lookup.dev[k];
+            plan.start[n_gpu] = entries;
+            for (int j = 0; j < use[k].nt; ++j) {
+                plan.dst[entries] = use[k].row[j];
+                plan.tok[entries] = use[k].tok[j];
+                ++entries;
+            }
+            ++n_gpu;
         }
-        ++n_gpu;
-    }
-    plan.start[n_gpu] = entries;
-    plan.groups[0] = n_gpu;
-    if (n_gpu > 0) {
-        const ExpertLayer& expert = model_.weights().pack().experts[(size_t) layer];
-        const kernels::NativeExpertLayout layout = kernels::native_expert_layout(
-            expert.gate_up_type, expert.down_type, geo_.n_embd, geo_.n_ff_exp, geo_.swiglu_limit);
-        kernels::native_quantize_q8_1(normalized, expert_input_q8_, geo_.n_embd, n_tokens, stream_);
+        plan.start[n_gpu] = entries;
+        plan.groups[0] = n_gpu;
+    };
+    const auto launch_gpu = [&](const ExpertPlan& plan, void* dev_plan, int n_gpu, int entries,
+                                const kernels::NativeExpertLayout& layout) {
         ExpertPlanSingle single_plan;
         const void* host_plan = &plan;
         size_t plan_bytes = sizeof(plan);
@@ -1809,17 +1822,60 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
             dst_offset = offsetof(ExpertPlanSingle, dst);
             tok_offset = offsetof(ExpertPlanSingle, tok);
         }
-        if (cudaMemcpyAsync(expert_plan_, host_plan, plan_bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+        if (cudaMemcpyAsync(dev_plan, host_plan, plan_bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess)
             return fail_cuda("expert plan upload");
-        const auto* device_plan = static_cast<const uint8_t*>(expert_plan_);
+        const auto* device_plan = static_cast<const uint8_t*>(dev_plan);
         kernels::native_expert_grouped_clamped(layout, geo_.swiglu_limit,
             reinterpret_cast<const unsigned long long*>(device_plan + ptr_offset),
             reinterpret_cast<const int32_t*>(device_plan + start_offset),
             reinterpret_cast<const int32_t*>(device_plan + groups_offset),
             reinterpret_cast<const int32_t*>(device_plan + dst_offset),
             reinterpret_cast<const int32_t*>(device_plan + tok_offset), n_gpu, entries,
-            expert_input_q8_, expert_scratch_, d_expert_rows_, stream_);
+            expert_input_q8_, expert_scratch_, d_gpu_expert_rows_, stream_);
+        return true;
+    };
+
+    ExpertPlan plan_hits, plan_fetched;
+    int hits_gpu = 0, hits_entries = 0, fetch_gpu = 0, fetch_entries = 0;
+    build_plan(plan_hits, false, hits_gpu, hits_entries);
+    if (fetched) build_plan(plan_fetched, true, fetch_gpu, fetch_entries);
+    if (hits_gpu > 0 || fetch_gpu > 0) {
+        const ExpertLayer& expert = model_.weights().pack().experts[(size_t) layer];
+        const kernels::NativeExpertLayout layout = kernels::native_expert_layout(
+            expert.gate_up_type, expert.down_type, geo_.n_embd, geo_.n_ff_exp, geo_.swiglu_limit);
+        kernels::native_quantize_q8_1(normalized, expert_input_q8_, geo_.n_embd, n_tokens, stream_);
+        if (hits_gpu > 0 && !launch_gpu(plan_hits, expert_plan_, hits_gpu, hits_entries, layout)) return false;
+        if (fetched) {
+            tier->await_fetch(stream_);
+            if (fetch_gpu > 0 && !launch_gpu(plan_fetched, expert_plan2_, fetch_gpu, fetch_entries, layout)) return false;
+        }
+    } else if (fetched) {
+        tier->await_fetch(stream_);
     }
+
+    WindowRowPtrs rp;
+    const size_t n_embd = (size_t) geo_.n_embd;
+    for (int r = 0; r < n_ids; ++r)
+        rp.p[r] = lookup.dev[uidx[r]] ? d_gpu_expert_rows_ + (size_t) r * n_embd
+                : lookup.dropped[uidx[r]] ? tier->zero_row()
+                : d_expert_rows_ + (size_t) r * n_embd;
+
+    struct JoinGuard {
+        volatile uint32_t* word = nullptr;
+        uint32_t val = 0;
+        ~JoinGuard() {
+            if (word) {
+                std::atomic_thread_fence(std::memory_order_release);
+                *word = val;
+            }
+        }
+    } join_guard;
+    if (cpu || reading) {
+        join_guard.word = h_join_;
+        join_guard.val = ++join_seq_;
+        kernels::wait_word(d_join_, join_guard.val, stream_);
+    }
+    weighted_route_sum_ptrs(rp, weights, nullptr, n_tokens, geo_.n_embd, output, stream_);
 
     if (cpu) tier->finish_cpu();
     if (reading) {
@@ -1827,9 +1883,7 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
         tier->start_cpu_window(layer, h_expert_input_, lookup, use, h_expert_rows_, true);
         tier->finish_cpu();
     }
-    // GPU expert kernels and the weighted sum share this stream; queue order provides their dependency.
-    weighted_route_sum(d_expert_rows_, weights, n_tokens, geo_.n_embd, output, stream_);
-    tier->promote(layer, lookup);
+    if (cpu || reading) tier->promote(layer, lookup);
     tier->mark_gap(stream_);
     return true;
 }
