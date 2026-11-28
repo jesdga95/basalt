@@ -264,7 +264,7 @@ upstream). It reports 1.5x decode and 1.2x prefill over the layer split on 2x RT
 
 ## Decisions (Jay took each default, 2026-11-23)
 1. **Default shares:** split and the peers' expert deal: free VRAM at start. Peer prompt stages: memory bandwidth (the slow card
-   must not take a third of a chunk's layers).
+   must not take a third of a chunk's layers); two cards: the cut moves toward the main card by what long reads show.
 2. **Dense peer scope:** prompt stages only. KV on a second card is what split does.
 3. **Split/KV balance:** the share divides weights plus KV and state at the configured context and slots; a part that does not fit is refused.
 4. **Mixed modes:** one mode per run; no split with a peer on a third card.

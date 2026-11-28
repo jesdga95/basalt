@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/qfn_runtime.hpp - the persistent driver over startup's loaded engine.
 #pragma once
 
+#include "basalt/model/stage_tuner.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/state.hpp"
 #include "../load/engine_local.hpp"
@@ -90,6 +91,7 @@ struct Context {
     std::function<engine_local::SplitPart(int64_t, int64_t, int64_t)> split_part;
     std::function<std::string(int, const std::vector<int>&)> split_layers_text;
     const std::vector<int>& split_cuts;
+    basalt::model::StageTuner& split_tuner;
     int& split_stages;
     basalt::program::ExpertSpill& tier_spill;
     std::function<void()> report_expert_tiers;
