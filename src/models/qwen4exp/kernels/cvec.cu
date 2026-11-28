@@ -33,6 +33,9 @@ bool upload_here(std::string& err) {
         basalt::core::device_copy(t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
         basalt::core::device_copy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
         basalt::core::device_copy(t.on, &flag, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (t.dir != nullptr) cudaFree(t.dir);
+        if (t.s != nullptr) cudaFree(t.s);
+        if (t.on != nullptr) cudaFree(t.on);
         err = "control vector: device allocation failed";
         t = DevTables{};
         return false;
@@ -115,10 +118,16 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
         g_dev[d] = DevTables{};
     }
     cudaSetDevice(prev);
+    g_cvec = Cvec{};
     g_dir_host = dir;
     g_s_host = s;
     g_on_host = true;
-    if (!upload_here(err)) return false;
+    if (!upload_here(err)) {
+        g_dir_host.clear();
+        g_s_host.clear();
+        g_on_host = false;
+        return false;
+    }
     const DevTables& t = g_dev[cur_device()];
     g_cvec.dir = t.dir;
     g_cvec.s = t.s;

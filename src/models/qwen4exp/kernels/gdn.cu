@@ -105,8 +105,10 @@ __global__ void gdn_conv_kernel(float* __restrict__ cs, const float* __restrict_
     for (int i = 0; i < dc - 1; ++i) acc += st[i] * w[i];   // kernel[0] reads the OLDEST state row
     acc += x[c] * w[dc - 1];                                // the new input lands in the LAST tap
     out[c] = acc;
-    for (int i = 0; i < dc - 2; ++i) st[i] = st[i + 1];     // slide: drop the oldest, append the newest
-    st[dc - 2] = x[c];
+    if (dc > 1) {
+        for (int i = 0; i < dc - 2; ++i) st[i] = st[i + 1];     // slide: drop the oldest, append the newest
+        st[dc - 2] = x[c];
+    }
 }
 
 /// `build_gdn_l2_norm`, one warp per row: x / sqrt(sum(x^2) + eps) over the last axis.

@@ -36,6 +36,15 @@ __device__ __forceinline__ int draft_tpc(int n_ids) {
     const int tiles = (n_ids + DT - 1) / DT;
     return tiles >= 256 ? 4 : tiles >= 96 ? 2 : 1;
 }
+int max_draft_chunks(int64_t cap) {
+    const int64_t tiles = (cap + DT - 1) / DT;
+    const int64_t m1 = tiles < 95 ? tiles : 95;
+    const int64_t m2 = tiles >= 96 ? ((tiles < 255 ? tiles : 255) + 1) / 2 : 0;
+    const int64_t m4 = tiles >= 256 ? (tiles + 3) / 4 : 0;
+    int64_t m = m1 > m2 ? m1 : m2;
+    if (m4 > m) m = m4;
+    return (int) (m > 0 ? m : 1);
+}
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -739,6 +748,19 @@ template <int MODE> void opt_in(void (*kernel)(AttnArgs), size_t bytes) {
         done[dev].store(true, std::memory_order_release);
     }
 }
+template <int KIND> void opt_in_merge(void (*kernel)(AttnArgs), size_t bytes) {
+    if (bytes <= 48 * 1024) return;
+    static std::atomic<size_t> cap_set[64];
+    const int dev = opt_in_device("qsa_dec_attn");
+    if (bytes > cap_set[dev].load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(opt_in_mutex());
+        if (bytes > cap_set[dev].load(std::memory_order_relaxed)) {
+            opt_in_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes),
+                         "qsa_dec_attn");
+            cap_set[dev].store(bytes, std::memory_order_release);
+        }
+    }
+}
 
 }  // namespace
 
@@ -774,6 +796,7 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
         launch_pdl(attn_chunk_v2<5, false>, grid, dim3(THREADS), bytes, st, a);
     } else if (mode == 1 && n_q == 1 && cap >= 8192) {   // the draft layer's wide window (verify's cap is a few thousand cells)
         a.chunk = 0;
+        a.n_chunks = max_draft_chunks(cap);
         constexpr size_t bytes = sizeof(DSmem);
         static std::atomic<bool> done[64];
         const int dev = opt_in_device("draft_attn");
@@ -795,8 +818,13 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     }
     const size_t mbytes = (size_t) (2 * a.n_chunks + WARPS) * sizeof(float);
     if (merge_after != nullptr) cudaStreamWaitEvent(st, (cudaEvent_t) merge_after, 0);
-    if (a.chunk == 0) launch_pdl(draft_merge, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
-    else launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
+    if (a.chunk == 0) {
+        opt_in_merge<0>(draft_merge, mbytes);
+        launch_pdl(draft_merge, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
+    } else {
+        opt_in_merge<1>(attn_merge_v2, mbytes);
+        launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "qsa_dec_attn: %s", cudaGetErrorString(e));
@@ -835,6 +863,7 @@ void qsa_dec_attn_seg(const float* q, const QsaSegTable& t, bool int8, const int
         launch_pdl(attn_chunk_v2<0, true>, grid, dim3(THREADS), bytes, st, a);
     }
     const size_t mbytes = (size_t) (2 * a.n_chunks + WARPS) * sizeof(float);
+    opt_in_merge<1>(attn_merge_v2, mbytes);
     launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
