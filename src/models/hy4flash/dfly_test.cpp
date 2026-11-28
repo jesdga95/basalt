@@ -2,6 +2,7 @@
 // (the real checkpoint's shapes), the source row, the draft loop, the flags, and the exactness of verification: whatever
 // drafts a window holds, the stream equals plain decoding's, greedy or drawn, against a fake target.
 #include "models/hy4flash/dfly.hpp"
+#include "models/hy4flash/engram.hpp"
 
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
@@ -129,6 +130,12 @@ void test_pack_record() {
     CHECK(parse("null", p, err) && !p.present);
     auto bad = tensors;
     bad["3.mlp.up_proj.weight"].shape = {9216, 3071};
+    CHECK(parse(meta_text(bad), p, err) && !dfly_check_shapes(p.tensors, p.dims, err));
+    bad = tensors;
+    bad["0.self_attn.linear_gate.weight"].shape = {100, 3072};   // not a multiple of 256
+    CHECK(parse(meta_text(bad), p, err) && !dfly_check_shapes(p.tensors, p.dims, err));
+    bad = tensors;
+    bad["final_norm.weight"].shape = {0};
     CHECK(parse(meta_text(bad), p, err) && !dfly_check_shapes(p.tensors, p.dims, err));
     bad = tensors;
     bad.erase("mtp_fusion.gate");
@@ -341,10 +348,79 @@ void test_exact_verify() {
     CHECK(offered > 1000 && accepted > 100 && accepted < offered);   // the windows really held drafts, some right, some wrong
 }
 
+void test_engram_bounds() {
+    EngramInfo en;
+    en.present = true;
+    en.n_gram = 3;
+    en.n_head = 2;
+    en.pad_token_id = 0;
+    en.token_map = {1, 2, 3, 4};
+    en.mult = {3, 5, 7};
+    en.primes = {11, 13, 17, 19};
+    en.offsets = {0, 100, 200, 300};
+    uint32_t ids[4] = {};
+    float valid = 0.f;
+    engram_ids(en, 0, 2, 1, 3, 5, false, ids, valid);
+    CHECK(valid == 1.f);
+    CHECK(ids[0] < 11 && ids[1] >= 100 && ids[1] < 113 && ids[2] >= 200 && ids[2] < 217 && ids[3] >= 300 && ids[3] < 319);
+
+    // n_gram > 3 must not read past prev[2] / toks[4]
+    EngramInfo bad_gram = en;
+    bad_gram.n_gram = 4;
+    bad_gram.mult = {3, 5, 7, 11};
+    bad_gram.primes = {11, 13, 17, 19, 23, 29};
+    bad_gram.offsets = {0, 100, 200, 300, 400, 500};
+    valid = 1.f;
+    uint32_t ids6[6] = {};
+    engram_ids(bad_gram, 0, 2, 1, 3, 5, false, ids6, valid);
+    CHECK(valid == 0.f);
+
+    // n_gram < 2, n_head <= 0, and negative or out-of-range layer index must fail safely
+    EngramInfo small_gram = en;
+    small_gram.n_gram = 1;
+    valid = 1.f;
+    engram_ids(small_gram, 0, 2, 1, 3, 5, false, ids, valid);
+    CHECK(valid == 0.f);
+
+    EngramInfo zero_head = en;
+    zero_head.n_head = 0;
+    valid = 1.f;
+    engram_ids(zero_head, 0, 2, 1, 3, 5, false, ids, valid);
+    CHECK(valid == 0.f);
+
+    valid = 1.f;
+    engram_ids(en, -1, 2, 1, 3, 5, false, ids, valid);
+    CHECK(valid == 0.f);
+
+    valid = 1.f;
+    engram_ids(en, 1, 2, 1, 3, 5, false, ids, valid);
+    CHECK(valid == 0.f);
+
+    // zero prime must not divide by zero
+    EngramInfo zero_prime = en;
+    zero_prime.primes[1] = 0;
+    valid = 0.f;
+    engram_ids(zero_prime, 0, 2, 1, 3, 5, false, ids, valid);
+    CHECK(valid == 1.f && ids[1] == 100);
+
+    // out-of-range pad_token_id (positive or negative) must not read OOB
+    EngramInfo bad_pad = en;
+    bad_pad.pad_token_id = 999;
+    valid = 0.f;
+    engram_ids(bad_pad, 0, 2, 1, 3, 0, false, ids, valid);
+    CHECK(valid == 1.f);
+
+    bad_pad.pad_token_id = -1;
+    valid = 0.f;
+    engram_ids(bad_pad, 0, 2, 1, 3, 0, false, ids, valid);
+    CHECK(valid == 1.f);
+}
+
 }  // namespace
 
 int main() {
     test_pack_record();
+    test_engram_bounds();
     test_source_row();
     test_draft_loop();
     test_flags();

@@ -138,6 +138,9 @@ int main(int argc, char** argv) {
         check(t.size() == 3 && t.next() == 3 && !t.has_image(), "track: a rewind to before the picture clears has_image");
         t.push_row(3, 2, 0);
         check(t.has_image(), "track: pushing an image after rewind sets has_image again");
+        t.rewind(-1);
+        check(t.size() == 0 && !t.has_image(), "track: negative rewind clears track");
+        t.push_row(0, 2, 0);
         t.clear();
         check(t.size() == 0 && !t.has_image(), "track: clear resets has_image");
     }
