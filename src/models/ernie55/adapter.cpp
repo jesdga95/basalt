@@ -34,21 +34,28 @@ public:
         return {key + ".prof"};
     }
 
-    // <ernie:tool_call>\n<invoke name="N">\n<parameter name="P">V</parameter>\n</invoke>\n</ernie:tool_call>
+    // <ernie:tool_call>\n<invoke name="N"><parameter name="P">V</parameter></invoke>\n</ernie:tool_call>
     program::grammar::ToolForm tool_form() const override {
         program::grammar::ToolForm f;
         f.call_open = "<ernie:tool_call>\n";
         f.call_close = "\n</ernie:tool_call>";
         f.fn_open = "<invoke name=\"";
-        f.fn_mid = "\">\n";
+        f.fn_mid = "\">";
         f.fn_close = "</invoke>";
         f.param_open = "<parameter name=\"";
         f.param_mid_text = "\">";
         f.param_mid_value = "\">";
-        f.param_close = "</parameter>\n";
+        f.param_close = "</parameter>";
         f.text_end = "</parameter>";
         f.calls_share_block = true;
         f.trigger = "<ernie:tool_call>";
+        return f;
+    }
+
+    program::grammar::ReplyForm reply_form() const override {
+        program::grammar::ReplyForm f;
+        f.think_open = "<ernie:think>";
+        f.think_close = "</ernie:think>";
         return f;
     }
 

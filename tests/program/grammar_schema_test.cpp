@@ -665,6 +665,43 @@ static void test_schema_regressions() {
     }
 }
 
+static void test_ernie55_tool_form() {
+    ToolForm saved = tool_form();
+    ToolForm ef;
+    ef.call_open = "<ernie:tool_call>\n";
+    ef.call_close = "\n</ernie:tool_call>";
+    ef.fn_open = "<invoke name=\"";
+    ef.fn_mid = "\">";
+    ef.fn_close = "</invoke>";
+    ef.param_open = "<parameter name=\"";
+    ef.param_mid_text = "\">";
+    ef.param_mid_value = "\">";
+    ef.param_close = "</parameter>";
+    ef.text_end = "</parameter>";
+    ef.calls_share_block = true;
+    ef.trigger = "<ernie:tool_call>";
+    set_tool_form(ef);
+
+    std::string err;
+    const std::string tools = R"([
+        {"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}},
+        {"name":"ping","parameters":{"type":"object","properties":{}}}
+    ])";
+    auto g = Grammar::parse(tool_call_gbnf(tools, ToolGrammarOptions{}, err), err);
+    set_tool_form(saved);
+    CHECK(g && err.empty());
+    if (!g) return;
+
+    // Single call, multi-param call, zero-param call, and parallel calls in one shared block.
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">ls -la</parameter></invoke>\n</ernie:tool_call>"));
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">ls</parameter><parameter name=\"timeout\">30</parameter></invoke>\n</ernie:tool_call>"));
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"ping\"></invoke>\n</ernie:tool_call>"));
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">pwd</parameter></invoke>\n<invoke name=\"ping\"></invoke>\n</ernie:tool_call>"));
+    // Reject spurious newlines after <invoke name="..."> or </parameter>.
+    CHECK(!pre(g, "<ernie:tool_call>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter></invoke>\n</ernie:tool_call>"));
+    CHECK(!pre(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">ls</parameter>\n</invoke>\n</ernie:tool_call>"));
+}
+
 int main() {
     set_test_tool_form();
     test_json_args();
@@ -675,6 +712,7 @@ int main() {
     test_array_nested();
     test_ref();
     test_tools();
+    test_ernie55_tool_form();
     test_text_unions();
     test_union_parameters();
     test_control_escapes();
