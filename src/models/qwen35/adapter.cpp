@@ -4,6 +4,7 @@
 #include "models/qwen35/adapter.hpp"
 
 #include "basalt/core/diag.hpp"
+#include "basalt/kernels/moe_ffn.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/prompt_stage.hpp"
@@ -89,7 +90,7 @@ dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions
     o.kv_int8 = kv == "int8" || kv == "nvfp4";
     o.kv_fp4 = kv == "nvfp4";
     o.kv_resident = kv_resident;
-    o.arch = "qwen35";
+    o.arch = is_moe(gg) ? "qwen35moe" : "qwen35";
     return o;
 }
 
@@ -129,6 +130,7 @@ public:
         model_.reset();
         for (auto& [dev, b] : blocks_) cudaFree(b.base);
         if (embd_) cudaFreeHost(embd_);
+        if (experts_dev_) cudaFree(experts_dev_);
     }
 
     const model::ModelDesc& desc() const override { return desc_; }
@@ -175,7 +177,7 @@ private:
         // the rope scaling of the run (rope_flags.hpp): the model's own base and trained context, the pack's keys, the flags
         g.rope.scaling.freq_base = g.rope.theta;
         g.rope.scaling.orig_ctx = (double) (g.context_length > 0 ? g.context_length : 262144);
-        if (!model::resolve_rope_scaling(req.rope, model::rope_keys(gg, "qwen35"), req.max_context, "basalt qwen35", g.rope.scaling,
+        if (!model::resolve_rope_scaling(req.rope, model::rope_keys(gg, is_moe(gg) ? "qwen35moe" : "qwen35"), req.max_context, "basalt qwen35", g.rope.scaling,
                                          err)) {
             err = "qwen35: " + err;
             return false;
@@ -193,8 +195,14 @@ private:
             return false;
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
+        moe_ = is_moe(gg);
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
+        if (moe_ && (req.gpus.cards.size() > 1 || want_block)) {
+            err = "qwen35moe: one card and the pack's MTP drafter only";
+            return false;
+        }
+        if (moe_ && !plan_experts(path, g, want_mtp, err)) return false;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
         if (req.gpus.cards.size() > 1 && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
@@ -279,8 +287,11 @@ private:
             if (!d.norm_e || !d.norm_h || !d.norm || !L.attn_norm || !L.ffn_norm || !L.q_norm || !L.k_norm ||
                 !linear(gg, "mtp.fc", H, 2 * H, d.fc, err) || !linear(gg, "mtp.attn_q", 2 * AQ, H, L.q, err) ||
                 !linear(gg, "mtp.attn_k", KV, H, L.k, err) || !linear(gg, "mtp.attn_v", KV, H, L.v, err) ||
-                !linear(gg, "mtp.attn_output", H, AQ, L.o, err) || !linear(gg, "mtp.ffn_gate", g.n_ff, H, L.gate, err) ||
-                !linear(gg, "mtp.ffn_up", g.n_ff, H, L.up, err) || !linear(gg, "mtp.ffn_down", H, g.n_ff, L.down, err))
+                !linear(gg, "mtp.attn_output", H, AQ, L.o, err))
+                return false;
+            if (moe_ ? !moe_ffn(gg, g, "mtp.", g.n_layers, L, err)
+                     : (!linear(gg, "mtp.ffn_gate", g.n_ff, H, L.gate, err) || !linear(gg, "mtp.ffn_up", g.n_ff, H, L.up, err) ||
+                        !linear(gg, "mtp.ffn_down", H, g.n_ff, L.down, err)))
                 return false;
             d.present = true;
         }
@@ -455,9 +466,58 @@ private:
             L.k_norm = floats(gg, p + "attn_k_norm.weight", g.head_dim, err);
             if (!L.q_norm || !L.k_norm) return false;
         }
+        if (moe_) return moe_ffn(gg, g, p, il, L, err);
         if (!linear(gg, p + "ffn_gate", g.n_ff, H, L.gate, err) || !linear(gg, p + "ffn_up", g.n_ff, H, L.up, err) ||
             !linear(gg, p + "ffn_down", H, g.n_ff, L.down, err))
             return false;
+        return true;
+    }
+
+    // a routed-expert layer's FFN (`p` the tensor prefix: "blk.N." or "mtp."): the shared expert's three projections (the
+    // dense stack's gate, up and down), the router with the shared expert's gate as its last row, the layer's experts
+    bool moe_ffn(const GgufFile& gg, const dense::Geometry& g, const std::string& p, int il, dense::Layer& L, std::string& err) {
+        const int H = g.n_embd;
+        if (!linear(gg, p + "ffn_gate_shexp", g.n_ff, H, L.gate, err) || !linear(gg, p + "ffn_up_shexp", g.n_ff, H, L.up, err) ||
+            !linear(gg, p + "ffn_down_shexp", H, g.n_ff, L.down, err))
+            return false;
+        L.router = bf16_concat(gg, p + "ffn_gate_inp.weight", (int64_t) g.moe_experts * H, p + "ffn_gate_inp_shexp.weight", H, err);
+        L.experts = experts_dev_ + (uint64_t) il * layer_bytes_;
+        return L.router != nullptr;
+    }
+
+    // every layer's routed experts (then the drafter layer's, when it runs) in one device allocation, read from the pack's
+    // `experts` and `mtp/experts` sections in the start's pass
+    bool plan_experts(const std::string& path, const dense::Geometry& g, bool mtp, std::string& err) {
+        core::ModelFile file;
+        core::ModelSources srcs;
+        if (!file.open(path, err)) return false;
+        core::model_sources(file, srcs);
+        layer_bytes_ = (uint64_t) kernels::moe::blob_bytes(g.n_embd, g.moe_ff) * (uint64_t) g.moe_experts;
+        const uint64_t main_bytes = layer_bytes_ * (uint64_t) g.n_layers, mtp_bytes = mtp ? layer_bytes_ : 0;
+        if (srcs.experts.bytes != main_bytes || (mtp && srcs.mtp_experts.bytes != layer_bytes_)) {
+            err = "qwen35moe: the pack's experts are " + std::to_string((unsigned long long) srcs.experts.bytes) + " bytes (" +
+                  std::to_string((unsigned long long) srcs.mtp_experts.bytes) + " for the drafter's), the model needs " +
+                  std::to_string((unsigned long long) main_bytes) + " (" + std::to_string((unsigned long long) layer_bytes_) + ")";
+            return false;
+        }
+        if (cudaMalloc((void**) &experts_dev_, main_bytes + mtp_bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "qwen35moe: out of device memory for " + std::to_string((unsigned long long) ((main_bytes + mtp_bytes) >> 20)) +
+                  " MiB of experts";
+            return false;
+        }
+        const auto add = [&](const core::FileRange& r, uint64_t at) {
+            core::LoadItem it;
+            it.file = plan_file_;
+            it.off = r.offset;
+            it.bytes = r.bytes;
+            it.dev = experts_dev_ + at;
+            cudaGetDevice(&it.device);
+            plan_.add(it);
+        };
+        add(srcs.experts, 0);
+        if (mtp) add(srcs.mtp_experts, main_bytes);
+        dev_bytes_ += main_bytes + mtp_bytes;
         return true;
     }
 
@@ -500,6 +560,23 @@ private:
         if (!d.sel_h || !d.pred || !d.succ) return false;
         d.present = true;
         return true;
+    }
+
+    // two BF16 tensors of different sizes in one buffer, the first then the second (a router's rows, then one more row)
+    const uint16_t* bf16_concat(const GgufFile& gg, const std::string& a, int64_t ea, const std::string& b, int64_t eb,
+                                std::string& err) {
+        const TensorInfo* ta = need(gg, a, kTypeBf16, ea, err);
+        const TensorInfo* tb = ta ? need(gg, b, kTypeBf16, eb, err) : nullptr;
+        if (!tb) return nullptr;
+        void* d = take(tensor_payload_bytes(*ta) + tensor_payload_bytes(*tb), a, err);
+        if (!d) return nullptr;
+        uint64_t at = 0;
+        for (const TensorInfo* t : {ta, tb}) {
+            queue(gg, *t, (char*) d + at);
+            at += tensor_payload_bytes(*t);
+        }
+        dev_bytes_ += at;
+        return (const uint16_t*) d;
     }
 
     const uint16_t* bf16(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
@@ -639,6 +716,9 @@ private:
     size_t n_tensors_ = 0;
     uint64_t dev_bytes_ = 0;
     void* embd_ = nullptr;
+    bool moe_ = false;                   // the pack is qwen35moe: routed-expert layers
+    uint8_t* experts_dev_ = nullptr;     // every layer's routed experts (the drafter layer's after them)
+    uint64_t layer_bytes_ = 0;           // one layer's
     core::LoadPlan plan_;                // the model's reads, for the start's one pass
     core::LoadPlan stage_plan_;          // the prompt split's, joined once its stage's memory is held
     core::LoadPlan* queue_to_ = &plan_;
@@ -658,7 +738,8 @@ private:
 
 class Adapter final : public model::ModelAdapter {
 public:
-    const char* arch() const override { return "qwen35"; }
+    explicit Adapter(bool moe) : moe_(moe) {}
+    const char* arch() const override { return moe_ ? "qwen35moe" : "qwen35"; }
     std::string validate(const GgufFile& g) const override { return validate_meta(g); }
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
 
@@ -686,7 +767,7 @@ public:
     // the pack's drafter runs in windows of up to 16 unless --spec says otherwise (0 or 1: plain decode)
     int planned_spec(const program::CommonOptions& o) const override {
         if (o.spec_given) return o.spec >= 2 ? o.spec : 0;
-        return has_drafter(o.model) ? kDefaultSpec : 0;
+        return has_drafter(o.model) ? default_spec() : 0;
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
@@ -708,7 +789,7 @@ public:
             basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 16", o.spec);
             return 2;
         }
-        if (!o.spec_given) o.spec = has_drafter(o.model) ? kDefaultSpec : 0;
+        if (!o.spec_given) o.spec = has_drafter(o.model) ? default_spec() : 0;
         if (o.spec >= 2 && !has_drafter(o.model)) {
             basalt::log::warn("basalt qwen35", "--spec %d off: the pack has no drafter layer", o.spec);
             o.spec = 0;
@@ -717,7 +798,8 @@ public:
     }
 
 private:
-    static constexpr int kDefaultSpec = 16;
+    // a routed-expert layer reads a different expert set for each row of a window, so its best window is shorter
+    int default_spec() const { return moe_ ? 8 : 16; }
     static bool has_drafter(const std::string& path) {
         core::ModelFile file;
         std::string err;
@@ -725,11 +807,19 @@ private:
         const core::Json* t = file.meta().get("tensors");
         return t != nullptr && (t->get("mtp.fc.weight") != nullptr || t->get("dflash.fc.0.weight") != nullptr);
     }
-    const char* model_name(const core::Json&) const override { return "Qwen3.8-27B"; }
+    const char* model_name(const core::Json&) const override { return moe_ ? "Qwen3.8-35B-A3B" : "Qwen3.8-27B"; }
+    bool moe_;
 };
 
 }  // namespace
 
-std::unique_ptr<model::ModelAdapter> make_adapter() { return std::make_unique<Adapter>(); }
+std::unique_ptr<model::ModelAdapter> make_adapter() { return std::make_unique<Adapter>(false); }
+std::unique_ptr<model::ModelAdapter> make_moe_adapter() { return std::make_unique<Adapter>(true); }
 
 }  // namespace basalt::models::qwen35
+
+// The routed-expert variant is the same adapter and layers with a routed-expert FFN, so it is registered from this library
+// as its own architecture id; the composition root finds it as basalt::models::qwen35moe::make_adapter().
+namespace basalt::models::qwen35moe {
+std::unique_ptr<model::ModelAdapter> make_adapter() { return qwen35::make_moe_adapter(); }
+}  // namespace basalt::models::qwen35moe

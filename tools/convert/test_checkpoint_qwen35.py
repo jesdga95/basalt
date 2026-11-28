@@ -710,13 +710,13 @@ class Qwen35RefusalTest(unittest.TestCase):
             sc = sc.copy()
             sc[0, 0] |= 0x80
             data = Q._job(("fp4s", str(d / "model-00001-of-00001.safetensors"),
-                           C.Checkpoint(d).t["lm_head.weight_scale"][1], H, VOCAB, 0, VOCAB, None, 0))
+                           C.Checkpoint(d).t["lm_head.weight_scale"][1], H, VOCAB, 0, VOCAB, None, 0, S.GDN_V_HEADS))
             self.assertIsInstance(data, bytes)      # the intact scales convert
             fx.tens["lm_head.weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
             write_safetensors(d / "model-00001-of-00001.safetensors", fx.tens)
             ck = C.Checkpoint(d)
             bad = Q._job(("fp4s", str(d / "model-00001-of-00001.safetensors"), ck.t["lm_head.weight_scale"][1], H, VOCAB, 0,
-                          VOCAB, None, 0))
+                          VOCAB, None, 0, S.GDN_V_HEADS))
             self.assertIsInstance(bad, str)
 
     def test_bf16_mlp_weight_is_refused(self):

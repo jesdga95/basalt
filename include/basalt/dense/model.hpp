@@ -49,8 +49,12 @@ struct Layer {
     // attention: q gives [query | gate] per head
     Linear q, k, v, o;
     const float *q_norm = nullptr, *k_norm = nullptr;
-    // FFN
+    // FFN (for a routed-expert layer, Geometry::moe_experts > 0, the shared expert: n_ff wide)
     Linear gate, up, down;
+    // routed experts: the router's rows then the shared expert's gate row (bf16 [moe_experts + 1][n_embd]), and the experts'
+    // blobs (kernels/moe_ffn.hpp)
+    const uint16_t* router = nullptr;
+    const uint8_t* experts = nullptr;
 };
 
 /// The drafter layer a pack may carry (multi-token prediction): fc(concat(norm_e(embed(next)), norm_h(hidden))),
@@ -84,6 +88,7 @@ struct BlockDrafter {
 
 struct Geometry {
     int n_layers = 0, n_embd = 0, n_ff = 0, n_vocab = 0;
+    int moe_experts = 0, moe_used = 0, moe_ff = 0;   ///< routed experts a layer holds, those a token uses, their width (0: dense FFN)
     int n_head = 0, n_kv = 0, head_dim = 0;
     kernels::RopeSpec rope;
     int gdn_state = 0, gdn_k_heads = 0, gdn_v_heads = 0, gdn_conv = 0;

@@ -107,15 +107,32 @@ class Tensor:
 class Plan:
     """The pack's `gguf` tensors in checkpoint order, each with how it is made."""
 
+    ARCH = ARCH
+    TEXT_TYPE = "qwen3_5_text"
+    RULES, GLOBALS = LAYER, GLOBAL      # the layer tensors (after `layers.N.`) and the global ones
+    V_HEADS = S.GDN_V_HEADS             # the GDN value heads the checkpoint has
+    DENSE = True                        # a dense FFN: the checkpoint has no experts
+
+    def keys(self, ck: C.Checkpoint):
+        """The checkpoint tensors this plan maps, in order."""
+        return ck.order
+
+    def make_kv(self, name: str | None) -> dict:
+        return model_kv(self.ck, name)
+
+    def write_sections(self, job, w, pool) -> dict:
+        """Sections beyond `gguf` (the dense pack has none); the `meta` entries describing them."""
+        return {}
+
     def __init__(self, ck: C.Checkpoint, head: str | None = None):
         tc = ck.text
         self.ck = ck
-        if tc.get("model_type") != "qwen3_5_text":
-            raise S.ConvertError(f"config.json: text model_type {tc.get('model_type')}, expected qwen3_5_text")
-        for k in ("num_experts", "hc_count"):
+        if tc.get("model_type") != self.TEXT_TYPE:
+            raise S.ConvertError(f"config.json: text model_type {tc.get('model_type')}, expected {self.TEXT_TYPE}")
+        for k in ("num_experts", "hc_count") if self.DENSE else ("hc_count",):
             if k in tc:
                 raise S.ConvertError(f"config.json: {k} is not a dense qwen3_5 field")
-        if int(tc["linear_num_key_heads"]) != S.GDN_K_HEADS or int(tc["linear_num_value_heads"]) != S.GDN_V_HEADS \
+        if int(tc["linear_num_key_heads"]) != S.GDN_K_HEADS or int(tc["linear_num_value_heads"]) != self.V_HEADS \
                 or int(tc["linear_key_head_dim"]) != S.GDN_HEAD or int(tc["linear_value_head_dim"]) != S.GDN_HEAD:
             raise S.ConvertError("the GDN head geometry differs from the GGUF head order this converter knows")
         self.tensors: dict[str, Tensor] = {}
@@ -125,18 +142,18 @@ class Plan:
         self.amax: dict[str, float] = {}      # FP4Q tensor -> its largest |value|
         self.row_scale: dict[str, np.ndarray] = {}   # F8Q tensor -> its rows' scales (float32)
         unknown = []
-        for k in ck.order:
+        for k in self.keys(ck):
             if k.startswith("model.visual.") or QUANT_SIDE.search(k):
                 continue
             key = k[:-len("_packed")] if k.endswith(".weight_packed") else k    # compressed-tensors' NVFP4 codes
             m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.+)", key)
             mm = re.fullmatch(r"mtp\.layers\.0\.(.+)", key)
             if m:
-                rule, name = LAYER.get(m.group(2)), lambda r: f"blk.{m.group(1)}.{r}"
+                rule, name = self.RULES.get(m.group(2)), lambda r: f"blk.{m.group(1)}.{r}"
             elif mm:
-                rule, name = LAYER.get(mm.group(1)), lambda r: f"mtp.{r}"
+                rule, name = self.RULES.get(mm.group(1)), lambda r: f"mtp.{r}"
             else:
-                rule, name = GLOBAL.get(key), lambda r: r
+                rule, name = self.GLOBALS.get(key), lambda r: r
             if rule is None:
                 unknown.append(k)
                 continue
@@ -203,17 +220,17 @@ class Plan:
 
     def _check_complete(self, tc):
         n_layers, kinds = int(tc["num_hidden_layers"]), tc["layer_types"]
-        need = [r[0] for r in GLOBAL.values()]
+        need = [r[0] for r in self.GLOBALS.values()]
         for l in range(n_layers):
             if kinds[l] not in ("linear_attention", "full_attention"):
                 raise S.ConvertError(f"config.json: layer {l} is {kinds[l]}")
-            for key, rule in LAYER.items():
+            for key, rule in self.RULES.items():
                 part = key.split(".")[0]
                 if part == "linear_attn" and kinds[l] != "linear_attention" or part == "self_attn" and kinds[l] != "full_attention":
                     continue
                 need.append(f"blk.{l}.{rule[0]}")
         if int(tc.get("mtp_num_hidden_layers", 0)) == 1:
-            need += [f"mtp.{r[0]}" for k, r in LAYER.items() if not k.startswith("linear_attn")]
+            need += [f"mtp.{r[0]}" for k, r in self.RULES.items() if not k.startswith("linear_attn")]
         missing = [n for n in need if n not in self.tensors]
         if missing:
             raise S.ConvertError(f"the checkpoint lacks {len(missing)} tensors the engine reads: " + ", ".join(missing[:8]))
@@ -228,7 +245,7 @@ class Plan:
             x = x + np.float32(1)
         if t.how == "negexp":
             x = (-np.exp(x.astype(np.float64))).astype(np.float32)
-        idx = C._index(t.how, x.shape[0], S.GDN_QK_ROWS)
+        idx = C._index(t.how, x.shape[0], S.GDN_QK_ROWS, self.V_HEADS)
         if idx is not None:
             x = x[idx]
         return np.ascontiguousarray(x, dtype=np.float32)
@@ -281,7 +298,7 @@ class Plan:
         x = v * np.repeat(E4M3[sc], 16, axis=1)
         x = x / g if reciprocal else x * g
         if reorder:
-            idx = C._index(t.how, rows, S.GDN_QK_ROWS)
+            idx = C._index(t.how, rows, S.GDN_QK_ROWS, self.V_HEADS)
             if idx is not None:
                 x = x[idx]
         return x
@@ -298,9 +315,9 @@ class Plan:
             base = t.src[:-len(".weight_packed")] if t.src.endswith("_packed") else t.src[:-len(".weight")]
             sp, soff = self.ck.t[base + ".weight_scale"][:2]
             for r in range(0, ne1, step):
-                yield ("fp4c", str(p), off, ne0, ne1, r, min(step, ne1 - r), kind, first)
+                yield ("fp4c", str(p), off, ne0, ne1, r, min(step, ne1 - r), kind, first, self.V_HEADS)
             for r in range(0, ne1, step):
-                yield ("fp4s", str(sp), soff, ne0, ne1, r, min(step, ne1 - r), kind, first)
+                yield ("fp4s", str(sp), soff, ne0, ne1, r, min(step, ne1 - r), kind, first, self.V_HEADS)
             return
         if t.form == "FP4Q":   # (codes, scales) per row block: chunks() writes the codes, then the scale plane
             gs = float(fp4q_global(self.amax[name]))
@@ -315,7 +332,7 @@ class Plan:
         scale = float(self.ck.values(t.src[:-len(".weight")] + ".weight_scale")) if dt == "F8_E4M3" else None
         step = max(1, ROWS_PER_JOB // ne0)
         for r in range(0, ne1, step):
-            yield ("f8" if t.form == "F8" else "q8", str(p), off, dt, scale, ne0, ne1, r, min(step, ne1 - r), kind, first)
+            yield ("f8" if t.form == "F8" else "q8", str(p), off, dt, scale, ne0, ne1, r, min(step, ne1 - r), kind, first, self.V_HEADS)
 
     def chunks(self, name, pool, depth: int = 64):
         scales = []
@@ -421,13 +438,13 @@ def _job(args):
         return S.q8_0(x) if np.isfinite(x).all() else "a non-finite value"
     if args[0] in ("fp4c", "fp4s"):   # code rows as stored (value 2i in the low nibble of byte i); scale rows into their
         # tiles (rows in 128s); both with rows / columns in the GGUF head order (whole 128-value heads move)
-        op, path, off, ne0, ne1, row0, rows, kind, first = args
+        op, path, off, ne0, ne1, row0, rows, kind, first, vh = args
         per = 2 if op == "fp4c" else 16          # values per byte
         mm = np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(ne1, ne0 // per))
         if kind == "rows":
-            u = mm[S.gdn_index(ne1, first)[row0:row0 + rows]]
+            u = mm[S.gdn_index(ne1, first, vh)[row0:row0 + rows]]
         elif kind == "cols":
-            u = mm[row0:row0 + rows][:, S.gdn_index(ne0, 0)[::per] // per]
+            u = mm[row0:row0 + rows][:, S.gdn_index(ne0, 0, vh)[::per] // per]
         else:
             u = mm[row0:row0 + rows]
         u = np.ascontiguousarray(u)
@@ -452,15 +469,15 @@ def _job(args):
             return "a non-finite value"
         codes, sc = fp4q_rows(x, np.float32(gs))
         return codes.tobytes(), sc
-    op, path, off, dt, scale, ne0, ne1, row0, rows, kind, first = args
+    op, path, off, dt, scale, ne0, ne1, row0, rows, kind, first, vh = args
     if dt == "F8_E4M3":
         mm = np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(ne1, ne0))
     else:
         mm = np.memmap(path, dtype="<u2", mode="r", offset=off, shape=(ne1, ne0))
     if kind == "rows":
-        u = mm[S.gdn_index(ne1, first)[row0:row0 + rows]]
+        u = mm[S.gdn_index(ne1, first, vh)[row0:row0 + rows]]
     elif kind == "cols":
-        u = mm[row0:row0 + rows][:, S.gdn_index(ne0, 0)]
+        u = mm[row0:row0 + rows][:, S.gdn_index(ne0, 0, vh)]
     else:
         u = mm[row0:row0 + rows]
     u = np.ascontiguousarray(u)
@@ -482,16 +499,16 @@ def nvfp4_scale_tiles(sc: np.ndarray) -> np.ndarray:
 
 
 # ------------------------------------------------------------------ metadata
-def model_kv(ck: C.Checkpoint, name: str | None) -> dict:
+def model_kv(ck: C.Checkpoint, name: str | None, arch: str = ARCH, split: str = C.QWEN35_HF_SPLIT) -> dict:
     c, tc = ck.config, ck.text
-    A = ARCH + "."
+    A = arch + "."
     d = ck.dir
     gen = json.loads((d / "generation_config.json").read_text(encoding="utf-8")) if (d / "generation_config.json").is_file() else {}
     card = C.front_matter(d / "README.md")
     kinds = tc["layer_types"]
     rope = tc.get("rope_parameters", {})
     head = int(tc["head_dim"])
-    kv = {"general.architecture": ARCH, "general.type": "model"}
+    kv = {"general.architecture": arch, "general.type": "model"}
     if "top_k" in gen:
         kv["general.sampling.top_k"] = int(gen["top_k"])
     if "top_p" in gen:
@@ -518,7 +535,7 @@ def model_kv(ck: C.Checkpoint, name: str | None) -> dict:
         A + "block_count": int(tc["num_hidden_layers"]),
         A + "context_length": int(tc["max_position_embeddings"]),
         A + "embedding_length": int(tc["hidden_size"]),
-        A + "feed_forward_length": int(tc["intermediate_size"]),
+        A + "feed_forward_length": int(tc.get("intermediate_size", tc.get("moe_intermediate_size"))),
         A + "attention.head_count": int(tc["num_attention_heads"]),
         A + "attention.head_count_kv": int(tc["num_key_value_heads"]),
         A + "attention.key_length": head,
@@ -541,7 +558,7 @@ def model_kv(ck: C.Checkpoint, name: str | None) -> dict:
         "general.file_type": 40,
         "general.quantization_version": 2,
     })
-    kv.update(C.tokenizer_kv(ck))
+    kv.update(C.tokenizer_kv(ck, split=split))
     return kv
 
 
@@ -566,7 +583,7 @@ VISION_GLOBAL = {
 def mmproj(ck: C.Checkpoint, out: pathlib.Path, name: str) -> None:
     """The vision tower as the clip GGUF the engine's encoder reads (llama.cpp's qwen3vl_merger layout)."""
     vc = ck.config["vision_config"]
-    if vc.get("model_type") not in ("qwen3_5_vision", "qwen3_5") or vc.get("deepstack_visual_indexes"):
+    if vc.get("model_type") not in ("qwen3_5_vision", "qwen3_5_moe_vision", "qwen3_5") or vc.get("deepstack_visual_indexes"):
         raise S.ConvertError("config.json: the vision tower is not the Qwen3-VL one without deepstack layers")
     pp = json.loads((ck.dir / "preprocessor_config.json").read_text(encoding="utf-8"))
     w = GGUFWriter()
@@ -735,7 +752,7 @@ class Drafter:
 LICENSE = {"apache-2.0": "Apache License 2.0"}
 
 
-def build(a, Job, fingerprint, die) -> None:
+def build(a, Job, fingerprint, die, plan_cls=Plan) -> None:
     def source_entry(p):
         return {"path": p.name, "size": p.stat().st_size, "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)}
 
@@ -747,11 +764,11 @@ def build(a, Job, fingerprint, die) -> None:
         die(f"{out} exists (use --force to overwrite)")
     try:
         ck = C.Checkpoint(a.checkpoint)
-        plan = Plan(ck, getattr(a, "head", None))
+        plan = plan_cls(ck, getattr(a, "head", None))
         bm = C.front_matter(ck.dir / "README.md").get("base_model")
         base = (bm if isinstance(bm, str) else bm[0]) if bm else "Qwen3.5"
         name = a.name or base.split("/")[-1] + " NVFP4"
-        kv = model_kv(ck, name)
+        kv = plan.make_kv(name)
         drafter = Drafter(a.drafter, ck) if getattr(a, "drafter", None) else None
         if drafter:
             kv.update(drafter.kv())
@@ -791,6 +808,7 @@ def build(a, Job, fingerprint, die) -> None:
             tv = pathlib.Path(tmp) / "text_vocab.gguf"
             text_vocab(kv, tv)
             job.file("vision/text_vocab", tv)
+            extra = plan.write_sections(job, w, pool)
             tens = {}
             every = dict(plan.tensors, **(drafter.tensors if drafter else {}))
             for n, off in zip(names, offs):
@@ -803,13 +821,14 @@ def build(a, Job, fingerprint, die) -> None:
             used = sorted({t_.how for t_ in plan.tensors.values()})
             lic = kv.get("general.license", "")
             meta = {
-                "format": "basalt", "version": 2, "name": name, "arch": ARCH,
+                "format": "basalt", "version": 2, "name": name, "arch": plan.ARCH,
                 "converter": {"tool": "tools/convert/convert.py"},
                 "sources": [{"path": p.name, "size": p.stat().st_size,
                              "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck.shards],
                 "gguf_kv": kv,
                 "tensors": tens,
                 "license": {"name": LICENSE.get(lic, lic)},
+                **extra,
                 "vision": {"projector": "qwen3vl_merger", "source": "the checkpoint's BF16 vision tower"},
                 "mtp": {"layers": int(ck.text.get("mtp_num_hidden_layers", 0)), "source": "the checkpoint's BF16 mtp.*, Q8_0"},
                 **({"dflash": {"source": pathlib.Path(a.drafter).name, "files": [source_entry(p) for p in drafter.files],

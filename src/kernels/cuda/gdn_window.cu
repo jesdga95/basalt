@@ -539,18 +539,19 @@ static int mapped_heads(const DecRecArgs& a) {
     return a.nk * (a.h_v / a.h_k);
 }
 
-bool dec_gdn_rec_supported(int n_embd) { return n_embd == 2560 || n_embd == 5120; }
+bool dec_gdn_rec_supported(int n_embd) { return n_embd == 2048 || n_embd == 2560 || n_embd == 5120; }
 
 // the kernel for a block width: NJ = n_embd / 256
+template<template<int, int> class K, int NJ, class L>
+static void by_rows(int max_t, L launch) {
+    if (max_t <= 2) launch(K<2, NJ>::f); else if (max_t <= 4) launch(K<4, NJ>::f); else if (max_t <= 8) launch(K<8, NJ>::f);
+    else launch(K<16, NJ>::f);
+}
 template<template<int, int> class K, class L>
 static void by_width(int n_embd, int max_t, L launch) {
-    if (n_embd == 5120) {
-        if (max_t <= 2) launch(K<2, 20>::f); else if (max_t <= 4) launch(K<4, 20>::f); else if (max_t <= 8) launch(K<8, 20>::f);
-        else launch(K<16, 20>::f);
-    } else {
-        if (max_t <= 2) launch(K<2, 10>::f); else if (max_t <= 4) launch(K<4, 10>::f); else if (max_t <= 8) launch(K<8, 10>::f);
-        else launch(K<16, 10>::f);
-    }
+    if (n_embd == 5120) by_rows<K, 20>(max_t, launch);
+    else if (n_embd == 2048) by_rows<K, 8>(max_t, launch);
+    else by_rows<K, 10>(max_t, launch);
 }
 template<int MAXT, int NJ> struct RecK { static constexpr auto f = rec_kernel<MAXT, NJ>; };
 template<int MAXT, int NJ> struct SplitK { static constexpr auto f = rec_split_kernel<MAXT, NJ>; };
@@ -592,6 +593,7 @@ void dec_gdn_gates(const DecRecArgs& a, int n_tok, float* gates, void* stream) {
     const dim3 grid((unsigned) a.h_v, (unsigned) ((n_tok + 3) / 4));
     const cudaStream_t s = (cudaStream_t) stream;
     if (a.n_embd == 5120) launch_pdl(gates_kernel<20>, grid, dim3(128), 0, s, a, n_tok, gates);
+    else if (a.n_embd == 2048) launch_pdl(gates_kernel<8>, grid, dim3(128), 0, s, a, n_tok, gates);
     else launch_pdl(gates_kernel<10>, grid, dim3(128), 0, s, a, n_tok, gates);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_gates: %s", cudaGetErrorString(e)); std::exit(1); }

@@ -54,6 +54,8 @@ std::string Geometry::check() const {
         if (n_kv <= 0 || n_head % n_kv || n_head / n_kv > 8) return "attention head grouping not supported";
         if (rope.rot <= 0 || rope.rot > head_dim || rope.rot % 2 || rope.rot / 2 > 64) return "rotary width not supported";
     }
+    if (moe_experts > 0 && (moe_used <= 0 || moe_used > moe_experts || moe_used > 16 || moe_experts > 512 || moe_ff % 64 || n_embd % 64))
+        return "routed experts: used 1-16 of at most 512, widths in 64-value blocks";
     if (gdn_layers() > 0) {
         if (!kernels::gdn_prompt_supported(gdn_state, gdn_k_heads, gdn_v_heads, gdn_conv)) return "GDN geometry not supported";
         if (!kernels::dec_gdn_rec_supported(n_embd)) return "GDN window kernel not built for this width";
@@ -145,7 +147,7 @@ size_t chunk_bytes(const Geometry& g) {
     const size_t keep = 6 * T * H * 4 + H * 4 +
                         std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)) +
                         prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) widest) + 2 * T * 4 + 5 * 256;
-    const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
+    const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T, HV) : 0;
     const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 +
                                               kernels::gqa_prompt_split_floats((int64_t) T, g.n_head, kAttnSplits) * 4
                                         : 0;
@@ -420,6 +422,88 @@ void Model::vision_detach() {
     enc_bytes = 0;
 }
 
+// A routed-expert model's dense matrices (Q8_0 blocks, which prompt chunks read through MMQ) as Q8 planes on the window gemm for
+// decode windows, which it reads in a fraction of MMQ's time: copies, made once the weights have landed (attach_drafter).  Other
+// models read the weights as they are.
+namespace {
+bool decode_planes(Model& m, std::string& err) {
+    m.wd = m.w;
+    if (m.g.moe_experts <= 0) return true;
+    namespace wg = kernels::wgemm;
+    std::vector<std::function<bool(void*)>>& steps = m.drafter_steps;
+    bool ok = true;
+    auto conv = [&](Linear& l) {
+        if (!l.w || l.type != 8 || l.cols % 256 != 0 || l.rows <= 0) return;
+        const size_t n = (size_t) l.rows * (size_t) l.cols / 32 * 34;
+        void* p = nullptr;
+        if (cudaMalloc(&p, n) != cudaSuccess) {
+            ok = false;
+            return;
+        }
+        m.owned.push_back(p);
+        const void* w = l.w;
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void*) {
+            kernels::wgemm::q8_planes(w, rows, cols, p, nullptr);
+            return true;
+        });
+        l.w = p;
+        l.type = kTypeQ8P;
+    };
+    auto layer = [&](Layer& L) {
+        for (Linear* l : {&L.qkv, &L.z, &L.out, &L.q, &L.k, &L.v, &L.o, &L.gate, &L.up, &L.down}) conv(*l);
+    };
+    for (Layer& L : m.wd.layers) layer(L);
+    if (m.o.drafter == Drafter::Mtp) {
+        conv(m.wd.mtp.fc);
+        layer(m.wd.mtp.layer);
+    }
+    // the window gemm's workspace for these calls (each matrix alone and the groups a layer runs together)
+    size_t need_p = m.ws.w8.partial_floats, need_t = m.ws.w8.tickets_n;
+    auto need = [&](std::initializer_list<const Linear*> ls) {
+        wg::Call c;
+        c.fmt = wg::Format::Q8;
+        c.n = 0;
+        for (const Linear* l : ls) {
+            if (l->type != kTypeQ8P) return;
+            c.K = l->cols;
+            c.m[c.n++].rows = l->rows;
+        }
+        size_t p, t;
+        wg::workspace_need(c, p, t);
+        need_p = std::max(need_p, p);
+        need_t = std::max(need_t, t);
+    };
+    auto needs = [&](const Layer& L) {
+        for (const Linear* l : {&L.qkv, &L.z, &L.out, &L.q, &L.k, &L.v, &L.o, &L.gate, &L.up, &L.down}) need({l});
+        need({&L.qkv, &L.z});
+        need({&L.q, &L.k, &L.v});
+        need({&L.gate, &L.up});
+    };
+    for (const Layer& L : m.wd.layers) needs(L);
+    if (m.o.drafter == Drafter::Mtp) {
+        need({&m.wd.mtp.fc});
+        needs(m.wd.mtp.layer);
+    }
+    if (need_p > m.ws.w8.partial_floats || need_t > m.ws.w8.tickets_n) {
+        void *p = nullptr, *t = nullptr;
+        if (cudaMalloc(&p, std::max<size_t>(need_p, 1) * 4) != cudaSuccess || cudaMalloc(&t, need_t * 4) != cudaSuccess ||
+            cudaMemset(t, 0, need_t * 4) != cudaSuccess) {
+            err = m.o.arch + ": out of device memory for the decode windows' workspace";
+            return false;
+        }
+        m.owned.push_back(p);
+        m.owned.push_back(t);
+        m.ws.w8.partial = (float*) p;
+        m.ws.w8.tickets = (int32_t*) t;
+        m.ws.w8.partial_floats = need_p;
+        m.ws.w8.tickets_n = need_t;
+    }
+    if (!ok) err = m.o.arch + ": out of device memory for the decode windows' Q8 planes";
+    return ok;
+}
+}  // namespace
+
 bool Model::ready_products(std::string& err) {
     mmq = std::make_unique<prefill::mmq::Context>();
     std::vector<const Layer*> all;
@@ -442,6 +526,10 @@ bool Model::ready_products(std::string& err) {
             return false;
         }
         prefill::mmq::load(l->type, l->rows);
+    }
+    if (g.moe_experts > 0 && moe.grouped) {   // the routed experts' NVFP4 matrices: gate and up as one, and down
+        prefill::mmq::load(kTypeNvfp4Blocks, 2 * g.moe_ff);
+        prefill::mmq::load(kTypeNvfp4Blocks, g.n_embd);
     }
     return true;
 }
@@ -484,7 +572,7 @@ bool Model::ensure_chunk(std::string& err) {
         b.gate = pre_arena.take<float>(T * HV);
         b.beta = pre_arena.take<float>(T * HV);
         b.ab = pre_arena.take<float>(T * 2 * HV);
-        b.work = pre_arena.take_bytes(kernels::gdn_work_bytes(T));
+        b.work = pre_arena.take_bytes(kernels::gdn_work_bytes(T, HV));
         pre_arena.rewind(phase);
     }
     if (gg.attn_layers()) {
@@ -559,6 +647,38 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         m->mmproj->release();
         basalt::log::info("basalt dense", "image encoder: %.2f GiB staged in page-locked RAM, on the card per request",
                           (double) m->encoder->weights_bytes() / 1073741824.0);
+    }
+    if (g.moe_experts > 0) {   // the routed-expert layers' scratch, a tile of rows at a time
+        const size_t R = kMoeTile, E = (size_t) g.moe_experts, K = (size_t) g.moe_used, H = (size_t) g.n_embd;
+        const size_t F = (size_t) g.moe_ff, P = R * K;
+        const size_t floats = R * (E + 1) + P + P * F + P * H + P * 2 * F;
+        const bool grouped = prefill::mmq::built() && prefill::mmq::supported(kTypeNvfp4Blocks) &&
+                             prefill::mmq::fits(kTypeNvfp4Blocks, 2 * (int64_t) F) && prefill::mmq::fits(kTypeNvfp4Blocks, (int64_t) H);
+        const size_t mx = grouped ? std::max(prefill::mmq::q8_bytes((int64_t) P, (int64_t) H), prefill::mmq::q8_bytes((int64_t) P, (int64_t) F)) : 0;
+        if (!m->moe_arena.reserve(floats * 4 + 5 * P * 4 + (E + 1) * 4 + R * H + R * H / 4 + mx + 16 * 256)) {
+            err = o.arch + ": out of device memory for the routed experts' scratch";
+            return nullptr;
+        }
+        MoeScratch& ms = m->moe;
+        ms.logits = m->moe_arena.take<float>(R * (E + 1));
+        ms.xq = m->moe_arena.take<int8_t>(R * H);
+        ms.xs = m->moe_arena.take<float>(R * H / 16);
+        ms.idx = m->moe_arena.take<int32_t>(R * K);
+        ms.wgt = m->moe_arena.take<float>(R * K);
+        ms.h = m->moe_arena.take<float>(P * F);
+        ms.y = m->moe_arena.take<float>(P * H);
+        ms.grouped = grouped;
+        if (grouped) {
+            ms.gu = m->moe_arena.take<float>(P * 2 * F);
+            ms.mx = m->moe_arena.take_bytes(mx);
+            ms.bounds = m->moe_arena.take<int32_t>(E + 1);
+            ms.tok = m->moe_arena.take<int32_t>(P);
+            ms.dst = m->moe_arena.take<int32_t>(P);
+            ms.exp = m->moe_arena.take<int32_t>(P);
+            ms.ident = m->moe_arena.take<int32_t>(P);
+            prefill::mmq::iota(ms.ident, (int64_t) P, nullptr);
+            cudaDeviceSynchronize();
+        }
     }
     if (!m->dec_arena.reserve(window_bytes(g, o.drafter == Drafter::Block ? w.dflash : BlockDrafter{}, o.max_context))) {
         err = o.arch + ": out of device memory for the decode scratch";
@@ -671,7 +791,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         m->kv8.ks = (uint16_t*) (m->kv8.v + cells);
         m->kv8.vs = m->kv8.ks + cells / 64;
     }
-    if (!decode_drafter(*m, err)) return nullptr;
+    if (!decode_drafter(*m, err) || !decode_planes(*m, err)) return nullptr;
     if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
         if (err.empty()) err = o.arch + ": readying the products failed";
         return nullptr;

@@ -1018,6 +1018,10 @@ def main():
             import checkpoint_ernie55 as E
             E.build(a, Job, fingerprint, die)
             return
+        if checkpoint_model_type(Path(a.checkpoint)) == "qwen3_5_moe":
+            import checkpoint_qwen35moe as M
+            M.build(a, Job, fingerprint, die)
+            return
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return

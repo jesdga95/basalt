@@ -25,6 +25,7 @@ constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
+constexpr int64_t kMtpVocab = 65536;      // and the MTP drafter's: its picks are proposals the full head verifies
 constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
@@ -83,6 +84,22 @@ struct WindowScratch {
     int32_t* bpos = nullptr;
 };
 
+/// A routed-expert layer's scratch for up to kMoeTile rows at a time.
+constexpr int kMoeTile = 4096;   // one prompt chunk: about 128 rows an expert, so the grouped products take a wide tile
+constexpr int kMoeGrouped = 64;               // rows from which a chunk's experts run as grouped MMQ products
+constexpr int kTypeNvfp4Blocks = 40;          // ggml NVFP4: 64 values in 36 bytes (the routed experts' matrices)
+struct MoeScratch {
+    bool grouped = false;        // the experts' NVFP4 matrices have MMQ tiles
+    float* gu = nullptr;         // [tile * used][2 ff]: the grouped gate and up products (rows in expert order)
+    void* mx = nullptr;          // MMQ's activation rows
+    int32_t *bounds = nullptr, *tok = nullptr, *dst = nullptr, *exp = nullptr, *ident = nullptr;   // the pairs by expert
+    float* logits = nullptr;     // [tile][experts + 1]: the router's outputs, then the shared expert's gate
+    int8_t* xq = nullptr;        // [tile][hidden]: the normed rows rounded to INT8 for the experts
+    float* xs = nullptr;         // [tile][hidden / 16]: their scales
+    int32_t* idx = nullptr;      // [tile][used]
+    float *wgt = nullptr, *h = nullptr, *y = nullptr;   // [tile][used], [tile * used][ff], [tile * used][hidden]
+};
+
 /// The prompt chunk's scratch (kChunk rows), its mixer and FFN buffers sharing memory.
 struct ChunkScratch {
     float *x = nullptr, *xn = nullptr, *tmp = nullptr;
@@ -124,8 +141,10 @@ class Model {
 public:
     Geometry g;
     Weights w;
+    Weights wd;   // the weights decode windows read: w, with a routed-expert model's dense Q8_0 matrices as Q8 planes (copies)
     Options o;
-    Arena dec_arena, pre_arena;
+    Arena dec_arena, pre_arena, moe_arena;
+    MoeScratch moe;
     WindowScratch ws;
     ChunkScratch cs;
     bool chunk_ready = false;
@@ -174,6 +193,13 @@ struct PeerStateDeleter {
     void operator()(SessionState* s) const;
 };
 /// One conversation's device state.
+/// The vocabulary rows the MTP drafter's head scores: its pick is a proposal the full head verifies, so on an F8 or NVFP4
+/// planes head the first kMtpVocab rows do (the drafter's logits row keeps -inf beyond them).
+inline int64_t mtp_vocab(const Model& m) {
+    const Linear& hd = m.w.head;
+    return (hd.type == kTypeF8 || hd.type == kTypeNvfp4Planes) && hd.rows > kMtpVocab ? kMtpVocab : m.g.n_vocab;
+}
+
 struct SessionState {
     cudaStream_t stream = nullptr;
     cudaStream_t side = nullptr;                  // the GDN commit, beside the block drafter
@@ -200,6 +226,7 @@ struct SessionState {
     int32_t* picks = nullptr;                    // device [kWindow]
     int64_t rope_delta = 0;                      // rope position - cell index for the next text token
     cudaGraphExec_t wg[2][kWindow + 1] = {};     // the decode window of T rows, captured once per T and state buffer
+    cudaGraphExec_t mtp_wg[kWindow] = {};        // the drafter chain's step k (one row), captured on its first run
     // the drafter (null without one): its KV, the last window's normed hidden rows, and the row waiting for the
     // token after it (cell tail_cell, -1 none)
     uint16_t *mtp_kc = nullptr, *mtp_vc = nullptr;
@@ -301,9 +328,13 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
 /// The drafter over n rows of (hidden, next token) pairs at cells c0..c0+n-1: `hid` device rows [n][n_embd] (main's
 /// normed hidden, or the drafter's own output), `tok` device ids of the tokens after them.  Writes its KV; with
 /// `out` (device [n][n_embd]) also its normed output rows and, for the last row, the head's pick and probability
-/// into lp_row (row_logprobs layout, device).  n <= kWindow.
+/// into lp_row (row_logprobs layout, device).  n <= kWindow.  Runs on `stream` (null: the session's).
 bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out,
-                float* lp_row, std::string& err);
+                float* lp_row, std::string& err, cudaStream_t stream = nullptr);
+/// Step k of the drafter's chain (mtp_window of one row with `out`): its kernels run as a graph, captured on the step's first
+/// run, whose positions come from the device like a decode window's.
+bool mtp_step(Model& m, SessionState& st, int k, const float* hid, const int32_t* tok, int64_t c0, float* out, float* lp_row,
+              std::string& err, cudaStream_t stream = nullptr);
 /// The drafter's history over a prompt chunk's pairs (n <= kChunk), KV only: hidden rows `hid`, next tokens `tok`
 /// (device ids) or next rows `emb` (device [n][n_embd]).
 bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok, const float* emb, int n, int64_t c0,
