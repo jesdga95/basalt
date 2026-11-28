@@ -69,18 +69,33 @@ The `gemma4` architecture (code in `src/models/gemma4`):
 
 ## Memory
 
-Every weight sits on one card; the embedding stays in RAM. The sliding layers' rings are a fixed size; the full layers' cells
-grow with `--max-context`. `--batch N` slots each take their own caches. On a 32 GB card (fp16 caches, one slot, the
-drafter loaded):
+The projections and the head sit on the main card; the embedding stays in RAM. The 26B A4B's routed experts are placed by
+the shared expert tier: every one the card holds beside the caches is a home there (all of them on a 32 GB card), the rest,
+the least routed first by the shipped profile (`data/profiles/gemma4-30x128.prof`), are homes in page-locked RAM.
 
-| Model | Weights on the card | Room |
-| --- | --- | --- |
-| 26B A4B | 14.6 GiB (experts 12.0) | the full 262,144 positions (11.9 GiB left free) |
-| 31B (`--mlp-nvfp4`) | 20.6 GiB | about 120,000 positions (65,536 leave 3.8 GiB free) |
-| 12B | 11.5 GiB | the full 262,144 positions (15.2 GiB left free) |
+- **Decode:** the card computes its experts from a table of their slots; a layer whose rows route to a RAM expert hands
+  those rows to the host through mapped memory, the CPU pool computes them while the card computes its own, and the card
+  takes their rows back before the layer ends. RAM experts a session keeps routing to come back to the card as copies
+  in the room beside the homes. With every expert on the card the windows hold no hand-off at all.
+- **Prompt:** a chunk reads every expert on the card: each layer's RAM experts are copied to a staging on the card (two
+  layers' buffers, one filling while the other is read), whose room the copies beside the homes give up for the prompt.
 
-With `--vision dynamic` the image encoder's region (1.28 GiB) stays free beside the caches, so the context is that much
-smaller.
+The sliding layers' rings are a fixed size; the full layers' cells grow with `--max-context`, up to the models' 262,144.
+`--batch N` slots (up to 16) each take their own caches. What fits beside the weights (one slot, the drafter loaded, vision
+on for the 26B A4B and the 31B, as the engine plans it at start):
+
+| Model | Card | Weights on the card | fp16 caches | `--kv fp8` |
+| --- | --- | --- | --- | --- |
+| 26B A4B | 32 GB | 14.6 GiB, every expert | 262,144 (11.9 GiB left free) | 262,144 (12.9 GiB left free) |
+| 26B A4B | 16 GB | 2.6 GiB and the experts that fit | 262,144 with 71 of each layer's 128 experts on the card (104 at 8,192) | 262,144 with 83 of 128 (108 at 8,192) |
+| 31B | 32 GB | 20.6 GiB | about 123,600 | about 238,200 |
+| 12B | 32 GB | 11.5 GiB | 262,144 (15.2 GiB left free) | 262,144 (16.4 GiB left free) |
+| 12B | 16 GB | 11.5 GiB | about 73,700 | about 192,500 |
+
+The 31B's weights do not fit a 16 GB card.
+
+With `--vision dynamic` the image encoder keeps no card memory beside the caches: its kernels' few MiB come out of the
+card's spare, and vision on or off give the same context.
 
 ## Chat
 
@@ -94,6 +109,28 @@ arguments.
 `--vision dynamic` ([vision](../running.md#vision---vision)). The picture is resized (aspect kept, bicubic) to the largest
 size of whole 48 x 48 cells within 280 cells, up or down, as the checkpoint's processor does; one token per cell, so a
 picture takes up to 280 tokens. Transparent pixels are laid over white. The encoder's weights are staged in page-locked RAM
-(1.1 GiB) and keep no card memory at rest: a request's pictures take a region of the card (1.28 GiB) from the room the model
-keeps free, and it goes back when they are read. On an RTX 5090 a request with one fresh picture gives its first token in 70
-to 120 ms (the region's copy, the encoder and the prompt).
+(1.1 GiB) and keep no card memory at rest: the tower's 27 layers stream through two slots of a region (0.35 GiB) that a
+request's pictures borrow from the prompt path's buffers (idle while pictures are read: they are read before the chunk that
+holds them), and the buffers come back when the pictures are read. On an RTX 5090 a request with one fresh picture gives
+its first token in 70 to 120 ms (the region's copy, the encoder and the prompt).
+
+## Speed
+
+An RTX 5090 at 400 W, `--kv fp8`, drafting on, one slot, vision on for the 26B A4B and the 31B, the second of two runs of
+three chat requests (thinking off: an explanation at temperature 0.6, a JSON list at 0 and an essay at 0.6) and a 16K-token
+prompt:
+
+| Model | Context | Explanation | JSON | Essay | Prompt read, 16K |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 26B A4B | 262,144 | 438 tok/s | 705 | 380 | 21,882 tok/s |
+| 31B | 229,376 | 165 tok/s | 263 | 125 | 5,526 tok/s |
+| 12B | 262,144 | 259 tok/s | 485 | 223 | 10,922 tok/s |
+
+An RTX 5060 Ti alone at 180 W with a Ryzen 9 9950X (`basalt-bench`, fp16 caches, a context sized to its fixtures): the
+26B A4B with 24 of each layer's 128 experts in RAM decodes the three fixtures at 144, 218 and 128 tok/s and reads a 16K
+prompt at 6,061 tok/s; the 12B at 76, 143 and 62 tok/s and 3,376 tok/s.
+
+## Quality
+
+`basalt-bench --model PACK --quality REF.safetensors` runs the [quality suite](../precision/quality-suite.md) against a
+model's BF16 reference; the results: [precision](../precision/gemma4.md#against-the-reference).
