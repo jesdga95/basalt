@@ -85,6 +85,16 @@ int main() {
     // reclaim workers are excluded on purpose, and a pure-CPU spinner keeps the kernel out of the window.
     if (ExternalCpuLoad probe; true) {
         check(probe.sample() == 0, "ExternalCpuLoad's first sample is the zero interval");
+        auto cpu_allowance = [] {
+            double cpus = (double) sysconf(_SC_NPROCESSORS_ONLN);
+            if (std::ifstream q("/sys/fs/cgroup/cpu.max"); q) {   // a container sees the host's counter but owns a slice
+                std::string quota, period;
+                if ((q >> quota >> period) && quota != "max" && quota.find_first_not_of("0123456789.") == std::string::npos &&
+                    period.find_first_not_of("0123456789.") == std::string::npos)
+                    if (const double allowed = std::stod(quota) / std::stod(period); allowed > 0 && allowed < cpus) cpus = allowed;
+            }
+            return cpus;
+        };
         auto mean_middle = [](std::vector<double>& v) {
             v.erase(v.begin(), v.begin() + 2);   // warm the interval before counting it
             if (v.empty()) return 0.0;
@@ -127,35 +137,26 @@ int main() {
                 (double) (kid_use.ru_utime.tv_sec + kid_use.ru_stime.tv_sec +
                           (kid_use.ru_utime.tv_usec + kid_use.ru_stime.tv_usec) / 1e6) / win;
             const double agg_rise = (aggregate_cores() - agg0) / win - base;   // the raw counter's own rise
-            // The sensor's rise must see the child's real consumption: a scheduler squeezed by parallel tests
-            // may hand the child less than a full core, and then reading less is the sensor being honest.
-            // The old bug this replaces: reading none of it.
-            char detail[160];
-            double cpus = (double) sysconf(_SC_NPROCESSORS_ONLN);
-            if (std::ifstream q("/sys/fs/cgroup/cpu.max"); q) {   // a container's /proc/stat is the host's whole
-                std::string quota, period;   // aggregate while nproc is its slice: the rise belongs to neither
-                if ((q >> quota >> period) && quota != "max")
-                    if (const double allowed = std::stod(quota) / std::stod(period); allowed > 0 && allowed < cpus) cpus = allowed;
-            }
-            if (base + child_cores > 0.95 * cpus) {
-                // Every cpu the process may see was already busy through the window: cpu seconds conserve and
-                // a marginal child displaces rather than adds. The rise is the machine's to hide.
-                std::snprintf(detail, sizeof detail,
-                              "sensor rise check skipped, the machine was saturated (base %.2f of %.0f cpus)", base, cpus);
-                check(true, detail);
-            } else if (peak - base < 0.05 && agg_rise < 0.3 && child_cores > 0.2) {
-                // The raw aggregate itself ignored a consumed core: this machine's cpu counter cannot answer
-                // the question at all (a host-global /proc/stat behind a small cgroup). The sensor cannot be
-                // judged by it - but if the aggregate moved and the sensor's rise did not, that IS the bug.
-                std::snprintf(detail, sizeof detail,
-                              "sensor rise check skipped, the cpu aggregate ignored a whole core (child %.2f, cpus %.0f)", child_cores, cpus);
-                check(true, detail);
-            } else {
-                std::snprintf(detail, sizeof detail,
-                              "the sensor's rise follows the busy child's own cpu consumption (rise %.2f, child %.2f, base %.2f)",
-                              peak - base, child_cores, base);
-                check(peak - base > 0.5 * child_cores && peak - base < child_cores + 1.5, detail);
-            }
+            char detail[192];
+            const double rise = peak - base;
+            const double cpus = cpu_allowance();
+            std::snprintf(detail, sizeof detail,
+                          "the sensor's rise matches the raw cpu aggregate's rise (sensor %.2f, aggregate %.2f, child %.2f, base %.2f)",
+                          rise, agg_rise, child_cores, base);
+            if (child_cores < 0.2)
+                // the scheduler fed the child nothing worth seeing; nothing to compare
+                check(true, "sensor rise check skipped, the child was starved of cpu");
+            else if (base + child_cores > 0.95 * cpus)
+                check(true, "sensor rise check skipped, the machine was saturated");
+            else if (rise < 0.05 && agg_rise < 0.3)
+                // neither the sensor nor the raw counter moved for a consumed core: the counter answers to
+                // someone else (host-global behind a cgroup) and judges nothing here
+                check(true, "sensor rise check skipped, the cpu aggregate itself ignored the core");
+            else
+                // the governor reads exactly this aggregate; the sensor has earned the right to subtract
+                // self and kernel workers, and nothing else - so agreement within the sampling noise of
+                // two differently-windowed means IS its contract, whatever cgroups and steal decided
+                check(rise + 0.4 > agg_rise && rise < agg_rise + 0.8, detail);
         } else
             check(false, "ExternalCpuLoad: fork failed");
     }
