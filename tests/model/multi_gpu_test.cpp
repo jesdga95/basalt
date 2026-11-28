@@ -160,7 +160,7 @@ int main() {
                                            "14.0 GiB free; lower its gpu-share, max-context or parallel");
     }
     {
-        // the RTX 5090 + RTX 5060 Ti case that used to put one layer on the second card: with free-VRAM shares a third
+        // a big main card and a small peer: with free-VRAM shares a third
         SplitSpec s = spec;
         s.layer.assign(24, GiB);
         s.fixed = {4 * GiB, 2 * GiB};

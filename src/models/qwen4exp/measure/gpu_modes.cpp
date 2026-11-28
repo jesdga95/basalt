@@ -1,7 +1,7 @@
 // basalt/program/measure/gpu_modes.cpp - see gpu_modes.hpp.
 //
-// The three replay modes and the per-stage event names were lifted out of `main()` unchanged; the aliases at the top
-// of each function are what the surrounding function used to provide, so the moved code reads as it did.
+// The three replay modes and the per-stage event names; the aliases at the top of each function stand for the values
+// the surrounding function provides.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "gpu_modes.hpp"
 

@@ -1,5 +1,5 @@
 // include/basalt/kernels/window_segs.hpp - a batch window's segments as kernels see them: which rows of one call belong to
-// which conversation (docs/design/batching.md). Header-only; a model's kernels take it by value in their arguments, beside
+// which conversation (docs/architecture/batching.md). Header-only; a model's kernels take it by value in their arguments, beside
 // each segment's cache addresses.
 #pragma once
 

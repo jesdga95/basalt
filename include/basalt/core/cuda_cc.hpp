@@ -1,6 +1,6 @@
 // include/basalt/core/cuda_cc.hpp - the one compute capability this build's kernels are compiled for.
 //
-// 12.0 is a discrete Blackwell card; 12.1 is the integrated Blackwell GPU of the N1X and GB10 systems-on-chip. The
+// 12.0 is a discrete Blackwell card; 12.1 is the integrated Blackwell GPU of a system-on-chip. The
 // build sets BASALT_CUDA_CC (cmake/target_arch.cmake) from CMAKE_CUDA_ARCHITECTURES; every "is this card ours" check
 // reads these names, so no file spells the number.
 #pragma once

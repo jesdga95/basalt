@@ -90,7 +90,7 @@ if(BUILD_TESTING)
   target_link_libraries(vision_cpu_parity PRIVATE vision_core)
   add_executable(vision_cuda_parity ${VISION_ROOT}/tests/vision/cuda_parity.cu)
   target_link_libraries(vision_cuda_parity PRIVATE vision_cuda)
-  # the parity program is outside src/vision now and needs the private kernel header
+  # the parity program is outside src/vision and needs the private kernel header
   target_include_directories(vision_cuda_parity PRIVATE ${VISION_ROOT}/src/vision)
   # Hy4-flash's tower on random weights (the position table against torch, CUDA against the CPU encoder)
   add_executable(hy4_encoder_parity ${VISION_ROOT}/tests/vision/hy4_encoder_parity.cpp)

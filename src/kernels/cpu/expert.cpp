@@ -151,7 +151,7 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
 ///
 /// The accumulator stays a FLOAT VECTOR for the whole row and is reduced once at the end.  Reducing per
 /// 64-weight block (two 8-lane horizontal sums: a store plus 16 scalar adds) cost far more than the dot
-/// products themselves - it made the kernel compute-bound at 21 GB/s instead of DRAM-bound at 32.
+/// products themselves and made the kernel compute-bound instead of DRAM-bound.
 inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
     return row_dot_z(codes, scales, a, nblocks);
 }

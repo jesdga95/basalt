@@ -3,7 +3,7 @@
 //
 // The user picks the cards (gpu), what they do together (gpu-mode) and their proportions (gpu-share); nothing here prices
 // or picks a mode. A model states what it can divide (bytes per layer, experts by heat) and gets its part back, or the
-// refusal with the numbers. Pure functions over byte counts and the card table: no GPU calls (design/multi-gpu.md).
+// refusal with the numbers. Pure functions over byte counts and the card table: no GPU calls (architecture/multi-gpu.md).
 #pragma once
 
 #include "basalt/program/gpu_select.hpp"

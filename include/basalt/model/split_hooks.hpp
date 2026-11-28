@@ -1,4 +1,4 @@
-// include/basalt/model/split_hooks.hpp - gpu-mode split for any model (docs/design/multi-gpu.md): the layers are divided
+// include/basalt/model/split_hooks.hpp - gpu-mode split for any model (docs/architecture/multi-gpu.md): the layers are divided
 // between the cards in order, each layer's KV and state on its card. Whatever runs a model's split derives SplitHooks and
 // writes the hooks below: what each layer and each card holds in bytes and the room each card has, then its part on each
 // card once cut. The driver does the rest, the same for every model: the cut by the Split shares (or --diag-gpu-cut), the
@@ -32,7 +32,7 @@ public:
     const std::vector<int>& split_devices() const { return devices_; }
 
 protected:
-    // ---- the hooks a model writes (docs/design/multi-gpu.md, "Split")
+    // ---- the hooks a model writes (docs/architecture/multi-gpu.md, "Split")
 
     /// Per layer its weights plus its KV and state at the context and slots, per card what it holds whatever its layers,
     /// and per card the bytes it has for them past its reserves.

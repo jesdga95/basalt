@@ -74,8 +74,7 @@ void expect_error(const char* what, const GpuCards& c, const SplitSpec& s, const
 
 int main() {
     constexpr uint64_t fp16_8k = 33555456, fp16_262k = 1073742848, int8_128k = 276825088, int8_262k = 553649152;
-    // RTX 5090 + RTX 5060 Ti at 8K: the share of free memory (0.67 / 0.33) gives the second card a third of the bytes, where
-    // the old pick put one layer there
+    // A big card + a small one at 8K: the share of free memory (0.67 / 0.33) gives the second card a third of the bytes
     expect("32+16, 8K fp16", cards(k5090, k16GB), spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), 40, 46);
     // gpu-share moves it: 3,1 gives the second card a quarter, 3,2 two fifths
     expect("32+16, 8K fp16, gpu-share 3,1", cards(k5090, k16GB, {0.75, 0.25}), spec(fp16_8k, 1, kMainFixed8K, k5090, k16GB), 47, 51);
