@@ -218,6 +218,21 @@ int main() {
         }
         check(same, "untimed: the picks do not depend on the round times");
     }
+    {   // position-group and regime separation: pos>=2 high acceptance does not inflate pos=0; stochastic regime does not pollute greedy
+        DraftPolicy p(8);
+        const float ch[5] = {0.92f, 0.92f, 0.92f, 0.92f, 0.92f};
+        for (int i = 0; i < 60; ++i) {
+            p.observe_window(ch, 5, (i % 2 == 0) ? 0 : 4, ds_cost(5));
+        }
+        check(p.chance_rate(0.92f, 2) > p.chance_rate(0.92f, 0) + 0.15,
+              "position groups: pos>=2 streak learns higher rate than pos=0");
+        p.set_regime(2);
+        for (int i = 0; i < 40; ++i) p.observe_window(ch, 3, 0, ds_cost(3));
+        const double r_stoch = p.chance_rate(0.92f, 0);
+        p.set_regime(0);
+        const double r_greedy = p.chance_rate(0.92f, 0);
+        check(r_greedy > r_stoch + 0.25, "regimes: stochastic rejections do not pollute greedy regime");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

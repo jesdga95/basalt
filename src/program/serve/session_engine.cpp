@@ -691,6 +691,11 @@ public:
     }
     void decode_stats_begin() {
         counts0_ = rt_.session().expert_counts();
+        if (rt_.policy) {
+            const int reg = (req_sp.greedy || req_sp.temperature <= 0.35f) ? 0
+                            : (req_sp.temperature <= 0.75f ? 1 : 2);
+            rt_.policy->set_regime(reg);
+        }
         draft_log_ = basalt::core::diagnostics().draft_log.empty() ? nullptr : rt_.draft_log();
         if (draft_log_ != nullptr) {
             std::fprintf(draft_log_, "R temp=%g S=%d\n", (double) req_temperature, max_window());

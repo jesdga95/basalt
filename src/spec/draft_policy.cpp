@@ -30,10 +30,13 @@ constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
 constexpr double kPriorN = 4.0;
 constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
 // Stated chances: the bins' upper edges. A confidence head is best near 1, where long windows are decided, so the bins
-// are finest there. Each bin starts from the stated chance, worth kChancePriorN tested drafts.
+// are finest there. Each bin starts from a regime-calibrated prior worth kChancePriorN tested drafts, and each draft
+// position group (pos 0, pos 1, pos >= 2) shrinks hierarchically toward the regime-pooled bin rate.
 constexpr float kChanceEdge[] = {0.3f, 0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.98f, 0.995f};
 constexpr double kChanceDecay = 0.98;
-constexpr double kChancePriorN = 10.0;
+constexpr double kChancePriorN = 6.0;
+constexpr double kPosPriorN = 4.0;
+constexpr double kRegimePrior[DraftPolicy::kRegimes] = {1.0, 0.88, 0.80};
 constexpr double kProbeChance = 0.85;   // the joint chance at which a drafter window one row past the best is probed
 
 }  // namespace
@@ -41,8 +44,16 @@ constexpr double kProbeChance = 0.85;   // the joint chance at which a drafter w
 DraftPolicy::DraftPolicy(int max_t, double margin, bool timed)
     : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), timed_(timed) {}
 
+void DraftPolicy::set_regime(int regime) {
+    regime_ = std::clamp(regime, 0, kRegimes - 1);
+}
+
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
+}
+
+int DraftPolicy::pos_group(int pos) {
+    return pos <= 0 ? 0 : (pos == 1 ? 1 : 2);
 }
 
 // measured fewer than kProbes times since it was new, or not for a long while
@@ -54,18 +65,25 @@ int DraftPolicy::chance_bin(float chance) {
     return b;
 }
 
-double DraftPolicy::chance_rate(float chance) const {
-    const int b = chance_bin(chance);
-    const double c = std::clamp((double) chance, 0.0, 1.0);
-    return (c_ok_[b] + kChancePriorN * c) / (c_n_[b] + kChancePriorN);
+double DraftPolicy::chance_rate_bin(int b, double c, int pos) const {
+    const double prior = kRegimePrior[regime_] * c;
+    const double r_pool = (p_ok_[regime_][b] + kChancePriorN * prior) / (p_n_[regime_][b] + kChancePriorN);
+    const int pg = pos_group(pos);
+    return (c_ok_[regime_][pg][b] + kPosPriorN * r_pool) / (c_n_[regime_][pg][b] + kPosPriorN);
 }
 
-// each bin's rate at its top edge (a chance of 1 in the last bin): no stated chance gets more
-double DraftPolicy::best_rate() const {
+double DraftPolicy::chance_rate(float chance, int pos) const {
+    const int b = chance_bin(chance);
+    const double c = std::clamp((double) chance, 0.0, 1.0);
+    return chance_rate_bin(b, c, pos);
+}
+
+// each bin's rate at its top edge (a chance of 1 in the last bin): no stated chance gets more at this draft position
+double DraftPolicy::best_rate(int pos) const {
     double hi = 0.0;
     for (int b = 0; b < kChanceBins; ++b) {
         const double top = b < kChanceBins - 1 ? (double) kChanceEdge[b] : 1.0;
-        hi = std::max(hi, (c_ok_[b] + kChancePriorN * top) / (c_n_[b] + kChancePriorN));
+        hi = std::max(hi, chance_rate_bin(b, top, pos));
     }
     return hi;
 }
@@ -135,7 +153,7 @@ DraftPolicy::Pick DraftPolicy::choose_window(const float* chance, int n, int loo
 double DraftPolicy::drafter_tokens(const float* chance, int t) const {
     double e = 1.0, all = 1.0;
     for (int i = 0; i + 1 < t; ++i) {
-        all *= chance_rate(chance[i]);
+        all *= chance_rate(chance[i], i);
         e += all;
     }
     return e;
@@ -175,7 +193,7 @@ int DraftPolicy::window(const float* chance, int n) const {
     double e = 1.0, all = 1.0, best = 1.0 / cost_ms(1);
     int best_t = 1;
     for (int t = 2; t <= most; ++t) {
-        all *= chance_rate(chance[t - 2]);
+        all *= chance_rate(chance[t - 2], t - 2);
         e += all;
         const double r = e / cost_ms(t);
         if (r > best) { best = r; best_t = t; }
@@ -184,13 +202,13 @@ int DraftPolicy::window(const float* chance, int n) const {
     // likely accepted, so a guessed or stale cost cannot keep the window from ever growing
     if (best_t < most && unmeasured(best_t + 1)) {
         double joint = 1.0;
-        for (int i = 0; i < best_t; ++i) joint *= chance_rate(chance[i]);
+        for (int i = 0; i < best_t; ++i) joint *= chance_rate(chance[i], i);
         if (joint >= kProbeChance) ++best_t;
     }
     return best_t;
 }
 
-// window()'s choice with draft j's chance known and the later ones at best_rate(): the windows without draft j are
+// window()'s choice with draft j's chance known and the later ones at best_rate(pos): the windows without draft j are
 // priced exactly; one with it wins only above them (E grows with every chance), or by the probe one row past t = j + 1
 bool DraftPolicy::may_verify(const float* chance, int j, int n) const {
     const int most = std::clamp(n + 1, 1, max_t_);
@@ -198,15 +216,14 @@ bool DraftPolicy::may_verify(const float* chance, int j, int n) const {
     double e = 1.0, all = 1.0, best = 1.0 / cost_ms(1);
     int best_t = 1;
     for (int t = 2; t <= j + 1; ++t) {
-        all *= chance_rate(chance[t - 2]);
+        all *= chance_rate(chance[t - 2], t - 2);
         e += all;
         const double r = e / cost_ms(t);
         if (r > best) { best = r; best_t = t; }
     }
-    const double hi = best_rate();
-    double joint = all * chance_rate(chance[j]);
+    double joint = all * chance_rate(chance[j], j);
     for (int t = j + 2; t <= most; ++t) {
-        all *= t == j + 2 ? chance_rate(chance[j]) : hi;
+        all *= t == j + 2 ? chance_rate(chance[j], j) : best_rate(t - 2);
         e += all;
         if (e / cost_ms(t) > best) return true;
     }
@@ -224,8 +241,12 @@ void DraftPolicy::observe_chances(const float* chance, int t, int accepted) {
     const int tested = std::min(t - 1, accepted + 1);
     for (int i = 0; i < tested; ++i) {
         const int b = chance_bin(chance[i]);
-        c_ok_[b] = kChanceDecay * c_ok_[b] + (i < accepted ? 1.0 : 0.0);
-        c_n_[b] = kChanceDecay * c_n_[b] + 1.0;
+        const int pg = pos_group(i);
+        const double hit = i < accepted ? 1.0 : 0.0;
+        p_ok_[regime_][b] = kChanceDecay * p_ok_[regime_][b] + hit;
+        p_n_[regime_][b] = kChanceDecay * p_n_[regime_][b] + 1.0;
+        c_ok_[regime_][pg][b] = kChanceDecay * c_ok_[regime_][pg][b] + hit;
+        c_n_[regime_][pg][b] = kChanceDecay * c_n_[regime_][pg][b] + 1.0;
     }
 }
 
