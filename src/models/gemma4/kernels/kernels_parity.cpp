@@ -502,7 +502,7 @@ void span_case(const char* name, const LayerShape& sh, int past, int C, std::mt1
     pr.ldq = qd, pr.ldk = kd, pr.ldv = kd, pr.q_norm = dqn, pr.k_norm = dkn, pr.rope = rt, pr.sh = sh;
     pr.kv.c[0] = {ck, cv, cap};
     // the text before the picture as one call, then the picture's rows as one (the ring holds the window and the picture)
-    for (const auto [p0, n] : {std::pair<int, int>{0, past}, std::pair<int, int>{past, C}}) {
+    for (const auto& [p0, n] : {std::pair<int, int>{0, past}, std::pair<int, int>{past, C}}) {
         if (n == 0) continue;
         pr.q = dq + (size_t) p0 * qd, pr.k = dk + (size_t) p0 * kd, pr.v = dv + (size_t) p0 * kd, pr.pos = dpos + p0;
         pr.q_out = qp + (size_t) p0 * qd;
