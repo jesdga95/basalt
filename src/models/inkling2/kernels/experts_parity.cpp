@@ -291,7 +291,7 @@ std::vector<double> reference(const Experts& X, const Call& c, int r0, int n, co
 }
 
 void run(const Experts& X, Call& c, const MoeFinish& f, const unsigned long long* table, cudaStream_t st) {
-    moe_plan(c.d_ids, c.rows, K, NE, table, c.ptr, c.start, c.ng, c.dst, c.tok, st);
+    bk::moe_plan(c.d_ids, c.rows, K, NE, table, c.ptr, c.start, c.ng, c.dst, c.tok, st);
     ExpertCall e = expert_call(X, c, table);
     experts_gate_up(e, st);
     experts_down(e, f, c.rows, st);
@@ -322,7 +322,7 @@ void test_format(int type) {
         void* scr = zeros<uint8_t>(bk::native_expert_scratch_bytes(c.rows * K, FF));
         float *rows_old = zeros<float>((size_t) c.rows * K * E), *y = zeros<float>((size_t) c.rows * E),
               *out_old = zeros<float>((size_t) c.rows * E), *ring_old = dev(ring0);
-        moe_plan(c.d_ids, c.rows, K, NE, X.dtable, c.ptr, c.start, c.ng, c.dst, c.tok, st);
+        bk::moe_plan(c.d_ids, c.rows, K, NE, X.dtable, c.ptr, c.start, c.ng, c.dst, c.tok, st);
         bk::native_quantize_q8_1(dx, xq, E, c.rows, st);
         bk::native_expert_grouped(X.L, c.ptr, c.start, c.ng, c.dst, c.tok, NE, c.rows * K, xq, scr, rows_old, st);
         moe_combine(rows_old, c.d_w, c.rows, K, y, st);
@@ -402,7 +402,7 @@ void test_format(int type) {
             if (!off[(size_t) c.ids[(size_t) i]]) std::copy(part.begin() + (size_t) i * E, part.begin() + (size_t) (i + 1) * E, pre.begin() + (size_t) i * E);
         basalt::core::device_copy(c2.part, pre.data(), pre.size() * 4, cudaMemcpyHostToDevice);
         float* ring2 = dev(ring0);
-        moe_plan(c2.d_ids, c2.rows, K, NE, doff, c2.ptr, c2.start, c2.ng, c2.dst, c2.tok, st);
+        bk::moe_plan(c2.d_ids, c2.rows, K, NE, doff, c2.ptr, c2.start, c2.ng, c2.dst, c2.tok, st);
         ExpertCall e = expert_call(X, c2, doff);
         experts_gate_up(e, st);
         experts_down_rows(e, finish_of(c2, ring2), c2.rows, st);
@@ -418,7 +418,7 @@ void test_format(int type) {
         c3.out = zeros<float>((size_t) c.rows * E);
         c3.tickets = zeros<int32_t>(expert_tickets());
         float* ring3 = dev(ring0);
-        moe_plan(c3.d_ids, c3.rows, K, NE, dnone, c3.ptr, c3.start, c3.ng, c3.dst, c3.tok, st);
+        bk::moe_plan(c3.d_ids, c3.rows, K, NE, dnone, c3.ptr, c3.start, c3.ng, c3.dst, c3.tok, st);
         ExpertCall e3 = expert_call(X, c3, dnone);
         experts_gate_up(e3, st);
         experts_down_rows(e3, finish_of(c3, ring3), c3.rows, st);
@@ -457,7 +457,7 @@ void bench(int type, bool same) {
         }
         std::set<int> distinct(c.ids.begin(), c.ids.end());
         const double bytes = (double) distinct.size() * (double) X.L.bytes;
-        moe_plan(c.d_ids, c.rows, K, NE, X.dtable, c.ptr, c.start, c.ng, c.dst, c.tok, st);
+        bk::moe_plan(c.d_ids, c.rows, K, NE, X.dtable, c.ptr, c.start, c.ng, c.dst, c.tok, st);
         ExpertCall e = expert_call(X, c, X.dtable);
         for (int i = 0; i < 5; ++i) {
             experts_gate_up(e, st);

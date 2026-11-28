@@ -40,6 +40,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--diag-dump") o.diag_dump = next("--diag-dump");
         else if (a == "--diag-tier-ram") o.diag_tier_ram = std::atoi(next("--diag-tier-ram"));
         else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));
+        else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
         else if (a == "--diag-serial-prompt") o.diag_serial_prompt = true;
         else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--diag-batch-check") o.diag_batch_check = true;

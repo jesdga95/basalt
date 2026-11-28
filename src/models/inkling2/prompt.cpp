@@ -10,6 +10,7 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/kernels/dense_ops.hpp"
+#include "basalt/kernels/expert_plan.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/row_norm.hpp"
@@ -123,7 +124,7 @@ void carve(Carve& c, Bufs& b, const Geometry& g, int chunk) {
     b.tok = c.take<int32_t>(P);
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
-    b.sort_scr = c.take<uint8_t>(moe_sort_scratch((int) P, g.n_expert));
+    b.sort_scr = c.take<uint8_t>(bk::moe_sort_scratch((int) P, g.n_expert));
     const size_t row_bytes = (size_t) std::max(kv_cache_row_bytes(false, false),
                                                std::max(kv_cache_row_bytes(true, false), kv_cache_row_bytes(false, true)));
     const size_t stage = (size_t) kKvHeads * R * row_bytes;   // staging must fit the widest cache format
@@ -843,7 +844,7 @@ private:
     // False when the next spilled visit's staging failed (staging_read).
     bool local_experts(const LayerWeights& w, int n, int rows) {
         const int E = g_.n_embd, F = g_.n_ff_exp, k = g_.n_used, pairs = rows * k;
-        moe_sort(b().ids, rows, k, n, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());
+        bk::moe_sort(b().ids, rows, k, n, b().sort_scr, b().bounds, b().tok, b().dst, b().exp, strm());
         if (w.gu_type == kTypeNvfp4 && w.d_type == kTypeNvfp4 && fp4_shape()) {
             return experts_fp4(w, n, rows);
         }

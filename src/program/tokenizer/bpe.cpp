@@ -72,6 +72,7 @@ bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, s
                      std::string& err) {
     raw_.clear();
     whole_.clear();
+    chars_.clear();
     merges_.clear();
     memo_.clear();
     memo_used_ = 0;
@@ -127,16 +128,41 @@ bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, s
         raw_[(size_t) id] = bytes;
         have[(size_t) id] = pure ? 2 : 1;
     }
-    // a pure token wins a bytes collision with an impure one
+    // a pure token wins a bytes collision with an impure one; sentencepiece's byte-fallback tokens stand apart (a byte's
+    // token in the tables is the character's)
+    auto type_of = [&](size_t id) { return id < types.size() ? (int) types[id] : -1; };
     for (size_t id = 0; id < raw_.size(); ++id) {
         if (!have[id]) continue;
+        if (spm_ && type_of(id) == 6) {   // <0xNN>: that byte
+            const std::string& t = raw_[id];
+            const auto hex = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+            if (t.size() != 6 || t.compare(0, 3, "<0x") != 0 || t[5] != '>' || hex(t[3]) < 0 || hex(t[4]) < 0) {
+                err = "token_type.json: a byte-fallback token that is not <0xNN>";
+                return false;
+            }
+            raw_[id] = std::string(1, (char) (hex(t[3]) * 16 + hex(t[4])));
+            byte_id_[(uint8_t) raw_[id][0]] = (int32_t) id;
+            continue;
+        }
         auto [it, fresh] = by_bytes.try_emplace(std::string_view(raw_[id]), (int32_t) id);
         if (!fresh && have[id] == 2 && have[(size_t) it->second] != 2) it->second = (int32_t) id;
     }
-    for (int b = 0; b < 256; ++b) {
-        const char c = (char) b;
-        auto it = by_bytes.find(std::string_view(&c, 1));
-        if (it != by_bytes.end()) byte_id_[b] = it->second;
+    if (spm_) {
+        for (int b = 0; b < 256; ++b)
+            if (byte_id_[b] < 0) { err = "sentencepiece vocabulary without a byte-fallback token for every byte"; return false; }
+        for (const auto& [bytes_of, id] : by_bytes) {   // the one-character entries a piece starts from
+            const int ty = type_of((size_t) id);
+            size_t i = 0;
+            if (ty == 3 || ty == 4 || bytes_of.empty()) continue;
+            (void) json::next_cp(bytes_of, i);
+            if (i == bytes_of.size()) chars_.emplace(bytes_of, id);
+        }
+    } else {
+        for (int b = 0; b < 256; ++b) {
+            const char c = (char) b;
+            auto it = by_bytes.find(std::string_view(&c, 1));
+            if (it != by_bytes.end()) byte_id_[b] = it->second;
+        }
     }
     // ignore_merges: the entries a piece can be (a literal is split off before the pieces)
     if (ignore_merges_)
@@ -225,60 +251,77 @@ bool Tokenizer::merge_piece(const uint8_t* p, size_t n, std::vector<int32_t>& ou
         const auto it = whole_.find(std::string_view((const char*) p, n));
         if (it != whole_.end()) { out.push_back(it->second); return true; }
     }
-    if (n == 1) {
-        const int32_t id = byte_id_[p[0]];
-        if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
-        out.push_back(id);
-        return true;
-    }
-    if (n <= kScanMaxSymbols) {
-        int32_t sym[kScanMaxSymbols];
-        uint32_t rank[kScanMaxSymbols];
-        int32_t merged[kScanMaxSymbols];
+    if (spm_) {   // each character's entry, or its bytes' fallback tokens; U+2581 is a space
+        sym_.clear();
+        for (size_t i = 0; i < n;) {
+            const uint8_t b = p[i];
+            size_t len = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 1;
+            if (i + len > n) len = 1;
+            std::string_view ch((const char*) p + i, len);
+            if (ch == "\xE2\x96\x81") ch = " ";
+            const auto it = chars_.find(ch);
+            if (it != chars_.end()) sym_.push_back(it->second);
+            else
+                for (size_t j = 0; j < len; ++j) sym_.push_back(byte_id_[p[i + j]]);
+            i += len;
+        }
+        n = sym_.size();
+    } else {
+        if (n == 1) {
+            const int32_t id = byte_id_[p[0]];
+            if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
+            out.push_back(id);
+            return true;
+        }
+        if (n <= kScanMaxSymbols) {
+            int32_t sym[kScanMaxSymbols];
+            uint32_t rank[kScanMaxSymbols];
+            int32_t merged[kScanMaxSymbols];
+            for (size_t i = 0; i < n; ++i) {
+                const int32_t id = byte_id_[p[i]];
+                if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
+                sym[i] = id;
+            }
+            size_t count = n;
+            const uint32_t kNone = 0xFFFFFFFFu;
+            for (size_t i = 0; i + 1 < count; ++i) {
+                uint32_t r;
+                merged[i] = find_merge(sym[i], sym[i + 1], r);
+                rank[i] = merged[i] >= 0 ? r : kNone;
+            }
+            for (;;) {
+                size_t best = 0;
+                uint32_t best_rank = kNone;
+                for (size_t i = 0; i + 1 < count; ++i)
+                    if (rank[i] < best_rank) { best_rank = rank[i]; best = i; }
+                if (best_rank == kNone) break;
+                sym[best] = merged[best];
+                if (best + 2 < count) std::memmove(sym + best + 1, sym + best + 2, (count - best - 2) * sizeof(int32_t));
+                std::memmove(rank + best, rank + best + 1, (count - best - 1) * sizeof(uint32_t));
+                std::memmove(merged + best, merged + best + 1, (count - best - 1) * sizeof(int32_t));
+                --count;
+                uint32_t r;
+                if (best + 1 < count) {
+                    merged[best] = find_merge(sym[best], sym[best + 1], r);
+                    rank[best] = merged[best] >= 0 ? r : kNone;
+                } else {
+                    rank[best] = kNone;
+                }
+                if (best > 0) {
+                    merged[best - 1] = find_merge(sym[best - 1], sym[best], r);
+                    rank[best - 1] = merged[best - 1] >= 0 ? r : kNone;
+                }
+            }
+            out.insert(out.end(), sym, sym + count);
+            return true;
+        }
+
+        sym_.resize(n);
         for (size_t i = 0; i < n; ++i) {
             const int32_t id = byte_id_[p[i]];
             if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
-            sym[i] = id;
+            sym_[i] = id;
         }
-        size_t count = n;
-        const uint32_t kNone = 0xFFFFFFFFu;
-        for (size_t i = 0; i + 1 < count; ++i) {
-            uint32_t r;
-            merged[i] = find_merge(sym[i], sym[i + 1], r);
-            rank[i] = merged[i] >= 0 ? r : kNone;
-        }
-        for (;;) {
-            size_t best = 0;
-            uint32_t best_rank = kNone;
-            for (size_t i = 0; i + 1 < count; ++i)
-                if (rank[i] < best_rank) { best_rank = rank[i]; best = i; }
-            if (best_rank == kNone) break;
-            sym[best] = merged[best];
-            if (best + 2 < count) std::memmove(sym + best + 1, sym + best + 2, (count - best - 2) * sizeof(int32_t));
-            std::memmove(rank + best, rank + best + 1, (count - best - 1) * sizeof(uint32_t));
-            std::memmove(merged + best, merged + best + 1, (count - best - 1) * sizeof(int32_t));
-            --count;
-            uint32_t r;
-            if (best + 1 < count) {
-                merged[best] = find_merge(sym[best], sym[best + 1], r);
-                rank[best] = merged[best] >= 0 ? r : kNone;
-            } else {
-                rank[best] = kNone;
-            }
-            if (best > 0) {
-                merged[best - 1] = find_merge(sym[best - 1], sym[best], r);
-                rank[best - 1] = merged[best - 1] >= 0 ? r : kNone;
-            }
-        }
-        out.insert(out.end(), sym, sym + count);
-        return true;
-    }
-
-    sym_.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-        const int32_t id = byte_id_[p[i]];
-        if (id < 0) { err = "a byte has no token in the vocabulary"; return false; }
-        sym_[i] = id;
     }
     // a long piece: a linked list of symbols and a min-heap of (rank, position); a stale entry is skipped
     auto greater = [](const HeapItem& a, const HeapItem& b) { return a.rank != b.rank ? a.rank > b.rank : a.pos > b.pos; };

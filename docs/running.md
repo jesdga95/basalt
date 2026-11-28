@@ -185,12 +185,13 @@ last bits of the logits, so a greedy answer can fork after some tokens (`dynamic
 
 `dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after.
 Hy4-flash reads images with `dynamic` only: its main-card expert slots go back for the request's pictures and fill again as after a
-prompt. Which
+prompt. Gemma 4
+reads images with `dynamic` only, from the room it keeps free beside its caches. Which
 images a request may name: [image sources](configuration/image-sources.md). An image may not sit in a system prompt.
 
 ## Video
 
-With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek, Hy4-flash, Inkling 2 Mini and ERNIE-5.5-Flash do not). A user message names a video as it names an image, from
+With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek, Hy4-flash, Inkling 2 Mini, ERNIE-5.5-Flash and Gemma 4 do not). A user message names a video as it names an image, from
 the same [sources](configuration/image-sources.md):
 
 | API | Part |

@@ -725,7 +725,7 @@ private:
         const core::Json* t = file.meta().get("tensors");
         return t != nullptr && (t->get("mtp.fc.weight") != nullptr || t->get("dflash.fc.0.weight") != nullptr);
     }
-    const char* model_name() const override { return "Qwen3.8-27B"; }
+    const char* model_name(const core::Json&) const override { return "Qwen3.8-27B"; }
 };
 
 }  // namespace

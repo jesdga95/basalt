@@ -27,6 +27,7 @@ struct Hparams {
     int image_size = 0, patch = 0, embd = 0, ffn = 0, layers = 0, heads = 0, merge = 0, proj = 0;
     int min_pixels = 0;   ///< smallest input area in pixels, when the file states one
     float eps = 0.f;
+    float rope_theta = 0.f;   ///< the rotary base, when the file states one (clip.vision.rope.freq_base)
     float mean[3] = {0, 0, 0}, std[3] = {1, 1, 1};
 };
 
