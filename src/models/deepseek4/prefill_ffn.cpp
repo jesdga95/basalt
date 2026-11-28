@@ -24,7 +24,7 @@ namespace {
 namespace mmq = basalt::prefill::mmq;
 constexpr int kRoutes = 6;
 constexpr int kGroup = mmq::kGatherGroupMax;
-constexpr int kAheadSlots = 4;
+constexpr int kAheadSlots = 6;   // staged groups in flight: a chunk crosses the link with every one of the 43 layers' experts
 constexpr int kBf16 = 30;
 constexpr int kCpuRows = 8;
 constexpr int kShareTokens = 512;

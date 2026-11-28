@@ -25,14 +25,17 @@ left 160 experts per layer file-backed. This is a bring-up smoke only, not a qua
 
 The session now maintains per-layer sliding, compressed-attention, and indexer caches and runs sparse MQA in the V4
 layer schedule. Prefill uses tensor-core sparse MQA (`sparse_mqa_tc`), batched indexer scoring, grouped `wo_a` MMQ,
-and 4-slot cross-layer expert staging. Decode uses per-layer CUDA graphs, multi-stream attention, compute-kernel
-staging, and the 3-stage DSpark drafter. Measured on a single RTX 5090 (32 GiB VRAM, 475 W power limit) + 247 GiB DDR5
-RAM (`--resident-budget-gib 145`, 29/256 MXFP4 experts/layer in VRAM):
+and 6-slot cross-layer expert staging. Decode uses per-layer CUDA graphs, multi-stream attention, compute-kernel
+staging, and the 3-stage DSpark drafter. The expert tier admits an expert to the card on two CPU uses with a two-lookup
+margin over its victim, halves the counts that pick victims every 256 tokens, budgets 128 copy claims per window row, and
+lends its prompt arena in 256 MiB segments, so promoted experts stop thrashing a 256-slot layer. Measured on a single
+RTX 5090 (32 GiB VRAM, 475 W power limit) + 247 GiB DDR5 RAM (`--resident-budget-gib 145`, 29/256 MXFP4 experts/layer in
+VRAM, drafting at its default):
 
 | Benchmark | Rate (tok/s) | Notes |
 | --- | ---: | --- |
-| `pp16384` | 1,884 | Engine (`1,865` wall) |
-| `tg conv / struct / prose` (lossless) | 23 / 24-27 / 24-25 | 60.9% VRAM, 15.4% PCIe, 23.7% CPU |
+| `pp16384` | 2,330 | Engine (`2,309` wall) |
+| `tg conv / struct / prose` (lossless) | 34-36 / 38-43 / 35-36 | 59.2% VRAM, 12.1% PCIe, 28.7% CPU |
 | `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 34 / 43 / 35 | Opt-in lossy routing |
 
 100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld`: PPL `3.9836 +/- 0.0596` (base
@@ -80,6 +83,7 @@ the stages' latents beside the window on a low-priority stream; only the accepte
 The expert placement itself starts from `data/profiles/deepseek4-43x256.prof` (measured routing profile). Greedy output
 is unchanged by drafting: the same 12 tokens came from `--spec 0` and `--spec 6` on a tokenizer-derived prompt, and
 the verifier's picks matched the plain draws.
+
 
 ## Architecture and ownership
 
