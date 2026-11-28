@@ -6,6 +6,7 @@
 // sub-chunk are staged in a larger ring than the decode ring, which still receives the rows decode will read.
 #include "models/deepseek41/attn_batch.hpp"
 
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/prefill_attn.hpp"
@@ -72,6 +73,12 @@ class Impl final : public AttnBatch {
 public:
     Impl(const DsModel& m, const AttnCaches& c, int cap, int max_pos) : m_(m), g_(m.geo()), c_(c), cap_(cap), max_pos_(max_pos) {}
     ~Impl() override {
+        core::OnDevice g(m_.device());
+        if (pos_copied_) {
+            if (pos_live_) cudaEventSynchronize(pos_copied_);
+            cudaEventDestroy(pos_copied_);
+        }
+        if (h_pos_) cudaFreeHost(h_pos_);
         for (void* p : allocs_) cudaFree(p);
         for (Fixed& f : fixed_)
             if (f.host) cudaFreeHost(f.host);
@@ -84,9 +91,17 @@ public:
         bool ok = alloc(&xq_, z.xq) && alloc(&kvraw_, z.kvraw) && alloc(&qr_, z.qr) && alloc(&q_, z.q) &&
                   alloc(&attn_, z.attn) && alloc(&oa_, z.oa) && alloc(&ident_, z.ident) && alloc(&stage_, z.stage) &&
                   alloc(&mws_, z.mws) && alloc(&cws_, z.cws) && alloc(&iws_, z.iws) &&
-                  alloc(&d_pos_, C * 4) && alloc(&d_start_, C * 4) && alloc(&d_n_, C * 4) && alloc(&d_lim_[0], C * 4) &&
-                  alloc(&d_lim_[1], C * 4) && alloc(&ids_, C * kTopK * 4) && alloc(&idn_, C * 4) &&
-                  alloc(&cand_, C * kMaxCandBlocks * 4) && alloc(&cand_n_, C * 4);
+                  alloc(&d_pos_buf_, 5 * C * 4) && alloc(&ids_, C * kTopK * 4) && alloc(&idn_, C * 4) &&
+                  alloc(&cand_, C * kMaxCandBlocks * 4) && alloc(&cand_n_, C * 4) &&
+                  cudaHostAlloc((void**) &h_pos_, 5 * C * 4, cudaHostAllocPortable) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&pos_copied_, cudaEventDisableTiming) == cudaSuccess;
+        if (ok) {
+            d_pos_ = d_pos_buf_;
+            d_start_ = d_pos_ + C;
+            d_n_ = d_start_ + C;
+            d_lim_[0] = d_n_ + C;
+            d_lim_[1] = d_lim_[0] + C;
+        }
         // layer-independent index arrays of the full and the tail sub-chunk, uploaded once from pinned memory
         for (Fixed& f : fixed_) {
             f.dev = nullptr;
@@ -132,20 +147,28 @@ public:
 private:
     // positions, window bounds and visible compressed rows of the whole chunk
     void upload_positions(int64_t pos0, int T, cudaStream_t st) {
-        std::vector<int32_t> pos((size_t) T), start((size_t) T), n((size_t) T), l1((size_t) T), l2((size_t) T);
+        if (pos_live_) cudaEventSynchronize(pos_copied_);
+        int32_t* pos = h_pos_;
+        int32_t* start = pos + T;
+        int32_t* n = start + T;
+        int32_t* l1 = n + T;
+        int32_t* l2 = l1 + T;
         for (int t = 0; t < T; ++t) {
             const int32_t p = (int32_t) (pos0 + t);
-            pos[(size_t) t] = p;
-            start[(size_t) t] = std::max<int32_t>(0, p - (kWindow - 1));
-            n[(size_t) t] = p - start[(size_t) t] + 1;
-            l1[(size_t) t] = p + 1;
-            l2[(size_t) t] = (p + 1) / 2;
+            pos[t] = p;
+            start[t] = std::max<int32_t>(0, p - (kWindow - 1));
+            n[t] = p - start[t] + 1;
+            l1[t] = p + 1;
+            l2[t] = (p + 1) / 2;
         }
-        cudaMemcpyAsync(d_pos_, pos.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(d_start_, start.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(d_n_, n.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(d_lim_[0], l1.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(d_lim_[1], l2.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
+        d_pos_ = d_pos_buf_;
+        d_start_ = d_pos_ + T;
+        d_n_ = d_start_ + T;
+        d_lim_[0] = d_n_ + T;
+        d_lim_[1] = d_lim_[0] + T;
+        cudaMemcpyAsync(d_pos_buf_, h_pos_, (size_t) 5 * (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        cudaEventRecord(pos_copied_, st);
+        pos_live_ = true;
         chunk_pos0_ = pos0;
         chunk_n_ = T;
     }
@@ -379,6 +402,9 @@ private:
     std::vector<void*> allocs_;
     void *xq_ = nullptr, *cws_ = nullptr, *iws_ = nullptr;
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
+    int32_t *d_pos_buf_ = nullptr, *h_pos_ = nullptr;
+    cudaEvent_t pos_copied_ = nullptr;
+    bool pos_live_ = false;
     int32_t *d_pos_ = nullptr, *d_start_ = nullptr, *d_n_ = nullptr, *d_lim_[2] = {nullptr, nullptr}, *ids_ = nullptr,
             *idn_ = nullptr, *cand_ = nullptr, *cand_n_ = nullptr, *ident_ = nullptr, *wo_ids_ = nullptr, *bounds_ = nullptr;
     basalt::prefill::mmq::Context ctx_;

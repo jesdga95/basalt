@@ -5,6 +5,7 @@
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/device.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
 #include "basalt/ggml/ggml.h"
@@ -55,8 +56,17 @@ class Session final : public model::BatchSession {
 public:
     explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        core::OnDevice g(m_.device());
+        if (drafter_ && stream_) drafter_->after_staging(stream_);
+        if (stream_) cudaStreamSynchronize(stream_);
+        if (mix_st_) cudaStreamSynchronize(mix_st_);
+        if (eng_st_) cudaStreamSynchronize(eng_st_);
+        if (row_st_) cudaStreamSynchronize(row_st_);
         for (auto& reads : eread_)   // reads still out land in eraw_ before it goes
             for (ngram::PleReader::Ticket& t : reads) finish_read(t);
+        vis_.reset();
+        prefill_.reset();
+        ops_.reset();
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
         if (h_emb4_) cudaFreeHost(h_emb4_);
@@ -205,8 +215,10 @@ public:
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         holding_ = false;   // drafts a batch left unread are another round's
+        const int cap = std::min(max_window() - 1, kDsparkBlock);
+        if (cap < 1) return {model::Status::Error, "deepseek41: drafting requires a decode window of at least 2"};
         std::string err;
-        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::clamp(n, 1, std::min(max_window() - 1, kDsparkBlock)), err))
+        if (!flush_features(pos, err) || !drafter_->draft_begin(dwin_, anchor, pos, std::clamp(n, 1, cap), err))
             return {model::Status::Error, err};
         ops_->commit_window(pos, stream_);   // the compressor commits the drafter does not read run beside it
         ops_->end_window();   // what is still queued runs while it drafts
@@ -256,6 +268,7 @@ public:
             core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
             lossy_ = t && t->route_lossy() ? t : nullptr;
         }
+        if (r.n_tokens < 1) return {model::Status::Error, "deepseek41: empty decode window"};
         if (r.row_tokens) {
             if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
             std::string err;
@@ -672,7 +685,7 @@ protected:
         if (h > 1) {
             if (draw_kernel_) kernels::sample_tokens(logits_, h, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
             else argmax_rows(logits_, h, g_.n_vocab, am_dev_, am_ws_, st);
-        } else if (draw_kernel_ && !v.reqs[i].logits) {
+        } else if (draw_kernel_) {
             kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
         } else {
             argmax_index(logits_, g_.n_vocab, am_dev_, am_ws_, st);
@@ -825,10 +838,15 @@ private:
     bool prepare_draw(const model::DecodeRequest& r, std::string& err) {
         history_len_ = 0;
         draw_kernel_ = false;
-        if (r.sampling == nullptr) return true;
-        sampling_ = *r.sampling;
+        if (r.sampling != nullptr) {
+            sampling_ = *r.sampling;
+        } else {
+            sampling_ = kernels::SamplerParams{};
+            sampling_.greedy = true;
+        }
         sampling_.logit_bias = bias_on_ ? d_bias_ : nullptr;
-        history_len_ = r.history != nullptr ? r.history_len : 0;
+        const int src_len = r.history != nullptr && r.history_len > 0 ? r.history_len : 0;
+        history_len_ = std::min(src_len, kHistoryCap);
         draw_kernel_ = !sampling_.greedy || bias_on_ || history_len_ > 0;
         if (!sampling_.greedy && kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) > kernels::kSamplerNarrowMax &&
             !kernels::sampler_wide_reserve(g_.n_vocab, stream_)) {
@@ -836,13 +854,29 @@ private:
             return false;
         }
         if (history_len_ > 0) {
+            const int n_rows = r.row_tokens ? r.n_tokens : 1;
+            const int first_row = r.row_tokens ? 0 : std::max(0, r.n_tokens - 1);
+            if (n_rows < 1 || n_rows > kMaxWindow) {
+                err = "deepseek41: penalty history rows out of range";
+                return false;
+            }
             if (d_hist_ == nullptr) {
                 void* v = nullptr;
-                if (cudaMalloc(&v, (size_t) kHistoryCap * kMaxWindow * sizeof(int32_t)) != cudaSuccess) { err = "out of device memory for the penalties"; return false; }
+                if (cudaMalloc(&v, (size_t) kHistoryCap * kMaxWindow * sizeof(int32_t)) != cudaSuccess) {
+                    err = "out of device memory for the penalties";
+                    return false;
+                }
                 allocs_.push_back(v);
                 d_hist_ = (int32_t*) v;
             }
-            if (basalt::core::device_copy(d_hist_, r.history, (size_t) r.n_tokens * history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            const int32_t* src = r.history + (size_t) first_row * (size_t) src_len + (size_t) (src_len - history_len_);
+            const size_t row_bytes = (size_t) history_len_ * sizeof(int32_t);
+            const cudaError_t ce =
+                src_len == history_len_
+                    ? cudaMemcpyAsync(d_hist_, src, (size_t) n_rows * row_bytes, cudaMemcpyHostToDevice, stream_)
+                    : cudaMemcpy2DAsync(d_hist_, row_bytes, src, (size_t) src_len * sizeof(int32_t), row_bytes,
+                                        (size_t) n_rows, cudaMemcpyHostToDevice, stream_);
+            if (ce != cudaSuccess) {
                 err = "the penalty history upload failed";
                 return false;
             }
@@ -1140,15 +1174,13 @@ private:
     bool batch_prologue(const int32_t* tokens, int T, int64_t pos) {
         const size_t n = (size_t) g_.n_embd;
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return fail(kSkippedRows);
+        if (pos > 0 && (int64_t) hist_.size() < pos)
+            return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         if (pos == 0) {
-            hist_.clear();
             whole_from_ = 0;
             ops_->reset();
             if (drafter_) drafter_->reset(dwin_);
         }
-        if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
-        hist_.resize((size_t) pos);
-        hist_.insert(hist_.end(), tokens, tokens + T);
         {
             std::string se;
             if (!ops_->stage_token(pos, T, stream_, se)) return fail(se);
@@ -1162,6 +1194,8 @@ private:
             if (!m_.embedding_row(tokens[t], row, e)) return fail(e);
             for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
         }
+        hist_.resize((size_t) pos);
+        hist_.insert(hist_.end(), tokens, tokens + T);
         if (!m_.pack().engram.layers.empty() && from < T) {
             engram_issue(tokens + from, T - from, pos + from, from, 1, true);
             engram_issue(tokens + from, T - from, pos + from, from, 1, false);
@@ -1270,15 +1304,13 @@ private:
         void* st = stream_;
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return fail(kSkippedRows);
         if (T > 1 && !dump_dir_.empty()) return fail("deepseek41: a decode window cannot run with tensor dumps");
+        if (pos > 0 && (int64_t) hist_.size() < pos)
+            return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         if (pos == 0) {
-            hist_.clear();
             whole_from_ = 0;
             ops_->reset();
             if (drafter_) drafter_->reset(dwin_);
         }
-        if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
-        hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
-        hist_.insert(hist_.end(), tokens, tokens + T);
         {
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
@@ -1296,6 +1328,8 @@ private:
             for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
         }
         DS_CUDA(cudaMemcpyAsync(x_, h_emb4_, n * kHcMult * T * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
+        hist_.insert(hist_.end(), tokens, tokens + T);
         dump("hc_init", -1, pos, x_, 4 * n * sizeof(float));
 
         // Engram rows of the window's rows not asked for with the drafts, requested now so the SSD reads overlap layer 0:
@@ -1397,31 +1431,17 @@ private:
             std::copy(h_next_, h_next_ + T, next);
             return true;
         }
-        if (next && !logits_out && draw_kernel_) {
-            kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
-            DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
-            DS_CUDA(cudaStreamSynchronize(stream_));
-            *next = *h_next_;
-            return true;
-        }
-        if (next && !logits_out) {
-            // greedy: the id comes back, not the logits
-            argmax_index(logits_, g_.n_vocab, am_dev_, am_ws_, st);
-            DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
-            DS_CUDA(cudaStreamSynchronize(stream_));
-            *next = *h_next_;
-            return true;
-        }
-        std::vector<float> host((size_t) g_.n_vocab);
-        DS_CUDA(cudaMemcpyAsync(host.data(), logits_, host.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_));
-        DS_CUDA(cudaStreamSynchronize(stream_));
-        if (logits_out) std::copy(host.begin(), host.end(), logits_out);
         if (next) {
-            size_t best = 0;
-            for (size_t i = 1; i < host.size(); ++i)
-                if (host[i] > host[best]) best = i;
-            *next = (int32_t) best;
+            if (draw_kernel_)
+                kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
+            else
+                argmax_index(logits_, g_.n_vocab, am_dev_, am_ws_, st);
+            DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
         }
+        if (logits_out)
+            DS_CUDA(cudaMemcpyAsync(logits_out, logits_, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+        DS_CUDA(cudaStreamSynchronize(stream_));
+        if (next) *next = *h_next_;
         return true;
     }
 

@@ -148,6 +148,8 @@ struct DsparkDrafter::Impl {
     explicit Impl(const DsModel& m) : main(m) {}
     ~Impl() {
         core::OnDevice g(device);
+        if (stage_st) cudaStreamSynchronize(stage_st);
+        if (st) cudaStreamSynchronize(st);
         for (void* p : allocs) cudaFree(p);
         if (h_feat) cudaFreeHost(h_feat);
         if (h_pos) cudaFreeHost(h_pos);
@@ -734,8 +736,21 @@ void DsparkDrafter::after_staging(void* stream) {
 bool DsparkDrafter::draft_begin(int w, int32_t anchor, int64_t pos, int n_out, std::string& err) {
     core::OnDevice g(p_->device);
     Impl& d = *p_;
+    if (w < 0 || (size_t) w >= d.ring_pos.size()) {
+        err = "dspark draft: window out of range";
+        return false;
+    }
     const std::vector<int64_t>& ring_pos = d.ring_pos[(size_t) w];
     n_out = std::clamp(n_out, 1, kT);
+    // An abandoned block may still be reading the mapped host staging on d.st.
+    if (d.block_live) {
+        const cudaError_t se = cudaStreamSynchronize(d.st);
+        d.block_live = false;
+        if (se != cudaSuccess) {
+            err = std::string("dspark draft: ") + cudaGetErrorString(se);
+            return false;
+        }
+    }
     try {
         // the block's host inputs: the anchor's embedding (the block copies it into the four hyper-connection streams),
         // then the index arrays (the last block, which read them, has ended; an inject before this block may still run)
