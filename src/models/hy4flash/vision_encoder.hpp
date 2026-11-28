@@ -49,6 +49,7 @@ private:
     std::unique_ptr<vision::CudaEncoder> enc_;
     void* region_ = nullptr;
     int tokens_ = 0;   ///< merged tokens the open region is sized for
+    int device_ = -1;
 };
 
 }  // namespace basalt::models::hy4flash

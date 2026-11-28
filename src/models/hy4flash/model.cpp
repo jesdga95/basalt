@@ -6,6 +6,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/loader.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/log.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/platform/file.hpp"
@@ -56,12 +57,28 @@ size_t Hy4Model::expert_stride() const {
     for (const ExpertLayer& el : pack_.experts) {
         blob = std::max<size_t>(blob, el.blob_bytes);
         if (!el.present) continue;
-        for (int t : {el.gu_type, el.d_type}) unit = std::lcm(unit, ggml_type_size((ggml_type) t));
+        for (int t : {el.gu_type, el.d_type}) {
+            const size_t ts = ggml_type_size((ggml_type) t);
+            if (ts > 0) unit = std::lcm(unit, ts);
+        }
     }
     return (blob + unit - 1) / unit * unit;
 }
 
 Hy4Model::~Hy4Model() {
+    const core::OnDevice on(device_);
+    dfly_.reset();
+    vis_.release();
+    scratch_.reset();
+    shared_tier_.tier.reset();
+    if (shared_tier_.h_x) {
+        cudaFreeHost(shared_tier_.h_x);
+        shared_tier_.h_x = nullptr;
+    }
+    if (shared_tier_.h_rows) {
+        cudaFreeHost(shared_tier_.h_rows);
+        shared_tier_.h_rows = nullptr;
+    }
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (fd_ >= 0) platform::close_fd(fd_);
@@ -74,8 +91,11 @@ const DevTensor* Hy4Model::tensor(const std::string& name) const {
 
 bool Hy4Model::embedding_row(int32_t token, float* out) const {
     const uint64_t n = (uint64_t) geo().n_embd;
-    if (token < 0 || (int64_t) token >= geo().n_vocab) return false;
-    const uint8_t* row = embd_.data() + (uint64_t) token * (n / 32) * 34;
+    const uint64_t row_bytes = (n / 32) * 34;
+    if (token < 0 || (int64_t) token >= geo().n_vocab || row_bytes == 0 ||
+        ((uint64_t) token + 1) * row_bytes > embd_.size())
+        return false;
+    const uint8_t* row = embd_.data() + (uint64_t) token * row_bytes;
     for (uint64_t b = 0; b < n / 32; ++b) dequantize_q8_0(row + b * 34, out + b * 32);
     return true;
 }
@@ -156,7 +176,9 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     uint64_t dense = 0;
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight") {
-            if (t.type != kTypeQ8_0 || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
+            const uint64_t need_bytes = (uint64_t) g.n_vocab * ((uint64_t) g.n_embd / 32) * 34;
+            if (t.type != kTypeQ8_0 || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd ||
+                t.shape[1] < (uint64_t) g.n_vocab || t.bytes < need_bytes) {
                 return {model::Status::Error, "hy4flash: token_embd.weight is not Q8_0 [n_embd][vocab]"};
             }
             embd_.resize(t.bytes);
@@ -193,7 +215,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         // multiple: zeros past the end, so the read stays inside the allocation wherever it lies
         const uint64_t past = !t.shape.empty() && prefill::mmq::supported(d.type) ? prefill::mmq::read_past_bytes(d.type, (int64_t) t.shape[0]) : 0;
         if (cudaMalloc(&d.ptr, d.bytes + past) != cudaSuccess) return {model::Status::Error, "hy4flash: out of device memory loading " + name};
-        if (past > 0 && cudaMemset((uint8_t*) d.ptr + d.bytes, 0, past) != cudaSuccess) return {model::Status::Error, "hy4flash: cannot clear the tail of " + name};
+        if (past > 0 && cudaMemset((uint8_t*) d.ptr + d.bytes, 0, past) != cudaSuccess) {
+            cudaFree(d.ptr);
+            return {model::Status::Error, "hy4flash: cannot clear the tail of " + name};
+        }
         core::LoadItem it;
         it.file = file;
         it.off = t.offset;
@@ -213,7 +238,11 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     spec_ = req.spec;
     if (req.draft)
         if (model::Result r = dfly_plan(pack_, reads, file, device_, dfly_); !r.ok()) return r;
-    if (dfly_) dfly_->head_q8 = dev_.at("output.weight").ptr;   // the drafts read the target's own Q8_0 head
+    if (dfly_) {
+        const DevTensor* out_w = tensor("output.weight");
+        if (!out_w || !out_w->ptr) return {model::Status::Error, "hy4flash: pack has no output.weight tensor"};
+        dfly_->head_q8 = out_w->ptr;   // the drafts read the target's own Q8_0 head
+    }
     // [vision] the image encoder staged before the context and the tier are sized: it holds no VRAM afterwards
     if (req.vision) {
         if (!vis_.stage(pack_.vision, g.n_embd, err)) return {model::Status::Error, "hy4flash: vision: " + err};
@@ -264,10 +293,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
 }
 
 model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
+    const core::OnDevice on(device_);
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, "hy4flash: " + err};
     if (dfly_) {   // the drafts' head screen, made from the head the reads placed
-        cudaSetDevice(device_);
         if (!dfly_->pack_screen(nullptr, err)) return {model::Status::Error, "hy4flash: " + err};
     }
     if (engram_ && engram_->ram_bytes() > 0) {

@@ -130,6 +130,7 @@ public:
 private:
     std::map<std::string, void*> slots_;
     uint64_t bytes_ = 0;
+    int device_ = -1;
 };
 
 /// The pack's drafter queued onto `reads` (file `file`, device `device`) when `pack` has one: `out` is null otherwise.
@@ -164,7 +165,7 @@ public:
 
 private:
     DflyTap() = default;
-    int E_ = 0, cap_ = 0, layers_ = 0;
+    int E_ = 0, cap_ = 0, layers_ = 0, device_ = -1;
     std::vector<int> idx_layers_;
     float* hid_ = nullptr;
     int32_t* sel_ = nullptr;
@@ -179,7 +180,7 @@ class DflyRunner {
 public:
     struct Env {
         const DflyWeights* w = nullptr;
-        int device = 0;
+        int device = -1;
         std::function<bool(int32_t, float*)> embed;              ///< a token's embedding row (E floats, host)
         int sel_cap = 2056;                                      ///< cells of a selection
         bool fp8 = false;                                        ///< the target's caches hold --kv fp8 rows (kFp8RowBytes)

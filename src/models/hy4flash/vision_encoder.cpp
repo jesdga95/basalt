@@ -1,6 +1,7 @@
 // src/models/hy4flash/vision_encoder.cpp - see vision_encoder.hpp.
 #include "models/hy4flash/vision_encoder.hpp"
 
+#include "basalt/core/on_device.hpp"
 #include "basalt/vision/mmproj.hpp"
 
 #include <cuda_runtime.h>
@@ -41,6 +42,7 @@ size_t ImageEncoder::region_bytes(const ImagePlan& plan) const { return enc_ ? e
 
 bool ImageEncoder::reserve(const ImagePlan& plan, std::string& err) {
     release();
+    cudaGetDevice(&device_);
     const int tokens = region_tokens(plan);
     const size_t bytes = enc_->arena_bytes(tokens);
     if (cudaMalloc(&region_, bytes) != cudaSuccess) {
@@ -59,7 +61,8 @@ bool ImageEncoder::reserve(const ImagePlan& plan, std::string& err) {
 
 void ImageEncoder::release() {
     if (!region_) return;
-    enc_->detach();
+    const core::OnDevice on(device_);
+    if (enc_) enc_->detach();
     cudaFree(region_);
     region_ = nullptr;
     tokens_ = 0;
