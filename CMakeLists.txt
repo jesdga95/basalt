@@ -22,6 +22,9 @@ option(WERROR "Treat compiler warnings as errors" OFF)
 # Optional peer architectures: building the peer-tier kernels for sm_89 (Ada) in addition to sm_120
 # allows a non-Blackwell card to serve as the expert tier, but adds build time.
 option(PEER_ADA "Compile peer kernels for sm_89 (Ada) in addition to sm_120" OFF)
+# The image encoder needs only Ampere-era instructions (cuBLAS, mma.sync m16n8k16, ldmatrix), so it
+# can carry sm_86 code beside the sm_120 build and --vision <GPU> may name an Ampere card.
+option(VISION_AMPERE "Compile the vision encoder (sidecar) for sm_86 (Ampere) too" OFF)
 if(BUILD_TESTING)
   enable_testing()
 endif()

@@ -72,6 +72,11 @@ add_library(vision_cuda STATIC
   ${VISION_ROOT}/src/vision/vision_kernels.cu)
 target_include_directories(vision_cuda PUBLIC ${VISION_ROOT}/include ${VISION_ROOT}/src/vision)
 target_link_libraries(vision_cuda PUBLIC vision_core CUDA::cudart CUDA::cublas)
+if(VISION_AMPERE)
+  # Applied at the target, not as a source property: a property set in the top-level file does not
+  # reach these sources, which are referenced through the subdirectory path.
+  target_compile_options(vision_cuda PRIVATE "--generate-code=arch=compute_86,code=sm_86")
+endif()
 
 add_executable(basalt-vision vision.cpp)
 target_compile_definitions(basalt-vision PRIVATE BASALT_VISION_CUDA)
