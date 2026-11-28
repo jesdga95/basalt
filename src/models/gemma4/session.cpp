@@ -496,16 +496,13 @@ public:
     }
 
     // ---- conversations: the full layers' cells by position (save_cells / restore_cells), the window rings by checkpoint
-    // (running_state). A ring holds the window and a chunk's rows, so a checkpoint at `pos` is intact while the session
-    // has not run more than kChunk rows past it.
-    size_t ring_bytes(int l) const {
-        const LayerShape s = g_.shape(l);
-        return (size_t) caches_[(size_t) l].cap * s.n_kv * s.hd * kv_elem_bytes(m_.kv_type());
-    }
+    // (running_state). A checkpoint at `pos` holds a ring's cells of the window's positions before `pos`, the only ones a
+    // row at `pos` or later reads; the ring holds them while the session has not run more than kChunk rows past `pos`.
+    size_t ring_bytes(int l) const { return (size_t) caches_[(size_t) l].cap * cell_bytes(l); }
     size_t running_bytes() const override {
         size_t n = 0;
         for (int l = 0; l < g_.n_layers; ++l)
-            if (g_.swa[(size_t) l]) n += 2 * ring_bytes(l);
+            if (g_.swa[(size_t) l]) n += 2 * (size_t) g_.shape(l).window * cell_bytes(l);
         return n;
     }
     model::Result running_state(int64_t pos, bool save, core::RunningState& st) override {
@@ -515,8 +512,17 @@ public:
         if (save && pos > (int64_t) hist_.size()) return {model::Status::Error, "gemma4: a checkpoint past the session's position"};
         for (int l = 0; l < g_.n_layers; ++l)
             if (g_.swa[(size_t) l]) {
-                st.regions.push_back({caches_[(size_t) l].k, ring_bytes(l)});
-                st.regions.push_back({caches_[(size_t) l].v, ring_bytes(l)});
+                // cells pos - window .. pos - 1 in ring order: a run to the ring's end, then its start (two pieces at every
+                // position; the second is empty when the run does not wrap). Before the window fills, the cells of the
+                // negative positions are ones a later row writes before it reads them.
+                const SegKv& c = caches_[(size_t) l];
+                const int64_t w = g_.shape(l).window, first = ((pos - w) % c.cap + c.cap) % c.cap;
+                const int64_t run = std::min(w, c.cap - first);
+                const size_t cb = cell_bytes(l);
+                for (void* base : {c.k, c.v}) {
+                    st.regions.push_back({(uint8_t*) base + (size_t) first * cb, (size_t) run * cb});
+                    st.regions.push_back({base, (size_t) (w - run) * cb});
+                }
             }
         st.stream = stream_;
         return {};
