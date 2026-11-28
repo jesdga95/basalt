@@ -5,7 +5,7 @@ to the others: [models](index.md). Rounding and quality: [precision](../precisio
 
 ## Pack
 
-One file, `Hy4-flash-NVFP4.basalt` (158.7 GB), built from Tencent's BF16 checkpoint (Tencent Hy License 1.0) with the vision
+The pack is `Hy4-flash-NVFP4.basalt` (158.7 GB), built from Tencent's BF16 checkpoint (Tencent Hy License 1.0) with the vision
 projector and the DFly2 drafter:
 
 - Routed experts: NVFP4, rounded once from BF16 (83.6 GB).
@@ -17,8 +17,8 @@ projector and the DFly2 drafter:
 
 Download it from [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt)
 (`hf download jesdga/Hy4-flash-Basalt Hy4-flash-NVFP4.basalt --local-dir models`), or build the same file yourself:
-[model file](../model-file.md#hy4-flash-nvfp4-pack). A test pack from AngelSlim's Q4_K_M GGUF converts too
-([model file](../model-file.md#hy4-flash-test-pack)).
+[model file](../model-file/hy4-flash.md#hy4-flash-nvfp4-pack). A test pack from AngelSlim's Q4_K_M GGUF converts too
+([model file](../model-file/hy4-flash.md#hy4-flash-test-pack)).
 
 ## Architecture
 
@@ -51,7 +51,9 @@ The `hy4flash` architecture (code in `src/models/hy4flash`): 42 layers over four
 - **Waits:** while a decode layer's expert sum waits for the CPU's and a peer's rows, the main card's memory is idle
   once its own experts are done. It then reads the next layer's attention gate and output products (the head after the last
   layer) into its L2, up to 56 MB, and stops when the rows are in; those products then read L2 instead of memory.
-- **Engram table:** read by row from the pack, so it takes no RAM of its own; the OS file cache keeps the hot rows.
+- **Engram table:** read by row from the pack by default (`--ple-io direct`), so it takes no RAM of its own; `--ple-io ram` maps
+  the table at start (reserving its RAM before the expert tier is sized) and locks it in RAM once the experts load (or touches it
+  into the OS page cache when locking is refused).
 - **Context:** `--max-context` from 1,024 up to 1,048,576, default 8,192. The 12 sparse layers keep a row of every position;
   the window layers' rings do not grow.
 - **Cache precision:** `--kv fp16` (default) keeps the rows in fp16; `--kv fp8` stores vLLM's 656-byte FP8 row
@@ -114,7 +116,7 @@ basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.66 GiB on the
 ## Parallel slots
 
 `--parallel N` starts N sessions, each with its own caches, rings and drafter context, over the one expert tier and one forward
-scratch. The busy slots decode together, one pass of up to 8 rows ([batched decoding](../design/batching.md)); a request alone in
+scratch. The busy slots decode together, one pass of up to 8 rows ([batched decoding](../architecture/batching.md)); a request alone in
 its slot gives the tokens it gives with `--parallel 1`. Speed with several slots is not measured.
 
 ## Images

@@ -59,6 +59,9 @@ public:
     size_t capacity() const { return cap_; }
     /// `key` names the save in flight (pending()): the address of the checkpoint's bytes.
     bool save(const std::vector<SaveSegment>& segments, cudaStream_t stream, const void* key, std::string& error);
+    /// The running state's bytes back into its regions through the spare (the save in flight lands first); without a
+    /// spare that holds them, a copy per region. Returns once the host bytes are free.
+    bool restore(const std::vector<RestoreSegment>& segments, cudaStream_t stream, std::string& error);
     /// The key of the save still in flight (null: none).
     const void* pending() const { return dst_; }
     /// Waits for the host copy; false if it failed (the saved bytes are then unusable).

@@ -19,6 +19,7 @@ int main() {
     check(plan_context(8192, 1 << 20, 20 * gib, 12).context == 8192, "8K fits");
     check(plan_context(1 << 20, 1 << 20, 20 * gib, 12).context == (1 << 20), "1M accepted: only the first 32,768 positions are backed");
     check(!plan_context(1 << 20, 1 << 20, gib / 2, 12).error.empty(), "refused when the first positions do not fit");
+    check(plan_context(262144, 1 << 20, gib / 2, 12, true, 2).context == 262144, "batched sessions back 4,096 base positions");
     check(!plan_context(512, 1 << 20, 40 * gib, 12).error.empty(), "below the least refused");
     check(!plan_context(2 << 20, 1 << 20, 40 * gib, 12).error.empty(), "past the native maximum refused");
     return failures ? 1 : 0;

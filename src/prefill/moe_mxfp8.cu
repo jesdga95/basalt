@@ -98,6 +98,11 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
     return r;
 }
 
+// GELU in its tanh form, as the decode path's grouped experts
+__device__ __forceinline__ float gelu_tanh(float g) {
+    return 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+}
+
 // One warp processes 128 contiguous elements (4 MXFP8 32-element blocks): 4 elements per thread via vectorized
 // float4 / uint2 loads, packed uint32_t (4x E4M3) stores, and 1 coalesced uint32_t (4x UE8M0) scale store per warp.
 template <typename T>
@@ -154,6 +159,7 @@ __global__ void quantize_mxfp8_kernel(const T* __restrict__ x, int64_t rows, int
 
 struct GemmArgs {
     const uint8_t* base;
+    const unsigned long long* blobs;
     size_t stride, w_off;
     const uint8_t* a_codes;
     const uint8_t* a_scales;
@@ -163,6 +169,7 @@ struct GemmArgs {
     int64_t ld_dst;
     int n, w_cols, half;
     float gate_softcap, up_softcap;
+    bool gelu;
 };
 
 template <bool SWIGLU>
@@ -221,7 +228,7 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     const int ntiles = min(kBlockTiles, (cnt - first + kTileTokens - 1) / kTileTokens);
     const int nkt = a.w_cols / kBK;
     const size_t row_bytes = (size_t) nkt * kBlockBytes;
-    const uint8_t* w_src = a.base + (size_t) j * a.stride + a.w_off;
+    const uint8_t* w_src = (a.blobs ? (const uint8_t*) a.blobs[j] : a.base + (size_t) j * a.stride) + a.w_off;
     const int brow0 = a.bounds[j] + first;
 
     if constexpr (GATHER) {
@@ -328,7 +335,10 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                     const float g0 = acc[mt][r][2 * h], g1 = acc[mt][r][2 * h + 1];
                     const float u0 = acc[mt][r + 2][2 * h], u1 = acc[mt][r + 2][2 * h + 1];
                     float v0, v1;
-                    if (sc) {
+                    if (a.gelu) {
+                        v0 = __fmul_rn(gelu_tanh(g0), u0);
+                        v1 = __fmul_rn(gelu_tanh(g1), u1);
+                    } else if (sc) {
                         v0 = __fmul_rn(__fmul_rn(cg * fast_tanh(g0 * inv_cg), fast_sigmoid(g0)), cu * fast_tanh(u0 * inv_cu));
                         v1 = __fmul_rn(__fmul_rn(cg * fast_tanh(g1 * inv_cg), fast_sigmoid(g1)), cu * fast_tanh(u1 * inv_cu));
                     } else {
@@ -434,6 +444,7 @@ void run(const Product& p, void* stream) {
     }
     GemmArgs a{};
     a.base = p.base;
+    a.blobs = p.blobs;
     a.stride = p.stride;
     a.w_off = p.w_off;
     a.a_codes = static_cast<const uint8_t*>(p.act);
@@ -450,6 +461,7 @@ void run(const Product& p, void* stream) {
     a.half = (int) (p.w_rows / 2);
     a.gate_softcap = p.gate_softcap;
     a.up_softcap = p.up_softcap;
+    a.gelu = p.gelu;
     const dim3 grid((unsigned) (p.w_rows / kBR), (unsigned) p.blocks);
     cudaStream_t s = (cudaStream_t) stream;
     if (p.ids && p.swiglu)       gemm_kernel<true, true><<<grid, kThreads, kSmemBytes, s>>>(a);

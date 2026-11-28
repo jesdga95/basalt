@@ -4,6 +4,7 @@
 // holds the later layers' weights, experts and caches instead (cards(), card_of()).
 #pragma once
 
+#include "basalt/core/kv_pool.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/model/adapter.hpp"
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::models::inkling2 {
@@ -92,6 +94,9 @@ public:
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
+    /// Card `card`'s KV pool: the full visits' cells of every session on it (the drafter's full layers on the main card).
+    core::KvPool& kv_pool(int card) { return kv_pool_[card]; }
+    const core::KvPool& kv_pool(int card) const { return kv_pool_[card]; }
     bool cache_int8() const { return int8_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests
     /// and windows, so nothing reads the experts while it holds their memory (lend_room).
@@ -123,6 +128,10 @@ public:
     /// One warning when the last promote found less free memory than counted: placement then follows a fresh reading of
     /// the card, not the requests alone.
     void note_shortage(const std::string& where);
+    /// A cache grow the card refused although the pool counted room: true for the first refusal of an episode (the caller
+    /// warns once), false while the episode lasts; a grow that maps without a refusal ends it.
+    bool grow_short() { return !std::exchange(grow_short_, true); }
+    void grow_mapped() { grow_short_ = false; }
     /// Sends the lowest-ranked copies back until at least `bytes` are freed (their entries go back to 0, the CPU computes
     /// them again), packs the rest to the front and returns whole granules. `freed`: the bytes given back. False when a
     /// table or copy update could not be confirmed: the placement is then wedged.
@@ -193,7 +202,7 @@ public:
     /// A prompt chunk sends layer l's rows to the second card: it holds experts of the layer that the main card has no copy of.
     bool peer_runs(int l) const { return peer_n(l) > 0 && !all_copied(l); }
     const SpillPlan& spill() const { return spill_; }
-    /// gpu-mode peer (docs/design/multi-gpu.md): the experts that spilled from the main card and the second card holds in
+    /// gpu-mode peer (docs/architecture/multi-gpu.md): the experts that spilled from the main card and the second card holds in
     /// its VRAM, the hottest first as far as its room goes. The main card runs every layer; a decode window's pairs on
     /// these experts go to the card from the CPU experts' doorbell thread (cpu_experts.hpp), a prompt chunk's rows go to
     /// it layer by layer (prompt.cpp) and its partial sums come back. They have no RAM copy and no staging.
@@ -269,6 +278,7 @@ private:
     int ldev_ = 0;                           ///< the card the weights being planned load to
     bool fp8_ = false, int8_ = false;
     int64_t ctx_ = kDefaultContext;
+    core::KvPool kv_pool_[2];
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
     std::weak_ptr<void> shared_;
@@ -310,6 +320,7 @@ private:
     uint64_t promote_pairs(const std::vector<size_t>& pairs, uint64_t keep_free);
     int64_t room_ = 0;   ///< room(): may run below 0 when the caches grow past what placement counted
     bool map_short_ = false;   ///< a promote could not map a page it counted (note_shortage)
+    bool grow_short_ = false;  ///< a cache grow found the card short and none has mapped cleanly since (grow_short)
     uint8_t* copies_va_ = nullptr;
     CopyLayout copy_lay_;
     uint64_t copy_reserved_ = 0;
@@ -360,11 +371,14 @@ private:
 /// A session over `model`; null with `err` set.
 std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::string& err);
 
-/// The device bytes a session takes for `context` positions in the selected KV cache format, its drafter aside, on card
-/// `card` of a split at `cut` (0: one card, every visit).
+/// The device bytes a session holds of its own for `context` positions in the selected KV cache format, its drafter aside,
+/// on card `card` of a split at `cut` (0: one card, every visit): the sliding-window visits' rings and its fixed buffers.
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut = 0, int card = 0);
+/// The KV pool bytes of card `card` the full visits' caches of one session take at `positions` positions, the drafter aside,
+/// each cache's allocation granules of `gran` bytes counted whole.
+uint64_t pool_bytes(const Geometry& g, int64_t positions, bool fp8, bool int8, uint64_t gran, int cut = 0, int card = 0);
 /// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
-/// first card's).
-uint64_t shared_bytes(const Geometry& g, bool drafter);
+/// first card's) and, on the card that draws (`head`), the sampler's list for a request without a top-k limit.
+uint64_t shared_bytes(const Geometry& g, bool drafter, bool head);
 
 }  // namespace basalt::models::inkling2

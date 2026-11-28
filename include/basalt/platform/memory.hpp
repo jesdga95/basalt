@@ -34,6 +34,10 @@ void* alloc_aligned(size_t bytes, size_t alignment);
 /// The matching release for `alloc_aligned`. A null is fine.
 void free_aligned(void* p);
 
+/// Hints to the OS to back [p, p + bytes) with transparent huge pages when available (MADV_HUGEPAGE on Linux;
+/// no-op on Windows). A hint, never an error; null pointers and ranges smaller than 2 MiB are ignored.
+void advise_hugepages(void* p, uint64_t bytes);
+
 /// Asks the OS to give back what it holds for [off, off + bytes) of a mapped file view that starts at `base` and is
 /// `view_bytes` long: the range widened to whole pages, because those are what can be given back, and clipped to the
 /// view. False when the OS refused or the range leaves the view. Windows takes the pages out of the process's working
@@ -164,6 +168,13 @@ enum class RamLevel { Ok, Low, Critical };
 /// Below this much available RAM a running request stops whatever the stall reading says: what a request still
 /// allocates (its own buffers, a checkpoint) plus room for the OS to compress or drop other programs' idle pages.
 inline constexpr uint64_t kRamHardFloor = 1ull << 30;
+/// The hard floor paired with a serving guard `floor`: `kRamHardFloor` for reserves of 2 GiB and above, and
+/// `floor / 2` below that so an explicit smaller `--ram-reserve-mib` (such as 1024) still keeps a `Low` grace
+/// window between the guard and the hard floor.
+inline uint64_t ram_hard_floor(uint64_t floor) {
+    const uint64_t half = floor / 2;
+    return half < kRamHardFloor ? half : kRamHardFloor;
+}
 /// The shares of time (percent, averaged over ten seconds) in which some task, or every task, waited on memory, above
 /// which RAM below the guard's floor is critical: tasks then wait on memory most of the time (thrashing). One program
 /// reclaiming into compressed swap stays below them, even when it is the only task running and so stalls `full` too.

@@ -40,11 +40,11 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--spec-oracle FILE` | CLI | With `--spec N` on a pack without a drafter: draft from an expected continuation. The verify exactness test. |
 | `--prefill-until P` | CLI | Batch the first P prompt positions; run the rest teacher-forced. |
 | `--spec-corrupt N` | CLI | Replace every Nth draft with a wrong token, to test rejection. |
-| `--diag-batch-check` | CLI | With `--batch N` (2 or more) and a prompt: every session's windows alone against the same windows batched, bitwise ([batched decoding](../design/batching.md)). |
-| `--diag-gpu-check` | CLI | With `--tokens-file`, `--max-new N` and two or more cards: the prompt and N greedy steps, each step's logits recorded (`--diag-gpu-trace FILE`) or compared with a reference run's (`--diag-gpu-ref FILE`, which feeds the reference's picks so every step sees the same context): bitwise steps, greedy identity, KLD (mean and worst step), top-1 ([several GPUs](../design/multi-gpu.md)). |
+| `--diag-batch-check` | CLI | With `--batch N` (2 or more) and a prompt: every session's windows alone against the same windows batched, bitwise ([batched decoding](../architecture/batching.md)). |
+| `--diag-gpu-check` | CLI | With `--tokens-file`, `--max-new N` and two or more cards: the prompt and N greedy steps, each step's logits recorded (`--diag-gpu-trace FILE`) or compared with a reference run's (`--diag-gpu-ref FILE`, which feeds the reference's picks so every step sees the same context): bitwise steps, greedy identity, KLD (mean and worst step), top-1 ([several GPUs](../architecture/multi-gpu.md)). |
 | `--diag-gpu-cut L` | CLI, serve | With `gpu-mode split`: the first layer of the second card, in place of the cut the shares make. One flag for every model. |
 | `--diag-gpu-same` | serve | Flash-Next with `gpu-mode split` and `--diag-gpu-cut L`: both stages of the split on GPU 0, the split's reference. |
-| `--diag-main-card-bits` | CLI, serve | Flash-Next: the other cards' stages run the main card's cuBLAS algorithms and plan by its SM count, so a peer's prompt stages and a split are bitwise against the main card (and `--diag-gpu-same`). A normal run lets each card use its own, which costs nothing and keeps the BF16 KLD level; the flag costs about 0.6% of a 64K prefill. |
+| `--diag-main-card-bits` | CLI, serve | Flash-Next: the other cards' stages run the main card's cuBLAS algorithms and plan by its SM count, so a peer's prompt stages and a split are bitwise against the main card (and `--diag-gpu-same`). A normal run lets each card use its own, which costs nothing and keeps the BF16 KLD level; the flag costs a little prefill speed. |
 | `--diag-fixed-experts` | CLI, serve | Flash-Next: a prompt's experts all run on the GPU and a window's verifiers see none in VRAM, so the CPU pool computes every window row; two placements of the same experts (a split and its `--diag-gpu-same` reference) then compute the same rows. |
 | `--diag-teacher` | CLI | DeepSeek with `--spec-oracle`: teacher-forces the file's tokens and counts differing picks. |
 | `--diag-tier-frozen` | CLI, serve | DeepSeek: fixed placement (no copies or promotion). |
@@ -58,15 +58,22 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--ple-io direct`, `ram` | engine | `direct` | Read the n-gram table unbuffered (`direct`) or lock it in RAM (`ram`). |
 | `--ple-row-cache`, `--ple-inflight`, `--ple-delay-us` | engine | 1048576 rows, 256, 0 | Row cache size, outstanding reads, and injected read delay for tests. |
 
-## Quality gate and bench
+## Quality suite, KLD gate and bench
 
 | Flag or key | Binary | Default | What it does |
 |---|---|---|---|
-| `--quality` | bench | 20 chunks | Run the PPL/KLD/top-1 gate through decode. [method](../precision/quality.md) |
-| `--kld-base FILE` | bench | | The llama.cpp KL-divergence base. |
-| `--quality-t N` | bench | 3 | Tokens per verify window in the gate. |
-| `--ppl-base`, `--ppl-out` | serve | | Base file for `ppl=` requests, and where they write rows. |
-| `ppl=K`, `ppl_t=T` | request keys | | Score chunk K; window width T. |
+| `--quality FILE` | bench | | Run the quality suite against a stored BF16 `.safetensors` reference. [quality suite](../precision/quality-suite.md) |
+| `--smoke` | bench | | Quality suite: deterministic smoke slice (every 20th conversation shorter than 5,000 tokens). |
+| `--quality-top K` | bench | 256 | Quality suite: top-K ids written per row (`score_top=K`, 1..256). |
+| `--quality-role R` | bench | `assistant` | Quality suite: rows to score (`assistant`, `other`, or `all`). |
+| `--quality-max-context N` | bench | 5120 | Quality suite: `--max-context N` for the engine (unless overridden after `--`) and skip longer conversations. |
+| `--quality-boot B` | bench | 2000 | Quality suite: conversation-level bootstrap resamples (fixed seed 0). |
+| `--kld [N]` | bench | 20 chunks | Run the wikitext PPL/KLD/top-1 gate through decode. [wikitext KLD](../precision/quality.md#wikitext-kld) |
+| `--kld-base FILE` | bench | | The llama.cpp KL-divergence base for `--kld`. |
+| `--kld-t N` | bench | 3 | Tokens per verify window in `--kld`. |
+| `--ppl-base`, `--ppl-out` | serve | | Base file for `ppl=` requests (wikitext KLD), and where `ppl=` and `score=` requests write rows. |
+| `ppl=K`, `ppl_t=T` | request keys | | Wikitext KLD gate: score chunk K; window width T. |
+| `score=N`, `score_top=K` | request keys | | Teacher-force the request's own ids and write the rows from position N to `--ppl-out` with their K likeliest ids (0: the whole row). [quality suite](../precision/quality-suite.md) |
 
 | Bench flag | Default | What it does |
 |---|---|---|

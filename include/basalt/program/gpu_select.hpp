@@ -5,7 +5,7 @@
 //               A,B,...: exactly these cards, in this order, the first is the main card; all: every visible card, in order;
 //   gpu-mode    peer, split or tensor: what the cards do together. Required with two or more cards, refused with one;
 //   gpu-share   one positive number per card, in the order of gpu: their relative shares. Refused with one card.
-// Nothing is picked for the user: a setting the run cannot honour is refused with the reason (design/multi-gpu.md).
+// Nothing is picked for the user: a setting the run cannot honour is refused with the reason (architecture/multi-gpu.md).
 // Cards are numbered as nvidia-smi numbers them; under CUDA_VISIBLE_DEVICES the numbers count within that list. The
 // choice is made before any CUDA call and narrows CUDA_VISIBLE_DEVICES to the chosen cards, main first, so the engine
 // always runs on device 0 with the rest after it. The decisions are pure functions over a card table.

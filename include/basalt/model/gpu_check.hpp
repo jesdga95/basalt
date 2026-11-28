@@ -1,4 +1,4 @@
-// include/basalt/model/gpu_check.hpp - the several-GPUs conformance check (docs/design/multi-gpu.md): a prompt and its greedy
+// include/basalt/model/gpu_check.hpp - the several-GPUs conformance check (docs/architecture/multi-gpu.md): a prompt and its greedy
 // continuation through the session interface only, so it names no model. `basalt --model FILE --gpu 0,1 --gpu-mode peer
 // --tokens-file F --diag-gpu-check --diag-gpu-trace OUT` records the run; the same command on the reference (one card, or a
 // split with both stages on one GPU) with `--diag-gpu-ref OUT` compares the two. tools/gpu_identity.py runs the pair.

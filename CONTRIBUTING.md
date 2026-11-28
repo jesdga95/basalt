@@ -17,9 +17,9 @@ Basalt is a local inference engine for NVIDIA Blackwell GPUs. Every rule below e
 
 ## Code structure
 
-- **Shared code is model-agnostic.** It sees a model only through the adapter, a model's own code stays in `src/models/<model>`, and a change for one model leaves the others' output and speed as they were. See [adding a model](docs/adding-a-model.md).
+- **Shared code is model-agnostic.** It sees a model only through the adapter, a model's own code stays in `src/models/<model>`, and a change for one model leaves the others' output and speed as they were. See [adding a model](docs/architecture/adding-a-model.md).
 - **Logic exists once.** What two models need lives in shared code and takes each model's numbers as parameters. Follow the existing pattern before adding a new one.
-- **One serving loop** runs every request of every model; a model plugs into it and never forks it. See [persistent serving](src/program/serve/README.md).
+- **One serving loop** runs every request of every model; a model plugs into it and never forks it. See [persistent serving](docs/architecture/serving.md).
 - **The engine does the work, the server serves.** Tokenizing and per-request work run in C++. `serve/` parses, routes and streams, names no model, and never repairs model output; constrained decoding (grammar) handles structure.
 - **Build structure: no slow TU.** A clean Release build must finish in under 10 minutes on 32 threads, and nvcc compiles a translation unit on one core, so the build takes as long as its slowest `.cu`. Keep every `.cu` to about a minute or two alone: a kernel that is instantiated in several variants (like `dm_peer_kernel`) gets one `.cu` per variant, behind a getter that returns its address (no relocatable device code), and shared device code goes in a header with no kernel in it. A `.cu` does not include another `.cu` (`tools/check_cu_includes.sh` fails on a new one; `tools/cu_includes.allow` lists the few that must inline). Time a new or changed `.cu` alone (`nvcc --time`) and report it with the change.
 
@@ -29,8 +29,8 @@ Basalt is a local inference engine for NVIDIA Blackwell GPUs. Every rule below e
 2. **A profile.** Give a microbench line for the kernel: µs per call and achieved GB/s (or TFLOP/s) against the bytes or FLOPs it must move. Give an end-to-end number from `basalt-bench`: ms per decode window and passes/s, not only tok/s, which drafting luck moves.
 3. **A quality check:**
    - Bitwise-identical output: show the greedy-identity check against the previous build. Pin the expert tiers, since changes in GPU module size move the auto-sized tiers and change rounding.
-   - Changed numerics (new reduction order, precision, quantization): run the perplexity/KLD gate against the BF16 reference ([docs/precision/quality.md](docs/precision/quality.md#the-bf16-reference)) through the decode path. Report PPL, mean KLD and top-1 agreement next to the previous build's. Large changes need the full 100-chunk run, not just the 20-chunk quick gate. The `docs/precision/` page that covers the change is updated in the same change, with fresh numbers where it quotes them.
-   - The bar: a default path is lossless only when mean KLD and top-1 are the same or better than the previous build's (within the gate's noise). A change that costs quality is opt-in (a flag, as `--kv fp8` is) and its precision page states the measured cost.
+   - Changed numerics (new reduction order, precision, quantization): run the [quality suite](docs/precision/quality-suite.md) against the model's BF16 reference through the decode path, in its paired mode against the previous build. Report mean KLD, top-1 agreement and the PPL ratio with their error bars. Large changes need the full set, not just the smoke slice. The `docs/precision/` page that covers the change is updated in the same change, with fresh numbers where it quotes them.
+   - The bar: a default path is lossless only when mean KLD and top-1 are the same or better than the previous build's (within the suite's paired error bar). A change that costs quality is opt-in (a flag, as `--kv fp8` is) and its precision page states the measured cost.
 4. **Benchmark hygiene:**
    - Every performance number states the GPU power limit it was measured at.
    - A/B comparisons alternate the two builds in the same session (ABBA), with the expert tiers pinned to the same placement in both. Numbers taken in different sessions drift and aren't comparable.

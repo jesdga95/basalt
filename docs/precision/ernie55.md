@@ -1,19 +1,19 @@
 # ERNIE-5.5-Flash precision
 
-Where ERNIE-5.5-Flash rounds and how its output compares. Method: [quality](quality.md). Guide: [ERNIE-5.5-Flash](../models/ernie55.md).
+Where ERNIE-5.5-Flash rounds and how its output compares. Guide: [ERNIE-5.5-Flash](../models/ernie55.md).
+Method: the [quality suite](quality-suite.md).
 
 ## Summary
 
 - **Pack source & BF16 reference:** The `.basalt` pack converts Baidu's official `baidu/ERNIE-5.5-Flash-Preview` release
   (native `MXFP4` routed experts + 128×128 blockwise `FP8` dense projections). Baidu also publishes
-  `baidu/ERNIE-5.5-Flash-Preview-BF16` (~560 GB), so a true BF16 KLD reference is possible (pending a community run on a
-  machine that fits the ~560 GB BF16 checkpoint).
+  `baidu/ERNIE-5.5-Flash-Preview-BF16` (~560 GB), so a true BF16 quality-suite reference is possible on a machine that fits the ~560 GB BF16 checkpoint.
 - **Routed experts are bit for bit the release's bits.** All 42 MoE layers × 512 experts (top-10 routed + 1 shared) keep the
   release's MXFP4 E2M1 codes and UE8M0 scales unchanged (`GGML_TYPE_MXFP4 = 39`, 17 bytes per 32 values).
 - **CPU and GPU MXFP4 parity:** The multi-row AVX2 / AVX-VNNI (`vpdpbusd`) CPU MXFP4 kernel is bitwise identical (`memcmp == 0`)
   to scalar `ggml_vec_dot_mxfp4_q8_0` across `nt = 1..8` (including SiTU-GLU `4.0 / 25.0`), verified by
   `native_expert_parity --mxfp4`.
-- **HCA Q-RMSNorm (`8af95001`):** Every HCA layer (37/43) and every DSpark layer (3/3) applies weightless per-head Q RMSNorm
+- **HCA Q-RMSNorm:** Every HCA layer (37/43) and every DSpark layer (3/3) applies weightless per-head Q RMSNorm
   (`head_dim = 512`, `eps = 1e-6`) before interleaved RoPE, matching upstream `vllm`.
 - **KV cache (`--kv fp8` vs. `--kv fp16`):** At `65,536` context on a 16 GB RTX 5070 Ti, `fp8` saves `0.26 GiB` VRAM (+42
   expert slots on GPU 0); at `262,144` context, `fp8` leaves `3.40 GiB` for the VRAM expert tier (13/512 experts/layer), whereas
@@ -24,7 +24,7 @@ Where ERNIE-5.5-Flash rounds and how its output compares. Method: [quality](qual
 ## Weights
 
 Every conversion rounding is deterministic and runs once in [`checkpoint_ernie55.py`](../../tools/convert/checkpoint_ernie55.py)
-and [`dspark_ernie55_attach.py`](../../tools/convert/dspark_ernie55_attach.py) ([model file](../model-file.md#ernie-55-flash-pack)):
+and [`dspark_ernie55_attach.py`](../../tools/convert/dspark_ernie55_attach.py) ([model file](../model-file/ernie55.md)):
 
 | Tensors | Stored as | From the release |
 | --- | --- | --- |
@@ -141,5 +141,5 @@ resumed decode can occasionally flip a boundary expert on near-tie tokens while 
   - `native_expert_parity --mxfp4`: **0 failures** (bitwise `memcmp == 0` across `nt = 1..8`, AVX2 & AVX-VNNI).
   - `prompt_cache_resume_drift_test.py`: **PASS** (cached resume vs. full recompute across short and long suffixes).
   - `conversation_store_test` & `conversation_cache_test`: **PASS** (hybrid HCA `ratio=128` + DSA multi-block roundtrip; 15,307 checks).
-- **BF16 KLD reference (wikitext-2, 100 chunks):**
-  - Pending community run against `baidu/ERNIE-5.5-Flash-Preview-BF16` (~560 GB, exceeding our 192 GB workstation).
+- **BF16 quality-suite reference:**
+  - Not scored: it needs a run against `baidu/ERNIE-5.5-Flash-Preview-BF16` (~560 GB) on a machine that fits it.

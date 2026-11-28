@@ -19,9 +19,12 @@ Protocol (one line each):
     and the tokens it holds.
     `BGEN`/`SGEN` then name the prompt where the ids go: `#<handle>[+<id>,...]` (the ids a request that ran in several
     engine runs adds after it); `PFREE <handle>` drops it.
-  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`; with
+  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> <n> <finish> <ms> [<drafts accepted> <drafts offered> [<windows>]]`
+    (finish `room`: the KV pool had no room for the slot to go on); `BWAIT <slot>` instead of BADM: the KV pool has no
+    room for the request now, it waits for a slot's BDONE and asks again; with
     `logprobs=K`, one `BP <slot> <id> <lp> [...]` line per kept pick ahead of its `BT` line;
-    `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
+    `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`);
+    `more=1` on a BGEN: another request waits to be admitted, so the engine waits briefly for its lines before its next round.
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
@@ -124,7 +127,7 @@ def relay_auto_flags(line: str) -> bool:
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
 PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "PROMPT ", "PMATCH ", "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
+                  "PROMPT ", "PMATCH ", "BADM ", "BWAIT ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ") + CONSOLE_LINES
 
 
 def log_unparsed(line: str, log) -> None:
@@ -437,6 +440,7 @@ class ProcessEngine:
         self.slot_held: list[int] = [0] * self.batch
         self.slot_used = [0.0] * self.batch
         self.slot_epoch = [0] * self.batch
+        self.slot_ends = 0                              # BDONE lines so far: a request that got BWAIT waits for the next
         # session identity (a load-balancer header) -> the slots its conversations run in, one owner per slot: a
         # conversation stays in the slot where its K/V sits, so its next turn continues it instead of being admitted
         # wherever and copied in.  A session may hold several slots: parallel agents of one session (a subagent
@@ -524,6 +528,10 @@ class ProcessEngine:
                 if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                     try:
                         slot_q[int(line.split()[1])].put(line)
+                        if line.startswith("BDONE "):       # a request that waits for KV room asks again
+                            with self.slot_cv:
+                                self.slot_ends += 1
+                                self.slot_cv.notify_all()
                         continue
                     except (IndexError, ValueError):
                         pass
@@ -1002,6 +1010,9 @@ class ProcessEngine:
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
+            elif line.startswith("BWAIT "):             # no KV room for the admission now: nothing ran
+                self._ctl_result = ("wait",)
+                return
             elif line.startswith("BADM "):
                 f = line.split()
                 # BADM <slot> 1: continues, the admission's token already sent; 2: continues, no token yet (the slot's
@@ -1294,6 +1305,7 @@ class ProcessEngine:
         solo_slot, run0, run_size, ctl_epoch = None, 0, 0, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
+        place = self.admission.arrive()   # this request's place in the line for KV room
         yields, solo_again = 0, 0
         carry = [0, 0, 0]         # draft counts (accepted, offered) and windows of the runs before the current one
         first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
@@ -1391,17 +1403,23 @@ class ProcessEngine:
                             # prefer the slot holding this prompt's start, else the longest unused
                             refresh = False
                             with self.slot_cv:
-                                if ticket is None:
-                                    ticket = self.admission.join()
                                 while True:
                                     if any(not self.slot_busy[b] and self.slot_held[b] > 0
                                            and (b >= len(epoch) or epoch[b] != self.slot_epoch[b])
                                            for b in self.slot_order):
                                         refresh = True
                                         break
+                                    # a request not yet entitled to ask for room holds no place in the slot line
+                                    if self.admission.room_may_ask(place, self.slot_ends, not any(self.slot_busy)):
+                                        if ticket is None:
+                                            ticket = self.admission.join()
+                                    elif ticket is not None:
+                                        self.admission.leave(ticket)
+                                        ticket = None
                                     cur_meets = meets()
                                     slot = self.pick_slot(cur_meets, size(), session)
-                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size())):
+                                    if (ticket is not None and slot is not None
+                                            and self.admission.may_go(ticket, self._resumes(slot, cur_meets, size()))):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
                                         slot_gen = self.gen
@@ -1464,7 +1482,10 @@ class ProcessEngine:
                         left = min(left, room)                  # the slot's room
                         while not self.slot_q[slot].empty():
                             self.slot_q[slot].get_nowait()
-                        head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
+                        with self.slot_cv:              # another request waits to be admitted: the engine waits for it
+                            more = " more=1" if self.waiting > 0 else ""   # before its next round (BGEN more=1)
+                        head = (f"BGENI {slot} {left}{gen_keys()}{more} {embeddings}" if embeddings
+                                else f"BGEN {slot} {left}{gen_keys()}{more}")
                         self._send(f"{head} {ref()}")
                         self._hold(slot, 0)                     # admission overwrites the slot
                         phase = "admit"
@@ -1486,6 +1507,35 @@ class ProcessEngine:
                             if x is None:
                                 ask_yield()
                                 yield None
+                        if self._ctl_result and self._ctl_result[0] == "wait":
+                            # no KV room for it now: the slot goes back and the request asks again once a slot ends
+                            phase = "none"
+                            with self.slot_cv:
+                                ends = self.slot_ends
+                                self.admission.room_refused(place, ends)
+                                self.slot_busy[slot] = False
+                                self.slot_cv.notify_all()
+                            slot, slot_gen = None, None
+                            self.ctl.release()
+                            holding = False
+                            beat = time.monotonic()
+                            while not cancel.is_set():
+                                with self.slot_cv:
+                                    if self.admission.room_may_ask(place, self.slot_ends, not any(self.slot_busy)):
+                                        break
+                                    self.slot_cv.wait(timeout=1.0)
+                                if time.monotonic() - beat >= 10.0:
+                                    beat = time.monotonic()
+                                    yield None
+                            if cancel.is_set():
+                                return
+                            if held["gen"] == self.gen:
+                                # the engine holds a bounded number of prompts and newer requests' may have pushed this
+                                # one out while it waited: it is held again before the request asks again
+                                self._send(f"PFREE {handle}")
+                                handle, _ = self._hold_prompt(ids, embeddings)
+                                held["handle"] = handle
+                            continue
                         self._note_first_reused(first, last0)
                         cont = bool(self._ctl_result and self._ctl_result[1])
                         phase = "slot" if cont else "none"
@@ -1497,10 +1547,11 @@ class ProcessEngine:
                             continue                            # gave way: retry after the shorter request
                         break
                 finally:
-                    if ticket is not None:
-                        with self.slot_cv:
+                    with self.slot_cv:
+                        if ticket is not None:
                             self.admission.leave(ticket)
-                            self.slot_cv.notify_all()
+                        self.admission.room_leave(place)
+                        self.slot_cv.notify_all()
                 self.ctl.release()
                 holding = False
                 if not cont:

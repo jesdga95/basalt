@@ -25,7 +25,7 @@ namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
-SwiGlu glu_of(const NativeFmt& f) { return {f.swiglu_limit, f.gate_softcap, f.up_softcap}; }
+SwiGlu glu_of(const NativeFmt& f) { return {f.swiglu_limit, f.gate_softcap, f.up_softcap, f.gelu}; }
 
 // The gate/up rows through ggml's single-token dot, then the layer's SwiGLU.
 void gu_rows_ggml(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0,
@@ -108,7 +108,7 @@ void mx8_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act
 
 void mx8_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0,
                    int r1) {
-    const int n = (int) f.n_ff;
+    const int n = (int) f.n_ffk;
     for (int t0 = 0; t0 < nt; t0 += kMx8Tok) {
         const int m = nt - t0 < kMx8Tok ? nt - t0 : kMx8Tok;
         Mx8Act a(hq + t0, m, n);
@@ -144,8 +144,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: cannot quantize an activation for this layer";
         return false;
     }
-    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ff % ggml_blck_size((ggml_type) d_type) ||
-        n_embd % ggml_blck_size(tg->vec_dot_type) || n_ff % ggml_blck_size(td->vec_dot_type)) {
+    // an MXFP8 down reads whole 128-value blocks: its rows end in zero columns past n_ff
+    const int64_t n_ffk = d_type == GGML_TYPE_MXFP8 ? (n_ff + 127) / 128 * 128 : n_ff;
+    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ffk % ggml_blck_size((ggml_type) d_type) ||
+        n_embd % ggml_blck_size(tg->vec_dot_type) || n_ffk % ggml_blck_size(td->vec_dot_type)) {
         err = "native experts: expert geometry is not whole blocks";
         return false;
     }
@@ -155,12 +157,13 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
+    f.n_ffk = n_ffk;
     f.swiglu_limit = swiglu_limit;
     f.gate_softcap = f.up_softcap = 0.f;
     f.up_type = up_type;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
     f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
-    f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
+    f.d_row = ggml_row_size((ggml_type) d_type, n_ffk);
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
@@ -173,7 +176,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.tail = gu_type == GGML_TYPE_NVFP4 ? kNvfp4Tail : 0;
     f.bytes += f.tail;
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
-    f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
+    f.h_bytes = ggml_row_size(td->vec_dot_type, n_ffk);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
@@ -199,6 +202,13 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.n_ffk > f.n_ff) {   // the padded columns' zeros
+        thread_local std::vector<float> hk;
+        hk.assign((size_t) f.n_ffk, 0.f);
+        std::memcpy(hk.data(), h, (size_t) f.n_ff * sizeof(float));
+        traits(f.d_act)->from_float(hk.data(), dst, f.n_ffk);
+        return;
+    }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 

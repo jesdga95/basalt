@@ -16,6 +16,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <random>
 #include <sstream>
@@ -33,6 +34,7 @@
 #include "basalt/program/engine_session.hpp"
 #include "basalt/program/gpu_select.hpp"
 #include "basalt/program/options.hpp"
+#include "quality_suite.hpp"
 
 #include <errno.h>
 
@@ -242,17 +244,24 @@ struct Options {
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
     int reps = 1;
-    bool quality = false, no_windows = false, print_command = false;
+    bool kld = false, quality = false, smoke = false, no_windows = false, print_command = false;
     bool community = false, hardware = false;
     std::string submitter;
     std::string community_dir;           // --community-dir: the community folder the run file is written under
-    int quality_chunks = 20, quality_t = 3;
+    int kld_chunks = 20, kld_t = 3;
+    std::string quality_ref;
+    int quality_top = 256;
+    basalt::program::quality::RoleFilter quality_role = basalt::program::quality::RoleFilter::Assistant;
+    int quality_max_context = 5120;
+    bool quality_max_context_set = false;
+    int quality_boot = 2000;
+    bool quality_mod_set = false;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
 
 void usage(const std::string& engine) {
     std::printf(
-        "basalt-bench - the standard benchmark: decode fixtures, prefill depths, optional quality gate\n"
+        "basalt-bench - the standard benchmark: decode fixtures, prefill depths, quality suite, wikitext KLD gate\n"
         "\n"
         "usage: basalt-bench --model FILE.basalt [options] [-- ENGINE ARGS...]\n"
         "\n"
@@ -262,11 +271,20 @@ void usage(const std::string& engine) {
         "  -p LIST            prefill depths in tokens (16384,32768,65536,131072; 32k style also accepted)\n"
         "  -r N               repetitions of the whole set (default 1); with N > 1 the table shows mean +- stddev\n"
         "                     and the first repetition is the cold one\n"
-        "  --quality [N]      the quality gate on N chunks (default 20): PPL / KLD / top-1 against --kld-base,\n"
+        "  --quality FILE     the quality suite against a stored BF16 .safetensors reference: KLD / top-1 / PPL\n"
+        "                     with conversation-level bootstrap error bars. Alone it runs only the quality suite;\n"
+        "                     with -p / -t it runs after them\n"
+        "  --smoke            quality suite: fixed smoke slice (every 20th conversation shorter than 5000 tokens)\n"
+        "  --quality-top K    quality suite: top-K ids written per row by the engine (default 256, 1..256)\n"
+        "  --quality-role R   quality suite: rows to score: assistant (default), other, or all\n"
+        "  --quality-max-context N  quality suite: --max-context N for the engine (unless overridden after --)\n"
+        "                     and skip conversations longer than N (default 5120)\n"
+        "  --quality-boot B   quality suite: conversation bootstrap resamples, fixed seed 0 (default 2000)\n"
+        "  --kld [N]          the wikitext KLD gate on N chunks (default 20): PPL / KLD / top-1 against --kld-base,\n"
         "                     through the decode path, adaptation off, --spec 5. Alone it runs\n"
         "                     only the gate; with -p / -t it runs after them\n"
-        "  --kld-base FILE    llama.cpp KL-divergence base for the quality gate\n"
-        "  --quality-t T      tokens per verify window in the quality gate (default 3)\n"
+        "  --kld-base FILE    llama.cpp KL-divergence base for the wikitext KLD gate\n"
+        "  --kld-t T          tokens per verify window in the wikitext KLD gate (default 3)\n"
         "  --seed N           sampling seed (N >= 1) sent with every decode request, so the sampled fixtures\n"
         "                     (conv, prose) give the same text on every run; without it each request is seeded\n"
         "                     from the clock\n"
@@ -386,14 +404,31 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
         else if (a == "--logs") o.logs = next("--logs");
-        else if (a == "--kld-base") o.kld_base = next("--kld-base");
+        else if (a == "--kld-base") { o.kld_base = next("--kld-base"); o.quality_mod_set = true; }
         else if (a == "--no-windows") o.no_windows = true;
         else if (a == "-r") o.reps = std::atoi(next("-r").c_str());
         else if (a == "--seed") {
             const std::string v = next("--seed");
             if (!all_digits(v.c_str()) || std::strtoull(v.c_str(), nullptr, 10) == 0) { err = "--seed needs an integer >= 1"; return false; }
             o.seed = std::strtoull(v.c_str(), nullptr, 10);
-        } else if (a == "--quality-t") o.quality_t = std::atoi(next("--quality-t").c_str());
+        } else if (a == "--kld-t") { o.kld_t = std::atoi(next("--kld-t").c_str()); o.quality_mod_set = true; }
+        else if (a == "--smoke") { o.smoke = true; o.quality_mod_set = true; }
+        else if (a == "--quality-top") { o.quality_top = std::atoi(next("--quality-top").c_str()); o.quality_mod_set = true; }
+        else if (a == "--quality-role") {
+            const std::string r = next("--quality-role");
+            if (err.empty() && !basalt::program::quality::parse_role_filter(r, o.quality_role)) {
+                err = "--quality-role takes assistant, other, or all";
+                return false;
+            }
+            o.quality_mod_set = true;
+        } else if (a == "--quality-max-context") {
+            o.quality_max_context = std::atoi(next("--quality-max-context").c_str());
+            o.quality_max_context_set = true;
+            o.quality_mod_set = true;
+        } else if (a == "--quality-boot") {
+            o.quality_boot = std::atoi(next("--quality-boot").c_str());
+            o.quality_mod_set = true;
+        }
         else if (a == "-p") {
             o.sel_prefill = true;
             for (const auto& d : split(next("-p"), ',')) {
@@ -406,7 +441,10 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             o.decode = split(next("-t"), ',');
         } else if (a == "--quality") {
             o.quality = true;
-            if (i + 1 < argc && all_digits(argv[i + 1])) o.quality_chunks = std::atoi(argv[++i]);
+            o.quality_ref = next("--quality");
+        } else if (a == "--kld") {
+            o.kld = true;
+            if (i + 1 < argc && all_digits(argv[i + 1])) o.kld_chunks = std::atoi(argv[++i]);
         } else if (a == "--set") {
             const std::vector<std::string> w = split(next("--set"), ' ');
             if (w.size() % 2 != 0) { err = "--set takes FLAG VALUE pairs"; return false; }
@@ -428,7 +466,8 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         if (!err.empty()) return false;
     }
     if (o.community) {
-        const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
+        const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r"
+                        : o.quality ? "--quality" : o.kld ? "--kld" : o.quality_mod_set ? "--quality / --kld options"
                         : !o.spec.empty() ? "--spec" : !o.engine.empty() ? "--engine"
                         : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : nullptr;   // engine flags (--set, others) are refused in main, which can ask the engine
@@ -443,7 +482,10 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (!o.community_dir.empty() && !o.community) { err = "--community-dir needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
     if (o.format != "md" && o.format != "json") { err = "-o takes md or json"; return false; }
-    if (o.quality_chunks < 1 || o.quality_t < 1) { err = "--quality and --quality-t need values >= 1"; return false; }
+    if (o.kld_chunks < 1 || o.kld_t < 1) { err = "--kld and --kld-t need values >= 1"; return false; }
+    if (o.quality_top < 1 || o.quality_top > 256) { err = "--quality-top needs a value in 1..256"; return false; }
+    if (o.quality_max_context < 2) { err = "--quality-max-context needs a value >= 2"; return false; }
+    if (o.quality_boot < 0) { err = "--quality-boot needs a value >= 0"; return false; }
     for (const auto& s : o.decode)
         if (s != "conv" && s != "struct" && s != "prose") {
             err = "-t: unknown fixture " + s + " (conv, struct, prose)";
@@ -565,7 +607,7 @@ double window_count(const Result& r) {
     return r.win.present ? (double) r.win.windows : (double) std::max<long long>(r.d.generated - r.d.accepted, 1);
 }
 
-struct Quality {
+struct KldGate {
     bool ran = false;
     std::string err;
     long long rows = 0, chunks = 0;
@@ -575,19 +617,26 @@ struct Quality {
     std::string args;
 };
 
-void summarize_rows(const std::string& path, Quality& q) {
+void summarize_rows(const std::string& path, KldGate& q) {
     std::ifstream f(path);
     std::string line;
     std::vector<double> nll, nllb, kld, dlp;
     long long same = 0;
     std::vector<long long> chunk_ids;
+    bool kld_finite = true;
+    bool kld_nan = false;
     while (std::getline(f, line)) {
         std::vector<std::string> c = split(line, '\t');
         if (c.size() < 10) continue;
         chunk_ids.push_back(std::atoll(c[0].c_str()));
         nll.push_back(std::atof(c[3].c_str()));
         nllb.push_back(std::atof(c[4].c_str()));
-        kld.push_back(std::atof(c[5].c_str()));
+        const double kv = std::atof(c[5].c_str());
+        if (!std::isfinite(kv)) {
+            kld_finite = false;
+            if (std::isnan(kv)) kld_nan = true;
+        }
+        kld.push_back(kv);
         same += std::atoll(c[6].c_str());
         dlp.push_back(std::atof(c[9].c_str()));
     }
@@ -599,17 +648,25 @@ void summarize_rows(const std::string& path, Quality& q) {
     double mn = 0, mb = 0, sq = 0, mk = 0, md = 0;
     for (size_t i = 0; i < n; ++i) { mn += nll[i]; mb += nllb[i]; sq += nll[i] * nll[i]; mk += kld[i]; md += dlp[i]; }
     mn /= (double) n; mb /= (double) n; mk /= (double) n; md /= (double) n;
-    const double se = std::sqrt(std::max(0.0, sq / (double) n - mn * mn) / (double) std::max<size_t>(1, n - 1));
+    const double var = sq / (double) n - mn * mn;
+    const double se = std::isnan(var) ? var : std::sqrt(std::max(0.0, var) / (double) std::max<size_t>(1, n - 1));
     q.ppl = std::exp(mn);
     q.ppl_err = q.ppl * se;
     q.base_ppl = std::exp(mb);
     q.ln_ratio = mn - mb;
-    std::sort(kld.begin(), kld.end());
-    auto pct = [&](double p) { return kld[std::min(n - 1, (size_t) std::llround(p * (double) (n - 1)))]; };
     q.kld_mean = mk;
-    q.kld_median = pct(0.5);
-    q.kld_p99 = pct(0.99);
-    q.kld_max = kld.back();
+    if (kld_finite || !kld_nan) {
+        std::sort(kld.begin(), kld.end());
+        auto pct = [&](double p) { return kld[std::min(n - 1, (size_t) std::llround(p * (double) (n - 1)))]; };
+        q.kld_median = pct(0.5);
+        q.kld_p99 = pct(0.99);
+        q.kld_max = kld.back();
+    } else {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        q.kld_median = nan;
+        q.kld_p99 = nan;
+        q.kld_max = nan;
+    }
     q.top1_pct = 100.0 * (double) same / (double) n;
     q.dlogp = md;
     q.ran = true;
@@ -729,19 +786,20 @@ int main(int argc, char** argv) {
     if (o.community) o.no_windows = true;   // the draft log is analysis, not part of the preset
 
     // what to run
-    const bool quality_only = o.quality && !o.sel_decode && !o.sel_prefill;
-    if (!o.sel_decode && !o.sel_prefill && !quality_only) {   // one of -t / -p runs only what it names
+    const bool aux_only = (o.quality || o.kld) && !o.sel_decode && !o.sel_prefill;
+    if (!o.sel_decode && !o.sel_prefill && !aux_only) {   // one of -t / -p runs only what it names
         o.decode = {"conv", "struct", "prose"};
         o.depths = {kPrefillBase};
     }
     if (o.community) o.depths = {kCommunityPrefillShort, kCommunityPrefillLong};
     auto wants = [&](const std::string& s) { return std::find(o.decode.begin(), o.decode.end(), s) != o.decode.end(); };
     const bool do_quality = o.quality;
+    const bool do_kld = o.kld;
     const bool do_decode = !o.decode.empty();
     const bool do_prefill = !o.depths.empty();
     const bool do_perf = do_decode || do_prefill;
-    if (do_quality && o.kld_base.empty()) {
-        basalt::log::error("basalt-bench", "the quality gate needs --kld-base FILE");
+    if (do_kld && o.kld_base.empty()) {
+        basalt::log::error("basalt-bench", "--kld needs --kld-base FILE");
         return 2;
     }
 
@@ -759,9 +817,10 @@ int main(int argc, char** argv) {
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
+    const std::string model_path = o.model.empty() ? arg_value(args, "--model") : o.model;
     // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
     std::string gpu_value;
-    if (!o.model.empty()) {
+    if (!model_path.empty()) {
         std::string gerr;
         std::vector<basalt::program::GpuCard> used;
         // a community run takes the user's cards and mode like any other, and its row records them in engine_args
@@ -795,7 +854,7 @@ int main(int argc, char** argv) {
             extra.push_back(kv.first);
             extra.push_back(kv.second);
         }
-        std::vector<std::string> plan_args = probe_args(fs::absolute(o.model).string(), {});
+        std::vector<std::string> plan_args = probe_args(fs::absolute(model_path).string(), {});
         merge_args(plan_args, extra);
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
@@ -814,11 +873,11 @@ int main(int argc, char** argv) {
     }
     std::string community_model, community_arch, community_plan_err;
     std::string community_kv;   // the cache format a community run passes; empty when the model takes neither
-    if (o.fixtures.empty() || o.community) {   // the model's own fixtures, when it has them; the community row's model name
+    if ((do_perf && o.fixtures.empty()) || o.community) {   // the model's own fixtures, when it has them; the community row's model name
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
-        const std::string abs_model = fs::absolute(o.model).string();
-        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, probe_args(abs_model, {}), plan_log, answer);
+        const std::string abs_model = model_path.empty() ? std::string() : fs::absolute(model_path).string();
+        const int asked = abs_model.empty() ? 0 : engine_plan(engine_bin, probe_args(abs_model, {}), plan_log, answer);
         if (o.community) {
             community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
             community_arch = basalt::program::plan_field(answer, "arch");
@@ -835,20 +894,20 @@ int main(int argc, char** argv) {
         fs::remove(plan_log, rm_ec);
         if (o.fixtures.empty()) o.fixtures = fixtures_for(fixtures_default(), answer);
     }
-    std::vector<std::string> quality_flags;
-    if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
+    std::vector<std::string> kld_flags;
+    if (do_kld && !model_path.empty()) {   // what the wikitext KLD gate starts this model with, and the window it scores
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id()) + ".log";
-        const int asked = engine_plan(engine_bin, probe_args(fs::absolute(o.model).string(), {"--ppl-base", o.kld_base}), plan_log, answer);
+        const int asked = engine_plan(engine_bin, probe_args(fs::absolute(model_path).string(), {"--ppl-base", o.kld_base}), plan_log, answer);
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
         if (asked != 0) {
-            basalt::log::error("basalt-bench", "--quality: the engine cannot plan this model");
+            basalt::log::error("basalt-bench", "--kld: the engine cannot plan this model");
             return 1;
         }
-        quality_flags = split(basalt::program::plan_field(answer, "quality_flags"), ' ');
+        kld_flags = split(basalt::program::plan_field(answer, "quality_flags"), ' ');
         const int window = std::atoi(basalt::program::plan_field(answer, "quality_window").c_str());
-        if (window > 0) o.quality_t = std::min(o.quality_t, window);
+        if (window > 0) o.kld_t = std::min(o.kld_t, window);
     }
     // fixtures, read before anything is started
     std::vector<std::vector<int64_t>> decode_ids(3);
@@ -870,19 +929,29 @@ int main(int argc, char** argv) {
         }
     }
 
+    const bool user_max_context = has_arg(args, "--max-context");
+    const std::vector<std::string> base_args = args;
     // the context the fixtures need, unless the command line gives one
-    if (!has_arg(args, "--max-context")) {
-        long long need = basalt::program::kDefaultContext;
-        for (size_t i = 0; i < 3; ++i)
-            if (!decode_ids[i].empty()) need = std::max(need, (long long) decode_ids[i].size() + kDecode[i].max_new + 16);
-        if (do_prefill)
-            for (long long depth : o.depths) {
-                const double scale = (double) depth / (double) kPrefillBase;
-                need = std::max(need, (long long) ((double) prefill_parts[1].size() * scale) + (long long) prefill_parts[0].size() +
-                                          (long long) prefill_parts[2].size() + kPrefillBaseDecode + 16);
-            }
-        set_arg(args, "--max-context", std::to_string(need));
+    if (!user_max_context) {
+        if (do_perf) {
+            long long need = basalt::program::kDefaultContext;
+            for (size_t i = 0; i < 3; ++i)
+                if (!decode_ids[i].empty()) need = std::max(need, (long long) decode_ids[i].size() + kDecode[i].max_new + 16);
+            if (do_prefill)
+                for (long long depth : o.depths) {
+                    const double scale = (double) depth / (double) kPrefillBase;
+                    need = std::max(need, (long long) ((double) prefill_parts[1].size() * scale) + (long long) prefill_parts[0].size() +
+                                              (long long) prefill_parts[2].size() + kPrefillBaseDecode + 16);
+                }
+            set_arg(args, "--max-context", std::to_string(need));
+        } else if (do_quality) {
+            set_arg(args, "--max-context", std::to_string(o.quality_max_context));
+        } else {
+            set_arg(args, "--max-context", std::to_string(basalt::program::kDefaultContext));
+        }
     }
+    if (!do_perf && do_quality && !has_arg(args, "--prompt-cache"))
+        set_arg(args, "--prompt-cache", "0");
     if (!community_kv.empty()) set_arg(args, "--kv", community_kv);
     if (o.print_command) {
         std::printf("%s --serve", engine_bin.c_str());
@@ -948,7 +1017,8 @@ int main(int argc, char** argv) {
     std::string peer_line;
     std::string engine_args_text;
     std::string lossy;   // the engine's flags that change the model's output (its INFO lossy=), comma separated
-    Quality quality;
+    basalt::program::quality::Summary quality;
+    KldGate kld;
 
     // ---- performance session
     std::vector<std::string> perf_args = args;
@@ -1048,6 +1118,12 @@ int main(int argc, char** argv) {
             while (std::getline(lg, l))
                 if (l.find("peer GPU") != std::string::npos && l.find("experts") != std::string::npos) peer_line = l;
         }
+        const std::string eng_primary_bus = eng.info.count("gpus") ? eng.info["gpus"].substr(0, eng.info["gpus"].find(',')) : std::string();
+        auto snap_primary = [&]() {
+            Nvml::Snap s;
+            if (!eng_primary_bus.empty() && nvml.snap_bus(eng_primary_bus, s)) return s;
+            return nvml.snap(0);
+        };
         for (int run = 1; run <= o.reps && !failed; ++run) {
             for (size_t i = 0; i < 3 && !failed; ++i) {
                 if (std::find(sess.decode.begin(), sess.decode.end(), kDecode[i].name) == sess.decode.end()) continue;
@@ -1059,7 +1135,7 @@ int main(int argc, char** argv) {
                     failed = true;
                     break;
                 }
-                const Nvml::Snap s = nvml.snap(0);
+                const Nvml::Snap s = snap_primary();
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
                 ++n_requests;
@@ -1090,7 +1166,7 @@ int main(int argc, char** argv) {
                     failed = true;
                     break;
                 }
-                const Nvml::Snap s = nvml.snap(0);
+                const Nvml::Snap s = snap_primary();
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
                 ++n_requests;
@@ -1126,39 +1202,150 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- quality session
+    // ---- quality suite session (--quality FILE)
     if (do_quality) {
+        quality.ref_path = o.quality_ref;
+        quality.role = o.quality_role;
+        quality.smoke = o.smoke;
+        quality.top_k = o.quality_top;
+        quality.boot = o.quality_boot;
+        int eff_max_context = o.quality_max_context;
+        if (!o.quality_max_context_set && user_max_context) {
+            const int parsed = std::atoi(arg_value(base_args, "--max-context").c_str());
+            if (parsed >= 2) eff_max_context = parsed;
+        }
+        quality.max_context = eff_max_context;
+
+        basalt::program::quality::Reference ref;
+        if (!basalt::program::quality::load_reference(o.quality_ref, ref, quality.err)) {
+            basalt::log::error("basalt-bench", "%s", quality.err.c_str());
+        } else {
+            quality.ref_model = ref.model_name;
+            const std::vector<int64_t> convs =
+                basalt::program::quality::select_conversations(ref, o.smoke, eff_max_context, quality.n_convs_skipped);
+            if (convs.empty()) {
+                quality.err = "no conversations selected from reference (check --quality-max-context / --smoke)";
+                basalt::log::error("basalt-bench", "%s", quality.err.c_str());
+            } else {
+                std::vector<std::string> qa = base_args;
+                if (!user_max_context) set_arg(qa, "--max-context", std::to_string(o.quality_max_context));
+                if (!has_arg(qa, "--prompt-cache")) set_arg(qa, "--prompt-cache", "0");
+                const std::string rows_path = (fs::path(work) / "quality_rows.txt").string();
+                basalt::platform::remove_file(rows_path);
+                set_arg(qa, "--ppl-out", rows_path);
+                for (const auto& a : qa) quality.engine_args += (quality.engine_args.empty() ? "" : " ") + a;
+
+                Engine eng;
+                const auto t0 = Clock::now();
+                basalt::log::info("basalt-bench", "starting the engine for the quality suite (%zu conversations)", convs.size());
+                if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
+                    basalt::log::error("basalt-bench", "%s", quality.err.c_str());
+                } else {
+                    if (info.empty()) info = eng.info;
+                    if (eng.info.count("lossy")) lossy = eng.info["lossy"];
+                    quality.load_s = secs(t0, Clock::now());
+                    const auto t1 = Clock::now();
+                    basalt::program::quality::Scorer scorer(ref, o.quality_role);
+                    uint64_t prev_off = 0;
+                    bool ok = true;
+                    std::vector<basalt::program::quality::ParsedRow> parsed;
+                    for (size_t idx = 0; idx < convs.size(); ++idx) {
+                        const int64_t c = convs[idx];
+                        const int64_t first_pos = basalt::program::quality::first_scored_pos(ref, c, o.quality_role);
+                        if (first_pos < 0) continue;
+                        const int64_t a = ref.conv_off[static_cast<size_t>(c)];
+                        const int64_t b = ref.conv_off[static_cast<size_t>(c + 1)];
+                        std::vector<int64_t> ids;
+                        ids.reserve(static_cast<size_t>(b - a));
+                        for (int64_t k = a; k < b; ++k) ids.push_back(static_cast<int64_t>(ref.tokens[static_cast<size_t>(k)]));
+                        const std::string keys = fmt(" score=%lld score_top=%d ppl_t=16", (long long) first_pos, o.quality_top);
+                        Done d;
+                        if (!eng.request(keys, 1, ids, d)) {
+                            quality.err = fmt("conv %lld: %s", (long long) c, d.err.c_str());
+                            ok = false;
+                            break;
+                        }
+                        uint64_t cur_size = 0;
+                        if (!basalt::platform::file_size(rows_path, cur_size) || cur_size < prev_off) {
+                            quality.err = fmt("conv %lld: cannot read %s", (long long) c, rows_path.c_str());
+                            ok = false;
+                            break;
+                        }
+                        const uint64_t delta = cur_size - prev_off;
+                        std::string chunk(static_cast<size_t>(delta), '\0');
+                        if (delta > 0) {
+                            const int fd = basalt::platform::open_fd_utf8(rows_path);
+                            const bool r_ok = fd >= 0 && basalt::platform::pread_all(fd, chunk.data(), delta, prev_off);
+                            if (fd >= 0) basalt::platform::close_fd(fd);
+                            if (!r_ok) {
+                                quality.err = fmt("conv %lld: failed reading %s", (long long) c, rows_path.c_str());
+                                ok = false;
+                                break;
+                            }
+                        }
+                        prev_off = cur_size;
+                        if (!basalt::program::quality::parse_basalt_rows(chunk.data(), chunk.size(), parsed, quality.err) ||
+                            !scorer.add_conversation(c, parsed, quality.err)) {
+                            ok = false;
+                            break;
+                        }
+                        if ((idx + 1) % 10 == 0 || idx + 1 == convs.size())
+                            basalt::log::raw("  quality %zu/%zu convs (conv %lld, %zu rows) %.0f s\n",
+                                             idx + 1, convs.size(), (long long) c, parsed.size(), secs(t1, Clock::now()));
+                    }
+                    quality.run_s = secs(t1, Clock::now());
+                    eng.stop();
+                    if (ok) {
+                        quality.missing_ref_ids = scorer.missing_ref_ids();
+                        if (quality.missing_ref_ids > 0) {
+                            basalt::log::warn("basalt-bench", "%lld reference ids were not in the engine top-K rows (bounded by row minimum)",
+                                              (long long) quality.missing_ref_ids);
+                        }
+                        if (!basalt::program::quality::summarize(scorer.scored_rows(), o.quality_role, o.quality_boot, 0, quality, quality.err)) {
+                            basalt::log::error("basalt-bench", "%s", quality.err.c_str());
+                        }
+                    } else {
+                        basalt::log::error("basalt-bench", "%s", quality.err.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- wikitext KLD gate session (--kld)
+    if (do_kld) {
         uint32_t n_ctx = 0;
         int32_t n_vocab = 0, n_chunk = 0;
         std::vector<std::vector<int64_t>> chunks;
-        quality.t = o.quality_t;
-        quality.n_chunks_asked = o.quality_chunks;
-        if (!read_kld_base(o.kld_base, n_ctx, n_vocab, n_chunk, chunks, o.quality_chunks, quality.err)) {
-            basalt::log::error("basalt-bench", "%s", quality.err.c_str());
+        kld.t = o.kld_t;
+        kld.n_chunks_asked = o.kld_chunks;
+        if (!read_kld_base(o.kld_base, n_ctx, n_vocab, n_chunk, chunks, o.kld_chunks, kld.err)) {
+            basalt::log::error("basalt-bench", "%s", kld.err.c_str());
         } else {
             std::vector<std::string> qa = args;
-            for (size_t f = 0; f < quality_flags.size(); ++f) {
-                const std::string& a = quality_flags[f];
+            for (size_t f = 0; f < kld_flags.size(); ++f) {
+                const std::string& a = kld_flags[f];
                 if (a.empty()) continue;
-                if (f + 1 < quality_flags.size() && quality_flags[f + 1].rfind("--", 0) != 0) {
-                    set_arg(qa, a, quality_flags[++f]);
+                if (f + 1 < kld_flags.size() && kld_flags[f + 1].rfind("--", 0) != 0) {
+                    set_arg(qa, a, kld_flags[++f]);
                 } else if (!has_arg(qa, a) && !(a == "--resident-experts" && has_arg(qa, "--mmap-experts"))) {
                     qa.push_back(a);
                 }
             }
             const std::string rows = (fs::path(work) / "rows.tsv").string();
-            std::remove(rows.c_str());
+            basalt::platform::remove_file(rows);
             set_arg(qa, "--ppl-base", o.kld_base);
             set_arg(qa, "--ppl-out", rows);
-            for (const auto& a : qa) quality.args += (quality.args.empty() ? "" : " ") + a;
+            for (const auto& a : qa) kld.args += (kld.args.empty() ? "" : " ") + a;
             Engine eng;
             const auto t0 = Clock::now();
-            basalt::log::info("basalt-bench", "starting the engine for the quality gate");
-            if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
-                basalt::log::error("basalt-bench", "%s", quality.err.c_str());
+            basalt::log::info("basalt-bench", "starting the engine for the wikitext KLD gate");
+            if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-kld.log").string(), kld.err)) {
+                basalt::log::error("basalt-bench", "%s", kld.err.c_str());
             } else {
+                if (info.empty()) info = eng.info;
                 if (eng.info.count("lossy")) lossy = eng.info["lossy"];
-                quality.load_s = secs(t0, Clock::now());
+                kld.load_s = secs(t0, Clock::now());
                 const auto t1 = Clock::now();
                 const int64_t first = (int64_t) (n_ctx / 2);
                 double pp_ms = 0, dec_ms = 0;
@@ -1166,22 +1353,22 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < chunks.size(); ++k) {
                     std::vector<int64_t> ids(chunks[k].begin(), chunks[k].begin() + first + 1);
                     Done d;
-                    const std::string keys = fmt(" ppl=%zu ppl_t=%d", k, o.quality_t);
+                    const std::string keys = fmt(" ppl=%zu ppl_t=%d", k, o.kld_t);
                     if (!eng.request(keys, (long long) n_ctx - 1 - first, ids, d)) {
-                        quality.err = fmt("chunk %zu: %s", k, d.err.c_str());
+                        kld.err = fmt("chunk %zu: %s", k, d.err.c_str());
                         ok = false;
                         break;
                     }
                     pp_ms += d.prompt_ms;
                     dec_ms += d.decode_ms;
-                    if ((k + 1) % 10 == 0) basalt::log::raw("  quality %zu/%zu chunks, %.0f s\n", k + 1, chunks.size(), secs(t1, Clock::now()));
+                    if ((k + 1) % 10 == 0) basalt::log::raw("  kld %zu/%zu chunks, %.0f s\n", k + 1, chunks.size(), secs(t1, Clock::now()));
                 }
-                quality.run_s = secs(t1, Clock::now());
+                kld.run_s = secs(t1, Clock::now());
                 eng.stop();
                 if (ok) {
-                    summarize_rows(rows, quality);
-                    quality.prompt_ms_chunk = pp_ms / (double) chunks.size();
-                    quality.decode_ms_chunk = dec_ms / (double) chunks.size();
+                    summarize_rows(rows, kld);
+                    kld.prompt_ms_chunk = pp_ms / (double) chunks.size();
+                    kld.decode_ms_chunk = dec_ms / (double) chunks.size();
                 }
             }
         }
@@ -1209,7 +1396,7 @@ int main(int argc, char** argv) {
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
-    // an integrated GPU has no power limit NVML reads (a GB10's is the system's): no warning, the table says unknown
+    // an integrated GPU has no power limit NVML reads (the system's is not the GPU's): no warning, the table says unknown
     const bool primary_integrated = have_primary && primary.vram_gib <= 0;
     if (power == "unknown" && !primary_integrated)
         basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
@@ -1322,7 +1509,7 @@ int main(int argc, char** argv) {
                 gpu_err = "NVML could not read the GPU at " + id;
                 break;
             }
-            // NVML gives an integrated GPU (a GB10) no memory size and no power limit: its memory is the machine's, and
+            // NVML gives an integrated GPU no memory size and no power limit: its memory is the machine's, and
             // its power is the submitter's to state, since the SoC's limit is not the GPU's
             const bool integrated = g.vram_gib <= 0;
             if (integrated) {
@@ -1395,14 +1582,40 @@ int main(int argc, char** argv) {
                    pre_tps[0], pre_s[0], pre_tps[1], pre_s[1], dec_tok / (dec_ms / 1000.0), dec_tok, dec_ms / 1000.0);
     }
     if (o.format == "md" && do_quality) {
-        rep += fmt("\nquality gate: %d chunks asked, T=%d\n", quality.n_chunks_asked, quality.t);
+        rep += fmt("\nquality suite: %s (role=%s, top=%d, max_context=%d, boot=%d%s)\n",
+                   quality.ref_path.c_str(), basalt::program::quality::role_filter_name(quality.role),
+                   quality.top_k, quality.max_context, quality.boot, quality.smoke ? ", smoke" : "");
         if (!quality.ran) {
-            rep += "quality gate failed: " + quality.err + "\n";
+            rep += "quality suite failed: " + quality.err + "\n";
         } else {
-            rep += fmt("chunks %lld  rows %lld\n", quality.chunks, quality.rows);
-            rep += fmt("PPL %.4f +/- %.4f   base PPL %.4f   ln(PPL/base) %.5f\n", quality.ppl, quality.ppl_err, quality.base_ppl, quality.ln_ratio);
-            rep += fmt("KLD mean %.5f  median %.5f  p99 %.4f  max %.4f\n", quality.kld_mean, quality.kld_median, quality.kld_p99, quality.kld_max);
-            rep += fmt("same top-1 %.2f%%   mean |dlogp| of the base top-1 %.5f\n", quality.top1_pct, quality.dlogp);
+            rep += fmt("rows %lld  conversations %lld", (long long) quality.n_rows, (long long) quality.n_convs);
+            if (quality.n_convs_skipped > 0) rep += fmt(" (%lld skipped > max_context)", (long long) quality.n_convs_skipped);
+            rep += "\n";
+            rep += fmt("KLD mean %.6f +/- %.6f  (naive +/- %.6f)\n", quality.kld_mean, quality.kld_se, quality.kld_naive_se);
+            rep += fmt("  median %.6f  p90 %.6f  p95 %.6f  p99 %.6f  p99.9 %.6f  max %.6f\n",
+                       quality.kld_median, quality.kld_p90, quality.kld_p95, quality.kld_p99, quality.kld_p99_9, quality.kld_max);
+            rep += fmt("same top-1 %.2f +/- %.2f%%   mean dp %.2f +/- %.2f%%   RMS dp %.2f +/- %.2f%%\n",
+                       quality.top1 * 100.0, quality.top1_se * 100.0,
+                       quality.dp_mean * 100.0, quality.dp_mean_se * 100.0,
+                       quality.dp_rms * 100.0, quality.dp_rms_se * 100.0);
+            rep += fmt("PPL %.4f +/- %.4f   base PPL %.4f +/- %.4f   ln(PPL/base) %.6f +/- %.6f   ratio %.6f +/- %.6f\n",
+                       quality.ppl_q, quality.ppl_q_se, quality.ppl_base, quality.ppl_base_se,
+                       quality.ln_ppl_ratio, quality.ln_ppl_ratio_se, quality.ppl_ratio, quality.ppl_ratio_se);
+            if (quality.rows_target_outside_topk > 0)
+                rep += fmt("rows with next token outside top-K (excluded from PPL): %lld\n", (long long) quality.rows_target_outside_topk);
+            if (quality.missing_ref_ids > 0)
+                rep += fmt("warning: %lld reference ids missing from top-K rows (bounded by row minimum)\n", (long long) quality.missing_ref_ids);
+        }
+    }
+    if (o.format == "md" && do_kld) {
+        rep += fmt("\nkld gate: %d chunks asked, T=%d\n", kld.n_chunks_asked, kld.t);
+        if (!kld.ran) {
+            rep += "kld gate failed: " + kld.err + "\n";
+        } else {
+            rep += fmt("chunks %lld  rows %lld\n", kld.chunks, kld.rows);
+            rep += fmt("PPL %.4f +/- %.4f   base PPL %.4f   ln(PPL/base) %.5f\n", kld.ppl, kld.ppl_err, kld.base_ppl, kld.ln_ratio);
+            rep += fmt("KLD mean %.5f  median %.5f  p99 %.4f  max %.4f\n", kld.kld_mean, kld.kld_median, kld.kld_p99, kld.kld_max);
+            rep += fmt("same top-1 %.2f%%   mean |dlogp| of the base top-1 %.5f\n", kld.top1_pct, kld.dlogp);
         }
     }
     if (o.format == "md" && !lossy.empty()) rep += "\nLOSSY: lossy flags were on, so these numbers don't compare with a run without them\n";
@@ -1512,20 +1725,65 @@ int main(int argc, char** argv) {
             j.begin_obj();
             j.key("ran"); j.boolean(quality.ran);
             j.key("error"); j.str(quality.err);
-            j.key("chunks"); j.integer(quality.chunks);
-            j.key("rows"); j.integer(quality.rows);
-            j.key("t"); j.integer(quality.t);
-            j.key("ppl"); j.num(quality.ppl);
-            j.key("ppl_err"); j.num(quality.ppl_err);
-            j.key("base_ppl"); j.num(quality.base_ppl);
+            j.key("ref"); j.str(quality.ref_path);
+            j.key("ref_model"); j.str(quality.ref_model);
+            j.key("role"); j.str(basalt::program::quality::role_filter_name(quality.role));
+            j.key("smoke"); j.boolean(quality.smoke);
+            j.key("top_k"); j.integer(quality.top_k);
+            j.key("max_context"); j.integer(quality.max_context);
+            j.key("boot"); j.integer(quality.boot);
+            j.key("rows"); j.integer(quality.n_rows);
+            j.key("conversations"); j.integer(quality.n_convs);
+            j.key("conversations_skipped"); j.integer(quality.n_convs_skipped);
+            j.key("missing_ref_ids"); j.integer(quality.missing_ref_ids);
+            j.key("rows_target_outside_topk"); j.integer(quality.rows_target_outside_topk);
             j.key("kld_mean"); j.num(quality.kld_mean);
+            j.key("kld_se"); j.num(quality.kld_se);
+            j.key("kld_naive_se"); j.num(quality.kld_naive_se);
             j.key("kld_median"); j.num(quality.kld_median);
+            j.key("kld_p90"); j.num(quality.kld_p90);
+            j.key("kld_p95"); j.num(quality.kld_p95);
             j.key("kld_p99"); j.num(quality.kld_p99);
+            j.key("kld_p99_9"); j.num(quality.kld_p99_9);
             j.key("kld_max"); j.num(quality.kld_max);
-            j.key("top1_pct"); j.num(quality.top1_pct);
-            j.key("prompt_ms_per_chunk"); j.num(quality.prompt_ms_chunk);
-            j.key("decode_ms_per_chunk"); j.num(quality.decode_ms_chunk);
-            j.key("engine_args"); j.str(quality.args);
+            j.key("top1_pct"); j.num(quality.top1 * 100.0);
+            j.key("top1_pct_se"); j.num(quality.top1_se * 100.0);
+            j.key("dp_mean_pct"); j.num(quality.dp_mean * 100.0);
+            j.key("dp_mean_pct_se"); j.num(quality.dp_mean_se * 100.0);
+            j.key("dp_rms_pct"); j.num(quality.dp_rms * 100.0);
+            j.key("dp_rms_pct_se"); j.num(quality.dp_rms_se * 100.0);
+            j.key("ppl_q"); j.num(quality.ppl_q);
+            j.key("ppl_q_se"); j.num(quality.ppl_q_se);
+            j.key("ppl_base"); j.num(quality.ppl_base);
+            j.key("ppl_base_se"); j.num(quality.ppl_base_se);
+            j.key("ln_ppl_ratio"); j.num(quality.ln_ppl_ratio);
+            j.key("ln_ppl_ratio_se"); j.num(quality.ln_ppl_ratio_se);
+            j.key("ppl_ratio"); j.num(quality.ppl_ratio);
+            j.key("ppl_ratio_se"); j.num(quality.ppl_ratio_se);
+            j.key("load_s"); j.num(quality.load_s);
+            j.key("run_s"); j.num(quality.run_s);
+            j.key("engine_args"); j.str(quality.engine_args);
+            j.end_obj();
+        }
+        if (do_kld) {
+            j.key("kld");
+            j.begin_obj();
+            j.key("ran"); j.boolean(kld.ran);
+            j.key("error"); j.str(kld.err);
+            j.key("chunks"); j.integer(kld.chunks);
+            j.key("rows"); j.integer(kld.rows);
+            j.key("t"); j.integer(kld.t);
+            j.key("ppl"); j.num(kld.ppl);
+            j.key("ppl_err"); j.num(kld.ppl_err);
+            j.key("base_ppl"); j.num(kld.base_ppl);
+            j.key("kld_mean"); j.num(kld.kld_mean);
+            j.key("kld_median"); j.num(kld.kld_median);
+            j.key("kld_p99"); j.num(kld.kld_p99);
+            j.key("kld_max"); j.num(kld.kld_max);
+            j.key("top1_pct"); j.num(kld.top1_pct);
+            j.key("prompt_ms_per_chunk"); j.num(kld.prompt_ms_chunk);
+            j.key("decode_ms_per_chunk"); j.num(kld.decode_ms_chunk);
+            j.key("engine_args"); j.str(kld.args);
             j.end_obj();
         }
         j.end_obj();
@@ -1554,5 +1812,5 @@ int main(int argc, char** argv) {
                               "docs/community and open a pull request (docs/community.md)", dir.c_str(), why.c_str());
         }
     }
-    return do_quality && !quality.ran ? 1 : 0;
+    return (do_kld && !kld.ran) || (do_quality && !quality.ran) ? 1 : 0;
 }

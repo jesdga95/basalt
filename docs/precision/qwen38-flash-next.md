@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next precision
 
-Where Flash-Next rounds and what each rounding costs. Method and reference: [quality](quality.md). Guide:
-[Flash-Next](../models/qwen38-flash-next.md).
+Where Flash-Next rounds and what each rounding costs. Guide: [Flash-Next](../models/qwen38-flash-next.md).
+Method: the [quality suite](quality-suite.md) (preferred). The KLD, PPL and top-1 figures on this page were measured with [wikitext KLD](quality.md#wikitext-kld).
 
 Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W as the peer expert tier, 128 GB of system RAM. Each number names its
 build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10.
@@ -41,13 +41,9 @@ attention launches as `int8`. Attention copies packed rows directly into shared 
 for the FP32 dot products and value accumulation. It reads 576 bytes per selected cell across both KV heads,
 compared with 1,056 for `int8`. A streamed cache (`--kv-resident`) uses the per-token path and also writes the host copy.
 
-On an RTX 5090 at 475 W, `q4_attn_bench` at 2,048 selected cells measured 9.2 → 8.2 µs per Q4_0 attention call
-(129 → 144 GB/s effective pool bandwidth). Int8 measured 8.8 µs. Random Q4_0 attention outputs matched the GPU
-reference bit for bit, with a maximum absolute error of 1.8e-8 against the double-precision CPU reference.
-
-The fused Q4_0 prelude uses warp shuffles to rotate Q, K and V and exchanges K and V together across warps. In
-`qsa_dec_fused_parity` on the same GPU at 475 W, the fused stages averaged 4.92 → 4.15 µs for one token and
-7.33 → 6.98 µs for eight. Rotated Q/K and the packed K/V blocks matched the separate kernels bit for bit.
+Random Q4_0 attention outputs match the GPU reference bit for bit, with a maximum absolute error of 1.8e-8 against the
+double-precision CPU reference (`q4_attn_bench`). The fused Q4_0 prelude rotates Q, K and V with warp shuffles and exchanges K and
+V together across warps; the rotated Q/K and the packed K/V blocks match the separate kernels bit for bit (`qsa_dec_fused_parity`).
 
 Decode activations are int8 (q8_1) into every quantized matmul. The hc read stays fp32 (llama.cpp quantizes it to Q8_0).
 
@@ -87,7 +83,7 @@ Measured prefill numbers (NVIDIA-checkpoint NVFP4 pack, 400 W + 180 W, T 3, int8
 
 ## QAD checkpoint
 
-The [QAD pack](../model-file.md#flash-next-qad-pack) keeps the routed experts bit for bit and re-quantizes the checkpoint's
+The [QAD pack](../model-file/qwen38-flash-next.md#flash-next-qad-pack) keeps the routed experts bit for bit and re-quantizes the checkpoint's
 MXFP8 projections and NVFP4 shared experts to Q6_K. Gate: 100 chunks, 400 W + 180 W, tiers pinned, int8 KV; decode is
 `basalt-bench` on two cards, int8 KV.
 
@@ -241,7 +237,7 @@ off on 320x240 and 640x360 sources, 0.1% on a 720x358 one (40 of 14.9 M two step
 What differs is the resize: the image path's Pillow-style bicubic against torchvision's float antialiased bicubic.
 
 A group's two frames go through the patch embedding's two temporal taps apart (W0 a + W1 b, rel L2 6e-7 to 9e-7 against double
-precision). A picture keeps the summed taps, so image output is bitwise as before. In the prompt, the template's whole video marker
+precision). A picture keeps the summed taps. In the prompt, the template's whole video marker
 becomes per-group `<t seconds>` text and pads, as the processor at the model's release (transformers 4.57.1) writes it.
 
 ## Lossy routing flags

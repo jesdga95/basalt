@@ -17,8 +17,8 @@ hf download florian862-art/ERNIE-5.5-Flash-Preview-Basalt ERNIE-5.5-Flash-Previe
 ```
 
 Or build it directly from Baidu's official Hugging Face checkpoint (`baidu/ERNIE-5.5-Flash-Preview`), which includes
-both the main weights and the bundled `model.mtp.*` DSpark drafter tensors (detailed section layout:
-[model file](../model-file.md#ernie-55-flash-pack)):
+the main weights and the bundled `model.mtp.*` DSpark drafter tensors (detailed section layout:
+[model file](../model-file/ernie55.md)):
 
 ```sh
 hf download baidu/ERNIE-5.5-Flash-Preview --local-dir ./ERNIE-5.5-Flash-Preview

@@ -68,6 +68,7 @@ target_link_libraries(vision_core PUBLIC model_file platform Threads::Threads)
 # device side
 add_library(vision_cuda STATIC
   ${VISION_ROOT}/src/vision/encoder_cuda.cu
+  ${VISION_ROOT}/src/vision/encoder_region.cpp
   ${VISION_ROOT}/src/vision/vision_kernels.cu)
 target_include_directories(vision_cuda PUBLIC ${VISION_ROOT}/include ${VISION_ROOT}/src/vision)
 target_link_libraries(vision_cuda PUBLIC vision_core CUDA::cudart CUDA::cublas)
@@ -89,7 +90,7 @@ if(BUILD_TESTING)
   target_link_libraries(vision_cpu_parity PRIVATE vision_core)
   add_executable(vision_cuda_parity ${VISION_ROOT}/tests/vision/cuda_parity.cu)
   target_link_libraries(vision_cuda_parity PRIVATE vision_cuda)
-  # the parity program is outside src/vision now and needs the private kernel header
+  # the parity program is outside src/vision and needs the private kernel header
   target_include_directories(vision_cuda_parity PRIVATE ${VISION_ROOT}/src/vision)
   # Hy4-flash's tower on random weights (the position table against torch, CUDA against the CPU encoder)
   add_executable(hy4_encoder_parity ${VISION_ROOT}/tests/vision/hy4_encoder_parity.cpp)
@@ -99,4 +100,8 @@ if(BUILD_TESTING)
   add_executable(cls_encoder_parity ${VISION_ROOT}/tests/vision/cls_encoder_parity.cpp)
   target_link_libraries(cls_encoder_parity PRIVATE vision_cuda)
   target_include_directories(cls_encoder_parity PRIVATE ${VISION_ROOT}/src/vision)
+  # the pooled tower on random weights (patch rows, positions, norms and turns, pooling, CUDA against a host reference)
+  add_executable(pool_encoder_parity ${VISION_ROOT}/tests/vision/pool_encoder_parity.cpp)
+  target_link_libraries(pool_encoder_parity PRIVATE vision_cuda)
+  target_include_directories(pool_encoder_parity PRIVATE ${VISION_ROOT}/src/vision)
 endif()

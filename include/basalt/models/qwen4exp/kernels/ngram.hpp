@@ -5,8 +5,9 @@
 //   * `ngram_rows` - the HOST hash.  Sixteen row indices per token from the last three token ids, computed
 //     with 64-bit multiply/xor and no tensor op at all.  The source computes it on the host
 //     because "ggml has no int64 and no xor".
-//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL and is NOT IN THE DENSE POOL: it is
-//     51.2e9 elements (28.8 GB) and is read straight from the source GGUF section of the model file.
+//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL in the official pack (a standalone table
+//     may also be Q5_0, Q5_1, Q8_0 or BF16) and is NOT IN THE DENSE POOL: it is 51.2e9 elements (28.8 GB) and is
+//     read straight from the source GGUF section of the model file.
 //
 // THE HASH IS THE ONE PLACE IN THIS MODEL WHERE A WRONG BIT IS SILENTLY PLAUSIBLE.  Every one of its
 // properties has a rival reading that produces a valid index in range:
@@ -45,6 +46,7 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: an IQ4_NL row
 inline constexpr int PLE_ROW_BYTES_Q5_0 = (PLE_HEAD_DIM / 32) * 22;       // 110: a Q5_0 row
+inline constexpr int PLE_ROW_BYTES_Q5_1 = (PLE_HEAD_DIM / 32) * 24;       // 120: a Q5_1 row
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;       // 170: a Q8_0 row
 inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;                // 320: a BF16 row
 inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;
@@ -142,7 +144,7 @@ public:
     /// Non-blocking prefetch of 16 rows for one token into the reader's row cache while the GPU is busy.
     void prefetch_rows(const uint32_t* rows16);
     void wait_prefetches();
-    /// Plan v0.3 P5: the rows of `n_tokens` tokens (16 each, `rows` token-major) into `out` (2560 floats per token),
+    /// The rows of `n_tokens` tokens (16 each, `rows` token-major) into `out` (2560 floats per token),
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
@@ -174,7 +176,7 @@ public:
     /// True when `PleIoOptions::lock` was asked for and the whole table was locked (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
-    /// "IQ4_NL" or "Q5_0".
+    /// "IQ4_NL", "Q5_0", "Q5_1", "Q8_0" or "BF16".
     const char* format() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values

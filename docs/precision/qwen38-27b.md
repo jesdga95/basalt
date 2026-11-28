@@ -1,11 +1,11 @@
 # Qwen3.8-27B precision
 
-What the dense stack computes in, where it rounds, and what that costs against the BF16 model. The method:
-[how quality is measured](quality.md).
+What the dense stack computes in, where it rounds, and what that costs against the BF16 model.
+Method: the [quality suite](quality-suite.md) (preferred). The KLD, PPL and top-1 figures on this page were measured with [wikitext KLD](quality.md#wikitext-kld).
 
 ## Weights
 
-The published pack, from QUASAR's quantization-aware checkpoint ([model file](../model-file.md#qwen38-27b-pack)):
+The published pack, from QUASAR's quantization-aware checkpoint ([model file](../model-file/qwen38-27b.md)):
 
 | Tensors | Stored as | From QUASAR's checkpoint |
 | --- | --- | --- |
@@ -65,7 +65,7 @@ as F8_E4M3 (E4M3 codes, FP32 per matrix), both bit for bit; the rest as above.
 
 ## Quality against BF16
 
-Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, one RTX 5090 at 400 W, the current build.
+Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, one RTX 5090 at 400 W.
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
 |---|---:|---:|---:|---:|---:|

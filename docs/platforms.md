@@ -2,7 +2,7 @@
 
 Linux x64 and Windows x64 with NVIDIA Blackwell (sm_120), and Linux Arm64 with the integrated Blackwell GPU (sm_121) of the DGX
 Spark, described in [arm64](arm64.md). Linux x64 is where the engine is tested and benchmarked. CI builds all three and runs the
-CPU tests on each. The GPU tests and the quality gate need a card.
+CPU tests on each. The GPU tests and the quality suite need a card.
 
 The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON`, a second card of sm_89 (Ada) can be a Flash-Next peer that holds and
 computes experts (`gpu-mode peer`, [GPUs](configuration/gpus.md#an-older-peer-card)); every other path and every other
@@ -23,7 +23,7 @@ They hold no CUDA libraries and no Python environment. Needs:
 
 - An NVIDIA driver of the R580 branch or newer. The archives are built with CUDA 13.0.2, whose Linux minimum is 580.95.05; NVIDIA
   publishes no Windows minimum since 13.0, so use a current driver there.
-  On Linux an older 615 build made every reply loop endlessly and 615.71.09 fixed it (#514): if output loops or looks garbled,
+  On Linux, 615 builds before 615.71.09 make every reply loop endlessly: if output loops or looks garbled,
   update the driver before anything else.
 - The CUDA 13 runtime libraries (cudart, cuBLAS) on the library path (`PATH` on Windows).
 - Python 3.10+ with the requirements in a `.venv` at the archive's top directory, which `bin/basalt serve` uses when it is there:
@@ -55,16 +55,11 @@ tier. A pack is read where it lies, so the packs go on `/models` and the config 
 `basalt serve --config /data/basalt_config.json --host 0.0.0.0` and arguments after the image name follow it (`--api-key KEY`).
 The served port is `server.port` (8080) and the mapped host port has to match it; `--gpu` names the cards the container sees.
 
-The container path is untested: no `basalt-bench` run and no PPL/KLD quality run has been measured inside the image, so the
-benchmark numbers describe native runs.
+Benchmark and quality numbers describe native runs, not the container.
 
 ## Platform code
 
-OS code lives only in `src/platform/` and `include/basalt/platform/`, and CMake `if(WIN32)` blocks. Anywhere else there is no `_WIN32`,
-`_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS call (mmap, madvise, pread, pthread/affinity,
-fork/exec/pipe, dlopen, /proc or /sys reads). `tools/check_platform_boundary.sh` enforces it. Each seam has a Linux and a Windows body,
-the Linux body being the code you would have written anyway, and a test in `tests/platform/` that runs on both. Paths are UTF-8 and go
-through the platform file calls.
+OS code lives only behind the platform layer: [platform code](architecture/platform-code.md).
 
 ## FFmpeg for video
 
@@ -111,6 +106,4 @@ passes it to nvcc's host compiler.
 The CPU expert kernel is compiled by MSVC on Windows and GCC on Linux. On one commit, `expert_parity` and `pool_test` give 0 failures
 on both, and the pool output matches the serial run bit for bit.
 
-Greedy tokens differ across the builds: with tiers pinned and adaptive swaps off, `struct` matches over 300 tokens, `conv` diverges at
-token 23 and `prose` at token 44. One build matches itself run to run, so the difference is the host compiler's CPU code (78% of expert
-rows). Quality of the Windows build has not been run ([quality](precision/quality.md)).
+Greedy tokens can differ across the builds. One build matches itself run to run, so the difference is the host compiler's CPU expert code. Quality of the Windows build has not been run ([quality](precision/quality-suite.md)).

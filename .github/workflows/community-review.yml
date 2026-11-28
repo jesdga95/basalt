@@ -2,7 +2,7 @@ name: community review
 
 # Decides what happens to a community benchmark pull request: deterministic gate first, a model review only if the
 # gate passed, then labels, a comment or a squash merge. The privileged context never runs anything from the PR:
-# it checks out the base commit and reads the PR's run files as data through the API. See docs/development/community-automerge.md.
+# it checks out the base commit and reads the PR's run files as data through the API. See docs/ci/community-automerge.md.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]

@@ -176,7 +176,7 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
         tile = pos / kTileTokens;
         rr = (int) (pos % kTileTokens);
     }
-    const int nkt = cols / kKTile * (TWO ? 2 : 1), nb = cols / 16;
+    const int nkt = (cols + kKTile - 1) / kKTile * (TWO ? 2 : 1), nb = cols / 16;
     const float* xr = x + (ids ? ids[r] : r) * ld;
     float bm[NBL];
     float amax = 0.0f;
@@ -357,12 +357,14 @@ struct GemmArgs {
     uint16_t* dst_f16;
     int64_t ld_dst;
     size_t tail_off;          // SWIGLU: the blob's {s_gate, s_up, s_down, -}
-    const uint8_t* base;      // FLAT: expert j's blob at base + j * stride, its blocks from blk_off
+    const uint8_t* base;      // FLAT: expert j's blob at base + j * stride (or blobs[j]), its blocks from blk_off
     size_t stride;
+    const unsigned long long* blobs;
     const int32_t* blk_off;
     int n;
     const int32_t* dst_ids;   // FLAT: output row r to dst row dst_ids[r] (null: r)
     float cg, cu;             // FLAT SWIGLU: the softcaps (cg > 0)
+    int gelu;                 // FLAT SWIGLU: the tail-scaled GELU gate in place of the SwiGLU
 };
 
 // The weight row behind B tile row sr of block rb: 128 consecutive rows, or (SWIGLU) the block's 64 gate rows and the
@@ -391,6 +393,16 @@ __device__ __forceinline__ float swiglu_cap(float g, float u, float4 s, float cg
     asm("add.rn.ftz.f32 %0, %1, 0f3F800000;" : "=f"(d) : "f"(e));
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sig) : "f"(d));
     return __fmul_rn(__fmul_rn(cg * tg, sig), cu * tu) * s.z;
+}
+
+// The tail-scaled GELU gate (tanh form): gelu_tanh(g s_gate) (u s_up) s_down
+__device__ __forceinline__ float gelu_gate(float g, float u, float4 s) {
+    g *= s.x;
+    return 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g))) * (u * s.y) * s.z;
+}
+// The FLAT gate/up product's activation: the GELU gate or the softcapped SwiGLU
+__device__ __forceinline__ float flat_gate(const GemmArgs& a, float g, float u, float4 s, float inv_cg, float inv_cu) {
+    return a.gelu ? gelu_gate(g, u, s) : swiglu_cap(g, u, s, a.cg, a.cu, inv_cg, inv_cu);
 }
 
 __device__ __forceinline__ float swiglu_tail(float g, float u, float4 s) {
@@ -489,10 +501,10 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     const int first = tp * kBlockTiles * kTileTokens;   // the block's first row inside the expert
     if (first >= cnt) return;
     const int ntiles = first + kTileTokens < cnt ? 2 : 1;
-    const int nkt = a.w_cols / kKTile;   // weight k-tiles (TM activation k-tiles each)
+    const int nkt = (a.w_cols + kKTile - 1) / kKTile;   // weight k-tiles (TM activation k-tiles each); the last may be half
     const size_t row_bytes = (size_t) (a.w_cols / 64) * 36;
     const size_t tile_stride = (size_t) TM * nkt * kAStage;
-    const uint8_t* blob = FLAT ? a.base + (size_t) j * a.stride : a.blob[j];
+    const uint8_t* blob = !FLAT ? a.blob[j] : a.blobs ? (const uint8_t*) a.blobs[j] : a.base + (size_t) j * a.stride;
     const uint8_t* w_src = blob + a.w_off;
     const int64_t tile0 = GATHER ? 0 : a.tile_off[j] + kBlockTiles * tp;
     const uint8_t* a_src = GATHER ? nullptr : a.a4 + tile0 * (int64_t) tile_stride;
@@ -548,6 +560,7 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
         const uint8_t* bs = smem + NS * TM * kBlockTiles * kAStage + stage * kBStage;
 #pragma unroll
         for (int s = 0; s < 2; ++s) {
+            if (s == 1 && kt == nkt - 1 && (a.w_cols & (kKTile - 1))) break;   // a half last k-tile
             unsigned b0[4], b1[4], sb[4];
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
@@ -600,8 +613,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
 #pragma unroll
                 for (int r = 0; r < 2; ++r)
                     *(float2*) (out + 8 * r) =
-                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 2][2 * h] * g, tail, a.cg, a.cu, inv_cg, inv_cu),
-                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 2][2 * h + 1] * g, tail, a.cg, a.cu, inv_cg, inv_cu));
+                        make_float2(flat_gate(a, acc[mt][r][2 * h] * g, acc[mt][r + 2][2 * h] * g, tail, inv_cg, inv_cu),
+                                    flat_gate(a, acc[mt][r][2 * h + 1] * g, acc[mt][r + 2][2 * h + 1] * g, tail, inv_cg, inv_cu));
             } else if (FLAT) {
                 const int64_t orow = a.dst_ids ? a.dst_ids[row0 + t] : row0 + t;
                 float* out = a.dst + orow * a.ld_dst + rb * kRowsPerBlock + warp_n * 32 + 2 * tig;
@@ -626,8 +639,9 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
 // 256 weight rows x 128 tokens (2 tiles), 2 activation terms, 2 pipeline stages (76 KiB smem): halves activation
 // loads across N-blocks and doubles MMA density per stage (8 warps, each 64 tokens x 64 rows = 4x8 MMA tiles).
 constexpr int kRows256 = 256;
-constexpr int kBStage256 = kRows256 * kBRowStride;                 // 20480
-constexpr int kSmem256 = 2 * (2 * kBlockTiles * kAStage + kBStage256); // 77824
+constexpr int kBRowStride256 = 112;   // a k-tile's 72 bytes from any 4-byte offset in whole 16-byte chunks; 28 words: no bank conflicts
+constexpr int kBStage256 = kRows256 * kBRowStride256;                // 28672
+constexpr int kSmem256 = 2 * (2 * kBlockTiles * kAStage + kBStage256); // 94208
 
 template <bool SWIGLU> __device__ __forceinline__ int64_t b_row256(int rb, int sr, int half) {
     if (!SWIGLU) return (int64_t) rb * kRows256 + sr;
@@ -661,24 +675,13 @@ __device__ __forceinline__ void load_stage256(int stage, int kt, uint8_t* smem, 
             }
         }
     }
-    // Coalesced 4-lane-per-row cp_async16 (.cg): 4 consecutive lanes read 64 contiguous bytes of each B row
-    // (2 full 32B L2 sectors, branchless odd offset), plus 1 pass of cp_async8 for the 8-byte edge.
-    const int r_base = (int) (threadIdx.x >> 2);
-    const int c16 = (int) (threadIdx.x & 3) * 16;
+    // A row's k-tile as the 16-byte chunks that hold it (rows 4-byte aligned: five or six), eight lanes a row, coalesced
 #pragma unroll
-    for (int p = 0; p < 4; ++p) {
-        const int row = p * 64 + r_base;
-        const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
-        const int odd = (int) (((uintptr_t) src >> 3) & 1u);
-        uint8_t* dst = bs + row * kBRowStride;
-        cp_async16(dst + (odd ? 16 : 0) + c16, src + (odd ? 8 : 0) + c16);
-    }
-    {
-        const int row = (int) threadIdx.x;
-        const uint8_t* src = w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes;
-        const int odd = (int) (((uintptr_t) src >> 3) & 1u);
-        uint8_t* dst = bs + row * kBRowStride;
-        cp_async8(dst + (odd ? 8 : 64), src + (odd ? 0 : 64));
+    for (int p = 0; p < kRows256 / (kThreads / 8); ++p) {
+        const int row = p * (kThreads / 8) + (int) (threadIdx.x >> 3), c = (int) (threadIdx.x & 7);
+        const uintptr_t src = (uintptr_t) (w_src + (size_t) b_row256<SWIGLU>(rb, row, half) * row_bytes + (size_t) kt * kBRowBytes);
+        const int shift = (int) (src & 15u);
+        if (c < (shift + kBRowBytes + 15) / 16) cp_async16(bs + row * kBRowStride256 + 16 * c, (const void*) (src - shift + 16 * c));
     }
 }
 
@@ -698,10 +701,10 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
     const int first = tp * kBlockTiles * kTileTokens;
     if (first >= cnt) return;
     const int ntiles = first + kTileTokens < cnt ? 2 : 1;
-    const int nkt = a.w_cols / kKTile;
+    const int nkt = (a.w_cols + kKTile - 1) / kKTile;   // the last may be half
     const size_t row_bytes = (size_t) (a.w_cols / 64) * 36;
     const size_t tile_stride = (size_t) 2 * nkt * kAStage;
-    const uint8_t* blob = a.base + (size_t) j * a.stride;
+    const uint8_t* blob = a.blobs ? (const uint8_t*) a.blobs[j] : a.base + (size_t) j * a.stride;
     const uint8_t* w_src = blob + a.w_off;
     const int64_t tile0 = GATHER ? 0 : a.tile_off[j] + kBlockTiles * tp;
     const uint8_t* a_src = GATHER ? nullptr : a.a4 + tile0 * (int64_t) tile_stride;
@@ -735,6 +738,12 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
     const int a_col = (lane >> 4) * 16;
     const int sfa_row = ((lane & 1) << 3) | (lane >> 2);
 
+    int row_shift[8];   // each fragment row's weight row start, mod 16
+#pragma unroll
+    for (int r = 0; r < 8; ++r)
+        row_shift[r] = (int) (((uintptr_t) w_src + (uintptr_t) b_row256<SWIGLU>(rb, b_tile_row256<SWIGLU>(warp_n, r) + group, a.half) *
+                               row_bytes) & 15u);
+
     float acc[4][8][4] = {};
     load_stage256<GATHER, SWIGLU>(0, 0, smem, a_src, tile_stride, ntiles, a_code, a_dst, a_scale, s_dst, w_src, row_bytes, rb,
                                   a.half);
@@ -756,14 +765,13 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
             const uint8_t* bs = smem + 2 * 2 * kBlockTiles * kAStage + stage * kBStage256;
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
+                if (s == 1 && kt == nkt - 1 && (a.w_cols & (kKTile - 1))) break;   // a half last k-tile
                 unsigned b0[8], b1[8], sb[8];
-                const int w_odd = (int) ((((uintptr_t) w_src >> 3) ^ (uintptr_t) kt) & 1u);
-                const int rb_odd = (int) ((row_bytes >> 3) & 1u);
 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
                     const int sr = b_tile_row256<SWIGLU>(warp_n, r) + group;
-                    const int odd = w_odd ^ (rb_odd & (int) b_row256<SWIGLU>(rb, sr, a.half));
-                    const uint8_t* p = bs + sr * kBRowStride + (odd << 3) + s * 36;
+                    // the row's k-tile sits at its source address's offset in its 16-byte chunk (a k-tile is 72 bytes)
+                    const uint8_t* p = bs + sr * kBRowStride256 + ((row_shift[r] + 8 * kt) & 15) + s * 36;
                     b0[r] = *(const uint32_t*) (p + 4 + 4 * tig);
                     b1[r] = *(const uint32_t*) (p + 20 + 4 * tig);
                     unsigned v = *(const uint32_t*) p & 0x7f7f7f7fu;
@@ -810,8 +818,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     const __half2 h2 = __floats2half2_rn(
-                        swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu, inv_cg, inv_cu),
-                        swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu, inv_cg, inv_cu));
+                        flat_gate(a, acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, inv_cg, inv_cu),
+                        flat_gate(a, acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, inv_cg, inv_cu));
                     *reinterpret_cast<uint32_t*>(out + 8 * r) = *reinterpret_cast<const uint32_t*>(&h2);
                 }
             } else if (SWIGLU) {
@@ -819,8 +827,8 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel_256(const GemmArgs a)
 #pragma unroll
                 for (int r = 0; r < 4; ++r)
                     *(float2*) (out + 8 * r) =
-                        make_float2(swiglu_cap(acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, a.cg, a.cu, inv_cg, inv_cu),
-                                    swiglu_cap(acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, a.cg, a.cu, inv_cg, inv_cu));
+                        make_float2(flat_gate(a, acc[mt][r][2 * h] * g, acc[mt][r + 4][2 * h] * g, tail, inv_cg, inv_cu),
+                                    flat_gate(a, acc[mt][r][2 * h + 1] * g, acc[mt][r + 4][2 * h + 1] * g, tail, inv_cg, inv_cu));
             } else if (a.dst_f16) {
                 const int64_t orow = a.dst_ids ? a.dst_ids[row0 + t] : row0 + t;
                 uint16_t* out = a.dst_f16 + orow * a.ld_dst + rb * kRows256 + warp_n * 64 + 2 * tig;
@@ -846,7 +854,7 @@ __global__ void tails_kernel(GemmArgs a, size_t off, int n, float* dst) {
 }  // namespace
 
 size_t a4_bytes(int64_t rows, int64_t cols, int experts) {
-    return (size_t) ((rows + kTileTokens - 1) / kTileTokens + experts) * (size_t) (cols / kKTile) * kAStage;
+    return (size_t) ((rows + kTileTokens - 1) / kTileTokens + experts) * (size_t) ((cols + kKTile - 1) / kKTile) * kAStage;
 }
 size_t scale_count(int64_t rows, int experts) {
     return (size_t) ((rows + kTileTokens - 1) / kTileTokens + experts) * kTileTokens;
@@ -875,6 +883,7 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
     const cudaStream_t s = (cudaStream_t) stream;
     if (two) {
         if (cols == 1152) quantize_kernel<3, false, true><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+        else if (cols == 704) quantize_kernel<2, false, true><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
         else { basalt::log::error("basalt", "prefill fp4: %lld columns (two terms)", (long long) cols); std::exit(1); }
     } else if (cols == 2560) quantize_kernel<5, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 640) quantize_kernel<2, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
@@ -903,6 +912,7 @@ void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, v
     const cudaStream_t s = (cudaStream_t) stream;
     if (two) {
         if (cols == 2304) quantize_kernel<5, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+        else if (cols == 2816) quantize_kernel<6, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
         else { basalt::log::error("basalt", "prefill fp4: %lld token columns (two terms)", (long long) cols); std::exit(1); }
     } else if (cols == 2560) quantize_kernel<5, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
     else if (cols == 640) quantize_kernel<2, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
@@ -945,10 +955,16 @@ template <bool GATHER, bool SWIGLU> void launch256(const GemmArgs& a, dim3 grid,
 }
 
 void run(const Product& p, void* stream) {
-    if (p.base) {   // a layer's experts in one launch
+    if (p.base || p.blobs) {   // a layer's experts in one launch
         if (p.n <= 0 || p.blocks <= 0) return;
-        if ((p.ids != nullptr) != p.swiglu || !p.blk_off || p.gate_softcap <= 0.0f) {
-            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off, softcaps, and token rows with the SwiGLU");
+        if ((p.ids != nullptr) != p.swiglu || !p.blk_off || (p.swiglu && !p.gelu && p.gate_softcap <= 0.0f)) {
+            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off, softcaps or the GELU, and token rows with the gate");
+            std::exit(1);
+        }
+        const bool wide = p.two && p.w_rows % kRows256 == 0;
+        if (p.w_cols % 64 || (!wide && (p.w_cols / 64 * 36) % 8)) {
+            basalt::log::error("basalt", "prefill fp4: %lld weight columns (whole 64-value blocks; the 128-row tiles take 8-byte rows)",
+                               (long long) p.w_cols);
             std::exit(1);
         }
         GemmArgs a{};
@@ -956,11 +972,11 @@ void run(const Product& p, void* stream) {
         a.gs = p.gs; a.bounds = p.bounds; a.tile_off = p.tile_off; a.ids = p.ids; a.dst = p.dst; a.dst_f16 = p.dst_f16; a.ld_dst = p.ld_dst;
         a.tail_off = p.tail_off;
         a.a4s = p.ids ? (const uint8_t*) p.a4 + (size_t) p.tokens * (size_t) ((p.two ? 2 : 1) * p.w_cols / 2) : nullptr;
-        a.base = p.base; a.stride = p.stride; a.blk_off = p.blk_off; a.n = p.n; a.dst_ids = p.dst_ids;
-        a.cg = p.gate_softcap; a.cu = p.up_softcap;
+        a.base = p.base; a.stride = p.stride; a.blobs = p.blobs; a.blk_off = p.blk_off; a.n = p.n; a.dst_ids = p.dst_ids;
+        a.cg = p.gate_softcap; a.cu = p.up_softcap; a.gelu = p.gelu;
         const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) p.blocks, 1);
         if (p.two) {
-            if (p.w_rows % kRows256 == 0) {
+            if (wide) {
                 const dim3 grid256((unsigned) (p.w_rows / kRows256), (unsigned) p.blocks, 1);
                 if (p.swiglu) launch256<true, true>(a, grid256, (cudaStream_t) stream);
                 else launch256<false, false>(a, grid256, (cudaStream_t) stream);
@@ -973,8 +989,8 @@ void run(const Product& p, void* stream) {
         return;
     }
     if (p.n <= 0 || p.max_rows <= 0) return;
-    if ((p.ids != nullptr) != p.swiglu) {
-        basalt::log::error("basalt", "prefill fp4: token rows go with the SwiGLU output only");
+    if ((p.ids != nullptr) != p.swiglu || p.gelu || p.w_cols % kKTile) {
+        basalt::log::error("basalt", "prefill fp4: token rows go with the SwiGLU output only (whole k-tiles, no GELU)");
         std::exit(1);
     }
     GemmArgs a{};

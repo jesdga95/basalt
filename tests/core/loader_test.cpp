@@ -41,10 +41,16 @@ struct TestFile {
         std::mt19937_64 rng(7);
         for (uint8_t& b : bytes) b = (uint8_t) rng();
         std::FILE* f = basalt::platform::open_file_utf8(path, "wb");
-        std::fwrite(bytes.data(), 1, bytes.size(), f);
-        std::fclose(f);
+        check(f != nullptr, "open test file");
+        if (f != nullptr) {
+            check(std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size(), "write test file");
+            std::fclose(f);
+        }
     }
-    ~TestFile() { std::filesystem::remove(path); }
+    ~TestFile() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
 };
 
 bool has_device() {
@@ -64,7 +70,7 @@ void host_ranges(const TestFile& f, int threads) {
     LoadPlan plan;
     const int file = plan.file(f.path);
     std::vector<std::vector<uint8_t>> out;
-    for (const R& r : ranges) out.emplace_back(r.len + 8, 0xEE);
+    for (const R& r : ranges) out.emplace_back(r.len + 8, (uint8_t) 0xEE);
     for (size_t i = 0; i < out.size(); ++i) {
         LoadItem it;
         it.file = file;
@@ -222,8 +228,11 @@ void bf16_blocks(Conv conv) {
     {
         std::vector<uint8_t> pad(off, 0x5a);
         std::FILE* fp = basalt::platform::open_file_utf8(path, "wb");
-        std::fwrite(pad.data(), 1, pad.size(), fp);
-        std::fwrite(vals.data(), 2, vals.size(), fp);
+        check(fp != nullptr, "open block test file");
+        if (fp == nullptr) return;
+        check(std::fwrite(pad.data(), 1, pad.size(), fp) == pad.size() &&
+                  std::fwrite(vals.data(), 2, vals.size(), fp) == vals.size(),
+              "write block test file");
         std::fclose(fp);
     }
     std::vector<uint8_t> want(n / 32 * (uint64_t) bb);
@@ -526,6 +535,8 @@ void steps(const TestFile& f) {
 
 void descriptor(const TestFile& f) {
     const int fd = basalt::platform::open_fd_utf8(f.path);
+    check(fd >= 0, "open descriptor");
+    if (fd < 0) return;
     std::vector<uint8_t> dst(100000);
     LoadPlan plan;
     LoadItem it;

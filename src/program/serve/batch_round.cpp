@@ -1,4 +1,4 @@
-// src/program/serve/batch_round.cpp - the batch slots' rounds, for every model (docs/design/batching.md): each active slot's
+// src/program/serve/batch_round.cpp - the batch slots' rounds, for every model (docs/architecture/batching.md): each active slot's
 // window, the rows the windows share, the groups that run as one batch through the model's sessions, then each slot's
 // accepted drafts, grammar, logprobs, tokens out and next drafts.
 #include "batch_plan.hpp"
@@ -29,18 +29,37 @@ struct SlotWin {
     int want = 0;
     bool drafting = false;
     bool solo = true;
+    bool reading = false;    // the rows are prompt tokens the slot reads (BSlot::pend)
+    bool confident = false;   // a batch round's window of stated-chance drafts: the rows batch_confident_shares gave it
 };
 
-// The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, or as its drafter's
-// own length rule keeps).
+// The slot's next window: its anchor and the drafts its drafter left (as many as the draft policy takes, as its drafter's
+// own length rule keeps, or in a confident window as many as the limit).
 void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
     BSlot& sl = bs[(size_t) b];
     basalt::model::ModelSession& s = slot_session(b);
+    w.reading = !sl.pend.empty();
+    if (w.reading) {   // forced rows as the solo request reads them (SessionRequest::read_windows): the anchor and the next ones
+        w.T = (int) std::min<int64_t>((int64_t) s.max_window(), (int64_t) sl.pend.size());
+        w.from_sfx = false;
+        w.match = 0;
+        w.win.assign((size_t) w.T, 0);
+        w.out.assign((size_t) w.T, -1);
+        w.win[0] = sl.x;
+        std::copy(sl.pend.begin(), sl.pend.begin() + (w.T - 1), w.win.begin() + 1);
+        w.history.clear();
+        w.d = {};
+        w.d.tokens = w.win.data();
+        w.d.n_tokens = w.T;
+        w.d.pos = sl.p;
+        w.d.next_token = &w.out[(size_t) w.T - 1];
+        return;
+    }
     const int own_limit = s.window_limit(sl.p);
     const int most = (int) std::min<int64_t>({(int64_t) s.max_window(), slot_context(b) - sl.p, (int64_t) std::size(sl.dr) + 1, (int64_t) limit,
                                               own_limit > 0 ? (int64_t) own_limit : INT64_MAX});
     const int own = s.own_window(sl.dprob, sl.n_dr);
-    w.T = std::max(1, std::min(own > 0 ? own : bpolicy->window(sl.dprob, sl.n_dr), most));
+    w.T = std::max(1, std::min(own > 0 ? own : w.confident ? sl.n_dr + 1 : bpolicy->window(sl.dprob, sl.n_dr), most));
     w.from_sfx = false;
     w.match = 0;
     if (sl.sfx && most >= 2) {   // a lookup proposal, as in the solo loop
@@ -100,6 +119,23 @@ bool Runtime::slot_window_finish(int b, SlotWin& w) {
 
 // The window's accepted drafts, grammar, logprobs and tokens; the rows it keeps (w.kept); whether drafts follow (w.want).
 bool Runtime::slot_window_accept(int b, SlotWin& w) {
+    if (w.reading) {   // every row stays; the slot's next token is the prompt's next one
+        BSlot& sl = bs[(size_t) b];
+        const int T = w.T;
+        sl.ids.insert(sl.ids.end(), w.win.begin(), w.win.end());
+        if (sl.sfx)
+            for (int i = 0; i < T; ++i) sl.sfx->append(sl.pend[(size_t) i]);
+        sl.p += T;
+        sl.x = sl.pend[(size_t) T - 1];
+        sl.pend.erase(sl.pend.begin(), sl.pend.begin() + T);
+        w.kept = T;
+        w.a = 0;
+        w.line.clear();
+        w.fin = nullptr;
+        w.want = 0;
+        w.drafting = false;
+        return true;
+    }
     std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
     bool grammar_dead = false;    // the grammar allowed no token: the slot ends as an error after this window
     const auto failed = [&](const std::string& m) {
@@ -184,11 +220,18 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
     basalt::model::ModelSession& s = slot_session(b);
     const int T = w.T, a = w.a;
     const char* fin = w.fin;
+    if (w.reading) {   // the prompt read: its turn checkpoint, as the solo request takes it
+        if (sl.pend.empty() && sl.pend_check && !slot_turn_checkpoint(b)) {
+            std::printf("ERR saving a conversation checkpoint failed: %s\n", err.c_str());
+            return false;
+        }
+        return true;
+    }
     basalt::protocol::emit_text(w.line + "\n");
     basalt::core::progress_beat();
     if (w.drafting) {
         const int max_n = std::min(s.max_window() - 1, (int) std::size(sl.dr));
-        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || bpolicy->may_verify(c, j, m); };
+        const auto need = [&](const float* c, int j, int m) { return (j == 0 && sl.sfx) || w.confident || bpolicy->may_verify(c, j, m); };
         if (const basalt::model::Result r = s.draft_end(sl.dr, sl.dprob, max_n, sl.n_dr, need); !r.ok()) {
             std::printf("ERR %s\n", r.message.c_str());
             return false;
@@ -197,6 +240,8 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             const double ms = s.window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
             if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
             else bpolicy->observe_window(w.chance, T, a, ms);
+        } else if (!w.from_sfx) {
+            bpolicy->observe_chances(w.chance, T, a);
         }
     }
     if (fin != nullptr) end_slot(b, fin);
@@ -250,22 +295,24 @@ bool Runtime::batch_round() {
         }
         return true;
     }
-    // the windows of a round share the batch's rows.  Drafts with stated chances: with no more slots than rows one pass
-    // serves all, the rows going to the drafts likeliest kept.  Drafters that set their own length: each window as it would
-    // run alone, shared max-min fairly when they do not fit (a window held to fewer takes its drafts again within its share)
+    // the windows of a round share the batch's rows.  Drafts with stated chances: each slot its leading drafts by
+    // batch_confident_shares (one slot: the policy's window).  Drafters that set their own length: each window as it would run alone, shared max-min fairly when
+    // they do not fit (a window held to fewer takes its drafts again within its share)
     constexpr int kShortSpecCap = 16;
     constexpr int kLongSpecCap = 96;
     const int n_act = (int) act.size();
-    int64_t max_pos = 0;
-    for (int i = 0; i < n_act; ++i) max_pos = std::max(max_pos, bs[(size_t) act[(size_t) i]].p);
-    const int spec_cap = max_pos >= 4096 ? std::min(cap, kLongSpecCap) : std::min(cap, kShortSpecCap);
-    const int row_cap = std::min(cap, std::max(n_act, spec_cap));
-    const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : row_cap;
-    const int per_slot_cap = std::min(row_cap, slot_cap_by_n);
+    const int slot_cap_by_n = n_act >= 24 ? 2 : n_act >= 6 ? 3 : n_act >= 2 ? 5 : cap;
+    int spec_cap = cap, per_slot_cap = std::min(cap, slot_cap_by_n);
     std::vector<SlotWin> wins(act.size());
+    bool confident = false;
     std::vector<int> rows(act.size());
     const BSlot& s0 = bs[(size_t) act[0]];
     if (slot_session(act[0]).own_window(s0.dprob, s0.n_dr) > 0) {
+        int64_t max_pos = 0;
+        for (int i = 0; i < n_act; ++i) max_pos = std::max(max_pos, bs[(size_t) act[(size_t) i]].p);
+        spec_cap = max_pos >= 4096 ? std::min(cap, kLongSpecCap) : std::min(cap, kShortSpecCap);
+        const int row_cap = std::min(cap, std::max(n_act, spec_cap));
+        per_slot_cap = std::min(row_cap, slot_cap_by_n);
         for (int i = 0; i < n_act; ++i) {
             slot_window_begin(act[(size_t) i], wins[(size_t) i], per_slot_cap);
             rows[(size_t) i] = wins[(size_t) i].T;
@@ -277,6 +324,8 @@ bool Runtime::batch_round() {
                 rows[(size_t) i] = wins[(size_t) i].T;
             }
     } else {
+        confident = n_act > 1;
+        if (confident) per_slot_cap = std::min(cap, kSpecMax + 1);
         std::vector<std::vector<double>> joint(act.size());
         for (int i = 0; i < n_act; ++i) {
             const BSlot& sl = bs[(size_t) act[(size_t) i]];
@@ -284,13 +333,15 @@ bool Runtime::batch_round() {
             const int max_k = std::min(sl.n_dr, std::max(0, per_slot_cap - 1));
             for (int k = 0; k < max_k; ++k) joint[(size_t) i].push_back(all *= bpolicy->chance_rate(sl.dprob[k]));
         }
-        const std::vector<int> share = batch_shares(joint, row_cap);
+        const std::vector<int> share = confident ? batch_confident_shares(joint, (int) bs.size(), cap) : batch_shares(joint, cap);
         for (int i = 0; i < n_act; ++i) {
+            wins[(size_t) i].confident = confident;
             slot_window_begin(act[(size_t) i], wins[(size_t) i], std::min(share[(size_t) i], per_slot_cap));
             rows[(size_t) i] = wins[(size_t) i].T;
         }
     }
-    for (const std::vector<size_t>& group : batch_groups(rows, cap)) {
+    const std::vector<std::vector<size_t>> groups = batch_groups(rows, cap);
+    for (const std::vector<size_t>& group : groups) {
         const Clock::time_point t0 = Clock::now();
         stats_lookups_begin();
         std::vector<basalt::model::ModelSession*> ss;
@@ -314,8 +365,10 @@ bool Runtime::batch_round() {
             wins[i].solo = group.size() == 1;
             if (!slot_window_accept(act[i], wins[i])) return false;
             kept.push_back(wins[i].kept);
-            // bound drafted tokens to what a slot's share of the batch window can verify next round
-            wins[i].want = std::min(wins[i].want, std::min(per_slot_cap - 1, std::max(0, (spec_cap + n_act - 1) / n_act - 1)));
+            // bound drafted tokens to what a slot's share of the batch window can verify next round; a confident round's
+            // slots draft the most the rule may take
+            if (confident && wins[i].want > 0) wins[i].want = kSpecMax;
+            else wins[i].want = std::min(wins[i].want, std::min(per_slot_cap - 1, std::max(0, (spec_cap + n_act - 1) / n_act - 1)));
             if (wins[i].want > 0) {
                 const BSlot& sl = bs[(size_t) act[i]];
                 ds.push_back(&slot_session(act[i]));

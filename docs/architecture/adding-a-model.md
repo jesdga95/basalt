@@ -14,14 +14,14 @@ A model lives in `src/models/<arch>/` and `include/basalt/models/<arch>/`. Share
 - A dialect in `serve/models/`: prompt rendering, output parsing, stop texts.
 
 Registering it is one word: the id in `BASALT_BUILTIN_MODELS` (`cmake/models.cmake`), which adds it to `-DBASALT_MODELS`
-([building](building.md#building-only-some-models)) and to the registration in `src/models/builtin.cpp`. Everything of the model in
+([building](../building.md#building-only-some-models)) and to the registration in `src/models/builtin.cpp`. Everything of the model in
 `CMakeLists.txt` (its libraries, kernels, tests and tools) sits under `if(BASALT_MODEL_<ARCH>)`, so a build without it compiles none of it.
 
 The router then needs one config entry. Nothing in the server names a model.
 
 ## Fixtures, flags and loading
 
-- Benchmark token ids go in `data/bench/<arch>`. `--quality` needs a BF16 reference.
+- Benchmark token ids go in `data/bench/<arch>`. Quality is measured against a BF16 reference with the [quality suite](../precision/quality-suite.md) (`basalt-bench --quality REF.safetensors`; `--kld --kld-base FILE` runs the wikitext KLD gate).
 - Flags: `parse_flag` and `finish_flags`. A flag a model lacks is the normal unknown-argument error. Token id flags default to the pack's tokens.
 - The start (`ModelAdapter::start`) runs in three steps. The model's `plan` decides and allocates everything, in the order its
   sizing depends on (weights, then what is sized from the memory left: caches, tiers, a peer's prompt stages), and queues every
@@ -43,9 +43,9 @@ The router then needs one config entry. Nothing in the server names a model.
   `model::PeerHooks` (what a peer holds, its room, what the model does with the shared deal) and `model::SplitHooks` (what each layer
   needs and what each card has; the shared driver cuts by the shares). The model receives `GpuCards` in its `LoadRequest` and writes
   each card's part of the start line; it never prices a mode or picks a cut. Check it with `--diag-gpu-check` and
-  `tools/gpu_identity.py` against one card ([several GPUs](design/multi-gpu.md)).
+  `tools/gpu_identity.py` against one card ([several GPUs](multi-gpu.md)).
 - `--parallel` slots in one pass through the weights: derive the session from `model::BatchSession`, write its hooks and run
-  the batch check, see [batched decoding](design/batching.md#adding-batching-to-a-model).
+  the batch check, see [batched decoding](batching.md#adding-batching-to-a-model).
 - A model with its own fast path derives from `serve::Runtime` and `serve::Request`; see `src/models/qwen4exp/`.
 - A dense model of GDN and gated attention layers (the Qwen3.5 family) needs only its pack read into `dense::Geometry` and
   `dense::Weights` (`include/basalt/dense/model.hpp`): the shared dense stack runs the layers, the drafters (MTP layer or DFlash

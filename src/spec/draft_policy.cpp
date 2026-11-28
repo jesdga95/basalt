@@ -214,6 +214,11 @@ bool DraftPolicy::may_verify(const float* chance, int j, int n) const {
 }
 
 void DraftPolicy::observe_window(const float* chance, int t, int accepted, double round_ms) {
+    observe_chances(chance, t, accepted);
+    observe(false, t, accepted, 0, round_ms);
+}
+
+void DraftPolicy::observe_chances(const float* chance, int t, int accepted) {
     // drafts 0..accepted-1 were accepted given their prefix and draft `accepted` (if the window had it) was not; the
     // drafts after it were never tested
     const int tested = std::min(t - 1, accepted + 1);
@@ -222,7 +227,6 @@ void DraftPolicy::observe_window(const float* chance, int t, int accepted, doubl
         c_ok_[b] = kChanceDecay * c_ok_[b] + (i < accepted ? 1.0 : 0.0);
         c_n_[b] = kChanceDecay * c_n_[b] + 1.0;
     }
-    observe(false, t, accepted, 0, round_ms);
 }
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {

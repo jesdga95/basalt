@@ -8,6 +8,7 @@
 #include "basalt/core/device_copy.hpp"
 #include "../cpu_expert_drain.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/expert_rows.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/router.hpp"
@@ -26,6 +27,8 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -226,6 +229,17 @@ std::vector<double> norm_ref(const std::vector<double>& x, const std::vector<flo
 
 // The q8_1 blocks of `rows` rows of `width` against a CPU rounding of the kernel's own fp32 rows `x`: the int8 values and
 // the scale exactly, the sum to its fp16 rounding.
+// The experts' f16 activation rows (xh_pos layout) of `rows` rows of `width` against the f16 rounding of the kernel's
+// own fp32 rows `x`, exactly.
+void check_xh(const char* what, const void* dxh, const std::vector<float>& x, int rows, int width) {
+    const std::vector<uint16_t> h = host(static_cast<const uint16_t*>(dxh), (size_t) rows * width);
+    bool ok = true;
+    for (int r = 0; r < rows && ok; ++r)
+        for (int i = 0; i < width && ok; ++i) ok = h[(size_t) r * width + basalt::kernels::xt::xh_pos(i)] == f2h(x[(size_t) r * width + i]);
+    std::printf("%-34s %s\n", what, ok ? "exact" : "FAIL");
+    failures += !ok;
+}
+
 void check_q8(const char* what, const void* dq8, const std::vector<float>& x, int rows, int width) {
     const size_t nb = (size_t) rows * width / 32;
     std::vector<uint8_t> q = host(static_cast<const uint8_t*>(dq8), nb * 36);
@@ -649,7 +663,7 @@ void test_experts() {
     void* scr = zeros<uint8_t>(bk::native_expert_scratch_bytes(R * K, FF));
     cudaStream_t st;
     cudaStreamCreate(&st);
-    moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx, xq, H, R, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, NE, R * K, xq, scr, rows, st);
     moe_combine(rows, dw, R, K, y, st);
@@ -676,7 +690,7 @@ void test_experts() {
         }
     report("experts (NVFP4, softcapped SwiGLU)", got, ref, 2e-2);   // q8_1 activations
     // the plan of row 1 alone gives that row's bits
-    moe_plan(dids + K, 1, K, NE, dtable, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids + K, 1, K, NE, dtable, ptr, start, ng, dst, tok, st);
     bk::native_quantize_q8_1(dx + H, xq, H, 1, st);
     bk::native_expert_grouped(L, ptr, start, ng, dst, tok, K, K, xq, scr, rows, st);
     float* y1 = zeros<float>(H);
@@ -688,7 +702,7 @@ void test_experts() {
     std::vector<unsigned long long> off = table;
     off[2] = 0;
     unsigned long long* doff = dev(off);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st);
     cudaStreamSynchronize(st);
     const int n_g = host(ng, 1)[0];
     const std::vector<int32_t> hs = host(start, (size_t) R * K + 2), hd = host(dst, (size_t) R * K);
@@ -702,8 +716,8 @@ void test_experts() {
     failures += !plan_ok;
     // the console's tally: two plans add each expert's pairs on the card to its entry, the expert off it stays at zero
     uint32_t* tally = zeros<uint32_t>(NE);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
-    moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
+    basalt::kernels::moe_plan(dids, R, K, NE, doff, ptr, start, ng, dst, tok, st, tally);
     cudaStreamSynchronize(st);
     const std::vector<uint32_t> ht = host(tally, NE);
     bool tally_ok = true;
@@ -946,6 +960,22 @@ void test_controllers() {
     three.norm_out = zeros<float>((size_t) 3 * E);
     controllers(three, S, 3, nullptr);
     same_bits("  three rows", host(three.norm_out, (size_t) 3 * E).data(), got.data(), (size_t) 3 * E * 4);
+    {   // a batch window of 320 rows: its first rows against the 8-row launch
+        const int W = 320;
+        CtrlArgs wide = a;
+        for (int s = 0; s < S; ++s) {
+            std::vector<float> d = randn((size_t) W * E, 1.f), m = randn((size_t) W * E, 1.f);
+            std::copy(dest[s].begin(), dest[s].end(), d.begin());
+            std::copy(msg[s].begin(), msg[s].end(), m.begin());
+            wide.dest[s] = dev(d);
+            wide.msg[s] = dev(m);
+            wide.q8[s] = zeros<uint8_t>((size_t) W * E / 32 * 36);
+        }
+        wide.norm_out = zeros<float>((size_t) W * E);
+        controllers(wide, S, W, nullptr);
+        same_bits("  320 rows", host(wide.norm_out, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
+        std::printf("  %.1f us a call (320 rows, 3 streams)\n", time_us([&] { controllers(wide, S, W, nullptr); }));
+    }
     std::printf("  %.1f us a call (1 row, 3 streams)\n", time_us([&] { controllers(one, S, 1, nullptr); }));
     std::printf("  %.1f us a call (%d rows, 3 streams)\n", time_us([&] { controllers(a, S, R, nullptr); }), R);
 }
@@ -1001,7 +1031,8 @@ void test_attention_window() {
     struct Case { bool window; int p0, R; int64_t cap; };
     const Case cases[] = {{true, 0, 1, kExtent + 8}, {true, 300, 3, kExtent + 8}, {true, 2900, 8, kExtent + 8},
                           {false, 700, 8, 4096}, {false, 120, 2, 4096}, {false, 2000, 2, 4096},
-                          {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096}};   // 2 rows: one slice, a slice each, the ring before position 0
+                          {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096},   // 2 rows: one slice, a slice each, the ring before position 0
+                          {false, 1012, 8, 4096}, {false, 1020, 8, 4096}};   // full keys up to 1019 (one kernel), past 1024 (prepare, splits, merge)
     for (const Kv kv : kAllKv)
         for (const Case& k : cases) {
             const int R = k.R;
@@ -1078,6 +1109,10 @@ void test_attention_window() {
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
                             time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }), kv_tag(kv));
             }
+            if (!k.window && R == 8 && k.p0 == 700) {
+                std::printf("  %.1f us a call (8 rows, 708 keys%s: one kernel)\n",
+                            time_us([&] { attention_window(pa[1], aa[1], R, max_keys, scr, nullptr); }), kv_tag(kv));
+            }
             if (k.window && R == 3) {
                 std::printf("  %.1f us a call (1 row, 301 keys, fused)  %.1f us (prepare + attention)%s\n",
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
@@ -1102,7 +1137,7 @@ void test_post_attn() {
             }
             a.o = dev(o); a.pos = dev(pos); a.taps = dev(taps); a.ring = dev(ring); a.hid = dev(hid); a.boundary = boundary;
             a.resid = zeros<float>((size_t) R * E); a.query = dev(q); a.norm = dev(w);
-            a.q8 = zeros<uint8_t>((size_t) R * E / 32 * 36); a.norm_out = zeros<float>((size_t) R * E);
+            a.xh = zeros<uint16_t>((size_t) R * E); a.norm_out = zeros<float>((size_t) R * E);
             if (mix_only) a.mix_out = zeros<float>((size_t) R * E);
             post_attn(a, R, nullptr);
             const std::vector<float> res = host(a.resid, (size_t) R * E);
@@ -1128,7 +1163,7 @@ void test_post_attn() {
             }
             const std::vector<float> got = host(mix_only ? a.mix_out : a.norm_out, (size_t) R * E);
             report(mix_only ? "  the MLP's mix" : "  the MLP's normed input", got, ref, 4e-6);
-            if (!mix_only) check_q8("  its q8_1 blocks", a.q8, got, R, E);
+            if (!mix_only) check_xh("  its f16 expert rows", a.xh, got, R, E);
             const std::vector<float> nr = host(a.ring, (size_t) kConvRing * E);
             bool ring_ok = true;
             for (int r = 0; r < R; ++r) ring_ok = ring_ok && !std::memcmp(&nr[(size_t) (pos[r] % kConvRing) * E], &o[(size_t) r * E], E * 4);
@@ -1140,7 +1175,7 @@ void test_post_attn() {
                 PostAttn one = a;
                 one.o = a.o + 2 * E; one.pos = a.pos + 2; one.ring = dev(ring2); one.hid = a.hid + 2 * E;
                 for (int i = 0; i < nb; ++i) one.blocks[i] = a.blocks[i] + 2 * E;
-                one.resid = zeros<float>(E); one.norm_out = zeros<float>(E); one.q8 = zeros<uint8_t>(E / 32 * 36);
+                one.resid = zeros<float>(E); one.norm_out = zeros<float>(E); one.xh = zeros<uint16_t>(E);
                 post_attn(one, 1, nullptr);
                 same_bits("  a row alone", host(one.norm_out, E).data(), &got[(size_t) 2 * E], (size_t) E * 4);
                 std::printf("  %.1f us a call (1 row, %d blocks)\n", time_us([&] { post_attn(one, 1, nullptr); }), nb);
@@ -1174,34 +1209,6 @@ void test_expert_prefetch() {
         std::printf("%-34s %s\n", all ? "expert_prefetch: every one in RAM" : "expert_prefetch: some in RAM", skip_ok ? "ok" : "FAIL");
         failures += !skip_ok;
     }
-}
-
-void test_moe_finish() {
-    const int R = 4, K = 8;
-    std::vector<int> pos = {130, 131, 132, 133};
-    const std::vector<float> rows = randn((size_t) R * K * E, 0.3f), w = randn((size_t) R * K, 0.3f, 1.f), taps = randn((size_t) E * kConv, 0.3f),
-                             ring = randn((size_t) kConvRing * E, 0.4f), resid = randn((size_t) R * E, 1.0f);
-    MoeFinish a;
-    a.rows = dev(rows); a.w = dev(w); a.k = K; a.pos = dev(pos); a.taps = dev(taps); a.ring = dev(ring); a.resid = dev(resid);
-    a.out = zeros<float>((size_t) R * E);
-    moe_finish(a, R, nullptr);
-    // the kernels it replaces: moe_combine, then post_conv with the residual
-    float *y = zeros<float>((size_t) R * E), *out2 = zeros<float>((size_t) R * E), *ring2 = dev(ring);
-    moe_combine(a.rows, a.w, R, K, y, nullptr);
-    post_conv(y, a.pos, a.taps, ring2, a.resid, R, out2, nullptr);
-    const std::vector<float> got = host(a.out, (size_t) R * E);
-    same_bits("moe_finish = moe_combine + post_conv", got.data(), host(out2, (size_t) R * E).data(), (size_t) R * E * 4);
-    same_bits("  the ring", host(a.ring, (size_t) kConvRing * E).data(), host(ring2, (size_t) kConvRing * E).data(), (size_t) kConvRing * E * 4);
-    MoeFinish t = a;   // with the drafter's tap: the same rows in both outputs
-    t.ring = dev(ring);
-    t.out = zeros<float>((size_t) R * E);
-    t.tap = zeros<float>((size_t) R * E);
-    moe_finish(t, R, nullptr);
-    same_bits("  with a tap: the output", host(t.out, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
-    same_bits("  with a tap: the tap", host(t.tap, (size_t) R * E).data(), got.data(), (size_t) R * E * 4);
-    MoeFinish one = a;
-    one.rows = a.rows + (size_t) 3 * K * E; one.w = a.w + 3 * K; one.pos = a.pos + 3; one.resid = a.resid + 3 * E; one.out = zeros<float>(E);
-    std::printf("  %.1f us a call (1 row)\n", time_us([&] { moe_finish(one, 1, nullptr); }));
 }
 
 // The CPU experts' rows into the experts' output (moe_cpu_merge): from mapped host memory a host function filled, in a
@@ -1277,33 +1284,60 @@ void test_cpu_merge() {
     failures += !ok;
 }
 
-// A host thread serving the doorbell as cpu_experts.cpp does: a raised bell taken (cleared), then after `delay_us` each
-// pair whose expert is off the card gets row (x_m row * 0.5 + its expert + the replay) in `out`, then `done`.
+// A host thread serving the doorbell as cpu_experts.cpp does: a new rows publication is read (after `early_us`, a slow
+// early consumer) into `q` as the pool's input and acknowledged; a raised bell is taken (cleared), its rows read again
+// if their publication is not the one read, then after `delay_us` each pair whose expert is off the card gets row
+// (input row * 0.5 + its expert + the replay) in `out`, then `done`. `copies` keeps every publication's read, by number.
 struct BellServer {
     CpuBell* bell = nullptr;
     const float* x_m = nullptr;
     const int32_t* ids_m = nullptr;
     float* out = nullptr;
     const unsigned long long* tab = nullptr;   // host copy of the blob table
-    int k = 0, delay_us = 0, layer = -1, rows = -1;
-    std::atomic<int> replay{0}, rings{0};
+    int k = 0, delay_us = 0, early_us = 0, layer = -1, rows = -1;
+    std::atomic<int> replay{0}, rings{0}, reread{0};
     std::atomic<bool> stop{false};
+    std::vector<float> q = std::vector<float>((size_t) kDecodeRows * E);
+    std::map<uint32_t, std::vector<float>> copies;
+    std::mutex mu;
     std::thread t;
     void start() {
         t = std::thread([this] {
-            std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done);
+            std::atomic_ref<uint32_t> ring(bell->ring), ticket(bell->ticket), fin(bell->done), raised(bell->rows),
+                shape(bell->rows_shape), acked(bell->rows_ack), ring_rows(bell->ring_rows);
+            uint32_t taken = 0;
+            auto read_rows = [&](int n) { std::memcpy(q.data(), x_m, (size_t) n * E * sizeof(float)); };
+            auto take_rows = [&] {
+                const uint32_t n = raised.load(std::memory_order_acquire);
+                if (!n || n == taken) return;
+                const int r = (int) (shape.load(std::memory_order_relaxed) >> 16);
+                if (early_us) std::this_thread::sleep_for(std::chrono::microseconds(early_us));
+                read_rows(r);
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    copies[n] = std::vector<float>(q.begin(), q.begin() + (size_t) r * E);
+                }
+                taken = n;
+                acked.store(n, std::memory_order_release);
+            };
             while (!stop.load(std::memory_order_relaxed)) {
+                take_rows();
                 const uint32_t w = ring.load(std::memory_order_acquire);
                 if (!w) continue;
-                const uint32_t visit = ticket.load(std::memory_order_relaxed);
+                const uint32_t visit = ticket.load(std::memory_order_relaxed), pub = ring_rows.load(std::memory_order_relaxed);
                 ring.store(0, std::memory_order_relaxed);
+                take_rows();
                 layer = (int) (w >> 8 & 0xffu);
                 rows = (int) (w >> 16);
+                if (pub == 0 || pub != taken) {
+                    read_rows(rows);
+                    reread.fetch_add(1);
+                }
                 if (delay_us) std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
                 for (int p = 0; p < rows * k; ++p)
                     if (!tab[ids_m[p]])
                         for (int c = 0; c < E; ++c)
-                            out[(size_t) p * E + c] = x_m[(size_t) (p / k) * E + c] * 0.5f + (float) ids_m[p] + (float) replay.load();
+                            out[(size_t) p * E + c] = q[(size_t) (p / k) * E + c] * 0.5f + (float) ids_m[p] + (float) replay.load();
                 rings.fetch_add(1);
                 fin.store(visit, std::memory_order_release);
             }
@@ -1314,6 +1348,29 @@ struct BellServer {
         t.join();
     }
 };
+
+// After a stream's visits have run: the latest rows publication, acquired, and whether the host acknowledged it within a
+// deadline (an all-card visit's stream can finish while the host still reads its rows), before the payload is checked or
+// poisoned again.
+bool rows_acked(CpuBell* bell) {
+    const uint32_t pub = std::atomic_ref<uint32_t>(bell->rows).load(std::memory_order_acquire);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::atomic_ref<uint32_t>(bell->rows_ack).load(std::memory_order_acquire) != pub) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::yield();
+    }
+    return pub != 0;
+}
+
+// rows_acked, or the case stops: the test's host is joined (it may still own the buffer), the failure printed, and the
+// process ends before anything reuses or frees the buffers.
+void require_ack(CpuBell* bell, BellServer& sv, const char* where) {
+    if (rows_acked(bell)) return;
+    sv.end();
+    std::printf("moe_cpu_ring + merge: doorbell FAIL (%s: rows not acknowledged)\n", where);
+    std::fflush(stdout);
+    std::_Exit(1);
+}
 
 // Replay a ring/merge graph with a delayed host. Only RAM visits advance the ticket and publish their choices and
 // RAM rows. The merge takes the host's rows only for the matching ticket in each replay.
@@ -1331,7 +1388,7 @@ void test_cpu_ring() {
     cudaHostGetDevicePointer((void**) &ids_md, ids_m, 0);
     cudaHostGetDevicePointer((void**) &out_md, out_m, 0);
     uint32_t* seq = nullptr;
-    cudaMalloc(&seq, sizeof(*seq));
+    cudaMalloc(&seq, 2 * sizeof(*seq));
     bool ok = true;
     for (int rows = 1; rows <= kDecodeRows; ++rows)
         for (int mode : {0, 1, 2, 3}) {
@@ -1364,11 +1421,12 @@ void test_cpu_ring() {
             sv.start();
             cudaStream_t st;
             cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
-            cudaMemsetAsync(seq, 0, sizeof(*seq), st);
+            cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
-            moe_cpu_ring(di, rows, K, dt, dx, L, x_md, ids_md, bell_d, seq, st);
+            moe_cpu_rows(dx, rows, L, x_md, bell_d, seq, st);
+            moe_cpu_ring(di, rows, K, dt, L, ids_md, bell_d, seq, st);
             moe_cpu_merge(di, rows, K, dt, out_md, dy, tally, st, bell_d, seq);
             cudaStreamEndCapture(st, &graph);
             cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
@@ -1390,6 +1448,7 @@ void test_cpu_ring() {
                 sv.replay.store(replay);
                 cudaGraphLaunch(exec, st);
                 ok &= cudaStreamSynchronize(st) == cudaSuccess;
+                require_ack(bell, sv, "a replay");   // published, and read and handed back by the host
                 if (grows) {
                     ++served;
                     last_rows = rows;
@@ -1407,13 +1466,15 @@ void test_cpu_ring() {
                     }
                 }
                 ok &= counts == want;
-                for (int r = 0; r < kDecodeRows; ++r)   // the payload is this replay's, rows and choices, bit for bit
+                for (int r = 0; r < kDecodeRows; ++r)   // the payload is this replay's, every row and the choices, bit for bit
                     for (int c = 0; c < E; ++c) {
                         const float got = x_m[(size_t) r * E + c];
                         uint32_t bits;
                         std::memcpy(&bits, &got, 4);
-                        ok &= grows >> r & 1 ? std::memcmp(&got, &gx[(size_t) r * E + c], 4) == 0 : bits == 0xffffffffu;
+                        ok &= r < rows ? std::memcmp(&got, &gx[(size_t) r * E + c], 4) == 0 : bits == 0xffffffffu;
                     }
+                ok &= std::atomic_ref<uint32_t>(bell->rows_shape).load(std::memory_order_relaxed) ==
+                      (1u | (uint32_t) L << 8 | (uint32_t) rows << 16);   // this visit's shape
                 for (int p = 0; p < kDecodeRows * K; ++p) ok &= ids_m[p] == (grows && p < pairs ? gids[(size_t) p] : -1);
 
                 // The merge without a bell takes the same completed host rows without the hand-off.
@@ -1429,9 +1490,11 @@ void test_cpu_ring() {
                         constexpr size_t row_values = (size_t) K * E;
                         poison();
                         cudaMemcpyAsync(dy, before.data(), row_values * sizeof(float), cudaMemcpyHostToDevice, st);
-                        moe_cpu_ring(di + r * K, 1, K, dt, dx + (size_t) r * E, L, x_md, ids_md, bell_d, seq, st);
+                        moe_cpu_rows(dx + (size_t) r * E, 1, L, x_md, bell_d, seq, st);
+                        moe_cpu_ring(di + r * K, 1, K, dt, L, ids_md, bell_d, seq, st);
                         moe_cpu_merge(di + r * K, 1, K, dt, out_md, dy, nullptr, st, bell_d, seq);
                         ok &= cudaStreamSynchronize(st) == cudaSuccess;
+                        require_ack(bell, sv, "a one-row visit");   // before the next row's poison
                         const auto single = host(dy, row_values);
                         ok &= std::memcmp(single.data(), y.data() + (size_t) r * row_values, row_values * sizeof(float)) == 0;
                         if (grows >> r & 1) {
@@ -1441,15 +1504,19 @@ void test_cpu_ring() {
                     }
                 }
             }
+            if (rows == 1 && mode == 0)
+                std::printf("  moe_cpu_rows %.1f us a call (1 row, the host acknowledging each)\n",
+                            time_us([&] { moe_cpu_rows(dx, 1, L, x_md, bell_d, seq, nullptr); }));
+            require_ack(bell, sv, "the timing calls");
             sv.end();
             const uint32_t expected = (uint32_t) served;
             ok &= bell->ring == 0 && bell->ticket == expected && bell->abort == 0;
             ok &= bell->done == (served ? expected : UINT32_MAX) && host(seq, 1)[0] == expected;
-            ok &= sv.rings.load() == served;
+            ok &= sv.rings.load() == served && sv.reread.load() == 0;   // every ring found its rows already read
             if (served) ok &= sv.layer == L && sv.rows == last_rows;
             if (rows == 1 && mode != 2) {
                 std::printf("  moe_cpu_ring %.1f us a call (1 row, %s)\n",
-                            time_us([&] { moe_cpu_ring(di, 1, K, dt, dx, L, x_md, ids_md, bell_d, seq, nullptr); }),
+                            time_us([&] { moe_cpu_ring(di, 1, K, dt, L, ids_md, bell_d, seq, nullptr); }),
                             mode == 0 ? "every expert on the card: no bell" : mode == 1 ? "every pair off the card" : "one pair off the card");
                 bell->ring = 0;
             }
@@ -1493,7 +1560,7 @@ void test_cpu_abort() {
     float *dx = dev(x), *dy = dev(before);
     uint32_t* tally = zeros<uint32_t>(NE);
     uint32_t* seq = nullptr;
-    cudaMalloc(&seq, sizeof(*seq));
+    cudaMalloc(&seq, 2 * sizeof(*seq));
     cudaStream_t st;
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
     struct LateCompletion {
@@ -1506,7 +1573,8 @@ void test_cpu_abort() {
     auto capture = [&](int n, cudaGraph_t& graph, cudaGraphExec_t& exec, LateCompletion* completion = nullptr) {
         cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
         for (int v = 0; v < n; ++v) {
-            moe_cpu_ring(di, rows, K, dt, dx, L, x_md, ids_md, bell_d, seq, st);
+            moe_cpu_rows(dx, rows, L, x_md, bell_d, seq, st);
+            moe_cpu_ring(di, rows, K, dt, L, ids_md, bell_d, seq, st);
             if (completion)
                 cudaLaunchHostFunc(st, +[](void* p) { static_cast<LateCompletion*>(p)->publish(); }, completion);
             moe_cpu_merge(di, rows, K, dt, out_md, dy, tally, st, bell_d, seq);
@@ -1533,7 +1601,7 @@ void test_cpu_abort() {
         std::memset(out_m, 0xff, (size_t) kDecodeRows * K * E * 4);
         cudaMemcpyAsync(dy, before.data(), before.size() * 4, cudaMemcpyHostToDevice, st);
         cudaMemsetAsync(tally, 0, NE * 4, st);
-        cudaMemsetAsync(seq, 0, sizeof(*seq), st);
+        cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
     };
     auto require_drain = [&](const char* where) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1578,7 +1646,7 @@ void test_cpu_abort() {
     abort_bell();
     cudaGraphLaunch(exec, st);
     require_drain("pre-aborted visits");
-    ok &= untouched() && payload_untouched() && bell->ring == 0 && bell->ticket == 0 && bell->done == 0;
+    ok &= untouched() && payload_untouched() && bell->ring == 0 && bell->rows == 0 && bell->ticket == 0 && bell->done == 0;
     ok &= host(seq, 1)[0] == visits;
     // 3. a served window, then the abort: what was taken stays, the next window takes nothing
     reset();
@@ -1723,6 +1791,147 @@ void test_cpu_abort() {
     cudaFreeHost(out_m);
 }
 
+// The rows buffer's hand-back: a slow early consumer (each publication read 300 us after it is seen), visits of the same
+// layer and width in a row, the first with every expert on the card (published, no ring, a merge that does not wait),
+// the second with pairs off the card, distinct rows each visit and replay. Every publication the host read must be
+// exactly the rows its visit sent (none overwritten while read), the ring's visit must use its own rows without a second
+// read, and an abort between a publication and its ring raises no ring and takes nothing.
+void test_cpu_rows_reuse() {
+    const int K = 8, NE = 128, L = 11, rows = 2, pairs = rows * K;
+    CpuBell *bell = nullptr, *bell_d = nullptr;
+    float *x_m = nullptr, *x_md = nullptr, *out_m = nullptr, *out_md = nullptr;
+    int32_t *ids_m = nullptr, *ids_md = nullptr;
+    cudaHostAlloc((void**) &bell, sizeof(CpuBell), cudaHostAllocMapped);
+    cudaHostAlloc((void**) &x_m, (size_t) kDecodeRows * E * 4, cudaHostAllocMapped);
+    cudaHostAlloc((void**) &ids_m, (size_t) kDecodeRows * K * 4, cudaHostAllocMapped);
+    cudaHostAlloc((void**) &out_m, (size_t) kDecodeRows * K * E * 4, cudaHostAllocMapped);
+    cudaHostGetDevicePointer((void**) &bell_d, bell, 0);
+    cudaHostGetDevicePointer((void**) &x_md, x_m, 0);
+    cudaHostGetDevicePointer((void**) &ids_md, ids_m, 0);
+    cudaHostGetDevicePointer((void**) &out_md, out_m, 0);
+    std::vector<unsigned long long> tab(NE);
+    for (int e = 0; e < NE; ++e) tab[(size_t) e] = e % 2;   // the even experts are off the card
+    std::vector<int32_t> ids_a((size_t) pairs), ids_b((size_t) pairs);
+    for (int p = 0; p < pairs; ++p) {
+        ids_a[(size_t) p] = 2 * ((p * 5) % 64) + 1;   // all on the card
+        ids_b[(size_t) p] = (p % K * 7 + p / K) % NE;
+    }
+    int32_t *da = dev(ids_a), *db = dev(ids_b);
+    unsigned long long* dt = dev(tab);
+    float *xa = dev(randn((size_t) rows * E)), *xb = dev(randn((size_t) rows * E));
+    const std::vector<float> before((size_t) pairs * E, -17.f);
+    float *ya = dev(before), *yb = dev(before);
+    uint32_t* seq = nullptr;
+    cudaMalloc(&seq, 2 * sizeof(*seq));
+    cudaStream_t st;
+    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    *bell = CpuBell{};
+    cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
+    BellServer sv;
+    sv.bell = bell;
+    sv.x_m = x_m;
+    sv.ids_m = ids_m;
+    sv.out = out_m;
+    sv.tab = tab.data();
+    sv.k = K;
+    sv.early_us = 300;
+    sv.start();
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+    moe_cpu_rows(xa, rows, L, x_md, bell_d, seq, st);
+    moe_cpu_ring(da, rows, K, dt, L, ids_md, bell_d, seq, st);
+    moe_cpu_merge(da, rows, K, dt, out_md, ya, nullptr, st, bell_d, seq);
+    moe_cpu_rows(xb, rows, L, x_md, bell_d, seq, st);
+    moe_cpu_ring(db, rows, K, dt, L, ids_md, bell_d, seq, st);
+    moe_cpu_merge(db, rows, K, dt, out_md, yb, nullptr, st, bell_d, seq);
+    cudaStreamEndCapture(st, &graph);
+    cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    bool ok = true;
+    std::vector<std::vector<float>> sent;   // by publication number - 1
+    for (int replay = 1; replay <= 6; ++replay) {
+        const std::vector<float> ga = randn((size_t) rows * E), gb = randn((size_t) rows * E);
+        basalt::core::device_copy(xa, ga.data(), ga.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(xb, gb.data(), gb.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(yb, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
+        sent.push_back(ga);
+        sent.push_back(gb);
+        sv.replay.store(replay);
+        cudaGraphLaunch(exec, st);
+        ok &= cudaStreamSynchronize(st) == cudaSuccess;
+        const std::vector<float> y = host(yb, (size_t) pairs * E);
+        for (int p = 0; p < pairs; ++p) {
+            const int e = ids_b[(size_t) p];
+            for (int c = 0; c < E; ++c) {
+                const float ref = !tab[(size_t) e] ? gb[(size_t) (p / K) * E + c] * 0.5f + (float) e + (float) replay : -17.f;
+                ok &= std::memcmp(&y[(size_t) p * E + c], &ref, 4) == 0;
+            }
+        }
+    }
+    // the host reads the second visit's rows only once, when published: the ring finds them read
+    ok &= sv.rings.load() == 6 && sv.reread.load() == 0;
+    {
+        std::lock_guard<std::mutex> lk(sv.mu);
+        ok &= sv.copies.size() == sent.size();   // every publication read, none skipped
+        for (const auto& [n, got] : sv.copies)
+            ok &= n >= 1 && n <= sent.size() && std::memcmp(got.data(), sent[n - 1].data(), got.size() * 4) == 0;
+        ok &= sv.copies.count((uint32_t) sent.size()) == 1;   // the last publication, a ringing visit's, was read
+    }
+    // an abort between the second visit's publication and its ring: no ring, nothing taken
+    {
+        struct Abort {
+            CpuBell* bell;
+            static void fire(void* p) {
+                std::atomic_ref<uint32_t>(static_cast<Abort*>(p)->bell->abort).store(1, std::memory_order_release);
+            }
+        } ab{bell};
+        basalt::core::device_copy(yb, before.data(), before.size() * 4, cudaMemcpyHostToDevice);
+        const int rung = sv.rings.load();
+        const uint32_t ticket = bell->ticket;
+        moe_cpu_rows(xb, rows, L, x_md, bell_d, seq, st);
+        cudaLaunchHostFunc(st, &Abort::fire, &ab);
+        moe_cpu_ring(db, rows, K, dt, L, ids_md, bell_d, seq, st);
+        moe_cpu_merge(db, rows, K, dt, out_md, yb, nullptr, st, bell_d, seq);
+        ok &= cudaStreamSynchronize(st) == cudaSuccess;
+        const std::vector<float> y = host(yb, (size_t) pairs * E);
+        ok &= std::all_of(y.begin(), y.end(), [](float v) { return v == -17.f; });
+        ok &= sv.rings.load() == rung && bell->ring == 0 && bell->ticket == ticket && bell->rows == (uint32_t) sent.size() + 1;
+    }
+    sv.end();
+    // nobody acknowledges: the second publication waits for the first's acknowledgement until an abort from outside the
+    // stream ends the wait; it then copies and publishes nothing
+    {
+        *bell = CpuBell{};
+        cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), st);
+        const std::vector<float> g1 = randn((size_t) rows * E);
+        basalt::core::device_copy(xa, g1.data(), g1.size() * 4, cudaMemcpyHostToDevice);
+        moe_cpu_rows(xa, rows, L, x_md, bell_d, seq, st);
+        moe_cpu_rows(xb, rows, L, x_md, bell_d, seq, st);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ok &= cudaStreamQuery(st) == cudaErrorNotReady;   // the second is waiting
+        std::atomic_ref<uint32_t>(bell->abort).store(1, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        cudaError_t q = cudaErrorNotReady;
+        while ((q = cudaStreamQuery(st)) == cudaErrorNotReady && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (q != cudaSuccess) {   // the device may still write the shared buffers: neither read nor freed
+            std::printf("moe_cpu_rows: buffer hand-back FAIL (an aborted wait did not drain)\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        ok &= bell->rows == 1 && bell->rows_ack == 0;
+        ok &= std::memcmp(x_m, g1.data(), g1.size() * 4) == 0;   // the first visit's rows, not overwritten
+    }
+    std::printf("%-34s %s\n", "moe_cpu_rows: buffer hand-back", ok ? "ok" : "FAIL");
+    failures += !ok;
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(st);
+    cudaFree(seq);
+    for (void* q : {(void*) da, (void*) db, (void*) dt, (void*) xa, (void*) xb, (void*) ya, (void*) yb}) cudaFree(q);
+    for (void* q : {(void*) bell, (void*) x_m, (void*) ids_m, (void*) out_m}) cudaFreeHost(q);
+}
+
 // Hand-off time from graphs of visits with no CPU expert work: copies plus a host callback versus the doorbell,
 // and doorbell-only timings for visits with no RAM pairs or several RAM pairs.
 void time_cpu_handoff() {
@@ -1759,8 +1968,8 @@ void time_cpu_handoff() {
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
     cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking);
     uint32_t* seq = nullptr;
-    cudaMalloc(&seq, sizeof(*seq));
-    cudaMemsetAsync(seq, 0, sizeof(*seq), side);
+    cudaMalloc(&seq, 2 * sizeof(*seq));
+    cudaMemsetAsync(seq, 0, 2 * sizeof(*seq), side);
     cudaStreamSynchronize(side);
     cudaEvent_t ready, done;
     cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
@@ -1799,7 +2008,8 @@ void time_cpu_handoff() {
     auto bell_visit = [&](const unsigned long long* t, int rows) {
         cudaEventRecord(ready, st);
         cudaStreamWaitEvent(side, ready, 0);
-        moe_cpu_ring(di, rows, K, t, dx, 5, x_md, ids_md, bell_d, seq, side);
+        moe_cpu_rows(dx, rows, 5, x_md, bell_d, seq, side);
+        moe_cpu_ring(di, rows, K, t, 5, ids_md, bell_d, seq, side);
         cudaEventRecord(done, side);
         cudaStreamWaitEvent(st, done, 0);
         moe_cpu_merge(di, rows, K, t, out_md, dy, nullptr, st, bell_d, seq);
@@ -1820,8 +2030,8 @@ void time_cpu_handoff() {
     for (void* q : {(void*) di, (void*) dt, (void*) da, (void*) dw, (void*) dx, (void*) dy}) cudaFree(q);
 }
 
-// A batch window (several conversations' rows in one call, docs/design/batching.md) against each conversation's own call:
-// the attention's q8_1 output, caches and rings, post_attn's and moe_finish's outputs and rings, bitwise. Three segments
+// A batch window (several conversations' rows in one call, docs/architecture/batching.md) against each conversation's own call:
+// the attention's q8_1 output, caches and rings, post_attn's outputs and rings, bitwise. Three segments
 // of 3, 1 and 2 rows (one at position 1, one past the window ring's wrap), over a window ring and a full cache, fp16 and E4M3.
 void test_batch_window() {
     struct Seg { int p0, T; };
@@ -1913,18 +2123,16 @@ void test_batch_window() {
             failures += !same;
             print_hash("q8_1 output", q8b);
         }
-    // post_attn and moe_finish: each conversation's ring and its own rows before it
-    const int nb = 2, K = 8;
+    // post_attn: each conversation's ring and its own rows before it
+    const int nb = 2;
     const std::vector<float> o = randn((size_t) R * E, 0.4f), taps = randn((size_t) E * kConv, 0.3f), hid = randn((size_t) R * E, 1.0f),
-                             q = randn(E, 0.05f), w = randn(E, 0.1f, 1.f), xr = randn((size_t) R * K * E, 0.3f), xw = randn((size_t) R * K, 0.3f, 1.f),
-                             mt = randn((size_t) E * kConv, 0.3f), mres = randn((size_t) R * E, 1.0f);
-    std::vector<std::vector<float>> blocks(nb), ar(S), mr(S);
+                             q = randn(E, 0.05f), w = randn(E, 0.1f, 1.f);
+    std::vector<std::vector<float>> blocks(nb), ar(S);
     for (int i = 0; i < nb; ++i) blocks[i] = randn((size_t) R * E, 0.7f + 0.5f * i);
     for (int i = 0; i < S; ++i) {
         ar[i] = randn((size_t) kConvRing * E, 0.4f);
-        mr[i] = randn((size_t) kConvRing * E, 0.4f);
     }
-    float *d_o = dev(o), *d_hid = dev(hid), *d_xr = dev(xr), *d_xw = dev(xw), *d_mres = dev(mres);
+    float *d_o = dev(o), *d_hid = dev(hid);
     std::vector<float*> d_blocks;
     for (auto& b : blocks) d_blocks.push_back(dev(b));
     const auto post_of = [&](int r0, int rows) {
@@ -1932,53 +2140,34 @@ void test_batch_window() {
         for (int i = 0; i < nb; ++i) a.blocks[a.n_blocks++] = d_blocks[i] + (size_t) r0 * E;
         a.o = d_o + (size_t) r0 * E; a.pos = dpos + r0; a.taps = dev(taps); a.hid = d_hid + (size_t) r0 * E;
         a.resid = zeros<float>((size_t) rows * E); a.query = dev(q); a.norm = dev(w);
-        a.q8 = zeros<uint8_t>((size_t) rows * E / 32 * 36); a.norm_out = zeros<float>((size_t) rows * E);
-        return a;
-    };
-    const auto moe_of = [&](int r0, int rows) {
-        MoeFinish a;
-        a.rows = d_xr + (size_t) r0 * K * E; a.w = d_xw + (size_t) r0 * K; a.k = K; a.pos = dpos + r0; a.taps = dev(mt);
-        a.resid = d_mres + (size_t) r0 * E; a.out = zeros<float>((size_t) rows * E);
+        a.xh = zeros<uint16_t>((size_t) rows * E); a.norm_out = zeros<float>((size_t) rows * E);
         return a;
     };
     std::vector<PostAttn> pa(S);
-    std::vector<MoeFinish> ma(S);
     for (int i = 0; i < S; ++i) {
         pa[i] = post_of(row0[i], segs[i].T);
         pa[i].ring = dev(ar[i]);
         post_attn(pa[i], segs[i].T, nullptr);
-        ma[i] = moe_of(row0[i], segs[i].T);
-        ma[i].ring = dev(mr[i]);
-        moe_finish(ma[i], segs[i].T, nullptr);
     }
     PostAttn pb = post_of(0, R);
-    MoeFinish mb = moe_of(0, R);
-    pb.seg = mb.seg = sg;
-    for (int i = 0; i < S; ++i) {
-        pb.seg.c[i].a_ring = dev(ar[i]);
-        mb.seg.c[i].m_ring = dev(mr[i]);
-    }
+    pb.seg = sg;
+    for (int i = 0; i < S; ++i) pb.seg.c[i].a_ring = dev(ar[i]);
     pb.ring = pb.seg.c[0].a_ring;
-    mb.ring = mb.seg.c[0].m_ring;
     post_attn(pb, R, nullptr);
-    moe_finish(mb, R, nullptr);
     cudaDeviceSynchronize();
-    bool post_same = true, moe_same = true;
+    bool post_same = true;
     const size_t ring_e = (size_t) kConvRing * E;
-    const std::vector<float> nb_all = host(pb.norm_out, (size_t) R * E), res_all = host(pb.resid, (size_t) R * E), out_all = host(mb.out, (size_t) R * E);
-    const std::vector<uint8_t> q8_all = host((uint8_t*) pb.q8, (size_t) R * E / 32 * 36);
+    const std::vector<float> nb_all = host(pb.norm_out, (size_t) R * E), res_all = host(pb.resid, (size_t) R * E);
+    const std::vector<uint16_t> xh_all = host((uint16_t*) pb.xh, (size_t) R * E);
     for (int i = 0; i < S; ++i) {
         const size_t n = (size_t) segs[i].T * E, at = (size_t) row0[i] * E;
         post_same = post_same && !std::memcmp(host(pa[i].norm_out, n).data(), nb_all.data() + at, n * 4) &&
                     !std::memcmp(host(pa[i].resid, n).data(), res_all.data() + at, n * 4) &&
-                    !std::memcmp(host((uint8_t*) pa[i].q8, n / 32 * 36).data(), q8_all.data() + at / 32 * 36, n / 32 * 36) &&
+                    !std::memcmp(host((uint16_t*) pa[i].xh, n).data(), xh_all.data() + at, n * 2) &&
                     host(pa[i].ring, ring_e) == host(pb.seg.c[i].a_ring, ring_e);
-        moe_same = moe_same && !std::memcmp(host(ma[i].out, n).data(), out_all.data() + at, n * 4) &&
-                   host(ma[i].ring, ring_e) == host(mb.seg.c[i].m_ring, ring_e);
     }
     std::printf("%-46s %s\n", "batch window: post_attn", post_same ? "bitwise = each conversation alone" : "FAIL");
-    std::printf("%-46s %s\n", "batch window: moe_finish", moe_same ? "bitwise = each conversation alone" : "FAIL");
-    failures += !post_same + !moe_same;
+    failures += !post_same;
 }
 
 
@@ -2057,7 +2246,7 @@ void test_attention_window_boundary() {
 }
 
 void test_router_select_plan() {
-    std::printf("router_select_plan (rows = 1..64)\n");
+    std::printf("router_select_plan (rows = 1..%d)\n", kBatchRows);
     constexpr int H = kWidth, NE = 128, K = 8, RMAX = kBatchRows;
     const std::vector<float> x = randn((size_t) RMAX * H, 0.5f), gate = randn((size_t) NE * H, 0.05f), bias = randn(NE, 0.1f);
     std::vector<unsigned long long> table(NE);
@@ -2081,14 +2270,14 @@ void test_router_select_plan() {
     for (int r = 0; r < RMAX; ++r) bk::router_logits(dx + (size_t) r * H, dg, 1, ra, dlog1 + (size_t) r * NE, nullptr);
     const std::vector<float> ref_log = host(dlog1, RMAX * NE);
     bool ok = true;
-    for (int R : {1, 2, 7, 16, 35, 64}) {
+    for (int R : {1, 2, 7, 16, 35, 64, kBatchRows}) {
         bk::router_logits(dx, dg, R, ra, dlog, nullptr);
         const std::vector<float> got_log = host(dlog, R * NE);
         ok = ok && std::memcmp(ref_log.data(), got_log.data(), (size_t) R * NE * 4) == 0;
         cudaMemset(tl_ref, 0, NE * 4);
         cudaMemset(tl_got, 0, NE * 4);
         bk::router_select(dlog1, db, R, ra, di_ref, dw_ref, nullptr);
-        moe_plan(di_ref, R, K, NE, dt, p_ref, s_ref, ng_ref, dst_ref, tok_ref, nullptr, tl_ref, rb_ref, rn_ref);
+        bk::moe_plan(di_ref, R, K, NE, dt, p_ref, s_ref, ng_ref, dst_ref, tok_ref, nullptr, tl_ref, rb_ref, rn_ref);
         router_select_plan(dlog, db, R, K, NE, ra.weight_scale, di_got, dw_got, dt, p_got, s_got, ng_got, dst_got, tok_got, nullptr,
                            tl_got, rb_got, rn_got);
         cudaDeviceSynchronize();
@@ -2105,7 +2294,7 @@ void test_router_select_plan() {
              host(rb_ref, kAheadExperts) == host(rb_got, kAheadExperts) &&
              host(rn_ref, 1) == host(rn_got, 1);
     }
-    std::printf("%-34s %s\n", "  logits + select + plan (1..64)", ok ? "bitwise" : "FAIL");
+    std::printf("%-34s %s\n", "  logits + select + plan (1..320)", ok ? "bitwise" : "FAIL");
     failures += !ok;
     cudaFree(dx); cudaFree(dg); cudaFree(db); cudaFree(dlog); cudaFree(dlog1);
     cudaFree(dw_ref); cudaFree(dw_got); cudaFree(di_ref); cudaFree(di_got);
@@ -2136,10 +2325,10 @@ int main() {
     test_attention_window();
     test_post_attn();
     test_expert_prefetch();
-    test_moe_finish();
     test_cpu_merge();
     test_cpu_ring();
     test_cpu_abort();
+    test_cpu_rows_reuse();
     time_cpu_handoff();
     test_heat_fold();
     test_batch_window();

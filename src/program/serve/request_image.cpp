@@ -6,13 +6,20 @@ namespace basalt::program::serve {
 
 Flow Request::begin_quality_gate(const std::string& base, const std::string& out, int most_rows) {
     ppl = nullptr;
-    if (req_ppl < 0) return Flow::proceed;
+    if (req_ppl < 0 && req_score < 0) return Flow::proceed;
     std::string pe2;
     PplGate::configure(base, out);
     ppl = &PplGate::get();
-    if (geni || !ppl->begin(req_ppl, ids.data(), n, runtime_.n_vocab, pe2)) {
+    const bool begun = req_score >= 0 ? ppl->begin_stream(ids.data(), n, req_score, req_score_top, runtime_.n_vocab, pe2)
+                                      : ppl->begin(req_ppl, ids.data(), n, runtime_.n_vocab, pe2);
+    if (geni || !begun) {
         std::printf("ERR %s\n", geni ? "ppl: text only" : pe2.c_str());
+        ppl = nullptr;
         return Flow::next;
+    }
+    if (req_score >= 0) {   // the prompt is the stream up to the first scored row; the rest is forced
+        n = (decltype(n)) (req_score + 1);
+        max_new = (decltype(max_new)) (ppl->end() - ppl->first());
     }
     req_temperature = 0.0f;
     req_ppl_t = std::clamp(req_ppl_t, 1, most_rows);
@@ -43,8 +50,7 @@ Flow Request::prepare_prompt() {
     bad = false;
     for (int64_t t : ids) bad = bad || t < 0 || t >= runtime_.n_vocab;
     if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); return Flow::next; }
-
-    return Flow::proceed;
+    return admit_room();
 }
 
 }  // namespace basalt::program::serve

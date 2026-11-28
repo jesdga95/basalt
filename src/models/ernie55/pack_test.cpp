@@ -203,6 +203,15 @@ int main(int argc, char** argv) {
     const auto p_oom = ctxp::plan_context(1048576, 1048576, 2ull << 30, 37, 6, 128, 512, 512, 64, 128, ctxp::CacheFormat::Fp8);
     expect(!p_oom.error.empty(), "1M context exceeding half of 2 GiB free VRAM rejected");
 
+    const uint64_t sample_prompt = 800ull << 20;
+    const uint64_t sample_headroom = 160ull << 20;
+    const auto tr = ctxp::plan_tier_reserve(sample_prompt, sample_headroom);
+    expect(tr.copies == ctxp::kCopiesReserveBytes, "copies reserve unchanged for lendable VRAM tiers");
+    expect(tr.beside_homes == ctxp::kBesideHomesReserveBytes, "beside_homes reserve sized for module room");
+    expect(tr.modules == ctxp::kModuleRoomBytes, "modules reserve matches CUDA/MMQ module room");
+    expect(tr.homes == sample_prompt + sample_headroom + ctxp::kModuleRoomBytes,
+           "homes reserve covers prompt chunk + MMQ headroom + modules");
+
     // 2. f32_range_is_bf16 check
     {
         TempFile tf{make_temp_path("basalt_ernie55_bf16_check.bin")};

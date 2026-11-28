@@ -360,8 +360,10 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
-    // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    // one allocation of the summed size and kReadPast more, through the uniform path's checks: n "slots" of 1 byte. open()
+    // zeroes all of it: a kernel's last loads read past a blob into the next slot (or past the last one) and multiply what
+    // they find by zero activations, so an empty slot must hold finite values
+    if (!open((int64_t) (off.back() + kReadPast), n_layers, n_expert, 1, err)) return false;
     slots_ = (int64_t) slot_bytes.size();
     live_slots_ = slots_;
     blob_ = mx;

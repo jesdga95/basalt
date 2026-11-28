@@ -397,6 +397,20 @@ proposed tokens), the gated attention and the GDN output gate. Licensed under th
 reproduced above.
 
 ================================================================================
+ingine-batch (https://github.com/satellitedown/ingine-batch), Apache License 2.0
+Copyright 2026 satellitedown.
+================================================================================
+
+The MXFP8 and NVFP4 down grouped expert tiles in src/kernels/cuda/nvfp4_grouped_mma.cuh adapt the design of
+ingine-batch's batched expert GEMM (native/src/kernels/batch/moe.cu): the expert weights as the M side of
+mma.m16n8k16 against the tokens, E4M3 (or E2M1 times its sub-block scale) codes decoded exactly to f16 in registers,
+and each thread's k positions taken as a permutation of each MMA's k shared by the weights and the activations.
+The tensor-core expert kernels in src/kernels/cuda/expert_tile.cuh (used by src/models/inkling2/kernels/experts.cu) adapt
+the same file's tile design: work items of weight rows x one tile of an expert's entries over the whole K, codes decoded
+in registers, K streamed through cp.async shared-memory stages with the weights evict-first, two blocks an SM, and the
+gate and up rows of one output in the same thread. Licensed under the Apache License, Version 2.0, reproduced above.
+
+================================================================================
 ERNIE-5.5-Flash-Preview (https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview,
 https://github.com/baidu/vLLM-ERNIE), Apache License 2.0
 Copyright (c) 2026 Baidu. All Rights Reserved.

@@ -1,49 +1,16 @@
 # How quality is measured
 
-Basalt scores a model against a full-precision reference on the same text, through the decode path that generates tokens. Both
-models use this method. Their numbers: [Qwen3.8-Flash-Next](qwen38-flash-next.md) and [DeepSeek-V4.1-Flash](deepseek41.md).
+Basalt scores a model against a stored full-precision reference, through the decode path that generates tokens.
 
-## The gate
+## The quality suite
 
-`basalt-bench --quality` runs the gate. `tools/ppl_gate.py` runs it offline against a built engine ([commands](#reproduce-the-reference)).
+Quality is measured with the [quality suite](quality-suite.md): stored BF16 top-K log-probabilities on chat conversations the BF16
+model wrote itself, scored through the engine's teacher-forced serve path (or llama.cpp for a GGUF). It reports mean KLD with
+percentiles, top-1 agreement, the change in the top token's probability and the PPL ratio, each with a conversation-bootstrap
+error bar, and compares two builds on the same rows in a paired mode.
 
-- **Text:** wikitext-2 in 512-token chunks. The first 256 tokens of each chunk are prefilled.
-- **Scored rows:** 256 to 510, through the decode path in verify windows of `--quality-t` tokens (default 3). The window tokens are the
-  reference text, so the drafter's output is not used.
-- **Reference:** a llama.cpp KL-divergence base file (`--kl-divergence-base`).
-- **KLD** is KL(base || test) over the full vocabulary, from the fp32 log-softmax, summed in double. Base terms at log-probability -16 or
-  below are skipped, a tiny underestimate.
-- **Reported:** PPL, mean KLD (the tables also give median and p99) and top-1 agreement.
-- **Length:** 20 chunks for a quick check. A change to numerics needs 100.
-- **Coverage:** the 256-token prefill halves run each model's prompt path for that length: MMQ for Flash-Next, whose FP4 prompt path
-  (used from 1,024-token chunks) and split prompt across cards the gate does not reach; those are measured separately
-  ([Flash-Next prefill](qwen38-flash-next.md#prefill)). Inkling 2 Mini's halves run its FP4 experts.
-- **Determinism:** two runs of one build match row for row, with the tiers pinned (see [greedy identity](#greedy-identity)).
-
-## The BF16 reference
-
-Every score is against the original model in BF16:
-
-| Model | Base | Base PPL |
-| --- | --- | --- |
-| Qwen3.8-Flash-Next | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp commit 436f6f89e), 100 chunks of 512, `-b 8192 -ub 8192` | 3.2749 (3.2733 on the scored rows) |
-| DeepSeek-V4.1-Flash | a BF16 GGUF by @giveen, made with `convert_hf_to_gguf --outtype bf16` (llama.cpp 330f0189), wikitext-2, 100 chunks of 512 | 2.7394 (2.7314 from the stored rows) |
-| Qwen3.8-27B | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp 5676dfbe), wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192` | 6.7437 (6.7411 on the scored rows) |
-| Hy4-flash | Tencent's BF16 checkpoint converted to a BF16 GGUF (llama.cpp 0a054d0b0), through `llama-perplexity` with the llama.cpp port's Engram gate norm epsilon set to FP32's (#556) and `add_bos_token=true`, wikitext-2, 100 chunks of 512; `hy4flash-bf16-base.kld` | 18.416 (over the 25,500 scored rows) |
-| Inkling 2 Mini | the official release with its experts dequantized to BF16 (no BF16 checkpoint exists; the release ships NVFP4 and MXFP8 experts): a BF16 GGUF from `convert_hf_to_gguf --outtype bf16` (llama.cpp 29b52d398), through `llama-perplexity`, wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192`; `inkling2-bf16-base.kld`. Not comparable with the other models' true-BF16 bases | 7.0714 |
-| ERNIE-5.5-Flash | Baidu publishes an official BF16 checkpoint (`baidu/ERNIE-5.5-Flash-Preview-BF16`, ~560 GB); wikitext-2 100-chunk BF16 KLD base pending community run | pending |
-
-The official Flash-Next packs are scored against the first base on their
-[Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). That gate is 100 chunks, T 3, int8 KV, resident
-experts and tiers pinned, on an RTX 5090 at 400 W with an RTX 5060 Ti at 180 W.
-
-The bases are published as the [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases) dataset on Hugging Face,
-with checksums: pass one to `basalt-bench --quality --kld-base FILE` to score a build or a self-converted pack.
-
-A quantized base is not a reference. llama.cpp's Q8_0 GGUF adds its own rounding, so every pack reads 0.003 to 0.010 KLD higher against a
-Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)).
-
-Numerics changes: report PPL, mean KLD and top-1 next to the previous build. Bitwise-neutral changes: show greedy identity.
+Numerics changes: report these next to the previous build's, with the paired error bar. Bitwise-neutral changes: show
+[greedy identity](#greedy-identity).
 
 ## Lossy routing flags
 
@@ -90,7 +57,53 @@ bin/basalt --serve --model MODEL.basalt {--spec 0 | --spec 7} --expert-cache N -
 
 After `READY`, `GEN 256 temperature=0 ID,ID,...` on stdin returns `T ID` lines and ends with `DONE`; `QUIT` ends the session. `LH` hash lines on stderr. Compare per position, matching rows by position.
 
-## Reproduce the reference
+## Wikitext KLD
+
+The KLD and PPL numbers in the model precision pages come from wikitext KLD: wikitext-2 against a llama.cpp KL-divergence base.
+The [quality suite](quality-suite.md) is the preferred method for measuring a model's quality, while wikitext KLD remains valid
+for quick checks and reproducing those numbers.
+
+### The gate
+
+`basalt-bench --kld --kld-base FILE` runs the gate. `tools/ppl_gate.py` runs it offline against a built engine ([commands](#reproduce-the-reference)).
+
+- **Text:** wikitext-2 in 512-token chunks. The first 256 tokens of each chunk are prefilled.
+- **Scored rows:** 256 to 510, through the decode path in verify windows of `--kld-t` tokens (default 3). The window tokens are the
+  reference text, so the drafter's output is not used.
+- **Reference:** a llama.cpp KL-divergence base file (`--kl-divergence-base`).
+- **KLD** is KL(base || test) over the full vocabulary, from the fp32 log-softmax, summed in double. Base terms at log-probability -16 or
+  below are skipped, a tiny underestimate.
+- **Reported:** PPL, mean KLD (the tables also give median and p99) and top-1 agreement.
+- **Length:** 20 chunks for a quick check. A change to numerics needs 100.
+- **Coverage:** the 256-token prefill halves run each model's prompt path for that length: MMQ for Flash-Next, whose FP4 prompt path
+  (used from 1,024-token chunks) and split prompt across cards the gate does not reach; those are measured separately
+  ([Flash-Next prefill](qwen38-flash-next.md#prefill)). Inkling 2 Mini's halves run its FP4 experts.
+- **Determinism:** two runs of one build match row for row, with the tiers pinned (see [greedy identity](#greedy-identity)).
+
+### The BF16 reference
+
+Every score is against the original model in BF16:
+
+| Model | Base | Base PPL |
+| --- | --- | --- |
+| Qwen3.8-Flash-Next | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp commit 436f6f89e), 100 chunks of 512, `-b 8192 -ub 8192` | 3.2749 (3.2733 on the scored rows) |
+| DeepSeek-V4.1-Flash | a BF16 GGUF made with `convert_hf_to_gguf --outtype bf16` (llama.cpp 330f0189), wikitext-2, 100 chunks of 512 | 2.7394 (2.7314 from the stored rows) |
+| Qwen3.8-27B | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp 5676dfbe), wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192` | 6.7437 (6.7411 on the scored rows) |
+| Hy4-flash | Tencent's BF16 checkpoint converted to a BF16 GGUF (llama.cpp 0a054d0b0), through `llama-perplexity` with the llama.cpp port's Engram gate norm epsilon set to FP32's and `add_bos_token=true`, wikitext-2, 100 chunks of 512; `hy4flash-bf16-base.kld` | 18.416 (over the 25,500 scored rows) |
+| Inkling 2 Mini | the official release with its experts dequantized to BF16 (no BF16 checkpoint exists; the release ships NVFP4 and MXFP8 experts): a BF16 GGUF from `convert_hf_to_gguf --outtype bf16` (llama.cpp 29b52d398), through `llama-perplexity`, wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192`; `inkling2-bf16-base.kld`. Not comparable with the other models' true-BF16 bases | 7.0714 |
+| ERNIE-5.5-Flash | Baidu publishes an official BF16 checkpoint (`baidu/ERNIE-5.5-Flash-Preview-BF16`, ~560 GB); a wikitext-2 100-chunk BF16 KLD base needs a machine that fits the checkpoint | none |
+
+The official Flash-Next packs are scored against the Flash-Next base on their
+[Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). That gate is 100 chunks, T 3, int8 KV, resident
+experts and tiers pinned, on an RTX 5090 at 400 W with an RTX 5060 Ti at 180 W.
+
+The bases are published as the [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases) dataset on Hugging Face,
+with checksums: pass one to `basalt-bench --kld --kld-base FILE` to score a build or a self-converted pack.
+
+A quantized base is not a reference. llama.cpp's Q8_0 GGUF adds its own rounding, so every pack reads 0.003 to 0.010 KLD higher against a
+Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)).
+
+### Reproduce the reference
 
 Flash-Next base (the model does not fit in RAM and VRAM, so the experts stream from disk):
 

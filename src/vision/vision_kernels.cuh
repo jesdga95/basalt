@@ -80,4 +80,31 @@ void launch_bias_scale_residual(float* x, const float* g, const float* bias, con
 /// y[i] = bf16(x[i]) for i < count
 void launch_to_bf16(const float* x, __nv_bfloat16* y, size_t count, cudaStream_t s);
 
+// The pooled tower: 16-pixel patches of a picture on whole cells of k x k patches, the sequence in pool order (the cells in
+// raster order, a cell's k * k patches in raster order inside it), separate column and row position tables, RMS norms around
+// attention and the gated MLP, q and k normed per head and turned by 2D rotary positions (NeoX halves), v normed without a
+// weight, unscaled scores, and each cell's patches averaged into one row.
+/// rows[t] (bf16 [n][3 * 16 * 16]: channel, row, column) for the n patches of the picture `rgb` (interleaved u8, w = gx * 16
+/// pixels wide) in pool order of k x k cells: bf16(2 (v / 255 - 0.5)).
+void launch_pool_patch_rows(const uint8_t* rgb, int w, int gx, int k, __nv_bfloat16* rows, int n, cudaStream_t s);
+/// x[t] += col_table[px] + row_table[py] for the patch at pool-order row t: `tables` holds the column table, then the row
+/// table, `size` rows of 1152 each.
+void launch_pool_embed(float* x, const float* tables, int n, int gx, int k, int size, cudaStream_t s);
+/// tab[t][j] = (cos, sin) for pool-order row t and pair j of 36: pairs 0..17 turn by the patch's column, pairs 18..35 by its
+/// row, pair j by theta^(-2 (j % 18) / 36).
+void launch_rope_pool(float* tab, int n, int gx, int k, float theta, cudaStream_t s);
+/// g [n][3456] (q, k, v of 16 heads of 72) into the fp16 head-major q, k, v: each head of q and k RMS-normed with its weight
+/// (`q_norm`, `k_norm`, 72 each) and turned by `rope` (within each half of 36 dims, dim i with dim i + 18), each head of v
+/// RMS-normed without one.
+void launch_qkv_normed(const float* g, const float* q_norm, const float* k_norm, const float* rope, __half* q, __half* k,
+                       __half* v, int n, float eps, cudaStream_t s);
+/// x[t] += rms(g[t]) * w; rows of 1152.
+void launch_norm_residual(float* x, const float* g, const float* w, int n, float eps, cudaStream_t s);
+/// y[t][c] = bf16(gelu_tanh(g[t][c]) * g[t][f + c]) for c < f: the gate's and the up product's outputs side by side in g [n][2f].
+void launch_gelu_gate(const float* g, __nv_bfloat16* y, int n, int f, cudaStream_t s);
+/// y[i] = bf16(rms(((mean of rows i k^2 .. i k^2 + k^2 - 1 of x) sqrt(1152) - bias) * scale)): each cell's patches pooled,
+/// scaled, standardised and RMS-normed without a weight; m rows of 1152.
+void launch_pool_finish(const float* x, const float* bias, const float* scale, __nv_bfloat16* y, int m, int k, float eps,
+                        cudaStream_t s);
+
 }  // namespace basalt::vision

@@ -4,6 +4,7 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/log.hpp"
+#include "basalt/kernels/window_segs.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
@@ -46,9 +47,10 @@ public:
     }
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
     // peer: the second card holds and computes experts the main card cannot (model.hpp peer_held); split: it runs the later layers (card_of)
+    int max_slots() const override { return basalt::kernels::kWindowSegsMax; }   // segments of one batch window
     program::GpuModes gpu_modes() const override { return {2, 2, 0}; }
-    const char* model_name() const override { return "Inkling-2-Mini"; }
-    const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
+    const char* model_name(const core::Json&) const override { return "Inkling-2-Mini"; }
+    const char* community_quant(const core::Json&) const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
     // --kv: attention caches as fp16 (default), fp8 or scaled int8; --spec, --draft-log: drafter windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {

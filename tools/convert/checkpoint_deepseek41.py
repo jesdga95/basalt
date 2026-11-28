@@ -122,15 +122,42 @@ def mxfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
 
 
 MXFP4_VALUES = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], np.float32)
+MXFP4_CODES = MXFP4_VALUES * np.float32(2)     # the engine's kvalues_fp4: e2m1 doubled, against the halved scale
 
 
 def mxfp4_values(rows: np.ndarray) -> np.ndarray:
-    """ggml MXFP4 rows (17-byte blocks, ENGRAM_ROW values a row) as f32 [rows, ENGRAM_ROW]."""
+    """ggml MXFP4 rows (17-byte blocks, ENGRAM_ROW values a row) as f32 [rows, ENGRAM_ROW], decoded as the engine's
+    dequantize_mxfp4: the e2m1 values doubled and e8m0_to_fp32_half's 2^(s - 128), so a scale byte 255 is 2^127, not
+    inf."""
     b = rows.reshape(-1, ENGRAM_ROW // 32, 17)
-    d = np.ldexp(np.float32(1), b[..., 0].astype(np.int32) - 127).astype(np.float32)[..., None]
-    q = b[..., 1:]
-    v = np.concatenate([MXFP4_VALUES[q & 15], MXFP4_VALUES[q >> 4]], axis=-1) * d
+    with np.errstate(over="ignore"):
+        d = np.ldexp(np.float32(1), b[..., 0].astype(np.int32) - 128).astype(np.float32)[..., None]
+        q = b[..., 1:]
+        v = np.concatenate([MXFP4_CODES[q & 15], MXFP4_CODES[q >> 4]], axis=-1) * d
     return v.reshape(-1, ENGRAM_ROW)
+
+
+def e4m3_scaled_values(raw: np.ndarray) -> np.ndarray:
+    """ggml type 43 as the Engram table stores it (33 bytes a 32-value block: one E8M0 scale, then 32 E4M3 codes) as f32
+    values, decoded as engram_rows.hpp reads them (the reserved E4M3 patterns and an E8M0 0xFF scale are 0, not NaN)."""
+    b = raw.reshape(-1, 33)
+    with np.errstate(over="ignore"):
+        d = np.ldexp(np.float32(1), b[:, 0].astype(np.int32) - 127).astype(np.float32)
+    d[b[:, 0] == 255] = 0.0
+    return (np.nan_to_num(E4M3[b[:, 1:]], nan=0.0) * d[:, None]).reshape(-1)
+
+
+def pack_values(type_name: str, raw: np.ndarray) -> np.ndarray:
+    """The values of a pack tensor stored as `type_name`, float32: MXFP4 (39) and type 43 (F8_E4M3_RAW) are BASE's
+    Engram row types, which ggufq has no decoder for; every other name is ggufq's."""
+    if type_name == "MXFP4":
+        return mxfp4_values(raw).reshape(-1)
+    if type_name == "F8_E4M3_RAW":
+        return e4m3_scaled_values(raw)
+    try:
+        return ggufq.dequantize(raw, ggufq.GGMLQuantizationType[type_name]).astype(np.float32)
+    except KeyError:
+        raise S.ConvertError(f"no decoder for {type_name}")
 
 
 def _engram_job(args):
@@ -416,7 +443,7 @@ class Converter:
         ne0 = int(bt["shape"][0])
         n = bt["bytes"] if rows is None else bt["bytes"] // int(np.prod(bt["shape"][1:] or [1])) * rows
         raw = np.fromfile(self.base.path, np.uint8, n, offset=off + bt["offset"])
-        return ggufq.dequantize(raw, ggufq.GGMLQuantizationType[bt["type"]]).astype(np.float32).reshape(-1, ne0)
+        return pack_values(bt["type"], raw).reshape(-1, ne0)
 
     def check(self, gname):
         """The converted tensor against BASE's of the same name: a layout or naming error shows as a large distance."""
@@ -425,7 +452,7 @@ class Converter:
         ne0 = int(bt["shape"][0])
         rows = min(int(np.prod(bt["shape"][1:] or [1])), 4096)
         raw = np.fromfile(p, np.uint8, min(n, n // int(np.prod(bt["shape"][1:] or [1])) * rows))
-        mine = ggufq.dequantize(raw, ggufq.GGMLQuantizationType[ty]).astype(np.float64).reshape(-1, ne0)
+        mine = pack_values(ty, raw).astype(np.float64).reshape(-1, ne0)
         theirs = self.base_values(gname, rows).astype(np.float64)
         d = float(np.sqrt(((mine - theirs) ** 2).sum() / max((theirs ** 2).sum(), 1e-30)))
         if not d < CHECK_RMS:
@@ -498,10 +525,7 @@ class Converter:
                 raise S.ConvertError(got)
             mine.append(mxfp4_values(np.frombuffer(got, np.uint8))[0])
             raw = np.fromfile(self.base.path, np.uint8, e["row_bytes"], offset=off + (first + int(r)) * e["row_bytes"])
-            if e["type"] == "MXFP4":
-                theirs.append(mxfp4_values(raw)[0])
-            else:
-                theirs.append(ggufq.dequantize(raw, ggufq.GGMLQuantizationType[e["type"]]).astype(np.float32))
+            theirs.append(pack_values(e["type"], raw))
         m, t = np.array(mine, np.float64), np.array(theirs, np.float64)
         d = float(np.sqrt(((m - t) ** 2).sum() / max((t ** 2).sum(), 1e-30)))
         if not d < 0.3:

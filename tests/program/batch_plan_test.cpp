@@ -55,6 +55,18 @@ int main() {
     check(whole, "with no more slots than rows the shares add up to the cap, so one pass serves all");
     check(batch_shares(Joint(20), 16) == Rows(20, 16), "more slots than rows: each may take the cap");
 
+    using basalt::program::serve::batch_confident_shares;
+    check(batch_confident_shares({{0.9, 0.8, 0.7, 0.6, 0.5}, {0.4, 0.2, 0.1}}, 2, 16) == Rows{5, 3},
+          "drafts while all of them stay above half, at least two, at most four");
+    check(batch_confident_shares({{0.9, 0.8, 0.3}, {0.9, 0.8, 0.3}}, 8, 16) == Rows{4, 4},
+          "a quarter of the slots busy: the bar falls to an eighth");
+    check(batch_confident_shares({{0.9}, {}}, 2, 16) == Rows{2, 1}, "no more drafts than the slot has");
+    check(batch_confident_shares({{0.9, 0.8, 0.7, 0.6}, {0.9, 0.8, 0.65, 0.55}}, 2, 8) == Rows{4, 4},
+          "past the cap the least likely drafts beyond the first two come off first");
+    check(batch_confident_shares({{0.9, 0.8, 0.7}, {0.9, 0.8, 0.7}, {0.9, 0.8, 0.7}}, 3, 7) == Rows{3, 2, 2},
+          "then a row at a time from the slot with most, the later slot first");
+    check(batch_confident_shares(Joint(20), 20, 16) == Rows(20, 16), "more slots than rows: each may take the cap");
+
     check(batch_fair_shares({3}, 8) == Rows{3}, "one slot keeps its window");
     check(batch_fair_shares({3, 5}, 8) == Rows{3, 5}, "windows that fit together keep their rows");
     check(batch_fair_shares({3, 7}, 8) == Rows{3, 5}, "the window wanting less is served in full, the other takes the rest");

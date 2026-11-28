@@ -502,7 +502,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
 }
 
 namespace {
-// Plan v0.3 P4 token graph: which of this layer's routed experts are resident, decided ON THE DEVICE from the
+// Token graph: which of this layer's routed experts are resident, decided ON THE DEVICE from the
 // static residency row, so no host step sits between the ring and the hit kernels.  One warp; k <= 32.
 __global__ void hit_select_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int k,
                                   int n_expert, int32_t* __restrict__ slot, int32_t* __restrict__ dst,
@@ -570,7 +570,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
 }
 
 namespace {
-// Plan v0.3 P6: experts GROUPED - one blob pointer per group (a VRAM slot or a mapped host blob read over PCIe),
+// Experts GROUPED - one blob pointer per group (a VRAM slot or a mapped host blob read over PCIe),
 // every entry of the group (a token routed to that expert) computed from ONE read of each row.  Per entry the
 // arithmetic is `row_dot_s2_q8`'s, chunk by chunk in the same lane order, so every entry is bitwise the per-entry
 // hit kernel's.
@@ -863,7 +863,7 @@ __global__ void __launch_bounds__(256) down_grouped_t_kernel(const unsigned long
 }  // namespace
 
 namespace {
-// Plan v0.3 P6: groups built on the device when every expert is resident at `base + id * blob` (the MTP layer):
+// Groups built on the device when every expert is resident at `base + id * blob` (the MTP layer):
 // one block of 128 threads, groups in first-appearance order, entries of a group in routing order.
 __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const uint8_t* base,
                                       long long blob, unsigned long long* __restrict__ grp_ptr,

@@ -20,7 +20,7 @@ in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
 - **Idle cards:** with `gpu` unset and more cards visible, every model warns once at start (`GPU 1 (RTX 5060 Ti) unused; to use
   more cards set gpu (0,1 or all) and gpu-mode`), in the CLI, the server and the bench. It is a warning, not an error. Naming a
   card (`gpu 0`) is a choice and prints nothing.
-- **Old values:** `gpu: auto`, a `gpu` list without a `gpu-mode`, and the flags the old multi-card logic had are errors, with the
+- **Refused values:** `gpu: auto`, a `gpu` list without a `gpu-mode`, and per-card tuning flags are errors, with the
   valid forms in the message ([upgrading](../changelog/0.5.7.md#upgrading)).
 
 ```
@@ -36,11 +36,11 @@ the shares, and checks the model's modes without loading it.
   experts of a mixture of experts, read the last layers of a long prompt, or both.
 - **split:** the layers are divided between the cards in order; each card holds its layers' weights and their KV cache and
   recurrent state, and a window or prompt chunk crosses from one card to the next. The cut follows the shares.
-- **tensor:** every layer sharded across the cards. The name is reserved; no model runs it yet.
+- **tensor:** every layer sharded across the cards. The name is reserved; no model runs it.
 
 | Model | peer | split | tensor |
 | --- | --- | --- | --- |
-| [Qwen3.8-Flash-Next](../models/qwen38-flash-next.md#cards) | up to 4 cards: experts and prompt layers | up to 8 cards | refused |
+| [Qwen3.8-Flash-Next](../models/qwen38-flash-next.md#memory) | up to 4 cards: experts and prompt layers | up to 8 cards | refused |
 | [DeepSeek-V4.1-Flash](../models/deepseek41.md#cards) | up to 5 cards: experts, a block of layers each | refused | refused |
 | [Hy4-flash](../models/hy4-flash.md#cards) | up to 4 cards: experts, a block of layers each | refused | refused |
 | [Qwen3.8-27B](../models/qwen38-27b.md#cards) | 2 cards: the last layers of long prompts | 2 cards | refused |
@@ -86,15 +86,13 @@ with `use gpu 0`.
 - **Tuning:** `peer-reserve-mib` (default 600) is the VRAM a peer keeps free beside its experts and prompt buffers; `peer-exclusive`
   keeps the peer's experts out of RAM when RAM is short; `gpu 0` keeps everything on the main card.
 
-Measured, from the ledger's rows:
+What a peer does and does not change:
 
-- **Flash-Next:** no speed loss against the earlier peer path (64K prefill 9,823 against 9,835 tok/s, conversation decode within
-  noise). A normal peer run scores BF16 KLD 0.06174 against 0.06221 on one card and top-1 91.84% against 91.80%.
-- **Qwen3.8-27B:** a 64K prefill reads 17% faster than on one card (7,410 against 6,336 tok/s); decode stays on the main card.
+- **Qwen3.8-27B:** a long prefill reads faster than on one card; decode stays on the main card.
 - **Inkling 2 Mini:** a peer helps only when experts spill beyond what the main card's elastic copies cover. At default settings one
-  card is fastest up to 1M tokens, and a peer is refused when the main card holds every expert
+  card is fastest, and a peer is refused when the main card holds every expert
   ([Inkling](../models/inkling2.md#two-cards)).
-- **Rounding:** a peer's prompt reads differ from one card's at summation-order rounding, about 0.01 KLD on `--diag-gpu-check`, the
+- **Rounding:** a peer's prompt reads differ from one card's at summation-order rounding, the
   same as any reordering of the experts' sum. `--diag-main-card-bits` makes Flash-Next's other cards compute the main card's bits,
   and the prompt stages are then bitwise ([diagnostics](diagnostics.md)).
 
@@ -110,7 +108,7 @@ model's experts or caches.
   first card's state back and runs the window again, so the text is the same either way (`pipelined windows: N launched, M held` per
   request).
 - **Qwen3.8-27B:** the output is the main card's alone to the bit ([27B](../models/qwen38-27b.md#cards)).
-- **Inkling 2 Mini:** a split holds every expert of its layers on its card; it is about 25% slower than one card at the contexts where
+- **Inkling 2 Mini:** a split holds every expert of its layers on its card; it is slower than one card at the contexts where
   one card holds or copies back its experts ([Inkling](../models/inkling2.md#two-cards)).
 - A split costs a fixed part of a window per crossing: use it for a model or context that does not fit one card, and a peer where it
   does.

@@ -81,7 +81,7 @@ void silu_inplace(float* x, int64_t n, void* stream);
 /// which); this one does not, and the same `sqrt(cols)`-sized argument applies to getting it wrong.
 void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream);
 
-/// Plan v0.3 P3 token graph: one thread spins until the host-written `*d_flag` equals the ring value `*d_seq`
+/// Token graph: one thread spins until the host-written `*d_flag` equals the ring value `*d_seq`
 /// (both mapped pinned memory), then fences so everything the host wrote before the flag is visible to the
 /// nodes that follow.  Captured once per layer between `pre[l]` and the parts copy; it is what lets one graph
 /// hold the whole token (a handoff needs no driver call).
@@ -111,7 +111,7 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream);
 
-/// Plan v0.3 P3: the doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
+/// The doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
 /// (k each) into the mapped host regions, fences, and increments the mapped sequence number - replacing three
 /// device-to-host memcpy nodes (copy-engine operations in the middle of the layer chain) and the ring kernel.
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
@@ -119,7 +119,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
                           float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream);
 
-/// Plan v0.3 P3: copy `n` int32 from mapped pinned host memory into device memory with a kernel (the QSA
+/// Copy `n` int32 from mapped pinned host memory into device memory with a kernel (the QSA
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// Three such copies in one launch (sizes n0, n1, n2; a size may be 0).

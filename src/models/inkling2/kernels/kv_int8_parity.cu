@@ -19,6 +19,8 @@
 
 namespace ink = basalt::models::inkling2;
 constexpr int kKeys100Ki = 100 * 1024;
+// Rows near this depth take all 64 slices, so any smaller slice count slices them differently.
+constexpr int kKeysAllSlices = 130000;
 constexpr int kKeysPartTail = 128 * 1024 - 1000;   // a deep row whose last slice is partly filled
 
 static const char* mma_ring_name(const ink::Int8MmaPlanInfo& info) {
@@ -422,6 +424,8 @@ static bool check_attention_mma(bool reduced) {
         depths.push_back(4096);
         for (const int boundary : {32768, 65536, kKeys100Ki, 131072, 196608, 262144})
             depths.insert(depths.end(), {boundary - 1, boundary, boundary + 1});
+        depths.push_back(kKeysAllSlices);
+        std::sort(depths.begin(), depths.end());
     }
     bool schedules_ok = true;
     bool reported[static_cast<int>(ink::Int8MmaPlan::Direct) + 1] = {};
@@ -598,6 +602,49 @@ static bool check_attention_mma(bool reduced) {
                        schedule && singleton_schedule[first + j], shard_invariant);
             }
         }
+        // Deep rows under the card's slice count and under 64, the most any card takes, against the CPU: each row alone and
+        // in every window.
+        if (ok && (depth == kKeysAllSlices || depth == 131072)) {
+            const int card = ink::attention_decode_int8_slices();
+            double worst_abs[2] = {}, worst_rel[2] = {};
+            for (int arm = 0; arm < 2 && ok; ++arm) {
+                const int slices = arm == 0 ? card : 64;
+                ink::attention_decode_int8_test_set_slices(slices);
+                const auto measure = [&](int first, int width, const char* how) {
+                    DecodeResult got;
+                    if (!run(first, width, Reader::Mma, got)) return false;
+                    double abs = 0., rel = 0., rel_sq = 0.;
+                    int rel_count = 0;
+                    bool finite = true;
+                    for (int j = 0; j < width; ++j)
+                        for (int d = 0; d < kOutput; ++d) {
+                            const double want = ref[(first + j) * kOutput + d], have = got.fp32[j * kOutput + d];
+                            finite &= std::isfinite(have);
+                            const double error = std::abs(have - want);
+                            abs = std::max(abs, error);
+                            if (std::abs(want) >= 1e-2) {
+                                rel = std::max(rel, error / std::abs(want));
+                                rel_sq += (error / std::abs(want)) * (error / std::abs(want));
+                                ++rel_count;
+                            }
+                        }
+                    std::printf("kv slices accuracy: depth=%d slices=%d %s T=%d first=%d max_abs=%.7g max_rel(|ref|>=1e-2)=%.7g "
+                                "rms_rel=%.7g finite=%d\n", depth, slices, how, width, first, abs, rel,
+                                rel_count ? std::sqrt(rel_sq / rel_count) : 0., finite);
+                    worst_abs[arm] = std::max(worst_abs[arm], abs);
+                    worst_rel[arm] = std::max(worst_rel[arm], rel);
+                    return finite && abs < 0.002 && rel < 0.05;
+                };
+                for (int j = 0; j < rows && ok; ++j) ok = measure(j, 1, "alone");
+                for (const int width : {2, 3, 5, 6, 7, 8}) {
+                    if (!ok) break;
+                    ok = measure(3 - (width - 1) / 2, width, "window");
+                }
+            }
+            ink::attention_decode_int8_test_set_slices(card);
+            std::printf("kv slices accuracy: depth=%d worst max_abs slices %d/64=%.7g/%.7g max_rel=%.7g/%.7g\n", depth, card,
+                        worst_abs[0], worst_abs[1], worst_rel[0], worst_rel[1]);
+        }
     }
     if (reduced) std::printf("reduced case list: %zu cases\n", cases.size());
     for (void* p : {(void*) dp, (void*) dq, (void*) dr, (void*) ds, (void*) dg, (void*) dt, (void*) dout, (void*) dq8,
@@ -732,8 +779,9 @@ static bool check_decode_graph(bool reduced) {
         for (const auto& out : fp32)
             for (const float x : out) finite &= std::isfinite(x);
         const bool identical = fp32[0] == fp32[1] && q8[0] == q8[1];
-        // The reader's prefix slice: whole passes of its block, at most 64 slices, for the proven bound's keys.
-        const int64_t units = (fewest + 128 * 64 - 1) / (128 * 64);
+        // The reader's prefix slice: whole passes of its block, at most the card's slice count, for the proven bound's keys.
+        const int64_t slices = ink::attention_decode_int8_slices();
+        const int64_t units = (fewest + 128 * slices - 1) / (128 * slices);
         const int prime_span = (int) std::max<int64_t>(units, 1) * 128;
         std::printf("kv MMA graph: depth=%d T=%d replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld finite=%d "
                     "pdl_launches=%ld\n", shape.depth, rows, replays, prime_span, identical, (long long) bucket,

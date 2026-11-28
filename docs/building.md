@@ -6,7 +6,7 @@ The build commands are in the [README](../README.md). Windows: [platforms](platf
 
 - `src/`, `include/`: the engine (`basalt`, `basalt-bench`, `basalt-probe`, `basalt-vision`).
 - `serve/`: the Python server with the OpenAI and Anthropic API and the stats page.
-- `tools/`: the converter (`tools/convert/convert.py`), the `.basalt` reader (`model_file.py`), the quality gate (`ppl_gate.py`), the
+- `tools/`: the converter (`tools/convert/convert.py`), the `.basalt` reader (`model_file.py`), the quality suite (`quality_suite/`), the wikitext KLD gate (`ppl_gate.py`), the
   greedy-identity check and the tokenizer.
 - `tests/`: parity and unit tests. `data/`: expert profiles (`data/profiles`) and benchmark fixtures (`data/bench`).
 
@@ -17,8 +17,7 @@ The build fetches nothing. The ggml and llama.cpp parts Basalt uses (quantizatio
 
 ## Building only some models
 
-`-DBASALT_MODELS=<ids>` is a semicolon list of architecture ids, or `all`, which builds every model and follows the
-models a later version adds. The option is required: a configure that leaves it out stops and says so. A model left out is not compiled at
+`-DBASALT_MODELS=<ids>` is a semicolon list of architecture ids, or `all`, which builds every model, including any added later. The option is required: a configure that leaves it out stops and says so. A model left out is not compiled at
 all: its C++ and CUDA sources, its kernels and its tests are skipped, which is most of the build time for DeepSeek.
 
 | Model | Id |
@@ -37,7 +36,7 @@ cmake -S . -B build -DBASALT_MODELS=qwen35                    # the 27B only
 cmake -S . -B build -DBASALT_MODELS=hy4flash                  # Hy4-flash only
 cmake -S . -B build -DBASALT_MODELS=inkling2                  # Inkling 2 Mini only
 cmake -S . -B build -DBASALT_MODELS=ernie55                   # ERNIE-5.5-Flash only
-cmake -S . -B build "-DBASALT_MODELS=qwen4exp;deepseek41"     # two of them; quote the semicolon
+cmake -S . -B build "-DBASALT_MODELS=qwen4exp;deepseek41"     # a list; quote the semicolon
 ```
 
 An unknown id, an empty value or no value stops the configure and names the valid ids. A pack of a model the build left out fails at load with

@@ -157,6 +157,7 @@ int Runtime::init_protocol() {
             std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"" + std::string(pre_.name) + "\"") != std::string_view::npos) {
             text_tokenizer.set_pretokenize(pre_.split);
             text_tokenizer.set_ignore_merges(pre_.ignore_merges);
+            text_tokenizer.set_sentencepiece(pre_.sentencepiece);
             if (text_tokenizer.load(std::string_view((const char*) vj.data(), vj.size()),
                                     std::string_view((const char*) mj.data(), mj.size()),
                                     std::string_view((const char*) tj.data(), tj.size()), terr))

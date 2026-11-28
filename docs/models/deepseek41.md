@@ -6,10 +6,10 @@ quality: [precision](../precision/deepseek41.md).
 ## Pack
 
 Packs on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's GGUFs:
-`DeepSeek-V4.1-Flash-1017-UD-IQ1_M` (about 260 GB) and `-UD-IQ2_XXS` (about 285 GB, closer to BF16, slower when experts spill to disk). Its layout and the DSpark section: [model file](../model-file.md#deepseek-pack).
+`DeepSeek-V4.1-Flash-1017-UD-IQ1_M` (about 260 GB) and `-UD-IQ2_XXS` (about 285 GB, closer to BF16, slower when experts spill to disk). Its layout and the DSpark section: [model file](../model-file/deepseek.md#deepseek-pack).
 
 Unsloth's `-UD-Q2_K_XL` (about 343 GB, MXFP4 and IQ3_S down experts, a Q5_K Engram table) has no published pack; it converts
-from the GGUF and is the closest of the three to BF16 ([precision](../precision/deepseek41.md#against-the-bf16-reference)):
+from the GGUF and is the closest to BF16 ([precision](../precision/deepseek41.md#against-the-bf16-reference)):
 
 ```sh
 python3 tools/convert/convert.py --gguf DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf --dspark DRAFTER.gguf \
@@ -17,7 +17,8 @@ python3 tools/convert/convert.py --gguf DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-0000
 ```
 
 An NVFP4 pack, `DeepSeek-V4.1-Flash-1017-NVFP4` (about 428 GB), is built from NVIDIA's NVFP4 checkpoint: NVFP4 routed
-experts, the FP8 projections as Q8_0, the MXFP4 Engram table ([how](../model-file.md#deepseek-nvfp4-pack)). It is meant for
+experts, the FP8 projections as Q8_0, the MXFP4 Engram table (a UD set's Engram may be IQ4_NL, Q5_K, Q6_K, MXFP4 or
+MXFP8; [how](../model-file/deepseek.md#deepseek-nvfp4-pack)). It is meant for
 machines whose RAM holds most of its experts (about 320 GB or more); with less, most experts are read from the SSD and decode
 is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W + 180 W).
 
@@ -38,6 +39,9 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   the homes and the copies are planned exactly as with `--vision off`. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
   pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
   the RAM to free.
+- **Engram table:** read by row from the pack by default (`--ple-io direct`), so it takes no RAM of its own; `--ple-io ram` maps
+  the table at start (reserving its RAM before the expert tier is sized) and locks it in RAM once the experts load (or touches it
+  into the OS page cache when locking is refused).
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
 - **Experts in the file:** with experts left in the file, the RAM tier is also a cache of it. A decode step that routes to a file
   expert reads it whole into the place of the layer's pinned expert used longest ago, around the OS file cache, while the CPU
@@ -53,8 +57,7 @@ is slow (2.8 tok/s with 172.8 GiB of experts on the SSD, 121 GiB of RAM, 400 W +
   take the tier's copies first (homes stay) and halve their chunks to fit above the reserve.
   `--vision dynamic` has no card memory at rest: a request's pictures borrow the encoder's weights and work buffers from the tier's copies
   beside the homes (all the copies when those do not hold them), and the tier takes them back and refills them when the pictures are read.
-  The homes keep 1.5 GiB free beside them when the pack carries a projector, with vision on or off, so the plan is the same either way. Before this the images' buffers (6 GiB of pinned host memory for the slots' largest pictures) took the RAM the tier needed, and on two cards
-  with a 1M context that moved 18 experts a layer onto the main card as homes in place of its 60 copies (5.77 against 19.24 GiB of tier). Two cards, drafted, conv / struct / prose tok/s with `--vision dynamic`: before 99 / 249 / 101 and 97 / 246 / 100, after 99 / 252 / 104 and 99 / 255 / 104; with vision off 97 / 256 / 101.
+  The homes keep 1.5 GiB free beside them when the pack carries a projector, with vision on or off, so the plan is the same either way.
 - **Cache precision:** `--kv fp8` (default) stores the caches as the model's reference rounds them, 920 bytes per position;
   `--kv fp16` keeps the unrounded values, 3,200 bytes per position (a 1M context about 3.2 GiB). [precision](../precision/deepseek41.md#where-each-stage-rounds)
 - **Refused flags:** `--rope-*`, `--yarn-*` (YaRN is part of the model).
@@ -69,8 +72,8 @@ modes it runs.
   card's free memory (or by `gpu-share`) so that every layer keeps the same number of peer slots. A peer that would hold nothing is
   refused. The peer computes its experts in every decode window and its share of each prompt chunk. An sm_89 peer is refused: its
   kernels are built for sm_120 only.
-- **Quality:** against one card a peer differs at CPU-against-GPU expert rounding (KLD 0.01 on the reference's own picks, BF16 gate
-  0.2805 against 0.2794); the same text as the earlier release with the tier frozen.
+- **Quality:** against one card a peer differs at CPU-against-GPU expert rounding (KLD 0.01 on the reference's own picks, BF16 KLD gate
+  0.2805 against 0.2794); the same text with the tier frozen.
 
 ## Long prompts
 
@@ -120,7 +123,7 @@ Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`
 
 ## Parallel slots
 
-Slots share one decode stream through the shared batch driver ([batching](../design/batching.md)), as on every model: a round
+Slots share one decode stream through the shared batch driver ([batching](../architecture/batching.md)), as on every model: a round
 runs the busy slots' windows as one batch of up to 8 rows. Each slot drafts as a single stream does, from the drafter's window
 rows of its own conversation. The slots share one drafter, so `--parallel` adds no drafter memory. A request alone in its slot
 gives the same greedy tokens as with `--parallel 1` (tiers pinned), and a batch's rows give bitwise their solo windows' picks and
@@ -128,9 +131,9 @@ logits (`--diag-batch-check`, frozen tier).
 
 With experts in RAM a batch's rows reach a wider union of experts than one slot's window, and the 8-row cap trims each slot's
 drafts (about 2 rows a slot at four slots, against 6-row windows alone), so on two cards batching is slower than running each
-slot's window in turn, as main did. Aggregate tok/s, two cards (400 W + 180 W), drafted, tiers unfrozen, 256 tokens a slot, ABBA:
+slot's window in turn. Aggregate tok/s, two cards (400 W + 180 W), drafted, tiers unfrozen, 256 tokens a slot, ABBA:
 
-| Slots | Main, in turn (A1 / A2) | Batched (B1 / B2) | Change |
+| Slots | In turn (A1 / A2) | Batched (B1 / B2) | Change |
 | --- | --- | --- | --- |
 | 1 | 89.3 / 87.0 | 87.0 / 92.8 | none: one slot runs its solo window, the same code |
 | 2 | 85.0 / 82.7 | 85.4 / 80.4 | -1.1% |

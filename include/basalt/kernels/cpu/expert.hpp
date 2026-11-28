@@ -67,8 +67,8 @@ CpuFeatures cpu_features();
 /// `n` must be a multiple of QKA and at most H. No allocation occurs.
 void act_quant_q8_1(const float* x, int n, ActQ& a);
 
-/// Plan v0.3 P6: ONE expert applied to up to MAXT tokens that were all routed to it (a speculative verify
-/// window routes ~1.5 tokens to each distinct expert). The 1.38 MB blob is read and its 2-bit codes unpacked
+/// ONE expert applied to up to MAXT tokens that were all routed to it (a speculative verify
+/// window routes a few tokens to each distinct expert). The blob is read and its 2-bit codes unpacked
 /// ONCE per block for all tokens; only the VNNI dot and the accumulation run per token. Every token's output
 /// is bitwise equal to `s2_expert_vnni_q` on that token (same operation order per token). A batch above `MAXT` runs one `s2_expert_vnni_q` per token.
 inline constexpr int MAXT = 8;

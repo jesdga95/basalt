@@ -11,6 +11,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/route_flags.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/meta.hpp"
@@ -72,9 +73,10 @@ public:
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
     /// Peer: the second cards hold experts, each a contiguous block of layers.
+    int max_slots() const override { return kMaxT; }   // one row each of a window
     program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }
 
-    const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
+    const char* model_name(const core::Json&) const override { return "DeepSeek-V4.1-Flash"; }
     const char* community_kv() const override { return "fp8"; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
@@ -83,6 +85,7 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--ple-io") o.ple_io = args.next("--ple-io");
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
@@ -99,6 +102,10 @@ public:
         if (!ctxp::cache_format(o.kv, fmt)) {
             basalt::log::error("basalt deepseek41", "--kv %s: DeepSeek's caches are fp8 (the default: FP8 window rows, FP4 "
                                "compressed rows and index keys) or fp16", o.kv.c_str());
+            return 2;
+        }
+        if (o.ple_io != "direct" && o.ple_io != "ram") {
+            basalt::log::error("basalt deepseek41", "--ple-io %s: direct (the default) or ram", o.ple_io.c_str());
             return 2;
         }
         if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {

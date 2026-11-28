@@ -151,14 +151,15 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. Flash-Next needs `kv` `int8` for N above 1 (another format stops the start, naming it). With `kv-resident`, each slot keeps only those cells in VRAM. |
-| `slot-full-context` | entry | switch | off | Give every slot the whole `max-context`, at N times the KV. |
+| `parallel` | entry | 1..64 | 1 | Serve N requests at once, each slot up to the whole `max-context` (running.md). Sets the engine's `batch`; a model that batches fewer slots stops the start, naming its limit (Inkling 2 Mini 64, Qwen3.8-27B 32, DeepSeek, Hy4-flash and Flash-Next 8). Flash-Next needs `kv` `int8` for N above 1 (another format stops the start, naming it). With `kv-resident`, each slot keeps only those cells in VRAM. |
+| `kv-pool` | entry | switch | on | A model with a KV pool (Inkling 2 Mini) backs every slot's cells from one pool as its conversation grows; off (`--no-kv-pool`): each slot holds its own KV for the whole `max-context`, fixed at start (the engine's `--kv-pool off`). |
 
 ## Conversation cache
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each on Flash-Next (page-locked, held from start with one more per slot). `0` reads every prompt from the start. |
+| `prompt-cache` | engine | integer | 6 | Conversation checkpoints a conversation keeps, about 118 MB of RAM each on Flash-Next. `0` reads every prompt from the start. |
+| `checkpoint-pool-mib` | engine | MiB | 4096 | Page-locked RAM the checkpoints of every slot share, held from start (never more than the slots can hold). Past it the least recently used checkpoint leaves. A pool below two checkpoints stops the start. |
 | `prompt-cache-every` | engine | tokens | 16384 (`0` = off) | Flash-Next only. Also checkpoint every N freshly read tokens (RAM only). |
 | `prompt-cache-root` | engine | tokens | 2048 (`0` = never) | Checkpoint the end of the system prompt when it is at least this long. |
 | `turn-token` | engine | token id | 248045 | The token that opens a chat turn; checkpoints go at the last one. |
@@ -174,7 +175,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `vision` | entry | `off`, `dynamic`, `cpu`, GPU number | `off` | Image input. A GPU number runs a sidecar on that card (about 2.2 GiB of its expert cache). `cpu` is slow. Needs a model with a vision projector. 32 MiB and 64 megapixels per image. [running](../running.md#vision---vision) |
+| `vision` | entry | `off`, `dynamic`, `cpu`, GPU number | `off` | Image input. A GPU number runs a sidecar on that card (a slice of its expert cache). `cpu` is slow. Needs a model with a vision projector. 32 MiB and 64 megapixels per image. [running](../running.md#vision---vision) |
 | `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Allow `http(s)` image URLs on this host from other machines. [image sources](image-sources.md) |
 | `image-dir` | server | directory, repeatable | none | Allow image files under this directory from other machines. [image sources](image-sources.md) |
 | `image-remote-only` | server | switch | off | Treat this machine's requests as remote too. [image sources](image-sources.md) |
