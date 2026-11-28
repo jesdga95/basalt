@@ -427,10 +427,12 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const auto one_on = [&](int c, int64_t positions, uint64_t round) {
             return pool_bytes(g, positions, fp8_, int8_, round, cut_, c) + (c == 0 && dspark_ ? dspark_pool_bytes(pack_, positions, round, int8_) : 0);
         };
-        // the least pool: every session at its first granule (the pool takes what is left after the experts; a conversation
-        // that outgrows it waits for room or is refused); with --kv-pool off every session holds the whole context
+        // the least pool: one session at the whole context or every session at its first granule, whichever is more (the pool
+        // takes what is left after the experts, and the card's idle room holds expert copies that give way as caches grow; a
+        // conversation beyond the pool waits for room or is refused); with --kv-pool off every session holds the whole context
         const auto pool_on = [&](int c) {
-            return req.kv_pool ? (uint64_t) n_sess * one_on(c, 1, gran) : (uint64_t) n_sess * one_on(c, want, gran);
+            return req.kv_pool ? std::max(one_on(c, want, gran), (uint64_t) n_sess * one_on(c, 1, gran))
+                               : (uint64_t) n_sess * one_on(c, want, gran);
         };
         // a position's bytes in card c's pool, granules aside
         const auto per_on = [&](int c) { return one_on(c, 2, 1) - one_on(c, 1, 1); };

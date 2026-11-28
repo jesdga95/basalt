@@ -491,7 +491,10 @@ public:
         if (heat_tally_) settle_window(r.pos);
         if (!ensure_positions(r.pos + r.n_tokens, err)) return grow_failed(err);
         if (heat_tally_) {   // the placement changes due at this position, before any row at or past it runs
-            if (rebalances() && next_rebalance_ >= 0 && r.pos >= next_rebalance_) rebalance_copies(r.pos, false);
+            // a request whose part was read in windows (a short one) never went through prefill_chunk, so its start is
+            // here: no rebalance scheduled yet, or one past a rewind
+            if (rebalances() && (next_rebalance_ < 0 || next_rebalance_ > r.pos + kRebalanceRows)) rebalance_copies(r.pos, true);
+            else if (rebalances() && r.pos >= next_rebalance_) rebalance_copies(r.pos, false);
             if (m_.loan_pending() && r.pos >= m_.loan_publish_at() && !publish_loan(r.pos)) return wedged();
             if (m_.wedged()) return wedged();
         }
@@ -1574,7 +1577,7 @@ private:
         }
         // the experts
         const bool on_cpu = cpu_ >> l & 1;   // the RAM experts' pairs on the CPU, beside the card's
-        if (on_cpu) {   // open until finish has queued the join: a throw between leaves the fork outside the call's sync
+        if (on_cpu) {   // open until finish is queued: a throw between leaves the fork or ring outside the call's sync
             fork_open_ = true;
             sh_->cpu->rows(l, rows, nrm, k.stream);   // quantized on the host while the router chooses
         }
