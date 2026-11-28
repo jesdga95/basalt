@@ -1510,6 +1510,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         short_ffn_.reset();
         short_ffn_cap_ = 0;
     }
+    tier->forget_use();   // a prompt starts and may change the topic: the victim counts start again
     tier->settle();
     if (!short_read) {
         tier->shrink();

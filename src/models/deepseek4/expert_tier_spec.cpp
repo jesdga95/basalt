@@ -3,6 +3,23 @@
 #include <algorithm>
 
 namespace basalt::models::deepseek4 {
+namespace {
+
+// Admission and victim policy for layers of 256 experts: an expert earns a card slot from repeated CPU use rather than a
+// single lookup, and the counts that pick victims decay slowly enough that an expert recurring over hundreds of tokens
+// keeps its slot through a run of one-off experts.
+constexpr int kAdmitUses = 2;
+// Copies a decode window may claim per row: a window's rows route to mostly different experts.
+constexpr int kClaimsPerRow = 128;
+// Tokens after which the lookup counts that pick the main card's victims halve, so an expert that recurs over hundreds of
+// tokens keeps its slot through a run of experts that come once.
+constexpr int kVictimHalfLife = 256;
+// An admitted expert's lookups must exceed its victim's by this much: a promotion moves two experts' bytes through RAM.
+constexpr int kAdmitMargin = 2;
+// Device bytes of each segment the copies' arena is mapped in, so a prompt borrows part of it instead of all.
+constexpr uint64_t kExpertLendSegment = 256ull << 20;
+
+}  // namespace
 
 bool make_expert_tier_spec(const Pack& pack, const std::string& path, int experts_fd,
                            const model::LoadRequest& request, core::ExpertTierSpec& spec, std::string& err) {
@@ -49,6 +66,11 @@ bool make_expert_tier_spec(const Pack& pack, const std::string& path, int expert
     out.pool_affinity = request.pool_affinity;
     out.pool_affinity_given = request.pool_affinity_given;
     out.expert_profile = request.expert_profile;
+    out.admit_uses = kAdmitUses;
+    out.claims_per_row = kClaimsPerRow;
+    out.victim_half_life = kVictimHalfLife;
+    out.admit_margin = kAdmitMargin;
+    out.lend_segment = kExpertLendSegment;
     out.route_tail_skip = request.route.tail_skip;
     out.route_prior = request.route.prior;
     spec = std::move(out);
