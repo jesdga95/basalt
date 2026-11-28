@@ -55,6 +55,13 @@ void Request::respell_prompt() {
     n = grown;
 }
 
+bool Request::repark_incoming() {
+    if (!incoming || !incoming_parked) return false;
+    if (!incoming->from_slot) return runtime_.conversations->put(std::move(*incoming));
+    runtime_.conversations->put_slot(std::move(*incoming), runtime_.bs.size());
+    return true;
+}
+
 Flow Request::restore() {
     runtime_.ckd_finish();   // a save that a request left behind (an error, a cancel) lands before anything moves
     runtime_.cur = ids;
@@ -183,7 +190,10 @@ Flow Request::restore() {
     on_disk = runtime_.disk.enabled() ? runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec)
                        : basalt::core::ConversationStore::Match{};
     from_disk = on_disk.tokens > std::max({resume, slot_tokens, parked.tokens});
-    if (!from_disk && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(runtime_.conversations->take(parked.index));
+    if (!from_disk && parked.tokens > std::max(resume, slot_tokens)) {
+        incoming.emplace(runtime_.conversations->take(parked.index));
+        incoming_parked = true;
+    }
     // RAM below the guard's floor (another program's peak): shed (after the conversation this request
     // continues is taken out of the cache), then let it come back before the request starts; a STOP ends the
     // wait, and the request then ends as cancelled.  A request that only continues the live conversation by a
@@ -211,8 +221,7 @@ Flow Request::restore() {
             // would continue goes back to the cache, the live one stays as it is (a batch slot's request ends
             // in its prompt read, which hands the slot back)
             if ((runtime_.stop_req.load() || runtime_.stdin_lost.load()) && !in_slot && runtime_.admit_slot < 0) {
-                if (incoming && incoming->from_slot) runtime_.conversations->put_slot(std::move(*incoming), runtime_.bs.size());
-                else if (incoming) (void) runtime_.conversations->put(std::move(*incoming));
+                (void) repark_incoming();
                 basalt::log::info("basalt serve", "RAM wait: the request was stopped after %.1f s",
                                   waited() / 1000.0);
                 basalt::log::info("basalt serve", "prompt %lld tokens = 0 reused + 0 of %lld read in 0 ms "
@@ -234,21 +243,44 @@ Flow Request::restore() {
         }
     }
     if (from_disk) {
-        const uint64_t need = runtime_.disk.load_bytes(on_disk);
+        uint64_t need = runtime_.disk.load_bytes(on_disk);
         const uint64_t floor = std::max<uint64_t>((uint64_t) runtime_.o.conversation_cache_min_free_mib << 20, runtime_.disk_floor);
         const auto t0 = Clock::now();
         basalt::core::SavedConversation image;
         std::string de;
-        if (basalt::core::Admission why; !runtime_.capture_admit(need, floor, &why)) {
-            basalt::log::warn("basalt serve", "conversation cache: %lld tokens on disk not read: %s",
-                              (long long) on_disk.tokens, basalt::core::conversation_refusal(why).c_str());
-        } else if (!runtime_.disk.load(on_disk, image, de)) {
-            basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
-                              "dropped", de.c_str());
+        basalt::core::Admission why;
+        bool admitted = runtime_.capture_admit(need, floor, &why);
+        const bool in_files = disk_kv_in_files(admitted);
+        const int64_t wanted = on_disk.tokens;
+        if (in_files) {   // only the running states come to RAM
+            need = runtime_.disk.load_bytes(on_disk, false);
+            runtime_.disk.touch(on_disk);   // the writes that make room for it evict it last
+            admitted = runtime_.admit_streamed(need, floor, &why);
+            // what left RAM for it went into the disk tier's index: the match is looked up again
+            on_disk = runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec);
+            admitted = admitted && on_disk.tokens == wanted;
+        }
+        if (!admitted) {
+            basalt::log::warn("basalt serve", "conversation cache: %lld tokens on disk not read: %s", (long long) wanted,
+                              why ? "the match left the disk tier while RAM was made for it"
+                                  : basalt::core::conversation_refusal(why).c_str());
+        } else if (!runtime_.disk.load(on_disk, image, de, in_files ? &incoming_kv : nullptr)) {
+            incoming_kv.reset();
+            basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s)", de.c_str());
         } else {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
-                              "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+            if (incoming_kv) {
+                uint64_t kv_bytes = 0;
+                for (size_t i = 0; i < incoming_kv->layers(); ++i)
+                    for (int b = 0; b < 5; ++b) kv_bytes += incoming_kv->bytes(i, b);
+                basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
+                                  "(%.2f GB of running state; %.2f GB of K/V go from the files into the session at "
+                                  "the restore)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9,
+                                  (double) kv_bytes / 1e9);
+            } else {
+                basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
+                                  "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+            }
             incoming.emplace(std::move(image));
             in_tokens = on_disk.tokens;
             in_live = true;
@@ -257,6 +289,7 @@ Flow Request::restore() {
             const auto again = runtime_.conversations->best(ids32, runtime_.req_imgs, want_cvec);
             if (again.tokens > std::max(resume, slot_tokens)) {
                 incoming.emplace(runtime_.conversations->take(again.index));
+                incoming_parked = true;
                 in_tokens = again.tokens;
                 in_live = again.live;
             }
@@ -273,7 +306,24 @@ Flow Request::restore() {
     validate_incoming();
     // Preserve the outgoing branch before any checkpoint rewind, reset,
     // or incoming restore overwrites the positional state it requires.
-    if (const Flow flow = make_room(); flow != Flow::proceed) return flow;
+    if (const Flow flow = make_room(); flow != Flow::proceed) {
+        // declined, the engine stays up: the conversation the request would have continued stays where the next
+        // request finds it.  One read from the disk tier is still there; one out of the RAM tier goes back.
+        if (flow == Flow::next && incoming && incoming_parked) {
+            const size_t tokens = incoming->live.ids.size();
+            const bool back = repark_incoming();
+            // what its return pushed out of the RAM tier goes to the tier below
+            for (auto& s : runtime_.conversations->take_spilled())
+                if (runtime_.disk.enabled() && !runtime_.disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec))
+                    runtime_.disk.put(std::move(s), Runtime::kDiskQueueCap);
+            basalt::log::info("basalt serve", "conversation cache: %zu tokens %s (the request was declined); "
+                              "parked=%zu bytes=%zu", tokens, back ? "back in the RAM tier" : "not taken back",
+                              runtime_.conversations->size(), runtime_.conversations->bytes());
+            runtime_.report_conversations();
+        }
+        drop_incoming();
+        return flow;
+    }
     if ((!from_live || incoming || slot_source >= 0) &&
         !runtime_.park_current(incoming ? incoming->bytes() : 0, incoming || slot_source >= 0 ? 0 : resume)) {
         std::printf("ERR %s\n", runtime_.err.c_str());
@@ -332,7 +382,7 @@ Flow Request::restore() {
         resume = in_tokens;
         from_live = in_live;
         retain_image();
-        incoming.reset();   // its running state and checkpoints are in the session now
+        drop_incoming();   // its running state and checkpoints are in the session now
         const double restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count();
         basalt::log::info("basalt serve", "conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu",
                      (long long) resume, from_live ? "live" : "checkpoint", restore_ms,

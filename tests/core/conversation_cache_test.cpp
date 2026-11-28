@@ -290,6 +290,45 @@ int main() {
         cache.put_slot(std::move(turn), 4);
         check(cache.superseded() == 1 && cache.slot_size() == 2, "a later turn of the same conversation supersedes its copy");
     }
+    {   // a conversation taken out and put back (the request that took it was declined) displaces nothing
+        const size_t one = image({1, 2, 3}).bytes();
+        ConversationCache cache(2 * one, 2);
+        cache.set_spill(true);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "park two, the budget and the slots full");
+        cache.put_slot(image({4, 4, 4}), 2);
+        const size_t held = cache.bytes();
+        auto budgeted = cache.take(cache.best(a, {}, true).index);
+        check(!budgeted.from_slot && cache.put(std::move(budgeted)) && cache.size() == 3 && cache.bytes() == held &&
+                  cache.best(a, {}, true).tokens == 3 && cache.best(b, {}, true).tokens == 3,
+              "a budgeted one goes back into the room it left");
+        auto slot = cache.take(cache.best(std::vector<int64_t>{4, 4, 4, 5}, {}, true).index);
+        check(slot.from_slot && cache.slot_size() == 0, "an idle slot's one taken out");
+        cache.put_slot(std::move(slot), 2);
+        check(cache.slot_size() == 1 && cache.size() == 3 && cache.bytes() == held, "and put back beside the others");
+        check(cache.evictions() == 0 && cache.take_spilled().empty(), "neither return evicts or spills anything");
+    }
+    {   // the longest parked conversation a caller accepts leaves, an idle slot's or a budgeted one alike
+        ConversationCache cache(1 << 20, 4);
+        cache.set_spill(true);
+        cache.put_slot(image({9, 8, 7}), 4);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({5, 6})), "park two beside an idle slot's conversation");
+        cache.put_slot(image({4, 4, 4, 4}), 4);
+        const auto any = [](const SavedConversation&) { return true; };
+        const auto longer = [](const SavedConversation& c) { return c.live.ids.size() >= 3; };
+        check(!cache.take_oldest([](const SavedConversation&) { return false; }) && cache.size() == 4,
+              "nothing leaves when no conversation is accepted");
+        auto first = cache.take_oldest(any);
+        check(first && first->from_slot && first->live.ids == std::vector<int32_t>({9, 8, 7}) && cache.slot_size() == 1,
+              "the longest parked one leaves first, with its bookkeeping");
+        auto second = cache.take_oldest(longer);
+        check(second && !second->from_slot && second->live.ids == std::vector<int32_t>({1, 2, 3}), "then the next");
+        auto third = cache.take_oldest(longer);
+        check(third && third->live.ids == std::vector<int32_t>({4, 4, 4, 4}) && cache.slot_size() == 0 &&
+                  cache.slot_bytes() == 0, "one that is not accepted is passed over");
+        check(!cache.take_oldest(longer) && cache.size() == 1 && cache.bytes() == image({5, 6}).bytes() &&
+                  cache.best(std::vector<int64_t>{5, 6, 7}, {}, true).tokens == 2, "and stays parked");
+        check(cache.evictions() == 0 && cache.take_spilled().empty(), "taking is no eviction and spills nothing");
+    }
     {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied
         auto running = [](std::initializer_list<int32_t> ids, uint8_t salt, size_t parts) {

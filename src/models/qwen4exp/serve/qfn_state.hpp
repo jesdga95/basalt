@@ -443,6 +443,7 @@ private:
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
     bool fixed_experts(basalt::core::VerifyHits& h, int dev);
+    bool disk_write(const basalt::core::ConversationSource& src, std::string& e);
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();
     bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false,

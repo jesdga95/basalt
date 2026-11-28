@@ -1,13 +1,19 @@
 #include <algorithm>
+#include "basalt/core/conversation_store.hpp"
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/system.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <memory>
+#include <string>
 #include <vector>
 
 using namespace basalt::core;
@@ -106,6 +112,73 @@ bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
 }
 
+// every file of a directory, by name; the directory is removed
+std::map<std::string, std::vector<uint8_t>> take_dir(const std::string& dir) {
+    std::map<std::string, std::vector<uint8_t>> out;
+    std::vector<basalt::platform::DirFile> files;
+    if (!basalt::platform::list_files(dir, files)) return out;
+    for (const auto& f : files) {
+        std::vector<uint8_t>& b = out[f.name];
+        b.resize((size_t) f.bytes);
+        std::FILE* fp = basalt::platform::open_file_utf8(dir + "/" + f.name, "rb");
+        if (!fp || std::fread(b.data(), 1, b.size(), fp) != b.size()) b.clear();
+        if (fp) std::fclose(fp);
+        basalt::platform::remove_file(dir + "/" + f.name);
+    }
+    basalt::platform::remove_file(dir);
+    return out;
+}
+
+// A buffer whose last pages are kept apart in a ring (a draft store over the working state): every read gives the
+// ring's bytes for those pages and the buffer's for the rest, whatever the read's bounds.
+void ring_pages() {
+    constexpr uint64_t kPageBytes = 96;
+    constexpr int64_t kPages = 20, kRing = 6;
+    std::vector<uint8_t> flat((size_t) (kPages * kPageBytes));
+    for (size_t i = 0; i < flat.size(); ++i) flat[i] = (uint8_t) (i * 7 + 1);
+    void *base_dev = nullptr, *ring_dev = nullptr;
+    cuda_check(cudaMalloc(&base_dev, flat.size()));
+    cuda_check(cudaMalloc(&ring_dev, (size_t) (kRing * kPageBytes)));
+    cuda_check(cudaMemcpy(base_dev, flat.data(), flat.size(), cudaMemcpyHostToDevice));
+    const uint8_t* base_p = static_cast<const uint8_t*>(base_dev);
+    for (const auto& [first, last] : std::vector<std::pair<int64_t, int64_t>>{{11, 17}, {14, 20}, {0, 6}, {3, 5},
+                                                                               {9, 9}, {16, 22}}) {
+        std::vector<uint8_t> ring((size_t) (kRing * kPageBytes), 0xEE), want = flat;
+        for (int64_t p = first; p < last; ++p)
+            for (uint64_t w = 0; w < kPageBytes; ++w) {
+                const uint8_t v = (uint8_t) (p * 31 + w * 3 + 5);
+                ring[(size_t) ((uint64_t) (p % kRing) * kPageBytes + w)] = v;
+                if (p < kPages) want[(size_t) ((uint64_t) p * kPageBytes + w)] = v;
+            }
+        cuda_check(cudaMemcpy(ring_dev, ring.data(), ring.size(), cudaMemcpyHostToDevice));
+        int base_reads = 0;
+        ConversationBytes base;
+        base.size = flat.size();
+        base.read = [&, base_p](uint64_t o, uint8_t* d, uint64_t n) {
+            ++base_reads;
+            return cudaMemcpy(d, base_p + o, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+        };
+        const ConversationBytes over = conversation_bytes_over_ring(base, ring_dev, kPageBytes, kRing, first, last);
+        check(over.size == flat.size(), "a ring's pages leave the buffer's size");
+        for (uint64_t step : {(uint64_t) flat.size(), (uint64_t) 1, (uint64_t) 37, kPageBytes, kPageBytes * kRing + 11}) {
+            std::vector<uint8_t> got(flat.size(), 0);
+            bool ok = true;
+            for (uint64_t o = 0; o < got.size(); o += step)
+                ok = ok && over.read(o, got.data() + o, std::min<uint64_t>(step, got.size() - o));
+            check(ok && got == want, "a store's ring pages read over the working state's");
+        }
+        base_reads = 0;
+        if (last > first && last <= kPages) {
+            std::vector<uint8_t> got((size_t) ((last - first) * kPageBytes));
+            check(over.read((uint64_t) first * kPageBytes, got.data(), got.size()) && base_reads == 0 &&
+                  std::equal(got.begin(), got.end(), want.begin() + (std::ptrdiff_t) (first * kPageBytes)),
+                  "pages the ring holds are read from it alone");
+        }
+    }
+    cuda_check(cudaFree(base_dev));
+    cuda_check(cudaFree(ring_dev));
+}
+
 void full_session(int fmt, int mode, int experts) {
     Fixture main(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
     auto& g=main.g;
@@ -179,6 +252,62 @@ void full_session(int fmt, int mode, int experts) {
           restored.live.state_d==a.live.state_d && restored.live.state_e==a.live.state_e &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
+    for (bool with_checks : {false,true}) {   // written from the session: the files of the queued capture; read back
+        // whole, and with the K/V left in its files and restored from them: the state of the whole capture
+        const std::vector<ConversationCheckpoint> none;   // no checkpoint: the live state is stored
+        auto disk_checks=checkpoints;
+        disk_checks.push_back(a.live);
+        const ConversationView flat{ids,images,with_checks?disk_checks:none,true};
+        SavedConversation whole;
+        check(conversation_snapshot_save(whole,flat,ss,g,draft.state,err),"capture A for the disk tier");
+        const std::string base=basalt::platform::temp_dir()+"/basalt-snapshot-disk-"+
+            std::to_string((long long)basalt::platform::process_id())+"-"+std::to_string(fmt)+std::to_string(mode)+
+            std::to_string(experts);
+        {
+            ConversationStore queued,direct;
+            queued.set_row_cells(qsa_real_shapes().idx_block);
+            direct.set_row_cells(qsa_real_shapes().idx_block);
+            check(queued.open(base+"-q",9,1ull<<30,err) && direct.open(base+"-d",9,1ull<<30,err),"open two stores");
+            check(queued.put(SavedConversation(whole),1ull<<30),"queue the captured image");
+            queued.flush();
+            ConversationSource src;
+            check(conversation_snapshot_source(src,flat,ss,g,&draft.state,err),"the session as a source");
+            check(src.ids==&flat.ids && src.checkpoints.size()==flat.checkpoints.size() &&
+                  (src.checkpoints.empty() || src.checkpoints[0]==&flat.checkpoints[0]),
+                  "the source borrows tokens and checkpoints");
+            check(src.bytes()>0 && direct.write(src,err),"write from the session");
+            check(direct.queued_bytes()==0,"a write from the session queues no image");
+            std::vector<int32_t> p=ids; p.push_back(1);
+            const auto m=direct.best(p.data(),p.size(),images,true);
+            check(m.tokens==(int64_t)ids.size(),"the written conversation matches");
+            SavedConversation loaded;
+            check(direct.load(m,loaded,err),"whole-image read of the session's write");
+            check(conversation_snapshot_restore(b,ss,g,draft.state,err)==ConversationRestore::restored,"restore B over it");
+            check(conversation_snapshot_restore(loaded,ss,g,draft.state,err)==ConversationRestore::restored,
+                  "restore the session's write through the whole-image read");
+            SavedConversation part;
+            std::unique_ptr<ConversationKvRead> kv;
+            check(direct.load(m,part,err,&kv) && kv && part.kv.size()==whole.kv.size() && part.kv[0].k.empty(),
+                  "read the state, the K/V left in its files");
+            check(!conversation_snapshot_validate(part,ss,g,nullptr,err,kv.get()),
+                  "an image with a draft layer in its files is refused without a draft");
+            check(conversation_snapshot_restore(b,ss,g,draft.state,err)==ConversationRestore::restored,"restore B over it");
+            check(conversation_snapshot_restore(part,ss,g,&draft.state,err,kv.get())==ConversationRestore::restored,
+                  "restore A with its K/V from the files");
+            SavedConversation back;
+            check(conversation_snapshot_save(back,flat,ss,g,draft.state,err),"capture the restored state");
+            bool same=back.kv.size()==whole.kv.size() && back.live.state_a==whole.live.state_a &&
+                      back.live.state_b==whole.live.state_b && back.live.state_c==whole.live.state_c &&
+                      back.live.state_d==whole.live.state_d && back.live.state_e==whole.live.state_e;
+            for (size_t i=0;same && i<back.kv.size();++i) same=equal(back.kv[i],whole.kv[i]);
+            check(same,"the K/V and state restored from the files equal the whole capture, draft included");
+            uint64_t fingerprint=0;
+            check(conversation_kv_verify(whole.kv.back(),draft.state,g,(int64_t)ids.size(),false,fingerprint,err),
+                  "the draft ring's resident pages refilled from the restored pool");
+        }
+        const auto qf=take_dir(base+"-q"),df=take_dir(base+"-d");
+        check(!qf.empty() && qf==df,"the session's write leaves the queued capture's files byte for byte");
+    }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty,{}};
@@ -286,6 +415,7 @@ int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     elastic_backing();
+    ring_pages();
     for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
         if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);

@@ -50,6 +50,13 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     return basalt::core::conversation_store_hash_file(o.model, h);
 }
 
+// Writes a conversation to the disk tier from where its state is (`src`: the session's buffers), a write buffer at a
+// time, with no copy of it in RAM.  The session waits for the write, whose progress is its heartbeat.  True when the
+// disk tier holds it afterwards.
+bool QfnRuntime::disk_write(const basalt::core::ConversationSource& src, std::string& e) {
+    return disk.write(src, e, [] { basalt::core::progress_beat(); });
+}
+
 // Save only on a switch/rewind, not on each continuing request. No graph
 // addresses change: all parked images live in ordinary host vectors.
 // `kept`: the tokens of the outgoing conversation the session goes on holding (the request continues from its
@@ -142,19 +149,61 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
     // a capped figure would under-evict and overfill the budget.
     const bool ram_room = !to_disk && conversations->make_room(estimate, held);
     if (!to_disk && !ram_room && disk_wants) to_disk = true;   // larger than the RAM tier: the disk tier takes it
+    const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024,
+                                              disk.enabled() ? disk_floor : 0);
+    const size_t retained = reuse.bytes() + stage_retained;
+    const size_t additional = estimate > retained ? estimate - retained : 0;
+    basalt::core::Admission whole_why;
+    const bool whole_ok = capture_admit(additional, floor, &whole_why);
+    const auto t0 = Clock::now();
+    // A park whose image RAM does not admit, into either tier, is written to the disk tier from the session, with no
+    // image of it in RAM; one RAM admits is captured, and what only the disk tier takes goes to its writer thread.
+    if (disk_wants && n_st == 0 && !whole_ok) {
+        // before anything makes room for a write the disk tier refuses: the least it writes, its checkpoints'
+        // states counted out (the store keeps only some of them)
+        size_t states = 0;
+        for (const ConvCheckpoint& c : checks) states += c.bytes();
+        const size_t least = fresh_estimate > states ? fresh_estimate - states : 0;
+        if (!disk.may_take(least)) {
+            basalt::log::info("basalt serve", "conversation cache: skip parking (%zu MiB do not fit the disk tier)",
+                              least >> 20);
+            return true;
+        }
+        reuse = {};   // its RAM goes before the write
+        const size_t need = basalt::core::ConversationStore::write_bytes(live.size());
+        if (basalt::core::Admission why; !admit_streamed(need, floor, &why)) {
+            refuse_parking(why, "parking (written from the session)", live.size(), need);
+            return true;
+        }
+        parking_admitted();
+        if (draft0 != nullptr && !mtp.snapshot_main(err)) return false;   // a streamed draft ring's own window
+        basalt::core::ConversationSource src;
+        std::string se;
+        bool stored = false;
+        try {
+            stored = basalt::core::conversation_snapshot_source(src, view, *rsp, g, draft0, se) && disk_write(src, se);
+        } catch (const std::bad_alloc&) {
+            se = "allocation failed";
+        }
+        if (!stored) basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
+        basalt::log::info("basalt serve", "conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=0 (to disk, written from the session)",
+                     stored ? "parked" : "skipped", live.size(),
+                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                     conversations->size(), conversations->bytes(), conversations->evictions(), (size_t) src.bytes());
+        report_conversations();
+        // what the RAM tier evicted to make room goes to the disk tier
+        for (auto& s : conversations->take_spilled())
+            if (!disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec)) disk.put(std::move(s), kDiskQueueCap);
+        return true;
+    }
     if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) {
         basalt::log::info("basalt serve", "conversation cache: skip parking (snapshot %zu MiB exceeds available budget)",
                      estimate >> 20);
         return true;
     }
-    const auto t0 = Clock::now();
     try {
-        const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024,
-                                                  disk.enabled() ? disk_floor : 0);
-        const size_t retained = reuse.bytes() + stage_retained;
-        const size_t additional = estimate > retained ? estimate - retained : 0;
-        if (basalt::core::Admission why; !capture_admit(additional, floor, &why)) {
-            refuse_parking(why, "parking", live.size(), estimate);
+        if (!whole_ok) {
+            refuse_parking(whole_why, "parking", live.size(), estimate);
             return true;
         }
         basalt::core::SavedConversation image;
@@ -253,7 +302,8 @@ bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bo
 // them: the RAM tier's (at exit), the solo session's and every idle slot's, each with its draft layer's K/V.  Between
 // requests (no slot decoding) this bounds what a crash or a kill loses; a slot's draft K/V is copied into the main
 // store for the capture, which every request refills from its own store first, so between requests that runs only
-// when the solo session holds no conversation of its own there.  At most `limit` images; returns those queued.
+// when the solo session holds no conversation of its own there.  At most `limit` images; returns those written or
+// queued.
 size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
     ckd_finish();   // a turn checkpoint's state may still be on its way to the host
     size_t written = 0;
@@ -273,26 +323,64 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
             basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
             return;
         }
-        if (at_exit) disk.flush();   // one image in RAM at a time
-        if (!admit_parking(bytes, floor, "disk write", ids.size(), bytes)) return;
-        try {
-            const auto t0 = Clock::now();
-            basalt::core::SavedConversation image;
-            if ((mtp_kv != nullptr && !mtp.snapshot_main(se)) ||   // a streamed draft ring's own window
-                !basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
-                basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
-                return;
+        if (at_exit) disk.flush();   // one image in RAM at a time; the queued ones before this one in the budget
+        if (capture_admit(bytes, floor)) {   // an image in RAM, which the writer thread writes
+            parking_admitted();
+            try {
+                const auto t0 = Clock::now();
+                basalt::core::SavedConversation image;
+                if ((mtp_kv != nullptr && !mtp.snapshot_main(se)) ||   // a streamed draft ring's own window
+                    !basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
+                    basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
+                    return;
+                }
+                if (disk.put(std::move(image), kDiskQueueCap)) {
+                    ++written;
+                    if (!at_exit)
+                        basalt::log::info("basalt serve", "conversation cache: %zu tokens to disk between requests "
+                                          "(captured in %.0f ms)", ids.size(),
+                                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
+            } catch (const std::bad_alloc&) {
+                basalt::log::warn("basalt serve", "conversation cache: allocation failed; not written to disk");
             }
-            if (disk.put(std::move(image), kDiskQueueCap)) {
-                ++written;
-                if (!at_exit)
-                    basalt::log::info("basalt serve", "conversation cache: %zu tokens to disk between requests "
-                                      "(captured in %.0f ms)", ids.size(),
-                                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-            }
-        } catch (const std::bad_alloc&) {
-            basalt::log::warn("basalt serve", "conversation cache: allocation failed; not written to disk");
+            return;
         }
+        // RAM does not admit the image: written from the session, with no image of it in RAM
+        size_t states = 0;   // the least it writes: its checkpoints' states counted out
+        for (const ConvCheckpoint& c : cks) states += c.bytes();
+        const size_t least = bytes > states ? bytes - states : 0;
+        if (!disk.may_take(least)) {
+            basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (%zu MiB do not fit "
+                              "the disk tier)", ids.size(), least >> 20);
+            return;
+        }
+        const uint64_t need = basalt::core::ConversationStore::write_bytes(ids.size());
+        if (basalt::core::Admission why; !admit_streamed(need, floor, &why)) {
+            refuse_parking(why, "disk write", ids.size(), need);
+            return;
+        }
+        parking_admitted();
+        const auto t0 = Clock::now();
+        basalt::core::ConversationSource src;
+        bool stored = false;
+        try {
+            stored = (mtp_kv == nullptr || mtp.snapshot_main(se)) &&   // a streamed draft ring's own window
+                     basalt::core::conversation_snapshot_source(src, view, s, g, mtp_kv, se) && disk_write(src, se);
+        } catch (const std::bad_alloc&) {
+            se = "allocation failed";
+        }
+        if (!stored) {
+            basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
+            return;
+        }
+        // between requests the caller goes on while one was written: only what it will not find to write again
+        if (at_exit || disk_has(ids, imgs, cks, cvec)) ++written;
+        if (!at_exit)
+            basalt::log::info("basalt serve", "conversation cache: %zu tokens to disk between requests "
+                              "(written from the session in %.0f ms, %.2f GB)", ids.size(),
+                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                              (double) src.bytes() / 1e9);
     };
     std::string se;
     if (mtp_on && !mtp.use_main(se)) se.clear();
@@ -382,8 +470,9 @@ bool QfnRuntime::park_idle_engine(std::string& e) {
 }
 
 // Idle conversation `b` (a batch slot; -1: the solo session's) out of VRAM, its K/V cells beyond the base back to the
-// driver: into the RAM tier when the RAM a capture must leave admits it, else nothing is copied when the disk tier
-// holds it.  False when it stays in VRAM (`e` empty) or its cells could not be given back (`e` set).
+// driver: into the RAM tier when the RAM a capture must leave admits it, else to the disk tier, written from the
+// session unless a stored copy reaches it.  False when it stays in VRAM (`e` empty) or its cells could not be given
+// back (`e` set).
 bool QfnRuntime::park_one(int b, std::string& e) {
     const auto t0 = Clock::now();
     basalt::core::SessionState& u = b >= 0 ? *bslot_ss[0][(size_t) b] : ss;
@@ -414,11 +503,37 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     const bool keep = o.conversation_cache_min_tokens <= 0 ||
                       (int64_t) ids.size() >= o.conversation_cache_min_tokens;
     bool to_ram = keep && capture_admit(est > moved ? est - moved : 0, floor);
-    const bool on_disk = keep && !to_ram && disk.enabled() && (int64_t) ids.size() >= disk_min_tokens() &&
-                         disk_has(ids, imgs, cks, cvec);
-    if (!to_ram && !on_disk && keep) {   // said once per idle stretch
-        double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;
-        const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
+    const bool disk_takes = keep && !to_ram && disk.enabled() && (int64_t) ids.size() >= disk_min_tokens();
+    bool on_disk = disk_takes && disk_has(ids, imgs, cks, cvec);
+    size_t bytes = 0;
+    bool written = false;
+    double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;   // what is said once per idle stretch
+    const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
+    // what the disk tier refuses at once is not made room for
+    const size_t least = est > moved ? est - moved : 0;   // the least it writes: its checkpoints' states counted out
+    const bool disk_room = disk_takes && !on_disk && disk.may_take(least);
+    if (disk_takes && !on_disk && !disk_room && noted != since)
+        basalt::log::info("basalt serve", "%s's idle conversation is not written to disk: %zu MiB do not fit the disk "
+                          "tier", who.c_str(), least >> 20);
+    if (disk_room && admit_streamed(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+        ckd_finish();   // the write reads its checkpoints' bytes
+        // its own K/V from the session, its draft layer's from the store that holds it
+        basalt::core::ConversationSource src;
+        try {
+            written = basalt::core::conversation_snapshot_source(src, view, *cap, g,
+                          static_cast<const basalt::core::QsaState*>(nullptr), se) &&
+                      (mtp_kv == nullptr || mtp.store_source(store, (int64_t) ids.size(), src.kv.emplace_back(), se)) &&
+                      disk_write(src, se);
+        } catch (const std::bad_alloc&) {
+            se = "allocation failed";
+        }
+        on_disk = written;
+        bytes = (size_t) src.bytes();
+        if (!written && noted != since)
+            basalt::log::warn("basalt serve", "%s's idle conversation is not written to disk (%s)", who.c_str(),
+                              se.c_str());
+    }
+    if (!to_ram && !on_disk && keep) {
         if (noted != since)
             basalt::log::info("basalt serve", "%s's idle conversation stays in VRAM: %zu MiB do not fit in RAM above "
                               "the %llu MiB floor", who.c_str(), (est - std::min(est, moved)) >> 20,
@@ -426,7 +541,6 @@ bool QfnRuntime::park_one(int b, std::string& e) {
         noted = since;
         return false;
     }
-    size_t bytes = 0;
     if (to_ram) {
         try {
             basalt::core::SavedConversation image;
@@ -466,6 +580,8 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     ++kv_moves;
     char where[64];
     if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);
+    else if (written)
+        std::snprintf(where, sizeof where, "to disk from the session (%.0f MiB)", (double) bytes / 1048576.0);
     else if (on_disk) std::snprintf(where, sizeof where, "kept on disk only");
     else std::snprintf(where, sizeof where, "dropped, below the %d token minimum", o.conversation_cache_min_tokens);
     basalt::log::info("basalt serve", "%s's idle conversation, %lld tokens, %s in %.0f ms: %lld KV cells back",
