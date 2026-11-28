@@ -171,6 +171,81 @@ int main(int argc, char** argv) {
         if (max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for type %d (dot rows)\n", type); ++bad; }
         if (max_gu > 1e-4) { std::printf("REFERENCE ERROR too large for type %d (gate/up rows)\n", type); ++bad; }
     }
+    // Q8_K hidden activation quantization (`native_quant_h`) and exact AVX-512 multi-token IQ down rows
+    // (`iq_exact_512_rows` / `iq1s_512_rows` / `native_down_rows`) bit for bit against ggml's single-token dot.
+    {
+        constexpr int kRows = 256, kCols = 2304;
+        std::mt19937 rng(701);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        const auto* qa = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        std::vector<float> h(kCols);
+        std::vector<uint8_t> hgot(cpu::kNativeHBytes), href(cpu::kNativeHBytes);
+        cpu::NativeFmt qf{};
+        std::string qerr;
+        if (!cpu::native_fmt(16, 16, kRows, kCols, qf, qerr)) {
+            std::printf("native_fmt(16, 16): %s\n", qerr.c_str());
+            return 1;
+        }
+        size_t qdiff = 0;
+        for (int trial = 0; trial < 16; ++trial) {
+            for (auto& v : h) v = trial == 0 ? 0.f : nd(rng);
+            cpu::native_quant_h(qf, h.data(), hgot.data());
+            qa->from_float(h.data(), href.data(), kCols);
+            qdiff += std::memcmp(hgot.data(), href.data(), qf.h_bytes) != 0;
+        }
+        if (qdiff) { std::printf("FAIL: native_quant_h Q8_K differs from ggml ref (%zu trials)\n", qdiff); ++bad; }
+
+        for (int type : {16, 17, 18, 19, 21, 22, 29}) {
+            cpu::NativeFmt f{};
+            std::string err;
+            if (!cpu::native_fmt(type, type, kRows, kCols, f, err)) {
+                std::printf("native_fmt(%d, %d): %s\n", type, type, err.c_str());
+                return 1;
+            }
+            std::vector<uint8_t> blob(f.bytes);
+            fill(blob, type, 900 + (uint64_t) type, 0);
+            if (type == GGML_TYPE_IQ1_M) {
+                const size_t bs = ggml_type_size(GGML_TYPE_IQ1_M);
+                for (size_t b = f.down_off; b + bs <= blob.size(); b += bs) {
+                    // IQ1_M packs its fp16 scale into the top nibbles of the four u16 words in scales[8] at +48.
+                    blob[b + 55] = (uint8_t) ((blob[b + 55] & 0x0f) | 0x20);
+                }
+            }
+            std::vector<std::vector<uint8_t>> hq(MAXT, std::vector<uint8_t>(cpu::kNativeHBytes));
+            const void* hp[MAXT];
+            for (int t = 0; t < MAXT; ++t) {
+                for (auto& v : h) v = nd(rng);
+                cpu::native_quant_h(f, h.data(), hq[(size_t) t].data());
+                hp[t] = hq[(size_t) t].data();
+            }
+            const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
+            std::vector<std::vector<float>> ref(MAXT, std::vector<float>(kRows));
+            for (int t = 0; t < MAXT; ++t)
+                for (int r = 0; r < kRows; ++r)
+                    tc->vec_dot(kCols, &ref[(size_t) t][(size_t) r], 0,
+                                blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[t], 0, 1);
+
+            size_t exact_diff = 0;
+            constexpr float kGuard = -777.f;
+            constexpr int r0 = 7, r1 = kRows - 11;
+            for (int nt = 1; nt <= MAXT; ++nt) {
+                std::vector<std::vector<float>> out(nt, std::vector<float>(kRows, kGuard));
+                float* op[MAXT];
+                for (int t = 0; t < nt; ++t) op[t] = out[(size_t) t].data();
+                cpu::native_down_rows(f, blob.data(), hp, nt, op, r0, r1);
+                for (int t = 0; t < nt; ++t)
+                    for (int r = 0; r < kRows; ++r) {
+                        const float want = (r >= r0 && r < r1) ? ref[(size_t) t][(size_t) r] : kGuard;
+                        exact_diff += std::memcmp(&out[(size_t) t][(size_t) r], &want, 4) != 0;
+                    }
+            }
+            if (exact_diff) {
+                std::printf("FAIL: type %d exact AVX-512 down rows differ from ggml (%zu values)\n", type, exact_diff);
+                ++bad;
+            }
+        }
+        std::printf("  exact AVX-512 IQ down rows & Q8_K quant_h (cols=%d): %s\n", kCols, bad ? "FAIL" : "bit-exact ok");
+    }
     // ---- multi-token bounds (nt <= 0 no-op, nt = 9, 13 chunking bitwise vs nt = 1) and Q8_K zero/NaN edge cases
     {
         constexpr int kBigT = 13, kRows = 16;
@@ -270,6 +345,69 @@ int main(int argc, char** argv) {
                 }
                 std::printf("  bench type %2d nt %d: %.2f us per 200 rows, %.2f GB/s (in cache, one thread)\n", type, nt,
                             best * 1e3 / reps, (double) reps * 400.0 * (double) f.gu_row / (best * 1e6));
+            }
+        }
+        // Hidden Q8_K quantization and exact IQ down rows at DeepSeek-V4.1 expert geometry (5120 x 2304).
+        constexpr int kDownRows = 5120, kDownCols = 2304;
+        std::vector<float> h(kDownCols);
+        for (auto& v : h) v = (float) ((int) (rng() % 2001) - 1000) / 400.f;
+        std::vector<uint8_t> hq_buf(cpu::kNativeHBytes);
+        const auto* qa = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        cpu::NativeFmt qf{};
+        std::string qerr;
+        cpu::native_fmt(16, 16, kDownRows, kDownCols, qf, qerr);
+        auto bench_q = [&](auto&& fn) {
+            double best = 1e30;
+            constexpr int kReps = 5000;
+            for (int k = 0; k < 5; ++k) {
+                const double t0 = now_ms();
+                for (int r = 0; r < kReps; ++r) fn();
+                best = std::min(best, now_ms() - t0);
+            }
+            return best * 1e3 / kReps;
+        };
+        const double q_ref = bench_q([&] { qa->from_float(h.data(), hq_buf.data(), kDownCols); });
+        const double q_vec = bench_q([&] { cpu::native_quant_h(qf, h.data(), hq_buf.data()); });
+        std::printf("  bench quant_h Q8_K (cols=%d): ggml %.2f us, native %.2f us (%.2fx)\n", kDownCols, q_ref, q_vec,
+                    q_ref / q_vec);
+        for (int type : {16, 17, 18, 19, 21, 22, 29}) {
+            cpu::NativeFmt f{};
+            std::string err;
+            cpu::native_fmt(type, type, kDownRows, kDownCols, f, err);
+            std::vector<uint8_t> blob(f.bytes);
+            fill(blob, type, 77 + (uint64_t) type, 0);
+            if (type == GGML_TYPE_IQ1_M) {
+                const size_t bs = ggml_type_size(GGML_TYPE_IQ1_M);
+                for (size_t b = f.down_off; b + bs <= blob.size(); b += bs)
+                    blob[b + 55] = (uint8_t) ((blob[b + 55] & 0x0f) | 0x20);
+            }
+            cpu::native_quant_h(f, h.data(), hq_buf.data());
+            const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
+            for (int nt : {1, 4, 6}) {
+                const void* hp[MAXT];
+                std::vector<std::vector<float>> out(nt, std::vector<float>(kDownRows));
+                float* op[MAXT];
+                for (int t = 0; t < nt; ++t) { hp[t] = hq_buf.data(); op[t] = out[(size_t) t].data(); }
+                constexpr int kReps = 5;
+                auto bench_d = [&](auto&& fn) {
+                    double best = 1e30;
+                    for (int k = 0; k < 3; ++k) {
+                        const double t0 = now_ms();
+                        for (int r = 0; r < kReps; ++r) fn();
+                        best = std::min(best, now_ms() - t0);
+                    }
+                    return best * 1e3 / kReps;
+                };
+                const double t_ref = bench_d([&] {
+                    for (int r = 0; r < kDownRows; ++r) {
+                        const uint8_t* dr = blob.data() + f.down_off + (size_t) r * f.d_row;
+                        for (int t = 0; t < nt; ++t) tc->vec_dot(kDownCols, &op[t][r], 0, dr, 0, hp[t], 0, 1);
+                    }
+                });
+                const double t_nat = bench_d([&] { cpu::native_down_rows(f, blob.data(), hp, nt, op, 0, kDownRows); });
+                const double bytes = (double) kDownRows * (double) f.d_row;
+                std::printf("  bench down type %2d (%dx%d) nt=%d: ggml %7.1f us, native %7.1f us (%.2fx, %.2f GB/s)\n",
+                            type, kDownRows, kDownCols, nt, t_ref, t_nat, t_ref / t_nat, bytes / (t_nat * 1e3));
             }
         }
     }

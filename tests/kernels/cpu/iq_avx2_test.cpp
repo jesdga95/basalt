@@ -894,6 +894,84 @@ int main(int argc, char** argv) {
             if (st512.max_rel > 1e-3) { std::printf("AVX-512 Q2_0 down rows too far from AVX2\n"); ++bad; }
         }
     }
+    // Q8_K hidden activation quantization (`native_quant_h`) and exact multi-token IQ down rows (`iq_exact_256_rows`
+    // and `native_down_rows`) against ggml's scalar quantizer and single-token vec_dot, bit for bit.
+    {
+        constexpr int kRows = 256, kCols = 2304;
+        const auto* qa = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        std::vector<float> h(kCols);
+        std::vector<uint8_t> hgot(cpu::kNativeHBytes), href(cpu::kNativeHBytes);
+        cpu::NativeFmt qf{};
+        std::string qerr;
+        if (!cpu::native_fmt(16, 16, kRows, kCols, qf, qerr)) {
+            std::printf("native_fmt(16, 16): %s\n", qerr.c_str());
+            return 1;
+        }
+        size_t qdiff = 0;
+        for (int trial = 0; trial < 16; ++trial) {
+            for (auto& v : h) v = trial == 0 ? 0.f : nd(rng);
+            cpu::native_quant_h(qf, h.data(), hgot.data());
+            qa->from_float(h.data(), href.data(), kCols);
+            qdiff += std::memcmp(hgot.data(), href.data(), qf.h_bytes) != 0;
+        }
+        if (qdiff) { std::printf("FAIL: native_quant_h Q8_K differs from ggml ref (%zu trials)\n", qdiff); ++bad; }
+
+        for (int type : {16, 17, 18, 21, 22, 23}) {
+            cpu::NativeFmt f{};
+            std::string err;
+            if (!cpu::native_fmt(type, type, kRows, kCols, f, err)) {
+                std::printf("native_fmt(%d, %d): %s\n", type, type, err.c_str());
+                return 1;
+            }
+            std::vector<uint8_t> blob(f.bytes);
+            fill(blob, type, 700 + (uint64_t) type, 0);
+            std::vector<std::vector<uint8_t>> hq(MAXT, std::vector<uint8_t>(cpu::kNativeHBytes));
+            const void* hp[MAXT];
+            for (int t = 0; t < MAXT; ++t) {
+                for (auto& v : h) v = nd(rng);
+                cpu::native_quant_h(f, h.data(), hq[(size_t) t].data());
+                hp[t] = hq[(size_t) t].data();
+            }
+            const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
+            std::vector<std::vector<float>> ref(MAXT, std::vector<float>(kRows));
+            for (int t = 0; t < MAXT; ++t)
+                for (int r = 0; r < kRows; ++r)
+                    tc->vec_dot(kCols, &ref[(size_t) t][(size_t) r], 0,
+                                blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[t], 0, 1);
+
+            size_t exact_diff = 0;
+            constexpr float kGuard = -777.f;
+            constexpr int r0 = 7, r1 = kRows - 11;
+            for (int nt = 1; nt <= MAXT; ++nt) {
+                std::vector<std::vector<float>> out(nt, std::vector<float>(kRows, kGuard));
+                float* op[MAXT];
+                for (int t = 0; t < nt; ++t) op[t] = out[(size_t) t].data();
+                for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+                    auto fn = v ? cpu::iq_exact_256_rows_vnni : cpu::iq_exact_256_rows_base;
+                    for (int t = 0; t < nt; ++t) std::fill(out[(size_t) t].begin(), out[(size_t) t].end(), kGuard);
+                    fn(type, blob.data() + f.down_off, f.d_row, kCols, hp, nt, op, r0, r1);
+                    for (int t = 0; t < nt; ++t)
+                        for (int r = 0; r < kRows; ++r) {
+                            const float want = (r >= r0 && r < r1) ? ref[(size_t) t][(size_t) r] : kGuard;
+                            exact_diff += std::memcmp(&out[(size_t) t][(size_t) r], &want, 4) != 0;
+                        }
+                    ++compared;
+                }
+                for (int t = 0; t < nt; ++t) std::fill(out[(size_t) t].begin(), out[(size_t) t].end(), kGuard);
+                cpu::native_down_rows(f, blob.data(), hp, nt, op, r0, r1);
+                for (int t = 0; t < nt; ++t)
+                    for (int r = 0; r < kRows; ++r) {
+                        const float want = (r >= r0 && r < r1) ? ref[(size_t) t][(size_t) r] : kGuard;
+                        exact_diff += std::memcmp(&out[(size_t) t][(size_t) r], &want, 4) != 0;
+                    }
+            }
+            if (exact_diff) {
+                std::printf("FAIL: type %d exact down rows differ from ggml (%zu values)\n", type, exact_diff);
+                ++bad;
+            }
+        }
+        std::printf("  exact IQ down rows & Q8_K quant_h (cols=%d): %s\n", kCols, bad ? "FAIL" : "bit-exact ok");
+    }
     bad += check_q8_1_finite(avx512);
     bad += check_q8_k_edge(avx512);
     bad += check_multitoken_bounds(vnni, avx512);
@@ -965,6 +1043,55 @@ int main(int argc, char** argv) {
                 const double uq = (now_ms() - t0) * 1e3 / reps;
                 std::printf("  down nt %d %s: IQ4_NL %.1f us (%.2f GB/s), Q2_0 %.1f us (%.2f GB/s) per expert (in cache, one thread)\n",
                             nt, v ? "vnni" : "base", ui, (double) blob.size() / ui / 1e3, uq, (double) q2blob.size() / uq / 1e3);
+            }
+        }
+        // exact AVX2/VNNI IQ down rows & Q8_K quant_h (5120x2304, DeepSeek-V4.1-Flash expert down shape)
+        constexpr int kBenchRows = 5120, kBenchCols = 2304;
+        const ggml_type_traits_cpu* tq8k = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+        std::vector<float> hq_src(kBenchCols);
+        for (auto& v : hq_src) v = nd(rng);
+        std::vector<uint8_t> q8_buf(cpu::kNativeHBytes);
+        for (int r = 0; r < 50; ++r) tq8k->from_float(hq_src.data(), q8_buf.data(), kBenchCols);
+        double t0 = now_ms();
+        for (int r = 0; r < 5000; ++r) tq8k->from_float(hq_src.data(), q8_buf.data(), kBenchCols);
+        const double q_ggml_us = (now_ms() - t0) * 1e3 / 5000.0;
+        for (int r = 0; r < 50; ++r) cpu::quantize_q8_K_avx2(hq_src.data(), q8_buf.data(), kBenchCols);
+        t0 = now_ms();
+        for (int r = 0; r < 5000; ++r) cpu::quantize_q8_K_avx2(hq_src.data(), q8_buf.data(), kBenchCols);
+        const double q_avx2_us = (now_ms() - t0) * 1e3 / 5000.0;
+        std::printf("  bench quant_h Q8_K (cols=%d): ggml %.2f us, avx2 %.2f us (%.2fx)\n", kBenchCols, q_ggml_us,
+                    q_avx2_us, q_ggml_us / q_avx2_us);
+        for (int type : {16, 17, 18, 21, 22, 23}) {
+            cpu::NativeFmt df;
+            if (!cpu::native_fmt(16, type, kBenchRows, kBenchCols, df, err)) continue;
+            const ggml_type_traits_cpu* tr = ggml_get_type_traits_cpu((ggml_type) type);
+            std::vector<uint8_t> dblob((size_t) kBenchRows * df.d_row);
+            fill(dblob, type, 1700 + (uint64_t) type, 0);
+            std::vector<std::vector<uint8_t>> acts(6, std::vector<uint8_t>(cpu::kNativeHBytes));
+            for (int t = 0; t < 6; ++t) cpu::quantize_q8_K_avx2(hq_src.data(), acts[(size_t) t].data(), kBenchCols);
+            for (int nt : {2, 4, 6}) {
+                const void* hp2[6];
+                std::vector<std::vector<float>> out2(nt, std::vector<float>(kBenchRows));
+                float* op2[6];
+                for (int t = 0; t < nt; ++t) { hp2[t] = acts[(size_t) t].data(); op2[t] = out2[(size_t) t].data(); }
+                const int reps = 20;
+                t0 = now_ms();
+                for (int r = 0; r < reps; ++r)
+                    for (int row = 0; row < kBenchRows; ++row) {
+                        const uint8_t* dr = dblob.data() + (size_t) row * df.d_row;
+                        for (int t = 0; t < nt; ++t) tr->vec_dot(kBenchCols, &op2[t][row], 0, dr, 0, hp2[t], 0, 1);
+                    }
+                const double ggml_us = (now_ms() - t0) * 1e3 / reps;
+                for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+                    auto fn = v ? cpu::iq_exact_256_rows_vnni : cpu::iq_exact_256_rows_base;
+                    fn(type, dblob.data(), df.d_row, kBenchCols, hp2, nt, op2, 0, kBenchRows);
+                    t0 = now_ms();
+                    for (int r = 0; r < reps; ++r) fn(type, dblob.data(), df.d_row, kBenchCols, hp2, nt, op2, 0, kBenchRows);
+                    const double us = (now_ms() - t0) * 1e3 / reps;
+                    std::printf("  bench down type %2d (%dx%d) nt=%d %s: ggml %7.1f us, exact %7.1f us (%.2fx, %.2f GB/s)\n",
+                                type, kBenchRows, kBenchCols, nt, v ? "vnni" : "base", ggml_us, us, ggml_us / us,
+                                (double) dblob.size() / us / 1e3);
+                }
             }
         }
     }

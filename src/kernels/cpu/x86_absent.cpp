@@ -46,6 +46,9 @@ void iq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*,
     absent("iq256_gu_rows");
 }
 void iq256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) { absent("iq256_rows"); }
+void iq_exact_256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    absent("iq_exact_256_rows");
+}
 void iq1s_512_gu_rows(const uint8_t*, size_t, size_t, int, float, float, bool, float, const void* const*, int, float* const*,
                       int, int) {
     absent("iq1s_512_gu_rows");

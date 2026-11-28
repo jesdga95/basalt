@@ -368,7 +368,11 @@ void exact_rows_k(int k, const uint8_t* w, size_t row_bytes, int nb, const void*
         case 1: exact_rows<TY, 1>(w, row_bytes, nb, act, out, r0, r1); break;
         case 2: exact_rows<TY, 2>(w, row_bytes, nb, act, out, r0, r1); break;
         case 3: exact_rows<TY, 3>(w, row_bytes, nb, act, out, r0, r1); break;
-        default: exact_rows<TY, 4>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 4: exact_rows<TY, 4>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 5: exact_rows<TY, 5>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 6: exact_rows<TY, 6>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 7: exact_rows<TY, 7>(w, row_bytes, nb, act, out, r0, r1); break;
+        default: exact_rows<TY, 8>(w, row_bytes, nb, act, out, r0, r1); break;
     }
 }
 
@@ -382,6 +386,9 @@ void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_of
         case 19: exact_gu_rows_k<19>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 16: exact_gu_rows_k<16>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 17: exact_gu_rows_k<17>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 18: exact_gu_rows_k<18>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 21: exact_gu_rows_k<21>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 22: exact_gu_rows_k<22>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 29: exact_gu_rows_k<29>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         default: break;
         }
@@ -391,12 +398,16 @@ void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_of
 void exact_rows_nt(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                    int r0, int r1) {
     const int nb = n / QK_K;
-    for (int t0 = 0; t0 < nt; t0 += 4) {
-        const int k = nt - t0 < 4 ? nt - t0 : 4;
+    const int step = (type == 19 || type == 29) ? 4 : 8;   // IQ1_S and IQ1_M keep two accumulators per token
+    for (int t0 = 0; t0 < nt; t0 += step) {
+        const int k = nt - t0 < step ? nt - t0 : step;
         switch (type) {
         case 19: exact_rows_k<19>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 16: exact_rows_k<16>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 17: exact_rows_k<17>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 18: exact_rows_k<18>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 21: exact_rows_k<21>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 22: exact_rows_k<22>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 29: exact_rows_k<29>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         default: break;
         }
@@ -583,7 +594,9 @@ void iq1s_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const*
     exact_rows_nt(19, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
-bool iq_exact_512_supported(int type) noexcept { return type == 16 || type == 17 || type == 29; }
+bool iq_exact_512_supported(int type) noexcept {
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29;
+}
 
 void iq_exact_512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su,
                           bool scaled, float limit, const void* const* act, int nt, float* const* ff, int r0, int r1) {
