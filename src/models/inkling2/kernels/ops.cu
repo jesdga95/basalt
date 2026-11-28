@@ -731,8 +731,10 @@ router_select_plan_kernel(const float* __restrict__ logits, const float* __restr
     bk::pdl_wait();
     bk::pdl_launch_dependents();
 
-    const float sc = 1.f / (1.f + expf(-logits[e]));
-    const float b = sc + my_bias;
+    const float sc_raw = 1.f / (1.f + expf(-logits[e]));
+    const float sc = isnan(sc_raw) ? 0.f : sc_raw;
+    const float b_raw = sc_raw + my_bias;
+    const float b = isnan(b_raw) ? -INFINITY : b_raw;
     sb[e] = b;
     __syncthreads();
 
@@ -840,16 +842,20 @@ router_select_plan_multi_kernel(const float* __restrict__ logits, const float* _
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const float lg = rl[lane + 32 * j];
-            sc[j] = 1.f / (1.f + expf(-lg));
-            b[j] = sc[j] + bias_reg[j];
+            const float sc_raw = 1.f / (1.f + expf(-lg));
+            sc[j] = isnan(sc_raw) ? 0.f : sc_raw;
+            const float bj = sc_raw + bias_reg[j];
+            b[j] = isnan(bj) ? -INFINITY : bj;
         }
         int sel_id = 0;
         float sel_s = 0.f;
+        unsigned taken = 0;
         for (int rank = 0; rank < k; ++rank) {
-            float bv = b[0], bs = sc[0];
-            int bi = lane;
+            float bv = -INFINITY, bs = 0.f;
+            int bi = NE;
 #pragma unroll
-            for (int j = 1; j < 4; ++j) {
+            for (int j = 0; j < 4; ++j) {
+                if ((taken >> j) & 1u) continue;
                 const int idx = lane + 32 * j;
                 if (b[j] > bv || (b[j] == bv && idx < bi)) {
                     bv = b[j];
@@ -874,7 +880,7 @@ router_select_plan_multi_kernel(const float* __restrict__ logits, const float* _
             }
 #pragma unroll
             for (int j = 0; j < 4; ++j)
-                if (bi == lane + 32 * j) b[j] = -INFINITY;
+                if (bi == lane + 32 * j) taken |= 1u << j;
         }
         float sum = 0.f;
         for (int rank = 0; rank < k; ++rank) sum += __shfl_sync(0xffffffffu, sel_s, rank);
@@ -970,7 +976,7 @@ void moe_combine(const float* out, const float* w, int rows, int k, float* y, vo
 }
 
 void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream) {
-    if (rows <= 0 || n <= 0) return;
+    if (rows <= 0 || n <= 0 || cap <= 0.f) return;
     bk::launch_pdl(softcap_kernel, dim3(256, (unsigned) rows), dim3(256), 0, (cudaStream_t) stream, x, n, ld, cap);
     check("softcap");
 }
