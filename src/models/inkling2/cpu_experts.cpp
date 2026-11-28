@@ -129,23 +129,39 @@ struct CpuExperts::Impl {
         for (int r = 0; r < rows; ++r)
             cpu::native_quant_act(fmt[(size_t) layer], input + (size_t) r * kWidth, acts[(size_t) r].data());
     }
-    // On the doorbell's thread: the visit's pairs on experts the second card holds go to it first, then the RAM pairs, every
-    // row of an expert in one job, on the pool; the card's rows land in `out` beside the pool's. `quantized`: its rows
-    // were quantized when they came.
+    // On the doorbell's thread: the visit's pairs on experts the second card holds go to it first (in chunks within
+    // PeerExperts' entry cap), overlapping the final peer chunk with the RAM pairs, every row of an expert in one job,
+    // on the pool; the card's rows land in `out` beside the pool's. `quantized`: its rows were quantized when they came.
     void run(int layer, int rows, bool quantized) {
         std::fill(job_of.begin(), job_of.end(), -1);
         bool quant[kBatchRows] = {};
-        int n = 0, on_peer = 0;
+        int n = 0;
+        float* peer_out = nullptr;
         std::string err;
         if (peer) {
-            for (int p = 0; p < rows * k; ++p) {
-                const int e = ids[p];
-                kind[(size_t) p] = e >= 0 && e < n_expert && model->peer_serves(layer, e) ? 2 : 0;
-                on_peer += kind[(size_t) p] == 2;
-            }
-            if (on_peer && !peer->launch_layout(layer, layout[(size_t) layer], input, ids, rows, k, kind.data(), err, out)) {
-                peer_failed(err);
-                on_peer = 0;
+            constexpr int kPeerCap = cpu::MAXT * 16;
+            const int max_peer_rows = k > 0 ? std::max(1, kPeerCap / k) : 1;
+            for (int r0 = 0; r0 < rows; r0 += max_peer_rows) {
+                const int nr = std::min(max_peer_rows, rows - r0);
+                const int p0 = r0 * k, pe = (r0 + nr) * k;
+                int chunk_peer = 0;
+                for (int p = p0; p < pe; ++p) {
+                    const int e = ids[p];
+                    kind[(size_t) p] = e >= 0 && e < n_expert && model->peer_serves(layer, e) ? 2 : 0;
+                    chunk_peer += kind[(size_t) p] == 2;
+                }
+                if (!chunk_peer) continue;
+                if (peer_out && !peer->finish(peer_out, err)) {
+                    peer_failed(err);
+                    return;
+                }
+                float* const chunk_out = out + (size_t) p0 * kWidth;
+                if (!peer->launch_layout(layer, layout[(size_t) layer], input + (size_t) r0 * kWidth, ids + p0, nr, k,
+                                         kind.data() + p0, err, chunk_out)) {
+                    peer_failed(err);
+                    return;
+                }
+                peer_out = chunk_out;
             }
         }
         for (int p = 0; p < rows * k; ++p) {
@@ -166,7 +182,7 @@ struct CpuExperts::Impl {
         for (int r = 0; r < rows && !quantized; ++r)
             if (quant[r]) cpu::native_quant_act(fmt[(size_t) layer], input + (size_t) r * kWidth, acts[(size_t) r].data());
         if (n) pool->run_split_multi_native(fmt[(size_t) layer], jobs.data(), n);
-        if (on_peer && !peer->finish(out, err)) peer_failed(err);
+        if (peer_out && !peer->finish(peer_out, err)) peer_failed(err);
     }
     // The doorbell's thread: a new rows publication is quantized, then acknowledged (the buffer goes back to the card); a
     // raised bell is taken, its visit computed (its rows quantized first if their publication is not the one taken), then

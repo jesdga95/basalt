@@ -94,6 +94,22 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
     for (int l = 0; l < L; ++l) below[(size_t) l + 1] = below[(size_t) l] + s.layer[(size_t) l];
     const Shares sh = shares_for(c, ShareUse::Split);
     cut.first.assign(n, 0);
+    double want0 = 0;
+    auto find_two_card_fit = [&](double target) -> int {
+        int fit = -1;
+        double fit_off = -1;
+        for (int b = 1; b < L; ++b) {
+            const uint64_t n0 = fixed(0) + below[(size_t) b];
+            const uint64_t n1 = fixed(1) + below[(size_t) L] - below[(size_t) b];
+            if (n0 > room(0) || n1 > room(1)) continue;
+            const double off = std::fabs((double) n0 - target);
+            if (fit < 0 || off < fit_off) {
+                fit = b;
+                fit_off = off;
+            }
+        }
+        return fit;
+    };
     if (c.diag_cut > 0) {
         if (n != 2 || c.diag_cut >= L) {
             cut.error = "--diag-gpu-cut " + std::to_string(c.diag_cut) + ": expected a layer from 1 to " + std::to_string(L - 1) +
@@ -114,6 +130,7 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
         for (size_t i = 0; i + 1 < n; ++i) {
             // card i ends at the boundary where cards 0..i come nearest their shares of every card's bytes
             want += sh.of[i] * (double) total;
+            if (i == 0) want0 = want;
             fixed_upto += fixed(i);
             int best = cut.first[i];
             double best_off = -1;
@@ -124,14 +141,30 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
                     best = b;
                 }
             }
-            if (best == cut.first[i]) return nothing(i);
-            if (best == L) return nothing(i + 1);
+            if (best == cut.first[i] || best == L) {
+                if (n == 2 && c.given.empty()) {
+                    const int fit = find_two_card_fit(want0);
+                    if (fit > 0) {
+                        cut.first[1] = fit;
+                        break;
+                    }
+                }
+                return nothing(best == cut.first[i] ? i : i + 1);
+            }
             cut.first[i + 1] = best;
         }
     }
     for (size_t i = 0; i < n; ++i) {
         const int e = i + 1 < n ? cut.first[i + 1] : L;
         cut.need.push_back(fixed(i) + below[(size_t) e] - below[(size_t) cut.first[i]]);
+    }
+    if (n == 2 && c.diag_cut <= 0 && c.given.empty() && (cut.need[0] > room(0) || cut.need[1] > room(1))) {
+        const int fit = find_two_card_fit(want0);
+        if (fit > 0) {
+            cut.first[1] = fit;
+            cut.need[0] = fixed(0) + below[(size_t) fit];
+            cut.need[1] = fixed(1) + below[(size_t) L] - below[(size_t) fit];
+        }
     }
     for (size_t i = 0; i < n; ++i)
         if (cut.need[i] > room(i)) {
