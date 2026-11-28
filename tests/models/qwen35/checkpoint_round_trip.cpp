@@ -2,12 +2,13 @@
 // transfer: saved after a prompt and a few decoded tokens, changed by decoding on, written back, the same greedy tokens
 // again and the same bytes when saved a second time. Needs a 27B pack (argument or BASALT_QWEN35_PACK) and its GPU;
 // exits 77 without either. Runs once with the pack's drafter on (its waiting row or block context in the state) and once
-// plain.
+// plain.  BASALT_QWEN35_CARDS=N splits the layers over CUDA 0..N-1, so every card's part of the state goes through too.
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/adapter.hpp"
 #include "models/qwen35/adapter.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,7 +54,7 @@ std::vector<uint8_t> save(model::ModelSession& s, int64_t pos) {
     std::vector<uint8_t> bytes(rs.bytes());
     std::memcpy(bytes.data(), rs.head.data(), rs.head.size());
     std::string err;
-    if (!core::checkpoint_copy_out({{bytes.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, err)) {
+    if (!core::running_copy_out(rs, bytes.data(), err)) {
         std::fprintf(stderr, "copy out: %s\n", err.c_str());
         std::exit(1);
     }
@@ -64,17 +65,27 @@ bool restore(model::ModelSession& s, const std::vector<uint8_t>& bytes, int64_t 
     core::RunningState rs;
     if (!s.running_state(pos, false, rs).ok() || rs.bytes() != bytes.size()) return false;
     std::string err;
-    if (!core::checkpoint_copy_in({{bytes.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, err)) return false;
+    if (!core::running_copy_in(rs, bytes.data(), err)) return false;
     return s.running_restored(pos, bytes.data()).ok();
 }
 
-void round_trip(const model::ModelAdapter& a, const std::string& pack, bool draft) {
-    const std::string tag = draft ? " (drafter on)" : " (plain)";
+void round_trip(const model::ModelAdapter& a, const std::string& pack, bool draft, int cards) {
+    const std::string tag = std::string(draft ? " (drafter on" : " (plain") + (cards > 1 ? ", " + std::to_string(cards) + " cards)" : ")");
     model::LoadRequest req;
     req.paths = {pack};
     req.max_context = 4096;
     req.draft = draft;
     req.spec = draft ? 16 : 0;
+    if (cards > 1) {
+        req.gpus.mode = program::GpuMode::Split;
+        for (int d = 0; d < cards; ++d) {
+            model::GpuCards::Card k;
+            k.device = d;
+            k.index = d;
+            k.label = "GPU " + std::to_string(d);
+            req.gpus.cards.push_back(k);
+        }
+    }
     model::Started started;
     if (const model::Result e = a.start(req, started); !e.ok()) {
         std::fprintf(stderr, "start: %s\n", e.message.c_str());
@@ -125,9 +136,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s: %s\n", pack.c_str(), err.c_str());
         return 1;
     }
+    const char* want = std::getenv("BASALT_QWEN35_CARDS");
+    const int cards = std::clamp(want ? std::atoi(want) : 1, 1, devices);
     const std::unique_ptr<model::ModelAdapter> a = models::qwen35::make_adapter();
-    round_trip(*a, pack, false);
-    round_trip(*a, pack, true);
+    round_trip(*a, pack, false, cards);
+    round_trip(*a, pack, true, cards);
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;
 }

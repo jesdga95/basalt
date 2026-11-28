@@ -160,6 +160,65 @@ int main() {
         check(none.save({{out.data(), big.regions()}}, work, out.data(), err) && none.pending() == nullptr && out == want,
               "without a spare a save lands at once");
     }
+    {   // cards after the second pack after the peer. One device stands in for every card: the offsets, not the GPUs.
+        Device main_d, peer_d, a_d, b_d;
+        main_d.add(16);
+        peer_d.add(8);
+        a_d.add(4);
+        b_d.add(32);
+        main_d.fill(11);
+        peer_d.fill(22);
+        a_d.fill(33);
+        b_d.fill(44);
+        RunningState rs;
+        rs.head = {1, 2, 3, 4};
+        rs.regions = main_d.regions();
+        rs.peer_regions = peer_d.regions();
+        rs.peer_device = 0;
+        RunningState::LaterCard a, b;
+        a.regions = a_d.regions();
+        a.device = 0;
+        b.regions = b_d.regions();
+        b.device = 0;
+        rs.further.push_back(std::move(a));
+        rs.further.push_back(std::move(b));
+        std::vector<uint8_t> host(rs.bytes(), 0);
+        std::copy(rs.head.begin(), rs.head.end(), host.begin());   // the engine stores the head; the copy writes after it
+        check(running_copy_out(rs, host.data(), err), "copy out, cards after the second");
+        auto at = [&](size_t off, const std::vector<uint8_t>& want, const char* what) {
+            check(off + want.size() <= host.size() && std::equal(want.begin(), want.end(), host.begin() + (std::ptrdiff_t) off), what);
+        };
+        at(0, rs.head, "the head stays ahead of the cards");
+        size_t off = rs.head.size();
+        at(off, main_d.read(), "the main card follows the head");
+        off += main_d.bytes();
+        at(off, peer_d.read(), "the second card follows the main card");
+        off += peer_d.bytes();
+        at(off, a_d.read(), "the third card follows the second");
+        off += a_d.bytes();
+        at(off, b_d.read(), "the fourth card follows the third");
+        check(off + b_d.bytes() == host.size(), "the cards fill the buffer");
+        main_d.fill(90);
+        peer_d.fill(91);
+        a_d.fill(92);
+        b_d.fill(93);
+        check(running_copy_in(rs, host.data(), err), "copy in, cards after the second");
+        cuda_check(cudaDeviceSynchronize());
+        check(main_d.read() == std::vector<uint8_t>(host.begin() + (std::ptrdiff_t) rs.head.size(),
+                                                    host.begin() + (std::ptrdiff_t) (rs.head.size() + main_d.bytes())),
+              "copy in restores the main card");
+        const size_t peer_at = rs.head.size() + main_d.bytes();
+        check(peer_d.read() == std::vector<uint8_t>(host.begin() + (std::ptrdiff_t) peer_at,
+                                                    host.begin() + (std::ptrdiff_t) (peer_at + peer_d.bytes())),
+              "copy in restores the second card");
+        const size_t a_at = peer_at + peer_d.bytes();
+        check(a_d.read() == std::vector<uint8_t>(host.begin() + (std::ptrdiff_t) a_at,
+                                                 host.begin() + (std::ptrdiff_t) (a_at + a_d.bytes())),
+              "copy in restores the third card");
+        const size_t b_at = a_at + a_d.bytes();
+        check(b_d.read() == std::vector<uint8_t>(host.begin() + (std::ptrdiff_t) b_at, host.end()),
+              "copy in restores the fourth card");
+    }
     cudaStreamDestroy(work);
     std::printf("checkpoint_transfer_test: %d checks passed\n", checks);
     return 0;

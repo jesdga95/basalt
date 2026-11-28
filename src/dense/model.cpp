@@ -361,7 +361,7 @@ uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
 }
 
 model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
-                            uint64_t main_weights) {
+                            uint64_t main_weights, int n_cards) {
     model::SplitSpec s;
     const bool mtp = o.drafter == Drafter::Mtp;
     const uint64_t slots = (uint64_t) std::max(o.sessions, 1);
@@ -374,8 +374,9 @@ model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDraf
     const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_format(), o.kv_resident) - layers +
                                (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
     const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_format(), o.kv_resident);
-    s.fixed = {main_weights + scratch + slots * slot_rest + stage_main_bytes(g, bd),
-               scratch + 2ull * kChunk * g.n_embd * 2};   // the second card: its own scratch and the landing residuals
+    const uint64_t later = scratch + 2ull * kChunk * g.n_embd * 2;   // a later card: its scratch and the landing residuals
+    s.fixed.assign((size_t) std::max(n_cards, 2), later);
+    s.fixed[0] = main_weights + scratch + slots * slot_rest + stage_main_bytes(g, bd);
     return s;
 }
 
@@ -515,6 +516,8 @@ bool Model::ensure_chunk(std::string& err) {
 
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err) {
     ModelPtr m(new Model());
+    cudaGetDevice(&m->dev);
+    m->home = m->dev;
     m->g = g;
     m->w = w;
     m->o = o;

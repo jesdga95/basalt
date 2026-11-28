@@ -4,7 +4,11 @@
 // windows that follow (one row, drafted windows of several rows kept in part or
 // whole, two sessions batched) give the same picks and logits; a checkpoint taken, decoded past and restored gives them
 // again.  Cuts 56, 48 and 44, fp16 and int8 KV, the block drafter on and off; with a picture's path as the second argument,
-// a picture read across the cards too.  Needs a 27B pack (argument or BASALT_QWEN35_PACK) and two GPUs; exits 77 without them.
+// a picture read across the cards too.  With three GPUs the layers split over three cards give a two-card split's output to
+// the bit as well (the MTP drafter too, with a pack that carries one).  BASALT_QWEN35_NO_ONE_CARD skips the one-card runs, for
+// a pack that does not fit one card (the three-card runs then stand on a two-card one).  Needs a 27B pack (argument or
+// BASALT_QWEN35_PACK) and two GPUs; exits 77 without them.
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/model/adapter.hpp"
@@ -42,6 +46,8 @@ struct Setup {
     int cut = 0;          // 0: one card
     bool draft = false, int8 = false;
     int prompt = 0;
+    bool three = false;   // the layers over CUDA 0, 1 and 2 (the cut planned)
+    bool mtp = false;     // the pack's MTP layer drafts
 };
 
 // what a run gives: the running state after the prompt (main regions, then the second card's), then per window its picks and
@@ -99,6 +105,20 @@ int32_t window(model::ModelSession& s, const int32_t* tok, int T, int64_t pos, O
     return rows.back();
 }
 
+// CUDA devices 0 .. n-1 in split, the cut left to the shares (a two-card --diag-gpu-cut is two_cards)
+basalt::model::GpuCards n_cards(int n) {
+    basalt::model::GpuCards c;
+    c.mode = basalt::program::GpuMode::Split;
+    for (int d = 0; d < n; ++d) {
+        basalt::model::GpuCards::Card k;
+        k.device = d;
+        k.index = d;
+        k.label = "GPU " + std::to_string(d);
+        c.cards.push_back(k);
+    }
+    return c;
+}
+
 // CUDA devices 0 and 1 in `mode`, a split's cut given (0: from the shares)
 basalt::model::GpuCards two_cards(basalt::program::GpuMode mode, int cut = 0) {
     basalt::model::GpuCards c;
@@ -122,7 +142,10 @@ Out run(const model::ModelAdapter& a, const std::string& pack, const Setup& su) 
     req.draft = su.draft;
     req.spec = su.draft ? 16 : 0;
     if (su.int8) req.kv = "int8";
-    if (su.cut) {
+    req.diag_mtp_drafter = su.mtp;
+    if (su.three) {
+        req.gpus = n_cards(3);
+    } else if (su.cut) {
         req.gpus = two_cards(basalt::program::GpuMode::Split, su.cut);
     }
     req.sessions = 2;
@@ -257,6 +280,30 @@ void compare(const model::ModelAdapter& a, const std::string& pack, Setup su, co
         check(one.batch == two.batch, "the same for two sessions in one batch" + at);
     }
 }
+
+// the layers over three cards against a two-card split at `base_cut`
+void compare_three(const model::ModelAdapter& a, const std::string& pack, Setup su, int base_cut) {
+    const std::string tag = std::string(su.mtp ? "MTP drafter, " : su.draft ? "drafter on, " : "plain, ") +
+                            (su.int8 ? "int8 KV, " : "fp16 KV, ") + std::to_string(su.prompt) + "-token prompt";
+    su.cut = base_cut;
+    const Out two = run(a, pack, su);
+    su.three = true;
+    const Out three = run(a, pack, su);
+    const std::string at = " (three cards against cut " + std::to_string(base_cut) + ", " + tag + ")";
+    check(three.stopped >= 2 && three.stopped <= (su.prompt + 4095) / 4096,
+          "a stopped read reports its chunks (" + std::to_string(three.stopped) + ")" + at);
+    check(two.state == three.state, "the state after the prompt (read again after a stopped read) has the same bytes" + at);
+    check(two.picks == three.picks && two.logits == three.logits, "the same picks and logits in windows of 1 to 16 rows" + at);
+    check(two.again == three.again, "the same again after a checkpoint is restored" + at);
+    check(two.batch == three.batch, "the same for two sessions in one batch" + at);
+}
+
+bool has_tensor(const std::string& pack, const char* name) {
+    const GgufFile gg(pack);
+    for (const TensorInfo& t : gg.tensors())
+        if (t.name == name) return true;
+    return false;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -271,10 +318,24 @@ int main(int argc, char** argv) {
     std::string err;
     if (!file.open(pack, err) || !file.load_meta(err) || !file.register_gguf_view(err)) die(pack.c_str(), err);
     const std::unique_ptr<model::ModelAdapter> a = models::qwen35::make_adapter();
-    compare(*a, pack, {0, true, false, 8200}, {56, 48, 44});
-    compare(*a, pack, {0, true, true, 16400}, {48});
-    compare(*a, pack, {0, false, true, 8200}, {44});
-    if (argc > 2) {   // a picture (its path the second argument)
+    const bool one_card = std::getenv("BASALT_QWEN35_NO_ONE_CARD") == nullptr;
+    if (one_card) {
+        compare(*a, pack, {0, true, false, 8200}, {56, 48, 44});
+        compare(*a, pack, {0, true, true, 16400}, {48});
+        compare(*a, pack, {0, false, true, 8200}, {44});
+    }
+    if (devices >= 3) {   // two-card cuts that fit 16 GB cards
+        compare_three(*a, pack, {0, true, false, 8200}, 32);
+        compare_three(*a, pack, {0, true, true, 16400}, 30);
+        compare_three(*a, pack, {0, false, true, 8200}, 28);
+        if (has_tensor(pack, "mtp.fc.weight")) {
+            compare_three(*a, pack, {0, true, false, 8200, false, true}, 32);
+            compare_three(*a, pack, {0, true, true, 16400, false, true}, 30);
+        } else {
+            std::printf("skip: the pack has no MTP layer, so the MTP drafter is not tried on three cards\n");
+        }
+    }
+    if (one_card && argc > 2) {   // a picture (its path the second argument)
         std::vector<uint8_t> image;
         if (FILE* f = std::fopen(argv[2], "rb")) {
             int c;

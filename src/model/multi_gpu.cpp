@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 
 namespace basalt::model {
 
@@ -32,6 +34,44 @@ std::string share_text(double v) {
 std::string card_name(const GpuCards::Card& c) {
     return (c.info.name.empty() ? std::string("GPU") : c.info.name) +
            (c.info.smi >= 0 ? " (nvidia-smi " + std::to_string(c.info.smi) + ")" : std::string());
+}
+
+// The free-VRAM cut divides layers only. When that leaves a card short of room, `first` becomes the cut that fits whose
+// boundaries sit nearest it. Every card still holds at least one layer. False when no cut fits (`first` is left as it was).
+bool nearest_fit(int L, size_t n, const std::vector<uint64_t>& below, const std::vector<uint64_t>& fixed,
+                 const std::vector<uint64_t>& room, const std::vector<int>& prefer, std::vector<int>& first) {
+    const int64_t INF = std::numeric_limits<int64_t>::max() / 4;
+    std::vector<std::vector<int64_t>> dp(n + 1, std::vector<int64_t>((size_t) L + 1, INF));
+    std::vector<std::vector<int>> prev(n + 1, std::vector<int>((size_t) L + 1, -1));
+    auto fits = [&](size_t card, int a, int e) {
+        return fixed[card] + below[(size_t) e] - below[(size_t) a] <= room[card];
+    };
+    for (int end = 1; end <= L - (int) n + 1; ++end)
+        if (fits(0, 0, end)) dp[1][(size_t) end] = 0;
+    for (size_t k = 2; k <= n; ++k) {
+        const int end_hi = k == n ? L : L - (int) (n - k);
+        for (int end = (int) k; end <= end_hi; ++end) {
+            if (k == n && end != L) continue;
+            for (int start = (int) k - 1; start < end; ++start) {
+                if (dp[k - 1][(size_t) start] >= INF || !fits(k - 1, start, end)) continue;
+                const int d = start - prefer[k - 1];
+                const int64_t cost = dp[k - 1][(size_t) start] + (d < 0 ? -d : d);
+                if (cost < dp[k][(size_t) end]) {
+                    dp[k][(size_t) end] = cost;
+                    prev[k][(size_t) end] = start;
+                }
+            }
+        }
+    }
+    if (dp[n][(size_t) L] >= INF) return false;
+    std::vector<int> got(n, 0);
+    for (size_t k = n, end = (size_t) L; k >= 2; --k) {
+        const int start = prev[k][end];
+        got[k - 1] = start;
+        end = (size_t) start;
+    }
+    first = std::move(got);
+    return true;
 }
 
 // the mode's name as the settings spell it (gpu_select.cpp's, which this library does not link)
@@ -102,8 +142,12 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
         }
         cut.first[1] = c.diag_cut;
     } else {
-        uint64_t total = below[(size_t) L];
-        for (size_t i = 0; i < n; ++i) total += fixed(i);
+        const bool given = sh.from == "gpu-share";
+        const uint64_t layers_all = below[(size_t) L];
+        uint64_t fixed_all = 0;
+        for (size_t i = 0; i < n; ++i) fixed_all += fixed(i);
+        // gpu-share divides every byte. The default divides the layers; a card's fixed bytes are already its own.
+        const uint64_t pool = given ? layers_all + fixed_all : layers_all;
         double want = 0;
         uint64_t fixed_upto = 0;
         auto nothing = [&](size_t i) {
@@ -112,13 +156,13 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
             return cut;
         };
         for (size_t i = 0; i + 1 < n; ++i) {
-            // card i ends at the boundary where cards 0..i come nearest their shares of every card's bytes
-            want += sh.of[i] * (double) total;
+            want += sh.of[i] * (double) pool;
             fixed_upto += fixed(i);
+            const double target = given ? want : want + (double) fixed_upto;
             int best = cut.first[i];
             double best_off = -1;
             for (int b = cut.first[i]; b <= L; ++b) {
-                const double off = std::fabs((double) (fixed_upto + below[(size_t) b]) - want);
+                const double off = std::fabs((double) (fixed_upto + below[(size_t) b]) - target);
                 if (best_off < 0 || off < best_off) {
                     best_off = off;
                     best = b;
@@ -127,6 +171,24 @@ SplitCut split_cut(const GpuCards& c, const SplitSpec& s) {
             if (best == cut.first[i]) return nothing(i);
             if (best == L) return nothing(i + 1);
             cut.first[i + 1] = best;
+        }
+        // the layer cut ignores fixed bytes. When a card's part does not fit, take the nearest cut that does.
+        // gpu-share asked for its own division: a part that does not fit stays refused.
+        if (!given) {
+            bool fits_now = true;
+            for (size_t i = 0; i < n && fits_now; ++i) {
+                const int e = i + 1 < n ? cut.first[i + 1] : L;
+                if (fixed(i) + below[(size_t) e] - below[(size_t) cut.first[i]] > room(i)) fits_now = false;
+            }
+            if (!fits_now) {
+                std::vector<uint64_t> fx(n), rm(n);
+                for (size_t i = 0; i < n; ++i) {
+                    fx[i] = fixed(i);
+                    rm[i] = room(i);
+                }
+                std::vector<int> moved = cut.first;
+                if (nearest_fit(L, n, below, fx, rm, cut.first, moved)) cut.first = std::move(moved);
+            }
         }
     }
     for (size_t i = 0; i < n; ++i) {

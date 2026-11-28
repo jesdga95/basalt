@@ -84,9 +84,9 @@ int main() {
     expect("32+16, 262K int8, two slots", cards(k5090, k16GB), spec(int8_262k, 2, kMainFixed, k5090, k16GB), 36, 46);
     // two RTX 5090s: half the bytes each
     expect("32+32, 262K fp16, two slots", cards(k5090, k5090), spec(fp16_262k, 2, kMainFixed, k5090, k5090), 26, 34);
-    // two 16 GB cards: the weights alone do not fit one; the main card's head and drafter count in its half
-    expect("16+16, 8K fp16", cards(k16GB, k16GB), spec(fp16_8k, 1, kMainFixed8K, k16GB, k16GB), 22, 28);
-    expect("two RTX 5070 Ti, 128K int8, spec 16 (#376)", cards(k16GB, k16GB), spec(int8_128k, 1, kMainFixed, k16GB, k16GB), 20, 30);
+    // two 16 GB cards: the weights alone do not fit one. The default cut halves the layers; the head stays on the main card.
+    expect("16+16, 8K fp16", cards(k16GB, k16GB), spec(fp16_8k, 1, kMainFixed8K, k16GB, k16GB), 30, 34);
+    expect("two RTX 5070 Ti, 128K int8, spec 16 (#376)", cards(k16GB, k16GB), spec(int8_128k, 1, kMainFixed, k16GB, k16GB), 30, 34);
     expect_error("16+16, 262K fp16 (does not fit)", cards(k16GB, k16GB), spec(fp16_262k, 1, kMainFixed, k16GB, k16GB),
                  "gpu-mode split: GPU ");
     // the diagnostic cut, taken as given

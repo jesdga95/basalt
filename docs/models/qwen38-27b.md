@@ -63,7 +63,7 @@ width from the pack; the GDN and attention kernels are shared with Flash-Next.
   identical.
 - **Slots:** `--parallel N` gives each slot its own cache and recurrent state (157 MiB). Slots share the weights.
 - **Cards:** one card by default; a second Blackwell card is `gpu-mode peer` (it reads long prompts) or `split` (it holds the
-  later layers) ([cards](#cards)).
+  later layers). `split` also runs on three to eight cards ([cards](#cards)).
 
 ## Drafting
 
@@ -79,8 +79,9 @@ model's distribution exactly, and more drafts are kept than the drafter's best g
 
 ## Cards
 
-`gpu` names two cards and `gpu-mode` what they do ([GPUs](../configuration/gpus.md)): `"gpu": "0,1", "gpu-mode": "peer"` or `"split"`.
-The model runs both on two cards and refuses `tensor` and a third card. With `gpu` unset and several cards visible, the model runs on GPU 0 and the start
+`gpu` names the cards and `gpu-mode` what they do ([GPUs](../configuration/gpus.md)): `"gpu": "0,1", "gpu-mode": "peer"` or
+`"gpu": "0,1,2", "gpu-mode": "split"`. Peer runs on two cards and refuses a third. Split runs on two to eight cards. The model refuses
+`tensor`. With `gpu` unset and several cards visible, the model runs on GPU 0 and the start
 warns once.
 
 | Mode | What the second card does | When to use it |
@@ -118,15 +119,17 @@ card), pictures and video (a picture's rows go through the main card; the text b
 its checkpoints, the thinking budget. A cancelled request is met within two chunks on either card (0.9 s into a 16K read and 1.4 s into a 40K one, against 0.5 and 0.8 s on one card)
 and the next request finds the state it would find after a cancel on one card.
 
-## Split: two cards when it does not fit one
+## Split: later layers when they do not fit one card
 
 With `gpu-mode split` the layers are cut by the shares (by default the cards' free VRAM): the main card keeps layers 0 to N-1 with the
-head, the drafter and the image encoder, the second card layers N to 63 with their own KV
-cache and recurrent state for every slot. The start line names the parts, then `layer split: layers 0-N-1 (... GiB) on CUDA0, N-63 (... GiB) on CUDA1`.
+head, the drafter and the image encoder, and each later card holds the next band of layers with their own KV
+cache and recurrent state for every slot. On two cards the start line names the parts, then `layer split: layers 0-N-1 (... GiB) on CUDA0, N-63 (... GiB) on CUDA1`.
+Three or more cards (up to eight) each hold one band; the residual is handed from one card to the next, and a prompt's chunks run as a pipeline across them.
 
-- **The cut** divides each layer's weights plus its cells and state at the context and slots by the shares. A part that does not fit
-  its card is refused with its numbers (lower the card's `gpu-share`, `--max-context` or `--parallel`). Nothing is priced: a model
-  that fits one card splits only when you say so.
+- **The cut** divides the layers by the cards' free VRAM, and the head and the drafter stay on the main card's budget, so they do not
+  take layers off it. When that cut does not fit, layers move onto a card that has room. `gpu-share` instead divides every byte,
+  fixed cost included, and is not moved. A part that still does not fit is refused with its numbers (lower that card's
+  `gpu-share`, `--max-context` or `--parallel`). Nothing is priced: a model that fits one card splits only when you say so.
 - **Decode:** each card runs its layers of every window as its own CUDA graph; the residual crosses through page-locked RAM that both
   graphs read and write with kernels, and the main card reads the block drafter's rows of the later layers back. Every product on the
   second card is planned as on the main card, so the output is the main card's alone to the bit, at every window width, with
@@ -169,4 +172,4 @@ for Flash-Next ([video](../running.md#video)); frames decode on the CPU.
 | Decode, `--parallel 2` / `--parallel 4`, every slot on the same chat, all slots together | 408 / 566 tok/s |
 | Prompt read, 8k / 16k / 32k / 64k, one card, then with an RTX 5060 Ti (180 W) as the prompt split's stage | 12,072 / 10,716 / 8,654 / 6,137, then 13,606 / 12,699 / 10,518 / 7,570 tok/s (+13% / +19% / +22% / +23%) |
 | The same with `--kv int8` | 12,822 / 12,070 / 10,644 / 8,637, then 14,610 / 14,828 / 13,214 / 10,991 tok/s (+14% / +23% / +24% / +27%) |
-| Prompt read, 4k / 16k / 32k / 64k, `--kv int8`, split across the RTX 5090 and an RTX 5060 Ti at layer 56, then 48 ([split](#split-two-cards-when-it-does-not-fit-one)) | 12,272 / 13,245 / 11,883 / 9,682, then 9,824 / 13,238 / 12,557 / 10,558 tok/s (a 4k prompt is one chunk: nothing overlaps) |
+| Prompt read, 4k / 16k / 32k / 64k, `--kv int8`, split across the RTX 5090 and an RTX 5060 Ti at layer 56, then 48 ([split](#split-later-layers-when-they-do-not-fit-one-card)) | 12,272 / 13,245 / 11,883 / 9,682, then 9,824 / 13,238 / 12,557 / 10,558 tok/s (a 4k prompt is one chunk: nothing overlaps) |

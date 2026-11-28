@@ -160,11 +160,15 @@ bool plan_prompt_split(Model& m, int dev, int l_min, const Weights& w, std::stri
 /// Once the stage's weights have landed: one chunk of zero rows through its layers, so that its kernels are loaded before the first
 /// prompt reads them (a lazily loaded kernel stalls the main card's queue).  Its state is left empty.  True with no stage.
 bool warm_prompt_split(Model& m, std::string& err);
-/// The layer split: CUDA device `dev` holds layers [cut, n) of `w` (their weights already on `dev`, the others empty) with
-/// their cells and recurrent state, and runs them in every decode window and prompt chunk of `m`, which holds layers
-/// [0, cut).  The second card plans its products as the main card, so the output is the main card's alone to the bit.
-/// Called with the main card current, before any session is made.
-bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err);
+/// The layer split: CUDA device `dev` holds layers [cut, end) of `w` (their weights already on `dev`, the others empty) with
+/// their cells and recurrent state, and runs them in every decode window and prompt chunk of `m`, which holds the layers
+/// before `cut`.  `end` 0 runs through the last layer.  A card that already forwards to another keeps that hand-off; the
+/// card attached here takes the new one.  Called with the parent card current (the main card, for the first stage), before
+/// any session is made.  Products are planned as the card that holds layer 0, so every stage matches that card to the bit.
+bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err, int layer_end = 0);
+/// Layers across `n_cards` (3 or more). `bounds` has `n_cards + 1` entries (0 .. n_layers), `devs[c]` is the CUDA device of
+/// card c (`devs[0]` is the main card), and `ws[c]` holds that card's layers. Card 0 is `m`, already built.
+bool attach_split_chain(Model& m, const int* devs, const int* bounds, const Weights* ws, int n_cards, std::string& err);
 /// Main-card bytes a second card's stage keeps (its hand-off buffers and the drafter features it holds back).
 uint64_t stage_main_bytes(const Geometry& g, const BlockDrafter& drafter);
 /// Main-card bytes a prompt split keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of
@@ -189,6 +193,6 @@ uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd);
 /// norms, drafter), the shared scratch, each slot's rest and the hand-off buffers, the second card its scratch and landing
 /// residuals. The rooms are the caller's.
 model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
-                            uint64_t main_weights);
+                            uint64_t main_weights, int n_cards = 2);
 
 }  // namespace basalt::dense

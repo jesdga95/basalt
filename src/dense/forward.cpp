@@ -616,8 +616,9 @@ void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cud
 }
 
 // A window's layers [m.lb, m.le) of `rows` rows in m.ws.x, the drafter's features of its target layers into `dacc`; on a layer
-// split, the window's first rows from the main card (the second card's model) and its later layers' rows from the second
-// card (the main card's), each card raising the other's flag (SplitHand).  `layer` runs one layer.
+// split, each card takes the residual from the card before it and hands its own to the next (SplitHand).  A middle card
+// waits for the card after it and splices that card's rows into the hand the card before it is waiting on.  `layer` runs
+// one layer.
 template <class LayerFn>
 void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t s) {
     const Geometry& g = m.g;
@@ -638,7 +639,16 @@ void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t 
         if (m.lb > 0 && next_tap < h->taps.size() && h->taps[next_tap] == il)
             kernels::copy_from_mapped((float*) (h->ret + (1 + next_tap++) * slot), (const float*) b.x, half, s);
     }
-    if (m.lb > 0) {   // the second card: its last rows back
+    if (m.lb > 0 && m.split) {   // a middle card: the next card's rows, then its taps into the remaining slots of this hand
+        const SplitHand* down = m.split_model->hand;
+        kernels::copy_from_mapped((float*) down->fwd, (const float*) b.x, half, s);
+        kernels::signal_flag(down->flag, 1, s);
+        kernels::wait_flag_ge(down->flag + 1, 1, s);
+        kernels::copy_from_mapped((float*) b.x, (const float*) down->ret, half, s);
+        for (size_t q = 0; q < down->taps.size(); ++q)
+            kernels::copy_from_mapped((float*) (h->ret + (1 + next_tap + q) * slot), (const float*) (down->ret + (1 + q) * slot), half, s);
+    }
+    if (m.lb > 0) {   // the card after the main one: its last rows back
         kernels::copy_from_mapped((float*) h->ret, (const float*) b.x, half, s);
         kernels::signal_flag(h->flag + 1, 1, s);
     } else if (h) {   // the main card: on to the second card, then its rows back and the features of its target layers
@@ -733,10 +743,11 @@ void lower_flags(SplitHand& h) {
 
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
                     std::string& err) {
-    if (m.split) {   // the second card's graph first: it waits for the main card's rows
+    if (m.split) {   // the later cards' graphs first: each waits for the residual from the card before it
         lower_flags(*m.hand);
+        if (m.split_model->hand != nullptr && m.split_model->hand != m.hand) lower_flags(*m.split_model->hand);
         const core::OnDevice on(m.split_dev);
-        if (!launch_window(*m.split_model, *st.peer, nullptr, T, pos, pos3, err)) return false;
+        if (!forward_window(*m.split_model, *st.peer, nullptr, T, pos, pos3, err)) return false;
     }
     return launch_window(m, st, tokens, T, pos, pos3, err);
 }
@@ -897,12 +908,13 @@ bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, 
 }  // namespace
 
 bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
-    if (m.split) {   // the second card's sessions, their graph first: it waits for the main card's rows
+    if (m.split) {   // the later cards' sessions, their graphs first: each waits for the residual from the card before it
         lower_flags(*m.hand);
+        if (m.split_model->hand != nullptr && m.split_model->hand != m.hand) lower_flags(*m.split_model->hand);
         std::vector<BatchSeg> ps((size_t) S);
         for (int k = 0; k < S; ++k) ps[(size_t) k] = {segs[k].st->peer.get(), segs[k].T, segs[k].pos};
         const core::OnDevice on(m.split_dev);
-        if (!launch_batch(*m.split_model, ps.data(), S, nullptr, pos3, err)) return false;
+        if (!forward_batch(*m.split_model, ps.data(), S, nullptr, pos3, err)) return false;
     }
     return launch_batch(m, segs, S, tokens, pos3, err);
 }

@@ -159,6 +159,8 @@ public:
     SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
     Model* split_model = nullptr;                // the split's second card's model, and its CUDA device
     int split_dev = -1;
+    int dev = 0;                                 // the CUDA device this card's weights live on
+    int home = 0;                                // the device of the card that holds layer 0; later cards' products plan as it
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).

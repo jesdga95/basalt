@@ -65,7 +65,7 @@ public:
     /// buffers and the main card's outgoing ones; called with the main card current.
     /// `split`: the stage keeps its layers' cells and runs every window too (its model sized for decode windows of the main
     /// card's context and sessions), and its landing buffers are its own.
-    bool open(Model& main, int d, int l, const Weights& w, bool split, std::string& err);
+    bool open(Model& main, int d, int l, const Weights& w, bool split, std::string& err, int layer_end = 0);
     /// Chunk slot k's residual (m.cs.x after the main card's layers, on `st`'s stream) on its way to the stage's card;
     /// `tail` (null: none) takes the chunk's drafter features too.  `again`: the slot held an earlier chunk.
     void send(Model& m, SessionState& st, int k, bool again, float* tail);
@@ -126,7 +126,7 @@ void Stage::read(SessionState& ps, int i, int k, bool again, int64_t p, const in
                  const std::vector<int>& tap_layers, int tail, bool read_last, int T, uint8_t* last) {
     const core::OnDevice on(dev);
     Model& lm = *model;
-    const int n = lm.g.n_layers;
+    const int n = lm.le;   // a middle card of a split stops at its own last layer
     const size_t bytes = (size_t) T * lm.g.n_embd * 2;
     const cudaStream_t ls = ps.stream;
     // lands beside the read of the chunk before
@@ -144,6 +144,7 @@ void Stage::read(SessionState& ps, int i, int k, bool again, int64_t p, const in
     if (tail >= 0) {
         for (size_t q = 0; q < tap_layers.size(); ++q) {
             const int tl = tap_layers[q];
+            if (tl >= n) break;
             chunk_layers(lm, ps, T, p, at, tl + 1, nullptr, read_last);
             cudaMemcpyAsync(tap_rows[(size_t) tail * (size_t) n_taps + q], lm.cs.x, bytes, cudaMemcpyDeviceToHost, ls);
             at = tl + 1;
@@ -238,7 +239,7 @@ bool take_cells(Arena& a, SessionState& s, const Geometry& g, bool int8, int ai0
 
 }  // namespace
 
-bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::string& err) {
+bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::string& err, int layer_end) {
     cudaGetDevice(&main_dev);
     dev = d;
     lo = l;
@@ -247,14 +248,21 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
     const size_t T = kChunk, H = (size_t) g.n_embd;
     const bool block = main.o.drafter == Drafter::Block;
     const BlockDrafter& bd = main.w.dflash;
-    if (block) n_taps = (int) std::count_if(bd.target_layers.begin(), bd.target_layers.end(), [&](int t) { return t >= l; });
-    const int n_tail = ring_tails(block ? &bd : nullptr);
+    const int lend = layer_end > 0 ? layer_end : g.n_layers;
+    // a card past the first stage keeps no drafter of its own; the layer ids and the ring window were copied onto it
+    std::vector<int> targets = bd.target_layers;
+    if (targets.empty() && main.hand != nullptr) targets = main.hand->taps;
+    n_taps = (int) std::count_if(targets.begin(), targets.end(), [&](int t) { return t >= l && t < lend; });
+    BlockDrafter probe;
+    probe.present = block || bd.window > 0;
+    probe.window = bd.window;
+    const int n_tail = ring_tails(probe.present ? &probe : nullptr);
     {
         const core::OnDevice on(dev);
         Options o = main.o;
         if (split) {
             o.layer_begin = l;
-            o.layer_end = 0;
+            o.layer_end = layer_end;   // 0: through the last layer
         } else {
             o.max_context = kChunk;   // its decode scratch is never used: the stage reads prompt chunks only
             o.sessions = 1;
@@ -270,6 +278,9 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
         lw.dflash = {};
         model = make_model(g, lw, o, err);
         if (!model) return false;
+        model->home = main.home;   // products plan as the card that holds layer 0, not as this stage's parent
+        model->w.dflash.window = bd.window;
+        model->w.dflash.target_layers = bd.target_layers.empty() ? targets : bd.target_layers;
         if (!model->ensure_chunk(err)) return false;
         if (split) {   // the landing residuals
             if (!arena.reserve(kSlots * T * H * 2 + 4096)) {
@@ -328,8 +339,8 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
             stage_ev.push_back(e);
         }
     }
-    // the second card's int8 prompt attention splits its keys as the main card's does, so its rows round the same
-    kernels::gqa_prompt_plan_device(main_dev);
+    // prompt attention rounds as the card that holds layer 0, so a later card matches it
+    kernels::gqa_prompt_plan_device(main.home);
     return true;
 }
 
@@ -636,29 +647,35 @@ void PeerStateDeleter::operator()(SessionState* s) const {
     delete s;
 }
 
-bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err) {
+bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err, int layer_end) {
     const Geometry& g = m.g;
     const size_t H = (size_t) g.n_embd, slot = (size_t) kBatch * H * 2;
     int main_dev = 0;
     cudaGetDevice(&main_dev);
-    // the second card's window products plan as the main card's (before its model sizes their workspace), so its rows round
-    // as the main card's
-    kernels::wgemm::plan_device(main_dev);
+    // window products plan as the card that holds layer 0 (before this stage's model sizes their workspace)
+    kernels::wgemm::plan_device(m.home);
     StagePtr p(new Stage());
     Stage& L = *p;
     const auto fail = [&](const std::string& what) {
         err = m.o.arch + ": the layer split on CUDA" + std::to_string(dev) + ": " + what;
         return false;
     };
-    if (!L.open(m, dev, cut, w, true, err)) return fail(err);
+    if (!L.open(m, dev, cut, w, true, err, layer_end)) return fail(err);
     SplitHand& h = L.split_hand;
     const BlockDrafter& bd = m.w.dflash;
-    if (m.o.drafter == Drafter::Block)
+    if (m.o.drafter == Drafter::Block) {
         for (size_t j = 0; j < bd.target_layers.size(); ++j)
             if (bd.target_layers[j] >= cut) {
                 if (h.taps.empty()) h.first_tap = j;
                 h.taps.push_back(bd.target_layers[j]);
             }
+    } else if (m.hand != nullptr) {
+        for (size_t j = 0; j < m.hand->taps.size(); ++j)
+            if (m.hand->taps[j] >= cut) {
+                if (h.taps.empty()) h.first_tap = m.hand->first_tap + j;
+                h.taps.push_back(m.hand->taps[j]);
+            }
+    }
     const size_t bytes = slot * (2 + h.taps.size()) + 256;
     void* dptr = nullptr;
     if (cudaHostAlloc((void**) &L.hand_mem, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
@@ -672,25 +689,331 @@ bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err
     h.flag = (uint32_t*) at;
     h.fwd = (uint16_t*) (at + 256);
     h.ret = (uint16_t*) (at + 256 + slot);
-    m.hand = &h;
+    if (!m.hand) m.hand = &h;   // a middle card already holds the hand-off from the card before it
     L.model->hand = &h;
     m.split_model = L.model.get();
     m.split_dev = dev;
+    const int last = (layer_end > 0 ? layer_end : g.n_layers) - 1;
     basalt::log::info("basalt dense", "layer split: CUDA%d runs layers %d-%d of every window and prompt chunk; its products planned as "
-                      "CUDA%d's", dev, cut, g.n_layers - 1, main_dev);
+                      "CUDA%d's (buffers on CUDA%d)", dev, cut, last, m.home, main_dev);
     m.split = std::move(p);
+    return true;
+}
+
+bool attach_split_chain(Model& m, const int* devs, const int* bounds, const Weights* ws, int n_cards, std::string& err) {
+    Model* cur = &m;
+    int parent = devs[0];
+    for (int c = 1; c < n_cards; ++c) {
+        if (cudaSetDevice(parent) != cudaSuccess) {
+            err = m.o.arch + ": cannot use CUDA" + std::to_string(parent);
+            return false;
+        }
+        const int end = c + 1 == n_cards ? 0 : bounds[c + 1];
+        if (!attach_split(*cur, devs[c], bounds[c], ws[c], err, end)) return false;
+        cur = cur->split_model;
+        parent = devs[c];
+    }
+    cudaSetDevice(devs[0]);
     return true;
 }
 
 bool split_session(Model& m, SessionState& st, std::string& err) {
     st.peer.reset(new SessionState());
     st.peer->dev = m.split_dev;
-    const core::OnDevice on(m.split_dev);
-    return init_state(*m.split_model, *st.peer, err);
+    {
+        const core::OnDevice on(m.split_dev);
+        if (!init_state(*m.split_model, *st.peer, err)) return false;
+    }
+    if (m.split_model->split) return split_session(*m.split_model, *st.peer, err);
+    return true;
 }
+
+namespace {
+
+int card_dev(const SessionState& st) {
+    if (st.dev >= 0) return st.dev;
+    int d = 0;
+    cudaGetDevice(&d);
+    return d;
+}
+
+// The stage whose model is `card` (the hand-off into it). Null for the main card.
+Stage* stage_owning(Model& root, Model* card) {
+    for (Model* p = &root; p != nullptr; p = p->split_model)
+        if (p->split_model == card) return p->split.get();
+    return nullptr;
+}
+
+// One chunk across three or more cards, each card after the one before it. The main card's block-drafter taps land in its
+// accumulator. With `save_taps`, each later card leaves the rows of the target layers it holds in its stage's tap_rows.
+// With `copy_back`, the last card's residual is left in the first stage's hand[1] (an MTP drafter reads it on the main card).
+bool chain_chunk(Model& root, SessionState& root_st, const int32_t* tokens, const float* rows, int T, int64_t pos,
+                 const int32_t* pos3, const int32_t* bounds, bool save_taps, bool copy_back, std::string& err) {
+    const bool block = root.o.drafter == Drafter::Block;
+    const BlockDrafter* bd = block ? &root.w.dflash : nullptr;
+    const bool tap_last = bd && std::find(bd->target_layers.begin(), bd->target_layers.end(), root.g.n_layers - 1) != bd->target_layers.end();
+    const bool mtp = root_st.mtp_kc != nullptr;   // only the main card's session holds the MTP drafter
+    uint8_t* residual = nullptr;
+    uint8_t* back = copy_back ? root.split->hand[1] : nullptr;
+    Model* card = &root;
+    SessionState* ss = &root_st;
+    for (int guard = 0; card != nullptr; ++guard) {
+        if (guard >= 8) {
+            err = root.o.arch + ": a layer split runs on at most 8 cards";
+            return false;
+        }
+        if (ss == nullptr) {
+            err = root.o.arch + ": a layer-split card has no session";
+            return false;
+        }
+        const core::OnDevice on(card_dev(*ss));
+        if (!card->ensure_chunk(err)) return false;
+        const size_t bytes = (size_t) T * card->g.n_embd * 2;
+        const bool main = card->lb == 0;
+        chunk_start(*card, *ss, main ? tokens : nullptr, main ? rows : nullptr, T, pos3, bounds);
+        if (residual) cudaMemcpyAsync(card->cs.x, residual, bytes, cudaMemcpyHostToDevice, ss->stream);
+        if (main) {
+            chunk_layers(*card, *ss, T, pos, 0, card->le, bd);
+        } else {
+            Stage* mine = stage_owning(root, card);
+            int at = card->lb;
+            int q = 0;
+            const bool read_last = card->le >= card->g.n_layers && (mtp || tap_last);
+            if (mine != nullptr) {
+                for (int tl : mine->split_hand.taps) {
+                    if (tl >= card->le) break;
+                    chunk_layers(*card, *ss, T, pos, at, tl + 1, nullptr, read_last);
+                    if (save_taps && q < (int) mine->tap_rows.size() && mine->tap_rows[(size_t) q] != nullptr)
+                        cudaMemcpyAsync(mine->tap_rows[(size_t) q], card->cs.x, bytes, cudaMemcpyDeviceToHost, ss->stream);
+                    ++q;
+                    at = tl + 1;
+                }
+            }
+            chunk_layers(*card, *ss, T, pos, at, card->le, nullptr, read_last);
+        }
+        Stage* down = card->split.get();
+        if (down != nullptr && down->hand[0] != nullptr) {
+            cudaMemcpyAsync(down->hand[0], card->cs.x, bytes, cudaMemcpyDeviceToHost, ss->stream);
+            residual = down->hand[0];
+        } else if (back != nullptr) {
+            cudaMemcpyAsync(back, card->cs.x, bytes, cudaMemcpyDeviceToHost, ss->stream);
+        }
+        if (cudaStreamSynchronize(ss->stream) != cudaSuccess) {
+            err = root.o.arch + ": a layer-split card failed: " + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        card = card->split_model;
+        ss = ss->peer.get();
+    }
+    return true;
+}
+
+// The rows chain_chunk saved, projected on the main card in target-layer order, after the taps the main card already added.
+bool chain_apply_taps(Model& m, SessionState& st, int T) {
+    if (m.o.drafter != Drafter::Block) return true;
+    const core::OnDevice on(card_dev(st));
+    const size_t bytes = (size_t) T * m.g.n_embd * 2;
+    Model* card = m.split_model;
+    while (card != nullptr) {
+        Stage* stage = stage_owning(m, card);
+        if (stage == nullptr) return false;
+        int q = 0;
+        for (int tl : stage->split_hand.taps) {
+            if (tl >= card->le) break;
+            if (q >= (int) stage->tap_rows.size() || stage->tap_rows[(size_t) q] == nullptr) return false;
+            cudaMemcpyAsync(m.cs.x, stage->tap_rows[(size_t) q], bytes, cudaMemcpyHostToDevice, st.stream);
+            chunk_tap(m, st, T, m.w.dflash, stage->split_hand.first_tap + (size_t) q);
+            ++q;
+        }
+        card = card->split_model;
+    }
+    return true;
+}
+
+// A prompt across three or more cards, pipelined: each card reads chunk i as soon as the card before it has handed it over and
+// its own chunk i - 1 is done, so the cards read different chunks side by side.  The block drafter's features of the chunks
+// its ring keeps are made on the main card after the last chunk, in order, as split_read makes them.
+bool chain_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos, const std::function<void(int)>& progress,
+                const std::function<bool()>& stop, std::string& err) {
+    Stage& L = *m.split;
+    const Geometry& g = m.g;
+    const int T = kChunk, H = g.n_embd;
+    constexpr int S = Stage::kSlots;
+    if (!m.ensure_chunk(err)) return false;
+    const bool block = m.o.drafter == Drafter::Block;
+    const BlockDrafter& bd = m.w.dflash;
+    const bool tap_last = block && std::find(bd.target_layers.begin(), bd.target_layers.end(), g.n_layers - 1) != bd.target_layers.end();
+    const int64_t cap = block ? st.dctx_cap : 0, b0 = pos + n;
+    const int chunks = (n + T - 1) / T;
+    const int t_last = n - (chunks - 1) * T;
+    const size_t n_keep = block ? std::min((size_t) ring_tails(&bd), L.mtail.size()) : 0;
+    int32_t* bnd = L.pos3;
+    int32_t* pos3 = L.pos3 + 4;
+    bnd[0] = 0;
+    bnd[1] = T;
+    bnd[2] = 0;
+    bnd[3] = t_last;
+    for (int t = 0; t < n; ++t) pos3[t * 3] = pos3[t * 3 + 1] = pos3[t * 3 + 2] = (int32_t) (pos + t + st.rope_delta);
+
+    // every later card: its stage (the hand-off into it), its model, its session
+    struct Hop {
+        Stage* stage;
+        Model* card;
+        SessionState* ss;
+        Model* from;
+        SessionState* from_ss;
+    };
+    std::vector<Hop> hops;
+    {
+        Model* from = &m;
+        SessionState* from_ss = &st;
+        while (from->split != nullptr && from->split_model != nullptr && from_ss->peer != nullptr) {
+            if (hops.size() >= 7) {   // the main card plus these hops is eight
+                err = m.o.arch + ": a layer split runs on at most 8 cards";
+                return false;
+            }
+            hops.push_back({from->split.get(), from->split_model, from_ss->peer.get(), from, from_ss});
+            from = from->split_model;
+            from_ss = from_ss->peer.get();
+        }
+    }
+    if (hops.empty()) {
+        err = m.o.arch + ": the layer split has no cards after the main one";
+        return false;
+    }
+    for (const Hop& h : hops) {
+        const core::OnDevice on(h.stage->dev);
+        while (h.stage->stage_ev.size() < 2 * (size_t) chunks) {
+            cudaEvent_t e = nullptr;
+            if (cudaEventCreate(&e) != cudaSuccess) {
+                err = "cannot create CUDA events";
+                return false;
+            }
+            h.stage->stage_ev.push_back(e);
+        }
+        if (block && h.stage->n_taps > 0 && h.stage->tap_rows.size() < n_keep * (size_t) h.stage->n_taps) {
+            err = m.o.arch + ": a layer-split card has too few drafter rows for the ring";
+            return false;
+        }
+    }
+    Stage& last = *hops.back().stage;
+    // the host keeps this many chunks queued past the last card's finished ones: enough for every card to hold one
+    const int ahead = (int) hops.size() + 1;
+
+    std::vector<int64_t> tail_pos;
+    std::vector<int> tail_rows;
+    cudaError_t e = cudaSuccess;
+    bool stopped = false;
+    int reaped = 0;
+    const auto reap = [&](int upto) {
+        for (; reaped < upto && e == cudaSuccess; ++reaped) {
+            {
+                const core::OnDevice on(last.dev);
+                e = cudaEventSynchronize(last.stage_ev[2 * (size_t) reaped + 1]);
+            }
+            if (e == cudaSuccess && progress) progress(std::min(n, (reaped + 1) * T));
+        }
+    };
+    const cudaStream_t ms = st.stream;
+    for (int i = 0; i < chunks; ++i) {
+        if (i >= ahead) {
+            reap(i - ahead + 1);
+            if (e != cudaSuccess) break;
+            if (stop && stop()) {
+                stopped = true;
+                break;
+            }
+        }
+        const int64_t p = pos + (int64_t) i * T;
+        const int k = i % S, t = i == chunks - 1 ? t_last : T;
+        const bool again = i >= S;
+        const int32_t* bc = t == T ? bnd : bnd + 2;
+        const bool tail = block && p + t > b0 - cap && tail_pos.size() < n_keep;
+        const int32_t* p3 = pos3 + (size_t) i * T * 3;
+        {
+            const core::OnDevice on(card_dev(st));
+            chunk_start(m, st, tokens + (size_t) i * T, nullptr, t, p3, bc);
+            chunk_layers(m, st, t, p, 0, m.le, block ? &bd : nullptr);
+            L.send(m, st, k, again, tail ? L.mtail[tail_pos.size()] : nullptr);
+        }
+        for (size_t c = 0; c < hops.size(); ++c) {
+            const Hop& h = hops[c];
+            const bool holds_last = h.card->le >= g.n_layers;
+            const bool read_last = holds_last && tap_last;
+            const int tail_at = tail && h.stage->n_taps > 0 ? (int) tail_pos.size() : -1;
+            h.stage->read(*h.ss, i, k, again, p, p3, bc, h.card->lb, h.stage->split_hand.taps, tail_at, read_last, t);
+            if (c + 1 < hops.size()) {
+                const core::OnDevice on(card_dev(*h.ss));
+                hops[c + 1].stage->send(*h.card, *h.ss, k, again, nullptr);
+            }
+        }
+        if (tail) {
+            tail_pos.push_back(p);
+            tail_rows.push_back(t);
+        }
+    }
+    // what is queued runs out, so that no copy is left in flight (after a stop the session holds part of the prompt)
+    for (SessionState* s = &st; s != nullptr; s = s->peer.get()) {
+        const core::OnDevice on(card_dev(*s));
+        const cudaError_t r = cudaDeviceSynchronize();
+        if (e == cudaSuccess) e = r;
+    }
+    if (e == cudaSuccess && !stopped) {
+        const core::OnDevice on(card_dev(st));
+        // the ring's chunks' features in order: the main card's part, then each later card's rows projected on the main card
+        for (size_t j = 0; j < tail_pos.size(); ++j) {
+            const int t = tail_rows[j];
+            cudaMemcpyAsync(m.cs.bounds, t == T ? bnd : bnd + 2, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, ms);
+            cudaMemcpyAsync(m.cs.dacc, L.mtail[j], (size_t) t * H * 4, cudaMemcpyDeviceToDevice, ms);
+            for (const Hop& h : hops) {
+                const Stage& sg = *h.stage;
+                int q = 0;
+                for (int tl : sg.split_hand.taps) {
+                    if (tl >= h.card->le) break;
+                    cudaMemcpyAsync(m.cs.x, sg.tap_rows[j * (size_t) sg.n_taps + (size_t) q], (size_t) t * H * 2,
+                                    cudaMemcpyHostToDevice, ms);
+                    chunk_tap(m, st, t, bd, sg.split_hand.first_tap + (size_t) q);
+                    ++q;
+                }
+            }
+            block_ctx_chunk(m, st, m.cs.dacc, t, tail_pos[j]);
+        }
+        const cudaError_t r = cudaStreamSynchronize(ms);
+        if (e == cudaSuccess) e = r;
+    }
+    if (e != cudaSuccess) {
+        err = m.o.arch + ": the layer split's prompt read failed: " + cudaGetErrorString(e);
+        return false;
+    }
+    if (stopped) {
+        basalt::log::info("basalt dense", "layer split: stopped, %d of %d tokens read", std::min(n, reaped * T), n);
+        return true;
+    }
+    reap(chunks);
+    return true;
+}
+
+}  // namespace
 
 bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos, const int32_t* pos3,
                  std::string& err) {
+    if (m.split_model != nullptr && m.split_model->split) {
+        Stage& L = *m.split;
+        if (!m.ensure_chunk(err)) return false;
+        int32_t* bnd = L.pos3;
+        bnd[0] = 0;
+        bnd[1] = T;
+        std::memcpy(L.pos3 + 4, pos3, (size_t) T * 3 * sizeof(int32_t));
+        const bool block = m.o.drafter == Drafter::Block;
+        if (!chain_chunk(m, st, tokens, rows, T, pos, L.pos3 + 4, bnd, block, true, err)) return false;
+        if (block && !chain_apply_taps(m, st, T)) {
+            err = m.o.arch + ": a layer-split card's drafter rows did not come back";
+            return false;
+        }
+        if (st.mtp_kc != nullptr)
+            cudaMemcpyAsync(m.cs.x, L.hand[1], (size_t) T * m.g.n_embd * 2, cudaMemcpyHostToDevice, st.stream);
+        return chunk_finish(m, st, T, pos, err);
+    }
     Stage& L = *m.split;
     const Geometry& g = m.g;
     if (!m.ensure_chunk(err)) return false;
@@ -723,6 +1046,7 @@ bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float*
 
 bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos, const std::function<void(int)>& progress,
                 const std::function<bool()>& stop, std::string& err) {
+    if (m.split_model != nullptr && m.split_model->split) return chain_read(m, st, tokens, n, pos, progress, stop, err);
     Stage& L = *m.split;
     const Geometry& g = m.g;
     const int T = kChunk, H = g.n_embd;
