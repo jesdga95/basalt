@@ -1912,6 +1912,7 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/nvfp4_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx2.cpp src/kernels/cpu/nvfp4_avx2_vnni.cpp
                                          src/kernels/cpu/nvfp4_avx2_dpbusd.cpp
+                                         src/kernels/cpu/mxfp4_avx512.cpp
                                          src/kernels/cpu/mxfp4_avx2.cpp src/kernels/cpu/mxfp4_avx2_vnni.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx2_vnni.cpp
                                          src/kernels/cpu/kq_avx2.cpp
@@ -1925,6 +1926,8 @@ else()
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags};-mbmi2")
 endif()
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                            "${_isa_avx512_flags}")
+set_source_files_properties(src/kernels/cpu/mxfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the same rows with the AVX-VNNI instructions and BMI2 (pdep for the grid indices), called only behind cpu_avxvnni_ok()
@@ -1943,7 +1946,7 @@ target_link_libraries(kernels_cpu PUBLIC ggml_quants)
 if(BASALT_ARM64)
   basalt_arm64_kernels_cpu()   # the NEON kernels in place of the x86 ones (cmake/arm64.cmake)
   # deferred to the end of this file, when every target and test exists: the x86 kernels' own tests are not built
-  cmake_language(DEFER CALL basalt_arm64_disable avx_bench iq_avx2_test iq_avx512_test nvfp4_cpu_rows_test router_dot_parity)
+  cmake_language(DEFER CALL basalt_arm64_disable avx_bench iq_avx2_test iq_avx512_test mxfp4_cpu_rows_test nvfp4_cpu_rows_test router_dot_parity)
 endif()
 if(BUILD_TESTING)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
@@ -2241,6 +2244,11 @@ if(BUILD_TESTING)
   target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
   set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+
+  add_executable(mxfp4_cpu_rows_test tests/kernels/cpu/mxfp4_cpu_rows_test.cpp)
+  target_link_libraries(mxfp4_cpu_rows_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME mxfp4_cpu_rows_test COMMAND mxfp4_cpu_rows_test)
+  set_tests_properties(mxfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
 
   # the MXFP8 CPU dot on each instruction set, bit for bit against the scalar row (the AVX-512 rows run where the host has them)
   add_executable(mxfp8_cpu_rows_test tests/kernels/cpu/mxfp8_cpu_rows_test.cpp)
