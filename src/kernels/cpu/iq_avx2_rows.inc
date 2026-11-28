@@ -82,6 +82,15 @@ inline float hsum8(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
+// ggml_cpu_dots.c's hsum_float_8, bit for bit: used by the exact multi-token down rows.
+inline float hsum8_ggml(__m256 v) {
+    __m128 r = _mm256_extractf128_ps(v, 1);
+    r = _mm_add_ps(r, _mm256_castps256_ps128(v));
+    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    r = _mm_add_ss(r, _mm_movehdup_ps(r));
+    return _mm_cvtss_f32(r);
+}
+
 // The int16 products of a maddubs times a scale, summed in pairs into the int32 accumulator: one `madd` and one `add`,
 // or the single AVX-VNNI instruction that is exactly that (no saturation in either).
 inline __m256i iq_acc(__m256i acc, __m256i prod16, __m256i scale16) {
@@ -226,7 +235,7 @@ template <> struct Fmt32<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 
     }
 };
 
-template <int TY, int NT>
+template <int TY, int NT, bool Exact = false>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     __m256 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
@@ -247,11 +256,15 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
                 }
             }
         }
-        const float dx = h2f(u16(blk)) * Fmt32<TY>::K;
+        const float dx = Exact ? h2f(u16(blk)) : h2f(u16(blk)) * Fmt32<TY>::K;
         for (int t = 0; t < NT; ++t)
             accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(acci[t]), accf[t]);
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    if constexpr (Exact) {
+        for (int t = 0; t < NT; ++t) res[t] = Fmt32<TY>::K * hsum8_ggml(accf[t]);
+    } else {
+        for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    }
 }
 
 // ---- IQ3_S (21), IQ3_XXS (18) and IQ2_S (22) a 64-value group at a time: both halves' grid indices in one
@@ -291,7 +304,7 @@ inline void block_finish(__m256 (&accf)[NT], const __m256i (&acc)[NT][2], const 
                                   accf[t]);
 }
 
-template <int NT>
+template <int NT, bool Exact = false>
 inline void row_dot_iq3s(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     const SgnConsts k;
     const __m256i shl = _mm256_setr_epi32(8, 7, 6, 5, 4, 3, 2, 1), shr = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
@@ -323,12 +336,16 @@ inline void row_dot_iq3s(const uint8_t* row, int nblocks, const block_q8_K* cons
                              _mm256_set1_epi16(scl[2 * j]), g1, sgn_at(blk + 78 + 8 * j, k.spread, k.bsel, k.one8),
                              _mm256_set1_epi16(scl[2 * j + 1]));
         }
-        block_finish<NT>(accf, acc, y, i, h2f(u16(blk)) * Fmt32<21>::K);
+        block_finish<NT>(accf, acc, y, i, Exact ? h2f(u16(blk)) : h2f(u16(blk)) * Fmt32<21>::K);
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    if constexpr (Exact) {
+        for (int t = 0; t < NT; ++t) res[t] = Fmt32<21>::K * hsum8_ggml(accf[t]);
+    } else {
+        for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    }
 }
 
-template <int NT>
+template <int NT, bool Exact = false>
 inline void row_dot_iq3xxs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     __m256 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
@@ -350,12 +367,16 @@ inline void row_dot_iq3xxs(const uint8_t* row, int nblocks, const block_q8_K* co
                                                  (long long) even_signs.v[(w1 >> 7) & 127], (long long) even_signs.v[w1 & 127]);
             group_tokens<NT>(acc, y, i, 64 * j, g0, s0, sc32(2 * (int) (w0 >> 28) + 1), g1, s1, sc32(2 * (int) (w1 >> 28) + 1));
         }
-        block_finish<NT>(accf, acc, y, i, h2f(u16(blk)) * Fmt32<18>::K);
+        block_finish<NT>(accf, acc, y, i, Exact ? h2f(u16(blk)) : h2f(u16(blk)) * Fmt32<18>::K);
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    if constexpr (Exact) {
+        for (int t = 0; t < NT; ++t) res[t] = Fmt32<18>::K * hsum8_ggml(accf[t]);
+    } else {
+        for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    }
 }
 
-template <int NT>
+template <int NT, bool Exact = false>
 inline void row_dot_iq2s(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     static const uint8_t k_sc[128] = {   // half H -> scale bytes 2H (lanes 0-7), 2H+1 (lanes 8-15)
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
@@ -389,9 +410,13 @@ inline void row_dot_iq2s(const uint8_t* row, int nblocks, const block_q8_K* cons
                              g1, sgn_at(blk + 38 + 8 * j, k.spread, k.bsel, k.one8),
                              _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*) k_sc + 2 * j + 1))));
         }
-        block_finish<NT>(accf, acc, y, i, h2f(u16(blk)) * Fmt32<22>::K);
+        block_finish<NT>(accf, acc, y, i, Exact ? h2f(u16(blk)) : h2f(u16(blk)) * Fmt32<22>::K);
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    if constexpr (Exact) {
+        for (int t = 0; t < NT; ++t) res[t] = Fmt32<22>::K * hsum8_ggml(accf[t]);
+    } else {
+        for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    }
 }
 
 // ---- IQ2_XS (17) with ggml's vectorized sign decode (arch/x86/quants.c, ggml_vec_dot_iq2_xs_q8_K):
@@ -400,7 +425,7 @@ inline void row_dot_iq2s(const uint8_t* row, int nblocks, const block_q8_K* cons
 // 32-byte load.  The 8 scale bytes become all 16 half-scales with ggml's unpack trick.  The grid lookups
 // stay scalar loads into set_epi64x (ggml does the same).  Every token still only pays a load, a sign,
 // a maddubs, a madd and an add per half, into alternating accumulators.
-template <int NT>
+template <int NT, bool Exact = false>
 inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     static const uint8_t bit_sel[32] = {
         1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80,
@@ -473,21 +498,25 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
                 }
             }
         }
-        const float dx = h2f(u16(blk)) * 0.125f;
+        const float dx = Exact ? h2f(u16(blk)) : h2f(u16(blk)) * 0.125f;
         for (int t = 0; t < NT; ++t)
             accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
                 _mm256_cvtepi32_ps(_mm256_add_epi32(acc[t][0], acc[t][1])), accf[t]);
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    if constexpr (Exact) {
+        for (int t = 0; t < NT; ++t) res[t] = 0.125f * hsum8_ggml(accf[t]);
+    } else {
+        for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    }
 }
 
-template <int TY, int NT, int M>
+template <int TY, int NT, int M, bool Exact = false>
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    if constexpr (TY == 17)                 row_dot_iq2xs<NT>(row, nblocks, y, res);
-    else if constexpr (TY == 21 && M == 1) row_dot_iq3s<NT>(row, nblocks, y, res);
-    else if constexpr (TY == 18 && M == 1) row_dot_iq3xxs<NT>(row, nblocks, y, res);
-    else if constexpr (TY == 22 && M == 1) row_dot_iq2s<NT>(row, nblocks, y, res);
-    else                                    row_dot<TY, NT>(row, nblocks, y, res);
+    if constexpr (TY == 17)                 row_dot_iq2xs<NT, Exact>(row, nblocks, y, res);
+    else if constexpr (TY == 21 && M == 1) row_dot_iq3s<NT, Exact>(row, nblocks, y, res);
+    else if constexpr (TY == 18 && M == 1) row_dot_iq3xxs<NT, Exact>(row, nblocks, y, res);
+    else if constexpr (TY == 22 && M == 1) row_dot_iq2s<NT, Exact>(row, nblocks, y, res);
+    else                                    row_dot<TY, NT, Exact>(row, nblocks, y, res);
 }
 
 // Gathered grid rows pay on Intel performance cores and lose on efficient ones (core type 0x20 in CPUID leaf 0x1a) and on
@@ -539,13 +568,13 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     }
 }
 
-template <int TY, int NT, int M>
+template <int TY, int NT, int M, bool Exact = false>
 void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT, M>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot_any<TY, NT, M, Exact>(w + (size_t) r * row_bytes, n / QK_K, y, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
@@ -569,16 +598,16 @@ void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n
     }
 }
 
-template <int TY, int M>
+template <int TY, int M, bool Exact = false>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
     for (int t0 = 0; t0 < nt; t0 += 4) {
         const int k = nt - t0 < 4 ? nt - t0 : 4;
         switch (k) {
-            case 1: dot_rows<TY, 1, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
-            case 2: dot_rows<TY, 2, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
-            case 3: dot_rows<TY, 3, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
-            case 4: dot_rows<TY, 4, M>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 1: dot_rows<TY, 1, M, Exact>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 2: dot_rows<TY, 2, M, Exact>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 3: dot_rows<TY, 3, M, Exact>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 4: dot_rows<TY, 4, M, Exact>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
             default: break;
         }
     }
@@ -718,6 +747,23 @@ void BASALT_IQ_EXPORT(iq256_rows_mode)(int mode, int type, const uint8_t* w, siz
         case 22 * 4: dot_rows_nt<22, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22 * 4 + 1: dot_rows_nt<22, 1>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 23 * 4: dot_rows_nt<23, 0>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        default: break;
+    }
+}
+
+void BASALT_IQ_EXPORT(iq_exact_256_rows)(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act,
+                                         int nt, float* const* out, int r0, int r1) {
+    const int m = (type == 18 || type == 21 || type == 22) ? rows_mode() : 0;
+    switch (type * 4 + m) {
+        case 16 * 4: dot_rows_nt<16, 0, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 17 * 4: dot_rows_nt<17, 0, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18 * 4: dot_rows_nt<18, 0, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18 * 4 + 1: dot_rows_nt<18, 1, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 21 * 4: dot_rows_nt<21, 0, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 21 * 4 + 1: dot_rows_nt<21, 1, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 22 * 4: dot_rows_nt<22, 0, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 22 * 4 + 1: dot_rows_nt<22, 1, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 23 * 4: dot_rows_nt<23, 0, true>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }

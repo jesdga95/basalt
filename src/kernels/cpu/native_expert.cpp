@@ -184,21 +184,29 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     return true;
 }
 
-void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+namespace {
+
+void quantize_act(int act_type, const float* x, void* dst, int64_t n) {
     if constexpr (platform::kArm64) {   // every activation format through the NEON build's quantizer
-        traits(f.gu_act)->from_float(x, dst, f.n_embd);
+        traits(act_type)->from_float(x, dst, n);
         return;
     }
     static const bool avx512 = cpu_avx512_ok();
-    if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
+    if (act_type == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
         if (avx512) {
-            quantize_q8_K_avx512(x, dst, f.n_embd);
+            quantize_q8_K_avx512(x, dst, n);
             return;
         }
-        quantize_q8_K_avx2(x, dst, f.n_embd);   // the engine runs on AVX2 CPUs at least
+        quantize_q8_K_avx2(x, dst, n);   // the engine runs on AVX2 CPUs at least
         return;
     }
-    traits(f.gu_act)->from_float(x, dst, f.n_embd);
+    traits(act_type)->from_float(x, dst, n);
+}
+
+}  // namespace
+
+void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    quantize_act(f.gu_act, x, dst, f.n_embd);
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
@@ -206,10 +214,10 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
         thread_local std::vector<float> hk;
         hk.assign((size_t) f.n_ffk, 0.f);
         std::memcpy(hk.data(), h, (size_t) f.n_ff * sizeof(float));
-        traits(f.d_act)->from_float(hk.data(), dst, f.n_ffk);
+        quantize_act(f.d_act, hk.data(), dst, f.n_ffk);
         return;
     }
-    traits(f.d_act)->from_float(h, dst, f.n_ff);
+    quantize_act(f.d_act, h, dst, f.n_ff);
 }
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
@@ -263,7 +271,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq1s_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
-    if (avx512 && !soft && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
+    const bool exact_gu_nt =
+        nt >= 2 || f.gu_type == GGML_TYPE_IQ1_M || f.gu_type == GGML_TYPE_IQ2_XXS || f.gu_type == GGML_TYPE_IQ2_XS;
+    if (avx512 && !soft && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && exact_gu_nt &&
+        iq1s_512_fits(n)) {
         iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
@@ -324,8 +335,15 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq1s_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }
-    if (avx512 && f.swiglu_limit > 0.f && !f.tail && iq_exact_512_supported(f.d_type) && iq1s_512_fits(n)) {
+    // IQ1_M wins at nt == 1 (IQ1_S already took iq1s_512_rows above); the IQ2/IQ3 multi-token kernels only pay off
+    // once weight decode is amortized across two or more tokens.
+    if (avx512 && !f.tail && iq_exact_512_supported(f.d_type) && (f.d_type == GGML_TYPE_IQ1_M || nt >= 2) &&
+        iq1s_512_fits(n)) {
         iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+        return;
+    }
+    if (!avx512 && cpu_avx2_ok() && !f.tail && nt >= 2 && iq256_supported(f.d_type) && n > 0 && n % 256 == 0) {
+        iq_exact_256_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }
     for (int r = r0; r < r1; ++r) {
