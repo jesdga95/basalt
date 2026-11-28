@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include <atomic>
 #include <stdexcept>
 #include <string>
 
@@ -239,10 +240,16 @@ void check(const char* what) {
 
 template <bool kWindow, bool kPacked>
 void launch(const MqaArgs& a, int n_chunks, int chunk0, int n_total, float* o_part, float* ml, cudaStream_t s) {
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(mqa_tc_partial<kWindow, kPacked>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kSmemBytes);
-        attr = true;
+    static std::atomic<bool> attr[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    const bool cached = dev >= 0 && dev < 64;
+    if (!cached || !attr[dev].load(std::memory_order_acquire)) {
+        const cudaError_t ae =
+            cudaFuncSetAttribute(mqa_tc_partial<kWindow, kPacked>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kSmemBytes);
+        if (ae != cudaSuccess)
+            throw std::runtime_error(std::string("mqa_tc_partial: shared-memory opt-in: ") + cudaGetErrorString(ae));
+        if (cached) attr[dev].store(true, std::memory_order_release);
     }
     mqa_tc_partial<kWindow, kPacked><<<dim3(n_chunks, kAttnHeads / kHeads, a.n_tokens), kThreads, kSmemBytes, s>>>(a, chunk0, n_total,
                                                                                                           o_part, ml);
