@@ -2,6 +2,7 @@
 #include "basalt/vision/encoder_cpu.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -94,13 +95,28 @@ void attend_all(const float* qkv, int n, int E, int H, float kq, std::vector<flo
 }  // namespace
 
 bool CpuEncoder::init(const Mmproj& mp, int threads, bool round_bf16, bool f16_quirks, std::string& err) {
+    mp_ = nullptr;
+    layers_.clear();
+    wpatch_.clear();
+    wpatch2_.clear();
+    own_w_.clear();
+    own_b_.clear();
+    cls_row_.clear();
+    bpatch_ = pos_ = postw_ = postb_ = bm0_ = bm2_ = newline_ = nullptr;
+    wm0_ = wm2_ = nullptr;
+    hy4_ = false;
+    cls_ = false;
+    edge_ = 48;
     f16_ = f16_quirks;
-    mp_ = &mp;
     threads_ = threads > 0 ? threads : (int) std::max(1u, std::thread::hardware_concurrency());
     round_ = round_bf16;
     const Hparams& h = mp.hp();
-    if (mp.find("v.class_embd")) return init_cls(mp, err);   // the class-token tower
-    if (h.embd != 1152 || h.heads != 16 || h.patch != 16 || h.ffn != 4304 || h.merge != 2 || h.layers < 1) {
+    if (mp.find("v.class_embd")) {
+        if (!init_cls(mp, err)) return false;
+        mp_ = &mp;
+        return true;
+    }
+    if (h.embd != 1152 || h.heads != 16 || h.patch != 16 || h.ffn != 4304 || h.merge != 2 || h.layers < 1 || h.proj <= 0) {
         err = "unexpected projector hyper-parameters";
         return false;
     }
@@ -182,16 +198,19 @@ bool CpuEncoder::init(const Mmproj& mp, int threads, bool round_bf16, bool f16_q
             !L.wup || !L.wdown)
             return false;
     }
+    mp_ = &mp;
     return true;
 }
 
 bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap) {
+    if (mp_ == nullptr || cls_) return false;
+    if (canvas.w <= 0 || canvas.h <= 0 || canvas.w % 32 != 0 || canvas.h % 32 != 0) return false;
     const Hparams& hp = mp_->hp();
     const int E = hp.embd, F = hp.ffn, H = hp.heads, D = E / H, gx = canvas.w / 16, gy = canvas.h / 16;
+    if ((int64_t) gx * gy > INT_MAX) return false;
     const int n = gx * gy;
-    const bool pair = !hy4_ && (int64_t) patches.size() == (int64_t) n * 1536;   // a video group: the two taps apart
-    if (hy4_ && gx % 2 != 0) return false;
-    if (n % 4 != 0 || (!pair && (int) patches.size() != n * 768)) return false;
+    const bool pair = !hy4_ && patches.size() == (size_t) n * 1536;   // a video group: the two taps apart
+    if (!pair && patches.size() != (size_t) n * 768) return false;
     std::vector<float> x((size_t) n * E), h((size_t) n * E), qkv((size_t) n * 3 * E), att((size_t) n * E),
         tmp((size_t) n * E), ffn((size_t) n * F), attk((size_t) H * n * D), attv((size_t) H * D * n);
     const int T = threads_;
@@ -350,7 +369,7 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
 
 bool CpuEncoder::init_cls(const Mmproj& mp, std::string& err) {
     const Hparams& h = mp.hp();
-    if (h.embd != 1024 || h.heads != 16 || h.patch != 20 || h.ffn != 4096 || h.merge != 2 || h.layers < 1) {
+    if (h.embd != 1024 || h.heads != 16 || h.patch != 20 || h.ffn != 4096 || h.merge != 2 || h.layers < 1 || h.proj <= 0) {
         err = "unexpected projector hyper-parameters";
         return false;
     }
@@ -402,14 +421,17 @@ bool CpuEncoder::init_cls(const Mmproj& mp, std::string& err) {
 }
 
 bool CpuEncoder::encode_padded(const Image& img, std::vector<float>& out, const TapFn& tap) {
-    if (!cls_ || img.w <= 0 || img.h <= 0 || img.rgb.size() != (size_t) img.w * img.h * 3) return false;
+    if (mp_ == nullptr || !cls_ || img.w <= 0 || img.h <= 0 || img.rgb.size() != (size_t) img.w * img.h * 3) return false;
     const Hparams& hp = mp_->hp();
     const int E = hp.embd, F = hp.ffn, H = hp.heads, P = hp.patch, PV = 3 * P * P, S = edge_;
     Geometry g;
     g.patch = P;
     g.merge = hp.merge;
     const Size canvas = padded_canvas(img.w, img.h, g);
-    const int gx = canvas.w / P, gy = canvas.h / P, n = gx * gy, Tn = n + 1, m = n / 4;
+    if (canvas.w <= 0 || canvas.h <= 0 || canvas.w % (P * hp.merge) != 0 || canvas.h % (P * hp.merge) != 0) return false;
+    const int gx = canvas.w / P, gy = canvas.h / P;
+    if ((int64_t) gx * gy >= INT_MAX) return false;
+    const int n = gx * gy, Tn = n + 1, m = n / 4;
     const int T = threads_;
     std::vector<float> rows;
     patchify_padded(img, g, hp.mean, hp.std, rows);

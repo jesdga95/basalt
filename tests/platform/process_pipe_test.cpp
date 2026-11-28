@@ -7,14 +7,17 @@
 #include "basalt/platform/system.hpp"
 
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -53,6 +56,10 @@ int main(int argc, char** argv) {
         std::fputs("to stderr\n", stderr);
         return 0;
     }
+    if (argc > 2 && std::strcmp(argv[1], "--print-arg") == 0) {
+        std::fputs(argv[2], stdout);
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--crash-terminate") == 0) {
         basalt::platform::install_crash_handler();
         basalt::core::progress_at("decode", 17, 64);
@@ -61,6 +68,11 @@ int main(int argc, char** argv) {
         } catch (...) {
             std::terminate();
         }
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--crash-abort") == 0) {
+        basalt::platform::install_crash_handler();
+        basalt::core::progress_at("decode", 17, 64);
+        std::abort();
     }
     using namespace basalt::platform;
     const std::string self = module_path();
@@ -81,6 +93,15 @@ int main(int argc, char** argv) {
         check(pipe_write_all(pc.in_fd, big.data(), big.size()), "a request larger than a pipe buffer is written");
         std::string got = read_line(pc.out_fd);
         check(got.size() == 200000 && got[0] == 'X', "and answered in full");
+        // pipe_wait_readable(-1) must wait until data arrives rather than returning false immediately.
+        check(!pipe_wait_readable(pc.out_fd, 0), "quiet pipe is not immediately readable");
+        std::thread delayed([in_fd = pc.in_fd] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            (void) pipe_write_all(in_fd, "ping\n", 5);
+        });
+        check(pipe_wait_readable(pc.out_fd, -1), "pipe_wait_readable(-1) waits until data arrives");
+        delayed.join();
+        check(read_line(pc.out_fd) == "PING", "delayed reply read after infinite wait");
         check(child_wait(pc.child, 0) == -1, "the child is still running while its input is open");
         close_fd(pc.in_fd);
         pc.in_fd = -1;
@@ -110,12 +131,31 @@ int main(int argc, char** argv) {
     }
     std::remove(log.c_str());
 
+    // invalid descriptors never crash the CRT and fail cleanly
+    char dummy = 0;
+    check(pipe_wait_readable(-1, 0), "pipe_wait_readable(-1) counts as ready without crashing");
+    check(!pipe_write_all(-1, "x", 1), "pipe_write_all(-1) fails cleanly");
+    check(pipe_read(-1, &dummy, 1) == -1, "pipe_read(-1) fails cleanly");
+
+    // an unopenable stderr_path fails cleanly instead of corrupting stdout
+    {
+        PipedChild bad_log;
+        std::string bad_err;
+        check(!spawn_piped({self, "--echo"}, temp_dir() + "/basalt_no_such_dir_xyz/err.log", bad_log, bad_err) && !bad_err.empty(),
+              "unopenable stderr_path fails spawn_piped cleanly");
+    }
+
     const auto both = capture_output({self, "--both"}, true);
     check(both && both->find("to stdout") != std::string::npos && both->find("to stderr") != std::string::npos,
           "capture_output with stderr mixed in");
     const auto only = capture_output({self, "--both"}, false);
     check(only && only->find("to stdout") != std::string::npos && only->find("to stderr") == std::string::npos,
           "capture_output without stderr");
+    const std::string tricky = "a&echo INJECTED|b>c^d%TEMP%\"q\"";
+    const auto lit = capture_output({self, "--print-arg", tricky}, false);
+    check(lit.has_value() && *lit == tricky, "capture_output passes shell metacharacters literally");
+    const auto missing = capture_output({temp_dir() + "/basalt_no_such_program_xyz"}, false);
+    check(!missing.has_value(), "capture_output returns nullopt for missing program");
 
     const std::string crash_log = temp_dir() + "/basalt_process_crash_test.err";
     PipedChild crashed;
@@ -134,5 +174,23 @@ int main(int argc, char** argv) {
               "crash handler writes exception and stage to stderr");
     }
     std::remove(crash_log.c_str());
+
+    const std::string abort_log = temp_dir() + "/basalt_process_abort_test.err";
+    PipedChild aborted;
+    std::string abort_err;
+    check(spawn_piped({self, "--crash-abort"}, abort_log, aborted, abort_err), "abort child starts: " + abort_err);
+    if (aborted.in_fd >= 0) {
+        const int rc = child_wait(aborted.child, 10000);
+        check(rc != 0, "abort child exits non-zero");
+        close_fd(aborted.in_fd);
+        close_fd(aborted.out_fd);
+        child_close(aborted.child);
+        std::ifstream af(abort_log);
+        std::string aline;
+        std::getline(af, aline);
+        check(aline.find("basalt crash: error: SIGABRT in decode (17) chunk 64") != std::string::npos,
+              "crash handler logs SIGABRT and stage to stderr");
+    }
+    std::remove(abort_log.c_str());
     return failures ? 1 : 0;
 }

@@ -59,7 +59,28 @@ int main() {
     check(f16_round(65519.0f) == 65504.0f, "f16_round keeps the largest finite half");
     check(f16_round(1.00048828125f) == 1.0f && f16_round(1.0014648f) == 1.0019531f, "f16_round ties to even");
 
-    (void) cpu_has_avx512_bf16();
+    const bool has_bf16 = cpu_has_avx512_bf16();
+    if (kX86) {
+        // Cross-check against Leaf 7 Subleaf 1 EAX bit 5 (AVX512_BF16) + AVX512F/BW/VL + OS XSAVE state,
+        // ensuring WAITPKG (Leaf 7 Subleaf 0 ECX bit 5) cannot produce a false positive.
+        unsigned q[4] = {};
+        cpuid(0, 0, q);
+        bool expect_bf16 = false;
+        if (q[0] >= 7u) {
+            cpuid(1, 0, q);
+            const unsigned ecx1 = q[2];
+            if (((ecx1 >> 12) & 1u) && ((ecx1 >> 27) & 1u) && ((ecx1 >> 28) & 1u) && (xgetbv0() & 0xE6) == 0xE6) {
+                cpuid(7, 0, q);
+                const unsigned max_sub = q[0], ebx7 = q[1];
+                const bool base_ok = max_sub >= 1u && ((ebx7 >> 16) & 1u) && ((ebx7 >> 30) & 1u) && ((ebx7 >> 31) & 1u);
+                if (base_ok) {
+                    cpuid(7, 1, q);
+                    expect_bf16 = ((q[0] >> 5) & 1u) != 0;
+                }
+            }
+        }
+        check(!has_bf16 || expect_bf16, "cpu_has_avx512_bf16 never reports true without AVX512_BF16 + AVX512F/BW/VL");
+    }
     check(true, "cpu_has_avx512_bf16 answers");
 
     check(std::bit_cast<float>(0x3f800000u) == 1.0f && std::bit_cast<uint32_t>(2.0f) == 0x40000000u, "std::bit_cast");

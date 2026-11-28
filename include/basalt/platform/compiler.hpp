@@ -155,23 +155,34 @@ inline float f16_round(float x) {
 #endif
 }
 
-/// Whether this CPU, and the OS saving its AVX-512 state, can run AVX512_BF16 with AVX512BW.
+/// Whether this CPU, and the OS saving its AVX-512 state, can run AVX512_BF16 with AVX512F/BW/VL and FMA.
 inline bool cpu_has_avx512_bf16() {
 #if !defined(BASALT_ARCH_X86)
     return false;
 #elif defined(_MSC_VER)
-    // The same readings GCC's run-time probe takes: the OS has to save the AVX-512 state, and leaf 7 subleaf 0
-    // names AVX512BW (EBX bit 30) and AVX512_BF16 (ECX bit 5).
+    // Leaf 1: FMA (ECX bit 12), OSXSAVE (27), AVX (28); XCR0 saves XMM/YMM/opmask/ZMM (0xE6).
+    // Leaf 7 subleaf 0: subleaf 1 present (EAX >= 1), AVX2 (EBX bit 5), AVX512F (16), AVX512DQ (17),
+    // AVX512CD (28), AVX512BW (30), AVX512VL (31) — everything MSVC /arch:AVX512 may emit.
+    // Leaf 7 subleaf 1: AVX512_BF16 (EAX bit 5).
     unsigned r[4];
     cpuid(0, 0, r);
     if (r[0] < 7u) return false;
     cpuid(1, 0, r);
-    if (!((r[2] >> 27) & 1u)) return false;                 // OSXSAVE
-    if ((xgetbv0() & 0xE6) != 0xE6) return false;           // the OS saves the AVX-512 state
+    const unsigned ecx1 = r[2];
+    if (!((ecx1 >> 12) & 1u) || !((ecx1 >> 27) & 1u) || !((ecx1 >> 28) & 1u)) return false;
+    if ((xgetbv0() & 0xE6) != 0xE6) return false;
     cpuid(7, 0, r);
-    return ((r[1] >> 30) & 1u) != 0 && ((r[2] >> 5) & 1u) != 0;   // AVX512BW, AVX512_BF16
+    if (r[0] < 1u) return false;
+    const unsigned ebx7 = r[1];
+    if (!((ebx7 >> 5) & 1u) || !((ebx7 >> 16) & 1u) || !((ebx7 >> 17) & 1u) ||
+        !((ebx7 >> 28) & 1u) || !((ebx7 >> 30) & 1u) || !((ebx7 >> 31) & 1u))
+        return false;
+    cpuid(7, 1, r);
+    return ((r[0] >> 5) & 1u) != 0;
 #else
-    return __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512bw");
+    return __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512f") &&
+           __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl") &&
+           __builtin_cpu_supports("fma");
 #endif
 }
 

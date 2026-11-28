@@ -46,10 +46,19 @@ DynLib DynLib::open_nvml() {
     return lib;
 }
 
-DynLib DynLib::open_app(const std::string& file) {
+DynLib DynLib::open_app(const std::string& file) { return open_app(file, std::string()); }
+
+DynLib DynLib::open_app(const std::string& file, const std::string& prefer_dir) {
     // Each candidate by full path: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR resolves the library's own dependencies in its
     // folder, and a bare name would never search PATH with these flags, so PATH is walked here.
+    auto is_absolute = [](const std::wstring& d) {
+        return (d.size() >= 3 && d[1] == L':' && (d[2] == L'\\' || d[2] == L'/')) || d.rfind(L"\\\\", 0) == 0;
+    };
     std::vector<std::wstring> dirs;
+    if (!prefer_dir.empty()) {
+        const std::wstring pd = to_wide(prefer_dir);
+        if (is_absolute(pd)) dirs.push_back(pd);
+    }
     const std::string self = module_path();
     const size_t cut = self.find_last_of("\\/");
     if (cut != std::string::npos) dirs.push_back(to_wide(self.substr(0, cut)));
@@ -64,9 +73,7 @@ DynLib DynLib::open_app(const std::string& file) {
             std::wstring d = path.substr(at, end - at);
             if (d.size() >= 2 && d.front() == L'"' && d.back() == L'"') d = d.substr(1, d.size() - 2);
             // only absolute entries (a drive or a share): a relative one would name the current directory
-            const bool absolute = (d.size() >= 3 && d[1] == L':' && (d[2] == L'\\' || d[2] == L'/')) ||
-                                  d.rfind(L"\\\\", 0) == 0;
-            if (absolute) dirs.push_back(d);
+            if (is_absolute(d)) dirs.push_back(d);
             at = end + 1;
         }
     }
@@ -109,8 +116,15 @@ DynLib DynLib::open_nvml() {
     return lib;
 }
 
-DynLib DynLib::open_app(const std::string& file) {
+DynLib DynLib::open_app(const std::string& file) { return open_app(file, std::string()); }
+
+DynLib DynLib::open_app(const std::string& file, const std::string& prefer_dir) {
     DynLib lib;
+    if (!prefer_dir.empty() && prefer_dir[0] == '/') {
+        const std::string full = prefer_dir + (prefer_dir.back() == '/' ? "" : "/") + file;
+        lib.h_ = dlopen(full.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (lib.h_ != nullptr) return lib;
+    }
     lib.h_ = dlopen(file.c_str(), RTLD_NOW | RTLD_LOCAL);
     return lib;
 }

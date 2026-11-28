@@ -40,5 +40,12 @@ int main() {
     check(!sys->path.empty(), "and the file it came from is named");
     check(line.rfind("VIDEO on FFmpeg ", 0) == 0, "the line says on with the release");
     check(sys->error_text(ff::kErrorEof).find("End of file") != std::string::npos, "FFmpeg's own text for AVERROR_EOF");
+    // An incomplete row whose avformat loads must fall through to a subsequent complete row.
+    ff::AbiRow partial = sys->abi;
+    partial.avutil = 99;
+    Ffmpeg fallback;
+    std::string fb_why;
+    check(load_ffmpeg({partial, sys->abi}, fallback, fb_why) && !fallback.path.empty(),
+          "incomplete earlier row falls through to complete row");
     return failures ? 1 : 0;
 }

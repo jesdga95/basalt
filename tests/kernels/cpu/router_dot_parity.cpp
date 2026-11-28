@@ -65,6 +65,46 @@ int main() {
                 (int) cpu::cpu_avx1_ok());
     if (cpu::cpu_avx2_ok()) run("avx2", cpu::bf16_rows_dot_multi);
     if (cpu::cpu_avx1_ok()) run("avx", cpu::bf16_rows_dot_multi_avx1);
+
+    // Non-multiple-of-8 cols and nt > 8 (verifies tail cursor reset across tokens and multi-chunk token loop).
+    auto run_edge = [&](const char* tag, void (*fn)(const uint16_t*, int, int, const float*, int, float*)) {
+        for (int cols : {5, 13, 29}) {
+            constexpr int ER = 17, ENT = 13;
+            std::vector<uint16_t> ew((size_t) ER * cols);
+            for (auto& v : ew) {
+                const float f = nd(rng);
+                uint32_t b;
+                std::memcpy(&b, &f, 4);
+                v = (uint16_t) (b >> 16);
+            }
+            std::vector<float> ex((size_t) ENT * cols);
+            for (auto& v : ex) v = nd(rng) * 20.f;
+            std::vector<double> eref((size_t) ENT * ER);
+            for (int t = 0; t < ENT; ++t)
+                for (int r = 0; r < ER; ++r) {
+                    double s = 0;
+                    for (int c = 0; c < cols; ++c) {
+                        const uint32_t b = (uint32_t) ew[(size_t) r * cols + c] << 16;
+                        float f;
+                        std::memcpy(&f, &b, 4);
+                        s += (double) f * ex[(size_t) t * cols + c];
+                    }
+                    eref[(size_t) t * ER + r] = s;
+                }
+            std::vector<float> eout((size_t) ENT * ER, -999.f);
+            fn(ew.data(), ER, cols, ex.data(), ENT, eout.data());
+            double num = 0, den = 0;
+            for (size_t i = 0; i < eout.size(); ++i) { num += std::fabs(eout[i] - eref[i]); den += std::fabs(eref[i]); }
+            const double rel = num / (den + 1e-30);
+            if (!(rel < 1e-5)) {
+                std::printf("  %-5s edge cols=%d nt=%d MISMATCH (rel %.2e)\n", tag, cols, ENT, rel);
+                ++failures;
+            }
+        }
+    };
+    if (cpu::cpu_avx2_ok()) run_edge("avx2", cpu::bf16_rows_dot_multi);
+    if (cpu::cpu_avx1_ok()) run_edge("avx", cpu::bf16_rows_dot_multi_avx1);
+
     std::printf("router_dot_parity: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

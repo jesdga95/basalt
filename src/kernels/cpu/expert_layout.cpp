@@ -151,6 +151,10 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
                              int64_t n_embd, int64_t n_ff, float swiglu_limit) {
+    if (n_layers <= 0 || n_expert <= 0) {
+        err = "expert layout: invalid layer or expert count";
+        return false;
+    }
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -195,6 +199,10 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             err = "expert layout: a malformed line: " + line;
             return false;
         }
+        if (L.offset[(size_t) l] != ~0ull) {
+            err = "expert layout: duplicate layer " + std::to_string(l);
+            return false;
+        }
         NativeFmt f;
         if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit, (int) ut)) return false;
         if (f.bytes != blob) {
@@ -207,13 +215,28 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
     }
+    if (L.n_expert <= 0) {
+        err = "expert layout: invalid expert count";
+        return false;
+    }
     uint64_t at = 0;
+    const uint64_t ne = (uint64_t) L.n_expert;
     for (int64_t l = 0; l < n_layers; ++l) {
         if (L.offset[(size_t) l] != at) {
             err = "expert layout: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+        const uint64_t b = L.bytes[(size_t) l];
+        if (b > UINT64_MAX / ne) {
+            err = "expert layout: layer size overflow";
+            return false;
+        }
+        const uint64_t layer_bytes = b * ne;
+        if (layer_bytes > UINT64_MAX - at) {
+            err = "expert layout: total size overflow";
+            return false;
+        }
+        at += layer_bytes;
     }
     L.total = at;
     g_layout = L;

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -39,7 +40,7 @@ std::vector<int64_t> sample_indices(int64_t total, double src_fps, const VideoOp
 }
 
 Size fit_video(int frames, int w, int h, const VideoOptions& o) {
-    if (frames <= 0 || w <= 0 || h <= 0) return {0, 0};
+    if (frames <= 0 || w <= 0 || h <= 0 || o.max_tokens <= 0 || o.group_tokens <= 0) return {0, 0};
     constexpr int f = 32;
     double hh = h, ww = w;
     if (h < f || w < f) {   // a frame under one merged token is scaled up first, aspect kept
@@ -49,7 +50,8 @@ Size fit_video(int frames, int w, int h, const VideoOptions& o) {
     }
     if (std::max(hh, ww) / std::min(hh, ww) > 200) return {0, 0};
     const int64_t max_px = (int64_t) o.max_tokens * 2048, min_px = o.min_volume;
-    const int64_t t_bar = (int64_t) std::nearbyint(frames / 2.0) * 2;
+    // A 1-frame clip pairs with itself as one two-frame group; nearbyint(0.5) rounds to 0 under ties-to-even.
+    const int64_t t_bar = std::max<int64_t>(2, (int64_t) std::nearbyint(frames / 2.0) * 2);
     int64_t hb = (int64_t) std::nearbyint(hh / f) * f, wb = (int64_t) std::nearbyint(ww / f) * f;
     const double vol = (double) frames * hh * ww;
     if (t_bar * hb * wb > max_px) {
@@ -61,8 +63,11 @@ Size fit_video(int frames, int w, int h, const VideoOptions& o) {
         hb = (int64_t) std::ceil(hh * beta / f) * f;
         wb = (int64_t) std::ceil(ww * beta / f) * f;
     }
+    hb = std::max<int64_t>(f, hb);
+    wb = std::max<int64_t>(f, wb);
     // one group is one encoder picture: a frame past its size is shrunk alone, aspect kept
     while ((hb / f) * (wb / f) > o.group_tokens) {
+        if (hb == f && wb == f) break;
         const double beta = std::sqrt((double) hb * (double) wb / ((double) o.group_tokens * f * f));
         const int64_t h2 = std::max<int64_t>(f, (int64_t) std::floor(hb / beta / f) * f);
         const int64_t w2 = std::max<int64_t>(f, (int64_t) std::floor(wb / beta / f) * f);
@@ -127,8 +132,10 @@ int64_t video_nvdec_bytes(const std::string& path) {
         ff::AVStream* const* streams = ff::field<ff::AVStream**>(fmt, ff::kFmtStreams);
         if (index >= 0 && (unsigned) index < ff::field<unsigned>(fmt, ff::kFmtNbStreams) && streams != nullptr) {
             const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(streams[index], F->abi.st_codecpar);
-            const int64_t px = (int64_t) ff::field<int>(par, F->abi.par_width) * ff::field<int>(par, F->abi.par_height);
-            if (px > 0) need = nvdec_need(px);
+            if (par != nullptr) {
+                const int pw = ff::field<int>(par, F->abi.par_width), ph = ff::field<int>(par, F->abi.par_height);
+                if (pw > 0 && ph > 0) need = nvdec_need((int64_t) pw * ph);
+            }
         }
     }
     F->avformat_close_input(&fmt);
@@ -181,10 +188,8 @@ namespace {
 ff::AVBufferRef* nvdec_device(const Ffmpeg& F, int gpu, void* cuda_context, std::string& why) {
     static std::mutex m;
     static std::map<int, ff::AVBufferRef*> devices;
-    static std::map<int, std::string> failed;
     std::lock_guard<std::mutex> l(m);
     if (auto it = devices.find(gpu); it != devices.end()) return it->second;
-    if (auto it = failed.find(gpu); it != failed.end()) { why = it->second; return nullptr; }
     ff::AVBufferRef* d = nullptr;
     int r = 0;
     if (cuda_context != nullptr) {
@@ -201,7 +206,7 @@ ff::AVBufferRef* nvdec_device(const Ffmpeg& F, int gpu, void* cuda_context, std:
         r = F.av_hwdevice_ctx_create(&d, ff::kHwDeviceCuda, std::to_string(gpu).c_str(), nullptr, 0);
     }
     if (r < 0 || d == nullptr) {
-        failed[gpu] = why = "FFmpeg cannot open GPU " + std::to_string(gpu) + " for NVDEC: " + F.error_text(r);
+        why = "FFmpeg cannot open GPU " + std::to_string(gpu) + " for NVDEC: " + F.error_text(r);
         return nullptr;
     }
     devices[gpu] = d;
@@ -259,7 +264,9 @@ struct Reader {
         // a stream whose NVDEC surfaces do not fit in what the card can spare is decoded on the CPU rather than take
         // memory the model needs
         const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(st, F.abi.st_codecpar);
-        const int64_t need = nvdec_need((int64_t) ff::field<int>(par, F.abi.par_width) * ff::field<int>(par, F.abi.par_height));
+        const int pw = par != nullptr ? ff::field<int>(par, F.abi.par_width) : 0;
+        const int ph = par != nullptr ? ff::field<int>(par, F.abi.par_height) : 0;
+        const int64_t need = pw > 0 && ph > 0 ? nvdec_need((int64_t) pw * ph) : 0;
         if (gpu >= 0 && spare >= 0 && need > spare) {
             nvdec_why = "NVDEC needs about " + std::to_string((long long) (need >> 20)) + " MiB, GPU " + std::to_string(gpu) +
                         " can spare " + std::to_string((long long) (spare >> 20));
@@ -374,6 +381,7 @@ private:
 
     std::string convert(const Job& j, ff::SwsContext*& sws, int& sw, int& sh, int& sf, int& scs, int& sr) {
         const int w = ff::field<int>(j.f, ff::kFrameWidth), h = ff::field<int>(j.f, ff::kFrameHeight);
+        if (w <= 0 || h <= 0) return "FFmpeg returned an empty frame";
         int pf = ff::field<int>(j.f, ff::kFrameFormat);
         uint8_t* data[ff::kNumDataPointers];
         int linesize[ff::kNumDataPointers];
@@ -384,6 +392,7 @@ private:
         // changes), so a frame converts the same whichever decoder made it.
         std::vector<uint8_t> planes;
         if (pf == ff::kPixFmtNv12 || pf == A.pix_fmt_p010) {
+            if (data[0] == nullptr || data[1] == nullptr) return "FFmpeg returned an incomplete frame";
             const bool ten = pf != ff::kPixFmtNv12;
             const int cw = (w + 1) / 2, ch = (h + 1) / 2, bytes = ten ? 2 : 1;
             // swscale reads whole blocks of 16 pixels, past the end of the last chroma row
@@ -392,7 +401,7 @@ private:
             uint8_t* u = y + (size_t) w * h * bytes;
             uint8_t* v = u + (size_t) cw * ch * bytes;
             for (int r = 0; r < h; ++r) {
-                const uint8_t* s = data[0] + (size_t) r * linesize[0];
+                const uint8_t* s = data[0] + (ptrdiff_t) r * (ptrdiff_t) linesize[0];
                 if (!ten) {
                     std::memcpy(y + (size_t) r * w, s, (size_t) w);
                 } else {
@@ -405,7 +414,7 @@ private:
                 }
             }
             for (int r = 0; r < ch; ++r) {
-                const uint8_t* s = data[1] + (size_t) r * linesize[1];
+                const uint8_t* s = data[1] + (ptrdiff_t) r * (ptrdiff_t) linesize[1];
                 for (int x = 0; x < cw; ++x) {
                     if (!ten) {
                         u[(size_t) r * cw + x] = s[2 * x];
@@ -510,6 +519,15 @@ bool read_video_once(const std::string& path, const VideoOptions& o, Video& out,
     const ff::AVRational tb = ff::field<ff::AVRational>(rd.st, a.st_time_base);
     const ff::AVCodecParameters* par = ff::field<ff::AVCodecParameters*>(rd.st, a.st_codecpar);
     const int pw = ff::field<int>(par, a.par_width), ph = ff::field<int>(par, a.par_height);
+    auto frame_over_limit = [&](int w, int h) {
+        if (w > 0 && h > 0 && (int64_t) w * h > o.max_frame_pixels) {
+            err = "the video's frames are " + std::to_string(w) + "x" + std::to_string(h) + "; the limit is " +
+                  std::to_string((long long) (o.max_frame_pixels >> 20)) + " megapixels a frame";
+            return true;
+        }
+        return false;
+    };
+    if (frame_over_limit(pw, ph)) return false;
     const int64_t nb_frames = ff::field<int64_t>(rd.st, a.st_nb_frames);
     const int64_t sdur = ff::field<int64_t>(rd.st, a.st_duration), fdur = ff::field<int64_t>(rd.fmt, a.fmt_duration);
     const double avg = ff::q2d(ff::field<ff::AVRational>(rd.st, a.st_avg_frame_rate));
@@ -528,8 +546,11 @@ bool read_video_once(const std::string& path, const VideoOptions& o, Video& out,
         Reader count(*F);
         if (!count.open(path, err)) return false;
         int r;
-        while ((r = count.next(err)) == 1)
+        while ((r = count.next(err)) == 1) {
+            const int cw = ff::field<int>(count.frm, ff::kFrameWidth), ch = ff::field<int>(count.frm, ff::kFrameHeight);
+            if (frame_over_limit(cw, ch)) return false;
             if (++total > o.max_source_frames) break;
+        }
         if (r < 0) return false;
     }
     if (total <= 0) { err = "the video has no frames"; return false; }
@@ -542,13 +563,6 @@ bool read_video_once(const std::string& path, const VideoOptions& o, Video& out,
     out.fps = fps;
     out.indices = sample_indices(total, fps, o);
     const int64_t n = (int64_t) out.indices.size();
-    // what is held is each sampled frame at its canvas (a frame is resized as it is decoded); a source frame is
-    // only decoded one at a time, and FFmpeg allocates it before anything is checked: its own size is capped
-    if ((int64_t) pw * ph > o.max_frame_pixels) {
-        err = "the video's frames are " + std::to_string(pw) + "x" + std::to_string(ph) + "; the limit is " +
-              std::to_string((long long) (o.max_frame_pixels >> 20)) + " megapixels a frame";
-        return false;
-    }
     // Sampled frames go to converters on worker threads (to RGB with the frame's own colour matrix, then resized
     // to the canvas); a frame NVDEC decoded is copied to the host first, the others never leave the device.
     Converters conv(*F, a, out, (int) n);
@@ -559,9 +573,11 @@ bool read_video_once(const std::string& path, const VideoOptions& o, Video& out,
         if (i++ != out.indices[k]) continue;
         const int fw = ff::field<int>(rd.frm, ff::kFrameWidth), fh = ff::field<int>(rd.frm, ff::kFrameHeight);
         if (k == 0 && pw > 0 && (fw != pw || fh != ph)) { err = F->version + ": layout check failed"; break; }
+        if (frame_over_limit(fw, fh)) break;
         F->av_frame_apply_cropping(rd.frm, 0);
         const int w = ff::field<int>(rd.frm, ff::kFrameWidth), h = ff::field<int>(rd.frm, ff::kFrameHeight);
         if (w <= 0 || h <= 0 || ff::field<int>(rd.frm, ff::kFrameFormat) < 0) { err = "FFmpeg returned an empty frame"; break; }
+        if (frame_over_limit(w, h)) break;
         if (k == 0) {
             out.src_w = w;
             out.src_h = h;

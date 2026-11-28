@@ -67,5 +67,10 @@ int main() {
     const std::vector<int64_t> tail = {5, 901, 901};
     check(mrope_positions(tail.data(), 3, pads, {{2, 2, 1}}, 64, pos.data(), runs).find("cannot end") != std::string::npos,
           "a prompt ending in a run");
+    const std::vector<int64_t> bad = {5, 900, 900, 5};
+    check(!mrope_positions(bad.data(), 4, pads, {{2, 0, 2}}, 64, pos.data(), runs).empty(), "nx == 0 grid is refused");
+    check(!mrope_positions(bad.data(), 4, pads, {{2, 2, 0}}, 64, pos.data(), runs).empty(), "ny == 0 grid is refused");
+    check(!mrope_positions(bad.data(), 4, pads, {{0, 2, 1}}, 64, pos.data(), runs).empty(), "rows == 0 grid is refused");
+    check(!mrope_positions(bad.data(), 4, pads, {{-1, 2, 1}}, 64, pos.data(), runs).empty(), "negative rows grid is refused");
     return failures ? 1 : 0;
 }

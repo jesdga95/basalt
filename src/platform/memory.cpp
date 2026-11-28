@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -390,10 +391,60 @@ uint64_t ram_budget(bool* known) {
 }
 
 namespace {
-std::atomic<bool> g_watch_stop{false};
-std::atomic<bool> g_watch_on{false};
 std::atomic<bool> g_resident_mode{false};
 std::atomic<uint64_t> g_resident_copy{0};
+
+struct MemoryWatchdog {
+    std::mutex api_mu;
+    std::mutex wait_mu;
+    std::condition_variable cv;
+    bool stop = false;
+    std::thread thread;
+
+    void start(uint64_t floor_bytes) {
+        std::lock_guard<std::mutex> api(api_mu);
+        if (thread.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lk(wait_mu);
+            stop = false;
+        }
+        thread = std::thread([this, floor_bytes] {
+            for (;;) {
+                {
+                    std::lock_guard<std::mutex> lk(wait_mu);
+                    if (stop) return;
+                }
+                const uint64_t avail = available_memory();
+                if (avail > 0 && avail < floor_bytes) {
+                    basalt::log::error("basalt", "%s",
+                                       ram_exhausted_message(avail, g_resident_mode.load(), g_resident_copy.load(),
+                                                             ram_reserve()).c_str());
+                    _exit(1);
+                }
+                std::unique_lock<std::mutex> lk(wait_mu);
+                if (cv.wait_for(lk, std::chrono::milliseconds(100), [this] { return stop; })) return;
+            }
+        });
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> api(api_mu);
+        if (!thread.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lk(wait_mu);
+            stop = true;
+        }
+        cv.notify_all();
+        thread.join();
+    }
+
+    ~MemoryWatchdog() { shutdown(); }
+};
+
+MemoryWatchdog& memory_watchdog() {
+    static MemoryWatchdog w;
+    return w;
+}
 }  // namespace
 
 std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t reserve) {
@@ -421,26 +472,9 @@ void watch_resident_ram(bool resident, uint64_t copy_bytes) {
     g_resident_copy = copy_bytes;
 }
 
-void start_memory_watchdog(uint64_t floor_bytes) {
-    if (g_watch_on.exchange(true)) return;
-    g_watch_stop = false;
-    std::thread([floor_bytes] {
-        while (!g_watch_stop.load()) {
-            const uint64_t avail = available_memory();
-            if (avail > 0 && avail < floor_bytes) {
-                basalt::log::error("basalt", "%s", ram_exhausted_message(avail, g_resident_mode.load(), g_resident_copy.load(),
-                                                                   ram_reserve()).c_str());
-                _exit(1);
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }).detach();   // never joined: the process may end while it sleeps
-}
+void start_memory_watchdog(uint64_t floor_bytes) { memory_watchdog().start(floor_bytes); }
 
-void stop_memory_watchdog() {
-    g_watch_stop = true;
-    g_watch_on = false;
-}
+void stop_memory_watchdog() { memory_watchdog().shutdown(); }
 
 MemoryStalls parse_memory_stalls(const std::string& text) {
     MemoryStalls m;
@@ -790,17 +824,20 @@ bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint6
 #else
     // Only whole pages can be given back: a page the range shares with a neighbour still holds bytes the caller may
     // read. So the range is widened to the page boundaries and then clipped to the view.
+    if (off > view_bytes || bytes > view_bytes - off) return false;
     const long ps = sysconf(_SC_PAGE_SIZE);
     if (ps <= 0) return false;
-    const uint64_t page = (uint64_t) ps;
-    const uint64_t end = off + bytes;
-    if (end > view_bytes) return false;
-    const uint64_t start = off - off % page;
-    const uint64_t remainder = end % page;
-    const uint64_t extra = remainder == 0 ? 0 : page - remainder;
-    const uint64_t wide = extra > view_bytes - end ? view_bytes : end + extra;
-    if (wide <= start) return true;
-    return madvise((void*) ((const uint8_t*) base + (size_t) start), (size_t) (wide - start), MADV_DONTNEED) == 0;
+    const uintptr_t page = (uintptr_t) ps;
+    const uintptr_t base_addr = (uintptr_t) base;
+    const uintptr_t view_end = base_addr + (uintptr_t) view_bytes;
+    uintptr_t aligned_start = (base_addr + (uintptr_t) off) & ~(page - 1);
+    if (aligned_start < base_addr) aligned_start = (base_addr + page - 1) & ~(page - 1);
+    const uintptr_t req_end = base_addr + (uintptr_t) (off + bytes);
+    const uintptr_t rem = req_end % page;
+    const uintptr_t extra = rem == 0 ? 0 : page - rem;
+    const uintptr_t aligned_end = extra > view_end - req_end ? view_end : req_end + extra;
+    if (aligned_end <= aligned_start) return true;
+    return madvise((void*) aligned_start, (size_t) (aligned_end - aligned_start), MADV_DONTNEED) == 0;
 #endif
 }
 
@@ -832,8 +869,13 @@ std::string commit_headroom_note() {
 
 static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                               uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+    (void) shared_hash;
     mapping_base = nullptr;
     mapping_bytes = 0;
+    if (bytes == 0) {
+        note = "cannot allocate an empty region";
+        return nullptr;
+    }
     if (!shared_file.empty()) {
         note = "shared arena files are not available on Windows";
         return nullptr;
@@ -843,7 +885,7 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     // ordinary allocation below, which is the expected outcome rather than an error.
     enable_privilege(L"SeLockMemoryPrivilege");
     const SIZE_T large = GetLargePageMinimum();
-    if (large > 0) {
+    if (large > 0 && bytes <= (uint64_t) SIZE_MAX - (uint64_t) (large - 1)) {
         // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
         const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
         void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
@@ -964,18 +1006,56 @@ struct SharedArenaHeader {
     uint64_t reserved[4];
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
+
+bool pwrite_all(int fd, const void* buf, size_t n, off_t off, int& err_out) {
+    const uint8_t* p = (const uint8_t*) buf;
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t w = ::pwrite(fd, p + done, n - done, off + (off_t) done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            err_out = errno;
+            return false;
+        }
+        if (w == 0) {
+            err_out = EIO;
+            return false;
+        }
+        done += (size_t) w;
+    }
+    return true;
+}
+
+bool pread_exact(int fd, void* buf, size_t n, off_t off) {
+    uint8_t* p = (uint8_t*) buf;
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t r = ::pread(fd, p + done, n - done, off + (off_t) done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0) return false;
+        done += (size_t) r;
+    }
+    return true;
+}
 }  // namespace
 
 static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                               uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
+    if (bytes == 0) {
+        note = "cannot allocate an empty region";
+        return nullptr;
+    }
     if (!shared_file.empty()) {
         if (shared_hash == 0) {
             note = "shared arena requires a nonzero model hash";
             return nullptr;
         }
-        if (bytes > UINT64_MAX - kSharedArenaHeaderBytes) {
+        if (bytes > (uint64_t) INT64_MAX - kSharedArenaHeaderBytes) {
             note = "shared arena size overflows its header";
             return nullptr;
         }
@@ -995,7 +1075,8 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
 
         const bool fresh = st.st_size == 0;
         if (fresh) {
-            if (ftruncate(fd, (off_t) file_bytes) != 0) {
+            while (ftruncate(fd, (off_t) file_bytes) != 0) {
+                if (errno == EINTR) continue;
                 const int e = errno;
                 close(fd);
                 note = "cannot size shared arena " + shared_file + ": " + std::strerror(e);
@@ -1007,12 +1088,11 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
             hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
             hdr.arena_bytes = bytes;
             hdr.arena_hash = shared_hash;
-            const ssize_t written = ::pwrite(fd, &hdr, sizeof hdr, 0);
-            if (written != (ssize_t) sizeof hdr) {
-                const int e = errno;
+            int we = 0;
+            if (!pwrite_all(fd, &hdr, sizeof hdr, 0, we)) {
+                if (ftruncate(fd, 0) != 0) {}
                 close(fd);
-                note = "cannot write shared arena header " + shared_file + ": " +
-                       (written < 0 ? std::string(std::strerror(e)) : std::string("short write"));
+                note = "cannot write shared arena header " + shared_file + ": " + std::strerror(we);
                 return nullptr;
             }
         } else {
@@ -1024,8 +1104,7 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
                 return nullptr;
             }
             SharedArenaHeader hdr{};
-            const ssize_t got_header = ::pread(fd, &hdr, sizeof hdr, 0);
-            if (got_header != (ssize_t) sizeof hdr ||
+            if (!pread_exact(fd, &hdr, sizeof hdr, 0) ||
                 std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
                 hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes || hdr.arena_bytes != bytes) {
                 close(fd);
@@ -1058,18 +1137,26 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
         return (uint8_t*) map + kSharedArenaHeaderBytes;
     }
 
+    constexpr uint64_t kAlign = 2ull << 20;
     {
-        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-        if (p != MAP_FAILED) {
-            got = RegionBacking::LargePages;
-            note = "hugetlb 2 MB pages";
-            return p;
+        // Linux munmap() of a MAP_HUGETLB mapping requires the length to be a multiple of the huge page size (2 MiB);
+        // round up here and record the rounded length in mapping_bytes so free_region() releases it without EINVAL.
+        if (bytes <= UINT64_MAX - (kAlign - 1)) {
+            const uint64_t hbytes = (bytes + kAlign - 1) & ~(kAlign - 1);
+            void* p = mmap(nullptr, (size_t) hbytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+            if (p != MAP_FAILED) {
+                mapping_base = p;
+                mapping_bytes = hbytes;
+                got = RegionBacking::LargePages;
+                note = "hugetlb 2 MB pages";
+                return p;
+            }
         }
         // MAP_HUGETLB is all-or-nothing: a pool smaller than the mapping fails exactly like an absent
         // one, and the old message guessed "no hugetlb pool configured" either way. Name the shortfall:
         // how many 2 MiB pages the mapping needs against what vm.nr_hugepages actually holds.
-        const unsigned long long need = ((unsigned long long) bytes + (1ull << 21) - 1) / (1ull << 21);
+        const unsigned long long need = ((unsigned long long) bytes - 1ull) / (1ull << 21) + 1ull;
         unsigned long long pool = 0;
         bool have_pool = false;
         if (std::FILE* f = std::fopen("/proc/sys/vm/nr_hugepages", "r")) {
@@ -1082,18 +1169,30 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
     // No hugetlb mapping: a 2 MiB-aligned anonymous mapping with MADV_HUGEPAGE, so transparent huge pages back
     // it where THP is "madvise" (the common distro default). The CPU expert pool streams whole experts out of
     // this arena; with 4 KB pages every 3 MB expert costs ~750 TLB misses.
-    constexpr uint64_t kAlign = 2ull << 20;
-    const uint64_t padded = bytes + kAlign;
-    void* raw = mmap(nullptr, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    const uint64_t page = ps > 0 ? (uint64_t) ps : 4096;
+    if (bytes > UINT64_MAX - (page - 1)) {
+        got = RegionBacking::NormalPages;
+        return nullptr;
+    }
+    const uint64_t map_bytes = (bytes + page - 1) & ~(page - 1);
+    if (map_bytes > UINT64_MAX - kAlign) {
+        got = RegionBacking::NormalPages;
+        return nullptr;
+    }
+    const uint64_t padded = map_bytes + kAlign;
+    void* raw = mmap(nullptr, (size_t) padded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = RegionBacking::NormalPages;
     if (raw == MAP_FAILED) return nullptr;
     const uintptr_t start = (uintptr_t) raw;
-    const uintptr_t aligned = (start + kAlign - 1) & ~(uintptr_t) (kAlign - 1);
-    if (aligned > start) munmap(raw, aligned - start);
-    const uintptr_t end = aligned + bytes, raw_end = start + padded;
-    if (raw_end > end) munmap((void*) end, raw_end - end);
+    const uintptr_t aligned = (start + (uintptr_t) kAlign - 1) & ~(uintptr_t) (kAlign - 1);
+    if (aligned > start) munmap(raw, (size_t) (aligned - start));
+    const uintptr_t end = aligned + (uintptr_t) map_bytes, raw_end = start + (uintptr_t) padded;
+    if (raw_end > end) munmap((void*) end, (size_t) (raw_end - end));
     void* p = (void*) aligned;
-    if (madvise(p, bytes, MADV_HUGEPAGE) == 0) {
+    mapping_base = p;
+    mapping_bytes = map_bytes;
+    if (madvise(p, (size_t) map_bytes, MADV_HUGEPAGE) == 0) {
         const std::string four_k = "; using 4 KB pages";
         if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)
             note.resize(note.size() - four_k.size());

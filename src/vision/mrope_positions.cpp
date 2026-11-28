@@ -7,6 +7,8 @@ namespace basalt::vision {
 
 std::string mrope_positions(const int64_t* ids, int64_t n, const std::vector<int64_t>& pads, const std::vector<MediaGrid>& grids,
                             int64_t cells, int32_t* pos, std::vector<int64_t>& runs) {
+    if (n < 0 || cells < n) return "invalid prompt or cell count";
+    if ((n > 0 && ids == nullptr) || (cells > 0 && pos == nullptr)) return "missing input or output buffer";
     auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
         pos[c * 3] = (int32_t) t;
         pos[c * 3 + 1] = (int32_t) h;
@@ -20,8 +22,12 @@ std::string mrope_positions(const int64_t* ids, int64_t n, const std::vector<int
         if (!is_pad(ids[i])) { put(i, p, p, p); ++p; ++i; continue; }
         if (k >= grids.size()) return "the prompt has more images than the embeddings file";
         const MediaGrid& m = grids[k++];
+        if (m.rows <= 0 || m.nx <= 0 || m.ny <= 0)
+            return "image " + std::to_string(k) + " has an invalid grid";
+        if (m.rows > n - i)
+            return "image " + std::to_string(k) + " has " + std::to_string((long long) m.rows) + " rows but fewer pad tokens";
         for (int64_t j = 0; j < m.rows; ++j)
-            if (i + j >= n || !is_pad(ids[i + j]))
+            if (!is_pad(ids[i + j]))
                 return "image " + std::to_string(k) + " has " + std::to_string((long long) m.rows) + " rows but fewer pad tokens";
         runs.push_back(i);
         for (int64_t j = 0; j < m.rows; ++j) put(i + j, p, p + j / m.nx, p + j % m.nx);

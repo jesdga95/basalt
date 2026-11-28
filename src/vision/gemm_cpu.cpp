@@ -1,6 +1,8 @@
 // src/vision/gemm_cpu.cpp - see gemm_cpu.hpp.  AVX2 + FMA: a 4 x 4 register tile, bf16 widened by a shift.
 #include "gemm_cpu.hpp"
 
+#include "basalt/platform/compiler.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <immintrin.h>
@@ -73,7 +75,11 @@ void run(const float* X, float* Y, int M, int N, int K, int threads, LoadRow loa
 
 }  // namespace
 
+// Probed outside the AVX-512 translation unit so hosts without AVX-512 never enter EVEX-compiled code.
+bool cpu_has_bf16() { return basalt::platform::cpu_has_avx512_bf16(); }
+
 void gemm_bf16w(const float* X, const uint16_t* W, float* Y, int M, int N, int K, int threads, bool round_x) {
+    if (M <= 0 || N <= 0 || K < 0) return;
     static const bool has_bf16 = cpu_has_bf16();
     if (round_x && has_bf16) { gemm_bf16_avx512(X, W, Y, M, N, K, threads); return; }
     std::vector<float> xr;
@@ -92,6 +98,7 @@ void gemm_bf16w(const float* X, const uint16_t* W, float* Y, int M, int N, int K
 }
 
 void gemm_f32w(const float* X, const float* W, float* Y, int M, int N, int K, int threads) {
+    if (M <= 0 || N <= 0 || K < 0) return;
     run(X, Y, M, N, K, threads, [&](int n, float* dst) { std::memcpy(dst, W + (size_t) n * K, sizeof(float) * K); });
 }
 

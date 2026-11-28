@@ -223,6 +223,7 @@ int drop_view_cases() {
         {"zero length", 5, 0, true},
         {"range past the end of the view", bytes - 100, 200, false},
         {"offset past the end of the view", bytes + 1, 1, false},
+        {"wrapping uint64 off + bytes overflow", UINT64_MAX - 10, 20, false},
     };
     for (const Case& c : cases) {
         volatile uint8_t sink = 0;
@@ -717,5 +718,10 @@ int main() {
     basalt::platform::unlock_resident(p, bytes);
     std::free(p);
     std::printf("platform_memory_test: %s\n", fail ? "FAILED" : "OK");
+    // Watchdog rapid start/stop/restart cycling must join cleanly without racing or leaking threads.
+    for (int i = 0; i < 5; ++i) {
+        basalt::platform::start_memory_watchdog(1);
+        basalt::platform::stop_memory_watchdog();
+    }
     return fail;
 }

@@ -35,6 +35,11 @@ std::optional<MappedFile> MappedFile::open_ro(const std::string& path, std::stri
         CloseHandle(h);
         return fail("cannot map a range past the end of");
     }
+    const uint64_t len = opt.bytes != 0 ? opt.bytes : fsize - opt.offset;
+    if (len == 0) {
+        CloseHandle(h);
+        return fail("cannot map an empty range of");
+    }
     // MapViewOfFile takes only allocation-granularity offsets, so the file is mapped whole and the pointer moved by
     // the offset. That is address space only: the pages arrive as they are touched. The view keeps the section and
     // the file alive, so both handles close here.
@@ -51,7 +56,7 @@ std::optional<MappedFile> MappedFile::open_ro(const std::string& path, std::stri
     m.region_ = raw;
     m.region_bytes_ = fsize;
     m.data_ = raw + opt.offset;
-    m.size_ = opt.bytes != 0 ? opt.bytes : fsize - opt.offset;
+    m.size_ = len;
     m.file_size_ = fsize;
     return m;
 }
@@ -94,13 +99,30 @@ std::optional<MappedFile> MappedFile::open_ro(const std::string& path, std::stri
         return fail("cannot map a range past the end of");
     }
     const uint64_t len = opt.bytes != 0 ? opt.bytes : fsize - opt.offset;
-    void* p = mmap(nullptr, (size_t) len, PROT_READ, opt.shared ? MAP_SHARED : MAP_PRIVATE, fd, (off_t) opt.offset);
+    if (len == 0) {
+        close_fd(fd);
+        return fail("cannot map an empty range of");
+    }
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) {
+        close_fd(fd);
+        return fail("cannot determine page size for");
+    }
+    const uint64_t page = (uint64_t) ps;
+    const uint64_t map_off = opt.offset - (opt.offset % page);
+    const uint64_t delta = opt.offset - map_off;
+    if (len > UINT64_MAX - delta || (uint64_t) (size_t) (len + delta) != len + delta) {
+        close_fd(fd);
+        return fail("cannot map an oversized range of");
+    }
+    const uint64_t map_len = len + delta;
+    void* p = mmap(nullptr, (size_t) map_len, PROT_READ, opt.shared ? MAP_SHARED : MAP_PRIVATE, fd, (off_t) map_off);
     close_fd(fd);   // the mapping holds the file; the descriptor is not needed
     if (p == MAP_FAILED) return fail("cannot map");
     MappedFile m;
     m.region_ = p;
-    m.region_bytes_ = len;
-    m.data_ = (const uint8_t*) p;
+    m.region_bytes_ = map_len;
+    m.data_ = (const uint8_t*) p + delta;
     m.size_ = len;
     m.file_size_ = fsize;
     return m;
@@ -114,9 +136,16 @@ void MappedFile::reset() {
 }
 
 void MappedFile::prefetch(uint64_t off, uint64_t len) const {
-    if (data_ == nullptr || off >= size_) return;
-    const uint64_t start = off & ~(uint64_t) 4095;
-    madvise((uint8_t*) data_ + start, (size_t) (off + len - start), MADV_WILLNEED);
+    if (data_ == nullptr || region_ == nullptr || len == 0 || off >= size_) return;
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) return;
+    const uint64_t page = (uint64_t) ps;
+    const uint64_t clamped = len > size_ - off ? size_ - off : len;
+    const uint64_t delta = (uint64_t) (data_ - (const uint8_t*) region_);
+    const uint64_t r_lo = delta + off;
+    const uint64_t r_hi = r_lo + clamped;
+    const uint64_t start = r_lo - (r_lo % page);
+    (void) madvise((uint8_t*) region_ + start, (size_t) (r_hi - start), MADV_WILLNEED);
 }
 
 // Only the pages wholly inside the range: a page shared with a neighbour the CPU may still read stays. MADV_DONTNEED
@@ -124,16 +153,32 @@ void MappedFile::prefetch(uint64_t off, uint64_t len) const {
 // back under pressure, and a minor fault away when they are needed again. Dropping them from the cache too
 // (POSIX_FADV_DONTNEED) would make every release a re-read from the disk.
 uint64_t MappedFile::release(uint64_t off, uint64_t len) const {
-    if (data_ == nullptr || off >= size_) return 0;
-    const uint64_t start = (off + 4095) & ~(uint64_t) 4095;
-    const uint64_t end = (off + len) & ~(uint64_t) 4095;
+    if (data_ == nullptr || region_ == nullptr || len == 0 || off >= size_) return 0;
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) return 0;
+    const uint64_t page = (uint64_t) ps;
+    const uint64_t clamped = len > size_ - off ? size_ - off : len;
+    const uint64_t delta = (uint64_t) (data_ - (const uint8_t*) region_);
+    const uint64_t r_lo = delta + off;
+    const uint64_t r_hi = r_lo + clamped;
+    const uint64_t rem = r_lo % page;
+    const uint64_t start = rem == 0 ? r_lo : (r_lo > UINT64_MAX - (page - rem) ? UINT64_MAX : r_lo + (page - rem));
+    const uint64_t end = r_hi - (r_hi % page);
     if (end <= start) return 0;
-    if (madvise((uint8_t*) data_ + start, (size_t) (end - start), MADV_DONTNEED) != 0) return 0;
+    if (madvise((uint8_t*) region_ + start, (size_t) (end - start), MADV_DONTNEED) != 0) return 0;
     return end - start;
 }
 
 LockResult lock_view(void* p, uint64_t bytes, const LockProgress& progress) {
-    if (p != nullptr && bytes != 0) madvise(p, (size_t) bytes, MADV_WILLNEED);
+    if (p != nullptr && bytes != 0) {
+        const long ps = sysconf(_SC_PAGE_SIZE);
+        if (ps > 0) {
+            const uintptr_t page = (uintptr_t) ps;
+            const uintptr_t base = (uintptr_t) p & ~(page - 1);
+            const uint64_t pad = (uint64_t) ((uintptr_t) p - base);
+            if (bytes <= UINT64_MAX - pad) (void) madvise((void*) base, (size_t) (bytes + pad), MADV_WILLNEED);
+        }
+    }
     return lock_resident(p, bytes, progress);
 }
 

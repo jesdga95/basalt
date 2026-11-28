@@ -144,6 +144,18 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: cannot quantize an activation for this layer";
         return false;
     }
+    if (n_embd <= 0 || n_ff <= 0) {
+        err = "native experts: invalid expert geometry";
+        return false;
+    }
+    if (n_ff > kNativeMaxFF) {
+        err = "native experts: intermediate width larger than the pool's buffers";
+        return false;
+    }
+    if ((gu_type == GGML_TYPE_Q2_0 && n_embd > kActMaxWidth) || (d_type == GGML_TYPE_Q2_0 && n_ff > kActMaxWidth)) {
+        err = "native experts: Q2_0 row width larger than the pool's buffers";
+        return false;
+    }
     // an MXFP8 down reads whole 128-value blocks: its rows end in zero columns past n_ff
     const int64_t n_ffk = d_type == GGML_TYPE_MXFP8 ? (n_ff + 127) / 128 * 128 : n_ff;
     if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ffk % ggml_blck_size((ggml_type) d_type) ||
@@ -263,7 +275,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq1s_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
-    if (avx512 && !soft && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
+    if (avx512 && !soft && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
         iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
@@ -324,7 +336,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq1s_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }
-    if (avx512 && f.swiglu_limit > 0.f && !f.tail && iq_exact_512_supported(f.d_type) && iq1s_512_fits(n)) {
+    if (avx512 && !f.tail && iq_exact_512_supported(f.d_type) && iq1s_512_fits(n)) {
         iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }

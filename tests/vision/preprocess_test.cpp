@@ -37,6 +37,26 @@ int main() {
             ++failures;
         }
     }
+    // Extreme aspect ratio must still stay within max_tokens, and min_tokens == 0 must not leave a zero side.
+    {
+        const Size extreme = fit_size(300000, 20, g);
+        if (extreme.w <= 0 || extreme.h <= 0 || extreme.w % 32 != 0 || extreme.h % 32 != 0 ||
+            (int64_t) (extreme.w / 32) * (extreme.h / 32) > g.max_tokens) {
+            std::fprintf(stderr, "FAIL fit_size 300000x20 exceeded max_tokens: %dx%d\n", extreme.w, extreme.h);
+            ++failures;
+        }
+        const Geometry g0{16, 2, 0, 4096};
+        const Size thin = fit_size(100, 10, g0);
+        if (thin.w < 32 || thin.h < 32 || thin.w % 32 != 0 || thin.h % 32 != 0) {
+            std::fprintf(stderr, "FAIL fit_size 100x10 with min_tokens=0: %dx%d\n", thin.w, thin.h);
+            ++failures;
+        }
+        const Geometry gbad{0, 2, 8, 4096};
+        if (!(fit_size(100, 100, gbad) == Size{0, 0})) {
+            std::fprintf(stderr, "FAIL fit_size accepted patch == 0\n");
+            ++failures;
+        }
+    }
 
     // a source that is neither constant nor separable, one side down and one up; one canvas row per line
     Image src{13, 7, std::vector<uint8_t>(13 * 7 * 3)};
