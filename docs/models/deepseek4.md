@@ -48,6 +48,30 @@ restore, and restarting at position zero. `BatchSession` is registered with the 
 expert routing currently selects its sequential fallback; this verifies API identity semantics, not parallel batch speed.
 The single available RTX 5090 leaves multi-GPU peer identity untested.
 
+## Decode pass breakdown
+
+Where a decode pass's 26.3 ms/token goes, on the tree and configuration of the table above (145 GiB RAM budget,
+1,000-expert cache, drafting at its default, 475 W). It is an Nsight Systems 2026.3.2 trace of 96 generated tokens in
+40 windows of 2.42 rows (`nsys profile --trace=cuda`, no CPU sampling; the engine emits no NVTX ranges). Each row is a
+group of kernel names over the decode window's activities, the copies are its Host-to-Device activities of 12 MB and up,
+and the card's busy time is the union of the two. The host's `lookup`, claim and publish poll have no timer of their own,
+so they are inside the idle row rather than split out.
+
+| stage | ms/token | of the wall | what it is |
+| --- | ---: | ---: | --- |
+| expert blobs over PCIe | 14.86 | 57% | 499 MB a token: 3,584 copies of 12.75 MB at 33.6 GB/s |
+| CPU-share wait | 4.15 | 16% | `wait_word` spins while the pool computes its experts (96 us a layer) |
+| routed expert matmuls | 2.71 | 10% | gate/up, down and swiglu of the resident and copy-resident experts |
+| other card work | 0.75 | 3% | attention, indexer, mHC, router, staged copies, publish, weighted sum, LM head, sampler |
+| idle between launches | 5.47 | 21% | 14,737 gaps, p90 184 us: the host's poll, lookup, claim and submission |
+| copies that overlap kernels | -1.71 | -7% | inside the kernels' intervals |
+| **total** | **26.23** | **100%** | the engine reported 2,527 ms for those 96 tokens, 26.32 ms/token |
+
+The kernels alone are 7.61 ms/token and the copies 14.86, and with the idle gaps they reconcile the pass to within 0.4%
+of what the engine measured. Nearly three quarters of it is expert traffic and the waits it forces, so a pass waits on
+the placement the tier chose, not on the token path that joins it. The profiled run's own 38.0 tok/s is not a throughput
+figure: different fixture, and a trace is not the benchmark.
+
 ## KV caches and `--kv`
 
 The session keeps three compressed cache families: sliding-window rows, the compressors' output rows, and the CSA
@@ -84,6 +108,12 @@ The expert placement itself starts from `data/profiles/deepseek4-43x256.prof` (m
 is unchanged by drafting: the same 12 tokens came from `--spec 0` and `--spec 6` on a tokenizer-derived prompt, and
 the verifier's picks matched the plain draws.
 
+What it buys depends on where the experts sit. At a frozen placement (36% VRAM, 64% CPU, no bus copies) drafting is
+near break-even: `--spec 0` against `--spec 6` ran A1/B1/B2/A2 in one session at 475 W, 145 GiB RAM budget and a
+1,000-expert cache, one repetition an arm. Paired means were conv 23.70 against 24.30, struct 19.95 against 25.35 and
+prose 26.25 against 25.20 tok/s (off against on); token-weighted over the three fixtures those are 24.73 against 24.71
+tok/s, -0.1%. A window multiplies expert traffic and the frozen tier answers every miss from the CPU pool, so the rows it
+accepts pay for the rows it adds: conv gains 2.5% and struct 27%, prose loses 4%.
 
 ## Architecture and ownership
 
