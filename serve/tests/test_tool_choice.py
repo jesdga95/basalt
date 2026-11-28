@@ -323,5 +323,98 @@ class Responses(Base):
         self.assertEqual(self.engine.prompts, [])
 
 
+class Inkling2Forcing(unittest.TestCase):
+    """tool_choice forcing with thinking=True on Inkling 2 (thinks_in_blocks): <|content_model_end_sampling|> after
+    <|end_message|> or skipping thinking must not bypass forcing, and a plain <|content_text|> block must be closed
+    with <|end_message|> before opening the forced call."""
+
+    def setUp(self):
+        from serve.models.inkling2 import END, END_TURN, HEADER, OWN_TOKENS, TEXT, THINK, TOOL_JSON, Inkling2
+
+        self.END, self.END_TURN, self.HEADER = END, END_TURN, HEADER
+        self.TEXT, self.THINK, self.TOOL_JSON = TEXT, THINK, TOOL_JSON
+        tpl_src = (Path(__file__).resolve().parent / "fixtures/inkling2_chat_template.jinja").read_text(encoding="utf-8")
+
+        class InkTok(ByteTokenizer):
+            SPECIALS = list(OWN_TOKENS)
+
+        self.tok = InkTok()
+        self.dialect = Inkling2()
+        self.template = self.dialect.template(tpl_src)
+
+    def ask(self, pass1_text, tool_choice, grammar=False):
+        tok, dialect = self.tok, self.dialect
+        H, TJ, E, ET = self.HEADER, self.TOOL_JSON, self.END, self.END_TURN
+        prompts, samplings = [], []
+
+        class InkForceEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+                prompts.append(list(ids))
+                samplings.append(dict(sampling))
+                prompt = tok.decode(ids)
+                if prompt.endswith('{"name":"search","args":'):
+                    out = '{"q":"2+2"}}' + E + ET
+                elif prompt.endswith(H):
+                    out = 'search' + TJ + '{"name":"search","args":{"q":"2+2"}}' + E + ET
+                else:
+                    out = pass1_text
+                for t in tok.encode(out, parse_special=True)[:max_new]:
+                    if cancel.is_set():
+                        return
+                    yield t
+
+        svc = Service(InkForceEngine(tok, "x", max_context=32768), tok, self.template, dialect=dialect, grammar=grammar)
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}],
+                    "max_tokens": 400, "tools": FN, "tool_choice": tool_choice}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read()), prompts, samplings
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_end_turn_after_thinking_does_not_bypass_forcing(self):
+        H, TH, E, ET = self.HEADER, self.THINK, self.END, self.END_TURN
+        named = {"type": "function", "function": {"name": "search"}}
+        for choice, name in (("required", None), (named, "search")):
+            with self.subTest(choice=choice):
+                res, prompts, samplings = self.ask(H + TH + "Thinking." + E + ET, choice, grammar=True)
+                ch = res["choices"][0]
+                self.assertEqual(ch["finish_reason"], "tool_calls")
+                self.assertEqual(ch["message"].get("reasoning_content"), "Thinking.")
+                self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"]))
+                                  for c in ch["message"]["tool_calls"]], [("search", {"q": "2+2"})])
+                p2 = self.tok.decode(prompts[1])
+                self.assertNotIn(self.TEXT, p2[len(self.tok.decode(prompts[0])):])
+                self.assertTrue(p2.endswith(E + self.dialect.forced_opening(name)))
+                gp = samplings[1].get("_gprompt")
+                self.assertEqual(self.tok.decode(prompts[1][gp:]), self.dialect.forced_opening(name))
+
+    def test_plain_content_block_is_closed_before_forced_call(self):
+        H, TX, E, ET = self.HEADER, self.TEXT, self.END, self.END_TURN
+        named = {"type": "function", "function": {"name": "search"}}
+        res, prompts, samplings = self.ask(H + TX + "I will not call." + E + ET, named, grammar=True)
+        ch = res["choices"][0]
+        self.assertEqual(ch["finish_reason"], "tool_calls")
+        self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"]))
+                          for c in ch["message"]["tool_calls"]], [("search", {"q": "2+2"})])
+        tail = self.tok.decode(prompts[1])[len(self.tok.decode(prompts[0])):]
+        self.assertEqual(tail, H + TX + E + self.dialect.forced_opening("search"))
+        gp = samplings[1].get("_gprompt")
+        self.assertEqual(self.tok.decode(prompts[1][gp:]), self.dialect.forced_opening("search"))
+
+    def test_immediate_end_turn_without_thinking_still_forces_call(self):
+        named = {"type": "function", "function": {"name": "search"}}
+        res, prompts, _ = self.ask(self.END_TURN, named, grammar=False)
+        ch = res["choices"][0]
+        self.assertEqual(ch["finish_reason"], "tool_calls")
+        self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"]))
+                          for c in ch["message"]["tool_calls"]], [("search", {"q": "2+2"})])
+        self.assertTrue(self.tok.decode(prompts[1]).endswith(self.dialect.forced_opening("search")))
+
+
 if __name__ == "__main__":
     unittest.main()

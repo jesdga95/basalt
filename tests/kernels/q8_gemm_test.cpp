@@ -285,7 +285,7 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     struct Sh { const char* name; int M, K; };
     const Sh shs[] = {{"w.proj [8664x2304]", 8664, 2304}, {"w.out [2304x3072]", 2304, 3072}, {"lm_head [65536x2304]", 65536, 2304}};
-    constexpr int TMAX = 32;
+    constexpr int TMAX = 128;
     for (const auto& s : shs) {
         std::vector<float> wf((size_t) s.M * s.K);
         for (float& v : wf) v = dist(rng);
@@ -314,14 +314,18 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
         ck(cudaStreamSynchronize(st), "sync single ref");
         ck(cudaMemcpy(single_ref.data(), y1, single_ref.size() * 4, cudaMemcpyDeviceToHost), "d2h single ref");
         for (int T = 1; T <= TMAX; ++T) {
-            if (T > 8 && T != 9 && T != 15 && T != 16 && T != 17 && T != 24 && T != 25 && T != 31 && T != 32) continue;
+            if (T > 8 && T != 9 && T != 15 && T != 16 && T != 17 && T != 24 && T != 25 && T != 31 && T != 32 && T != 33 && T != 48 && T != 49 && T != 63 && T != 64 && T != 65 && T != 96 && T != 97 && T != 127 && T != 128) continue;
             bk::native_q8_planes_mmvq(dpl, dxq, y1, s.K, s.M, T, st);
             if (T <= 8) bk::native_q8_0_mmvq(draw, dxq, y0, s.K, s.M, T, st);
             ck(cudaStreamSynchronize(st), "sync mmvq");
             std::vector<float> b((size_t) T * s.M);
             ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h b");
             if (std::memcmp(single_ref.data(), b.data(), b.size() * sizeof(float)) != 0) {
-                std::printf("FAIL native_q8_planes_mmvq row-invariance %s T=%d (not bitwise identical to T=1)\n", s.name, T);
+                size_t bad = 0, first = 0;
+                for (size_t i = 0; i < b.size(); ++i)
+                    if (std::memcmp(&single_ref[i], &b[i], 4) != 0) { if (!bad) first = i; ++bad; }
+                std::printf("FAIL native_q8_planes_mmvq row-invariance %s T=%d (not bitwise identical to T=1): %zu differ, first col %zu row %zu: %.9g vs %.9g\n",
+                            s.name, T, bad, first / s.M, first % s.M, single_ref[first], b[first]);
                 std::exit(1);
             }
             if (T <= 8) {
@@ -339,7 +343,7 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
                 }
             }
         }
-        std::printf("PASS native_q8_planes_mmvq %s T=1..32: bitwise row-invariant & matches native_q8_0_mmvq (rel <= 1e-5)\n", s.name);
+        std::printf("PASS native_q8_planes_mmvq %s T=1..128: bitwise row-invariant & matches native_q8_0_mmvq (rel <= 1e-5)\n", s.name);
         if (s.M == 8664) {
             bk::Q80Segments sg0, sg1;
             sg0.n = sg1.n = 3;
@@ -361,7 +365,7 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
             ck(cudaStreamSynchronize(st), "sync seg ref");
             ck(cudaMemcpy(seg_ref.data(), y1, seg_ref.size() * 4, cudaMemcpyDeviceToHost), "d2h seg ref");
             for (int T = 1; T <= TMAX; ++T) {
-                if (T > 8 && T != 9 && T != 15 && T != 16 && T != 17 && T != 24 && T != 25 && T != 31 && T != 32) continue;
+                if (T > 8 && T != 9 && T != 15 && T != 16 && T != 17 && T != 24 && T != 25 && T != 31 && T != 32 && T != 33 && T != 48 && T != 49 && T != 63 && T != 64 && T != 65 && T != 96 && T != 97 && T != 127 && T != 128) continue;
                 if (T <= 8) bk::native_q8_0_mmvq_segments(draw, sg0, s.K, T, st);
                 bk::native_q8_planes_mmvq_segments(dpl, s.M, sg1, s.K, T, st);
                 ck(cudaStreamSynchronize(st), "sync seg");
@@ -393,7 +397,7 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
                 check_range(TMAX * 6552, 8 * 6552, (size_t) T * 1056, "K");
                 check_range(TMAX * 7608, 8 * 7608, (size_t) T * 1056, "V");
             }
-            std::printf("PASS native_q8_planes_mmvq_segments [6552,1056,1056]x2304 T=1..32: bitwise row-invariant & matches (rel <= 1e-5)\n");
+            std::printf("PASS native_q8_planes_mmvq_segments [6552,1056,1056]x2304 T=1..128: bitwise row-invariant & matches (rel <= 1e-5)\n");
         }
         cudaFree(draw); cudaFree(dpl); cudaFree(dx); cudaFree(dxq); cudaFree(y0); cudaFree(y1);
     }
@@ -515,6 +519,56 @@ void run_bench(std::mt19937& rng) {
     cudaEventDestroy(e1);
 }
 
+// Decode-window projections through Q8_0 planes (native_q8_planes_mmvq) at the batch round's row counts.
+void run_bench_planes(std::mt19937& rng) {
+    namespace bk = basalt::kernels;
+    struct Sh { const char* name; int M, K; };
+    const Sh shs[] = {{"w.proj [8664x2304]", 8664, 2304}, {"w.out [2304x3072]", 2304, 3072}, {"lm_head [200064x2304]", 200064, 2304}};
+    const int Ts[] = {1, 2, 3, 4, 8, 16, 32, 64, 96, 128};
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    cudaStream_t st = nullptr;
+    ck(cudaStreamCreate(&st), "stream");
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "e0");
+    ck(cudaEventCreate(&e1), "e1");
+    for (const auto& s : shs) {
+        std::vector<float> wf((size_t) s.M * s.K);
+        for (float& v : wf) v = dist(rng);
+        std::vector<block_q8_0> wb;
+        make_q8_0(wf, s.M, s.K, wb);
+        const size_t bytes = wb.size() * sizeof(block_q8_0);
+        std::vector<float> hx((size_t) 128 * s.K);
+        for (float& v : hx) v = dist(rng);
+        void *draw = nullptr, *dpl = nullptr, *dxq = nullptr;
+        float *dx = nullptr, *y = nullptr;
+        ck(cudaMalloc(&draw, bytes), "raw");
+        ck(cudaMemcpy(draw, wb.data(), bytes, cudaMemcpyHostToDevice), "cpy raw");
+        ck(cudaMalloc(&dpl, bytes), "pl");
+        bk::wgemm::q8_planes(draw, s.M, s.K, dpl, st);
+        ck(cudaMalloc(&dx, hx.size() * sizeof(float)), "dx");
+        ck(cudaMemcpy(dx, hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice), "cpy dx");
+        ck(cudaMalloc(&dxq, bk::native_q8_1_bytes(s.K, 128)), "dxq");
+        bk::native_quantize_q8_1(dx, dxq, s.K, 128, st);
+        ck(cudaMalloc(&y, (size_t) 128 * s.M * sizeof(float)), "y");
+        std::printf("%-24s", s.name);
+        for (const int T : Ts) {
+            for (int i = 0; i < 5; ++i) bk::native_q8_planes_mmvq(dpl, dxq, y, s.K, s.M, T, st);
+            ck(cudaEventRecord(e0, st), "r0");
+            for (int i = 0; i < 50; ++i) bk::native_q8_planes_mmvq(dpl, dxq, y, s.K, s.M, T, st);
+            ck(cudaEventRecord(e1, st), "r1");
+            ck(cudaEventSynchronize(e1), "sync");
+            float ms = 0.0f;
+            ck(cudaEventElapsedTime(&ms, e0, e1), "el");
+            std::printf("  T=%d %.1f us", T, ms * 1000.0f / 50);
+        }
+        std::printf("\n");
+        cudaFree(draw); cudaFree(dpl); cudaFree(dx); cudaFree(dxq); cudaFree(y);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaStreamDestroy(st);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -536,6 +590,7 @@ int main(int argc, char** argv) {
     test_q8_planes_mmvq_parity(rng);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) run_bench(rng);
+        if (std::strcmp(argv[i], "--bench-planes") == 0) run_bench_planes(rng);
     }
     std::printf("ALL Q8 GEMM TESTS PASSED\n");
     return 0;

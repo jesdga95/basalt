@@ -115,6 +115,15 @@ class Controls(unittest.TestCase):
             list(svc.run(svc.tok.encode("x"), thinking, None, 16, {"_grammar": {"kind": "json_object"}}, threading.Event()))
             self.assertEqual(svc.engine.requests[-1][1]["_grammar"], want, thinking)
 
+    def test_thinking_off_without_a_grammar_sends_the_one_that_forbids_thinking(self):
+        for thinking, want in ((False, {"kind": "text", "calls": False, "think": False}), (True, None)):
+            svc = service(HEADER + TEXT + "Four." + END)
+            list(svc.run(svc.tok.encode("x"), thinking, None, 16, None, threading.Event()))
+            self.assertEqual((svc.engine.requests[-1][1] or {}).get("_grammar"), want, thinking)
+
+    def test_the_prompt_is_not_prefilled_when_thinking_is_off(self):
+        self.assertTrue(self.prompt(enable_thinking=False).endswith(self.tail))
+
     def test_off_is_the_lowest_effort(self):
         self.assertEqual(self.prompt(enable_thinking=False), EFFORT.format("0") + self.tail)
 

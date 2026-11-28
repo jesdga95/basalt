@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 namespace basalt::models::deepseek41 {
@@ -29,7 +30,7 @@ DsModel::~DsModel() {
     if (experts_fd_ >= 0) platform::close_fd(experts_fd_);
 }
 
-bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& err) {
+bool DsModel::load(const std::string& path, core::LoadPlan& plan, bool ple_ram, std::string& err) {
     if (!open_pack(path, pack_, err)) return false;
     path_ = path;
     cudaGetDevice(&device_);
@@ -101,7 +102,13 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;
+        // Map now so tier_spec() reserves its RAM; lock/touch in attach() after the expert tier's reads finish so
+        // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
+        if (ple_ram) {
+            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false)) return false;
+        } else if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes)) {
+            return false;
+        }
     }
     return true;
 }
@@ -161,9 +168,10 @@ core::ExpertTierSpec DsModel::tier_spec() const {
         if (tiers_.vision && !vision_blas().open(err)) return false;
         return prompt_host_.open(*this, 0, sessions(), tiers_.vision, err);
     };
-    s.host.bytes = [this] { return prompt_host_.bytes(); };
+    s.host.bytes = [this] { return prompt_host_.bytes() + (engram_ ? engram_->ram_bytes() : 0); };
     s.host.set_ring = [this](int pieces, std::string& err) { return prompt_host_.set_ring(pieces, err); };
     s.host.ram_only = [this] { warm_token_table(); };
+    s.host_cache_keep = engram_ ? engram_->ram_bytes() : 0;
     return s;
 }
 
@@ -255,8 +263,10 @@ bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {
 model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads,
                             std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     if (req.paths.empty()) return {model::Status::Error, "deepseek41: no model path"};
+    if (!req.ple_io.empty() && req.ple_io != "direct" && req.ple_io != "ram")
+        return {model::Status::Error, "deepseek41: --ple-io " + req.ple_io + ": direct or ram"};
     std::string err;
-    if (!load(req.paths.front(), reads, err)) return {model::Status::Error, "deepseek41: " + err};
+    if (!load(req.paths.front(), reads, req.ple_io == "ram", err)) return {model::Status::Error, "deepseek41: " + err};
     CacheFormat fmt = CacheFormat::Fp8;
     if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
     set_cache_format(fmt);
@@ -282,6 +292,14 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
 model::Result DsModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, err};
+    if (engram_ && engram_->ram_bytes() > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        engram_->lock_ram();
+        basalt::log::info("basalt deepseek41", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
+                          (double) engram_->ram_bytes() / (1024.0 * 1024.0 * 1024.0),
+                          engram_->locked() ? "locked in RAM" : "loaded (not locked)",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     return {};
 }
 

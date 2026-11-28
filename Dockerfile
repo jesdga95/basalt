@@ -39,7 +39,7 @@ RUN apt-get update \
 WORKDIR /opt/basalt
 COPY . /opt/basalt/
 
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASALT_MODELS=all \
     && cmake --build build -j"$(nproc)" \
     && python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir -r requirements.txt

@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable a
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
-                          sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
+                          sampling_items, shared_line, slots_text, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine import suspend  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
@@ -76,6 +76,14 @@ def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str]
     names = ("--grammar", "--no-grammar")
     origin = "cli" if any(w in names for w in cli) else "config" if any(w in names for w in used) else ""
     return (on, origin) if origin else None
+
+
+def url_host(host: str) -> str:
+    """Format a bind host for an http:// URL: map wildcard addresses to loopback and bracket IPv6 literals."""
+    here = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    if ":" in here and not (here.startswith("[") and here.endswith("]")):
+        return f"[{here}]"
+    return here
 
 
 def open_when_ready(svc, url, now=False, opener=None):
@@ -171,12 +179,6 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
                 lines.append(f"[server] warning: {plan['warning']}")
             cfg["gpu"] = plan["devices"]
             cfg["spec"] = plan.get("spec")
-            if getattr(a, "split_default", False) and plan.get("max_context"):
-                # the engine's default context, shared by the slots
-                a.shared_context = int(plan["max_context"])
-                part = ["--max-context", str(slot_share(a.shared_context, a.parallel))]
-                cfg["args"] += part
-                cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
             for flag, value in (("--gpu-mode", gpu_text(a.gpu_mode)), ("--gpu-share", gpu_text(a.gpu_share))):
@@ -185,7 +187,6 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
     for flag in a.skipped:
         lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
     cfg["items"] = start_items(file_engine, cli_engine,
-                               (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                grammar_entry(a.grammar, sys.argv[1:], used_argv), a.debug) if pack and not a.mock_engine else []
     cfg["items"] = with_spec(cfg["items"], cfg.get("spec"))
     if a.alias and not pack:
@@ -267,8 +268,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             if mode == "dynamic":
                 vision = EngineVision(cfg["vision"])
             else:
-                vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                env=vision_env(env, mode), start=not multi)
+                vision = Vision(cfg["vision"], log=cfg.get("log"), env=vision_env(env, mode), start=not multi)
         if a.lazy and not multi:
             print(tagged("model", "unloaded, the first request loads it"), flush=True)
         has_grammar = known is not None and "--grammar" in known
@@ -471,7 +471,7 @@ def main() -> int:
             s.totals_path = tp
             s.load_totals(pricing_cli)
     httpd = serve(router, host=a.host, port=a.port)
-    here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
+    here = url_host(a.host)
 
     def announcer(s: Service, m):
         first_load, said_video = [True], [False]
@@ -484,8 +484,7 @@ def main() -> int:
                 if not a.mock_engine:
                     warn_tight_ram(engine.info.get("arena_mib"))
                 if getattr(engine, "batch", 0):
-                    shared = None if m.slot_full_context else getattr(m, "shared_context", None)
-                    print(tagged("slots", slots_text(engine.batch, engine.max_context, shared) + ", others queue"),
+                    print(tagged("slots", slots_text(engine.batch, engine.max_context, m.kv_pool) + ", others queue"),
                           flush=True)
             print(tagged("weights", f"loaded{f' {s.model}' if multi else ''}, ctx={engine.max_context} "
                                     f"images={'on' if s.vision else 'off'}"), flush=True)
@@ -515,7 +514,7 @@ def main() -> int:
         # reachable from other devices: print the addresses
         ips = lan_addresses()
         for ip in ips:
-            print(tagged("network", f"http://{ip}:{a.port}/v1"), flush=True)
+            print(tagged("network", f"http://{url_host(ip)}:{a.port}/v1"), flush=True)
         if not ips:
             print(tagged("network", f"port={a.port}"), flush=True)
         if exposed_without_key(a.host, svc.api_key):
@@ -526,8 +525,7 @@ def main() -> int:
         else:
             svc.start_load()                            # the page and the API are up; requests wait for the load
     if a.open:
-        open_when_ready(svc, f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/",
-                        now=bool(a.mock_engine or a.lazy))
+        open_when_ready(svc, f"http://{here}:{a.port}/", now=bool(a.mock_engine or a.lazy))
     # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)   # one stop: a later TERM must not cut the engine's QUIT short

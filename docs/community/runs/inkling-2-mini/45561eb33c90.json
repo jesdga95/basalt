@@ -1,0 +1,35 @@
+{
+  "submitter": "WeiLiuu",
+  "date": "2026-11-27",
+  "commit": "a9dcf083a0",
+  "preset": "community-1",
+  "model": "Inkling-2-Mini",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 600,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 57.9
+    }
+  ],
+  "ram_gib": 94,
+  "cpu": "AMD Ryzen 9 9950X3D2, 16 cores",
+  "ram_gbps": 70.2,
+  "os": "Windows",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 19674.0,
+  "prefill_64k_tps": 15938.3,
+  "decode_tps": 563.3,
+  "decode_conv_tps": 350.2,
+  "decode_struct_tps": 676.9,
+  "decode_prose_tps": 294.8,
+  "accept_conv_pct": 64.6,
+  "accept_struct_pct": 82.2,
+  "accept_prose_pct": 44.5,
+  "draft_len_conv": 1.8,
+  "draft_len_struct": 8.4,
+  "draft_len_prose": 1.4,
+  "engine_args": "--gpu 0 --max-context 63233 --kv int8"
+}

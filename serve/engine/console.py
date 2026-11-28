@@ -164,22 +164,24 @@ class ConsoleLines:
         now = self.clock()
         with self.lock:
             m = self.map
-        if m is None:
-            return None
-        age = max(0.0, now - m["t"])
+            if m is None:
+                return None
+            t_map, total, homes, recent = m["t"], m["total"], list(m["homes"]), list(m["recent"])
+            lines = list(m["lines"])
+        age = max(0.0, now - t_map)
         k = DECAY ** age
         # lookups a second over the lines of about the last second: a line sent early (a request's start or end) covers
         # only a moment, and alone would read as no lookups for most experts
-        span, sums = 0.0, [0] * len(m["recent"])
+        span, sums = 0.0, [0] * len(recent)
         if age <= STALE_S:
-            for t, dt, routed in reversed(m["lines"]):
+            for _, dt, routed in reversed(lines):
                 if span >= RATE_MAP_S:
                     break
                 span += dt
                 sums = [a + n for a, n in zip(sums, routed)]
-        return {"total": m["total"], "window_s": 1, "tier": list(m["homes"]),
+        return {"total": total, "window_s": 1, "tier": homes,
                 "routed": [round(n / span, 2) if span > 0 else 0 for n in sums],
-                "recent": [round(r * k, 2) for r in m["recent"]]}
+                "recent": [round(r * k, 2) for r in recent]}
 
 
 def norm_bus(bus) -> str:

@@ -341,6 +341,7 @@ void DirectFile::wake() {
 // count is the queue depth).
 struct DirectFile::Impl {
     int fd = -1;
+    bool no_buffering = false;
     uint64_t size = 0;
     std::mutex mu;
     std::condition_variable cv_work, cv_done;
@@ -359,20 +360,18 @@ struct DirectFile::Impl {
             lk.unlock();
             uint32_t total = 0;
             bool ok = true;
+            auto* dst = static_cast<uint8_t*>(p.buffer);
             while (total < p.length) {
-                const ssize_t got = pread(fd, (uint8_t*) p.buffer + total, (size_t) (p.length - total),
-                                          (off_t) (p.offset + total));
+                const ssize_t got = pread(fd, dst + total, p.length - total, (off_t) (p.offset + total));
                 if (got < 0) {
                     if (errno == EINTR) continue;
                     ok = false;
                     total = 0;
                     break;
                 }
-                if (got == 0) break;   // EOF
+                if (got == 0) break;   // end of file
                 total += (uint32_t) got;
-                // O_DIRECT only returns an unaligned count on the partial final block at EOF; issuing another
-                // O_DIRECT pread at an unaligned offset/buffer would fail with EINVAL.
-                if ((size_t) got % DirectFile::alignment() != 0) break;
+                if (no_buffering && (total % DirectFile::alignment()) != 0) break;   // unaligned short O_DIRECT read is EOF
             }
             lk.lock();
             // only a waiter that found the list empty is blocked, so only the first completion needs to wake it
@@ -401,8 +400,19 @@ bool DirectFile::open(const std::string& path, std::string& err, int workers, bo
     close();
     if (!valid_workers(workers, err)) return false;
     (void) mapped_elsewhere;   // a mapping of the file does not hold up O_DIRECT reads of it here
+    impl_->no_buffering = true;
     impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+    if (impl_->fd < 0 && errno == EINVAL) {
+        // File systems without O_DIRECT (such as tmpfs, FUSE, or some ZFS/overlayfs mounts) return EINVAL: fall back
+        // to buffered reads and report bypasses_cache() == false.
+        impl_->no_buffering = false;
+        impl_->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    }
+    if (impl_->fd < 0) {
+        impl_->no_buffering = false;
+        err = "DirectFile: cannot open " + path;
+        return false;
+    }
     return finish_open(path, err, workers);
 }
 
@@ -427,13 +437,14 @@ void DirectFile::close() {
     impl_->stop_pool();
     if (impl_->fd >= 0) ::close(impl_->fd);
     impl_->fd = -1;
+    impl_->no_buffering = false;
     impl_->size = 0;
     impl_->done.clear();
     impl_->queue.clear();
 }
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
-bool DirectFile::bypasses_cache() const { return is_open(); }
+bool DirectFile::bypasses_cache() const { return is_open() && impl_->no_buffering; }
 uint64_t DirectFile::size() const { return impl_->size; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {

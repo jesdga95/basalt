@@ -137,6 +137,43 @@ class Parsing(unittest.TestCase):
                          {"type": "json_schema", "json_schema": {"name": "n", "schema": {}}})
         self.assertIsNone(text_format({"text": {"format": {"type": "text"}}}))
 
+    def test_malformed_field_types_raise_responses_error(self):
+        bad_enc = ENCRYPTED_PREFIX + base64.b64encode(json.dumps({"text": 123}).encode()).decode()
+        bad_inputs = (
+            ([{"role": "user", "content": [{"type": "input_text", "text": 123}]}], "input[0].content[0].text"),
+            ([{"role": "assistant", "content": [{"type": "refusal", "refusal": ["no"]}]}], "input[0].content[0].refusal"),
+            ([{"role": "user", "content": [{"type": "input_image", "image_url": 123}]}], "input[0].content[0]"),
+            ([{"type": "reasoning", "content": 5}], "input[0].content"),
+            ([{"type": "reasoning", "content": [{"type": "reasoning_text", "text": 42}]}], "input[0].content[0].text"),
+            ([{"type": "reasoning", "encrypted_content": bad_enc}], "input[0].encrypted_content"),
+            ([{"type": "function_call", "name": "f", "call_id": ["bad"]}], "input[0].call_id"),
+            ([{"type": "function_call", "name": "f", "namespace": 7}], "input[0].namespace"),
+            ([{"type": "function_call_output", "call_id": {"x": 1}, "output": "ok"}], "input[0].call_id"),
+        )
+        for items, param in bad_inputs:
+            with self.subTest(param=param), self.assertRaises(ResponsesError) as e:
+                input_messages({"input": items})
+            self.assertEqual(e.exception.param, param)
+        bad_tools = (
+            ([{"type": "function", "name": "f", "description": 123}], "tools[0].description"),
+            ([{"type": "custom", "name": "c", "description": ["x"]}], "tools[0].description"),
+            ([{"type": "custom", "name": "c", "format": {"type": "grammar", "definition": 5}}], "tools[0].format"),
+            ([{"type": "namespace", "name": 7, "tools": []}], "tools[0].name"),
+            ([{"type": "namespace", "name": "", "tools": []}], "tools[0].name"),
+            ([{"type": "namespace", "name": "ns", "description": 9, "tools": []}], "tools[0].description"),
+            ([{"type": "namespace", "name": "ns", "tools": "bad"}], "tools[0].tools"),
+        )
+        for tools, param in bad_tools:
+            with self.subTest(param=param), self.assertRaises(ResponsesError) as e:
+                request_tools({"tools": tools})
+            self.assertEqual(e.exception.param, param)
+        # _order_tool_results itself tolerates unhashable _call_id values defensively
+        from serve.api.responses import _order_tool_results
+        msgs = [{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": {}}, "_call_id": ["a"]}]},
+                {"role": "tool", "content": "r", "_call_id": {"k": 1}}]
+        _order_tool_results(msgs)
+        self.assertEqual(msgs[1]["content"], "r")
+
 
 # ------------------------------------------------------------------------------------------------ over HTTP
 class Server(unittest.TestCase):
@@ -247,7 +284,13 @@ class OverHttp(Server):
     def test_errors_use_the_responses_format(self):
         for body, param in (({"model": "basalt"}, "input"), ({"model": "basalt", "input": "x", "previous_response_id": "r"},
                                                          "previous_response_id"),
-                            ({"model": "basalt", "input": "x", "reasoning": {"effort": "huge"}}, "reasoning.effort")):
+                            ({"model": "basalt", "input": "x", "reasoning": {"effort": "huge"}}, "reasoning.effort"),
+                            ({"model": "basalt", "input": [{"role": "user", "content": [{"type": "input_text", "text": 5}]}]},
+                             "input[0].content[0].text"),
+                            ({"model": "basalt", "input": [{"type": "function_call", "name": "f", "call_id": ["x"]}]},
+                             "input[0].call_id"),
+                            ({"model": "basalt", "input": "x", "tools": [{"type": "namespace", "name": "ns", "tools": 3}]},
+                             "tools[0].tools")):
             code, r = self.post(body)
             self.assertEqual(code, 400)
             self.assertEqual(set(r["error"]), {"message", "type", "param", "code"})

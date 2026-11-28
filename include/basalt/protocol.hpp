@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "basalt/log.hpp"
@@ -47,12 +48,13 @@ inline std::string context_no_room_line(long long prompt, long long context) {
            std::to_string(context) + ")\n";
 }
 
-/// `CONV parked=N bytes=N evictions=N[ restored=N restored_ms=X]`: the conversation cache's RAM tier, after a park
-/// or (with `restored` >= 0, the tokens a request got back and the ms it took) a restore.
-inline std::string conversation_line(size_t parked, size_t bytes, size_t evictions, long long restored = -1,
-                                     double restored_ms = 0) {
+/// `CONV parked=N bytes=N evictions=N refused=N[ restored=N restored_ms=X]`: the conversation cache's RAM tier and the
+/// parkings RAM admission refused since startup, after a park, a refusal or (with `restored` >= 0, the tokens a request
+/// got back and the ms it took) a restore.
+inline std::string conversation_line(size_t parked, size_t bytes, size_t evictions, uint64_t refused,
+                                     long long restored = -1, double restored_ms = 0) {
     std::string l = "CONV parked=" + std::to_string(parked) + " bytes=" + std::to_string(bytes) +
-                    " evictions=" + std::to_string(evictions);
+                    " evictions=" + std::to_string(evictions) + " refused=" + std::to_string(refused);
     if (restored >= 0) {
         char ms[32];
         std::snprintf(ms, sizeof ms, "%.1f", restored_ms);

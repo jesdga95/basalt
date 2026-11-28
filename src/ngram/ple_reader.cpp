@@ -1,6 +1,11 @@
 // src/ngram/ple_reader.cpp - see include/basalt/ngram/ple_reader.hpp.
 #include "basalt/ngram/ple_reader.hpp"
 
+#include "basalt/core/load_progress.hpp"
+#include "basalt/log.hpp"
+#include "basalt/platform/mapped_file.hpp"
+#include "basalt/platform/memory.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -8,6 +13,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -99,6 +105,10 @@ struct TicketState {
 // (plus `wake`, which is thread-safe).
 struct PleReader::Impl {
     DirectFile file;
+    std::optional<platform::MappedFile> mapped;
+    const uint8_t* mapped_data = nullptr;
+    bool ram_mode = false;
+    bool locked = false;
     uint64_t table_offset = 0;
     uint64_t n_rows = 0;
     uint32_t row_bytes = ROW_BYTES;
@@ -366,6 +376,65 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     return true;
 }
 
+bool PleReader::open_ram(const std::string& path, uint64_t table_offset, uint64_t n_rows, std::string& err,
+                         uint32_t row_bytes, bool lock) {
+    close();
+    if (row_bytes == 0 || row_bytes > PAGE) { err = "PleReader: row_bytes must be 1..4096"; return false; }
+    if (n_rows > UINT64_MAX / (uint64_t) row_bytes) {
+        err = "PleReader: the table extends past the end of " + path;
+        return false;
+    }
+    const uint64_t need = n_rows * (uint64_t) row_bytes;
+    std::optional<platform::MappedFile> mapped = platform::MappedFile::open_ro(path, &err);
+    if (!mapped) return false;
+    if (table_offset > mapped->size() || need > mapped->size() - table_offset) {
+        err = "PleReader: the table extends past the end of " + path;
+        return false;
+    }
+    Impl& m = *impl_;
+    m.mapped = std::move(*mapped);
+    m.mapped_data = m.mapped->data() + table_offset;
+    m.table_offset = table_offset;
+    m.n_rows = n_rows;
+    m.row_bytes = row_bytes;
+    m.ram_mode = true;
+    m.locked = false;
+    m.error.clear();
+    reset_stats();
+    if (lock) lock_ram();
+    return true;
+}
+
+void PleReader::lock_ram() {
+    Impl& m = *impl_;
+    const uint64_t need = ram_bytes();
+    if (!m.ram_mode || m.mapped_data == nullptr || need == 0) return;
+    const uint64_t page = platform::system_page_size() ? platform::system_page_size() : (uint64_t) PAGE;
+    const uintptr_t a0 = (uintptr_t) m.mapped_data & ~(uintptr_t) (page - 1);
+    const uintptr_t a1 = (uintptr_t) m.mapped_data + (uintptr_t) need;
+    const uint64_t span = (uint64_t) (a1 - a0);
+    // Lock the table's pages in RAM; where the OS refuses (low ulimit -l or working-set quota), touch every page
+    // so the table lands in the OS page cache ahead of the first request.
+    core::LoadProgress prog("ngram", span);
+    uint64_t reported = 0;
+    const platform::LockResult lr = platform::lock_view(
+        (void*) a0, span, [&](uint64_t done) { prog.add(done - reported); reported = done; });
+    m.locked = lr.ok && lr.locked_bytes >= span;
+    if (!m.locked) {
+        basalt::log::warn("basalt", "PLE table lock incomplete (%s): touching its pages instead", lr.note.c_str());
+        volatile uint32_t sink = 0;
+        for (uintptr_t p = a0 + (uintptr_t) reported; p < a1; p += page) {
+            sink = sink + *(const volatile uint8_t*) p;
+            if (((p - a0) & ((256u << 20) - 1)) == 0) {
+                const uint64_t pos = (uint64_t) (p - a0);
+                if (pos > reported) { prog.add(pos - reported); reported = pos; }
+            }
+        }
+        (void) sink;
+    }
+    prog.finish();
+}
+
 void PleReader::close() {
     Impl& m = *impl_;
     if (m.worker.joinable()) {
@@ -390,6 +459,11 @@ void PleReader::close() {
         }
     }
     m.file.close();
+    m.mapped.reset();
+    m.mapped_data = nullptr;
+    m.ram_mode = false;
+    m.locked = false;
+    m.n_rows = 0;
     DirectFile::free_aligned(m.slab);
     m.slab = nullptr;
     m.queue.clear();
@@ -404,11 +478,29 @@ void PleReader::close() {
     m.last_issue_us = m.last_read_us = 0;
 }
 
-bool PleReader::is_open() const { return impl_->file.is_open(); }
+bool PleReader::is_open() const { return impl_->ram_mode || impl_->file.is_open(); }
 uint32_t PleReader::row_bytes() const { return impl_->row_bytes; }
+bool PleReader::locked() const { return impl_->locked; }
+uint64_t PleReader::ram_bytes() const { return impl_->ram_mode ? impl_->n_rows * (uint64_t) impl_->row_bytes : 0; }
 
 PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_raw) {
     Impl& m = *impl_;
+    if (m.ram_mode) {
+        const uint32_t rb = m.row_bytes;
+        const uint64_t nr = m.n_rows;
+        const uint8_t* base = m.mapped_data;
+        for (size_t i = 0; i < n; ++i) {
+            uint8_t* dst = out_raw + i * rb;
+            if (rows[i] >= nr) std::memset(dst, 0, rb);
+            else std::memcpy(dst, base + (uint64_t) rows[i] * rb, rb);
+        }
+        std::lock_guard<std::mutex> lk(m.mu);
+        const uint32_t id = m.next_ticket++;
+        if (m.next_ticket == 0) m.next_ticket = 1;
+        m.stats.requests += n;
+        m.tickets[id].pending = 0;
+        return Ticket{id};
+    }
     // A row the cache misses, by the page it starts on.
     struct Miss {
         uint64_t first;
@@ -563,6 +655,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
 
 void PleReader::set_keepalive(double period_ms, double window_s) {
     Impl& m = *impl_;
+    if (m.ram_mode) return;
     {
         std::lock_guard<std::mutex> lk(m.mu);
         m.keep_us = period_ms > 0 ? period_ms * 1000.0 : 0.0;
@@ -575,6 +668,7 @@ void PleReader::set_keepalive(double period_ms, double window_s) {
 
 void PleReader::rearm_keepalive() {
     Impl& m = *impl_;
+    if (m.ram_mode) return;
     {
         std::lock_guard<std::mutex> lk(m.mu);
         if (m.keep_us > 0) m.last_issue_us = now_us();

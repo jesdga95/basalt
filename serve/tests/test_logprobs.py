@@ -101,6 +101,19 @@ class Channels(unittest.TestCase):
         self.assertEqual([(t["index"], [e["token"] for e in t["content"]]) for t in part["tool_calls"]],
                          [(0, ["<call", ">"]), (1, ["<call"])])
 
+    def test_openai_collect_logprobs_many_chunks(self):
+        # verifies linear-time accumulation across thousands of chunks
+        n = 4000
+        chunks = [{"id": "c", "created": 1, "model": "m",
+                   "choices": [{"index": 0, "delta": {"content": "a"}, "finish_reason": None,
+                                "logprobs": {"content": [lp("a")]}}]} for _ in range(n)]
+        chunks.append({"id": "c", "created": 1, "model": "m",
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                       "usage": {"prompt_tokens": 1, "completion_tokens": n, "total_tokens": n + 1}})
+        out = openai_collect(chunks)
+        self.assertEqual(len(out["choices"][0]["logprobs"]["content"]), n)
+        self.assertEqual(len(out["choices"][0]["message"]["content"]), n)
+
 
 class ChannelRules(unittest.TestCase):
     """Channels over a parser's states and events, token by token, as Service.run feeds it."""
@@ -141,6 +154,64 @@ class ChannelRules(unittest.TestCase):
         out = c.token(lp("hm"), "reasoning", "reasoning", [])
         out += c.token(None, "reasoning", "content", [Event("reasoning", "hm")])   # the budget's close
         self.assertEqual([(ch, e["token"]) for ch, e, _ in out], [("reasoning", "hm")])
+
+    def test_finish_after_unclosed_tool_start_keeps_call_index(self):
+        # call 0 opened (tool_start) and cut off before tool_call: index must stay 0, never -1
+        a, b = ToolCall("read", {}), ToolCall("bash", {})
+        c = logprobs.Channels(thinking=False)
+        out = c.token(lp("<call"), "call", "call", [Event("tool_start", call=a)])
+        out += c.token(lp("arg"), "call", "call", [])
+        out += c.finish([])
+        self.assertEqual([(ch, i, e["token"]) for ch, e, i in out], [("tool", 0, "<call"), ("tool", 0, "arg")])
+        # call 0 done, call 1 opened and cut off: pending tokens belong to call 1, not call 0
+        c2 = logprobs.Channels(thinking=False)
+        out2 = c2.token(lp("<a"), "call", "call", [Event("tool_start", call=a)])
+        out2 += c2.token(lp("/>"), "call", "call", [Event("tool_call", call=a)])
+        out2 += c2.token(lp("<b"), "call", "call", [Event("tool_start", call=b)])
+        out2 += c2.token(lp("tail"), "call", "call", [])
+        out2 += c2.finish([])
+        self.assertEqual([(ch, i, e["token"]) for ch, e, i in out2],
+                         [("tool", 0, "<a"), ("tool", 0, "/>"), ("tool", 1, "<b"), ("tool", 1, "tail")])
+
+    def test_inkling2_framing_tokens_stay_out_of_logprobs(self):
+        from serve.models.inkling2 import END, END_TURN, HEADER, TEXT, THINK, TOOL_JSON, Inkling2Parser
+
+        frame = {HEADER, THINK, TEXT, END, END_TURN}
+        tools = [{"name": "search", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}]
+
+        def drive(tokens, stream_tools=True):
+            p, c, out = Inkling2Parser(thinking=True, tools=tools, stream_tools=stream_tools), logprobs.Channels(True), []
+            for tok in tokens:
+                st0 = p.state
+                evs = p.feed(tok)
+                out += c.token(lp(tok), st0, p.state, evs)
+            out += c.finish(p.finish())
+            return out
+
+        # Single-token specials: thinking + content (with trailing space held by _XmlCalls) + tool call + trailing header
+        seq = [HEADER, THINK, "Let", " me", END,
+               HEADER, TEXT, "Hi", " ", END,
+               HEADER, TEXT, "there", END,
+               HEADER, "search", TOOL_JSON, '{"name":"search","args":{"q":"1"}}', END,
+               END, HEADER]
+        for stream_tools in (True, False):
+            out = drive(seq, stream_tools=stream_tools)
+            leaked = [e["token"] for _, e, _ in out if e["token"] in frame]
+            self.assertEqual(leaked, [], stream_tools)
+            self.assertEqual("".join(e["token"] for ch, e, _ in out if ch == "reasoning"), "Let me")
+            self.assertEqual("".join(e["token"] for ch, e, _ in out if ch == "content"), "Hi there")
+            self.assertEqual([e["token"] for ch, e, i in out if ch == "tool" and i == 0],
+                             ["search", TOOL_JSON, '{"name":"search","args":{"q":"1"}}'])
+
+        # Split framing tokens across sub-tokens also never leak
+        split_seq = ["<|mess", "age_model|>", "<|content_", "thinking|>", "hm", "<|end_", "message|>",
+                     "<|mess", "age_model|>", "<|content_", "text|>", "ok", "<|end_", "message|>"]
+        out2 = drive(split_seq)
+        self.assertEqual([(ch, e["token"]) for ch, e, _ in out2], [("reasoning", "hm"), ("content", "ok")])
+        # END_TURN fed in between stays out
+        c = logprobs.Channels(thinking=True)
+        self.assertEqual(c.token(lp(END_TURN), "between", "between", []), [])
+        self.assertEqual(c.finish([]), [])
 
 
 class Responses(unittest.TestCase):
@@ -193,6 +264,44 @@ class Responses(unittest.TestCase):
         self.assertEqual([x["token"] for x in rdelta["logprobs"]], ["hm"])
         adelta = [e for e in events if e["type"] == "response.function_call_arguments.delta"][0]
         self.assertEqual([x["token"] for x in adelta["logprobs"]], ["<call", "args"])
+
+    def test_responses_flushes_residual_content_and_reasoning_logprobs(self):
+        # Residual tokens held back at close() (reasoning -> message transition and end-of-stream)
+        asm = Assembler({logprobs.REQUEST_KEY: 0}, "m", 3, {}, False)
+        events = asm.start()
+        asm.logprob("reasoning", lp("hm"))
+        events += asm.feed(Event("reasoning", "hm"))
+        asm.logprob("reasoning", lp("..."))               # trailing reasoning token without another delta
+        asm.logprob("content", lp("Hi"))
+        events += asm.feed(Event("content", "Hi"))
+        asm.logprob("content", lp("!"))                   # trailing answer token held back at end-of-stream
+        events += asm.finish({"finish": "stop", "completion_tokens": 4})
+        r_deltas = [e for e in events if e["type"] == "response.reasoning_text.delta"]
+        t_deltas = [e for e in events if e["type"] == "response.output_text.delta"]
+        self.assertEqual([x["token"] for e in r_deltas for x in e["logprobs"]], ["hm", "..."])
+        self.assertEqual([x["token"] for e in t_deltas for x in e["logprobs"]], ["Hi", "!"])
+        t_done = [e for e in events if e["type"] == "response.output_text.done"][0]
+        self.assertEqual([x["token"] for x in t_done["logprobs"]], ["Hi", "!"])
+        rs, msg = events[-1]["response"]["output"]
+        self.assertEqual([x["token"] for x in rs["logprobs"]], ["hm", "..."])
+        self.assertEqual([x["token"] for x in msg["content"][0]["logprobs"]], ["Hi", "!"])
+
+        # Residual tokens arriving after items already closed (before finish()) attach to last matching item
+        asm2 = Assembler({logprobs.REQUEST_KEY: 0}, "m", 3, {}, False)
+        events2 = asm2.start()
+        asm2.logprob("reasoning", lp("r1"))
+        events2 += asm2.feed(Event("reasoning", "r1"))
+        asm2.logprob("content", lp("c1"))
+        events2 += asm2.feed(Event("content", "c1"))
+        call = ToolCall("read", {})
+        events2 += asm2.feed(Event("tool_call", call=call))
+        asm2.logprob("reasoning", lp("r2"))
+        asm2.logprob("content", lp("c2"))
+        events2 += asm2.finish({"finish": "stop", "completion_tokens": 4})
+        out2 = events2[-1]["response"]["output"]
+        self.assertEqual([x["token"] for x in out2[0]["logprobs"]], ["r1", "r2"])
+        self.assertEqual([x["token"] for x in out2[1]["content"][0]["logprobs"]], ["c1", "c2"])
+        self.assertEqual((asm2.lps, asm2.lps_reasoning), ([], []))
 
 
 class Api(unittest.TestCase):

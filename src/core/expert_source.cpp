@@ -513,13 +513,17 @@ bool FileExpertSource::plan_cache_complement(
         return false;
     }
 
+    // Page-aligned slots let registration cut at any expert without splitting its GPU mapping.
+    const uint64_t alignment = pin ? std::max<uint64_t>(1, platform::system_page_size()) : 1;
+    const auto stride = [alignment](uint64_t bytes) { return detail::cache_complement_stride(bytes, alignment); };
+    std::vector<uint64_t> layer_strides(layer_blob_bytes_.size());
+    std::transform(layer_blob_bytes_.begin(), layer_blob_bytes_.end(), layer_strides.begin(), stride);
     // The GPU cache's experts, and the bytes each slot's expert takes here (for the lend region below).
     const int64_t n_slots = cache.slots();
     std::vector<std::pair<int32_t, int32_t>> primary_gpu_pairs;
     std::vector<int32_t> pair_slot;
     std::vector<uint64_t> slot_bytes((size_t) std::max<int64_t>(n_slots, 0), 0);
     std::vector<uint8_t> on_gpu((size_t) n_layers_ * (size_t) n_expert_, 0);   // held by the cache (counted when filled)
-    uint64_t gpu_bytes = 0;
     primary_gpu_pairs.reserve((size_t) cache.resident());
     pair_slot.reserve((size_t) cache.resident());
     for (int64_t layer = 0; layer < n_layers_; ++layer) {
@@ -528,14 +532,13 @@ bool FileExpertSource::plan_cache_complement(
             if (slot == kNotResident) continue;
             primary_gpu_pairs.emplace_back((int32_t) layer, (int32_t) expert);
             on_gpu[(size_t) layer * (size_t) n_expert_ + (size_t) expert] = 1;
-            gpu_bytes += layer_blob_bytes_[(size_t) layer];
             pair_slot.push_back(slot);
-            if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
+            if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_strides[(size_t) layer];
         }
     }
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
-    if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
+    if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_strides, primary_gpu_pairs,
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
     const bool what_fits = budget_bytes == kResidentWhatFits;   // the soft mode's second try
     uint64_t budget_physical = 0;   // the RAM reading a budget was sized from (0: no budget)
@@ -576,7 +579,7 @@ bool FileExpertSource::plan_cache_complement(
         }
         for (auto& [b, n] : spare_sizes) {
             n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
-            spare_bytes += (uint64_t) n * b;
+            spare_bytes += (uint64_t) n * stride(b);
         }
     }
 
@@ -597,7 +600,7 @@ bool FileExpertSource::plan_cache_complement(
         // The places have to fit in the RAM the budget may reach: pack the experts to the budget, but never past what
         // leaves the places room beside it.  A budget with room to spare beside it keeps its experts whole.
         uint64_t max_spare_blob = 0;
-        for (const auto& [b, n] : spare_sizes) max_spare_blob = std::max(max_spare_blob, b);
+        for (const auto& [b, n] : spare_sizes) max_spare_blob = std::max(max_spare_blob, stride(b));
         const uint64_t pack_bytes = ram_tier_pack_bytes(
             budget_bytes, ram_tier_room(budget_physical, headroom_bytes, pin), spare_bytes, max_spare_blob);
         if (rank != nullptr)
@@ -605,7 +608,7 @@ bool FileExpertSource::plan_cache_complement(
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                const uint64_t b = layer_strides[(size_t) pr.first];
                 if (b > pack_bytes - at) continue;
                 ranked[i] = at;
                 at += b;
@@ -659,7 +662,7 @@ bool FileExpertSource::plan_cache_complement(
             core.reserve(primary_gpu_pairs.size());
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
                 if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
-            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
+            if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_strides, core,
                                                     additional_gpu_pairs, offsets, bytes, err)) return false;
         }
     }
@@ -730,13 +733,13 @@ bool FileExpertSource::plan_cache_complement(
             }
         }
     std::vector<uint64_t> bounds;   // where a registration the driver refuses whole may be cut: blob starts
-    if (register_arena && platform::kBoundHostRegistration && !allocation.allocation_pinned()) {
+    if (register_arena && !allocation.allocation_pinned()) {
         std::vector<uint64_t> starts;
         for (uint64_t off : offsets) if (off != kNoComplement) starts.push_back(off);
         uint64_t at = spare_at;
         for (const auto& [blob, count] : spare_sizes)
-            for (int64_t i = 0; i < count; ++i, at += blob) starts.push_back(at);
-        bounds = ram_pin_slices(std::move(starts), ram_padded(bytes), platform::system_page_size(), 1ull << 30);
+            for (int64_t i = 0; i < count; ++i, at += stride(blob)) starts.push_back(at);
+        bounds = ram_pin_slices(std::move(starts), ram_padded(bytes), alignment, 1ull << 30);
     }
     // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
     // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
@@ -780,7 +783,7 @@ bool FileExpertSource::plan_cache_complement(
     {
         uint64_t at = spare_at;
         for (const auto& [b, n] : spare_sizes)
-            for (int64_t i = 0; i < n; ++i, at += b) spare_free_.emplace_back(at, b);
+            for (int64_t i = 0; i < n; ++i, at += stride(b)) spare_free_.emplace_back(at, b);
         if (!spare_sizes.empty())
             basalt::log::info("basalt", "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)",
                          (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
@@ -802,28 +805,27 @@ void FileExpertSource::pin_landed_complement() {
     std::string& note = pc.note;
     const auto reg_t0 = std::chrono::steady_clock::now();
     if (pc.register_arena) {
-        const RamPin rp = pin_ram(complement_allocation_, pc.bounds, /*mapped=*/true, &device);
+        RamPin rp = pin_ram(complement_allocation_, pc.bounds, /*mapped=*/true, &device);
         if (rp.allocation_backed) {
             partial_pin = bytes;
             note = "CUDA-pinned through host VMM";
-        } else if constexpr (platform::kBoundHostRegistration) {
+        } else {
             partial_pin = std::min(bytes, rp.registered_bytes);
             lock_off = rp.lock_off;
             locked = rp.locked_bytes;
-            slice_at = rp.slice_starts;
-            slice_dev = rp.slice_devices;
-            note = "registered " + std::to_string(partial_pin >> 20) + " MiB";
-            if (rp.capped) note += "; " + rp.cap_why;
-            if (!rp.refused.empty()) note += "; " + rp.refused;
+            slice_at = std::move(rp.slice_starts);
+            slice_dev = std::move(rp.slice_devices);
+            if (rp.sliced || rp.capped) {
+                note = "registered " + std::to_string(partial_pin >> 20) + " MiB in " +
+                       std::to_string(slice_at.size()) + " ranges";
+                if (rp.capped) note += "; " + rp.cap_why;
+                if (!rp.refused.empty()) note += "; CUDA registration refused (" + rp.refused + ")";
+            } else if (device != nullptr) {
+                note = "page-locked and mapped";
+            } else {
+                note = "page-locking refused (" + rp.refused + ")";
+            }
             if (!rp.lock_note.empty()) note += "; " + rp.lock_note;
-        } else if (device != nullptr) {
-            partial_pin = bytes;   // released through the registered-prefix path
-            lock_off = bytes;
-            note = "page-locked and mapped";
-        } else {
-            note = "page-locking refused (" + rp.refused + ")";
-            locked = rp.locked_bytes;
-            note += "; " + rp.lock_note;
         }
     } else {
         // no memory the driver could register: the copy is locked in the working set instead

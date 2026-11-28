@@ -9,7 +9,7 @@ import threading
 import time
 
 from serve.util.console import tagged
-from serve.util.loglevel import ERR, WARN, engine_line
+from serve.util.loglevel import ERR, WARN, engine_line, unstamp
 
 
 DRAFT_HEAD_FAIL = "the draft head does not fit"
@@ -48,7 +48,7 @@ def start_last_line(log: str | None, offset: int) -> str:
         return ""
     lines = text.splitlines()[1 if start > offset else 0:]   # not a line cut in half
     for x in reversed(lines):
-        x = x.strip()
+        x = unstamp(x.strip())
         e = engine_line(x) if x else None
         if x and (e is None or e.level != WARN):
             return x if e is None else e.text
@@ -520,7 +520,7 @@ def start_errors(log: str | None, offset: int) -> list[str]:
             lines = f.read().decode("utf-8", "replace").splitlines()
     except (OSError, ValueError):
         return []
-    return [e for x in lines if (e := engine_error(x.strip())) is not None]
+    return [e for x in lines if (e := engine_error(unstamp(x.strip()))) is not None]
 
 
 def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=20.0, out=None, gpus=None,
@@ -543,7 +543,7 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
         if chunk.count(b"\n"):
             cut = chunk.rfind(b"\n") + 1
             pos += cut
-            for line in chunk[:cut].decode("utf-8", "replace").splitlines():
+            for line in map(unstamp, chunk[:cut].decode("utf-8", "replace").splitlines()):
                 if load_planning(line):
                     bars.say("[server] planning weight allocation")
                     last = time.time()

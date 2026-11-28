@@ -123,6 +123,10 @@ static void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRIC
     }
 }
 
+static inline float q8_1_finite_c(float v) {
+    return fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v;
+}
+
 static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK8_1 == 0);
     const int nb = k / QK8_1;
@@ -142,26 +146,41 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
 
         const float amax = vmaxvq_f32(amaxv[0]);
 
-        const float d = amax / ((1 << 7) - 1);
-        const float id = d ? 1.0f/d : 0.0f;
+        if (isnan(amax)) {
+            y[i].d = GGML_CPU_FP32_TO_FP16(amax);
+            y[i].s = GGML_CPU_FP32_TO_FP16(amax);
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            continue;
+        }
+
+        const float raw_d = amax / ((1 << 7) - 1);
+        const int d_clamped = raw_d > 65504.0f;
+        const float d = d_clamped ? 65504.0f : raw_d;
+        float id = d ? 1.0f/d : 0.0f;
+        if (!isfinite(id)) id = 0.0f;
 
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
 
         int32x4_t accv = vdupq_n_s32(0);
+        const int32x4_t q_min = vdupq_n_s32(-127);
+        const int32x4_t q_max = vdupq_n_s32( 127);
 
         for (int j = 0; j < 8; j++) {
             const float32x4_t v  = vmulq_n_f32(srcv[j], id);
-            const int32x4_t   vi = vcvtnq_s32_f32(v);
+            int32x4_t         vi = vcvtnq_s32_f32(v);
+            if (d_clamped) {
+                vi = vminq_s32(vmaxq_s32(vi, q_min), q_max);
+            }
 
-            y[i].qs[4*j + 0] = vgetq_lane_s32(vi, 0);
-            y[i].qs[4*j + 1] = vgetq_lane_s32(vi, 1);
-            y[i].qs[4*j + 2] = vgetq_lane_s32(vi, 2);
-            y[i].qs[4*j + 3] = vgetq_lane_s32(vi, 3);
+            y[i].qs[4*j + 0] = (int8_t) vgetq_lane_s32(vi, 0);
+            y[i].qs[4*j + 1] = (int8_t) vgetq_lane_s32(vi, 1);
+            y[i].qs[4*j + 2] = (int8_t) vgetq_lane_s32(vi, 2);
+            y[i].qs[4*j + 3] = (int8_t) vgetq_lane_s32(vi, 3);
 
             accv = vaddq_s32(accv, vi);
         }
 
-        y[i].s = GGML_CPU_FP32_TO_FP16(d * vaddvq_s32(accv));
+        y[i].s = GGML_CPU_FP32_TO_FP16(q8_1_finite_c(d * (float) vaddvq_s32(accv)));
     }
 }
 

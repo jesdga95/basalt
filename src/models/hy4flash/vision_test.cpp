@@ -120,15 +120,26 @@ int main(int argc, char** argv) {
         }
         check(got == c.want, (std::string("track: ") + c.name).c_str());
     }
-    // a rewind drops the cells after it, a rewind into the text before a picture restores the text position
+    // a rewind drops the cells after it, a rewind into the text before a picture restores the text position and clears has_image
     {
         hy4::RopeTrack t;
+        check(!t.has_image(), "track: empty track has no image");
         for (int i = 0; i < 3; ++i) t.push_text();
+        check(!t.has_image(), "track: text-only track has no image");
         const int32_t start = t.next();
         for (int j = 0; j < 8; ++j) t.push_row(start, 4, j);
-        check(t.next() == 7, "track: the text after a 2x3 picture");
+        check(t.next() == 7 && t.has_image(), "track: the text after a 2x3 picture");
+        t.push_text();
+        t.rewind(11);
+        check(t.has_image(), "track: rewind after image keeps has_image");
+        t.rewind(4);
+        check(t.has_image(), "track: rewind inside image keeps has_image");
         t.rewind(3);
-        check(t.size() == 3 && t.next() == 3, "track: a rewind to before the picture");
+        check(t.size() == 3 && t.next() == 3 && !t.has_image(), "track: a rewind to before the picture clears has_image");
+        t.push_row(3, 2, 0);
+        check(t.has_image(), "track: pushing an image after rewind sets has_image again");
+        t.clear();
+        check(t.size() == 0 && !t.has_image(), "track: clear resets has_image");
     }
 
     // bicubic against Pillow on a real picture, up, down and mixed

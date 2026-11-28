@@ -6,6 +6,10 @@
 // A serve request with `ppl=K` reads chunk K's first half as its prompt and then teacher-forces the rest through
 // the verify windows; every scored row is compared with the base row here and written as one line to
 // --ppl-out: chunk pos target nll nll_base kld same_top top top_base dlogp_top_base.
+// A request with `score=N` (no base) is its own token stream: ids[0..N] are the prompt, the rest are teacher-forced
+// the same way, and each row from N on (predicting the token after it) goes to --ppl-out: with `score_top=K` (K >= 1)
+// one text line, pos target lp_target lse then K id:lp pairs (the likeliest first, ties to the lower id); with K = 0
+// the whole row binary, the position (int64), the target (int32) and n_vocab float32 log probabilities.
 #include "basalt/platform/file.hpp"
 
 #include <algorithm>
@@ -33,12 +37,13 @@ public:
         return g;
     }
     bool available() const { return fd_ >= 0 && out_ != nullptr; }
-    int64_t first() const { return n_ctx_ / 2; }
-    int64_t end() const { return n_ctx_ - 1; }   // one past the last scored position
+    int64_t first() const { return stream_ ? s_first_ : n_ctx_ / 2; }
+    int64_t end() const { return stream_ ? (int64_t) tok_.size() - 1 : n_ctx_ - 1; }   // one past the last scored position
     int32_t token(int64_t pos) const { return tok_[(size_t) pos]; }
 
     // chunk K's tokens; the request's prompt must be the chunk's first n_ctx/2 + 1 tokens
     bool begin(int chunk, const int64_t* ids, int64_t n, int64_t n_vocab, std::string& err) {
+        stream_ = false;
         if (!available()) { err = "ppl: --ppl-base / --ppl-out not set or not readable"; return false; }
         if (n_vocab != n_vocab_) { err = "ppl: the base has another vocabulary size"; return false; }
         if (chunk < 0 || chunk >= n_chunk_) { err = "ppl: chunk out of range"; return false; }
@@ -51,6 +56,21 @@ public:
         for (int64_t i = 0; i < n; ++i)
             if (ids[i] != tok_[(size_t) i]) { err = "ppl: the prompt differs from the chunk tokens"; return false; }
         chunk_ = chunk;
+        return true;
+    }
+
+    // the request's own stream: ids[0..n), rows first .. n-2 scored, `top` likeliest per row (0: the whole row)
+    bool begin_stream(const int64_t* ids, int64_t n, int64_t first, int top, int64_t n_vocab, std::string& err) {
+        if (out_ == nullptr) { err = "score: --ppl-out not set or not writable"; return false; }
+        if (first < 0 || first >= n - 1) { err = "score: the scored position is not inside the stream"; return false; }
+        if (top < 0 || top > 256) { err = "score: score_top is 0 (the whole row) to 256"; return false; }
+        tok_.assign(ids, ids + n);
+        for (int32_t t : tok_)
+            if (t < 0 || t >= n_vocab) { err = "score: a token outside the vocabulary"; return false; }
+        stream_ = true;
+        s_first_ = first;
+        s_top_ = top;
+        n_vocab_ = n_vocab;
         return true;
     }
 
@@ -69,7 +89,7 @@ public:
     bool finish(std::string& err) {
         const bool ok = wait(err);
         std::fflush(out_);
-        basalt::platform::advise_dontneed(fd_, 0, 0);   // the rows this chunk read need not stay cached
+        if (fd_ >= 0) basalt::platform::advise_dontneed(fd_, 0, 0);   // the rows this chunk read need not stay cached
         return ok;
     }
 
@@ -81,7 +101,13 @@ private:
     PplGate() {
         const char* base = paths().first.c_str();
         const char* out = paths().second.c_str();
-        if (paths().first.empty() || paths().second.empty()) return;
+        if (paths().second.empty()) return;
+        out_ = basalt::platform::open_file_utf8(paths().second, "ab");
+        if (out_ == nullptr) {
+            basalt::log::error("basalt ppl", "cannot write %s", out);
+            return;
+        }
+        if (paths().first.empty()) return;   // scoring a request's own stream only
         fd_ = basalt::platform::open_fd_utf8(paths().first);
         char magic[8];
         uint32_t n_ctx = 0;
@@ -96,11 +122,6 @@ private:
         n_vocab_ = nv[0];
         n_chunk_ = nv[1];
         row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
-        out_ = basalt::platform::open_file_utf8(paths().second, "ab");
-        if (out_ == nullptr) {
-            basalt::log::error("basalt ppl", "cannot write %s", out);
-            close_fd();
-        }
     }
     ~PplGate() {
         if (out_ != nullptr) std::fclose(out_);
@@ -122,8 +143,37 @@ private:
         return true;
     }
 
+    // a stream row: its log probabilities, as score=N says
+    bool stream_row(int64_t pos, const std::vector<float>& lg) {
+        const int64_t V = n_vocab_;
+        float maxv = lg[0];
+        for (int64_t i = 1; i < V; ++i) maxv = std::max(maxv, lg[(size_t) i]);
+        double sum = 0.0;
+        for (int64_t i = 0; i < V; ++i) sum += std::exp(lg[(size_t) i] - maxv);
+        const float lse = maxv + (float) std::log(sum);
+        const int32_t tgt = tok_[(size_t) pos + 1];
+        if (s_top_ == 0) {
+            std::vector<float> lp((size_t) V);
+            for (int64_t i = 0; i < V; ++i) lp[(size_t) i] = lg[(size_t) i] - lse;
+            const int64_t p64 = pos;
+            return std::fwrite(&p64, 8, 1, out_) == 1 && std::fwrite(&tgt, 4, 1, out_) == 1 &&
+                   std::fwrite(lp.data(), 4, lp.size(), out_) == lp.size();
+        }
+        std::vector<int32_t> ids((size_t) V);
+        for (int64_t i = 0; i < V; ++i) ids[(size_t) i] = (int32_t) i;
+        const size_t k = (size_t) std::min<int64_t>(s_top_, V);
+        std::partial_sort(ids.begin(), ids.begin() + (std::ptrdiff_t) k, ids.end(), [&](int32_t a, int32_t b) {
+            return lg[(size_t) a] > lg[(size_t) b] || (lg[(size_t) a] == lg[(size_t) b] && a < b);
+        });
+        std::fprintf(out_, "%lld\t%d\t%.6f\t%.6f", (long long) pos, tgt, lg[(size_t) tgt] - lse, lse);
+        for (size_t j = 0; j < k; ++j) std::fprintf(out_, "\t%d:%.6f", ids[j], lg[(size_t) ids[j]] - lse);
+        std::fputc('\n', out_);
+        return true;
+    }
+
     // the same arithmetic as llama-perplexity's KL-divergence pass
     bool row(int64_t pos, const std::vector<float>& lg) {
+        if (stream_) return stream_row(pos, lg);
         const int64_t r = pos - first(), rows = n_ctx_ - 1 - first();
         const uint64_t off = 20 + (uint64_t) n_chunk_ * n_ctx_ * 4 +
                              ((uint64_t) chunk_ * rows + (uint64_t) r) * (uint64_t) row_u16_ * 2;
@@ -162,6 +212,9 @@ private:
     std::FILE* out_ = nullptr;
     int64_t n_ctx_ = 0, n_vocab_ = 0, n_chunk_ = 0, row_u16_ = 0;
     int chunk_ = -1;
+    bool stream_ = false;   // score=N: the request's own stream, no base
+    int64_t s_first_ = 0;
+    int s_top_ = 0;
     std::vector<int32_t> tok_;
     std::vector<uint16_t> base_;
     std::future<bool> pending_;

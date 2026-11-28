@@ -79,6 +79,8 @@ public:
 private:
     // 1: fed, 0: not allowed
     bool feed(int32_t token);
+    void build_first_mask();
+    bool opens_block(int32_t token);
     void mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias);
     std::string describe() const;
 
@@ -92,6 +94,13 @@ private:
     bool on_ = false;
     bool thinking_ = false;
     bool blocks_ = false;        // this request's reply is read as blocks
+    bool ban_think_ = false;     // a reply of blocks that may not think, outside a grammar of blocks: no thinking block opens
+    bool after_header_ = false;  // the last token opened a block
+    bool has_grammar_ = false;
+    std::vector<std::string> call_names_;   // the tools a reply may call, when known
+    std::vector<uint8_t> first_mask_;       // the tokens that start one of their names
+    bool must_call_ = false;                // every block that opens is a call
+    bool text_only_ = false;     // no grammar and no calls: every block of a reply of blocks is a text block
     bool allow_think_ = true;    // a reply of blocks may think
     Phase phase_ = Phase::answer;
     int64_t windows_ = 0, misses_ = 0, fallbacks_ = 0, ns_ = 0;

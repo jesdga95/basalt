@@ -1,0 +1,35 @@
+{
+  "submitter": "giveen",
+  "date": "2026-11-25",
+  "commit": "f790236b9a",
+  "preset": "community-1",
+  "model": "Hy4-flash",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 475,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 47.5
+    }
+  ],
+  "ram_gib": 247,
+  "cpu": "Intel Core Ultra 9 285K, 24 cores",
+  "ram_gbps": 74.1,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "fp16",
+  "prefill_16k_tps": 3743.2,
+  "prefill_64k_tps": 3690.9,
+  "decode_tps": 92.2,
+  "decode_conv_tps": 68.4,
+  "decode_struct_tps": 103.0,
+  "decode_prose_tps": 71.6,
+  "accept_conv_pct": 78.7,
+  "accept_struct_pct": 99.9,
+  "accept_prose_pct": 66.5,
+  "draft_len_conv": 1.4,
+  "draft_len_struct": 4.8,
+  "draft_len_prose": 0.9,
+  "engine_args": "--gpu 0 --max-context 56544"
+}

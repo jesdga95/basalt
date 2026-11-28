@@ -986,7 +986,7 @@ void test_experts_fp4() {
     uint8_t* blobs = dev(ex.blobs);
     int32_t* dids = dev(ids);
     float *dw = dev(w), *dx = dev(x);
-    const int RMAX = 2048, PMAX = RMAX * K;
+    const int RMAX = 8192, PMAX = RMAX * K;   // the longest prompt chunk (prompt.hpp kSpillPromptChunk)
     int32_t *bounds = zeros<int32_t>(NE + 1), *tok = zeros<int32_t>(PMAX), *dst = zeros<int32_t>(PMAX), *rexp = zeros<int32_t>(PMAX);
     int32_t *toff = zeros<int32_t>(NE + 1), *boff = zeros<int32_t>(NE + 1);
     void* scr = zeros<uint8_t>(moe_sort_scratch(PMAX, NE));
@@ -1079,6 +1079,23 @@ void test_experts_fp4() {
     run(100, dids, dx, dw, y2, true);
     const std::vector<float> g2 = host(y2, (size_t) 100 * E);
     same_bits("  rows 0..99 as a chunk of their own", g2.data(), got.data(), g2.size() * 4);
+    {   // the same rows first in a chunk of the longest width
+        std::vector<int32_t> ids_w((size_t) RMAX * K);
+        std::copy(ids.begin(), ids.end(), ids_w.begin());
+        for (int r = R; r < RMAX; ++r) {
+            std::shuffle(perm.begin(), perm.end(), rng);
+            for (int s = 0; s < K; ++s) ids_w[(size_t) r * K + s] = perm[s];
+        }
+        std::vector<float> w_w = randn((size_t) RMAX * K, 0.5f, 1.f), x_w = randn((size_t) RMAX * E, 1.0f);
+        std::copy(w.begin(), w.end(), w_w.begin());
+        std::copy(x.begin(), x.end(), x_w.begin());
+        int32_t* dids_w = dev(ids_w);
+        float *dw_w = dev(w_w), *dx_w = dev(x_w), *yw = zeros<float>((size_t) RMAX * E);
+        run(RMAX, dids_w, dx_w, dw_w, yw, true);
+        const std::vector<float> gw = host(yw, (size_t) R * E);
+        same_bits("  rows 0..255 first in a 8,192-row chunk", gw.data(), got.data(), gw.size() * 4);
+        for (void* q : {(void*) dids_w, (void*) dw_w, (void*) dx_w, (void*) yw}) cudaFree(q);
+    }
     // deterministic fp16 intermediate pipeline matches fp32 down + moe_combine and CPU double
     {
         float* yf = zeros<float>((size_t) R * E);
@@ -1118,15 +1135,16 @@ void test_experts_fp4() {
     }
     // timing at a 2,048-row chunk's shape: 16,384 pairs over the 128 experts
     {
-        std::vector<int32_t> big((size_t) PMAX);
-        for (int r = 0; r < RMAX; ++r) {
+        const int RT = 2048, PT = RT * K;
+        std::vector<int32_t> big((size_t) PT);
+        for (int r = 0; r < RT; ++r) {
             std::shuffle(perm.begin(), perm.end(), rng);
             for (int s = 0; s < K; ++s) big[(size_t) r * K + s] = perm[s];
         }
         int32_t* bids = dev(big);
-        float *bx = dev(randn((size_t) RMAX * E, 1.f)), *bw = dev(randn((size_t) PMAX, 0.5f, 1.f)), *by = zeros<float>((size_t) RMAX * E);
-        const double us = time_us([&] { run(RMAX, bids, bx, bw, by, true); }, 10);
-        const double fl = 2.0 * PMAX * 3 * F * E;
+        float *bx = dev(randn((size_t) RT * E, 1.f)), *bw = dev(randn((size_t) PT, 0.5f, 1.f)), *by = zeros<float>((size_t) RT * E);
+        const double us = time_us([&] { run(RT, bids, bx, bw, by, true); }, 10);
+        const double fl = 2.0 * PT * 3 * F * E;
         std::printf("  FP4 experts, 2,048 rows: sort + quantize + gate/up + H + down + sum %.0f us (%.0f TOP/s)\n", us, fl / us / 1e6);
         cudaFree(bids);
         cudaFree(bx);

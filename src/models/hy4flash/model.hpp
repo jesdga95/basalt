@@ -26,6 +26,7 @@ struct DevTensor {
 
 /// The most second cards whose expert tiers a start uses (gpu-mode peer takes no more cards than the main card and these).
 constexpr int kMaxSecondCards = 3;
+constexpr int kMaxWindow = 8;   // rows of a decode window, and of one expert group
 constexpr int64_t kDefaultContext = 8192;
 constexpr uint64_t kExpertLendSegment = 256ull << 20;
 
@@ -108,7 +109,7 @@ private:
     int64_t ctx_ = kDefaultContext;
 };
 
-/// A session over `model`; null with `err` set.
-std::unique_ptr<model::ModelSession> make_session(Hy4Model& model, std::string& err);
+/// A session over `model`; null with `err` set. `secondary` starts dormant (0 physical VRAM for rings/KV/drafter until used).
+std::unique_ptr<model::ModelSession> make_session(Hy4Model& model, std::string& err, bool secondary = false);
 
 }  // namespace basalt::models::hy4flash

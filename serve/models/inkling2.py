@@ -114,12 +114,15 @@ class _Blocks:
     # ------------------------------------------------------------------ a tool call
     def _name(self, out: list) -> bool:
         at = self.buf.find(TOOL_JSON)
+        end, hdr = self.buf.find(END), self.buf.find(HEADER)
+        cut = min((i for i in (end, hdr) if i >= 0), default=-1)
+        if cut >= 0 and (at < 0 or cut < at):   # this block ended (or a new one opened) with no call: text
+            if cut:
+                out.append(Event("content", self.buf[:cut]))
+            self.buf = self.buf[cut + (len(END) if cut == end else 0):]
+            self.state = "between"
+            return True
         if at < 0:
-            if END in self.buf:         # a name with no call: text
-                end = self.buf.find(END)
-                out.append(Event("content", self.buf[:end]))
-                self.buf, self.state = self.buf[end + len(END):], "between"
-                return True
             return False
         self._open_call(out, self.buf[:at].strip())
         self.buf = self.buf[at + len(TOOL_JSON):]
@@ -137,7 +140,7 @@ class _Blocks:
 
     def _start(self, out: list) -> None:
         """Sends "tool_start" once the call has a name: its header's, or the one its JSON opens with."""
-        if self.started or not self.stream_tools:
+        if self.started:
             return
         if not self.call.name:
             m = _NAME.match(self.raw)
@@ -147,6 +150,8 @@ class _Blocks:
                 self.call.name = json.loads(m.group(1))
             except ValueError:
                 return
+        if not self.stream_tools:
+            return
         self.started = True
         out.append(Event("tool_start", call=self.call))
 
@@ -324,6 +329,8 @@ def parse_xml(s: str, tools: dict, final: bool):
             if s.startswith("</invoke>", pos):
                 pos += len("</invoke>")
                 break
+            if "</invoke>".startswith(s[pos:]):
+                return (NO,) if final else (MORE,)
             m, wait = _open_tag(s[pos:], _PARAM, "<parameter name=")
             if m is None:
                 return (NO,) if final or wait == NO else (MORE,)
@@ -331,7 +338,7 @@ def parse_xml(s: str, tools: dict, final: bool):
             while True:         # a close counts when a parameter or the invoke's end follows it
                 i = s.find("</parameter>", at)
                 if i < 0:
-                    return (NO,) if final else (MORE,)
+                    return (NO,) if final else (MORE, ">")
                 tail = s[_skip(s, i + len("</parameter>")):]
                 if tail.startswith(("<parameter ", "</invoke>")):
                     break
@@ -371,6 +378,7 @@ class _XmlCalls(frontend.CodeTracker):
         self.stream_tools = stream_tools
         self.buf = ""
         self.pend = False               # buf starts (after whitespace) with an opener that begins a call's text
+        self.wait_gt = False            # inside a parameter value: nothing can change until a closing '>' arrives
         self.lead = False               # a call just ended: the whitespace after it is dropped
         self._reset_track()
 
@@ -394,7 +402,7 @@ class _XmlCalls(frontend.CodeTracker):
         return out + [Event("tool_call", call=call)]
 
     def push(self, text: str, final: bool = False) -> list:
-        if self.pend and not final and ">" not in text:     # nothing that can end a tag came
+        if self.pend and self.wait_gt and not final and ">" not in text:     # inside a parameter value: wait for '>'
             self.buf += text
             return []
         self.buf += text
@@ -427,13 +435,14 @@ class _XmlCalls(frontend.CodeTracker):
                     continue
                 cut = len(self.buf[:i].rstrip())
                 content(self.buf[:cut])
-                self.buf, self.pend = self.buf[cut:], True
+                self.buf, self.pend, self.wait_gt = self.buf[cut:], True, False
             body = self.buf.lstrip()
             ws = len(self.buf) - len(body)
             r = parse_xml(body, self.tools, final)
             if r[0] == MORE:
+                self.wait_gt = len(r) > 1
                 break
-            self.pend = False
+            self.pend = self.wait_gt = False
             if r[0] == NO:              # text after all: the whitespace and the opener
                 op = next(o for o in XML_OPENERS if body.startswith(o))
                 content(self.buf[:ws + len(op)])
@@ -445,7 +454,7 @@ class _XmlCalls(frontend.CodeTracker):
             self._reset_track()
         if final and self.buf:
             content(self.buf)
-            self.buf, self.pend = "", False
+            self.buf, self.pend, self.wait_gt = "", False, False
         return out
 
 

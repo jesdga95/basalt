@@ -12,12 +12,12 @@ Needs CUDA 13, GCC 13+ and CMake 3.24+, as on x86.
 
 ```sh
 export CUDACXX=/usr/local/cuda/bin/nvcc
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=121
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=121 -DBASALT_MODELS=all
 cmake --build build -j
 ctest --test-dir build -L cpu -LE avx512 -j 8 --output-on-failure
 ```
 
-`-DBASALT_MODELS="inkling2;qwen4exp"` builds only the models named, which is much quicker for a first build.
+`-DBASALT_MODELS="inkling2;qwen4exp"` builds only the models named, which is much quicker for a first build; `all` builds every model.
 
 `CUDACXX` names the toolkit's own `nvcc`: the `nvcc` of a distribution's CUDA package can stop on an SVE declaration in
 `math-vector.h` from the system's glibc. CMake picks Arm64 from the machine and defaults the architecture to 121 there, so
@@ -64,7 +64,7 @@ integrated GPU (the SoC's limit is the system's, not the GPU's) and refuses besi
 
 ## Quality
 
-The GPU kernels are the discrete card's, compiled for 12.1, and give the same output: Inkling 2 Mini's 100-chunk KLD on a GB10
+The GPU kernels are the discrete card's, compiled for 12.1, and give the same output: Inkling 2 Mini's 100-chunk wikitext KLD on a GB10
 matched an RTX 5090's to every printed digit. The NEON expert kernels sum in a different order from the AVX-512 ones, so CPU
 experts are not bit-identical to an x86 build, at the same quality: with `--expert-cache 1500` the GB10 scored KLD 0.00435, top-1
 97.20% against the 5090's 0.00451 and 97.20%.

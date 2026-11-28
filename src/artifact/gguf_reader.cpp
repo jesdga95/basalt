@@ -36,6 +36,8 @@ int main(int argc, char** argv) {
             for (const auto& t : g.tensors()) ordered.push_back(&t);
             std::sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->offset < b->offset; });
             size_t bad = 0, unknown = 0;
+            const uint64_t payload = g.file_size() - g.data_start();
+            const uint64_t align = g.alignment();
             for (size_t i = 0; i < ordered.size(); ++i) {
                 const auto* t = ordered[i];
                 int el = 0, by = 0;
@@ -43,22 +45,37 @@ int main(int argc, char** argv) {
                     ++unknown;
                     continue;
                 }
-                if (t->elements() % (uint64_t)el) {
+                uint64_t elems = 1;
+                bool ovf = t->shape.empty();
+                for (uint64_t d : t->shape) {
+                    if (d != 0 && elems > (std::numeric_limits<uint64_t>::max)() / d) { ovf = true; break; }
+                    elems *= d;
+                }
+                if (ovf || elems % (uint64_t)el != 0) {
                     ++bad;
                     continue;
                 }
-                const uint64_t nb = t->elements() / (uint64_t)el * (uint64_t)by;
+                const uint64_t blocks = elems / (uint64_t)el;
+                if (blocks > (std::numeric_limits<uint64_t>::max)() / (uint64_t)by) {
+                    ++bad;
+                    continue;
+                }
+                const uint64_t nb = blocks * (uint64_t)by;
+                if (t->offset > payload || nb > payload - t->offset) {
+                    ++bad;
+                    continue;
+                }
                 // The bracket is on the GAP to the next tensor's offset, not on that offset itself -
                 // offsets are relative to data_start, so the gap is a difference. Comparing against
                 // the raw offset would flag almost every tensor.
                 const uint64_t end = (i + 1 < ordered.size()) ? ordered[i + 1]->offset - t->offset
-                                                              : g.file_size() - g.data_start() - t->offset;
-                if (!(nb <= end && end < nb + 32)) ++bad;
+                                                              : payload - t->offset;
+                if (end < nb || end - nb >= align) ++bad;
             }
             std::printf("  geometry bracket: %zu out of range, %zu types unknown\n", bad, unknown);
             const std::string err = basalt::model::check_architecture(g);
             std::printf("  architecture guard: %s\n", err.empty() ? "PASS" : ("FAIL - " + err).c_str());
-            if (bad) return 1;
+            if (bad || !err.empty()) return 1;
         }
         return 0;
     } catch (const std::exception& e) {

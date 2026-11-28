@@ -45,7 +45,8 @@ the text model.
   embedding (0.86 GiB) stays in page-locked RAM and the card gathers its rows. Two cards: [peer or split](#two-cards).
 - **Context:** `--max-context` from 1,024 to 1,048,576, default 8,192.
 - **Per position:** the 8 full-attention visits keep every position, 32 KiB with `--kv fp16`, 18 KiB with `--kv int8`, 16 KiB
-  with `--kv fp8`, plus the drafter's full layer (fp16 in every mode); the window layers' rings do not grow.
+  with `--kv fp8`, plus the drafter's full layer (4 KiB fp16, 2.06 KiB int8 with `--kv int8`); the window layers' rings do not
+  grow.
 - **Experts in RAM when the context needs the room:** when the asked context does not fit beside every expert, the least
   routed experts (by the shipped profile `data/profiles/inkling2-24x128.prof`) are planned into page-locked RAM, just enough,
   and decode computes them on the CPU. After routing, a visit with RAM experts publishes its choices and the input rows
@@ -78,7 +79,9 @@ the text model.
   CUDA failure) stops the engine: every later request is refused. With one session, a refused decode window ends its
   request with an error and the engine serves the next. Nothing changes when everything fits.
 - **Which experts get a copy:** the profile's order until the session has looked experts up, then the lookups of the rows its
-  windows keep (rejected drafts do not count), decayed over 320 kept rows. The least looked up give way first when the caches
+  windows keep (rejected drafts do not count), decayed over 320 kept rows, discounted by the visits of the expert's layer: a
+  visit waits for its RAM experts only while the CPU's share outlasts the card's, so a looped layer's counts are divided by
+  its three visits to the power 0.75. The least looked up give way first when the caches
   grow. With one session and an elastic spill, at a request's start and every 256 decode positions after it, up to 64 copies
   move to clearly hotter RAM experts of the same size.
 - **Prompt loan:** with an elastic spill, one session and one card, the prompt path's device memory that decode leaves idle (the
@@ -130,7 +133,7 @@ small or held back (a desktop, another process).
     At 1M tokens, where the elastic copies bring all 1,938 spilled experts back, one card reads 8,992 tok/s and decodes 365, 650 and
     313 (conversation, struct, prose) and the peer 8,895 and 357, 645 and 311: the peer buys nothing there.
   - Quality: with the experts on the peer the BF16 KLD is level with the CPU's (`--expert-cache 1500`: 0.00440 and 97.25% top-1
-    against 0.00444 and 97.15% on one card, 100 chunks). A peer's prompt differs from a resident card's at summation-order rounding
+    against 0.00444 and 97.15% on one card, 100 chunks of wikitext KLD). A peer's prompt differs from a resident card's at summation-order rounding
     (about 0.01 KLD on `--diag-gpu-check`, the same as reordering any expert sum); its decode rows are exact, and with every spilled
     expert copied back it is bitwise one card.
 - **Split:** the second card runs the layers from the cut on, with their experts, caches and rings; the first runs the rest, the
@@ -170,9 +173,12 @@ windows, because a chunk's fixed cost there is more than eight windows. The draf
 chunk stages each spilled layer's experts on the card, each from its card copy while the spill still holds one and from RAM
 where the caches' growth sent it back; a chunk of at most 1,024 rows (a tool result, a short turn) stages only the experts its
 rows route to; a longer chunk copies a layer's experts on a second stream once the spilled visit before it has read the
-staging, under the kernels in between. At `--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are
-found; decode runs at 264 tok/s on a short chat, 173 at 131K and 108 at 400K (plain decoding), and a 400K prompt reads at about
-4,110 tok/s. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server
+staging, under the kernels in between. A read of more than 4,096 tokens with experts in RAM runs chunks of up to 8,192 rows,
+half the stagings, when the card's copies can make room for the wider buffers (about 1 GiB, and the drafter's 288 MiB tap):
+the lowest-ranked copies go back to RAM for the read and the same copies return after it, so shorter reads and decode keep
+the placement they had. At `--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are found; decode runs
+at 264 tok/s on a short chat, 173 at 131K and 108 at 400K (plain decoding), and a 400K prompt reads at about 4,110 tok/s.
+Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server
 (`--max-context 262144`). On an RTX 5090 at 400 W with every expert on the card, prompts of 2K, 16K, 32K and 128K tokens read at
 about 14,100, 13,300, 12,200 and 8,900 tok/s.
 
