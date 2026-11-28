@@ -35,7 +35,7 @@ VRAM, drafting at its default):
 | Benchmark | Rate (tok/s) | Notes |
 | --- | ---: | --- |
 | `pp16384` | 2,330 | Engine (`2,309` wall) |
-| `tg conv / struct / prose` (lossless) | 34-36 / 38-43 / 35-36 | 59.2% VRAM, 12.1% PCIe, 28.7% CPU |
+| `tg conv / struct / prose` (lossless) | 34-36 / 38-43 / 35-36 | 58-59% VRAM, 12-13% PCIe, 29% CPU |
 | `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 34 / 43 / 35 | Opt-in lossy routing |
 
 100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld`: PPL `3.9836 +/- 0.0596` (base
