@@ -65,10 +65,9 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
         std::thread th([&] {
             const basalt::core::OnDevice on(0);
             ok = runtime_.sp.run(ids.data() + a0, b0 - a0, a0, terr);
-            if (ok && runtime_.ov_post) {   // (the checkpoint's copy to the host beside the windows)
+            if (ok && runtime_.ov_post) {   // (the lent slots' experts back beside the windows)
                 ok = runtime_.ov_post();
-                runtime_.ov_post_done = ok;
-                if (!ok) terr = "saving a conversation checkpoint failed" + runtime_.ckpt_why;
+                if (!ok) terr = "returning the lent slots their experts failed" + runtime_.ckpt_why;
             }
             std::lock_guard<std::mutex> lk(mail.mu);
             mail.fin = true;

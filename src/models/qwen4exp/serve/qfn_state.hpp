@@ -433,7 +433,6 @@ private:
     Clock::time_point bt_start{};
     bool ov_active{};
     std::function<bool ()> ov_post{};   // what the overlapped read's thread does right after its last chunk
-    bool ov_post_done{};
 
     int64_t part_slots(const PfPart& p, int64_t c);
     uint64_t part_bytes(const PfPart& p, int32_t first);
