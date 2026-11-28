@@ -160,6 +160,17 @@ then encoded by the vision tower and projector. Preserve the planner's patch per
 building prompt positions. Add the encoder's CPU reference before CUDA parity. Image weights and patch buffers must be
 staged only while encoding; `--vision dynamic` must return encoder memory to the expert tier after each image batch.
 
+## Open items
+
+- **Per-layer slot weights (`core::ExpertTierSpec::layer_weights`) are unset for this model.** A table needs a per-layer
+  count of what each layer's misses cost, and this tree cannot produce one: `ExpertTier::report()` prints the aggregate
+  hit/copy/CPU split only, the console's expert map (serve path, `expert_map`) is a 640-pair routing sample rather than
+  per-layer misses, `--expert-profile-save` writes through Flash-Next's adaptive tier alone, and `--diag-dump` is wired
+  for DeepSeek-V4.1-Flash, Hy4-flash and Inkling 2 but not here. Any of three would produce the trace - route IDs from a
+  `--diag-dump` for this model, a per-layer line beside the TIER report, or a full rather than sampled per-layer tally.
+  The weights then follow Hy4-flash's method: a 768-token decode trace per fixture, each layer's misses priced at what
+  its CPU share took, the copies given four at a time where they save most, half the move kept. No value is guessed.
+
 ## Milestones and gates
 
 1. Finish converter identity/metadata checks and document pack tensor coverage.
