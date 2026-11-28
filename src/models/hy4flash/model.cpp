@@ -36,13 +36,10 @@ constexpr int kClaimsPerRow = 128;
 // the counts, session.cpp)
 constexpr int kVictimHalfLife = 256;
 // The main card's copies by layer (core::ExpertTierSpec::layer_weights) for the 41 layers of 512 experts: the early layers
-// route more widely and miss far more often (layers 0-3 sent 2.3-2.9 experts a token to the CPU at 141 copies each,
-// layers 15, 27 and 31-33 under 0.6). From 768-token plain decode routing traces of one prose and one code prompt
-// (2026-11-19, Hy4-flash-NVFP4.basalt, RTX 5090 + RTX 5060 Ti, 141 copies a layer at the time): per layer, the misses an
-// LRU of each size leaves, priced at what that layer's CPU share took (93 us an expert, the MoE's GPU share 75 us), and
-// the copies given four at a time where they save the most. The table keeps half of that move (0.5 + 0.5 x copies over
-// their mean): the whole of it took struct's six-row windows of repeated keys down 2% on serve, half of it took them up
-// 4.6% and prose up 2.3% (bench.sh, none of its fixtures in the traces).
+// route more widely and miss far more often than layers 15, 27 and 31-33. Derived from plain decode routing traces of prose
+// and code prompts: per layer, the misses an LRU of each size leaves, priced at what that layer's CPU share costs against the
+// MoE's GPU share, and the copies given four at a time where they save the most. The table keeps half of that move
+// (0.5 + 0.5 x copies over their mean): the whole of it favours short windows of repeated keys less than the half does.
 constexpr float kLayerSlotWeights[41] = {1.380f, 1.420f, 1.410f, 1.310f, 1.195f, 1.155f, 1.080f, 1.195f, 1.065f, 1.195f, 1.295f,
                                          1.025f, 1.165f, 1.240f, 1.065f, 0.725f, 0.940f, 0.785f, 1.040f, 0.925f, 1.265f, 1.010f,
                                          0.910f, 0.800f, 0.995f, 0.925f, 0.840f, 0.725f, 0.770f, 0.925f, 0.870f, 0.725f, 0.725f,

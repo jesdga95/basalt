@@ -1,4 +1,4 @@
-// include/basalt/model/batch_window.hpp - what every model's decode_batch builds first (docs/design/batching.md): the
+// include/basalt/model/batch_window.hpp - what every model's decode_batch builds first (docs/architecture/batching.md): the
 // windows of several sessions as one row-tagged window of segments, and the graphs of its compositions. Header-only, no GPU.
 #pragma once
 

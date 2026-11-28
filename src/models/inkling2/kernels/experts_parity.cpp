@@ -6,7 +6,7 @@
 //   - bits: each conversation's rows alone (a single window, the small tile shape) against the same rows in a batch window
 //     of 64 segments (the wide shape) and of 8 (the middle one); a call with experts off the card (the down writes the
 //     card's rows, the others come in, then the finish) against the same call with every expert on it;
-//   - --bench: us a call (gate/up + down) and GB/s of the experts' weights the call reads, at 1, 4, 8, 64, 256 and 320 rows.
+//   - --bench: time a call (gate/up + down) and bandwidth over the experts' weights the call reads, at 1, 4, 8, 64, 256 and 320 rows.
 #include "basalt/core/device_copy.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/expert_rows.hpp"

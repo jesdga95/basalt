@@ -2030,7 +2030,7 @@ void time_cpu_handoff() {
     for (void* q : {(void*) di, (void*) dt, (void*) da, (void*) dw, (void*) dx, (void*) dy}) cudaFree(q);
 }
 
-// A batch window (several conversations' rows in one call, docs/design/batching.md) against each conversation's own call:
+// A batch window (several conversations' rows in one call, docs/architecture/batching.md) against each conversation's own call:
 // the attention's q8_1 output, caches and rings, post_attn's outputs and rings, bitwise. Three segments
 // of 3, 1 and 2 rows (one at position 1, one past the window ring's wrap), over a window ring and a full cache, fp16 and E4M3.
 void test_batch_window() {

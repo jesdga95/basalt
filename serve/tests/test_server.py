@@ -3401,7 +3401,7 @@ class ThinkingBudget(unittest.TestCase):
         self.engine.generate = pt
 
     def test_thinking_budget_caps_the_thinking_not_the_reply_on_the_text_path(self):
-        # issue #512: the engine answers PT with the pass's cap (the budget); that must not become the total cap
+        # the engine answers PT with the pass's cap (the budget); that must not become the total cap
         self.engine.max_context = 16384
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40           # far longer than any budget below
         self._pt_engine()

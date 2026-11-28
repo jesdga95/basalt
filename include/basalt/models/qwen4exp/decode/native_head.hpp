@@ -10,7 +10,7 @@ class LoadPlan;
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
 /// activation scratch. The normal canonical head remains available for numerical A/B comparisons.
-/// Plan v0.3 P6: any type the native MMVQ takes (Q5_K in the Q2_0 / IQ3_XXS files, IQ4_XS in IQ2_XS).
+/// Any type the native MMVQ takes (Q5_K in the Q2_0 / IQ3_XXS files, IQ4_XS in IQ2_XS).
 /// `load` takes the model's shards (basalt::gguf_split_paths): the architecture is checked on the first, the
 /// tensor is read from the shard that holds it.
 class NativeHead {
@@ -30,7 +30,7 @@ public:
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
-    /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
+    /// The GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
     /// Bytes of one vocabulary row.
@@ -51,7 +51,7 @@ private:
     bool planes_ = false;
 };
 
-/// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
+/// `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
 /// is read over PCIe per token.  The rows of the lowest ids (the byte-level BPE gives the most frequent tokens the
 /// lowest ids) also have a VRAM copy, `kHotRows` of them, which the gathers read instead: it is allocated before the
 /// expert cache is sized, so it comes out of that cache.  `embed_row`, the verify window and the MTP drafter use it

@@ -396,7 +396,7 @@ int check_multitoken_bounds(bool vnni, bool avx512) {
         if (avx512 && cpu::iq512_supported(type)) check_pair("avx512", cpu::iq512_gu_rows, cpu::iq512_rows);
     }
 
-    // (2) IQ4_NL down rows (nt = 0, -1, 9, 13: previously overflowed stack y[8] for nt > 8)
+    // (2) IQ4_NL down rows (nt = 0, -1, 9, 13: must not overflow stack y[8] for nt > 8)
     {
         cpu::NativeFmt f;
         std::string err;
