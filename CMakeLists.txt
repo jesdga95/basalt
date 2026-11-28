@@ -643,6 +643,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/route_tail_skip.cu
                         src/kernels/cuda/row_norm.cu
                         src/kernels/cuda/sparse_mqa.cu
+                        src/kernels/cuda/sparse_mqa_out_grouped.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BUILD_TESTING)

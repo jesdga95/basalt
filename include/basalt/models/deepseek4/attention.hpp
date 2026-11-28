@@ -19,6 +19,9 @@ size_t attention_kv_scratch_bytes(int n_tokens);
 void project_attention_kv(const float* x, int wkv_type, const void* wkv, const float* norm, float rms_eps,
                           const int32_t* positions, const kernels::MqaRopeTable& rope, int n_tokens,
                           void* q8_scratch, float* projected, float* out, void* stream);
+void project_attention_kv_q8(const void* x_q8_1, int wkv_type, const void* wkv, const float* norm, float rms_eps,
+                             const int32_t* positions, const kernels::MqaRopeTable& rope, int n_tokens,
+                             float* projected, float* out, void* stream);
 
 /// Writes prepared `[T][512]` values to the sliding cache slot `position % 128` in `fmt`'s row layout (win_row_bytes);
 /// ring slots must be unique within the call.

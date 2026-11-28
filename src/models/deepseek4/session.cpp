@@ -4,6 +4,7 @@
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/mhc.hpp"
+#include "basalt/kernels/row_norm.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/dense_ops.hpp"
@@ -86,11 +87,14 @@ public:
         images_done();
         for (void* p : device_) if (p) cudaFree(p);
         if (stream_) cudaStreamDestroy(stream_);
+        if (row_st_) cudaStreamDestroy(row_st_);
+        for (cudaEvent_t ev : row_ev_) if (ev) cudaEventDestroy(ev);
         if (h_expert_input_) cudaFreeHost(h_expert_input_);
         if (h_expert_rows_) cudaFreeHost(h_expert_rows_);
         if (h_expert_ids_) cudaFreeHost(h_expert_ids_);
         if (h_expert_seq_) cudaFreeHost(h_expert_seq_);
         if (h_route_meta_) cudaFreeHost(h_route_meta_);
+        if (h_route_meta_dyn_) cudaFreeHost(h_route_meta_dyn_);
         if (h_join_) cudaFreeHost(h_join_);
         if (feat_ev_) cudaEventDestroy(feat_ev_);
         if (h_initial_) cudaFreeHost(h_initial_);
@@ -98,8 +102,11 @@ public:
 
     bool init(std::string& err) {
         format_ = model_.cache_format();
-        if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
-            err = "cannot create a CUDA stream";
+        if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&row_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&row_ev_[0], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&row_ev_[1], cudaEventDisableTiming) != cudaSuccess) {
+            err = "cannot create CUDA streams";
             return false;
         }
         const size_t n = (size_t) geo_.n_embd;
@@ -178,12 +185,14 @@ public:
             cudaHostAlloc(reinterpret_cast<void**>(&h_expert_seq_), 64, host_flags) != cudaSuccess ||
             cudaHostAlloc(reinterpret_cast<void**>(&h_join_), 64, host_flags) != cudaSuccess ||
             cudaHostAlloc(reinterpret_cast<void**>(&h_route_meta_), sizeof(RouteMeta), host_flags) != cudaSuccess ||
+            cudaHostAlloc(reinterpret_cast<void**>(&h_route_meta_dyn_), sizeof(RouteMeta), host_flags) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_input_), h_expert_input_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_ids_), h_expert_ids_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_seq_), h_expert_seq_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_join_), h_join_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_rows_), h_expert_rows_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_route_meta_), h_route_meta_, 0) != cudaSuccess) {
+            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_route_meta_), h_route_meta_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_route_meta_dyn_), h_route_meta_dyn_, 0) != cudaSuccess) {
             err = "cannot map the expert staging buffers";
             return false;
         }
@@ -241,6 +250,45 @@ public:
                 err = "deepseek4: cannot allocate dspark feature tap buffer";
                 return false;
             }
+        }
+        layers_.resize((size_t) geo_.n_layers);
+        for (int layer = 0; layer < geo_.n_layers; ++layer) {
+            ResolvedLayer& rl = layers_[(size_t) layer];
+            if (!model_.weights().attention_layer_weights(layer, rl.attention, err) ||
+                !model_.weights().ffn_layer_weights(layer, rl.route, rl.shared, err)) {
+                err = "deepseek4: " + err;
+                return false;
+            }
+            const ExpertLayer& ex = model_.weights().pack().experts[(size_t) layer];
+            rl.expert_layout = kernels::native_expert_layout(ex.gate_up_type, ex.down_type, geo_.n_embd, geo_.n_ff_exp,
+                                                             geo_.swiglu_limit);
+            const int ratio = geo_.compress_ratio[(size_t) layer];
+            if (ratio) {
+                rl.attn_ape = model_.weights().tensor(layer, "attn_compressor_ape.weight");
+                rl.attn_norm = model_.weights().tensor(layer, "attn_compressor_norm.weight");
+                rl.attn_gate = model_.weights().tensor(layer, "attn_compressor_gate.weight");
+                rl.attn_kv = model_.weights().tensor(layer, "attn_compressor_kv.weight");
+                if (!rl.attn_ape || !rl.attn_norm || !rl.attn_gate || !rl.attn_kv) {
+                    err = "deepseek4: compressed-attention layer is missing validated compressor tensors";
+                    return false;
+                }
+                if (ratio == 4) {
+                    rl.index_ape = model_.weights().tensor(layer, "indexer_compressor_ape.weight");
+                    rl.index_norm = model_.weights().tensor(layer, "indexer_compressor_norm.weight");
+                    rl.index_gate = model_.weights().tensor(layer, "indexer_compressor_gate.weight");
+                    rl.index_kv = model_.weights().tensor(layer, "indexer_compressor_kv.weight");
+                    rl.index_q = model_.weights().tensor(layer, "indexer.attn_q_b.weight");
+                    rl.index_proj = model_.weights().tensor(layer, "indexer.proj.weight");
+                    if (!rl.index_ape || !rl.index_norm || !rl.index_gate || !rl.index_kv || !rl.index_q || !rl.index_proj) {
+                        err = "deepseek4: CSA layer is missing validated indexer tensors";
+                        return false;
+                    }
+                }
+            }
+        }
+        if (!model_.weights().head_weights(head_weights_, err)) {
+            err = "deepseek4: " + err;
+            return false;
         }
         err.clear();
         return true;
@@ -914,7 +962,19 @@ private:
     DsModel& model_;
     const Geometry& geo_;
     model::BatchShared& batch_shared_;
-    cudaStream_t stream_ = nullptr;
+    struct ResolvedLayer {
+        AttentionLayerWeights attention;
+        FfnRouteWeights route;
+        SharedExpertWeights shared;
+        kernels::NativeExpertLayout expert_layout;
+        const DeviceTensor *attn_ape = nullptr, *attn_norm = nullptr, *attn_gate = nullptr, *attn_kv = nullptr;
+        const DeviceTensor *index_ape = nullptr, *index_norm = nullptr, *index_gate = nullptr, *index_kv = nullptr,
+                           *index_q = nullptr, *index_proj = nullptr;
+    };
+    std::vector<ResolvedLayer> layers_;
+    HeadWeights head_weights_{};
+    cudaStream_t stream_ = nullptr, row_st_ = nullptr;
+    cudaEvent_t row_ev_[2]{};
     std::vector<void*> device_;
     std::vector<RopeTables> ropes_;
     std::vector<LayerCache> layer_cache_;
@@ -979,6 +1039,7 @@ private:
     uint32_t join_seq_ = 0;
     int32_t* d_expert_ids_ = nullptr;
     RouteMeta *h_route_meta_ = nullptr, *d_route_meta_ = nullptr;
+    RouteMeta *h_route_meta_dyn_ = nullptr, *d_route_meta_dyn_ = nullptr;
 };
 
 bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings,
@@ -1036,17 +1097,25 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
     }
 
     if (begin_tier) if (core::ExpertTier* tier = model_.tier()) tier->begin_token(n_tokens);
+    if (!attention_only) {
+        for (int t = 0; t < n_tokens; ++t) {
+            const int32_t tok = tokens[t];
+            const bool image = tok >= geo_.n_vocab;
+            h_route_meta_->fixed_row[t] = image ? 0 : tok;
+            h_route_meta_->fixed_mask[t] = (uint8_t) !image;
+            h_route_meta_->alternate_mask[t] = (uint8_t) image;
+            h_route_meta_dyn_->fixed_row[t] = 0;
+            h_route_meta_dyn_->fixed_mask[t] = 0;
+            h_route_meta_dyn_->alternate_mask[t] = (uint8_t) image;
+        }
+    }
     const int first_layer = layer_only >= 0 ? layer_only : 0;
     const int end_layer = layer_only >= 0 ? layer_only + 1 : geo_.n_layers;
     for (int layer = first_layer; layer < end_layer; ++layer) {
-        AttentionLayerWeights attention;
-        FfnRouteWeights route;
-        SharedExpertWeights shared;
-        if (!model_.weights().attention_layer_weights(layer, attention, err_) ||
-            !model_.weights().ffn_layer_weights(layer, route, shared, err_)) {
-            err_ = "deepseek4: " + err_;
-            return false;
-        }
+        const ResolvedLayer& rl = layers_[(size_t) layer];
+        const AttentionLayerWeights& attention = rl.attention;
+        FfnRouteWeights route = rl.route;
+        const SharedExpertWeights& shared = rl.shared;
         AttentionLayerScratch attention_scratch;
         attention_scratch.hc_workspace = hc_workspace_;
         attention_scratch.coefficients = attn_coef_;
@@ -1091,27 +1160,19 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                     return false;
                 };
 
-                const DeviceTensor* attn_ape = model_.weights().tensor(layer, "attn_compressor_ape.weight");
-                const DeviceTensor* attn_norm = model_.weights().tensor(layer, "attn_compressor_norm.weight");
-                const DeviceTensor* attn_gate = model_.weights().tensor(layer, "attn_compressor_gate.weight");
-                const DeviceTensor* attn_kv = model_.weights().tensor(layer, "attn_compressor_kv.weight");
-                if (!attn_ape || !attn_norm || !attn_gate || !attn_kv) {
-                    err_ = "deepseek4: compressed-attention layer is missing validated compressor tensors";
-                    return false;
-                }
+                const DeviceTensor* attn_ape = rl.attn_ape;
+                const DeviceTensor* attn_norm = rl.attn_norm;
+                const DeviceTensor* attn_gate = rl.attn_gate;
+                const DeviceTensor* attn_kv = rl.attn_kv;
                 if (!ensure_cache(*cache.attention, cache_bytes)) return false;
 
                 if (ratio == 4) {
-                    const DeviceTensor* index_ape = model_.weights().tensor(layer, "indexer_compressor_ape.weight");
-                    const DeviceTensor* index_norm = model_.weights().tensor(layer, "indexer_compressor_norm.weight");
-                    const DeviceTensor* index_gate = model_.weights().tensor(layer, "indexer_compressor_gate.weight");
-                    const DeviceTensor* index_kv = model_.weights().tensor(layer, "indexer_compressor_kv.weight");
-                    const DeviceTensor* index_q = model_.weights().tensor(layer, "indexer.attn_q_b.weight");
-                    const DeviceTensor* index_proj = model_.weights().tensor(layer, "indexer.proj.weight");
-                    if (!index_ape || !index_norm || !index_gate || !index_kv || !index_q || !index_proj) {
-                        err_ = "deepseek4: CSA layer is missing validated indexer tensors";
-                        return false;
-                    }
+                    const DeviceTensor* index_ape = rl.index_ape;
+                    const DeviceTensor* index_norm = rl.index_norm;
+                    const DeviceTensor* index_gate = rl.index_gate;
+                    const DeviceTensor* index_kv = rl.index_kv;
+                    const DeviceTensor* index_q = rl.index_q;
+                    const DeviceTensor* index_proj = rl.index_proj;
                     if (!ensure_cache(*cache.indexer, (uint64_t) visible * idx_row_bytes(format_))) return false;
 
                     kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
@@ -1188,27 +1249,38 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
 
         if (attention_only) return true;
 
-        RouteRows rows;
-        if (!build_route_rows(tokens, n_tokens, geo_.n_vocab, layer, geo_.n_layers, geo_.hash_layers, rows, err_)) return false;
-        std::copy_n(rows.fixed_rows.data(), n_tokens, h_route_meta_->fixed_row);
-        std::copy_n(rows.fixed_mask.data(), n_tokens, h_route_meta_->fixed_mask);
-        std::copy_n(rows.alternate_mask.data(), n_tokens, h_route_meta_->alternate_mask);
+        const RouteMeta* rm = layer < geo_.hash_layers ? d_route_meta_ : d_route_meta_dyn_;
         route.routing = router_mixed_args(geo_.n_expert, geo_.n_vocab,
             layer < geo_.hash_layers ? hash_routes_ + (size_t) layer * geo_.n_vocab * 6 : nullptr,
-            route_fixed_row_, route_fixed_mask_, route_alt_mask_, route.routing.bias, route.routing.alternate_bias);
+            rm->fixed_row, rm->fixed_mask, rm->alternate_mask, route.routing.bias, route.routing.alternate_bias);
 
-        FfnRouteScratch route_scratch{hc_workspace_, ffn_coef_, collapsed_, ffn_normed_, router_logits_, route_ids_, route_weights_};
+        const int n_ids = n_tokens * geo_.n_used;
         try {
+            kernels::hc_mixes(next_streams_, route.hc_fn, route.hc_scale, route.hc_base, n_tokens, route.hc,
+                              hc_workspace_, ffn_coef_, stream_);
+            kernels::hc_pre_rms_norm(next_streams_, ffn_coef_, kernels::kHcCoef, route.norm, n_tokens, geo_.n_embd,
+                                     route.hc.rms_eps, collapsed_, ffn_normed_, stream_);
+            if (cudaEventRecord(row_ev_[0], stream_) != cudaSuccess ||
+                cudaStreamWaitEvent(row_st_, row_ev_[0], 0) != cudaSuccess ||
+                cudaMemcpyAsync(d_expert_input_, ffn_normed_, (size_t) n_tokens * geo_.n_embd * sizeof(float),
+                                cudaMemcpyDeviceToDevice, row_st_) != cudaSuccess ||
+                cudaEventRecord(row_ev_[1], row_st_) != cudaSuccess)
+                return fail_cuda("expert input stage");
+            router_step(ffn_normed_, route.gate, n_tokens, geo_.n_embd, route.routing, router_logits_,
+                        route_ids_, route_weights_, stream_);
+            if (cudaStreamWaitEvent(stream_, row_ev_[1], 0) != cudaSuccess)
+                return fail_cuda("expert input wait");
+            kernels::doorbell_publish(nullptr, route_ids_, nullptr, 0, n_ids, nullptr, d_expert_ids_, nullptr,
+                                      d_expert_seq_, stream_);
             SharedExpertScratch shared_scratch{shared_in_q8_, shared_hidden_q8_, shared_gate_, shared_up_, shared_hidden_};
-            prepare_ffn_routes(next_streams_, n_tokens, route, route_scratch, stream_);
             shared_expert_step(ffn_normed_, n_tokens, shared, shared_scratch, shared_output_, stream_);
         } catch (const std::exception& e) {
             err_ = std::string("deepseek4 FFN layer ") + std::to_string(layer) + ": " + e.what();
             return false;
         }
-        if (!routed_step(layer, ffn_normed_, n_tokens, route, route_weights_, routed_output_)) return false;
+        if (!routed_step(layer, ffn_normed_, n_tokens, route, route_weights_, ffn_output_)) return false;
         try {
-            finish_ffn_layer(next_streams_, ffn_coef_, shared_output_, routed_output_, n_tokens, geo_.n_embd,
+            kernels::hc_post(ffn_output_, next_streams_, ffn_coef_, kernels::kHcCoef, n_tokens, geo_.n_embd,
                              streams_, stream_);
         } catch (const std::exception& e) {
             err_ = std::string("deepseek4 FFN finish ") + std::to_string(layer) + ": " + e.what();
@@ -1240,14 +1312,9 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
         feat_staged_ = true;
     }
 
-    HeadWeights head;
-    if (!model_.weights().head_weights(head, err_)) {
-        err_ = "deepseek4: " + err_;
-        return false;
-    }
     HeadScratch head_scratch{head_hc_workspace_, head_coef_, head_collapsed_, head_normed_};
     try {
-        model_head_step(streams_, n_tokens, head, head_scratch, final_logits_, stream_);
+        model_head_step(streams_, n_tokens, head_weights_, head_scratch, final_logits_, stream_);
     } catch (const std::exception& e) {
         err_ = std::string("deepseek4 output head: ") + e.what();
         return false;
@@ -1728,10 +1795,8 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
 
     const int n_ids = n_tokens * geo_.n_used;
     const uint32_t sequence = *h_expert_seq_;
-    kernels::doorbell_publish(normalized, route_ids_, weights, (int64_t) n_tokens * geo_.n_embd, n_ids, d_expert_input_, d_expert_ids_,
-                              nullptr, d_expert_seq_, stream_);
 
-    // The single publish kernel writes both payloads before advancing the mapped sequence word.
+    // The single publish kernel writes ids before advancing the mapped sequence word.
     bool ids_ready = false;
     const volatile uint32_t* staged_sequence = h_expert_seq_;
     for (int spin = 0; spin < (1 << 22); ++spin) {
@@ -1875,7 +1940,7 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
         join_guard.val = ++join_seq_;
         kernels::wait_word(d_join_, join_guard.val, stream_);
     }
-    weighted_route_sum_ptrs(rp, weights, nullptr, n_tokens, geo_.n_embd, output, stream_);
+    weighted_route_sum_ptrs(rp, weights, shared_output_, n_tokens, geo_.n_embd, output, stream_);
 
     if (cpu) tier->finish_cpu();
     if (reading) {

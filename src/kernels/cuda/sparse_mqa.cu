@@ -1,5 +1,6 @@
 // Shared 64-head sparse MQA with an attention sink and inverse RoPE.
 #include "basalt/kernels/sparse_mqa.hpp"
+#include "sparse_mqa_out_grouped.hpp"
 #include "basalt/kernels/mqa_chunk.cuh"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q8_1_fm.cuh"
@@ -463,12 +464,14 @@ void sparse_mqa_output_q8(int wo_a_type, const void* wo_a, int wo_b_type, const 
     constexpr int output_width = kSparseMqaOutputGroups * kSparseMqaOutputRank;
     const size_t per_group_x = native_q8_1_bytes(kSparseMqaGroupInput, 1);
     const size_t per_group_w = native_mmvq_weight_bytes(wo_a_type, kSparseMqaGroupInput, kSparseMqaOutputRank);
-    for (int t = 0; t < n_tokens; ++t) {
-        for (int g = 0; g < kSparseMqaOutputGroups; ++g) {
-            const auto* wx = static_cast<const uint8_t*>(q8_scratch) + (size_t) (t * kSparseMqaOutputGroups + g) * per_group_x;
-            const auto* ww = static_cast<const uint8_t*>(wo_a) + (size_t) g * per_group_w;
-            native_mmvq(wo_a_type, ww, wx, latent + (size_t) t * output_width + (size_t) g * kSparseMqaOutputRank,
-                        kSparseMqaGroupInput, kSparseMqaOutputRank, 1, stream);
+    if (!sparse_mqa_wo_a_grouped(wo_a_type, wo_a, q8_scratch, latent, n_tokens, stream)) {
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int g = 0; g < kSparseMqaOutputGroups; ++g) {
+                const auto* wx = static_cast<const uint8_t*>(q8_scratch) + (size_t) (t * kSparseMqaOutputGroups + g) * per_group_x;
+                const auto* ww = static_cast<const uint8_t*>(wo_a) + (size_t) g * per_group_w;
+                native_mmvq(wo_a_type, ww, wx, latent + (size_t) t * output_width + (size_t) g * kSparseMqaOutputRank,
+                            kSparseMqaGroupInput, kSparseMqaOutputRank, 1, stream);
+            }
         }
     }
     native_quantize_q8_1(latent, q8_scratch, output_width, n_tokens, stream);

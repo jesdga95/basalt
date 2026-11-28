@@ -11,6 +11,18 @@ size_t attention_kv_scratch_bytes(int n_tokens) {
     return kernels::native_q8_1_bytes(4096, n_tokens);
 }
 
+void project_attention_kv_q8(const void* x_q8_1, int wkv_type, const void* wkv, const float* norm, float rms_eps,
+                             const int32_t* positions, const kernels::MqaRopeTable& rope, int n_tokens,
+                             float* projected, float* out, void* stream) {
+    attention_kv_scratch_bytes(n_tokens);
+    if (!x_q8_1 || !wkv || !norm || !positions || !projected || !out || !stream ||
+        !kernels::native_mmvq_supported(wkv_type))
+        throw std::invalid_argument("deepseek4 project_attention_kv_q8: invalid arguments or weight type");
+    (void) kernels::native_mmvq_weight_bytes(wkv_type, 4096, 512);
+    kernels::native_mmvq(wkv_type, wkv, x_q8_1, projected, 4096, 512, n_tokens, stream);
+    prepare_attention_kv(projected, norm, rms_eps, positions, rope, n_tokens, out, stream);
+}
+
 void project_attention_kv(const float* x, int wkv_type, const void* wkv, const float* norm, float rms_eps,
                           const int32_t* positions, const kernels::MqaRopeTable& rope, int n_tokens,
                           void* q8_scratch, float* projected, float* out, void* stream) {
@@ -18,10 +30,8 @@ void project_attention_kv(const float* x, int wkv_type, const void* wkv, const f
     if (!x || !wkv || !norm || !positions || !q8_scratch || !projected || !out || !stream ||
         !kernels::native_mmvq_supported(wkv_type))
         throw std::invalid_argument("deepseek4 project_attention_kv: invalid arguments or weight type");
-    (void) kernels::native_mmvq_weight_bytes(wkv_type, 4096, 512);
     kernels::native_quantize_q8_1(x, q8_scratch, 4096, n_tokens, stream);
-    kernels::native_mmvq(wkv_type, wkv, q8_scratch, projected, 4096, 512, n_tokens, stream);
-    prepare_attention_kv(projected, norm, rms_eps, positions, rope, n_tokens, out, stream);
+    project_attention_kv_q8(q8_scratch, wkv_type, wkv, norm, rms_eps, positions, rope, n_tokens, projected, out, stream);
 }
 
 void attention_step(const float* x, const AttentionStepWeights& w, const kernels::MqaRopeTable& rope,
@@ -38,8 +48,8 @@ void attention_step(const float* x, const AttentionStepWeights& w, const kernels
     kernels::native_quantize_q8_1(x, s.input_q8, 4096, n_tokens, stream);
     kernels::sparse_mqa_q_latent(s.input_q8, w.q, n_tokens, s.q_latent, s.q_latent_q8, stream);
     kernels::sparse_mqa_q_heads(w.q, n_tokens, selection.pos, rope, s.q_latent_q8, s.q_heads, stream);
-    project_attention_kv(x, w.kv_type, w.kv, w.kv_norm, w.q.rms_eps, selection.pos, rope, n_tokens, s.input_q8,
-                         s.kv_projected, s.kv_row, stream);
+    project_attention_kv_q8(s.input_q8, w.kv_type, w.kv, w.kv_norm, w.q.rms_eps, selection.pos, rope, n_tokens,
+                            s.kv_projected, s.kv_row, stream);
     // Stage all projections together, then make each row's cache visible only after its causal attention has read the
     // previous ring. A bulk cache write would let a later row overwrite a wrapped slot still needed by an earlier row.
     for (int t = 0; t < n_tokens; ++t) {

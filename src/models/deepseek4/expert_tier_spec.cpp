@@ -30,7 +30,7 @@ bool make_expert_tier_spec(const Pack& pack, const std::string& path, int expert
             err = "deepseek4 expert tier: invalid expert blob for layer " + std::to_string(layer);
             return false;
         }
-        out.layers.push_back({e.gate_up_type, e.down_type, e.offset, e.bytes, 0.f});
+        out.layers.push_back({e.gate_up_type, e.down_type, e.offset, e.bytes, g.swiglu_limit});
         out.share_stride = std::max(out.share_stride, e.bytes);
     }
 
