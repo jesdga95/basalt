@@ -27,6 +27,12 @@ void project_attention_kv_q8(const void* x_q8_1, int wkv_type, const void* wkv, 
 /// ring slots must be unique within the call.
 void cache_attention_window(void* ring, const float* rows, const int32_t* positions, int n_tokens, CacheFormat fmt,
                             void* stream);
+/// Stage window rows into `stage[pos % stage_cap]` and (for `t >= ring_from`) `ring[pos % 128]`.
+void window_stage_copy(const void* ring, void* stage, int stage_cap, int64_t p_lo, int count, CacheFormat fmt,
+                       void* stream);
+void kv_window_stage(const float* projected, const float* norm, float rms_eps, const int32_t* positions,
+                     const kernels::MqaRopeTable& rope, int n_tokens, void* stage, int stage_cap, void* ring,
+                     int ring_from, CacheFormat fmt, void* stream);
 /// The fp32 ring the step/parity paths use.
 void cache_attention_window_f32(float* ring, const float* rows, const int32_t* positions, int n_tokens, void* stream);
 

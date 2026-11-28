@@ -61,4 +61,9 @@ void indexer_select_window(const float* q, const float* head_weights, const void
                            const int32_t* pos, int n_tokens, int32_t* out_ids, int32_t* n_selected,
                            void* workspace, size_t workspace_bytes, CacheFormat fmt, void* stream);
 
+size_t indexer_select_batch_workspace_bytes(int max_tokens, int max_comp);
+void indexer_select_batch(const float* q, const float* head_weights, const void* keys, int max_comp,
+                          const int32_t* pos, int n_tokens, int32_t* out_ids, int32_t* n_selected,
+                          void* workspace, size_t workspace_bytes, CacheFormat fmt, void* stream);
+
 }  // namespace basalt::models::deepseek4

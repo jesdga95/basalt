@@ -1,10 +1,11 @@
 #include "basalt/models/deepseek4/indexer.hpp"
 #include "cache_rows.cuh"
 
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
-
 #include <cuda_runtime.h>
 #include <cub/device/device_radix_sort.cuh>
+#include <mma.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -754,6 +755,155 @@ void indexer_select_window(const float* q, const float* head_weights, const void
     win_select_final_kernel<<<dim3(1, n_tokens), kWinTopkThreads, 0, s>>>(
         max_comp, out_ids, n_selected, pos, st, stride);
     check(cudaGetLastError(), "window selection launch");
+}
+
+namespace {
+
+namespace wmma = nvcuda::wmma;
+constexpr int kTcTok = 2, kTcRows = 64, kTcLd = kIndexerDim + 8, kTcCLd = kTcRows + 4, kTcThreads = 256,
+              kTcScoreBlocks = 64;
+constexpr int kTcM = kTcTok * kIndexerHeads;   // 128 = 8 warps * 16
+constexpr size_t kTcSmem = (size_t) kTcM * kTcLd * 2 + (size_t) kTcRows * kTcLd * 2 + (size_t) kTcM * kTcCLd * 4;
+static_assert(kTcM / 16 == kTcThreads / 32, "a warp per 16 query rows");
+
+__global__ void __launch_bounds__(kTcThreads) idx_score_tc_kernel(const float* __restrict__ iq,
+                                                                   const float* __restrict__ iw,
+                                                                   const int32_t* __restrict__ pos, int n_tokens,
+                                                                   const uint8_t* __restrict__ ik, int n_comp,
+                                                                   float* __restrict__ scores) {
+    extern __shared__ __align__(128) unsigned char tc_smem[];
+    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(tc_smem);
+    __nv_bfloat16* Bs = As + (size_t) kTcM * kTcLd;
+    float* Cs = reinterpret_cast<float*>(Bs + (size_t) kTcRows * kTcLd);
+    __shared__ float wsh[kTcTok][kIndexerHeads];
+    const int t0 = blockIdx.y * kTcTok, nt = min(kTcTok, n_tokens - t0);
+    const int n_eff = win_eff_rows(pos, n_tokens, n_comp);
+    if (blockIdx.x * kTcRows >= n_eff) return;
+    for (int i = threadIdx.x; i < kTcM * kIndexerDim; i += kTcThreads) {
+        const int r = i / kIndexerDim, d = i % kIndexerDim, t = r / kIndexerHeads;
+        As[r * kTcLd + d] = __float2bfloat16(
+            t < nt ? iq[(size_t) (t0 + t) * kIndexerHeads * kIndexerDim + (size_t) (r % kIndexerHeads) * kIndexerDim + d]
+                   : 0.f);
+    }
+    if (threadIdx.x < kTcTok * kIndexerHeads) {
+        const int t = threadIdx.x / kIndexerHeads, h = threadIdx.x % kIndexerHeads;
+        wsh[t][h] = t < nt ? iw[(t0 + t) * kIndexerHeads + h] : 0.f;
+    }
+    const int warp = threadIdx.x >> 5;
+    for (int base = blockIdx.x * kTcRows; base < n_eff; base += gridDim.x * kTcRows) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < kTcRows * (kIndexerDim / 8); i += kTcThreads) {
+            const int r = i / (kIndexerDim / 8), c = i % (kIndexerDim / 8), j = base + r;
+            float k[8];
+            if (j < n_eff) {
+                const uint8_t* row = ik + (size_t) j * kIdxRowBytes;
+                const uint32_t sw = *reinterpret_cast<const uint32_t*>(row + kIndexerDim / 2);
+                rows::fp4p_values<8>(reinterpret_cast<const uint32_t*>(row)[c], (sw >> (8 * (c / 4))) & 0xffu, k);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) k[e] = 0.f;
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) Bs[r * kTcLd + c * 8 + e] = __float2bfloat16(k[e]);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kTcRows / 16];
+#pragma unroll
+        for (int n = 0; n < kTcRows / 16; ++n) wmma::fill_fragment(acc[n], 0.f);
+#pragma unroll
+        for (int kk = 0; kk < kIndexerDim / 16; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+            wmma::load_matrix_sync(a, As + (size_t) warp * 16 * kTcLd + kk * 16, kTcLd);
+#pragma unroll
+            for (int n = 0; n < kTcRows / 16; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+                wmma::load_matrix_sync(b, Bs + (size_t) n * 16 * kTcLd + kk * 16, kTcLd);
+                wmma::mma_sync(acc[n], a, b, acc[n]);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < kTcRows / 16; ++n)
+            wmma::store_matrix_sync(Cs + (size_t) warp * 16 * kTcCLd + n * 16, acc[n], kTcCLd, wmma::mem_row_major);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < kTcTok * kTcRows; idx += kTcThreads) {
+            const int t = idx / kTcRows, jj = idx % kTcRows, j = base + jj;
+            if (t < nt && j < n_eff) {
+                const int nv = (pos[t0 + t] + 1) / kRatio;
+                float s = -INFINITY;
+                if (j < nv) {
+                    s = 0.f;
+#pragma unroll
+                    for (int h = 0; h < kIndexerHeads; ++h)
+                        s += fmaxf(Cs[(size_t) (t * kIndexerHeads + h) * kTcCLd + jj], 0.f) * wsh[t][h];
+                }
+                scores[(size_t) (t0 + t) * n_comp + j] = s;
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(kWinTopkThreads) win_topk_batch_kernel(const float* __restrict__ scores, int n,
+                                                                          int K, int32_t* __restrict__ out,
+                                                                          int32_t* __restrict__ out_n,
+                                                                          const int32_t* __restrict__ pos) {
+    const int t = blockIdx.x;
+    const int rows = win_sel_rows(n, pos + t);
+    win_topk_one(scores + (size_t) t * n, rows, K, out + (size_t) t * kIndexerTopK, out_n + t);
+}
+
+}  // namespace
+
+size_t indexer_select_batch_workspace_bytes(int max_tokens, int max_comp) {
+    if (max_tokens < 1 || max_comp < 1 || max_comp > kMaxRows)
+        throw std::invalid_argument("deepseek4 indexer_select_batch: invalid capacity");
+    size_t bytes = align256((size_t) max_tokens * max_comp * sizeof(float)) + 256;
+    if (max_comp > kWinSelOneBlock) bytes += (size_t) max_tokens * win_sel_stride(max_comp);
+    return bytes;
+}
+
+void indexer_select_batch(const float* q, const float* head_weights, const void* keys, int max_comp,
+                          const int32_t* pos, int n_tokens, int32_t* out_ids, int32_t* n_selected,
+                          void* workspace, size_t workspace_bytes, CacheFormat fmt, void* stream) {
+    if (!q || !head_weights || !keys || !pos || !out_ids || !n_selected || !workspace ||
+        max_comp < 1 || max_comp > kMaxRows || n_tokens < 1 || n_tokens > 65535 ||
+        workspace_bytes < indexer_select_batch_workspace_bytes(n_tokens, max_comp) || fmt == CacheFormat::F32)
+        throw std::invalid_argument("deepseek4 indexer_select_batch: invalid arguments");
+    auto* base = static_cast<unsigned char*>(workspace);
+    auto* scores = reinterpret_cast<float*>(base);
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (fmt == CacheFormat::Fp8) {
+        static bool attr = false;
+        if (!attr) {
+            cudaFuncSetAttribute(idx_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem);
+            attr = true;
+        }
+        dim3 g(std::min((max_comp + kTcRows - 1) / kTcRows, kTcScoreBlocks), (n_tokens + kTcTok - 1) / kTcTok);
+        idx_score_tc_kernel<<<g, kTcThreads, kTcSmem, s>>>(q, head_weights, pos, n_tokens,
+                                                           static_cast<const uint8_t*>(keys), max_comp, scores);
+    } else {
+        dim3 g(std::min((max_comp + 127) / 128, kWinScoreBlocks), n_tokens);
+        win_idx_score_kernel<false><<<g, 128, 0, s>>>(q, head_weights, pos, static_cast<const uint8_t*>(keys),
+                                                      max_comp, idx_row_bytes(fmt), scores);
+    }
+    check(cudaGetLastError(), "batch score launch");
+    if (max_comp <= kWinSelOneBlock) {
+        win_topk_batch_kernel<<<n_tokens, kWinTopkThreads, 0, s>>>(scores, max_comp, kIndexerTopK, out_ids,
+                                                                   n_selected, pos);
+    } else {
+        auto* st = reinterpret_cast<WinSelState*>(base + align256((size_t) n_tokens * max_comp * sizeof(float)));
+        const size_t stride = win_sel_stride(max_comp);
+        const int grid = std::min((max_comp + kWinSelThreads - 1) / kWinSelThreads, kWinSelBlocks);
+        win_select_begin_kernel<<<dim3(1, n_tokens), kWinTopkThreads, 0, s>>>(
+            scores, max_comp, kIndexerTopK, out_ids, n_selected, pos, st, stride);
+        for (int pass = 0; pass < 4; ++pass)
+            win_select_pass_kernel<<<dim3(grid, n_tokens), kWinSelThreads, 0, s>>>(
+                scores, max_comp, kIndexerTopK, pos, pass, st, stride);
+        win_select_mask_kernel<<<dim3(grid, n_tokens), kWinSelThreads, 0, s>>>(
+            scores, max_comp, kIndexerTopK, pos, st, stride);
+        win_select_final_kernel<<<dim3(1, n_tokens), kWinTopkThreads, 0, s>>>(
+            max_comp, out_ids, n_selected, pos, st, stride);
+    }
+    check(cudaGetLastError(), "batch selection launch");
 }
 
 }  // namespace basalt::models::deepseek4

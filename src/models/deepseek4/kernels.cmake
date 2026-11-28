@@ -7,6 +7,7 @@ add_library(deepseek4_kernels STATIC
   src/models/deepseek4/shared_expert.cu
   src/models/deepseek4/routed_expert.cu
   src/models/deepseek4/attention.cu
+  src/models/deepseek4/prefill_attn.cu
   src/models/deepseek4/compress.cu
   src/models/deepseek4/indexer_compress.cu
   src/models/deepseek4/indexer_project.cu

@@ -137,4 +137,79 @@ void cache_attention_window_f32(float* ring, const float* rows, const int32_t* p
     check_launch();
 }
 
+namespace {
+
+__global__ void window_copy_kernel(const uint4* __restrict__ ring, uint4* __restrict__ stage, int stage_cap,
+                                   int64_t p_lo) {
+    const int words = blockDim.x;
+    const int64_t p = p_lo + blockIdx.x;
+    stage[(size_t) (p % stage_cap) * words + threadIdx.x] = ring[(size_t) (p % 128) * words + threadIdx.x];
+}
+
+__global__ void kv_window_stage_kernel(const float* __restrict__ projected, const float* __restrict__ norm, float eps,
+                                       const int32_t* __restrict__ positions, kernels::MqaRopeTable rope,
+                                       uint8_t* __restrict__ stage, int stage_cap, uint8_t* __restrict__ ring,
+                                       int ring_from, int row_bytes, int mode) {
+    __shared__ float row[D];
+    __shared__ float partial[Threads / 32];
+    const int token = blockIdx.x;
+    const int i = threadIdx.x;
+    const size_t base = (size_t) token * D;
+
+    row[i] = bf16_round(projected[base + i]);
+    const float square_sum = reduce_sum(row[i] * row[i], partial);
+    row[i] = bf16_round(row[i] * rsqrtf(square_sum / D + eps) * norm[i]);
+    __syncthreads();
+
+    if (i < Rope / 2) {
+        const int d = QuantWidth + i * 2;
+        float sine, cosine;
+        sincosf((float) positions[token] * rope.step[i], &sine, &cosine);
+        cosine *= rope.mscale;
+        sine *= rope.mscale;
+        const float a = row[d];
+        const float b = row[d + 1];
+        row[d] = bf16_round(a * cosine - b * sine);
+        row[d + 1] = bf16_round(a * sine + b * cosine);
+    }
+    __syncthreads();
+
+    const int position = positions[token];
+    if (position < 0) return;
+    const float val = row[i];
+    uint8_t* srow = stage + (size_t) (position % stage_cap) * row_bytes;
+    if (mode == 1) rows::put_fp8(val, i, D, srow);
+    else if (mode == 0) static_cast<__half*>(static_cast<void*>(srow))[i] = __float2half(val);
+    else static_cast<float*>(static_cast<void*>(srow))[i] = val;
+
+    if (token >= ring_from) {
+        uint8_t* rrow = ring + (size_t) (position % 128) * row_bytes;
+        if (mode == 1) rows::put_fp8(val, i, D, rrow);
+        else if (mode == 0) static_cast<__half*>(static_cast<void*>(rrow))[i] = __float2half(val);
+        else static_cast<float*>(static_cast<void*>(rrow))[i] = val;
+    }
+}
+
+}  // namespace
+
+void window_stage_copy(const void* ring, void* stage, int stage_cap, int64_t p_lo, int count, CacheFormat fmt,
+                       void* stream) {
+    if (count <= 0) return;
+    window_copy_kernel<<<count, win_row_bytes(fmt) / 16, 0, (cudaStream_t) stream>>>(
+        static_cast<const uint4*>(ring), static_cast<uint4*>(stage), stage_cap, p_lo);
+    check_launch();
+}
+
+void kv_window_stage(const float* projected, const float* norm, float rms_eps, const int32_t* positions,
+                     const kernels::MqaRopeTable& rope, int n_tokens, void* stage, int stage_cap, void* ring,
+                     int ring_from, CacheFormat fmt, void* stream) {
+    if (!projected || !norm || !positions || !stage || !ring || n_tokens < 1 ||
+        !(rms_eps > 0.f) || !std::isfinite(rms_eps) || !std::isfinite(rope.mscale))
+        throw std::invalid_argument("deepseek4 kv_window_stage: invalid arguments");
+    kv_window_stage_kernel<<<n_tokens, Threads, 0, (cudaStream_t) stream>>>(
+        projected, norm, rms_eps, positions, rope, static_cast<uint8_t*>(stage), stage_cap,
+        static_cast<uint8_t*>(ring), ring_from, win_row_bytes(fmt), row_mode(fmt));
+    check_launch();
+}
+
 }  // namespace basalt::models::deepseek4
