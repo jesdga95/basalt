@@ -114,13 +114,15 @@ bool FileReads::read_direct(const std::vector<Blob>& blobs) {
     const auto by_cache = [&](const Piece& p) { ok = platform::pread_all(fd_, p.dst, p.copy, p.at + p.skip) && ok; };
     size_t next = 0;
     int in_flight = 0;
-    int piece_of[kDepth];
+    int piece_of[kDepth] = {};
+    bool active[kDepth] = {};
     std::string err;
     const auto submit = [&](int buf) {
         while (next < pieces_.size()) {
             const size_t i = next++;
             if (direct_.submit(pieces_[i].at, stage_ + (size_t) buf * kStage, pieces_[i].length, (uint64_t) buf, err)) {
                 piece_of[buf] = (int) i;
+                active[buf] = true;
                 ++in_flight;
                 return;
             }
@@ -131,10 +133,24 @@ bool FileReads::read_direct(const std::vector<Blob>& blobs) {
     platform::Completion done[kDepth];
     while (in_flight > 0) {
         const int n = direct_.wait(done, kDepth, -1);
+        if (n <= 0) {
+            direct_.close();
+            for (int buf = 0; buf < kDepth; ++buf) {
+                if (active[buf]) {
+                    by_cache(pieces_[(size_t) piece_of[buf]]);
+                    active[buf] = false;
+                }
+            }
+            while (next < pieces_.size()) by_cache(pieces_[next++]);
+            break;
+        }
         for (int c = 0; c < n; ++c) {
             if (done[c].tag == platform::DirectFile::WAKE_TAG) continue;
+            if (done[c].tag >= (uint64_t) kDepth) continue;
             const int buf = (int) done[c].tag;
+            if (!active[buf]) continue;
             const Piece& p = pieces_[(size_t) piece_of[buf]];
+            active[buf] = false;
             --in_flight;
             if (done[c].ok && done[c].bytes >= p.skip + p.copy) std::memcpy(p.dst, stage_ + (size_t) buf * kStage + p.skip, p.copy);
             else by_cache(p);

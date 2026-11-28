@@ -485,5 +485,25 @@ int main() {
             check(conversation_prefix(c, exact, {}) == 0, "a prompt as long as the key cannot consume its last token");
         }
     }
+    {
+        // put_slot with keep == 0 must not insert into entries_ (evicts existing slots; spills incoming if spilling).
+        ConversationCache cache(1 << 20, 4);
+        cache.put_slot(image({1, 2, 3}), 2);
+        cache.put_slot(image({4, 5, 6}), 2);
+        check(cache.size() == 2 && cache.bytes() > 0, "put_slot(keep=2) stores two slot entries");
+        cache.put_slot(image({7, 8, 9}), 0);
+        check(cache.size() == 0 && cache.bytes() == 0 && cache.take_spilled().empty(),
+              "put_slot(keep=0) without spill drops existing slots and does not retain incoming");
+
+        cache.set_spill(true);
+        cache.put_slot(image({10, 11, 12}), 2);
+        check(cache.size() == 1, "put_slot(keep=2) stores one slot entry with spill enabled");
+        cache.put_slot(image({13, 14, 15}), 0);
+        auto spilled = cache.take_spilled();
+        check(cache.size() == 0 && cache.bytes() == 0 && spilled.size() == 2 &&
+              spilled[0].live.ids == std::vector<int32_t>{10, 11, 12} &&
+              spilled[1].live.ids == std::vector<int32_t>{13, 14, 15},
+              "put_slot(keep=0) with spill evicts existing slots and spills incoming image");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

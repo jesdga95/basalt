@@ -40,7 +40,7 @@ struct ConversationStoreBuffer;
 class ConversationStore {
 public:
     /// Cells behind one pooled row of a K/V layer's index (before open).
-    void set_row_cells(int64_t cells) { row_cells_ = cells; }
+    void set_row_cells(int64_t cells) { row_cells_ = cells > 0 ? cells : 1; }
     struct Match {
         size_t index = 0;
         int64_t tokens = 0;
@@ -115,7 +115,7 @@ private:
     std::vector<std::unique_ptr<Entry>> entries_;
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
-    uint64_t queue_bytes_ = 0, clock_ = 0, next_id_ = 0;
+    uint64_t queue_bytes_ = 0, writing_bytes_ = 0, clock_ = 0, next_id_ = 0;
     bool stop_ = false, busy_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept
