@@ -51,9 +51,15 @@ class Builder {
         if (value.type != Type::Number) fail(path, key + " must be a number");
         double d = round_up ? std::ceil(value.as_double()) : std::floor(value.as_double());
         // out-of-range doubles saturate: a cast would be undefined
-        if (!(d > -9.2e18)) return INT64_MIN;
-        if (!(d < 9.2e18)) return INT64_MAX;
+        if (!(d >= -0x1p63)) return INT64_MIN;
+        if (!(d < 0x1p63)) return INT64_MAX;
         return (int64_t) d;
+    }
+
+    // an exclusive bound moved one integer inwards, saturating at the int64 limits
+    static int64_t step(int64_t v, int dir) {
+        if (dir > 0) return v == INT64_MAX ? v : v + 1;
+        return v == INT64_MIN ? v : v - 1;
     }
 
     static SchemaNode::Format get_format(const JsonValue& schema, const std::string& path) {
@@ -243,12 +249,12 @@ class Builder {
         if (schema.contains("minimum")) {
             node->minimum = get_bound(schema, "minimum", path, /* round_up */ true);
         } else if (schema.contains("exclusiveMinimum")) {
-            node->minimum = get_bound(schema, "exclusiveMinimum", path, /* round_up */ false) + 1;
+            node->minimum = step(get_bound(schema, "exclusiveMinimum", path, /* round_up */ false), +1);
         }
         if (schema.contains("maximum")) {
             node->maximum = get_bound(schema, "maximum", path, /* round_up */ false);
         } else if (schema.contains("exclusiveMaximum")) {
-            node->maximum = get_bound(schema, "exclusiveMaximum", path, /* round_up */ true) - 1;
+            node->maximum = step(get_bound(schema, "exclusiveMaximum", path, /* round_up */ true), -1);
         }
         return node;
     }

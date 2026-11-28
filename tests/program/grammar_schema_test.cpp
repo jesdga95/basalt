@@ -551,6 +551,17 @@ static void test_schema_regressions() {
         CHECK(num_frac && !ok(num_frac, "0") && ok(num_frac, "1") && ok(num_frac, "9") && !ok(num_frac, "10"));
         auto num_huge = build(R"({"allOf":[{"type":"integer"},{"type":"number","maximum":1e300}]})");
         CHECK(num_huge && ok(num_huge, "123456789"));
+        // bounds at the int64 limits: in-range values keep their bound, exclusive ones saturate instead of overflowing
+        auto near_max = build(R"({"allOf":[{"type":"integer"},{"type":"number","minimum":9.21e18}]})");
+        CHECK(near_max && ok(near_max, "9210000000000000000") && !ok(near_max, "9209999999999999999"));
+        auto exmin_huge = build(R"({"allOf":[{"type":"integer"},{"type":"number","exclusiveMinimum":1e300}]})");
+        CHECK(exmin_huge && !ok(exmin_huge, "0"));
+        auto exmax_huge = build(R"({"allOf":[{"type":"integer"},{"type":"number","exclusiveMaximum":-1e300}]})");
+        CHECK(exmax_huge && !ok(exmax_huge, "0"));
+        auto exmin_int = build(R"({"type":"integer","exclusiveMinimum":9223372036854775807})");
+        CHECK(exmin_int && !ok(exmin_int, "0"));
+        auto exmax_int = build(R"({"type":"integer","exclusiveMaximum":-9223372036854775808})");
+        CHECK(exmax_int && !ok(exmax_int, "0"));
     }
 
     // R2C-1: number_text overflow, ULLONG_MAX, and malformed JSON numbers
