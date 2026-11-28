@@ -1311,11 +1311,12 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
     const size_t n = (size_t) geo_.n_embd;
     const size_t stream_row = 4 * n;
     constexpr int kAttnTile = 128;
+    constexpr int kOutWidth = kernels::kSparseMqaOutputGroups * kernels::kSparseMqaOutputRank;
     int cap = std::min(model_.diag_rows() > 0 ? model_.diag_rows() : (short_read ? kShortChunk : kMaxChunk), total_tokens);
     float *current = nullptr, *attended = nullptr, *coefficients = nullptr, *collapsed = nullptr,
           *normalized = nullptr, *hc_workspace = nullptr, *logits = nullptr, *route_weights = nullptr,
           *shared = nullptr, *routed = nullptr, *chunk_q_latent = nullptr, *chunk_kv_proj = nullptr,
-          *chunk_kv_row = nullptr, *chunk_out_latent = nullptr, *tile_q_heads = nullptr, *tile_mqa_out = nullptr,
+          *chunk_kv_row = nullptr, *tile_out_latent = nullptr, *tile_q_heads = nullptr, *tile_mqa_out = nullptr,
           *tile_comp_kv = nullptr, *tile_comp_score = nullptr, *tile_idx_kv = nullptr, *tile_idx_score = nullptr,
           *tile_idx_qr_bf16 = nullptr, *tile_idx_q_raw = nullptr, *tile_idx_q_out = nullptr,
           *tile_idx_w_raw = nullptr, *tile_idx_hw = nullptr, *tile_idx_angles = nullptr;
@@ -1325,7 +1326,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
     uint8_t *fixed_mask = nullptr, *alternate_mask = nullptr;
     std::unique_ptr<PrefillFfn> local_ffn;
     PrefillFfn* prompt_ffn = nullptr;
-    const int hca_max_visible = std::max(1, (int) ((pos + total_tokens) / 16));
+    const int hca_max_visible = std::max(1, (int) ((pos + total_tokens) / 128));
 
     for (;;) {
         buffers.clear();
@@ -1349,7 +1350,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         chunk_q_latent = static_cast<float*>(alloc((size_t) cap * 1024 * sizeof(float)));
         chunk_kv_proj = static_cast<float*>(alloc((size_t) cap * 512 * sizeof(float)));
         chunk_kv_row = static_cast<float*>(alloc((size_t) cap * 512 * sizeof(float)));
-        chunk_out_latent = static_cast<float*>(alloc((size_t) cap * 1024 * sizeof(float)));
+        tile_out_latent = static_cast<float*>(alloc((size_t) tile_cap * kOutWidth * sizeof(float)));
         tile_q_heads = static_cast<float*>(alloc((size_t) tile_cap * 64 * 512 * sizeof(float)));
         tile_mqa_out = static_cast<float*>(alloc((size_t) tile_cap * 64 * 512 * sizeof(float)));
         tile_comp_kv = static_cast<float*>(alloc((size_t) tile_cap * 1024 * sizeof(float)));
@@ -1373,7 +1374,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
         const bool bufs_ok = current && attended && coefficients && collapsed && normalized && hc_workspace &&
                              logits && route_ids && route_weights && shared && routed && fixed_rows &&
                              fixed_mask && alternate_mask && chunk_q_latent && chunk_kv_proj && chunk_kv_row &&
-                             chunk_out_latent && tile_q_heads && tile_mqa_out && tile_comp_kv && tile_comp_score &&
+                             tile_out_latent && tile_q_heads && tile_mqa_out && tile_comp_kv && tile_comp_score &&
                              tile_idx_kv && tile_idx_score && tile_idx_qr_bf16 && tile_idx_q_raw && tile_idx_q_out &&
                              tile_idx_w_raw && tile_idx_hw && tile_idx_angles && tile_sel_ids && tile_sel_cnt &&
                              tile_comp_row && hca_ids && chunk_pos && chunk_win_start && chunk_win_n &&
@@ -1624,13 +1625,13 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                     if (!prompt_ffn->dense_mmq(tile_mqa_out + (size_t) g * kernels::kSparseMqaGroupInput, 64 * 512,
                                                attention.attention.output_a_type, ww,
                                                kernels::kSparseMqaGroupInput, kernels::kSparseMqaOutputRank, b,
-                                               chunk_out_latent + (size_t) row * 1024 + (size_t) g * kernels::kSparseMqaOutputRank,
-                                               1024, stream_, err_)) return false;
+                                               tile_out_latent + (size_t) g * kernels::kSparseMqaOutputRank,
+                                               kOutWidth, stream_, err_)) return false;
                 }
+                if (!prompt_ffn->dense_mmq(tile_out_latent, kOutWidth, attention.attention.output_b_type,
+                                           attention.attention.output_b, kOutWidth, geo_.n_embd, b,
+                                           shared + (size_t) row * n, geo_.n_embd, stream_, err_)) return false;
             }
-            if (!prompt_ffn->dense_mmq(chunk_out_latent, 1024, attention.attention.output_b_type,
-                                       attention.attention.output_b, 1024, geo_.n_embd, T,
-                                       shared, geo_.n_embd, stream_, err_)) return false;
             try {
                 finish_attention_layer(current, coefficients, shared, T, geo_.n_embd, attended, stream_);
             } catch (const std::exception& e) {
@@ -1687,7 +1688,6 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
                 err_ = std::string("deepseek4 prompt FFN finish: ") + e.what();
                 return false;
             }
-            std::swap(current, attended);
         }
 
         if (tapped) {

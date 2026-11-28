@@ -225,11 +225,8 @@ public:
                 group_max = std::max(group_max, cnt);
             }
             gb[n] = group_rows;
-            if (cudaMemcpyAsync(B.bounds, gb, (size_t) (n + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, copy_) != cudaSuccess) {
-                err = "deepseek4: cannot upload prompt MMQ group bounds";
-                return false;
-            }
             mmq::GatherGroup gather;
+            bool host_synced = false;
             for (int q = 0; q < n; ++q) {
                 const int e = used[first + (size_t) q];
                 core::ExpertTier::Source src = tier_.locate(layer, e);
@@ -242,6 +239,13 @@ public:
                             return false;
                         }
                     } else {
+                        if (!host_synced) {
+                            if (cudaEventSynchronize(B.copied) != cudaSuccess) {
+                                err = "deepseek4: host staging sync failed";
+                                return false;
+                            }
+                            host_synced = true;
+                        }
                         uint8_t* const host_dst = B.host + stage_stride_ * (size_t) q;
                         if (!weights_.read_expert_blob(layer, e, host_dst, (size_t) el.bytes, err)) return false;
                         if (cudaMemcpyAsync(dev_dst, host_dst, (size_t) el.bytes, cudaMemcpyHostToDevice, copy_) != cudaSuccess) {
@@ -266,6 +270,10 @@ public:
             if (cudaEventRecord(B.copied, copy_) != cudaSuccess ||
                 cudaStreamWaitEvent(last_stream_, B.copied, 0) != cudaSuccess) {
                 err = "deepseek4: compute stream wait failed";
+                return false;
+            }
+            if (cudaMemcpyAsync(B.bounds, gb, (size_t) (n + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, last_stream_) != cudaSuccess) {
+                err = "deepseek4: cannot upload prompt MMQ group bounds";
                 return false;
             }
             const int row0 = bounds_host_[(size_t) used[first]];
@@ -467,11 +475,11 @@ uint64_t prompt_room_bytes(const ModelWeights& weights, int64_t context, int cap
     const uint64_t n = (uint64_t) g.n_embd, c = (uint64_t) std::max(cap, 1);
     const uint64_t tiles = 2 * 128 * 64 * 512 * 8 + 2 * 128 * 1024 * 4 + 2 * 128 * 256 * 4 +
                            128 * 1024 * 4 + 2 * 128 * 64 * 128 * 4 + 128 * 64 * 4 * 2 + 128 * 32 * 4 +
-                           128 * 512 * 4;
-    const uint64_t rows = c * (8 * n + (uint64_t) g.n_expert + 4 * n + 2 * (uint64_t) g.n_used + 2 * 1024 +
+                           128 * 512 * 4 + 128 * 8192 * 4;
+    const uint64_t rows = c * (8 * n + (uint64_t) g.n_expert + 4 * n + 2 * (uint64_t) g.n_used + 1024 +
                                2 * 512 + 16 + 16 * 4) * sizeof(float) +
                           c * 6 * sizeof(int32_t) + c * sizeof(uint32_t) * 4;
-    const uint64_t hca = 8 * ((uint64_t) std::max<int64_t>(1, context / 16 + 1)) * sizeof(int32_t);
+    const uint64_t hca = 8 * ((uint64_t) std::max<int64_t>(1, context / 128 + 1)) * sizeof(int32_t);
     return prefill_ffn_bytes(weights, cap) + rows + tiles + hca;
 }
 
