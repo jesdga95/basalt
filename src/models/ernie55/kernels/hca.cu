@@ -6,6 +6,7 @@
 //   - Inverse interleaved RoPE on VHA-mixed attention output
 #include "basalt/models/ernie55/kernels.hpp"
 
+#include "basalt/kernels/mma_f16.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/ernie55/cache_layout.hpp"
@@ -528,6 +529,251 @@ __global__ void hca_attention_gqa512_kernel(const float* __restrict__ q, const u
     }
 }
 
+// ---- Blackwell tensor-core prefill attention (the prefill pass: n_tokens > 8) --------------------------------------------------
+// Modeled directly on hy4flash/kernels/mla.cu's attend_mma_kernel: one 256-thread block (8 warps) per token, all
+// n_heads <= 32 query heads in a single M = 32 MMA tile. The token's keys (compressed blocks + sliding window +
+// kv_rot rows of the current chunk) go through shared memory 32 at a time, converted to packed FP16 as they are
+// fetched (FP8 and FP16 cache rows, F32 kv_rot rows); S = Q K^T and O += P V run on mma.m16n8k16 with the scaled
+// query and the probabilities in FP16, accumulated in FP32. The softmax is a running one, the sink its first element.
+// Needs sm_80+ (ldmatrix / mma.sync); the kernel and its launch are compiled for __CUDA_ARCH__ >= 800 (this build
+// targets sm_120+), elsewhere hca_attention() falls back to hca_attention_gqa512_kernel.
+
+// FP16 shared-memory row strides (avoid bank conflicts; kMmaLd * 2 % 16 == 0 keeps the uint4 staging aligned)
+constexpr int kMmaCells = 32;   // KV tile height: 32 keys per iteration
+constexpr int kMmaG = 2;        // M = 16 * kMmaG = 32 padded query heads per block
+constexpr int kMmaLd = 520;     // qh/ks stride in FP16 elements: 512 + 8
+constexpr int kMmaPLd = 40;     // ph (softmax probabilities) stride in FP16 elements
+
+constexpr float kHcaScale512 = 0.04419417382415922f;   // 1 / sqrt(512)
+
+constexpr size_t mma512_smem() {
+    constexpr int M = 16 * kMmaG;
+    return (size_t) (M * kMmaLd + kMmaCells * kMmaLd + M * kMmaPLd) * sizeof(uint16_t)
+         + (size_t) (2 * M * kMmaCells + 2 * M) * sizeof(float);
+}
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+
+// the FP16 MMA inlines and the wider -> FP16 conversions Basalt's attention kernels share
+using basalt::kernels::mma_f16::bf2_to_h2;
+using basalt::kernels::mma_f16::e4m3x2_to_h2_f32scale;
+using basalt::kernels::mma_f16::f32_to_h_clamped;
+using basalt::kernels::mma_f16::ldsm4;
+using basalt::kernels::mma_f16::ldsm4t;
+using basalt::kernels::mma_f16::mma16816h;
+
+// Eight values of a cache row's chunk ch (of 64) as eight packed FP16 values, ready for the shared-memory staging.
+// FP16 rows: the eight halves. FP8 rows: chunks below 56 are eight E4M3 codes times their 64-value group's scale
+// (8-value chunks, 64-value groups: scales[ch >> 3], NOT hy4flash's ch >> 4), the rest eight BF16 rope values. The
+// rope tail starts at row + 448 + 7 * 4 = 476, which is only 4-byte aligned (476 % 16 == 12): it loads as four
+// uint32_t, never a uint4 (that would be a misaligned-address trap). An FP8 code times its power-of-two scale stays
+// normal in FP16 down to 2^-14; the smaller scales store_hca_row may hold (down to 2^-22) round through FP16
+// subnormals, and the BF16 rope values and F32 kv_rot rows saturate to FP16's finite range, never to +-Inf.
+template <bool FP8>
+__device__ __forceinline__ uint4 fetch_row8(const uint8_t* cache, size_t slot, int ch) {
+    if (!FP8) return *reinterpret_cast<const uint4*>(cache + slot * (size_t) (2 * 512) + ch * 16);
+    const uint8_t* row = cache + slot * (size_t) kHcaFp8Stride;
+    if (ch < 56) {
+        const uint2 codes = *reinterpret_cast<const uint2*>(row + ch * 8);
+        const float s = reinterpret_cast<const float*>(row + 448)[ch >> 3];
+        return make_uint4(e4m3x2_to_h2_f32scale(codes.x & 0xffffu, s), e4m3x2_to_h2_f32scale(codes.x >> 16, s),
+                          e4m3x2_to_h2_f32scale(codes.y & 0xffffu, s), e4m3x2_to_h2_f32scale(codes.y >> 16, s));
+    }
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(row + 448 + 7 * 4 + (ch - 56) * 16);
+    return make_uint4(bf2_to_h2(w[0]), bf2_to_h2(w[1]), bf2_to_h2(w[2]), bf2_to_h2(w[3]));
+}
+
+// The eight F32 values of a kv_rot row's chunk ch as eight packed FP16 values (the row is 16-byte aligned: its base
+// is a cudaMalloc'd float buffer, the row and chunk offsets are multiples of 16 bytes), saturated to FP16's range.
+__device__ __forceinline__ uint4 fetch_f32_8(const float* row, int ch) {
+    const float4* src = reinterpret_cast<const float4*>(row + ch * 8);
+    const float4 a = src[0], b = src[1];
+    const __half2 h0 = __halves2half2(f32_to_h_clamped(a.x), f32_to_h_clamped(a.y));
+    const __half2 h1 = __halves2half2(f32_to_h_clamped(a.z), f32_to_h_clamped(a.w));
+    const __half2 h2 = __halves2half2(f32_to_h_clamped(b.x), f32_to_h_clamped(b.y));
+    const __half2 h3 = __halves2half2(f32_to_h_clamped(b.z), f32_to_h_clamped(b.w));
+    return make_uint4(*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1),
+                      *reinterpret_cast<const uint32_t*>(&h2), *reinterpret_cast<const uint32_t*>(&h3));
+}
+
+// One block (256 threads, 8 warps) per token of a prefill chunk: online-softmax attention over the compressed
+// blocks [0 .. n_comp) + the sliding window [win_start .. p] (the current chunk's rows straight from kv_rot) with
+// per-head attn_sink. Padded heads (n_heads .. 31) compute but never write.
+template <bool FP8>
+__global__ void __launch_bounds__(256) hca_attention_mma512_kernel(const float* __restrict__ q,
+                                                                   const uint8_t* __restrict__ comp_cache,
+                                                                   const uint8_t* __restrict__ win_cache,
+                                                                   const float* __restrict__ kv_rot,
+                                                                   const float* __restrict__ attn_sink,
+                                                                   const int32_t* __restrict__ pos, int n_heads,
+                                                                   int win_size, int win_cap, int ratio,
+                                                                   float* __restrict__ out) {
+    extern __shared__ __align__(16) unsigned char smraw[];
+    constexpr int W = 512, M = 16 * kMmaG;
+    uint16_t* qh = (uint16_t*) smraw;
+    uint16_t* ks = qh + M * kMmaLd;
+    uint16_t* ph = ks + kMmaCells * kMmaLd;
+    float* sp = (float*) (ph + M * kMmaPLd);   // [2][M][32]
+    float* alpha_s = sp + 2 * M * 32;
+    float* l_s = alpha_s + M;
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const int h0 = blockIdx.x * M;
+    const int t = blockIdx.y;
+    const int p = pos[t], pos0 = pos[0];
+    const int n_comp = (p + 1) / ratio;
+    const int win_start = p - (win_size - 1) > 0 ? p - (win_size - 1) : 0;
+    const int total_keys = n_comp + (p - win_start + 1);
+
+    // the query, scaled by 1 / sqrt(512) and in FP16; heads >= n_heads pad with zeros
+    for (int i = tid; i < M * W; i += 256) {
+        const int h = i / W, e = i - h * W;
+        const int gh = h0 + h;
+        const float v = gh < n_heads ? q[((size_t) t * n_heads + gh) * W + e] : 0.0f;
+        qh[h * kMmaLd + e] = __half_as_ushort(f32_to_h_clamped(v * kHcaScale512));
+    }
+    // the softmax: a warp keeps 2 * kMmaG = 4 heads
+    float m[2 * kMmaG], l[2 * kMmaG];
+#pragma unroll
+    for (int hh = 0; hh < 2 * kMmaG; ++hh) {
+        const int h = w * 2 * kMmaG + hh;
+        const int gh = h0 + h;
+        m[hh] = gh < n_heads ? attn_sink[gh] : 0.0f;
+        l[hh] = 1.0f;
+    }
+    if (tid < M) l_s[tid] = 1.0f;
+    // O: a warp keeps the 16 heads of group rg and the 128 output dimensions dq * 128 .. dq * 128 + 127
+    float acc[8 * kMmaG][4];
+#pragma unroll
+    for (int j = 0; j < 8 * kMmaG; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+    const int id = lane >> 3, r8 = lane & 7, rg = w % kMmaG, dq = w / kMmaG;
+    // S: a warp takes the heads of group rg, half kh of the 512 dimensions and 16 keys from key 16 * cp
+    const int kh = (w / kMmaG) & 1, cp = w / (2 * kMmaG);
+    // a thread's share of a tile (8 chunks of 8 values), loaded a tile ahead: the next tile's reads are in flight
+    // while this one computes
+    constexpr int kPer = kMmaCells * (W / 8) / 256;
+    uint4 pre[kPer];
+    auto fetch = [&](int j0) {
+        const int tn = min(kMmaCells, total_keys - j0);
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (W / 8), ch = i - c * (W / 8);
+            pre[k] = make_uint4(0, 0, 0, 0);
+            if (c < tn) {
+                const int j = j0 + c;
+                if (j < n_comp) {
+                    pre[k] = fetch_row8<FP8>(comp_cache, (size_t) j, ch);
+                } else {
+                    const int jp = win_start + (j - n_comp);
+                    if (kv_rot && jp >= pos0) pre[k] = fetch_f32_8(kv_rot + (size_t) (jp - pos0) * W, ch);
+                    else pre[k] = fetch_row8<FP8>(win_cache, (size_t) (jp % win_cap), ch);
+                }
+            }
+        }
+    };
+    fetch(0);
+    for (int j0 = 0; j0 < total_keys; j0 += kMmaCells) {
+        const int tn = min(kMmaCells, total_keys - j0);
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (W / 8), ch = i - c * (W / 8);
+            *reinterpret_cast<uint4*>(ks + c * kMmaLd + ch * 8) = pre[k];
+        }
+        __syncthreads();
+        if (j0 + kMmaCells < total_keys) fetch(j0 + kMmaCells);
+        {   // S = Q K^T: the half kh of the dimensions' partial dots
+            float c[kMmaG][4];
+#pragma unroll
+            for (int nt = 0; nt < kMmaG; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < 8; ++kk) {
+                const int kb = (kh * 16 + kk * 2) * 16;
+                uint32_t b[kMmaG][4];
+#pragma unroll
+                for (int nt = 0; nt < kMmaG; ++nt)
+                    ldsm4(b[nt], ks + ((cp * kMmaG + nt) * 8 + r8) * kMmaLd + kb + id * 8);
+#pragma unroll
+                for (int s2 = 0; s2 < 2; ++s2) {
+                    const int kd = kb + s2 * 16;
+                    uint32_t ah[4];
+                    ldsm4(ah, qh + (rg * 16 + (id & 1) * 8 + r8) * kMmaLd + kd + (id >> 1) * 8);
+#pragma unroll
+                    for (int nt = 0; nt < kMmaG; ++nt) mma16816h(c[nt], ah, b[nt][2 * s2], b[nt][2 * s2 + 1]);
+                }
+            }
+            const int row = rg * 16 + (lane >> 2);
+#pragma unroll
+            for (int nt = 0; nt < kMmaG; ++nt) {
+                const int col = (cp * kMmaG + nt) * 8 + (lane & 3) * 2;
+                sp[(kh * M + row) * 32 + col] = c[nt][0];
+                sp[(kh * M + row) * 32 + col + 1] = c[nt][1];
+                sp[(kh * M + row + 8) * 32 + col] = c[nt][2];
+                sp[(kh * M + row + 8) * 32 + col + 1] = c[nt][3];
+            }
+        }
+        __syncthreads();
+        // the running softmax: a lane a key
+#pragma unroll
+        for (int hh = 0; hh < 2 * kMmaG; ++hh) {
+            const int h = w * 2 * kMmaG + hh;
+            const bool valid = lane < tn;
+            const float sc = valid ? sp[h * 32 + lane] + sp[(M + h) * 32 + lane] : -INFINITY;
+            const float mx = warp_max(sc);
+            const float nm = fmaxf(m[hh], mx);
+            const float alpha = expf(m[hh] - nm);
+            const float pr = valid ? expf(sc - nm) : 0.0f;
+            const float sum = warp_sum(pr);
+            l[hh] = l[hh] * alpha + sum;
+            m[hh] = nm;
+            ph[h * kMmaPLd + lane] = __half_as_ushort(__float2half_rn(pr));
+            if (lane == 0) {
+                alpha_s[h] = alpha;
+                l_s[h] = l[hh];
+            }
+        }
+        __syncthreads();
+        // O = O * alpha + P V
+        {
+            const float a0 = alpha_s[rg * 16 + (lane >> 2)], a1 = alpha_s[rg * 16 + (lane >> 2) + 8];
+#pragma unroll
+            for (int j = 0; j < 8 * kMmaG; ++j) {
+                acc[j][0] *= a0; acc[j][1] *= a0;
+                acc[j][2] *= a1; acc[j][3] *= a1;
+            }
+#pragma unroll
+            for (int s2 = 0; s2 < 2; ++s2) {
+                uint32_t ah[4];
+                ldsm4(ah, ph + (rg * 16 + (id & 1) * 8 + r8) * kMmaPLd + s2 * 16 + (id >> 1) * 8);
+#pragma unroll
+                for (int jj = 0; jj < 4 * kMmaG; ++jj) {
+                    uint32_t b[4];
+                    ldsm4t(b, ks + (s2 * 16 + (id & 1) * 8 + r8) * kMmaLd + dq * (W / (2 * kMmaG)) + jj * 16 + (id >> 1) * 8);
+                    mma16816h(acc[2 * jj], ah, b[0], b[1]);
+                    mma16816h(acc[2 * jj + 1], ah, b[2], b[3]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const int row = rg * 16 + (lane >> 2);
+    const int g0 = h0 + row, g1 = h0 + row + 8;
+    const float i0 = 1.0f / l_s[row], i1 = 1.0f / l_s[row + 8];
+#pragma unroll
+    for (int j = 0; j < 8 * kMmaG; ++j) {
+        const int d = dq * (W / (2 * kMmaG)) + j * 8 + (lane & 3) * 2;
+        if (g0 < n_heads) {
+            float* o0 = out + ((size_t) t * n_heads + g0) * W + d;
+            o0[0] = acc[j][0] * i0; o0[1] = acc[j][1] * i0;
+        }
+        if (g1 < n_heads) {
+            float* o1 = out + ((size_t) t * n_heads + g1) * W + d;
+            o1[0] = acc[j][2] * i1; o1[1] = acc[j][3] * i1;
+        }
+    }
+}
+
+#endif  // __CUDA_ARCH__ >= 800
+
 }  // namespace
 
 void hca_q_rope(float* q, const int32_t* pos, int n_tokens, int n_heads, int head_dim, float rms_eps,
@@ -612,6 +858,27 @@ void hca_attention(const float* q, const uint8_t* comp_cache, const uint8_t* win
     if (n_tokens <= 0) return;
     const int cap = win_cap > 0 ? win_cap : win_size;
     if (head_dim == 512) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+        // the prefill pass: one tensor-core block per (32-head tile, token)
+        if (n_tokens > 8) {
+            // the dynamic shared-memory opt-in and the sm_80+ check, once per device and instantiation; a card that
+            // rejects either keeps the scalar kernel
+            static bk::mma_f16::MmaSmemCache smem_cache[2];
+            const bool mma_usable =
+                fp8 ? bk::mma_f16::mma_smem_ready(smem_cache[1], hca_attention_mma512_kernel<true>, mma512_smem())
+                    : bk::mma_f16::mma_smem_ready(smem_cache[0], hca_attention_mma512_kernel<false>, mma512_smem());
+            if (mma_usable) {
+                const dim3 grid((n_heads + 16 * kMmaG - 1) / (16 * kMmaG), n_tokens);
+                if (fp8)
+                    hca_attention_mma512_kernel<true><<<grid, 256, mma512_smem(), (cudaStream_t) stream>>>(
+                        q, comp_cache, win_cache, kv_rot, attn_sink, pos, n_heads, win_size, cap, ratio, out);
+                else
+                    hca_attention_mma512_kernel<false><<<grid, 256, mma512_smem(), (cudaStream_t) stream>>>(
+                        q, comp_cache, win_cache, kv_rot, attn_sink, pos, n_heads, win_size, cap, ratio, out);
+                return;
+            }
+        }
+#endif
         hca_attention_gqa512_kernel<<<dim3((n_heads + 7) / 8, n_tokens), 256, 0, (cudaStream_t) stream>>>(
             q, comp_cache, win_cache, kv_rot, attn_sink, pos, n_heads, win_size, cap, ratio, fp8, out);
         return;

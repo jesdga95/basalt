@@ -1,6 +1,7 @@
 // src/models/hy4flash/kernels/mla.cu - the absorbed MLA of Hy4-flash over a window or chunk of rows: the per-head Q8_0
 // products, the query and cache-row preparation, and the attention over the shared latent with a per-head sink. A row's
 // result does not depend on the other rows or on how many there are.
+#include "basalt/kernels/mma_f16.cuh"
 #include "basalt/kernels/mqa_chunk.cuh"
 #include "basalt/models/hy4flash/kernels.hpp"
 
@@ -443,21 +444,13 @@ __global__ void __launch_bounds__(mqa::kThreads) attend_kernel(const float* __re
 // fp16, accumulated in fp32, as llama.cpp's flash attention does. The softmax is a running one, the sink its first element.
 constexpr int kMmaCells = 32, kLd = 584, kPLd = 40;   // smem row strides in fp16 elements (avoid bank conflicts)
 
-__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
-}
-__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
-}
-__device__ __forceinline__ void mma16816h(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v) {
-    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
-    const __half2 h = __float22half2_rn(f);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
+// the FP16 MMA inlines and the BF16 / FP8 -> fp16 conversions Basalt's attention kernels share (the wider inputs
+// saturate to fp16's finite range, which for these cache rows is all they can hold anyway)
+using basalt::kernels::mma_f16::bf2_to_h2;
+using basalt::kernels::mma_f16::e4m3x2_to_h2;
+using basalt::kernels::mma_f16::ldsm4;
+using basalt::kernels::mma_f16::ldsm4t;
+using basalt::kernels::mma_f16::mma16816h;
 
 // Eight values of a cell's row (chunk ch of 72) as raw words, and the same as eight fp16 values. fp16 rows: the eight values. FP8
 // rows: chunks below 64 are eight E4M3 codes then their group's scale, the rest eight BF16 rope values; a code times its
@@ -474,10 +467,6 @@ __device__ __forceinline__ uint4 fetch8(const uint8_t* cache, size_t cell, int c
     return *reinterpret_cast<const uint4*>(row + kFp8RopeOff + (ch - kFp8Codes / 8) * 16);
 }
 __device__ __forceinline__ uint4 half8(const uint16_t*, uint4 v, int) { return v; }
-__device__ __forceinline__ uint32_t e4m3x2_to_h2(uint32_t codes, __half2 scale) {
-    const __half2 h = __hmul2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) codes, __NV_E4M3)), scale);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
 __device__ __forceinline__ uint4 half8(const uint8_t*, uint4 v, int ch) {
     if (ch >= kFp8Codes / 8) return make_uint4(bf2_to_h2(v.x), bf2_to_h2(v.y), bf2_to_h2(v.z), bf2_to_h2(v.w));
     const __half2 s = __float2half2_rn(__uint_as_float(v.z));

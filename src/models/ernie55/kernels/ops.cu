@@ -175,6 +175,129 @@ __global__ void mhc_coef_ernie_kernel(const float* __restrict__ ws, const float*
     if (lane < 16) out[8 + lane] = v;
 }
 
+// Single-pass prefill mHC mixes: 1 CTA (8 warps = 256 threads) processes up to 8 tokens simultaneously, reading x
+// ONCE from VRAM (instead of 24x in mhc_partial_kernel) and hc_fn ONCE per 8 tokens from L2, then computing the exact
+// ERNIE RMS + Sinkhorn-Knopp coefficients in-register without touching workspace memory.
+__global__ void __launch_bounds__(256) mhc_mixes_prefill_kernel(const float* __restrict__ x,
+                                                                const float* __restrict__ fn,
+                                                                const float* __restrict__ scale,
+                                                                const float* __restrict__ base, int n_tokens, int flat,
+                                                                float rms_eps, float hc_eps, int sinkhorn_iters,
+                                                                float* __restrict__ coef) {
+    constexpr int kBT = 8;
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+    const int t0 = blockIdx.x * kBT;
+    const int bt_n = min(kBT, n_tokens - t0);
+    const int n4 = flat >> 2;
+
+    __shared__ float4 sm_x[kBT][64];
+    __shared__ float sm_dot[kBT][kHcCoef];
+    __shared__ float sm_ss[kBT];
+
+    float dot[3][kBT];
+#pragma unroll
+    for (int j = 0; j < 3; ++j)
+#pragma unroll
+        for (int b = 0; b < kBT; ++b) dot[j][b] = 0.0f;
+    float ss_acc = 0.0f;
+
+    const float4* x_w = (wid < bt_n) ? reinterpret_cast<const float4*>(x + (size_t) (t0 + wid) * flat) : nullptr;
+    const float4* fn0 = reinterpret_cast<const float4*>(fn + (size_t) (wid * 3 + 0) * flat);
+    const float4* fn1 = reinterpret_cast<const float4*>(fn + (size_t) (wid * 3 + 1) * flat);
+    const float4* fn2 = reinterpret_cast<const float4*>(fn + (size_t) (wid * 3 + 2) * flat);
+
+    for (int k4 = 0; k4 < n4; k4 += 64) {
+        if (x_w) {
+            const float4 a0 = x_w[k4 + lane];
+            const float4 a1 = x_w[k4 + lane + 32];
+            sm_x[wid][lane] = a0;
+            sm_x[wid][lane + 32] = a1;
+            ss_acc = fmaf(a0.x, a0.x, ss_acc); ss_acc = fmaf(a0.y, a0.y, ss_acc);
+            ss_acc = fmaf(a0.z, a0.z, ss_acc); ss_acc = fmaf(a0.w, a0.w, ss_acc);
+            ss_acc = fmaf(a1.x, a1.x, ss_acc); ss_acc = fmaf(a1.y, a1.y, ss_acc);
+            ss_acc = fmaf(a1.z, a1.z, ss_acc); ss_acc = fmaf(a1.w, a1.w, ss_acc);
+        } else {
+            sm_x[wid][lane] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            sm_x[wid][lane + 32] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+
+        const float4 w0a = fn0[k4 + lane], w0b = fn0[k4 + lane + 32];
+        const float4 w1a = fn1[k4 + lane], w1b = fn1[k4 + lane + 32];
+        const float4 w2a = fn2[k4 + lane], w2b = fn2[k4 + lane + 32];
+#pragma unroll
+        for (int b = 0; b < kBT; ++b) {
+            const float4 xa = sm_x[b][lane];
+            const float4 xb = sm_x[b][lane + 32];
+            dot[0][b] = fmaf(xa.x, w0a.x, dot[0][b]); dot[0][b] = fmaf(xa.y, w0a.y, dot[0][b]);
+            dot[0][b] = fmaf(xa.z, w0a.z, dot[0][b]); dot[0][b] = fmaf(xa.w, w0a.w, dot[0][b]);
+            dot[0][b] = fmaf(xb.x, w0b.x, dot[0][b]); dot[0][b] = fmaf(xb.y, w0b.y, dot[0][b]);
+            dot[0][b] = fmaf(xb.z, w0b.z, dot[0][b]); dot[0][b] = fmaf(xb.w, w0b.w, dot[0][b]);
+
+            dot[1][b] = fmaf(xa.x, w1a.x, dot[1][b]); dot[1][b] = fmaf(xa.y, w1a.y, dot[1][b]);
+            dot[1][b] = fmaf(xa.z, w1a.z, dot[1][b]); dot[1][b] = fmaf(xa.w, w1a.w, dot[1][b]);
+            dot[1][b] = fmaf(xb.x, w1b.x, dot[1][b]); dot[1][b] = fmaf(xb.y, w1b.y, dot[1][b]);
+            dot[1][b] = fmaf(xb.z, w1b.z, dot[1][b]); dot[1][b] = fmaf(xb.w, w1b.w, dot[1][b]);
+
+            dot[2][b] = fmaf(xa.x, w2a.x, dot[2][b]); dot[2][b] = fmaf(xa.y, w2a.y, dot[2][b]);
+            dot[2][b] = fmaf(xa.z, w2a.z, dot[2][b]); dot[2][b] = fmaf(xa.w, w2a.w, dot[2][b]);
+            dot[2][b] = fmaf(xb.x, w2b.x, dot[2][b]); dot[2][b] = fmaf(xb.y, w2b.y, dot[2][b]);
+            dot[2][b] = fmaf(xb.z, w2b.z, dot[2][b]); dot[2][b] = fmaf(xb.w, w2b.w, dot[2][b]);
+        }
+        __syncthreads();
+    }
+
+    ss_acc = warp_sum(ss_acc);
+    if (lane == 0) sm_ss[wid] = ss_acc;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+#pragma unroll
+        for (int b = 0; b < kBT; ++b) {
+            const float s = warp_sum(dot[j][b]);
+            if (lane == 0) sm_dot[b][wid * 3 + j] = s;
+        }
+    }
+    __syncthreads();
+
+    if (wid >= bt_n) return;
+    const float inv_rms = 1.0f / (sqrtf(sm_ss[wid] / (float) flat) + rms_eps);
+    const float mix_val = (lane < kHcCoef) ? (sm_dot[wid][lane] * inv_rms) : 0.0f;
+    float* out = coef + (size_t) (t0 + wid) * kHcCoef;
+    if (lane < 4) {
+        out[lane] = sigmoidf_ieee(mix_val * scale[0] + base[lane]) + hc_eps;
+    } else if (lane < 8) {
+        out[lane] = sigmoidf_ieee(mix_val * scale[1] + base[lane]) * 2.0f;
+    }
+    const int r = (lane >> 2) & 3, c = lane & 3;
+    const unsigned all = 0xffffffffu;
+    const float m_comb = sm_dot[wid][8 + (lane & 15)] * inv_rms;
+    float v = m_comb * scale[2] + base[8 + (lane & 15)];
+    const auto row = [&](float x_, int j) { return __shfl_sync(all, x_, (lane & 16) | (r << 2) | j); };
+    const auto col = [&](float x_, int i) { return __shfl_sync(all, x_, (lane & 16) | (i << 2) | c); };
+    {
+        const float m = fmaxf(fmaxf(row(v, 0), row(v, 1)), fmaxf(row(v, 2), row(v, 3)));
+        v = expf(v - m);
+        float s = 0.f;
+        s += row(v, 0);
+        s += row(v, 1);
+        s += row(v, 2);
+        s += row(v, 3);
+        const float inv = 1.0f / s;
+        v = v * inv + hc_eps;
+    }
+    {
+        const float cs = col(v, 0) + col(v, 1) + col(v, 2) + col(v, 3) + hc_eps;
+        v *= 1.0f / cs;
+    }
+    for (int it = 1; it < sinkhorn_iters; ++it) {
+        const float rs = row(v, 0) + row(v, 1) + row(v, 2) + row(v, 3) + hc_eps;
+        v *= 1.0f / rs;
+        const float cs = col(v, 0) + col(v, 1) + col(v, 2) + col(v, 3) + hc_eps;
+        v *= 1.0f / cs;
+    }
+    if (lane < 16) out[8 + lane] = v;
+}
+
 __global__ void mhc_contract_coef_kernel(const float* __restrict__ ws, const float* __restrict__ scale,
                                          const float* __restrict__ base, int flat, float rms_eps, float hc_eps,
                                          float* __restrict__ coef4) {
@@ -649,6 +772,11 @@ void mhc_mixes(const float* x, const float* hc_fn, const float* hc_scale, const 
     const int flat = kHcMult * n_embd;
     if (flat % (kHcSplits * 4) || sinkhorn_iters < 1) throw std::invalid_argument("ernie55 mhc_mixes: geometry");
     cudaStream_t st = (cudaStream_t) stream;
+    if (n_tokens > 8 && (flat % 256) == 0) {
+        mhc_mixes_prefill_kernel<<<(n_tokens + 7) / 8, 256, 0, st>>>(
+            x, hc_fn, hc_scale, hc_base, n_tokens, flat, rms_eps, hc_eps, sinkhorn_iters, coef);
+        return;
+    }
     bk::launch_pdl(mhc_partial_kernel, dim3(kHcSplits, kHcCoef, n_tokens), dim3(kThreads), 0, st, x, hc_fn, flat, kHcCoef, workspace);
     bk::launch_pdl(mhc_coef_ernie_kernel, dim3(n_tokens), dim3(32), 0, st, (const float*) workspace, hc_scale, hc_base, flat,
                    rms_eps, hc_eps, sinkhorn_iters, coef);
