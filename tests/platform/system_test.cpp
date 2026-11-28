@@ -9,8 +9,10 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <numeric>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -83,11 +85,18 @@ int main() {
     // reclaim workers are excluded on purpose, and a pure-CPU spinner keeps the kernel out of the window.
     if (ExternalCpuLoad probe; true) {
         check(probe.sample() == 0, "ExternalCpuLoad's first sample is the zero interval");
-        double base = 0;
-        for (int i = 0; i < 10; ++i) {
+        auto mean_middle = [](std::vector<double>& v) {
+            v.erase(v.begin(), v.begin() + 2);   // warm the interval before counting it
+            if (v.empty()) return 0.0;
+            v.pop_back();                        // and drop the edge that bleeds into the next phase
+            return std::accumulate(v.begin(), v.end(), 0.0) / (double) v.size();
+        };
+        std::vector<double> base_window;
+        for (int i = 0; i < 12; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            base = std::max(base, probe.sample());
+            base_window.push_back(probe.sample());
         }
+        const double base = mean_middle(base_window);   // a mean, not a max: one ambient spike must not eat the rise
         if (const pid_t kid = fork(); kid == 0) {
             const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1600);
             volatile double sink = 1;
@@ -95,18 +104,29 @@ int main() {
             _exit(0);
         } else if (kid > 0) {
             const auto t0 = std::chrono::steady_clock::now();
-            double peak = 0;
+            auto aggregate_cores = [] {   // the same cpu sum the sensor reads, sampled independently
+                double busy = 0;
+                std::ifstream f("/proc/stat");
+                std::string cpu;
+                long long v;
+                if (f >> cpu) for (int i = 0; i < 10 && (f >> v); ++i) if (i != 3 && i != 4) busy += (double) v;
+                return busy / (double) sysconf(_SC_CLK_TCK);
+            };
+            const double agg0 = aggregate_cores();
+            std::vector<double> kid_window;
             for (int i = 0; i < 14; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                peak = std::max(peak, probe.sample());
+                kid_window.push_back(probe.sample());
             }
+            const double peak = mean_middle(kid_window);
             int status = 0;
             rusage kid_use{};
             wait4(kid, &status, 0, &kid_use);
+            const double win = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             const double child_cores =   // what the child actually held, seconds of cpu per second of window
                 (double) (kid_use.ru_utime.tv_sec + kid_use.ru_stime.tv_sec +
-                          (kid_use.ru_utime.tv_usec + kid_use.ru_stime.tv_usec) / 1e6) /
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                          (kid_use.ru_utime.tv_usec + kid_use.ru_stime.tv_usec) / 1e6) / win;
+            const double agg_rise = (aggregate_cores() - agg0) / win - base;   // the raw counter's own rise
             // The sensor's rise must see the child's real consumption: a scheduler squeezed by parallel tests
             // may hand the child less than a full core, and then reading less is the sensor being honest.
             // The old bug this replaces: reading none of it.
@@ -123,9 +143,10 @@ int main() {
                 std::snprintf(detail, sizeof detail,
                               "sensor rise check skipped, the machine was saturated (base %.2f of %.0f cpus)", base, cpus);
                 check(true, detail);
-            } else if (peak - base < 0.05 && child_cores > 0.2) {
-                // A whole core consumed and the aggregate cpu counter never moved: the machine's clock cannot
-                // answer this question at all (a host-global /proc/stat behind a small cgroup).
+            } else if (peak - base < 0.05 && agg_rise < 0.3 && child_cores > 0.2) {
+                // The raw aggregate itself ignored a consumed core: this machine's cpu counter cannot answer
+                // the question at all (a host-global /proc/stat behind a small cgroup). The sensor cannot be
+                // judged by it - but if the aggregate moved and the sensor's rise did not, that IS the bug.
                 std::snprintf(detail, sizeof detail,
                               "sensor rise check skipped, the cpu aggregate ignored a whole core (child %.2f, cpus %.0f)", child_cores, cpus);
                 check(true, detail);
