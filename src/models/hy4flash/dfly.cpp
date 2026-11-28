@@ -1,5 +1,6 @@
 // src/models/hy4flash/dfly.cpp - the DFly2 drafter on the device: weights, the tap, and the block pass (dfly.hpp).
 #include "basalt/core/device_copy.hpp"
+#include "basalt/core/on_device.hpp"
 #include "models/hy4flash/dfly.hpp"
 
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -28,12 +29,14 @@ namespace bk = basalt::kernels;
 // ---- weights ------------------------------------------------------------------------------------------------------------
 
 DflyWeights::~DflyWeights() {
+    const core::OnDevice on(device_);
     for (auto& [name, p] : slots_)
         if (p) cudaFree(p);
     if (head_screen) cudaFree(head_screen);
 }
 
 bool DflyWeights::allocate(const DflyDims& d, std::string& err) {
+    cudaGetDevice(&device_);
     dims = d;
     if (!bk::q80_screen_supported(d.E)) {
         err = "no draft head screen for a width of " + std::to_string(d.E);
@@ -104,6 +107,7 @@ void* DflyWeights::slot(const std::string& name) const {
 }
 
 bool DflyWeights::pack_screen(void* stream, std::string& err) {
+    const core::OnDevice on(device_);
     if (!head_q8 || !head_screen) {
         err = "the drafter has no head to screen";
         return false;
@@ -131,16 +135,20 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
     d.vocab = g.n_vocab;
     d.rms_eps = g.rms_eps;
     d.rope_base = g.rope_base;
-    if (d.E != g.n_embd || d.mask_id >= g.n_vocab || d.topk != g.idx_top_k || d.heads != g.heads[(size_t) d.kv_layers[0]])
-        return {model::Status::Error, "hy4flash: the drafter's width, mask token, selection width or head count are not the target's"};
+    if (d.E != g.n_embd || d.mask_id >= g.n_vocab || d.topk != g.idx_top_k)
+        return {model::Status::Error, "hy4flash: the drafter's width, mask token or selection width are not the target's"};
     for (int i = 0; i < d.layers; ++i) {
         const int kv = d.kv_layers[(size_t) i], ix = d.idx_layers[(size_t) i];
-        if (kv < 0 || kv >= g.n_layers || ix < 0 || ix >= g.n_layers || g.swa[(size_t) kv] || !g.indexed[(size_t) ix] ||
-            g.heads[(size_t) kv] != d.heads)
+        if (kv < 0 || kv >= g.n_layers || ix < 0 || ix >= g.n_layers || g.swa[(size_t) kv] || !g.indexed[(size_t) ix])
             return {model::Status::Error, "hy4flash: draft layer " + std::to_string(i) + " names a target layer that is not a sparse one"};
+        if (g.heads[(size_t) kv] != d.heads)
+            return {model::Status::Error, "hy4flash: draft layer " + std::to_string(i) + "'s head count does not match target layer " + std::to_string(kv)};
     }
     auto w = std::make_unique<DflyWeights>();
-    if (!w->allocate(d, err)) return {model::Status::Error, "hy4flash: " + err};
+    {
+        const core::OnDevice on(device);
+        if (!w->allocate(d, err)) return {model::Status::Error, "hy4flash: " + err};
+    }
     for (const DflySpec& s : dfly_specs(d)) {
         const DflyTensor& t = dp.tensors.at(s.name);
         core::LoadItem it;
@@ -162,6 +170,7 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
 
 std::unique_ptr<DflyTap> DflyTap::create(const DflyDims& d, int sel_cap, std::string& err) {
     std::unique_ptr<DflyTap> t(new DflyTap());
+    cudaGetDevice(&t->device_);
     t->E_ = d.E;
     t->cap_ = sel_cap;
     t->layers_ = d.layers;
@@ -175,6 +184,7 @@ std::unique_ptr<DflyTap> DflyTap::create(const DflyDims& d, int sel_cap, std::st
 }
 
 DflyTap::~DflyTap() {
+    const core::OnDevice on(device_);
     if (hid_) cudaFree(hid_);
     if (sel_) cudaFree(sel_);
 }
@@ -232,9 +242,11 @@ struct DflyRunner::Impl {
     bool ready = false;        ///< the mask row and the bias are read (at the first block: a session is made before the weights are placed)
     int n = 0;                 ///< drafts of the block begin() enqueued
     int32_t anchor = 0;
+    int device = -1;
     bool pending = false;
 
     ~Impl() {
+        const core::OnDevice on(device);
         for (void* p : bufs) cudaFree(p);
         for (void* p : pinned) cudaFreeHost(p);
     }
@@ -274,10 +286,15 @@ struct DflyRunner::Impl {
 };
 
 std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err) {
+    int dev = env.device;
+    if (dev < 0) cudaGetDevice(&dev);
+    const core::OnDevice on(dev);
     std::unique_ptr<DflyRunner> r(new DflyRunner());
     r->p_ = std::make_unique<Impl>();
     Impl& p = *r->p_;
+    p.device = dev;
     p.env = env;
+    p.env.device = dev;
     p.w = env.w;
     p.d = env.w->dims;
     const DflyDims& d = p.d;
@@ -319,6 +336,7 @@ DflyRunner::~DflyRunner() = default;
 bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
                        std::string& err, int64_t rope_pos) {
     Impl& p = *p_;
+    const core::OnDevice on(p.device);
     const DflyDims& d = p.d;
     const DflyWeights& w = *p.w;
     if (n < 1 || n > kDflyDrafts || row < 0) {
@@ -366,7 +384,7 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
         for (int i = 0; i < d.layers; ++i) {
             const int cnt = tap.count(i, row);
             nctxs[i] = cnt < 0 ? (int) pos : cnt;
-            if (nctxs[i] + R > 4096 || nctxs[i] > p.env.sel_cap) {
+            if (nctxs[i] < 0 || nctxs[i] + R > 4096 || nctxs[i] > p.env.sel_cap) {
                 err = "dfly: " + std::to_string(nctxs[i]) + " selected rows";
                 return false;
             }
@@ -448,6 +466,7 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
 }
 
 void DflyRunner::copy_block(float* host, int rows, void* stream) const {
+    const core::OnDevice on(p_->device);
     cudaMemcpyAsync(host, p_->z, (size_t) rows * p_->d.E * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream);
     cudaStreamSynchronize((cudaStream_t) stream);
 }
@@ -455,6 +474,7 @@ void DflyRunner::copy_block(float* host, int rows, void* stream) const {
 bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std::string& err,
                         const std::function<void(int, int32_t)>& on_row, const std::function<bool(const float*, int)>& need) {
     Impl& p = *p_;
+    const core::OnDevice on(p.device);
     made = 0;
     if (!p.pending) {
         err = "dfly: no block was begun";
@@ -548,11 +568,17 @@ bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, std::functio
     if (!tap_) return false;
     DflyRunner::Env env;
     env.w = w;
+    cudaGetDevice(&env.device);
     env.embed = std::move(embed);
     env.sel_cap = sel_cap;
     env.fp8 = fp8;
     runner_ = DflyRunner::create(env, err);
-    return runner_ != nullptr;
+    if (!runner_) {
+        tap_.reset();
+        w_ = nullptr;
+        return false;
+    }
+    return true;
 }
 
 model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const std::vector<uint8_t*>& cache, void* stream,
