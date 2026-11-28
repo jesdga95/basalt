@@ -108,8 +108,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0) {
+            session_release(s);
+            delete[] s.qsa_states;
+            s.qsa_states = nullptr;
             return 0;
+        }
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));
@@ -124,12 +128,14 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 }
 
 void session_release(SessionState& s) {
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) qsa_state_release(s.qsa_states[s.qsa_ord0 + j]);
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (s.qsa_states[j].owns_rope) {
-            basalt::kernels::rope_table_release(s.qsa_states[j].cos_tab);
-            s.qsa_states[j].owns_rope = false;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.owns_rope) {
+            basalt::kernels::rope_table_release(q.cos_tab);
+            q.owns_rope = false;
         }
+        qsa_state_release(q);
+    }
 }
 
 int64_t session_kv_cells(const SessionState& s) {
@@ -360,6 +366,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                 return false;
             }
             if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+                cudaStreamDestroy(cs);
                 err = "session_capture: begin failed at layer " + std::to_string(l);
                 return false;
             }
@@ -372,6 +379,10 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                                                   s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
                                                   half, stage_prefix);
             if (!ok) {
+                cudaGraph_t bad = nullptr;
+                cudaStreamEndCapture(cs, &bad);
+                if (bad != nullptr) cudaGraphDestroy(bad);
+                cudaStreamDestroy(cs);
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
                 return false;
             }
@@ -379,27 +390,34 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
             const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
             cudaStreamDestroy(cs);
             if (ce != cudaSuccess) {
+                if (graph != nullptr) cudaGraphDestroy(graph);
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " +
                       cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
                 return false;
             }
             if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
+                cudaGraphDestroy(graph);
                 err = "session_capture: instantiate failed at layer " + std::to_string(l);
                 return false;
             }
             cudaGraphDestroy(graph);
             return true;
         };
-        if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
-        if (!capture(/*post=*/true, &gr.posts[l], "post")) return false;
+        auto fail = [&]() {
+            gr.n = l + 1;
+            session_graphs_free(gr);
+            return false;
+        };
+        if (!capture(/*post=*/false, &gr.execs[l], "pre")) return fail();
+        if (!capture(/*post=*/true, &gr.posts[l], "post")) return fail();
         if (split) {
-            if (!capture(/*post=*/false, &gr.preA[l], "preA", /*half=*/1)) return false;
-            if (!capture(/*post=*/false, &gr.preB[l], "preB", /*half=*/2)) return false;
+            if (!capture(/*post=*/false, &gr.preA[l], "preA", /*half=*/1)) return fail();
+            if (!capture(/*post=*/false, &gr.preB[l], "preB", /*half=*/2)) return fail();
             // Prefixes 1..5, ALL through the new parameter - including the fifth, so that it and the fourth
             // differ only in the one stage between them and not in how many nodes their graphs carry.
             for (int k = 1; k <= 5; ++k)
                 if (!capture(/*post=*/false, &gr.preP[k - 1][l], "preP", /*half=*/0, /*stage_prefix=*/k))
-                    return false;
+                    return fail();
         }
         ++gr.n;
         if (qsa) ++qsa_index;
@@ -620,7 +638,8 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
 
 void session_graphs_free(SessionGraphs& gr) {
     if (gr.execs) {
-        for (int64_t i = 0; i < gr.n; ++i) cudaGraphExecDestroy(gr.execs[i]);
+        for (int64_t i = 0; i < gr.n; ++i)
+            if (gr.execs[i] != nullptr) cudaGraphExecDestroy(gr.execs[i]);
         delete[] gr.execs;
     }
     if (gr.posts) {

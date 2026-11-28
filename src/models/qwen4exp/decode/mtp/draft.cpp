@@ -47,6 +47,13 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
             if (!capture_step(j, err)) return false;
     }
     const Clock::time_point t0 = Clock::now();
+    if (cs_busy_) {
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        cs_busy_ = false;
+    }
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
         h_step_[row * 4 + 0] = (int32_t) cell;
@@ -121,6 +128,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         for (int j = 1; j < max_steps && draft_keep(pr, j - 1, host_th); ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
                 if (cudaGraphLaunch(step_exec_[tier_][j], cs_) != cudaSuccess) {
+                    cs_busy_ = true;
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
@@ -144,9 +152,14 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         decode_gaps().mark(8);
         // the skipped steps' nodes finish beside the next window; the profile stamps and the logits copy need the end
         const bool sync = !arrived || gstamp_ != nullptr || diag_ != nullptr;
-        if (sync && cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
+        if (sync) {
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            cs_busy_ = false;
+        } else {
+            cs_busy_ = true;
         }
     }
     run_launch_hook();   // no graph ran: the hook still runs, once
@@ -184,6 +197,7 @@ int MtpDrafter::draft_more(int have, int32_t* drafts, float* probs) {
     int n = have;
     for (; n < chain_steps_ && n < kMtpChainMax; ++n) {
         if (((volatile int32_t*) h_out_)[n] < 0) break;
+        basalt::platform::load_fence();
         drafts[n] = ((volatile int32_t*) h_out_)[n];
         if (probs) probs[n] = ((volatile float*) h_prob_)[n];
     }

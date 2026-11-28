@@ -53,13 +53,17 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     bool pending = l > 0 && !cvec().covers(l - 1);
     if (l == 1 && ple_on) {
         if (!ple_side) {
-            if (v_.ar_on() || dm) wait_flag_ge(v_.m_flag_, 1, cs);
+            if (v_.lb_ == 1) {
+                if (!v_.batch_rec_) wait_flag_ge(v_.m_flag_ + 8, 1, cs);
+            } else if (v_.ar_on() || dm) {
+                wait_flag_ge(v_.m_flag_, 1, cs);
+            }
             copy_from_mapped(v_.ple_, v_.m_ple_, (int64_t) T * N, cs);
         }
         // the rows' write, post-ops, history advance and snapshots in two launches, the value projection on the side
         // stream beside the key's
         cudaStream_t pside = v_.sh_hi_ != nullptr ? v_.sh_hi_ : v_.sh_cs_;
-        const bool ple_fork = pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
+        const bool ple_fork = !v_.prof_on_ && pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
         if (ple_side) {
             cudaStreamWaitEvent(cs, v_.ev_ple_join_, 0);
             ple_open = false;

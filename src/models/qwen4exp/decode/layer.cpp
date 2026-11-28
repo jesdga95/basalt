@@ -614,6 +614,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
             cudaSuccess) {
+        qsa_state_release(st);
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
@@ -625,6 +626,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         uint8_t* d = nullptr;
         if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+            if (h != nullptr) cudaFreeHost(h);
+            qsa_state_release(st);
             // the driver may pin only a small amount of host memory in all, which is less than a long context of
             // 8-bit KV needs
             if (p.mode == 1) basalt::log::error("basalt", "KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
@@ -632,6 +635,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
+        st.host_pinned = h;
         g_kv_host_bytes += bytes;
         Cursor hc{d};
         if (st.kv_q4) {
@@ -684,6 +688,13 @@ int64_t qsa_kv_elastic() { return g_kv_elastic; }
 void qsa_state_release(QsaState& st) {
     delete st.kv_arena;
     st.kv_arena = nullptr;
+    if (st.host_step != nullptr) { cudaFreeHost(st.host_step); st.host_step = nullptr; }
+    if (st.host_pos != nullptr) { cudaFreeHost(st.host_pos); st.host_pos = nullptr; }
+    if (st.host_pinned != nullptr) {
+        cudaFreeHost(st.host_pinned);
+        st.host_pinned = nullptr;
+        st.host = basalt::kernels::KvHostPools{};
+    }
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {

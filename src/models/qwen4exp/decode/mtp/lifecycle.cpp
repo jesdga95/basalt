@@ -6,7 +6,10 @@ namespace basalt::core {
 using namespace mtp_detail;
 
 MtpDrafter::~MtpDrafter() {
+    const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
+    if (cs2_) cudaStreamSynchronize(cs2_);
+    if (cs3_) cudaStreamSynchronize(cs3_);
     if (ev_done_) cudaEventDestroy(ev_done_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
@@ -33,16 +36,18 @@ MtpDrafter::~MtpDrafter() {
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (dense_) cudaFree(dense_);
     if (experts_) cudaFree(experts_);
+    qsa_state_release(st_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
     if (dhead_) cudaFree(dhead_);
     if (dvocab_) cudaFree(dvocab_);
+    if (dxids_) cudaFree(dxids_);
     if (top_scratch_) cudaFree(top_scratch_);
     if (proxy_) cudaFree(proxy_);
     if (proxy_scratch_) cudaFree(proxy_scratch_);
     if (gstamp_) cudaFree(gstamp_);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, diag_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
 
