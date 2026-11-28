@@ -90,4 +90,56 @@ void swiglu_split_clamped(const float* gate_up, int n_rows, int n_ff, float limi
         throw std::runtime_error(std::string("deepseek4 split SwiGLU: ") + cudaGetErrorString(error));
 }
 
+namespace {
+
+__global__ void stage_copy_floats_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+__global__ void stage_copy_words_kernel(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+__global__ void stage_copy_strided_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                          int n_rows, int row_floats, int dst_stride_floats) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = (int64_t) n_rows * row_floats;
+    if (i >= total) return;
+    const int r = (int) (i / row_floats);
+    const int c = (int) (i - (int64_t) r * row_floats);
+    dst[(int64_t) r * dst_stride_floats + c] = src[i];
+}
+
+}  // namespace
+
+void stage_copy_floats(const float* src, float* dst, int64_t n, void* stream) {
+    if (n <= 0) return;
+    stage_copy_floats_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        src, dst, n);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("deepseek4 stage_copy_floats: ") + cudaGetErrorString(error));
+}
+
+void stage_copy_words(const uint32_t* src, uint32_t* dst, int n, void* stream) {
+    if (n <= 0) return;
+    stage_copy_words_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        src, dst, n);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("deepseek4 stage_copy_words: ") + cudaGetErrorString(error));
+}
+
+void stage_copy_strided(const float* src, float* dst, int n_rows, int row_floats, int dst_stride_floats, void* stream) {
+    const int64_t total = (int64_t) n_rows * row_floats;
+    if (total <= 0) return;
+    stage_copy_strided_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        src, dst, n_rows, row_floats, dst_stride_floats);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("deepseek4 stage_copy_strided: ") + cudaGetErrorString(error));
+}
+
 }  // namespace basalt::models::deepseek4

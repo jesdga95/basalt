@@ -14,6 +14,7 @@
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/platform/compiler.hpp"
 #include "basalt/program/probe_rates.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/models/deepseek4/compress.hpp"
@@ -99,6 +100,8 @@ public:
         if (h_expert_seq_) cudaFreeHost(h_expert_seq_);
         if (h_route_meta_) cudaFreeHost(h_route_meta_);
         if (h_route_meta_dyn_) cudaFreeHost(h_route_meta_dyn_);
+        if (h_plan_hits_) cudaFreeHost(h_plan_hits_);
+        if (h_plan_fetch_) cudaFreeHost(h_plan_fetch_);
         if (h_join_) cudaFreeHost(h_join_);
         if (feat_ev_) cudaEventDestroy(feat_ev_);
         if (h_initial_) cudaFreeHost(h_initial_);
@@ -199,13 +202,17 @@ public:
             cudaHostAlloc(reinterpret_cast<void**>(&h_join_), 64, host_flags) != cudaSuccess ||
             cudaHostAlloc(reinterpret_cast<void**>(&h_route_meta_), sizeof(RouteMeta), host_flags) != cudaSuccess ||
             cudaHostAlloc(reinterpret_cast<void**>(&h_route_meta_dyn_), sizeof(RouteMeta), host_flags) != cudaSuccess ||
+            cudaHostAlloc(reinterpret_cast<void**>(&h_plan_hits_), sizeof(ExpertPlan), host_flags) != cudaSuccess ||
+            cudaHostAlloc(reinterpret_cast<void**>(&h_plan_fetch_), sizeof(ExpertPlan), host_flags) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_input_), h_expert_input_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_ids_), h_expert_ids_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_seq_), h_expert_seq_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_join_), h_join_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_expert_rows_), h_expert_rows_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_route_meta_), h_route_meta_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_route_meta_dyn_), h_route_meta_dyn_, 0) != cudaSuccess) {
+            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_route_meta_dyn_), h_route_meta_dyn_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_plan_hits_host_), h_plan_hits_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_plan_fetch_host_), h_plan_fetch_, 0) != cudaSuccess) {
             err = "cannot map the expert staging buffers";
             return false;
         }
@@ -1017,7 +1024,7 @@ private:
     bool prefill_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr,
                       const std::function<bool()>& stop = {}, const std::function<void(int)>& progress = {});
     bool routed_step(int layer, const float* normalized, int n_tokens, const FfnRouteWeights& route,
-                     const float* weights, float* output);
+                     const float* weights, float* output, uint32_t expect_seq);
     bool fail_cuda(const char* operation);
 
     DsModel& model_;
@@ -1102,10 +1109,12 @@ private:
     float* d_expert_input_ = nullptr;
     int32_t *h_expert_ids_ = nullptr;
     uint32_t *h_expert_seq_ = nullptr, *d_expert_seq_ = nullptr, *h_join_ = nullptr, *d_join_ = nullptr;
-    uint32_t join_seq_ = 0;
+    uint32_t join_seq_ = 0, expert_seq_ = 0;
     int32_t* d_expert_ids_ = nullptr;
     RouteMeta *h_route_meta_ = nullptr, *d_route_meta_ = nullptr;
     RouteMeta *h_route_meta_dyn_ = nullptr, *d_route_meta_dyn_ = nullptr;
+    ExpertPlan *h_plan_hits_ = nullptr, *d_plan_hits_host_ = nullptr;
+    ExpertPlan *h_plan_fetch_ = nullptr, *d_plan_fetch_host_ = nullptr;
 };
 
 bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings,
@@ -1397,19 +1406,16 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                     const int slot = drafter_->feature_slot(layer);
                     if (slot >= 0) {
                         const size_t fstride = (size_t) drafter_->feature_floats();
-                        for (int t = 0; t < n_tokens; ++t) {
-                            if (cudaMemcpyAsync(d_feat_ + (size_t) t * fstride + (size_t) slot * n,
-                                                collapsed_ + (size_t) t * n, n * sizeof(float),
-                                                cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
-                                return fail_cuda("dspark feature tap");
-                        }
+                        stage_copy_strided(collapsed_, d_feat_ + (size_t) slot * n, n_tokens, (int) n, (int) fstride,
+                                           stream_);
                     }
                 }
                 if (cudaEventRecord(row_ev_[0], stream_) != cudaSuccess ||
-                    cudaStreamWaitEvent(row_st_, row_ev_[0], 0) != cudaSuccess ||
-                    cudaMemcpyAsync(d_expert_input_, ffn_normed_, (size_t) n_tokens * geo_.n_embd * sizeof(float),
-                                    cudaMemcpyDeviceToDevice, row_st_) != cudaSuccess ||
-                    cudaEventRecord(row_ev_[1], row_st_) != cudaSuccess)
+                    cudaStreamWaitEvent(row_st_, row_ev_[0], 0) != cudaSuccess)
+                    return fail_cuda("expert input stage");
+                stage_copy_floats(ffn_normed_, d_expert_input_, (int64_t) n_tokens * geo_.n_embd, row_st_);
+                kernels::native_quantize_q8_1(ffn_normed_, expert_input_q8_, geo_.n_embd, n_tokens, row_st_);
+                if (cudaEventRecord(row_ev_[1], row_st_) != cudaSuccess)
                     return fail_cuda("expert input stage");
                 router_step(ffn_normed_, route.gate, n_tokens, geo_.n_embd, route.routing, router_logits_,
                             route_ids_, route_weights_, stream_);
@@ -1438,7 +1444,8 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
             if (!enqueue_head()) return false;
         }
         if (attention_only) return true;
-        if (!routed_step(layer, ffn_normed_, n_tokens, route, route_weights_, ffn_output_)) return false;
+        const uint32_t expect_seq = ++expert_seq_;
+        if (!routed_step(layer, ffn_normed_, n_tokens, route, route_weights_, ffn_output_, expect_seq)) return false;
         if (!use_graphs || layer + 1 == end_layer) {
             const auto enqueue_tail = [&]() -> bool {
                 try {
@@ -1947,7 +1954,7 @@ bool Session::prefill_rows(const int32_t* tokens, int total_tokens, int64_t pos,
 }
 
 bool Session::routed_step(int layer, const float* normalized, int n_tokens, const FfnRouteWeights&,
-                          const float* weights, float* output) {
+                          const float* weights, float* output, uint32_t expect_seq) {
     core::ExpertTier* tier = model_.tier();
     if (!tier || !normalized || !weights || !output || n_tokens < 1 || n_tokens > kExpertWindow) {
         err_ = "deepseek4: expert tier or routed-expert buffers are unavailable";
@@ -1955,22 +1962,20 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
     }
 
     const int n_ids = n_tokens * geo_.n_used;
-    const uint32_t sequence = *h_expert_seq_;
+    tier->pump(layer, 2 + n_tokens);
 
     // The single publish kernel writes ids before advancing the mapped sequence word.
     bool ids_ready = false;
     const volatile uint32_t* staged_sequence = h_expert_seq_;
     for (int spin = 0; spin < (1 << 22); ++spin) {
-        if (*staged_sequence != sequence) {
+        if ((int32_t) (*staged_sequence - expect_seq) >= 0) {
             std::atomic_thread_fence(std::memory_order_acquire);
             ids_ready = true;
             break;
         }
-        std::atomic_signal_fence(std::memory_order_seq_cst);
+        platform::cpu_relax();
     }
     if (!ids_ready && !sync()) return false;
-
-    tier->pump(layer, 3);
     int32_t unique[kExpertWindowRoutes]{};
     int uidx[kExpertWindowRoutes]{};
     core::ExpertTier::Use use[kExpertWindowRoutes]{};
@@ -2024,10 +2029,8 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
         plan.start[n_gpu] = entries;
         plan.groups[0] = n_gpu;
     };
-    const auto launch_gpu = [&](const ExpertPlan& plan, void* dev_plan, int n_gpu, int entries,
-                                const kernels::NativeExpertLayout& layout) {
-        ExpertPlanSingle single_plan;
-        const void* host_plan = &plan;
+    const auto launch_gpu = [&](const ExpertPlan& plan, const ExpertPlan* mapped_dev_plan, void* dev_plan,
+                                int n_gpu, int entries, const kernels::NativeExpertLayout& layout) {
         size_t plan_bytes = sizeof(plan);
         size_t ptr_offset = offsetof(ExpertPlan, ptr);
         size_t start_offset = offsetof(ExpertPlan, start);
@@ -2035,21 +2038,10 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
         size_t dst_offset = offsetof(ExpertPlan, dst);
         size_t tok_offset = offsetof(ExpertPlan, tok);
         if (n_tokens == 1) {
-            std::copy_n(plan.ptr, n_gpu, single_plan.ptr);
-            std::copy_n(plan.start, n_gpu + 1, single_plan.start);
-            single_plan.groups[0] = n_gpu;
-            std::copy_n(plan.dst, entries, single_plan.dst);
-            std::copy_n(plan.tok, entries, single_plan.tok);
-            host_plan = &single_plan;
-            plan_bytes = sizeof(single_plan);
-            ptr_offset = offsetof(ExpertPlanSingle, ptr);
-            start_offset = offsetof(ExpertPlanSingle, start);
-            groups_offset = offsetof(ExpertPlanSingle, groups);
-            dst_offset = offsetof(ExpertPlanSingle, dst);
-            tok_offset = offsetof(ExpertPlanSingle, tok);
+            plan_bytes = (offsetof(ExpertPlan, tok) + (size_t) entries * sizeof(int32_t) + 3) & ~size_t(3);
         }
-        if (cudaMemcpyAsync(dev_plan, host_plan, plan_bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-            return fail_cuda("expert plan upload");
+        stage_copy_words(reinterpret_cast<const uint32_t*>(mapped_dev_plan), static_cast<uint32_t*>(dev_plan),
+                         (int) (plan_bytes / 4), stream_);
         const auto* device_plan = static_cast<const uint8_t*>(dev_plan);
         kernels::native_expert_grouped_clamped(layout, geo_.swiglu_limit,
             reinterpret_cast<const unsigned long long*>(device_plan + ptr_offset),
@@ -2061,19 +2053,17 @@ bool Session::routed_step(int layer, const float* normalized, int n_tokens, cons
         return true;
     };
 
-    ExpertPlan plan_hits, plan_fetched;
+    ExpertPlan& plan_hits = *h_plan_hits_;
+    ExpertPlan& plan_fetched = *h_plan_fetch_;
     int hits_gpu = 0, hits_entries = 0, fetch_gpu = 0, fetch_entries = 0;
     build_plan(plan_hits, false, hits_gpu, hits_entries);
     if (fetched) build_plan(plan_fetched, true, fetch_gpu, fetch_entries);
     if (hits_gpu > 0 || fetch_gpu > 0) {
-        const ExpertLayer& expert = model_.weights().pack().experts[(size_t) layer];
-        const kernels::NativeExpertLayout layout = kernels::native_expert_layout(
-            expert.gate_up_type, expert.down_type, geo_.n_embd, geo_.n_ff_exp, geo_.swiglu_limit);
-        kernels::native_quantize_q8_1(normalized, expert_input_q8_, geo_.n_embd, n_tokens, stream_);
-        if (hits_gpu > 0 && !launch_gpu(plan_hits, expert_plan_, hits_gpu, hits_entries, layout)) return false;
+        const kernels::NativeExpertLayout& layout = layers_[(size_t) layer].expert_layout;
+        if (hits_gpu > 0 && !launch_gpu(plan_hits, d_plan_hits_host_, expert_plan_, hits_gpu, hits_entries, layout)) return false;
         if (fetched) {
             tier->await_fetch(stream_);
-            if (fetch_gpu > 0 && !launch_gpu(plan_fetched, expert_plan2_, fetch_gpu, fetch_entries, layout)) return false;
+            if (fetch_gpu > 0 && !launch_gpu(plan_fetched, d_plan_fetch_host_, expert_plan2_, fetch_gpu, fetch_entries, layout)) return false;
         }
     } else if (fetched) {
         tier->await_fetch(stream_);
