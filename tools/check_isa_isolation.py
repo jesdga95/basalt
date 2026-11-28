@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 # Objects built with AVX-512 flags on purpose; their kernels are reached through a run-time CPU check.
-AVX512_OBJECTS = ("iq_avx512", "nvfp4_avx512", "ggml_dots_avx512", "gemm_cpu_avx512", "src/kernels/cpu/expert.cpp")
+AVX512_OBJECTS = ("iq_avx512", "nvfp4_avx512", "mxfp4_avx512", "ggml_dots_avx512", "gemm_cpu_avx512", "src/kernels/cpu/expert.cpp")
 # Multi-config MSVC generators place src/kernels/cpu/expert.cpp at kernels_cpu.dir/<Config>/expert.obj.
 MSVC_EXPERT_OBJ = re.compile(r"(?:^|/)kernels_cpu\.dir/(?:[^/]+/)?expert\.obj$")
 # EVEX-encoded instructions start with byte 0x62 in 64-bit mode, whatever registers they name.

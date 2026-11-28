@@ -8,6 +8,7 @@
 #include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
+#include "basalt/kernels/cpu/mxfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/log.hpp"
@@ -32,6 +33,7 @@ bool iq1s_512_fits(int) noexcept { return false; }
 bool iq4nl256_fits(int) noexcept { return false; }
 bool nvfp4_512_fits(int, int) noexcept { return false; }
 bool nvfp4_256_fits(int, int) noexcept { return false; }
+bool mxfp4_512_fits(int, int) noexcept { return false; }
 bool kq256_supported(int) noexcept { return false; }
 
 // ---- the kernels: never reached ----
@@ -74,6 +76,13 @@ void nvfp4_256_gu_rows(const uint8_t*, size_t, size_t, int, float, float, const 
 }
 void nvfp4_256_down_rows(const uint8_t*, size_t, int, float, const void* const*, int, float* const*, int, int) {
     absent("nvfp4_256_down_rows");
+}
+void mxfp4_512_gu_rows(const uint8_t*, size_t, size_t, int, const SwiGlu&, const void* const*, int, float* const*, int,
+                       int) {
+    absent("mxfp4_512_gu_rows");
+}
+void mxfp4_512_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    absent("mxfp4_512_down_rows");
 }
 
 void kq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
