@@ -20,6 +20,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/models/gemma4/kernels.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "models/gemma4/experts.hpp"
 #include "models/gemma4/model.hpp"
 #include "models/gemma4/prompt.hpp"
@@ -422,6 +423,15 @@ public:
             cudaStreamSynchronize(stream_) != cudaSuccess)
             return {model::Status::Error, "gemma4: the log probabilities failed"};
         return {};
+    }
+
+    // the KV format and the experts' placement (a community row reads both); a dense model has no expert to spill
+    std::string info_words() const override {
+        const std::string kv = m_.kv_type() == KvType::F8 ? "kv=fp8" : "kv=fp16";
+        core::ExpertTier* t = m_.tier();
+        return t ? "expert_slots=" + std::to_string(t->gpu_slots()) + " expert_slots_primary=" + std::to_string(t->slots()) +
+                       " ram_experts_mib=" + std::to_string(t->ram_bytes() >> 20) + " " + kv + " " + program::spill_words(t->spill())
+                 : kv + " " + program::spill_words({});
     }
 
     // SLEEP / WAKE: every weight stays on the card, so the session has nothing to lend: ok, no slots, SLEEP goes on to the
