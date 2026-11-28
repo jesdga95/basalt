@@ -152,7 +152,7 @@ void Verifier::gs_init() {
         const WeightRef *qkv, *z, *out, *a, *b, *conv, *norm, *dt, *sa;
     };
     std::vector<Src> src;
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = lb_; l < le_; ++l) {
         if (is_qsa_layer(g, l)) continue;
         const LayerView v(*wt_, l);
         Src s{v.get("attn_qkv.weight"), v.get("attn_gate.weight"), v.get("ssm_out.weight"), v.get("ssm_alpha.weight"),
@@ -319,6 +319,7 @@ void Verifier::gs_free() {
         if (gs_pxq_) cudaFree(gs_pxq_);
         if (gs_mixl_) cudaFree(gs_mixl_);
         if (gs_pscr_) cudaFree(gs_pscr_);
+        if (gs_commit_done_) cudaEventDestroy(gs_commit_done_);
         const OnDevice on0(device_);
         for (GsLayer& L : gs_layers_)
             for (void* p : {L.wqkv0, L.wz0, L.wo0})
@@ -332,6 +333,8 @@ void Verifier::gs_free() {
     gs_h_x_ = gs_m_x_ = gs_h_part_ = gs_m_part_ = nullptr;
     gs_mixl_ = nullptr; gs_pscr_ = nullptr; gs_qkv0_ = gs_z0_ = nullptr;
     gs_live_ = gs_split_ = false;
+    gs_commit_pending_ = false;
+    gs_commit_done_ = nullptr;
     gs_ss_ = nullptr;
     gs_layers_.clear();
     gs_state_ = nullptr;

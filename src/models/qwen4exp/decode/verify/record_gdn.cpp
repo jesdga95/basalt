@@ -34,7 +34,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
     float* beta = v_.beta_L_ + (size_t) gi * MT * HV;
     PdlScope ps(pdl);   // the layer's GDN kernels, after the hc read
     if (gs_split) {   // CUDA0's key heads in place (dec_gdn_rec's head map); the peer's arrive in the combine
-        const GsLayer& GL = v_.gs_layers_[(size_t) gi];
+        const GsLayer& GL = v_.gs_layers_[(size_t) (gi - gdn_first)];
         const int C0 = (int) (C / HK * v_.gs_nk0_), Z0 = (int) (ZV / HK * v_.gs_nk0_);
         kernels::dense_tc_pair(GL.tq, GL.wqkv0, v_.gs_qkv0_, C0, GL.tz, GL.wz0, v_.gs_z0_, Z0, v_.xq_, (int) N, n, cs);
         DecRecArgs ra;

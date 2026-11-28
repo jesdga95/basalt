@@ -161,6 +161,12 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
     if (parts & 1) {
+        if (gs_commit_pending_) {
+            const OnDevice on(gs_dev_);
+            gs_commit_pending_ = false;
+            const cudaError_t pe = gs_commit_done_ != nullptr ? cudaEventSynchronize(gs_commit_done_) : cudaStreamSynchronize(dm_->ps);
+            if (pe != cudaSuccess) { err = std::string("verify: peer commit: ") + cudaGetErrorString(pe); return false; }
+        }
         h_commit_[0] = n_keep;
         h_commit_[1] = n_keep - 1;
         for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
@@ -173,12 +179,12 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         decode_events().record(DecodeEvents::kCommitPre, cm_);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cm_);
         decode_events().record(DecodeEvents::kCommitPost, cm_);
+        if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         if (gs_split_ && gs_live_) {   // the peer's heads, on its stream behind its window
             const OnDevice on(gs_dev_);
             gs_ca_.n_keep = h_commit_;
             basalt::kernels::gdn_commit_layers(gs_ca_, dm_->ps, kCommitBlocks);
         }
-        if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window's first node waits for the epoch (the host names it in
         // h_pend_), and the drafter (its own stream) reads only this window's final rows and its own K/V.  h_commit_ is
         // next written after the next window's results are read, i.e. after this graph has run.  Everything else waits
@@ -186,12 +192,31 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         if (!g_commit_async || next_ != nullptr) {
             const cudaError_t se = cudaStreamSynchronize(cm_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+            if (gs_split_ && gs_live_) {
+                const OnDevice on(gs_dev_);
+                const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
+                if (pe != cudaSuccess) { err = std::string("verify: peer commit: ") + cudaGetErrorString(pe); return false; }
+            }
         } else {
             const cudaError_t re = cudaEventRecord(commit_done_, cm_);
             if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
             (void) cudaStreamQuery(cm_);
             commit_pending_ = true;
             lz_pending_ = lazy_on();   // its later GDN layers: the next window, or apply_lazy
+            if (gs_split_ && gs_live_) {
+                const OnDevice on(gs_dev_);
+                if (gs_commit_done_ == nullptr &&
+                    cudaEventCreateWithFlags(&gs_commit_done_, cudaEventDisableTiming) != cudaSuccess) {
+                    const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
+                    if (pe != cudaSuccess) { err = std::string("verify: peer commit: ") + cudaGetErrorString(pe); return false; }
+                } else if (cudaEventRecord(gs_commit_done_, dm_->ps) != cudaSuccess) {
+                    err = std::string("verify: peer commit event: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                } else {
+                    (void) cudaStreamQuery(dm_->ps);
+                    gs_commit_pending_ = true;
+                }
+            }
         }
         decode_gaps().mark(4);
     }
@@ -211,6 +236,12 @@ bool Verifier::wait_commit(std::string& err) {
         commit_pending_ = false;
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    }
+    if (gs_commit_pending_) {
+        const OnDevice on(gs_dev_);
+        gs_commit_pending_ = false;
+        const cudaError_t pe = gs_commit_done_ != nullptr ? cudaEventSynchronize(gs_commit_done_) : cudaStreamSynchronize(dm_->ps);
+        if (pe != cudaSuccess) { err = std::string("verify: peer commit: ") + cudaGetErrorString(pe); return false; }
     }
     if (gs_live_ && !gs_move(false, err)) return false;
     return next_ == nullptr || next_->wait_commit(err);

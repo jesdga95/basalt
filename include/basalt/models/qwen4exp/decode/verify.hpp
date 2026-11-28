@@ -703,6 +703,8 @@ private:
     // session gs_ss_ (CUDA0's copies of them are stale); split: the last window ran split
     basalt::kernels::GdnCommitLayers gs_ca_;
     bool gs_live_ = false, gs_split_ = false;
+    bool gs_commit_pending_ = false;
+    cudaEvent_t gs_commit_done_ = nullptr;
     SessionState* gs_ss_ = nullptr;
     float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead, q80p_vhead)

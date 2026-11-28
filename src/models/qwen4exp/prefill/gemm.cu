@@ -21,6 +21,7 @@
 #include <mutex>
 #include <tuple>
 #include "basalt/core/diag.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/log.hpp"
 
 
@@ -104,6 +105,7 @@ bool Gemm::prepare_handle(std::string& err) {
 }
 
 Gemm::~Gemm() {
+    const core::OnDevice od(device_);
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (lt_) cublasLtDestroy((cublasLtHandle_t) lt_);
     if (!external_) {
@@ -117,6 +119,7 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     cublasHandle_t h = nullptr;
     int dev = 0;
     cudaGetDevice(&dev);
+    device_ = dev;
     if (dev >= 0 && dev < 16 && g_prepared[dev] != nullptr) {
         h = g_prepared[dev];
         g_prepared[dev] = nullptr;
@@ -148,6 +151,8 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     // every failure names the call and the real status, so "no VRAM" can be told from a broken install
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) device_ = dev;
     cublasHandle_t h = nullptr;
     if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
         err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
