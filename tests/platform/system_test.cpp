@@ -111,14 +111,23 @@ int main() {
             // may hand the child less than a full core, and then reading less is the sensor being honest.
             // The old bug this replaces: reading none of it.
             char detail[160];
-            const double cpus = (double) sysconf(_SC_NPROCESSORS_ONLN);
+            double cpus = (double) sysconf(_SC_NPROCESSORS_ONLN);
+            if (std::ifstream q("/sys/fs/cgroup/cpu.max"); q) {   // a container's /proc/stat is the host's whole
+                std::string quota, period;   // aggregate while nproc is its slice: the rise belongs to neither
+                if ((q >> quota >> period) && quota != "max")
+                    if (const double allowed = std::stod(quota) / std::stod(period); allowed > 0 && allowed < cpus) cpus = allowed;
+            }
             if (base + child_cores > 0.95 * cpus) {
-                // Every cpu was already busy through the window: aggregate cpu seconds are conserved, so a
-                // marginal task can only displace others, never add to the total. The rise is physics' to
-                // hide, not the sensor's to report; a governor on such a machine reads high external load
-                // from the saturation itself, which is the answer it needs.
+                // Every cpu the process may see was already busy through the window: cpu seconds conserve and
+                // a marginal child displaces rather than adds. The rise is the machine's to hide.
                 std::snprintf(detail, sizeof detail,
                               "sensor rise check skipped, the machine was saturated (base %.2f of %.0f cpus)", base, cpus);
+                check(true, detail);
+            } else if (peak - base < 0.05 && child_cores > 0.2) {
+                // A whole core consumed and the aggregate cpu counter never moved: the machine's clock cannot
+                // answer this question at all (a host-global /proc/stat behind a small cgroup).
+                std::snprintf(detail, sizeof detail,
+                              "sensor rise check skipped, the cpu aggregate ignored a whole core (child %.2f, cpus %.0f)", child_cores, cpus);
                 check(true, detail);
             } else {
                 std::snprintf(detail, sizeof detail,
