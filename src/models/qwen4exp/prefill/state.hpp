@@ -13,6 +13,7 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <algorithm>
+#include <atomic>
 #include <vector>
 #include <memory>
 #include <future>
@@ -144,6 +145,7 @@ struct Prefill::Impl {
         std::vector<int64_t> tok;            // tokens[from - 2, to)
         int64_t run_pos0 = 0, to = 0;
         bool pending = false;
+        std::atomic<bool> stop{false};
         std::future<void> fut;
     } warm;
 };

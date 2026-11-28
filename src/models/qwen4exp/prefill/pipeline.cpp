@@ -56,7 +56,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     const bool body_ok = run_impl(tokens, n, pos0, err);
     // the tokens the warm-up reads belong to this request: wait for it once the run that reads them is over
     impl_->warm.pending = false;
-    if (impl_->warm.fut.valid() && (!body_ok || pos0 + n >= impl_->warm.to)) impl_->warm.fut.wait();
+    const bool stop_warm = !body_ok || (should_stop && should_stop());
+    if (impl_->warm.fut.valid() && (stop_warm || pos0 + n >= impl_->warm.to)) {
+        if (stop_warm) impl_->warm.stop.store(true, std::memory_order_release);
+        impl_->warm.fut.wait();
+    }
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
