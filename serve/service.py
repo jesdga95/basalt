@@ -15,7 +15,7 @@ from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineSta
 from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
 from serve.api.grammar import GPROMPT_KEY, REQUEST_KEY as GRAMMAR_KEY
-from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, effort_kwargs, forced_call, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
@@ -173,6 +173,7 @@ class Service:
         self.answer_room: str | int = "auto"             # answer reserve when thinking: "auto" or a fixed token count (0: none)
         self.reasoning_effort: str | None = None         # effort for a request that names none (None: the template's)
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
+        self.force_call_on_reopen = False                # tools offered, no call or answer yet, and the model opens a second thinking block: close it and force a call
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
 
@@ -1498,6 +1499,14 @@ class Service:
         opening_text = (self.dialect.nothink_lead + force) if forced_now else ""
         if forced_now:                                  # the parser reads it as if the model had written it
             opening, force = parser.feed(opening_text), None
+        reopen_force = None                             # the opening that forces a call when thinking reopens (force_call_on_reopen)
+        left_thinking = False                           # a thinking block closed with no answer or call after it
+        was_thinking = False                            # the model has thought in this reply
+        if self.force_call_on_reopen and thinking and tools and force is None and self.dialect.thinks_in_blocks:
+            try:
+                reopen_force = forced_call("required", tools, self.dialect.forced_opening)[1]
+            except ValueError:
+                reopen_force = None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
         prompt_ms0 = None                               # the first engine run's prompt read time
@@ -1645,6 +1654,7 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         over = False                    # the budget was reached in a pass it does not cap: stopping soon
                         looped = False                  # the wrap is for a repeated token, not the budget
+                        reopened = False                # the wrap is for a second thinking block: write a forced call
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
                         resumed = False                 # stopped for answer now, but not at a point to close: go on
@@ -1739,6 +1749,18 @@ class Service:
                                         and parser.state == "reasoning" and not parser.buf and not detok.pending()):
                                     wrap = looped = True
                                     break
+                                if reopen_force:
+                                    if any(ev.kind in ("tool_start", "tool_call")
+                                           or (ev.kind == "content" and (ev.text or "").strip()) for ev in evs):
+                                        reopen_force = None  # the model answered or called on its own: leave it
+                                    elif parser.state != "reasoning":
+                                        left_thinking = left_thinking or was_thinking   # a block that thought, then closed
+                                    else:
+                                        if left_thinking and not parser.buf and not detok.pending():
+                                            force, reopen_force = reopen_force, None
+                                            wrap = reopened = True   # a second thinking block with nothing said: close it, write the call
+                                            break
+                                        was_thinking = True
                                 if one_call and any(ev.kind == "tool_call" for ev in evs):
                                     finish = "stop"         # no second call after a forced one
                                     break
@@ -1873,6 +1895,8 @@ class Service:
                                 print(f"[server] answer now: closing the thinking after {thinking_n} tokens", flush=True)
                             elif looped:
                                 print(f"[server] thinking repeated one token {run_n} times, ending it", flush=True)
+                            elif reopened:
+                                print(f"[server] thinking reopened after {thinking_n} tokens with no answer or call, closing it and forcing a call", flush=True)
                             else:
                                 print(f"[server] thinking budget reached ({thought} tokens), wrapping up", flush=True)
                         elif resumed:

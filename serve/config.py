@@ -650,6 +650,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
                     help="end the thinking and let the model answer when it repeats one token this many times in a "
                          "row inside the thinking (0 = never)")
+    ap.add_argument("--force-call-on-reopen", action="store_true", default=False,
+                    help="for models that think in blocks: when tools are offered and the model opens a second thinking "
+                         "block before saying anything or calling a tool, close it and force a call, as tool_choice "
+                         "required would (default: the model decides)")
     ap.add_argument("--video-max-tokens", type=video_tokens, default=VIDEO_MAX_TOKENS, metavar="N",
                     help=f"the most image tokens one video may take over all its frames (default {VIDEO_MAX_TOKENS}): "
                          "frames are sampled at 2 a second (4 to 768; a request's video part may ask fps and "

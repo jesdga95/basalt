@@ -247,6 +247,59 @@ class Tokens(unittest.TestCase):
         ids = svc.encode_prompt([{"role": "user", "content": user}], None, {})
         self.assertIn(",".join(map(str, svc.tok.encode(user, parse_special=False))), ",".join(map(str, ids)))
 
+    def reopen_run(self, flag, reply, max_new=4000):
+        """Run one request whose first pass writes `reply` (text with markers); later passes write a call. Returns
+        (merged events, the prompts the engine saw)."""
+        svc = service()
+        svc.force_call_on_reopen = flag
+        tok = svc.tok
+        tools = [{"name": "edit", "description": "edit a file",
+                  "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+        first = tok.encode(reply, parse_special=True)
+        rest = tok.encode('{"path":"a"}}' + END + END_TURN, parse_special=True)
+        prompts = []
+
+        def scripted(ids, max_new, sampling, cancel, embeddings=None, session=None):
+            prompts.append(list(ids))
+            for t in (first if len(prompts) == 1 else rest)[:int(max_new)]:
+                yield t
+
+        svc.engine.generate = scripted
+        ids = svc.encode_prompt([{"role": "user", "content": "fix it"}], tools, {})
+        evs = [x for k, x in svc.run(ids, True, tools, max_new, {}, threading.Event()) if k == "event"]
+        return merged(evs), prompts
+
+    def test_reopened_thinking_with_tools_forces_the_call(self):
+        # A thinking block that closed with nothing said, then a second one opens: with the flag the server closes
+        # the second block and writes the opening of the call, as tool_choice required would. Without the flag the
+        # model thinks on.
+        reply = HEADER + THINK + "pondering " * 5 + END + HEADER + THINK + "again " * 40
+        opening = Inkling2().forced_opening("edit")
+        got, prompts = self.reopen_run(True, reply)
+        self.assertEqual(len(prompts), 2)
+        svc = service()
+        self.assertEqual(prompts[1][-len(svc.tok.encode(END + opening, parse_special=True)):],
+                         svc.tok.encode(END + opening, parse_special=True))
+        self.assertIn(("call", "edit", {"path": "a"}), [g if len(g) == 3 else None for g in got])
+        got, prompts = self.reopen_run(False, reply)
+        self.assertEqual(len(prompts), 1)
+        self.assertFalse([g for g in got if g[0] == "call"])
+
+    def test_reopened_thinking_is_left_alone_after_the_model_spoke(self):
+        # Text between the blocks: the model is answering, so a later thinking block is its own business.
+        reply = (HEADER + THINK + "pondering " * 5 + END + HEADER + TEXT + "working on it" + END
+                 + HEADER + THINK + "again " * 40)
+        got, prompts = self.reopen_run(True, reply)
+        self.assertEqual(len(prompts), 1)
+        self.assertFalse([g for g in got if g[0] == "call"])
+
+    def test_one_thinking_block_then_its_own_call_is_not_forced(self):
+        reply = (HEADER + THINK + "pondering " * 5 + END
+                 + HEADER + "edit" + TOOL_JSON + '{"name":"edit","args":{"path":"b"}}' + END + END_TURN)
+        got, prompts = self.reopen_run(True, reply)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn(("call", "edit", {"path": "b"}), [g if len(g) == 3 else None for g in got])
+
 
 if __name__ == "__main__":
     unittest.main()
