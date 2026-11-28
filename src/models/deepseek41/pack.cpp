@@ -3,6 +3,7 @@
 
 #include "models/deepseek41/engram_rows.hpp"
 
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -56,6 +57,13 @@ bool read_int_array(const std::string& text, const char* key, std::vector<int32_
 }  // namespace
 
 bool open_pack(const std::string& path, Pack& p, std::string& err) {
+    p.geo = {};
+    p.tensors.clear();
+    p.experts.clear();
+    p.experts_range = {};
+    p.engram = {};
+    p.vision = {};
+    p.dspark = {};
     if (!p.file.open(path, err) || !p.file.load_meta(err)) return false;
     const Json& meta = p.file.meta();
     const Json* arch = meta.get("arch");
@@ -103,24 +111,50 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     for (double d : numbers(member(*gj, "swiglu_clamp_exp"))) g.clamp_exp.push_back((float) d);
     for (double d : numbers(member(*gj, "swiglu_clamp_shexp"))) g.clamp_shexp.push_back((float) d);
     for (double d : numbers(member(*gj, "attention.compress_ratios"))) g.compress_ratio.push_back((int) d);
-    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_expert <= 0) {
-        err = path + ": meta.geometry is incomplete";
+    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_embd % 32 != 0 || g.n_expert <= 0 || g.n_used <= 0 || g.n_used > 8 ||
+        g.n_used > g.n_expert || g.n_ff_exp <= 0 || g.n_ff_exp % 32 != 0 || g.n_shared < 0) {
+        err = path + ": meta.geometry is incomplete or invalid";
         return false;
+    }
+    for (int r : g.compress_ratio) {
+        if (r < 0) {
+            err = path + ": meta.geometry has a negative compress ratio";
+            return false;
+        }
     }
     g.compress_ratio.resize((size_t) g.n_layers, 0);
     g.clamp_exp.resize((size_t) g.n_layers, 10.0f);
     g.clamp_shexp.resize((size_t) g.n_layers, 10.0f);
     if (const Json* gk = meta.get("gguf_kv"))
-        if (const Json* t = gk->get("tokenizer.ggml.tokens")) g.n_vocab = (int) t->count;
+        if (const Json* t = gk->get("tokenizer.ggml.tokens"); t && t->is_array() && t->count <= (uint64_t) INT_MAX)
+            g.n_vocab = (int) t->count;
+    if (g.n_vocab <= 0) {
+        err = path + ": meta has no vocabulary size";
+        return false;
+    }
 
     // tensors; offsets are relative to the section a tensor names (the GGUF section by default)
     for (const auto& [name, t] : tj->members) {
+        if (!t.is_object()) {
+            err = path + ": tensor " + name + " is not an object";
+            return false;
+        }
+        const Json* off_j = t.get("offset");
+        if (!off_j || off_j->type != Json::Type::Int || off_j->neg) {
+            err = path + ": tensor " + name + " has no valid offset";
+            return false;
+        }
         TensorRef r;
         r.name = name;
         r.type = (int) num_or(t.get("type_id"), 0);
-        if (const Json* sh = t.get("shape"))
+        if (const Json* sh = t.get("shape"); sh && sh->is_array())
             for (const Json& d : sh->items) r.shape.push_back(d.u64());
-        r.bytes = (uint64_t) num_or(t.get("bytes"), 0);
+        const Json* bytes_j = t.get("bytes");
+        if (bytes_j && (bytes_j->type != Json::Type::Int || bytes_j->neg)) {
+            err = path + ": tensor " + name + " has an invalid byte size";
+            return false;
+        }
+        r.bytes = bytes_j ? bytes_j->u64() : 0;
         std::string section = "gguf";
         if (const Json* s = t.get("section"); s && s->is_string()) section = s->s;
         const core::ModelFile::Section* sec = p.file.find(section);
@@ -128,7 +162,12 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
             err = path + ": tensor " + name + " names a missing section " + section;
             return false;
         }
-        r.offset = sec->offset + t.get("offset")->u64();
+        const uint64_t rel_off = off_j->u64();
+        if (rel_off > sec->bytes || r.bytes > sec->bytes - rel_off) {
+            err = path + ": tensor " + name + " runs past the end of section " + section;
+            return false;
+        }
+        r.offset = sec->offset + rel_off;
         p.tensors.emplace(name, std::move(r));
     }
 
@@ -137,12 +176,17 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
 
     // the experts section and its per-layer layout
     p.experts_range = p.file.range("experts");
+    if (p.experts_range.empty()) {
+        err = path + ": missing experts section";
+        return false;
+    }
     std::vector<uint8_t> text;
     if (!p.file.read("experts.layout", text, err)) return false;
     {
         std::istringstream in(std::string(text.begin(), text.end()));
         std::string line;
         p.experts.resize((size_t) g.n_layers);
+        std::vector<uint8_t> has((size_t) g.n_layers, 0);
         int seen = 0, version = 0;
         while (std::getline(in, line)) {
             if (line.rfind("# experts v", 0) == 0) version = std::atoi(line.c_str() + 11);
@@ -150,7 +194,10 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
             std::istringstream ls(line);
             long long l, gu, d, up = -1;
             unsigned long long off, by;
-            if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers || (version >= 7 && !(ls >> up))) {
+            if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers || by == 0 ||
+                (uint64_t) off > p.experts_range.bytes ||
+                (uint64_t) by > (p.experts_range.bytes - (uint64_t) off) / (uint64_t) g.n_expert ||
+                (version >= 7 && !(ls >> up))) {
                 err = "experts.layout: bad line '" + line + "'";
                 return false;
             }
@@ -158,6 +205,11 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
                 err = "experts.layout: layer " + std::to_string(l) + "'s gate and up differ in type";
                 return false;
             }
+            if (has[(size_t) l]) {
+                err = "experts.layout: duplicate layer " + std::to_string(l);
+                return false;
+            }
+            has[(size_t) l] = 1;
             p.experts[(size_t) l] = {(int) gu, (int) d, off, by};
             ++seen;
         }
@@ -170,32 +222,57 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     // Engram
     if (const Json* ej = meta.get("engram"); ej && ej->is_object()) {
         EngramInfo& e = p.engram;
-        const core::ModelFile::Section* sec = p.file.find(ej->get("section") ? ej->get("section")->s : "engram");
+        const Json* sec_j = ej->get("section");
+        const std::string sec_name = sec_j && sec_j->is_string() ? sec_j->s : "engram";
+        const core::ModelFile::Section* sec = p.file.find(sec_name);
         if (!sec) {
             err = path + ": meta.engram names a missing section";
             return false;
         }
-        e.present = true;
-        e.file_offset = sec->offset;
-        e.rows = ej->get("rows")->u64();
-        e.row_bytes = (uint32_t) ej->get("row_bytes")->u64();
-        e.row_values = (int) ej->get("row_values")->u64();
-        e.type = (int) num_or(ej->get("type_id"), 20);
-        if (e.row_values != 256) {   // every consumer dequantizes one row into 256 floats
-            err = path + ": the Engram rows hold " + std::to_string(e.row_values) + " values; rows of 256 values are read";
+        const Json *rows_j = ej->get("rows"), *rb_j = ej->get("row_bytes"), *rv_j = ej->get("row_values");
+        if (!rows_j || rows_j->type != Json::Type::Int || rows_j->neg ||
+            !rb_j || rb_j->type != Json::Type::Int || rb_j->neg ||
+            !rv_j || rv_j->type != Json::Type::Int || rv_j->neg) {
+            err = path + ": meta.engram is missing rows, row_bytes or row_values";
             return false;
         }
+        e.file_offset = sec->offset;
+        e.rows = rows_j->u64();
+        const uint64_t row_bytes_u = rb_j->u64();
+        const uint64_t row_values_u = rv_j->u64();
+        e.type = (int) num_or(ej->get("type_id"), 20);
+        if (row_values_u != 256) {   // every consumer dequantizes one row into 256 floats
+            err = path + ": the Engram rows hold " + std::to_string(row_values_u) + " values; rows of 256 values are read";
+            return false;
+        }
+        e.row_values = 256;
         const size_t want = engram_row_bytes(e.type, e.row_values);   // the whole row: blocks of 32 values, or of 256
-        if (want == 0 || e.row_bytes != (uint32_t) want) {
-            err = path + ": the Engram rows are type " + std::to_string(e.type) + " of " + std::to_string(e.row_bytes) +
+        if (want == 0 || row_bytes_u != want) {
+            err = path + ": the Engram rows are type " + std::to_string(e.type) + " of " + std::to_string(row_bytes_u) +
                   " bytes; IQ4_NL, Q5_K, Q6_K, MXFP4 and MXFP8 rows are read";
             return false;
         }
-        for (double d : numbers(ej->get("ple.layers"))) e.layers.push_back((int) d);
+        e.row_bytes = (uint32_t) row_bytes_u;
+        if (e.rows > sec->bytes / (uint64_t) e.row_bytes) {
+            err = path + ": meta.engram rows exceed its section size";
+            return false;
+        }
+        for (double d : numbers(ej->get("ple.layers"))) {
+            const int l = (int) d;
+            if (l < 0 || l >= g.n_layers) {
+                err = path + ": meta.engram layer out of range";
+                return false;
+            }
+            e.layers.push_back(l);
+        }
         EngramHashParams& h = e.hash;
         h.n_gram = (int) num_or(ej->get("ple.ngram_size"), 4);
         h.n_head = (int) num_or(ej->get("ple.heads_per_ngram"), 8);
         h.pad_token_id = (int) num_or(ej->get("engram.pad_token_id"), 2);
+        if (h.n_gram < 2 || h.n_gram > 9 || h.n_head <= 0 || h.n_head > INT_MAX / (h.n_gram - 1)) {
+            err = path + ": meta.engram has invalid n-gram geometry";
+            return false;
+        }
         h.mult = unsigneds(ej->get("ple.layer_multipliers"));
         h.primes = unsigneds(ej->get("ple.head_vocab_sizes"));
         h.offsets = unsigneds(ej->get("ple.head_offsets"));
@@ -205,12 +282,27 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
             err = path + ": the Engram hash arrays do not match its layer count";
             return false;
         }
+        for (size_t i = 0; i < h.primes.size(); ++i) {
+            if (h.primes[i] == 0) {
+                err = path + ": meta.engram has a zero head vocab size";
+                return false;
+            }
+            if (h.offsets[i] > e.rows || h.primes[i] > e.rows - h.offsets[i]) {
+                err = path + ": meta.engram head range exceeds table rows";
+                return false;
+            }
+        }
         std::vector<uint8_t> raw;
         if (!p.file.read("meta", raw, err)) return false;
         if (!read_int_array(std::string(raw.begin(), raw.end()), "deepseek41.engram.token_map", h.token_map)) {
             err = path + ": the Engram token map is missing";
             return false;
         }
+        if (h.pad_token_id < 0 || (size_t) h.pad_token_id >= h.token_map.size()) {
+            err = path + ": meta.engram pad_token_id is out of range";
+            return false;
+        }
+        e.present = true;
     }
     return true;
 }

@@ -15,6 +15,12 @@ foreach(_t router_parity norm_parity hc_parity engram_parity attn_index_parity p
   endif()
 endforeach()
 if(BUILD_TESTING)
+  add_executable(ds41_engram_hash_test
+    src/models/deepseek41/kernels/engram_hash_test.cpp
+    src/models/deepseek41/kernels/engram_hash.cpp)
+  target_include_directories(ds41_engram_hash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(ds41_engram_hash_test PRIVATE warnings)
+  basalt_cpu_test(NAME ds41_engram_hash_test COMMAND ds41_engram_hash_test)
   add_executable(ds41_cache_rows_parity src/models/deepseek41/kernels/cache_rows_parity.cu)
   target_include_directories(ds41_cache_rows_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(ds41_cache_rows_parity PRIVATE ${_gpu_runtime_target})

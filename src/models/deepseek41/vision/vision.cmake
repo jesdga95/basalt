@@ -5,6 +5,12 @@ add_library(deepseek41_vision STATIC
 target_include_directories(deepseek41_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(deepseek41_vision PUBLIC vision_core CUDA::cudart CUDA::cublas)
 if(BUILD_TESTING)
+  add_executable(ds41_vision_plan_test
+    src/models/deepseek41/vision/plan_test.cpp
+    src/models/deepseek41/vision/plan.cpp)
+  target_include_directories(ds41_vision_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(ds41_vision_plan_test PRIVATE vision_core warnings)
+  basalt_cpu_test(NAME ds41_vision_plan_test COMMAND ds41_vision_plan_test)
   add_executable(ds41_vision_parity src/models/deepseek41/vision/parity.cpp)
   target_link_libraries(ds41_vision_parity PRIVATE deepseek41_vision)
   # the encoder on a card short of room: refusals leave no CUDA error, and the retry encodes as a fresh encoder (GPU)

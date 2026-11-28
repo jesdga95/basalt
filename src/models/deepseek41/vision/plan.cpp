@@ -29,8 +29,9 @@ float bf16_round(float v) {
 }  // namespace
 
 VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens) {
-    const int p = kVisionPatch, r = merge;
-    if (min_pixels > 0 && (int64_t) w * h > 0 && (int64_t) w * h < min_pixels) {
+    const int p = kVisionPatch, r = std::max(merge, 1);
+    max_tokens = std::max(max_tokens, 4);
+    if (min_pixels > 0 && w > 0 && h > 0 && (int64_t) w * h < min_pixels) {
         const double ratio = std::sqrt((double) min_pixels / ((double) w * (double) h));
         w = (int) (w * ratio);
         h = (int) (h * ratio);
@@ -55,6 +56,8 @@ VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens) {
             bw = (int) std::floor(w * beta / p) * p;
         }
     }
+    bw = std::max(bw, p);
+    bh = std::max(bh, p);
     VisionPlan pl;
     pl.width = bw;
     pl.height = bh;
@@ -68,6 +71,12 @@ VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens) {
 
 void image_patches(const basalt::vision::Image& src, const VisionPlan& plan, std::vector<float>& rows) {
     const int bw = plan.width, bh = plan.height;
+    if (src.w <= 0 || src.h <= 0 || bw <= 0 || bh <= 0 || plan.gx <= 0 || plan.gy <= 0 ||
+        (int64_t) plan.gx * kVisionPatch > bw || (int64_t) plan.gy * kVisionPatch > bh ||
+        src.rgb.size() < (size_t) src.w * (size_t) src.h * 3) {
+        rows.clear();
+        return;
+    }
     // aspect-preserving fit, centred on grey (python round: half to even)
     int nw = bw, nh = bh;
     const double im = (double) src.w / src.h, dest = (double) bw / bh;
