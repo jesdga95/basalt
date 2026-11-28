@@ -386,7 +386,11 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
-class ConversationCache {
+/// Parked conversations, matched by their tokens and kept or evicted whole, least recently active first.  `Image` is
+/// what one holds: a RAM image (SavedConversation), or a VRAM one (a model's, with the same live/checkpoints/cvec/
+/// from_slot members and bytes()).
+template <class Image>
+class BasicConversationCache {
 public:
     struct Match {
         size_t index = 0;
@@ -394,7 +398,7 @@ public:
         bool live = false;
     };
 
-    ConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
+    BasicConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
@@ -453,8 +457,8 @@ public:
         return best;
     }
 
-    SavedConversation take(size_t index) {
-        SavedConversation out = std::move(entries_.at(index));
+    Image take(size_t index) {
+        Image out = std::move(entries_.at(index));
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         forget(out);
         return out;
@@ -470,10 +474,24 @@ public:
             if (!evict_oldest(false)) break;
         return true;
     }
+    /// What make_room(incoming, held) would evict, in the entries' bytes (the retained buffers aside), without
+    /// evicting: SIZE_MAX when it would refuse.
+    size_t room_frees(size_t incoming, size_t held = 0) const {
+        if (!enabled() || held > budget_ || incoming > budget_ - held) return SIZE_MAX;
+        size_t count = entries_.size() - slot_count_, bytes = bytes_ - slot_bytes_, freed = 0;
+        for (size_t i = 0; i < entries_.size() && (count >= slots_ || bytes > budget_ - held - incoming); ++i) {
+            if (entries_[i].from_slot) continue;
+            const size_t n = entries_[i].bytes();
+            freed += n;
+            bytes -= n;
+            --count;
+        }
+        return freed;
+    }
 
     /// An idle batch slot's conversation, out of VRAM: kept whatever the byte budget (the caller has admitted its
     /// RAM), at most `keep` of them; the longest parked leaves first (to the tier below when spilling).
-    void put_slot(SavedConversation&& image, size_t keep) {
+    void put_slot(Image&& image, size_t keep) {
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         while (slot_count_ > 0 && slot_count_ >= keep && evict_oldest(true)) {}
         image.from_slot = true;
@@ -486,7 +504,7 @@ public:
 
     /// With spilling on, what make_room evicts waits in take_spilled() for the tier below (the disk) instead of going.
     void set_spill(bool on) { spill_ = on; }
-    std::vector<SavedConversation> take_spilled() { return std::exchange(spilled_, {}); }
+    std::vector<Image> take_spilled() { return std::exchange(spilled_, {}); }
 
     // Drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
@@ -510,7 +528,7 @@ public:
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                SavedConversation gone = std::move(entries_[i]);
+                Image gone = std::move(entries_[i]);
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 forget(gone);
                 ++dropped;
@@ -538,7 +556,7 @@ public:
         return freed;
     }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    bool put(Image&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
@@ -552,7 +570,7 @@ public:
 private:
     size_t budgeted_bytes() const { return bytes_ - slot_bytes_ + reuse_.bytes(); }
     // the bookkeeping of an entry that has left `entries_`
-    void forget(const SavedConversation& e) {
+    void forget(const Image& e) {
         const size_t n = e.bytes();
         bytes_ -= n;
         if (e.from_slot) { slot_bytes_ -= n; --slot_count_; }
@@ -561,7 +579,7 @@ private:
     bool evict_oldest(bool from_slot) {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].from_slot != from_slot) continue;
-            SavedConversation gone = std::move(entries_[i]);
+            Image gone = std::move(entries_[i]);
             entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
             forget(gone);
             if (spill_) spilled_.push_back(std::move(gone));
@@ -572,11 +590,13 @@ private:
     }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     size_t slot_bytes_ = 0, slot_count_ = 0;
-    std::deque<SavedConversation> entries_; // least recently active first
+    std::deque<Image> entries_; // least recently active first
     bool spill_ = false;
-    std::vector<SavedConversation> spilled_;
+    std::vector<Image> spilled_;
     ConversationKvReuse reuse_;
     const void* reuse_owner_ = nullptr;
 };
+
+using ConversationCache = BasicConversationCache<SavedConversation>;
 
 } // namespace basalt::core

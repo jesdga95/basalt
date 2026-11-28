@@ -179,6 +179,27 @@ void full_session(int fmt, int mode, int experts) {
           restored.live.state_d==a.live.state_d && restored.live.state_e==a.live.state_e &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
+    {   // --kv-pool: a device image of A, restored over B, leaves what a RAM image of A leaves
+        DeviceConversation dev, none;
+        check(conversation_device_save(dev,view,ss,g,&draft.state,err),"save a device image of A");
+        check(dev.bytes()==conversation_device_bytes(ss,g,&draft.state,(int64_t)ids.size()) &&
+              conversation_device_bytes(ss,g,&draft.state,3)<dev.bytes(),"device image size as estimated");
+        fill(177);
+        ss.ple_prev[0]=ss.ple_prev[1]=-7;
+        check(conversation_device_restore(none,ss,g,&draft.state,err)==ConversationRestore::invalid,
+              "an empty device image is refused");
+        check(conversation_device_restore(dev,ss,g,&draft.state,err)==ConversationRestore::restored,"restore the device image");
+        check(conversation_snapshot_save(restored,view,ss,g,draft.state,err),"capture after the device restore");
+        check(restored.live.state_a==a.live.state_a && restored.live.state_b==a.live.state_b &&
+              restored.live.state_c==a.live.state_c && restored.live.state_d==a.live.state_d &&
+              restored.live.state_e==a.live.state_e && equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),
+              "device image A/B/A exactness including spare key");
+        check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed from a device image");
+        check(conversation_device_restore(dev,ss,g,nullptr,err)==ConversationRestore::invalid,
+              "a device image with a draft is refused where none is expected");
+        DeviceConversation moved=std::move(dev);
+        check(dev.bytes()==0 && moved.bytes()>0,"a device image moves its allocation");
+    }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty,{}};

@@ -113,6 +113,10 @@ public:
     bool shrink(int64_t keep_bytes, std::string& err);
     /// `slots()` after `shrink(keep_bytes)`, without shrinking.
     int64_t slots_after_shrink(int64_t keep_bytes) const;
+    /// The segment boundary at or below `bytes` (the mapped bytes when `bytes` is past them): `shrink` to it keeps
+    /// no more than `bytes`, so it frees at least `mapped_bytes() - bytes`.  A keep inside a large segment (the
+    /// tail's head, or --vram-segment-mib's) is rounded up by `shrink` and would free a segment less.
+    int64_t segment_floor(int64_t bytes) const;
     /// Maps segments again up to `want_bytes` (rounded DOWN to a segment, at most the arena; the last, shorter
     /// segment only when `want_bytes` covers the arena).  Stops at the first segment the driver cannot back (false,
     /// `err`: what was mapped by then stays).  The new slots are empty until the caller fills them.

@@ -128,6 +128,18 @@ RAM, a session, or at exit. Only the system prompt's and the last three turns' s
 they were made with, and checked by hash; a bad file is deleted. The folder is capped by the budget (least recently used first), and a
 write always leaves 4 GiB of the volume free. After a restart, a prompt that starts with a stored conversation reads it back.
 
+## Conversations in VRAM: `--kv-pool`
+
+Off by default. Qwen3.8-Flash-Next on one card, with elastic KV and without `--parallel`. Elastic KV is on by default in `serve` on one
+card; any `--kv-resident` (even one equal to its floor) or `--vram-elastic` turns it off, and the pool with it. A conversation the session
+switches away from stays in VRAM, beside the live one, until their tokens together would pass `--max-context` (each pooled one also counts
+its running state, about 124 MiB): then the oldest leaves first. A prompt that continues a pooled conversation goes on from where it ended,
+without reading it again, and needs no free RAM. The pool takes its VRAM from the expert cache, never below the slots a prompt chunk needs,
+and gives way when the live conversation grows. A conversation the pool cannot take (past the budget beside the live one, or no VRAM above
+that floor) is parked as without the pool, before anything is evicted or the cache shrinks; after an image fails to allocate, one as large
+goes the same way until `VRAM` or `SLEEP`. Each pooled conversation keeps its deepest checkpoint in RAM (the system prompt's stays with the
+session). `SLEEP` drops the pool. The log lines start with `kv pool:`.
+
 ## Sleep: `--idle-sleep`
 
 After the given seconds without requests, the engine frees its VRAM (the driver moves the GPU state to host memory). The process and its
