@@ -73,6 +73,43 @@ int main() {
     check(!basalt::core::write_expert_profile(path, L, E, {{3, 0}}, err), "a pair out of range is refused");
     check(basalt::core::read_expert_profile(basalt::core::FileRange(path), L, E, back, slots, err) && back == r0,
           "a refused save keeps the file");
+    // Corrupt profiles: duplicate pairs, n_ranked > n_layers * n_expert, and invalid geometry are refused without clobbering `back`.
+    {
+        const std::vector<Pair> saved_back = back;
+        auto write_raw = [&](const std::string& p, const std::vector<uint32_t>& hdr, const std::vector<Pair>& pairs) {
+            std::vector<uint8_t> bytes;
+            auto pu32 = [&](uint32_t v) { for (int b = 0; b < 4; ++b) bytes.push_back((uint8_t) (v >> (8 * b))); };
+            auto pu16 = [&](uint32_t v) { bytes.push_back((uint8_t) v); bytes.push_back((uint8_t) (v >> 8)); };
+            for (uint32_t v : hdr) pu32(v);
+            for (const Pair& pr : pairs) { pu16((uint32_t) pr.first); pu16((uint32_t) pr.second); }
+            if (std::FILE* f = std::fopen(p.c_str(), "wb")) {
+                std::fwrite(bytes.data(), 1, bytes.size(), f);
+                std::fclose(f);
+            }
+        };
+        const std::string dup_path = (dir / "dup.bin").string();
+        write_raw(dup_path, {1u, 3u, 4u, 2u, 2u}, {{1, 2}, {1, 2}});
+        check(!basalt::core::read_expert_profile(basalt::core::FileRange(dup_path), L, E, back, slots, err) &&
+                  back == saved_back,
+              "duplicate pair in expert profile is refused without clobbering output");
+
+        const std::string over_path = (dir / "over.bin").string();
+        std::vector<Pair> thirteen(13, {0, 0});
+        write_raw(over_path, {1u, 3u, 4u, 13u, 13u}, thirteen);
+        check(!basalt::core::read_expert_profile(basalt::core::FileRange(over_path), L, E, back, slots, err) &&
+                  back == saved_back,
+              "n_ranked > n_layers * n_expert is refused");
+
+        check(!basalt::core::read_expert_profile(basalt::core::FileRange(path), 0, E, back, slots, err) &&
+                  back == saved_back,
+              "invalid model expert geometry is refused");
+
+        // Header-only ExpertCache::replace bounds guard: safe no-op on empty/out-of-range/self-replace calls.
+        basalt::core::ExpertCache empty_cache;
+        empty_cache.replace(-1, 0, 1);
+        empty_cache.replace(0, 0, 0);
+        empty_cache.replace(0, -1, 1);
+    }
     std::filesystem::remove_all(dir);
     if (fails == 0) std::puts("expert_profile_save_test: OK");
     return fails == 0 ? 0 : 1;

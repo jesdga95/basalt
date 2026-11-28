@@ -285,7 +285,7 @@ public:
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
-    uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
+    uint64_t pinned_bytes() const { return complement_pinned_ && !unpinned_ ? complement_pin_limit_ : 0; }
     uint64_t resident_bytes() const { return complement_bytes_; }
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_allocation_pinned() const { return complement_allocation_.allocation_pinned(); }
@@ -400,7 +400,7 @@ public:
 private:
     struct AdviseWorker;
     mutable std::unique_ptr<AdviseWorker> advise_worker_;
-    mutable std::once_flag advise_once_;
+    mutable std::mutex advise_mu_;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;

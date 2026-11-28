@@ -8,14 +8,20 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <filesystem>
-#include <utility>
 #include <cstring>
+#include <filesystem>
+#include <limits>
+#include <utility>
 
 namespace basalt::core {
 
 bool read_expert_profile(const FileRange& range, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
+    if (n_layers <= 0 || n_expert <= 0 ||
+        (uint64_t) n_layers > (uint64_t) std::numeric_limits<size_t>::max() / (uint64_t) n_expert) {
+        err = "read_expert_profile: invalid model expert geometry";
+        return false;
+    }
     const std::string& path = range.path;
     std::vector<uint8_t> raw_file;
     std::string rerr;
@@ -44,15 +50,19 @@ bool read_expert_profile(const FileRange& range, int64_t n_layers, int64_t n_exp
         err = "read_expert_profile: the header claims more ranked pairs than slots";
         return false;
     }
-    ranked.assign(n_ranked, {0, 0});
-    std::vector<uint16_t> raw((size_t) n_ranked * 2);
-    if (n_ranked > 0) {
-        if (raw_file.size() - at < raw.size() * 2) {
-            err = "read_expert_profile: the ranked list is truncated";
-            return false;
-        }
-        std::memcpy(raw.data(), raw_file.data() + at, raw.size() * 2);
+    const uint64_t max_pairs = (uint64_t) n_layers * (uint64_t) n_expert;
+    if ((uint64_t) n_ranked > max_pairs) {
+        err = "read_expert_profile: the header claims more ranked pairs than experts";
+        return false;
     }
+    if (raw_file.size() - at < (uint64_t) n_ranked * 4) {
+        err = "read_expert_profile: the ranked list is truncated";
+        return false;
+    }
+    std::vector<std::pair<int32_t, int32_t>> parsed(n_ranked, {0, 0});
+    std::vector<uint16_t> raw((size_t) n_ranked * 2);
+    if (n_ranked > 0) std::memcpy(raw.data(), raw_file.data() + at, raw.size() * 2);
+    std::vector<uint8_t> seen((size_t) max_pairs, 0);
     for (uint32_t i = 0; i < n_ranked; ++i) {
         const int32_t l = (int32_t) raw[(size_t) i * 2], e = (int32_t) raw[(size_t) i * 2 + 1];
         if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
@@ -62,8 +72,17 @@ bool read_expert_profile(const FileRange& range, int64_t n_layers, int64_t n_exp
             err = buf;
             return false;
         }
-        ranked[(size_t) i] = {l, e};
+        const size_t idx = (size_t) l * (size_t) n_expert + (size_t) e;
+        if (seen[idx]) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "read_expert_profile: duplicate pair %u (layer %d, expert %d)", i, l, e);
+            err = buf;
+            return false;
+        }
+        seen[idx] = 1;
+        parsed[(size_t) i] = {l, e};
     }
+    ranked = std::move(parsed);
     slots = (int64_t) want;
     (void) version;   // a future format bumps it; the layout check above is what protects this reader today
     return true;
@@ -288,6 +307,11 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         err = "ExpertCache: n_layers, n_expert and blob_bytes must all be positive";
         return false;
     }
+    if ((uint64_t) n_slots > std::numeric_limits<uint64_t>::max() / (uint64_t) blob_bytes ||
+        (uint64_t) n_layers > (uint64_t) std::numeric_limits<size_t>::max() / (uint64_t) n_expert) {
+        err = "ExpertCache: requested arena size overflows";
+        return false;
+    }
 
     const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
 
@@ -355,9 +379,19 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     if (slot_bytes.empty()) { err = "ExpertCache: no slots"; return false; }
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
+    constexpr uint64_t kMaxBytes = (uint64_t) std::numeric_limits<int64_t>::max();
     for (size_t i = 0; i < slot_bytes.size(); ++i) {
+        if (slot_bytes[i] <= 0 || (uint64_t) slot_bytes[i] > kMaxBytes - 255) {
+            err = "ExpertCache: invalid slot size";
+            return false;
+        }
         // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
-        off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
+        const uint64_t aligned = ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
+        if (aligned > kMaxBytes - off[i]) {
+            err = "ExpertCache: sized arena overflows";
+            return false;
+        }
+        off[i + 1] = off[i] + aligned;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
     // one allocation of the summed size and kReadPast more, through the uniform path's checks: n "slots" of 1 byte. open()
@@ -425,24 +459,25 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         if (layer_next_.empty()) return kNotResident;
         int64_t lo = 0, hi = 0;
         layer_slot_range(layer, lo, hi);
-        if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
+        const int64_t limit = std::min(hi, live_slots_);
+        if ((int64_t) layer_next_[(size_t) layer] >= limit) return kNotResident;   // this layer's quota is full
         residency_[at] = layer_next_[(size_t) layer]++;
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    if (next_free_ >= live_slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (base_ == nullptr || slot < 0 || slot >= live_slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (base_ == nullptr || slot < 0 || slot >= live_slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
@@ -452,7 +487,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
-              std::to_string(slots_ - 1);
+              std::to_string(live_slots_ - 1);
         return false;
     }
     if (host_blob == nullptr) {

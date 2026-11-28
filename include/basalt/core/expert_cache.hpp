@@ -132,8 +132,12 @@ public:
 
     /// Publish a same-layer replacement after its slot copy has completed.
     void replace(int64_t layer, int32_t old_expert, int32_t new_expert) {
-        auto& old = residency_[(size_t) layer * n_expert_ + old_expert];
-        residency_[(size_t) layer * n_expert_ + new_expert] = old;
+        if (layer < 0 || layer >= n_layers_ || old_expert < 0 || old_expert >= n_expert_ ||
+            new_expert < 0 || new_expert >= n_expert_ || old_expert == new_expert) {
+            return;
+        }
+        auto& old = residency_[(size_t) layer * (size_t) n_expert_ + (size_t) old_expert];
+        residency_[(size_t) layer * (size_t) n_expert_ + (size_t) new_expert] = old;
         old = kNotResident;
     }
 
