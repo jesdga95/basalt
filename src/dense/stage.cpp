@@ -718,7 +718,7 @@ bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float*
         chunk_tap(m, st, T, bd, h.first_tap + q);
     }
     if (mtp) cudaMemcpyAsync(m.cs.x, L.hand[1], bytes, cudaMemcpyHostToDevice, ms);
-    return chunk_finish(m, st, T, pos, err);
+    return chunk_finish(m, st, T, pos, err, L.pos3 + 4);
 }
 
 bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos, const std::function<void(int)>& progress,
